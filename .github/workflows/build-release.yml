@@ -47,6 +47,22 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Download wintun.dll (gitignored — must be fetched at build time)
+      - name: Download Wintun
+        shell: pwsh
+        run: |
+          $wintunUrl = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          $zipPath = "$env:RUNNER_TEMP\wintun.zip"
+          Invoke-WebRequest -Uri $wintunUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath "$env:RUNNER_TEMP\wintun"
+          # Copy to resources/ for Tauri bundling
+          New-Item -ItemType Directory -Force -Path "src-tauri/resources"
+          Copy-Item "$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" "src-tauri/resources/wintun.dll"
+          # Also copy to wintun-extract for build.rs
+          New-Item -ItemType Directory -Force -Path "src-tauri/wintun-extract/wintun/bin/amd64"
+          Copy-Item "$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" "src-tauri/wintun-extract/wintun/bin/amd64/wintun.dll"
+          Write-Host "Wintun DLL ready ($(Get-Item src-tauri/resources/wintun.dll | Select-Object -ExpandProperty Length) bytes)"
+
       - name: Build Tauri application
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
