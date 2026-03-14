@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+target/
+
+# Build outputs
+dist/
+dist-ssr/
+
+# Tauri build outputs
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/gen/
+
+# SECURITY (DEP-001): Cargo.lock MUST be committed for applications
+# This ensures reproducible builds and that audited dependency versions are used.
+# DO NOT add Cargo.lock to this file!
+# See: https://doc.rust-lang.org/cargo/faq.html#why-have-cargolock-in-version-control
+
+# Local env files
+.env
+.env.local
+.env.*.local
+
+# Editor directories
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Wintun DLL (downloaded at build time)
+wintun.dll
+
+# Tauri updater signing keys
+.tauri/
+*.key

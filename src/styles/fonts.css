@@ -1,0 +1,30 @@
+/* L-4: Locally bundled Inter font — no external network requests.
+ *
+ * A desktop VPN client should never phone home to Google Fonts:
+ * 1. Privacy: Leaks metrics to Google on every launch
+ * 2. Offline: Font must load without internet (VPN app starts BEFORE tunnel)
+ * 3. Speed: Eliminates 2× DNS + HTTPS round trips on startup
+ *
+ * Font source: https://rsms.me/inter/ — SIL Open Font License 1.1
+ * Variable font covers weights 100-900 in a single ~300 KB file.
+ *
+ * To regenerate: download InterVariable.woff2 from
+ *   https://github.com/rsms/inter/releases
+ * and place in src/assets/fonts/
+ */
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('../assets/fonts/Inter-Variable.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Inter';
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('../assets/fonts/Inter-Variable-Italic.woff2') format('woff2');
+}

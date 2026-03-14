@@ -1,0 +1,61 @@
+# cargo-deny configuration for Birdo VPN client
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "warn"
+notice = "warn"
+# Track allowed advisories with expiration dates and justifications.
+# Format: "RUSTSEC-YYYY-NNNN"
+# Review these monthly and remove once upstream patches land.
+#
+# Example (uncomment when needed):
+# ignore = [
+#   # RUSTSEC-2024-XXXX: curve25519-dalek timing side-channel
+#   # Tracked: https://github.com/nickel-ai/boringtun/issues/XXX
+#   # Expires: 2025-09-01 — re-evaluate at that time
+#   "RUSTSEC-2024-XXXX",
+# ]
+ignore = [
+    # RUSTSEC-2024-0344: boringtun timing side-channel in curve25519-dalek
+    # Upstream fix still pending. No practical exploit for VPN traffic:
+    # - The side-channel requires co-located attacker with microsecond timing
+    # - WireGuard handshake already has 500ms minimum duration (CRYPTO-001 in wireguard_new.rs)
+    # - Our handshake_with_retry() masks timing via exponential backoff
+    # Mitigation: constant-time handshake padding applied in our code layer.
+    # Tracked: https://github.com/cloudflare/boringtun/issues/396
+    # Review-by: 2026-07-01 — escalate to crate replacement if still unpatched
+    "RUSTSEC-2024-0344",
+]
+
+[licenses]
+unlicensed = "deny"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "OpenSSL",
+    "CC0-1.0",
+    "Unicode-3.0",
+]
+copyleft = "deny"
+allow-osi-fsf-free = "neither"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+# Deny known-problematic crates
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

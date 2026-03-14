@@ -1,0 +1,43 @@
+# Birdo VPN — Dependency Advisory Check
+# Run: cargo deny check advisories
+# Schedule: weekly (or on every PR)
+
+name: Dependency Audit (cargo-deny)
+
+on:
+  schedule:
+    - cron: '0 9 * * 1' # Every Monday at 09:00 UTC
+  pull_request:
+    paths:
+      - 'birdo-client-win/src-tauri/Cargo.toml'
+      - 'birdo-client-win/src-tauri/Cargo.lock'
+      - 'birdo-client-win/src-tauri/deny.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: birdo-client-win/src-tauri
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      - name: Check advisories
+        run: cargo deny check advisories
+
+      - name: Check licenses
+        run: cargo deny check licenses
+
+      - name: Check bans
+        run: cargo deny check bans
+
+      - name: Check sources
+        run: cargo deny check sources

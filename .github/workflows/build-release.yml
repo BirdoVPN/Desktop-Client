@@ -1,0 +1,131 @@
+name: Build & Sign Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'win-v*'
+
+# Minimum permissions — release job gets write below
+permissions: {}
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write  # Required for Sigstore keyless signing (Fulcio OIDC)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri application
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build
+
+      # ── Sigstore keyless signing ──────────────────────────────────────
+      # Uses GitHub OIDC identity (no certificates to manage/purchase).
+      # Each artifact gets a .sigstore bundle containing:
+      #   - Fulcio short-lived certificate (proves GitHub Actions built this)
+      #   - Rekor transparency log entry (publicly auditable)
+      # Users verify with: cosign verify-blob --bundle <file>.sigstore <file>
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Sign NSIS installer with Sigstore
+        shell: pwsh
+        run: |
+          $nsisExe = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" | Select-Object -First 1
+          if ($nsisExe) {
+            cosign sign-blob --yes --bundle "$($nsisExe.FullName).sigstore" $nsisExe.FullName
+            Write-Host "Signed $($nsisExe.Name) → $($nsisExe.Name).sigstore"
+          } else {
+            Write-Error "NSIS installer not found"
+            exit 1
+          }
+
+      - name: Sign MSI installer with Sigstore
+        shell: pwsh
+        run: |
+          $msiFile = Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1
+          if ($msiFile) {
+            cosign sign-blob --yes --bundle "$($msiFile.FullName).sigstore" $msiFile.FullName
+            Write-Host "Signed $($msiFile.Name) → $($msiFile.Name).sigstore"
+          } else {
+            Write-Error "MSI installer not found"
+            exit 1
+          }
+
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.exe, *.msi
+          $checksums = @()
+          foreach ($file in $artifacts) {
+            $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash.ToLower()
+            $checksums += "$hash  $($file.Name)"
+            Write-Host "$hash  $($file.Name)"
+          }
+          $checksums | Out-File -FilePath "src-tauri/target/release/bundle/SHA256SUMS.txt" -Encoding utf8
+
+      - name: Sign checksums file with Sigstore
+        run: |
+          cosign sign-blob --yes --bundle "src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore" "src-tauri/target/release/bundle/SHA256SUMS.txt"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: birdo-vpn-windows-installers
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.sigstore
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.sigstore
+            src-tauri/target/release/bundle/SHA256SUMS.txt
+            src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore
+          retention-days: 30
+
+      # Create GitHub release if triggered by a tag
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.sigstore
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.sigstore
+            src-tauri/target/release/bundle/SHA256SUMS.txt
+            src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore
+          generate_release_notes: true
+          draft: true
