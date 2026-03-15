@@ -150,25 +150,12 @@ jobs:
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: birdo-vpn-windows
-          signing-policy-slug: release-signing
-          artifact-configuration-slug: nsis-installer
+          project-slug: BirdoVPN
+          signing-policy-slug: BirdoVPN
+          artifact-configuration-slug: initial
           github-artifact-id: birdo-vpn-windows-installers
           wait-for-completion: true
           output-artifact-directory: signed-nsis/
-
-      - name: Submit MSI installer to SignPath
-        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
-        uses: signpath/github-action-submit-signing-request@v1.1
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: birdo-vpn-windows
-          signing-policy-slug: release-signing
-          artifact-configuration-slug: msi-installer
-          github-artifact-id: birdo-vpn-windows-installers
-          wait-for-completion: true
-          output-artifact-directory: signed-msi/
 
       - name: Upload signed NSIS installer
         if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
@@ -176,14 +163,6 @@ jobs:
         with:
           name: birdo-vpn-windows-signed-nsis
           path: signed-nsis/
-          retention-days: 30
-
-      - name: Upload signed MSI installer
-        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: birdo-vpn-windows-signed-msi
-          path: signed-msi/
           retention-days: 30
 
   # ── Job 3: GitHub Release ───────────────────────────────────────────
@@ -202,7 +181,7 @@ jobs:
           name: birdo-vpn-windows-installers
           path: release-unsigned/
 
-      # Download signed artifacts if SignPath signing succeeded
+      # Download signed artifact if SignPath signing succeeded
       - name: Download signed NSIS
         if: needs.sign.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -211,15 +190,7 @@ jobs:
           path: release-signed/
         continue-on-error: true
 
-      - name: Download signed MSI
-        if: needs.sign.result == 'success'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: birdo-vpn-windows-signed-msi
-          path: release-signed/
-        continue-on-error: true
-
-      # Assemble release: prefer signed installers, fall back to unsigned
+      # Assemble release: prefer signed installer, fall back to unsigned
       - name: Assemble release files
         shell: bash
         run: |
@@ -227,21 +198,16 @@ jobs:
           # Copy Sigstore bundles and checksums (always from unsigned)
           find release-unsigned -name '*.sigstore' -exec cp {} release-files/ \;
           find release-unsigned -name 'SHA256SUMS*' -exec cp {} release-files/ \;
-          # Use signed installers if available, otherwise unsigned
-          if [ -d release-signed ] && ls release-signed/*.exe 2>/dev/null; then
-            cp release-signed/*.exe release-files/
+          # Use signed EXE if available, otherwise unsigned
+          if [ -d release-signed ] && find release-signed -name '*.exe' | grep -q .; then
+            find release-signed -name '*.exe' -exec cp {} release-files/ \;
             echo "Using SignPath-signed EXE"
           else
             find release-unsigned -name '*.exe' -exec cp {} release-files/ \;
-            echo "Using unsigned EXE (SignPath not configured)"
+            echo "Using unsigned EXE"
           fi
-          if [ -d release-signed ] && ls release-signed/*.msi 2>/dev/null; then
-            cp release-signed/*.msi release-files/
-            echo "Using SignPath-signed MSI"
-          else
-            find release-unsigned -name '*.msi' -exec cp {} release-files/ \;
-            echo "Using unsigned MSI (SignPath not configured)"
-          fi
+          # MSI is not yet SignPath-signed (single PE config)
+          find release-unsigned -name '*.msi' -exec cp {} release-files/ \;
           echo "Release files:"
           ls -la release-files/
 
