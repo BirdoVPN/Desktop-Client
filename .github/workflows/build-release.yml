@@ -26,6 +26,8 @@ jobs:
   # Builds unsigned Tauri installers + Sigstore provenance signatures.
   build:
     runs-on: windows-latest
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     permissions:
       contents: write
       id-token: write  # Required for Sigstore keyless signing (Fulcio OIDC)
@@ -119,6 +121,7 @@ jobs:
           cosign sign-blob --yes --bundle "src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore" "src-tauri/target/release/bundle/SHA256SUMS.txt"
 
       - name: Upload build artifacts
+        id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: birdo-vpn-windows-installers
@@ -153,7 +156,7 @@ jobs:
           project-slug: BirdoVPN
           signing-policy-slug: BirdoVPN
           artifact-configuration-slug: initial
-          github-artifact-id: birdo-vpn-windows-installers
+          github-artifact-id: ${{ needs.build.outputs.artifact-id }}
           wait-for-completion: true
           output-artifact-directory: signed-nsis/
 
