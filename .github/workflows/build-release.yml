@@ -134,38 +134,110 @@ jobs:
             src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore
           retention-days: 30
 
-  # ── Job 2: SignPath Authenticode Signing ─────────────────────────────
-  # Submits build artifacts to SignPath Foundation for Authenticode signing.
-  # This gives "Publisher: SignPath Foundation" (trusted) in SmartScreen/UAC.
-  # Uses origin verification — SignPath verifies the build came from this repo.
-  # Skipped if SIGNPATH_ORGANIZATION_ID is not set (before Foundation approval).
+  # ── Job 2: SignPath Authenticode Signing (REST API) ───────────────────
+  # Signs .exe with Authenticode via SignPath REST API (no Trusted Build System needed).
+  # Uses direct artifact upload instead of GitHub Actions connector.
+  # Skipped if SIGNPATH_ORGANIZATION_ID is not set.
   sign:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
-      actions: read       # To verify the build artifact origin
-      id-token: write     # For SignPath origin verification (OIDC)
+      actions: read
     steps:
-      - name: Submit NSIS installer to SignPath
-        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
-        uses: signpath/github-action-submit-signing-request@v1.1
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: BirdoVPN
-          signing-policy-slug: BirdoVPN
-          artifact-configuration-slug: initial
-          github-artifact-id: ${{ needs.build.outputs.artifact-id }}
-          wait-for-completion: true
-          output-artifact-directory: signed-nsis/
+          name: birdo-vpn-windows-installers
+          path: artifacts/
 
-      - name: Upload signed NSIS installer
+      - name: Sign EXE via SignPath API
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        shell: bash
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+        run: |
+          set -euo pipefail
+          API="https://app.signpath.io/API/v1/${SIGNPATH_ORG_ID}"
+
+          # Find the EXE
+          EXE_FILE=$(find artifacts -name '*.exe' -not -name '*.sigstore' | head -1)
+          if [ -z "$EXE_FILE" ]; then
+            echo "::error::No EXE found in artifacts"
+            exit 1
+          fi
+          echo "Signing: $EXE_FILE"
+
+          # Submit signing request
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "${API}/SigningRequests" \
+            -H "Authorization: Bearer ${SIGNPATH_API_TOKEN}" \
+            -F "ProjectSlug=BirdoVPN" \
+            -F "SigningPolicySlug=BirdoVPN" \
+            -F "ArtifactConfigurationSlug=initial" \
+            -F "Artifact=@${EXE_FILE}" \
+            -F "Description=Automated release signing from GitHub Actions")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::SignPath API returned HTTP ${HTTP_CODE}: ${BODY}"
+            exit 1
+          fi
+
+          # Extract signing request ID from Location header or response
+          SIGNING_REQUEST_ID=$(echo "$BODY" | jq -r '.signingRequestId // .id // empty')
+          if [ -z "$SIGNING_REQUEST_ID" ]; then
+            echo "::error::Could not extract signing request ID from response: ${BODY}"
+            exit 1
+          fi
+          echo "Signing request ID: $SIGNING_REQUEST_ID"
+
+          # Poll for completion (max 10 minutes)
+          for i in $(seq 1 60); do
+            sleep 10
+            STATUS_RESPONSE=$(curl -s \
+              -H "Authorization: Bearer ${SIGNPATH_API_TOKEN}" \
+              "${API}/SigningRequests/${SIGNING_REQUEST_ID}")
+            STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status')
+            echo "  Poll $i: status=$STATUS"
+
+            case "$STATUS" in
+              Completed)
+                echo "Signing completed!"
+                DOWNLOAD_LINK=$(echo "$STATUS_RESPONSE" | jq -r '.signedArtifactLink')
+                break
+                ;;
+              Failed|Denied|Cancelled)
+                echo "::error::Signing request ${STATUS}: $(echo "$STATUS_RESPONSE" | jq -r '.statusComment // "no details"')"
+                exit 1
+                ;;
+            esac
+          done
+
+          if [ "$STATUS" != "Completed" ]; then
+            echo "::error::Signing request timed out after 10 minutes"
+            exit 1
+          fi
+
+          # Download signed artifact
+          mkdir -p signed
+          SIGNED_NAME=$(basename "$EXE_FILE")
+          curl -s -L \
+            -H "Authorization: Bearer ${SIGNPATH_API_TOKEN}" \
+            "${DOWNLOAD_LINK}" \
+            -o "signed/${SIGNED_NAME}"
+
+          echo "Downloaded signed artifact: signed/${SIGNED_NAME} ($(stat -c%s "signed/${SIGNED_NAME}") bytes)"
+
+      - name: Upload signed artifact
         if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: birdo-vpn-windows-signed-nsis
-          path: signed-nsis/
+          path: signed/
           retention-days: 30
 
   # ── Job 3: GitHub Release ───────────────────────────────────────────
