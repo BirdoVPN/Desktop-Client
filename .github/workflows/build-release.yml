@@ -11,7 +11,7 @@ on:
     tags:
       - 'win-v*'
 
-# Minimum permissions — release job gets write below
+# Minimum permissions — each job declares its own
 permissions: {}
 
 concurrency:
@@ -22,6 +22,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Job 1: Build ────────────────────────────────────────────────────
+  # Builds unsigned Tauri installers + Sigstore provenance signatures.
   build:
     runs-on: windows-latest
     permissions:
@@ -70,10 +72,8 @@ jobs:
         run: npx tauri build
 
       # ── Sigstore keyless signing ──────────────────────────────────────
-      # Uses GitHub OIDC identity (no certificates to manage/purchase).
-      # Each artifact gets a .sigstore bundle containing:
-      #   - Fulcio short-lived certificate (proves GitHub Actions built this)
-      #   - Rekor transparency log entry (publicly auditable)
+      # Provenance layer — proves GitHub Actions built this artifact.
+      # Each artifact gets a .sigstore bundle (Fulcio cert + Rekor log).
       # Users verify with: cosign verify-blob --bundle <file>.sigstore <file>
       - name: Install Cosign
         uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
@@ -131,63 +131,63 @@ jobs:
             src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore
           retention-days: 30
 
-  # ── SignPath Authenticode Signing ───────────────────────────────────
-  # Submits the unsigned artifacts to SignPath for Authenticode signing.
-  # This gives "Publisher: Birdo VPN" in Windows instead of "Unknown publisher".
-  # The step is skipped if SIGNPATH_API_TOKEN is not set (before approval).
+  # ── Job 2: SignPath Authenticode Signing ─────────────────────────────
+  # Submits build artifacts to SignPath Foundation for Authenticode signing.
+  # This gives "Publisher: SignPath Foundation" (trusted) in SmartScreen/UAC.
+  # Uses origin verification — SignPath verifies the build came from this repo.
+  # Skipped if SIGNPATH_ORGANIZATION_ID is not set (before Foundation approval).
   sign:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
-      actions: read       # Required to read artifacts
-      id-token: write     # Required for SignPath trusted build verification
+      actions: read       # To verify the build artifact origin
+      id-token: write     # For SignPath origin verification (OIDC)
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: birdo-vpn-windows-installers
-          path: artifacts/
-
       - name: Submit NSIS installer to SignPath
-        if: ${{ vars.SIGNPATH_ORG_SLUG != '' }}
-        uses: signpath/github-action-submit-signing-request@v1
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@v1.1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORG_SLUG }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           project-slug: birdo-vpn-windows
           signing-policy-slug: release-signing
           artifact-configuration-slug: nsis-installer
           github-artifact-id: birdo-vpn-windows-installers
           wait-for-completion: true
-          output-artifact-directory: signed/
-          parameters: |
-            inputFile: artifacts/nsis/*.exe
+          output-artifact-directory: signed-nsis/
 
       - name: Submit MSI installer to SignPath
-        if: ${{ vars.SIGNPATH_ORG_SLUG != '' }}
-        uses: signpath/github-action-submit-signing-request@v1
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: signpath/github-action-submit-signing-request@v1.1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORG_SLUG }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           project-slug: birdo-vpn-windows
           signing-policy-slug: release-signing
           artifact-configuration-slug: msi-installer
           github-artifact-id: birdo-vpn-windows-installers
           wait-for-completion: true
-          output-artifact-directory: signed/
-          parameters: |
-            inputFile: artifacts/msi/*.msi
+          output-artifact-directory: signed-msi/
 
-      - name: Upload signed artifacts
-        if: ${{ vars.SIGNPATH_ORG_SLUG != '' }}
+      - name: Upload signed NSIS installer
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: birdo-vpn-windows-signed
-          path: signed/
+          name: birdo-vpn-windows-signed-nsis
+          path: signed-nsis/
           retention-days: 30
 
-  # ── GitHub Release ──────────────────────────────────────────────────
+      - name: Upload signed MSI installer
+        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: birdo-vpn-windows-signed-msi
+          path: signed-msi/
+          retention-days: 30
+
+  # ── Job 3: GitHub Release ───────────────────────────────────────────
+  # Publishes signed artifacts (or unsigned if SignPath not yet configured).
   release:
     needs: [build, sign]
     if: always() && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/')
@@ -195,26 +195,59 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Always download unsigned artifacts (for Sigstore bundles + checksums)
       - name: Download unsigned artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: birdo-vpn-windows-installers
-          path: release-files/
+          path: release-unsigned/
 
-      - name: Download signed artifacts (if available)
+      # Download signed artifacts if SignPath signing succeeded
+      - name: Download signed NSIS
         if: needs.sign.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: birdo-vpn-windows-signed
-          path: release-files/
+          name: birdo-vpn-windows-signed-nsis
+          path: release-signed/
         continue-on-error: true
 
-      # Create GitHub release if triggered by a tag
+      - name: Download signed MSI
+        if: needs.sign.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: birdo-vpn-windows-signed-msi
+          path: release-signed/
+        continue-on-error: true
+
+      # Assemble release: prefer signed installers, fall back to unsigned
+      - name: Assemble release files
+        shell: bash
+        run: |
+          mkdir -p release-files
+          # Copy Sigstore bundles and checksums (always from unsigned)
+          find release-unsigned -name '*.sigstore' -exec cp {} release-files/ \;
+          find release-unsigned -name 'SHA256SUMS*' -exec cp {} release-files/ \;
+          # Use signed installers if available, otherwise unsigned
+          if [ -d release-signed ] && ls release-signed/*.exe 2>/dev/null; then
+            cp release-signed/*.exe release-files/
+            echo "Using SignPath-signed EXE"
+          else
+            find release-unsigned -name '*.exe' -exec cp {} release-files/ \;
+            echo "Using unsigned EXE (SignPath not configured)"
+          fi
+          if [ -d release-signed ] && ls release-signed/*.msi 2>/dev/null; then
+            cp release-signed/*.msi release-files/
+            echo "Using SignPath-signed MSI"
+          else
+            find release-unsigned -name '*.msi' -exec cp {} release-files/ \;
+            echo "Using unsigned MSI (SignPath not configured)"
+          fi
+          echo "Release files:"
+          ls -la release-files/
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
-          files: release-files/**
-          generate_release_notes: true
-          draft: true
+          files: release-files/*
           generate_release_notes: true
           draft: true
