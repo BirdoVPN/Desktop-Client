@@ -3,7 +3,7 @@
 //! Handles VPN connection, disconnection, and status reporting.
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::api::types::VpnConfig;
 use crate::api::types::ConnectResponse;
@@ -200,6 +200,68 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     VpnSettings { custom_dns, local_network_sharing, custom_mtu, custom_port, stealth_mode, quantum_protection }
 }
 
+/// Phase 1 helper: Start Xray Reality stealth tunnel if the server provided config.
+/// Returns the local `127.0.0.1:<port>` endpoint for WireGuard to route through.
+async fn start_stealth_tunnel(
+    app: &AppHandle,
+    response: &ConnectResponse,
+) -> Result<Option<String>, String> {
+    if !response.stealth_enabled.unwrap_or(false) || response.xray_endpoint.is_none() {
+        return Ok(None);
+    }
+
+    let xray_config = crate::vpn::xray::XrayConfig {
+        endpoint: response.xray_endpoint.clone().unwrap(),
+        uuid: response.xray_uuid.clone().unwrap_or_default(),
+        public_key: response.xray_public_key.clone().unwrap_or_default(),
+        short_id: response.xray_short_id.clone().unwrap_or_default(),
+        sni: response.xray_sni.clone().unwrap_or_else(|| "www.microsoft.com".to_string()),
+        flow: response.xray_flow.clone().unwrap_or_else(|| "xtls-rprx-vision".to_string()),
+        wg_port: 51820,
+    };
+
+    let app_data_dir = app.path().app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+
+    let xray_manager: tauri::State<'_, XrayManager> = app.state();
+    match xray_manager.start(&app_data_dir, &xray_config).await {
+        Ok(local_port) => {
+            tracing::info!("Xray Reality tunnel active, WireGuard will use 127.0.0.1:{}", local_port);
+            Ok(Some(format!("127.0.0.1:{}", local_port)))
+        }
+        Err(e) => {
+            tracing::error!("Failed to start Xray Reality tunnel: {}", e);
+            // SEC: Do NOT silently fall back — user explicitly requested stealth mode.
+            // Connecting without stealth would expose VPN traffic to DPI.
+            Err(format!("Stealth tunnel failed to start: {}. Connection aborted to protect your privacy.", e))
+        }
+    }
+}
+
+/// Phase 2 helper: Derive Rosenpass post-quantum hybrid PSK if the server supports it.
+fn derive_quantum_psk(response: &ConnectResponse) -> Option<String> {
+    if !response.quantum_enabled.unwrap_or(false) || response.rosenpass_public_key.is_none() {
+        return None;
+    }
+
+    let rp_config = crate::vpn::rosenpass::RosenpassConfig {
+        server_public_key: response.rosenpass_public_key.clone().unwrap(),
+        server_psk: response.preshared_key.clone(),
+    };
+
+    match crate::vpn::rosenpass::derive_hybrid_psk(&rp_config) {
+        Ok(psk) => {
+            tracing::info!("Rosenpass hybrid PSK derived successfully");
+            Some(psk)
+        }
+        Err(e) => {
+            tracing::error!("Failed to derive Rosenpass PSK: {}", e);
+            // Fall back to server PSK or none
+            None
+        }
+    }
+}
+
 /// Check if the current process has administrator privileges.
 /// The frontend calls this on mount to show a warning banner if not elevated.
 #[tauri::command]
@@ -252,6 +314,9 @@ pub async fn connect_vpn(
     // FIX-1-1: Generate X25519 keypair locally — private key never leaves this device.
     let (local_private_key, client_public_key) = generate_wireguard_keypair();
 
+    // Apply VPN settings early — needed for the API call (stealth/quantum flags)
+    let vpn_settings = apply_vpn_settings(&app).await;
+
     // Connect via backend API — send public key, NOT private key
     tracing::debug!("Calling /vpn/connect for server {}", server_id);
     let response = match api.connect_vpn(
@@ -278,68 +343,12 @@ pub async fn connect_vpn(
     }
 
     tracing::info!("Got VPN config from server, extracting fields...");
-    let vpn_settings = apply_vpn_settings(&app).await;
 
     // Phase 1: Xray Reality Stealth Tunnel
-    // If stealth mode is enabled and server provided Xray config, start Xray first.
-    // WireGuard will connect through the local Xray proxy instead of directly to the server.
-    let stealth_endpoint_override = if response.stealth_enabled.unwrap_or(false)
-        && response.xray_endpoint.is_some()
-    {
-        let xray_config = crate::vpn::xray::XrayConfig {
-            endpoint: response.xray_endpoint.clone().unwrap(),
-            uuid: response.xray_uuid.clone().unwrap_or_default(),
-            public_key: response.xray_public_key.clone().unwrap_or_default(),
-            short_id: response.xray_short_id.clone().unwrap_or_default(),
-            sni: response.xray_sni.clone().unwrap_or_else(|| "www.microsoft.com".to_string()),
-            flow: response.xray_flow.clone().unwrap_or_else(|| "xtls-rprx-vision".to_string()),
-            wg_port: 51820,
-        };
-
-        let app_data_dir = app.path().app_data_dir()
-            .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-
-        let xray_manager: tauri::State<'_, XrayManager> = app.state();
-        match xray_manager.start(&app_data_dir, &xray_config).await {
-            Ok(local_port) => {
-                tracing::info!("Xray Reality tunnel active, WireGuard will use 127.0.0.1:{}", local_port);
-                Some(format!("127.0.0.1:{}", local_port))
-            }
-            Err(e) => {
-                tracing::error!("Failed to start Xray Reality tunnel: {}", e);
-                // SEC: Do NOT silently fall back — user explicitly requested stealth mode.
-                // Connecting without stealth would expose VPN traffic to DPI.
-                return Err(format!("Stealth tunnel failed to start: {}. Connection aborted to protect your privacy.", e));
-            }
-        }
-    } else {
-        None
-    };
+    let stealth_endpoint_override = start_stealth_tunnel(&app, &response).await?;
 
     // Phase 2: Rosenpass Post-Quantum PSK
-    // If quantum protection is enabled and server provided Rosenpass key, derive hybrid PSK.
-    let quantum_psk = if response.quantum_enabled.unwrap_or(false)
-        && response.rosenpass_public_key.is_some()
-    {
-        let rp_config = crate::vpn::rosenpass::RosenpassConfig {
-            server_public_key: response.rosenpass_public_key.clone().unwrap(),
-            server_psk: response.preshared_key.clone(),
-        };
-
-        match crate::vpn::rosenpass::derive_hybrid_psk(&rp_config) {
-            Ok(psk) => {
-                tracing::info!("Rosenpass hybrid PSK derived successfully");
-                Some(psk)
-            }
-            Err(e) => {
-                tracing::error!("Failed to derive Rosenpass PSK: {}", e);
-                // Fall back to server PSK or none
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let quantum_psk = derive_quantum_psk(&response);
 
     // H-2 FIX: Use shared helper instead of duplicated extraction logic
     // FIX-1-1: Pass locally generated private key — server response won't contain one
@@ -654,3 +663,4 @@ pub fn get_wfp_status() -> crate::vpn::wfp::KillSwitchStatus {
 }
 
 // Multi-hop and port forwarding commands extracted to vpn_multi_hop.rs and vpn_port_forward.rs
+

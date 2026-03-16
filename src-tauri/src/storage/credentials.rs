@@ -17,7 +17,6 @@ const SERVICE_NAME: &str = "BirdoVPN";
 pub enum CredentialKey {
     AccessToken,
     RefreshToken,
-    LastServer,
 }
 
 impl CredentialKey {
@@ -25,7 +24,6 @@ impl CredentialKey {
         match self {
             CredentialKey::AccessToken => "access_token",
             CredentialKey::RefreshToken => "refresh_token",
-            CredentialKey::LastServer => "last_server",
         }
     }
 }
@@ -115,7 +113,6 @@ impl CredentialStore {
         let keys = [
             CredentialKey::AccessToken,
             CredentialKey::RefreshToken,
-            CredentialKey::LastServer,
         ];
 
         for key in keys {

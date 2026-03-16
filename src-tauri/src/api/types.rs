@@ -1,9 +1,7 @@
 //! API request and response types
 //!
 //! These types are defined for serialization/deserialization with the API.
-//! Some fields are only used for deserialization and may appear unused.
-
-#![allow(dead_code)]
+//! Fields on Deserialize structs are populated by serde, not by Rust code.
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -447,26 +445,6 @@ pub struct KeyRotationResponse {
     pub preshared_key: Option<String>,
     /// Expiration of the new key (ISO8601)
     pub expires_at: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConnectionReport {
-    pub server_id: String,
-    pub connected: bool,
-    pub client_version: String,
-}
-
-// ============================================================================
-// Server Statistics
-// ============================================================================
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ServerStats {
-    pub server_id: String,
-    pub current_users: u32,
-    pub max_users: u32,
-    pub bandwidth_in: u64,
-    pub bandwidth_out: u64,
 }
 
 // ============================================================================

@@ -70,7 +70,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             <DataItem
               icon={Eye}
               title="No Activity Logs"
-              description="We never log your browsing activity, connection timestamps, or DNS queries."
+              description="We never log your browsing activity or DNS queries. Minimal connection metadata is retained for up to 90 days for security monitoring."
             />
             <DataItem
               icon={Shield}
