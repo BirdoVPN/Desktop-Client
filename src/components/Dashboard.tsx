@@ -498,6 +498,15 @@ export function Dashboard() {
                     </div>
                     <span>WireGuard</span>
                   </div>
+
+                  {/* Row 4: Plan badge */}
+                  {account.plan && (
+                    <div className="flex justify-center pt-1">
+                      <span className="rounded-full bg-white/5 border border-white/10 px-3 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-white/50">
+                        {account.plan}
+                      </span>
+                    </div>
+                  )}
                 </div>
               ) : (
                 /* Placeholder when disconnected */

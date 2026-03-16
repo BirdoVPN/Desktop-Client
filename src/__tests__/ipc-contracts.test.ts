@@ -161,3 +161,72 @@ describe('IPC Contract: Settings', () => {
     expect(mockedInvoke).toHaveBeenCalledWith('save_settings', { settings });
   });
 });
+
+describe('IPC Contract: Account Deletion', () => {
+  it('delete_account sends password payload', async () => {
+    mockedInvoke.mockResolvedValueOnce(undefined);
+
+    await invoke('delete_account', { request: { password: 'mypassword123' } });
+
+    expect(mockedInvoke).toHaveBeenCalledWith('delete_account', {
+      request: { password: 'mypassword123' },
+    });
+  });
+
+  it('delete_account rejects on 401', async () => {
+    mockedInvoke.mockRejectedValueOnce(new Error('Invalid password'));
+
+    await expect(
+      invoke('delete_account', { request: { password: 'wrong' } })
+    ).rejects.toThrow('Invalid password');
+  });
+});
+
+describe('IPC Contract: Multi-Hop', () => {
+  it('connect_multi_hop sends entry and exit node IDs', async () => {
+    mockedInvoke.mockResolvedValueOnce({ success: true });
+
+    await invoke('connect_multi_hop', {
+      entryNodeId: 'de-1',
+      exitNodeId: 'us-1',
+    });
+
+    expect(mockedInvoke).toHaveBeenCalledWith('connect_multi_hop', {
+      entryNodeId: 'de-1',
+      exitNodeId: 'us-1',
+    });
+  });
+
+  it('get_multi_hop_routes returns array', async () => {
+    mockedInvoke.mockResolvedValueOnce([
+      { entryNodeId: 'de-1', exitNodeId: 'us-1', entryCountry: 'Germany', exitCountry: 'United States' },
+    ]);
+
+    const result = await invoke('get_multi_hop_routes');
+    expect(Array.isArray(result)).toBe(true);
+  });
+});
+
+describe('IPC Contract: Port Forwarding', () => {
+  it('create_port_forward sends port and protocol', async () => {
+    mockedInvoke.mockResolvedValueOnce({ id: 'pf-1', externalPort: 8080 });
+
+    await invoke('create_port_forward', {
+      request: { internalPort: 8080, protocol: 'tcp' },
+    });
+
+    expect(mockedInvoke).toHaveBeenCalledWith('create_port_forward', {
+      request: { internalPort: 8080, protocol: 'tcp' },
+    });
+  });
+
+  it('delete_port_forward sends id', async () => {
+    mockedInvoke.mockResolvedValueOnce(undefined);
+
+    await invoke('delete_port_forward', { id: 'pf-1' });
+
+    expect(mockedInvoke).toHaveBeenCalledWith('delete_port_forward', {
+      id: 'pf-1',
+    });
+  });
+});

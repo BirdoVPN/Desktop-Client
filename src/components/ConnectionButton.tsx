@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { motion } from 'framer-motion';
-import { Power } from 'lucide-react';
+import { Power, Shield } from 'lucide-react';
 
 export function ConnectionButton() {
   const {
@@ -30,7 +30,9 @@ export function ConnectionButton() {
   const isConnected = connectionState === 'connected';
   const isConnecting =
     connectionState === 'connecting' || connectionState === 'disconnecting'
-    || connectionState === 'reconnecting' || connectionState === 'rekeying';
+    || connectionState === 'reconnecting' || connectionState === 'rekeying'
+    || connectionState === 'authenticating' || connectionState === 'stealth_connecting';
+  const isKillSwitchActive = connectionState === 'kill_switch_active';
 
   const handleToggle = async () => {
     if (isConnecting) return;
@@ -118,11 +120,13 @@ export function ConnectionButton() {
       <motion.button
         onClick={handleToggle}
         disabled={isConnecting}
-        aria-label={isConnecting ? 'Connecting to VPN' : isConnected ? 'Disconnect from VPN' : 'Connect to VPN'}
+        aria-label={isKillSwitchActive ? 'Kill switch active — click to disconnect' : isConnecting ? 'Connecting to VPN' : isConnected ? 'Disconnect from VPN' : 'Connect to VPN'}
         whileHover={{ scale: 1.05 }}
         whileTap={{ scale: 0.95 }}
         className={`relative flex h-32 w-32 items-center justify-center rounded-full transition-all focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-white/60 focus-visible:ring-offset-2 focus-visible:ring-offset-black ${
-          isConnected
+          isKillSwitchActive
+            ? 'bg-orange-500 shadow-lg shadow-orange-500/30 animate-pulse'
+            : isConnected
             ? 'bg-green-500 shadow-lg shadow-green-500/30'
             : isConnecting
             ? 'bg-yellow-500 shadow-lg shadow-yellow-500/30'
@@ -131,6 +135,11 @@ export function ConnectionButton() {
       >
         {isConnecting ? (
           <div className="h-12 w-12 animate-spin rounded-full border-4 border-white/30 border-t-white" />
+        ) : isKillSwitchActive ? (
+          <Shield
+            size={48}
+            className="text-white"
+          />
         ) : (
           <Power
             size={48}

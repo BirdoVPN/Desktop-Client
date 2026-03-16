@@ -9,6 +9,124 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 // ============================================================================
+// Protocol Error Codes (from birdo-shared/protocol.json)
+// ============================================================================
+
+/// Standardized error codes for cross-platform consistency.
+/// Generated from the ErrorCode enum in protocol.json.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProtocolErrorCode {
+    AuthRequired,
+    AuthExpired,
+    SubscriptionRequired,
+    SubscriptionExpired,
+    DeviceLimitReached,
+    RateLimited,
+    ServerOffline,
+    ServerFull,
+    NoServersAvailable,
+    TunnelCreationFailed,
+    TunnelStartFailed,
+    DnsConfigurationFailed,
+    RouteConfigurationFailed,
+    KillSwitchFailed,
+    Ipv6BlockFailed,
+    StealthTunnelFailed,
+    QuantumHandshakeFailed,
+    AdminRequired,
+    NetworkUnreachable,
+    HandshakeTimeout,
+    DllIntegrityFailed,
+    JniIntegrityFailed,
+    SettingsTampered,
+    BiometricFailed,
+    Unknown,
+}
+
+impl ProtocolErrorCode {
+    /// Human-readable message for UI display
+    pub fn user_message(&self) -> &'static str {
+        match self {
+            Self::AuthRequired => "Please sign in to continue",
+            Self::AuthExpired => "Your session has expired — please sign in again",
+            Self::SubscriptionRequired => "A subscription is required for this feature",
+            Self::SubscriptionExpired => "Your subscription has expired",
+            Self::DeviceLimitReached => "Device limit reached — remove a device to connect",
+            Self::RateLimited => "Too many requests — please wait a moment",
+            Self::ServerOffline => "This server is currently offline",
+            Self::ServerFull => "This server is at capacity — try another",
+            Self::NoServersAvailable => "No servers available — check back shortly",
+            Self::TunnelCreationFailed => "Failed to create VPN tunnel",
+            Self::TunnelStartFailed => "Failed to start VPN tunnel",
+            Self::DnsConfigurationFailed => "Failed to configure DNS",
+            Self::RouteConfigurationFailed => "Failed to configure routing",
+            Self::KillSwitchFailed => "Kill switch activation failed",
+            Self::Ipv6BlockFailed => "IPv6 leak protection failed",
+            Self::StealthTunnelFailed => "Stealth tunnel failed — try without stealth mode",
+            Self::QuantumHandshakeFailed => "Post-quantum handshake failed — try without quantum protection",
+            Self::AdminRequired => "Administrator privileges are required",
+            Self::NetworkUnreachable => "Network is unreachable — check your connection",
+            Self::HandshakeTimeout => "Connection timed out — try a closer server",
+            Self::DllIntegrityFailed => "Security check failed — application files may be corrupted",
+            Self::JniIntegrityFailed => "Security check failed — application files may be corrupted",
+            Self::SettingsTampered => "Settings integrity check failed",
+            Self::BiometricFailed => "Biometric authentication failed",
+            Self::Unknown => "An unexpected error occurred",
+        }
+    }
+}
+
+impl std::fmt::Display for ProtocolErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.user_message())
+    }
+}
+
+/// Parsed error body from API responses
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiErrorBody {
+    #[serde(default)]
+    pub error_code: Option<ProtocolErrorCode>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Heartbeat response from the backend
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatResponse {
+    pub valid: bool,
+    #[serde(default = "default_true")]
+    pub server_online: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+fn default_true() -> bool { true }
+
+// ============================================================================
+// Connection Quality Reporting (P2-15)
+// ============================================================================
+
+/// Client-reported quality telemetry, sent every ~60s while connected.
+/// Backend stores ephemerally in Redis and aggregates per-server.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityReport {
+    pub key_id: String,
+    pub latency_ms: f64,
+    pub jitter_ms: f64,
+    pub packet_loss_percent: f64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub handshake_age_seconds: u64,
+    pub connection_state: String,
+    pub platform: String,
+}
+
+// ============================================================================
 // Authentication Types
 // ============================================================================
 
@@ -190,6 +308,13 @@ pub struct VpnConfig {
     pub allowed_ips: Vec<String>,
     pub dns: Vec<String>,
     pub client_ip: String,
+    /// Optional IPv6 tunnel address (e.g. "fd00::2/128"). When present, enables
+    /// dual-stack routing through the tunnel.
+    #[serde(default)]
+    pub client_ipv6: Option<String>,
+    /// IPv6 CIDRs to route through the tunnel (e.g. ["::/0"]). Empty = IPv4-only.
+    #[serde(default)]
+    pub allowed_ips_v6: Vec<String>,
     pub mtu: u16,
     pub persistent_keepalive: u16,
 }
@@ -237,6 +362,12 @@ pub struct ConnectRequest {
     /// generate a keypair and never sees the private key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_public_key: Option<String>,
+    /// Request stealth mode (Xray Reality tunnel)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stealth_mode: Option<bool>,
+    /// Request post-quantum protection (Rosenpass PSK)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantum_protection: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -271,6 +402,28 @@ pub struct ConnectResponse {
     pub persistent_keepalive: Option<u16>,
     #[serde(default)]
     pub server_node: Option<ServerNodeInfo>,
+    // Stealth Mode (Xray Reality)
+    #[serde(default, rename = "stealthEnabled")]
+    pub stealth_enabled: Option<bool>,
+    #[serde(default, rename = "xrayEndpoint")]
+    pub xray_endpoint: Option<String>,
+    #[serde(default, rename = "xrayUuid")]
+    pub xray_uuid: Option<String>,
+    #[serde(default, rename = "xrayPublicKey")]
+    pub xray_public_key: Option<String>,
+    #[serde(default, rename = "xrayShortId")]
+    pub xray_short_id: Option<String>,
+    #[serde(default, rename = "xraySni")]
+    pub xray_sni: Option<String>,
+    #[serde(default, rename = "xrayFlow")]
+    pub xray_flow: Option<String>,
+    // Post-Quantum (Rosenpass)
+    #[serde(default, rename = "quantumEnabled")]
+    pub quantum_enabled: Option<bool>,
+    #[serde(default, rename = "rosenpassPublicKey")]
+    pub rosenpass_public_key: Option<String>,
+    #[serde(default, rename = "rosenpassEndpoint")]
+    pub rosenpass_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -281,6 +434,19 @@ pub struct ServerNodeInfo {
     pub region: String,
     pub country: String,
     pub hostname: String,
+}
+
+/// P3-25: Response from key rotation endpoint
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyRotationResponse {
+    pub success: bool,
+    pub new_key_id: String,
+    pub server_public_key: String,
+    #[serde(default)]
+    pub preshared_key: Option<String>,
+    /// Expiration of the new key (ISO8601)
+    pub expires_at: String,
 }
 
 #[derive(Debug, Serialize)]

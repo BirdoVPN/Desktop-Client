@@ -18,6 +18,18 @@
   --ring: rgba(255, 255, 255, 0.2);
 }
 
+/* Light mode overrides */
+:root.light {
+  --background: #f8f8f8;
+  --foreground: #111111;
+  --card: rgba(255, 255, 255, 0.95);
+  --card-foreground: #111111;
+  --muted: rgba(240, 240, 240, 0.9);
+  --muted-foreground: #666666;
+  --border: rgba(0, 0, 0, 0.08);
+  --ring: rgba(0, 0, 0, 0.2);
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -217,4 +229,75 @@ input {
   border-radius: 50%;
   filter: blur(120px);
   pointer-events: none;
+}
+
+/* Accessibility: respect user's reduced-motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .pulse-ring,
+  .status-blink,
+  .animate-ping {
+    animation: none !important;
+  }
+}
+
+/* Focus-visible outlines for keyboard navigation */
+:focus-visible {
+  outline: 2px solid rgba(168, 85, 247, 0.8);
+  outline-offset: 2px;
+}
+
+/* Light mode adjustments for glass elements */
+:root.light body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+:root.light .glass {
+  background: rgba(255, 255, 255, 0.6);
+  border-color: rgba(0, 0, 0, 0.08);
+}
+
+:root.light .glass-strong {
+  background: rgba(255, 255, 255, 0.8);
+  border-color: rgba(0, 0, 0, 0.12);
+}
+
+:root.light .glass-card {
+  background: rgba(255, 255, 255, 0.85);
+  border-color: rgba(0, 0, 0, 0.08);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+}
+
+:root.light .glass-input {
+  background: rgba(0, 0, 0, 0.04);
+  border-color: rgba(0, 0, 0, 0.1);
+}
+
+:root.light .glass-input:focus {
+  background: rgba(0, 0, 0, 0.06);
+  border-color: rgba(0, 0, 0, 0.2);
+}
+
+:root.light .text-gradient {
+  background: linear-gradient(to bottom, #111, rgba(17, 17, 17, 0.6));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+:root.light ::-webkit-scrollbar-thumb {
+  background: rgba(168, 85, 247, 0.3);
+}
+
+:root.light ::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.05);
 }

@@ -55,6 +55,12 @@ pub struct AppSettings {
     /// WireGuard MTU: 0 = automatic (server default), 1280-1500 = custom
     #[serde(default)]
     pub wireguard_mtu: u16,
+    /// Enable Xray Reality stealth tunnel (bypass DPI/censorship)
+    #[serde(default)]
+    pub stealth_mode: bool,
+    /// Enable Rosenpass post-quantum key exchange
+    #[serde(default)]
+    pub quantum_protection: bool,
 }
 
 fn default_wireguard_port() -> String {

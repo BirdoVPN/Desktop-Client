@@ -27,6 +27,11 @@ import {
   ArrowRightLeft,
   Trash2,
   Loader2,
+  Eye,
+  Lock,
+  Sun,
+  Moon,
+  Laptop,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -43,6 +48,13 @@ export function Settings() {
   const [portFwdProtocol, setPortFwdProtocol] = useState<'tcp' | 'udp'>('tcp');
   const [portFwdLoading, setPortFwdLoading] = useState(false);
   const [multiHopLoading, setMultiHopLoading] = useState(false);
+  const [speedTestRunning, setSpeedTestRunning] = useState(false);
+  const [speedTestResult, setSpeedTestResult] = useState<{
+    downloadMbps: number;
+    uploadMbps: number;
+    latencyMs: number;
+    jitterMs: number;
+  } | null>(null);
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -51,7 +63,7 @@ export function Settings() {
     };
   }, []);
 
-  const { settings, updateSettings, servers, multiHopRoutes, setMultiHopRoutes, portForwards, setPortForwards } = useAppStore(
+  const { settings, updateSettings, servers, multiHopRoutes, setMultiHopRoutes, portForwards, setPortForwards, theme, setTheme } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
@@ -60,6 +72,8 @@ export function Settings() {
       setMultiHopRoutes: s.setMultiHopRoutes,
       portForwards: s.portForwards,
       setPortForwards: s.setPortForwards,
+      theme: s.theme,
+      setTheme: s.setTheme,
     }))
   );
 
@@ -96,6 +110,8 @@ export function Settings() {
             local_network_sharing: newSettings.localNetworkSharing,
             wireguard_port: newSettings.wireGuardPort,
             wireguard_mtu: newSettings.wireGuardMtu,
+            stealth_mode: newSettings.stealthMode,
+            quantum_protection: newSettings.quantumProtection,
           },
         });
       } catch (err) {
@@ -262,6 +278,41 @@ export function Settings() {
             enabled={settings.startMinimized}
             onChange={(v) => handleToggle('startMinimized', v)}
           />
+        </Section>
+
+        {/* ── Appearance Section ── */}
+        <Section title="Appearance">
+          <div className="glass rounded-lg p-3">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
+                <Sun size={18} className="text-white" />
+              </div>
+              <div>
+                <p className="text-sm font-medium text-white">Theme</p>
+                <p className="text-xs text-white/50">Choose dark or light mode</p>
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                { value: 'dark' as const, icon: Moon, label: 'Dark' },
+                { value: 'light' as const, icon: Sun, label: 'Light' },
+                { value: 'system' as const, icon: Laptop, label: 'System' },
+              ].map((opt) => (
+                <button
+                  key={opt.value}
+                  onClick={() => setTheme(opt.value)}
+                  className={`flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition ${
+                    theme === opt.value
+                      ? 'bg-white text-black'
+                      : 'bg-white/5 text-white/60 hover:bg-white/10'
+                  }`}
+                >
+                  <opt.icon size={14} />
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </Section>
 
         {/* ── DNS Section ── */}
@@ -524,6 +575,31 @@ export function Settings() {
             <Info size={14} className="text-white/40 shrink-0" />
             <p className="text-xs text-white/40">
               Changes take effect on next connection.
+            </p>
+          </div>
+        </Section>
+
+        {/* ── Stealth & Quantum Section ── */}
+        <Section title="Stealth & Quantum">
+          <SettingToggle
+            icon={Eye}
+            title="Stealth Mode"
+            description="Disguise VPN traffic as normal HTTPS (Xray Reality)"
+            enabled={settings.stealthMode}
+            onChange={(v) => handleToggle('stealthMode', v)}
+          />
+          <SettingToggle
+            icon={Lock}
+            title="Quantum Protection"
+            description="Post-quantum key exchange (Rosenpass hybrid PSK)"
+            enabled={settings.quantumProtection}
+            onChange={(v) => handleToggle('quantumProtection', v)}
+          />
+          <div className="glass rounded-lg p-3 flex items-center gap-3">
+            <Info size={14} className="text-white/40 shrink-0" />
+            <p className="text-xs text-white/40">
+              Stealth mode wraps WireGuard in TLS 1.3 to bypass censorship.
+              Quantum protection adds future-proof key exchange. Both enabled by default.
             </p>
           </div>
         </Section>
@@ -800,6 +876,52 @@ export function Settings() {
           </div>
         </Section>
 
+        {/* ── Speed Test Section ── */}
+        <Section title="Speed Test">
+          <div className="space-y-3">
+            <div className="glass rounded-lg p-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
+                    <Zap size={18} className="text-white" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium text-white">Test VPN Speed</p>
+                    <p className="text-xs text-white/50">
+                      {speedTestResult
+                        ? `↓ ${speedTestResult.downloadMbps.toFixed(1)} / ↑ ${speedTestResult.uploadMbps.toFixed(1)} Mbps · ${speedTestResult.latencyMs}ms`
+                        : 'Measure download, upload & latency'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  disabled={speedTestRunning}
+                  onClick={async () => {
+                    setSpeedTestRunning(true);
+                    setSpeedTestResult(null);
+                    try {
+                      const result = await invoke<{
+                        downloadMbps: number;
+                        uploadMbps: number;
+                        latencyMs: number;
+                        jitterMs: number;
+                      }>('run_speed_test_command');
+                      setSpeedTestResult(result);
+                    } catch {
+                      // silent — user can retry
+                    } finally {
+                      setSpeedTestRunning(false);
+                    }
+                  }}
+                  className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-white transition hover:bg-white/20 disabled:opacity-50"
+                >
+                  {speedTestRunning ? <Loader2 size={14} className="animate-spin" /> : 'Run'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </Section>
+
         {/* ── Updates Section ── */}
         <Section title="Updates">
           <UpdateChecker />
@@ -821,6 +943,11 @@ export function Settings() {
               href="https://birdo.app/terms"
             />
           </div>
+        </Section>
+
+        {/* ── Account Deletion (GDPR) ── */}
+        <Section title="Danger Zone">
+          <DeleteAccountButton />
         </Section>
 
         {/* ── About Section ── */}
@@ -980,5 +1107,104 @@ function SettingLink({ title, href }: SettingLinkProps) {
       <span className="text-sm font-medium text-white">{title}</span>
       <ExternalLink size={14} className="text-white/40" />
     </a>
+  );
+}
+
+function DeleteAccountButton() {
+  const [step, setStep] = useState<'idle' | 'confirm' | 'password'>('idle');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleDelete = async () => {
+    if (!password) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await invoke('delete_account', { request: { password } });
+      // Account deleted — force reload to return to login screen
+      window.location.reload();
+    } catch (e: unknown) {
+      setError(typeof e === 'string' ? e : 'Deletion failed');
+      setLoading(false);
+    }
+  };
+
+  if (step === 'idle') {
+    return (
+      <button
+        onClick={() => setStep('confirm')}
+        className="glass flex w-full items-center gap-3 rounded-lg p-3 text-left transition hover:bg-red-500/20"
+      >
+        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-red-500/20">
+          <Trash2 size={18} className="text-red-400" />
+        </div>
+        <div>
+          <p className="text-sm font-medium text-red-400">Delete Account</p>
+          <p className="text-xs text-white/50">Permanently delete your account and all data</p>
+        </div>
+      </button>
+    );
+  }
+
+  if (step === 'confirm') {
+    return (
+      <div className="glass rounded-lg p-4 space-y-3">
+        <div className="flex items-center gap-2 text-red-400">
+          <AlertTriangle size={18} />
+          <p className="text-sm font-semibold">Are you sure?</p>
+        </div>
+        <p className="text-xs text-white/60">
+          This will permanently delete your account, VPN configurations, and all associated data. This action cannot be undone.
+        </p>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setStep('idle')}
+            className="flex-1 rounded-lg bg-white/10 px-3 py-2 text-xs font-medium text-white transition hover:bg-white/20"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => setStep('password')}
+            className="flex-1 rounded-lg bg-red-500/80 px-3 py-2 text-xs font-medium text-white transition hover:bg-red-500"
+          >
+            Continue
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="glass rounded-lg p-4 space-y-3">
+      <p className="text-sm font-medium text-red-400">Enter your password to confirm</p>
+      {error && (
+        <p className="text-xs text-red-400">{error}</p>
+      )}
+      <input
+        type="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        placeholder="Password"
+        className="w-full rounded-lg bg-white/10 px-3 py-2 text-sm text-white placeholder-white/30 outline-none focus:ring-1 focus:ring-red-400/50"
+        autoFocus
+        onKeyDown={(e) => e.key === 'Enter' && handleDelete()}
+      />
+      <div className="flex gap-2">
+        <button
+          onClick={() => { setStep('idle'); setPassword(''); setError(null); }}
+          className="flex-1 rounded-lg bg-white/10 px-3 py-2 text-xs font-medium text-white transition hover:bg-white/20"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={handleDelete}
+          disabled={loading || !password}
+          className="flex-1 rounded-lg bg-red-500/80 px-3 py-2 text-xs font-medium text-white transition hover:bg-red-500 disabled:opacity-50"
+        >
+          {loading ? <Loader2 size={14} className="mx-auto animate-spin" /> : 'Delete Forever'}
+        </button>
+      </div>
+    </div>
   );
 }

@@ -165,6 +165,51 @@ pub async fn logout(
     Ok(true)
 }
 
+/// GDPR: Permanently delete account and all associated data.
+/// Requires password confirmation to prevent accidental deletion from a
+/// compromised webview (defense-in-depth).
+#[derive(Debug, Deserialize)]
+pub struct DeleteAccountRequest {
+    pub password: String,
+}
+
+impl Drop for DeleteAccountRequest {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+#[tauri::command]
+pub async fn delete_account(
+    request: DeleteAccountRequest,
+    api: State<'_, BirdoApi>,
+    credentials: State<'_, CredentialStore>,
+) -> Result<bool, String> {
+    tracing::info!("Account deletion requested (GDPR)");
+
+    api.delete_account(&request.password)
+        .await
+        .map_err(|e| format!("Account deletion failed: {}", e))?;
+
+    // Clear all local credentials after successful server-side deletion
+    let _ = credentials.clear_tokens();
+
+    tracing::info!("Account permanently deleted");
+    Ok(true)
+}
+
+/// GDPR: Export all user data (Right to Data Portability, Art. 20).
+/// Returns a JSON blob the frontend can save to disk.
+#[tauri::command]
+pub async fn export_user_data(
+    api: State<'_, BirdoApi>,
+) -> Result<serde_json::Value, String> {
+    tracing::info!("GDPR data export requested");
+    api.export_user_data()
+        .await
+        .map_err(|e| format!("Data export failed: {}", e))
+}
+
 /// Get current authentication state
 #[tauri::command]
 pub async fn get_auth_state(

@@ -57,7 +57,7 @@ impl Default for AutoReconnectConfig {
             initial_delay_ms: 1000,      // 1 second
             max_delay_ms: 60000,         // 1 minute max
             max_attempts: 10,            // Give up after 10 tries
-            backoff_multiplier: 1.5,
+            backoff_multiplier: 2.0,
             health_check_interval_ms: 5000, // Check every 5 seconds
         }
     }
@@ -227,6 +227,9 @@ impl AutoReconnectService {
         // FIX-2-13: Heartbeat counter — send heartbeat every ~30s (6 ticks × 5s)
         let mut heartbeat_tick_count: u32 = 0;
         const HEARTBEAT_EVERY_N_TICKS: u32 = 6;
+        // P2-15: Quality report counter — send every ~60s (12 ticks × 5s)
+        let mut quality_tick_count: u32 = 0;
+        const QUALITY_EVERY_N_TICKS: u32 = 12;
 
         loop {
             tokio::select! {
@@ -261,14 +264,63 @@ impl AutoReconnectService {
 
                             // FIX-2-13: Periodic heartbeat to backend while connected.
                             // Reports session liveness so backend can detect orphaned keys.
+                            // P1-9: Parse response — disconnect if session invalid.
                             heartbeat_tick_count += 1;
                             if heartbeat_tick_count >= HEARTBEAT_EVERY_N_TICKS {
                                 heartbeat_tick_count = 0;
                                 if let Some(key_id) = vpn_manager.get_key_id().await {
-                                    if let Err(e) = api.heartbeat(&key_id).await {
-                                        tracing::warn!("Heartbeat failed: {}", e);
-                                    } else {
-                                        tracing::debug!("Heartbeat sent for key {}", key_id);
+                                    match api.heartbeat(&key_id).await {
+                                        Ok(resp) => {
+                                            if !resp.valid {
+                                                tracing::warn!("Heartbeat: session invalidated by server — disconnecting");
+                                                let _ = vpn_manager.disconnect().await;
+                                                let _ = vpn_manager.set_state(
+                                                    ConnectionState::Error("Session expired — please reconnect".to_string())
+                                                ).await;
+                                                *last_reconnect_info.write().await = None;
+                                            } else if !resp.server_online {
+                                                tracing::warn!("Heartbeat: server going offline");
+                                            } else {
+                                                tracing::debug!("Heartbeat sent for key {}", key_id);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Heartbeat failed: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // P2-15: Periodic quality telemetry reporting
+                            quality_tick_count += 1;
+                            if quality_tick_count >= QUALITY_EVERY_N_TICKS {
+                                quality_tick_count = 0;
+                                let stats = vpn_manager.get_stats().await;
+                                if let Some(ref key_id) = stats.key_id {
+                                    let connected_secs = stats.connected_at
+                                        .map(|t| (chrono::Utc::now() - t).num_seconds().max(0) as u64)
+                                        .unwrap_or(0);
+                                    // P2-16: Use real jitter and packet loss from rolling stats
+                                    let jitter = stats.jitter_ms();
+                                    let loss = stats.packet_loss_percent();
+                                    let report = crate::api::types::QualityReport {
+                                        key_id: key_id.clone(),
+                                        latency_ms: stats.latency_ms.unwrap_or(0) as f64,
+                                        jitter_ms: jitter,
+                                        packet_loss_percent: loss,
+                                        bytes_in: stats.bytes_received,
+                                        bytes_out: stats.bytes_sent,
+                                        handshake_age_seconds: connected_secs,
+                                        connection_state: "connected".to_string(),
+                                        platform: "windows".to_string(),
+                                    };
+                                    // Snapshot packet counters for the next loss window
+                                    {
+                                        let mut stats_w = vpn_manager.stats.write().await;
+                                        stats_w.snapshot_packets();
+                                    }
+                                    if let Err(e) = api.report_quality(&report).await {
+                                        tracing::debug!("Quality report failed (non-fatal): {}", e);
                                     }
                                 }
                             }

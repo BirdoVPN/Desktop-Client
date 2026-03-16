@@ -30,10 +30,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum ConnectionState {
     Disconnected,
     Connecting,
+    /// P1-6: API auth in progress (after calling /vpn/connect, before config applied)
+    Authenticating,
+    /// P1-6: Xray Reality stealth tunnel being established
+    StealthConnecting,
     Connected,
     Disconnecting,
     /// SM-002: Reconnecting state with attempt tracking
     Reconnecting { attempt: u32 },
+    /// P1-6: Kill switch active after disconnect (blocking all non-VPN traffic)
+    KillSwitchActive,
     Error(String),
 }
 
@@ -50,13 +56,14 @@ impl ConnectionState {
         matches!(self, 
             ConnectionState::Disconnected | 
             ConnectionState::Error(_) |
+            ConnectionState::KillSwitchActive |
             ConnectionState::Reconnecting { .. }
         )
     }
     
     /// Check if disconnect is meaningful in this state
     pub fn can_disconnect(&self) -> bool {
-        !matches!(self, ConnectionState::Disconnected | ConnectionState::Disconnecting)
+        !matches!(self, ConnectionState::Disconnected | ConnectionState::Disconnecting | ConnectionState::KillSwitchActive)
     }
 }
 
@@ -67,15 +74,61 @@ pub struct ConnectionStats {
     pub packets_sent: u64,
     pub packets_received: u64,
     pub latency_ms: Option<u32>,
+    /// P2-16: Rolling latency samples for jitter calculation (stddev).
+    pub latency_samples: Vec<u32>,
+    /// P2-16: Packets sent at last quality report (for loss estimation).
+    pub prev_packets_sent: u64,
+    /// P2-16: Packets received at last quality report (for loss estimation).
+    pub prev_packets_received: u64,
     pub connected_at: Option<chrono::DateTime<chrono::Utc>>,
     pub server_id: Option<String>,
     pub key_id: Option<String>,
     pub server_name: Option<String>,
 }
 
+impl ConnectionStats {
+    /// P2-16: Compute jitter as standard deviation of recent latency samples.
+    pub fn jitter_ms(&self) -> f64 {
+        if self.latency_samples.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.latency_samples.iter().map(|&s| s as f64).sum::<f64>()
+            / self.latency_samples.len() as f64;
+        let variance = self.latency_samples.iter()
+            .map(|&s| { let d = s as f64 - mean; d * d })
+            .sum::<f64>() / self.latency_samples.len() as f64;
+        variance.sqrt()
+    }
+
+    /// P2-16: Estimate packet loss percentage since last report window.
+    pub fn packet_loss_percent(&self) -> f64 {
+        let sent_delta = self.packets_sent.saturating_sub(self.prev_packets_sent);
+        let recv_delta = self.packets_received.saturating_sub(self.prev_packets_received);
+        if sent_delta == 0 {
+            return 0.0;
+        }
+        let lost = sent_delta.saturating_sub(recv_delta);
+        (lost as f64 / sent_delta as f64) * 100.0
+    }
+
+    /// Push a latency sample, keeping at most 20 entries.
+    pub fn push_latency_sample(&mut self, ms: u32) {
+        self.latency_samples.push(ms);
+        if self.latency_samples.len() > 20 {
+            self.latency_samples.remove(0);
+        }
+    }
+
+    /// Snapshot the current packet counters for the next loss calculation window.
+    pub fn snapshot_packets(&mut self) {
+        self.prev_packets_sent = self.packets_sent;
+        self.prev_packets_received = self.packets_received;
+    }
+}
+
 pub struct VpnManager {
     state: Arc<RwLock<ConnectionState>>,
-    stats: Arc<RwLock<ConnectionStats>>,
+    pub(crate) stats: Arc<RwLock<ConnectionStats>>,
     tunnel: Arc<RwLock<Option<WintunTunnel>>>,
     current_config: Arc<RwLock<Option<VpnConfig>>>,
     /// SM-002: Operation lock to prevent concurrent connect/disconnect
@@ -126,6 +179,9 @@ impl VpnManager {
                 packets_sent: 0,
                 packets_received: 0,
                 latency_ms: None,
+                latency_samples: Vec::new(),
+                prev_packets_sent: 0,
+                prev_packets_received: 0,
                 connected_at: None,
                 server_id: None,
                 key_id: None,
@@ -199,6 +255,9 @@ impl VpnManager {
                     packets_sent: 0,
                     packets_received: 0,
                     latency_ms: None,
+                    latency_samples: Vec::new(),
+                    prev_packets_sent: 0,
+                    prev_packets_received: 0,
                     connected_at: None,
                     server_id: None,
                     key_id: None,
@@ -459,6 +518,10 @@ impl VpnManager {
                             stats.packets_sent = pkts_sent;
                             stats.packets_received = pkts_received;
                             stats.latency_ms = latency;
+                            // P2-16: Push latency sample for jitter calculation
+                            if let Some(lat) = latency {
+                                stats.push_latency_sample(lat);
+                            }
                         }
                         Err(_) => tracing::error!("Stats write lock timeout in update_stats"),
                     }

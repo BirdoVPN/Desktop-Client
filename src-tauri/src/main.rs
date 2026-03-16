@@ -37,6 +37,25 @@ fn main() {
 
     info!("Birdo VPN Client starting...");
 
+    // Initialize Sentry crash reporting (release builds only).
+    // The DSN is public — it only identifies the project. The guard must
+    // live for the entire process so panics / crashes are flushed before exit.
+    let _sentry_guard = sentry::init((
+        option_env!("SENTRY_DSN").unwrap_or(""),
+        sentry::ClientOptions {
+            release: Some(std::borrow::Cow::Borrowed(env!("CARGO_PKG_VERSION"))),
+            environment: if cfg!(debug_assertions) {
+                Some("development".into())
+            } else {
+                Some("production".into())
+            },
+            // Scrub PII: no usernames, IPs, or email in breadcrumbs
+            send_default_pii: false,
+            sample_rate: 1.0,
+            ..Default::default()
+        },
+    ));
+
     // ── Self-elevation ──────────────────────────────────────────────────
     // Wintun adapter creation is an in-process FFI call that requires
     // administrator privileges. If we're not elevated, relaunch with
@@ -88,10 +107,12 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_deep_link::init())
         // Register application state
         .manage(BirdoApi::new())
         .manage(CredentialStore)
         .manage(VpnManager::new())
+        .manage(crate::vpn::xray::XrayManager::new())
         .setup(|app| {
             info!("Setting up Birdo VPN application...");
 
@@ -171,6 +192,19 @@ fn main() {
                 let _ = window.show();
             }
 
+            // Listen for deep link events (birdo:// protocol)
+            let handle = app.handle().clone();
+            app.listen("deep-link://new-url", move |event| {
+                if let Some(urls) = event.payload().strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    info!("Deep link received: {}", urls);
+                    if let Some(window) = handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = window.emit("deep-link", urls);
+                    }
+                }
+            });
+
             info!("Birdo VPN Client initialized successfully");
             Ok(())
         })
@@ -190,6 +224,8 @@ fn main() {
             commands::auth::get_auth_state,
             commands::auth::refresh_token,
             commands::auth::verify_2fa,  // FIX C-2: 2FA TOTP verification
+            commands::auth::delete_account,  // GDPR account deletion
+            commands::auth::export_user_data, // GDPR data export
             // VPN operations
             commands::vpn::connect_vpn,
             commands::vpn::disconnect_vpn,
@@ -210,6 +246,10 @@ fn main() {
             commands::killswitch::activate_killswitch,
             commands::killswitch::deactivate_killswitch,
             commands::killswitch::get_killswitch_status,
+            // Split Tunneling
+            commands::split_tunnel::add_split_tunnel_app,
+            commands::split_tunnel::remove_split_tunnel_app,
+            commands::split_tunnel::clear_split_tunnel_apps,
             // Auto-updater
             commands::updater::check_for_updates,
             commands::updater::install_update,
@@ -219,12 +259,18 @@ fn main() {
             commands::vpn::get_subscription_status,
             commands::vpn::get_wfp_status,
             // Multi-Hop (Double VPN)
-            commands::vpn::get_multi_hop_routes,
-            commands::vpn::connect_multi_hop,
+            commands::vpn_multi_hop::get_multi_hop_routes,
+            commands::vpn_multi_hop::connect_multi_hop,
             // Port Forwarding
-            commands::vpn::get_port_forwards,
-            commands::vpn::create_port_forward,
-            commands::vpn::delete_port_forward,
+            commands::vpn_port_forward::get_port_forwards,
+            commands::vpn_port_forward::create_port_forward,
+            commands::vpn_port_forward::delete_port_forward,
+            // Speed Test
+            commands::speed_test::run_speed_test_command,
+            // Biometric (Windows Hello)
+            commands::biometric::check_biometric_available,
+            commands::biometric::set_biometric_enabled,
+            commands::biometric::authenticate_biometric,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

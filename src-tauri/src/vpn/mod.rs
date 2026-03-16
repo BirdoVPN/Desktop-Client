@@ -7,7 +7,12 @@ pub mod buffer_pool;  // FIX-2-4: Reduced to packet size constants only
 pub mod doh;  // DNS-over-HTTPS resolver for SEC-002
 pub mod latency;
 pub mod manager;
+pub mod network_monitor;  // P2-15: System network connectivity monitor
+pub mod rosenpass;  // Post-quantum PSK derivation (matching Android RosenpassManager)
+pub mod speed_test;  // On-device speed test (P3-26)
 pub mod tunnel;
+mod tunnel_dns;  // DNS helpers extracted from tunnel.rs
+pub mod xray;  // Xray Reality stealth tunnel (matching Android XrayManager)
 // Removed: pub mod wireguard; - deprecated file with placeholder crypto
 mod wireguard_new;
 

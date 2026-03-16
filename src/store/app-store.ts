@@ -48,6 +48,8 @@ export interface AccountInfo {
 
 export type Protocol = 'wireguard';
 
+export type ThemeMode = 'dark' | 'light' | 'system';
+
 export interface AppSettings {
   killSwitchEnabled: boolean;
   autoConnect: boolean;
@@ -67,6 +69,9 @@ export interface AppSettings {
   multiHopEnabled: boolean;
   multiHopEntryNodeId: string | null;
   multiHopExitNodeId: string | null;
+  // Stealth & Quantum
+  stealthMode: boolean;
+  quantumProtection: boolean;
 }
 
 export interface MultiHopRoute {
@@ -161,6 +166,14 @@ interface AppState {
   isOnline: boolean;
   setOnline: (online: boolean) => void;
 
+  // Theme
+  theme: ThemeMode;
+  setTheme: (theme: ThemeMode) => void;
+
+  // Deep link
+  deepLinkAction: { action: string; serverId?: string } | null;
+  setDeepLinkAction: (action: { action: string; serverId?: string } | null) => void;
+
   // Actions — Logout
   logout: () => void;
 }
@@ -194,6 +207,8 @@ const defaultSettings: AppSettings = {
   multiHopEnabled: false,
   multiHopEntryNodeId: null,
   multiHopExitNodeId: null,
+  stealthMode: true,
+  quantumProtection: true,
 };
 
 export const useAppStore = create<AppState>()(
@@ -206,6 +221,14 @@ export const useAppStore = create<AppState>()(
       hasAcceptedConsent: false,
       isOnline: true,
       account: { ...defaultAccount },
+
+      // Theme
+      theme: 'dark' as ThemeMode,
+      setTheme: (theme) => set({ theme }),
+
+      // Deep link
+      deepLinkAction: null,
+      setDeepLinkAction: (action) => set({ deepLinkAction: action }),
 
       connectionState: 'disconnected' as ConnectionState,
       currentServer: null,
@@ -327,6 +350,7 @@ export const useAppStore = create<AppState>()(
         favoriteServers: state.favoriteServers,
         settings: state.settings,
         hasAcceptedConsent: state.hasAcceptedConsent,
+        theme: state.theme,
       }),
     }
   )

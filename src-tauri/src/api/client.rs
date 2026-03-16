@@ -219,6 +219,26 @@ impl BirdoApi {
         Ok(())
     }
 
+    /// GDPR: Permanently delete account and all associated data
+    pub async fn delete_account(&self, password: &str) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct DeleteBody<'a> {
+            password: &'a str,
+        }
+        self.post::<_, serde_json::Value>(
+            endpoints::auth::GDPR_DELETE,
+            &DeleteBody { password },
+            true,
+        ).await?;
+        self.clear_tokens().await;
+        Ok(())
+    }
+
+    /// GDPR: Export all user data (Right to Data Portability, Art. 20)
+    pub async fn export_user_data(&self) -> Result<serde_json::Value, ApiError> {
+        self.get(endpoints::auth::GDPR_EXPORT, true).await
+    }
+
     // ========================================================================
     // VPN Endpoints
     // ========================================================================
@@ -230,12 +250,21 @@ impl BirdoApi {
 
     /// Connect to a VPN server and get WireGuard configuration
     /// FIX-1-1: Accepts optional client_public_key for client-side keygen
-    pub async fn connect_vpn(&self, server_id: &str, device_name: &str, client_public_key: Option<String>) -> Result<ConnectResponse, ApiError> {
+    pub async fn connect_vpn(
+        &self,
+        server_id: &str,
+        device_name: &str,
+        client_public_key: Option<String>,
+        stealth_mode: Option<bool>,
+        quantum_protection: Option<bool>,
+    ) -> Result<ConnectResponse, ApiError> {
         let payload = ConnectRequest {
             server_node_id: Some(server_id.to_string()),
             device_name: Some(device_name.to_string()),
             preferred_region: None,
             client_public_key,
+            stealth_mode,
+            quantum_protection,
         };
         
         self.post(endpoints::vpn::CONNECT, &payload, true).await
@@ -249,10 +278,32 @@ impl BirdoApi {
 
     /// Report connection status to server (heartbeat)
     /// FIX-2-13: Called periodically by auto_reconnect health check loop
-    pub async fn heartbeat(&self, key_id: &str) -> Result<(), ApiError> {
-        self.post::<_, serde_json::Value>(&endpoints::vpn::heartbeat(key_id), &(), true)
-            .await?;
+    /// P1-9: Now returns HeartbeatResponse so callers can act on valid/serverOnline
+    pub async fn heartbeat(&self, key_id: &str) -> Result<HeartbeatResponse, ApiError> {
+        self.post::<_, HeartbeatResponse>(&endpoints::vpn::heartbeat(key_id), &(), true)
+            .await
+    }
 
+    /// P3-25: Rotate the WireGuard key for an active connection.
+    /// Sends a new client public key; server returns new server public key and key_id.
+    /// The old key is deactivated server-side after rotation succeeds.
+    pub async fn rotate_key(&self, key_id: &str, new_public_key: &str) -> Result<super::types::KeyRotationResponse, ApiError> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RotateRequest<'a> {
+            client_public_key: &'a str,
+        }
+        self.post(&endpoints::vpn::rotate_key(key_id), &RotateRequest { client_public_key: new_public_key }, true).await
+    }
+
+    /// P2-15: Report connection quality telemetry to the backend.
+    /// Fire-and-forget — callers should not block on failure.
+    pub async fn report_quality(&self, report: &QualityReport) -> Result<(), ApiError> {
+        let _: serde_json::Value = self.post(endpoints::vpn::QUALITY_REPORT, report, true).await
+            .or_else(|e| {
+                // 204 No Content is expected — treat parse errors as success
+                if matches!(e, ApiError::Parse(_)) { Ok(serde_json::Value::Null) } else { Err(e) }
+            })?;
         Ok(())
     }
 
@@ -489,10 +540,13 @@ impl BirdoApi {
                 Err(ApiError::ServerError(status.as_u16()))
             }
             _ => {
-                // SEC: Log the raw response for debugging but never expose it to
-                // the frontend — it may contain server stack traces, HTML error
-                // pages, or internal details that shouldn't reach the UI.
+                // P1-7: Try to parse a typed error code from the response body
                 let error_text = response.text().await.unwrap_or_default();
+                if let Ok(body) = serde_json::from_str::<super::types::ApiErrorBody>(&error_text) {
+                    if let Some(code) = body.error_code {
+                        return Err(ApiError::Protocol(code));
+                    }
+                }
                 tracing::debug!("Unhandled HTTP {}: {}", status, error_text);
                 Err(ApiError::Unknown(format!("HTTP {}", status.as_u16())))
             }

@@ -6,8 +6,9 @@ import { Login } from '@/components/Login';
 import { Dashboard } from '@/components/Dashboard';
 import { PixelCanvas } from '@/components/PixelCanvas';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, useReducedMotion, MotionConfig } from 'framer-motion';
 
 interface AuthState {
   is_authenticated: boolean;
@@ -25,6 +26,7 @@ function App() {
     setUserEmail,
     setAccount,
     setConsent,
+    theme,
   } = useAppStore(
     useShallow((s) => ({
       isAuthenticated: s.isAuthenticated,
@@ -34,9 +36,22 @@ function App() {
       setUserEmail: s.setUserEmail,
       setAccount: s.setAccount,
       setConsent: s.setConsent,
+      theme: s.theme,
     }))
   );
   const [initializing, setInitializing] = useState(true);
+
+  // Apply theme class to <html> element
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.remove('light', 'dark');
+    if (theme === 'system') {
+      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      root.classList.add(prefersDark ? 'dark' : 'light');
+    } else {
+      root.classList.add(theme);
+    }
+  }, [theme]);
 
   useEffect(() => {
     // Check for stored authentication on startup
@@ -69,6 +84,29 @@ function App() {
 
     checkAuth();
   }, [setAuthenticated, setLoading, setUserEmail, setAccount]);
+
+  // Listen for birdo:// deep link events from the Rust backend
+  useEffect(() => {
+    const unlisten = listen<string>('deep-link', (event) => {
+      const url = event.payload;
+      console.log('[deep-link] received:', url);
+      try {
+        const parsed = new URL(url);
+        const action = parsed.hostname;
+        const path = parsed.pathname.replace(/^\//, '');
+
+        if (action === 'connect' && path) {
+          // birdo://connect/<server-id>
+          useAppStore.getState().setDeepLinkAction({ action: 'connect', serverId: path });
+        } else if (action === 'settings') {
+          useAppStore.getState().setDeepLinkAction({ action: 'settings' });
+        }
+      } catch {
+        console.warn('[deep-link] failed to parse URL:', url);
+      }
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
 
   if (initializing) {
     return (
@@ -104,6 +142,7 @@ function App() {
   };
 
   return (
+    <MotionConfig reducedMotion="user">
     <div className="relative h-screen overflow-hidden bg-[#000000]">
       <PixelCanvas />
       
@@ -147,6 +186,7 @@ function App() {
         )}
       </AnimatePresence>
     </div>
+    </MotionConfig>
   );
 }
 

@@ -174,14 +174,42 @@ pub fn sanitize_error(msg: &str) -> String {
         static HOST_RE: Lazy<Regex> = Lazy::new(|| {
             Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){1,}\.[a-zA-Z]{2,}\b").unwrap()
         });
+        // P2-13: Strip HTML tags
+        static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"<[^>]{1,200}>").unwrap()
+        });
+        // P2-13: Strip stack traces (lines starting with "at " or Java-style exception patterns)
+        static STACK_TRACE_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"(?m)^\s*at .*$").unwrap()
+        });
 
-        let result = IPV4_RE.replace_all(msg, |caps: &regex::Captures| {
+        // P2-13: If the message looks like raw HTML, replace entirely
+        if msg.contains("<html") || msg.contains("<HTML") || msg.contains("<!DOCTYPE") {
+            return "[server error]".to_string();
+        }
+
+        // Strip HTML tags
+        let result = HTML_TAG_RE.replace_all(msg, "").to_string();
+
+        // Strip stack trace lines
+        let result = STACK_TRACE_RE.replace_all(&result, "").to_string();
+
+        let result = IPV4_RE.replace_all(&result, |caps: &regex::Captures| {
             format!("{}.x.x.x", &caps[1])
         }).to_string();
 
         let result = EMAIL_RE.replace_all(&result, "[redacted-email]").to_string();
 
-        HOST_RE.replace_all(&result, "[redacted-host]").to_string()
+        let result = HOST_RE.replace_all(&result, "[redacted-host]").to_string();
+
+        // P2-20: Truncate to 200 chars (aligned with Android InputValidator.sanitizeErrorMessage)
+        if result.len() > 200 {
+            let mut truncated = result[..197].to_string();
+            truncated.push_str("...");
+            truncated
+        } else {
+            result
+        }
     }
 }
 

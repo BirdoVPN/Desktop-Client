@@ -12,6 +12,7 @@ use crate::commands::settings::get_settings;
 use crate::storage::CredentialStore;
 use crate::utils::redact::sanitize_error;
 use crate::vpn::manager::{ConnectionState, VpnManager};
+use crate::vpn::xray::XrayManager;
 use crate::vpn::AutoReconnectService;
 
 // FIX-1-1: Client-side WireGuard key generation
@@ -30,7 +31,7 @@ pub struct ConnectionStats {
 }
 
 /// Get the device name for this machine
-fn get_device_name() -> String {
+pub(super) fn get_device_name() -> String {
     hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "Windows PC".to_string())
@@ -86,11 +87,18 @@ pub fn build_vpn_config(
         return Err("No valid DNS addresses in server response".to_string());
     }
 
-    // Filter out IPv6 CIDRs — Wintun tunnel is IPv4-only on Windows
-    let allowed_ips: Vec<String> = response.allowed_ips
-        .unwrap_or_else(|| vec!["0.0.0.0/0".to_string()])
-        .into_iter()
+    // Separate IPv4 and IPv6 CIDRs for the tunnel.
+    // IPv4 routes go to allowed_ips (used by existing Wintun routing).
+    // IPv6 routes go to allowed_ips_v6 (for future dual-stack support).
+    let all_ips = response.allowed_ips
+        .unwrap_or_else(|| vec!["0.0.0.0/0".to_string()]);
+    let allowed_ips: Vec<String> = all_ips.iter()
         .filter(|ip| !ip.contains(':'))
+        .cloned()
+        .collect();
+    let allowed_ips_v6: Vec<String> = all_ips.iter()
+        .filter(|ip| ip.contains(':'))
+        .cloned()
         .collect();
     let allowed_ips = if allowed_ips.is_empty() { vec!["0.0.0.0/0".to_string()] } else { allowed_ips };
 
@@ -134,6 +142,8 @@ pub fn build_vpn_config(
         allowed_ips,
         dns,
         client_ip: assigned_ip,
+        client_ipv6: None, // P3-21: Set from backend response when server supports IPv6
+        allowed_ips_v6,
         mtu,
         persistent_keepalive,
     };
@@ -143,7 +153,7 @@ pub fn build_vpn_config(
 
 /// Generate a X25519 keypair for WireGuard. Returns (local_private_key_b64, client_public_key_b64).
 /// Private key bytes are zeroized immediately after encoding.
-fn generate_wireguard_keypair() -> (String, String) {
+pub(super) fn generate_wireguard_keypair() -> (String, String) {
     let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let public = PublicKey::from(&secret);
     let mut private_key_bytes = secret.to_bytes();
@@ -162,10 +172,14 @@ pub struct VpnSettings {
     pub custom_mtu: u16,
     /// "auto" = use server default, otherwise a port number string.
     pub custom_port: String,
+    /// Enable Xray Reality stealth tunnel
+    pub stealth_mode: bool,
+    /// Enable Rosenpass post-quantum protection
+    pub quantum_protection: bool,
 }
 
 /// Read VPN-related settings and configure WFP split tunneling / local network sharing.
-async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
+pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     let settings = get_settings(app.clone()).await.ok();
     let custom_dns = settings.as_ref().and_then(|s| s.custom_dns.clone());
     let local_network_sharing = settings.as_ref().map(|s| s.local_network_sharing).unwrap_or(false);
@@ -173,6 +187,8 @@ async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     let split_tunnel_apps = settings.as_ref().map(|s| s.split_tunnel_apps.clone()).unwrap_or_default();
     let custom_mtu = settings.as_ref().map(|s| s.wireguard_mtu).unwrap_or(0);
     let custom_port = settings.as_ref().map(|s| s.wireguard_port.clone()).unwrap_or_else(|| "auto".to_string());
+    let stealth_mode = settings.as_ref().map(|s| s.stealth_mode).unwrap_or(false);
+    let quantum_protection = settings.as_ref().map(|s| s.quantum_protection).unwrap_or(false);
 
     crate::vpn::wfp::set_local_network_sharing(local_network_sharing);
     if split_tunneling_enabled && !split_tunnel_apps.is_empty() {
@@ -181,7 +197,7 @@ async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         crate::vpn::wfp::set_split_tunnel_apps(vec![]).await;
     }
 
-    VpnSettings { custom_dns, local_network_sharing, custom_mtu, custom_port }
+    VpnSettings { custom_dns, local_network_sharing, custom_mtu, custom_port, stealth_mode, quantum_protection }
 }
 
 /// Check if the current process has administrator privileges.
@@ -238,7 +254,13 @@ pub async fn connect_vpn(
 
     // Connect via backend API — send public key, NOT private key
     tracing::debug!("Calling /vpn/connect for server {}", server_id);
-    let response = match api.connect_vpn(&server_id, &device_name, Some(client_public_key)).await {
+    let response = match api.connect_vpn(
+        &server_id,
+        &device_name,
+        Some(client_public_key),
+        if vpn_settings.stealth_mode { Some(true) } else { None },
+        if vpn_settings.quantum_protection { Some(true) } else { None },
+    ).await {
         Ok(resp) => {
             tracing::info!("API response received: success={}", resp.success);
             resp
@@ -258,13 +280,85 @@ pub async fn connect_vpn(
     tracing::info!("Got VPN config from server, extracting fields...");
     let vpn_settings = apply_vpn_settings(&app).await;
 
+    // Phase 1: Xray Reality Stealth Tunnel
+    // If stealth mode is enabled and server provided Xray config, start Xray first.
+    // WireGuard will connect through the local Xray proxy instead of directly to the server.
+    let stealth_endpoint_override = if response.stealth_enabled.unwrap_or(false)
+        && response.xray_endpoint.is_some()
+    {
+        let xray_config = crate::vpn::xray::XrayConfig {
+            endpoint: response.xray_endpoint.clone().unwrap(),
+            uuid: response.xray_uuid.clone().unwrap_or_default(),
+            public_key: response.xray_public_key.clone().unwrap_or_default(),
+            short_id: response.xray_short_id.clone().unwrap_or_default(),
+            sni: response.xray_sni.clone().unwrap_or_else(|| "www.microsoft.com".to_string()),
+            flow: response.xray_flow.clone().unwrap_or_else(|| "xtls-rprx-vision".to_string()),
+            wg_port: 51820,
+        };
+
+        let app_data_dir = app.path().app_data_dir()
+            .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+
+        let xray_manager: tauri::State<'_, XrayManager> = app.state();
+        match xray_manager.start(&app_data_dir, &xray_config).await {
+            Ok(local_port) => {
+                tracing::info!("Xray Reality tunnel active, WireGuard will use 127.0.0.1:{}", local_port);
+                Some(format!("127.0.0.1:{}", local_port))
+            }
+            Err(e) => {
+                tracing::error!("Failed to start Xray Reality tunnel: {}", e);
+                // SEC: Do NOT silently fall back — user explicitly requested stealth mode.
+                // Connecting without stealth would expose VPN traffic to DPI.
+                return Err(format!("Stealth tunnel failed to start: {}. Connection aborted to protect your privacy.", e));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase 2: Rosenpass Post-Quantum PSK
+    // If quantum protection is enabled and server provided Rosenpass key, derive hybrid PSK.
+    let quantum_psk = if response.quantum_enabled.unwrap_or(false)
+        && response.rosenpass_public_key.is_some()
+    {
+        let rp_config = crate::vpn::rosenpass::RosenpassConfig {
+            server_public_key: response.rosenpass_public_key.clone().unwrap(),
+            server_psk: response.preshared_key.clone(),
+        };
+
+        match crate::vpn::rosenpass::derive_hybrid_psk(&rp_config) {
+            Ok(psk) => {
+                tracing::info!("Rosenpass hybrid PSK derived successfully");
+                Some(psk)
+            }
+            Err(e) => {
+                tracing::error!("Failed to derive Rosenpass PSK: {}", e);
+                // Fall back to server PSK or none
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // H-2 FIX: Use shared helper instead of duplicated extraction logic
     // FIX-1-1: Pass locally generated private key — server response won't contain one
     // P3-1: Pass custom MTU and port from user settings
-    let (config, server_name) = build_vpn_config(
+    let (mut config, server_name) = build_vpn_config(
         response, &server_id, vpn_settings.custom_dns, Some(local_private_key),
         vpn_settings.custom_mtu, &vpn_settings.custom_port,
     )?;
+
+    // Phase 3: Apply stealth endpoint override (Xray local proxy)
+    if let Some(ref stealth_ep) = stealth_endpoint_override {
+        tracing::info!("Overriding WireGuard endpoint to Xray proxy: {}", stealth_ep);
+        config.endpoint = stealth_ep.clone();
+    }
+
+    // Phase 3b: Apply quantum PSK override
+    if let Some(ref psk) = quantum_psk {
+        config.preshared_key = Some(psk.clone());
+    }
 
     tracing::debug!(
         "Got VPN config: endpoint={}, client_ip={}",
@@ -304,6 +398,7 @@ pub async fn connect_vpn(
 /// Disconnect from VPN
 #[tauri::command]
 pub async fn disconnect_vpn(
+    app: AppHandle,
     api: State<'_, BirdoApi>,
     vpn_manager: State<'_, VpnManager>,
     auto_reconnect: State<'_, AutoReconnectService>,
@@ -318,6 +413,10 @@ pub async fn disconnect_vpn(
     // FIX-R5: Signal that this is a user-initiated disconnect so auto-reconnect
     // does not immediately bring the tunnel back up.
     vpn_manager.set_user_disconnected(true);
+
+    // Stop Xray Reality tunnel if running
+    let xray_manager: tauri::State<'_, XrayManager> = app.state();
+    xray_manager.stop().await;
 
     // Get key_id before disconnecting locally
     let key_id = vpn_manager.get_key_id().await;
@@ -499,7 +598,7 @@ pub async fn quick_connect(
 
 /// Parse the endpoint IP from a "host:port" string.
 /// Returns None if the host part is not a valid IPv4 address (e.g. a hostname).
-fn parse_endpoint_ip(endpoint: &str) -> Option<std::net::Ipv4Addr> {
+pub(super) fn parse_endpoint_ip(endpoint: &str) -> Option<std::net::Ipv4Addr> {
     if endpoint.starts_with('[') {
         // IPv6 [addr]:port — not relevant for WFP IPv4 filters
         return None;
@@ -554,193 +653,4 @@ pub fn get_wfp_status() -> crate::vpn::wfp::KillSwitchStatus {
     status
 }
 
-// ============================================================================
-// Multi-Hop (Double VPN) Commands
-// ============================================================================
-
-/// Get available multi-hop routes (SOVEREIGN plan only)
-#[tauri::command]
-pub async fn get_multi_hop_routes(
-    api: State<'_, BirdoApi>,
-    credentials: State<'_, CredentialStore>,
-) -> Result<Vec<crate::api::types::MultiHopRoute>, String> {
-    // Restore tokens if needed
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
-
-    api.get_multi_hop_routes()
-        .await
-        .map_err(|e| sanitize_error(&format!("Failed to get multi-hop routes: {}", e)))
-}
-
-/// Connect via multi-hop (double VPN): routes through entry node then exit node
-#[tauri::command]
-pub async fn connect_multi_hop(
-    #[allow(non_snake_case)]
-    entryNodeId: String,
-    #[allow(non_snake_case)]
-    exitNodeId: String,
-    app: AppHandle,
-    api: State<'_, BirdoApi>,
-    vpn_manager: State<'_, VpnManager>,
-    credentials: State<'_, CredentialStore>,
-    auto_reconnect: State<'_, AutoReconnectService>,
-) -> Result<bool, String> {
-    tracing::debug!(entry = %entryNodeId, exit = %exitNodeId, "connect_multi_hop called");
-
-    if !crate::utils::elevation::is_elevated() {
-        return Err(
-            "Administrator privileges required. Please right-click the app \
-             and select \"Run as administrator\", or restart from an elevated terminal."
-            .to_string(),
-        );
-    }
-
-    // Restore tokens if needed
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
-
-    let device_name = get_device_name();
-    let (local_private_key, client_public_key) = generate_wireguard_keypair();
-
-    // Call multi-hop connect endpoint
-    let mh_response = api.connect_multi_hop(
-        &entryNodeId, &exitNodeId, &device_name, &client_public_key,
-    ).await.map_err(|e| sanitize_error(&format!("Multi-hop connect failed: {}", e)))?;
-
-    if !mh_response.success {
-        let msg = mh_response.message.unwrap_or_else(|| "Multi-hop connection failed".to_string());
-        return Err(msg);
-    }
-
-    // Convert MultiHopConnectResponse → ConnectResponse so we can reuse build_vpn_config
-    let connect_response = ConnectResponse {
-        success: mh_response.success,
-        message: mh_response.message,
-        config: mh_response.config,
-        key_id: mh_response.key_id,
-        private_key: mh_response.private_key,
-        public_key: mh_response.public_key,
-        preshared_key: mh_response.preshared_key,
-        assigned_ip: mh_response.assigned_ip,
-        server_public_key: mh_response.server_public_key,
-        endpoint: mh_response.endpoint,
-        dns: mh_response.dns,
-        allowed_ips: mh_response.allowed_ips,
-        mtu: mh_response.mtu,
-        persistent_keepalive: mh_response.persistent_keepalive,
-        server_node: None,
-    };
-
-    let vpn_settings = apply_vpn_settings(&app).await;
-    let server_label = format!("Multi-Hop: {} → {}", entryNodeId, exitNodeId);
-    let (config, _server_name) = build_vpn_config(
-        connect_response, &entryNodeId, vpn_settings.custom_dns, Some(local_private_key),
-        vpn_settings.custom_mtu, &vpn_settings.custom_port,
-    )?;
-
-    // Set VPN server IP for kill switch
-    if let Some(ip) = parse_endpoint_ip(&config.endpoint) {
-        crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
-        if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
-            tracing::warn!("Failed to update WFP VPN server: {}", e);
-        }
-    }
-
-    vpn_manager
-        .connect(config, server_label.clone(), vpn_settings.local_network_sharing)
-        .await
-        .map_err(|e| sanitize_error(&format!("Multi-hop connection failed: {}", e)))?;
-
-    auto_reconnect.clear_user_disconnected();
-    tracing::info!("Multi-hop VPN connected: {} → {}", entryNodeId, exitNodeId);
-    auto_reconnect.store_last_config(
-        entryNodeId, server_label, vpn_settings.local_network_sharing,
-        vpn_settings.custom_mtu, vpn_settings.custom_port,
-    ).await;
-    if let Err(e) = auto_reconnect.start().await {
-        tracing::warn!("Failed to start auto-reconnect: {}", e);
-    }
-    Ok(true)
-}
-
-// ============================================================================
-// Port Forwarding Commands
-// ============================================================================
-
-/// Get active port forwards for the current user
-#[tauri::command]
-pub async fn get_port_forwards(
-    api: State<'_, BirdoApi>,
-    credentials: State<'_, CredentialStore>,
-) -> Result<Vec<crate::api::types::PortForward>, String> {
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
-
-    api.get_port_forwards()
-        .await
-        .map_err(|e| sanitize_error(&format!("Failed to get port forwards: {}", e)))
-}
-
-/// Create a new port forward
-#[tauri::command]
-pub async fn create_port_forward(
-    port: u16,
-    protocol: String,
-    api: State<'_, BirdoApi>,
-    credentials: State<'_, CredentialStore>,
-) -> Result<crate::api::types::CreatePortForwardResponse, String> {
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
-
-    api.create_port_forward(port, &protocol, None)
-        .await
-        .map_err(|e| sanitize_error(&format!("Failed to create port forward: {}", e)))
-}
-
-/// Delete an existing port forward
-#[tauri::command]
-pub async fn delete_port_forward(
-    id: String,
-    api: State<'_, BirdoApi>,
-    credentials: State<'_, CredentialStore>,
-) -> Result<bool, String> {
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
-
-    api.delete_port_forward(&id)
-        .await
-        .map_err(|e| sanitize_error(&format!("Failed to delete port forward: {}", e)))?;
-
-    Ok(true)
-}
+// Multi-hop and port forwarding commands extracted to vpn_multi_hop.rs and vpn_port_forward.rs

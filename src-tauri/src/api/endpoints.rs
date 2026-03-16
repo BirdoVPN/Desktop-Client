@@ -14,6 +14,10 @@ pub mod auth {
     pub const TWO_FACTOR_VERIFY: &str = "/auth/2fa/verify";
     /// Password reset request (opens flow — server sends email)
     pub const _PASSWORD_RESET_REQUEST: &str = "/auth/password/request-reset";
+    /// GDPR account deletion (requires password confirmation)
+    pub const GDPR_DELETE: &str = "/v1/gdpr/delete";
+    /// GDPR data export (Right to Data Portability)
+    pub const GDPR_EXPORT: &str = "/v1/gdpr/export";
 }
 
 /// User endpoints — FIX C-3: route through /auth/me instead of phantom /users/subscription
@@ -38,4 +42,12 @@ pub mod vpn {
     pub fn heartbeat(key_id: &str) -> String {
         format!("/vpn/heartbeat/{}", key_id)
     }
+
+    /// Returns the path for rotating the WireGuard key of an active connection
+    pub fn rotate_key(key_id: &str) -> String {
+        format!("/vpn/connections/{}/rotate", key_id)
+    }
+
+    /// P2-15: Client quality telemetry reporting endpoint
+    pub const QUALITY_REPORT: &str = "/vpn/quality-report";
 }

@@ -21,7 +21,7 @@
 //!   4. `activate_blocking()` wraps all filter additions in a single
 //!      `FwpmTransactionBegin0` / `FwpmTransactionCommit0` pair.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -110,6 +110,8 @@ struct WfpEngine {
     handle: HANDLE,
     filter_ids: Vec<u64>,
     sublayer_added: bool,
+    /// Map from permit_id (V4 filter ID) → (app_path, all filter IDs for that app)
+    split_tunnel_map: std::collections::HashMap<u64, (String, Vec<u64>)>,
 }
 
 // SAFETY: The WFP engine handle is a plain kernel object handle that
@@ -151,6 +153,7 @@ impl WfpEngine {
             handle,
             filter_ids: Vec::new(),
             sublayer_added: false,
+            split_tunnel_map: std::collections::HashMap::new(),
         })
     }
 
@@ -168,6 +171,7 @@ impl WfpEngine {
             self.handle = HANDLE::default();
             self.filter_ids.clear();
             self.sublayer_added = false;
+            self.split_tunnel_map.clear();
         }
         Ok(())
     }
@@ -285,6 +289,8 @@ impl WfpEngine {
                 tracing::debug!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
             }
         }
+        // Split tunnel map entries reference filter_ids that were just removed
+        self.split_tunnel_map.clear();
     }
 
     // ── High-level filter builders ──────────────────────────────────
@@ -315,6 +321,173 @@ impl WfpEngine {
         );
         filter.numFilterConditions = 0;
         filter.filterCondition = std::ptr::null_mut();
+        self.add_filter(&filter)?;
+        Ok(())
+    }
+
+    /// Permit IPv6 localhost (::1/128).
+    fn add_permit_localhost_v6(&mut self) -> Result<(), String> {
+        let name = wide_nul("Birdo: Permit IPv6 localhost");
+        // ::1 = 16 bytes, /128 mask = all ones
+        let mut addr_mask = FWP_V6_ADDR_AND_MASK {
+            addr: Ipv6Addr::LOCALHOST.octets(),
+            prefixLength: 128,
+        };
+
+        let mut condition = FWPM_FILTER_CONDITION0::default();
+        condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+        condition.matchType = FWP_MATCH_EQUAL;
+        condition.conditionValue.r#type = FWP_V6_ADDR_MASK;
+        condition.conditionValue.Anonymous.v6AddrMask = &mut addr_mask;
+
+        let mut filter = self.make_base_filter(
+            &name,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            FWP_ACTION_PERMIT,
+            WEIGHT_PERMIT,
+        );
+        filter.numFilterConditions = 1;
+        filter.filterCondition = &mut condition;
+
+        self.add_filter(&filter)?;
+        Ok(())
+    }
+
+    /// Permit DHCPv6 (UDP ports 546-547).
+    fn add_permit_dhcpv6(&mut self) -> Result<(), String> {
+        let name = wide_nul("Birdo: Permit DHCPv6");
+
+        // Condition 1: protocol == UDP (17)
+        let mut cond_proto = FWPM_FILTER_CONDITION0::default();
+        cond_proto.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+        cond_proto.matchType = FWP_MATCH_EQUAL;
+        cond_proto.conditionValue.r#type = FWP_UINT8;
+        cond_proto.conditionValue.Anonymous.uint8 = 17; // IPPROTO_UDP
+
+        // Condition 2: remote port in range 546..=547
+        let mut port_range = FWP_RANGE0::default();
+        port_range.valueLow.r#type = FWP_UINT16;
+        port_range.valueLow.Anonymous.uint16 = 546;
+        port_range.valueHigh.r#type = FWP_UINT16;
+        port_range.valueHigh.Anonymous.uint16 = 547;
+
+        let mut cond_port = FWPM_FILTER_CONDITION0::default();
+        cond_port.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+        cond_port.matchType = FWP_MATCH_RANGE;
+        cond_port.conditionValue.r#type = FWP_RANGE_TYPE;
+        cond_port.conditionValue.Anonymous.rangeValue = &mut port_range;
+
+        let mut conditions = [cond_proto, cond_port];
+        let mut filter = self.make_base_filter(
+            &name,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            FWP_ACTION_PERMIT,
+            WEIGHT_PERMIT,
+        );
+        filter.numFilterConditions = conditions.len() as u32;
+        filter.filterCondition = conditions.as_mut_ptr();
+
+        self.add_filter(&filter)?;
+        Ok(())
+    }
+
+    /// Permit a split-tunnel app on the IPv6 layer.
+    /// Returns the filter ID on success, or 0 if the app could not be resolved.
+    fn add_permit_app_v6(&mut self, exe_path: &str) -> Result<u64, String> {
+        let wide_path = wide_nul(exe_path);
+
+        let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
+        let err = unsafe {
+            FwpmGetAppIdFromFileName0(
+                windows::core::PCWSTR(wide_path.as_ptr()),
+                &mut app_id,
+            )
+        };
+        if err != 0 {
+            return Ok(0); // Non-fatal: skip (already warned at V4 level)
+        }
+
+        let label = format!("Birdo: Permit split-tunnel app v6 ({})",
+            std::path::Path::new(exe_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(exe_path)
+        );
+        let name = wide_nul(&label);
+
+        let mut condition = FWPM_FILTER_CONDITION0::default();
+        condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
+        condition.matchType = FWP_MATCH_EQUAL;
+        condition.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
+        condition.conditionValue.Anonymous.byteBlob = unsafe { &mut *app_id };
+
+        let mut filter = self.make_base_filter(
+            &name,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            FWP_ACTION_PERMIT,
+            WEIGHT_PERMIT,
+        );
+        filter.numFilterConditions = 1;
+        filter.filterCondition = &mut condition;
+
+        let result = self.add_filter(&filter);
+
+        unsafe {
+            FwpmFreeMemory0(&mut (app_id as *mut std::ffi::c_void));
+        }
+
+        result.map(|id| {
+            tracing::debug!("Split tunnel permit v6 added for: {} (filter_id={})", exe_path, id);
+            id
+        })
+    }
+
+    /// Block STUN/TURN ports on IPv6 layer (mirrors IPv4 STUN blocking).
+    fn add_block_stun_turn_v6(&mut self) -> Result<(), String> {
+        self.add_port_range_block_v6("Birdo: Block STUN/UDP v6", 17, 3478, 3497)?;
+        self.add_port_range_block_v6("Birdo: Block TURN/TCP v6", 6, 3478, 3497)?;
+        self.add_port_range_block_v6("Birdo: Block Google STUN v6", 17, 19302, 19302)?;
+        Ok(())
+    }
+
+    /// Helper — block a remote port range for a given IP protocol on IPv6 layer.
+    fn add_port_range_block_v6(
+        &mut self,
+        label: &str,
+        protocol: u8,
+        port_low: u16,
+        port_high: u16,
+    ) -> Result<(), String> {
+        let name = wide_nul(label);
+
+        let mut cond_proto = FWPM_FILTER_CONDITION0::default();
+        cond_proto.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+        cond_proto.matchType = FWP_MATCH_EQUAL;
+        cond_proto.conditionValue.r#type = FWP_UINT8;
+        cond_proto.conditionValue.Anonymous.uint8 = protocol;
+
+        let mut port_range = FWP_RANGE0::default();
+        port_range.valueLow.r#type = FWP_UINT16;
+        port_range.valueLow.Anonymous.uint16 = port_low;
+        port_range.valueHigh.r#type = FWP_UINT16;
+        port_range.valueHigh.Anonymous.uint16 = port_high;
+
+        let mut cond_port = FWPM_FILTER_CONDITION0::default();
+        cond_port.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+        cond_port.matchType = FWP_MATCH_RANGE;
+        cond_port.conditionValue.r#type = FWP_RANGE_TYPE;
+        cond_port.conditionValue.Anonymous.rangeValue = &mut port_range;
+
+        let mut conditions = [cond_proto, cond_port];
+        let mut filter = self.make_base_filter(
+            &name,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            FWP_ACTION_BLOCK,
+            WEIGHT_BLOCK_STUN,
+        );
+        filter.numFilterConditions = conditions.len() as u32;
+        filter.filterCondition = conditions.as_mut_ptr();
+
         self.add_filter(&filter)?;
         Ok(())
     }
@@ -535,7 +708,7 @@ impl WfpEngine {
     /// Permit all traffic from a specific application executable.
     /// Uses FwpmGetAppIdFromFileName0 to get the WFP app ID blob,
     /// then adds a permit filter matching that app ID.
-    fn add_permit_app(&mut self, exe_path: &str) -> Result<(), String> {
+    fn add_permit_app(&mut self, exe_path: &str) -> Result<u64, String> {
         let wide_path = wide_nul(exe_path);
 
         // Get the WFP application ID blob for this executable
@@ -554,7 +727,7 @@ impl WfpEngine {
                 "FwpmGetAppIdFromFileName0 failed for '{}': 0x{:08X} — skipping",
                 exe_path, err
             );
-            return Ok(()); // Non-fatal: skip this app rather than fail the whole transaction
+            return Ok(0); // Non-fatal: skip this app rather than fail the whole transaction
         }
 
         let label = format!("Birdo: Permit split-tunnel app ({})",
@@ -590,8 +763,9 @@ impl WfpEngine {
             FwpmFreeMemory0(&mut (app_id as *mut std::ffi::c_void));
         }
 
-        result.map(|_| {
-            tracing::debug!("Split tunnel permit added for: {}", exe_path);
+        result.map(|id| {
+            tracing::debug!("Split tunnel permit added for: {} (filter_id={})", exe_path, id);
+            id
         })
     }
 
@@ -703,7 +877,9 @@ pub async fn activate_blocking() -> Result<(), String> {
 
         // Permit exceptions (high weight, evaluated first)
         engine.add_permit_localhost()?;
+        engine.add_permit_localhost_v6()?;
         engine.add_permit_dhcp()?;
+        engine.add_permit_dhcpv6()?;
 
         if let Some(ip) = vpn_ip {
             engine.add_permit_vpn_server(ip)?;
@@ -715,19 +891,28 @@ pub async fn activate_blocking() -> Result<(), String> {
             engine.add_permit_local_networks()?;
         }
 
-        // Split tunneling: permit traffic from excluded apps
+        // Split tunneling: permit traffic from excluded apps (IPv4 + IPv6)
         let split_apps = SPLIT_TUNNEL_APPS.try_read();
         if let Ok(apps) = split_apps {
             if !apps.is_empty() {
                 tracing::info!("Adding split tunnel permits for {} app(s)", apps.len());
                 for app_path in apps.iter() {
-                    engine.add_permit_app(app_path)?;
+                    let v4_id = engine.add_permit_app(app_path)?;
+                    if v4_id != 0 {
+                        let mut ids = vec![v4_id];
+                        let v6_id = engine.add_permit_app_v6(app_path)?;
+                        if v6_id != 0 {
+                            ids.push(v6_id);
+                        }
+                        engine.split_tunnel_map.insert(v4_id, (app_path.clone(), ids));
+                    }
                 }
             }
         }
 
-        // WebRTC STUN/TURN leak prevention (highest weight)
+        // WebRTC STUN/TURN leak prevention (highest weight, IPv4 + IPv6)
         engine.add_block_stun_turn()?;
+        engine.add_block_stun_turn_v6()?;
 
         Ok(())
     })();
@@ -862,6 +1047,151 @@ pub async fn set_split_tunnel_apps(app_names: Vec<String>) {
 
     let mut apps = SPLIT_TUNNEL_APPS.write().await;
     *apps = resolved_paths;
+}
+
+/// Add a dynamic split tunnel permit for a specific application.
+///
+/// - Resolves the app path (accepts short names like "chrome.exe" or full paths).
+/// - Adds to `SPLIT_TUNNEL_APPS` so the app persists across kill switch rebuilds.
+/// - If the kill switch is currently blocking, immediately installs WFP filters.
+/// - Returns a permit ID (the V4 filter ID) that can be used with
+///   `remove_split_tunnel_permit`. Returns 0 if the kill switch is not active
+///   (the app is queued and will be applied when blocking activates).
+pub async fn add_split_tunnel_permit(app_path: String) -> Result<u64, String> {
+    let resolved = resolve_app_path(&app_path)
+        .ok_or_else(|| format!("Could not resolve app path: {}", app_path))?;
+
+    // Add to persistent list so it survives kill switch rebuilds
+    {
+        let mut apps = SPLIT_TUNNEL_APPS.write().await;
+        if !apps.contains(&resolved) {
+            apps.push(resolved.clone());
+        }
+    }
+
+    // If kill switch is not active, just queue — filters will be added on next activate
+    if !IS_BLOCKING.load(Ordering::SeqCst) {
+        tracing::info!("Split tunnel: queued '{}' (kill switch not active)", resolved);
+        return Ok(0);
+    }
+
+    if !IS_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("Kill switch not initialized".to_string());
+    }
+
+    let mut guard = ENGINE
+        .lock()
+        .map_err(|e| format!("engine lock poisoned: {}", e))?;
+    let engine = guard.as_mut().ok_or("WFP engine not open")?;
+
+    let v4_id = engine.add_permit_app(&resolved)?;
+    if v4_id == 0 {
+        return Err(format!("Failed to create WFP app ID for: {}", resolved));
+    }
+
+    let mut ids = vec![v4_id];
+    let v6_id = engine.add_permit_app_v6(&resolved)?;
+    if v6_id != 0 {
+        ids.push(v6_id);
+    }
+
+    engine.split_tunnel_map.insert(v4_id, (resolved.clone(), ids));
+    tracing::info!("Split tunnel permit added for '{}' (permit_id={})", resolved, v4_id);
+
+    Ok(v4_id)
+}
+
+/// Remove a specific split tunnel permit by its permit ID.
+///
+/// Removes the WFP filters and also removes the app from `SPLIT_TUNNEL_APPS`.
+pub async fn remove_split_tunnel_permit(permit_id: u64) -> Result<(), String> {
+    if permit_id == 0 {
+        return Err("Invalid permit ID (0)".to_string());
+    }
+
+    if !IS_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("Kill switch not initialized".to_string());
+    }
+
+    let app_to_remove;
+
+    {
+        let mut guard = ENGINE
+            .lock()
+            .map_err(|e| format!("engine lock poisoned: {}", e))?;
+        let engine = guard.as_mut().ok_or("WFP engine not open")?;
+
+        let (app_path, filter_ids) = engine
+            .split_tunnel_map
+            .remove(&permit_id)
+            .ok_or_else(|| format!("Split tunnel permit {} not found", permit_id))?;
+
+        for id in &filter_ids {
+            // SAFETY: `engine.handle` is a valid WFP engine handle.
+            // `id` was returned by a prior successful `FwpmFilterAdd0` call.
+            let err = unsafe { FwpmFilterDeleteById0(engine.handle, *id) };
+            // 0x80320003 = FWP_E_FILTER_NOT_FOUND — benign
+            if err != 0 && err != 0x80320003 {
+                tracing::warn!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
+            }
+            engine.filter_ids.retain(|&fid| fid != *id);
+        }
+
+        app_to_remove = app_path;
+    } // guard dropped — safe to acquire async lock
+
+    {
+        let mut apps = SPLIT_TUNNEL_APPS.write().await;
+        apps.retain(|a| a != &app_to_remove);
+    }
+
+    tracing::info!(
+        "Split tunnel permit removed for '{}' (permit_id={})",
+        app_to_remove,
+        permit_id
+    );
+    Ok(())
+}
+
+/// Remove all split tunnel permits.
+///
+/// Clears `SPLIT_TUNNEL_APPS` and removes all tracked split tunnel WFP filters.
+pub async fn clear_split_tunnel_permits() -> Result<(), String> {
+    // Clear the persistent list
+    {
+        let mut apps = SPLIT_TUNNEL_APPS.write().await;
+        apps.clear();
+    }
+
+    if !IS_INITIALIZED.load(Ordering::SeqCst) {
+        return Ok(()); // Nothing to clean up in WFP
+    }
+
+    let mut guard = ENGINE
+        .lock()
+        .map_err(|e| format!("engine lock poisoned: {}", e))?;
+    if let Some(engine) = guard.as_mut() {
+        let entries: Vec<(u64, Vec<u64>)> = engine
+            .split_tunnel_map
+            .drain()
+            .map(|(k, (_, ids))| (k, ids))
+            .collect();
+
+        for (permit_id, filter_ids) in entries {
+            for id in &filter_ids {
+                // SAFETY: `engine.handle` is a valid WFP engine handle.
+                let err = unsafe { FwpmFilterDeleteById0(engine.handle, *id) };
+                if err != 0 && err != 0x80320003 {
+                    tracing::warn!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
+                }
+                engine.filter_ids.retain(|&fid| fid != *id);
+            }
+            tracing::debug!("Cleared split tunnel permit_id={}", permit_id);
+        }
+    }
+
+    tracing::info!("All split tunnel permits cleared");
+    Ok(())
 }
 
 /// Resolve an app name or path to a full executable path.

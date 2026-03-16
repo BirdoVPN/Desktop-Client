@@ -25,7 +25,7 @@ fn cmd(program: &str) -> Command {
 }
 
 /// Wintun adapter configuration
-const ADAPTER_NAME: &str = "Birdo VPN";
+pub(super) const ADAPTER_NAME: &str = "Birdo VPN";
 const TUNNEL_TYPE: &str = "Birdo";
 
 /// Fixed GUID for the Birdo VPN adapter, so we can reliably reopen/delete
@@ -95,10 +95,10 @@ fn base64_encode_utf16le(script: &str) -> String {
 /// H-4 FIX: Stores original DNS configuration for an adapter, enabling
 /// precise restoration on disconnect instead of blindly setting DHCP.
 #[derive(Debug, Clone)]
-struct AdapterDnsSnapshot {
-    adapter_name: String,
+pub(super) struct AdapterDnsSnapshot {
+    pub(super) adapter_name: String,
     /// Original DNS servers (empty = was DHCP)
-    dns_servers: Vec<String>,
+    pub(super) dns_servers: Vec<String>,
 }
 
 pub struct WintunTunnel {
@@ -557,6 +557,11 @@ impl WintunTunnel {
         Ok(())
     }
 
+    // ===================================================================
+    // SECTION: Routing — configure_routes, get_adapter_index, get_default_gateway,
+    //   configure_local_network_routes, parse_cidr (consider future tunnel_routing.rs)
+    // ===================================================================
+
     /// Configure routes to send traffic through the VPN
     /// FIX-ROUTE-2: Accept the endpoint IP from the WireGuard session to avoid
     /// double-resolution.  The WG socket connects to IP_A (resolved at socket
@@ -762,6 +767,11 @@ impl WintunTunnel {
     }
 
     /// H-3 FIX: Get list of non-VPN adapter names using PowerShell Get-NetAdapter.
+    // ===================================================================
+    // SECTION: DNS — get_non_vpn_adapters, snapshot_adapter_dns, configure_dns,
+    //   restore_dns (static helpers also in tunnel_dns.rs)
+    // ===================================================================
+
     /// This is reliable regardless of adapter name formatting, unlike netsh text parsing.
     /// SEC-C4 FIX: Use -EncodedCommand with Base64 to prevent command injection
     /// via malicious adapter names containing PowerShell metacharacters.
@@ -929,6 +939,11 @@ impl WintunTunnel {
         tracing::debug!("DNS configured (VPN-only): {:?}", self.config.dns);
         Ok(())
     }
+
+    // ===================================================================
+    // SECTION: IPv6 — block_ipv6_leaks, unblock_ipv6
+    //   (consider future tunnel_ipv6.rs extraction)
+    // ===================================================================
 
     /// Block IPv6 traffic to prevent leaks
     /// IPv6 traffic would bypass the VPN tunnel since we only route IPv4
