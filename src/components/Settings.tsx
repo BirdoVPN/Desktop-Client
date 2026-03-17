@@ -63,7 +63,7 @@ export function Settings() {
     };
   }, []);
 
-  const { settings, updateSettings, servers, multiHopRoutes, setMultiHopRoutes, portForwards, setPortForwards, theme, setTheme } = useAppStore(
+  const { settings, updateSettings, servers, multiHopRoutes, setMultiHopRoutes, portForwards, setPortForwards, theme, setTheme, account } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
@@ -74,8 +74,20 @@ export function Settings() {
       setPortForwards: s.setPortForwards,
       theme: s.theme,
       setTheme: s.setTheme,
+      account: s.account,
     }))
   );
+
+  const planLevel = (plan: string | null | undefined): number => {
+    switch (plan?.toUpperCase()) {
+      case 'SOVEREIGN': return 2;
+      case 'OPERATIVE': return 1;
+      default: return 0;
+    }
+  };
+  const userPlan = planLevel(account?.plan);
+  const hasOperative = userPlan >= 1;
+  const hasSovereign = userPlan >= 2;
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => setAppVersion('unknown'));
@@ -584,9 +596,10 @@ export function Settings() {
           <SettingToggle
             icon={Eye}
             title="Stealth Mode"
-            description="Disguise VPN traffic as normal HTTPS (Xray Reality)"
+            description={hasOperative ? "Disguise VPN traffic as normal HTTPS (Xray Reality)" : "Requires Operative plan or higher"}
             enabled={settings.stealthMode}
             onChange={(v) => handleToggle('stealthMode', v)}
+            disabled={!hasOperative}
           />
           <SettingToggle
             icon={Lock}
@@ -609,9 +622,10 @@ export function Settings() {
           <SettingToggle
             icon={Split}
             title="Split Tunneling"
-            description="Exclude certain apps from VPN"
+            description={hasOperative ? "Exclude certain apps from VPN" : "Requires Operative plan or higher"}
             enabled={settings.splitTunnelingEnabled}
             onChange={(v) => handleToggle('splitTunnelingEnabled', v)}
+            disabled={!hasOperative}
           />
           <AnimatePresence>
             {settings.splitTunnelingEnabled && (
@@ -669,7 +683,7 @@ export function Settings() {
           <SettingToggle
             icon={Layers}
             title="Multi-Hop Routing"
-            description="Route through two servers for extra privacy"
+            description={hasSovereign ? "Route through two servers for extra privacy" : "Requires Sovereign plan"}
             enabled={settings.multiHopEnabled}
             onChange={(v) => {
               handleToggle('multiHopEnabled', v);
@@ -681,6 +695,7 @@ export function Settings() {
                   .finally(() => setMultiHopLoading(false));
               }
             }}
+            disabled={!hasSovereign}
           />
           <AnimatePresence>
             {settings.multiHopEnabled && (
@@ -749,7 +764,10 @@ export function Settings() {
 
         {/* ── Port Forwarding Section ── */}
         <Section title="Port Forwarding">
-          <div className="glass rounded-lg p-3 space-y-3">
+          <div className={`glass rounded-lg p-3 space-y-3 ${!hasSovereign ? 'opacity-50 pointer-events-none' : ''}`}>
+            {!hasSovereign && (
+              <p className="text-xs text-amber-400">Requires Sovereign plan</p>
+            )}
             <div className="flex items-center gap-3 mb-2">
               <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
                 <Router size={18} className="text-white" />
@@ -878,7 +896,10 @@ export function Settings() {
 
         {/* ── Speed Test Section ── */}
         <Section title="Speed Test">
-          <div className="space-y-3">
+          <div className={`space-y-3 ${!hasOperative ? 'opacity-50 pointer-events-none' : ''}`}>
+            {!hasOperative && (
+              <p className="text-xs text-amber-400">Requires Operative plan or higher</p>
+            )}
             <div className="glass rounded-lg p-3">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
@@ -997,6 +1018,7 @@ interface SettingToggleProps {
   description: string;
   enabled: boolean;
   onChange: (enabled: boolean) => void;
+  disabled?: boolean;
 }
 
 function SettingToggle({
@@ -1005,9 +1027,10 @@ function SettingToggle({
   description,
   enabled,
   onChange,
+  disabled,
 }: SettingToggleProps) {
   return (
-    <div className="glass flex items-center justify-between rounded-lg p-3">
+    <div className={`glass flex items-center justify-between rounded-lg p-3 ${disabled ? 'opacity-50' : ''}`}>
       <div className="flex items-center gap-3">
         <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
           <Icon size={18} className="text-white" />
@@ -1021,10 +1044,11 @@ function SettingToggle({
         role="switch"
         aria-checked={enabled}
         aria-label={title}
-        onClick={() => onChange(!enabled)}
+        onClick={() => !disabled && onChange(!enabled)}
+        disabled={disabled}
         className={`relative h-6 w-11 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 ${
-          enabled ? 'bg-white' : 'bg-white/20'
-        }`}
+          enabled && !disabled ? 'bg-white' : 'bg-white/20'
+        } ${disabled ? 'cursor-not-allowed' : ''}`}
       >
         <div
           className={`absolute top-1 h-4 w-4 rounded-full transition-all ${
