@@ -28,10 +28,13 @@ export interface ConnectionStats {
 export type ConnectionState =
   | 'disconnected'
   | 'connecting'
+  | 'authenticating'
+  | 'stealth_connecting'
   | 'connected'
   | 'disconnecting'
   | 'reconnecting'
   | 'rekeying'
+  | 'kill_switch_active'
   | 'error';
 
 export interface AccountInfo {

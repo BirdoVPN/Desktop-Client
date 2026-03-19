@@ -111,6 +111,8 @@ export function Dashboard() {
           multiHopEnabled: rustSettings.multi_hop_enabled ?? false,
           multiHopEntryNodeId: rustSettings.multi_hop_entry_node_id ?? null,
           multiHopExitNodeId: rustSettings.multi_hop_exit_node_id ?? null,
+          stealthMode: rustSettings.stealth_mode ?? false,
+          quantumProtection: rustSettings.quantum_protection ?? false,
         });
       } catch (err) {
         console.warn('Failed to hydrate settings from backend:', err);

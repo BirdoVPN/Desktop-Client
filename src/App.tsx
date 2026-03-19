@@ -8,7 +8,7 @@ import { PixelCanvas } from '@/components/PixelCanvas';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
-import { motion, AnimatePresence, useReducedMotion, MotionConfig } from 'framer-motion';
+import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 
 interface AuthState {
   is_authenticated: boolean;
