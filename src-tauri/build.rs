@@ -1,7 +1,7 @@
 use std::env;
 
 fn main() {
-    // Embed Windows manifest to request admin privileges
+    // Embed Windows-specific manifest (admin privileges, OS compatibility)
     #[cfg(windows)]
     {
         let winres = winres::WindowsResource::new();

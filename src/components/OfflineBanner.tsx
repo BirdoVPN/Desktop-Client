@@ -9,7 +9,7 @@ import { motion, AnimatePresence } from 'framer-motion';
  * Mirrors Android's NetworkMonitor.kt + BirdoNavGraph offline banner.
  *
  * Uses the browser's `navigator.onLine` as a lightweight heuristic.
- * This is sufficient for desktop since Windows triggers online/offline
+ * This is sufficient for desktop since the OS triggers online/offline
  * events when the network interface changes.
  */
 export function OfflineBanner() {

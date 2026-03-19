@@ -345,7 +345,7 @@ export const useAppStore = create<AppState>()(
     {
       name: 'birdo-vpn-storage',
       // SECURITY: Only non-sensitive preferences persisted in localStorage.
-      // Auth tokens and VPN keys remain in Rust-side Windows Credential Manager.
+      // Auth tokens and VPN keys remain in Rust-side native secure storage.
       partialize: (state) => ({
         favoriteServers: state.favoriteServers,
         settings: state.settings,

@@ -14,12 +14,19 @@ a download was built from this repository's source code — not tampered with.
 
 # 2. Download the installer AND its .sigstore bundle from the GitHub Release
 
-# 3. Verify
+# 3. Verify (Windows example)
 cosign verify-blob \
   --bundle BirdoVPN-Setup-1.0.0.exe.sigstore \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp "github.com/.*birdo-client-win" \
+  --certificate-identity-regexp "github.com/BirdoVPN/" \
   BirdoVPN-Setup-1.0.0.exe
+
+# 3. Verify (macOS example)
+cosign verify-blob \
+  --bundle BirdoVPN-1.0.0.dmg.sigstore \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp "github.com/BirdoVPN/" \
+  BirdoVPN-1.0.0.dmg
 ```
 
 If valid, you'll see:
@@ -36,7 +43,7 @@ Each release includes a `SHA256SUMS.txt` that is itself Sigstore-signed:
 cosign verify-blob \
   --bundle SHA256SUMS.txt.sigstore \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp "github.com/.*birdo-client-win" \
+  --certificate-identity-regexp "github.com/BirdoVPN/" \
   SHA256SUMS.txt
 
 # 2. Verify file checksums (PowerShell)
@@ -73,7 +80,7 @@ To see exactly which commit and workflow produced a binary:
 cosign verify-blob \
   --bundle BirdoVPN-Setup-1.0.0.exe.sigstore \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp "github.com/.*birdo-client-win" \
+  --certificate-identity-regexp "github.com/BirdoVPN/" \
   --output-certificate cert.pem \
   BirdoVPN-Setup-1.0.0.exe
 
@@ -95,7 +102,7 @@ Every signing event is recorded in Sigstore's public transparency log:
 
 | Error | Fix |
 |-------|-----|
-| `cosign: command not found` | Install cosign: `winget install sigstore.cosign` |
+| `cosign: command not found` | Install cosign: `winget install sigstore.cosign` (Windows) or `brew install cosign` (macOS) |
 | `no matching signatures` | Ensure you downloaded the `.sigstore` bundle from the same release |
 | `certificate identity mismatch` | Check the `--certificate-identity-regexp` matches the repo URL |
 | `BUNDLE_NOT_FOUND` | The `.sigstore` file must be next to the artifact being verified |

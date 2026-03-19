@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # ============================================================
-# Birdo VPN — Windows 10/11 QA Checklist
+# Birdo VPN — Windows QA Checklist\n# (For macOS QA, see qa-checklist-macos.sh when available)
 # ============================================================
 # Run this script to walk through the manual QA test matrix.
 # Mark each test as PASS / FAIL / SKIP with notes.

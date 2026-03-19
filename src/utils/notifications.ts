@@ -1,7 +1,7 @@
 /**
  * Native notification utility for Birdo VPN
  *
- * Sends Windows toast notifications for VPN connection events,
+ * Sends native desktop notifications for VPN connection events,
  * gated behind the user's notification preference.
  */
 
