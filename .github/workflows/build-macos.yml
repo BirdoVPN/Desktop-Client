@@ -74,6 +74,9 @@ jobs:
           iconutil -c icns icon.iconset -o src-tauri/icons/icon.icns
           ls -la src-tauri/icons/icon.icns
 
+      - name: Prepare resources directory
+        run: mkdir -p src-tauri/resources
+
       - name: Build Tauri application
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
