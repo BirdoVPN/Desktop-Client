@@ -55,6 +55,14 @@ pub async fn enable_killswitch() -> Result<bool, String> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if !is_elevated() {
+            tracing::warn!("Kill switch requires root privileges on macOS");
+            return Err("Root privileges required for kill switch".to_string());
+        }
+    }
+
     KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
     tracing::info!("Kill switch enabled and ready");
     Ok(true)
@@ -89,6 +97,13 @@ pub async fn disable_killswitch(vpn_manager: State<'_, VpnManager>) -> Result<bo
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = pf_deactivate_blocking().await {
+            tracing::warn!("Failed to remove pf rules: {}", e);
+        }
+    }
+
     KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
     // SEC-C3 FIX: No longer storing KILLSWITCH_ACTIVE — wfp::is_blocking() is the source of truth
     tracing::info!("Kill switch disabled");
@@ -118,6 +133,15 @@ pub async fn activate_killswitch() -> Result<bool, String> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        let server_ip = VPN_SERVER_IP.read().await.clone();
+        if let Err(e) = pf_activate_blocking(server_ip).await {
+            tracing::error!("Failed to activate pf blocking: {}", e);
+            return Err(format!("Failed to activate blocking: {}", e));
+        }
+    }
+
     // SEC-C3 FIX: Removed KILLSWITCH_ACTIVE.store — wfp::is_blocking() is the source of truth
     Ok(true)
 }
@@ -136,6 +160,14 @@ pub async fn deactivate_killswitch() -> Result<bool, String> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = pf_deactivate_blocking().await {
+            tracing::error!("Failed to deactivate pf blocking: {}", e);
+            return Err(format!("Failed to deactivate blocking: {}", e));
+        }
+    }
+
     // SEC-C3 FIX: Removed KILLSWITCH_ACTIVE.store — wfp::is_blocking() is the source of truth
     Ok(true)
 }
@@ -148,7 +180,9 @@ pub async fn get_killswitch_status() -> Result<KillSwitchStatus, String> {
     
     #[cfg(target_os = "windows")]
     let active = wfp::is_blocking();
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let active = PF_BLOCKING.load(Ordering::SeqCst);
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let active = false;
 
     // blocking_connections is deprecated, always 0
@@ -170,4 +204,87 @@ pub async fn set_vpn_server_ip(ip: Option<Ipv4Addr>) {
 /// Check if kill switch is currently enabled
 pub fn is_enabled() -> bool {
     KILLSWITCH_ENABLED.load(Ordering::SeqCst)
+}
+
+// ──────────────────────────────────────────────────────────────
+// macOS pf (packet filter) kill switch implementation
+// ──────────────────────────────────────────────────────────────
+
+/// Tracks whether pf blocking rules are active on macOS
+#[cfg(target_os = "macos")]
+static PF_BLOCKING: AtomicBool = AtomicBool::new(false);
+
+/// Anchor name for Birdo VPN pf rules
+#[cfg(target_os = "macos")]
+const PF_ANCHOR: &str = "com.birdo.vpn.killswitch";
+
+/// Activate pf blocking: block all traffic except to the VPN server and localhost.
+#[cfg(target_os = "macos")]
+async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    use std::io::Write;
+
+    let server_rule = if let Some(ip) = server_ip {
+        format!("pass out quick proto udp to {} no state\n", ip)
+    } else {
+        String::new()
+    };
+
+    // Build pf rules for the anchor
+    let rules = format!(
+        "# Birdo VPN Kill Switch\n\
+         block drop all\n\
+         pass on lo0 all\n\
+         pass out quick proto udp to any port 67 no state\n\
+         pass in quick proto udp from any port 68 no state\n\
+         {server_rule}"
+    );
+
+    // Write rules to a temporary file (no user input in the rules — safe)
+    let rules_path = "/tmp/birdo_pf_killswitch.conf";
+    let mut file = std::fs::File::create(rules_path)
+        .map_err(|e| format!("Failed to create pf rules file: {}", e))?;
+    file.write_all(rules.as_bytes())
+        .map_err(|e| format!("Failed to write pf rules: {}", e))?;
+
+    // Load rules into the anchor
+    let output = crate::utils::hidden_cmd("pfctl")
+        .args(["-a", PF_ANCHOR, "-f", rules_path])
+        .output()
+        .map_err(|e| format!("pfctl load failed: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pfctl load anchor failed: {}", stderr));
+    }
+
+    // Enable pf if not already enabled
+    let _ = crate::utils::hidden_cmd("pfctl")
+        .args(["-e"])
+        .output();
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(rules_path);
+
+    PF_BLOCKING.store(true, Ordering::SeqCst);
+    tracing::info!("macOS pf kill switch activated");
+    Ok(())
+}
+
+/// Deactivate pf blocking: flush the Birdo anchor rules.
+#[cfg(target_os = "macos")]
+async fn pf_deactivate_blocking() -> Result<(), String> {
+    // Flush the anchor
+    let output = crate::utils::hidden_cmd("pfctl")
+        .args(["-a", PF_ANCHOR, "-F", "all"])
+        .output()
+        .map_err(|e| format!("pfctl flush failed: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!("pfctl flush anchor: {}", stderr);
+    }
+
+    PF_BLOCKING.store(false, Ordering::SeqCst);
+    tracing::info!("macOS pf kill switch deactivated");
+    Ok(())
 }

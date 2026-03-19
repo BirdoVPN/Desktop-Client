@@ -401,7 +401,7 @@ impl AutoReconnectService {
                                         let client_public_key = base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
                                         private_key_bytes.zeroize();
                                         
-                                        match api.connect_vpn(&info.server_id, &device_name, Some(client_public_key)).await {
+                                        match api.connect_vpn(&info.server_id, &device_name, Some(client_public_key), None, None).await {
                                             Ok(response) => {
                                                 // Re-check user disconnect flag before committing
                                                 if user_disconnected.load(Ordering::SeqCst) {

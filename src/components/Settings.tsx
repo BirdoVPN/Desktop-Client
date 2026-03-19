@@ -279,7 +279,7 @@ export function Settings() {
           <SettingToggle
             icon={Zap}
             title="Launch at Login"
-            description="Start Birdo VPN when Windows starts"
+            description="Start Birdo VPN when your computer starts"
             enabled={settings.autostart}
             onChange={(v) => handleToggle('autostart', v)}
           />

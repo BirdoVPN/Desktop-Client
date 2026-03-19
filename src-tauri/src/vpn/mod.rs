@@ -1,6 +1,8 @@
 //! VPN tunnel module
 //!
-//! WireGuard tunnel management using Wintun and boringtun.
+//! WireGuard tunnel management using platform-specific virtual adapters:
+//! - Windows: Wintun virtual network adapter
+//! - macOS: utun kernel interface
 
 pub mod auto_reconnect;
 pub mod buffer_pool;  // FIX-2-4: Reduced to packet size constants only
@@ -10,9 +12,16 @@ pub mod manager;
 pub mod network_monitor;  // P2-15: System network connectivity monitor
 pub mod rosenpass;  // Post-quantum PSK derivation (matching Android RosenpassManager)
 pub mod speed_test;  // On-device speed test (P3-26)
-pub mod tunnel;
-mod tunnel_dns;  // DNS helpers extracted from tunnel.rs
 pub mod xray;  // Xray Reality stealth tunnel (matching Android XrayManager)
+
+// Platform-specific tunnel implementations
+#[cfg(target_os = "windows")]
+pub mod tunnel;
+#[cfg(target_os = "macos")]
+pub mod tunnel_macos;
+
+#[cfg(target_os = "windows")]
+mod tunnel_dns;  // DNS helpers extracted from tunnel.rs (Windows-specific netsh/powershell)
 // Removed: pub mod wireguard; - deprecated file with placeholder crypto
 mod wireguard_new;
 

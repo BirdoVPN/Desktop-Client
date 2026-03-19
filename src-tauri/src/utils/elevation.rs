@@ -65,14 +65,22 @@ pub fn is_elevated() -> bool {
 
     #[cfg(not(target_os = "windows"))]
     {
-        false
+        // On macOS/Linux, check if effective UID is 0 (root)
+        // Use `id -u` command to avoid needing libc as a direct dependency
+        std::process::Command::new("id")
+            .args(["-u"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+            .unwrap_or(false)
     }
 }
 
 /// Run a command with elevated privileges.
 ///
 /// If the process is already elevated, runs the command directly.
-/// Otherwise, uses PowerShell `Start-Process -Verb RunAs` to request UAC.
+/// Otherwise:
+/// - Windows: Uses PowerShell `Start-Process -Verb RunAs` to request UAC.
+/// - macOS: Uses `osascript` to request admin privileges via authorization prompt.
 ///
 /// Returns the combined stdout + stderr output.
 pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
@@ -93,38 +101,78 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
         return Ok(format!("{}{}", stdout, stderr));
     }
 
-    // Not elevated — use PowerShell to spawn with RunAs
-    let args_str = args.iter()
-        .map(|a| format!("'{}'", a.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(", ");
+    #[cfg(target_os = "windows")]
+    {
+        // Not elevated — use PowerShell to spawn with RunAs
+        let args_str = args.iter()
+            .map(|a| format!("'{}'", a.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-    let ps_command = format!(
-        "Start-Process -FilePath '{}' -ArgumentList {} -Verb RunAs -Wait -WindowStyle Hidden -PassThru | Select-Object -ExpandProperty ExitCode",
-        program,
-        args_str
-    );
+        let ps_command = format!(
+            "Start-Process -FilePath '{}' -ArgumentList {} -Verb RunAs -Wait -WindowStyle Hidden -PassThru | Select-Object -ExpandProperty ExitCode",
+            program,
+            args_str
+        );
 
-    tracing::debug!("Elevating command: {} {}", program, args.join(" "));
+        tracing::debug!("Elevating command: {} {}", program, args.join(" "));
 
-    let output = super::hidden_cmd("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
-        .output()
-        .map_err(|e| format!("Failed to elevate {}: {}", program, e))?;
+        let output = super::hidden_cmd("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
+            .output()
+            .map_err(|e| format!("Failed to elevate {}: {}", program, e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!("Elevated command failed: {}", stderr));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("Elevated command failed: {}", stderr));
+        }
+
+        Ok(stdout)
     }
 
-    Ok(stdout)
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, use osascript to run commands with admin privileges
+        // SEC: Build the command safely — quote each argument
+        let escaped_args: Vec<String> = args.iter()
+            .map(|a| a.replace('\\', "\\\\").replace('"', "\\\""))
+            .collect();
+        let full_cmd = format!("{} {}", program, escaped_args.join(" "));
+
+        tracing::debug!("Elevating command on macOS: {}", full_cmd);
+
+        let apple_script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            full_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+
+        let output = super::hidden_cmd("osascript")
+            .args(["-e", &apple_script])
+            .output()
+            .map_err(|e| format!("Failed to elevate {}: {}", program, e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("Elevated command failed: {}", stderr));
+        }
+
+        Ok(stdout)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Err(format!("Privilege elevation not supported on this platform"))
+    }
 }
 
-/// Run a netsh command, elevating if necessary.
+/// Run a netsh command, elevating if necessary. (Windows only)
 ///
 /// This is a convenience wrapper for the most common privilege-requiring operation.
+#[cfg(target_os = "windows")]
 pub fn run_netsh_elevated(args: &[&str]) -> Result<(), String> {
     if is_elevated() {
         // Already elevated — run directly

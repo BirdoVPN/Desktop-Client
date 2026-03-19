@@ -100,6 +100,16 @@ pub async fn connect_multi_hop(
         mtu: mh_response.mtu,
         persistent_keepalive: mh_response.persistent_keepalive,
         server_node: None,
+        stealth_enabled: None,
+        xray_endpoint: None,
+        xray_uuid: None,
+        xray_public_key: None,
+        xray_short_id: None,
+        xray_sni: None,
+        xray_flow: None,
+        quantum_enabled: None,
+        rosenpass_public_key: None,
+        rosenpass_endpoint: None,
     };
 
     let vpn_settings = apply_vpn_settings(&app).await;
@@ -112,6 +122,7 @@ pub async fn connect_multi_hop(
     // Set VPN server IP for kill switch
     if let Some(ip) = parse_endpoint_ip(&config.endpoint) {
         crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
+        #[cfg(target_os = "windows")]
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
         }

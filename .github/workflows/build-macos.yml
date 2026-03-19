@@ -1,0 +1,158 @@
+name: Build macOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'mac-v*'
+
+# Minimum permissions — each job declares its own
+permissions: {}
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14        # Apple Silicon (M1+)
+            arch: aarch64-apple-darwin
+            label: arm64
+          - runner: macos-13        # Intel
+            arch: x86_64-apple-darwin
+            label: x64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+      id-token: write  # Required for Sigstore keyless signing
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.arch }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Generate macOS icon (icns) from PNG
+        run: |
+          mkdir -p icon.iconset
+          sips -z 16 16     src-tauri/icons/icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     src-tauri/icons/icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     src-tauri/icons/icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     src-tauri/icons/icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   src-tauri/icons/icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   src-tauri/icons/icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   src-tauri/icons/icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   src-tauri/icons/icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   src-tauri/icons/icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 src-tauri/icons/icon.png --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o src-tauri/icons/icon.icns
+          ls -la src-tauri/icons/icon.icns
+
+      - name: Build Tauri application
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --target ${{ matrix.arch }}
+
+      # ── Sigstore keyless signing ──────────────────────────────────────
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Sign DMG with Sigstore
+        run: |
+          DMG_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/dmg -name '*.dmg' | head -1)
+          if [ -n "$DMG_FILE" ]; then
+            cosign sign-blob --yes --bundle "${DMG_FILE}.sigstore" "$DMG_FILE"
+            echo "Signed $(basename $DMG_FILE)"
+          else
+            echo "::warning::DMG not found — build may have produced .app only"
+          fi
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd src-tauri/target/${{ matrix.arch }}/release/bundle
+          find . -type f \( -name '*.dmg' -o -name '*.app' \) | while read f; do
+            shasum -a 256 "$f" >> SHA256SUMS.txt
+          done
+          cat SHA256SUMS.txt || echo "No artifacts to checksum"
+
+      - name: Sign checksums with Sigstore
+        run: |
+          SUMS="src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt"
+          if [ -f "$SUMS" ]; then
+            cosign sign-blob --yes --bundle "${SUMS}.sigstore" "$SUMS"
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: birdo-vpn-macos-${{ matrix.label }}
+          path: |
+            src-tauri/target/${{ matrix.arch }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.arch }}/release/bundle/dmg/*.sigstore
+            src-tauri/target/${{ matrix.arch }}/release/bundle/macos/*.app
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt.sigstore
+          retention-days: 30
+
+  # ── Create universal binary (optional) ─────────────────────────────
+  universal:
+    needs: build-macos
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: birdo-vpn-macos-arm64
+          path: arm64/
+
+      - name: Download x64 artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: birdo-vpn-macos-x64
+          path: x64/
+
+      - name: List artifacts
+        run: |
+          echo "=== ARM64 ==="
+          find arm64 -type f
+          echo "=== X64 ==="
+          find x64 -type f
+
+      - name: Upload combined artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: birdo-vpn-macos-all
+          path: |
+            arm64/
+            x64/
+          retention-days: 30

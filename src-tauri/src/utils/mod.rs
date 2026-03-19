@@ -7,7 +7,10 @@ pub mod telemetry;
 // elevation and telemetry are scaffolding — used when specific operations
 // need UAC elevation or crash reporting. Re-exports here for convenience.
 #[allow(unused_imports)]
-pub use elevation::{is_elevated, run_elevated, run_netsh_elevated};
+pub use elevation::{is_elevated, run_elevated};
+#[cfg(target_os = "windows")]
+#[allow(unused_imports)]
+pub use elevation::run_netsh_elevated;
 pub use redact::redact_email;
 pub use redact::redact_endpoint;
 pub use redact::redact_ip;

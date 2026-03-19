@@ -34,7 +34,10 @@ pub struct ConnectionStats {
 pub(super) fn get_device_name() -> String {
     hostname::get()
         .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "Windows PC".to_string())
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") { "Mac".to_string() }
+            else { "Desktop".to_string() }
+        })
 }
 
 /// H-2 FIX: Shared helper to extract VPN config from ConnectResponse.
@@ -190,11 +193,14 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     let stealth_mode = settings.as_ref().map(|s| s.stealth_mode).unwrap_or(false);
     let quantum_protection = settings.as_ref().map(|s| s.quantum_protection).unwrap_or(false);
 
-    crate::vpn::wfp::set_local_network_sharing(local_network_sharing);
-    if split_tunneling_enabled && !split_tunnel_apps.is_empty() {
-        crate::vpn::wfp::set_split_tunnel_apps(split_tunnel_apps).await;
-    } else {
-        crate::vpn::wfp::set_split_tunnel_apps(vec![]).await;
+    #[cfg(target_os = "windows")]
+    {
+        crate::vpn::wfp::set_local_network_sharing(local_network_sharing);
+        if split_tunneling_enabled && !split_tunnel_apps.is_empty() {
+            crate::vpn::wfp::set_split_tunnel_apps(split_tunnel_apps).await;
+        } else {
+            crate::vpn::wfp::set_split_tunnel_apps(vec![]).await;
+        }
     }
 
     VpnSettings { custom_dns, local_network_sharing, custom_mtu, custom_port, stealth_mode, quantum_protection }
@@ -379,6 +385,7 @@ pub async fn connect_vpn(
     if let Some(ip) = parse_endpoint_ip(&config.endpoint) {
         crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
         // update_vpn_server sets the IP AND re-activates blocking atomically
+        #[cfg(target_os = "windows")]
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
         }
@@ -472,9 +479,12 @@ pub async fn get_vpn_status(vpn_manager: State<'_, VpnManager>) -> Result<VpnSta
     let state_str = match state {
         ConnectionState::Disconnected => "disconnected",
         ConnectionState::Connecting => "connecting",
+        ConnectionState::Authenticating => "authenticating",
+        ConnectionState::StealthConnecting => "stealth_connecting",
         ConnectionState::Connected => "connected",
         ConnectionState::Disconnecting => "disconnecting",
         ConnectionState::Reconnecting { .. } => "reconnecting",
+        ConnectionState::KillSwitchActive => "killswitch_active",
         ConnectionState::Error(_) => "error",
     };
 
@@ -564,7 +574,7 @@ pub async fn quick_connect(
 
     // Connect via backend API — send public key only
     let response = api
-        .connect_vpn(&best_server.id, &device_name, Some(client_public_key))
+        .connect_vpn(&best_server.id, &device_name, Some(client_public_key), None, None)
         .await
         .map_err(|e| sanitize_error(&format!("Failed to connect: {}", e)))?;
 
@@ -581,6 +591,7 @@ pub async fn quick_connect(
     // Set the VPN server IP for kill switch permit rules (quick connect path)
     if let Some(ip) = parse_endpoint_ip(&config.endpoint) {
         crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
+        #[cfg(target_os = "windows")]
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
         }
@@ -649,17 +660,28 @@ pub async fn get_subscription_status(
         .map_err(|e| sanitize_error(&format!("Failed to get subscription: {}", e)))
 }
 
-/// Get detailed WFP kill switch status
+/// Get detailed kill switch / firewall status
 #[tauri::command]
-pub fn get_wfp_status() -> crate::vpn::wfp::KillSwitchStatus {
-    let status = crate::vpn::wfp::get_status();
-    tracing::debug!(
-        "WFP status: initialized={}, active={}, method={}",
-        crate::vpn::wfp::is_initialized(),
-        status.active,
-        status.method
-    );
-    status
+pub fn get_wfp_status() -> serde_json::Value {
+    #[cfg(target_os = "windows")]
+    {
+        let status = crate::vpn::wfp::get_status();
+        tracing::debug!(
+            "WFP status: initialized={}, active={}, method={}",
+            crate::vpn::wfp::is_initialized(),
+            status.active,
+            status.method
+        );
+        serde_json::to_value(status).unwrap_or_default()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        serde_json::json!({
+            "active": false,
+            "method": "pf",
+            "initialized": false
+        })
+    }
 }
 
 // Multi-hop and port forwarding commands extracted to vpn_multi_hop.rs and vpn_port_forward.rs

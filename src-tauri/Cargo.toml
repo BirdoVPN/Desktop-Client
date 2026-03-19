@@ -1,19 +1,21 @@
 [package]
-name = "birdo-client-win"
+name = "birdo-vpn-desktop"
 version = "1.0.0"
-description = "Birdo VPN Windows Client"
+description = "Birdo VPN Desktop Client (Windows & macOS)"
 authors = ["Birdo VPN"]
 license = "Proprietary"
 edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "birdo_client_win_lib"
+name = "birdo_vpn_desktop_lib"
 # Only rlib needed for Tauri - cdylib/staticlib cause C++ runtime linker errors
 crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
+
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
 [dependencies]
@@ -101,6 +103,14 @@ windows = { version = "0.58", features = [
 
 # Wintun driver bindings
 wintun = "0.5"
+
+# macOS-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+# nix crate for utun/socket/ioctl operations
+nix = { version = "0.29", features = ["net", "ioctl", "socket", "fs"] }
+# System Configuration framework bindings
+core-foundation = "0.10"
+system-configuration = "0.6"
 
 [features]
 default = ["custom-protocol"]

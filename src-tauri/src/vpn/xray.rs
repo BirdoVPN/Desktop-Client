@@ -105,13 +105,20 @@ impl XrayManager {
         );
 
         // Start Xray process
-        let mut child = Command::new(&xray_binary)
-            .args(["run", "-config"])
+        let mut cmd = Command::new(&xray_binary);
+        cmd.args(["run", "-config"])
             .arg(&config_file)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW on Windows
-            .spawn()
+            .stderr(Stdio::piped());
+
+        // CREATE_NO_WINDOW on Windows to hide console
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+
+        let mut child = cmd.spawn()
             .map_err(|e| format!("Failed to start Xray process: {}. Binary: {:?}", e, xray_binary))?;
 
         tracing::info!("Xray process started (PID: {})", child.id());
@@ -390,8 +397,13 @@ fn build_xray_config(
 
 /// Find the xray binary — check bundled resources first, then PATH
 fn find_xray_binary(app_data_dir: &PathBuf) -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    const XRAY_BIN: &str = "xray.exe";
+    #[cfg(not(target_os = "windows"))]
+    const XRAY_BIN: &str = "xray";
+
     // Check app resources directory
-    let bundled = app_data_dir.join("xray").join("xray.exe");
+    let bundled = app_data_dir.join("xray").join(XRAY_BIN);
     if bundled.exists() {
         return Ok(bundled);
     }
@@ -399,12 +411,12 @@ fn find_xray_binary(app_data_dir: &PathBuf) -> Result<PathBuf, String> {
     // Check alongside the main executable
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            let sibling = exe_dir.join("xray.exe");
+            let sibling = exe_dir.join(XRAY_BIN);
             if sibling.exists() {
                 return Ok(sibling);
             }
             // Also check resources subdirectory
-            let resources = exe_dir.join("resources").join("xray.exe");
+            let resources = exe_dir.join("resources").join(XRAY_BIN);
             if resources.exists() {
                 return Ok(resources);
             }
@@ -416,10 +428,10 @@ fn find_xray_binary(app_data_dir: &PathBuf) -> Result<PathBuf, String> {
         return Ok(path);
     }
 
-    Err(
-        "Xray binary not found. Place xray.exe in the app resources directory or install it in PATH."
-            .to_string(),
-    )
+    Err(format!(
+        "Xray binary not found. Place {} in the app resources directory or install it in PATH.",
+        XRAY_BIN
+    ))
 }
 
 #[cfg(test)]

@@ -768,104 +768,9 @@ impl WintunTunnel {
 
     /// H-3 FIX: Get list of non-VPN adapter names using PowerShell Get-NetAdapter.
     // ===================================================================
-    // SECTION: DNS — get_non_vpn_adapters, snapshot_adapter_dns, configure_dns,
-    //   restore_dns (static helpers also in tunnel_dns.rs)
+    // SECTION: DNS — configure_dns, restore_dns
+    // Static helpers (get_non_vpn_adapters, snapshot_adapter_dns) are in tunnel_dns.rs
     // ===================================================================
-
-    /// This is reliable regardless of adapter name formatting, unlike netsh text parsing.
-    /// SEC-C4 FIX: Use -EncodedCommand with Base64 to prevent command injection
-    /// via malicious adapter names containing PowerShell metacharacters.
-    fn get_non_vpn_adapters() -> Vec<String> {
-        // Build PowerShell script, then Base64-encode it to avoid injection
-        let ps_script = format!(
-            "Get-NetAdapter -Physical -ErrorAction SilentlyContinue | \
-             Where-Object {{ $_.Name -ne '{}' -and $_.Status -eq 'Up' }} | \
-             Select-Object -ExpandProperty Name",
-            ADAPTER_NAME  // ADAPTER_NAME is a compile-time constant, safe to interpolate
-        );
-        let encoded = base64_encode_utf16le(&ps_script);
-        let output = cmd("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                &encoded,
-            ])
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect()
-            }
-            _ => {
-                tracing::warn!("PowerShell Get-NetAdapter failed, falling back to netsh");
-                // Fallback to netsh parsing (original behavior)
-                let netsh_output = cmd("netsh")
-                    .args(["interface", "show", "interface"])
-                    .output();
-                match netsh_output {
-                    Ok(out) => {
-                        let text = String::from_utf8_lossy(&out.stdout);
-                        text.lines()
-                            .filter_map(|line| {
-                                let trimmed = line.trim();
-                                if trimmed.is_empty() || trimmed.starts_with("---") 
-                                    || trimmed.starts_with("Admin") || trimmed.starts_with("Idx") {
-                                    return None;
-                                }
-                                let parts: Vec<&str> = trimmed.splitn(5, char::is_whitespace).collect();
-                                if parts.len() >= 5 {
-                                    let name = parts[4..].join(" ").trim().to_string();
-                                    if !name.is_empty() && name != ADAPTER_NAME
-                                        && !name.contains("Loopback") && !name.contains("loopback") {
-                                        return Some(name);
-                                    }
-                                }
-                                None
-                            })
-                            .collect()
-                    }
-                    Err(_) => Vec::new(),
-                }
-            }
-        }
-    }
-
-    /// H-4 FIX: Snapshot the current DNS configuration of an adapter.
-    /// SEC-C4 FIX: Use -EncodedCommand with Base64 to prevent command injection
-    /// via adapter names that contain single quotes or PowerShell metacharacters.
-    fn snapshot_adapter_dns(adapter_name: &str) -> AdapterDnsSnapshot {
-        let ps_script = format!(
-            "(Get-DnsClientServerAddress -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses -join ','",
-            adapter_name.replace('\'', "''")
-        );
-        let encoded = base64_encode_utf16le(&ps_script);
-        let output = cmd("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                &encoded,
-            ])
-            .output();
-
-        let dns_servers = match output {
-            Ok(out) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if text.is_empty() {
-                    Vec::new()
-                } else {
-                    text.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-                }
-            }
-            _ => Vec::new(),
-        };
-
-        AdapterDnsSnapshot {
-            adapter_name: adapter_name.to_string(),
-            dns_servers,
-        }
-    }
 
     /// Configure DNS servers
     /// SECURITY FIX (Vuln-DNS-1): Disable DNS on all non-VPN adapters to prevent
@@ -882,7 +787,9 @@ impl WintunTunnel {
         // H-4 FIX: Snapshot original DNS config BEFORE modifying anything
         let mut snapshots = Vec::new();
         for name in &non_vpn_adapters {
-            snapshots.push(Self::snapshot_adapter_dns(name));
+            if let Some(snap) = Self::snapshot_adapter_dns(name) {
+                snapshots.push(snap);
+            }
         }
         *self.dns_snapshots.write().await = snapshots;
         tracing::debug!("Captured DNS snapshots for {} adapters", non_vpn_adapters.len());

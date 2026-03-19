@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Allow outgoing network connections (required for VPN client) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <!-- Allow creating network server sockets (for local WireGuard UDP listener) -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <!-- Allow reading/writing user-selected files (for config import/export) -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <!-- Allow access to system keychain for credential storage -->
+    <key>com.apple.security.personal-information.keychain</key>
+    <true/>
+</dict>
+</plist>

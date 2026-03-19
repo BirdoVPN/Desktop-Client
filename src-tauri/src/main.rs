@@ -1,10 +1,11 @@
-//! Birdo VPN Windows Client
+//! Birdo VPN Desktop Client
 //!
 //! Main entry point for the Tauri application.
 //! Handles window management, system tray, and IPC commands.
+//! Supports Windows and macOS.
 
-// FIX-R11: Hide console window in release builds
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// FIX-R11: Hide console window in release builds (Windows only)
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod api;
 mod commands;
@@ -18,7 +19,7 @@ use vpn::{VpnManager, AutoReconnectService};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, RunEvent, WindowEvent,
+    Emitter, Listener, Manager, RunEvent, WindowEvent,
 };
 use tracing::{info, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -30,7 +31,13 @@ fn main() {
     // Initialize logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "birdo_client_win=info,wintun=info,wintun_dll=info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| {
+                if cfg!(target_os = "windows") {
+                    "birdo_vpn_desktop=info,wintun=info,wintun_dll=info".into()
+                } else {
+                    "birdo_vpn_desktop=info".into()
+                }
+            }),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -335,27 +342,47 @@ fn setup_panic_hook() {
 fn cleanup_on_crash() {
     error!("Performing emergency cleanup...");
 
-    // Legacy netsh fallback — harmless no-op since FIX-2-1 (rules are now
-    // managed via WFP dynamic sessions, not netsh).  Kept in case a mixed
-    // upgrade scenario leaves stale netsh rules from a pre-2-1 version.
-    let rules = [
-        vpn::wfp::RULE_NAMES.block_all,
-        vpn::wfp::RULE_NAMES.permit_vpn,
-        vpn::wfp::RULE_NAMES.permit_localhost,
-        vpn::wfp::RULE_NAMES.permit_dhcp,
-        vpn::wfp::RULE_NAMES.block_ipv6,
-        vpn::wfp::RULE_NAMES.block_stun,
-        vpn::wfp::RULE_NAMES.block_turn,
-    ];
-    for rule in rules {
-        let _ = crate::utils::hidden_cmd("netsh")
-            .args(["advfirewall", "firewall", "delete", "rule", &format!("name={}", rule)])
-            .output();
+    #[cfg(target_os = "windows")]
+    {
+        // Legacy netsh fallback — harmless no-op since FIX-2-1 (rules are now
+        // managed via WFP dynamic sessions, not netsh).  Kept in case a mixed
+        // upgrade scenario leaves stale netsh rules from a pre-2-1 version.
+        let rules = [
+            vpn::wfp::RULE_NAMES.block_all,
+            vpn::wfp::RULE_NAMES.permit_vpn,
+            vpn::wfp::RULE_NAMES.permit_localhost,
+            vpn::wfp::RULE_NAMES.permit_dhcp,
+            vpn::wfp::RULE_NAMES.block_ipv6,
+            vpn::wfp::RULE_NAMES.block_stun,
+            vpn::wfp::RULE_NAMES.block_turn,
+        ];
+        for rule in rules {
+            let _ = crate::utils::hidden_cmd("netsh")
+                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={}", rule)])
+                .output();
+        }
+        // WFP engine handle will be closed automatically when the process exits,
+        // triggering removal of all dynamic-session filters.
+        error!("Emergency cleanup completed (WFP dynamic session auto-cleans filters)");
     }
 
-    // WFP engine handle will be closed automatically when the process exits,
-    // triggering removal of all dynamic-session filters.
-    error!("Emergency cleanup completed (WFP dynamic session auto-cleans filters)");
+    #[cfg(target_os = "macos")]
+    {
+        // Flush the Birdo VPN pf anchor rules on crash
+        let _ = std::process::Command::new("pfctl")
+            .args(["-a", "com.birdo.vpn.killswitch", "-F", "all"])
+            .output();
+
+        // Restore DNS to DHCP (best effort)
+        let _ = std::process::Command::new("networksetup")
+            .args(["-setdnsservers", "Wi-Fi", "empty"])
+            .output();
+        let _ = std::process::Command::new("dscacheutil")
+            .args(["-flushcache"])
+            .output();
+
+        error!("Emergency cleanup completed (pf rules flushed, DNS restored)");
+    }
 }
 
 /// Write crash report to a file for later analysis

@@ -13,7 +13,12 @@ use std::time::Duration;
 use tokio::sync::{RwLock, Mutex as TokioMutex};
 use tokio::time::timeout;
 
-use super::tunnel::WintunTunnel;
+// Platform-specific tunnel implementation
+#[cfg(target_os = "windows")]
+use super::tunnel::WintunTunnel as PlatformTunnel;
+#[cfg(target_os = "macos")]
+use super::tunnel_macos::UtunTunnel as PlatformTunnel;
+
 use crate::api::types::VpnConfig;
 
 /// SM-002: Timeout for state lock acquisition to prevent deadlocks
@@ -129,7 +134,7 @@ impl ConnectionStats {
 pub struct VpnManager {
     state: Arc<RwLock<ConnectionState>>,
     pub(crate) stats: Arc<RwLock<ConnectionStats>>,
-    tunnel: Arc<RwLock<Option<WintunTunnel>>>,
+    tunnel: Arc<RwLock<Option<PlatformTunnel>>>,
     current_config: Arc<RwLock<Option<VpnConfig>>>,
     /// SM-002: Operation lock to prevent concurrent connect/disconnect
     /// Only one connect or disconnect operation can run at a time
@@ -339,19 +344,19 @@ impl VpnManager {
             .map_err(|e| format!("Failed to set connecting state: {}", e))?;
         tracing::info!("Set state to Connecting");
 
-        tracing::info!("Creating Wintun tunnel for: {}", server_name);
+        tracing::info!("Creating VPN tunnel for: {}", server_name);
         tracing::debug!("Tunnel config: endpoint={}, client_ip={}", config.endpoint, config.client_ip);
 
         // CONNECT-FIX: Wrap the entire tunnel creation + start in a timeout.
-        // If WintunTunnel::create or ::start hangs (e.g. netsh deadlocks on
+        // If tunnel creation or start hangs (e.g. netsh deadlocks on Windows
         // UAC prompt, or antivirus blocks wintun.dll), we fail fast instead of
         // leaving the state stuck at Connecting forever.
         let tunnel_result = timeout(CONNECT_TIMEOUT, async {
-            let tunnel = WintunTunnel::create(&config, local_network_sharing).await
+            let tunnel = PlatformTunnel::create(&config, local_network_sharing).await
                 .map_err(|e| format!("Failed to create tunnel: {}", e))?;
             tunnel.start().await
                 .map_err(|e| format!("Failed to start tunnel: {}", e))?;
-            Ok::<WintunTunnel, String>(tunnel)
+            Ok::<PlatformTunnel, String>(tunnel)
         }).await;
 
         match tunnel_result {
