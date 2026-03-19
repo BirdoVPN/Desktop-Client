@@ -75,7 +75,9 @@ jobs:
           ls -la src-tauri/icons/icon.icns
 
       - name: Prepare resources directory
-        run: mkdir -p src-tauri/resources
+        run: |
+          mkdir -p src-tauri/resources
+          touch src-tauri/resources/.gitkeep
 
       - name: Build Tauri application
         env:
