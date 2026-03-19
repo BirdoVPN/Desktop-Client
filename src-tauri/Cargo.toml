@@ -108,6 +108,8 @@ wintun = "0.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 # nix crate for utun/socket/ioctl operations
 nix = { version = "0.29", features = ["net", "ioctl", "socket", "fs"] }
+# libc for raw utun fd read/write and AF_SYSTEM socket creation
+libc = "0.2"
 # System Configuration framework bindings
 core-foundation = "0.10"
 system-configuration = "0.6"

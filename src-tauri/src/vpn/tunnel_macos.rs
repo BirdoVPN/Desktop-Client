@@ -12,8 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::{mpsc, RwLock};
-use nix::sys::socket::{socket, AddressFamily, SockType, SockFlag};
-use nix::unistd::close;
 
 use super::wireguard_new::WireGuardSession;
 use crate::api::types::VpnConfig;
@@ -199,7 +197,7 @@ impl UtunTunnel {
 
         // Close the utun file descriptor
         if let Some(fd) = self.utun_fd.write().await.take() {
-            let _ = close(fd);
+            let _ = unsafe { libc::close(fd) };
             tracing::info!("Closed utun file descriptor");
         }
 
@@ -231,7 +229,7 @@ impl UtunTunnel {
     /// Get current latency in milliseconds.
     pub async fn get_latency_ms(&self) -> Option<u32> {
         if let Some(session) = self.wg_session.read().await.as_ref() {
-            session.latency_ms()
+            session.get_latency_ms().await
         } else {
             None
         }
@@ -292,19 +290,18 @@ impl UtunTunnel {
                     let fd = utun_fd;
                     let mut buf = read_buf.clone();
                     move || {
-                        use nix::unistd::read;
-                        match read(fd, &mut buf) {
-                            Ok(n) if n > UTUN_HEADER_SIZE => {
-                                buf.truncate(n);
-                                Some(buf)
+                        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                        if n > UTUN_HEADER_SIZE as isize {
+                            buf.truncate(n as usize);
+                            Some(buf)
+                        } else if n < 0 {
+                            let err = std::io::Error::last_os_error();
+                            if err.raw_os_error() != Some(libc::EAGAIN) {
+                                tracing::debug!("utun read error: {}", err);
                             }
-                            Ok(_) => None,
-                            Err(e) => {
-                                if e != nix::errno::Errno::EAGAIN {
-                                    tracing::debug!("utun read error: {}", e);
-                                }
-                                None
-                            }
+                            None
+                        } else {
+                            None
                         }
                     }
                 }) => {
@@ -315,12 +312,13 @@ impl UtunTunnel {
 
                         // Encrypt and send via WireGuard
                         if let Some(session) = wg_session.read().await.as_ref() {
-                            if let Ok(encrypted) = session.encapsulate(ip_packet).await {
-                                if let Err(e) = session.send(&encrypted).await {
-                                    tracing::debug!("Failed to send WG packet: {}", e);
-                                } else {
+                            match session.send_packet(ip_packet).await {
+                                Ok(_) => {
                                     bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
                                     packets_sent.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Failed to send WG packet: {}", e);
                                 }
                             }
                         }
@@ -330,7 +328,7 @@ impl UtunTunnel {
 
             // Read from WireGuard and write decrypted packets to utun
             if let Some(session) = wg_session.read().await.as_ref() {
-                if let Ok(Some(decrypted)) = session.receive().await {
+                if let Ok(Some(decrypted)) = session.recv_packet().await {
                     let packet_len = decrypted.len() as u64;
 
                     // Prepend utun header (AF_INET = 0x00000002 for IPv4)
@@ -341,8 +339,10 @@ impl UtunTunnel {
                     let fd = utun_fd;
                     let buf = write_buf[..write_len].to_vec();
                     let _ = tokio::task::spawn_blocking(move || {
-                        use nix::unistd::write;
-                        let _ = write(fd, &buf);
+                        let written = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+                        if written < 0 {
+                            tracing::debug!("utun write error: {}", std::io::Error::last_os_error());
+                        }
                     }).await;
 
                     bytes_received.fetch_add(packet_len, Ordering::Relaxed);
@@ -506,7 +506,7 @@ fn create_utun_device() -> Result<(String, i32), String> {
 }
 
 /// Configure the utun interface IP address and MTU.
-fn configure_utun_address(utun_name: &str, client_ip: &str, mtu: &u32) -> Result<(), String> {
+fn configure_utun_address(utun_name: &str, client_ip: &str, mtu: &u16) -> Result<(), String> {
     // Validate utun_name to prevent command injection
     if !utun_name.starts_with("utun") || !utun_name[4..].chars().all(|c| c.is_ascii_digit()) {
         return Err(format!("Invalid utun name: {}", utun_name));
