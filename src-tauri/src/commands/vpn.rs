@@ -36,6 +36,7 @@ pub(super) fn get_device_name() -> String {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| {
             if cfg!(target_os = "macos") { "Mac".to_string() }
+            else if cfg!(target_os = "linux") { "Linux".to_string() }
             else { "Desktop".to_string() }
         })
 }
@@ -217,7 +218,8 @@ async fn start_stealth_tunnel(
     }
 
     let xray_config = crate::vpn::xray::XrayConfig {
-        endpoint: response.xray_endpoint.clone().unwrap(),
+        endpoint: response.xray_endpoint.clone()
+            .ok_or("Server indicated stealth mode but provided no Xray endpoint")?,
         uuid: response.xray_uuid.clone().unwrap_or_default(),
         public_key: response.xray_public_key.clone().unwrap_or_default(),
         short_id: response.xray_short_id.clone().unwrap_or_default(),
@@ -251,7 +253,7 @@ fn derive_quantum_psk(response: &ConnectResponse) -> Option<String> {
     }
 
     let rp_config = crate::vpn::rosenpass::RosenpassConfig {
-        server_public_key: response.rosenpass_public_key.clone().unwrap(),
+        server_public_key: response.rosenpass_public_key.clone()?,  // guarded by is_none() check above
         server_psk: response.preshared_key.clone(),
     };
 
@@ -676,9 +678,16 @@ pub fn get_wfp_status() -> serde_json::Value {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let (method, active) = if cfg!(target_os = "macos") {
+            ("pf", false)
+        } else if cfg!(target_os = "linux") {
+            ("iptables", crate::vpn::firewall_linux::is_blocking())
+        } else {
+            ("none", false)
+        };
         serde_json::json!({
-            "active": false,
-            "method": "pf",
+            "active": active,
+            "method": method,
             "initialized": false
         })
     }

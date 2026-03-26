@@ -19,6 +19,8 @@ pub mod xray;  // Xray Reality stealth tunnel (matching Android XrayManager)
 pub mod tunnel;
 #[cfg(target_os = "macos")]
 pub mod tunnel_macos;
+#[cfg(target_os = "linux")]
+pub mod tunnel_linux;
 
 #[cfg(target_os = "windows")]
 mod tunnel_dns;  // DNS helpers extracted from tunnel.rs (Windows-specific netsh/powershell)
@@ -28,6 +30,10 @@ mod wireguard_new;
 // Windows Filtering Platform for kill switch
 #[cfg(target_os = "windows")]
 pub mod wfp;
+
+// Linux iptables firewall for kill switch
+#[cfg(target_os = "linux")]
+pub mod firewall_linux;
 
 // Re-export the new boringtun-based implementation
 #[allow(unused_imports)]

@@ -11,6 +11,7 @@
 //! The Xray binary (xray.exe) is bundled in src-tauri/resources/ and
 //! extracted to the app data directory at runtime.
 
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -46,7 +47,6 @@ pub struct XrayConfig {
 pub struct XrayManager {
     process: Arc<Mutex<Option<Child>>>,
     local_port: Arc<Mutex<u16>>,
-    config_path: Arc<Mutex<Option<PathBuf>>>,
     health_cancel: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
@@ -55,7 +55,6 @@ impl XrayManager {
         Self {
             process: Arc::new(Mutex::new(None)),
             local_port: Arc::new(Mutex::new(DEFAULT_LOCAL_PORT)),
-            config_path: Arc::new(Mutex::new(None)),
             health_cancel: Arc::new(Mutex::new(None)),
         }
     }
@@ -86,15 +85,9 @@ impl XrayManager {
             &config.flow,
         );
 
-        // Write config to temp file
-        let config_dir = app_data_dir.join("xray");
-        std::fs::create_dir_all(&config_dir)
-            .map_err(|e| format!("Failed to create Xray config directory: {}", e))?;
-        let config_file = config_dir.join("config.json");
-        std::fs::write(&config_file, serde_json::to_string_pretty(&xray_config)
-            .map_err(|e| format!("Failed to serialize Xray config: {}", e))?)
-            .map_err(|e| format!("Failed to write Xray config: {}", e))?;
-        *self.config_path.lock().await = Some(config_file.clone());
+        // Serialize config JSON for stdin delivery
+        let config_json = serde_json::to_string_pretty(&xray_config)
+            .map_err(|e| format!("Failed to serialize Xray config: {}", e))?;
 
         // Find xray binary — check resources dir first, then PATH
         let xray_binary = find_xray_binary(app_data_dir)?;
@@ -104,10 +97,10 @@ impl XrayManager {
             config.sni, local_port, server_host, server_port
         );
 
-        // Start Xray process
+        // Start Xray process — pipe config via stdin to avoid writing secrets to disk
         let mut cmd = Command::new(&xray_binary);
-        cmd.args(["run", "-config"])
-            .arg(&config_file)
+        cmd.args(["run", "-c", "stdin:"])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -120,6 +113,13 @@ impl XrayManager {
 
         let mut child = cmd.spawn()
             .map_err(|e| format!("Failed to start Xray process: {}. Binary: {:?}", e, xray_binary))?;
+
+        // Pipe config JSON to stdin and close to signal EOF
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(config_json.as_bytes())
+                .map_err(|e| format!("Failed to write Xray config to stdin: {}", e))?;
+            // stdin dropped here → EOF sent → Xray parses config
+        }
 
         tracing::info!("Xray process started (PID: {})", child.id());
 
@@ -156,12 +156,6 @@ impl XrayManager {
 
         // Give Xray time to bind the port
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-
-        // Delete config file immediately — Xray loads config into memory at startup,
-        // so the file (containing UUID, Reality keys) doesn't need to persist on disk.
-        if let Some(ref path) = *self.config_path.lock().await {
-            let _ = std::fs::remove_file(path);
-        }
 
         // Verify the process is still alive
         let mut proc = self.process.lock().await;
@@ -200,13 +194,6 @@ impl XrayManager {
             let _ = child.kill();
             let _ = child.wait(); // Reap the zombie
         }
-
-        // Clean up config file
-        let mut config_path = self.config_path.lock().await;
-        if let Some(ref path) = *config_path {
-            let _ = std::fs::remove_file(path);
-        }
-        *config_path = None;
     }
 
     /// Get the local port Xray is listening on
@@ -318,7 +305,8 @@ impl Drop for XrayManager {
 
 /// Find an available TCP/UDP port starting from the given port
 fn find_available_port(start: u16) -> Option<u16> {
-    for port in start..start + 100 {
+    let end = start.saturating_add(100).min(u16::MAX);
+    for port in start..=end {
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return Some(port);
         }

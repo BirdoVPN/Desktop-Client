@@ -85,6 +85,8 @@ pub struct BirdoApi {
     /// of VPN private keys in wireguard_new.rs.
     access_token: Arc<RwLock<Option<Zeroizing<String>>>>,
     refresh_token: Arc<RwLock<Option<Zeroizing<String>>>>,
+    /// Guard to prevent concurrent token refresh attempts (H-1 race fix)
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BirdoApi {
@@ -114,6 +116,7 @@ impl BirdoApi {
             client,
             access_token: Arc::new(RwLock::new(None)),
             refresh_token: Arc::new(RwLock::new(None)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -418,6 +421,14 @@ impl BirdoApi {
         if matches!(&result, Err(ApiError::Unauthorized)) && auth {
             let has_refresh = self.refresh_token.read().await.is_some();
             if has_refresh {
+                // H-1 FIX: Serialize token refresh attempts to prevent concurrent
+                // refreshes from racing and overwriting each other's tokens.
+                let _guard = self.refresh_lock.lock().await;
+                // Re-check: another thread may have already refreshed while we waited
+                let retry_first = self.do_request::<T>(&method, path, body, auth).await;
+                if !matches!(&retry_first, Err(ApiError::Unauthorized)) {
+                    return retry_first;
+                }
                 tracing::info!("Got 401 — attempting transparent token refresh");
                 match self.refresh_token_internal().await {
                     Ok(_) => {
@@ -624,6 +635,7 @@ impl Clone for BirdoApi {
             client: self.client.clone(),
             access_token: Arc::clone(&self.access_token),
             refresh_token: Arc::clone(&self.refresh_token),
+            refresh_lock: Arc::clone(&self.refresh_lock),
         }
     }
 }

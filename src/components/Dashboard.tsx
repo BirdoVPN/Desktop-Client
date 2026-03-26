@@ -21,7 +21,7 @@ import {
   Shield,
   AlertTriangle,
 } from 'lucide-react';
-import { formatBytes, formatUptime } from '@/utils/helpers';
+import { formatBytes, formatUptime, settingsFromRust, friendlyVpnError, type RustSettings } from '@/utils/helpers';
 import { initNotifications, notifyConnected, notifyDisconnected } from '@/utils/notifications';
 
 type Tab = 'connect' | 'servers' | 'account' | 'settings';
@@ -41,6 +41,24 @@ interface RustVpnStatus {
   bytes_received: number;
   connected_at: string | null;
   server_name: string | null;
+}
+
+interface RustServer {
+  id: string;
+  name: string;
+  country: string;
+  country_code?: string;
+  countryCode?: string;
+  city: string;
+  hostname: string;
+  ip_address?: string;
+  ipAddress?: string;
+  port: number;
+  load?: number;
+  is_premium?: boolean;
+  is_streaming?: boolean;
+  is_p2p?: boolean;
+  is_online?: boolean;
 }
 
 export function Dashboard() {
@@ -93,29 +111,10 @@ export function Dashboard() {
   useEffect(() => {
     const hydrate = async () => {
       try {
-        const rustSettings = await invoke<any>('get_settings');
-        hydrateSettings({
-          killSwitchEnabled: rustSettings.killswitch_enabled ?? true,
-          autoConnect: rustSettings.auto_connect ?? false,
-          autostart: rustSettings.autostart ?? false,
-          startMinimized: rustSettings.start_minimized ?? false,
-          notifications: rustSettings.notifications_enabled ?? true,
-          preferredServerId: rustSettings.preferred_server_id ?? null,
-          splitTunnelingEnabled: rustSettings.split_tunneling_enabled ?? false,
-          splitTunnelApps: rustSettings.split_tunnel_apps ?? [],
-          customDns: rustSettings.custom_dns ?? null,
-          protocol: 'wireguard',
-          localNetworkSharing: rustSettings.local_network_sharing ?? false,
-          wireGuardPort: rustSettings.wireguard_port ?? 'auto',
-          wireGuardMtu: rustSettings.wireguard_mtu ?? 0,
-          multiHopEnabled: rustSettings.multi_hop_enabled ?? false,
-          multiHopEntryNodeId: rustSettings.multi_hop_entry_node_id ?? null,
-          multiHopExitNodeId: rustSettings.multi_hop_exit_node_id ?? null,
-          stealthMode: rustSettings.stealth_mode ?? false,
-          quantumProtection: rustSettings.quantum_protection ?? false,
-        });
-      } catch (err) {
-        console.warn('Failed to hydrate settings from backend:', err);
+        const rustSettings = await invoke<RustSettings>('get_settings');
+        hydrateSettings(settingsFromRust(rustSettings));
+      } catch {
+        // Settings hydration failed — will use localStorage defaults
       }
     };
     hydrate();
@@ -143,15 +142,17 @@ export function Dashboard() {
         }>('get_subscription_status');
         setAccount({
           plan: sub.plan?.toUpperCase() || 'RECON',
-          status: (sub.status as any) || 'active',
+          status: (['active', 'expired', 'cancelled'] as const).includes(sub.status as 'active')
+            ? (sub.status as 'active' | 'expired' | 'cancelled')
+            : 'unknown',
           expiresAt: sub.expires_at ?? null,
           activeDevices: sub.devices_used ?? 0,
           maxDevices: sub.devices_limit ?? 1,
           bandwidthUsed: sub.bandwidth_used ?? 0,
           bandwidthLimit: sub.bandwidth_limit ?? 0,
         });
-      } catch (err) {
-        console.warn('Failed to fetch subscription info:', err);
+      } catch {
+        // Subscription fetch failed — will show defaults
       }
     };
     fetchAccount();
@@ -161,8 +162,8 @@ export function Dashboard() {
   useEffect(() => {
     const fetchServers = async () => {
       try {
-        const servers = await invoke<any[]>('get_servers');
-        const mapped = servers.map((s: any) => ({
+        const servers = await invoke<RustServer[]>('get_servers');
+        const mapped = servers.map((s) => ({
           id: s.id,
           name: s.name,
           country: s.country,
@@ -180,21 +181,24 @@ export function Dashboard() {
         }));
         setServers(mapped);
 
-        // Ping servers in background
-        for (const srv of mapped) {
-          if (srv.hostname || srv.ipAddress) {
-            invoke<number | null>('ping_server', {
-              hostname: srv.hostname || srv.ipAddress,
-              port: srv.port ?? 51820,
-            })
-              .then((ping) => {
+        // Ping servers in background (batched to avoid IPC flooding)
+        const PING_BATCH_SIZE = 5;
+        const pingable = mapped.filter((srv) => srv.hostname || srv.ipAddress);
+        for (let i = 0; i < pingable.length; i += PING_BATCH_SIZE) {
+          const batch = pingable.slice(i, i + PING_BATCH_SIZE);
+          await Promise.allSettled(
+            batch.map((srv) =>
+              invoke<number | null>('ping_server', {
+                hostname: srv.hostname || srv.ipAddress,
+                port: srv.port ?? 51820,
+              }).then((ping) => {
                 if (ping != null) setServerPing(srv.id, ping);
               })
-              .catch(() => {});
-          }
+            )
+          );
         }
-      } catch (err) {
-        console.error('Failed to fetch servers:', err);
+      } catch {
+        // Server fetch failed — will retry on next mount
       }
     };
     fetchServers();
@@ -214,10 +218,9 @@ export function Dashboard() {
       try {
         setConnectionState('connecting');
         await invoke('quick_connect');
-        setConnectionState('connected');
+        // Let the polling loop set 'connected' from backend state
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn('Auto-connect failed:', msg);
+        const msg = friendlyVpnError(err);
         setErrorMessage(msg);
         setConnectionState('error');
       }
@@ -238,9 +241,9 @@ export function Dashboard() {
       store.setConnectionState('connecting');
       try {
         await invoke('quick_connect');
-        useAppStore.getState().setConnectionState('connected');
+        // Let polling loop set authoritative state from backend
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = friendlyVpnError(err);
         useAppStore.getState().setErrorMessage(msg);
         useAppStore.getState().setConnectionState('error');
       }
@@ -256,14 +259,14 @@ export function Dashboard() {
         s.setCurrentServer(null);
         s.setVpnIp(null);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = friendlyVpnError(err);
         useAppStore.getState().setErrorMessage(msg);
         useAppStore.getState().setConnectionState('error');
       }
     });
     return () => {
-      unlistenConnect.then(f => f());
-      unlistenDisconnect.then(f => f());
+      unlistenConnect.then(f => f()).catch(() => {});
+      unlistenDisconnect.then(f => f()).catch(() => {});
     };
   }, []);
 
@@ -304,8 +307,18 @@ export function Dashboard() {
 
         // Sync connection state from Rust backend
         // Skip overwriting transient UI states (connecting/disconnecting)
+        const validStates: Set<string> = new Set([
+          'disconnected', 'connecting', 'authenticating', 'stealth_connecting',
+          'connected', 'disconnecting', 'reconnecting', 'rekeying',
+          'kill_switch_active', 'error',
+        ]);
         const current = useAppStore.getState().connectionState;
-        if (status.state !== current && current !== 'connecting' && current !== 'disconnecting') {
+        if (
+          validStates.has(status.state) &&
+          status.state !== current &&
+          current !== 'connecting' &&
+          current !== 'disconnecting'
+        ) {
           setConnectionState(status.state as ConnectionState);
         }
         if (status.state === 'connected' || status.state === 'rekeying') {

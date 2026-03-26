@@ -7,6 +7,8 @@ export function countryCodeToFlag(countryCode: string): string {
   if (!countryCode || countryCode.length !== 2) return '🌐';
 
   const upper = countryCode.toUpperCase();
+  if (!/^[A-Z]{2}$/.test(upper)) return '🌐';
+
   const first = upper.codePointAt(0)! - 0x41 + 0x1f1e6;
   const second = upper.codePointAt(1)! - 0x41 + 0x1f1e6;
 
@@ -19,7 +21,7 @@ export function countryCodeToFlag(countryCode: string): string {
 export function formatBytes(bytes: number): string {
   if (bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
@@ -81,4 +83,101 @@ export function isValidPort(port: string): boolean {
 export function isValidMtu(mtu: string): boolean {
   const n = Number(mtu);
   return Number.isInteger(n) && n >= 1280 && n <= 1500;
+}
+
+/**
+ * Extract a user-facing message from an unknown error value.
+ */
+export function extractErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Map raw Rust/backend VPN errors to user-friendly messages.
+ * Prevents leaking server IPs, hostnames, or internal details in the UI.
+ */
+export function friendlyVpnError(error: unknown): string {
+  const raw = extractErrorMessage(error).toLowerCase();
+  if (raw.includes('connection refused') || raw.includes('connect to')) return 'Unable to reach the VPN server. Please try another server.';
+  if (raw.includes('handshake') || raw.includes('timeout')) return 'Connection timed out. The server may be busy — try again or switch servers.';
+  if (raw.includes('authentication') || raw.includes('unauthorized') || raw.includes('401')) return 'Authentication failed. Please log in again.';
+  if (raw.includes('no servers') || raw.includes('server list')) return 'No servers available. Check your internet connection.';
+  if (raw.includes('already connected') || raw.includes('already active')) return 'VPN is already connected.';
+  if (raw.includes('dns') || raw.includes('resolve')) return 'DNS resolution failed. Check your network settings.';
+  if (raw.includes('permission') || raw.includes('elevation') || raw.includes('privilege')) return 'Administrator permission is required for this operation.';
+  if (raw.includes('kill switch') || raw.includes('killswitch')) return 'Kill switch error. Please disconnect and try again.';
+  if (raw.includes('subscription') || raw.includes('plan') || raw.includes('device limit')) return 'Subscription limit reached. Upgrade your plan or disconnect other devices.';
+  return 'Connection failed. Please try again.';
+}
+
+// ── Settings snake_case ↔ camelCase mapping ────────────────────────
+
+/** Shape returned by the Rust `get_settings` command (snake_case). */
+export interface RustSettings {
+  killswitch_enabled: boolean;
+  auto_connect: boolean;
+  autostart: boolean;
+  start_minimized: boolean;
+  notifications_enabled: boolean;
+  preferred_server_id: string | null;
+  split_tunneling_enabled: boolean;
+  split_tunnel_apps: string[];
+  custom_dns: string[] | null;
+  local_network_sharing: boolean;
+  wireguard_port: string;
+  wireguard_mtu: number;
+  multi_hop_enabled: boolean;
+  multi_hop_entry_node_id: string | null;
+  multi_hop_exit_node_id: string | null;
+  stealth_mode: boolean;
+  quantum_protection: boolean;
+}
+
+import type { AppSettings } from '../store/app-store';
+
+/** Convert Rust snake_case settings to store camelCase. */
+export function settingsFromRust(rs: RustSettings): AppSettings {
+  return {
+    killSwitchEnabled: rs.killswitch_enabled ?? true,
+    autoConnect: rs.auto_connect ?? false,
+    autostart: rs.autostart ?? false,
+    startMinimized: rs.start_minimized ?? false,
+    notifications: rs.notifications_enabled ?? true,
+    preferredServerId: rs.preferred_server_id ?? null,
+    splitTunnelingEnabled: rs.split_tunneling_enabled ?? false,
+    splitTunnelApps: rs.split_tunnel_apps ?? [],
+    customDns: rs.custom_dns ?? null,
+    protocol: 'wireguard',
+    localNetworkSharing: rs.local_network_sharing ?? false,
+    wireGuardPort: rs.wireguard_port ?? 'auto',
+    wireGuardMtu: rs.wireguard_mtu ?? 0,
+    multiHopEnabled: rs.multi_hop_enabled ?? false,
+    multiHopEntryNodeId: rs.multi_hop_entry_node_id ?? null,
+    multiHopExitNodeId: rs.multi_hop_exit_node_id ?? null,
+    stealthMode: rs.stealth_mode ?? true,
+    quantumProtection: rs.quantum_protection ?? true,
+  };
+}
+
+/** Convert store camelCase settings to Rust snake_case for `save_settings`. */
+export function settingsToRust(s: AppSettings): RustSettings {
+  return {
+    killswitch_enabled: s.killSwitchEnabled,
+    auto_connect: s.autoConnect,
+    autostart: s.autostart,
+    start_minimized: s.startMinimized,
+    notifications_enabled: s.notifications,
+    preferred_server_id: s.preferredServerId,
+    split_tunneling_enabled: s.splitTunnelingEnabled,
+    split_tunnel_apps: s.splitTunnelApps,
+    custom_dns: s.customDns,
+    local_network_sharing: s.localNetworkSharing,
+    wireguard_port: s.wireGuardPort,
+    wireguard_mtu: s.wireGuardMtu,
+    multi_hop_enabled: s.multiHopEnabled,
+    multi_hop_entry_node_id: s.multiHopEntryNodeId,
+    multi_hop_exit_node_id: s.multiHopExitNodeId,
+    stealth_mode: s.stealthMode,
+    quantum_protection: s.quantumProtection,
+  };
 }

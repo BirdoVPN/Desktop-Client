@@ -40,7 +40,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi", "dmg", "app"],
+    "targets": ["nsis", "msi", "dmg", "app", "deb", "appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -69,6 +69,16 @@
       "signingIdentity": null,
       "entitlements": "Entitlements.plist",
       "frameworks": []
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libayatana-appindicator3-1", "iptables", "iproute2"],
+        "section": "net",
+        "priority": "optional"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
     },
     "publisher": "Birdo VPN",
     "copyright": "© 2026 Birdo VPN. All rights reserved.",

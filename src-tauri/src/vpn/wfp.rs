@@ -591,7 +591,7 @@ impl WfpEngine {
     fn add_block_stun_turn(&mut self) -> Result<(), String> {
         self.add_port_range_block("Birdo: Block STUN/UDP", 17, 3478, 3497)?;
         self.add_port_range_block("Birdo: Block TURN/TCP", 6, 3478, 3497)?;
-        self.add_port_range_block("Birdo: Block Google STUN", 17, 19302, 19302)?;
+        self.add_port_range_block("Birdo: Block Google STUN", 17, 19302, 19309)?;
         Ok(())
     }
 

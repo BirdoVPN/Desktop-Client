@@ -21,6 +21,13 @@ fn main() {
             println!("cargo:warning=SENTRY_DSN is not set — crash reporting will be disabled in this release build");
         }
     }
+
+    // Linux: check for required system libraries
+    #[cfg(target_os = "linux")]
+    {
+        // Ensure pkg-config can find GTK and WebKit (required by Tauri on Linux)
+        println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    }
     
     // Copy wintun.dll to output directory (Windows only)
     #[cfg(windows)]

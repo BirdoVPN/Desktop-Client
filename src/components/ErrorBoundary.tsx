@@ -16,7 +16,9 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: unknown) {
-    console.error('[ErrorBoundary] Unhandled React error:', error);
+    if (import.meta.env.DEV) {
+      console.error('[ErrorBoundary] Unhandled React error:', error);
+    }
   }
 
   render() {

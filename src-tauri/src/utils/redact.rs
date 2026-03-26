@@ -165,22 +165,22 @@ pub fn sanitize_error(msg: &str) -> String {
 
         // Compiled once, reused across calls
         static IPV4_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").unwrap()
+            Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").expect("IPv4 regex")
         });
         static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").unwrap()
+            Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").expect("email regex")
         });
         // Matches common hostname patterns (at least two labels with TLD)
         static HOST_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){1,}\.[a-zA-Z]{2,}\b").unwrap()
+            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){1,}\.[a-zA-Z]{2,}\b").expect("hostname regex")
         });
         // P2-13: Strip HTML tags
         static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"<[^>]{1,200}>").unwrap()
+            Regex::new(r"<[^>]{1,200}>").expect("HTML tag regex")
         });
         // P2-13: Strip stack traces (lines starting with "at " or Java-style exception patterns)
         static STACK_TRACE_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"(?m)^\s*at .*$").unwrap()
+            Regex::new(r"(?m)^\s*at .*$").expect("stack trace regex")
         });
 
         // P2-13: If the message looks like raw HTML, replace entirely

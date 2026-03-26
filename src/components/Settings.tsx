@@ -4,7 +4,7 @@ import { getVersion } from '@tauri-apps/api/app';
 import { useAppStore, type MultiHopRoute } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { UpdateChecker } from './UpdateChecker';
-import { isValidDnsAddress, isValidPort } from '@/utils/helpers';
+import { isValidDnsAddress, isValidPort, settingsToRust } from '@/utils/helpers';
 import {
   Shield,
   Wifi,
@@ -108,26 +108,10 @@ export function Settings() {
     async (newSettings: typeof settings) => {
       try {
         await invoke('save_settings', {
-          settings: {
-            autostart: newSettings.autostart,
-            start_minimized: newSettings.startMinimized,
-            killswitch_enabled: newSettings.killSwitchEnabled,
-            notifications_enabled: newSettings.notifications,
-            auto_connect: newSettings.autoConnect,
-            preferred_server_id: newSettings.preferredServerId,
-            split_tunneling_enabled: newSettings.splitTunnelingEnabled,
-            split_tunnel_apps: newSettings.splitTunnelApps,
-            custom_dns: newSettings.customDns,
-            protocol: newSettings.protocol,
-            local_network_sharing: newSettings.localNetworkSharing,
-            wireguard_port: newSettings.wireGuardPort,
-            wireguard_mtu: newSettings.wireGuardMtu,
-            stealth_mode: newSettings.stealthMode,
-            quantum_protection: newSettings.quantumProtection,
-          },
+          settings: settingsToRust(newSettings),
         });
-      } catch (err) {
-        console.error('Failed to save settings:', err);
+      } catch {
+        // Settings save failed — ignored (Rust backend logs the error)
       }
     },
     []
@@ -167,8 +151,8 @@ export function Settings() {
     if (key === 'autostart') {
       try {
         await invoke('set_autostart', { enabled: value });
-      } catch (err) {
-        console.error('Failed to toggle autostart:', err);
+      } catch {
+        // Autostart toggle failed
         return;
       }
     }
@@ -691,7 +675,7 @@ export function Settings() {
                 setMultiHopLoading(true);
                 invoke<MultiHopRoute[]>('get_multi_hop_routes')
                   .then(setMultiHopRoutes)
-                  .catch((e) => console.error('Failed to load routes:', e))
+                  .catch(() => {})
                   .finally(() => setMultiHopLoading(false));
               }
             }}
@@ -717,7 +701,11 @@ export function Settings() {
                         <select
                           className="w-full rounded-lg glass-input px-3 py-2 text-sm text-white outline-none"
                           value={settings.multiHopEntryNodeId || ''}
-                          onChange={(e) => updateSettings({ multiHopEntryNodeId: e.target.value || null })}
+                          onChange={(e) => {
+                            const nodeId = e.target.value || null;
+                            updateSettings({ multiHopEntryNodeId: nodeId });
+                            saveSettingsToBackend({ ...settings, multiHopEntryNodeId: nodeId });
+                          }}
                         >
                           <option value="">Select entry node...</option>
                           {servers.filter((s) => s.isOnline).map((s) => (
@@ -735,7 +723,11 @@ export function Settings() {
                         <select
                           className="w-full rounded-lg glass-input px-3 py-2 text-sm text-white outline-none"
                           value={settings.multiHopExitNodeId || ''}
-                          onChange={(e) => updateSettings({ multiHopExitNodeId: e.target.value || null })}
+                          onChange={(e) => {
+                            const nodeId = e.target.value || null;
+                            updateSettings({ multiHopExitNodeId: nodeId });
+                            saveSettingsToBackend({ ...settings, multiHopExitNodeId: nodeId });
+                          }}
                         >
                           <option value="">Select exit node...</option>
                           {servers
@@ -800,8 +792,8 @@ export function Settings() {
                         try {
                           await invoke('delete_port_forward', { id: pf.id });
                           setPortForwards(portForwards.filter((f) => f.id !== pf.id));
-                        } catch (e) {
-                          console.error('Failed to delete port forward:', e);
+                        } catch {
+                          // Port forward delete failed
                         }
                       }}
                       className="text-white/40 hover:text-red-400 transition"
@@ -858,8 +850,8 @@ export function Settings() {
                       enabled: true,
                     }]);
                     setPortFwdPort('');
-                  } catch (e) {
-                    console.error('Failed to create port forward:', e);
+                  } catch {
+                    // Port forward create failed
                   } finally {
                     setPortFwdLoading(false);
                   }

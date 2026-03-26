@@ -201,10 +201,10 @@ impl WintunTunnel {
         use std::fs::OpenOptions;
         #[cfg(windows)]
         use std::os::windows::fs::OpenOptionsExt;
-        {
+        // T-1 FIX: Keep exclusive handle open through load_from_path to eliminate
+        // TOCTOU window between hash verification and DLL load.
+        let _exclusive_handle = {
             use std::io::Read;
-            // T-1 FIX: Propagate error with `?` — previously the Result was silently
-            // discarded, so integrity check ran without the exclusive lock on failure.
             let mut exclusive_handle = OpenOptions::new()
                 .read(true)
                 .share_mode(0) // Exclusive — no other process can modify
@@ -217,17 +217,21 @@ impl WintunTunnel {
                 .map_err(|e| format!("Failed to read wintun.dll: {}", e))?;
             // Hash check happens while we hold the exclusive handle
             verify_dll_integrity(&bytes, &dll_path)?;
-        }
+            exclusive_handle // keep alive through load_from_path
+        };
 
         // SAFETY: `dll_path` points to a wintun.dll whose SHA-256 hash was
-        // verified immediately above while holding an exclusive file lock,
-        // preventing TOCTOU replacement.  `wintun::load_from_path` performs
-        // `LoadLibraryW` and resolves FFI symbol pointers; the resulting
-        // `Wintun` handle is kept alive for the tunnel's lifetime.
+        // verified immediately above. The exclusive file lock (`_exclusive_handle`)
+        // is held through this call, preventing TOCTOU replacement.
+        // `wintun::load_from_path` performs `LoadLibraryW` and resolves FFI
+        // symbol pointers; the resulting `Wintun` handle is kept alive for the
+        // tunnel's lifetime.
         let wintun = unsafe {
             wintun::load_from_path(&dll_path)
                 .map_err(|e| format!("Failed to load wintun.dll: {}", e))?
         };
+        // DLL is now loaded into process memory — safe to release exclusive lock
+        drop(_exclusive_handle);
 
         tracing::info!("Wintun DLL loaded successfully from {:?}", dll_path);
 
@@ -964,13 +968,20 @@ impl WintunTunnel {
         // Re-enable IPv6 adapter bindings via PowerShell (no netsh equivalent).
         // Spawn it non-blocking — adapter re-binding is not critical for VPN disconnect.
         tokio::task::spawn_blocking(|| {
-            let _ = cmd("powershell")
+            match cmd("powershell")
                 .args([
                     "-NoProfile", "-NonInteractive", "-Command",
                     "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | \
                      Enable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue",
                 ])
-                .output();
+                .output()
+            {
+                Ok(o) if !o.status.success() => {
+                    tracing::warn!("IPv6 re-enable failed: {}", String::from_utf8_lossy(&o.stderr));
+                }
+                Err(e) => tracing::warn!("IPv6 re-enable failed: {}", e),
+                _ => {}
+            }
         });
 
         tracing::debug!("IPv6 block rules removed");
@@ -1510,12 +1521,19 @@ impl Drop for WintunTunnel {
             .args(["advfirewall", "firewall", "delete", "rule", "name=Birdo Block IPv6"])
             .output();
         // Re-enable IPv6 adapter bindings
-        let _ = cmd("powershell")
+        match cmd("powershell")
             .args([
                 "-NoProfile", "-NonInteractive", "-Command",
                 "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Enable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue",
             ])
-            .output();
+            .output()
+        {
+            Ok(o) if !o.status.success() => {
+                tracing::warn!("IPv6 re-enable failed: {}", String::from_utf8_lossy(&o.stderr));
+            }
+            Err(e) => tracing::warn!("IPv6 re-enable failed: {}", e),
+            _ => {}
+        }
 
         tracing::warn!("Emergency cleanup complete — DNS/route state may need manual verification");
     }

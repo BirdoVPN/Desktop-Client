@@ -312,7 +312,7 @@ impl AutoReconnectService {
                                         bytes_out: stats.bytes_sent,
                                         handshake_age_seconds: connected_secs,
                                         connection_state: "connected".to_string(),
-                                        platform: "windows".to_string(),
+                                        platform: std::env::consts::OS.to_string(),
                                     };
                                     // Snapshot packet counters for the next loss window
                                     {
@@ -383,9 +383,12 @@ impl AutoReconnectService {
                                         // FIX-1-6: Flush DNS cache before reconnect to prevent
                                         // stale DNS entries from leaking through the system resolver
                                         // during the brief window before the new tunnel's DNS is set.
-                                        let _ = crate::utils::hidden_cmd("ipconfig")
-                                            .args(["/flushdns"])
-                                            .output();
+                                        #[cfg(target_os = "windows")]
+                                        { let _ = crate::utils::hidden_cmd("ipconfig").args(["/flushdns"]).output(); }
+                                        #[cfg(target_os = "macos")]
+                                        { let _ = std::process::Command::new("dscacheutil").args(["-flushcache"]).output(); }
+                                        #[cfg(target_os = "linux")]
+                                        { let _ = std::process::Command::new("resolvectl").args(["flush-caches"]).output(); }
                                         
                                         let device_name = hostname::get()
                                             .map(|h| h.to_string_lossy().to_string())

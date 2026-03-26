@@ -7,6 +7,7 @@
 //! - State transitions are validated to prevent illegal states
 //! - Operation lock prevents concurrent connect/disconnect races
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
@@ -18,6 +19,8 @@ use tokio::time::timeout;
 use super::tunnel::WintunTunnel as PlatformTunnel;
 #[cfg(target_os = "macos")]
 use super::tunnel_macos::UtunTunnel as PlatformTunnel;
+#[cfg(target_os = "linux")]
+use super::tunnel_linux::LinuxTunnel as PlatformTunnel;
 
 use crate::api::types::VpnConfig;
 
@@ -80,7 +83,7 @@ pub struct ConnectionStats {
     pub packets_received: u64,
     pub latency_ms: Option<u32>,
     /// P2-16: Rolling latency samples for jitter calculation (stddev).
-    pub latency_samples: Vec<u32>,
+    pub latency_samples: VecDeque<u32>,
     /// P2-16: Packets sent at last quality report (for loss estimation).
     pub prev_packets_sent: u64,
     /// P2-16: Packets received at last quality report (for loss estimation).
@@ -118,9 +121,9 @@ impl ConnectionStats {
 
     /// Push a latency sample, keeping at most 20 entries.
     pub fn push_latency_sample(&mut self, ms: u32) {
-        self.latency_samples.push(ms);
+        self.latency_samples.push_back(ms);
         if self.latency_samples.len() > 20 {
-            self.latency_samples.remove(0);
+            self.latency_samples.pop_front();
         }
     }
 
@@ -184,7 +187,7 @@ impl VpnManager {
                 packets_sent: 0,
                 packets_received: 0,
                 latency_ms: None,
-                latency_samples: Vec::new(),
+                latency_samples: VecDeque::new(),
                 prev_packets_sent: 0,
                 prev_packets_received: 0,
                 connected_at: None,
@@ -260,7 +263,7 @@ impl VpnManager {
                     packets_sent: 0,
                     packets_received: 0,
                     latency_ms: None,
-                    latency_samples: Vec::new(),
+                    latency_samples: VecDeque::new(),
                     prev_packets_sent: 0,
                     prev_packets_received: 0,
                     connected_at: None,

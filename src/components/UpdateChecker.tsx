@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { Download, Check, AlertCircle, Loader2, RefreshCw } from 'lucide-react';
@@ -23,6 +23,13 @@ export function UpdateChecker() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+    };
+  }, []);
 
   const checkForUpdates = useCallback(async () => {
     setStatus('checking');
@@ -40,8 +47,8 @@ export function UpdateChecker() {
         setStatus('available');
       } else {
         setStatus('up-to-date');
-        // Reset to idle after 3 seconds
-        setTimeout(() => setStatus('idle'), 3000);
+        if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = setTimeout(() => setStatus('idle'), 3000);
       }
     } catch (err) {
       setError('Update server is not available right now. Try again later.');

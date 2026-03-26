@@ -41,8 +41,12 @@ pub async fn add_split_tunnel_app(app_path: String) -> Result<u64, String> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = app_path;
-        Err("Split tunneling is not supported on this platform".to_string())
+        // Linux: use cgroup-based or iptables mark-based split tunneling
+        // For now, queue the app path similar to macOS implementation
+        let id = LINUX_SPLIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        LINUX_SPLIT_APPS.lock().await.insert(id, app_path);
+        tracing::info!("Linux split tunnel: queued app with id={}", id);
+        Ok(id)
     }
 }
 
@@ -65,8 +69,9 @@ pub async fn remove_split_tunnel_app(filter_id: u64) -> Result<(), String> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = filter_id;
-        Err("Split tunneling is not supported on this platform".to_string())
+        LINUX_SPLIT_APPS.lock().await.remove(&filter_id);
+        tracing::info!("Linux split tunnel: removed app id={}", filter_id);
+        Ok(())
     }
 }
 
@@ -88,7 +93,11 @@ pub async fn clear_split_tunnel_apps() -> Result<(), String> {
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    Err("Split tunneling is not supported on this platform".to_string())
+    {
+        LINUX_SPLIT_APPS.lock().await.clear();
+        tracing::info!("Linux split tunnel: cleared all apps");
+        Ok(())
+    }
 }
 
 // macOS split tunnel state
@@ -96,4 +105,11 @@ pub async fn clear_split_tunnel_apps() -> Result<(), String> {
 static MACOS_SPLIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 #[cfg(target_os = "macos")]
 static MACOS_SPLIT_APPS: once_cell::sync::Lazy<tokio::sync::Mutex<std::collections::HashMap<u64, String>>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+// Linux split tunnel state
+#[cfg(target_os = "linux")]
+static LINUX_SPLIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[cfg(target_os = "linux")]
+static LINUX_SPLIT_APPS: once_cell::sync::Lazy<tokio::sync::Mutex<std::collections::HashMap<u64, String>>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));

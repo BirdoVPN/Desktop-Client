@@ -16,6 +16,8 @@ use tokio::sync::RwLock;
 
 #[cfg(target_os = "windows")]
 use crate::vpn::wfp;
+#[cfg(target_os = "linux")]
+use crate::vpn::firewall_linux;
 use crate::utils::elevation::is_elevated;
 
 use crate::vpn::manager::VpnManager;
@@ -63,6 +65,14 @@ pub async fn enable_killswitch() -> Result<bool, String> {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        if !is_elevated() {
+            tracing::warn!("Kill switch requires root privileges on Linux");
+            return Err("Root privileges required for kill switch".to_string());
+        }
+    }
+
     KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
     tracing::info!("Kill switch enabled and ready");
     Ok(true)
@@ -104,6 +114,13 @@ pub async fn disable_killswitch(vpn_manager: State<'_, VpnManager>) -> Result<bo
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = firewall_linux::deactivate_blocking().await {
+            tracing::warn!("Failed to remove iptables rules: {}", e);
+        }
+    }
+
     KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
     // SEC-C3 FIX: No longer storing KILLSWITCH_ACTIVE — wfp::is_blocking() is the source of truth
     tracing::info!("Kill switch disabled");
@@ -142,6 +159,15 @@ pub async fn activate_killswitch() -> Result<bool, String> {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        let server_ip = VPN_SERVER_IP.read().await.clone();
+        if let Err(e) = firewall_linux::activate_blocking(server_ip).await {
+            tracing::error!("Failed to activate iptables blocking: {}", e);
+            return Err(format!("Failed to activate blocking: {}", e));
+        }
+    }
+
     // SEC-C3 FIX: Removed KILLSWITCH_ACTIVE.store — wfp::is_blocking() is the source of truth
     Ok(true)
 }
@@ -168,6 +194,14 @@ pub async fn deactivate_killswitch() -> Result<bool, String> {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = firewall_linux::deactivate_blocking().await {
+            tracing::error!("Failed to deactivate iptables blocking: {}", e);
+            return Err(format!("Failed to deactivate blocking: {}", e));
+        }
+    }
+
     // SEC-C3 FIX: Removed KILLSWITCH_ACTIVE.store — wfp::is_blocking() is the source of truth
     Ok(true)
 }
@@ -182,7 +216,9 @@ pub async fn get_killswitch_status() -> Result<KillSwitchStatus, String> {
     let active = wfp::is_blocking();
     #[cfg(target_os = "macos")]
     let active = PF_BLOCKING.load(Ordering::SeqCst);
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    let active = firewall_linux::is_blocking();
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let active = false;
 
     // blocking_connections is deprecated, always 0
@@ -239,18 +275,22 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
          {server_rule}"
     );
 
-    // Write rules to a temporary file (no user input in the rules — safe)
-    let rules_path = "/tmp/birdo_pf_killswitch.conf";
-    let mut file = std::fs::File::create(rules_path)
-        .map_err(|e| format!("Failed to create pf rules file: {}", e))?;
-    file.write_all(rules.as_bytes())
-        .map_err(|e| format!("Failed to write pf rules: {}", e))?;
+    // Pipe rules directly to pfctl via stdin — avoids TOCTOU race and world-readable temp file
+    let mut child = crate::utils::hidden_cmd("pfctl")
+        .args(["-a", PF_ANCHOR, "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("pfctl spawn failed: {}", e))?;
 
-    // Load rules into the anchor
-    let output = crate::utils::hidden_cmd("pfctl")
-        .args(["-a", PF_ANCHOR, "-f", rules_path])
-        .output()
-        .map_err(|e| format!("pfctl load failed: {}", e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(rules.as_bytes())
+            .map_err(|e| format!("Failed to write pf rules to stdin: {}", e))?;
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| format!("pfctl wait failed: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -261,9 +301,6 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
     let _ = crate::utils::hidden_cmd("pfctl")
         .args(["-e"])
         .output();
-
-    // Clean up temp file
-    let _ = std::fs::remove_file(rules_path);
 
     PF_BLOCKING.store(true, Ordering::SeqCst);
     tracing::info!("macOS pf kill switch activated");

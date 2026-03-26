@@ -3,6 +3,7 @@ import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { motion } from 'framer-motion';
 import { Power, Shield } from 'lucide-react';
+import { friendlyVpnError } from '@/utils/helpers';
 
 export function ConnectionButton() {
   const {
@@ -37,6 +38,23 @@ export function ConnectionButton() {
   const handleToggle = async () => {
     if (isConnecting) return;
 
+    // Kill switch active: disconnect/clear kill switch instead of connecting
+    if (isKillSwitchActive) {
+      setConnectionState('disconnecting');
+      setErrorMessage(null);
+      try {
+        await invoke('disconnect_vpn');
+        setConnectionState('disconnected');
+        setCurrentServer(null);
+        setVpnIp(null);
+      } catch (error) {
+        const msg = friendlyVpnError(error);
+        setErrorMessage(msg);
+        setConnectionState('error');
+      }
+      return;
+    }
+
     if (isConnected) {
       // Disconnect
       setConnectionState('disconnecting');
@@ -47,7 +65,7 @@ export function ConnectionButton() {
         setCurrentServer(null);
         setVpnIp(null);
       } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
+        const msg = friendlyVpnError(error);
         setErrorMessage(msg);
         setConnectionState('error');
       }
@@ -66,7 +84,7 @@ export function ConnectionButton() {
           });
           setConnectionState('connected');
         } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error);
+          const msg = friendlyVpnError(error);
           setErrorMessage(msg);
           setConnectionState('error');
           setCurrentServer(null);
@@ -88,7 +106,7 @@ export function ConnectionButton() {
         await invoke<boolean>('connect_vpn', { serverId: targetServer.id });
         setConnectionState('connected');
       } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
+        const msg = friendlyVpnError(error);
         setErrorMessage(msg);
         setConnectionState('error');
         setCurrentServer(null);

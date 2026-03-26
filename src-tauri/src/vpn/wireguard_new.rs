@@ -39,12 +39,6 @@ impl SensitiveKey {
     fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.0
     }
-    
-    fn into_array(mut self) -> [u8; 32] {
-        let arr = self.0;
-        self.0.zeroize(); // Zeroize before moving out
-        arr
-    }
 }
 
 /// WireGuard session using boringtun
@@ -137,19 +131,28 @@ impl WireGuardSession {
         let endpoint_addr: SocketAddr = match endpoint.parse::<SocketAddr>() {
             Ok(addr) => addr,
             Err(_) => {
+                // L-7 FIX: Use DNS-over-HTTPS to prevent plain DNS leak of VPN server hostname
                 tracing::warn!(
-                    "Endpoint '{}' is not a pre-resolved IP:port — falling back to system DNS. \
-                     This may leak the VPN server hostname via plain DNS.",
+                    "Endpoint '{}' is not a pre-resolved IP:port — resolving via DoH",
                     endpoint
                 );
-                use tokio::net::lookup_host;
-                let addrs: Vec<SocketAddr> = lookup_host(&*endpoint)
+                // Extract host and port from the endpoint string
+                let (host, port) = {
+                    let parts: Vec<&str> = endpoint.rsplitn(2, ':').collect();
+                    if parts.len() != 2 {
+                        return Err(format!("Invalid endpoint format: {}", endpoint));
+                    }
+                    let port: u16 = parts[0].parse()
+                        .map_err(|_| format!("Invalid port in endpoint: {}", endpoint))?;
+                    (parts[1].to_string(), port)
+                };
+                let ip = super::doh::resolve_via_doh(&host)
                     .await
-                    .map_err(|e| format!("Failed to resolve endpoint '{}': {}", endpoint, e))?
-                    .collect();
-                
-                addrs.into_iter().next()
-                    .ok_or_else(|| format!("No IP address found for endpoint: {}", endpoint))?
+                    .map_err(|e| format!(
+                        "DoH resolution failed for '{}': {}. Pre-resolve endpoints to IP:port to avoid this.",
+                        endpoint, e
+                    ))?;
+                SocketAddr::from((ip, port))
             }
         };
 
@@ -217,30 +220,11 @@ impl WireGuardSession {
         }
         tracing::debug!("UDP socket buffers set to {}MB", buffer_size / 1024 / 1024);
 
-        // FIX-2-2: Bind WireGuard UDP socket to the physical interface that reaches
-        // the VPN server endpoint. This prevents WG handshake/data traffic from
-        // looping through the tunnel after default routes are installed.
-        // On Windows, IP_UNICAST_IF sets the interface index for outgoing packets.
-        #[cfg(target_os = "windows")]
-        {
-            use std::net::IpAddr;
-            if let IpAddr::V4(server_ip) = endpoint_addr.ip() {
-                // Find the interface that routes to the server IP
-                if let Ok(output) = crate::utils::hidden_cmd("route")
-                    .args(["print", &server_ip.to_string()])
-                    .output()
-                {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    // Parse route table to get the interface index for the default gateway
-                    // The interface index is used with IP_UNICAST_IF socket option
-                    let _route_info = stdout; // Route info available for debugging
-                }
-                // Set IP_UNICAST_IF via raw socket option (interface index in network byte order)
-                // This uses the default interface that can reach the endpoint IP
-                // The connect() call below already handles routing, but this adds defense-in-depth
-                tracing::debug!("WG UDP socket will connect directly to {}", endpoint_addr);
-            }
-        }
+        // FIX-2-2: The WireGuard UDP socket is bound to the physical interface via
+        // connect() to the endpoint IP, which establishes the route before tunnel
+        // routes are installed. IP_UNICAST_IF is not needed — connect() already
+        // pins the socket to the correct interface.
+        tracing::debug!("WG UDP socket will connect directly to {}", endpoint_addr);
 
         socket
             .connect(&endpoint_addr)

@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, Server } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { Search, Star, Zap, Film, Download, Signal, Server as ServerIcon } from 'lucide-react';
-import { countryCodeToFlag } from '@/utils/helpers';
+import { countryCodeToFlag, friendlyVpnError } from '@/utils/helpers';
 
 export function ServerList() {
   const [searchQuery, setSearchQuery] = useState('');
@@ -89,7 +89,7 @@ export function ServerList() {
       await invoke('connect_vpn', { serverId: server.id });
       setConnectionState('connected');
     } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
+      const msg = friendlyVpnError(error);
       setErrorMessage(msg);
       setConnectionState('error');
       setCurrentServer(null);
@@ -122,15 +122,15 @@ export function ServerList() {
 
         {/* Filter tabs */}
         <div className="mt-3 flex gap-2">
-          {[
-            { key: 'all', label: 'All' },
-            { key: 'favorites', label: 'Favorites', icon: Star },
-            { key: 'streaming', label: 'Streaming', icon: Film },
-            { key: 'p2p', label: 'P2P', icon: Download },
-          ].map(({ key, label, icon: Icon }) => (
+          {([
+            { key: 'all' as const, label: 'All' },
+            { key: 'favorites' as const, label: 'Favorites', icon: Star },
+            { key: 'streaming' as const, label: 'Streaming', icon: Film },
+            { key: 'p2p' as const, label: 'P2P', icon: Download },
+          ]).map(({ key, label, icon: Icon }) => (
             <button
               key={key}
-              onClick={() => setFilter(key as any)}
+              onClick={() => setFilter(key)}
               className={`flex items-center gap-1 rounded-full px-3 py-1 text-xs transition ${
                 filter === key
                   ? 'bg-white/10 text-white border border-white/20'

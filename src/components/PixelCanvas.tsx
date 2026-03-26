@@ -111,8 +111,10 @@ export function PixelCanvas() {
       mouseY = e.clientY - rect.top;
     };
 
+    let resizeTimer: ReturnType<typeof setTimeout>;
     const handleResize = () => {
-      initGrid();
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(initGrid, 150);
     };
 
     // Pause animation when window is hidden to save CPU/GPU
@@ -137,6 +139,7 @@ export function PixelCanvas() {
       window.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       cancelAnimationFrame(animationFrameId);
+      clearTimeout(resizeTimer);
     };
   }, []);
 

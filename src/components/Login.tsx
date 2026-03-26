@@ -141,6 +141,7 @@ export function Login() {
       if (result.success) {
         setUserEmail(result.user?.email || email);
         setPassword('');
+        setChallengeToken(null);
         setAuthenticated(true);
       } else {
         setError(result.error || 'Verification failed');

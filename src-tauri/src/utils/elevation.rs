@@ -165,7 +165,24 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        Err(format!("Privilege elevation not supported on this platform"))
+        // On Linux, use pkexec (PolicyKit) for graphical sudo prompt
+        let escaped_args: Vec<&str> = args.to_vec();
+        tracing::debug!("Elevating command on Linux via pkexec: {} {}", program, args.join(" "));
+
+        let output = super::hidden_cmd("pkexec")
+            .arg(program)
+            .args(&escaped_args)
+            .output()
+            .map_err(|e| format!("Failed to elevate via pkexec: {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("Elevated command failed: {}", stderr));
+        }
+
+        Ok(stdout)
     }
 }
 

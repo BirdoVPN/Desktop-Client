@@ -89,7 +89,6 @@ function App() {
   useEffect(() => {
     const unlisten = listen<string>('deep-link', (event) => {
       const url = event.payload;
-      console.log('[deep-link] received:', url);
       try {
         const parsed = new URL(url);
         const action = parsed.hostname;
@@ -102,10 +101,10 @@ function App() {
           useAppStore.getState().setDeepLinkAction({ action: 'settings' });
         }
       } catch {
-        console.warn('[deep-link] failed to parse URL:', url);
+        // Malformed deep-link URL — ignore silently
       }
     });
-    return () => { unlisten.then((fn) => fn()); };
+    return () => { unlisten.then((fn) => fn()).catch(() => {}); };
   }, []);
 
   if (initializing) {

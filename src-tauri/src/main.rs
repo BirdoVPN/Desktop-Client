@@ -2,7 +2,7 @@
 //!
 //! Main entry point for the Tauri application.
 //! Handles window management, system tray, and IPC commands.
-//! Supports Windows and macOS.
+//! Supports Windows, macOS, and Linux.
 
 // FIX-R11: Hide console window in release builds (Windows only)
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
@@ -105,6 +105,22 @@ fn main() {
         }
     }
 
+    // Linux: TUN device creation requires root (or CAP_NET_ADMIN).
+    // In production, the .deb/.AppImage should be launched via pkexec or
+    // the binary should have CAP_NET_ADMIN capability set.
+    #[cfg(target_os = "linux")]
+    {
+        use crate::utils::elevation::is_elevated;
+        if is_elevated() {
+            info!("Running with root privileges ✓");
+        } else {
+            info!(
+                "Not running as root — TUN creation will require pkexec elevation. \
+                 For best experience, run with: sudo birdo-vpn, or set CAP_NET_ADMIN."
+            );
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
@@ -147,8 +163,11 @@ fn main() {
             let menu = Menu::with_items(app, &[&connect, &disconnect, &show, &quit])?;
 
             // Build system tray
+            let tray_icon = app.default_window_icon()
+                .ok_or("default window icon not set in tauri.conf.json")?
+                .clone();
             let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().expect("default window icon must be set in tauri.conf.json").clone())
+                .icon(tray_icon)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .tooltip("Birdo VPN - Disconnected")
@@ -382,6 +401,19 @@ fn cleanup_on_crash() {
             .output();
 
         error!("Emergency cleanup completed (pf rules flushed, DNS restored)");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Remove iptables kill switch rules
+        vpn::firewall_linux::emergency_cleanup();
+
+        // Restore DNS: revert systemd-resolved or restore resolv.conf
+        let _ = std::process::Command::new("resolvectl")
+            .args(["revert", "birdo0"])
+            .output();
+
+        error!("Emergency cleanup completed (iptables rules flushed, DNS reverted)");
     }
 }
 
