@@ -48,7 +48,7 @@ on top of Sigstore in the `build-macos.yml` workflow.
 
 ### Why Not Authenticode?
 
-Traditional Authenticode OV certificates ($60–500/year) require identity verification
+Traditional Authenticode OV certificates ($60-500/year) require identity verification
 and annual renewal. Sigstore is free, automated, and provides **stronger provenance
 guarantees** — you can verify exactly which repo, commit, and workflow produced a binary.
 

@@ -1220,7 +1220,7 @@ impl WintunTunnel {
                     //
                     // FIX-R4: Use try_read() instead of read().await to avoid starving a
                     // pending write lock during disconnect.  If disconnect is acquiring the
-                    // write lock we simply skip this iteration (10–500 µs later we retry).
+                    // write lock we simply skip this iteration (10-500 µs later we retry).
                     let guard = wg_session.try_read();
                     if let Ok(ref session_guard) = guard {
                       if let Some(ref wg) = **session_guard {

@@ -559,7 +559,7 @@ export function Settings() {
                     className="w-full rounded-lg glass-input px-3 py-1.5 text-sm text-white placeholder-white/30 outline-none font-mono"
                   />
                   <p className="mt-1 text-xs text-white/30">
-                    Valid range: 1280 – 1500. Recommended: 1420
+                    Valid range: 1280 - 1500. Recommended: 1420
                   </p>
                 </div>
               )}

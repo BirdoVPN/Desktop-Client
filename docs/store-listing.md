@@ -19,7 +19,7 @@ Sovereign VPN with WireGuard® — no activity logs, stealth mode, blazing fast.
 Birdo VPN protects your internet connection with WireGuard® encryption. Browse privately, access content freely, and stay secure on any network.
 
 🔒 **No Activity Logs**
-Birdo VPN never logs your browsing activity, DNS queries, or traffic data. Minimal metadata (connection timestamps) is retained for security and abuse prevention only — see our privacy policy for retention periods.
+Birdo VPN operates a strict zero-logs policy on RAM-only volatile infrastructure. No browsing activity, DNS queries, traffic content, connection timestamps, or IP addresses are logged. All VPN servers run exclusively in volatile memory with automated memory scrubbing.
 
 ⚡ **WireGuard® Protocol**
 Built on the modern WireGuard protocol for blazing-fast speeds with minimal CPU overhead. Connect in under a second.
@@ -59,7 +59,8 @@ A stunning dark-mode interface with smooth animations, built with modern design 
 
 **Why Birdo VPN?**
 • No ads, no trackers, no data sales — ever
-• Minimal data collection — only email and subscription status
+• Zero-logs on RAM-only volatile infrastructure
+• Only account-level data stored (email, subscription)
 • Built on the open-source WireGuard protocol
 • Post-quantum encryption (Rosenpass key exchange)
 • Stealth mode — bypass VPN detection and censorship

@@ -70,12 +70,12 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             <DataItem
               icon={Eye}
               title="No Activity Logs"
-              description="We never log your browsing activity or DNS queries. Minimal connection metadata is retained for up to 90 days for security monitoring."
+              description="Zero-logs policy on RAM-only volatile infrastructure. No browsing, traffic, DNS, timestamps, or IPs are logged."
             />
             <DataItem
               icon={Shield}
-              title="Minimal Account Data"
-              description="Only your email and subscription status are stored — nothing more."
+              title="Account Data Only"
+              description="Only your email and subscription status are stored in a separate account database — never on VPN servers."
             />
             <DataItem
               icon={BarChart3}

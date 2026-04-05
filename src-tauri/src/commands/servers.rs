@@ -106,7 +106,7 @@ pub async fn ping_server(hostname: String, port: Option<u16>) -> Result<Option<u
         return Err("Invalid hostname for latency testing".to_string());
     }
 
-    // Block 172.16.0.0/12 (172.16.x.x – 172.31.x.x)
+    // Block 172.16.0.0/12 (172.16.x.x - 172.31.x.x)
     if hostname.starts_with("172.") {
         let is_private = hostname.split('.').nth(1)
             .and_then(|s| s.parse::<u16>().ok())
