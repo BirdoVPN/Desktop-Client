@@ -958,6 +958,21 @@ export function Settings() {
           </div>
         </Section>
 
+        {/* ── Account Management ── */}
+        <Section title="Account">
+          <div className="space-y-1">
+            <SettingLink
+              title="Change Password"
+              href="https://birdo.app/dashboard/settings"
+            />
+            <SettingLink
+              title="Two-Factor Authentication"
+              href="https://birdo.app/dashboard/settings"
+            />
+            <DataExportButton />
+          </div>
+        </Section>
+
         {/* ── Account Deletion (GDPR) ── */}
         <Section title="Danger Zone">
           <DeleteAccountButton />
@@ -1123,6 +1138,50 @@ function SettingLink({ title, href }: SettingLinkProps) {
       <span className="text-sm font-medium text-white">{title}</span>
       <ExternalLink size={14} className="text-white/40" />
     </a>
+  );
+}
+
+function DataExportButton() {
+  const [loading, setLoading] = useState(false);
+  const [done, setDone] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleExport = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await invoke<Record<string, unknown>>('export_user_data');
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `birdo-data-export-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setDone(true);
+    } catch (err) {
+      setError(typeof err === 'string' ? err : 'Export failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleExport}
+      disabled={loading}
+      className="glass flex w-full items-center justify-between rounded-lg p-3 transition hover:bg-white/10 disabled:opacity-50"
+    >
+      <span className="text-sm font-medium text-white">
+        {done ? 'Data Exported ✓' : 'Export My Data (GDPR)'}
+      </span>
+      {loading ? (
+        <Loader2 size={14} className="animate-spin text-white/40" />
+      ) : (
+        <ChevronRight size={14} className="text-white/40" />
+      )}
+      {error && <span className="text-xs text-red-400 ml-2">{error}</span>}
+    </button>
   );
 }
 
