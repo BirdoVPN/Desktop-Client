@@ -182,7 +182,7 @@ jobs:
       # Authenticode signatures to each matching file using the SHA-256 digest and
       # the RFC 3161 timestamp from Microsoft's own timestamping authority.
       - name: Sign Windows installers via Azure Trusted Signing (EXE + MSI)
-        uses: azure/trusted-signing-action@0b3ead4d05d7bca55a0cca4cf9d7c6e3c1b3c2b4 # v0.5.1
+        uses: azure/trusted-signing-action@48da903ca5e2d362da62c631a42d77c02ec7eadb # v1.2.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
