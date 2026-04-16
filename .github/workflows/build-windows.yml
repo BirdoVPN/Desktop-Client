@@ -192,6 +192,7 @@ jobs:
           certificate-profile-name: ${{ vars.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
           files-folder: artifacts
           files-folder-filter: exe,msi
+          files-folder-recurse: true
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -211,8 +212,8 @@ jobs:
         with:
           name: birdo-vpn-windows-signed
           path: |
-            artifacts/*.exe
-            artifacts/*.msi
+            artifacts/**/*.exe
+            artifacts/**/*.msi
           retention-days: 30
 
   # ── Job 3: GitHub Release ───────────────────────────────────────────
