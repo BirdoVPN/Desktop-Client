@@ -19,6 +19,25 @@ use crate::vpn::wfp;
 /// kill switch is not currently active (the app is queued for when it activates).
 #[tauri::command]
 pub async fn add_split_tunnel_app(app_path: String) -> Result<u64, String> {
+    // SEC FIX: Validate app_path before storing or passing to WFP/pf.
+    // A compromised renderer could pass traversal sequences, null bytes,
+    // or system paths (System32/lsass.exe) to bypass VPN kill-switch for
+    // privileged processes — trivially defeating leak protection.
+    if app_path.is_empty() || app_path.contains("..") || app_path.contains('\0') {
+        return Err("Invalid application path".to_string());
+    }
+
+    // On Windows, block adding system process paths to split tunnel.
+    // This prevents a compromised webview from routing DNS or system
+    // traffic outside the VPN tunnel.
+    #[cfg(target_os = "windows")]
+    {
+        let lower = app_path.to_lowercase();
+        if lower.contains("system32") || lower.contains("syswow64") {
+            return Err("Cannot add system processes to split tunnel".to_string());
+        }
+    }
+
     tracing::info!("Adding split tunnel app: {}", app_path);
 
     #[cfg(target_os = "windows")]

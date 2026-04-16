@@ -134,15 +134,33 @@ jobs:
             src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore
           retention-days: 30
 
-  # ── Job 2: SignPath Authenticode Signing (REST API) ───────────────────
-  # Signs .exe with Authenticode via SignPath REST API (no Trusted Build System needed).
-  # Uses direct artifact upload instead of GitHub Actions connector.
-  # Skipped if SIGNPATH_ORGANIZATION_ID is not set.
+  # ── Job 2: Azure Trusted Signing (Authenticode) ──────────────────────
+  # Signs NSIS .exe and MSI with Authenticode via Microsoft Azure Trusted Signing.
+  # Authentication uses OIDC federation — no client secrets required.
+  # Requires the following GitHub secrets/vars:
+  #   AZURE_TENANT_ID      — Azure Active Directory tenant ID
+  #   AZURE_CLIENT_ID      — App registration (service principal) client ID
+  #   AZURE_SUBSCRIPTION_ID — Azure subscription ID (optional, for resource scoping)
+  # And the following GitHub variables (not secrets):
+  #   AZURE_TRUSTED_SIGNING_ACCOUNT_NAME    — "Birdo"  (existing account in BirdoVPN resource group)
+  #   AZURE_TRUSTED_SIGNING_ENDPOINT        — "https://neu.codesigning.azure.net/"
+  #   AZURE_TRUSTED_SIGNING_CERT_PROFILE    — "BirdoVPNCertProfile"
+  #
+  # OIDC Setup:
+  # 1. In Azure AD, register an App. Under "Certificates & secrets > Federated credentials",
+  #    add a GitHub Actions credential:
+  #      Issuer: https://token.actions.githubusercontent.com
+  #      Subject: repo:<org>/<repo>:ref:refs/tags/*   (restrict to tag pushes)
+  # 2. Grant the app "Code Signing Certificate Profile Signer" role on your
+  #    Trusted Signing Account resource in Azure.
+  # 3. Set AZURE_TENANT_ID and AZURE_CLIENT_ID as GitHub repository secrets.
+  # 4. Set the three AZURE_TRUSTED_SIGNING_* values as GitHub repository variables.
   sign:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     permissions:
+      id-token: write   # REQUIRED: Allows OIDC JWT exchange with Azure AD
       actions: read
     steps:
       - name: Download build artifacts
@@ -151,93 +169,74 @@ jobs:
           name: birdo-vpn-windows-installers
           path: artifacts/
 
-      - name: Sign EXE via SignPath API
-        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
-        shell: bash
-        env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-          SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-        run: |
-          set -euo pipefail
-          API="https://app.signpath.io/API/v1/${SIGNPATH_ORG_ID}"
+      # Log in to Azure using OIDC (no stored client secrets)
+      - name: Azure Login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true
 
-          # Find the EXE
-          EXE_FILE=$(find artifacts -name '*.exe' -not -name '*.sigstore' | head -1)
-          if [ -z "$EXE_FILE" ]; then
-            echo "::error::No EXE found in artifacts"
-            exit 1
-          fi
-          echo "Signing: $EXE_FILE"
+      # Sign NSIS EXE + MSI installer in a single pass — files-folder-filter accepts
+      # a comma-separated list of extensions. Azure Trusted Signing applies
+      # Authenticode signatures to each matching file using the SHA-256 digest and
+      # the RFC 3161 timestamp from Microsoft's own timestamping authority.
+      - name: Sign Windows installers via Azure Trusted Signing (EXE + MSI)
+        uses: azure/trusted-signing-action@0b3ead4d05d7bca55a0cca4cf9d7c6e3c1b3c2b4 # v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          endpoint: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
+          files-folder: artifacts
+          files-folder-filter: exe,msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false   # Azure CLI is authenticated via OIDC login above
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
 
-          # Submit signing request
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X POST "${API}/SigningRequests" \
-            -H "Authorization: Bearer ${SIGNPATH_API_TOKEN}" \
-            -F "ProjectSlug=BirdoVPN" \
-            -F "SigningPolicySlug=BirdoVPN" \
-            -F "ArtifactConfigurationSlug=initial" \
-            -F "Artifact=@${EXE_FILE}" \
-            -F "Description=Automated release signing from GitHub Actions")
+      # Sign MSI installer
+      - name: Sign MSI installer via Azure Trusted Signing
+        uses: azure/trusted-signing-action@0b3ead4d05d7bca55a0cca4cf9d7c6e3c1b3c2b4 # v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          endpoint: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
+          files-folder: artifacts
+          files-folder-filter: msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          BODY=$(echo "$RESPONSE" | head -n -1)
-
-          if [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::SignPath API returned HTTP ${HTTP_CODE}: ${BODY}"
-            exit 1
-          fi
-
-          # Extract signing request ID from Location header or response
-          SIGNING_REQUEST_ID=$(echo "$BODY" | jq -r '.signingRequestId // .id // empty')
-          if [ -z "$SIGNING_REQUEST_ID" ]; then
-            echo "::error::Could not extract signing request ID from response: ${BODY}"
-            exit 1
-          fi
-          echo "Signing request ID: $SIGNING_REQUEST_ID"
-
-          # Poll for completion (max 10 minutes)
-          for i in $(seq 1 60); do
-            sleep 10
-            STATUS_RESPONSE=$(curl -s \
-              -H "Authorization: Bearer ${SIGNPATH_API_TOKEN}" \
-              "${API}/SigningRequests/${SIGNING_REQUEST_ID}")
-            STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status')
-            echo "  Poll $i: status=$STATUS"
-
-            case "$STATUS" in
-              Completed)
-                echo "Signing completed!"
-                DOWNLOAD_LINK=$(echo "$STATUS_RESPONSE" | jq -r '.signedArtifactLink')
-                break
-                ;;
-              Failed|Denied|Cancelled)
-                echo "::error::Signing request ${STATUS}: $(echo "$STATUS_RESPONSE" | jq -r '.statusComment // "no details"')"
-                exit 1
-                ;;
-            esac
-          done
-
-          if [ "$STATUS" != "Completed" ]; then
-            echo "::error::Signing request timed out after 10 minutes"
-            exit 1
-          fi
-
-          # Download signed artifact
-          mkdir -p signed
-          SIGNED_NAME=$(basename "$EXE_FILE")
-          curl -s -L \
-            -H "Authorization: Bearer ${SIGNPATH_API_TOKEN}" \
-            "${DOWNLOAD_LINK}" \
-            -o "signed/${SIGNED_NAME}"
-
-          echo "Downloaded signed artifact: signed/${SIGNED_NAME} ($(stat -c%s "signed/${SIGNED_NAME}") bytes)"
-
-      - name: Upload signed artifact
-        if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+      - name: Upload signed artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: birdo-vpn-windows-signed-nsis
-          path: signed/
+          name: birdo-vpn-windows-signed
+          path: |
+            artifacts/*.exe
+            artifacts/*.msi
           retention-days: 30
 
   # ── Job 3: GitHub Release ───────────────────────────────────────────
@@ -249,40 +248,42 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Always download unsigned artifacts (for Sigstore bundles + checksums)
-      - name: Download unsigned artifacts
+      # Download Sigstore bundles + checksums from unsigned artifacts
+      - name: Download unsigned artifacts (Sigstore + checksums)
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: birdo-vpn-windows-installers
           path: release-unsigned/
 
-      # Download signed artifact if SignPath signing succeeded
-      - name: Download signed NSIS
+      # Download Azure Trusted Signing artifacts (signed EXE + MSI)
+      - name: Download signed artifacts
         if: needs.sign.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: birdo-vpn-windows-signed-nsis
+          name: birdo-vpn-windows-signed
           path: release-signed/
         continue-on-error: true
 
-      # Assemble release: prefer signed installer, fall back to unsigned
+      # Assemble release: prefer Azure-signed installers, fall back to unsigned
       - name: Assemble release files
         shell: bash
         run: |
           mkdir -p release-files
-          # Copy Sigstore bundles and checksums (always from unsigned)
+
+          # Always include Sigstore provenance bundles + checksums
           find release-unsigned -name '*.sigstore' -exec cp {} release-files/ \;
           find release-unsigned -name 'SHA256SUMS*' -exec cp {} release-files/ \;
-          # Use signed EXE if available, otherwise unsigned
+
           if [ -d release-signed ] && find release-signed -name '*.exe' | grep -q .; then
+            echo "Using Azure Trusted Signing-signed installers"
             find release-signed -name '*.exe' -exec cp {} release-files/ \;
-            echo "Using SignPath-signed EXE"
+            find release-signed -name '*.msi' -exec cp {} release-files/ \;
           else
+            echo "WARNING: Azure signing failed or unavailable — using unsigned installers"
             find release-unsigned -name '*.exe' -exec cp {} release-files/ \;
-            echo "Using unsigned EXE"
+            find release-unsigned -name '*.msi' -exec cp {} release-files/ \;
           fi
-          # MSI is not yet SignPath-signed (single PE config)
-          find release-unsigned -name '*.msi' -exec cp {} release-files/ \;
+
           echo "Release files:"
           ls -la release-files/
 

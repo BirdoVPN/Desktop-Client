@@ -36,6 +36,12 @@ pub async fn create_port_forward(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<crate::api::types::CreatePortForwardResponse, String> {
+    // SEC FIX: Rust-side allowlist validation — TypeScript types are not a security boundary.
+    // A compromised renderer can bypass TypeScript and send arbitrary strings via IPC.
+    if protocol != "tcp" && protocol != "udp" {
+        return Err("Invalid protocol: must be 'tcp' or 'udp'".to_string());
+    }
+
     if !api.is_authenticated().await {
         if let Ok(tokens) = credentials.get_tokens() {
             api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
@@ -57,6 +63,16 @@ pub async fn delete_port_forward(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<bool, String> {
+    // SEC FIX: Validate id is a CUID/UUID to prevent URL path traversal.
+    // The id flows into format!("{}/{}", PORT_FORWARDS_ENDPOINT, id), so
+    // a malicious renderer could inject traversal sequences like "../../other".
+    if id.is_empty()
+        || id.len() > 50
+        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Invalid port forward ID".to_string());
+    }
+
     if !api.is_authenticated().await {
         if let Ok(tokens) = credentials.get_tokens() {
             api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;

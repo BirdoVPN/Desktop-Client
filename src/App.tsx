@@ -96,6 +96,8 @@ function App() {
 
         if (action === 'connect' && path) {
           // birdo://connect/<server-id>
+          // Validate: allow only alphanumeric, dashes, underscores, max 64 chars
+          if (!/^[a-zA-Z0-9_-]{1,64}$/.test(path)) return;
           useAppStore.getState().setDeepLinkAction({ action: 'connect', serverId: path });
         } else if (action === 'settings') {
           useAppStore.getState().setDeepLinkAction({ action: 'settings' });

@@ -217,14 +217,44 @@ async fn start_stealth_tunnel(
         return Ok(None);
     }
 
+    // SEC: Validate all Xray parameters from the server response before use.
+    // A compromised or MitM'd server could send malformed values to crash the client.
+    let uuid = response.xray_uuid.clone().unwrap_or_default();
+    let public_key = response.xray_public_key.clone().unwrap_or_default();
+    let short_id = response.xray_short_id.clone().unwrap_or_default();
+    let sni = response.xray_sni.clone().unwrap_or_else(|| "www.microsoft.com".to_string());
+    let flow = response.xray_flow.clone().unwrap_or_else(|| "xtls-rprx-vision".to_string());
+
+    // UUID: RFC 4122 format
+    if uuid.is_empty() || uuid.len() != 36 || !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("Invalid Xray UUID format from server".to_string());
+    }
+    // Public key: 64-char hex (Curve25519 key in X25519 Reality format)
+    if public_key.is_empty() || public_key.len() > 64 || !public_key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Invalid Xray public key format from server (expected ≤64 hex chars)".to_string());
+    }
+    // Short ID: hex string, max 16 chars (8 bytes)
+    if short_id.len() > 16 || !short_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Invalid Xray shortId format from server (expected ≤16 hex chars)".to_string());
+    }
+    // SNI: valid domain name characters only, reasonable length
+    if sni.is_empty() || sni.len() > 253 || !sni.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-') {
+        return Err("Invalid Xray SNI format from server".to_string());
+    }
+    // Flow: allowlisted values only
+    const ALLOWED_FLOWS: &[&str] = &["xtls-rprx-vision", "xtls-rprx-vision-udp", ""];
+    if !ALLOWED_FLOWS.contains(&flow.as_str()) {
+        return Err(format!("Unsupported Xray flow type '{}' from server", flow));
+    }
+
     let xray_config = crate::vpn::xray::XrayConfig {
         endpoint: response.xray_endpoint.clone()
             .ok_or("Server indicated stealth mode but provided no Xray endpoint")?,
-        uuid: response.xray_uuid.clone().unwrap_or_default(),
-        public_key: response.xray_public_key.clone().unwrap_or_default(),
-        short_id: response.xray_short_id.clone().unwrap_or_default(),
-        sni: response.xray_sni.clone().unwrap_or_else(|| "www.microsoft.com".to_string()),
-        flow: response.xray_flow.clone().unwrap_or_else(|| "xtls-rprx-vision".to_string()),
+        uuid,
+        public_key,
+        short_id,
+        sni,
+        flow,
         wg_port: 51820,
     };
 

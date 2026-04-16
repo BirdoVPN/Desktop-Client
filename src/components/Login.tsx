@@ -134,8 +134,10 @@ export function Login() {
         error?: string;
         user?: { email?: string };
       }>('verify_2fa', {
-        challengeToken: challengeToken,
-        code: totpCode,
+        request: {
+          challengeToken: challengeToken,
+          code: totpCode,
+        },
       });
 
       if (result.success) {

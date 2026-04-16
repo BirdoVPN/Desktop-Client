@@ -137,6 +137,12 @@ impl BirdoApi {
         self.access_token.read().await.is_some()
     }
 
+    /// Return a clone of the hardened reqwest Client for reuse by other commands.
+    /// This avoids creating secondary un-hardened clients that bypass TLS pinning.
+    pub fn http_client(&self) -> Client {
+        self.client.clone()
+    }
+
     // ========================================================================
     // Authentication Endpoints
     // ========================================================================

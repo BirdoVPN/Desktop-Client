@@ -298,12 +298,15 @@ export function Dashboard() {
       return;
     }
 
+    let cancelled = false;
     const poll = async () => {
       try {
         const [status, stats] = await Promise.all([
           invoke<RustVpnStatus>('get_vpn_status'),
           invoke<RustVpnStats>('get_vpn_stats'),
         ]);
+
+        if (cancelled) return; // component unmounted while await was in-flight
 
         // Sync connection state from Rust backend
         // Skip overwriting transient UI states (connecting/disconnecting)
@@ -332,6 +335,7 @@ export function Dashboard() {
     poll();
     statsInterval.current = setInterval(poll, 2000);
     return () => {
+      cancelled = true;
       if (statsInterval.current) clearInterval(statsInterval.current);
     };
   }, [isActive, setConnectionState]);

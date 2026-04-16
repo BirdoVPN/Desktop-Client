@@ -134,18 +134,25 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
 
     #[cfg(target_os = "macos")]
     {
-        // On macOS, use osascript to run commands with admin privileges
-        // SEC: Build the command safely — quote each argument
-        let escaped_args: Vec<String> = args.iter()
-            .map(|a| a.replace('\\', "\\\\").replace('"', "\\\""))
-            .collect();
-        let full_cmd = format!("{} {}", program, escaped_args.join(" "));
+        // On macOS, use osascript to run commands with admin privileges.
+        // SEC: Use POSIX single-quote wrapping for each argument — immune to
+        // injection via spaces, backticks, $(), semicolons, or double-quotes.
+        // Any literal ' in an argument is safely represented as '\'' .
+        let posix_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let shell_cmd = std::iter::once(posix_quote(program))
+            .chain(args.iter().map(|a| posix_quote(a.as_str())))
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        tracing::debug!("Elevating command on macOS: {}", full_cmd);
+        // Escape for embedding in an AppleScript double-quoted string:
+        // only backslash and double-quote need escaping at this level.
+        let apple_escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+
+        tracing::debug!("Elevating command on macOS");
 
         let apple_script = format!(
             "do shell script \"{}\" with administrator privileges",
-            full_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+            apple_escaped
         );
 
         let output = super::hidden_cmd("osascript")
