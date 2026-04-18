@@ -123,12 +123,14 @@ pub async fn clear_split_tunnel_apps() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 static MACOS_SPLIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 #[cfg(target_os = "macos")]
-static MACOS_SPLIT_APPS: once_cell::sync::Lazy<tokio::sync::Mutex<std::collections::HashMap<u64, String>>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+static MACOS_SPLIT_APPS: once_cell::sync::Lazy<
+    tokio::sync::Mutex<std::collections::HashMap<u64, String>>,
+> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
 // Linux split tunnel state
 #[cfg(target_os = "linux")]
 static LINUX_SPLIT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 #[cfg(target_os = "linux")]
-static LINUX_SPLIT_APPS: once_cell::sync::Lazy<tokio::sync::Mutex<std::collections::HashMap<u64, String>>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+static LINUX_SPLIT_APPS: once_cell::sync::Lazy<
+    tokio::sync::Mutex<std::collections::HashMap<u64, String>>,
+> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));

@@ -2,8 +2,8 @@
 //!
 //! Handles login, logout, token refresh, and auth state management.
 
-use crate::api::BirdoApi;
 use crate::api::types::LoginResult;
+use crate::api::BirdoApi;
 use crate::storage::CredentialStore;
 use crate::utils::redact_email;
 use serde::{Deserialize, Serialize};
@@ -49,7 +49,6 @@ impl Drop for LoginRequest {
     }
 }
 
-
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub success: bool,
@@ -87,8 +86,15 @@ pub async fn login(
         if attempts.len() >= MAX_LOGIN_ATTEMPTS {
             let oldest = attempts[0];
             let wait = window.saturating_sub(now.duration_since(oldest));
-            tracing::warn!("Login rate limit exceeded — {} attempts in {}s window", attempts.len(), LOGIN_WINDOW_SECS);
-            return Err(format!("Too many login attempts. Please wait {} seconds.", wait.as_secs()));
+            tracing::warn!(
+                "Login rate limit exceeded — {} attempts in {}s window",
+                attempts.len(),
+                LOGIN_WINDOW_SECS
+            );
+            return Err(format!(
+                "Too many login attempts. Please wait {} seconds.",
+                wait.as_secs()
+            ));
         }
         attempts.push(now);
     }
@@ -99,11 +105,19 @@ pub async fn login(
         Ok(result) => match result {
             LoginResult::Success { tokens, .. } => {
                 // Store tokens in Windows Credential Manager for persistence
-                if let Err(e) = credentials.store_tokens(&tokens.access_token, &tokens.refresh_token) {
-                    tracing::warn!("Failed to persist credentials to Windows Credential Manager: {}", e);
+                if let Err(e) =
+                    credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
+                {
+                    tracing::warn!(
+                        "Failed to persist credentials to Windows Credential Manager: {}",
+                        e
+                    );
                 }
 
-                tracing::trace!("Login: tokens set in API client: is_authenticated={}", api.is_authenticated().await);
+                tracing::trace!(
+                    "Login: tokens set in API client: is_authenticated={}",
+                    api.is_authenticated().await
+                );
 
                 let user_info = UserInfo {
                     email: Some(request.email.clone()),
@@ -121,7 +135,9 @@ pub async fn login(
                     challenge_token: None,
                 })
             }
-            LoginResult::TwoFactorChallenge { challenge_token, .. } => {
+            LoginResult::TwoFactorChallenge {
+                challenge_token, ..
+            } => {
                 // FIX C-2: 2FA is enabled — return challenge token to frontend
                 tracing::info!("2FA required for: {}", redact_email(&request.email));
                 Ok(LoginResponse {
@@ -201,9 +217,7 @@ pub async fn delete_account(
 /// GDPR: Export all user data (Right to Data Portability, Art. 20).
 /// Returns a JSON blob the frontend can save to disk.
 #[tauri::command]
-pub async fn export_user_data(
-    api: State<'_, BirdoApi>,
-) -> Result<serde_json::Value, String> {
+pub async fn export_user_data(api: State<'_, BirdoApi>) -> Result<serde_json::Value, String> {
     tracing::info!("GDPR data export requested");
     api.export_user_data()
         .await
@@ -219,8 +233,9 @@ pub async fn get_auth_state(
     match credentials.get_tokens() {
         Ok(tokens) => {
             // Set tokens in API client
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
-            
+            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
+
             // Try to get user profile to validate token
             match api.get_profile().await {
                 Ok(profile) => Ok(AuthState {
@@ -234,10 +249,12 @@ pub async fn get_auth_state(
                     match api.refresh_token().await {
                         Ok(new_tokens) => {
                             // Use rotated refresh token if server returned one, else keep existing
-                            let refresh_to_store = new_tokens.refresh_token
+                            let refresh_to_store = new_tokens
+                                .refresh_token
                                 .as_deref()
                                 .unwrap_or(&tokens.refresh_token);
-                            let _ = credentials.store_tokens(&new_tokens.access_token, refresh_to_store);
+                            let _ = credentials
+                                .store_tokens(&new_tokens.access_token, refresh_to_store);
                             Ok(AuthState {
                                 is_authenticated: true,
                                 email: None,
@@ -278,12 +295,14 @@ pub async fn refresh_token(
         .map_err(|_| "Not authenticated".to_string())?;
 
     // Set tokens in API client first
-    api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
+    api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+        .await;
 
     match api.refresh_token().await {
         Ok(new_tokens) => {
             // FIX C-1: Use updated refresh token if server returned one, else keep existing
-            let refresh_to_store = new_tokens.refresh_token
+            let refresh_to_store = new_tokens
+                .refresh_token
                 .as_deref()
                 .unwrap_or(&tokens.refresh_token);
             credentials
@@ -322,20 +341,32 @@ pub async fn verify_2fa(
         if attempts.len() >= MAX_TOTP_ATTEMPTS {
             let oldest = attempts[0];
             let wait = window.saturating_sub(now.duration_since(oldest));
-            tracing::warn!("2FA rate limit exceeded — {} attempts in {}s window", attempts.len(), TOTP_WINDOW_SECS);
-            return Err(format!("Too many 2FA attempts. Please wait {} seconds.", wait.as_secs()));
+            tracing::warn!(
+                "2FA rate limit exceeded — {} attempts in {}s window",
+                attempts.len(),
+                TOTP_WINDOW_SECS
+            );
+            return Err(format!(
+                "Too many 2FA attempts. Please wait {} seconds.",
+                wait.as_secs()
+            ));
         }
         attempts.push(now);
     }
 
     tracing::info!("2FA verification attempt");
 
-    match api.verify_2fa(&request.challenge_token, &request.code).await {
+    match api
+        .verify_2fa(&request.challenge_token, &request.code)
+        .await
+    {
         Ok(response) => {
             if response.ok {
                 if let Some(ref tokens) = response.tokens {
                     // Persist tokens to Windows Credential Manager
-                    if let Err(e) = credentials.store_tokens(&tokens.access_token, &tokens.refresh_token) {
+                    if let Err(e) =
+                        credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
+                    {
                         tracing::warn!("Failed to persist credentials after 2FA: {}", e);
                     }
                 }
@@ -380,13 +411,18 @@ pub async fn login_anonymous(
     // Generate a stable device ID from machine identity
     let device_id = crate::utils::get_device_id();
 
-    tracing::info!("Anonymous login attempt (device: {}...)", &device_id[..8.min(device_id.len())]);
+    tracing::info!(
+        "Anonymous login attempt (device: {}...)",
+        &device_id[..8.min(device_id.len())]
+    );
 
     match api.login_anonymous(&device_id).await {
         Ok(result) => {
             if result.ok {
                 if let Some(ref tokens) = result.tokens {
-                    if let Err(e) = credentials.store_tokens(&tokens.access_token, &tokens.refresh_token) {
+                    if let Err(e) =
+                        credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
+                    {
                         tracing::warn!("Failed to persist anonymous credentials: {}", e);
                     }
                 }

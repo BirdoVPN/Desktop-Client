@@ -15,9 +15,7 @@ const SPEED_TEST_URL: &str = "https://birdo.app/api/speed-test";
 /// SEC FIX: Reuse the hardened BirdoApi client (HTTPS-only, TLS 1.2+, cert-pinned)
 /// instead of building a bare reqwest::Client that bypasses all TLS safeguards.
 #[tauri::command]
-pub async fn run_speed_test_command(
-    api: State<'_, BirdoApi>,
-) -> Result<SpeedTestResult, String> {
+pub async fn run_speed_test_command(api: State<'_, BirdoApi>) -> Result<SpeedTestResult, String> {
     let client = api.http_client();
     run_speed_test(&client, SPEED_TEST_URL, SPEED_TEST_URL).await
 }

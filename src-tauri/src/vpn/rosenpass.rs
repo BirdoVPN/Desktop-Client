@@ -7,10 +7,10 @@
 //! This matches the Android RosenpassManager fallback implementation:
 //! server Rosenpass public key + local entropy → HKDF → WireGuard PSK
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use rand::RngCore;
 use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use sha2::Sha256;
 use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -71,8 +71,8 @@ pub fn derive_hybrid_psk(config: &RosenpassConfig) -> Result<String, String> {
 
 /// HKDF-Extract: PRK = HMAC-SHA256(salt, IKM)
 fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Result<Vec<u8>, String> {
-    let mut mac = HmacSha256::new_from_slice(salt)
-        .map_err(|e| format!("HKDF extract error: {}", e))?;
+    let mut mac =
+        HmacSha256::new_from_slice(salt).map_err(|e| format!("HKDF extract error: {}", e))?;
     mac.update(ikm);
     Ok(mac.finalize().into_bytes().to_vec())
 }
@@ -88,8 +88,8 @@ fn hkdf_expand(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<u8>, String
     let n = (length + 31) / 32;
 
     for i in 1..=n {
-        let mut mac = HmacSha256::new_from_slice(prk)
-            .map_err(|e| format!("HKDF expand error: {}", e))?;
+        let mut mac =
+            HmacSha256::new_from_slice(prk).map_err(|e| format!("HKDF expand error: {}", e))?;
         mac.update(&t);
         mac.update(info);
         mac.update(&[i as u8]);
@@ -118,7 +118,9 @@ mod tests {
         };
 
         let psk = derive_hybrid_psk(&config).unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&psk).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&psk)
+            .unwrap();
         assert_eq!(decoded.len(), 32);
     }
 
@@ -133,7 +135,9 @@ mod tests {
         };
 
         let psk = derive_hybrid_psk(&config).unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&psk).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&psk)
+            .unwrap();
         assert_eq!(decoded.len(), 32);
     }
 

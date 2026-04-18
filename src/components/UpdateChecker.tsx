@@ -50,7 +50,7 @@ export function UpdateChecker() {
         if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
         idleTimerRef.current = setTimeout(() => setStatus('idle'), 3000);
       }
-    } catch (err) {
+    } catch (_err) {
       setError('Update server is not available right now. Try again later.');
       setStatus('error');
     }
@@ -91,7 +91,7 @@ export function UpdateChecker() {
       });
 
       setStatus('ready');
-    } catch (err) {
+    } catch (_err) {
       setError('Download failed. Please try again.');
       setStatus('error');
     }
@@ -100,7 +100,7 @@ export function UpdateChecker() {
   const restartApp = useCallback(async () => {
     try {
       await relaunch();
-    } catch (err) {
+    } catch (_err) {
       setError('Failed to restart. Please close and reopen the app.');
       setStatus('error');
     }

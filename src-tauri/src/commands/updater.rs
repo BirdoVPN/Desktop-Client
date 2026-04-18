@@ -26,8 +26,10 @@ pub struct UpdateProgress {
 pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
     tracing::info!("Checking for updates...");
 
-    let updater = app.updater().map_err(|e| format!("Failed to get updater: {}", e))?;
-    
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Failed to get updater: {}", e))?;
+
     match updater.check().await {
         Ok(Some(update)) => {
             tracing::info!("Update available: v{}", update.version);
@@ -59,8 +61,10 @@ pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
     tracing::info!("Installing update...");
 
-    let updater = app.updater().map_err(|e| format!("Failed to get updater: {}", e))?;
-    
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Failed to get updater: {}", e))?;
+
     let update = updater
         .check()
         .await
@@ -97,7 +101,7 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     // Request app restart
     tracing::info!("Update installed, restarting...");
     app.restart();
-    
+
     // Note: restart() doesn't return, but we need to satisfy the return type
     #[allow(unreachable_code)]
     Ok(())

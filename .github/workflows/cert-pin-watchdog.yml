@@ -1,0 +1,58 @@
+name: Cert Pin Expiry Watchdog
+
+# Runs daily and warns/fails when the leaf cert pinned in
+# `src-tauri/src/api/client.rs` is within 30 / 7 days of expiry.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'   # daily at 06:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write   # optional: open an issue when expiry is imminent
+
+jobs:
+  check-pin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check leaf cert expiry vs pinned hash
+        env:
+          HOST: birdo.app
+        run: |
+          set -euo pipefail
+          # Fetch live cert metadata
+          NOT_AFTER=$(echo | openssl s_client -servername "$HOST" -connect "$HOST:443" 2>/dev/null \
+            | openssl x509 -noout -enddate \
+            | sed 's/notAfter=//')
+          LIVE_PIN=$(echo | openssl s_client -servername "$HOST" -connect "$HOST:443" 2>/dev/null \
+            | openssl x509 -outform DER \
+            | openssl dgst -sha256 -binary \
+            | openssl enc -base64)
+
+          NOT_AFTER_TS=$(date -u -d "$NOT_AFTER" +%s)
+          NOW_TS=$(date -u +%s)
+          DAYS_LEFT=$(( (NOT_AFTER_TS - NOW_TS) / 86400 ))
+
+          echo "Live cert for $HOST:"
+          echo "  not_after: $NOT_AFTER"
+          echo "  days_left: $DAYS_LEFT"
+          echo "  live pin : $LIVE_PIN"
+
+          # Compare to pins baked into client.rs
+          PINS_FILE="src-tauri/src/api/client.rs"
+          if ! grep -q "$LIVE_PIN" "$PINS_FILE"; then
+            echo "::error file=$PINS_FILE::Live cert pin $LIVE_PIN is NOT present in client.rs — clients will reject connections!"
+            exit 1
+          fi
+
+          if [ "$DAYS_LEFT" -lt 7 ]; then
+            echo "::error::Pinned cert expires in $DAYS_LEFT days — rotate IMMEDIATELY"
+            exit 1
+          elif [ "$DAYS_LEFT" -lt 30 ]; then
+            echo "::warning::Pinned cert expires in $DAYS_LEFT days — schedule rotation"
+          else
+            echo "Pinned cert OK — $DAYS_LEFT days remaining"
+          fi

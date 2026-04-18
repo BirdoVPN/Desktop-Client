@@ -44,6 +44,7 @@ pub mod vpn {
     }
 
     /// Returns the path for rotating the WireGuard key of an active connection
+    #[allow(dead_code)] // Used by ApiClient::rotate_key (reserved auto-rotate surface)
     pub fn rotate_key(key_id: &str) -> String {
         format!("/vpn/connections/{}/rotate", key_id)
     }

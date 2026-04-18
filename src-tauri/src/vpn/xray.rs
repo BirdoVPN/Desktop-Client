@@ -11,15 +11,15 @@
 //! The Xray binary (xray.exe) is bundled in src-tauri/resources/ and
 //! extracted to the app data directory at runtime.
 
+use serde_json::json;
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::watch;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use serde_json::json;
+use tokio::sync::watch;
+use tokio::sync::Mutex;
 
 /// Default local UDP port for the dokodemo-door inbound
 const DEFAULT_LOCAL_PORT: u16 = 51821;
@@ -94,7 +94,10 @@ impl XrayManager {
 
         tracing::info!(
             "Starting Xray Reality tunnel: {} → 127.0.0.1:{} → {}:{}",
-            config.sni, local_port, server_host, server_port
+            config.sni,
+            local_port,
+            server_host,
+            server_port
         );
 
         // Start Xray process — pipe config via stdin to avoid writing secrets to disk
@@ -111,12 +114,17 @@ impl XrayManager {
             cmd.creation_flags(0x08000000);
         }
 
-        let mut child = cmd.spawn()
-            .map_err(|e| format!("Failed to start Xray process: {}. Binary: {:?}", e, xray_binary))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "Failed to start Xray process: {}. Binary: {:?}",
+                e, xray_binary
+            )
+        })?;
 
         // Pipe config JSON to stdin and close to signal EOF
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(config_json.as_bytes())
+            stdin
+                .write_all(config_json.as_bytes())
                 .map_err(|e| format!("Failed to write Xray config to stdin: {}", e))?;
             // stdin dropped here → EOF sent → Xray parses config
         }
@@ -163,7 +171,10 @@ impl XrayManager {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     let _ = proc.take(); // Clean up
-                    return Err(format!("Xray process exited immediately with status: {}", status));
+                    return Err(format!(
+                        "Xray process exited immediately with status: {}",
+                        status
+                    ));
                 }
                 Ok(None) => { /* Still running — good */ }
                 Err(e) => {
@@ -197,6 +208,7 @@ impl XrayManager {
     }
 
     /// Get the local port Xray is listening on
+    #[allow(dead_code)] // Exposed for future port-forwarding inspection commands
     pub async fn get_local_port(&self) -> u16 {
         *self.local_port.lock().await
     }
@@ -252,20 +264,24 @@ impl XrayManager {
                 }
 
                 // Check 2: Can we connect to the local port?
-                let port_open = tokio::net::TcpStream::connect(
-                    format!("127.0.0.1:{}", port)
-                ).await.is_ok();
+                let port_open = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+                    .await
+                    .is_ok();
 
                 if port_open {
                     if consecutive_failures > 0 {
-                        tracing::info!("Xray health recovered after {} failures", consecutive_failures);
+                        tracing::info!(
+                            "Xray health recovered after {} failures",
+                            consecutive_failures
+                        );
                     }
                     consecutive_failures = 0;
                 } else {
                     consecutive_failures += 1;
                     tracing::warn!(
                         "Xray health check failed: port {} not responding (failure #{})",
-                        port, consecutive_failures
+                        port,
+                        consecutive_failures
                     );
                 }
             }
@@ -273,6 +289,7 @@ impl XrayManager {
     }
 
     /// Check if Xray process is currently running
+    #[allow(dead_code)] // Surfaced via diagnostics command pending UI wiring
     pub async fn is_running(&self) -> bool {
         let mut proc = self.process.lock().await;
         if let Some(ref mut child) = *proc {
@@ -320,7 +337,8 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16), String> {
     if parts.len() != 2 {
         return Err(format!("Invalid endpoint format: {}", endpoint));
     }
-    let port = parts[0].parse::<u16>()
+    let port = parts[0]
+        .parse::<u16>()
         .map_err(|_| format!("Invalid port in endpoint: {}", endpoint))?;
     Ok((parts[1].to_string(), port))
 }
@@ -436,8 +454,15 @@ mod tests {
     #[test]
     fn test_build_xray_config_structure() {
         let config = build_xray_config(
-            51821, "1.2.3.4", 8443, 51820,
-            "test-uuid", "test-pubkey", "abcdef01", "www.example.com", "xtls-rprx-vision",
+            51821,
+            "1.2.3.4",
+            8443,
+            51820,
+            "test-uuid",
+            "test-pubkey",
+            "abcdef01",
+            "www.example.com",
+            "xtls-rprx-vision",
         );
         assert_eq!(config["inbounds"][0]["port"], 51821);
         assert_eq!(config["outbounds"][0]["protocol"], "vless");

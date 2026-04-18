@@ -21,7 +21,7 @@ vi.mock('@tauri-apps/api/app', () => ({
 vi.mock('framer-motion', () => ({
   motion: {
     div: ({ children, ...props }: React.PropsWithChildren<Record<string, unknown>>) => {
-      const { initial, animate, exit, ...rest } = props as Record<string, unknown>;
+      const { initial: _initial, animate: _animate, exit: _exit, ...rest } = props as Record<string, unknown>;
       return <div {...(rest as React.HTMLAttributes<HTMLDivElement>)}>{children}</div>;
     },
   },

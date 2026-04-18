@@ -34,24 +34,22 @@ pub async fn get_servers(
     credentials: State<'_, CredentialStore>,
 ) -> Result<Vec<ServerInfo>, String> {
     tracing::trace!("get_servers command called");
-    
+
     // Set tokens in API client if available
     if let Ok(tokens) = credentials.get_tokens() {
         tracing::trace!("Setting tokens in API client");
-        api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
+        api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+            .await;
     } else {
         tracing::trace!("No tokens available in credential store");
     }
 
     tracing::trace!("Calling api.get_servers()");
-    let servers = api
-        .get_servers()
-        .await
-        .map_err(|e| {
-            tracing::warn!("Failed to fetch servers: {}", e);
-            format!("Failed to fetch servers: {}", e)
-        })?;
-    
+    let servers = api.get_servers().await.map_err(|e| {
+        tracing::warn!("Failed to fetch servers: {}", e);
+        format!("Failed to fetch servers: {}", e)
+    })?;
+
     tracing::trace!("Got {} servers from API", servers.len());
 
     Ok(servers
@@ -102,13 +100,18 @@ pub async fn ping_server(hostname: String, port: Option<u16>) -> Result<Option<u
         || hostname == "0.0.0.0"
         || hostname.starts_with("[")
     {
-        tracing::warn!("ping_server blocked: invalid or private hostname '{}'", hostname);
+        tracing::warn!(
+            "ping_server blocked: invalid or private hostname '{}'",
+            hostname
+        );
         return Err("Invalid hostname for latency testing".to_string());
     }
 
     // Block 172.16.0.0/12 (172.16.x.x - 172.31.x.x)
     if hostname.starts_with("172.") {
-        let is_private = hostname.split('.').nth(1)
+        let is_private = hostname
+            .split('.')
+            .nth(1)
             .and_then(|s| s.parse::<u16>().ok())
             .map(|octet| (16..=31).contains(&octet))
             .unwrap_or(false);

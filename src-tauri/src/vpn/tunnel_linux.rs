@@ -8,8 +8,8 @@
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
@@ -94,14 +94,16 @@ impl LinuxTunnel {
 
         // Snapshot current network config for restoration
         let snapshot = capture_network_snapshot().await?;
-        tracing::info!("Captured network snapshot: gw={:?}, iface={:?}",
+        tracing::info!(
+            "Captured network snapshot: gw={:?}, iface={:?}",
             snapshot.default_gateway.as_deref().map(|s| redact_ip(s)),
-            snapshot.default_interface);
+            snapshot.default_interface
+        );
         *self.network_snapshot.write().await = Some(snapshot);
 
         // Create the TUN device
-        let (tun_name, tun_fd) = create_tun_device()
-            .map_err(|e| format!("Failed to create TUN device: {}", e))?;
+        let (tun_name, tun_fd) =
+            create_tun_device().map_err(|e| format!("Failed to create TUN device: {}", e))?;
         tracing::info!("Created TUN device: {}", tun_name);
 
         *self.tun_name.write().await = Some(tun_name.clone());
@@ -119,7 +121,10 @@ impl LinuxTunnel {
         tracing::info!("WireGuard session created");
 
         let endpoint_ip = wg_session.endpoint_ip();
-        tracing::info!("WireGuard endpoint IP: {}", redact_ip(&endpoint_ip.to_string()));
+        tracing::info!(
+            "WireGuard endpoint IP: {}",
+            redact_ip(&endpoint_ip.to_string())
+        );
         *self.endpoint_ip.write().await = Some(endpoint_ip.to_string());
 
         // Configure the TUN interface IP and bring it up
@@ -336,7 +341,8 @@ impl LinuxTunnel {
                         if written < 0 {
                             tracing::debug!("TUN write error: {}", std::io::Error::last_os_error());
                         }
-                    }).await;
+                    })
+                    .await;
 
                     bytes_received.fetch_add(packet_len, Ordering::Relaxed);
                     packets_received.fetch_add(1, Ordering::Relaxed);
@@ -357,12 +363,17 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
     Ipv4Addr::from_str(&config.client_ip)
         .map_err(|_| format!("Invalid client_ip: '{}'", config.client_ip))?;
 
-    let endpoint_host = config.endpoint.split(':').next()
+    let endpoint_host = config
+        .endpoint
+        .split(':')
+        .next()
         .ok_or_else(|| "Invalid endpoint format: missing host".to_string())?;
     if endpoint_host.parse::<Ipv4Addr>().is_err() {
         if endpoint_host.is_empty()
             || endpoint_host.len() > 253
-            || !endpoint_host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            || !endpoint_host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
             || endpoint_host.starts_with('-')
             || endpoint_host.starts_with('.')
         {
@@ -371,8 +382,7 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
     }
 
     for dns in &config.dns {
-        Ipv4Addr::from_str(dns)
-            .map_err(|_| format!("Invalid DNS address: '{}'", dns))?;
+        Ipv4Addr::from_str(dns).map_err(|_| format!("Invalid DNS address: '{}'", dns))?;
     }
 
     for cidr in &config.allowed_ips {
@@ -380,9 +390,9 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
         if parts.len() != 2 {
             return Err(format!("Invalid CIDR format: '{}'", cidr));
         }
-        Ipv4Addr::from_str(parts[0])
-            .map_err(|_| format!("Invalid network in CIDR: '{}'", cidr))?;
-        let prefix: u8 = parts[1].parse()
+        Ipv4Addr::from_str(parts[0]).map_err(|_| format!("Invalid network in CIDR: '{}'", cidr))?;
+        let prefix: u8 = parts[1]
+            .parse()
             .map_err(|_| format!("Invalid prefix in CIDR: '{}'", cidr))?;
         if prefix > 32 {
             return Err(format!("Prefix out of range in CIDR: '{}'", cidr));
@@ -450,7 +460,11 @@ fn create_tun_device() -> Result<(String, i32), String> {
     }
 
     // Extract actual device name from ifreq
-    let name_end = ifr.ifr_name.iter().position(|&b| b == 0).unwrap_or(libc::IFNAMSIZ);
+    let name_end = ifr
+        .ifr_name
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(libc::IFNAMSIZ);
     let tun_name = String::from_utf8_lossy(&ifr.ifr_name[..name_end]).to_string();
 
     // Set non-blocking mode
@@ -509,12 +523,24 @@ async fn configure_routes(
     // Get current default gateway for endpoint route
     let default_gw = get_default_gateway()?;
     let default_iface = get_default_interface()?;
-    tracing::info!("Default gateway: {} via {}", redact_ip(&default_gw), default_iface);
+    tracing::info!(
+        "Default gateway: {} via {}",
+        redact_ip(&default_gw),
+        default_iface
+    );
 
     // Add a specific route for the VPN endpoint via the real gateway
     // so WireGuard UDP packets don't get caught in the VPN tunnel
     let output = cmd("ip")
-        .args(["route", "add", &format!("{}/32", endpoint_ip), "via", &default_gw, "dev", &default_iface])
+        .args([
+            "route",
+            "add",
+            &format!("{}/32", endpoint_ip),
+            "via",
+            &default_gw,
+            "dev",
+            &default_iface,
+        ])
         .output()
         .map_err(|e| format!("Failed to add endpoint route: {}", e))?;
 
@@ -545,7 +571,15 @@ async fn configure_routes(
         let rfc1918 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
         for cidr in &rfc1918 {
             let _ = cmd("ip")
-                .args(["route", "add", cidr, "via", &default_gw, "dev", &default_iface])
+                .args([
+                    "route",
+                    "add",
+                    cidr,
+                    "via",
+                    &default_gw,
+                    "dev",
+                    &default_iface,
+                ])
                 .output();
         }
         tracing::info!("Added local network sharing routes (RFC1918)");
@@ -557,7 +591,11 @@ async fn configure_routes(
 /// Configure DNS servers on Linux.
 ///
 /// Prefers systemd-resolved (resolvectl) when available, falls back to /etc/resolv.conf.
-async fn configure_dns(dns_servers: &[String], tun_name: &str, uses_resolved: bool) -> Result<(), String> {
+async fn configure_dns(
+    dns_servers: &[String],
+    tun_name: &str,
+    uses_resolved: bool,
+) -> Result<(), String> {
     if uses_resolved {
         // systemd-resolved: set DNS for our TUN interface
         let mut args = vec!["dns".to_string(), tun_name.to_string()];
@@ -584,10 +622,15 @@ async fn configure_dns(dns_servers: &[String], tun_name: &str, uses_resolved: bo
             tracing::warn!("resolvectl domain warning: {}", stderr);
         }
 
-        tracing::info!("Configured DNS via systemd-resolved on {}: {:?}", tun_name, dns_servers);
+        tracing::info!(
+            "Configured DNS via systemd-resolved on {}: {:?}",
+            tun_name,
+            dns_servers
+        );
     } else {
         // Fallback: write /etc/resolv.conf directly
-        let mut contents = String::from("# Generated by Birdo VPN — will be restored on disconnect\n");
+        let mut contents =
+            String::from("# Generated by Birdo VPN — will be restored on disconnect\n");
         for dns in dns_servers {
             contents.push_str(&format!("nameserver {}\n", dns));
         }
@@ -606,9 +649,7 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
     if snapshot.uses_systemd_resolved {
         // systemd-resolved: revert the TUN interface DNS (device is being torn down,
         // systemd-resolved will automatically drop configuration for removed interfaces)
-        let _ = cmd("resolvectl")
-            .args(["revert", TUN_DEVICE_NAME])
-            .output();
+        let _ = cmd("resolvectl").args(["revert", TUN_DEVICE_NAME]).output();
         tracing::info!("Reverted systemd-resolved DNS for {}", TUN_DEVICE_NAME);
     } else if let Some(ref backup) = snapshot.resolv_conf_backup {
         // Restore original /etc/resolv.conf
@@ -639,9 +680,7 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
 
     // Remove allowed_ip routes
     for cidr in allowed_ips {
-        let _ = cmd("ip")
-            .args(["route", "del", cidr])
-            .output();
+        let _ = cmd("ip").args(["route", "del", cidr]).output();
     }
 
     tracing::info!("Removed VPN routes");
@@ -668,10 +707,12 @@ async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
             .map_err(|e| format!("Failed to get DNS status: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let servers: Vec<String> = stdout.lines()
+        let servers: Vec<String> = stdout
+            .lines()
             .filter(|l| l.contains("DNS Servers:") || l.contains("Current DNS Server:"))
             .flat_map(|l| {
-                l.split(':').nth(1)
+                l.split(':')
+                    .nth(1)
                     .map(|s| s.trim().to_string())
                     .into_iter()
                     .filter(|s| !s.is_empty())
@@ -682,7 +723,8 @@ async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
     } else {
         // Read from /etc/resolv.conf
         let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-        let servers: Vec<String> = resolv.lines()
+        let servers: Vec<String> = resolv
+            .lines()
             .filter(|l| l.starts_with("nameserver"))
             .filter_map(|l| l.split_whitespace().nth(1).map(|s| s.to_string()))
             .collect();
@@ -708,7 +750,8 @@ fn get_default_gateway() -> Result<String, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // default via 192.168.1.1 dev eth0
-    stdout.split_whitespace()
+    stdout
+        .split_whitespace()
         .skip_while(|&w| w != "via")
         .nth(1)
         .map(|s| s.to_string())
@@ -724,7 +767,8 @@ fn get_default_interface() -> Result<String, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // default via 192.168.1.1 dev eth0
-    stdout.split_whitespace()
+    stdout
+        .split_whitespace()
         .skip_while(|&w| w != "dev")
         .nth(1)
         .map(|s| s.to_string())

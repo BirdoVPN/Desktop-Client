@@ -6,6 +6,10 @@
 //!
 //! Emits connectivity state changes that the auto-reconnect module
 //! uses to pause/resume reconnection attempts.
+//!
+//! NOTE: Public API is exposed but not yet wired to `auto_reconnect.rs`.
+//! Suppress dead-code warnings until the integration ticket lands.
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

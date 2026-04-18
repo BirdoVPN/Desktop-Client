@@ -75,7 +75,8 @@ pub enum Protocol {
 }
 
 fn get_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app.path()
+    Ok(app
+        .path()
         .app_config_dir()
         .map_err(|e| format!("Failed to get config dir: {}", e))?
         .join("settings.json"))
@@ -85,31 +86,30 @@ fn get_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn get_hmac_key() -> Result<Vec<u8>, String> {
     let entry = Entry::new(SETTINGS_HMAC_SERVICE, SETTINGS_HMAC_KEY_NAME)
         .map_err(|e| format!("Failed to create HMAC key entry: {}", e))?;
-    
+
     match entry.get_password() {
-        Ok(key_hex) => {
-            hex::decode(&key_hex).map_err(|e| format!("Corrupted HMAC key: {}", e))
-        }
+        Ok(key_hex) => hex::decode(&key_hex).map_err(|e| format!("Corrupted HMAC key: {}", e)),
         Err(keyring::Error::NoEntry) => {
             // First run — generate a random 32-byte key
             use rand::Rng;
             let key: [u8; 32] = rand::thread_rng().gen();
             let key_hex = hex::encode(&key);
-            entry.set_password(&key_hex)
+            entry
+                .set_password(&key_hex)
                 .map_err(|e| format!("Failed to store HMAC key: {}", e))?;
             tracing::info!("Generated new settings HMAC key");
             Ok(key.to_vec())
         }
-        Err(e) => {
-            Err(format!("Cannot access HMAC key from credential store: {}", e))
-        }
+        Err(e) => Err(format!(
+            "Cannot access HMAC key from credential store: {}",
+            e
+        )),
     }
 }
 
 /// Compute HMAC-SHA256 over serialized settings JSON
 fn compute_hmac(settings_json: &str, key: &[u8]) -> Result<String, String> {
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|e| format!("HMAC key error: {}", e))?;
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC key error: {}", e))?;
     mac.update(settings_json.as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
@@ -137,7 +137,8 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
         return Ok(AppSettings::default());
     }
 
-    let content = fs::read_to_string(&path).map_err(|e| format!("Failed to read settings: {}", e))?;
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read settings: {}", e))?;
 
     // Try to parse as signed settings (new format)
     if let Ok(signed) = serde_json::from_str::<SignedSettings>(&content) {
@@ -180,8 +181,8 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
     }
 
-    let settings_json = serde_json::to_string(settings)
-        .map_err(|e| format!("Failed to serialize: {}", e))?;
+    let settings_json =
+        serde_json::to_string(settings).map_err(|e| format!("Failed to serialize: {}", e))?;
 
     let hmac_key = get_hmac_key()?;
     let hmac = compute_hmac(&settings_json, &hmac_key)?;
@@ -197,14 +198,12 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
     // FIX-2-6: Atomic write — write to temp file then rename.
     // Prevents corruption if process crashes or power is lost mid-write.
     let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &content)
-        .map_err(|e| format!("Failed to write temp settings: {}", e))?;
-    fs::rename(&tmp_path, &path)
-        .map_err(|e| {
-            // Clean up temp file on rename failure
-            let _ = fs::remove_file(&tmp_path);
-            format!("Failed to atomically replace settings file: {}", e)
-        })?;
+    fs::write(&tmp_path, &content).map_err(|e| format!("Failed to write temp settings: {}", e))?;
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        // Clean up temp file on rename failure
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to atomically replace settings file: {}", e)
+    })?;
     Ok(())
 }
 

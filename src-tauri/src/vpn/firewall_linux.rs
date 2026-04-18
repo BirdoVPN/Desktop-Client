@@ -61,8 +61,12 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
     iptables(&["-A", CHAIN_NAME, "-i", "lo", "-j", "ACCEPT"])?;
 
     // Allow DHCP (UDP 67/68) so the system can maintain its network lease
-    iptables(&["-A", CHAIN_NAME, "-p", "udp", "--dport", "67", "-j", "ACCEPT"])?;
-    iptables(&["-A", CHAIN_NAME, "-p", "udp", "--dport", "68", "-j", "ACCEPT"])?;
+    iptables(&[
+        "-A", CHAIN_NAME, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
+    ])?;
+    iptables(&[
+        "-A", CHAIN_NAME, "-p", "udp", "--dport", "68", "-j", "ACCEPT",
+    ])?;
 
     // Allow traffic to VPN server IP
     if let Some(ip) = server_ip {
@@ -75,7 +79,16 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
     iptables(&["-A", CHAIN_NAME, "-i", "birdo0", "-j", "ACCEPT"])?;
 
     // Allow established/related connections (for responses to allowed traffic)
-    iptables(&["-A", CHAIN_NAME, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])?;
+    iptables(&[
+        "-A",
+        CHAIN_NAME,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "ESTABLISHED,RELATED",
+        "-j",
+        "ACCEPT",
+    ])?;
 
     // Drop everything else
     iptables(&["-A", CHAIN_NAME, "-j", "DROP"])?;

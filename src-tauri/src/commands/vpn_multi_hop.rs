@@ -4,16 +4,16 @@
 
 use tauri::{AppHandle, State};
 
-use crate::api::BirdoApi;
 use crate::api::types::ConnectResponse;
+use crate::api::BirdoApi;
 use crate::storage::CredentialStore;
 use crate::utils::redact::sanitize_error;
 use crate::vpn::manager::VpnManager;
 use crate::vpn::AutoReconnectService;
 
 use super::vpn::{
-    apply_vpn_settings, build_vpn_config, generate_wireguard_keypair,
-    get_device_name, parse_endpoint_ip,
+    apply_vpn_settings, build_vpn_config, generate_wireguard_keypair, get_device_name,
+    parse_endpoint_ip,
 };
 
 /// Get available multi-hop routes (SOVEREIGN plan only)
@@ -25,7 +25,8 @@ pub async fn get_multi_hop_routes(
     // Restore tokens if needed
     if !api.is_authenticated().await {
         if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
+            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
         }
     }
     if !api.is_authenticated().await {
@@ -40,10 +41,8 @@ pub async fn get_multi_hop_routes(
 /// Connect via multi-hop (double VPN): routes through entry node then exit node
 #[tauri::command]
 pub async fn connect_multi_hop(
-    #[allow(non_snake_case)]
-    entryNodeId: String,
-    #[allow(non_snake_case)]
-    exitNodeId: String,
+    #[allow(non_snake_case)] entryNodeId: String,
+    #[allow(non_snake_case)] exitNodeId: String,
     app: AppHandle,
     api: State<'_, BirdoApi>,
     vpn_manager: State<'_, VpnManager>,
@@ -56,14 +55,15 @@ pub async fn connect_multi_hop(
         return Err(
             "Administrator privileges required. Please right-click the app \
              and select \"Run as administrator\", or restart from an elevated terminal."
-            .to_string(),
+                .to_string(),
         );
     }
 
     // Restore tokens if needed
     if !api.is_authenticated().await {
         if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
+            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
         }
     }
     if !api.is_authenticated().await {
@@ -74,12 +74,15 @@ pub async fn connect_multi_hop(
     let (local_private_key, client_public_key) = generate_wireguard_keypair();
 
     // Call multi-hop connect endpoint
-    let mh_response = api.connect_multi_hop(
-        &entryNodeId, &exitNodeId, &device_name, &client_public_key,
-    ).await.map_err(|e| sanitize_error(&format!("Multi-hop connect failed: {}", e)))?;
+    let mh_response = api
+        .connect_multi_hop(&entryNodeId, &exitNodeId, &device_name, &client_public_key)
+        .await
+        .map_err(|e| sanitize_error(&format!("Multi-hop connect failed: {}", e)))?;
 
     if !mh_response.success {
-        let msg = mh_response.message.unwrap_or_else(|| "Multi-hop connection failed".to_string());
+        let msg = mh_response
+            .message
+            .unwrap_or_else(|| "Multi-hop connection failed".to_string());
         return Err(msg);
     }
 
@@ -115,8 +118,12 @@ pub async fn connect_multi_hop(
     let vpn_settings = apply_vpn_settings(&app).await;
     let server_label = format!("Multi-Hop: {} → {}", entryNodeId, exitNodeId);
     let (config, _server_name) = build_vpn_config(
-        connect_response, &entryNodeId, vpn_settings.custom_dns, Some(local_private_key),
-        vpn_settings.custom_mtu, &vpn_settings.custom_port,
+        connect_response,
+        &entryNodeId,
+        vpn_settings.custom_dns,
+        Some(local_private_key),
+        vpn_settings.custom_mtu,
+        &vpn_settings.custom_port,
     )?;
 
     // Set VPN server IP for kill switch
@@ -129,16 +136,25 @@ pub async fn connect_multi_hop(
     }
 
     vpn_manager
-        .connect(config, server_label.clone(), vpn_settings.local_network_sharing)
+        .connect(
+            config,
+            server_label.clone(),
+            vpn_settings.local_network_sharing,
+        )
         .await
         .map_err(|e| sanitize_error(&format!("Multi-hop connection failed: {}", e)))?;
 
     auto_reconnect.clear_user_disconnected();
     tracing::info!("Multi-hop VPN connected: {} → {}", entryNodeId, exitNodeId);
-    auto_reconnect.store_last_config(
-        entryNodeId, server_label, vpn_settings.local_network_sharing,
-        vpn_settings.custom_mtu, vpn_settings.custom_port,
-    ).await;
+    auto_reconnect
+        .store_last_config(
+            entryNodeId,
+            server_label,
+            vpn_settings.local_network_sharing,
+            vpn_settings.custom_mtu,
+            vpn_settings.custom_port,
+        )
+        .await;
     if let Err(e) = auto_reconnect.start().await {
         tracing::warn!("Failed to start auto-reconnect: {}", e);
     }

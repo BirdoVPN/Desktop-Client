@@ -116,16 +116,81 @@ jobs:
             cosign sign-blob --yes --bundle "${SUMS}.sigstore" "$SUMS"
           fi
 
+      # ── GPG signing (detached .asc, classic Linux distribution model) ───
+      # Required GitHub secrets (Settings → Secrets and variables → Actions):
+      #   LINUX_GPG_PRIVATE_KEY       — ASCII-armoured private key block
+      #   LINUX_GPG_PASSPHRASE        — passphrase for the private key
+      #   LINUX_GPG_KEY_ID            — long key ID (e.g. ABCDEF0123456789)
+      # The public key must be published at https://birdo.app/.well-known/birdo-release.asc
+      # so users can verify with:  gpg --verify file.asc file
+      - name: Detect GPG availability
+        id: gpg-detect
+        env:
+          GPG_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          GPG_KID: ${{ secrets.LINUX_GPG_KEY_ID }}
+        run: |
+          if [ -n "$GPG_KEY" ] && [ -n "$GPG_KID" ]; then
+            echo "HAS_GPG=true"  >> "$GITHUB_ENV"
+          else
+            echo "HAS_GPG=false" >> "$GITHUB_ENV"
+            echo "::warning::LINUX_GPG_PRIVATE_KEY / LINUX_GPG_KEY_ID not configured — skipping GPG signing"
+          fi
+
+      - name: Import GPG signing key
+        if: ${{ env.HAS_GPG == 'true' }}
+        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec # v6.3.0
+        with:
+          gpg_private_key: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          passphrase:      ${{ secrets.LINUX_GPG_PASSPHRASE }}
+
+      - name: GPG-sign .deb (detached .asc)
+        if: ${{ env.HAS_GPG == 'true' }}
+        run: |
+          DEB_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/deb -name '*.deb' | head -1)
+          if [ -n "$DEB_FILE" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "${{ secrets.LINUX_GPG_PASSPHRASE }}" \
+                --local-user "${{ secrets.LINUX_GPG_KEY_ID }}" \
+                --armor --detach-sign --output "${DEB_FILE}.asc" "$DEB_FILE"
+            echo "GPG-signed $(basename $DEB_FILE) → $(basename $DEB_FILE).asc"
+          fi
+
+      - name: GPG-sign AppImage (detached .asc)
+        if: ${{ env.HAS_GPG == 'true' }}
+        run: |
+          APPIMAGE_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/appimage -name '*.AppImage' | head -1)
+          if [ -n "$APPIMAGE_FILE" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "${{ secrets.LINUX_GPG_PASSPHRASE }}" \
+                --local-user "${{ secrets.LINUX_GPG_KEY_ID }}" \
+                --armor --detach-sign --output "${APPIMAGE_FILE}.asc" "$APPIMAGE_FILE"
+            echo "GPG-signed $(basename $APPIMAGE_FILE) → $(basename $APPIMAGE_FILE).asc"
+          fi
+
+      - name: GPG-sign SHA256SUMS (detached .asc)
+        if: ${{ env.HAS_GPG == 'true' }}
+        run: |
+          SUMS="src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt"
+          if [ -f "$SUMS" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "${{ secrets.LINUX_GPG_PASSPHRASE }}" \
+                --local-user "${{ secrets.LINUX_GPG_KEY_ID }}" \
+                --armor --detach-sign --output "${SUMS}.asc" "$SUMS"
+          fi
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: birdo-vpn-linux-${{ matrix.label }}
           path: |
             src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.deb.asc
             src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.sigstore
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage
+            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.asc
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.sigstore
             src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt.asc
             src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt.sigstore
           retention-days: 30
 

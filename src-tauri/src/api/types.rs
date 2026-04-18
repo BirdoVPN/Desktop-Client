@@ -1,7 +1,10 @@
 //! API request and response types
 //!
 //! These types are defined for serialization/deserialization with the API.
-//! Fields on Deserialize structs are populated by serde, not by Rust code.
+//! Fields on Deserialize structs are populated by serde, not by Rust code,
+//! and are surfaced to the frontend via Tauri commands or read by future
+//! features. Suppress dead-code warnings module-wide.
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -62,12 +65,18 @@ impl ProtocolErrorCode {
             Self::KillSwitchFailed => "Kill switch activation failed",
             Self::Ipv6BlockFailed => "IPv6 leak protection failed",
             Self::StealthTunnelFailed => "Stealth tunnel failed — try without stealth mode",
-            Self::QuantumHandshakeFailed => "Post-quantum handshake failed — try without quantum protection",
+            Self::QuantumHandshakeFailed => {
+                "Post-quantum handshake failed — try without quantum protection"
+            }
             Self::AdminRequired => "Administrator privileges are required",
             Self::NetworkUnreachable => "Network is unreachable — check your connection",
             Self::HandshakeTimeout => "Connection timed out — try a closer server",
-            Self::DllIntegrityFailed => "Security check failed — application files may be corrupted",
-            Self::JniIntegrityFailed => "Security check failed — application files may be corrupted",
+            Self::DllIntegrityFailed => {
+                "Security check failed — application files may be corrupted"
+            }
+            Self::JniIntegrityFailed => {
+                "Security check failed — application files may be corrupted"
+            }
             Self::SettingsTampered => "Settings integrity check failed",
             Self::BiometricFailed => "Biometric authentication failed",
             Self::Unknown => "An unexpected error occurred",
@@ -102,7 +111,9 @@ pub struct HeartbeatResponse {
     pub message: Option<String>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 // ============================================================================
 // Connection Quality Reporting (P2-15)
@@ -173,10 +184,7 @@ pub enum LoginResult {
         challenge_token: String,
     },
     /// Successful login with tokens
-    Success {
-        ok: bool,
-        tokens: TokenPair,
-    },
+    Success { ok: bool, tokens: TokenPair },
 }
 
 /// FIX C-2: Request body for 2FA TOTP verification
@@ -266,9 +274,15 @@ pub struct SubscriptionStatus {
     pub bandwidth_limit: Option<u64>,
 }
 
-fn default_plan() -> String { "recon".to_string() }
-fn default_status() -> String { "active".to_string() }
-fn default_one() -> u32 { 1 }
+fn default_plan() -> String {
+    "recon".to_string()
+}
+fn default_status() -> String {
+    "active".to_string()
+}
+fn default_one() -> u32 {
+    1
+}
 
 // ============================================================================
 // VPN Types

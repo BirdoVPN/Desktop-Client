@@ -4,10 +4,8 @@
 //! and non-VPN adapter enumeration.
 
 use std::process::Command;
-use tracing;
 
-use super::tunnel::{WintunTunnel, AdapterDnsSnapshot};
-use crate::utils::redact_ip;
+use super::tunnel::{AdapterDnsSnapshot, WintunTunnel};
 
 /// Hidden command helper
 fn cmd(program: &str) -> Command {
@@ -17,7 +15,8 @@ fn cmd(program: &str) -> Command {
 /// SEC-C4 FIX: Encode PowerShell script as Base64 UTF-16LE
 fn base64_encode_utf16le(script: &str) -> String {
     use base64::Engine;
-    let utf16: Vec<u8> = script.encode_utf16()
+    let utf16: Vec<u8> = script
+        .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
         .collect();
     base64::engine::general_purpose::STANDARD.encode(&utf16)
@@ -38,7 +37,8 @@ impl WintunTunnel {
         {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout.lines()
+                stdout
+                    .lines()
                     .map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty())
                     .collect()
@@ -51,8 +51,11 @@ impl WintunTunnel {
                 {
                     Ok(output) => {
                         let stdout = String::from_utf8_lossy(&output.stdout);
-                        stdout.lines()
-                            .filter(|l| l.contains("Connected") && !l.contains(super::tunnel::ADAPTER_NAME))
+                        stdout
+                            .lines()
+                            .filter(|l| {
+                                l.contains("Connected") && !l.contains(super::tunnel::ADAPTER_NAME)
+                            })
                             .filter_map(|l| l.split_whitespace().last().map(String::from))
                             .collect()
                     }

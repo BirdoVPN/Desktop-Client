@@ -8,19 +8,19 @@
 //! - Operation lock prevents concurrent connect/disconnect races
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, Mutex as TokioMutex};
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::time::timeout;
 
 // Platform-specific tunnel implementation
 #[cfg(target_os = "windows")]
 use super::tunnel::WintunTunnel as PlatformTunnel;
-#[cfg(target_os = "macos")]
-use super::tunnel_macos::UtunTunnel as PlatformTunnel;
 #[cfg(target_os = "linux")]
 use super::tunnel_linux::LinuxTunnel as PlatformTunnel;
+#[cfg(target_os = "macos")]
+use super::tunnel_macos::UtunTunnel as PlatformTunnel;
 
 use crate::api::types::VpnConfig;
 
@@ -35,6 +35,7 @@ const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Variants reserved for upcoming auth/stealth/killswitch state transitions
 pub enum ConnectionState {
     Disconnected,
     Connecting,
@@ -45,7 +46,9 @@ pub enum ConnectionState {
     Connected,
     Disconnecting,
     /// SM-002: Reconnecting state with attempt tracking
-    Reconnecting { attempt: u32 },
+    Reconnecting {
+        attempt: u32,
+    },
     /// P1-6: Kill switch active after disconnect (blocking all non-VPN traffic)
     KillSwitchActive,
     Error(String),
@@ -56,22 +59,28 @@ impl ConnectionState {
     pub fn is_tunnel_active(&self) -> bool {
         matches!(self, ConnectionState::Connected)
     }
-    
+
     /// Check if a new connection can be initiated
     /// STATE-FIX: Also allow connecting from Reconnecting state, which is set
     /// by auto-reconnect before calling connect(). Without this, reconnect fails silently.
     pub fn can_connect(&self) -> bool {
-        matches!(self, 
-            ConnectionState::Disconnected | 
-            ConnectionState::Error(_) |
-            ConnectionState::KillSwitchActive |
-            ConnectionState::Reconnecting { .. }
+        matches!(
+            self,
+            ConnectionState::Disconnected
+                | ConnectionState::Error(_)
+                | ConnectionState::KillSwitchActive
+                | ConnectionState::Reconnecting { .. }
         )
     }
-    
+
     /// Check if disconnect is meaningful in this state
     pub fn can_disconnect(&self) -> bool {
-        !matches!(self, ConnectionState::Disconnected | ConnectionState::Disconnecting | ConnectionState::KillSwitchActive)
+        !matches!(
+            self,
+            ConnectionState::Disconnected
+                | ConnectionState::Disconnecting
+                | ConnectionState::KillSwitchActive
+        )
     }
 }
 
@@ -102,16 +111,24 @@ impl ConnectionStats {
         }
         let mean = self.latency_samples.iter().map(|&s| s as f64).sum::<f64>()
             / self.latency_samples.len() as f64;
-        let variance = self.latency_samples.iter()
-            .map(|&s| { let d = s as f64 - mean; d * d })
-            .sum::<f64>() / self.latency_samples.len() as f64;
+        let variance = self
+            .latency_samples
+            .iter()
+            .map(|&s| {
+                let d = s as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / self.latency_samples.len() as f64;
         variance.sqrt()
     }
 
     /// P2-16: Estimate packet loss percentage since last report window.
     pub fn packet_loss_percent(&self) -> f64 {
         let sent_delta = self.packets_sent.saturating_sub(self.prev_packets_sent);
-        let recv_delta = self.packets_received.saturating_sub(self.prev_packets_received);
+        let recv_delta = self
+            .packets_received
+            .saturating_sub(self.prev_packets_received);
         if sent_delta == 0 {
             return 0.0;
         }
@@ -205,7 +222,8 @@ impl VpnManager {
     /// FIX-R5: Mark that the user explicitly disconnected.
     /// Auto-reconnect checks this flag and does NOT reconnect if true.
     pub fn set_user_disconnected(&self, value: bool) {
-        self.user_initiated_disconnect.store(value, AtomicOrdering::SeqCst);
+        self.user_initiated_disconnect
+            .store(value, AtomicOrdering::SeqCst);
     }
 
     /// SM-002: Acquire state read lock with timeout to prevent deadlock
@@ -220,7 +238,10 @@ impl VpnManager {
     }
 
     /// SM-002: Acquire state write lock with timeout to prevent deadlock
-    async fn write_state_with_timeout(&self, new_state: ConnectionState) -> Result<ConnectionState, VpnError> {
+    async fn write_state_with_timeout(
+        &self,
+        new_state: ConnectionState,
+    ) -> Result<ConnectionState, VpnError> {
         match timeout(STATE_LOCK_TIMEOUT, self.state.write()).await {
             Ok(mut guard) => {
                 let old_state = guard.clone();
@@ -241,12 +262,15 @@ impl VpnManager {
 
     /// Get current connection state
     pub async fn get_state(&self) -> ConnectionState {
-        self.read_state_with_timeout().await.unwrap_or(ConnectionState::Error("Lock timeout".into()))
+        self.read_state_with_timeout()
+            .await
+            .unwrap_or(ConnectionState::Error("Lock timeout".into()))
     }
 
     /// Set connection state (used by auto-reconnect to set Reconnecting state)
     pub async fn set_state(&self, new_state: ConnectionState) -> Result<(), String> {
-        self.write_state_with_timeout(new_state).await
+        self.write_state_with_timeout(new_state)
+            .await
             .map_err(|e| format!("Failed to set state: {}", e))?;
         Ok(())
     }
@@ -295,30 +319,44 @@ impl VpnManager {
         local_network_sharing: bool,
     ) -> Result<(), String> {
         tracing::info!("VpnManager::connect called for server: {}", server_name);
-        
+
         // FIX-R5: Clear the user-disconnected flag so auto-reconnect can work again
-        self.user_initiated_disconnect.store(false, AtomicOrdering::SeqCst);
-        
+        self.user_initiated_disconnect
+            .store(false, AtomicOrdering::SeqCst);
+
         // SM-002: Acquire operation lock first to prevent concurrent operations
-        let _operation_guard = self.acquire_operation_lock().await
+        let _operation_guard = self
+            .acquire_operation_lock()
+            .await
             .map_err(|e| format!("Failed to acquire operation lock: {}", e))?;
-        
+
         // Check current state with timeout
-        let current_state = self.read_state_with_timeout().await
+        let current_state = self
+            .read_state_with_timeout()
+            .await
             .map_err(|e| format!("Failed to read state: {}", e))?;
-        
+
         tracing::debug!("Current VPN state: {:?}", current_state);
-        
+
         // If already connected, auto-disconnect first (acts as reconnect).
         // This handles edge cases: stale state, rapid reconnect, UI race.
-        if matches!(current_state, ConnectionState::Connected | ConnectionState::Connecting) {
-            tracing::info!("Already {:?} — tearing down old tunnel before reconnecting", current_state);
-            let _ = self.write_state_with_timeout(ConnectionState::Disconnecting).await;
-            
+        if matches!(
+            current_state,
+            ConnectionState::Connected | ConnectionState::Connecting
+        ) {
+            tracing::info!(
+                "Already {:?} — tearing down old tunnel before reconnecting",
+                current_state
+            );
+            let _ = self
+                .write_state_with_timeout(ConnectionState::Disconnecting)
+                .await;
+
             match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
                 Ok(mut guard) => {
                     if let Some(tunnel) = guard.take() {
-                        if let Err(e) = timeout(Duration::from_secs(10), tunnel.stop()).await
+                        if let Err(e) = timeout(Duration::from_secs(10), tunnel.stop())
+                            .await
                             .unwrap_or(Err("Tunnel stop timed out".into()))
                         {
                             tracing::warn!("Old tunnel teardown error (continuing): {}", e);
@@ -327,9 +365,11 @@ impl VpnManager {
                 }
                 Err(_) => {
                     tracing::error!("Tunnel lock timeout during auto-disconnect — cannot safely create new tunnel");
-                    let _ = self.write_state_with_timeout(ConnectionState::Error(
-                        "Tunnel lock timeout".into()
-                    )).await;
+                    let _ = self
+                        .write_state_with_timeout(ConnectionState::Error(
+                            "Tunnel lock timeout".into(),
+                        ))
+                        .await;
                     return Err("Tunnel lock timeout during teardown — please try again".into());
                 }
             }
@@ -343,38 +383,49 @@ impl VpnManager {
         }
 
         // Set connecting state with timeout
-        self.write_state_with_timeout(ConnectionState::Connecting).await
+        self.write_state_with_timeout(ConnectionState::Connecting)
+            .await
             .map_err(|e| format!("Failed to set connecting state: {}", e))?;
         tracing::info!("Set state to Connecting");
 
         tracing::info!("Creating VPN tunnel for: {}", server_name);
-        tracing::debug!("Tunnel config: endpoint={}, client_ip={}", config.endpoint, config.client_ip);
+        tracing::debug!(
+            "Tunnel config: endpoint={}, client_ip={}",
+            config.endpoint,
+            config.client_ip
+        );
 
         // CONNECT-FIX: Wrap the entire tunnel creation + start in a timeout.
         // If tunnel creation or start hangs (e.g. netsh deadlocks on Windows
         // UAC prompt, or antivirus blocks wintun.dll), we fail fast instead of
         // leaving the state stuck at Connecting forever.
         let tunnel_result = timeout(CONNECT_TIMEOUT, async {
-            let tunnel = PlatformTunnel::create(&config, local_network_sharing).await
+            let tunnel = PlatformTunnel::create(&config, local_network_sharing)
+                .await
                 .map_err(|e| format!("Failed to create tunnel: {}", e))?;
-            tunnel.start().await
+            tunnel
+                .start()
+                .await
                 .map_err(|e| format!("Failed to start tunnel: {}", e))?;
             Ok::<PlatformTunnel, String>(tunnel)
-        }).await;
+        })
+        .await;
 
         match tunnel_result {
             Ok(Ok(tunnel)) => {
                 tracing::info!("Tunnel started successfully");
 
                 // Update state with timeout protection
-                let _ = self.write_state_with_timeout(ConnectionState::Connected).await;
-                
+                let _ = self
+                    .write_state_with_timeout(ConnectionState::Connected)
+                    .await;
+
                 // Update tunnel reference with timeout
                 match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
                     Ok(mut guard) => *guard = Some(tunnel),
                     Err(_) => tracing::error!("Tunnel write lock timeout"),
                 }
-                
+
                 match timeout(STATE_LOCK_TIMEOUT, self.current_config.write()).await {
                     Ok(mut guard) => {
                         // FIX-R3: Store config for reconnect metadata but scrub key material.
@@ -406,13 +457,20 @@ impl VpnManager {
             Ok(Err(e)) => {
                 tracing::error!("Tunnel creation/start failed: {}", e);
                 let err = VpnError::General(e);
-                let _ = self.write_state_with_timeout(ConnectionState::Error(err.to_string())).await;
+                let _ = self
+                    .write_state_with_timeout(ConnectionState::Error(err.to_string()))
+                    .await;
                 Err(err.to_string())
             }
             Err(_) => {
-                let err = VpnError::General(format!("Connection timed out after {}s", CONNECT_TIMEOUT.as_secs()));
+                let err = VpnError::General(format!(
+                    "Connection timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                ));
                 tracing::error!("{}", err);
-                let _ = self.write_state_with_timeout(ConnectionState::Error(err.to_string())).await;
+                let _ = self
+                    .write_state_with_timeout(ConnectionState::Error(err.to_string()))
+                    .await;
                 Err(err.to_string())
             }
         }
@@ -424,19 +482,25 @@ impl VpnManager {
     /// A stuck Disconnecting state is worse than a dirty Disconnected state.
     pub async fn disconnect(&self) -> Result<(), String> {
         // SM-002: Acquire operation lock first
-        let _operation_guard = self.acquire_operation_lock().await
+        let _operation_guard = self
+            .acquire_operation_lock()
+            .await
             .map_err(|e| format!("Failed to acquire operation lock: {}", e))?;
-        
+
         // Check current state with timeout
-        let current_state = self.read_state_with_timeout().await
+        let current_state = self
+            .read_state_with_timeout()
+            .await
             .map_err(|e| format!("Failed to read state: {}", e))?;
-        
+
         if !current_state.can_disconnect() {
             tracing::debug!("Already disconnected or disconnecting");
             return Ok(());
         }
 
-        let _ = self.write_state_with_timeout(ConnectionState::Disconnecting).await;
+        let _ = self
+            .write_state_with_timeout(ConnectionState::Disconnecting)
+            .await;
 
         tracing::info!("Disconnecting from VPN");
 
@@ -469,8 +533,10 @@ impl VpnManager {
 
         // STATE-FIX: ALWAYS transition to Disconnected, even on error.
         // A stuck Disconnecting state blocks all future operations.
-        let _ = self.write_state_with_timeout(ConnectionState::Disconnected).await;
-        
+        let _ = self
+            .write_state_with_timeout(ConnectionState::Disconnected)
+            .await;
+
         match timeout(STATE_LOCK_TIMEOUT, self.current_config.write()).await {
             Ok(mut guard) => *guard = None,
             Err(_) => tracing::error!("Config write lock timeout during disconnect"),

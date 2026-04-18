@@ -8,8 +8,8 @@
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
@@ -97,12 +97,15 @@ impl UtunTunnel {
 
         // Snapshot current network config for restoration
         let snapshot = capture_network_snapshot().await?;
-        tracing::info!("Captured network snapshot: service={}", snapshot.service_name);
+        tracing::info!(
+            "Captured network snapshot: service={}",
+            snapshot.service_name
+        );
         *self.network_snapshot.write().await = Some(snapshot);
 
         // Create the utun device
-        let (utun_name, utun_fd) = create_utun_device()
-            .map_err(|e| format!("Failed to create utun device: {}", e))?;
+        let (utun_name, utun_fd) =
+            create_utun_device().map_err(|e| format!("Failed to create utun device: {}", e))?;
         tracing::info!("Created utun device: {}", utun_name);
 
         *self.utun_name.write().await = Some(utun_name.clone());
@@ -121,7 +124,10 @@ impl UtunTunnel {
         tracing::info!("WireGuard session created");
 
         let endpoint_ip = wg_session.endpoint_ip();
-        tracing::info!("WireGuard endpoint IP: {}", redact_ip(&endpoint_ip.to_string()));
+        tracing::info!(
+            "WireGuard endpoint IP: {}",
+            redact_ip(&endpoint_ip.to_string())
+        );
         *self.endpoint_ip.write().await = Some(endpoint_ip.to_string());
 
         // Configure the utun interface IP
@@ -339,11 +345,17 @@ impl UtunTunnel {
                     let fd = utun_fd;
                     let buf = write_buf[..write_len].to_vec();
                     let _ = tokio::task::spawn_blocking(move || {
-                        let written = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+                        let written = unsafe {
+                            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+                        };
                         if written < 0 {
-                            tracing::debug!("utun write error: {}", std::io::Error::last_os_error());
+                            tracing::debug!(
+                                "utun write error: {}",
+                                std::io::Error::last_os_error()
+                            );
                         }
-                    }).await;
+                    })
+                    .await;
 
                     bytes_received.fetch_add(packet_len, Ordering::Relaxed);
                     packets_received.fetch_add(1, Ordering::Relaxed);
@@ -364,12 +376,17 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
     Ipv4Addr::from_str(&config.client_ip)
         .map_err(|_| format!("Invalid client_ip: '{}'", config.client_ip))?;
 
-    let endpoint_host = config.endpoint.split(':').next()
+    let endpoint_host = config
+        .endpoint
+        .split(':')
+        .next()
         .ok_or_else(|| "Invalid endpoint format: missing host".to_string())?;
     if endpoint_host.parse::<Ipv4Addr>().is_err() {
         if endpoint_host.is_empty()
             || endpoint_host.len() > 253
-            || !endpoint_host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            || !endpoint_host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
             || endpoint_host.starts_with('-')
             || endpoint_host.starts_with('.')
         {
@@ -378,8 +395,7 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
     }
 
     for dns in &config.dns {
-        Ipv4Addr::from_str(dns)
-            .map_err(|_| format!("Invalid DNS address: '{}'", dns))?;
+        Ipv4Addr::from_str(dns).map_err(|_| format!("Invalid DNS address: '{}'", dns))?;
     }
 
     for cidr in &config.allowed_ips {
@@ -387,9 +403,9 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
         if parts.len() != 2 {
             return Err(format!("Invalid CIDR format: '{}'", cidr));
         }
-        Ipv4Addr::from_str(parts[0])
-            .map_err(|_| format!("Invalid network in CIDR: '{}'", cidr))?;
-        let prefix: u8 = parts[1].parse()
+        Ipv4Addr::from_str(parts[0]).map_err(|_| format!("Invalid network in CIDR: '{}'", cidr))?;
+        let prefix: u8 = parts[1]
+            .parse()
             .map_err(|_| format!("Invalid prefix in CIDR: '{}'", cidr))?;
         if prefix > 32 {
             return Err(format!("Prefix out of range in CIDR: '{}'", cidr));
@@ -437,9 +453,7 @@ fn create_utun_device() -> Result<(String, i32), String> {
     const CTLIOCGINFO: libc::c_ulong = 0xc0644e03;
 
     // Create AF_SYSTEM socket
-    let fd: RawFd = unsafe {
-        libc::socket(AF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL)
-    };
+    let fd: RawFd = unsafe { libc::socket(AF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
     if fd < 0 {
         return Err(format!(
             "Failed to create AF_SYSTEM socket: errno {}",
@@ -452,12 +466,9 @@ fn create_utun_device() -> Result<(String, i32), String> {
         ctl_id: 0,
         ctl_name: [0u8; 96],
     };
-    ctl_info.ctl_name[..UTUN_CONTROL_NAME.len()]
-        .copy_from_slice(UTUN_CONTROL_NAME);
+    ctl_info.ctl_name[..UTUN_CONTROL_NAME.len()].copy_from_slice(UTUN_CONTROL_NAME);
 
-    let ret = unsafe {
-        libc::ioctl(fd, CTLIOCGINFO, &mut ctl_info as *mut CtlInfo)
-    };
+    let ret = unsafe { libc::ioctl(fd, CTLIOCGINFO, &mut ctl_info as *mut CtlInfo) };
     if ret < 0 {
         unsafe { libc::close(fd) };
         return Err(format!(
@@ -489,7 +500,11 @@ fn create_utun_device() -> Result<(String, i32), String> {
 
         if ret == 0 {
             let utun_name = format!("utun{}", unit);
-            tracing::info!("Successfully created utun device: {} (fd={})", utun_name, fd);
+            tracing::info!(
+                "Successfully created utun device: {} (fd={})",
+                utun_name,
+                fd
+            );
 
             // Set non-blocking mode
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -531,7 +546,11 @@ fn configure_utun_address(utun_name: &str, client_ip: &str, mtu: &u16) -> Result
         .map_err(|e| format!("Failed to set MTU: {}", e))?;
 
     if !output.status.success() {
-        tracing::warn!("Failed to set MTU to {}: {}", mtu, String::from_utf8_lossy(&output.stderr));
+        tracing::warn!(
+            "Failed to set MTU to {}: {}",
+            mtu,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     Ok(())
@@ -573,7 +592,16 @@ async fn configure_routes(
 
         // route -n add -net <network> -netmask <mask> -interface <utun>
         let output = cmd("route")
-            .args(["-n", "add", "-net", network, "-netmask", &mask, "-interface", utun_name])
+            .args([
+                "-n",
+                "add",
+                "-net",
+                network,
+                "-netmask",
+                &mask,
+                "-interface",
+                utun_name,
+            ])
             .output()
             .map_err(|e| format!("Failed to add route for {}: {}", cidr, e))?;
 
@@ -590,7 +618,15 @@ async fn configure_routes(
             let parts: Vec<&str> = cidr.split('/').collect();
             let mask = prefix_to_mask(parts[1].parse().unwrap_or(8));
             let _ = cmd("route")
-                .args(["-n", "add", "-net", parts[0], "-netmask", &mask, &default_gw])
+                .args([
+                    "-n",
+                    "add",
+                    "-net",
+                    parts[0],
+                    "-netmask",
+                    &mask,
+                    &default_gw,
+                ])
                 .output();
         }
         tracing::info!("Added local network sharing routes (RFC1918)");
@@ -707,7 +743,8 @@ fn get_primary_network_service() -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Extract interface from "interface: en0"
-    let iface = stdout.lines()
+    let iface = stdout
+        .lines()
         .find(|l| l.trim().starts_with("interface:"))
         .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().to_string())
@@ -744,7 +781,8 @@ fn get_default_gateway() -> Result<String, String> {
         .map_err(|e| format!("Failed to get default gateway: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines()
+    stdout
+        .lines()
         .find(|l| l.trim().starts_with("gateway:"))
         .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().to_string())
@@ -759,7 +797,8 @@ fn get_default_interface() -> Result<String, String> {
         .map_err(|e| format!("Failed to get default interface: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines()
+    stdout
+        .lines()
         .find(|l| l.trim().starts_with("interface:"))
         .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().to_string())

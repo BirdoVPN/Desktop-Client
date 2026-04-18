@@ -32,7 +32,7 @@ pub async fn check_server_latency(
     timeout_ms: u64,
 ) -> LatencyResult {
     let _addr_str = format!("{}:{}", hostname, port);
-    
+
     // FIX-2-3: Resolve hostname via DNS-over-HTTPS to prevent leaking VPN server
     // hostnames to the ISP's DNS resolver. Falls back gracefully on parse if it's an IP.
     let socket_addr: SocketAddr = match hostname.parse::<std::net::IpAddr>() {
@@ -98,12 +98,7 @@ pub async fn check_multiple_servers(
     let mut handles = Vec::new();
 
     for (server_id, hostname, port) in servers {
-        let handle = tokio::spawn(check_server_latency(
-            server_id,
-            hostname,
-            port,
-            timeout_ms,
-        ));
+        let handle = tokio::spawn(check_server_latency(server_id, hostname, port, timeout_ms));
         handles.push(handle);
     }
 
@@ -115,13 +110,11 @@ pub async fn check_multiple_servers(
     }
 
     // Sort by latency (reachable servers first, then by latency)
-    results.sort_by(|a, b| {
-        match (a.latency_ms, b.latency_ms) {
-            (Some(la), Some(lb)) => la.cmp(&lb),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
+    results.sort_by(|a, b| match (a.latency_ms, b.latency_ms) {
+        (Some(la), Some(lb)) => la.cmp(&lb),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     });
 
     results
@@ -140,12 +133,9 @@ pub async fn find_best_server(
 /// Falls back to TCP if ICMP fails
 /// FIX-2-3: Resolves hostname via DoH, then passes IP to ping to avoid DNS leaks.
 #[cfg(target_os = "windows")]
-pub async fn check_latency_icmp(
-    hostname: &str,
-    timeout_ms: u64,
-) -> Result<u32, String> {
+pub async fn check_latency_icmp(hostname: &str, timeout_ms: u64) -> Result<u32, String> {
     use tokio::process::Command;
-    
+
     // FIX-2-3: Resolve via DoH first, then ping the IP to prevent DNS leaks
     let target = match hostname.parse::<std::net::IpAddr>() {
         Ok(ip) => ip.to_string(),
@@ -154,7 +144,7 @@ pub async fn check_latency_icmp(
             .map(|ip| ip.to_string())
             .map_err(|e| format!("DoH resolution failed for ping target: {}", e))?,
     };
-    
+
     // Use Windows ping command (PB-3.10: non-blocking tokio Command)
     // tokio::process::Command has creation_flags() built-in on Windows
     let mut ping_cmd = Command::new("ping");
@@ -171,7 +161,7 @@ pub async fn check_latency_icmp(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     // Parse the ping output to extract time
     // Example: "Reply from 1.2.3.4: bytes=32 time=15ms TTL=64"
     for line in stdout.lines() {
@@ -203,13 +193,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_latency_cloudflare() {
-        let result = check_server_latency(
-            "test".to_string(),
-            "1.1.1.1".to_string(),
-            443,
-            3000,
-        ).await;
-        
+        let result =
+            check_server_latency("test".to_string(), "1.1.1.1".to_string(), 443, 3000).await;
+
         println!("Latency result: {:?}", result);
         // Cloudflare should generally be reachable
     }

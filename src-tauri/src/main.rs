@@ -5,7 +5,10 @@
 //! Supports Windows, macOS, and Linux.
 
 // FIX-R11: Hide console window in release builds (Windows only)
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 mod api;
 mod commands;
@@ -15,19 +18,19 @@ mod vpn;
 
 use api::BirdoApi;
 use storage::CredentialStore;
-use vpn::{VpnManager, AutoReconnectService};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Listener, Manager, RunEvent, WindowEvent,
 };
-use tracing::{info, error};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use vpn::{AutoReconnectService, VpnManager};
 
 fn main() {
     // Set custom panic hook for crash recovery
     setup_panic_hook();
-    
+
     // Initialize logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -82,7 +85,10 @@ fn main() {
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    error!("Self-elevation failed: {}. Continuing without admin — VPN will not work.", e);
+                    error!(
+                        "Self-elevation failed: {}. Continuing without admin — VPN will not work.",
+                        e
+                    );
                     // Continue anyway so the UI shows the error to the user
                 }
             }
@@ -152,7 +158,7 @@ fn main() {
                 app.manage(auto_reconnect);
                 info!("Auto-reconnect service registered");
             }
-            
+
             // Create system tray menu
             let quit = MenuItem::with_id(app, "quit", "Quit Birdo VPN", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
@@ -163,7 +169,8 @@ fn main() {
             let menu = Menu::with_items(app, &[&connect, &disconnect, &show, &quit])?;
 
             // Build system tray
-            let tray_icon = app.default_window_icon()
+            let tray_icon = app
+                .default_window_icon()
                 .ok_or("default window icon not set in tauri.conf.json")?
                 .clone();
             let _tray = TrayIconBuilder::new()
@@ -221,7 +228,11 @@ fn main() {
             // Listen for deep link events (birdo:// protocol)
             let handle = app.handle().clone();
             app.listen("deep-link://new-url", move |event| {
-                if let Some(urls) = event.payload().strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                if let Some(urls) = event
+                    .payload()
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                {
                     info!("Deep link received: {}", urls);
                     if let Some(window) = handle.get_webview_window("main") {
                         let _ = window.show();
@@ -249,8 +260,8 @@ fn main() {
             commands::auth::logout,
             commands::auth::get_auth_state,
             commands::auth::refresh_token,
-            commands::auth::verify_2fa,  // FIX C-2: 2FA TOTP verification
-            commands::auth::delete_account,  // GDPR account deletion
+            commands::auth::verify_2fa, // FIX C-2: 2FA TOTP verification
+            commands::auth::delete_account, // GDPR account deletion
             commands::auth::export_user_data, // GDPR data export
             // VPN operations
             commands::vpn::connect_vpn,
@@ -309,20 +320,21 @@ fn main() {
 }
 
 /// Set up a custom panic hook for crash recovery
-/// 
+///
 /// This ensures that:
 /// 1. Crashes are logged with full backtraces
 /// 2. The VPN tunnel is properly cleaned up on crash
 /// 3. Kill switch firewall rules are removed
 fn setup_panic_hook() {
     let default_hook = std::panic::take_hook();
-    
+
     std::panic::set_hook(Box::new(move |panic_info| {
         // Log the panic
-        let location = panic_info.location()
+        let location = panic_info
+            .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".to_string());
-        
+
         let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
             s.to_string()
         } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
@@ -335,17 +347,17 @@ fn setup_panic_hook() {
         // Panic messages propagated from error chains can contain raw IP addresses,
         // emails, or hostnames. Apply the same PII redaction used for API errors.
         let message = crate::utils::redact::sanitize_error(&message);
-        
+
         error!("PANIC at {}: {}", location, message);
         error!("Backtrace:\n{:?}", std::backtrace::Backtrace::capture());
-        
+
         // Clean up VPN and kill switch on crash
         // Use std::process::Command to ensure cleanup even if async runtime is broken
         cleanup_on_crash();
-        
+
         // Write crash report to file for later analysis
         write_crash_report(&location, &message);
-        
+
         // Call the default hook (will abort the process)
         default_hook(panic_info);
     }));
@@ -377,7 +389,13 @@ fn cleanup_on_crash() {
         ];
         for rule in rules {
             let _ = crate::utils::hidden_cmd("netsh")
-                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={}", rule)])
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "delete",
+                    "rule",
+                    &format!("name={}", rule),
+                ])
                 .output();
         }
         // WFP engine handle will be closed automatically when the process exits,
@@ -420,17 +438,17 @@ fn cleanup_on_crash() {
 /// Write crash report to a file for later analysis
 fn write_crash_report(location: &str, message: &str) {
     use std::io::Write;
-    
+
     let crash_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("Birdo VPN")
         .join("crashes");
-    
+
     let _ = std::fs::create_dir_all(&crash_dir);
-    
+
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
-    
+
     if let Ok(mut file) = std::fs::File::create(&crash_file) {
         let _ = writeln!(file, "Birdo VPN Crash Report");
         let _ = writeln!(file, "=====================");
@@ -440,7 +458,7 @@ fn write_crash_report(location: &str, message: &str) {
         let _ = writeln!(file, "");
         let _ = writeln!(file, "Backtrace:");
         let _ = writeln!(file, "{:?}", std::backtrace::Backtrace::capture());
-        
+
         error!("Crash report written to {:?}", crash_file);
     }
 }
@@ -451,8 +469,8 @@ fn write_crash_report(location: &str, message: &str) {
 fn self_elevate() -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current exe path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))?;
 
     // Collect command-line args (skip argv[0] which is the exe itself)
     let args: Vec<String> = std::env::args().skip(1).collect();

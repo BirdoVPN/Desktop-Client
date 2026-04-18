@@ -28,10 +28,10 @@ use tokio::sync::RwLock;
 
 use crate::utils::elevation::is_elevated as is_admin;
 
+use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
-use windows::core::GUID;
 
 // ── Stable GUIDs ─────────────────────────────────────────────────────
 // Constant across process restarts so `initialize()` can clean up stale
@@ -130,8 +130,7 @@ impl WfpEngine {
 
         let mut session = FWPM_SESSION0::default();
         session.flags = FWPM_SESSION_FLAG_DYNAMIC;
-        session.displayData.name =
-            windows::core::PWSTR(session_name.as_ptr() as *mut u16);
+        session.displayData.name = windows::core::PWSTR(session_name.as_ptr() as *mut u16);
 
         let mut handle = HANDLE::default();
         // SAFETY: All pointers (`session_name`, `session`) are valid, stack-allocated, and
@@ -141,9 +140,9 @@ impl WfpEngine {
             FwpmEngineOpen0(
                 windows::core::PCWSTR::null(), // local engine
                 RPC_C_AUTHN_WINNT,
-                None,              // default auth identity
-                Some(&session),    // session config
-                &mut handle,       // output handle
+                None,           // default auth identity
+                Some(&session), // session config
+                &mut handle,    // output handle
             )
         };
         if err != 0 {
@@ -215,10 +214,8 @@ impl WfpEngine {
 
         let mut sublayer = FWPM_SUBLAYER0::default();
         sublayer.subLayerKey = BIRDO_SUBLAYER_KEY;
-        sublayer.displayData.name =
-            windows::core::PWSTR(name.as_ptr() as *mut u16);
-        sublayer.displayData.description =
-            windows::core::PWSTR(desc.as_ptr() as *mut u16);
+        sublayer.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
+        sublayer.displayData.description = windows::core::PWSTR(desc.as_ptr() as *mut u16);
         sublayer.weight = 0xFFFF; // highest priority sublayer
 
         // SAFETY: `self.handle` is a valid WFP engine handle.  `sublayer` is a
@@ -244,9 +241,7 @@ impl WfpEngine {
         if self.sublayer_added {
             // SAFETY: `self.handle` is a valid WFP engine handle.
             // `BIRDO_SUBLAYER_KEY` is a static GUID with 'static lifetime.
-            let err = unsafe {
-                FwpmSubLayerDeleteByKey0(self.handle, &BIRDO_SUBLAYER_KEY)
-            };
+            let err = unsafe { FwpmSubLayerDeleteByKey0(self.handle, &BIRDO_SUBLAYER_KEY) };
             // 0x80320013 = FWP_E_SUBLAYER_NOT_FOUND — benign
             if err != 0 && err != 0x80320013 {
                 tracing::warn!("FwpmSubLayerDeleteByKey0 failed: 0x{:08X}", err);
@@ -398,16 +393,14 @@ impl WfpEngine {
 
         let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
         let err = unsafe {
-            FwpmGetAppIdFromFileName0(
-                windows::core::PCWSTR(wide_path.as_ptr()),
-                &mut app_id,
-            )
+            FwpmGetAppIdFromFileName0(windows::core::PCWSTR(wide_path.as_ptr()), &mut app_id)
         };
         if err != 0 {
             return Ok(0); // Non-fatal: skip (already warned at V4 level)
         }
 
-        let label = format!("Birdo: Permit split-tunnel app v6 ({})",
+        let label = format!(
+            "Birdo: Permit split-tunnel app v6 ({})",
             std::path::Path::new(exe_path)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -437,7 +430,11 @@ impl WfpEngine {
         }
 
         result.map(|id| {
-            tracing::debug!("Split tunnel permit v6 added for: {} (filter_id={})", exe_path, id);
+            tracing::debug!(
+                "Split tunnel permit v6 added for: {} (filter_id={})",
+                exe_path,
+                id
+            );
             id
         })
     }
@@ -647,9 +644,21 @@ impl WfpEngine {
     /// while the kill switch is active.
     fn add_permit_local_networks(&mut self) -> Result<(), String> {
         let ranges: [(&str, Ipv4Addr, Ipv4Addr); 3] = [
-            ("Birdo: Permit LAN 10.0.0.0/8", Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(255, 0, 0, 0)),
-            ("Birdo: Permit LAN 172.16.0.0/12", Ipv4Addr::new(172, 16, 0, 0), Ipv4Addr::new(255, 240, 0, 0)),
-            ("Birdo: Permit LAN 192.168.0.0/16", Ipv4Addr::new(192, 168, 0, 0), Ipv4Addr::new(255, 255, 0, 0)),
+            (
+                "Birdo: Permit LAN 10.0.0.0/8",
+                Ipv4Addr::new(10, 0, 0, 0),
+                Ipv4Addr::new(255, 0, 0, 0),
+            ),
+            (
+                "Birdo: Permit LAN 172.16.0.0/12",
+                Ipv4Addr::new(172, 16, 0, 0),
+                Ipv4Addr::new(255, 240, 0, 0),
+            ),
+            (
+                "Birdo: Permit LAN 192.168.0.0/16",
+                Ipv4Addr::new(192, 168, 0, 0),
+                Ipv4Addr::new(255, 255, 0, 0),
+            ),
         ];
 
         for (label, network, mask) in &ranges {
@@ -717,20 +726,19 @@ impl WfpEngine {
         // `app_id` is an out-param that receives a pointer to an OS-allocated blob.
         // We free it with `FwpmFreeMemory0` after building the filter.
         let err = unsafe {
-            FwpmGetAppIdFromFileName0(
-                windows::core::PCWSTR(wide_path.as_ptr()),
-                &mut app_id,
-            )
+            FwpmGetAppIdFromFileName0(windows::core::PCWSTR(wide_path.as_ptr()), &mut app_id)
         };
         if err != 0 {
             tracing::warn!(
                 "FwpmGetAppIdFromFileName0 failed for '{}': 0x{:08X} — skipping",
-                exe_path, err
+                exe_path,
+                err
             );
             return Ok(0); // Non-fatal: skip this app rather than fail the whole transaction
         }
 
-        let label = format!("Birdo: Permit split-tunnel app ({})",
+        let label = format!(
+            "Birdo: Permit split-tunnel app ({})",
             std::path::Path::new(exe_path)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -764,7 +772,11 @@ impl WfpEngine {
         }
 
         result.map(|id| {
-            tracing::debug!("Split tunnel permit added for: {} (filter_id={})", exe_path, id);
+            tracing::debug!(
+                "Split tunnel permit added for: {} (filter_id={})",
+                exe_path,
+                id
+            );
             id
         })
     }
@@ -782,8 +794,7 @@ impl WfpEngine {
         weight: u8,
     ) -> FWPM_FILTER0 {
         let mut filter = FWPM_FILTER0::default();
-        filter.displayData.name =
-            windows::core::PWSTR(name.as_ptr() as *mut u16);
+        filter.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
         filter.flags = FWPM_FILTER_FLAG_NONE;
         filter.layerKey = layer;
         filter.subLayerKey = BIRDO_SUBLAYER_KEY;
@@ -904,7 +915,9 @@ pub async fn activate_blocking() -> Result<(), String> {
                         if v6_id != 0 {
                             ids.push(v6_id);
                         }
-                        engine.split_tunnel_map.insert(v4_id, (app_path.clone(), ids));
+                        engine
+                            .split_tunnel_map
+                            .insert(v4_id, (app_path.clone(), ids));
                     }
                 }
             }
@@ -1071,7 +1084,10 @@ pub async fn add_split_tunnel_permit(app_path: String) -> Result<u64, String> {
 
     // If kill switch is not active, just queue — filters will be added on next activate
     if !IS_BLOCKING.load(Ordering::SeqCst) {
-        tracing::info!("Split tunnel: queued '{}' (kill switch not active)", resolved);
+        tracing::info!(
+            "Split tunnel: queued '{}' (kill switch not active)",
+            resolved
+        );
         return Ok(0);
     }
 
@@ -1095,8 +1111,14 @@ pub async fn add_split_tunnel_permit(app_path: String) -> Result<u64, String> {
         ids.push(v6_id);
     }
 
-    engine.split_tunnel_map.insert(v4_id, (resolved.clone(), ids));
-    tracing::info!("Split tunnel permit added for '{}' (permit_id={})", resolved, v4_id);
+    engine
+        .split_tunnel_map
+        .insert(v4_id, (resolved.clone(), ids));
+    tracing::info!(
+        "Split tunnel permit added for '{}' (permit_id={})",
+        resolved,
+        v4_id
+    );
 
     Ok(v4_id)
 }
@@ -1204,10 +1226,7 @@ fn resolve_app_path(name: &str) -> Option<String> {
     }
 
     // Try to resolve using `where.exe` (searches PATH, App Paths registry, etc.)
-    if let Ok(output) = crate::utils::hidden_cmd("where.exe")
-        .arg(name)
-        .output()
-    {
+    if let Ok(output) = crate::utils::hidden_cmd("where.exe").arg(name).output() {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if let Some(first_line) = stdout.lines().next() {
@@ -1221,14 +1240,18 @@ fn resolve_app_path(name: &str) -> Option<String> {
     }
 
     // Search common install locations
-    let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
-    let program_files_x86 = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+    let program_files_x86 = std::env::var("ProgramFiles(x86)")
+        .unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
     let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
 
     let search_roots = [&program_files, &program_files_x86, &local_app_data];
 
     for root in &search_roots {
-        if root.is_empty() { continue; }
+        if root.is_empty() {
+            continue;
+        }
         // Quick top-level search (one level deep)
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {

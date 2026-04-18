@@ -13,8 +13,8 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 
 // FIX-1-1: Client-side keygen for auto-reconnect
-use boringtun::x25519::{PublicKey, StaticSecret};
 use base64::Engine as _;
+use boringtun::x25519::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use super::manager::{ConnectionState, VpnManager};
@@ -54,9 +54,9 @@ impl Default for AutoReconnectConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            initial_delay_ms: 1000,      // 1 second
-            max_delay_ms: 60000,         // 1 minute max
-            max_attempts: 10,            // Give up after 10 tries
+            initial_delay_ms: 1000, // 1 second
+            max_delay_ms: 60000,    // 1 minute max
+            max_attempts: 10,       // Give up after 10 tries
             backoff_multiplier: 2.0,
             health_check_interval_ms: 5000, // Check every 5 seconds
         }
@@ -67,23 +67,23 @@ impl Default for AutoReconnectConfig {
 pub struct AutoReconnectService {
     config: Arc<RwLock<AutoReconnectConfig>>,
     vpn_manager: Arc<VpnManager>,
-    
+
     /// H-5 FIX: Store only server_id + server_name for reconnection.
     /// Fresh keys are fetched from the API on each reconnect attempt.
     last_reconnect_info: Arc<RwLock<Option<ReconnectInfo>>>,
-    
+
     /// API client for fetching fresh VPN configs on reconnect
     api: Arc<BirdoApi>,
-    
+
     /// Current reconnect attempt count
     attempt_count: Arc<AtomicU32>,
-    
+
     /// Whether we're currently in reconnect mode
     is_reconnecting: Arc<AtomicBool>,
-    
+
     /// Channel to stop the health check loop
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
-    
+
     /// Whether the service is running
     running: Arc<AtomicBool>,
 
@@ -115,7 +115,10 @@ impl AutoReconnectService {
     /// Enable or disable auto-reconnect
     pub async fn set_enabled(&self, enabled: bool) {
         self.config.write().await.enabled = enabled;
-        tracing::info!("Auto-reconnect {}", if enabled { "enabled" } else { "disabled" });
+        tracing::info!(
+            "Auto-reconnect {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
     }
 
     /// Check if auto-reconnect is enabled
@@ -126,7 +129,14 @@ impl AutoReconnectService {
     /// H-5 FIX: Store only the reconnect metadata (server_id + name).
     /// The full VpnConfig with key material is NOT stored because keys are
     /// zeroized after WireGuard session creation. Reconnect fetches fresh keys.
-    pub async fn store_last_config(&self, server_id: String, server_name: String, local_network_sharing: bool, custom_mtu: u16, custom_port: String) {
+    pub async fn store_last_config(
+        &self,
+        server_id: String,
+        server_name: String,
+        local_network_sharing: bool,
+        custom_mtu: u16,
+        custom_port: String,
+    ) {
         let server_name_log = server_name.clone();
         *self.last_reconnect_info.write().await = Some(ReconnectInfo {
             server_id,
@@ -190,7 +200,8 @@ impl AutoReconnectService {
                 running,
                 user_disconnected,
                 shutdown_rx,
-            ).await;
+            )
+            .await;
         });
 
         tracing::info!("Auto-reconnect service started");
@@ -257,7 +268,7 @@ impl AutoReconnectService {
                                 tracing::info!("Reconnection successful");
                                 is_reconnecting.store(false, Ordering::SeqCst);
                                 attempt_count.store(0, Ordering::SeqCst);
-                                
+
                                 // Deactivate kill switch now that we're connected
                                 let _ = killswitch::deactivate_killswitch().await;
                             }
@@ -328,15 +339,15 @@ impl AutoReconnectService {
                         ConnectionState::Disconnected => {
                             // Clone reconnect info atomically to prevent TOCTOU race condition
                             let info_snapshot = last_reconnect_info.read().await.clone();
-                            
+
                             // Check if we should auto-reconnect
                             if cfg.enabled && info_snapshot.is_some() {
                                 let attempts = attempt_count.load(Ordering::SeqCst);
-                                
+
                                 if cfg.max_attempts == 0 || attempts < cfg.max_attempts {
                                     // Trigger reconnect
                                     is_reconnecting.store(true, Ordering::SeqCst);
-                                    
+
                                     // SECURITY FIX (PB-4): Handle kill switch activation failure.
                                     match killswitch::activate_killswitch().await {
                                         Ok(_) => {
@@ -352,7 +363,7 @@ impl AutoReconnectService {
                                             continue;
                                         }
                                     }
-                                    
+
                                     // Calculate delay with exponential backoff
                                     let delay = Self::calculate_backoff(
                                         attempts,
@@ -360,7 +371,7 @@ impl AutoReconnectService {
                                         cfg.max_delay_ms,
                                         cfg.backoff_multiplier,
                                     );
-                                    
+
                                     tracing::info!(
                                         "Auto-reconnect attempt {} (delay: {}ms)",
                                         attempts + 1,
@@ -373,7 +384,7 @@ impl AutoReconnectService {
                                     ).await;
 
                                     tokio::time::sleep(Duration::from_millis(delay)).await;
-                                    
+
                                     // H-5 FIX: Fetch fresh VPN config from API instead of reusing
                                     // zeroized key material. The stored ReconnectInfo only has
                                     // server_id + server_name — keys are fetched fresh each time.
@@ -389,7 +400,7 @@ impl AutoReconnectService {
                                         { let _ = std::process::Command::new("dscacheutil").args(["-flushcache"]).output(); }
                                         #[cfg(target_os = "linux")]
                                         { let _ = std::process::Command::new("resolvectl").args(["flush-caches"]).output(); }
-                                        
+
                                         let device_name = hostname::get()
                                             .map(|h| h.to_string_lossy().to_string())
                                             .unwrap_or_else(|_| "Windows PC".to_string());
@@ -403,7 +414,7 @@ impl AutoReconnectService {
                                         let mut local_private_key = base64::engine::general_purpose::STANDARD.encode(&private_key_bytes);
                                         let client_public_key = base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
                                         private_key_bytes.zeroize();
-                                        
+
                                         match api.connect_vpn(&info.server_id, &device_name, Some(client_public_key), None, None).await {
                                             Ok(response) => {
                                                 // Re-check user disconnect flag before committing
@@ -454,16 +465,16 @@ impl AutoReconnectService {
                         ConnectionState::Error(ref error_msg) => {
                             // STATE-001: Error state should trigger recovery
                             let info_snapshot = last_reconnect_info.read().await.clone();
-                            
+
                             if cfg.enabled && info_snapshot.is_some() {
                                 let attempts = attempt_count.load(Ordering::SeqCst);
-                                
+
                                 tracing::warn!(
                                     "Connection error detected: {}, attempting recovery (attempt {})",
                                     error_msg,
                                     attempts + 1
                                 );
-                                
+
                                 if cfg.max_attempts == 0 || attempts < cfg.max_attempts {
                                     // SECURITY FIX (PB-4): Handle kill switch activation failure.
                                     // If kill switch fails during error recovery, abort to prevent leak.
@@ -481,10 +492,10 @@ impl AutoReconnectService {
                                             continue;
                                         }
                                     }
-                                    
+
                                     // Clean disconnect to reset state machine to Disconnected
                                     let _ = vpn_manager.disconnect().await;
-                                    
+
                                     // The next loop iteration will see Disconnected state
                                     // and trigger the normal reconnect logic
                                     is_reconnecting.store(true, Ordering::SeqCst);

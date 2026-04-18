@@ -9,8 +9,12 @@ export function countryCodeToFlag(countryCode: string): string {
   const upper = countryCode.toUpperCase();
   if (!/^[A-Z]{2}$/.test(upper)) return '🌐';
 
-  const first = upper.codePointAt(0)! - 0x41 + 0x1f1e6;
-  const second = upper.codePointAt(1)! - 0x41 + 0x1f1e6;
+  // Regex above guarantees two ASCII letters, so codePointAt returns numbers,
+  // but satisfy the compiler without non-null assertions.
+  const cp0 = upper.codePointAt(0) ?? 0x41;
+  const cp1 = upper.codePointAt(1) ?? 0x41;
+  const first = cp0 - 0x41 + 0x1f1e6;
+  const second = cp1 - 0x41 + 0x1f1e6;
 
   return String.fromCodePoint(first) + String.fromCodePoint(second);
 }

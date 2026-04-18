@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned for reproducible builds across all CI runners (Windows MSVC, macOS, Linux)
+# and local dev. Bumping this requires a deliberate review of the boringtun and
+# tauri compatibility matrix and triggers a fresh `cargo audit` pass.
+channel = "1.83.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

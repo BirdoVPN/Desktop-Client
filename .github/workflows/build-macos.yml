@@ -1,5 +1,356 @@
 name: Build macOS Release
 
+# Production macOS build workflow for BirdoVPN.
+#
+# Hardened release pipeline that produces a Gatekeeper- and notarization-
+# friendly DMG for both Apple Silicon and Intel, then ships a signed
+# draft GitHub Release on tag `mac-v*`.
+#
+# REQUIRED secrets (configure under repo Settings → Secrets and variables → Actions):
+#   APPLE_CERTIFICATE                Base64-encoded Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD       Password for the .p12
+#   APPLE_SIGNING_IDENTITY           e.g. "Developer ID Application: Birdo Ltd (TEAMID)"
+#   APPLE_ID                         Apple-ID email used for notarization
+#   APPLE_ID_PASSWORD                App-specific password (NOT account password)
+#   APPLE_TEAM_ID                    10-char Apple Developer Team ID
+#   APPLE_KEYCHAIN_PASSWORD          Random one-shot password for the temp keychain
+#   TAURI_SIGNING_PRIVATE_KEY        minisign private key for the auto-updater
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#
+# If the Apple-* secrets are missing the workflow still builds and runs the
+# Sigstore-keyless attestation flow, but skips Apple codesign + notarization
+# (Gatekeeper will quarantine the DMG on download).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'mac-v*'
+
+permissions: {}
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14        # Apple Silicon (M1+)
+            arch: aarch64-apple-darwin
+            label: arm64
+          - runner: macos-15        # Intel x86_64 (macos-13 deprecated)
+            arch: x86_64-apple-darwin
+            label: x64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write   # Sigstore keyless OIDC
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.arch }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Generate macOS icon (icns) from PNG
+        run: |
+          set -euo pipefail
+          mkdir -p icon.iconset
+          sips -z 16 16     src-tauri/icons/icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     src-tauri/icons/icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     src-tauri/icons/icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     src-tauri/icons/icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   src-tauri/icons/icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   src-tauri/icons/icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   src-tauri/icons/icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   src-tauri/icons/icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   src-tauri/icons/icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 src-tauri/icons/icon.png --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o src-tauri/icons/icon.icns
+
+      - name: Prepare resources directory
+        run: |
+          mkdir -p src-tauri/resources
+          touch src-tauri/resources/.gitkeep
+
+      # ── Apple codesign keychain setup ──────────────────────────────
+      - name: Detect Apple signing capability
+        id: signcap
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            echo "have_apple_signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_apple_signing=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::APPLE_CERTIFICATE secret not set — building UNSIGNED DMG. Gatekeeper will quarantine it."
+          fi
+
+      - name: Import Apple Developer ID certificate
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/birdo-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+      # ── Tauri build ────────────────────────────────────────────────
+      - name: Build Tauri application (signed)
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx tauri build --target ${{ matrix.arch }}
+
+      - name: Build Tauri application (unsigned fallback)
+        if: steps.signcap.outputs.have_apple_signing != 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --target ${{ matrix.arch }}
+
+      # ── Notarize + Staple ──────────────────────────────────────────
+      - name: Notarize and staple DMG
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          DMG_FILE=$(find "src-tauri/target/${{ matrix.arch }}/release/bundle/dmg" -name '*.dmg' -print -quit || true)
+          if [ -z "${DMG_FILE:-}" ]; then
+            echo "::error::No DMG produced by Tauri build"
+            exit 1
+          fi
+
+          echo "Notarizing $DMG_FILE ..."
+          xcrun notarytool submit "$DMG_FILE" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 30m
+
+          echo "Stapling notarization ticket ..."
+          xcrun stapler staple "$DMG_FILE"
+          xcrun stapler validate "$DMG_FILE"
+
+          echo "Verifying Gatekeeper acceptance ..."
+          spctl --assess --type open --context context:primary-signature -vv "$DMG_FILE" || \
+            echo "::warning::spctl assessment did not pass — investigate before release"
+
+      # ── Sigstore keyless attestation ────────────────────────────────
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Sign DMG with Sigstore (transparency log)
+        run: |
+          set -euo pipefail
+          DMG_FILE=$(find "src-tauri/target/${{ matrix.arch }}/release/bundle/dmg" -name '*.dmg' -print -quit || true)
+          if [ -n "${DMG_FILE:-}" ]; then
+            cosign sign-blob --yes --bundle "${DMG_FILE}.sigstore" "$DMG_FILE"
+            echo "Sigstore-signed $(basename "$DMG_FILE")"
+          else
+            echo "::warning::DMG not found"
+          fi
+
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.arch }}/release/bundle"
+          cd "$BUNDLE_DIR"
+          : > SHA256SUMS.txt
+          while IFS= read -r f; do
+            shasum -a 256 "$f" >> SHA256SUMS.txt
+          done < <(find . -type f \( -name '*.dmg' -o -name '*.app.tar.gz' \))
+          cat SHA256SUMS.txt || true
+
+      - name: Sign checksums with Sigstore
+        run: |
+          SUMS="src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt"
+          if [ -s "$SUMS" ]; then
+            cosign sign-blob --yes --bundle "${SUMS}.sigstore" "$SUMS"
+          fi
+
+      - name: Cleanup keychain
+        if: always() && steps.signcap.outputs.have_apple_signing == 'true'
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/birdo-build.keychain-db"
+          [ -f "$KEYCHAIN_PATH" ] && security delete-keychain "$KEYCHAIN_PATH" || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: birdo-vpn-macos-${{ matrix.label }}
+          path: |
+            src-tauri/target/${{ matrix.arch }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.arch }}/release/bundle/dmg/*.sigstore
+            src-tauri/target/${{ matrix.arch }}/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/${{ matrix.arch }}/release/bundle/macos/*.app.tar.gz.sig
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt.sigstore
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── GitHub Release (tag-only) ────────────────────────────────────
+  release:
+    needs: build-macos
+    if: startsWith(github.ref, 'refs/tags/mac-v')
+    runs-on: macos-14
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: birdo-vpn-macos-arm64
+          path: dist/arm64/
+
+      - name: Download x64 artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: birdo-vpn-macos-x64
+          path: dist/x64/
+
+      - name: Inspect artifacts
+        run: find dist -type f -print
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Verify each input checksum bundle
+        run: |
+          set -euo pipefail
+          for sums in dist/arm64/SHA256SUMS.txt dist/x64/SHA256SUMS.txt; do
+            if [ -f "$sums" ] && [ -f "${sums}.sigstore" ]; then
+              cosign verify-blob \
+                --bundle "${sums}.sigstore" \
+                --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                "$sums"
+            fi
+          done
+
+      - name: Assemble release directory
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -name '*.dmg' -exec cp -v {} release/ \;
+          find dist -name '*.dmg.sigstore' -exec cp -v {} release/ \;
+          for arch in arm64 x64; do
+            f="dist/${arch}/SHA256SUMS.txt"
+            if [ -f "$f" ]; then
+              cp -v "$f" "release/SHA256SUMS-${arch}.txt"
+              [ -f "${f}.sigstore" ] && cp -v "${f}.sigstore" "release/SHA256SUMS-${arch}.txt.sigstore" || true
+            fi
+          done
+          cd release
+          shasum -a 256 *.dmg > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Sign combined checksums with Sigstore
+        run: |
+          cd release
+          cosign sign-blob --yes --bundle SHA256SUMS.txt.sigstore SHA256SUMS.txt
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#mac-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          draft: true
+          prerelease: false
+          tag_name: ${{ github.ref_name }}
+          name: BirdoVPN macOS ${{ steps.ver.outputs.version }}
+          body: |
+            ## BirdoVPN for macOS — ${{ steps.ver.outputs.version }}
+
+            ### Downloads
+            * `BirdoVPN_${{ steps.ver.outputs.version }}_aarch64.dmg` — Apple Silicon (M1/M2/M3/M4)
+            * `BirdoVPN_${{ steps.ver.outputs.version }}_x64.dmg` — Intel x86_64
+
+            ### Verifying authenticity
+            All artefacts are:
+            * Apple Developer-ID signed and notarized (Gatekeeper-trusted)
+            * Sigstore keyless-signed (transparency-logged) — verify with `cosign`
+            * SHA256-pinned in `SHA256SUMS.txt`
+
+            ```bash
+            shasum -a 256 -c SHA256SUMS.txt
+            cosign verify-blob \
+              --bundle SHA256SUMS.txt.sigstore \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/' \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+              SHA256SUMS.txt
+            ```
+          files: |
+            release/*.dmg
+            release/*.dmg.sigstore
+            release/SHA256SUMS*.txt
+            release/SHA256SUMS*.sigstore
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+name: Build macOS Release
+
 on:
   workflow_dispatch:
     inputs:

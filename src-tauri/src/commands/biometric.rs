@@ -6,7 +6,7 @@
 //! Provides biometric lock functionality matching Android's BiometricPrompt.
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BiometricStatus {

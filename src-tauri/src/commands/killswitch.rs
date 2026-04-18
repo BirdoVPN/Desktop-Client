@@ -14,11 +14,11 @@ use std::sync::Arc;
 use tauri::State;
 use tokio::sync::RwLock;
 
-#[cfg(target_os = "windows")]
-use crate::vpn::wfp;
+use crate::utils::elevation::is_elevated;
 #[cfg(target_os = "linux")]
 use crate::vpn::firewall_linux;
-use crate::utils::elevation::is_elevated;
+#[cfg(target_os = "windows")]
+use crate::vpn::wfp;
 
 use crate::vpn::manager::VpnManager;
 
@@ -211,7 +211,7 @@ pub async fn deactivate_killswitch() -> Result<bool, String> {
 #[tauri::command]
 pub async fn get_killswitch_status() -> Result<KillSwitchStatus, String> {
     let enabled = is_enabled();
-    
+
     #[cfg(target_os = "windows")]
     let active = wfp::is_blocking();
     #[cfg(target_os = "macos")]
@@ -285,11 +285,13 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
         .map_err(|e| format!("pfctl spawn failed: {}", e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(rules.as_bytes())
+        stdin
+            .write_all(rules.as_bytes())
             .map_err(|e| format!("Failed to write pf rules to stdin: {}", e))?;
     }
 
-    let output = child.wait_with_output()
+    let output = child
+        .wait_with_output()
         .map_err(|e| format!("pfctl wait failed: {}", e))?;
 
     if !output.status.success() {
@@ -298,9 +300,7 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
     }
 
     // Enable pf if not already enabled
-    let _ = crate::utils::hidden_cmd("pfctl")
-        .args(["-e"])
-        .output();
+    let _ = crate::utils::hidden_cmd("pfctl").args(["-e"]).output();
 
     PF_BLOCKING.store(true, Ordering::SeqCst);
     tracing::info!("macOS pf kill switch activated");

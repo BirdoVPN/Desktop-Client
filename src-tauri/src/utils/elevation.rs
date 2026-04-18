@@ -24,11 +24,11 @@
 pub fn is_elevated() -> bool {
     #[cfg(target_os = "windows")]
     {
+        use windows::Win32::Foundation::HANDLE;
         use windows::Win32::Security::{
             GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
         };
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        use windows::Win32::Foundation::HANDLE;
 
         // SAFETY: Win32 API calls are used correctly here:
         // - GetCurrentProcess returns a pseudo-handle that does not need closing.
@@ -104,7 +104,8 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
         // Not elevated — use PowerShell to spawn with RunAs
-        let args_str = args.iter()
+        let args_str = args
+            .iter()
             .map(|a| format!("'{}'", a.replace('\'', "''")))
             .collect::<Vec<_>>()
             .join(", ");
@@ -174,7 +175,11 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
     {
         // On Linux, use pkexec (PolicyKit) for graphical sudo prompt
         let escaped_args: Vec<&str> = args.to_vec();
-        tracing::debug!("Elevating command on Linux via pkexec: {} {}", program, args.join(" "));
+        tracing::debug!(
+            "Elevating command on Linux via pkexec: {} {}",
+            program,
+            args.join(" ")
+        );
 
         let output = super::hidden_cmd("pkexec")
             .arg(program)
@@ -225,7 +230,10 @@ pub fn run_netsh_elevated(args: &[&str]) -> Result<(), String> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("requires elevation") || stderr.contains("access is denied") || stderr.contains("Access is denied") {
+    if stderr.contains("requires elevation")
+        || stderr.contains("access is denied")
+        || stderr.contains("Access is denied")
+    {
         tracing::info!("netsh requires elevation, requesting UAC...");
         run_elevated("netsh", args)?;
         Ok(())

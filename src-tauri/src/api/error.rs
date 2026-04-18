@@ -1,7 +1,7 @@
 //! API error types
 
-use std::fmt;
 use super::types::ProtocolErrorCode;
+use std::fmt;
 
 #[derive(Debug)]
 pub enum ApiError {

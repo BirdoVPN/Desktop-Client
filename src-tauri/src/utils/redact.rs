@@ -2,7 +2,7 @@
 //!
 //! Provides helper functions to redact sensitive information from logs
 //! to protect user privacy in production builds.
-//! 
+//!
 //! LOG-001: All error messages and logs should use these functions
 //! to prevent PII exposure.
 
@@ -14,7 +14,7 @@ pub fn redact_ip(ip: &str) -> String {
     {
         ip.to_string()
     }
-    
+
     #[cfg(not(debug_assertions))]
     {
         // IPv4: Show first octet only (e.g., "192.x.x.x")
@@ -30,7 +30,8 @@ pub fn redact_ip(ip: &str) -> String {
             if let Some(colon_pos) = ip.rfind(':') {
                 let ip_part = &ip[..colon_pos];
                 let port = &ip[colon_pos..];
-                let redacted_ip = ip_part.split('.')
+                let redacted_ip = ip_part
+                    .split('.')
                     .next()
                     .map(|first| format!("{}.x.x.x", first))
                     .unwrap_or_else(|| "[redacted]".to_string());
@@ -55,7 +56,7 @@ pub fn redact_email(email: &str) -> String {
     {
         email.to_string()
     }
-    
+
     #[cfg(not(debug_assertions))]
     {
         let parts: Vec<&str> = email.split('@').collect();
@@ -82,19 +83,19 @@ pub fn redact_hostname(hostname: &str) -> String {
     {
         hostname.to_string()
     }
-    
+
     #[cfg(not(debug_assertions))]
     {
         // Check if it looks like an IP address
         if hostname.parse::<std::net::Ipv4Addr>().is_ok() {
             return redact_ip(hostname);
         }
-        
+
         // Check for IPv6
         if hostname.contains("::") || hostname.matches(':').count() >= 2 {
             return redact_ip(hostname);
         }
-        
+
         // Hostname: show only TLD for privacy
         // vpn.example.com -> ***.com
         // eu-west-1.vpn.example.com -> ***.com
@@ -175,13 +176,11 @@ pub fn sanitize_error(msg: &str) -> String {
             Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){1,}\.[a-zA-Z]{2,}\b").expect("hostname regex")
         });
         // P2-13: Strip HTML tags
-        static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"<[^>]{1,200}>").expect("HTML tag regex")
-        });
+        static HTML_TAG_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"<[^>]{1,200}>").expect("HTML tag regex"));
         // P2-13: Strip stack traces (lines starting with "at " or Java-style exception patterns)
-        static STACK_TRACE_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"(?m)^\s*at .*$").expect("stack trace regex")
-        });
+        static STACK_TRACE_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"(?m)^\s*at .*$").expect("stack trace regex"));
 
         // P2-13: If the message looks like raw HTML, replace entirely
         if msg.contains("<html") || msg.contains("<HTML") || msg.contains("<!DOCTYPE") {
@@ -194,11 +193,15 @@ pub fn sanitize_error(msg: &str) -> String {
         // Strip stack trace lines
         let result = STACK_TRACE_RE.replace_all(&result, "").to_string();
 
-        let result = IPV4_RE.replace_all(&result, |caps: &regex::Captures| {
-            format!("{}.x.x.x", &caps[1])
-        }).to_string();
+        let result = IPV4_RE
+            .replace_all(&result, |caps: &regex::Captures| {
+                format!("{}.x.x.x", &caps[1])
+            })
+            .to_string();
 
-        let result = EMAIL_RE.replace_all(&result, "[redacted-email]").to_string();
+        let result = EMAIL_RE
+            .replace_all(&result, "[redacted-email]")
+            .to_string();
 
         let result = HOST_RE.replace_all(&result, "[redacted-host]").to_string();
 
@@ -229,13 +232,13 @@ mod tests {
         let result = redact_email("john.doe@example.com");
         assert!(!result.is_empty());
     }
-    
+
     #[test]
     fn test_redact_hostname() {
         let result = redact_hostname("vpn.example.com");
         assert!(!result.is_empty());
     }
-    
+
     #[test]
     fn test_redact_endpoint() {
         let result = redact_endpoint("vpn.example.com:51820");

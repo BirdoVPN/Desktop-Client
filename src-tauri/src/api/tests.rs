@@ -173,7 +173,10 @@ mod types_serialization_tests {
         let json = r#"{"requiresTwoFactor":true,"challengeToken":"ct_abc"}"#;
         let result: LoginResult = serde_json::from_str(json).unwrap();
         match result {
-            LoginResult::TwoFactorChallenge { requires_two_factor, challenge_token } => {
+            LoginResult::TwoFactorChallenge {
+                requires_two_factor,
+                challenge_token,
+            } => {
                 assert!(requires_two_factor);
                 assert_eq!(challenge_token, "ct_abc");
             }
@@ -303,7 +306,12 @@ mod vpn_config_security_tests {
         // After scrub, private key should be zeroed (all null bytes)
         assert!(config.private_key.bytes().all(|b| b == 0));
         // Preshared key should also be zeroed
-        assert!(config.preshared_key.as_ref().unwrap().bytes().all(|b| b == 0));
+        assert!(config
+            .preshared_key
+            .as_ref()
+            .unwrap()
+            .bytes()
+            .all(|b| b == 0));
     }
 
     #[test]
@@ -338,14 +346,16 @@ mod client_construction_tests {
     #[tokio::test]
     async fn set_tokens_makes_authenticated() {
         let api = BirdoApi::new();
-        api.set_tokens("access".to_string(), "refresh".to_string()).await;
+        api.set_tokens("access".to_string(), "refresh".to_string())
+            .await;
         assert!(api.is_authenticated().await);
     }
 
     #[tokio::test]
     async fn clear_tokens_makes_unauthenticated() {
         let api = BirdoApi::new();
-        api.set_tokens("access".to_string(), "refresh".to_string()).await;
+        api.set_tokens("access".to_string(), "refresh".to_string())
+            .await;
         assert!(api.is_authenticated().await);
 
         api.clear_tokens().await;

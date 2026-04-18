@@ -7,11 +7,11 @@
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, RwLock};
 use wintun::{Adapter, Session};
 
@@ -63,7 +63,7 @@ const WINTUN_DLL_SHA256: &str = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f68
 fn verify_dll_integrity(bytes: &[u8], display_path: &std::path::Path) -> Result<(), String> {
     let hash = Sha256::digest(bytes);
     let hex_hash = format!("{:x}", hash);
-    
+
     if hex_hash != WINTUN_DLL_SHA256 {
         tracing::error!(
             "wintun.dll integrity check FAILED: expected {}, got {}",
@@ -76,8 +76,11 @@ fn verify_dll_integrity(bytes: &[u8], display_path: &std::path::Path) -> Result<
             WINTUN_DLL_SHA256, hex_hash
         ));
     }
-    
-    tracing::info!("wintun.dll integrity verified (SHA256 matches) at {:?}", display_path);
+
+    tracing::info!(
+        "wintun.dll integrity verified (SHA256 matches) at {:?}",
+        display_path
+    );
     Ok(())
 }
 
@@ -86,7 +89,8 @@ fn verify_dll_integrity(bytes: &[u8], display_path: &std::path::Path) -> Result<
 /// because -EncodedCommand does not interpret shell metacharacters.
 fn base64_encode_utf16le(script: &str) -> String {
     use base64::Engine;
-    let utf16: Vec<u8> = script.encode_utf16()
+    let utf16: Vec<u8> = script
+        .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
         .collect();
     base64::engine::general_purpose::STANDARD.encode(&utf16)
@@ -136,7 +140,7 @@ impl WintunTunnel {
     /// access to printers, NAS devices, and other LAN resources.
     pub async fn create(config: &VpnConfig, local_network_sharing: bool) -> Result<Self, String> {
         tracing::debug!("Creating Wintun tunnel for {}", redact_ip(&config.endpoint));
-        
+
         Ok(Self {
             config: config.clone(),
             running: Arc::new(AtomicBool::new(false)),
@@ -165,7 +169,10 @@ impl WintunTunnel {
         // Validate all config values that will be passed to system commands
         self.validate_config()?;
 
-        tracing::info!("Starting Wintun tunnel to {}", redact_ip(&self.config.endpoint));
+        tracing::info!(
+            "Starting Wintun tunnel to {}",
+            redact_ip(&self.config.endpoint)
+        );
 
         // Load Wintun DLL — verify integrity before loading
         // SEC-C2 FIX: Use absolute path derived from executable location to prevent
@@ -187,12 +194,12 @@ impl WintunTunnel {
             } else {
                 tracing::error!(
                     "wintun.dll not found at {:?} or {:?}",
-                    beside_exe, in_resources
+                    beside_exe,
+                    in_resources
                 );
-                return Err(
-                    "wintun.dll not found in the application directory. \
-                     Please reinstall the application.".to_string()
-                );
+                return Err("wintun.dll not found in the application directory. \
+                     Please reinstall the application."
+                    .to_string());
             }
         };
 
@@ -213,7 +220,8 @@ impl WintunTunnel {
             // Read bytes from the exclusive handle directly (not a second open)
             // to avoid OS error 32 (sharing violation) self-deadlock.
             let mut bytes = Vec::new();
-            exclusive_handle.read_to_end(&mut bytes)
+            exclusive_handle
+                .read_to_end(&mut bytes)
                 .map_err(|e| format!("Failed to read wintun.dll: {}", e))?;
             // Hash check happens while we hold the exclusive handle
             verify_dll_integrity(&bytes, &dll_path)?;
@@ -237,7 +245,10 @@ impl WintunTunnel {
 
         // Log elevation status for diagnostics
         let elevated = crate::utils::elevation::is_elevated();
-        tracing::info!("Process elevation status: {}", if elevated { "ADMIN" } else { "NOT ADMIN" });
+        tracing::info!(
+            "Process elevation status: {}",
+            if elevated { "ADMIN" } else { "NOT ADMIN" }
+        );
         if !elevated {
             tracing::warn!(
                 "Wintun requires administrator privileges. Adapter creation will likely fail."
@@ -284,7 +295,9 @@ impl WintunTunnel {
                         let (win_err, win_desc) = get_last_error_info();
                         tracing::error!(
                             "Adapter creation failed: {} (Win32: {} — {})",
-                            e, win_err, win_desc
+                            e,
+                            win_err,
+                            win_desc
                         );
 
                         // Retry strategy: clean up any stale state and try again
@@ -298,7 +311,13 @@ impl WintunTunnel {
 
                         // 2. Try disabling the network interface via netsh
                         let netsh_result = cmd("netsh")
-                            .args(["interface", "set", "interface", ADAPTER_NAME, "admin=disable"])
+                            .args([
+                                "interface",
+                                "set",
+                                "interface",
+                                ADAPTER_NAME,
+                                "admin=disable",
+                            ])
                             .output();
                         match &netsh_result {
                             Ok(out) if out.status.success() => {
@@ -330,7 +349,12 @@ impl WintunTunnel {
 
                         // Retry with fixed GUID
                         tracing::info!("Retrying adapter creation...");
-                        match Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, Some(ADAPTER_GUID)) {
+                        match Adapter::create(
+                            &wintun,
+                            ADAPTER_NAME,
+                            TUNNEL_TYPE,
+                            Some(ADAPTER_GUID),
+                        ) {
                             Ok(adapter) => {
                                 tracing::info!("Adapter created successfully on retry");
                                 adapter
@@ -339,7 +363,9 @@ impl WintunTunnel {
                                 let (win_err2, win_desc2) = get_last_error_info();
                                 tracing::error!(
                                     "Adapter creation failed on retry: {} (Win32: {} — {})",
-                                    e2, win_err2, win_desc2
+                                    e2,
+                                    win_err2,
+                                    win_desc2
                                 );
 
                                 // Last resort: try WITHOUT fixed GUID (let Windows assign one)
@@ -364,9 +390,11 @@ impl WintunTunnel {
         // After successful adapter creation, check driver version
         match wintun::get_running_driver_version(&wintun) {
             Ok(version) => tracing::info!("Wintun driver version (post-create): {}", version),
-            Err(e) => tracing::warn!("Could not query driver version after adapter creation: {}", e),
+            Err(e) => tracing::warn!(
+                "Could not query driver version after adapter creation: {}",
+                e
+            ),
         }
-
 
         // adapter is already Arc<Adapter> from wintun crate
         tracing::info!("Wintun adapter ready");
@@ -395,7 +423,10 @@ impl WintunTunnel {
         // This is the IP the socket is connected to — we MUST use this same IP
         // for the endpoint host route to prevent a routing loop.
         let endpoint_ip = wg_session.endpoint_ip();
-        tracing::info!("WireGuard socket connected to endpoint IP: {}", redact_ip(&endpoint_ip.to_string()));
+        tracing::info!(
+            "WireGuard socket connected to endpoint IP: {}",
+            redact_ip(&endpoint_ip.to_string())
+        );
 
         // Configure the adapter's IP address
         self.configure_adapter().await?;
@@ -462,14 +493,20 @@ impl WintunTunnel {
             .map_err(|_| format!("Invalid client_ip: '{}'", self.config.client_ip))?;
 
         // Validate endpoint host (passed to route add)
-        let endpoint_host = self.config.endpoint.split(':').next()
+        let endpoint_host = self
+            .config
+            .endpoint
+            .split(':')
+            .next()
             .ok_or_else(|| "Invalid endpoint format: missing host".to_string())?;
         // Endpoint host can be an IP or a hostname. Validate that hostnames
         // contain only safe characters (alphanumeric, dots, hyphens).
         if endpoint_host.parse::<Ipv4Addr>().is_err() {
             if endpoint_host.is_empty()
                 || endpoint_host.len() > 253
-                || !endpoint_host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                || !endpoint_host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
                 || endpoint_host.starts_with('-')
                 || endpoint_host.starts_with('.')
             {
@@ -479,8 +516,7 @@ impl WintunTunnel {
 
         // Validate DNS entries (passed to netsh set/add dns)
         for dns in &self.config.dns {
-            Ipv4Addr::from_str(dns)
-                .map_err(|_| format!("Invalid DNS address: '{}'", dns))?;
+            Ipv4Addr::from_str(dns).map_err(|_| format!("Invalid DNS address: '{}'", dns))?;
         }
 
         // Validate allowed_ips CIDRs (network portion passed to route add)
@@ -491,7 +527,8 @@ impl WintunTunnel {
             }
             Ipv4Addr::from_str(parts[0])
                 .map_err(|_| format!("Invalid network address in CIDR: '{}'", cidr))?;
-            let prefix: u8 = parts[1].parse()
+            let prefix: u8 = parts[1]
+                .parse()
                 .map_err(|_| format!("Invalid prefix length in CIDR: '{}'", cidr))?;
             if prefix > 32 {
                 return Err(format!("Prefix length out of range in CIDR: '{}'", cidr));
@@ -500,7 +537,10 @@ impl WintunTunnel {
 
         // Validate MTU is in sane range
         if self.config.mtu < 576 || self.config.mtu > 9000 {
-            return Err(format!("Invalid MTU: {} (expected 576-9000)", self.config.mtu));
+            return Err(format!(
+                "Invalid MTU: {} (expected 576-9000)",
+                self.config.mtu
+            ));
         }
 
         tracing::debug!("VPN config validation passed");
@@ -548,12 +588,15 @@ impl WintunTunnel {
                 "store=active",
             ])
             .output();
-        
+
         if let Ok(output) = mtu_output {
             if output.status.success() {
                 tracing::debug!("MTU set to {}", self.config.mtu);
             } else {
-                tracing::warn!("Failed to set MTU: {}", String::from_utf8_lossy(&output.stderr));
+                tracing::warn!(
+                    "Failed to set MTU: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         }
 
@@ -585,7 +628,10 @@ impl WintunTunnel {
         // system default because the interface metric alone is higher.
         let _ = cmd("netsh")
             .args([
-                "interface", "ip", "set", "interface",
+                "interface",
+                "ip",
+                "set",
+                "interface",
                 ADAPTER_NAME,
                 "metric=5",
             ])
@@ -657,8 +703,9 @@ impl WintunTunnel {
         for allowed_ip in &self.config.allowed_ips {
             if allowed_ip == "0.0.0.0/0" {
                 tracing::info!("Splitting 0.0.0.0/0 into two /1 routes for reliable routing");
-                routes_to_add.push(("0.0.0.0".to_string(), "128.0.0.0".to_string()));    // 0.0.0.0/1
-                routes_to_add.push(("128.0.0.0".to_string(), "128.0.0.0".to_string()));  // 128.0.0.0/1
+                routes_to_add.push(("0.0.0.0".to_string(), "128.0.0.0".to_string())); // 0.0.0.0/1
+                routes_to_add.push(("128.0.0.0".to_string(), "128.0.0.0".to_string()));
+            // 128.0.0.0/1
             } else {
                 let (network, mask) = self.parse_cidr(allowed_ip)?;
                 routes_to_add.push((network, mask));
@@ -675,7 +722,7 @@ impl WintunTunnel {
                     network,
                     "mask",
                     mask,
-                    "0.0.0.0",  // Gateway - use 0.0.0.0 for point-to-point interfaces
+                    "0.0.0.0", // Gateway - use 0.0.0.0 for point-to-point interfaces
                     "metric",
                     "5",
                     "IF",
@@ -697,12 +744,20 @@ impl WintunTunnel {
                     );
                 }
                 Err(e) => {
-                    tracing::error!("Failed to execute route command for {} mask {}: {}", network, mask, e);
+                    tracing::error!(
+                        "Failed to execute route command for {} mask {}: {}",
+                        network,
+                        mask,
+                        e
+                    );
                 }
             }
         }
 
-        tracing::info!("Routes configured ({} entries + endpoint host route)", routes_to_add.len());
+        tracing::info!(
+            "Routes configured ({} entries + endpoint host route)",
+            routes_to_add.len()
+        );
         Ok(())
     }
 
@@ -720,13 +775,16 @@ impl WintunTunnel {
             }
         };
 
-        tracing::info!("Configuring local network sharing routes via {}", redact_ip(&default_gateway));
+        tracing::info!(
+            "Configuring local network sharing routes via {}",
+            redact_ip(&default_gateway)
+        );
 
         // RFC1918 private address ranges
         let local_routes: [(&str, &str); 3] = [
-            ("10.0.0.0", "255.0.0.0"),         // 10.0.0.0/8
-            ("172.16.0.0", "255.240.0.0"),      // 172.16.0.0/12
-            ("192.168.0.0", "255.255.0.0"),     // 192.168.0.0/16
+            ("10.0.0.0", "255.0.0.0"),      // 10.0.0.0/8
+            ("172.16.0.0", "255.240.0.0"),  // 172.16.0.0/12
+            ("192.168.0.0", "255.255.0.0"), // 192.168.0.0/16
         ];
 
         let mut added = 0u32;
@@ -744,15 +802,30 @@ impl WintunTunnel {
                 .output()
             {
                 Ok(output) if output.status.success() => {
-                    tracing::debug!("Local network route added: {} mask {} via {}", network, mask, redact_ip(&default_gateway));
+                    tracing::debug!(
+                        "Local network route added: {} mask {} via {}",
+                        network,
+                        mask,
+                        redact_ip(&default_gateway)
+                    );
                     added += 1;
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!("Local network route failed for {} mask {}: {}", network, mask, stderr.trim());
+                    tracing::warn!(
+                        "Local network route failed for {} mask {}: {}",
+                        network,
+                        mask,
+                        stderr.trim()
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to execute route for {} mask {}: {}", network, mask, e);
+                    tracing::warn!(
+                        "Failed to execute route for {} mask {}: {}",
+                        network,
+                        mask,
+                        e
+                    );
                 }
             }
         }
@@ -760,12 +833,18 @@ impl WintunTunnel {
         // Also add link-local (169.254.0.0/16) for mDNS/device discovery
         let _ = cmd("route")
             .args([
-                "add", "169.254.0.0", "mask", "255.255.0.0",
-                &default_gateway, "metric", "1",
+                "add",
+                "169.254.0.0",
+                "mask",
+                "255.255.0.0",
+                &default_gateway,
+                "metric",
+                "1",
             ])
             .output();
 
-        self.local_network_routes_added.store(true, Ordering::SeqCst);
+        self.local_network_routes_added
+            .store(true, Ordering::SeqCst);
         tracing::info!("Local network sharing: {}/3 routes added", added);
         Ok(())
     }
@@ -796,15 +875,22 @@ impl WintunTunnel {
             }
         }
         *self.dns_snapshots.write().await = snapshots;
-        tracing::debug!("Captured DNS snapshots for {} adapters", non_vpn_adapters.len());
+        tracing::debug!(
+            "Captured DNS snapshots for {} adapters",
+            non_vpn_adapters.len()
+        );
 
         // STEP 1: Disable DNS on all other adapters to prevent SMHNR leak
         for iface_name in &non_vpn_adapters {
             let _ = cmd("netsh")
                 .args([
-                    "interface", "ip", "set", "dns",
+                    "interface",
+                    "ip",
+                    "set",
+                    "dns",
                     &format!("name={}", iface_name),
-                    "static", "none",
+                    "static",
+                    "none",
                 ])
                 .output();
             tracing::debug!("Disabled DNS on adapter: {}", iface_name);
@@ -908,10 +994,16 @@ impl WintunTunnel {
 
         // PERF-CONNECT: Combined both netsh firewall rules into one call.
         // METHOD 4+5: Block ICMPv6 + protocol 41 (6in4 tunneling)
-        for (name, protocol) in [("Birdo VPN Block ICMPv6", "icmpv6"), ("Birdo VPN Block 6in4", "41")] {
+        for (name, protocol) in [
+            ("Birdo VPN Block ICMPv6", "icmpv6"),
+            ("Birdo VPN Block 6in4", "41"),
+        ] {
             match cmd("netsh")
                 .args([
-                    "advfirewall", "firewall", "add", "rule",
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
                     &format!("name={}", name),
                     "dir=out",
                     "action=block",
@@ -919,29 +1011,46 @@ impl WintunTunnel {
                 ])
                 .output()
             {
-                Ok(o) if o.status.success() => { succeeded += 1; }
-                Ok(_) => { warnings.push(if protocol == "icmpv6" { "ICMPv6" } else { "6in4" }); }
-                Err(_) => { warnings.push(if protocol == "icmpv6" { "ICMPv6" } else { "6in4" }); }
+                Ok(o) if o.status.success() => {
+                    succeeded += 1;
+                }
+                Ok(_) => {
+                    warnings.push(if protocol == "icmpv6" {
+                        "ICMPv6"
+                    } else {
+                        "6in4"
+                    });
+                }
+                Err(_) => {
+                    warnings.push(if protocol == "icmpv6" {
+                        "ICMPv6"
+                    } else {
+                        "6in4"
+                    });
+                }
             }
         }
 
         // At least one method must succeed to proceed
         if succeeded == 0 {
-            return Err(
-                "Critical: All IPv6 leak prevention methods failed. \
+            return Err("Critical: All IPv6 leak prevention methods failed. \
                  Ensure the app is running as administrator."
-                .to_string(),
-            );
+                .to_string());
         }
 
         if !warnings.is_empty() {
             tracing::warn!(
                 "IPv6 protection: {}/{} methods succeeded, failed: {:?}",
-                succeeded, succeeded + warnings.len() as u32, warnings
+                succeeded,
+                succeeded + warnings.len() as u32,
+                warnings
             );
         }
 
-        tracing::info!("IPv6 leak protection enabled ({} methods active)", succeeded);
+        tracing::info!(
+            "IPv6 leak protection enabled ({} methods active)",
+            succeeded
+        );
         Ok(())
     }
 
@@ -961,7 +1070,13 @@ impl WintunTunnel {
             "Birdo VPN Block 6in4",
         ] {
             let _ = cmd("netsh")
-                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={}", rule_name)])
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "delete",
+                    "rule",
+                    &format!("name={}", rule_name),
+                ])
                 .output();
         }
 
@@ -993,19 +1108,22 @@ impl WintunTunnel {
     /// this restores each adapter to its original DNS servers.
     async fn restore_dns(&self) -> Result<(), String> {
         tracing::debug!("Restoring DNS from snapshots");
-        
+
         // Restore DNS on VPN adapter
         let _ = cmd("netsh")
             .args([
-                "interface", "ip", "set", "dns",
+                "interface",
+                "ip",
+                "set",
+                "dns",
                 &format!("name={}", ADAPTER_NAME),
-                "dhcp"
+                "dhcp",
             ])
             .output();
 
         // H-4 FIX: Restore from snapshots instead of blindly setting DHCP
         let snapshots = self.dns_snapshots.read().await.clone();
-        
+
         if snapshots.is_empty() {
             // No snapshots — fall back to DHCP on all adapters (legacy behavior)
             tracing::warn!("No DNS snapshots found, falling back to DHCP restoration");
@@ -1013,7 +1131,10 @@ impl WintunTunnel {
             for name in &adapters {
                 let _ = cmd("netsh")
                     .args([
-                        "interface", "ip", "set", "dns",
+                        "interface",
+                        "ip",
+                        "set",
+                        "dns",
                         &format!("name={}", name),
                         "dhcp",
                     ])
@@ -1025,7 +1146,10 @@ impl WintunTunnel {
                     // Was DHCP — restore to DHCP
                     let _ = cmd("netsh")
                         .args([
-                            "interface", "ip", "set", "dns",
+                            "interface",
+                            "ip",
+                            "set",
+                            "dns",
                             &format!("name={}", snapshot.adapter_name),
                             "dhcp",
                         ])
@@ -1037,15 +1161,22 @@ impl WintunTunnel {
                         if i == 0 {
                             let _ = cmd("netsh")
                                 .args([
-                                    "interface", "ip", "set", "dns",
+                                    "interface",
+                                    "ip",
+                                    "set",
+                                    "dns",
                                     &format!("name={}", snapshot.adapter_name),
-                                    "static", dns,
+                                    "static",
+                                    dns,
                                 ])
                                 .output();
                         } else {
                             let _ = cmd("netsh")
                                 .args([
-                                    "interface", "ip", "add", "dns",
+                                    "interface",
+                                    "ip",
+                                    "add",
+                                    "dns",
                                     &format!("name={}", snapshot.adapter_name),
                                     dns,
                                     &format!("index={}", i + 1),
@@ -1053,11 +1184,15 @@ impl WintunTunnel {
                                 .output();
                         }
                     }
-                    tracing::debug!("Restored {} to static DNS: {:?}", snapshot.adapter_name, snapshot.dns_servers);
+                    tracing::debug!(
+                        "Restored {} to static DNS: {:?}",
+                        snapshot.adapter_name,
+                        snapshot.dns_servers
+                    );
                 }
             }
         }
-        
+
         tracing::debug!("DNS restoration complete");
         Ok(())
     }
@@ -1097,7 +1232,7 @@ impl WintunTunnel {
             .map_err(|e| format!("Failed to get interfaces: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        
+
         // Parse the output to find our adapter
         for line in stdout.lines() {
             if line.contains(ADAPTER_NAME) {
@@ -1116,13 +1251,19 @@ impl WintunTunnel {
         let ps_output = cmd("powershell")
             .args([
                 "-Command",
-                &format!("(Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue).ifIndex", ADAPTER_NAME),
+                &format!(
+                    "(Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue).ifIndex",
+                    ADAPTER_NAME
+                ),
             ])
             .output()
             .map_err(|e| format!("Failed to get adapter index via PowerShell: {}", e))?;
 
-        let idx_str = String::from_utf8_lossy(&ps_output.stdout).trim().to_string();
-        idx_str.parse::<u32>()
+        let idx_str = String::from_utf8_lossy(&ps_output.stdout)
+            .trim()
+            .to_string();
+        idx_str
+            .parse::<u32>()
             .map_err(|_| format!("Could not find interface index for {}", ADAPTER_NAME))
     }
 
@@ -1155,7 +1296,7 @@ impl WintunTunnel {
     }
 
     /// Packet processing loop - reads from Wintun, encrypts, sends to WireGuard server
-    /// 
+    ///
     /// PERF-001: Uses batch processing to amortize lock + timer overhead.
     /// PERF-002: Acquires RwLock once per batch (not per packet) to reduce contention.
     /// PERF-003: Uses adaptive polling with interval timers instead of per-iteration sleep.
@@ -1174,13 +1315,13 @@ impl WintunTunnel {
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         tracing::debug!("Starting packet processing loop (batch mode)");
-        
+
         // Adaptive polling: start fast, slow down when idle
         let mut idle_cycles: u32 = 0;
-        const IDLE_THRESHOLD: u32 = 100;       // Switch to slow mode after 100 idle cycles
-        const FAST_POLL_US: u64 = 10;          // 10 microseconds when active
-        const SLOW_POLL_US: u64 = 500;         // 500 microseconds when idle
-        
+        const IDLE_THRESHOLD: u32 = 100; // Switch to slow mode after 100 idle cycles
+        const FAST_POLL_US: u64 = 10; // 10 microseconds when active
+        const SLOW_POLL_US: u64 = 500; // 500 microseconds when idle
+
         // FIX-DL: Timer task — boringtun requires periodic update_timers() calls
         // to send keepalives, manage rekeys, and handle cookie responses.
         // Without this the server's session expires and stops sending data.
@@ -1190,7 +1331,7 @@ impl WintunTunnel {
         // Diagnostic: periodic stats log to verify bidirectional traffic
         let mut last_stats_log = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
-        
+
         // PERF-001: Batch size — process up to this many packets per wakeup
         // to amortize timer and lock overhead across multiple packets
         const MAX_BATCH_SIZE: usize = 64;
@@ -1198,7 +1339,7 @@ impl WintunTunnel {
         loop {
             tokio::select! {
                 biased;  // Prioritize shutdown over packet processing
-                
+
                 _ = shutdown_rx.recv() => {
                     tracing::debug!("Received shutdown signal");
                     break;
@@ -1210,7 +1351,7 @@ impl WintunTunnel {
                     if !running.load(Ordering::Relaxed) {
                         break;
                     }
-                    
+
                     let mut had_activity = false;
 
                     // PERF-002: Acquire the WireGuard session lock ONCE for the entire batch
@@ -1269,7 +1410,7 @@ impl WintunTunnel {
                                 }
                                 Ok(None) => break, // No more packets in this batch
                                 Err(e) => {
-                                    // Don't log transient decryption errors at warn level 
+                                    // Don't log transient decryption errors at warn level
                                     // (they're expected during rekey transitions)
                                     tracing::trace!("WireGuard recv error: {}", e);
                                     break;
@@ -1307,7 +1448,7 @@ impl WintunTunnel {
                     }
                     // FIX-R4: Drop the read guard here; if try_read failed we simply do nothing
                     drop(guard);
-                    
+
                     // Update idle counter for adaptive polling
                     if had_activity {
                         idle_cycles = 0; // Reset on any activity
@@ -1353,9 +1494,15 @@ impl WintunTunnel {
             self.unblock_ipv6(),
             self.cleanup_routes(),
         );
-        if let Err(e) = dns_r { tracing::warn!("DNS restore error: {}", e); }
-        if let Err(e) = ipv6_r { tracing::warn!("IPv6 unblock error: {}", e); }
-        if let Err(e) = route_r { tracing::warn!("Route cleanup error: {}", e); }
+        if let Err(e) = dns_r {
+            tracing::warn!("DNS restore error: {}", e);
+        }
+        if let Err(e) = ipv6_r {
+            tracing::warn!("IPv6 unblock error: {}", e);
+        }
+        if let Err(e) = route_r {
+            tracing::warn!("Route cleanup error: {}", e);
+        }
 
         // STEP 4: Close Wintun adapter
         *self.session.write().await = None;
@@ -1364,7 +1511,7 @@ impl WintunTunnel {
         }
 
         // NOTE: Kill switch deactivation is handled separately by the VPN manager
-        // or auto-reconnect service, NOT here. This allows the kill switch to 
+        // or auto-reconnect service, NOT here. This allows the kill switch to
         // remain active during reconnection attempts.
 
         tracing::info!("Tunnel stopped successfully");
@@ -1377,7 +1524,10 @@ impl WintunTunnel {
 
         // Remove server endpoint host route (use the stored resolved IP, not the config hostname)
         if let Some(ref endpoint_ip) = *self.resolved_endpoint_ip.read().await {
-            tracing::debug!("Removing endpoint host route for {}", redact_ip(endpoint_ip));
+            tracing::debug!(
+                "Removing endpoint host route for {}",
+                redact_ip(endpoint_ip)
+            );
             let _ = cmd("route")
                 .args(["delete", endpoint_ip, "mask", "255.255.255.255"])
                 .output();
@@ -1387,12 +1537,14 @@ impl WintunTunnel {
         for allowed_ip in &self.config.allowed_ips {
             if allowed_ip == "0.0.0.0/0" {
                 // FIX-ROUTE: Clean up the two /1 split routes
-                let _ = cmd("route").args(["delete", "0.0.0.0", "mask", "128.0.0.0"]).output();
-                let _ = cmd("route").args(["delete", "128.0.0.0", "mask", "128.0.0.0"]).output();
-            } else if let Ok((network, _)) = self.parse_cidr(allowed_ip) {
                 let _ = cmd("route")
-                    .args(["delete", &network])
+                    .args(["delete", "0.0.0.0", "mask", "128.0.0.0"])
                     .output();
+                let _ = cmd("route")
+                    .args(["delete", "128.0.0.0", "mask", "128.0.0.0"])
+                    .output();
+            } else if let Ok((network, _)) = self.parse_cidr(allowed_ip) {
+                let _ = cmd("route").args(["delete", &network]).output();
             }
         }
 
@@ -1406,9 +1558,12 @@ impl WintunTunnel {
                 ("169.254.0.0", "255.255.0.0"),
             ];
             for (network, mask) in &local_routes {
-                let _ = cmd("route").args(["delete", network, "mask", mask]).output();
+                let _ = cmd("route")
+                    .args(["delete", network, "mask", mask])
+                    .output();
             }
-            self.local_network_routes_added.store(false, Ordering::SeqCst);
+            self.local_network_routes_added
+                .store(false, Ordering::SeqCst);
         }
 
         Ok(())
@@ -1478,14 +1633,15 @@ impl Drop for WintunTunnel {
         self.running.store(false, Ordering::SeqCst);
 
         // Best-effort: flush DNS cache to clear VPN-specific entries
-        let _ = cmd("ipconfig")
-            .args(["/flushdns"])
-            .output();
+        let _ = cmd("ipconfig").args(["/flushdns"]).output();
 
         // Best-effort: reset VPN adapter DNS to DHCP (prevents DNS leak)
         let _ = cmd("netsh")
             .args([
-                "interface", "ip", "set", "dns",
+                "interface",
+                "ip",
+                "set",
+                "dns",
                 &format!("name={}", ADAPTER_NAME),
                 "dhcp",
             ])
@@ -1494,9 +1650,7 @@ impl Drop for WintunTunnel {
         // Best-effort: remove server-specific route
         if let Some(endpoint_ip) = self.config.endpoint.split(':').next() {
             if !endpoint_ip.is_empty() {
-                let _ = cmd("route")
-                    .args(["delete", endpoint_ip])
-                    .output();
+                let _ = cmd("route").args(["delete", endpoint_ip]).output();
             }
         }
 
@@ -1511,14 +1665,32 @@ impl Drop for WintunTunnel {
             ])
             .output();
         let _ = cmd("netsh")
-            .args(["advfirewall", "firewall", "delete", "rule", "name=Birdo VPN Block ICMPv6"])
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=Birdo VPN Block ICMPv6",
+            ])
             .output();
         let _ = cmd("netsh")
-            .args(["advfirewall", "firewall", "delete", "rule", "name=Birdo VPN Block 6in4"])
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=Birdo VPN Block 6in4",
+            ])
             .output();
         // Also try legacy rule names
         let _ = cmd("netsh")
-            .args(["advfirewall", "firewall", "delete", "rule", "name=Birdo Block IPv6"])
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=Birdo Block IPv6",
+            ])
             .output();
         // Re-enable IPv6 adapter bindings
         match cmd("powershell")

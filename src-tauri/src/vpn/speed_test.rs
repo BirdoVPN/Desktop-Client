@@ -10,8 +10,8 @@
 //!
 //! Privacy: No user data is transmitted. Only random/zero-filled payloads.
 
-use std::time::Instant;
 use serde::Serialize;
+use std::time::Instant;
 
 /// Speed test result reported to the frontend
 #[derive(Debug, Clone, Serialize)]
@@ -124,7 +124,8 @@ pub async fn measure_latency(
     }
 
     let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
-    let variance = latencies.iter().map(|l| (l - avg).powi(2)).sum::<f64>() / latencies.len() as f64;
+    let variance =
+        latencies.iter().map(|l| (l - avg).powi(2)).sum::<f64>() / latencies.len() as f64;
     let jitter = variance.sqrt();
 
     (avg as u32, jitter as u32)
@@ -142,10 +143,12 @@ pub async fn run_speed_test(
     let (latency_ms, jitter_ms) = measure_latency(client, speed_test_url, 5).await;
 
     // 2. Download test (10MB)
-    let (download_mbps, bytes_downloaded) = measure_download(client, speed_test_url, 10 * 1024 * 1024).await?;
+    let (download_mbps, bytes_downloaded) =
+        measure_download(client, speed_test_url, 10 * 1024 * 1024).await?;
 
     // 3. Upload test (5MB)
-    let (upload_mbps, bytes_uploaded) = measure_upload(client, speed_test_url, 5 * 1024 * 1024).await?;
+    let (upload_mbps, bytes_uploaded) =
+        measure_upload(client, speed_test_url, 5 * 1024 * 1024).await?;
 
     let duration_seconds = start.elapsed().as_secs_f64();
 

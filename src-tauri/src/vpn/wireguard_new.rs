@@ -31,21 +31,21 @@ impl SensitiveKey {
     fn new() -> Self {
         Self([0u8; 32])
     }
-    
+
     fn as_slice(&self) -> &[u8] {
         &self.0
     }
-    
+
     fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.0
     }
 }
 
 /// WireGuard session using boringtun
-/// 
+///
 /// Uses parking_lot::Mutex instead of std::sync::Mutex for better performance
 /// in async contexts (no priority inversion, smaller size, faster operations)
-/// 
+///
 /// # Security (MEM-003)
 /// This struct implements Drop with explicit zeroization of any retained key material.
 /// The boringtun Tunn struct handles its own internal key zeroization.
@@ -64,7 +64,7 @@ pub struct WireGuardSession {
 
 impl WireGuardSession {
     /// Create a new WireGuard session with boringtun
-    /// 
+    ///
     /// # Security (MEM-003)
     /// All key material passed to this function is zeroized after being copied
     /// into the boringtun Tunn struct. The caller's copies are also cleared.
@@ -78,13 +78,18 @@ impl WireGuardSession {
         let private_key_bytes = BASE64
             .decode(private_key_b64)
             .map_err(|e| format!("Invalid private key: {}", e))?;
-        
+
         if private_key_bytes.len() != 32 {
-            return Err(format!("Invalid private key length: {}", private_key_bytes.len()));
+            return Err(format!(
+                "Invalid private key length: {}",
+                private_key_bytes.len()
+            ));
         }
-        
+
         let mut private_key = SensitiveKey::new();
-        private_key.as_mut_slice().copy_from_slice(&private_key_bytes);
+        private_key
+            .as_mut_slice()
+            .copy_from_slice(&private_key_bytes);
         // Zeroize the temporary vector immediately
         let mut temp_bytes = private_key_bytes;
         temp_bytes.zeroize();
@@ -93,13 +98,18 @@ impl WireGuardSession {
         let server_key_bytes = BASE64
             .decode(server_public_key_b64)
             .map_err(|e| format!("Invalid server public key: {}", e))?;
-        
+
         if server_key_bytes.len() != 32 {
-            return Err(format!("Invalid server key length: {}", server_key_bytes.len()));
+            return Err(format!(
+                "Invalid server key length: {}",
+                server_key_bytes.len()
+            ));
         }
-        
+
         let mut server_public_key = SensitiveKey::new();
-        server_public_key.as_mut_slice().copy_from_slice(&server_key_bytes);
+        server_public_key
+            .as_mut_slice()
+            .copy_from_slice(&server_key_bytes);
         let mut temp_server_bytes = server_key_bytes;
         temp_server_bytes.zeroize();
 
@@ -142,7 +152,8 @@ impl WireGuardSession {
                     if parts.len() != 2 {
                         return Err(format!("Invalid endpoint format: {}", endpoint));
                     }
-                    let port: u16 = parts[0].parse()
+                    let port: u16 = parts[0]
+                        .parse()
                         .map_err(|_| format!("Invalid port in endpoint: {}", endpoint))?;
                     (parts[1].to_string(), port)
                 };
@@ -166,28 +177,29 @@ impl WireGuardSession {
             private_key.zeroize(); // Explicit zeroize before drop
             arr
         };
-        
+
         let server_key_arr = {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(server_public_key.as_slice());
             server_public_key.zeroize();
             arr
         };
-        
+
         let psk_arr = psk.as_ref().map(|p| {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(p.as_slice());
             arr
         });
-        
+
         let tunnel = Tunn::new(
             StaticSecret::from(private_key_arr),
             PublicKey::from(server_key_arr),
-            psk_arr, // Preshared key for additional security
+            psk_arr,  // Preshared key for additional security
             Some(25), // Persistent keepalive
-            0, // Tunnel index
-            None, // Rate limiter
-        ).map_err(|e| format!("Failed to create WireGuard tunnel: {:?}", e))?;
+            0,        // Tunnel index
+            None,     // Rate limiter
+        )
+        .map_err(|e| format!("Failed to create WireGuard tunnel: {:?}", e))?;
 
         // MEM-003: Zeroize our copies of keys after tunnel creation
         // The keys have been moved into the Tunn struct
@@ -200,7 +212,7 @@ impl WireGuardSession {
         if let Some(mut psk_arr) = psk_arr {
             psk_arr.zeroize();
         }
-        
+
         tracing::trace!("Key material zeroized after tunnel creation");
 
         // Create UDP socket with large buffers for high-speed throughput
@@ -255,31 +267,31 @@ impl WireGuardSession {
 
     /// Maximum number of handshake retry attempts
     const MAX_HANDSHAKE_RETRIES: u32 = 3;
-    
+
     /// Minimum handshake duration for timing attack protection (CRYPTO-001)
     /// A failed handshake to a wrong public key completes in ~1ms locally,
     /// while a correct key takes ~50ms network round-trip. 170ms hides the
     /// difference while keeping connection snappy.
     const MIN_HANDSHAKE_DURATION_MS: u64 = 170;
-    
+
     /// Perform WireGuard handshake with automatic retry
     /// NEW-001: Improves reliability on poor/unstable networks
     /// CRYPTO-001: Constant-time failure handling to prevent timing attacks
     async fn handshake_with_retry(&self) -> Result<(), String> {
         let start = Instant::now();
-        
+
         let result = self.do_handshake_with_retry_internal().await;
-        
+
         // CRYPTO-001: Ensure minimum duration to prevent timing attacks
         let elapsed = start.elapsed();
         let min_duration = Duration::from_millis(Self::MIN_HANDSHAKE_DURATION_MS);
         if elapsed < min_duration {
             tokio::time::sleep(min_duration - elapsed).await;
         }
-        
+
         result
     }
-    
+
     /// Internal handshake retry logic
     async fn do_handshake_with_retry_internal(&self) -> Result<(), String> {
         for attempt in 1..=Self::MAX_HANDSHAKE_RETRIES {
@@ -323,7 +335,7 @@ impl WireGuardSession {
 
         // Generate handshake initiation packet using boringtun
         let mut dst = vec![0u8; 2048];
-        
+
         let handshake_init = {
             let mut tunnel = self.tunnel.lock();
             tunnel.format_handshake_initiation(&mut dst, false)
@@ -356,7 +368,7 @@ impl WireGuardSession {
         match timeout.await {
             Ok(Ok(n)) => {
                 tracing::debug!("Received {} bytes response", n);
-                
+
                 let mut dst = vec![0u8; 2048];
                 let result = {
                     let mut tunnel = self.tunnel.lock();
@@ -375,17 +387,13 @@ impl WireGuardSession {
                             .send(response_data)
                             .await
                             .map_err(|e| format!("Failed to send response: {}", e))?;
-                        
+
                         tracing::info!("WireGuard handshake complete (with response)");
                         *self.is_connected.write().await = true;
                         Ok(())
                     }
-                    TunnResult::Err(e) => {
-                        Err(format!("Handshake failed: {:?}", e))
-                    }
-                    other => {
-                        Err(format!("Unexpected handshake result: {:?}", other))
-                    }
+                    TunnResult::Err(e) => Err(format!("Handshake failed: {:?}", e)),
+                    other => Err(format!("Unexpected handshake result: {:?}", other)),
                 }
             }
             Ok(Err(e)) => Err(format!("Failed to receive handshake response: {}", e)),
@@ -406,7 +414,7 @@ impl WireGuardSession {
         if total_size <= 1600 {
             // PERF-001: Fast path — stack allocation for normal-sized packets
             let mut dst = [0u8; 1600];
-            
+
             let result = {
                 let mut tunnel = self.tunnel.lock();
                 tunnel.encapsulate(packet, &mut dst)
@@ -414,7 +422,8 @@ impl WireGuardSession {
 
             match result {
                 TunnResult::WriteToNetwork(data) => {
-                    let sent = self.socket
+                    let sent = self
+                        .socket
                         .send(data)
                         .await
                         .map_err(|e| format!("Failed to send: {}", e))?;
@@ -426,7 +435,7 @@ impl WireGuardSession {
         } else {
             // Slow path — heap allocation for jumbo/oversized packets
             let mut dst = vec![0u8; total_size];
-            
+
             let result = {
                 let mut tunnel = self.tunnel.lock();
                 tunnel.encapsulate(packet, &mut dst)
@@ -434,7 +443,8 @@ impl WireGuardSession {
 
             match result {
                 TunnResult::WriteToNetwork(data) => {
-                    let sent = self.socket
+                    let sent = self
+                        .socket
                         .send(data)
                         .await
                         .map_err(|e| format!("Failed to send: {}", e))?;
@@ -453,17 +463,14 @@ impl WireGuardSession {
     /// Returns Vec<u8> for cross-boundary compatibility (Wintun write requires owned data).
     pub async fn recv_packet(&self) -> Result<Option<Vec<u8>>, String> {
         let mut raw = [0u8; super::buffer_pool::MAX_PACKET_SIZE];
-        
+
         match self.socket.try_recv(&mut raw) {
             Ok(n) => {
                 tracing::trace!("Socket received {} bytes (encrypted)", n);
 
                 // FIX-R2: Reject oversized datagrams that exceed reasonable WireGuard bounds
                 if n > 9000 {
-                    tracing::warn!(
-                        recv_len = n,
-                        "Received oversized UDP datagram — dropping"
-                    );
+                    tracing::warn!(recv_len = n, "Received oversized UDP datagram — dropping");
                     return Ok(None);
                 }
 
@@ -483,7 +490,10 @@ impl WireGuardSession {
                     }
                     TunnResult::Done => Ok(None),
                     TunnResult::WriteToNetwork(data) => {
-                        tracing::trace!("Decapsulate → WriteToNetwork ({} bytes, e.g. handshake response)", data.len());
+                        tracing::trace!(
+                            "Decapsulate → WriteToNetwork ({} bytes, e.g. handshake response)",
+                            data.len()
+                        );
                         // Send keepalive or timer response — don't return to tunnel
                         let _ = self.socket.send(data).await;
                         Ok(None)
@@ -504,7 +514,7 @@ impl WireGuardSession {
     pub async fn update_timers(&self) -> Result<(), String> {
         // PERF: Stack-allocate keepalive buffer (WIREGUARD_OVERHEAD = 80 bytes)
         let mut dst = [0u8; WIREGUARD_OVERHEAD];
-        
+
         let result = {
             let mut tunnel = self.tunnel.lock();
             tunnel.update_timers(&mut dst)
@@ -543,7 +553,7 @@ impl WireGuardSession {
     /// This is a best-effort measurement - returns None if measurement fails
     pub async fn measure_latency(&self) -> Option<u32> {
         let start = Instant::now();
-        
+
         // Send a keepalive packet
         let mut dst = [0u8; WIREGUARD_OVERHEAD];
         let send_result = {
@@ -562,10 +572,8 @@ impl WireGuardSession {
 
         // Wait for response with timeout
         let mut buf = [0u8; 256];
-        let timeout_result = tokio::time::timeout(
-            Duration::from_millis(2000),
-            self.socket.recv(&mut buf)
-        ).await;
+        let timeout_result =
+            tokio::time::timeout(Duration::from_millis(2000), self.socket.recv(&mut buf)).await;
 
         match timeout_result {
             Ok(Ok(_)) => {
@@ -592,7 +600,7 @@ impl WireGuardSession {
 
 /// Implement Drop to ensure secure cleanup of cryptographic material
 /// MEM-003: CRITICAL - Prevents key material retention after session ends
-/// 
+///
 /// This is defense-in-depth: boringtun's Tunn also implements zeroization,
 /// but we ensure the Arc wrapper doesn't leave stale data.
 impl Drop for WireGuardSession {
@@ -601,10 +609,10 @@ impl Drop for WireGuardSession {
             session_duration_secs = self.created_at.elapsed().as_secs(),
             "Dropping WireGuardSession - ensuring secure cleanup"
         );
-        
+
         // Log the Arc reference count for debugging
         let strong_count = Arc::strong_count(&self.tunnel);
-        
+
         if strong_count == 1 {
             // We have the only reference - tunnel will be dropped after this
             // boringtun's Tunn handles its own internal key zeroization
@@ -619,10 +627,10 @@ impl Drop for WireGuardSession {
                 strong_count
             );
         }
-        
+
         // The Arc<FastMutex<Tunn>> will be dropped automatically after this,
         // which will trigger boringtun's internal zeroization when refcount hits 0
-        
+
         tracing::trace!("WireGuardSession drop complete");
     }
 }

@@ -57,7 +57,7 @@ impl CredentialStore {
             .map_err(|e| format!("Failed to store credential: {}", e))?;
 
         tracing::debug!("Stored credential: {} (len={})", key_name, value.len());
-        
+
         // Verify it was actually stored (debug builds only — avoid redundant
         // read-back in production since the Windows Credential Manager API is
         // atomic and the read blocks the calling thread).
@@ -66,7 +66,11 @@ impl CredentialStore {
             match entry.get_password() {
                 Ok(stored) => {
                     if stored.len() != value.len() {
-                        tracing::error!("Credential verification failed: stored len {} != original len {}", stored.len(), value.len());
+                        tracing::error!(
+                            "Credential verification failed: stored len {} != original len {}",
+                            stored.len(),
+                            value.len()
+                        );
                         return Err("Credential verification failed".to_string());
                     }
                     tracing::debug!("Verified credential stored successfully: {}", key_name);
@@ -77,7 +81,7 @@ impl CredentialStore {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -110,10 +114,7 @@ impl CredentialStore {
 
     /// Clear all stored credentials
     pub fn clear_all() -> Result<(), String> {
-        let keys = [
-            CredentialKey::AccessToken,
-            CredentialKey::RefreshToken,
-        ];
+        let keys = [CredentialKey::AccessToken, CredentialKey::RefreshToken];
 
         for key in keys {
             Self::delete(key)?;
@@ -141,33 +142,33 @@ impl CredentialStore {
             Ok(Some(token)) => {
                 tracing::trace!("get_tokens: got access_token (len={})", token.len());
                 token
-            },
+            }
             Ok(None) => {
                 tracing::trace!("get_tokens: access_token is None");
                 return Err("No access token stored".to_string());
-            },
+            }
             Err(e) => {
                 tracing::warn!("get_tokens: error retrieving access_token: {}", e);
                 return Err(e);
             }
         };
-        
+
         tracing::trace!("get_tokens: retrieving refresh_token");
         let refresh = match Self::retrieve(CredentialKey::RefreshToken) {
             Ok(Some(token)) => {
                 tracing::trace!("get_tokens: got refresh_token (len={})", token.len());
                 token
-            },
+            }
             Ok(None) => {
                 tracing::trace!("get_tokens: refresh_token is None");
                 return Err("No refresh token stored".to_string());
-            },
+            }
             Err(e) => {
                 tracing::warn!("get_tokens: error retrieving refresh_token: {}", e);
                 return Err(e);
             }
         };
-        
+
         tracing::trace!("get_tokens: successfully retrieved both tokens");
         Ok(TokenPair {
             access_token: access,

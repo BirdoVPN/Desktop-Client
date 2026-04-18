@@ -16,7 +16,8 @@ pub async fn get_port_forwards(
 ) -> Result<Vec<crate::api::types::PortForward>, String> {
     if !api.is_authenticated().await {
         if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
+            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
         }
     }
     if !api.is_authenticated().await {
@@ -44,7 +45,8 @@ pub async fn create_port_forward(
 
     if !api.is_authenticated().await {
         if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
+            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
         }
     }
     if !api.is_authenticated().await {
@@ -68,14 +70,17 @@ pub async fn delete_port_forward(
     // a malicious renderer could inject traversal sequences like "../../other".
     if id.is_empty()
         || id.len() > 50
-        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return Err("Invalid port forward ID".to_string());
     }
 
     if !api.is_authenticated().await {
         if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
+            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
         }
     }
     if !api.is_authenticated().await {

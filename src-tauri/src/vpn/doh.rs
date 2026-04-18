@@ -11,7 +11,7 @@
 //! This is safe because we need only 1-of-N providers to succeed.
 
 use serde::Deserialize;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -32,8 +32,8 @@ struct DohAnswer {
 }
 
 /// DNS record types
-const DNS_TYPE_A: i32 = 1;       // IPv4
-const _DNS_TYPE_AAAA: i32 = 28;  // IPv6 (reserved for future use)
+const DNS_TYPE_A: i32 = 1; // IPv4
+const _DNS_TYPE_AAAA: i32 = 28; // IPv6 (reserved for future use)
 
 /// DoH provider configuration with certificate pinning.
 /// Each provider specifies one or more SPKI SHA-256 pin hashes.
@@ -78,8 +78,8 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         // Chain: cloudflare-dns.com → SSL.com SSL Intermediate CA ECC R2 → SSL.com Root CA ECC
         // Pins regenerated 2025-07-16 from live cloudflare-dns.com certificate.
         pins: &[
-            "47AoJnidZT0iTT7ay+Tod8tyhvxMkiZy9iJnQcpXrWU=",  // leaf: cloudflare-dns.com (expires 2026-12-21)
-            "lItxEa9C9UbVec/1ziveyCE03ZkUhCvdsMUocutgTjk=",  // intermediate: SSL.com SSL Intermediate CA ECC R2
+            "47AoJnidZT0iTT7ay+Tod8tyhvxMkiZy9iJnQcpXrWU=", // leaf: cloudflare-dns.com (expires 2026-12-21)
+            "lItxEa9C9UbVec/1ziveyCE03ZkUhCvdsMUocutgTjk=", // intermediate: SSL.com SSL Intermediate CA ECC R2
         ],
     },
     DoHProvider {
@@ -87,8 +87,8 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         // Chain: dns.google → WR2 (Google Trust Services) → GTS Root R1
         // Pins regenerated 2025-07-16 from live dns.google certificate.
         pins: &[
-            "ACUte493Q17uULD+DmOIon7nIx0FUDnohxxMNNlA/Pg=",  // leaf: dns.google (expires 2026-04-27)
-            "5v4iv0Xk8NO4XFngLA9JVBjh640yEPeI1IzV4ctUfNQ=",  // intermediate: WR2 (Google Trust Services)
+            "ACUte493Q17uULD+DmOIon7nIx0FUDnohxxMNNlA/Pg=", // leaf: dns.google (expires 2026-04-27)
+            "5v4iv0Xk8NO4XFngLA9JVBjh640yEPeI1IzV4ctUfNQ=", // intermediate: WR2 (Google Trust Services)
         ],
     },
     DoHProvider {
@@ -96,8 +96,8 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         // Chain: dns.quad9.net → DigiCert Global G3 TLS ECC SHA384 2020 CA1 → DigiCert Global Root G3
         // Pins regenerated 2025-07-16 from live dns.quad9.net certificate.
         pins: &[
-            "SCxBhlVQMlGdPR2qQI+sDmPHCvMNIq0+V8LUnjtP29w=",  // leaf: dns.quad9.net (expires 2026-07-27)
-            "BYfWvSgZWHq5D7WWSApXk72fdQaj6s5z9eqzZgF/4lk=",  // intermediate: DigiCert Global G3 TLS ECC SHA384 2020 CA1
+            "SCxBhlVQMlGdPR2qQI+sDmPHCvMNIq0+V8LUnjtP29w=", // leaf: dns.quad9.net (expires 2026-07-27)
+            "BYfWvSgZWHq5D7WWSApXk72fdQaj6s5z9eqzZgF/4lk=", // intermediate: DigiCert Global G3 TLS ECC SHA384 2020 CA1
         ],
     },
 ];
@@ -194,10 +194,10 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
-        .https_only(true)                                  // Enforce HTTPS only
-        .danger_accept_invalid_certs(false)                 // Reject invalid certs
-        .min_tls_version(reqwest::tls::Version::TLS_1_2)   // Minimum TLS 1.2
-        .tls_info(true)                                     // PROD: Enable TLS info for pinning
+        .https_only(true) // Enforce HTTPS only
+        .danger_accept_invalid_certs(false) // Reject invalid certs
+        .min_tls_version(reqwest::tls::Version::TLS_1_2) // Minimum TLS 1.2
+        .tls_info(true) // PROD: Enable TLS info for pinning
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
@@ -240,7 +240,10 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
         );
     }
 
-    Err(format!("All DoH providers failed. Last error: {}", last_error))
+    Err(format!(
+        "All DoH providers failed. Last error: {}",
+        last_error
+    ))
 }
 
 /// Internal error type to distinguish pinning failures from network errors
@@ -277,7 +280,10 @@ async fn resolve_single_provider(
     }
 
     if !resp.status().is_success() {
-        return Err(DoHError::Network(format!("DoH response status: {}", resp.status())));
+        return Err(DoHError::Network(format!(
+            "DoH response status: {}",
+            resp.status()
+        )));
     }
 
     let doh_resp: DohResponse = resp
@@ -287,7 +293,10 @@ async fn resolve_single_provider(
 
     // DNS status 0 = NOERROR
     if doh_resp.status != 0 {
-        return Err(DoHError::Parse(format!("DNS error status: {}", doh_resp.status)));
+        return Err(DoHError::Parse(format!(
+            "DNS error status: {}",
+            doh_resp.status
+        )));
     }
 
     // Find the first A record
@@ -314,7 +323,9 @@ async fn resolve_single_provider(
         }
     }
 
-    Err(DoHError::Parse("No A record found in DNS response".to_string()))
+    Err(DoHError::Parse(
+        "No A record found in DNS response".to_string(),
+    ))
 }
 
 /// Check if an IPv4 address is in a private/reserved range.
@@ -351,7 +362,7 @@ mod tests {
         assert!(is_private_ip(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(is_private_ip(Ipv4Addr::new(127, 0, 0, 1)));
         assert!(is_private_ip(Ipv4Addr::new(169, 254, 1, 1)));
-        assert!(is_private_ip(Ipv4Addr::new(100, 64, 0, 1)));   // CGNAT
+        assert!(is_private_ip(Ipv4Addr::new(100, 64, 0, 1))); // CGNAT
         assert!(!is_private_ip(Ipv4Addr::new(1, 1, 1, 1)));
         assert!(!is_private_ip(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(!is_private_ip(Ipv4Addr::new(104, 16, 0, 1)));

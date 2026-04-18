@@ -101,7 +101,11 @@ mod kill_switch_tests {
             "BirdoVPN_BlockTURN",
         ];
         for rule in rules {
-            assert!(rule.starts_with("BirdoVPN"), "Rule '{}' missing BirdoVPN prefix", rule);
+            assert!(
+                rule.starts_with("BirdoVPN"),
+                "Rule '{}' missing BirdoVPN prefix",
+                rule
+            );
         }
     }
 
@@ -114,11 +118,15 @@ mod kill_switch_tests {
         let weight_block_stun: u8 = 15;
 
         // Permits must override block-all
-        assert!(weight_permit > weight_block_all,
-            "Permit weight must exceed block-all weight");
+        assert!(
+            weight_permit > weight_block_all,
+            "Permit weight must exceed block-all weight"
+        );
         // STUN blocks must override permits
-        assert!(weight_block_stun > weight_permit,
-            "STUN block weight must exceed permit weight");
+        assert!(
+            weight_block_stun > weight_permit,
+            "STUN block weight must exceed permit weight"
+        );
     }
 
     /// FIX-2-1: Validate IPv4 address conversion for WFP.
@@ -214,14 +222,21 @@ mod tunnel_health_tests {
 
         // Should complete within 10 minutes worst case
         let total_secs = total_ms / 1000;
-        assert!(total_secs < 600, "Total reconnect time {} exceeds 10 minutes", total_secs);
+        assert!(
+            total_secs < 600,
+            "Total reconnect time {} exceeds 10 minutes",
+            total_secs
+        );
     }
 
     #[test]
     fn buffer_pool_size_is_within_bounds() {
         // WireGuard MTU is typically 1420, with overhead the buffer should be >= 1500
         let buffer_size: usize = 65536; // Common buffer pool allocation
-        assert!(buffer_size >= 1500, "Buffer too small for WireGuard packets");
+        assert!(
+            buffer_size >= 1500,
+            "Buffer too small for WireGuard packets"
+        );
         assert!(buffer_size <= 1 << 20, "Buffer unreasonably large (>1MB)");
     }
 }
@@ -420,7 +435,7 @@ mod vpn_error_tests {
 
 #[cfg(test)]
 mod vpn_manager_tests {
-    use super::super::manager::{VpnManager, ConnectionState};
+    use super::super::manager::{ConnectionState, VpnManager};
 
     #[tokio::test]
     async fn new_manager_starts_disconnected() {
@@ -511,7 +526,10 @@ mod buffer_pool_tests {
         // WireGuard Transport Data Message overhead:
         // 4 (type) + 4 (receiver) + 8 (nonce) + 16 (AEAD tag) = 32 bytes minimum
         // Plus alignment padding.  The codebase uses 148 which includes padding.
-        assert!(WIREGUARD_OVERHEAD >= 32, "Overhead too small for WireGuard header");
+        assert!(
+            WIREGUARD_OVERHEAD >= 32,
+            "Overhead too small for WireGuard header"
+        );
         assert!(WIREGUARD_OVERHEAD <= 256, "Overhead unreasonably large");
     }
 
@@ -563,7 +581,9 @@ mod auto_reconnect_service_tests {
     #[tokio::test]
     async fn store_last_config_roundtrip() {
         let service = create_service();
-        service.store_last_config("server-1".into(), "US East".into(), false).await;
+        service
+            .store_last_config("server-1".into(), "US East".into(), false)
+            .await;
         // Store should succeed without panic
         service.clear_last_config().await;
     }

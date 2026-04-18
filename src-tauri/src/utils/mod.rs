@@ -6,16 +6,16 @@ pub mod telemetry;
 
 // elevation and telemetry are scaffolding — used when specific operations
 // need UAC elevation or crash reporting. Re-exports here for convenience.
-#[allow(unused_imports)]
-pub use elevation::{is_elevated, run_elevated};
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 pub use elevation::run_netsh_elevated;
+#[allow(unused_imports)]
+pub use elevation::{is_elevated, run_elevated};
 pub use redact::redact_email;
 pub use redact::redact_endpoint;
 pub use redact::redact_ip;
 #[allow(unused_imports)]
-pub use telemetry::{report as telemetry_report, breadcrumb as telemetry_breadcrumb};
+pub use telemetry::{breadcrumb as telemetry_breadcrumb, report as telemetry_report};
 
 /// Create a `std::process::Command` that runs hidden on Windows (no console popup).
 ///
@@ -39,7 +39,7 @@ pub fn hidden_cmd(program: &str) -> std::process::Command {
 /// Generate a stable, anonymous device identifier.
 /// Uses SHA-256 of the hostname + OS family + username for a non-reversible but consistent ID.
 pub fn get_device_id() -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
