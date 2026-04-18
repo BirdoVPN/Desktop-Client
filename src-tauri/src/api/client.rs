@@ -2,26 +2,28 @@
 //!
 //! Handles all HTTP communication with the Birdo VPN backend.
 
+use base64::Engine as _;
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
-use sha2::{Sha256, Digest};
-use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
+use super::endpoints;
 use super::error::ApiError;
 use super::types::*;
-use super::endpoints;
 
 // H-1: erased_serde is used for the generic retry interceptor
 // that needs to pass serializable bodies through a trait object.
 use erased_serde;
 
 /// Production API URL
-/// This should match the CSP in tauri.conf.json: connect-src https://birdo.app
-const API_BASE_URL: &str = "https://birdo.app/api";
+/// This should match the CSP in tauri.conf.json: connect-src https://*.birdo.app
+/// As of subdomain-based routing, the backend is reachable via api.birdo.app
+/// (Caddy reverse-proxies api.birdo.app -> backend:4000 directly, no /api prefix).
+const API_BASE_URL: &str = "https://api.birdo.app";
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Windows)");
 
 /// SEC-C1: SHA-256 hashes of the full DER-encoded **leaf** certificate for birdo.app.
@@ -60,13 +62,13 @@ const CERT_PINS_SHA256: &[&str] = &[
     // so intermediate/root pins are omitted (they would never match).
     //
     // Current leaf cert (CN=birdo.app, issuer: Google Trust Services WE1) expires 2026-06-02.
-    "EQul2kftgtOaU85XCKuj4SK3DW5256uxNdEvZXZbuJM=",  // leaf: birdo.app (Google/CF, expires 2026-06-02)
-    // ── Next cert pin slot ──────────────────────────────────────────────
-    // After renewing the certificate on Cloudflare, add the new leaf hash
-    // here BEFORE removing the old one. This ensures clients that haven't
-    // updated yet still pass pinning against the old cert, while updated
-    // clients accept the new one.
-    // "<NEW_LEAF_PIN_HERE>",  // leaf: birdo.app (next cert, expires ~YYYY-MM-DD)
+    "EQul2kftgtOaU85XCKuj4SK3DW5256uxNdEvZXZbuJM=", // leaf: birdo.app (Google/CF, expires 2026-06-02)
+                                                    // ── Next cert pin slot ──────────────────────────────────────────────
+                                                    // After renewing the certificate on Cloudflare, add the new leaf hash
+                                                    // here BEFORE removing the old one. This ensures clients that haven't
+                                                    // updated yet still pass pinning against the old cert, while updated
+                                                    // clients accept the new one.
+                                                    // "<NEW_LEAF_PIN_HERE>",  // leaf: birdo.app (next cert, expires ~YYYY-MM-DD)
 ];
 
 /// FIX H-3: Build-time guard — release builds MUST have certificate pins populated.
@@ -157,15 +159,14 @@ impl BirdoApi {
         };
 
         // Use desktop-specific endpoint that returns tokens in body
-        let result: LoginResult = self.post(endpoints::auth::LOGIN_DESKTOP, &payload, false).await?;
+        let result: LoginResult = self
+            .post(endpoints::auth::LOGIN_DESKTOP, &payload, false)
+            .await?;
 
         // Only store tokens if login succeeded (not 2FA challenge)
         if let LoginResult::Success { ref tokens, .. } = result {
-            self.set_tokens(
-                tokens.access_token.clone(),
-                tokens.refresh_token.clone(),
-            )
-            .await;
+            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
         }
 
         Ok(result)
@@ -173,21 +174,24 @@ impl BirdoApi {
 
     /// FIX C-2: Verify TOTP code for 2FA challenge.
     /// Called after login returns LoginResult::TwoFactorChallenge.
-    pub async fn verify_2fa(&self, challenge_token: &str, totp_code: &str) -> Result<TwoFactorVerifyResponse, ApiError> {
+    pub async fn verify_2fa(
+        &self,
+        challenge_token: &str,
+        totp_code: &str,
+    ) -> Result<TwoFactorVerifyResponse, ApiError> {
         let payload = TwoFactorVerifyRequest {
             challenge_token: challenge_token.to_string(),
             token: totp_code.to_string(),
         };
 
-        let response: TwoFactorVerifyResponse = self.post(endpoints::auth::TWO_FACTOR_VERIFY, &payload, false).await?;
+        let response: TwoFactorVerifyResponse = self
+            .post(endpoints::auth::TWO_FACTOR_VERIFY, &payload, false)
+            .await?;
 
         // Store tokens from successful 2FA verification
         if let Some(ref tokens) = response.tokens {
-            self.set_tokens(
-                tokens.access_token.clone(),
-                tokens.refresh_token.clone(),
-            )
-            .await;
+            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
         }
 
         Ok(response)
@@ -208,11 +212,12 @@ impl BirdoApi {
             refresh_token: (*refresh).clone(),
         };
 
-        let response: RefreshResponse = self.post(endpoints::auth::REFRESH, &payload, false).await?;
+        let response: RefreshResponse =
+            self.post(endpoints::auth::REFRESH, &payload, false).await?;
 
         // Update access token
         *self.access_token.write().await = Some(Zeroizing::new(response.access_token.clone()));
-        
+
         // FIX C-1: Also update refresh token if server rotated it
         if let Some(ref new_refresh) = response.refresh_token {
             *self.refresh_token.write().await = Some(Zeroizing::new(new_refresh.clone()));
@@ -223,7 +228,9 @@ impl BirdoApi {
 
     /// Logout (invalidate tokens on server)
     pub async fn logout(&self) -> Result<(), ApiError> {
-        let _ = self.post::<_, serde_json::Value>(endpoints::auth::LOGOUT, &(), true).await;
+        let _ = self
+            .post::<_, serde_json::Value>(endpoints::auth::LOGOUT, &(), true)
+            .await;
         self.clear_tokens().await;
         Ok(())
     }
@@ -238,7 +245,8 @@ impl BirdoApi {
             endpoints::auth::GDPR_DELETE,
             &DeleteBody { password },
             true,
-        ).await?;
+        )
+        .await?;
         self.clear_tokens().await;
         Ok(())
     }
@@ -275,13 +283,14 @@ impl BirdoApi {
             stealth_mode,
             quantum_protection,
         };
-        
+
         self.post(endpoints::vpn::CONNECT, &payload, true).await
     }
 
     /// Disconnect from VPN (revoke key)
     pub async fn disconnect_vpn(&self, key_id: &str) -> Result<(), ApiError> {
-        self.delete::<serde_json::Value>(&endpoints::vpn::connection(key_id), true).await?;
+        self.delete::<serde_json::Value>(&endpoints::vpn::connection(key_id), true)
+            .await?;
         Ok(())
     }
 
@@ -296,22 +305,40 @@ impl BirdoApi {
     /// P3-25: Rotate the WireGuard key for an active connection.
     /// Sends a new client public key; server returns new server public key and key_id.
     /// The old key is deactivated server-side after rotation succeeds.
-    pub async fn rotate_key(&self, key_id: &str, new_public_key: &str) -> Result<super::types::KeyRotationResponse, ApiError> {
+    #[allow(dead_code)] // Wired to auto-rotate timer in P3-25 follow-up
+    pub async fn rotate_key(
+        &self,
+        key_id: &str,
+        new_public_key: &str,
+    ) -> Result<super::types::KeyRotationResponse, ApiError> {
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         struct RotateRequest<'a> {
             client_public_key: &'a str,
         }
-        self.post(&endpoints::vpn::rotate_key(key_id), &RotateRequest { client_public_key: new_public_key }, true).await
+        self.post(
+            &endpoints::vpn::rotate_key(key_id),
+            &RotateRequest {
+                client_public_key: new_public_key,
+            },
+            true,
+        )
+        .await
     }
 
     /// P2-15: Report connection quality telemetry to the backend.
     /// Fire-and-forget — callers should not block on failure.
     pub async fn report_quality(&self, report: &QualityReport) -> Result<(), ApiError> {
-        let _: serde_json::Value = self.post(endpoints::vpn::QUALITY_REPORT, report, true).await
+        let _: serde_json::Value = self
+            .post(endpoints::vpn::QUALITY_REPORT, report, true)
+            .await
             .or_else(|e| {
                 // 204 No Content is expected — treat parse errors as success
-                if matches!(e, ApiError::Parse(_)) { Ok(serde_json::Value::Null) } else { Err(e) }
+                if matches!(e, ApiError::Parse(_)) {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Err(e)
+                }
             })?;
         Ok(())
     }
@@ -340,10 +367,13 @@ impl BirdoApi {
             device_id: device_id.to_string(),
         };
 
-        let result: AnonymousLoginResult = self.post(endpoints::auth::LOGIN_ANONYMOUS, &payload, false).await?;
+        let result: AnonymousLoginResult = self
+            .post(endpoints::auth::LOGIN_ANONYMOUS, &payload, false)
+            .await?;
 
         if let Some(ref tokens) = result.tokens {
-            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone()).await;
+            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
         }
 
         Ok(result)
@@ -373,7 +403,8 @@ impl BirdoApi {
             client_public_key: Some(client_public_key.to_string()),
         };
 
-        self.post(endpoints::vpn::MULTI_HOP_CONNECT, &payload, true).await
+        self.post(endpoints::vpn::MULTI_HOP_CONNECT, &payload, true)
+            .await
     }
 
     // ========================================================================
@@ -398,12 +429,17 @@ impl BirdoApi {
             preferred_port,
         };
 
-        self.post(endpoints::vpn::PORT_FORWARDS, &payload, true).await
+        self.post(endpoints::vpn::PORT_FORWARDS, &payload, true)
+            .await
     }
 
     /// Delete a port forward
     pub async fn delete_port_forward(&self, id: &str) -> Result<(), ApiError> {
-        self.delete::<serde_json::Value>(&format!("{}/{}", endpoints::vpn::PORT_FORWARDS, id), true).await?;
+        self.delete::<serde_json::Value>(
+            &format!("{}/{}", endpoints::vpn::PORT_FORWARDS, id),
+            true,
+        )
+        .await?;
         Ok(())
     }
 
@@ -422,7 +458,7 @@ impl BirdoApi {
         auth: bool,
     ) -> Result<T, ApiError> {
         let result = self.do_request::<T>(&method, path, body, auth).await;
-        
+
         // If we got a 401 and we have a refresh token, try refreshing
         if matches!(&result, Err(ApiError::Unauthorized)) && auth {
             let has_refresh = self.refresh_token.read().await.is_some();
@@ -450,7 +486,7 @@ impl BirdoApi {
                 }
             }
         }
-        
+
         result
     }
 
@@ -483,7 +519,10 @@ impl BirdoApi {
             request = request.bearer_auth(token.as_str());
         }
 
-        let response = request.send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         self.handle_response(response).await
     }
 
@@ -501,12 +540,14 @@ impl BirdoApi {
         };
 
         // Use do_request directly to avoid infinite retry loop
-        let response: RefreshResponse = self.do_request(
-            &reqwest::Method::POST,
-            endpoints::auth::REFRESH,
-            Some(&payload),
-            false,
-        ).await?;
+        let response: RefreshResponse = self
+            .do_request(
+                &reqwest::Method::POST,
+                endpoints::auth::REFRESH,
+                Some(&payload),
+                false,
+            )
+            .await?;
 
         *self.access_token.write().await = Some(Zeroizing::new(response.access_token));
         // FIX C-1: Also update refresh token if rotated
@@ -517,7 +558,8 @@ impl BirdoApi {
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str, auth: bool) -> Result<T, ApiError> {
-        self.request_with_retry(reqwest::Method::GET, path, None, auth).await
+        self.request_with_retry(reqwest::Method::GET, path, None, auth)
+            .await
     }
 
     async fn post<B: Serialize + Sync, T: DeserializeOwned>(
@@ -526,11 +568,13 @@ impl BirdoApi {
         body: &B,
         auth: bool,
     ) -> Result<T, ApiError> {
-        self.request_with_retry(reqwest::Method::POST, path, Some(body), auth).await
+        self.request_with_retry(reqwest::Method::POST, path, Some(body), auth)
+            .await
     }
 
     async fn delete<T: DeserializeOwned>(&self, path: &str, auth: bool) -> Result<T, ApiError> {
-        self.request_with_retry(reqwest::Method::DELETE, path, None, auth).await
+        self.request_with_retry(reqwest::Method::DELETE, path, None, auth)
+            .await
     }
 
     async fn handle_response<T: DeserializeOwned>(
@@ -543,9 +587,10 @@ impl BirdoApi {
         let status = response.status();
 
         match status {
-            StatusCode::OK | StatusCode::CREATED => {
-                response.json().await.map_err(|e| ApiError::Parse(e.to_string()))
-            }
+            StatusCode::OK | StatusCode::CREATED => response
+                .json()
+                .await
+                .map_err(|e| ApiError::Parse(e.to_string())),
             StatusCode::UNAUTHORIZED => {
                 // Try to refresh token
                 Err(ApiError::Unauthorized)
@@ -553,9 +598,9 @@ impl BirdoApi {
             StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
             StatusCode::NOT_FOUND => Err(ApiError::NotFound),
             StatusCode::TOO_MANY_REQUESTS => Err(ApiError::RateLimited),
-            StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => {
-                Err(ApiError::ServerError(status.as_u16()))
-            }
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE => Err(ApiError::ServerError(status.as_u16())),
             _ => {
                 // P1-7: Try to parse a typed error code from the response body
                 let error_text = response.text().await.unwrap_or_default();
@@ -600,17 +645,14 @@ impl BirdoApi {
             })?;
 
         let peer_cert_der = tls_info.peer_certificate().ok_or_else(|| {
-            ApiError::CertificatePinningFailed(
-                "No peer certificate in TLS info".into(),
-            )
+            ApiError::CertificatePinningFailed("No peer certificate in TLS info".into())
         })?;
 
         // Compute SHA-256 of the full DER-encoded certificate.
         let hash = {
             let mut hasher = Sha256::new();
             hasher.update(peer_cert_der);
-            base64::engine::general_purpose::STANDARD
-                .encode(hasher.finalize())
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
         };
 
         if CERT_PINS_SHA256.iter().any(|pin| *pin == hash) {

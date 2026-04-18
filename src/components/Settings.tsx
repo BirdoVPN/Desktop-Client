@@ -945,7 +945,7 @@ export function Settings() {
           <div className="space-y-1">
             <SettingLink
               title="Manage Subscription"
-              href="https://birdo.app/dashboard"
+              href="https://dashboard.birdo.app"
             />
             <SettingLink
               title="Privacy Policy"
@@ -963,11 +963,11 @@ export function Settings() {
           <div className="space-y-1">
             <SettingLink
               title="Change Password"
-              href="https://birdo.app/dashboard/settings"
+              href="https://dashboard.birdo.app/settings"
             />
             <SettingLink
               title="Two-Factor Authentication"
-              href="https://birdo.app/dashboard/settings"
+              href="https://dashboard.birdo.app/settings"
             />
             <DataExportButton />
           </div>

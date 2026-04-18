@@ -116,7 +116,7 @@ export function Login() {
 
   const handleForgotPassword = async () => {
     try {
-      await open('https://birdo.app/reset-password');
+      await open('https://auth.birdo.app/reset-password');
     } catch {
       setError('Failed to open browser');
     }
@@ -491,7 +491,7 @@ export function Login() {
                   <p className="text-center text-xs text-white/40">
                     Don't have an anonymous ID?{' '}
                     <a
-                      href="https://birdo.app/register"
+                      href="https://auth.birdo.app/register"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="text-white/60 hover:text-white/80 transition"
@@ -512,7 +512,7 @@ export function Login() {
             >
               Don't have an account?{' '}
               <a
-                href="https://birdo.app/register"
+                href="https://auth.birdo.app/register"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="font-medium text-white transition hover:text-white/80"
