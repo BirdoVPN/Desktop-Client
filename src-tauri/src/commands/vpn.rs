@@ -350,27 +350,37 @@ async fn start_stealth_tunnel(
 }
 
 /// Phase 2 helper: Derive Rosenpass post-quantum hybrid PSK if the server supports it.
+///
+/// IMPORTANT: A previous version of this function called `derive_hybrid_psk()` which
+/// mixed in client-only random entropy. That entropy never reaches the server, so the
+/// PSK derived here could never match the PSK the server's WireGuard peer was configured
+/// with. The handshake completed at the noise level on each side independently, but
+/// every transport packet failed authentication — producing the classic
+/// "tunnel up, packets out, no packets in, no IP reachable" symptom.
+///
+/// True post-quantum PSK derivation requires running the actual Rosenpass UDP exchange
+/// against the server's `rosenpass_endpoint`. Until that's wired up, we fall back to
+/// the genuine random PSK the server already generates per-peer and ships in
+/// `response.preshared_key`. WireGuard still gets a strong 32-byte PSK; we just don't
+/// claim it's PQ-derived.
 fn derive_quantum_psk(response: &ConnectResponse) -> Option<String> {
     if !response.quantum_enabled.unwrap_or(false) || response.rosenpass_public_key.is_none() {
         return None;
     }
 
-    let rp_config = crate::vpn::rosenpass::RosenpassConfig {
-        server_public_key: response.rosenpass_public_key.clone()?, // guarded by is_none() check above
-        server_psk: response.preshared_key.clone(),
-    };
-
-    match crate::vpn::rosenpass::derive_hybrid_psk(&rp_config) {
-        Ok(psk) => {
-            tracing::info!("Rosenpass hybrid PSK derived successfully");
-            Some(psk)
-        }
-        Err(e) => {
-            tracing::error!("Failed to derive Rosenpass PSK: {}", e);
-            // Fall back to server PSK or none
-            None
-        }
+    if response.preshared_key.is_some() {
+        tracing::info!(
+            "Quantum protection enabled — using server-provided PSK (Rosenpass UDP exchange not yet wired up client-side)"
+        );
+    } else {
+        tracing::warn!(
+            "Quantum protection requested but server did not return a preshared_key; running without PSK"
+        );
     }
+
+    // Pass through the server's PSK as-is. `build_vpn_config` will already have
+    // populated this; the override in `connect_vpn` becomes a no-op.
+    response.preshared_key.clone()
 }
 
 /// Check if the current process has administrator privileges.

@@ -582,7 +582,13 @@ mod auto_reconnect_service_tests {
     async fn store_last_config_roundtrip() {
         let service = create_service();
         service
-            .store_last_config("server-1".into(), "US East".into(), false)
+            .store_last_config(
+                "server-1".into(),
+                "US East".into(),
+                false,
+                1420,
+                String::new(),
+            )
             .await;
         // Store should succeed without panic
         service.clear_last_config().await;

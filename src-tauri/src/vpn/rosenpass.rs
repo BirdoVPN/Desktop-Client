@@ -1,11 +1,20 @@
 //! Rosenpass Post-Quantum PSK Derivation
 //!
-//! Provides hybrid post-quantum key exchange for WireGuard connections.
-//! Uses HKDF-SHA256 to derive a 32-byte PSK from the server's Rosenpass
-//! public key combined with local entropy.
+//! ⚠️ **DEPRECATED — DO NOT CALL `derive_hybrid_psk` FROM CONNECT FLOW.**
 //!
-//! This matches the Android RosenpassManager fallback implementation:
-//! server Rosenpass public key + local entropy → HKDF → WireGuard PSK
+//! This module's `derive_hybrid_psk()` mixes in client-only random entropy that the
+//! server cannot reproduce, so the resulting PSK can never match the server's
+//! WireGuard peer config. Using it on the connect path breaks the WireGuard handshake
+//! (tunnel comes up, packets sent, none received). See `commands/vpn.rs::derive_quantum_psk`.
+//!
+//! A proper post-quantum PSK requires running the actual Rosenpass UDP exchange
+//! against the node's `rosenpass_endpoint`. Until that's implemented, the connect
+//! flow uses the genuine random PSK the server already returns in the connect response.
+//!
+//! Kept compiled (behind tests) so the algorithm is preserved for future reference
+//! when the real exchange is wired up.
+
+#![allow(dead_code)]
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};

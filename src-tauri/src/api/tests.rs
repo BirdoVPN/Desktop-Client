@@ -242,6 +242,8 @@ mod types_serialization_tests {
             device_name: None,
             preferred_region: None,
             client_public_key: None,
+            stealth_mode: None,
+            quantum_protection: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["serverNodeId"], "node-1");
@@ -293,6 +295,8 @@ mod vpn_config_security_tests {
             allowed_ips: vec!["0.0.0.0/0".to_string()],
             dns: vec!["1.1.1.1".to_string()],
             client_ip: "10.0.0.2".to_string(),
+            client_ipv6: None,
+            allowed_ips_v6: Vec::new(),
             mtu: 1420,
             persistent_keepalive: 25,
         }
