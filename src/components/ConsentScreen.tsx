@@ -1,5 +1,7 @@
 import { motion } from 'framer-motion';
 import { Shield, Eye, BarChart3, ShieldOff } from 'lucide-react';
+import { BirdoButton, BirdoCard } from './birdo';
+import { gradient, white } from '@/lib/birdo-theme';
 
 interface ConsentScreenProps {
   onAccept: () => void;
@@ -31,14 +33,15 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5 }}
         >
-          {/* Shield icon */}
+          {/* Brand mark */}
           <motion.div
-            className="mt-8 mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-white/5 border border-white/10"
+            className="mt-8 mb-4 flex h-16 w-16 items-center justify-center rounded-2xl"
+            style={{ background: gradient.primary, boxShadow: '0 16px 32px -12px rgba(124,58,237,0.55)' }}
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.5, delay: 0.1 }}
           >
-            <Shield size={32} className="text-white" />
+            <Shield size={32} color="#FFFFFF" />
           </motion.div>
 
           {/* Title */}
@@ -62,31 +65,35 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
 
           {/* Data processing summary card */}
           <motion.div
-            className="w-full rounded-2xl glass-card p-5 space-y-5 mb-5"
+            className="w-full mb-5"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5, delay: 0.25 }}
           >
-            <DataItem
-              icon={Eye}
-              title="No Activity Logs"
-              description="Zero-logs policy on RAM-only volatile infrastructure. No browsing, traffic, DNS, timestamps, or IPs are logged."
-            />
-            <DataItem
-              icon={Shield}
-              title="Account Data Only"
-              description="Only your email and subscription status are stored in a separate account database — never on VPN servers."
-            />
-            <DataItem
-              icon={BarChart3}
-              title="Anonymous Crash Reports"
-              description="Crash reports help us fix bugs. They contain no personal information."
-            />
-            <DataItem
-              icon={ShieldOff}
-              title="No Data Sales"
-              description="Your data is never sold, shared with advertisers, or monetized in any way."
-            />
+            <BirdoCard padding="1.25rem" cornerRadius={20}>
+              <div className="space-y-5">
+                <DataItem
+                  icon={Eye}
+                  title="No Activity Logs"
+                  description="Zero-logs policy on RAM-only volatile infrastructure. No browsing, traffic, DNS, timestamps, or IPs are logged."
+                />
+                <DataItem
+                  icon={Shield}
+                  title="Account Data Only"
+                  description="Only your email and subscription status are stored in a separate account database — never on VPN servers."
+                />
+                <DataItem
+                  icon={BarChart3}
+                  title="Anonymous Crash Reports"
+                  description="Crash reports help us fix bugs. They contain no personal information."
+                />
+                <DataItem
+                  icon={ShieldOff}
+                  title="No Data Sales"
+                  description="Your data is never sold, shared with advertisers, or monetized in any way."
+                />
+              </div>
+            </BirdoCard>
           </motion.div>
 
           {/* Privacy policy link */}
@@ -94,7 +101,8 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             href="https://birdo.app/privacy"
             target="_blank"
             rel="noopener noreferrer"
-            className="mb-6 text-sm text-white/60 underline underline-offset-2 hover:text-white/80 transition"
+            className="mb-6 text-sm underline underline-offset-2 transition hover:opacity-100"
+            style={{ color: white.w60 }}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.3 }}
@@ -103,32 +111,41 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
           </motion.a>
 
           {/* Accept button */}
-          <motion.button
-            onClick={onAccept}
-            className="btn-primary w-full rounded-xl px-4 py-3.5 font-semibold text-sm"
+          <motion.div
+            className="w-full"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5, delay: 0.35 }}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
           >
-            I Agree &amp; Continue
-          </motion.button>
+            <BirdoButton
+              text="I Agree & Continue"
+              variant="brand"
+              size="large"
+              fullWidth
+              onClick={onAccept}
+            />
+          </motion.div>
 
           {/* Decline button */}
-          <motion.button
-            onClick={onDecline}
-            className="mt-3 w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white/40 hover:bg-white/10 hover:text-white/60 transition"
+          <motion.div
+            className="mt-3 w-full"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5, delay: 0.4 }}
           >
-            Decline
-          </motion.button>
+            <BirdoButton
+              text="Decline"
+              variant="secondary"
+              size="medium"
+              fullWidth
+              onClick={onDecline}
+            />
+          </motion.div>
 
           {/* Required notice */}
           <motion.p
-            className="mt-4 text-xs text-white/20 text-center"
+            className="mt-4 text-xs text-center"
+            style={{ color: white.w40 }}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.45 }}

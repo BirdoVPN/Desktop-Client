@@ -152,7 +152,7 @@ export function WorldGlobe({
         pointResolution={6}
         // Pulsing rings under the selected server
         ringsData={rings}
-        ringColor={(d: { color: string }) => () => d.color}
+        ringColor={(d: object) => (d as { color: string }).color}
         ringMaxRadius="maxR"
         ringPropagationSpeed="propagationSpeed"
         ringRepeatPeriod="repeatPeriod"

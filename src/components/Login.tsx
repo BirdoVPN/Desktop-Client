@@ -2,8 +2,10 @@ import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '@/store/app-store';
-import { Eye, EyeOff, Loader2, ShieldCheck, UserRound, KeyRound } from 'lucide-react';
+import { Eye, EyeOff, ShieldCheck, UserRound, KeyRound, Shield } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { BirdoBadge } from './birdo';
+import { gradient, white, hairline } from '@/lib/birdo-theme';
 
 /** Map raw backend error strings to user-friendly messages */
 function friendlyError(raw: unknown): string {
@@ -173,10 +175,21 @@ export function Login() {
       {/* Header with drag region */}
       <div
         data-tauri-drag-region
-        className="flex h-12 items-center justify-center border-b border-white/5 glass-strong"
+        className="flex h-12 items-center justify-center gap-2.5"
+        style={{
+          backgroundColor: 'rgba(11,11,16,0.65)',
+          borderBottom: `1px solid ${hairline.soft}`,
+          backdropFilter: 'blur(8px)',
+        }}
       >
-        <span className="text-lg font-semibold text-white">
-          Birdo VPN
+        <div
+          className="flex h-7 w-7 items-center justify-center rounded-[8px]"
+          style={{ background: gradient.primary }}
+        >
+          <Shield size={16} color="#FFFFFF" />
+        </div>
+        <span className="text-base font-semibold" style={{ color: white.w100 }}>
+          BirdoVPN
         </span>
       </div>
 
@@ -189,19 +202,13 @@ export function Login() {
           transition={{ duration: 0.5 }}
         >
           {/* Status badge */}
-          <motion.div 
+          <motion.div
             className="mb-6 flex justify-center"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5, delay: 0.1 }}
           >
-            <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-1.5 text-sm text-white backdrop-blur-md">
-              <span className="relative flex h-2 w-2">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-white opacity-75"></span>
-                <span className="relative inline-flex h-2 w-2 rounded-full bg-white"></span>
-              </span>
-              Secure Connection
-            </div>
+            <BirdoBadge text="Secure Connection" tone="success" pulseDot />
           </motion.div>
 
           <motion.h2 
@@ -272,13 +279,17 @@ export function Login() {
               <motion.button
                 type="submit"
                 disabled={isLoading || totpCode.length !== 6}
-                className="btn-primary w-full rounded-lg px-4 py-3.5 font-semibold disabled:cursor-not-allowed disabled:opacity-50"
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
+                className="w-full rounded-2xl font-semibold text-white text-base h-[56px] disabled:cursor-not-allowed disabled:opacity-50 transition-opacity"
+                style={{
+                  backgroundImage: gradient.primary,
+                  border: `1px solid ${hairline.strong}`,
+                  boxShadow: '0 14px 32px -10px rgba(168,85,247,0.45)',
+                }}
+                whileTap={!isLoading ? { scale: 0.98 } : undefined}
               >
                 {isLoading ? (
                   <span className="flex items-center justify-center gap-2">
-                    <Loader2 className="h-5 w-5 animate-spin" />
+                    <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
                     Verifying...
                   </span>
                 ) : (
@@ -289,7 +300,8 @@ export function Login() {
               <button
                 type="button"
                 onClick={handleBack}
-                className="w-full text-center text-sm text-white/50 hover:text-white/70 transition"
+                className="w-full text-center text-sm transition"
+                style={{ color: white.w60 }}
               >
                 ← Back to login
               </button>
@@ -391,17 +403,21 @@ export function Login() {
                   <motion.button
                     type="submit"
                     disabled={isLoading}
-                    className="btn-primary w-full rounded-lg px-4 py-3.5 font-semibold disabled:cursor-not-allowed disabled:opacity-50"
-                    whileHover={{ scale: 1.02 }}
-                    whileTap={{ scale: 0.98 }}
+                    className="w-full rounded-2xl font-semibold text-white text-base h-[56px] disabled:cursor-not-allowed disabled:opacity-50 transition-opacity"
+                    style={{
+                      backgroundImage: gradient.primary,
+                      border: `1px solid ${hairline.strong}`,
+                      boxShadow: '0 14px 32px -10px rgba(168,85,247,0.45)',
+                    }}
+                    whileTap={!isLoading ? { scale: 0.98 } : undefined}
                   >
                     {isLoading ? (
                       <span className="flex items-center justify-center gap-2">
-                        <Loader2 className="h-5 w-5 animate-spin" />
+                        <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
                         Connecting...
                       </span>
                     ) : (
-                      'Sign In'
+                      'Initialize Uplink'
                     )}
                   </motion.button>
                 </motion.form>
@@ -474,13 +490,17 @@ export function Login() {
                     type="button"
                     onClick={handleAnonymousLogin}
                     disabled={isLoading || anonId.replace(/\D/g, '').length < 24}
-                    className="btn-primary w-full rounded-lg px-4 py-3.5 font-semibold disabled:cursor-not-allowed disabled:opacity-50"
-                    whileHover={{ scale: 1.02 }}
-                    whileTap={{ scale: 0.98 }}
+                    className="w-full rounded-2xl font-semibold text-white text-base h-[56px] disabled:cursor-not-allowed disabled:opacity-50 transition-opacity"
+                    style={{
+                      backgroundImage: gradient.primary,
+                      border: `1px solid ${hairline.strong}`,
+                      boxShadow: '0 14px 32px -10px rgba(168,85,247,0.45)',
+                    }}
+                    whileTap={!isLoading ? { scale: 0.98 } : undefined}
                   >
                     {isLoading ? (
                       <span className="flex items-center justify-center gap-2">
-                        <Loader2 className="h-5 w-5 animate-spin" />
+                        <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
                         Signing in...
                       </span>
                     ) : (

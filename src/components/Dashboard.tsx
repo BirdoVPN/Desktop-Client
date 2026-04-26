@@ -300,7 +300,7 @@ export function Dashboard() {
   }, [connectionState, currentServer]);
 
   // ── Status polling ────────────────────────────────────────────────
-  const isActive = isConnected || isConnecting || connectionState === 'reconnecting';
+  const isActive = isConnected || isConnecting;
   useEffect(() => {
     if (!isActive) {
       setLiveStats(null);

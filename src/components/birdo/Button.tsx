@@ -8,7 +8,7 @@
  */
 import { motion } from 'framer-motion';
 import type { LucideIcon } from 'lucide-react';
-import { brand, status, white, hairline, gradient, motion as motionTokens } from '@/lib/birdo-theme';
+import { status, white, gradient, motion as motionTokens } from '@/lib/birdo-theme';
 
 export type BirdoButtonVariant = 'primary' | 'brand' | 'secondary' | 'ghost' | 'danger';
 export type BirdoButtonSize = 'small' | 'medium' | 'large';
