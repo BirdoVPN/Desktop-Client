@@ -144,16 +144,32 @@ jobs:
 
       # Inject signCommand into tauri.conf.json so Tauri signs every
       # signable artifact (main .exe BEFORE bundling, then NSIS, then MSI).
-      # signtool path on windows-latest runners is on PATH.
+      # IMPORTANT: Tauri spawns the signCommand directly (no shell), so
+      # `signtool` must be referenced by its absolute path. The Windows SDK
+      # bin dir is NOT on the default PATH for child processes.
       - name: Inject Tauri signCommand for Authenticode
         if: steps.sign-mode.outputs.enabled == 'true'
         shell: pwsh
         run: |
+          # Locate signtool.exe (Windows 10 SDK x64)
+          $sdkRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $signtool = Get-ChildItem -Path $sdkRoot -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match '\\x64\\' } |
+                      Sort-Object { [version]($_.Directory.Parent.Name) } -Descending |
+                      Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe (x64) not found under $sdkRoot" }
+          Write-Host "Using signtool: $signtool"
+
           $confPath = "src-tauri/tauri.conf.json"
           $conf = Get-Content $confPath -Raw | ConvertFrom-Json
-          # signtool will be called once per file with %1 substituted
-          $signCmd = 'signtool sign /v /debug /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib "' + $env:TRUSTED_SIGNING_DLIB + '" /dmdf "' + $env:TRUSTED_SIGNING_METADATA + '" %1'
-          # Set bundle.windows.signCommand
+          # Tauri parses the string as `program args...` and substitutes %1.
+          # Quote every path that may contain spaces.
+          $signCmd = '"' + $signtool + '"' +
+                     ' sign /v /debug /fd SHA256' +
+                     ' /tr http://timestamp.acs.microsoft.com /td SHA256' +
+                     ' /dlib "' + $env:TRUSTED_SIGNING_DLIB + '"' +
+                     ' /dmdf "' + $env:TRUSTED_SIGNING_METADATA + '"' +
+                     ' %1'
           if (-not $conf.bundle.windows) { $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{}) -Force }
           $conf.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $signCmd -Force
           $conf | ConvertTo-Json -Depth 32 | Out-File -FilePath $confPath -Encoding utf8
