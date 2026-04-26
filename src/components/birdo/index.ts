@@ -23,3 +23,9 @@ export type {
   BirdoNavRowProps,
   BirdoSwitchProps,
 } from './ListItem';
+
+export { WorldGlobe } from './WorldGlobe';
+export type { WorldGlobeProps } from './WorldGlobe';
+
+export { ServerSelectorSheet } from './ServerSelectorSheet';
+export type { ServerSelectorSheetProps } from './ServerSelectorSheet';
