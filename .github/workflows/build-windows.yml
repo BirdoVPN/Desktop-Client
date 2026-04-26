@@ -144,9 +144,10 @@ jobs:
 
       # Inject signCommand into tauri.conf.json so Tauri signs every
       # signable artifact (main .exe BEFORE bundling, then NSIS, then MSI).
-      # IMPORTANT: Tauri spawns the signCommand directly (no shell), so
-      # `signtool` must be referenced by its absolute path. The Windows SDK
-      # bin dir is NOT on the default PATH for child processes.
+      # IMPORTANT: Tauri shlex-parses signCommand with Unix-style rules,
+      # which mangles Windows backslash paths. Workaround: write a wrapper
+      # .cmd script and reference *that* (a single, simple path) from the
+      # signCommand. The .cmd script can use Windows quoting freely.
       - name: Inject Tauri signCommand for Authenticode
         if: steps.sign-mode.outputs.enabled == 'true'
         shell: pwsh
@@ -160,21 +161,27 @@ jobs:
           if (-not $signtool) { throw "signtool.exe (x64) not found under $sdkRoot" }
           Write-Host "Using signtool: $signtool"
 
+          # Write a wrapper .cmd that takes the file to sign as %1
+          $wrapperPath = "$env:RUNNER_TEMP\sign-wrapper.cmd"
+          @"
+@echo off
+"$signtool" sign /v /debug /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib "$env:TRUSTED_SIGNING_DLIB" /dmdf "$env:TRUSTED_SIGNING_METADATA" %1
+exit /b %ERRORLEVEL%
+"@ | Out-File -FilePath $wrapperPath -Encoding ascii
+          Write-Host "Wrapper written: $wrapperPath"
+          Get-Content $wrapperPath | Write-Host
+
+          # Use forward slashes in the path to avoid shlex backslash escaping.
+          $wrapperForwardSlash = $wrapperPath -replace '\\', '/'
+
           $confPath = "src-tauri/tauri.conf.json"
           $conf = Get-Content $confPath -Raw | ConvertFrom-Json
-          # Tauri parses the string as `program args...` and substitutes %1.
-          # Quote every path that may contain spaces.
-          $signCmd = '"' + $signtool + '"' +
-                     ' sign /v /debug /fd SHA256' +
-                     ' /tr http://timestamp.acs.microsoft.com /td SHA256' +
-                     ' /dlib "' + $env:TRUSTED_SIGNING_DLIB + '"' +
-                     ' /dmdf "' + $env:TRUSTED_SIGNING_METADATA + '"' +
-                     ' %1'
+          # Single argument: the wrapper. %1 = file to sign.
+          $signCmd = '"' + $wrapperForwardSlash + '" "%1"'
           if (-not $conf.bundle.windows) { $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{}) -Force }
           $conf.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $signCmd -Force
           $conf | ConvertTo-Json -Depth 32 | Out-File -FilePath $confPath -Encoding utf8
-          Write-Host "Injected signCommand into $confPath"
-          Get-Content $confPath | Select-String -Pattern 'signCommand' -Context 0,1
+          Write-Host "Injected signCommand: $signCmd"
 
       - name: Build Tauri application
         env:
