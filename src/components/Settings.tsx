@@ -1011,7 +1011,10 @@ function Section({
 }) {
   return (
     <div>
-      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-white/40">
+      <h3
+        className="mb-2 px-1 text-[11px] font-semibold uppercase"
+        style={{ color: 'rgba(255,255,255,0.60)', letterSpacing: '1.4px' }}
+      >
         {title}
       </h3>
       <div className="space-y-2">{children}</div>
@@ -1037,14 +1040,25 @@ function SettingToggle({
   disabled,
 }: SettingToggleProps) {
   return (
-    <div className={`glass flex items-center justify-between rounded-lg p-3 ${disabled ? 'opacity-50' : ''}`}>
+    <div
+      className={`flex items-center justify-between rounded-2xl px-3.5 py-3 ${disabled ? 'opacity-50' : ''}`}
+      style={{
+        backgroundColor: '#0B0B10',
+        border: '1px solid rgba(255,255,255,0.08)',
+      }}
+    >
       <div className="flex items-center gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
-          <Icon size={18} className="text-white" />
+        <div
+          className="flex h-9 w-9 items-center justify-center rounded-full"
+          style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}
+        >
+          <Icon size={16} className="text-white" />
         </div>
         <div>
           <p className="text-sm font-medium text-white">{title}</p>
-          <p className="text-xs text-white/50">{description}</p>
+          <p className="text-xs" style={{ color: 'rgba(255,255,255,0.60)' }}>
+            {description}
+          </p>
         </div>
       </div>
       <button
@@ -1053,14 +1067,16 @@ function SettingToggle({
         aria-label={title}
         onClick={() => !disabled && onChange(!enabled)}
         disabled={disabled}
-        className={`relative h-6 w-11 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 ${
-          enabled && !disabled ? 'bg-white' : 'bg-white/20'
-        } ${disabled ? 'cursor-not-allowed' : ''}`}
+        className={`relative h-7 w-12 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 ${
+          disabled ? 'cursor-not-allowed' : ''
+        }`}
+        style={{
+          backgroundColor: enabled && !disabled ? '#A855F7' : 'rgba(255,255,255,0.20)',
+        }}
       >
         <div
-          className={`absolute top-1 h-4 w-4 rounded-full transition-all ${
-            enabled ? 'left-6 bg-black' : 'left-1 bg-white'
-          }`}
+          className="absolute top-1 h-5 w-5 rounded-full bg-white transition-all"
+          style={{ left: enabled ? '24px' : '4px' }}
         />
       </button>
     </div>
@@ -1085,25 +1101,35 @@ function SettingExpandable({
   children,
 }: SettingExpandableProps) {
   return (
-    <div className="glass rounded-lg p-3">
+    <div
+      className="rounded-2xl px-3.5 py-3"
+      style={{
+        backgroundColor: '#0B0B10',
+        border: '1px solid rgba(255,255,255,0.08)',
+      }}
+    >
       <button
         onClick={onToggle}
         className="flex w-full items-center justify-between"
       >
         <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
-            <Icon size={18} className="text-white" />
+          <div
+            className="flex h-9 w-9 items-center justify-center rounded-full"
+            style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}
+          >
+            <Icon size={16} className="text-white" />
           </div>
           <div className="text-left">
             <p className="text-sm font-medium text-white">{title}</p>
-            <p className="text-xs text-white/50">{description}</p>
+            <p className="text-xs" style={{ color: 'rgba(255,255,255,0.60)' }}>
+              {description}
+            </p>
           </div>
         </div>
         <ChevronRight
           size={16}
-          className={`text-white/40 transition-transform ${
-            expanded ? 'rotate-90' : ''
-          }`}
+          className={`transition-transform ${expanded ? 'rotate-90' : ''}`}
+          style={{ color: 'rgba(255,255,255,0.40)' }}
         />
       </button>
       <AnimatePresence>
@@ -1133,10 +1159,14 @@ function SettingLink({ title, href }: SettingLinkProps) {
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className="glass flex items-center justify-between rounded-lg p-3 transition hover:bg-white/10"
+      className="flex items-center justify-between rounded-2xl px-3.5 py-3 transition hover:bg-white/[0.04]"
+      style={{
+        backgroundColor: '#0B0B10',
+        border: '1px solid rgba(255,255,255,0.08)',
+      }}
     >
       <span className="text-sm font-medium text-white">{title}</span>
-      <ExternalLink size={14} className="text-white/40" />
+      <ExternalLink size={14} style={{ color: 'rgba(255,255,255,0.40)' }} />
     </a>
   );
 }
