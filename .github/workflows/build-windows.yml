@@ -161,15 +161,17 @@ jobs:
           if (-not $signtool) { throw "signtool.exe (x64) not found under $sdkRoot" }
           Write-Host "Using signtool: $signtool"
 
-          # Write a wrapper .cmd that takes the file to sign as %1
+          # Write a wrapper .cmd that takes the file to sign as %1.
+          # Avoid here-strings (YAML indentation conflicts) — build via Set-Content.
           $wrapperPath = "$env:RUNNER_TEMP\sign-wrapper.cmd"
-          @"
-@echo off
-"$signtool" sign /v /debug /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib "$env:TRUSTED_SIGNING_DLIB" /dmdf "$env:TRUSTED_SIGNING_METADATA" %1
-exit /b %ERRORLEVEL%
-"@ | Out-File -FilePath $wrapperPath -Encoding ascii
+          $lines = @(
+            '@echo off',
+            '"' + $signtool + '" sign /v /debug /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib "' + $env:TRUSTED_SIGNING_DLIB + '" /dmdf "' + $env:TRUSTED_SIGNING_METADATA + '" %1',
+            'exit /b %ERRORLEVEL%'
+          )
+          Set-Content -Path $wrapperPath -Value $lines -Encoding ascii
           Write-Host "Wrapper written: $wrapperPath"
-          Get-Content $wrapperPath | Write-Host
+          Get-Content $wrapperPath | ForEach-Object { Write-Host "  $_" }
 
           # Use forward slashes in the path to avoid shlex backslash escaping.
           $wrapperForwardSlash = $wrapperPath -replace '\\', '/'
