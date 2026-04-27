@@ -1,5 +1,22 @@
-name: Build macOS Release
+name: Build macOS Release (PAUSED)
 
+# ============================================================================
+# DEVELOPMENT PAUSED -- 2026-04-27
+# ----------------------------------------------------------------------------
+# Active development on the macOS client is paused while we focus on shipping
+# the Windows (and sibling Linux) desktop client and the Android mobile
+# client. The macOS app is publicly listed as "currently awaiting release".
+#
+# This workflow is intentionally restricted to manual `workflow_dispatch`
+# only -- the `mac-v*` tag trigger has been removed -- so that:
+#   * a stale or accidental tag push cannot ship an unsigned/notarized DMG
+#   * we don't burn macOS runner minutes on builds we won't release
+#   * the signing + notarization wiring stays intact for the day we resume
+#
+# To resume: restore the `push.tags: ['mac-v*']` trigger below and remove
+# this banner.
+# ============================================================================
+#
 # Production macOS build workflow for BirdoVPN.
 #
 # Hardened release pipeline that produces a Gatekeeper- and notarization-
@@ -25,12 +42,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g., 1.0.0)'
+        description: 'Release version (e.g., 1.0.0) -- macOS dev is paused; manual runs only'
         required: true
         type: string
-  push:
-    tags:
-      - 'mac-v*'
 
 permissions: {}
 
