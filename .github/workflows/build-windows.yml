@@ -36,6 +36,7 @@ jobs:
   # signtool can find it on PATH.
   build:
     runs-on: windows-latest
+    timeout-minutes: 35  # Hard cap. Rust compile ~12m + signing ~3m. If we hit 35m, signing hung.
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     permissions:
@@ -144,10 +145,9 @@ jobs:
 
       # Inject signCommand into tauri.conf.json so Tauri signs every
       # signable artifact (main .exe BEFORE bundling, then NSIS, then MSI).
-      # IMPORTANT: Tauri shlex-parses signCommand with Unix-style rules,
-      # which mangles Windows backslash paths. Workaround: write a wrapper
-      # .cmd script and reference *that* (a single, simple path) from the
-      # signCommand. The .cmd script can use Windows quoting freely.
+      # We use the OBJECT notation { cmd, args } which bypasses Tauri's
+      # shlex string parsing entirely — no quoting/escaping issues.
+      # signtool is invoked DIRECTLY (no cmd.exe / no .cmd wrapper).
       - name: Inject Tauri signCommand for Authenticode
         if: steps.sign-mode.outputs.enabled == 'true'
         shell: pwsh
@@ -160,34 +160,53 @@ jobs:
                       Select-Object -First 1 -ExpandProperty FullName
           if (-not $signtool) { throw "signtool.exe (x64) not found under $sdkRoot" }
           Write-Host "Using signtool: $signtool"
-
-          # Write a wrapper .cmd that takes the file to sign as %1.
-          # Avoid here-strings (YAML indentation conflicts) — build via Set-Content.
-          $wrapperPath = "$env:RUNNER_TEMP\sign-wrapper.cmd"
-          $lines = @(
-            '@echo off',
-            '"' + $signtool + '" sign /v /debug /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib "' + $env:TRUSTED_SIGNING_DLIB + '" /dmdf "' + $env:TRUSTED_SIGNING_METADATA + '" %1',
-            'exit /b %ERRORLEVEL%'
-          )
-          Set-Content -Path $wrapperPath -Value $lines -Encoding ascii
-          Write-Host "Wrapper written: $wrapperPath"
-          Get-Content $wrapperPath | ForEach-Object { Write-Host "  $_" }
+          "SIGNTOOL_PATH=$signtool" | Out-File -FilePath $env:GITHUB_ENV -Append
 
           $confPath = "src-tauri/tauri.conf.json"
           $conf = Get-Content $confPath -Raw | ConvertFrom-Json
-          # Use object notation { cmd, args } to avoid Tauri's space-splitting
-          # of string commands. .cmd files cannot be launched by CreateProcess
-          # directly, so invoke via cmd.exe.
           $signCmd = [pscustomobject]@{
-            cmd  = "$env:WINDIR\System32\cmd.exe"
-            args = @('/c', $wrapperPath, '%1')
+            cmd  = $signtool
+            args = @(
+              'sign',
+              '/v',
+              '/debug',
+              '/fd', 'SHA256',
+              '/tr', 'http://timestamp.acs.microsoft.com',
+              '/td', 'SHA256',
+              '/dlib', $env:TRUSTED_SIGNING_DLIB,
+              '/dmdf', $env:TRUSTED_SIGNING_METADATA,
+              '%1'
+            )
           }
           if (-not $conf.bundle.windows) { $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{}) -Force }
           $conf.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $signCmd -Force
           $conf | ConvertTo-Json -Depth 32 | Out-File -FilePath $confPath -Encoding utf8
-          Write-Host "Injected signCommand: $signCmd"
+          Write-Host "signCommand (object form):"
+          $signCmd | ConvertTo-Json -Depth 6
+
+      # Smoke-test signtool BEFORE the long Rust build, so any Azure auth or
+      # dlib issue surfaces in seconds, not 12+ minutes (or 4 hours of hang).
+      - name: Smoke-test signtool against a dummy binary
+        if: steps.sign-mode.outputs.enabled == 'true'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          # Make a small valid PE file by copying an existing exe.
+          $dummy = "$env:RUNNER_TEMP\dummy-sign-test.exe"
+          Copy-Item -Path "$env:WINDIR\System32\notepad.exe" -Destination $dummy -Force
+          Write-Host "Calling: $env:SIGNTOOL_PATH sign ... $dummy"
+          & $env:SIGNTOOL_PATH sign /v /debug /fd SHA256 `
+            /tr http://timestamp.acs.microsoft.com /td SHA256 `
+            /dlib $env:TRUSTED_SIGNING_DLIB `
+            /dmdf $env:TRUSTED_SIGNING_METADATA `
+            $dummy
+          if ($LASTEXITCODE -ne 0) { throw "signtool smoke-test failed with exit $LASTEXITCODE" }
+          $sig = Get-AuthenticodeSignature -FilePath $dummy
+          if ($sig.Status -ne 'Valid') { throw "Smoke-test artifact has invalid signature: $($sig.Status)" }
+          Write-Host "Smoke-test OK: signed by $($sig.SignerCertificate.Subject)"
 
       - name: Build Tauri application
+        timeout-minutes: 25
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
