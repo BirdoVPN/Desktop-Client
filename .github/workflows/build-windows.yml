@@ -173,14 +173,15 @@ jobs:
           Write-Host "Wrapper written: $wrapperPath"
           Get-Content $wrapperPath | ForEach-Object { Write-Host "  $_" }
 
-          # Use forward slashes in the path to avoid shlex backslash escaping.
-          $wrapperForwardSlash = $wrapperPath -replace '\\', '/'
-
           $confPath = "src-tauri/tauri.conf.json"
           $conf = Get-Content $confPath -Raw | ConvertFrom-Json
-          # Tauri uses CreateProcess directly (no shell), which cannot launch
-          # .cmd files. Invoke through cmd.exe with full path. %1 = file to sign.
-          $signCmd = '"C:/Windows/System32/cmd.exe" /c "' + $wrapperForwardSlash + '" "%1"'
+          # Use object notation { cmd, args } to avoid Tauri's space-splitting
+          # of string commands. .cmd files cannot be launched by CreateProcess
+          # directly, so invoke via cmd.exe.
+          $signCmd = [pscustomobject]@{
+            cmd  = "$env:WINDIR\System32\cmd.exe"
+            args = @('/c', $wrapperPath, '%1')
+          }
           if (-not $conf.bundle.windows) { $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{}) -Force }
           $conf.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $signCmd -Force
           $conf | ConvertTo-Json -Depth 32 | Out-File -FilePath $confPath -Encoding utf8

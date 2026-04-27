@@ -1,6 +1,6 @@
 [package]
 name = "birdo-vpn-desktop"
-version = "1.2.5"
+version = "1.2.6"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
 license = "Proprietary"
