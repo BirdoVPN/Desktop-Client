@@ -179,8 +179,8 @@ jobs:
           $confPath = "src-tauri/tauri.conf.json"
           $conf = Get-Content $confPath -Raw | ConvertFrom-Json
           # Tauri uses CreateProcess directly (no shell), which cannot launch
-          # .cmd files. Invoke through cmd.exe explicitly. %1 = file to sign.
-          $signCmd = 'cmd /c "' + $wrapperForwardSlash + '" "%1"'
+          # .cmd files. Invoke through cmd.exe with full path. %1 = file to sign.
+          $signCmd = '"C:/Windows/System32/cmd.exe" /c "' + $wrapperForwardSlash + '" "%1"'
           if (-not $conf.bundle.windows) { $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{}) -Force }
           $conf.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $signCmd -Force
           $conf | ConvertTo-Json -Depth 32 | Out-File -FilePath $confPath -Encoding utf8
