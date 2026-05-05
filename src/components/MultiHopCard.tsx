@@ -241,8 +241,20 @@ function MultiHopPicker({ servers, entryId, exitId, onApply, onDisable, onClose 
   const [draftExit, setDraftExit] = useState<string | null>(exitId);
 
   const onlineServers = servers.filter((s) => s.isOnline);
-  const exitChoices = onlineServers.filter((s) => s.id !== draftEntry);
-  const canApply = !!(draftEntry && draftExit && draftEntry !== draftExit);
+  // Backend rejects entry+exit pairs in the same country (privacy: a single-country
+  // double-hop leaks no real metadata vs single-hop). Mirror that filter here so the
+  // user can never pick a combo that will be rejected on connect.
+  const draftEntryServer = onlineServers.find((s) => s.id === draftEntry) || null;
+  const exitChoices = onlineServers.filter(
+    (s) => s.id !== draftEntry && (!draftEntryServer || s.countryCode !== draftEntryServer.countryCode)
+  );
+  const canApply = !!(
+    draftEntry &&
+    draftExit &&
+    draftEntry !== draftExit &&
+    draftEntryServer &&
+    onlineServers.find((s) => s.id === draftExit)?.countryCode !== draftEntryServer.countryCode
+  );
 
   return (
     <motion.div
@@ -302,7 +314,9 @@ function MultiHopPicker({ servers, entryId, exitId, onApply, onDisable, onClose 
         <div className="mb-3 max-h-72 overflow-y-auto rounded-xl" style={{ backgroundColor: white.w05 }}>
           {(step === 'entry' ? onlineServers : exitChoices).length === 0 ? (
             <p className="p-4 text-center text-sm" style={{ color: white.w60 }}>
-              No servers available.
+              {step === 'exit' && draftEntryServer
+                ? `No exit servers available outside ${draftEntryServer.country}. Pick a different entry.`
+                : 'No servers available.'}
             </p>
           ) : (
             (step === 'entry' ? onlineServers : exitChoices).map((s) => {
@@ -313,8 +327,11 @@ function MultiHopPicker({ servers, entryId, exitId, onApply, onDisable, onClose 
                   onClick={() => {
                     if (step === 'entry') {
                       setDraftEntry(s.id);
-                      // If exit equals new entry, clear exit and advance
-                      if (draftExit === s.id) setDraftExit(null);
+                      // Clear exit if it's the same node OR same country as the new entry.
+                      const curExit = onlineServers.find((x) => x.id === draftExit);
+                      if (draftExit === s.id || (curExit && curExit.countryCode === s.countryCode)) {
+                        setDraftExit(null);
+                      }
                       setStep('exit');
                     } else {
                       setDraftExit(s.id);
