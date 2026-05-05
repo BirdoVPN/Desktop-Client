@@ -55,20 +55,18 @@ const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " 
 /// When this array is empty, pinning is DISABLED and a warning is logged on
 /// every request. Populate before public release.
 const CERT_PINS_SHA256: &[&str] = &[
-    // Pins verified 2026-03-07 from live birdo.app edge certificate.
-    // These are full DER cert SHA-256 hashes (NOT SPKI).
+    // Pins are full DER cert SHA-256 hashes (NOT SPKI).
     //
     // LEAF ONLY — reqwest peer_certificate() does not expose the chain,
     // so intermediate/root pins are omitted (they would never match).
     //
-    // Current leaf cert (CN=birdo.app, issuer: Google Trust Services WE1) expires 2026-06-02.
-    "EQul2kftgtOaU85XCKuj4SK3DW5256uxNdEvZXZbuJM=", // leaf: birdo.app (Google/CF, expires 2026-06-02)
-                                                    // ── Next cert pin slot ──────────────────────────────────────────────
-                                                    // After renewing the certificate on Cloudflare, add the new leaf hash
-                                                    // here BEFORE removing the old one. This ensures clients that haven't
-                                                    // updated yet still pass pinning against the old cert, while updated
-                                                    // clients accept the new one.
-                                                    // "<NEW_LEAF_PIN_HERE>",  // leaf: birdo.app (next cert, expires ~YYYY-MM-DD)
+    // Cloudflare auto-rotates the edge cert every ~90 days; we keep an
+    // overlap window of (current + previous) pins so in-flight clients
+    // that haven't auto-updated keep working.
+    //
+    // ROTATION: see scripts/rotate-cert-pins.sh in the main repo.
+    "hObTwNVt08WYElPDYs2wHT2Ec/+8OYssiRcCmFHg0A0=", // current leaf: birdo.app (Google WE1, expires 2026-07-31), verified 2026-05-04
+    "EQul2kftgtOaU85XCKuj4SK3DW5256uxNdEvZXZbuJM=", // previous leaf (expired ~2026-05; kept for in-flight clients, remove next release)
 ];
 
 /// FIX H-3: Build-time guard — release builds MUST have certificate pins populated.

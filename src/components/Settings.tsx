@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
-import { useAppStore, type MultiHopRoute } from '@/store/app-store';
+import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { UpdateChecker } from './UpdateChecker';
 import { isValidDnsAddress, isValidPort, settingsToRust } from '@/utils/helpers';
@@ -12,7 +12,6 @@ import {
   ExternalLink,
   Info,
   Globe,
-  Split,
   Zap,
   Monitor,
   Server,
@@ -23,8 +22,6 @@ import {
   Network,
   Router,
   SlidersHorizontal,
-  Layers,
-  ArrowRightLeft,
   Trash2,
   Loader2,
   Eye,
@@ -39,7 +36,6 @@ export function Settings() {
   const [appVersion, setAppVersion] = useState('');
   const [dnsInput, setDnsInput] = useState('');
   const [dnsError, setDnsError] = useState<string | null>(null);
-  const [splitAppInput, setSplitAppInput] = useState('');
   const [killSwitchError, setKillSwitchError] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<string | null>(null);
   const [customPortInput, setCustomPortInput] = useState('');
@@ -47,7 +43,6 @@ export function Settings() {
   const [portFwdPort, setPortFwdPort] = useState('');
   const [portFwdProtocol, setPortFwdProtocol] = useState<'tcp' | 'udp'>('tcp');
   const [portFwdLoading, setPortFwdLoading] = useState(false);
-  const [multiHopLoading, setMultiHopLoading] = useState(false);
   const [speedTestRunning, setSpeedTestRunning] = useState(false);
   const [speedTestResult, setSpeedTestResult] = useState<{
     downloadMbps: number;
@@ -63,13 +58,10 @@ export function Settings() {
     };
   }, []);
 
-  const { settings, updateSettings, servers, multiHopRoutes, setMultiHopRoutes, portForwards, setPortForwards, theme, setTheme, account } = useAppStore(
+  const { settings, updateSettings, portForwards, setPortForwards, theme, setTheme, account } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
-      servers: s.servers,
-      multiHopRoutes: s.multiHopRoutes,
-      setMultiHopRoutes: s.setMultiHopRoutes,
       portForwards: s.portForwards,
       setPortForwards: s.setPortForwards,
       theme: s.theme,
@@ -201,23 +193,9 @@ export function Settings() {
     saveSettingsToBackend(updated);
   };
 
-  const addSplitApp = () => {
-    const app = splitAppInput.trim();
-    if (!app) return;
-    if (settings.splitTunnelApps.includes(app)) return;
-    const next = [...settings.splitTunnelApps, app];
-    const updated = { ...settings, splitTunnelApps: next };
-    updateSettings({ splitTunnelApps: next });
-    saveSettingsToBackend(updated);
-    setSplitAppInput('');
-  };
-
-  const removeSplitApp = (app: string) => {
-    const next = settings.splitTunnelApps.filter((a) => a !== app);
-    const updated = { ...settings, splitTunnelApps: next };
-    updateSettings({ splitTunnelApps: next });
-    saveSettingsToBackend(updated);
-  };
+  // Split-tunneling and Multi-Hop have moved out of Settings:
+  //   - Split tunneling is configured per-connection on the Dashboard
+  //   - Multi-Hop has its own selector card on the Dashboard (Sovereign-gated)
 
   return (
     <div className="h-full overflow-y-auto">
@@ -601,158 +579,8 @@ export function Settings() {
           </div>
         </Section>
 
-        {/* ── Split Tunneling Section ── */}
-        <Section title="Split Tunneling">
-          <SettingToggle
-            icon={Split}
-            title="Split Tunneling"
-            description={hasOperative ? "Exclude certain apps from VPN" : "Requires Operative plan or higher"}
-            enabled={settings.splitTunnelingEnabled}
-            onChange={(v) => handleToggle('splitTunnelingEnabled', v)}
-            disabled={!hasOperative}
-          />
-          <AnimatePresence>
-            {settings.splitTunnelingEnabled && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                className="overflow-hidden"
-              >
-                <div className="glass rounded-lg p-3 space-y-2">
-                  {settings.splitTunnelApps.map((app) => (
-                    <div
-                      key={app}
-                      className="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2"
-                    >
-                      <span className="text-sm text-white truncate">
-                        {app}
-                      </span>
-                      <button
-                        onClick={() => removeSplitApp(app)}
-                        className="text-white/40 hover:text-red-400 transition shrink-0"
-                        aria-label={`Remove ${app}`}
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
-                  ))}
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={splitAppInput}
-                      onChange={(e) => setSplitAppInput(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && addSplitApp()}
-                      placeholder="e.g. chrome.exe"
-                      className="flex-1 rounded-lg glass-input px-3 py-1.5 text-sm text-white placeholder-white/30 outline-none"
-                    />
-                    <button
-                      onClick={addSplitApp}
-                      className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-white transition hover:bg-white/20"
-                    >
-                      <Plus size={14} />
-                    </button>
-                  </div>
-                  <p className="text-xs text-white/30">
-                    Enter application executable names to bypass the VPN tunnel.
-                  </p>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </Section>
-
-        {/* ── Multi-Hop (Double VPN) Section ── */}
-        <Section title="Multi-Hop (Double VPN)">
-          <SettingToggle
-            icon={Layers}
-            title="Multi-Hop Routing"
-            description={hasSovereign ? "Route through two servers for extra privacy" : "Requires Sovereign plan"}
-            enabled={settings.multiHopEnabled}
-            onChange={(v) => {
-              handleToggle('multiHopEnabled', v);
-              if (v && multiHopRoutes.length === 0) {
-                setMultiHopLoading(true);
-                invoke<MultiHopRoute[]>('get_multi_hop_routes')
-                  .then(setMultiHopRoutes)
-                  .catch(() => {})
-                  .finally(() => setMultiHopLoading(false));
-              }
-            }}
-            disabled={!hasSovereign}
-          />
-          <AnimatePresence>
-            {settings.multiHopEnabled && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                className="overflow-hidden"
-              >
-                <div className="glass rounded-lg p-3 space-y-3">
-                  {multiHopLoading ? (
-                    <div className="flex items-center justify-center py-4 gap-2 text-white/50 text-sm">
-                      <Loader2 size={16} className="animate-spin" /> Loading routes...
-                    </div>
-                  ) : (
-                    <>
-                      <div>
-                        <label className="text-xs font-medium text-white/60 mb-1 block">Entry Server</label>
-                        <select
-                          className="w-full rounded-lg glass-input px-3 py-2 text-sm text-white outline-none"
-                          value={settings.multiHopEntryNodeId || ''}
-                          onChange={(e) => {
-                            const nodeId = e.target.value || null;
-                            updateSettings({ multiHopEntryNodeId: nodeId });
-                            saveSettingsToBackend({ ...settings, multiHopEntryNodeId: nodeId });
-                          }}
-                        >
-                          <option value="">Select entry node...</option>
-                          {servers.filter((s) => s.isOnline).map((s) => (
-                            <option key={s.id} value={s.id}>
-                              {s.country} - {s.name} ({s.load}% load)
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="flex justify-center">
-                        <ArrowRightLeft size={16} className="text-white/30" />
-                      </div>
-                      <div>
-                        <label className="text-xs font-medium text-white/60 mb-1 block">Exit Server</label>
-                        <select
-                          className="w-full rounded-lg glass-input px-3 py-2 text-sm text-white outline-none"
-                          value={settings.multiHopExitNodeId || ''}
-                          onChange={(e) => {
-                            const nodeId = e.target.value || null;
-                            updateSettings({ multiHopExitNodeId: nodeId });
-                            saveSettingsToBackend({ ...settings, multiHopExitNodeId: nodeId });
-                          }}
-                        >
-                          <option value="">Select exit node...</option>
-                          {servers
-                            .filter((s) => s.isOnline && s.id !== settings.multiHopEntryNodeId)
-                            .map((s) => (
-                              <option key={s.id} value={s.id}>
-                                {s.country} - {s.name} ({s.load}% load)
-                              </option>
-                            ))}
-                        </select>
-                      </div>
-                    </>
-                  )}
-                  <div className="glass rounded-lg p-3 flex items-center gap-3">
-                    <Info size={14} className="text-white/40 shrink-0" />
-                    <p className="text-xs text-white/40">
-                      Requires Sovereign plan. Traffic is routed: You → Entry → Exit → Internet.
-                      Connect with the main button after selecting servers.
-                    </p>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </Section>
+        {/* Split Tunneling and Multi-Hop have moved to the Dashboard
+            (the Connect page) where they apply per-session. */}
 
         {/* ── Port Forwarding Section ── */}
         <Section title="Port Forwarding">

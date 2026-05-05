@@ -102,6 +102,9 @@ export function extractErrorMessage(error: unknown): string {
  */
 export function friendlyVpnError(error: unknown): string {
   const raw = extractErrorMessage(error).toLowerCase();
+  if (raw.includes('multi-hop is temporarily unavailable') || raw.includes('multi-hop unavailable')) return 'Multi-Hop unavailable on this route. Try a different entry or exit server.';
+  if (raw.includes('mesh') && raw.includes('forwarding')) return 'Failed to set up Multi-Hop forwarding between servers. Try a different exit.';
+  if (raw.includes('sovereign')) return 'Multi-Hop requires a Sovereign subscription.';
   if (raw.includes('connection refused') || raw.includes('connect to')) return 'Unable to reach the VPN server. Please try another server.';
   if (raw.includes('handshake') || raw.includes('timeout')) return 'Connection timed out. The server may be busy — try again or switch servers.';
   if (raw.includes('authentication') || raw.includes('unauthorized') || raw.includes('401')) return 'Authentication failed. Please log in again.';

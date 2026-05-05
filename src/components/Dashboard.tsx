@@ -33,6 +33,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { Settings } from './Settings';
+import { MultiHopCard } from './MultiHopCard';
 import { OfflineBanner } from './OfflineBanner';
 import {
   BirdoBadge,
@@ -92,7 +93,10 @@ export function Dashboard() {
   const [showServerSheet, setShowServerSheet] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [liveStats, setLiveStats] = useState<RustVpnStats | null>(null);
+  /** Step shown to the user during a Multi-Hop connect attempt. */
+  const [mhStep, setMhStep] = useState<'idle' | 'entry' | 'forwarding' | 'exit'>('idle');
   const statsInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const mhStepTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
 
   const {
     connectionState,
@@ -362,16 +366,40 @@ export function Dashboard() {
     // Multi-hop
     if (settings.multiHopEnabled && settings.multiHopEntryNodeId && settings.multiHopExitNodeId) {
       const entry = servers.find((s) => s.id === settings.multiHopEntryNodeId);
+      const exit = servers.find((s) => s.id === settings.multiHopExitNodeId);
       setConnectionState('connecting');
       setCurrentServer(entry || null);
       setErrorMessage(null);
+
+      // Drive the visible step indicator. The Rust call is monolithic so we
+      // approximate progress with timers; if the call resolves earlier the
+      // final state will overwrite these.
+      mhStepTimers.current.forEach(clearTimeout);
+      mhStepTimers.current = [];
+      setMhStep('entry');
+      mhStepTimers.current.push(setTimeout(() => setMhStep('forwarding'), 1800));
+      mhStepTimers.current.push(setTimeout(() => setMhStep('exit'), 3600));
+
       try {
         await invoke<boolean>('connect_multi_hop', {
           entryNodeId: settings.multiHopEntryNodeId,
           exitNodeId: settings.multiHopExitNodeId,
         });
+        mhStepTimers.current.forEach(clearTimeout);
+        mhStepTimers.current = [];
+        setMhStep('idle');
         setConnectionState('connected');
+        // Surface the route in the current-server label.
+        if (entry && exit) {
+          setCurrentServer({
+            ...entry,
+            name: `${entry.city || entry.country} \u2192 ${exit.city || exit.country}`,
+          });
+        }
       } catch (err) {
+        mhStepTimers.current.forEach(clearTimeout);
+        mhStepTimers.current = [];
+        setMhStep('idle');
         setErrorMessage(friendlyVpnError(err));
         setConnectionState('error');
         setCurrentServer(null);
@@ -541,6 +569,18 @@ export function Dashboard() {
               <div className="h-2.5" />
             </>
           )}
+
+          {/* Multi-Hop progress banner */}
+          {isConnecting && settings.multiHopEnabled && mhStep !== 'idle' && (
+            <>
+              <MultiHopProgressBanner step={mhStep} />
+              <div className="h-2.5" />
+            </>
+          )}
+
+          {/* Multi-Hop selector card (Sovereign-only; clicking when not Sovereign opens an upgrade modal) */}
+          <MultiHopCard busy={isConnecting || isDisconnecting} />
+          <div className="h-2.5" />
 
           {/* Server selector */}
           <ServerSelectorCard
@@ -729,6 +769,71 @@ function BannerRow({ icon: Icon, color, bg, border, text }: BannerRowProps) {
     </div>
   );
 }
+
+// ── Multi-Hop progress banner ────────────────────────────────────────
+interface MultiHopProgressBannerProps {
+  step: 'idle' | 'entry' | 'forwarding' | 'exit';
+}
+
+function MultiHopProgressBanner({ step }: MultiHopProgressBannerProps) {
+  const steps: Array<{ key: 'entry' | 'forwarding' | 'exit'; label: string }> = [
+    { key: 'entry', label: 'Entry' },
+    { key: 'forwarding', label: 'Forwarding' },
+    { key: 'exit', label: 'Exit' },
+  ];
+  const stepIdx = steps.findIndex((s) => s.key === step);
+  const currentLabel =
+    step === 'entry'
+      ? 'Establishing entry tunnel\u2026'
+      : step === 'forwarding'
+      ? 'Setting up multi-hop forwarding\u2026'
+      : step === 'exit'
+      ? 'Routing through exit server\u2026'
+      : '';
+
+  return (
+    <div
+      className="rounded-2xl px-3.5 py-3"
+      style={{
+        backgroundColor: 'rgba(168,85,247,0.08)',
+        border: '1px solid rgba(168,85,247,0.30)',
+      }}
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <RefreshCw size={14} color="#A855F7" className="animate-spin" />
+        <p className="flex-1 text-xs font-medium" style={{ color: '#C4B5FD' }}>
+          {currentLabel}
+        </p>
+      </div>
+      <div className="flex items-center gap-1.5">
+        {steps.map((s, i) => (
+          <div key={s.key} className="flex flex-1 items-center gap-1.5">
+            <div
+              className="h-1 flex-1 rounded-full transition-all"
+              style={{
+                backgroundColor: i <= stepIdx ? '#A855F7' : 'rgba(255,255,255,0.10)',
+              }}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="mt-1 flex justify-between text-[10px] uppercase tracking-wide" style={{ color: 'rgba(255,255,255,0.40)' }}>
+        {steps.map((s, i) => (
+          <span
+            key={s.key}
+            style={{
+              color: i <= stepIdx ? '#C4B5FD' : 'rgba(255,255,255,0.40)',
+              fontWeight: i === stepIdx ? 600 : 400,
+            }}
+          >
+            {s.label}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 
 interface StatsRowProps {
   stats: RustVpnStats | null;
