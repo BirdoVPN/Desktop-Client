@@ -1,7 +1,7 @@
 /**
  * Split Tunnel section tests.
  *
- * Verifies the split-tunneling UI in Settings: toggling enabled state,
+ * Verifies the split-tunneling UI in the Dashboard card: toggling enabled state,
  * adding/removing apps, and invoking the Rust backend via save_settings.
  *
  * Run: npx vitest run src/__tests__/SplitTunnel.test.tsx
@@ -9,7 +9,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings } from '@/components/Settings';
+import { SplitTunnelCard } from '@/components/SplitTunnelCard';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/api/app', () => ({
@@ -42,6 +42,9 @@ let mockSettings = {
   wireGuardMtu: 0,
   stealthMode: true,
   quantumProtection: true,
+  multiHopEnabled: false,
+  multiHopEntryNodeId: null,
+  multiHopExitNodeId: null,
   preferredServerId: null,
 };
 
@@ -55,6 +58,17 @@ vi.mock('@/store/app-store', () => ({
       setMultiHopRoutes: vi.fn(),
       portForwards: [],
       setPortForwards: vi.fn(),
+      account: {
+        email: 'release@birdo.app',
+        plan: 'OPERATIVE',
+        accountId: 'acct_test',
+        maxDevices: 5,
+        activeDevices: 1,
+        expiresAt: null,
+        bandwidthUsed: 0,
+        bandwidthLimit: 0,
+        status: 'active',
+      },
       theme: 'system',
       setTheme: vi.fn(),
     })
@@ -86,27 +100,23 @@ beforeEach(() => {
     wireGuardMtu: 0,
     stealthMode: true,
     quantumProtection: true,
+    multiHopEnabled: false,
+    multiHopEntryNodeId: null,
+    multiHopExitNodeId: null,
     preferredServerId: null,
   };
 });
 
 describe('Split Tunneling section', () => {
   it('renders the split tunneling toggle', () => {
-    render(<Settings />);
-    // "Split Tunneling" may appear multiple times (section heading + toggle label);
-    // assert at least one occurrence is in the document.
+    render(<SplitTunnelCard busy={false} />);
     expect(screen.getAllByText('Split Tunneling').length).toBeGreaterThan(0);
-    // Description text depends on user plan tier; either variant is acceptable
-    // and may appear multiple times (shared with other paywalled features).
-    const hasDesc =
-      screen.queryAllByText('Exclude certain apps from VPN').length > 0 ||
-      screen.queryAllByText(/Requires .* plan/i).length > 0;
-    expect(hasDesc).toBe(true);
+    expect(screen.getByText('Choose which apps bypass VPN')).toBeInTheDocument();
   });
 
   it('shows the app input when split tunneling is enabled', () => {
     mockSettings.splitTunnelingEnabled = true;
-    render(<Settings />);
+    render(<SplitTunnelCard busy={false} />);
     expect(
       screen.getByPlaceholderText('e.g. chrome.exe')
     ).toBeInTheDocument();
@@ -114,7 +124,7 @@ describe('Split Tunneling section', () => {
 
   it('adds a split tunnel app and calls save_settings', async () => {
     mockSettings.splitTunnelingEnabled = true;
-    render(<Settings />);
+    render(<SplitTunnelCard busy={false} />);
 
     const input = screen.getByPlaceholderText('e.g. chrome.exe');
     fireEvent.change(input, { target: { value: 'firefox.exe' } });
@@ -141,7 +151,7 @@ describe('Split Tunneling section', () => {
   it('removes a split tunnel app and calls save_settings', async () => {
     mockSettings.splitTunnelingEnabled = true;
     mockSettings.splitTunnelApps = ['chrome.exe', 'slack.exe'];
-    render(<Settings />);
+    render(<SplitTunnelCard busy={false} />);
 
     const removeBtn = screen.getByLabelText('Remove chrome.exe');
     fireEvent.click(removeBtn);
@@ -167,7 +177,7 @@ describe('Split Tunneling section', () => {
   it('does not add duplicate apps', () => {
     mockSettings.splitTunnelingEnabled = true;
     mockSettings.splitTunnelApps = ['chrome.exe'];
-    render(<Settings />);
+    render(<SplitTunnelCard busy={false} />);
 
     const input = screen.getByPlaceholderText('e.g. chrome.exe');
     fireEvent.change(input, { target: { value: 'chrome.exe' } });
@@ -178,7 +188,7 @@ describe('Split Tunneling section', () => {
 
   it('does not add empty app names', () => {
     mockSettings.splitTunnelingEnabled = true;
-    render(<Settings />);
+    render(<SplitTunnelCard busy={false} />);
 
     const input = screen.getByPlaceholderText('e.g. chrome.exe');
     fireEvent.change(input, { target: { value: '   ' } });
@@ -190,7 +200,7 @@ describe('Split Tunneling section', () => {
   it('displays existing split tunnel apps', () => {
     mockSettings.splitTunnelingEnabled = true;
     mockSettings.splitTunnelApps = ['chrome.exe', 'slack.exe'];
-    render(<Settings />);
+    render(<SplitTunnelCard busy={false} />);
 
     expect(screen.getByText('chrome.exe')).toBeInTheDocument();
     expect(screen.getByText('slack.exe')).toBeInTheDocument();

@@ -34,6 +34,7 @@ import {
 } from 'lucide-react';
 import { Settings } from './Settings';
 import { MultiHopCard } from './MultiHopCard';
+import { SplitTunnelCard } from './SplitTunnelCard';
 import { OfflineBanner } from './OfflineBanner';
 import {
   BirdoBadge,
@@ -577,6 +578,10 @@ export function Dashboard() {
               <div className="h-2.5" />
             </>
           )}
+
+          {/* Split tunneling applies to the next VPN session. */}
+          <SplitTunnelCard busy={isConnecting || isDisconnecting} />
+          <div className="h-2.5" />
 
           {/* Multi-Hop selector card (Sovereign-only; clicking when not Sovereign opens an upgrade modal) */}
           <MultiHopCard busy={isConnecting || isDisconnecting} />
