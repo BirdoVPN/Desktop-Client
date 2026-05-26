@@ -12,6 +12,7 @@
 //! extracted to the app data directory at runtime.
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -23,6 +24,85 @@ use tokio::sync::Mutex;
 
 /// Default local UDP port for the dokodemo-door inbound
 const DEFAULT_LOCAL_PORT: u16 = 51821;
+
+/// AUDIT-N4: Expected SHA-256 of the bundled xray binary.
+///
+/// The xray binary terminates the entire VPN traffic stream (WireGuard wrapped
+/// inside VLESS+Reality TLS 1.3). A tampered binary could:
+///   - exfil the VLESS UUID, Reality public key, and server endpoint;
+///   - silently downgrade Reality to plain TLS, defeating the
+///     censorship-resistance / DPI-evasion property we market;
+///   - forward traffic through an attacker-controlled relay.
+///
+/// This constant must be updated in a reviewable PR every time the bundled
+/// xray binary is upgraded. The build pipeline writes the per-target SHA into
+/// XRAY_BINARY_SHA256 at compile time when available; the placeholder below
+/// is the empty-string sentinel that triggers a hard-fail at runtime if the
+/// build pipeline did not populate it (fail-closed — never run an
+/// un-attested binary in production).
+#[cfg(not(debug_assertions))]
+const XRAY_BINARY_SHA256: Option<&str> = option_env!("XRAY_BINARY_SHA256");
+#[cfg(debug_assertions)]
+const XRAY_BINARY_SHA256: Option<&str> = option_env!("XRAY_BINARY_SHA256");
+
+/// AUDIT-N4: verify the xray binary on disk against XRAY_BINARY_SHA256
+/// before exec'ing it. Returns Ok(()) on match, error string on mismatch or
+/// when the constant is unset in a release build.
+fn verify_xray_integrity(path: &std::path::Path) -> Result<(), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("Failed to read xray binary for integrity check: {}", e))?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+
+    match XRAY_BINARY_SHA256 {
+        Some(expected) if !expected.is_empty() => {
+            if actual.eq_ignore_ascii_case(expected) {
+                tracing::info!(
+                    "xray binary integrity verified (SHA-256 matches) at {:?}",
+                    path
+                );
+                Ok(())
+            } else {
+                tracing::error!(
+                    "xray binary integrity check FAILED at {:?}: expected {}, got {}",
+                    path,
+                    expected,
+                    actual
+                );
+                Err(format!(
+                    "xray binary integrity verification failed. \
+                     The binary may have been tampered with. \
+                     Expected SHA-256: {}, Got: {}",
+                    expected, actual
+                ))
+            }
+        }
+        _ => {
+            // Build pipeline did not set XRAY_BINARY_SHA256.
+            // In release builds this is a hard fail (fail-closed). In debug
+            // builds we log and continue so developers can iterate without
+            // having to recompute the hash on every rebuild.
+            #[cfg(not(debug_assertions))]
+            {
+                tracing::error!(
+                    "XRAY_BINARY_SHA256 unset in release build — refusing to exec xray (sha was {})",
+                    actual
+                );
+                return Err("XRAY_BINARY_SHA256 unset in release build. \
+                     The build pipeline must export this env var with the \
+                     SHA-256 of the bundled xray binary."
+                    .to_string());
+            }
+            #[cfg(debug_assertions)]
+            {
+                tracing::warn!(
+                    "XRAY_BINARY_SHA256 unset (debug build) — skipping integrity check (actual sha: {})",
+                    actual
+                );
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Xray Reality tunnel configuration from server ConnectResponse
 #[derive(Debug, Clone)]
@@ -91,6 +171,14 @@ impl XrayManager {
 
         // Find xray binary — check resources dir first, then PATH
         let xray_binary = find_xray_binary(app_data_dir)?;
+
+        // AUDIT-N4: verify SHA-256 BEFORE exec. Without this, an attacker who
+        // can plant a binary in any of the lookup paths (or who tampers with
+        // an installed binary) gets execution under the same privileges as
+        // the VPN client — typically admin/root for tunnel setup. The xray
+        // process also handles the entire VPN payload, so a malicious build
+        // can silently downgrade Reality to plain TLS without the user noticing.
+        verify_xray_integrity(&xray_binary)?;
 
         tracing::info!(
             "Starting Xray Reality tunnel: {} → 127.0.0.1:{} → {}:{}",
@@ -401,27 +489,31 @@ fn build_xray_config(
     })
 }
 
-/// Find the xray binary — check bundled resources first, then PATH
-fn find_xray_binary(app_data_dir: &PathBuf) -> Result<PathBuf, String> {
+/// Find the xray binary — check bundled resources first, then PATH.
+///
+/// AUDIT-N4: the previous lookup order included `app_data_dir/xray/<bin>`
+/// (typically %APPDATA% on Windows, ~/.local/share on Linux), which is
+/// USER-WRITABLE without admin. Combined with the fact that this Tauri app
+/// requests admin elevation for tunnel setup, that path was a privilege-
+/// escalation primitive: any unprivileged code running as the same user
+/// could plant a fake xray binary there and have it auto-executed with
+/// elevated rights. We now refuse user-writable lookup paths entirely.
+/// Bundled binaries must live next to the app exe (admin-installed) or in
+/// the system PATH (administrator-controlled).
+fn find_xray_binary(_app_data_dir: &PathBuf) -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     const XRAY_BIN: &str = "xray.exe";
     #[cfg(not(target_os = "windows"))]
     const XRAY_BIN: &str = "xray";
 
-    // Check app resources directory
-    let bundled = app_data_dir.join("xray").join(XRAY_BIN);
-    if bundled.exists() {
-        return Ok(bundled);
-    }
-
-    // Check alongside the main executable
+    // Check alongside the main executable (Program Files install — admin-only writable).
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let sibling = exe_dir.join(XRAY_BIN);
             if sibling.exists() {
                 return Ok(sibling);
             }
-            // Also check resources subdirectory
+            // Also check resources subdirectory (Tauri standard install layout).
             let resources = exe_dir.join("resources").join(XRAY_BIN);
             if resources.exists() {
                 return Ok(resources);
@@ -429,13 +521,15 @@ fn find_xray_binary(app_data_dir: &PathBuf) -> Result<PathBuf, String> {
         }
     }
 
-    // Fall back to PATH
+    // Fall back to PATH (administrator-controlled on a properly managed host).
     if let Ok(path) = which::which("xray") {
         return Ok(path);
     }
 
     Err(format!(
-        "Xray binary not found. Place {} in the app resources directory or install it in PATH.",
+        "Xray binary not found. Place {} next to the application executable \
+         (admin-installed) or in the system PATH. User-writable locations \
+         are no longer accepted (AUDIT-N4).",
         XRAY_BIN
     ))
 }

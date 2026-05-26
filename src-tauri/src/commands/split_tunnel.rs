@@ -19,22 +19,72 @@ use crate::vpn::wfp;
 /// kill switch is not currently active (the app is queued for when it activates).
 #[tauri::command]
 pub async fn add_split_tunnel_app(app_path: String) -> Result<u64, String> {
-    // SEC FIX: Validate app_path before storing or passing to WFP/pf.
-    // A compromised renderer could pass traversal sequences, null bytes,
-    // or system paths (System32/lsass.exe) to bypass VPN kill-switch for
-    // privileged processes — trivially defeating leak protection.
-    if app_path.is_empty() || app_path.contains("..") || app_path.contains('\0') {
+    // PFA-M8: defence-in-depth path validation. A compromised renderer or
+    // chained XSS in the Tauri webview could otherwise smuggle paths that
+    // bypass the kill switch for privileged processes.
+    if app_path.is_empty() {
+        return Err("Invalid application path".to_string());
+    }
+    if app_path.len() > 32_768 {
+        return Err("Application path too long".to_string());
+    }
+    if app_path.contains('\0') || app_path.contains("..") {
+        return Err("Invalid application path".to_string());
+    }
+    // Reject any control character (newline / CR / tab / vertical tab)
+    // that could break logging, audit pipelines, or downstream parsers.
+    if app_path.chars().any(|c| c.is_control()) {
         return Err("Invalid application path".to_string());
     }
 
-    // On Windows, block adding system process paths to split tunnel.
-    // This prevents a compromised webview from routing DNS or system
-    // traffic outside the VPN tunnel.
+    // On Windows, require an absolute drive-letter path, .exe extension,
+    // and refuse system / device / UNC roots that map to privileged code.
     #[cfg(target_os = "windows")]
     {
         let lower = app_path.to_lowercase();
-        if lower.contains("system32") || lower.contains("syswow64") {
+        if lower.starts_with("\\\\?\\") || lower.starts_with("\\\\.\\") || lower.starts_with("\\\\")
+        {
+            return Err("UNC and device-namespace paths are not permitted".to_string());
+        }
+        let bytes = lower.as_bytes();
+        let drive_letter_path = bytes.len() >= 3
+            && (bytes[0] as char).is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/');
+        if !drive_letter_path {
+            return Err("Application path must be an absolute drive-letter path".to_string());
+        }
+        if !lower.ends_with(".exe") {
+            return Err("Only .exe files may be added to split tunnel".to_string());
+        }
+        if lower.contains("\\system32\\")
+            || lower.contains("\\syswow64\\")
+            || lower.contains("\\windows\\servicing\\")
+            || lower.contains("\\winsxs\\")
+        {
             return Err("Cannot add system processes to split tunnel".to_string());
+        }
+    }
+
+    // On Unix, require absolute path and refuse known privileged trees.
+    #[cfg(not(target_os = "windows"))]
+    {
+        if !app_path.starts_with('/') {
+            return Err("Application path must be absolute".to_string());
+        }
+        let lower = app_path.to_lowercase();
+        for forbidden in [
+            "/sbin/",
+            "/usr/sbin/",
+            "/system/",
+            "/system32/",
+            "/proc/",
+            "/sys/",
+            "/dev/",
+        ] {
+            if lower.starts_with(forbidden) || lower.contains(forbidden) {
+                return Err("Cannot add system path to split tunnel".to_string());
+            }
         }
     }
 

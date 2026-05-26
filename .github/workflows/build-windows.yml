@@ -20,6 +20,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  XRAY_VERSION: v26.2.6
+  XRAY_WINDOWS_SHA256: 50e0e08032f3ff4d14c46c9adb3edc7a969fbbbc54a9188cce71378e23ed3eaa
 
 jobs:
   # ── Job 1: Build + Authenticode-sign (inner .exe AND installers) ────
@@ -77,6 +79,25 @@ jobs:
           New-Item -ItemType Directory -Force -Path "src-tauri/wintun-extract/wintun/bin/amd64"
           Copy-Item "$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" "src-tauri/wintun-extract/wintun/bin/amd64/wintun.dll"
           Write-Host "Wintun DLL ready ($(Get-Item src-tauri/resources/wintun.dll | Select-Object -ExpandProperty Length) bytes)"
+
+      - name: Download pinned Xray Reality engine
+        shell: pwsh
+        run: |
+          $xrayUrl = "https://github.com/XTLS/Xray-core/releases/download/$env:XRAY_VERSION/Xray-windows-64.zip"
+          $zipPath = "$env:RUNNER_TEMP\xray-windows-64.zip"
+          Invoke-WebRequest -Uri $xrayUrl -OutFile $zipPath
+          $actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:XRAY_WINDOWS_SHA256) {
+            throw "Xray zip SHA256 mismatch. Expected $env:XRAY_WINDOWS_SHA256, got $actual"
+          }
+          Expand-Archive -Path $zipPath -DestinationPath "$env:RUNNER_TEMP\xray" -Force
+          $xrayExe = Get-ChildItem "$env:RUNNER_TEMP\xray" -Recurse -Filter xray.exe | Select-Object -First 1
+          if (-not $xrayExe) { throw "xray.exe not found in release archive" }
+          New-Item -ItemType Directory -Force -Path "src-tauri/resources" | Out-Null
+          Copy-Item $xrayExe.FullName "src-tauri/resources/xray.exe" -Force
+          $binarySha = (Get-FileHash -Path "src-tauri/resources/xray.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "XRAY_BINARY_SHA256=$binarySha" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Xray ready: src-tauri/resources/xray.exe ($binarySha)"
 
       # ── Authenticode signing setup (only on tag builds) ──────────────
       # Skip for PR/dispatch builds — those produce unsigned binaries that

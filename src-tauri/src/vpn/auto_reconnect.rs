@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tauri::AppHandle;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 
@@ -18,7 +19,8 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use super::manager::{ConnectionState, VpnManager};
-use crate::api::BirdoApi;
+use crate::api::types::{ConnectResponse, MultiHopConnectResponse};
+use crate::api::{ApiError, BirdoApi};
 
 /// H-5 FIX: Instead of storing the full VpnConfig (which has zeroized keys),
 /// store only the metadata needed to request fresh keys from the backend.
@@ -31,6 +33,14 @@ pub struct ReconnectInfo {
     pub custom_mtu: u16,
     /// P3-3: Persist custom port so reconnects honour user settings ("auto" = server default).
     pub custom_port: String,
+    /// Persist custom DNS so reconnects match the user's active settings.
+    pub custom_dns: Option<Vec<String>>,
+    /// Whether reconnect must request and receive Xray Reality stealth mode.
+    pub stealth_mode: bool,
+    /// Whether reconnect must request and receive BirdoPQ protection.
+    pub quantum_protection: bool,
+    /// Exit node for multi-hop reconnects. None means a normal single-hop reconnect.
+    pub multi_hop_exit_node_id: Option<String>,
 }
 
 /// Configuration for auto-reconnect behavior
@@ -75,6 +85,11 @@ pub struct AutoReconnectService {
     /// API client for fetching fresh VPN configs on reconnect
     api: Arc<BirdoApi>,
 
+    /// App handle used to access managed Xray state and app data paths during
+    /// protected auto-reconnects. If unavailable, protected reconnect fails
+    /// closed instead of downgrading to direct WireGuard.
+    app_handle: Arc<std::sync::RwLock<Option<AppHandle>>>,
+
     /// Current reconnect attempt count
     attempt_count: Arc<AtomicU32>,
 
@@ -99,6 +114,7 @@ impl AutoReconnectService {
             vpn_manager,
             last_reconnect_info: Arc::new(RwLock::new(None)),
             api,
+            app_handle: Arc::new(std::sync::RwLock::new(None)),
             attempt_count: Arc::new(AtomicU32::new(0)),
             is_reconnecting: Arc::new(AtomicBool::new(false)),
             shutdown_tx: Arc::new(RwLock::new(None)),
@@ -110,6 +126,14 @@ impl AutoReconnectService {
     /// Update auto-reconnect configuration
     pub async fn set_config(&self, config: AutoReconnectConfig) {
         *self.config.write().await = config;
+    }
+
+    /// Attach the Tauri app handle after setup so reconnects can start Xray.
+    pub fn set_app_handle(&self, app: AppHandle) {
+        match self.app_handle.write() {
+            Ok(mut guard) => *guard = Some(app),
+            Err(_) => tracing::warn!("Auto-reconnect app handle lock poisoned"),
+        }
     }
 
     /// Enable or disable auto-reconnect
@@ -136,6 +160,10 @@ impl AutoReconnectService {
         local_network_sharing: bool,
         custom_mtu: u16,
         custom_port: String,
+        custom_dns: Option<Vec<String>>,
+        stealth_mode: bool,
+        quantum_protection: bool,
+        multi_hop_exit_node_id: Option<String>,
     ) {
         let server_name_log = server_name.clone();
         *self.last_reconnect_info.write().await = Some(ReconnectInfo {
@@ -144,6 +172,10 @@ impl AutoReconnectService {
             local_network_sharing,
             custom_mtu,
             custom_port,
+            custom_dns,
+            stealth_mode,
+            quantum_protection,
+            multi_hop_exit_node_id,
         });
         self.attempt_count.store(0, Ordering::SeqCst);
         tracing::debug!("Stored reconnect info for: {}", server_name_log);
@@ -184,6 +216,7 @@ impl AutoReconnectService {
         let vpn_manager = Arc::clone(&self.vpn_manager);
         let last_reconnect_info = Arc::clone(&self.last_reconnect_info);
         let api = Arc::clone(&self.api);
+        let app_handle = Arc::clone(&self.app_handle);
         let attempt_count = Arc::clone(&self.attempt_count);
         let is_reconnecting = Arc::clone(&self.is_reconnecting);
         let running = Arc::clone(&self.running);
@@ -195,6 +228,7 @@ impl AutoReconnectService {
                 vpn_manager,
                 last_reconnect_info,
                 api,
+                app_handle,
                 attempt_count,
                 is_reconnecting,
                 running,
@@ -224,6 +258,7 @@ impl AutoReconnectService {
         vpn_manager: Arc<VpnManager>,
         last_reconnect_info: Arc<RwLock<Option<ReconnectInfo>>>,
         api: Arc<BirdoApi>,
+        app_handle: Arc<std::sync::RwLock<Option<AppHandle>>>,
         attempt_count: Arc<AtomicU32>,
         is_reconnecting: Arc<AtomicBool>,
         running: Arc<AtomicBool>,
@@ -415,7 +450,30 @@ impl AutoReconnectService {
                                         let client_public_key = base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
                                         private_key_bytes.zeroize();
 
-                                        match api.connect_vpn(&info.server_id, &device_name, Some(client_public_key), None, None).await {
+                                        let pq_pk = if info.quantum_protection {
+                                            match crate::vpn::birdo_pq::get_client_public_key_b64() {
+                                                Some(pk) => Some(pk),
+                                                None => {
+                                                    tracing::error!(
+                                                        "Post-quantum engine unavailable during auto-reconnect; refusing downgrade"
+                                                    );
+                                                    local_private_key.zeroize();
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                        let response_result = Self::request_fresh_response(
+                                            &api,
+                                            info,
+                                            &device_name,
+                                            client_public_key,
+                                            pq_pk,
+                                        ).await;
+
+                                        match response_result {
                                             Ok(response) => {
                                                 // Re-check user disconnect flag before committing
                                                 if user_disconnected.load(Ordering::SeqCst) {
@@ -423,12 +481,69 @@ impl AutoReconnectService {
                                                     local_private_key.zeroize();
                                                     continue;
                                                 }
+
+                                                if let Err(e) = crate::commands::vpn::enforce_requested_protection(
+                                                    &response,
+                                                    info.stealth_mode,
+                                                    info.quantum_protection,
+                                                ) {
+                                                    tracing::error!("Auto-reconnect aborted: {}", e);
+                                                    local_private_key.zeroize();
+                                                    continue;
+                                                }
+
+                                                let stealth_endpoint_override = match Self::start_stealth_for_reconnect(
+                                                    &app_handle,
+                                                    &response,
+                                                    info.stealth_mode,
+                                                ).await {
+                                                    Ok(endpoint) => endpoint,
+                                                    Err(e) => {
+                                                        tracing::error!("Auto-reconnect stealth setup failed: {}", e);
+                                                        local_private_key.zeroize();
+                                                        continue;
+                                                    }
+                                                };
+
+                                                let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
+                                                    response.xray_endpoint.clone().or_else(|| response.endpoint.clone())
+                                                } else {
+                                                    None
+                                                };
+
+                                                let quantum_psk = match crate::commands::vpn::derive_quantum_psk(&response) {
+                                                    Ok(psk) => psk,
+                                                    Err(e) => {
+                                                        tracing::error!("Auto-reconnect PQ setup failed: {}", e);
+                                                        local_private_key.zeroize();
+                                                        continue;
+                                                    }
+                                                };
+
                                                 // Use the shared config builder — pass local private key
-                                                // P3-3: Pass custom MTU and port so reconnects honour user settings
-                                                match crate::commands::vpn::build_vpn_config(response, &info.server_id, None, Some(local_private_key), info.custom_mtu, &info.custom_port) {
-                                                    Ok((config, _name)) => {
+                                                // P3-3: Pass custom MTU, port, and DNS so reconnects honour user settings
+                                                match crate::commands::vpn::build_vpn_config(response, &info.server_id, info.custom_dns.clone(), Some(local_private_key), info.custom_mtu, &info.custom_port) {
+                                                    Ok((mut config, _name)) => {
                                                         // local_private_key moved into config → WireGuardSession
                                                         // handles zeroization from here
+                                                        if let Some(ref stealth_endpoint) = stealth_endpoint_override {
+                                                            config.endpoint = stealth_endpoint.clone();
+                                                        }
+                                                        if let Some(ref psk) = quantum_psk {
+                                                            config.preshared_key = Some(psk.clone());
+                                                        }
+
+                                                        let killswitch_endpoint = upstream_endpoint_for_killswitch
+                                                            .as_deref()
+                                                            .unwrap_or(&config.endpoint);
+                                                        if let Some(ip) = crate::commands::vpn::parse_endpoint_ip(killswitch_endpoint) {
+                                                            crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
+                                                            #[cfg(target_os = "windows")]
+                                                            if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
+                                                                tracing::warn!("Failed to update WFP VPN server during reconnect: {}", e);
+                                                            }
+                                                        }
+
                                                         match vpn_manager.connect(config, info.server_name.clone(), info.local_network_sharing).await {
                                                             Ok(_) => {
                                                                 tracing::info!("Auto-reconnect successful on attempt {}", attempts + 1);
@@ -530,6 +645,96 @@ impl AutoReconnectService {
         (delay as u64).min(max_delay)
     }
 
+    async fn request_fresh_response(
+        api: &BirdoApi,
+        info: &ReconnectInfo,
+        device_name: &str,
+        client_public_key: String,
+        pq_client_public_key: Option<String>,
+    ) -> Result<ConnectResponse, ApiError> {
+        if let Some(exit_node_id) = info.multi_hop_exit_node_id.as_deref() {
+            let response = api
+                .connect_multi_hop(
+                    &info.server_id,
+                    exit_node_id,
+                    device_name,
+                    &client_public_key,
+                    info.stealth_mode,
+                    info.quantum_protection,
+                    pq_client_public_key,
+                )
+                .await?;
+            Ok(Self::multi_hop_response_to_connect_response(response))
+        } else {
+            api.connect_vpn(
+                &info.server_id,
+                device_name,
+                Some(client_public_key),
+                if info.stealth_mode { Some(true) } else { None },
+                if info.quantum_protection {
+                    Some(true)
+                } else {
+                    None
+                },
+                pq_client_public_key,
+            )
+            .await
+        }
+    }
+
+    async fn start_stealth_for_reconnect(
+        app_handle: &Arc<std::sync::RwLock<Option<AppHandle>>>,
+        response: &ConnectResponse,
+        stealth_requested: bool,
+    ) -> Result<Option<String>, String> {
+        if !stealth_requested && !response.stealth_enabled.unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let app = app_handle
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| {
+                "Stealth reconnect requested but the app runtime is unavailable; refusing downgrade."
+                    .to_string()
+            })?;
+
+        crate::commands::vpn::start_stealth_tunnel(&app, response).await
+    }
+
+    fn multi_hop_response_to_connect_response(
+        response: MultiHopConnectResponse,
+    ) -> ConnectResponse {
+        ConnectResponse {
+            success: response.success,
+            message: response.message,
+            config: response.config,
+            key_id: response.key_id,
+            private_key: response.private_key,
+            public_key: response.public_key,
+            preshared_key: response.preshared_key,
+            assigned_ip: response.assigned_ip,
+            server_public_key: response.server_public_key,
+            endpoint: response.endpoint,
+            dns: response.dns,
+            allowed_ips: response.allowed_ips,
+            mtu: response.mtu,
+            persistent_keepalive: response.persistent_keepalive,
+            server_node: None,
+            stealth_enabled: response.stealth_enabled,
+            xray_endpoint: response.xray_endpoint,
+            xray_uuid: response.xray_uuid,
+            xray_public_key: response.xray_public_key,
+            xray_short_id: response.xray_short_id,
+            xray_sni: response.xray_sni,
+            xray_flow: response.xray_flow,
+            quantum_enabled: response.quantum_enabled,
+            rosenpass_public_key: response.rosenpass_public_key,
+            rosenpass_endpoint: response.rosenpass_endpoint,
+        }
+    }
+
     /// Get current reconnect status
     pub fn get_status(&self) -> AutoReconnectStatus {
         AutoReconnectStatus {
@@ -554,6 +759,7 @@ impl Clone for AutoReconnectService {
             vpn_manager: Arc::clone(&self.vpn_manager),
             last_reconnect_info: Arc::clone(&self.last_reconnect_info),
             api: Arc::clone(&self.api),
+            app_handle: Arc::clone(&self.app_handle),
             attempt_count: Arc::clone(&self.attempt_count),
             is_reconnecting: Arc::clone(&self.is_reconnecting),
             shutdown_tx: Arc::clone(&self.shutdown_tx),

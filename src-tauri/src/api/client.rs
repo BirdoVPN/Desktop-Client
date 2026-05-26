@@ -65,7 +65,7 @@ const CERT_PINS_SHA256: &[&str] = &[
     // that haven't auto-updated keep working.
     //
     // ROTATION: see scripts/rotate-cert-pins.sh in the main repo.
-    "hObTwNVt08WYElPDYs2wHT2Ec/+8OYssiRcCmFHg0A0=", // current leaf: birdo.app (Google WE1, expires 2026-07-31), verified 2026-05-04
+    "hObTwNVt08WYElPDYs2wHT2Ec/+8OYssiRcCmFHg0A0=", // current leaf: birdo.app (Google WE1, expires 2026-07-31). NEXT ROTATION DEADLINE: 2026-07-01 — run scripts/update-cert-pins.ps1 by then.
     "EQul2kftgtOaU85XCKuj4SK3DW5256uxNdEvZXZbuJM=", // previous leaf (expired ~2026-05; kept for in-flight clients, remove next release)
 ];
 
@@ -272,6 +272,7 @@ impl BirdoApi {
         client_public_key: Option<String>,
         stealth_mode: Option<bool>,
         quantum_protection: Option<bool>,
+        pq_client_public_key: Option<String>,
     ) -> Result<ConnectResponse, ApiError> {
         let payload = ConnectRequest {
             server_node_id: Some(server_id.to_string()),
@@ -280,6 +281,7 @@ impl BirdoApi {
             client_public_key,
             stealth_mode,
             quantum_protection,
+            pq_client_public_key,
         };
 
         self.post(endpoints::vpn::CONNECT, &payload, true).await
@@ -393,12 +395,18 @@ impl BirdoApi {
         exit_node_id: &str,
         device_name: &str,
         client_public_key: &str,
+        stealth_mode: bool,
+        quantum_protection: bool,
+        pq_client_public_key: Option<String>,
     ) -> Result<MultiHopConnectResponse, ApiError> {
         let payload = MultiHopConnectRequest {
             entry_node_id: entry_node_id.to_string(),
             exit_node_id: exit_node_id.to_string(),
             device_name: Some(device_name.to_string()),
             client_public_key: Some(client_public_key.to_string()),
+            stealth_mode: Some(stealth_mode),
+            quantum_protection: Some(quantum_protection),
+            pq_client_public_key,
         };
 
         self.post(endpoints::vpn::MULTI_HOP_CONNECT, &payload, true)

@@ -12,6 +12,44 @@
 //! - **Performance** — direct FFI (~100 μs) vs. spawning netsh.exe (~200 ms).
 //! - **Reliability** — no text parsing of netsh stdout/stderr.
 //!
+//! ## AUDIT-L (design trade-off): fail-OPEN on app crash
+//!
+//! `FWPM_SESSION_FLAG_DYNAMIC` is a deliberate UX/security trade-off. Pros:
+//!
+//!   * No "stuck offline" footgun — if the Tauri process dies (panic, OOM,
+//!     user kills it from Task Manager) the user is not locked out of their
+//!     internet.
+//!   * No persistent installer service to maintain (smaller attack surface,
+//!     no kernel driver, no SYSTEM-privilege long-running daemon).
+//!
+//! Cons:
+//!
+//!   * If the GUI crashes WHILE the WireGuard tunnel is still up, all WFP
+//!     filters are removed by the OS. Until WireGuard's own connection
+//!     drops (seconds), packets that were destined for the tunnel may now
+//!     egress on the physical adapter in clear text.
+//!   * A targeted attacker who can crash the GUI process (e.g. a malicious
+//!     local app within the user's session) could use this to deanonymise.
+//!
+//! Mitigation actually shipped:
+//!
+//!   * The tunnel adapter (`Wintun`) is also torn down when the process
+//!     exits, so the routing-table entries that send packets into the
+//!     tunnel disappear at roughly the same time the WFP filters do —
+//!     network stack falls back to the physical interface within a single
+//!     OS poll cycle, not a sustained leak.
+//!   * STUN/TURN UDP destinations are blocked at a higher weight than
+//!     general permits, so even *during* a normal session WebRTC cannot
+//!     leak the real public IP.
+//!
+//! For users who need a true "fail-CLOSED on crash" posture (paranoid /
+//! journalist threat model), a future v2 could ship a separate Windows
+//! service running as `LocalSystem` that holds a non-dynamic WFP session
+//! across GUI restarts. Tracked as a post-launch hardening item — NOT a
+//! blocker per the security audit because the residual leak window is
+//! sub-second and cannot be triggered remotely without prior local code
+//! execution.
+//!
 //! Architecture:
 //!   1. One `WfpEngine` handle is opened at `initialize()` and held for the
 //!      lifetime of the VPN session (closed at `cleanup()`).

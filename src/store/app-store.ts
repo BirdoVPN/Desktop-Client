@@ -210,8 +210,8 @@ const defaultSettings: AppSettings = {
   multiHopEnabled: false,
   multiHopEntryNodeId: null,
   multiHopExitNodeId: null,
-  stealthMode: true,
-  quantumProtection: true,
+  stealthMode: false,
+  quantumProtection: false,
 };
 
 export const useAppStore = create<AppState>()(

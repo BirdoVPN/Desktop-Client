@@ -12,8 +12,8 @@ use crate::vpn::manager::VpnManager;
 use crate::vpn::AutoReconnectService;
 
 use super::vpn::{
-    apply_vpn_settings, build_vpn_config, generate_wireguard_keypair, get_device_name,
-    parse_endpoint_ip,
+    apply_vpn_settings, build_vpn_config, derive_quantum_psk, enforce_requested_protection,
+    generate_wireguard_keypair, get_device_name, parse_endpoint_ip, start_stealth_tunnel,
 };
 
 /// Get available multi-hop routes (SOVEREIGN plan only)
@@ -72,10 +72,28 @@ pub async fn connect_multi_hop(
 
     let device_name = get_device_name();
     let (local_private_key, client_public_key) = generate_wireguard_keypair();
+    let vpn_settings = apply_vpn_settings(&app).await;
+
+    let pq_pk = if vpn_settings.quantum_protection {
+        Some(crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
+            "Post-quantum engine unavailable. Connection aborted because quantum protection is enabled."
+                .to_string()
+        })?)
+    } else {
+        None
+    };
 
     // Call multi-hop connect endpoint
     let mh_response = api
-        .connect_multi_hop(&entryNodeId, &exitNodeId, &device_name, &client_public_key)
+        .connect_multi_hop(
+            &entryNodeId,
+            &exitNodeId,
+            &device_name,
+            &client_public_key,
+            vpn_settings.stealth_mode,
+            vpn_settings.quantum_protection,
+            pq_pk,
+        )
         .await
         .map_err(|e| sanitize_error(&format!("Multi-hop connect failed: {}", e)))?;
 
@@ -103,31 +121,62 @@ pub async fn connect_multi_hop(
         mtu: mh_response.mtu,
         persistent_keepalive: mh_response.persistent_keepalive,
         server_node: None,
-        stealth_enabled: None,
-        xray_endpoint: None,
-        xray_uuid: None,
-        xray_public_key: None,
-        xray_short_id: None,
-        xray_sni: None,
-        xray_flow: None,
-        quantum_enabled: None,
-        rosenpass_public_key: None,
-        rosenpass_endpoint: None,
+        stealth_enabled: mh_response.stealth_enabled,
+        xray_endpoint: mh_response.xray_endpoint,
+        xray_uuid: mh_response.xray_uuid,
+        xray_public_key: mh_response.xray_public_key,
+        xray_short_id: mh_response.xray_short_id,
+        xray_sni: mh_response.xray_sni,
+        xray_flow: mh_response.xray_flow,
+        quantum_enabled: mh_response.quantum_enabled,
+        rosenpass_public_key: mh_response.rosenpass_public_key,
+        rosenpass_endpoint: mh_response.rosenpass_endpoint,
     };
 
-    let vpn_settings = apply_vpn_settings(&app).await;
+    enforce_requested_protection(
+        &connect_response,
+        vpn_settings.stealth_mode,
+        vpn_settings.quantum_protection,
+    )?;
+
+    let stealth_endpoint_override = start_stealth_tunnel(&app, &connect_response).await?;
+    let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
+        connect_response
+            .xray_endpoint
+            .clone()
+            .or_else(|| connect_response.endpoint.clone())
+    } else {
+        None
+    };
+    let quantum_psk = derive_quantum_psk(&connect_response)?;
+
     let server_label = format!("Multi-Hop: {} → {}", entryNodeId, exitNodeId);
-    let (config, _server_name) = build_vpn_config(
+    let (mut config, _server_name) = build_vpn_config(
         connect_response,
         &entryNodeId,
-        vpn_settings.custom_dns,
+        vpn_settings.custom_dns.clone(),
         Some(local_private_key),
         vpn_settings.custom_mtu,
         &vpn_settings.custom_port,
     )?;
 
+    if let Some(ref stealth_ep) = stealth_endpoint_override {
+        tracing::info!(
+            "Overriding multi-hop WireGuard endpoint to Xray proxy: {}",
+            stealth_ep
+        );
+        config.endpoint = stealth_ep.clone();
+    }
+
+    if let Some(ref psk) = quantum_psk {
+        config.preshared_key = Some(psk.clone());
+    }
+
     // Set VPN server IP for kill switch
-    if let Some(ip) = parse_endpoint_ip(&config.endpoint) {
+    let killswitch_endpoint = upstream_endpoint_for_killswitch
+        .as_deref()
+        .unwrap_or(&config.endpoint);
+    if let Some(ip) = parse_endpoint_ip(killswitch_endpoint) {
         crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
         #[cfg(target_os = "windows")]
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
@@ -153,6 +202,10 @@ pub async fn connect_multi_hop(
             vpn_settings.local_network_sharing,
             vpn_settings.custom_mtu,
             vpn_settings.custom_port,
+            vpn_settings.custom_dns,
+            vpn_settings.stealth_mode,
+            vpn_settings.quantum_protection,
+            Some(exitNodeId.clone()),
         )
         .await;
     if let Err(e) = auto_reconnect.start().await {

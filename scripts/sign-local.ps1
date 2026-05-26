@@ -23,10 +23,10 @@ Write-Host "Using cosign at: $($cosign.Source)" -ForegroundColor Green
 # Collect artifacts to sign
 $artifacts = @()
 
-$nsisExe = Get-ChildItem "W:\vpn\birdo-client-win\src-tauri\target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+$nsisExe = Get-ChildItem "W:\vpn\birdo-client-desktop\src-tauri\target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($nsisExe) { $artifacts += $nsisExe }
 
-$msiFile = Get-ChildItem "W:\vpn\birdo-client-win\src-tauri\target\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+$msiFile = Get-ChildItem "W:\vpn\birdo-client-desktop\src-tauri\target\release\bundle\msi\*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($msiFile) { $artifacts += $msiFile }
 
 if ($artifacts.Count -eq 0) {
@@ -56,7 +56,7 @@ foreach ($artifact in $artifacts) {
 
 # Generate checksums
 Write-Host "`nGenerating SHA256 checksums..." -ForegroundColor Yellow
-$checksumFile = "W:\vpn\birdo-client-win\src-tauri\target\release\bundle\SHA256SUMS.txt"
+$checksumFile = "W:\vpn\birdo-client-desktop\src-tauri\target\release\bundle\SHA256SUMS.txt"
 $checksums = @()
 foreach ($artifact in $artifacts) {
     $hash = (Get-FileHash -Path $artifact.FullName -Algorithm SHA256).Hash.ToLower()

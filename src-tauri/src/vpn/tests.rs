@@ -16,7 +16,7 @@ mod auto_reconnect_tests {
         assert_eq!(config.initial_delay_ms, 1000);
         assert_eq!(config.max_delay_ms, 60000);
         assert_eq!(config.max_attempts, 10);
-        assert!((config.backoff_multiplier - 1.5).abs() < f64::EPSILON);
+        assert!((config.backoff_multiplier - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.health_check_interval_ms, 5000);
     }
 
@@ -588,6 +588,10 @@ mod auto_reconnect_service_tests {
                 false,
                 1420,
                 String::new(),
+                Some(vec!["1.1.1.1".into()]),
+                true,
+                true,
+                Some("exit-1".into()),
             )
             .await;
         // Store should succeed without panic

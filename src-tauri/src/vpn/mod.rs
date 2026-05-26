@@ -5,6 +5,7 @@
 //! - macOS: utun kernel interface
 
 pub mod auto_reconnect;
+pub mod birdo_pq; // AUDIT-C1: BirdoPQ v1 ML-KEM-1024 PSK derivation (mirror of Android RosenpassManager)
 pub mod buffer_pool; // FIX-2-4: Reduced to packet size constants only
 pub mod doh; // DNS-over-HTTPS resolver for SEC-002
 pub mod latency;

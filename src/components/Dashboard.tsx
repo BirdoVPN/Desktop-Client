@@ -69,6 +69,9 @@ interface RustVpnStatus {
   bytes_received: number;
   connected_at: string | null;
   server_name: string | null;
+  stealthActive?: boolean;
+  quantumActive?: boolean;
+  pqMode?: 'disabled' | 'server_provided' | 'bilateral';
 }
 
 interface RustServer {

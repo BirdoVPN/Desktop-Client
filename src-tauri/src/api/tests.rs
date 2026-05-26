@@ -244,6 +244,7 @@ mod types_serialization_tests {
             client_public_key: None,
             stealth_mode: None,
             quantum_protection: None,
+            pq_client_public_key: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["serverNodeId"], "node-1");

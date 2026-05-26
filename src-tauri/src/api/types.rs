@@ -380,6 +380,13 @@ pub struct ConnectRequest {
     /// Request post-quantum protection (Rosenpass PSK)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantum_protection: Option<bool>,
+    /// AUDIT-C1: BirdoPQ v1 ML-KEM-1024 client public key (Base64).
+    /// When present together with `quantum_protection=true`, the server
+    /// encapsulates against this key and returns the ciphertext in
+    /// `rosenpassPublicKey` so the client can derive the same PSK locally.
+    /// Closes B1 (PQ claimed but not implemented on desktop).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pq_client_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -483,6 +490,12 @@ pub struct MultiHopConnectRequest {
     pub device_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stealth_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantum_protection: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pq_client_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -517,6 +530,26 @@ pub struct MultiHopConnectResponse {
     pub persistent_keepalive: Option<u16>,
     #[serde(default)]
     pub multi_hop: Option<MultiHopInfo>,
+    #[serde(default, rename = "stealthEnabled")]
+    pub stealth_enabled: Option<bool>,
+    #[serde(default, rename = "xrayEndpoint")]
+    pub xray_endpoint: Option<String>,
+    #[serde(default, rename = "xrayUuid")]
+    pub xray_uuid: Option<String>,
+    #[serde(default, rename = "xrayPublicKey")]
+    pub xray_public_key: Option<String>,
+    #[serde(default, rename = "xrayShortId")]
+    pub xray_short_id: Option<String>,
+    #[serde(default, rename = "xraySni")]
+    pub xray_sni: Option<String>,
+    #[serde(default, rename = "xrayFlow")]
+    pub xray_flow: Option<String>,
+    #[serde(default, rename = "quantumEnabled")]
+    pub quantum_enabled: Option<bool>,
+    #[serde(default, rename = "rosenpassPublicKey")]
+    pub rosenpass_public_key: Option<String>,
+    #[serde(default, rename = "rosenpassEndpoint")]
+    pub rosenpass_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

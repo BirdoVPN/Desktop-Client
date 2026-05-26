@@ -9,9 +9,9 @@ on:
     - cron: '0 9 * * 1' # Every Monday at 09:00 UTC
   pull_request:
     paths:
-      - 'birdo-client-win/src-tauri/Cargo.toml'
-      - 'birdo-client-win/src-tauri/Cargo.lock'
-      - 'birdo-client-win/src-tauri/deny.toml'
+      - 'birdo-client-desktop/src-tauri/Cargo.toml'
+      - 'birdo-client-desktop/src-tauri/Cargo.lock'
+      - 'birdo-client-desktop/src-tauri/deny.toml'
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,7 @@ permissions:
 
 defaults:
   run:
-    working-directory: birdo-client-win/src-tauri
+    working-directory: birdo-client-desktop/src-tauri
 
 jobs:
   cargo-deny:

@@ -253,7 +253,7 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
 
 /// Phase 1 helper: Start Xray Reality stealth tunnel if the server provided config.
 /// Returns the local `127.0.0.1:<port>` endpoint for WireGuard to route through.
-async fn start_stealth_tunnel(
+pub(crate) async fn start_stealth_tunnel(
     app: &AppHandle,
     response: &ConnectResponse,
 ) -> Result<Option<String>, String> {
@@ -358,29 +358,73 @@ async fn start_stealth_tunnel(
 /// every transport packet failed authentication — producing the classic
 /// "tunnel up, packets out, no packets in, no IP reachable" symptom.
 ///
-/// True post-quantum PSK derivation requires running the actual Rosenpass UDP exchange
-/// against the server's `rosenpass_endpoint`. Until that's wired up, we fall back to
-/// the genuine random PSK the server already generates per-peer and ships in
-/// `response.preshared_key`. WireGuard still gets a strong 32-byte PSK; we just don't
-/// claim it's PQ-derived.
-fn derive_quantum_psk(response: &ConnectResponse) -> Option<String> {
-    if !response.quantum_enabled.unwrap_or(false) || response.rosenpass_public_key.is_none() {
-        return None;
+/// AUDIT-C1: Derive WireGuard PSK, preferring genuine bilateral PQ.
+///
+/// Order of preference:
+///   1. BirdoPQ v1 ML-KEM-1024 — decapsulate the server-supplied ciphertext
+///      with our persistent client secret key (HNDL-safe).
+///   2. If the server enabled quantum mode but decapsulation fails, abort.
+///   3. Server-provided classical PSK (TLS-delivered random; not HNDL-safe).
+///   4. None — connection runs without PSK.
+///
+/// The selected mode is latched in `vpn::birdo_pq` so the UI can render the
+/// real protection level instead of a no-op toggle indicator.
+pub(crate) fn derive_quantum_psk(response: &ConnectResponse) -> Result<Option<String>, String> {
+    // 1) True bilateral PQ — only succeeds when server returned a ciphertext
+    //    AND we have a local keypair AND decapsulation produced a PSK.
+    if let Some(psk) = crate::vpn::birdo_pq::try_decapsulate(response) {
+        return Ok(Some(psk));
     }
 
+    if response.quantum_enabled.unwrap_or(false) {
+        crate::vpn::birdo_pq::record_disabled();
+        return Err(
+            "Post-quantum key exchange failed after the server enabled BirdoPQ. Connection aborted to prevent a silent downgrade."
+                .to_string(),
+        );
+    }
+
+    // 2) Fall back to the server's classical preshared_key when present.
     if response.preshared_key.is_some() {
-        tracing::info!(
-            "Quantum protection enabled — using server-provided PSK (Rosenpass UDP exchange not yet wired up client-side)"
-        );
-    } else {
-        tracing::warn!(
-            "Quantum protection requested but server did not return a preshared_key; running without PSK"
+        if response.quantum_enabled.unwrap_or(false) {
+            tracing::warn!(
+                "BirdoPQ: server did not return a PQ ciphertext — falling back to \
+                 server-provided classical PSK (NOT HNDL-safe)"
+            );
+        }
+        crate::vpn::birdo_pq::record_server_provided();
+        return Ok(response.preshared_key.clone());
+    }
+
+    // 3) No PSK at all.
+    crate::vpn::birdo_pq::record_disabled();
+    Ok(None)
+}
+
+/// Fail closed if the user requested a protected mode but the backend response
+/// did not enable that mode. This prevents silent downgrade paths in normal
+/// connect, quick-connect, multi-hop, and auto-reconnect.
+pub(crate) fn enforce_requested_protection(
+    response: &ConnectResponse,
+    stealth_mode: bool,
+    quantum_protection: bool,
+) -> Result<(), String> {
+    if stealth_mode && !response.stealth_enabled.unwrap_or(false) {
+        return Err(
+            "Stealth mode was requested but the server did not enable it. Connection aborted to prevent a silent downgrade."
+                .to_string(),
         );
     }
 
-    // Pass through the server's PSK as-is. `build_vpn_config` will already have
-    // populated this; the override in `connect_vpn` becomes a no-op.
-    response.preshared_key.clone()
+    if quantum_protection && !response.quantum_enabled.unwrap_or(false) {
+        crate::vpn::birdo_pq::record_disabled();
+        return Err(
+            "Post-quantum protection was requested but the server did not enable it. Connection aborted to prevent a silent downgrade."
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 /// Check if the current process has administrator privileges.
@@ -440,6 +484,18 @@ pub async fn connect_vpn(
 
     // Connect via backend API — send public key, NOT private key
     tracing::debug!("Calling /vpn/connect for server {}", server_id);
+
+    // AUDIT-C1: When PQ is requested, attach our ML-KEM-1024 client public key
+    // so the server can encapsulate against it and ship us the ciphertext.
+    let pq_pk = if vpn_settings.quantum_protection {
+        Some(crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
+            "Post-quantum engine unavailable. Connection aborted because quantum protection is enabled."
+                .to_string()
+        })?)
+    } else {
+        None
+    };
+
     let response = match api
         .connect_vpn(
             &server_id,
@@ -455,6 +511,7 @@ pub async fn connect_vpn(
             } else {
                 None
             },
+            pq_pk,
         )
         .await
     {
@@ -476,13 +533,27 @@ pub async fn connect_vpn(
         return Err(msg);
     }
 
+    enforce_requested_protection(
+        &response,
+        vpn_settings.stealth_mode,
+        vpn_settings.quantum_protection,
+    )?;
+
     tracing::info!("Got VPN config from server, extracting fields...");
 
     // Phase 1: Xray Reality Stealth Tunnel
     let stealth_endpoint_override = start_stealth_tunnel(&app, &response).await?;
+    let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
+        response
+            .xray_endpoint
+            .clone()
+            .or_else(|| response.endpoint.clone())
+    } else {
+        None
+    };
 
     // Phase 2: Rosenpass Post-Quantum PSK
-    let quantum_psk = derive_quantum_psk(&response);
+    let quantum_psk = derive_quantum_psk(&response)?;
 
     // H-2 FIX: Use shared helper instead of duplicated extraction logic
     // FIX-1-1: Pass locally generated private key — server response won't contain one
@@ -490,7 +561,7 @@ pub async fn connect_vpn(
     let (mut config, server_name) = build_vpn_config(
         response,
         &server_id,
-        vpn_settings.custom_dns,
+        vpn_settings.custom_dns.clone(),
         Some(local_private_key),
         vpn_settings.custom_mtu,
         &vpn_settings.custom_port,
@@ -517,7 +588,10 @@ pub async fn connect_vpn(
     );
 
     // Set the VPN server IP for kill switch permit rules
-    if let Some(ip) = parse_endpoint_ip(&config.endpoint) {
+    let killswitch_endpoint = upstream_endpoint_for_killswitch
+        .as_deref()
+        .unwrap_or(&config.endpoint);
+    if let Some(ip) = parse_endpoint_ip(killswitch_endpoint) {
         crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
         // update_vpn_server sets the IP AND re-activates blocking atomically
         #[cfg(target_os = "windows")]
@@ -545,6 +619,10 @@ pub async fn connect_vpn(
             vpn_settings.local_network_sharing,
             vpn_settings.custom_mtu,
             vpn_settings.custom_port,
+            vpn_settings.custom_dns,
+            vpn_settings.stealth_mode,
+            vpn_settings.quantum_protection,
+            None,
         )
         .await;
     if let Err(e) = auto_reconnect.start().await {
@@ -609,11 +687,17 @@ pub struct VpnStatus {
     pub bytes_received: u64,
     pub connected_at: Option<String>,
     pub server_name: Option<String>,
+    pub stealth_active: bool,
+    pub quantum_active: bool,
+    pub pq_mode: crate::vpn::birdo_pq::PqMode,
 }
 
 /// Get current VPN connection status
 #[tauri::command]
-pub async fn get_vpn_status(vpn_manager: State<'_, VpnManager>) -> Result<VpnStatus, String> {
+pub async fn get_vpn_status(
+    vpn_manager: State<'_, VpnManager>,
+    xray_manager: State<'_, XrayManager>,
+) -> Result<VpnStatus, String> {
     // Update stats from tunnel
     vpn_manager.update_stats().await;
 
@@ -638,6 +722,10 @@ pub async fn get_vpn_status(vpn_manager: State<'_, VpnManager>) -> Result<VpnSta
         bytes_received: stats.bytes_received,
         connected_at: stats.connected_at.map(|t| t.to_rfc3339()),
         server_name: stats.server_name,
+        stealth_active: xray_manager.is_running().await,
+        quantum_active: crate::vpn::birdo_pq::current_mode()
+            == crate::vpn::birdo_pq::PqMode::Bilateral,
+        pq_mode: crate::vpn::birdo_pq::current_mode(),
     })
 }
 
@@ -716,34 +804,92 @@ pub async fn quick_connect(
     // FIX-1-1: Generate X25519 keypair locally
     let (local_private_key, client_public_key) = generate_wireguard_keypair();
 
+    // AUDIT-C1: quick-connect respects the user's quantum-protection setting too.
+    let vpn_settings = apply_vpn_settings(&app).await;
+    let pq_pk = if vpn_settings.quantum_protection {
+        Some(crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
+            "Post-quantum engine unavailable. Connection aborted because quantum protection is enabled."
+                .to_string()
+        })?)
+    } else {
+        None
+    };
+
     // Connect via backend API — send public key only
     let response = api
         .connect_vpn(
             &best_server.id,
             &device_name,
             Some(client_public_key),
-            None,
-            None,
+            if vpn_settings.stealth_mode {
+                Some(true)
+            } else {
+                None
+            },
+            if vpn_settings.quantum_protection {
+                Some(true)
+            } else {
+                None
+            },
+            pq_pk,
         )
         .await
         .map_err(|e| sanitize_error(&format!("Failed to connect: {}", e)))?;
 
-    let vpn_settings = apply_vpn_settings(&app).await;
+    if !response.success {
+        let msg = response
+            .message
+            .clone()
+            .unwrap_or_else(|| "Connection failed".to_string());
+        return Err(msg);
+    }
+
+    enforce_requested_protection(
+        &response,
+        vpn_settings.stealth_mode,
+        vpn_settings.quantum_protection,
+    )?;
+
+    let stealth_endpoint_override = start_stealth_tunnel(&app, &response).await?;
+    let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
+        response
+            .xray_endpoint
+            .clone()
+            .or_else(|| response.endpoint.clone())
+    } else {
+        None
+    };
+    let quantum_psk = derive_quantum_psk(&response)?;
 
     // H-2 FIX: Use shared helper instead of duplicated extraction logic
     // FIX-1-1: Pass locally generated private key
     // P3-1: Pass custom MTU and port from user settings
-    let (config, _server_name) = build_vpn_config(
+    let (mut config, _server_name) = build_vpn_config(
         response,
         &best_server.id,
-        vpn_settings.custom_dns,
+        vpn_settings.custom_dns.clone(),
         Some(local_private_key),
         vpn_settings.custom_mtu,
         &vpn_settings.custom_port,
     )?;
 
+    if let Some(ref stealth_ep) = stealth_endpoint_override {
+        tracing::info!(
+            "Overriding quick-connect WireGuard endpoint to Xray proxy: {}",
+            stealth_ep
+        );
+        config.endpoint = stealth_ep.clone();
+    }
+
+    if let Some(ref psk) = quantum_psk {
+        config.preshared_key = Some(psk.clone());
+    }
+
     // Set the VPN server IP for kill switch permit rules (quick connect path)
-    if let Some(ip) = parse_endpoint_ip(&config.endpoint) {
+    let killswitch_endpoint = upstream_endpoint_for_killswitch
+        .as_deref()
+        .unwrap_or(&config.endpoint);
+    if let Some(ip) = parse_endpoint_ip(killswitch_endpoint) {
         crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
         #[cfg(target_os = "windows")]
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
@@ -770,6 +916,10 @@ pub async fn quick_connect(
             vpn_settings.local_network_sharing,
             vpn_settings.custom_mtu,
             vpn_settings.custom_port,
+            vpn_settings.custom_dns,
+            vpn_settings.stealth_mode,
+            vpn_settings.quantum_protection,
+            None,
         )
         .await;
     if let Err(e) = auto_reconnect.start().await {
@@ -781,7 +931,7 @@ pub async fn quick_connect(
 
 /// Parse the endpoint IP from a "host:port" string.
 /// Returns None if the host part is not a valid IPv4 address (e.g. a hostname).
-pub(super) fn parse_endpoint_ip(endpoint: &str) -> Option<std::net::Ipv4Addr> {
+pub(crate) fn parse_endpoint_ip(endpoint: &str) -> Option<std::net::Ipv4Addr> {
     if endpoint.starts_with('[') {
         // IPv6 [addr]:port — not relevant for WFP IPv4 filters
         return None;

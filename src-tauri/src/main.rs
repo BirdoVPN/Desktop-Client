@@ -155,6 +155,7 @@ fn main() {
                     std::sync::Arc::new(vpn_manager),
                     std::sync::Arc::new(api),
                 );
+                auto_reconnect.set_app_handle(app.handle().clone());
                 app.manage(auto_reconnect);
                 info!("Auto-reconnect service registered");
             }

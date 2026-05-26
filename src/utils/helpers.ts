@@ -161,8 +161,8 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     multiHopEnabled: rs.multi_hop_enabled ?? false,
     multiHopEntryNodeId: rs.multi_hop_entry_node_id ?? null,
     multiHopExitNodeId: rs.multi_hop_exit_node_id ?? null,
-    stealthMode: rs.stealth_mode ?? true,
-    quantumProtection: rs.quantum_protection ?? true,
+    stealthMode: rs.stealth_mode ?? false,
+    quantumProtection: rs.quantum_protection ?? false,
   };
 }
 

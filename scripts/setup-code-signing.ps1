@@ -48,7 +48,7 @@ Write-Host @"
   Verification:
     cosign verify-blob --bundle <file>.sigstore \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      --certificate-identity-regexp "github.com/.*birdo-client-win" \
+      --certificate-identity-regexp "github.com/.*birdo-client-desktop" \
       <file>
 
 "@ -ForegroundColor Gray
