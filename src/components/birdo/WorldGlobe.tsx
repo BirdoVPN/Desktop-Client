@@ -11,6 +11,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Globe from 'react-globe.gl';
 import type { GlobeMethods } from 'react-globe.gl';
+import earthTextureUrl from '../../../node_modules/three-globe/example/img/earth-blue-marble.jpg?url';
+import earthTopologyUrl from '../../../node_modules/three-globe/example/img/earth-topology.png?url';
 import { brand, status, surface } from '@/lib/birdo-theme';
 import { countryCoords } from '@/utils/country-coords';
 import type { Server } from '@/store/app-store';
@@ -42,6 +44,7 @@ export function WorldGlobe({
 }: WorldGlobeProps) {
   const globeRef = useRef<GlobeMethods | undefined>(undefined);
   const containerRef = useRef<HTMLDivElement>(null);
+  const cameraReadyRef = useRef(false);
   const [size, setSize] = useState({ w: 380, h: 640 });
 
   // ── Resize observer (Tauri window is fixed but be safe) ─────────────
@@ -65,11 +68,22 @@ export function WorldGlobe({
       autoRotateSpeed: number;
       enableZoom: boolean;
       enablePan: boolean;
+      enableDamping: boolean;
+      minPolarAngle: number;
+      maxPolarAngle: number;
     };
     controls.autoRotate = autoRotate && !isConnected;
-    controls.autoRotateSpeed = 0.4;
+    controls.autoRotateSpeed = 0.28;
     controls.enableZoom = false;
     controls.enablePan = false;
+    controls.enableDamping = true;
+    controls.minPolarAngle = Math.PI * 0.47;
+    controls.maxPolarAngle = Math.PI * 0.53;
+
+    if (!cameraReadyRef.current) {
+      g.pointOfView({ lat: 12, lng: -20, altitude: 2.35 }, 0);
+      cameraReadyRef.current = true;
+    }
   }, [autoRotate, isConnected]);
 
   // ── Pan to selected server when connected ───────────────────────────
@@ -135,13 +149,12 @@ export function WorldGlobe({
         width={size.w}
         height={size.h}
         backgroundColor="rgba(0,0,0,0)"
-        // Use a low-detail topology and shade it ourselves rather than loading
-        // a high-res NASA texture (keeps bundle size + first-paint fast).
         showGlobe
-        globeImageUrl={null as unknown as string}
+        globeImageUrl={earthTextureUrl}
+        bumpImageUrl={earthTopologyUrl}
         showAtmosphere
-        atmosphereColor={brand.purple}
-        atmosphereAltitude={0.18}
+        atmosphereColor="#7BB2E6"
+        atmosphereAltitude={0.16}
         // Server points
         pointsData={points}
         pointLat="lat"

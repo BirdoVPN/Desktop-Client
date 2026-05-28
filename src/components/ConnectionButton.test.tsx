@@ -28,6 +28,7 @@ function makeMockServer(id: string) {
     isStreaming: false,
     isP2p: false,
     isOnline: true,
+    isAccessible: true,
   }
 }
 
@@ -91,14 +92,13 @@ describe('ConnectionButton', () => {
     expect(invoke).toHaveBeenCalledWith('disconnect_vpn')
   })
 
-  it('does not connect when no servers available', () => {
+  it('shows an error when no servers are available', () => {
     useAppStore.setState({ servers: [], currentServer: null })
     render(<ConnectionButton />)
     const button = screen.getByRole('button')
     
     fireEvent.click(button)
     
-    // Should remain disconnected since no server is available
-    expect(useAppStore.getState().connectionState).toBe('disconnected')
+    expect(useAppStore.getState().connectionState).toBe('error')
   })
 })

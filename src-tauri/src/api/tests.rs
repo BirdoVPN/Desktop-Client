@@ -218,7 +218,23 @@ mod types_serialization_tests {
         assert_eq!(server.country_code, "US");
         assert!(server.is_premium);
         assert!(server.is_online);
-        assert_eq!(server.port, 51820);
+        assert_eq!(server.port, Some(51820));
+    }
+
+    #[test]
+    fn vpn_server_deserializes_public_listing_shape() {
+        let json = r#"{
+            "id": "s1", "name": "US East", "region": "us-east",
+            "country": "United States", "countryCode": "US", "city": "New York",
+            "load": 45, "tier": "FREE", "isPremium": false,
+            "isStreaming": false, "isP2p": true, "isOnline": true, "accessible": true
+        }"#;
+        let server: VpnServer = serde_json::from_str(json).unwrap();
+        assert_eq!(server.country_code, "US");
+        assert_eq!(server.hostname, None);
+        assert_eq!(server.ip_address, None);
+        assert_eq!(server.port, None);
+        assert!(server.accessible);
     }
 
     #[test]

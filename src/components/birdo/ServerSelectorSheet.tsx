@@ -5,7 +5,7 @@
  */
 import { useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, X, Star, Film, Download, Signal } from 'lucide-react';
+import { Search, X, Star, Film, Download, Signal, Lock } from 'lucide-react';
 import type { Server } from '@/store/app-store';
 import { surface, white, hairline, brand } from '@/lib/birdo-theme';
 import { countryCodeToFlag } from '@/utils/helpers';
@@ -62,6 +62,7 @@ export function ServerSelectorSheet({
         const aFav = favoriteServers.includes(a.id) ? 0 : 1;
         const bFav = favoriteServers.includes(b.id) ? 0 : 1;
         if (aFav !== bFav) return aFav - bFav;
+        if (a.isAccessible !== b.isAccessible) return a.isAccessible ? -1 : 1;
         if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
         if (a.load !== b.load) return a.load - b.load;
         return a.name.localeCompare(b.name);
@@ -252,7 +253,7 @@ function ServerRow({
       <button
         type="button"
         onClick={onSelect}
-        disabled={!server.isOnline}
+        disabled={!server.isOnline || !server.isAccessible}
         aria-label={`Connect to ${server.city}, ${server.country}`}
         className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-colors disabled:opacity-50"
         style={{
@@ -285,7 +286,13 @@ function ServerRow({
         </span>
 
         <span className="flex shrink-0 items-center gap-2.5 text-xs">
-          {server.ping != null && (
+          {!server.isAccessible && (
+            <span className="flex items-center gap-1" style={{ color: white.w40 }}>
+              <Lock size={11} />
+              Locked
+            </span>
+          )}
+          {server.ping != null && server.isAccessible && (
             <span style={{ color: white.w60 }}>{server.ping}ms</span>
           )}
           <span className="flex items-center gap-1" style={{ color: loadColor }}>

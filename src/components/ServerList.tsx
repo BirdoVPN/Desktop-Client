@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, Server } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
-import { Search, Star, Zap, Film, Download, Signal, Server as ServerIcon } from 'lucide-react';
+import { Search, Star, Zap, Film, Download, Signal, Server as ServerIcon, Lock } from 'lucide-react';
 import { countryCodeToFlag, friendlyVpnError } from '@/utils/helpers';
 
 export function ServerList() {
@@ -63,7 +63,8 @@ export function ServerList() {
       const bFav = favoriteServers.includes(b.id) ? 0 : 1;
       if (aFav !== bFav) return aFav - bFav;
 
-      // Online servers before offline
+      // Accessible servers before locked, then online before offline
+      if (a.isAccessible !== b.isAccessible) return a.isAccessible ? -1 : 1;
       if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
 
       // Lowest load first
@@ -77,7 +78,7 @@ export function ServerList() {
   }, [servers, searchQuery, filter, favoriteServers]);
 
   const handleConnect = async (server: Server) => {
-    if (!server.isOnline) return;
+    if (!server.isOnline || !server.isAccessible) return;
     const state = useAppStore.getState().connectionState;
     if (state === 'connecting' || state === 'connected' || state === 'disconnecting') return;
 
@@ -168,7 +169,7 @@ export function ServerList() {
                   currentServer?.id === server.id
                     ? 'ring-1 ring-white/20'
                     : ''
-                } ${!server.isOnline ? 'opacity-50' : ''}`}
+                } ${(!server.isOnline || !server.isAccessible) ? 'opacity-50' : ''}`}
                 onClick={() => handleConnect(server)}
                 onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleConnect(server); } }}
               >
@@ -196,7 +197,13 @@ export function ServerList() {
 
                 {/* Load & ping */}
                 <div className="flex items-center gap-3 text-xs">
-                  {server.ping && (
+                  {!server.isAccessible && (
+                    <span className="flex items-center gap-1 text-white/40">
+                      <Lock size={12} />
+                      Locked
+                    </span>
+                  )}
+                  {server.ping && server.isAccessible && (
                     <span className="text-white/60">{server.ping}ms</span>
                   )}
                   <div className="flex items-center gap-1">

@@ -50,6 +50,17 @@ vi.mock('@/store/app-store', () => ({
         preferredServerId: null,
       },
       updateSettings: vi.fn(),
+      account: {
+        email: 'test@birdo.app',
+        plan: 'operative',
+        accountId: 'acct_test',
+        maxDevices: 5,
+        activeDevices: 1,
+        expiresAt: null,
+        bandwidthUsed: 0,
+        bandwidthLimit: 0,
+        status: 'active',
+      },
       servers: [],
       multiHopRoutes: [],
       setMultiHopRoutes: vi.fn(),
@@ -67,6 +78,11 @@ vi.mock('zustand/react/shallow', () => ({
 
 const mockedInvoke = vi.mocked(invoke);
 
+function renderToolsTab() {
+  render(<Settings />);
+  fireEvent.click(screen.getByText('Tools'));
+}
+
 beforeEach(() => {
   mockedInvoke.mockReset();
   mockedInvoke.mockResolvedValue(undefined);
@@ -74,7 +90,7 @@ beforeEach(() => {
 
 describe('Speed Test section', () => {
   it('renders the Run button', () => {
-    render(<Settings />);
+    renderToolsTab();
     expect(screen.getByText('Run')).toBeInTheDocument();
   });
 
@@ -86,7 +102,7 @@ describe('Speed Test section', () => {
       jitterMs: 3,
     });
 
-    render(<Settings />);
+    renderToolsTab();
     fireEvent.click(screen.getByText('Run'));
 
     await waitFor(() => {
@@ -103,7 +119,7 @@ describe('Speed Test section', () => {
       })
     );
 
-    render(<Settings />);
+    renderToolsTab();
     const btn = screen.getByText('Run');
     fireEvent.click(btn);
 
@@ -128,7 +144,7 @@ describe('Speed Test section', () => {
       jitterMs: 3,
     });
 
-    render(<Settings />);
+    renderToolsTab();
     fireEvent.click(screen.getByText('Run'));
 
     await waitFor(() => {
@@ -150,7 +166,7 @@ describe('Speed Test section', () => {
       jitterMs: 5,
     });
 
-    render(<Settings />);
+    renderToolsTab();
     const btn = screen.getByText('Run');
     fireEvent.click(btn);
 
@@ -162,7 +178,7 @@ describe('Speed Test section', () => {
   it('re-enables button after speed test errors', async () => {
     mockedInvoke.mockRejectedValueOnce(new Error('Network error'));
 
-    render(<Settings />);
+    renderToolsTab();
     const btn = screen.getByText('Run');
     fireEvent.click(btn);
 

@@ -34,6 +34,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 
 export function Settings() {
   const [appVersion, setAppVersion] = useState('');
+  const [activeSettingsTab, setActiveSettingsTab] = useState<'general' | 'vpn' | 'tools' | 'account'>('general');
   const [dnsInput, setDnsInput] = useState('');
   const [dnsError, setDnsError] = useState<string | null>(null);
   const [killSwitchError, setKillSwitchError] = useState<string | null>(null);
@@ -200,7 +201,39 @@ export function Settings() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="p-4 space-y-5">
+        <div
+          className="grid grid-cols-4 gap-1 rounded-2xl p-1"
+          style={{
+            backgroundColor: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.08)',
+          }}
+        >
+          {[
+            { key: 'general' as const, label: 'General' },
+            { key: 'vpn' as const, label: 'VPN' },
+            { key: 'tools' as const, label: 'Tools' },
+            { key: 'account' as const, label: 'Account' },
+          ].map((tab) => {
+            const active = activeSettingsTab === tab.key;
+            return (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => setActiveSettingsTab(tab.key)}
+                className="min-w-0 rounded-xl px-2 py-2 text-xs font-semibold transition"
+                style={{
+                  backgroundColor: active ? '#F2F2F2' : 'transparent',
+                  color: active ? '#050507' : 'rgba(255,255,255,0.62)',
+                }}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
 
+        {activeSettingsTab === 'general' && (
+          <>
         {/* ── Connection Section ── */}
         <Section title="Connection">
           <SettingToggle
@@ -288,7 +321,11 @@ export function Settings() {
             </div>
           </div>
         </Section>
+          </>
+        )}
 
+        {activeSettingsTab === 'vpn' && (
+          <>
         {/* ── DNS Section ── */}
         <Section title="DNS">
           <SettingExpandable
@@ -578,7 +615,11 @@ export function Settings() {
             </p>
           </div>
         </Section>
+          </>
+        )}
 
+        {activeSettingsTab === 'tools' && (
+          <>
         {/* Split Tunneling and Multi-Hop have moved to the Dashboard
             (the Connect page) where they apply per-session. */}
 
@@ -762,7 +803,11 @@ export function Settings() {
             </div>
           </div>
         </Section>
+          </>
+        )}
 
+        {activeSettingsTab === 'account' && (
+          <>
         {/* ── Updates Section ── */}
         <Section title="Updates">
           <UpdateChecker />
@@ -820,6 +865,8 @@ export function Settings() {
             </div>
           </div>
         </div>
+          </>
+        )}
 
         {/* Bottom spacer */}
         <div className="h-2" />

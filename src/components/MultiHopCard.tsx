@@ -240,7 +240,7 @@ function MultiHopPicker({ servers, entryId, exitId, onApply, onDisable, onClose 
   const [draftEntry, setDraftEntry] = useState<string | null>(entryId);
   const [draftExit, setDraftExit] = useState<string | null>(exitId);
 
-  const onlineServers = servers.filter((s) => s.isOnline);
+  const onlineServers = servers.filter((s) => s.isOnline && s.isAccessible);
   // Backend rejects entry+exit pairs in the same country (privacy: a single-country
   // double-hop leaks no real metadata vs single-hop). Mirror that filter here so the
   // user can never pick a combo that will be rejected on connect.

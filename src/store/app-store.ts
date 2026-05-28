@@ -16,6 +16,7 @@ export interface Server {
   isStreaming: boolean;
   isP2p: boolean;
   isOnline: boolean;
+  isAccessible: boolean;
 }
 
 export interface ConnectionStats {

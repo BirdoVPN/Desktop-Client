@@ -21,6 +21,7 @@ function makeMockServer(overrides: Partial<Server> = {}): Server {
     isStreaming: false,
     isP2p: false,
     isOnline: true,
+    isAccessible: true,
     ...overrides,
   }
 }

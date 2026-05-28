@@ -294,16 +294,28 @@ pub struct VpnServer {
     pub id: String,
     pub name: String,
     pub country: String,
+    #[serde(default)]
     pub country_code: String,
+    #[serde(default)]
     pub city: String,
-    pub hostname: String,
-    pub ip_address: String,
-    pub port: u16,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default, alias = "ip")]
+    pub ip_address: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
     pub load: u8,
+    #[serde(default)]
     pub is_premium: bool,
+    #[serde(default)]
     pub is_streaming: bool,
+    #[serde(default)]
     pub is_p2p: bool,
+    #[serde(default = "default_true")]
     pub is_online: bool,
+    #[serde(default = "default_true")]
+    pub accessible: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -712,7 +712,7 @@ pub async fn get_vpn_status(
         ConnectionState::Connected => "connected",
         ConnectionState::Disconnecting => "disconnecting",
         ConnectionState::Reconnecting { .. } => "reconnecting",
-        ConnectionState::KillSwitchActive => "killswitch_active",
+        ConnectionState::KillSwitchActive => "kill_switch_active",
         ConnectionState::Error(_) => "error",
     };
 

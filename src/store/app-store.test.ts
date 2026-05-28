@@ -327,6 +327,7 @@ function makeMockServer(id: string, overrides: Partial<import('./app-store').Ser
     isStreaming: false,
     isP2p: false,
     isOnline: true,
+    isAccessible: true,
     ...overrides,
   }
 }

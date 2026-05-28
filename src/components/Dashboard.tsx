@@ -81,15 +81,16 @@ interface RustServer {
   country_code?: string;
   countryCode?: string;
   city: string;
-  hostname: string;
+  hostname?: string;
   ip_address?: string;
   ipAddress?: string;
-  port: number;
+  port?: number;
   load?: number;
   is_premium?: boolean;
   is_streaming?: boolean;
   is_p2p?: boolean;
   is_online?: boolean;
+  accessible?: boolean;
 }
 
 export function Dashboard() {
@@ -219,6 +220,7 @@ export function Dashboard() {
           isStreaming: s.is_streaming ?? false,
           isP2p: s.is_p2p ?? false,
           isOnline: s.is_online ?? true,
+          isAccessible: s.accessible ?? true,
         }));
         setServers(mapped);
 
@@ -412,8 +414,13 @@ export function Dashboard() {
       return;
     }
 
-    const target = currentServer || servers.find((s) => s.isOnline);
-    if (!target) return;
+    const target = (currentServer?.isOnline && currentServer.isAccessible)
+      ? currentServer
+      : servers.find((s) => s.isOnline && s.isAccessible);
+    if (!target) {
+      setErrorMessage('No accessible online servers are available for this account.');
+      return;
+    }
 
     setConnectionState('connecting');
     setCurrentServer(target);

@@ -94,9 +94,15 @@ export function ConnectionButton() {
       }
 
       // Standard connect - use current server or best available
-      const targetServer = currentServer || servers.find((s) => s.isOnline);
+      const targetServer = (currentServer?.isOnline && currentServer.isAccessible)
+        ? currentServer
+        : servers.find((s) => s.isOnline && s.isAccessible);
 
-      if (!targetServer) return;
+      if (!targetServer) {
+        setErrorMessage('No accessible online servers are available for this account.');
+        setConnectionState('error');
+        return;
+      }
 
       setConnectionState('connecting');
       setCurrentServer(targetServer);

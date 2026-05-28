@@ -15,15 +15,18 @@ use tokio::time::timeout;
 pub struct ServerInfo {
     pub id: String,
     pub name: String,
-    pub hostname: String,
+    pub hostname: Option<String>,
     pub country: String,
     pub country_code: String,
     pub city: String,
+    pub ip_address: Option<String>,
+    pub port: Option<u16>,
     pub load: u8,
     pub is_premium: bool,
     pub is_streaming: bool,
     pub is_p2p: bool,
     pub is_online: bool,
+    pub accessible: bool,
     pub latency_ms: Option<u32>,
 }
 
@@ -61,11 +64,14 @@ pub async fn get_servers(
             country: s.country,
             country_code: s.country_code,
             city: s.city,
+            ip_address: s.ip_address,
+            port: s.port,
             load: s.load,
             is_premium: s.is_premium,
             is_streaming: s.is_streaming,
             is_p2p: s.is_p2p,
             is_online: s.is_online,
+            accessible: s.accessible,
             latency_ms: None, // Will be filled by ping_server
         })
         .collect())
