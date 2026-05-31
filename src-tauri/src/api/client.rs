@@ -64,8 +64,9 @@ const CERT_PINS_SHA256: &[&str] = &[
     // overlap window of (current + previous) pins so in-flight clients
     // that haven't auto-updated keep working.
     //
-    // ROTATION: see scripts/rotate-cert-pins.sh in the main repo.
-    "hObTwNVt08WYElPDYs2wHT2Ec/+8OYssiRcCmFHg0A0=", // current leaf: birdo.app (Google WE1, expires 2026-07-31). NEXT ROTATION DEADLINE: 2026-07-01 — run scripts/update-cert-pins.ps1 by then.
+    // ROTATION: run `scripts/rotate-cert-pins.sh birdo.app --write` from the
+    // monorepo root and follow docs/CERT-PIN-ROTATION.md (overlap method).
+    "hObTwNVt08WYElPDYs2wHT2Ec/+8OYssiRcCmFHg0A0=", // current leaf: birdo.app (Google WE1, expires 2026-07-31). NEXT ROTATION DEADLINE: 2026-07-01 — see docs/CERT-PIN-ROTATION.md.
     "EQul2kftgtOaU85XCKuj4SK3DW5256uxNdEvZXZbuJM=", // previous leaf (expired ~2026-05; kept for in-flight clients, remove next release)
 ];
 
@@ -592,11 +593,28 @@ impl BirdoApi {
 
         let status = response.status();
 
-        match status {
-            StatusCode::OK | StatusCode::CREATED => response
+        if matches!(status, StatusCode::OK | StatusCode::CREATED) {
+            return response
                 .json()
                 .await
-                .map_err(|e| ApiError::Parse(e.to_string())),
+                .map_err(|e| ApiError::Parse(e.to_string()));
+        }
+
+        // Parse the body once for typed protocol errors and backend-provided messages.
+        let error_text = response.text().await.unwrap_or_default();
+        if let Ok(body) = serde_json::from_str::<super::types::ApiErrorBody>(&error_text) {
+            if let Some(code) = body.error_code {
+                return Err(ApiError::Protocol(code));
+            }
+            if let Some(message) = body.message {
+                let message = message.trim();
+                if !message.is_empty() {
+                    return Err(ApiError::Unknown(message.to_string()));
+                }
+            }
+        }
+
+        match status {
             StatusCode::UNAUTHORIZED => {
                 // Try to refresh token
                 Err(ApiError::Unauthorized)
@@ -608,13 +626,6 @@ impl BirdoApi {
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE => Err(ApiError::ServerError(status.as_u16())),
             _ => {
-                // P1-7: Try to parse a typed error code from the response body
-                let error_text = response.text().await.unwrap_or_default();
-                if let Ok(body) = serde_json::from_str::<super::types::ApiErrorBody>(&error_text) {
-                    if let Some(code) = body.error_code {
-                        return Err(ApiError::Protocol(code));
-                    }
-                }
                 tracing::debug!("Unhandled HTTP {}: {}", status, error_text);
                 Err(ApiError::Unknown(format!("HTTP {}", status.as_u16())))
             }

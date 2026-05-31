@@ -64,6 +64,15 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Type-check frontend
+        run: npm run type-check
+
+      - name: Run unit tests (single-run)
+        run: npm run test:run
+
       # Download wintun.dll (gitignored — must be fetched at build time)
       - name: Download Wintun
         shell: pwsh

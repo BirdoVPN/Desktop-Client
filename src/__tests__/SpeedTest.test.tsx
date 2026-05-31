@@ -8,7 +8,8 @@
  * Run: npx vitest run src/__tests__/SpeedTest.test.tsx
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Settings } from '@/components/Settings';
 
@@ -78,9 +79,19 @@ vi.mock('zustand/react/shallow', () => ({
 
 const mockedInvoke = vi.mocked(invoke);
 
-function renderToolsTab() {
-  render(<Settings />);
-  fireEvent.click(screen.getByText('Tools'));
+async function renderToolsTab() {
+  await act(async () => {
+    render(<Settings />);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  await act(async () => {
+    await userEvent.click(screen.getByText('Tools'));
+    await Promise.resolve();
+  });
+  await waitFor(() => {
+    expect(screen.getByText('Run')).toBeInTheDocument();
+  });
 }
 
 beforeEach(() => {
@@ -89,8 +100,8 @@ beforeEach(() => {
 });
 
 describe('Speed Test section', () => {
-  it('renders the Run button', () => {
-    renderToolsTab();
+  it('renders the Run button', async () => {
+    await renderToolsTab();
     expect(screen.getByText('Run')).toBeInTheDocument();
   });
 
@@ -102,8 +113,11 @@ describe('Speed Test section', () => {
       jitterMs: 3,
     });
 
-    renderToolsTab();
-    fireEvent.click(screen.getByText('Run'));
+    await renderToolsTab();
+    await act(async () => {
+      await userEvent.click(screen.getByText('Run'));
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(mockedInvoke).toHaveBeenCalledWith('run_speed_test_command');
@@ -119,20 +133,25 @@ describe('Speed Test section', () => {
       })
     );
 
-    renderToolsTab();
+    await renderToolsTab();
     const btn = screen.getByText('Run');
-    fireEvent.click(btn);
+    await act(async () => {
+      await userEvent.click(btn);
+    });
 
     await waitFor(() => {
       expect(btn).toBeDisabled();
     });
 
     // Cleanup: resolve the dangling promise
-    resolve!({
-      downloadMbps: 0,
-      uploadMbps: 0,
-      latencyMs: 0,
-      jitterMs: 0,
+    await act(async () => {
+      resolve!({
+        downloadMbps: 0,
+        uploadMbps: 0,
+        latencyMs: 0,
+        jitterMs: 0,
+      });
+      await Promise.resolve();
     });
   });
 
@@ -144,8 +163,11 @@ describe('Speed Test section', () => {
       jitterMs: 3,
     });
 
-    renderToolsTab();
-    fireEvent.click(screen.getByText('Run'));
+    await renderToolsTab();
+    await act(async () => {
+      await userEvent.click(screen.getByText('Run'));
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(
@@ -166,9 +188,12 @@ describe('Speed Test section', () => {
       jitterMs: 5,
     });
 
-    renderToolsTab();
+    await renderToolsTab();
     const btn = screen.getByText('Run');
-    fireEvent.click(btn);
+    await act(async () => {
+      await userEvent.click(btn);
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(screen.getByText('Run')).not.toBeDisabled();
@@ -178,9 +203,12 @@ describe('Speed Test section', () => {
   it('re-enables button after speed test errors', async () => {
     mockedInvoke.mockRejectedValueOnce(new Error('Network error'));
 
-    renderToolsTab();
+    await renderToolsTab();
     const btn = screen.getByText('Run');
-    fireEvent.click(btn);
+    await act(async () => {
+      await userEvent.click(btn);
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(screen.getByText('Run')).not.toBeDisabled();

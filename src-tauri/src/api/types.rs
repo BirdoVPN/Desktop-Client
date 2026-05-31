@@ -408,6 +408,8 @@ pub struct ConnectResponse {
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
+    pub error_code: Option<ProtocolErrorCode>,
+    #[serde(default)]
     pub config: Option<String>,
     #[serde(default)]
     pub key_id: Option<String>,

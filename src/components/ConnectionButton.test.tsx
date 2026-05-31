@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { ConnectionButton } from './ConnectionButton'
 import { useAppStore } from '@/store/app-store'
 
@@ -11,7 +11,18 @@ vi.mock('@tauri-apps/api/core', () => ({
 // Mock framer-motion to avoid animation issues in tests
 vi.mock('framer-motion', () => ({
   motion: {
-    button: ({ children, ...props }: any) => <button {...props}>{children}</button>,
+    button: ({ children, ...props }: any) => {
+      const {
+        whileHover: _whileHover,
+        whileTap: _whileTap,
+        initial: _initial,
+        animate: _animate,
+        exit: _exit,
+        transition: _transition,
+        ...rest
+      } = props
+      return <button {...rest}>{children}</button>
+    },
     div: ({ children, ...props }: any) => <div {...props}>{children}</div>,
   },
 }))
@@ -71,10 +82,12 @@ describe('ConnectionButton', () => {
     const { invoke } = await import('@tauri-apps/api/core')
     render(<ConnectionButton />)
     const button = screen.getByRole('button')
-    
+
     fireEvent.click(button)
-    
-    expect(invoke).toHaveBeenCalledWith('connect_vpn', { serverId: 'us-1' })
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('connect_vpn', { serverId: 'us-1' })
+    })
   })
 
   it('calls disconnect_vpn on click when connected', async () => {
@@ -86,10 +99,12 @@ describe('ConnectionButton', () => {
 
     render(<ConnectionButton />)
     const button = screen.getByRole('button')
-    
+
     fireEvent.click(button)
-    
-    expect(invoke).toHaveBeenCalledWith('disconnect_vpn')
+
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('disconnect_vpn')
+    })
   })
 
   it('shows an error when no servers are available', () => {
