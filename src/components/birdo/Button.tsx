@@ -61,10 +61,10 @@ export function BirdoButton({
       backgroundImage = gradient.primary;
       break;
     case 'secondary':
-      bg = white.w10;
+      bg = white.w06;
       fg = white.w100;
       border = `1px solid transparent`;
-      backgroundImage = `linear-gradient(${white.w10}, ${white.w10}) padding-box, ${gradient.glassStroke} border-box`;
+      backgroundImage = `linear-gradient(${white.w06}, ${white.w06}) padding-box, ${gradient.glassStroke} border-box`;
       break;
     case 'ghost':
       bg = 'transparent';
@@ -94,8 +94,8 @@ export function BirdoButton({
       disabled={isInactive}
       aria-label={ariaLabel ?? text}
       whileTap={!isInactive ? { scale: 0.97 } : undefined}
-      transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
-      className={`relative flex items-center justify-center gap-2 rounded-[14px] font-semibold transition-opacity disabled:cursor-not-allowed ${
+      transition={{ duration: 0.12, ease: motionTokens.ease }}
+      className={`relative flex items-center justify-center rounded-birdo-md font-semibold transition-opacity disabled:cursor-not-allowed ${
         fullWidth ? 'w-full' : ''
       } ${className}`}
       style={{
@@ -112,11 +112,11 @@ export function BirdoButton({
     >
       {isLoading ? (
         <span
-          className="h-[18px] w-[18px] animate-spin rounded-full border-2 border-current border-t-transparent"
+          className="mr-2.5 h-[18px] w-[18px] animate-spin rounded-full border-2 border-current border-t-transparent"
           aria-hidden
         />
       ) : Icon ? (
-        <Icon size={18} aria-hidden />
+        <Icon size={18} className="mr-2" aria-hidden />
       ) : null}
       <span>{text}</span>
     </motion.button>
