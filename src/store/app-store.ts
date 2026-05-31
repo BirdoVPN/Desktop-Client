@@ -54,6 +54,15 @@ export type Protocol = 'wireguard';
 
 export type ThemeMode = 'dark' | 'light' | 'system';
 
+// ── Navigation (mobile-parity 3-tab bottom nav + push sub-screens) ──────────
+export type TabId = 'profile' | 'home' | 'settings';
+export type RouteId =
+  | 'serverList'
+  | 'vpnSettings'
+  | 'splitTunnel'
+  | 'portForward'
+  | 'subscription';
+
 export interface AppSettings {
   killSwitchEnabled: boolean;
   autoConnect: boolean;
@@ -178,6 +187,15 @@ interface AppState {
   deepLinkAction: { action: string; serverId?: string } | null;
   setDeepLinkAction: (action: { action: string; serverId?: string } | null) => void;
 
+  // ── Navigation (mobile-parity router; NOT persisted) ──────────────────
+  // Bottom-nav tabs + a per-session push stack for slide-in sub-screens.
+  tab: TabId;
+  navStack: RouteId[];
+  setTab: (tab: TabId) => void;
+  pushRoute: (route: RouteId) => void;
+  popRoute: () => void;
+  resetNav: () => void;
+
   // Actions — Logout
   logout: () => void;
 }
@@ -233,6 +251,16 @@ export const useAppStore = create<AppState>()(
       // Deep link
       deepLinkAction: null,
       setDeepLinkAction: (action) => set({ deepLinkAction: action }),
+
+      // Navigation (not persisted — see partialize)
+      tab: 'home' as TabId,
+      navStack: [],
+      setTab: (tab) => set({ tab, navStack: [] }),
+      pushRoute: (route) =>
+        set((state) => ({ navStack: [...state.navStack, route] })),
+      popRoute: () =>
+        set((state) => ({ navStack: state.navStack.slice(0, -1) })),
+      resetNav: () => set({ tab: 'home', navStack: [] }),
 
       connectionState: 'disconnected' as ConnectionState,
       currentServer: null,
