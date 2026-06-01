@@ -97,7 +97,7 @@
         "https://api.birdo.app/updates/{{target}}/{{arch}}/{{current_version}}"
       ],
       "dialog": true,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENBQzdCNTQ4RkI1ODdFNDUKUldSRmZsajdTTFhIeXRUWVRSMW1rM28zeGR1WTZtczRSc1ZyWFNiWko1bjJpWWdmakxGdmFzSTcK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ1NzJBNzhCMUI1RUM1QTcKUldTbnhWNGJpNmR5MVV5Slp0aVRibzNDVkV4U1h2VEtRZm8wMFN4RDhpMmJhajh4MGUyd2U4NlAK"
     },
     "deep-link": {
       "desktop": {
