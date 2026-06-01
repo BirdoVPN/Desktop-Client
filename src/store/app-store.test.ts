@@ -24,6 +24,8 @@ describe('useAppStore', () => {
         autostart: false,
         startMinimized: false,
         notifications: true,
+        showIpInNotification: false,
+        showLocationInNotification: false,
         preferredServerId: null,
         splitTunnelingEnabled: false,
         splitTunnelApps: [],

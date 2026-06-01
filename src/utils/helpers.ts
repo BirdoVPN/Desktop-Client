@@ -151,6 +151,11 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     autostart: rs.autostart ?? false,
     startMinimized: rs.start_minimized ?? false,
     notifications: rs.notifications_enabled ?? true,
+    // Frontend-only notification detail sub-toggles: the Rust backend doesn't
+    // round-trip these, so default them here. The store's hydrateSettings
+    // preserves any localStorage-persisted value on top of this.
+    showIpInNotification: false,
+    showLocationInNotification: false,
     preferredServerId: rs.preferred_server_id ?? null,
     splitTunnelingEnabled: rs.split_tunneling_enabled ?? false,
     splitTunnelApps: rs.split_tunnel_apps ?? [],

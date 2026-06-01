@@ -69,6 +69,12 @@ export interface AppSettings {
   autostart: boolean;
   startMinimized: boolean;
   notifications: boolean;
+  // Notification detail sub-toggles. Frontend-only preference (persisted in
+  // localStorage), NOT part of the Rust `save_settings` payload — the backend
+  // `AppSettings` struct has no matching fields, so these never go through
+  // `settingsToRust`.
+  showIpInNotification: boolean;
+  showLocationInNotification: boolean;
   preferredServerId: string | null;
   splitTunnelingEnabled: boolean;
   splitTunnelApps: string[];
@@ -218,6 +224,8 @@ const defaultSettings: AppSettings = {
   autostart: false,
   startMinimized: false,
   notifications: true,
+  showIpInNotification: false,
+  showLocationInNotification: false,
   preferredServerId: null,
   splitTunnelingEnabled: false,
   splitTunnelApps: [],
@@ -333,10 +341,21 @@ export const useAppStore = create<AppState>()(
           settings: { ...state.settings, ...partial },
         })),
       hydrateSettings: (s) =>
-        set({
-          settings: { ...defaultSettings, ...s },
+        set((state) => ({
+          // Keep frontend-only preferences (notification detail sub-toggles)
+          // that the Rust backend doesn't round-trip; merge the Rust-owned
+          // fields on top of defaults + the current (localStorage) state.
+          settings: {
+            ...defaultSettings,
+            ...s,
+            // These come back as `false` from settingsFromRust (the Rust
+            // backend doesn't store them) — re-apply the live localStorage
+            // value so the user's choice survives a get_settings hydrate.
+            showIpInNotification: state.settings.showIpInNotification,
+            showLocationInNotification: state.settings.showLocationInNotification,
+          },
           settingsHydrated: true,
-        }),
+        })),
 
       // Settings shortcuts
       setKillSwitch: (enabled) =>

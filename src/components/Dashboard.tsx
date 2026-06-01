@@ -1,14 +1,18 @@
 /**
  * Dashboard — Connect screen mirroring mobile's HomeScreen.kt.
  *
- * Layout (replaces the previous tab-bar structure):
+ * Layout:
  *  - Full-bleed WorldGlobe background (auto-rotates when not connected)
- *  - Top bar: brand mark + email + settings + logout buttons
- *  - Floating status pill below top bar
- *  - Bottom translucent panel: stats (when connected) → kill switch alert →
- *    error banner → server selector card → compact connect button
+ *  - HomeTopBar: multi-hop toggle (left) + brand mark + email + logout (right)
+ *  - Floating <StatusPill/> below the top bar
+ *  - Bottom translucent rounded-t-[24px] panel: stats (when connected) →
+ *    admin banner → error banner → server selector (single, or Entry/Exit pair
+ *    when multi-hop is armed) → compact connect button
  *  - Server picker is a modal bottom sheet (not a separate tab)
- *  - Settings opens as a full-screen slide-over
+ *  - Settings is now a bottom-nav tab (no in-file slide-over)
+ *
+ * Connection logic (polling, handleConnect, tray listeners, handleLogout) is
+ * preserved byte-for-behavior from the previous revision.
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -20,39 +24,37 @@ import {
   ArrowDown,
   ArrowUp,
   Clock,
-  Power,
-  Settings as SettingsIcon,
   LogOut,
-  Shield,
   ShieldAlert,
   ShieldOff,
   AlertTriangle,
   AlertCircle,
   ChevronRight,
-  RefreshCw,
-  WifiOff,
+  Route as AltRoute,
+  Lock,
 } from 'lucide-react';
-import { Settings } from './Settings';
-import { MultiHopCard } from './MultiHopCard';
-import { SplitTunnelCard } from './SplitTunnelCard';
-import { OfflineBanner } from './OfflineBanner';
 import {
-  BirdoBadge,
+  AppIconMark,
   BirdoCard,
+  BirdoIconAction,
+  CompactConnectButton,
+  StatusPill,
   WorldGlobe,
   ServerSelectorSheet,
-  type BadgeTone,
+  type ConnectButtonState,
 } from './birdo';
+import type { Server } from '@/store/app-store';
 import {
   formatBytes,
   formatUptime,
   countryCodeToFlag,
   settingsFromRust,
+  settingsToRust,
   friendlyVpnError,
   type RustSettings,
 } from '@/utils/helpers';
 import { initNotifications, notifyConnected, notifyDisconnected } from '@/utils/notifications';
-import { gradient, brand, status, white, hairline, surface } from '@/lib/birdo-theme';
+import { brand, status, white, hairline, surface } from '@/lib/birdo-theme';
 
 interface RustVpnStats {
   bytes_in: number;
@@ -93,15 +95,30 @@ interface RustServer {
   accessible?: boolean;
 }
 
+/** Which hop the multi-hop server sheet is currently picking. */
+type MultiHopTarget = 'entry' | 'exit';
+
+const planLevel = (plan: string | null | undefined): number => {
+  switch (plan?.toUpperCase()) {
+    case 'SOVEREIGN':
+      return 2;
+    case 'OPERATIVE':
+      return 1;
+    default:
+      return 0;
+  }
+};
+
 export function Dashboard() {
-  const [showSettings, setShowSettings] = useState(false);
   const [showServerSheet, setShowServerSheet] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [liveStats, setLiveStats] = useState<RustVpnStats | null>(null);
-  /** Step shown to the user during a Multi-Hop connect attempt. */
-  const [mhStep, setMhStep] = useState<'idle' | 'entry' | 'forwarding' | 'exit'>('idle');
+  /** Which hop the multi-hop picker sheet is editing (null = closed). */
+  const [multiHopPickerTarget, setMultiHopPickerTarget] = useState<MultiHopTarget | null>(null);
+  /** Transient toast shown when a locked feature is tapped. */
+  const [toast, setToast] = useState<string | null>(null);
   const statsInterval = useRef<ReturnType<typeof setInterval> | null>(null);
-  const mhStepTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const {
     connectionState,
@@ -110,6 +127,7 @@ export function Dashboard() {
     favoriteServers,
     userEmail,
     settings,
+    account,
     errorMessage,
     isAdmin,
     setConnectionState,
@@ -118,6 +136,7 @@ export function Dashboard() {
     setServerPing,
     toggleFavorite,
     setAccount,
+    updateSettings,
     logout,
     setAuthenticated,
     hydrateSettings,
@@ -132,6 +151,7 @@ export function Dashboard() {
       favoriteServers: s.favoriteServers,
       userEmail: s.userEmail,
       settings: s.settings,
+      account: s.account,
       errorMessage: s.errorMessage,
       isAdmin: s.isAdmin,
       setConnectionState: s.setConnectionState,
@@ -140,6 +160,7 @@ export function Dashboard() {
       setServerPing: s.setServerPing,
       toggleFavorite: s.toggleFavorite,
       setAccount: s.setAccount,
+      updateSettings: s.updateSettings,
       logout: s.logout,
       setAuthenticated: s.setAuthenticated,
       hydrateSettings: s.hydrateSettings,
@@ -159,6 +180,17 @@ export function Dashboard() {
   const isDisconnecting = connectionState === 'disconnecting';
   const isError = connectionState === 'error';
   const isKillSwitchActive = connectionState === 'kill_switch_active';
+
+  // ── Multi-Hop arm state (mirrors mobile's top-bar toggle) ─────────────
+  // The arm + entry/exit selection live in `settings` so they survive a
+  // restart and ride the existing `save_settings` full-object persistence.
+  const isSovereign = planLevel(account?.plan) >= 2;
+  const multiHopArmed = settings.multiHopEnabled;
+  const entryServer = servers.find((s) => s.id === settings.multiHopEntryNodeId) || null;
+  const exitServer = servers.find((s) => s.id === settings.multiHopExitNodeId) || null;
+  const sameServer = !!(entryServer && exitServer && entryServer.id === exitServer.id);
+  const multiHopReady = !!(multiHopArmed && entryServer && exitServer && !sameServer);
+  const multiHopBlocked = multiHopArmed && !multiHopReady && !isConnected;
 
   // ── Hydrate settings from Rust ────────────────────────────────────
   useEffect(() => {
@@ -350,7 +382,63 @@ export function Dashboard() {
     };
   }, [isActive, setConnectionState]);
 
+  // ── Toast auto-dismiss ────────────────────────────────────────────
+  useEffect(() => {
+    return () => { if (toastTimer.current) clearTimeout(toastTimer.current); };
+  }, []);
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 3200);
+  }, []);
+
+  // ── Settings persistence (full-object save_settings path) ─────────
+  // Mirrors the previous MultiHopCard.persist: patch Zustand, then push the
+  // FULL settings object to Rust via the unchanged invoke contract.
+  const persistSettings = useCallback(
+    async (patch: Partial<typeof settings>) => {
+      const next = { ...useAppStore.getState().settings, ...patch };
+      updateSettings(patch);
+      try {
+        await invoke('save_settings', { settings: settingsToRust(next) });
+      } catch {
+        /* Rust will log */
+      }
+    },
+    [updateSettings]
+  );
+
   // ── Handlers ──────────────────────────────────────────────────────
+  const handleToggleMultiHop = useCallback(() => {
+    if (isConnecting || isDisconnecting) return;
+    if (!isSovereign) {
+      showToast('Multi-Hop is a SOVEREIGN feature. Upgrade to enable.');
+      return;
+    }
+    if (multiHopArmed) {
+      // Disarm: clear the route so the single selector returns clean.
+      persistSettings({
+        multiHopEnabled: false,
+        multiHopEntryNodeId: null,
+        multiHopExitNodeId: null,
+      });
+    } else {
+      persistSettings({ multiHopEnabled: true });
+    }
+  }, [isConnecting, isDisconnecting, isSovereign, multiHopArmed, persistSettings, showToast]);
+
+  const handlePickMultiHopServer = useCallback(
+    (server: Server) => {
+      if (multiHopPickerTarget === 'entry') {
+        persistSettings({ multiHopEntryNodeId: server.id });
+      } else if (multiHopPickerTarget === 'exit') {
+        persistSettings({ multiHopExitNodeId: server.id });
+      }
+      setMultiHopPickerTarget(null);
+    },
+    [multiHopPickerTarget, persistSettings]
+  );
+
   const handleConnect = useCallback(async () => {
     if (isConnecting || isDisconnecting) return;
 
@@ -377,35 +465,20 @@ export function Dashboard() {
       setCurrentServer(entry || null);
       setErrorMessage(null);
 
-      // Drive the visible step indicator. The Rust call is monolithic so we
-      // approximate progress with timers; if the call resolves earlier the
-      // final state will overwrite these.
-      mhStepTimers.current.forEach(clearTimeout);
-      mhStepTimers.current = [];
-      setMhStep('entry');
-      mhStepTimers.current.push(setTimeout(() => setMhStep('forwarding'), 1800));
-      mhStepTimers.current.push(setTimeout(() => setMhStep('exit'), 3600));
-
       try {
         await invoke<boolean>('connect_multi_hop', {
           entryNodeId: settings.multiHopEntryNodeId,
           exitNodeId: settings.multiHopExitNodeId,
         });
-        mhStepTimers.current.forEach(clearTimeout);
-        mhStepTimers.current = [];
-        setMhStep('idle');
         setConnectionState('connected');
         // Surface the route in the current-server label.
         if (entry && exit) {
           setCurrentServer({
             ...entry,
-            name: `${entry.city || entry.country} \u2192 ${exit.city || exit.country}`,
+            name: `${entry.city || entry.country} → ${exit.city || exit.country}`,
           });
         }
       } catch (err) {
-        mhStepTimers.current.forEach(clearTimeout);
-        mhStepTimers.current = [];
-        setMhStep('idle');
         setErrorMessage(friendlyVpnError(err));
         setConnectionState('error');
         setCurrentServer(null);
@@ -452,8 +525,26 @@ export function Dashboard() {
     setShowLogoutConfirm(false);
   }, [logout, setAuthenticated]);
 
-  // ── Status pill props ─────────────────────────────────────────────
-  const pill = statusPill({ isConnected, isConnecting, isDisconnecting, isError });
+  // ── Connect button state/label derivation ─────────────────────────
+  const busy = isConnecting || isDisconnecting;
+  const connectState: ConnectButtonState =
+    isConnected ? 'connected'
+    : busy ? 'busy'
+    : multiHopReady ? 'multiHopReady'
+    : multiHopBlocked ? 'multiHopBlocked'
+    : 'idle';
+  const connectLabel =
+    isConnected ? 'Disconnect'
+    : isConnecting ? 'Connecting...'
+    : isDisconnecting ? 'Disconnecting...'
+    : multiHopBlocked ? 'Choose entry & exit'
+    : multiHopReady ? 'Connect Multi-Hop'
+    : 'Connect';
+  // When multi-hop is armed but not fully configured, the button is inert.
+  const handleConnectClick = useCallback(() => {
+    if (multiHopBlocked) return;
+    handleConnect();
+  }, [multiHopBlocked, handleConnect]);
 
   return (
     <div className="relative h-full overflow-hidden" style={{ backgroundColor: surface.s0 }}>
@@ -461,7 +552,7 @@ export function Dashboard() {
       <div data-tauri-drag-region className="absolute inset-x-0 top-0 z-50 h-8" />
 
       {/* Globe background — hidden while server sheet open to avoid flicker */}
-      {!showServerSheet && (
+      {!showServerSheet && multiHopPickerTarget === null && (
         <WorldGlobe
           servers={servers}
           selectedServerId={currentServer?.id ?? null}
@@ -470,46 +561,18 @@ export function Dashboard() {
         />
       )}
 
-      {/* Offline banner */}
-      <div className="relative z-30">
-        <OfflineBanner />
-      </div>
-
       {/* Top bar */}
-      <div
-        className="relative z-20 flex items-center gap-2 px-4 pt-9 pb-2"
-        style={{ backgroundColor: 'rgba(11,11,16,0.55)', backdropFilter: 'blur(8px)' }}
-      >
-        <BrandLockup />
-        <div className="flex-1" />
-        {userEmail && (
-          <span
-            className="max-w-[140px] truncate text-xs"
-            style={{ color: white.w40 }}
-          >
-            {userEmail}
-          </span>
-        )}
-        <IconButton
-          icon={SettingsIcon}
-          ariaLabel="Settings"
-          onClick={() => setShowSettings(true)}
-        />
-        <IconButton
-          icon={LogOut}
-          ariaLabel="Log out"
-          onClick={() => setShowLogoutConfirm(true)}
-        />
-      </div>
+      <HomeTopBar
+        userEmail={userEmail}
+        multiHopArmed={multiHopArmed}
+        multiHopUnlocked={isSovereign}
+        onToggleMultiHop={handleToggleMultiHop}
+        onLogout={() => setShowLogoutConfirm(true)}
+      />
 
       {/* Status pill */}
       <div className="relative z-10 mt-3 flex justify-center">
-        <BirdoBadge
-          text={pill.text}
-          tone={pill.tone}
-          icon={pill.icon}
-          pulseDot={pill.pulse}
-        />
+        <StatusPill state={connectionState} />
       </div>
 
       {/* Spacer to push panel to bottom */}
@@ -517,7 +580,7 @@ export function Dashboard() {
         <div className="flex-1" />
         {/* Bottom panel */}
         <div
-          className="pointer-events-auto rounded-t-3xl px-5 pt-4 pb-4"
+          className="pointer-events-auto rounded-t-[24px] px-5 pt-4 pb-4"
           style={{
             backgroundColor: 'rgba(11,11,16,0.92)',
             borderTop: `1px solid ${hairline.soft}`,
@@ -581,43 +644,63 @@ export function Dashboard() {
             </>
           )}
 
-          {/* Multi-Hop progress banner */}
-          {isConnecting && settings.multiHopEnabled && mhStep !== 'idle' && (
-            <>
-              <MultiHopProgressBanner step={mhStep} />
-              <div className="h-2.5" />
-            </>
+          {/* Server selector — single, or Entry/Exit pair when multi-hop armed */}
+          {multiHopArmed ? (
+            <MultiHopServerPair
+              entry={entryServer}
+              exit={exitServer}
+              sameServer={sameServer}
+              disabled={busy}
+              onPickEntry={() => setMultiHopPickerTarget('entry')}
+              onPickExit={() => setMultiHopPickerTarget('exit')}
+            />
+          ) : (
+            <ServerSelectorCard
+              server={currentServer}
+              disabled={busy}
+              onClick={() => {
+                if (servers.length > 0) setShowServerSheet(true);
+              }}
+            />
           )}
-
-          {/* Split tunneling applies to the next VPN session. */}
-          <SplitTunnelCard busy={isConnecting || isDisconnecting} />
-          <div className="h-2.5" />
-
-          {/* Multi-Hop selector card (Sovereign-only; clicking when not Sovereign opens an upgrade modal) */}
-          <MultiHopCard busy={isConnecting || isDisconnecting} />
-          <div className="h-2.5" />
-
-          {/* Server selector */}
-          <ServerSelectorCard
-            server={currentServer}
-            disabled={isConnecting || isDisconnecting}
-            onClick={() => {
-              if (servers.length > 0) setShowServerSheet(true);
-            }}
-          />
           <div className="h-2.5" />
 
           {/* Compact connect button */}
           <CompactConnectButton
-            isConnected={isConnected}
-            isConnecting={isConnecting}
-            isDisconnecting={isDisconnecting}
-            onClick={handleConnect}
+            state={connectState}
+            label={connectLabel}
+            busy={busy}
+            multiHopReady={multiHopReady}
+            multiHopBlocked={multiHopBlocked}
+            onClick={handleConnectClick}
           />
         </div>
       </div>
 
-      {/* Server selector sheet */}
+      {/* Toast / snackbar (locked-feature notice) */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            className="pointer-events-none absolute inset-x-0 bottom-6 z-50 flex justify-center px-6"
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 16 }}
+          >
+            <div
+              className="max-w-sm rounded-2xl px-4 py-3 text-center text-xs font-medium shadow-lg"
+              style={{
+                backgroundColor: surface.s3,
+                border: `1px solid ${hairline.soft}`,
+                color: white.w100,
+              }}
+            >
+              {toast}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Server selector sheet (single-hop) */}
       <ServerSelectorSheet
         open={showServerSheet}
         servers={servers}
@@ -628,22 +711,20 @@ export function Dashboard() {
         onDismiss={() => setShowServerSheet(false)}
       />
 
-      {/* Settings slide-over */}
-      <AnimatePresence>
-        {showSettings && (
-          <motion.div
-            className="absolute inset-0 z-40 overflow-y-auto"
-            style={{ backgroundColor: surface.s0 }}
-            initial={{ x: '100%' }}
-            animate={{ x: 0 }}
-            exit={{ x: '100%' }}
-            transition={{ type: 'spring', damping: 28, stiffness: 280 }}
-          >
-            <SettingsHeader onBack={() => setShowSettings(false)} />
-            <Settings />
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* Server selector sheet (multi-hop entry/exit picker) */}
+      <ServerSelectorSheet
+        open={multiHopPickerTarget !== null}
+        servers={servers}
+        selectedServerId={
+          multiHopPickerTarget === 'entry'
+            ? settings.multiHopEntryNodeId
+            : settings.multiHopExitNodeId
+        }
+        favoriteServers={favoriteServers}
+        onSelect={handlePickMultiHopServer}
+        onToggleFavorite={(id) => toggleFavorite(id)}
+        onDismiss={() => setMultiHopPickerTarget(null)}
+      />
 
       {/* Logout confirm modal */}
       <AnimatePresence>
@@ -712,59 +793,106 @@ export function Dashboard() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Helpers
+// Top bar
 // ─────────────────────────────────────────────────────────────────────────
 
-function statusPill(args: {
-  isConnected: boolean;
-  isConnecting: boolean;
-  isDisconnecting: boolean;
-  isError: boolean;
-}): { text: string; tone: BadgeTone; icon?: typeof SettingsIcon; pulse: boolean } {
-  if (args.isConnected) return { text: 'Protected', tone: 'success', pulse: true };
-  if (args.isConnecting) return { text: 'Connecting...', tone: 'warning', icon: RefreshCw, pulse: false };
-  if (args.isDisconnecting) return { text: 'Disconnecting...', tone: 'warning', icon: RefreshCw, pulse: false };
-  if (args.isError) return { text: 'Connection Error', tone: 'danger', icon: AlertCircle, pulse: false };
-  return { text: 'Not Connected', tone: 'neutral', icon: WifiOff, pulse: false };
+interface HomeTopBarProps {
+  userEmail: string | null;
+  multiHopArmed: boolean;
+  multiHopUnlocked: boolean;
+  onToggleMultiHop: () => void;
+  onLogout: () => void;
+}
+
+function HomeTopBar({
+  userEmail,
+  multiHopArmed,
+  multiHopUnlocked,
+  onToggleMultiHop,
+  onLogout,
+}: HomeTopBarProps) {
+  return (
+    <div
+      className="relative z-20 flex items-center gap-2 px-4 pt-9 pb-2"
+      style={{ backgroundColor: 'rgba(11,11,16,0.55)', backdropFilter: 'blur(8px)' }}
+    >
+      <MultiHopTopAction
+        armed={multiHopArmed}
+        unlocked={multiHopUnlocked}
+        onClick={onToggleMultiHop}
+      />
+      <BrandLockup />
+      <div className="flex-1" />
+      {userEmail && (
+        <span
+          className="max-w-[160px] truncate text-xs"
+          style={{ color: white.w40 }}
+        >
+          {userEmail}
+        </span>
+      )}
+      <BirdoIconAction
+        icon={LogOut}
+        contentDescription="Log out"
+        onClick={onLogout}
+        tint={white.w60}
+      />
+    </div>
+  );
+}
+
+interface MultiHopTopActionProps {
+  armed: boolean;
+  unlocked: boolean;
+  onClick: () => void;
+}
+
+/** Compact 40px icon toggle in the top-left that arms Multi-Hop. */
+function MultiHopTopAction({ armed, unlocked, onClick }: MultiHopTopActionProps) {
+  const active = armed && unlocked;
+  const tint = !unlocked ? white.w40 : active ? brand.purple : white.w80;
+  const bg = active ? brand.purpleBg : white.w05;
+  const border = active ? 'rgba(168,85,247,0.55)' : hairline.soft;
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label="Multi-Hop"
+      aria-pressed={active}
+      className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl transition-colors"
+      style={{ backgroundColor: bg, border: `1px solid ${border}` }}
+    >
+      <AltRoute size={20} color={tint} aria-hidden />
+      {!unlocked && (
+        <span
+          className="absolute bottom-0.5 right-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full"
+          style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
+        >
+          <Lock size={9} color="#FFFFFF" aria-hidden />
+        </span>
+      )}
+    </button>
+  );
 }
 
 function BrandLockup() {
   return (
     <div className="flex items-center gap-2.5">
-      <div
-        className="flex h-8 w-8 items-center justify-center rounded-[10px]"
-        style={{ background: gradient.primary }}
-      >
-        <Shield size={18} color="#FFFFFF" />
-      </div>
+      <AppIconMark size={32} style={{ borderRadius: 10 }} />
       <span className="text-base font-semibold" style={{ color: white.w100 }}>
-        BirdoVPN
+        Birdo VPN
       </span>
     </div>
   );
 }
 
-interface IconButtonProps {
-  icon: typeof SettingsIcon;
-  ariaLabel: string;
-  onClick: () => void;
-}
-
-function IconButton({ icon: Icon, ariaLabel, onClick }: IconButtonProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label={ariaLabel}
-      className="flex h-9 w-9 items-center justify-center rounded-full transition-colors hover:bg-white/10"
-    >
-      <Icon size={18} color={white.w60} />
-    </button>
-  );
-}
+// ─────────────────────────────────────────────────────────────────────────
+// Banners
+// ─────────────────────────────────────────────────────────────────────────
 
 interface BannerRowProps {
-  icon: typeof Shield;
+  icon: typeof ShieldAlert;
   color: string;
   bg: string;
   border: string;
@@ -785,70 +913,9 @@ function BannerRow({ icon: Icon, color, bg, border, text }: BannerRowProps) {
   );
 }
 
-// ── Multi-Hop progress banner ────────────────────────────────────────
-interface MultiHopProgressBannerProps {
-  step: 'idle' | 'entry' | 'forwarding' | 'exit';
-}
-
-function MultiHopProgressBanner({ step }: MultiHopProgressBannerProps) {
-  const steps: Array<{ key: 'entry' | 'forwarding' | 'exit'; label: string }> = [
-    { key: 'entry', label: 'Entry' },
-    { key: 'forwarding', label: 'Forwarding' },
-    { key: 'exit', label: 'Exit' },
-  ];
-  const stepIdx = steps.findIndex((s) => s.key === step);
-  const currentLabel =
-    step === 'entry'
-      ? 'Establishing entry tunnel\u2026'
-      : step === 'forwarding'
-      ? 'Setting up multi-hop forwarding\u2026'
-      : step === 'exit'
-      ? 'Routing through exit server\u2026'
-      : '';
-
-  return (
-    <div
-      className="rounded-2xl px-3.5 py-3"
-      style={{
-        backgroundColor: 'rgba(168,85,247,0.08)',
-        border: '1px solid rgba(168,85,247,0.30)',
-      }}
-    >
-      <div className="mb-2 flex items-center gap-2">
-        <RefreshCw size={14} color="#A855F7" className="animate-spin" />
-        <p className="flex-1 text-xs font-medium" style={{ color: '#C4B5FD' }}>
-          {currentLabel}
-        </p>
-      </div>
-      <div className="flex items-center gap-1.5">
-        {steps.map((s, i) => (
-          <div key={s.key} className="flex flex-1 items-center gap-1.5">
-            <div
-              className="h-1 flex-1 rounded-full transition-all"
-              style={{
-                backgroundColor: i <= stepIdx ? '#A855F7' : 'rgba(255,255,255,0.10)',
-              }}
-            />
-          </div>
-        ))}
-      </div>
-      <div className="mt-1 flex justify-between text-[10px] uppercase tracking-wide" style={{ color: 'rgba(255,255,255,0.40)' }}>
-        {steps.map((s, i) => (
-          <span
-            key={s.key}
-            style={{
-              color: i <= stepIdx ? '#C4B5FD' : 'rgba(255,255,255,0.40)',
-              fontWeight: i === stepIdx ? 600 : 400,
-            }}
-          >
-            {s.label}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
+// ─────────────────────────────────────────────────────────────────────────
+// Stats
+// ─────────────────────────────────────────────────────────────────────────
 
 interface StatsRowProps {
   stats: RustVpnStats | null;
@@ -902,6 +969,10 @@ function StatTile({ icon: Icon, tint, label, value }: StatTileProps) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Server selectors
+// ─────────────────────────────────────────────────────────────────────────
+
 interface ServerSelectorCardProps {
   server: { city: string; country: string; countryCode: string } | null;
   disabled: boolean;
@@ -912,6 +983,7 @@ function ServerSelectorCard({ server, disabled, onClick }: ServerSelectorCardPro
   return (
     <button
       type="button"
+      data-testid="server-selector"
       onClick={onClick}
       disabled={disabled}
       className="w-full text-left transition-opacity disabled:opacity-50"
@@ -942,83 +1014,85 @@ function ServerSelectorCard({ server, disabled, onClick }: ServerSelectorCardPro
   );
 }
 
-interface CompactConnectButtonProps {
-  isConnected: boolean;
-  isConnecting: boolean;
-  isDisconnecting: boolean;
-  onClick: () => void;
+interface MultiHopServerPairProps {
+  entry: Server | null;
+  exit: Server | null;
+  sameServer: boolean;
+  disabled: boolean;
+  onPickEntry: () => void;
+  onPickExit: () => void;
 }
 
-function CompactConnectButton({
-  isConnected,
-  isConnecting,
-  isDisconnecting,
-  onClick,
-}: CompactConnectButtonProps) {
-  const busy = isConnecting || isDisconnecting;
-  const bgImage =
-    isConnected ? gradient.connectGreen
-    : busy ? gradient.connectBusy
-    : gradient.connectIdle;
-  const label =
-    isConnected ? 'Disconnect'
-    : isConnecting ? 'Connecting...'
-    : isDisconnecting ? 'Disconnecting...'
-    : 'Connect';
-  const shadowColor =
-    isConnected ? 'rgba(34,197,94,0.45)' : 'rgba(168,85,247,0.45)';
-
+/** Two stacked Entry/Exit selector cards shown when Multi-Hop is armed. */
+function MultiHopServerPair({
+  entry,
+  exit,
+  sameServer,
+  disabled,
+  onPickEntry,
+  onPickExit,
+}: MultiHopServerPairProps) {
   return (
-    <motion.button
-      type="button"
-      onClick={onClick}
-      disabled={busy}
-      aria-label={label}
-      whileTap={!busy ? { scale: 0.98 } : undefined}
-      className="relative flex h-[60px] w-full items-center justify-center gap-2.5 rounded-2xl transition-opacity disabled:cursor-not-allowed"
-      style={{
-        backgroundImage: bgImage,
-        border: `1px solid ${hairline.strong}`,
-        boxShadow: `0 14px 32px -10px ${shadowColor}`,
-        opacity: busy ? 0.85 : 1,
-      }}
-    >
-      {busy ? (
-        <span
-          className="h-[20px] w-[20px] animate-spin rounded-full border-2 border-white/30 border-t-white"
-          aria-hidden
-        />
-      ) : (
-        <Power size={22} color="#FFFFFF" aria-hidden />
+    <div className="w-full">
+      <MultiHopServerCard label="Entry server" server={entry} disabled={disabled} onClick={onPickEntry} />
+      <div className="flex justify-center py-2">
+        <ArrowDown size={18} color={white.w40} aria-hidden />
+      </div>
+      <MultiHopServerCard label="Exit server" server={exit} disabled={disabled} onClick={onPickExit} />
+      {sameServer && (
+        <p className="mt-1.5 text-[11px]" style={{ color: status.red }}>
+          Entry and exit must be different servers.
+        </p>
       )}
-      <span className="text-base font-semibold text-white">{label}</span>
-    </motion.button>
+    </div>
   );
 }
 
-interface SettingsHeaderProps { onBack: () => void; }
-function SettingsHeader({ onBack }: SettingsHeaderProps) {
+interface MultiHopServerCardProps {
+  label: string;
+  server: Server | null;
+  disabled: boolean;
+  onClick: () => void;
+}
+
+function MultiHopServerCard({ label, server, disabled, onClick }: MultiHopServerCardProps) {
   return (
-    <div
-      className="sticky top-0 z-10 flex items-center gap-2 px-4 pt-9 pb-3"
-      style={{
-        backgroundColor: 'rgba(11,11,16,0.95)',
-        borderBottom: `1px solid ${hairline.soft}`,
-        backdropFilter: 'blur(8px)',
-      }}
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="w-full text-left transition-opacity disabled:opacity-50"
     >
-      <button
-        type="button"
-        onClick={onBack}
-        aria-label="Back"
-        className="flex h-9 w-9 items-center justify-center rounded-full transition-colors hover:bg-white/10"
-        style={{ color: white.w80 }}
-      >
-        <ChevronRight size={20} className="rotate-180" />
-      </button>
-      <h1 className="text-lg font-semibold" style={{ color: white.w100 }}>
-        Settings
-      </h1>
-    </div>
+      <BirdoCard cornerRadius={16} padding="0.875rem">
+        <div className="flex items-center gap-3.5">
+          <span
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-[22px]"
+            style={{ backgroundColor: white.w05, border: `1px solid ${hairline.soft}` }}
+          >
+            {server ? countryCodeToFlag(server.countryCode) : '🌐'}
+          </span>
+          <div className="min-w-0 flex-1">
+            <div
+              className="text-[10px] font-bold uppercase tracking-wider"
+              style={{ color: brand.purple }}
+            >
+              {label}
+            </div>
+            <div
+              className="mt-0.5 truncate text-sm font-semibold"
+              style={{ color: white.w100 }}
+            >
+              {server ? server.name : 'Choose…'}
+            </div>
+            {server && (
+              <div className="truncate text-xs" style={{ color: white.w60 }}>
+                {(server.city || server.country)} · {server.load}% load
+              </div>
+            )}
+          </div>
+          <ChevronRight size={18} color={white.w40} />
+        </div>
+      </BirdoCard>
+    </button>
   );
 }
