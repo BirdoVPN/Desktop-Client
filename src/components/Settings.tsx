@@ -9,9 +9,9 @@
  * As a TAB ROOT it renders its OWN title header (no pushed BirdoTopBar / back
  * button) — matching `ProfileScreen.kt` / Profile.tsx.
  *
- * Sections (mobile order): APPEARANCE (theme), CONNECTION (kill switch,
- * auto-connect, notifications + show-IP / show-location sub-toggles), SECURITY
- * (biometric unlock — hidden when unavailable), STARTUP (launch at login, start
+ * Sections (mobile order): APPEARANCE (theme), CONNECTION (auto-connect,
+ * notifications + show-IP / show-location sub-toggles), SECURITY (biometric
+ * unlock — hidden when unavailable), STARTUP (launch at login, start
  * minimized), MANAGE (push rows), ABOUT (version + updates + support links).
  *
  * Every settings write goes through the SAME full-object path used elsewhere:
@@ -19,15 +19,13 @@
  * Partial saves are never sent. `get_settings` hydrates the store on mount.
  *
  * Specials:
- *   - Kill Switch is armed via `enable_killswitch` / `disable_killswitch`; the
- *     Rust `disable_killswitch` command is REJECTED while the VPN is up, so we
- *     surface that inline and reconcile the armed flag from `get_killswitch_status`.
  *   - Biometric Unlock uses `check_biometric_available` -> { available, enabled,
  *     method }; toggling calls `set_biometric_enabled` { enabled } and, when
  *     enabling, confirms with `authenticate_biometric` { reason }.
  *
- * Split-Tunnel + Multi-Hop have moved OUT of Settings (they live on the
- * dashboard / their own screens now).
+ * Kill Switch, Split-Tunnel + Multi-Hop have moved OUT of Settings — Kill Switch
+ * lives in VPN Settings (Security) matching mobile; Split-Tunnel / Multi-Hop
+ * live on the dashboard / their own screens now.
  */
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -35,7 +33,6 @@ import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
 import {
-  Shield,
   Wifi,
   Bell,
   Eye,
@@ -54,7 +51,6 @@ import {
   Moon,
   Sun,
   Laptop,
-  AlertTriangle,
   Gauge,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
@@ -78,13 +74,6 @@ import type { ThemeMode } from '@/store/app-store';
 const DASHBOARD_URL = 'https://dashboard.birdo.app';
 const PRIVACY_URL = 'https://birdo.app/privacy';
 const TERMS_URL = 'https://birdo.app/terms';
-
-/** Shape returned by the Rust `get_killswitch_status` command. */
-interface KillSwitchStatus {
-  enabled: boolean;
-  active: boolean;
-  blocking_connections: number;
-}
 
 /** Shape returned by the Rust `check_biometric_available` command. */
 interface BiometricStatus {
@@ -111,7 +100,6 @@ export function Settings() {
     settings,
     updateSettings,
     hydrateSettings,
-    connectionState,
     theme,
     setTheme,
     pushRoute,
@@ -120,7 +108,6 @@ export function Settings() {
       settings: s.settings,
       updateSettings: s.updateSettings,
       hydrateSettings: s.hydrateSettings,
-      connectionState: s.connectionState,
       theme: s.theme,
       setTheme: s.setTheme,
       pushRoute: s.pushRoute,
@@ -128,28 +115,46 @@ export function Settings() {
   );
 
   const [appVersion, setAppVersion] = useState('');
-  const [killSwitchError, setKillSwitchError] = useState<string | null>(null);
   const [biometric, setBiometric] = useState<BiometricStatus | null>(null);
 
   // ── Speed test (on-device, through the tunnel via Rust) ───────────────────
+  // The Rust test measures throughput THROUGH the VPN tunnel, so it only works
+  // while connected. Short-circuit when disconnected and surface a friendly
+  // message on any failure instead of silently swallowing the error.
   const [speedTestRunning, setSpeedTestRunning] = useState(false);
   const [speedTestResult, setSpeedTestResult] = useState<SpeedTestResult | null>(null);
+  const [speedTestError, setSpeedTestError] = useState<string | null>(null);
   const runSpeedTest = useCallback(async () => {
+    // Throughput is measured through the tunnel — require an active connection.
+    if (useAppStore.getState().connectionState !== 'connected') {
+      setSpeedTestResult(null);
+      setSpeedTestError('Connect to a VPN server first to run a speed test.');
+      return;
+    }
     setSpeedTestRunning(true);
     setSpeedTestResult(null);
+    setSpeedTestError(null);
     try {
       const result = await invoke<SpeedTestResult>('run_speed_test_command');
       setSpeedTestResult(result);
-    } catch {
-      /* surfaced via the disabled->enabled re-enable; Rust logs detail */
+      setSpeedTestError(null);
+    } catch (err) {
+      const lower = String(err).toLowerCase();
+      const notConnected =
+        lower.includes('not connected') ||
+        lower.includes('no tunnel') ||
+        lower.includes('tunnel') ||
+        lower.includes('timeout') ||
+        lower.includes('timed out');
+      setSpeedTestError(
+        notConnected
+          ? 'Connect to a VPN server first to run a speed test.'
+          : 'Speed test failed. Try again.',
+      );
     } finally {
       setSpeedTestRunning(false);
     }
   }, []);
-
-  // The Rust `disable_killswitch` command is rejected unless the tunnel is fully
-  // down. Mirror that here (anything other than disconnected/error counts as up).
-  const vpnActive = connectionState !== 'disconnected' && connectionState !== 'error';
 
   // ── Hydrate settings from Rust on mount ────────────────────────────────────
   useEffect(() => {
@@ -166,19 +171,6 @@ export function Settings() {
       .then(setAppVersion)
       .catch(() => setAppVersion('unknown'));
   }, []);
-
-  // ── Reconcile the armed kill-switch flag with the backend source of truth ──
-  useEffect(() => {
-    invoke<KillSwitchStatus>('get_killswitch_status')
-      .then((s) => {
-        if (s.enabled !== useAppStore.getState().settings.killSwitchEnabled) {
-          updateSettings({ killSwitchEnabled: s.enabled });
-        }
-      })
-      .catch(() => {
-        /* Rust logs; keep persisted preference */
-      });
-  }, [updateSettings]);
 
   // ── Biometric availability ────────────────────────────────────────────────
   useEffect(() => {
@@ -204,40 +196,6 @@ export function Settings() {
       saveSettingsToBackend(next);
     },
     [updateSettings, saveSettingsToBackend],
-  );
-
-  // ── Kill Switch (special: armed via enable/disable_killswitch) ──────────────
-  const handleKillSwitch = useCallback(
-    async (value: boolean) => {
-      setKillSwitchError(null);
-      try {
-        if (value) {
-          await invoke('enable_killswitch');
-        } else {
-          await invoke('disable_killswitch');
-        }
-      } catch (err) {
-        const msg = String(err);
-        const lower = msg.toLowerCase();
-        if (lower.includes('administrator') || lower.includes('root') || lower.includes('privilege')) {
-          setKillSwitchError(
-            'Kill switch requires administrator privileges. Run Birdo as administrator and try again.',
-          );
-        } else if (
-          lower.includes('connected') ||
-          lower.includes('connecting') ||
-          lower.includes('disconnect first') ||
-          lower.includes('vpn is')
-        ) {
-          setKillSwitchError('Cannot disable the kill switch while the VPN is connected. Disconnect first.');
-        } else {
-          setKillSwitchError(msg);
-        }
-        return;
-      }
-      persist({ killSwitchEnabled: value });
-    },
-    [persist],
   );
 
   // ── Auto-start (special: OS integration via set_autostart) ──────────────────
@@ -298,16 +256,10 @@ export function Settings() {
         <ThemeSelector theme={theme} onSelect={setTheme} />
 
         {/* ── CONNECTION ─────────────────────────────────────────────── */}
+        {/* Kill Switch lives in VPN Settings (Security), matching mobile — not
+            duplicated here. Connection here is just Auto-Connect + Notifications. */}
         <BirdoSectionHeader title="Connection" className="mt-2" />
         <BirdoCard padding="0.25rem">
-          <BirdoToggleRow
-            title="Kill Switch"
-            subtitle="Block all traffic if the VPN connection drops"
-            leadingIcon={Shield}
-            leadingTint={statusTokens.green}
-            checked={settings.killSwitchEnabled}
-            onCheckedChange={handleKillSwitch}
-          />
           <BirdoToggleRow
             title="Auto-Connect"
             subtitle="Connect to the VPN when the app starts"
@@ -357,31 +309,6 @@ export function Settings() {
             )}
           </AnimatePresence>
         </BirdoCard>
-
-        <AnimatePresence>
-          {killSwitchError && (
-            <motion.div
-              className="mt-2 flex items-start gap-2 rounded-birdo-sm px-3 py-2 text-xs"
-              style={{
-                backgroundColor: statusTokens.yellowBg,
-                border: `1px solid ${hairline.soft}`,
-                color: statusTokens.yellowLight,
-              }}
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-            >
-              <AlertTriangle size={14} className="mt-0.5 shrink-0" aria-hidden />
-              <span>{killSwitchError}</span>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {vpnActive && (
-          <p className="mt-1.5 px-1 text-[11px]" style={{ color: white.w40 }}>
-            The kill switch can&apos;t be turned off while the VPN is connected. Disconnect first.
-          </p>
-        )}
 
         {/* ── SECURITY (biometric — hidden when unavailable) ───────────── */}
         {biometric?.available && (
@@ -488,6 +415,11 @@ export function Settings() {
               {speedTestRunning ? 'Running…' : 'Run'}
             </button>
           </div>
+          {speedTestError && (
+            <div className="mt-2 text-xs" style={{ color: statusTokens.red }}>
+              {speedTestError}
+            </div>
+          )}
         </BirdoCard>
 
         {/* ── ABOUT ──────────────────────────────────────────────────── */}

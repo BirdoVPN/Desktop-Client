@@ -30,48 +30,58 @@ vi.mock('framer-motion', () => ({
 }));
 
 // Mock zustand store
-vi.mock('@/store/app-store', () => ({
-  useAppStore: vi.fn((selector) =>
-    selector({
-      settings: {
-        killSwitchEnabled: false,
-        autoConnect: false,
-        autostart: false,
-        startMinimized: false,
-        notifications: true,
-        splitTunnelingEnabled: false,
-        splitTunnelApps: [],
-        customDns: null,
-        protocol: 'wireguard',
-        localNetworkSharing: false,
-        wireGuardPort: 'auto',
-        wireGuardMtu: 0,
-        stealthMode: true,
-        quantumProtection: true,
-        preferredServerId: null,
-      },
-      updateSettings: vi.fn(),
-      account: {
-        email: 'test@birdo.app',
-        plan: 'operative',
-        accountId: 'acct_test',
-        maxDevices: 5,
-        activeDevices: 1,
-        expiresAt: null,
-        bandwidthUsed: 0,
-        bandwidthLimit: 0,
-        status: 'active',
-      },
-      servers: [],
-      multiHopRoutes: [],
-      setMultiHopRoutes: vi.fn(),
-      portForwards: [],
-      setPortForwards: vi.fn(),
-      theme: 'system',
-      setTheme: vi.fn(),
-    })
-  ),
-}));
+// Shared mock state. connectionState='connected' so the Speed Test handler's
+// "connect first" guard passes and run_speed_test_command actually runs. The
+// handler reads useAppStore.getState().connectionState, so getState is mocked too.
+const mockStoreState = {
+  connectionState: 'connected',
+  settings: {
+    killSwitchEnabled: false,
+    autoConnect: false,
+    autostart: false,
+    startMinimized: false,
+    notifications: true,
+    splitTunnelingEnabled: false,
+    splitTunnelApps: [],
+    customDns: null,
+    protocol: 'wireguard',
+    localNetworkSharing: false,
+    wireGuardPort: 'auto',
+    wireGuardMtu: 0,
+    stealthMode: true,
+    quantumProtection: true,
+    preferredServerId: null,
+  },
+  updateSettings: vi.fn(),
+  hydrateSettings: vi.fn(),
+  account: {
+    email: 'test@birdo.app',
+    plan: 'operative',
+    accountId: 'acct_test',
+    maxDevices: 5,
+    activeDevices: 1,
+    expiresAt: null,
+    bandwidthUsed: 0,
+    bandwidthLimit: 0,
+    status: 'active',
+  },
+  servers: [],
+  multiHopRoutes: [],
+  setMultiHopRoutes: vi.fn(),
+  portForwards: [],
+  setPortForwards: vi.fn(),
+  theme: 'system',
+  setTheme: vi.fn(),
+  pushRoute: vi.fn(),
+};
+
+vi.mock('@/store/app-store', () => {
+  const useAppStore = vi.fn((selector) => selector(mockStoreState));
+  // The Speed Test handler calls useAppStore.getState().connectionState directly.
+  (useAppStore as unknown as { getState: () => typeof mockStoreState }).getState = () =>
+    mockStoreState;
+  return { useAppStore };
+});
 
 vi.mock('zustand/react/shallow', () => ({
   useShallow: (fn: unknown) => fn,

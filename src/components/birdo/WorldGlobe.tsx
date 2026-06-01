@@ -6,8 +6,9 @@
  *  - Deep-space rect fill (#030714 dark / #EEF1F8 light), ~STAR_COUNT twinkling
  *    stars, a soft atmospheric halo feathered at the limb.
  *  - Ocean sphere radial gradient (core #1A3050 -> rim #071426) offset toward
- *    the light, three-tier sun-lit landmass (dim/mid/lit) drawn as a coarse
- *    lat/long cell grid masked to the continents.
+ *    the light, three-tier sun-lit landmass (dim/mid/lit) drawn from real
+ *    Natural Earth country polygons (world-atlas 110m TopoJSON) projected onto
+ *    the sphere, clipped to the visible hemisphere with hairline borders.
  *  - A crawling day/night terminator, brand-purple server dots with halos, a
  *    great-circle connection arc (purple idle / green connected) that animates
  *    in when connected, and a default user pin at London (51.51, -0.13).
@@ -20,6 +21,9 @@
  *   birdo-client-mobile/app/src/main/java/app/birdo/vpn/ui/theme/Color.kt
  */
 import { useEffect, useMemo, useRef } from 'react';
+import { feature } from 'topojson-client';
+import worldData from 'world-atlas/countries-110m.json';
+import type { Feature, FeatureCollection, GeometryObject } from 'geojson';
 import { brand } from '@/lib/birdo-theme';
 import { countryCoords } from '@/utils/country-coords';
 import type { Server } from '@/store/app-store';
@@ -94,85 +98,92 @@ const STAR_COUNT = 90;
 const USER_LAT = 51.51; // London
 const USER_LON = -0.13;
 
-// ── Coarse continent landmask ────────────────────────────────────────────────
-// A faithful 720×360 bitmask is too heavy to port verbatim; per the brief a
-// coarse dotted-grid sphere that reads as the mobile globe is acceptable. We
-// approximate continents with a set of lat/lon boxes and sample them on a grid
-// — the *look* is dotted violet-blue land on a dark sphere.
-type Box = [latMin: number, latMax: number, lonMin: number, lonMax: number];
-const CONTINENTS: Box[] = [
-  // North America
-  [49, 71, -168, -56], // Canada / Alaska
-  [25, 49, -125, -67], // contiguous US
-  [14, 30, -118, -86], // Mexico
-  [7, 18, -92, -77], // Central America
-  // Greenland
-  [60, 83, -55, -18],
-  // South America
-  [-4, 12, -82, -60], // northern SA
-  [-23, -4, -74, -35], // Brazil / central
-  [-56, -23, -76, -53], // southern cone
-  // Europe
-  [43, 60, -10, 30], // core Europe
-  [50, 71, 4, 60], // Scandinavia / Baltics / W. Russia
-  [36, 44, -10, 28], // Iberia / Italy / Balkans
-  [49, 60, -8, 2], // UK / Ireland
-  // Africa
-  [12, 37, -17, 35], // North Africa / Sahara
-  [-5, 14, -17, 48], // sub-Saharan / Horn
-  [-35, -5, 12, 41], // southern Africa
-  // Middle East / Central Asia
-  [12, 42, 34, 60],
-  [35, 55, 50, 90],
-  // Russia / Siberia
-  [50, 73, 60, 180],
-  // South Asia
-  [6, 35, 68, 90],
-  // East / SE Asia
-  [20, 53, 100, 135], // China / Korea
-  [30, 46, 129, 146], // Japan
-  [-10, 28, 95, 141], // SE Asia / Indonesia
-  // Australia
-  [-39, -11, 113, 154],
-  // New Zealand
-  [-47, -34, 166, 179],
-];
+// ── Real-world landmass (Natural Earth 110m country polygons) ────────────────
+// world-atlas ships `countries-110m.json`, a TopoJSON of 177 countries at
+// ~110m resolution (~10.5k vertices total). We convert it once to GeoJSON,
+// flatten every polygon ring into a pre-projected 3D unit-vector list, and
+// store each country's centroid direction for sun-lit shading. The rings are
+// projected + hemisphere-clipped per frame in `drawLand` (cheap at this size).
 
-function isLand(latDeg: number, lonDeg: number): boolean {
-  for (let i = 0; i < CONTINENTS.length; i++) {
-    const b = CONTINENTS[i];
-    if (latDeg >= b[0] && latDeg <= b[1] && lonDeg >= b[2] && lonDeg <= b[3]) {
-      return true;
-    }
+const D2R = Math.PI / 180;
+
+/** A polygon ring as pre-computed unit-sphere vectors (one per source vertex). */
+interface RingVec {
+  x: Float64Array;
+  y: Float64Array;
+  z: Float64Array;
+  n: number;
+}
+
+/** A country: its rings plus a centroid unit-vector for light-direction shading. */
+interface LandCountry {
+  rings: RingVec[];
+  cx: number; // centroid unit vector (mean of ring vertices, re-normalised)
+  cy: number;
+  cz: number;
+}
+
+/** Convert one [lon,lat] ring → pre-projected unit vectors on the sphere. */
+function ringToVec(coords: number[][]): RingVec | null {
+  const n = coords.length;
+  if (n < 3) return null;
+  const x = new Float64Array(n);
+  const y = new Float64Array(n);
+  const z = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const lon = coords[i][0] * D2R;
+    const lat = coords[i][1] * D2R;
+    const cP = Math.cos(lat);
+    x[i] = cP * Math.sin(lon);
+    y[i] = Math.sin(lat);
+    z[i] = cP * Math.cos(lon);
   }
-  return false;
+  return { x, y, z, n };
 }
 
-interface LandSample {
-  sinPhi: number;
-  cosPhi: number;
-  lonRad: number;
-}
-
-/** Pre-compute land cell centres on a lat/lon grid (runs once). */
-function precomputeLandSamples(): { samples: LandSample[]; cellSizeRad: number } {
-  const rows = 90; // 2° lat steps
-  const cols = 180; // 2° lon steps
-  const cellLat = Math.PI / rows;
-  const samples: LandSample[] = [];
-  for (let r = 0; r < rows; r++) {
-    const latDeg = 90 - ((r + 0.5) * 180) / rows;
-    const phi = (latDeg * Math.PI) / 180;
-    const sinPhi = Math.sin(phi);
-    const cosPhi = Math.cos(phi);
-    for (let c = 0; c < cols; c++) {
-      const lonDeg = -180 + ((c + 0.5) * 360) / cols;
-      if (!isLand(latDeg, lonDeg)) continue;
-      samples.push({ sinPhi, cosPhi, lonRad: (lonDeg * Math.PI) / 180 });
+/** Parse the TopoJSON → flattened country list (runs once at module load). */
+function buildLand(): LandCountry[] {
+  const fc = feature(worldData, worldData.objects.countries) as FeatureCollection<
+    GeometryObject
+  >;
+  const out: LandCountry[] = [];
+  for (const f of fc.features as Feature<GeometryObject>[]) {
+    const geom = f.geometry;
+    let polygons: number[][][][];
+    if (geom.type === 'Polygon') {
+      polygons = [geom.coordinates];
+    } else if (geom.type === 'MultiPolygon') {
+      polygons = geom.coordinates;
+    } else {
+      continue;
     }
+    const rings: RingVec[] = [];
+    let sx = 0;
+    let sy = 0;
+    let sz = 0;
+    let count = 0;
+    for (const poly of polygons) {
+      for (const ring of poly) {
+        const rv = ringToVec(ring);
+        if (!rv) continue;
+        rings.push(rv);
+        for (let i = 0; i < rv.n; i++) {
+          sx += rv.x[i];
+          sy += rv.y[i];
+          sz += rv.z[i];
+        }
+        count += rv.n;
+      }
+    }
+    if (rings.length === 0 || count === 0) continue;
+    const len = Math.hypot(sx, sy, sz) || 1;
+    out.push({ rings, cx: sx / len, cy: sy / len, cz: sz / len });
   }
-  return { samples, cellSizeRad: cellLat * 1.55 };
+  return out;
 }
+
+// Parse once — the data is static, so this lives at module scope.
+const LAND: LandCountry[] = buildLand();
 
 interface StarDatum {
   x: number;
@@ -220,8 +231,8 @@ export function WorldGlobe({
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // One-shot precomputation.
-  const landSamples = useMemo(() => precomputeLandSamples(), []);
+  // One-shot precomputation. (Country polygons are parsed once at module load
+  // into `LAND`; only the star field is per-component.)
   const stars = useMemo(() => precomputeStars(STAR_COUNT), []);
 
   const serverPoints = useMemo<ServerPoint[]>(() => {
@@ -335,7 +346,6 @@ export function WorldGlobe({
         dpr,
         pal,
         stars,
-        landSamples,
         isConnected: connected,
         focusLatDeg: effectiveLat,
         focusLonDeg: effectiveLon,
@@ -373,7 +383,7 @@ export function WorldGlobe({
       cancelAnimationFrame(raf);
       ro.disconnect();
     };
-  }, [landSamples, stars]);
+  }, [stars]);
 
   return (
     <div ref={containerRef} className={`absolute inset-0 ${className}`} aria-hidden>
@@ -391,7 +401,6 @@ interface RenderArgs {
   dpr: number;
   pal: GlobePalette;
   stars: StarDatum[];
-  landSamples: { samples: LandSample[]; cellSizeRad: number };
   isConnected: boolean;
   focusLatDeg: number;
   focusLonDeg: number;
@@ -466,8 +475,7 @@ function renderGlobe(ctx: CanvasRenderingContext2D, a: RenderArgs) {
     ctx.fill();
   }
 
-  // Camera trig (focus the point at screen centre).
-  const D2R = Math.PI / 180;
+  // Camera trig (focus the point at screen centre). `D2R` is module scope.
   const latRad = a.focusLatDeg * D2R;
   const lonRad = a.focusLonDeg * D2R;
   const cosLat = Math.cos(latRad);
@@ -495,39 +503,39 @@ function renderGlobe(ctx: CanvasRenderingContext2D, a: RenderArgs) {
     return [cx + sx * radius, cy - ty * radius];
   };
 
-  // ── Continents: project precomputed samples, classify by lighting, draw
-  // three brightness buckets as square cells. ───────────────────────────────
-  const cellPx = radius * a.landSamples.cellSizeRad;
-  const buckets: Array<{ color: string; cells: Array<[number, number, number]> }> = [
-    { color: pal.landDim, cells: [] },
-    { color: pal.landMid, cells: [] },
-    { color: pal.landLit, cells: [] },
-  ];
-  for (const cell of a.landSamples.samples) {
-    const lam = cell.lonRad - lonRad;
-    const sinL = Math.sin(lam);
-    const cosL = Math.cos(lam);
-    const sx = cell.cosPhi * sinL;
-    const sy = cell.sinPhi;
-    const sz = cell.cosPhi * cosL;
-    const ty = sy * cosLat - sz * sinLat;
-    const tz = sy * sinLat + sz * cosLat;
-    if (tz <= 0.02) continue;
-    const px = cx + sx * radius;
-    const py = cy - ty * radius;
-    const dot = sx * lx + ty * ly + tz * lz;
-    const half = cellPx * (0.55 + 0.45 * tz) * 0.5;
-    const bi = dot > 0.55 ? 2 : dot > 0.2 ? 1 : 0;
-    buckets[bi].cells.push([px, py, half]);
-  }
-  for (const bkt of buckets) {
-    ctx.fillStyle = bkt.color;
+  // ── Continents: project real Natural Earth country polygons onto the sphere,
+  // clip each ring to the visible hemisphere (bridging across the limb so a
+  // coastline crossing the horizon hugs the disc edge instead of cutting a
+  // chord), then fill shaded by the country centroid's angle to the light and
+  // stroke a hairline border. ───────────────────────────────────────────────
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, twoPi); // hard clip to the disc (safety net)
+  ctx.clip();
+  ctx.lineJoin = 'round';
+  const borderColor = withAlpha(pal.rim, pal.rimAlpha * 0.55);
+  for (const country of LAND) {
+    // Centroid lighting (camera-space) → pick one of three brightness buckets.
+    const csx = country.cx * cosLon - country.cz * sinLon;
+    const csz = country.cx * sinLon + country.cz * cosLon;
+    const cty = country.cy * cosLat - csz * sinLat;
+    const ctz = country.cy * sinLat + csz * cosLat;
+    const litDot = csx * lx + cty * ly + ctz * lz;
+    const fillColor = litDot > 0.45 ? pal.landLit : litDot > 0.05 ? pal.landMid : pal.landDim;
+
     ctx.beginPath();
-    for (const [px, py, half] of bkt.cells) {
-      ctx.rect(px - half, py - half, half * 2, half * 2);
+    let drewRing = false;
+    for (const ring of country.rings) {
+      drewRing = traceRing(ctx, ring, cx, cy, radius, cosLat, sinLat, cosLon, sinLon) || drewRing;
     }
-    ctx.fill();
+    if (!drewRing) continue; // country wholly on the far hemisphere
+    ctx.fillStyle = fillColor;
+    ctx.fill('evenodd');
+    ctx.lineWidth = 0.6;
+    ctx.strokeStyle = borderColor;
+    ctx.stroke();
   }
+  ctx.restore();
 
   // ── Inner limb darkening — vignette ring near the disc edge. ──────────────
   {
@@ -656,6 +664,134 @@ function renderGlobe(ctx: CanvasRenderingContext2D, a: RenderArgs) {
     const userPos = project(USER_LAT, USER_LON);
     if (userPos) drawGlobePin(ctx, userPos[0], userPos[1], withAlpha(pal.accent, 0.95), a.pulse, true);
   }
+}
+
+/**
+ * Trace one country ring onto the current path, clipped to the visible
+ * hemisphere of the orthographic globe.
+ *
+ * Each vertex's pre-computed unit vector is rotated into camera space; a vertex
+ * is visible when its camera-space z (`tz`) is ≥ 0. We emit the visible runs of
+ * the ring and, wherever the coastline dips behind the limb and returns, bridge
+ * the gap with an arc that follows the disc edge (`arcLimb`) — so partially
+ * visible landmasses hug the sphere instead of being cut by a straight chord.
+ * Returns true if any sub-path was added (ring touches the visible hemisphere).
+ */
+function traceRing(
+  ctx: CanvasRenderingContext2D,
+  ring: RingVec,
+  cx: number,
+  cy: number,
+  radius: number,
+  cosLat: number,
+  sinLat: number,
+  cosLon: number,
+  sinLon: number,
+): boolean {
+  const n = ring.n;
+  // Camera-space transform of a ring vertex by index.
+  const camAt = (i: number): { sx: number; ty: number; tz: number } => {
+    const x = ring.x[i];
+    const y = ring.y[i];
+    const z = ring.z[i];
+    const sx = x * cosLon - z * sinLon;
+    const sz = x * sinLon + z * cosLon;
+    const ty = y * cosLat - sz * sinLat;
+    const tz = y * sinLat + sz * cosLat;
+    return { sx, ty, tz };
+  };
+
+  // Linear-interpolate the limb crossing between a visible and a hidden vertex,
+  // then push it onto the rim circle. Returns the screen point + its rim angle.
+  const limbCross = (
+    aCam: { sx: number; ty: number; tz: number },
+    bCam: { sx: number; ty: number; tz: number },
+  ): { px: number; py: number; ang: number } => {
+    const t = aCam.tz / (aCam.tz - bCam.tz); // tz = 0 between a (vis) and b (hid)
+    let sx = aCam.sx + (bCam.sx - aCam.sx) * t;
+    let ty = aCam.ty + (bCam.ty - aCam.ty) * t;
+    const len = Math.hypot(sx, ty) || 1;
+    sx /= len;
+    ty /= len; // onto the unit rim
+    return { px: cx + sx * radius, py: cy - ty * radius, ang: Math.atan2(-ty, sx) };
+  };
+
+  let started = false; // a sub-path is open on the ctx path
+  let exitAng = 0; // rim angle where we last went behind the limb
+  let haveExit = false; // an unmatched limb exit awaits a re-entry bridge
+  let any = false;
+
+  // Iterate every edge (i → i+1) with wrap-around; GeoJSON rings are closed so
+  // vertex 0 == vertex n-1, making the wrap edge degenerate (harmless).
+  let prev = camAt(0);
+  for (let i = 1; i <= n; i++) {
+    const cur = camAt(i % n);
+    const aVis = prev.tz >= 0;
+    const bVis = cur.tz >= 0;
+
+    if (aVis && bVis) {
+      // Wholly visible edge.
+      if (!started) {
+        ctx.moveTo(cx + prev.sx * radius, cy - prev.ty * radius);
+        started = true;
+      }
+      ctx.lineTo(cx + cur.sx * radius, cy - cur.ty * radius);
+      any = true;
+    } else if (aVis && !bVis) {
+      // Leaving the visible hemisphere — draw to the limb crossing, pen up.
+      if (!started) {
+        ctx.moveTo(cx + prev.sx * radius, cy - prev.ty * radius);
+        started = true;
+      }
+      const c = limbCross(prev, cur);
+      ctx.lineTo(c.px, c.py);
+      exitAng = c.ang;
+      haveExit = true;
+      any = true;
+    } else if (!aVis && bVis) {
+      // Re-entering — find the entry crossing, bridge along the limb from the
+      // last exit if we have one, then continue along the coastline.
+      const c = limbCross(cur, prev); // order so the visible end is first
+      if (started && haveExit) {
+        arcLimb(ctx, cx, cy, radius, exitAng, c.ang);
+        ctx.lineTo(cx + cur.sx * radius, cy - cur.ty * radius);
+      } else {
+        ctx.moveTo(c.px, c.py);
+        ctx.lineTo(cx + cur.sx * radius, cy - cur.ty * radius);
+        started = true;
+      }
+      haveExit = false;
+      any = true;
+    }
+    // (!aVis && !bVis): edge fully hidden — nothing to draw.
+
+    prev = cur;
+  }
+  if (started) ctx.closePath();
+  return any;
+}
+
+/**
+ * Append an arc along the globe limb between two rim angles, choosing the short
+ * way round so the bridged coastline cannot loop the wrong side of the disc.
+ */
+function arcLimb(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  radius: number,
+  fromAng: number,
+  toAng: number,
+): void {
+  // Screen angle for ctx.arc uses +y downward; our rim angle uses -ty, so the
+  // ctx angle is the negative of our math angle.
+  let from = -fromAng;
+  let to = -toAng;
+  let delta = to - from;
+  while (delta > Math.PI) delta -= Math.PI * 2;
+  while (delta < -Math.PI) delta += Math.PI * 2;
+  to = from + delta;
+  ctx.arc(cx, cy, radius, from, to, delta < 0);
 }
 
 function drawDisc(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, color: string) {

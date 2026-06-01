@@ -21,6 +21,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.1.0",
     "@tauri-apps/plugin-autostart": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-notification": "^2.0.0",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.0.1",
@@ -31,6 +32,8 @@
     "react-dom": "^18.3.1",
     "react-globe.gl": "^2.37.1",
     "three": "^0.184.0",
+    "topojson-client": "^3.1.0",
+    "world-atlas": "^2.0.2",
     "zustand": "^5.0.0"
   },
   "devDependencies": {
@@ -41,6 +44,8 @@
     "@testing-library/user-event": "^14.6.1",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@types/topojson-client": "^3.1.5",
+    "@types/topojson-specification": "^1.0.5",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "@vitejs/plugin-react": "^4.3.3",

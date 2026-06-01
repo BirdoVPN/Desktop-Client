@@ -18,8 +18,9 @@
  */
 import { useCallback, useMemo, useState, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 import { useShallow } from 'zustand/react/shallow';
-import { Info, Lock, Plus, Scissors, Search, X } from 'lucide-react';
+import { FolderOpen, Info, Lock, Plus, Scissors, Search, X } from 'lucide-react';
 import { useAppStore, type AppSettings } from '@/store/app-store';
 import {
   BirdoTopBar,
@@ -88,6 +89,28 @@ export function SplitTunnel() {
     persist({ splitTunnelApps: [...apps, appName] });
     setAppInput('');
   }, [appInput, apps, enabled, persist]);
+
+  // ── Native file picker — select an .exe instead of typing the path ──
+  // The picked path's basename is added via the SAME full-object persist() the
+  // text-field Add uses, so storage stays consistent (save_settings).
+  const browseForApp = useCallback(async () => {
+    if (!enabled) return;
+    let selected: string | string[] | null;
+    try {
+      selected = await open({
+        multiple: false,
+        filters: [{ name: 'Applications', extensions: ['exe'] }],
+      });
+    } catch {
+      // Dialog cancelled or unavailable — nothing to add.
+      return;
+    }
+    if (typeof selected !== 'string') return;
+    // Derive the basename from the returned path (handles \ and /).
+    const appName = selected.split(/[\\/]/).pop()?.trim();
+    if (!appName || apps.includes(appName)) return;
+    persist({ splitTunnelApps: [...apps, appName] });
+  }, [apps, enabled, persist]);
 
   const removeApp = useCallback(
     (appName: string) => {
@@ -207,6 +230,19 @@ export function SplitTunnel() {
                   variant="brand"
                   size="medium"
                   ariaLabel="Add split tunnel app"
+                />
+              </div>
+              <div className="mt-2">
+                <BirdoButton
+                  text="Browse…"
+                  icon={FolderOpen}
+                  onClick={() => {
+                    void browseForApp();
+                  }}
+                  variant="secondary"
+                  size="medium"
+                  fullWidth
+                  ariaLabel="Browse for an application"
                 />
               </div>
             </div>

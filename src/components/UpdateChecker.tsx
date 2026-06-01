@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
-import { Download, Check, AlertCircle, Loader2, RefreshCw } from 'lucide-react';
+import { Download, Check, Loader2, RefreshCw } from 'lucide-react';
 
 type UpdateStatus = 
   | 'idle' 
@@ -51,7 +51,10 @@ export function UpdateChecker() {
         idleTimerRef.current = setTimeout(() => setStatus('idle'), 3000);
       }
     } catch (_err) {
-      setError('Update server is not available right now. Try again later.');
+      // The update endpoint isn't deployed yet, so check() can 404. This is
+      // expected until the update server ships — keep the tone neutral and
+      // avoid implying the user is (or isn't) on the latest version.
+      setError('Update check unavailable right now.');
       setStatus('error');
     }
   }, []);
@@ -116,10 +119,8 @@ export function UpdateChecker() {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className={`flex h-10 w-10 items-center justify-center rounded-lg ${
-              status === 'available' || status === 'ready' 
-                ? 'bg-emerald-500/20' 
-                : status === 'error'
-                ? 'bg-red-500/20'
+              status === 'available' || status === 'ready'
+                ? 'bg-emerald-500/20'
                 : 'bg-white/10'
             }`}>
               {status === 'checking' || status === 'downloading' ? (
@@ -129,7 +130,7 @@ export function UpdateChecker() {
               ) : status === 'ready' ? (
                 <Check size={20} className="text-emerald-400" />
               ) : status === 'error' ? (
-                <AlertCircle size={20} className="text-red-400" />
+                <RefreshCw size={20} className="text-white/40" />
               ) : status === 'up-to-date' ? (
                 <Check size={20} className="text-emerald-400" />
               ) : (
@@ -143,7 +144,7 @@ export function UpdateChecker() {
                 {status === 'downloading' && `Downloading... ${downloadProgress}%`}
                 {status === 'ready' && 'Update ready to install'}
                 {status === 'up-to-date' && 'You\'re up to date!'}
-                {status === 'error' && 'Update check failed'}
+                {status === 'error' && 'Software Updates'}
                 {status === 'idle' && 'Software Updates'}
               </p>
               <p className="text-xs text-white/60">

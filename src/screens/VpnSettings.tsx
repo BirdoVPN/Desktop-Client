@@ -138,12 +138,13 @@ export function VpnSettings() {
       } catch (err) {
         const msg = String(err);
         const lower = msg.toLowerCase();
-        if (lower.includes('administrator') || lower.includes('root') || lower.includes('privilege')) {
-          setKillSwitchError(
-            'Kill switch requires administrator privileges. Run Birdo as administrator and try again.',
-          );
-        } else if (lower.includes('connected') || lower.includes('connecting') || lower.includes('disconnect first')) {
-          setKillSwitchError('Cannot disable the kill switch while the VPN is connected. Disconnect first.');
+        if (lower.includes('administrator') || lower.includes('admin') || lower.includes('root') || lower.includes('privilege')) {
+          setKillSwitchError('Kill switch requires running Birdo as administrator.');
+        } else if (
+          !value &&
+          (lower.includes('connected') || lower.includes('connecting') || lower.includes('disconnect'))
+        ) {
+          setKillSwitchError('Disconnect before turning off the kill switch.');
         } else {
           setKillSwitchError(msg);
         }

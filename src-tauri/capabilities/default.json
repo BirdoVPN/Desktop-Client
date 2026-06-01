@@ -11,6 +11,8 @@
     "notification:allow-notify",
     "updater:default",
     "process:default",
-    "deep-link:default"
+    "deep-link:default",
+    "dialog:default",
+    "dialog:allow-open"
   ]
 }
