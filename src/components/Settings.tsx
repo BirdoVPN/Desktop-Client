@@ -69,7 +69,6 @@ import { UpdateChecker } from './UpdateChecker';
 import {
   brand,
   status as statusTokens,
-  surface,
   white,
   hairline,
   motion as motionTokens,
@@ -281,7 +280,8 @@ export function Settings() {
   );
 
   return (
-    <div className="h-full overflow-y-auto" style={{ backgroundColor: surface.s0 }}>
+    // Transparent so the App-level PixelCanvas backdrop shows through.
+    <div className="h-full overflow-y-auto">
       {/* Tab-root header (no back button) */}
       <div data-tauri-drag-region className="px-5 pb-2 pt-6">
         <h1 className="text-[22px] font-semibold" style={{ color: '#FFFFFF' }}>

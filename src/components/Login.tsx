@@ -174,7 +174,9 @@ export function Login() {
   );
 
   return (
-    <div className="flex h-full flex-col bg-birdo-s0">
+    // Transparent root so the App-level PixelCanvas shows through behind the
+    // login content (opaque bg-birdo-s0 here was hiding the animated backdrop).
+    <div className="flex h-full flex-col">
       {/* ── Thin draggable header ── */}
       <div
         data-tauri-drag-region

@@ -89,7 +89,11 @@ pub async fn set_biometric_enabled(enabled: bool) -> Result<(), String> {
 pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
+        // CREATE_NO_WINDOW — suppress the flashing console window when launching
+        // PowerShell for the Windows Hello bridge.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         // SEC: Use hardcoded verification message to prevent PowerShell injection.
         // The `reason` parameter from the frontend is intentionally ignored —
@@ -121,6 +125,7 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
 
         let output = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| format!("Failed to launch Windows Hello: {e}"))?;
 
@@ -199,7 +204,11 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
 
 #[cfg(windows)]
 fn is_windows_hello_available() -> bool {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+    // CREATE_NO_WINDOW — this runs on the Settings screen mount; without it a
+    // PowerShell console window flashes up every time Settings opens.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new("powershell")
         .args([
             "-NoProfile",
@@ -219,6 +228,7 @@ fn is_windows_hello_available() -> bool {
             Write-Output $result
             "#,
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     match output {

@@ -1,11 +1,11 @@
 /**
- * AppIconMark — the Birdo brand mark in a rounded square. There is no dedicated
- * brand asset under `src/assets`, so we reuse the Tauri app icon (the same mark
- * shipped on the window / tray) imported as a static URL by Vite.
+ * AppIconMark — the Birdo brand mark in a rounded square. The icon is bundled
+ * from `src/assets/app-icon.png` (a copy of the Tauri app icon) so Vite reliably
+ * fingerprints + emits it in the production build. Importing from outside `src`
+ * (../../../src-tauri/icons) silently failed to bundle, rendering a blank box.
  */
 import type { CSSProperties } from 'react';
-// Relative import: the icon lives outside `src`, so the `@/` alias can't reach it.
-import iconUrl from '../../../src-tauri/icons/icon.png';
+import iconUrl from '@/assets/app-icon.png';
 
 export interface AppIconMarkProps {
   size?: number;
