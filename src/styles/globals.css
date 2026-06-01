@@ -16,18 +16,84 @@
   --muted-foreground: #a6a6a6;
   --border: rgba(255, 255, 255, 0.08);
   --ring: rgba(255, 255, 255, 0.2);
+
+  /* ── Birdo design tokens (mirror mobile Color.kt/Brand.kt) ─────────────
+     Consumed by tailwind.config.js utilities + components. Dark is default. */
+  --birdo-black: #000000;
+  --birdo-s0: #050507;
+  --birdo-s1: #0b0b10;
+  --birdo-s2: #12121a;
+  --birdo-s3: #1a1a24;
+  --birdo-card-glass: rgba(20, 20, 25, 0.7);
+
+  --birdo-purple: #a855f7;
+  --birdo-purple-mid: #7c3aed;
+  --birdo-purple-deep: #6d28d9;
+  --birdo-purple-light: #c084fc;
+  --birdo-purple-soft: #c4b5fd;
+  --birdo-purple-bg: rgba(168, 85, 247, 0.1);
+
+  --birdo-green: #22c55e;
+  --birdo-green-light: #4ade80;
+  --birdo-green-bg: rgba(34, 197, 94, 0.1);
+  --birdo-yellow-light: #facc15;
+  --birdo-red: #f87171;
+  --birdo-red-bg: rgba(248, 113, 113, 0.1);
+
+  --birdo-primary: #ffffff;
+  --birdo-on-primary: #000000;
+
+  --w100: #f2f2f2;
+  --w80: rgba(255, 255, 255, 0.8);
+  --w60: rgba(255, 255, 255, 0.6);
+  --w40: rgba(255, 255, 255, 0.4);
+  --w20: rgba(255, 255, 255, 0.2);
+  --w10: rgba(255, 255, 255, 0.1);
+  --w06: rgba(255, 255, 255, 0.06);
+  --w05: rgba(255, 255, 255, 0.05);
+  --w04: rgba(255, 255, 255, 0.04);
+  --w03: rgba(255, 255, 255, 0.03);
+
+  --birdo-hairline: rgba(255, 255, 255, 0.12);
+  --birdo-hairline-soft: rgba(255, 255, 255, 0.08);
 }
 
-/* Light mode overrides */
+/* Light mode = mobile's "dim-light" DARK-SLATE theme (NOT white).
+   Mirrors mobile Color.kt:67-76. We re-point the Birdo surface/text/border
+   vars to slate; brand/status accents stay the same family (softer violet). */
 :root.light {
-  --background: #f8f8f8;
-  --foreground: #111111;
-  --card: rgba(255, 255, 255, 0.95);
-  --card-foreground: #111111;
-  --muted: rgba(240, 240, 240, 0.9);
-  --muted-foreground: #666666;
-  --border: rgba(0, 0, 0, 0.08);
-  --ring: rgba(0, 0, 0, 0.2);
+  --background: #1b1c24;
+  --foreground: #e8e9f0;
+  --card: #22232c;
+  --card-foreground: #e8e9f0;
+  --muted: #2a2b36;
+  --muted-foreground: #b7b9c9;
+  --border: rgba(255, 255, 255, 0.1);
+  --ring: rgba(255, 255, 255, 0.2);
+
+  --birdo-black: #16171d;
+  --birdo-s0: #1b1c24;
+  --birdo-s1: #22232c;
+  --birdo-s2: #2a2b36;
+  --birdo-s3: #2f3040;
+  --birdo-card-glass: rgba(42, 43, 54, 0.7);
+
+  --birdo-purple: #b794f6; /* softer violet accent on slate */
+  --birdo-purple-bg: rgba(168, 85, 247, 0.16);
+
+  --w100: #e8e9f0;
+  --w80: #b7b9c9;
+  --w60: #b7b9c9;
+  --w40: #7a7c8e;
+  --w20: rgba(255, 255, 255, 0.2);
+  --w10: rgba(255, 255, 255, 0.1);
+  --w06: rgba(255, 255, 255, 0.06);
+  --w05: rgba(255, 255, 255, 0.05);
+  --w04: rgba(255, 255, 255, 0.04);
+  --w03: rgba(255, 255, 255, 0.03);
+
+  --birdo-hairline: rgba(255, 255, 255, 0.2);
+  --birdo-hairline-soft: rgba(255, 255, 255, 0.1);
 }
 
 * {

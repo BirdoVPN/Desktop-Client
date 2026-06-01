@@ -45,6 +45,14 @@ pub(super) fn get_device_name() -> String {
         })
 }
 
+fn connect_failure_message(response: &ConnectResponse) -> String {
+    response
+        .message
+        .clone()
+        .or_else(|| response.error_code.as_ref().map(|code| code.user_message().to_string()))
+        .unwrap_or_else(|| "Connection failed".to_string())
+}
+
 /// H-2 FIX: Shared helper to extract VPN config from ConnectResponse.
 /// Previously duplicated ~60 lines between connect_vpn and quick_connect.
 /// Any security fix (DNS validation, field extraction) now only needs one change.
@@ -65,9 +73,7 @@ pub fn build_vpn_config(
     custom_port: &str,
 ) -> Result<(VpnConfig, String), String> {
     if !response.success {
-        let msg = response
-            .message
-            .unwrap_or_else(|| "Connection failed".to_string());
+        let msg = connect_failure_message(&response);
         tracing::error!("Server rejected connection: {}", msg);
         return Err(msg);
     }
@@ -526,9 +532,7 @@ pub async fn connect_vpn(
     };
 
     if !response.success {
-        let msg = response
-            .message
-            .unwrap_or_else(|| "Connection failed".to_string());
+        let msg = connect_failure_message(&response);
         tracing::error!("Server rejected connection: {}", msg);
         return Err(msg);
     }
@@ -712,7 +716,7 @@ pub async fn get_vpn_status(
         ConnectionState::Connected => "connected",
         ConnectionState::Disconnecting => "disconnecting",
         ConnectionState::Reconnecting { .. } => "reconnecting",
-        ConnectionState::KillSwitchActive => "killswitch_active",
+        ConnectionState::KillSwitchActive => "kill_switch_active",
         ConnectionState::Error(_) => "error",
     };
 
@@ -837,10 +841,7 @@ pub async fn quick_connect(
         .map_err(|e| sanitize_error(&format!("Failed to connect: {}", e)))?;
 
     if !response.success {
-        let msg = response
-            .message
-            .clone()
-            .unwrap_or_else(|| "Connection failed".to_string());
+        let msg = connect_failure_message(&response);
         return Err(msg);
     }
 

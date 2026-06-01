@@ -108,6 +108,7 @@ pub async fn connect_multi_hop(
     let connect_response = ConnectResponse {
         success: mh_response.success,
         message: mh_response.message,
+        error_code: None,
         config: mh_response.config,
         key_id: mh_response.key_id,
         private_key: mh_response.private_key,

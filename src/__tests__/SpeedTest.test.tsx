@@ -8,7 +8,8 @@
  * Run: npx vitest run src/__tests__/SpeedTest.test.tsx
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Settings } from '@/components/Settings';
 
@@ -50,6 +51,17 @@ vi.mock('@/store/app-store', () => ({
         preferredServerId: null,
       },
       updateSettings: vi.fn(),
+      account: {
+        email: 'test@birdo.app',
+        plan: 'operative',
+        accountId: 'acct_test',
+        maxDevices: 5,
+        activeDevices: 1,
+        expiresAt: null,
+        bandwidthUsed: 0,
+        bandwidthLimit: 0,
+        status: 'active',
+      },
       servers: [],
       multiHopRoutes: [],
       setMultiHopRoutes: vi.fn(),
@@ -67,27 +79,60 @@ vi.mock('zustand/react/shallow', () => ({
 
 const mockedInvoke = vi.mocked(invoke);
 
+// The Settings screen is now a single scrollable list (no tabs); the Speed
+// Test section's "Run" button is rendered directly.
+async function renderToolsTab() {
+  await act(async () => {
+    render(<Settings />);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  await waitFor(() => {
+    expect(screen.getByText('Run')).toBeInTheDocument();
+  });
+}
+
+// The rebuilt Settings fires several commands on mount (get_settings,
+// get_app_version, get_killswitch_status, check_biometric_available). Route by
+// command name so the speed-test result isn't swallowed by a mount call, and
+// let each test override only run_speed_test_command via `speedTestImpl`.
+let speedTestImpl: () => Promise<unknown> = () =>
+  Promise.resolve({ downloadMbps: 0, uploadMbps: 0, latencyMs: 0 });
+
 beforeEach(() => {
   mockedInvoke.mockReset();
-  mockedInvoke.mockResolvedValue(undefined);
+  speedTestImpl = () => Promise.resolve({ downloadMbps: 0, uploadMbps: 0, latencyMs: 0 });
+  mockedInvoke.mockImplementation((cmd: string) => {
+    switch (cmd) {
+      case 'run_speed_test_command':
+        return speedTestImpl();
+      case 'get_app_version':
+        return Promise.resolve('1.0.0');
+      case 'get_killswitch_status':
+        return Promise.resolve({ enabled: false, active: false, blocking_connections: 0 });
+      case 'check_biometric_available':
+        return Promise.resolve({ available: false, enabled: false, method: 'none' });
+      default:
+        return Promise.resolve(undefined);
+    }
+  });
 });
 
 describe('Speed Test section', () => {
-  it('renders the Run button', () => {
-    render(<Settings />);
+  it('renders the Run button', async () => {
+    await renderToolsTab();
     expect(screen.getByText('Run')).toBeInTheDocument();
   });
 
   it('invokes run_speed_test_command when Run is clicked', async () => {
-    mockedInvoke.mockResolvedValueOnce({
-      downloadMbps: 95.3,
-      uploadMbps: 42.1,
-      latencyMs: 12,
-      jitterMs: 3,
-    });
+    speedTestImpl = () =>
+      Promise.resolve({ downloadMbps: 95.3, uploadMbps: 42.1, latencyMs: 12 });
 
-    render(<Settings />);
-    fireEvent.click(screen.getByText('Run'));
+    await renderToolsTab();
+    await act(async () => {
+      await userEvent.click(screen.getByText('Run'));
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(mockedInvoke).toHaveBeenCalledWith('run_speed_test_command');
@@ -95,41 +140,37 @@ describe('Speed Test section', () => {
   });
 
   it('disables button while speed test is running', async () => {
-    // Never-resolving promise to keep the test "running"
+    // Pending promise to keep the test "running"; the button label swaps to
+    // "Running…" and the element gains the disabled attribute.
     let resolve: (v: unknown) => void;
-    mockedInvoke.mockReturnValueOnce(
-      new Promise((r) => {
-        resolve = r;
-      })
-    );
+    speedTestImpl = () => new Promise((r) => { resolve = r; });
 
-    render(<Settings />);
+    await renderToolsTab();
     const btn = screen.getByText('Run');
-    fireEvent.click(btn);
+    await act(async () => {
+      await userEvent.click(btn);
+    });
 
     await waitFor(() => {
-      expect(btn).toBeDisabled();
+      expect(screen.getByRole('button', { name: /running/i })).toBeDisabled();
     });
 
     // Cleanup: resolve the dangling promise
-    resolve!({
-      downloadMbps: 0,
-      uploadMbps: 0,
-      latencyMs: 0,
-      jitterMs: 0,
+    await act(async () => {
+      resolve!({ downloadMbps: 0, uploadMbps: 0, latencyMs: 0 });
+      await Promise.resolve();
     });
   });
 
   it('displays results in download/upload/ping format', async () => {
-    mockedInvoke.mockResolvedValueOnce({
-      downloadMbps: 95.3,
-      uploadMbps: 42.1,
-      latencyMs: 12,
-      jitterMs: 3,
-    });
+    speedTestImpl = () =>
+      Promise.resolve({ downloadMbps: 95.3, uploadMbps: 42.1, latencyMs: 12 });
 
-    render(<Settings />);
-    fireEvent.click(screen.getByText('Run'));
+    await renderToolsTab();
+    await act(async () => {
+      await userEvent.click(screen.getByText('Run'));
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(
@@ -143,16 +184,14 @@ describe('Speed Test section', () => {
   });
 
   it('re-enables button after speed test completes', async () => {
-    mockedInvoke.mockResolvedValueOnce({
-      downloadMbps: 50.0,
-      uploadMbps: 25.0,
-      latencyMs: 20,
-      jitterMs: 5,
-    });
+    speedTestImpl = () =>
+      Promise.resolve({ downloadMbps: 50.0, uploadMbps: 25.0, latencyMs: 20 });
 
-    render(<Settings />);
-    const btn = screen.getByText('Run');
-    fireEvent.click(btn);
+    await renderToolsTab();
+    await act(async () => {
+      await userEvent.click(screen.getByText('Run'));
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(screen.getByText('Run')).not.toBeDisabled();
@@ -160,11 +199,13 @@ describe('Speed Test section', () => {
   });
 
   it('re-enables button after speed test errors', async () => {
-    mockedInvoke.mockRejectedValueOnce(new Error('Network error'));
+    speedTestImpl = () => Promise.reject(new Error('Network error'));
 
-    render(<Settings />);
-    const btn = screen.getByText('Run');
-    fireEvent.click(btn);
+    await renderToolsTab();
+    await act(async () => {
+      await userEvent.click(screen.getByText('Run'));
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(screen.getByText('Run')).not.toBeDisabled();

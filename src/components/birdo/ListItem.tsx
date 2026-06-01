@@ -35,7 +35,7 @@ export function BirdoListItem({
     <Wrapper
       type={Wrapper === 'button' ? 'button' : undefined}
       onClick={onClick && enabled ? onClick : undefined}
-      className={`flex w-full items-center gap-3.5 rounded-xl px-3.5 py-3 text-left ${
+      className={`flex w-full items-center gap-3.5 overflow-hidden rounded-birdo-md px-3.5 py-3 text-left ${
         onClick && enabled ? 'transition-colors hover:bg-white/5' : ''
       } ${className}`}
       disabled={Wrapper === 'button' ? !enabled : undefined}

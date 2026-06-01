@@ -3,7 +3,8 @@ import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ConsentScreen } from '@/components/ConsentScreen';
 import { Login } from '@/components/Login';
-import { Dashboard } from '@/components/Dashboard';
+import { AppShell } from '@/components/AppShell';
+import { OfflineBanner } from '@/components/OfflineBanner';
 import { PixelCanvas } from '@/components/PixelCanvas';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -98,8 +99,12 @@ function App() {
           // birdo://connect/<server-id>
           // Validate: allow only alphanumeric, dashes, underscores, max 64 chars
           if (!/^[a-zA-Z0-9_-]{1,64}$/.test(path)) return;
+          // Ensure the Home tab is foregrounded so Dashboard handles the connect.
+          useAppStore.getState().setTab('home');
           useAppStore.getState().setDeepLinkAction({ action: 'connect', serverId: path });
         } else if (action === 'settings') {
+          // birdo://settings → route to the Settings tab (router refactor).
+          useAppStore.getState().setTab('settings');
           useAppStore.getState().setDeepLinkAction({ action: 'settings' });
         }
       } catch {
@@ -144,9 +149,13 @@ function App() {
 
   return (
     <MotionConfig reducedMotion="user">
-    <div className="relative h-screen overflow-hidden bg-[#000000]">
+    <div className="relative h-screen overflow-hidden bg-birdo-black">
       <PixelCanvas />
-      
+
+      {/* Global offline banner — shows on every screen (matches mobile's
+          above-NavHost placement), not just the dashboard. */}
+      <OfflineBanner />
+
       <AnimatePresence mode="wait">
         {!hasAcceptedConsent ? (
           <motion.div
@@ -164,14 +173,14 @@ function App() {
           </motion.div>
         ) : isAuthenticated ? (
           <motion.div
-            key="dashboard"
+            key="appshell"
             className="relative z-10 h-full"
             initial={{ opacity: 0, x: 20 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: -20 }}
             transition={{ duration: 0.3 }}
           >
-            <Dashboard />
+            <AppShell />
           </motion.div>
         ) : (
           <motion.div

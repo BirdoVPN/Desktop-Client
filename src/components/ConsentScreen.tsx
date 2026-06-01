@@ -1,7 +1,7 @@
 import { motion } from 'framer-motion';
 import { Shield, Eye, BarChart3, ShieldOff } from 'lucide-react';
-import { BirdoButton, BirdoCard } from './birdo';
-import { gradient, white } from '@/lib/birdo-theme';
+import { AppIconMark, BirdoButton, BirdoCard } from './birdo';
+import { brand } from '@/lib/birdo-theme';
 
 interface ConsentScreenProps {
   onAccept: () => void;
@@ -21,7 +21,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
         data-tauri-drag-region
         className="flex h-8 shrink-0 items-center justify-center"
       >
-        <span className="text-[10px] font-semibold tracking-widest text-white/30 uppercase">
+        <span className="text-[10px] font-semibold uppercase tracking-widest text-w40">
           Birdo VPN
         </span>
       </div>
@@ -35,18 +35,17 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
         >
           {/* Brand mark */}
           <motion.div
-            className="mt-8 mb-4 flex h-16 w-16 items-center justify-center rounded-2xl"
-            style={{ background: gradient.primary, boxShadow: '0 16px 32px -12px rgba(124,58,237,0.55)' }}
+            className="mt-8 mb-4"
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.5, delay: 0.1 }}
           >
-            <Shield size={32} color="#FFFFFF" />
+            <AppIconMark size={64} style={{ borderRadius: 20 }} />
           </motion.div>
 
           {/* Title */}
           <motion.h1
-            className="mb-2 text-2xl font-bold text-white text-center"
+            className="mb-2 text-center text-2xl font-bold text-w100"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5, delay: 0.15 }}
@@ -55,17 +54,17 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
           </motion.h1>
 
           <motion.p
-            className="mb-6 text-sm text-white/50 text-center leading-relaxed"
+            className="mb-6 text-center text-sm leading-relaxed text-w60"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5, delay: 0.2 }}
           >
-            Before you get started, here's how we handle your data.
+            Before using Birdo VPN, please review how your data is handled.
           </motion.p>
 
           {/* Data processing summary card */}
           <motion.div
-            className="w-full mb-5"
+            className="mb-5 w-full"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5, delay: 0.25 }}
@@ -75,22 +74,22 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
                 <DataItem
                   icon={Eye}
                   title="No Activity Logs"
-                  description="Zero-logs policy on RAM-only volatile infrastructure. No browsing, traffic, DNS, timestamps, or IPs are logged."
+                  description="Birdo VPN operates a strict zero-logs policy on RAM-only volatile infrastructure. No browsing activity, DNS queries, traffic content, connection timestamps, or IP addresses are logged."
                 />
                 <DataItem
                   icon={Shield}
                   title="Account Data Only"
-                  description="Only your email and subscription status are stored in a separate account database — never on VPN servers."
+                  description="Only your email, subscription status, and aggregate bandwidth are stored in a separate account database — never on VPN servers."
                 />
                 <DataItem
                   icon={BarChart3}
-                  title="Anonymous Crash Reports"
-                  description="Crash reports help us fix bugs. They contain no personal information."
+                  title="Crash Reports"
+                  description="Anonymous crash reports help fix bugs faster. No personal data is included."
                 />
                 <DataItem
                   icon={ShieldOff}
                   title="No Data Sales"
-                  description="Your data is never sold, shared with advertisers, or monetized in any way."
+                  description="Your data is never sold, shared with advertisers, or used for profiling."
                 />
               </div>
             </BirdoCard>
@@ -101,13 +100,13 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             href="https://birdo.app/privacy"
             target="_blank"
             rel="noopener noreferrer"
-            className="mb-6 text-sm underline underline-offset-2 transition hover:opacity-100"
-            style={{ color: white.w60 }}
+            className="mb-6 text-sm underline underline-offset-2 transition hover:opacity-80"
+            style={{ color: brand.purpleSoft }}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.3 }}
           >
-            Read our full Privacy Policy
+            Read the full Privacy Policy
           </motion.a>
 
           {/* Accept button */}
@@ -144,13 +143,12 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
 
           {/* Required notice */}
           <motion.p
-            className="mt-4 text-xs text-center"
-            style={{ color: white.w40 }}
+            className="mt-4 text-center text-xs text-w40"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.45 }}
           >
-            Consent is required to use Birdo VPN. Declining will close the app.
+            You must accept the privacy policy to use Birdo VPN.
           </motion.p>
         </motion.div>
       </div>
@@ -169,14 +167,12 @@ function DataItem({
 }) {
   return (
     <div className="flex gap-3">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white/10">
-        <Icon size={18} className="text-white/70" />
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-birdo-sm bg-white/10">
+        <Icon size={18} className="text-w60" />
       </div>
       <div>
-        <p className="text-sm font-medium text-white">{title}</p>
-        <p className="mt-0.5 text-xs text-white/50 leading-relaxed">
-          {description}
-        </p>
+        <p className="text-sm font-medium text-w100">{title}</p>
+        <p className="mt-0.5 text-xs leading-relaxed text-w60">{description}</p>
       </div>
     </div>
   );

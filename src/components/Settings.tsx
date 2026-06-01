@@ -1,122 +1,217 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+/**
+ * Settings — mobile-parity top-level TAB ROOT.
+ *
+ * Mirrors mobile's `SettingsScreen.kt`: a short scrollable list of
+ * `BirdoSectionHeader` + `BirdoCard` groups built from `BirdoToggleRow` /
+ * `BirdoNavRow`, with the heavy/configurable surfaces PUSHED to their own
+ * sub-screens (VPN Settings, Split Tunneling, Port Forwarding, Subscription).
+ *
+ * As a TAB ROOT it renders its OWN title header (no pushed BirdoTopBar / back
+ * button) — matching `ProfileScreen.kt` / Profile.tsx.
+ *
+ * Sections (mobile order): APPEARANCE (theme), CONNECTION (kill switch,
+ * auto-connect, notifications + show-IP / show-location sub-toggles), SECURITY
+ * (biometric unlock — hidden when unavailable), STARTUP (launch at login, start
+ * minimized), MANAGE (push rows), ABOUT (version + updates + support links).
+ *
+ * Every settings write goes through the SAME full-object path used elsewhere:
+ *   invoke('save_settings', { settings: settingsToRust(next) })
+ * Partial saves are never sent. `get_settings` hydrates the store on mount.
+ *
+ * Specials:
+ *   - Kill Switch is armed via `enable_killswitch` / `disable_killswitch`; the
+ *     Rust `disable_killswitch` command is REJECTED while the VPN is up, so we
+ *     surface that inline and reconcile the armed flag from `get_killswitch_status`.
+ *   - Biometric Unlock uses `check_biometric_available` -> { available, enabled,
+ *     method }; toggling calls `set_biometric_enabled` { enabled } and, when
+ *     enabling, confirms with `authenticate_biometric` { reason }.
+ *
+ * Split-Tunnel + Multi-Hop have moved OUT of Settings (they live on the
+ * dashboard / their own screens now).
+ */
+import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { getVersion } from '@tauri-apps/api/app';
-import { useAppStore } from '@/store/app-store';
+import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { motion, AnimatePresence } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
-import { UpdateChecker } from './UpdateChecker';
-import { isValidDnsAddress, isValidPort, settingsToRust } from '@/utils/helpers';
 import {
   Shield,
   Wifi,
   Bell,
-  ExternalLink,
-  Info,
-  Globe,
+  Eye,
+  MapPin,
+  Fingerprint,
   Zap,
   Monitor,
-  Server,
-  ChevronRight,
-  X,
-  Plus,
-  AlertTriangle,
-  Network,
-  Router,
   SlidersHorizontal,
-  Trash2,
-  Loader2,
-  Eye,
-  Lock,
-  Sun,
+  Split,
+  Router,
+  CreditCard,
+  ExternalLink,
+  ShieldCheck,
+  FileText,
+  Palette,
   Moon,
+  Sun,
   Laptop,
+  AlertTriangle,
+  Gauge,
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useAppStore } from '@/store/app-store';
+import { settingsToRust, settingsFromRust, type RustSettings } from '@/utils/helpers';
+import {
+  BirdoCard,
+  BirdoSectionHeader,
+  BirdoToggleRow,
+  BirdoNavRow,
+} from '@/components/birdo';
+import { UpdateChecker } from './UpdateChecker';
+import {
+  brand,
+  status as statusTokens,
+  surface,
+  white,
+  hairline,
+  motion as motionTokens,
+} from '@/lib/birdo-theme';
+import type { ThemeMode } from '@/store/app-store';
+
+const DASHBOARD_URL = 'https://dashboard.birdo.app';
+const PRIVACY_URL = 'https://birdo.app/privacy';
+const TERMS_URL = 'https://birdo.app/terms';
+
+/** Shape returned by the Rust `get_killswitch_status` command. */
+interface KillSwitchStatus {
+  enabled: boolean;
+  active: boolean;
+  blocking_connections: number;
+}
+
+/** Shape returned by the Rust `check_biometric_available` command. */
+interface BiometricStatus {
+  available: boolean;
+  enabled: boolean;
+  method: string; // "windows_hello" | "touch_id" | "none"
+}
+
+/** Shape returned by the Rust `run_speed_test_command`. */
+interface SpeedTestResult {
+  downloadMbps: number;
+  uploadMbps: number;
+  latencyMs: number;
+}
+
+const THEME_OPTIONS: { value: ThemeMode; label: string; icon: typeof Moon }[] = [
+  { value: 'dark', label: 'Dark', icon: Moon },
+  { value: 'light', label: 'Light', icon: Sun },
+  { value: 'system', label: 'System', icon: Laptop },
+];
 
 export function Settings() {
-  const [appVersion, setAppVersion] = useState('');
-  const [dnsInput, setDnsInput] = useState('');
-  const [dnsError, setDnsError] = useState<string | null>(null);
-  const [killSwitchError, setKillSwitchError] = useState<string | null>(null);
-  const [activeSection, setActiveSection] = useState<string | null>(null);
-  const [customPortInput, setCustomPortInput] = useState('');
-  const [customMtuInput, setCustomMtuInput] = useState('');
-  const [portFwdPort, setPortFwdPort] = useState('');
-  const [portFwdProtocol, setPortFwdProtocol] = useState<'tcp' | 'udp'>('tcp');
-  const [portFwdLoading, setPortFwdLoading] = useState(false);
-  const [speedTestRunning, setSpeedTestRunning] = useState(false);
-  const [speedTestResult, setSpeedTestResult] = useState<{
-    downloadMbps: number;
-    uploadMbps: number;
-    latencyMs: number;
-    jitterMs: number;
-  } | null>(null);
-  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-    };
-  }, []);
-
-  const { settings, updateSettings, portForwards, setPortForwards, theme, setTheme, account } = useAppStore(
+  const {
+    settings,
+    updateSettings,
+    hydrateSettings,
+    connectionState,
+    theme,
+    setTheme,
+    pushRoute,
+  } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
-      portForwards: s.portForwards,
-      setPortForwards: s.setPortForwards,
+      hydrateSettings: s.hydrateSettings,
+      connectionState: s.connectionState,
       theme: s.theme,
       setTheme: s.setTheme,
-      account: s.account,
-    }))
+      pushRoute: s.pushRoute,
+    })),
   );
 
-  const planLevel = (plan: string | null | undefined): number => {
-    switch (plan?.toUpperCase()) {
-      case 'SOVEREIGN': return 2;
-      case 'OPERATIVE': return 1;
-      default: return 0;
-    }
-  };
-  const userPlan = planLevel(account?.plan);
-  const hasOperative = userPlan >= 1;
-  const hasSovereign = userPlan >= 2;
+  const [appVersion, setAppVersion] = useState('');
+  const [killSwitchError, setKillSwitchError] = useState<string | null>(null);
+  const [biometric, setBiometric] = useState<BiometricStatus | null>(null);
 
-  useEffect(() => {
-    getVersion().then(setAppVersion).catch(() => setAppVersion('unknown'));
+  // ── Speed test (on-device, through the tunnel via Rust) ───────────────────
+  const [speedTestRunning, setSpeedTestRunning] = useState(false);
+  const [speedTestResult, setSpeedTestResult] = useState<SpeedTestResult | null>(null);
+  const runSpeedTest = useCallback(async () => {
+    setSpeedTestRunning(true);
+    setSpeedTestResult(null);
+    try {
+      const result = await invoke<SpeedTestResult>('run_speed_test_command');
+      setSpeedTestResult(result);
+    } catch {
+      /* surfaced via the disabled->enabled re-enable; Rust logs detail */
+    } finally {
+      setSpeedTestRunning(false);
+    }
   }, []);
 
-  // Initialize custom port/MTU inputs from settings
-  useEffect(() => {
-    if (settings.wireGuardPort && !['auto', '51820', '53'].includes(settings.wireGuardPort)) {
-      setCustomPortInput(settings.wireGuardPort);
-    }
-    if (settings.wireGuardMtu > 0) {
-      setCustomMtuInput(settings.wireGuardMtu.toString());
-    }
-  }, [settings.wireGuardPort, settings.wireGuardMtu]);
+  // The Rust `disable_killswitch` command is rejected unless the tunnel is fully
+  // down. Mirror that here (anything other than disconnected/error counts as up).
+  const vpnActive = connectionState !== 'disconnected' && connectionState !== 'error';
 
-  // Persist settings to Rust backend whenever they change
-  const saveSettingsToBackend = useCallback(
-    async (newSettings: typeof settings) => {
-      try {
-        await invoke('save_settings', {
-          settings: settingsToRust(newSettings),
-        });
-      } catch {
-        // Settings save failed — ignored (Rust backend logs the error)
-      }
+  // ── Hydrate settings from Rust on mount ────────────────────────────────────
+  useEffect(() => {
+    invoke<RustSettings>('get_settings')
+      .then((rs) => hydrateSettings(settingsFromRust(rs)))
+      .catch(() => {
+        /* Rust backend logs the error; keep persisted preference */
+      });
+  }, [hydrateSettings]);
+
+  // ── App version ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    invoke<string>('get_app_version')
+      .then(setAppVersion)
+      .catch(() => setAppVersion('unknown'));
+  }, []);
+
+  // ── Reconcile the armed kill-switch flag with the backend source of truth ──
+  useEffect(() => {
+    invoke<KillSwitchStatus>('get_killswitch_status')
+      .then((s) => {
+        if (s.enabled !== useAppStore.getState().settings.killSwitchEnabled) {
+          updateSettings({ killSwitchEnabled: s.enabled });
+        }
+      })
+      .catch(() => {
+        /* Rust logs; keep persisted preference */
+      });
+  }, [updateSettings]);
+
+  // ── Biometric availability ────────────────────────────────────────────────
+  useEffect(() => {
+    invoke<BiometricStatus>('check_biometric_available')
+      .then(setBiometric)
+      .catch(() => setBiometric({ available: false, enabled: false, method: 'none' }));
+  }, []);
+
+  // ── Persist the FULL settings object via the shared settingsToRust path ─────
+  const saveSettingsToBackend = useCallback(async (next: typeof settings) => {
+    try {
+      await invoke('save_settings', { settings: settingsToRust(next) });
+    } catch {
+      /* Rust backend logs the error */
+    }
+  }, []);
+
+  // Patch the store + persist the full object.
+  const persist = useCallback(
+    (patch: Partial<typeof settings>) => {
+      const next = { ...useAppStore.getState().settings, ...patch };
+      updateSettings(patch);
+      saveSettingsToBackend(next);
     },
-    []
+    [updateSettings, saveSettingsToBackend],
   );
 
-  const handleToggle = async (
-    key: keyof typeof settings,
-    value: boolean
-  ) => {
-    // Special handling for kill switch
-    if (key === 'killSwitchEnabled') {
+  // ── Kill Switch (special: armed via enable/disable_killswitch) ──────────────
+  const handleKillSwitch = useCallback(
+    async (value: boolean) => {
+      setKillSwitchError(null);
       try {
-        setKillSwitchError(null);
         if (value) {
           await invoke('enable_killswitch');
         } else {
@@ -124,1020 +219,368 @@ export function Settings() {
         }
       } catch (err) {
         const msg = String(err);
-        if (msg.toLowerCase().includes('administrator')) {
+        const lower = msg.toLowerCase();
+        if (lower.includes('administrator') || lower.includes('root') || lower.includes('privilege')) {
           setKillSwitchError(
-            'Kill switch requires administrator privileges. Right-click the app and select "Run as administrator".'
+            'Kill switch requires administrator privileges. Run Birdo as administrator and try again.',
           );
-        } else if (msg.toLowerCase().includes('vpn is')) {
-          setKillSwitchError(
-            'Cannot disable kill switch while VPN is active. Disconnect first.'
-          );
+        } else if (
+          lower.includes('connected') ||
+          lower.includes('connecting') ||
+          lower.includes('disconnect first') ||
+          lower.includes('vpn is')
+        ) {
+          setKillSwitchError('Cannot disable the kill switch while the VPN is connected. Disconnect first.');
         } else {
           setKillSwitchError(msg);
         }
         return;
       }
-    }
+      persist({ killSwitchEnabled: value });
+    },
+    [persist],
+  );
 
-    // Special handling for autostart
-    if (key === 'autostart') {
+  // ── Auto-start (special: OS integration via set_autostart) ──────────────────
+  const handleAutostart = useCallback(
+    async (value: boolean) => {
       try {
         await invoke('set_autostart', { enabled: value });
       } catch {
-        // Autostart toggle failed
+        /* Autostart toggle failed — leave the setting unchanged */
         return;
       }
-    }
+      persist({ autostart: value });
+    },
+    [persist],
+  );
 
-    const next = { ...settings, [key]: value };
-    updateSettings({ [key]: value });
-    saveSettingsToBackend(next);
-  };
-
-  const isValidIp = (ip: string): boolean => {
-    const result = isValidDnsAddress(ip);
-    if (!result.valid && result.error) {
-      setDnsError(result.error);
-      return false;
-    }
-    return result.valid;
-  };
-
-  const addDns = () => {
-    const ip = dnsInput.trim();
-    if (!ip) return;
-    if (!isValidIp(ip)) {
-      return;
-    }
-    const current = settings.customDns || [];
-    if (current.includes(ip)) {
-      setDnsError('DNS server already added');
-      return;
-    }
-    if (current.length >= 3) {
-      setDnsError('Maximum 3 DNS servers allowed');
-      return;
-    }
-    setDnsError(null);
-    const next = [...current, ip];
-    const updated = { ...settings, customDns: next };
-    updateSettings({ customDns: next });
-    saveSettingsToBackend(updated);
-    setDnsInput('');
-  };
-
-  const removeDns = (ip: string) => {
-    const next = (settings.customDns || []).filter((d) => d !== ip);
-    const updated = { ...settings, customDns: next.length > 0 ? next : null };
-    updateSettings({ customDns: next.length > 0 ? next : null });
-    saveSettingsToBackend(updated);
-  };
-
-  // Split-tunneling and Multi-Hop have moved out of Settings:
-  //   - Split tunneling is configured per-connection on the Dashboard
-  //   - Multi-Hop has its own selector card on the Dashboard (Sovereign-gated)
+  // ── Biometric Unlock (special: keyring-backed + optional confirm) ───────────
+  const handleBiometric = useCallback(
+    async (value: boolean) => {
+      // When enabling, confirm the user can actually authenticate first.
+      if (value) {
+        try {
+          const ok = await invoke<boolean>('authenticate_biometric', {
+            reason: 'Confirm to enable biometric unlock',
+          });
+          if (!ok) return; // user cancelled — leave it off
+        } catch {
+          /* Auth failed/unavailable — abort enabling */
+          return;
+        }
+      }
+      try {
+        await invoke('set_biometric_enabled', { enabled: value });
+        setBiometric((prev) => (prev ? { ...prev, enabled: value } : prev));
+      } catch {
+        /* Persist failed — Rust logs the error */
+      }
+    },
+    [],
+  );
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="p-4 space-y-5">
+    <div className="h-full overflow-y-auto" style={{ backgroundColor: surface.s0 }}>
+      {/* Tab-root header (no back button) */}
+      <div data-tauri-drag-region className="px-5 pb-2 pt-6">
+        <h1 className="text-[22px] font-semibold" style={{ color: '#FFFFFF' }}>
+          Settings
+        </h1>
+        <p className="mt-0.5 text-[13px]" style={{ color: white.w60 }}>
+          App preferences &amp; account
+        </p>
+      </div>
 
-        {/* ── Connection Section ── */}
-        <Section title="Connection">
-          <SettingToggle
-            icon={Shield}
+      <div className="flex flex-col gap-1 px-5 pb-12 pt-2">
+        {/* ── APPEARANCE ─────────────────────────────────────────────── */}
+        <BirdoSectionHeader title="Appearance" />
+        <ThemeSelector theme={theme} onSelect={setTheme} />
+
+        {/* ── CONNECTION ─────────────────────────────────────────────── */}
+        <BirdoSectionHeader title="Connection" className="mt-2" />
+        <BirdoCard padding="0.25rem">
+          <BirdoToggleRow
             title="Kill Switch"
-            description="Block all traffic if VPN disconnects"
-            enabled={settings.killSwitchEnabled}
-            onChange={(v) => handleToggle('killSwitchEnabled', v)}
+            subtitle="Block all traffic if the VPN connection drops"
+            leadingIcon={Shield}
+            leadingTint={statusTokens.green}
+            checked={settings.killSwitchEnabled}
+            onCheckedChange={handleKillSwitch}
           />
+          <BirdoToggleRow
+            title="Auto-Connect"
+            subtitle="Connect to the VPN when the app starts"
+            leadingIcon={Wifi}
+            leadingTint={statusTokens.blue}
+            checked={settings.autoConnect}
+            onCheckedChange={(v) => persist({ autoConnect: v })}
+          />
+          <BirdoToggleRow
+            title="Notifications"
+            subtitle="Show connection status notifications"
+            leadingIcon={Bell}
+            leadingTint={statusTokens.yellow}
+            checked={settings.notifications}
+            onCheckedChange={(v) => persist({ notifications: v })}
+          />
+
+          {/* Expandable show-IP / show-location sub-toggles. */}
+          <AnimatePresence initial={false}>
+            {settings.notifications && (
+              <motion.div
+                className="overflow-hidden"
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
+              >
+                <div className="ml-2 border-l" style={{ borderColor: hairline.soft }}>
+                  <BirdoToggleRow
+                    title="Show IP in notification"
+                    subtitle="Display your VPN IP address"
+                    leadingIcon={Eye}
+                    leadingTint={white.w60}
+                    checked={settings.showIpInNotification}
+                    onCheckedChange={(v) => updateSettings({ showIpInNotification: v })}
+                  />
+                  <BirdoToggleRow
+                    title="Show location in notification"
+                    subtitle="Display the server city / country"
+                    leadingIcon={MapPin}
+                    leadingTint={white.w60}
+                    checked={settings.showLocationInNotification}
+                    onCheckedChange={(v) => updateSettings({ showLocationInNotification: v })}
+                  />
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </BirdoCard>
+
+        <AnimatePresence>
           {killSwitchError && (
             <motion.div
-              className="flex items-start gap-2 rounded-lg border border-yellow-500/20 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300"
+              className="mt-2 flex items-start gap-2 rounded-birdo-sm px-3 py-2 text-xs"
+              style={{
+                backgroundColor: statusTokens.yellowBg,
+                border: `1px solid ${hairline.soft}`,
+                color: statusTokens.yellowLight,
+              }}
               initial={{ opacity: 0, height: 0 }}
               animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
             >
-              <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" aria-hidden />
               <span>{killSwitchError}</span>
             </motion.div>
           )}
-          <SettingToggle
-            icon={Wifi}
-            title="Auto-Connect"
-            description="Connect to VPN when app starts"
-            enabled={settings.autoConnect}
-            onChange={(v) => handleToggle('autoConnect', v)}
-          />
-          <SettingToggle
-            icon={Bell}
-            title="Notifications"
-            description="Show connection status notifications"
-            enabled={settings.notifications}
-            onChange={(v) => handleToggle('notifications', v)}
-          />
-        </Section>
+        </AnimatePresence>
 
-        {/* ── Startup Section ── */}
-        <Section title="Startup">
-          <SettingToggle
-            icon={Zap}
+        {vpnActive && (
+          <p className="mt-1.5 px-1 text-[11px]" style={{ color: white.w40 }}>
+            The kill switch can&apos;t be turned off while the VPN is connected. Disconnect first.
+          </p>
+        )}
+
+        {/* ── SECURITY (biometric — hidden when unavailable) ───────────── */}
+        {biometric?.available && (
+          <>
+            <BirdoSectionHeader title="Security" className="mt-2" />
+            <BirdoCard padding="0.25rem">
+              <BirdoToggleRow
+                title="Biometric Unlock"
+                subtitle={
+                  biometric.method === 'touch_id'
+                    ? 'Require Touch ID to open the app'
+                    : 'Require Windows Hello to open the app'
+                }
+                leadingIcon={Fingerprint}
+                leadingTint={statusTokens.green}
+                checked={biometric.enabled}
+                onCheckedChange={handleBiometric}
+              />
+            </BirdoCard>
+          </>
+        )}
+
+        {/* ── STARTUP ────────────────────────────────────────────────── */}
+        <BirdoSectionHeader title="Startup" className="mt-2" />
+        <BirdoCard padding="0.25rem">
+          <BirdoToggleRow
             title="Launch at Login"
-            description="Start Birdo VPN when your computer starts"
-            enabled={settings.autostart}
-            onChange={(v) => handleToggle('autostart', v)}
+            subtitle="Start Birdo VPN when your computer starts"
+            leadingIcon={Zap}
+            leadingTint={brand.purple}
+            checked={settings.autostart}
+            onCheckedChange={handleAutostart}
           />
-          <SettingToggle
-            icon={Monitor}
+          <BirdoToggleRow
             title="Start Minimized"
-            description="Start in system tray instead of full window"
-            enabled={settings.startMinimized}
-            onChange={(v) => handleToggle('startMinimized', v)}
+            subtitle="Start in the system tray instead of a full window"
+            leadingIcon={Monitor}
+            leadingTint={white.w60}
+            checked={settings.startMinimized}
+            onCheckedChange={(v) => persist({ startMinimized: v })}
           />
-        </Section>
+        </BirdoCard>
 
-        {/* ── Appearance Section ── */}
-        <Section title="Appearance">
-          <div className="glass rounded-lg p-3">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
-                <Sun size={18} className="text-white" />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-white">Theme</p>
-                <p className="text-xs text-white/50">Choose dark or light mode</p>
-              </div>
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              {[
-                { value: 'dark' as const, icon: Moon, label: 'Dark' },
-                { value: 'light' as const, icon: Sun, label: 'Light' },
-                { value: 'system' as const, icon: Laptop, label: 'System' },
-              ].map((opt) => (
-                <button
-                  key={opt.value}
-                  onClick={() => setTheme(opt.value)}
-                  className={`flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition ${
-                    theme === opt.value
-                      ? 'bg-white text-black'
-                      : 'bg-white/5 text-white/60 hover:bg-white/10'
-                  }`}
-                >
-                  <opt.icon size={14} />
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        </Section>
-
-        {/* ── DNS Section ── */}
-        <Section title="DNS">
-          <SettingExpandable
-            icon={Globe}
-            title="Custom DNS Servers"
-            description={
-              settings.customDns && settings.customDns.length > 0
-                ? `${settings.customDns.length} server${settings.customDns.length > 1 ? 's' : ''} configured`
-                : 'Using VPN default DNS'
-            }
-            expanded={activeSection === 'dns'}
-            onToggle={() =>
-              setActiveSection(activeSection === 'dns' ? null : 'dns')
-            }
-          >
-            <div className="mt-3 space-y-2">
-              {(settings.customDns || []).map((dns) => (
-                <div
-                  key={dns}
-                  className="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2"
-                >
-                  <span className="text-sm text-white font-mono">{dns}</span>
-                  <button
-                    onClick={() => removeDns(dns)}
-                    className="text-white/40 hover:text-red-400 transition"
-                    aria-label={`Remove ${dns}`}
-                  >
-                    <X size={14} />
-                  </button>
-                </div>
-              ))}
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={dnsInput}
-                  onChange={(e) => {
-                    setDnsInput(e.target.value);
-                    setDnsError(null);
-                  }}
-                  onKeyDown={(e) => e.key === 'Enter' && addDns()}
-                  placeholder="e.g. 1.1.1.1"
-                  className="flex-1 rounded-lg glass-input px-3 py-1.5 text-sm text-white placeholder-white/30 outline-none font-mono"
-                />
-                <button
-                  onClick={addDns}
-                  className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-white transition hover:bg-white/20"
-                >
-                  <Plus size={14} />
-                </button>
-              </div>
-              {dnsError && (
-                <p className="text-xs text-red-400">{dnsError}</p>
-              )}
-              <p className="text-xs text-white/30">
-                Leave empty to use the VPN server's DNS. Popular options: 1.1.1.1
-                (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9)
-              </p>
-            </div>
-          </SettingExpandable>
-        </Section>
-
-        {/* ── VPN Settings Section ── */}
-        <Section title="VPN Settings">
-          <SettingToggle
-            icon={Network}
-            title="Local Network Sharing"
-            description="Access local devices (printers, NAS) while connected"
-            enabled={settings.localNetworkSharing}
-            onChange={(v) => handleToggle('localNetworkSharing', v)}
+        {/* ── MANAGE (push rows) ─────────────────────────────────────── */}
+        <BirdoSectionHeader title="Manage" className="mt-2" />
+        <BirdoCard padding="0.25rem">
+          <BirdoNavRow
+            title="VPN Settings"
+            subtitle="Protocol, DNS, kill switch & WireGuard tuning"
+            leadingIcon={SlidersHorizontal}
+            leadingTint={statusTokens.blue}
+            onClick={() => pushRoute('vpnSettings')}
           />
-
-          <SettingExpandable
-            icon={Router}
-            title="WireGuard Port"
-            description={
-              settings.wireGuardPort === 'auto'
-                ? 'Automatic'
-                : `Port ${settings.wireGuardPort}`
-            }
-            expanded={activeSection === 'port'}
-            onToggle={() =>
-              setActiveSection(activeSection === 'port' ? null : 'port')
-            }
-          >
-            <div className="mt-3 space-y-2">
-              {(['auto', '51820', '53', 'custom'] as const).map((option) => {
-                const selectedPort = ['auto', '51820', '53'].includes(settings.wireGuardPort)
-                  ? settings.wireGuardPort
-                  : 'custom';
-                return (
-                  <label
-                    key={option}
-                    className={`flex items-center gap-3 rounded-lg px-3 py-2 cursor-pointer transition ${
-                      selectedPort === option
-                        ? 'bg-white/10'
-                        : 'hover:bg-white/5'
-                    }`}
-                  >
-                    <div
-                      className={`h-4 w-4 rounded-full border-2 flex items-center justify-center ${
-                        selectedPort === option
-                          ? 'border-white'
-                          : 'border-white/30'
-                      }`}
-                    >
-                      {selectedPort === option && (
-                        <div className="h-2 w-2 rounded-full bg-white" />
-                      )}
-                    </div>
-                    <span className="text-sm text-white">
-                      {option === 'auto'
-                        ? 'Automatic'
-                        : option === 'custom'
-                        ? 'Custom'
-                        : option}
-                    </span>
-                    <input
-                      type="radio"
-                      name="wg-port"
-                      className="sr-only"
-                      checked={selectedPort === option}
-                      onChange={() => {
-                        if (option === 'custom') {
-                          const port = customPortInput;
-                          const next = {
-                            ...settings,
-                            wireGuardPort: isValidPort(port) ? port : 'auto',
-                          };
-                          updateSettings({ wireGuardPort: next.wireGuardPort });
-                          saveSettingsToBackend(next);
-                        } else {
-                          const next = { ...settings, wireGuardPort: option };
-                          updateSettings({ wireGuardPort: option });
-                          saveSettingsToBackend(next);
-                        }
-                      }}
-                    />
-                  </label>
-                );
-              })}
-
-              {!['auto', '51820', '53'].includes(settings.wireGuardPort) && (
-                <div className="ml-7">
-                  <input
-                    type="text"
-                    value={customPortInput}
-                    onChange={(e) => {
-                      const filtered = e.target.value.replace(/\D/g, '').slice(0, 5);
-                      setCustomPortInput(filtered);
-                      if (isValidPort(filtered)) {
-                        updateSettings({ wireGuardPort: filtered });
-                        if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-                        saveDebounceRef.current = setTimeout(() => {
-                          const next = { ...useAppStore.getState().settings, wireGuardPort: filtered };
-                          saveSettingsToBackend(next);
-                        }, 500);
-                      }
-                    }}
-                    placeholder="1-65535"
-                    className="w-full rounded-lg glass-input px-3 py-1.5 text-sm text-white placeholder-white/30 outline-none font-mono"
-                  />
-                </div>
-              )}
-
-              <p className="text-xs text-white/30">
-                Use port 53 to bypass restrictive firewalls. Default is 51820.
-              </p>
-            </div>
-          </SettingExpandable>
-
-          <SettingExpandable
-            icon={SlidersHorizontal}
-            title="MTU"
-            description={
-              settings.wireGuardMtu === 0
-                ? 'Automatic (server default)'
-                : `Custom: ${settings.wireGuardMtu}`
-            }
-            expanded={activeSection === 'mtu'}
-            onToggle={() =>
-              setActiveSection(activeSection === 'mtu' ? null : 'mtu')
-            }
-          >
-            <div className="mt-3 space-y-2">
-              <label className="flex items-center gap-3 rounded-lg px-3 py-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={settings.wireGuardMtu === 0}
-                  onChange={(e) => {
-                    if (e.target.checked) {
-                      setCustomMtuInput('');
-                      const next = { ...settings, wireGuardMtu: 0 };
-                      updateSettings({ wireGuardMtu: 0 });
-                      saveSettingsToBackend(next);
-                    } else {
-                      setCustomMtuInput('1420');
-                      const next = { ...settings, wireGuardMtu: 1420 };
-                      updateSettings({ wireGuardMtu: 1420 });
-                      saveSettingsToBackend(next);
-                    }
-                  }}
-                  className="sr-only"
-                />
-                <div
-                  className={`h-4 w-4 rounded border-2 flex items-center justify-center ${
-                    settings.wireGuardMtu === 0
-                      ? 'border-white bg-white'
-                      : 'border-white/30'
-                  }`}
-                >
-                  {settings.wireGuardMtu === 0 && (
-                    <svg viewBox="0 0 12 12" className="h-3 w-3 text-black">
-                      <path
-                        d="M10 3L4.5 8.5L2 6"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        fill="none"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
-                  )}
-                </div>
-                <span className="text-sm text-white">Automatic (use server default)</span>
-              </label>
-
-              {settings.wireGuardMtu !== 0 && (
-                <div className="ml-7">
-                  <input
-                    type="text"
-                    value={customMtuInput}
-                    onChange={(e) => {
-                      const filtered = e.target.value.replace(/\D/g, '').slice(0, 4);
-                      setCustomMtuInput(filtered);
-                      const n = Number(filtered);
-                      if (n >= 1280 && n <= 1500) {
-                        updateSettings({ wireGuardMtu: n });
-                        if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-                        saveDebounceRef.current = setTimeout(() => {
-                          const next = { ...useAppStore.getState().settings, wireGuardMtu: n };
-                          saveSettingsToBackend(next);
-                        }, 500);
-                      }
-                    }}
-                    placeholder="1280-1500"
-                    className="w-full rounded-lg glass-input px-3 py-1.5 text-sm text-white placeholder-white/30 outline-none font-mono"
-                  />
-                  <p className="mt-1 text-xs text-white/30">
-                    Valid range: 1280 - 1500. Recommended: 1420
-                  </p>
-                </div>
-              )}
-            </div>
-          </SettingExpandable>
-
-          {/* Info note matching Android */}
-          <div className="glass rounded-lg p-3 flex items-center gap-3">
-            <Info size={14} className="text-white/40 shrink-0" />
-            <p className="text-xs text-white/40">
-              Changes take effect on next connection.
-            </p>
-          </div>
-        </Section>
-
-        {/* ── Stealth & Quantum Section ── */}
-        <Section title="Stealth & Quantum">
-          <SettingToggle
-            icon={Eye}
-            title="Stealth Mode"
-            description={hasOperative ? "Disguise VPN traffic as normal HTTPS (Xray Reality)" : "Requires Operative plan or higher"}
-            enabled={settings.stealthMode}
-            onChange={(v) => handleToggle('stealthMode', v)}
-            disabled={!hasOperative}
+          <BirdoNavRow
+            title="Split Tunneling"
+            subtitle="Choose which apps bypass the VPN"
+            leadingIcon={Split}
+            leadingTint={white.w60}
+            onClick={() => pushRoute('splitTunnel')}
           />
-          <SettingToggle
-            icon={Lock}
-            title="Quantum Protection"
-            description="Post-quantum key exchange (Rosenpass hybrid PSK)"
-            enabled={settings.quantumProtection}
-            onChange={(v) => handleToggle('quantumProtection', v)}
+          <BirdoNavRow
+            title="Port Forwarding"
+            subtitle="Forward external ports to your device"
+            leadingIcon={Router}
+            leadingTint={white.w60}
+            onClick={() => pushRoute('portForward')}
           />
-          <div className="glass rounded-lg p-3 flex items-center gap-3">
-            <Info size={14} className="text-white/40 shrink-0" />
-            <p className="text-xs text-white/40">
-              Stealth mode wraps WireGuard in TLS 1.3 to bypass censorship.
-              Quantum protection adds future-proof key exchange. Both enabled by default.
-            </p>
-          </div>
-        </Section>
+          <BirdoNavRow
+            title="Subscription"
+            subtitle="Manage your plan & billing"
+            leadingIcon={CreditCard}
+            leadingTint={brand.purpleSoft}
+            onClick={() => pushRoute('subscription')}
+          />
+        </BirdoCard>
 
-        {/* Split Tunneling and Multi-Hop have moved to the Dashboard
-            (the Connect page) where they apply per-session. */}
-
-        {/* ── Port Forwarding Section ── */}
-        <Section title="Port Forwarding">
-          <div className={`glass rounded-lg p-3 space-y-3 ${!hasSovereign ? 'opacity-50 pointer-events-none' : ''}`}>
-            {!hasSovereign && (
-              <p className="text-xs text-amber-400">Requires Sovereign plan</p>
-            )}
-            <div className="flex items-center gap-3 mb-2">
-              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
-                <Router size={18} className="text-white" />
-              </div>
-              <div className="flex-1">
-                <p className="text-sm font-medium text-white">Port Forwards</p>
-                <p className="text-xs text-white/50">
-                  Forward external ports to your device
-                </p>
-              </div>
+        {/* ── SPEED TEST ─────────────────────────────────────────────── */}
+        <BirdoSectionHeader title="Speed Test" className="mt-2" />
+        <BirdoCard>
+          <div className="flex items-center gap-3.5">
+            <div
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
+              style={{ backgroundColor: white.w05 }}
+            >
+              <Gauge size={18} color={statusTokens.greenLight} aria-hidden />
             </div>
-
-            {/* Active forwards list */}
-            {portForwards.length > 0 && (
-              <div className="space-y-1">
-                {portForwards.map((pf) => (
-                  <div
-                    key={pf.id}
-                    className="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2"
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className={`h-2 w-2 rounded-full ${pf.enabled ? 'bg-green-400' : 'bg-white/30'}`} />
-                      <span className="text-sm text-white">
-                        {pf.externalPort} → {pf.internalPort}
-                      </span>
-                      <span className="text-xs text-white/40 uppercase">{pf.protocol}</span>
-                    </div>
-                    <button
-                      onClick={async () => {
-                        try {
-                          await invoke('delete_port_forward', { id: pf.id });
-                          setPortForwards(portForwards.filter((f) => f.id !== pf.id));
-                        } catch {
-                          // Port forward delete failed
-                        }
-                      }}
-                      className="text-white/40 hover:text-red-400 transition"
-                      aria-label={`Delete port forward ${pf.externalPort}`}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                ))}
+            <div className="min-w-0 flex-1">
+              <div className="text-[15px] font-medium" style={{ color: white.w100 }}>
+                Connection Speed
               </div>
-            )}
-
-            {/* Add new port forward */}
-            <div className="flex gap-2 items-end">
-              <div className="flex-1">
-                <label className="text-xs text-white/50 mb-1 block">Port</label>
-                <input
-                  type="number"
-                  min="1"
-                  max="65535"
-                  value={portFwdPort}
-                  onChange={(e) => setPortFwdPort(e.target.value)}
-                  placeholder="8080"
-                  className="w-full rounded-lg glass-input px-3 py-1.5 text-sm text-white placeholder-white/30 outline-none"
-                />
-              </div>
-              <div>
-                <label className="text-xs text-white/50 mb-1 block">Protocol</label>
-                <select
-                  className="rounded-lg glass-input px-3 py-1.5 text-sm text-white outline-none"
-                  value={portFwdProtocol}
-                  onChange={(e) => setPortFwdProtocol(e.target.value as 'tcp' | 'udp')}
-                >
-                  <option value="tcp">TCP</option>
-                  <option value="udp">UDP</option>
-                </select>
-              </div>
-              <button
-                disabled={portFwdLoading || !portFwdPort}
-                onClick={async () => {
-                  const port = parseInt(portFwdPort, 10);
-                  if (isNaN(port) || port < 1 || port > 65535) return;
-                  setPortFwdLoading(true);
-                  try {
-                    const result = await invoke<{ id: string; externalPort: number; internalPort: number; protocol: string }>('create_port_forward', {
-                      port,
-                      protocol: portFwdProtocol,
-                    });
-                    setPortForwards([...portForwards, {
-                      id: result.id,
-                      externalPort: result.externalPort,
-                      internalPort: result.internalPort,
-                      protocol: result.protocol,
-                      enabled: true,
-                    }]);
-                    setPortFwdPort('');
-                  } catch {
-                    // Port forward create failed
-                  } finally {
-                    setPortFwdLoading(false);
-                  }
-                }}
-                className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-white transition hover:bg-white/20 disabled:opacity-50"
-              >
-                {portFwdLoading ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
-              </button>
-            </div>
-
-            <p className="text-xs text-white/30">
-              Requires an active VPN connection. Forward ports for gaming, torrents, or servers.
-            </p>
-          </div>
-        </Section>
-
-        {/* ── Protocol Section ── */}
-        <Section title="Protocol">
-          <div className="glass rounded-lg p-3 flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
-              <Server size={18} className="text-white" />
-            </div>
-            <div className="flex-1">
-              <p className="text-sm font-medium text-white">WireGuard</p>
-              <p className="text-xs text-white/50">
-                Fast, modern, and secure VPN protocol
-              </p>
-            </div>
-            <span className="rounded-full bg-green-500/10 border border-green-500/20 px-2 py-0.5 text-xs text-green-400">
-              Active
-            </span>
-          </div>
-        </Section>
-
-        {/* ── Speed Test Section ── */}
-        <Section title="Speed Test">
-          <div className={`space-y-3 ${!hasOperative ? 'opacity-50 pointer-events-none' : ''}`}>
-            {!hasOperative && (
-              <p className="text-xs text-amber-400">Requires Operative plan or higher</p>
-            )}
-            <div className="glass rounded-lg p-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/10">
-                    <Zap size={18} className="text-white" />
-                  </div>
-                  <div>
-                    <p className="text-sm font-medium text-white">Test VPN Speed</p>
-                    <p className="text-xs text-white/50">
-                      {speedTestResult
-                        ? `↓ ${speedTestResult.downloadMbps.toFixed(1)} / ↑ ${speedTestResult.uploadMbps.toFixed(1)} Mbps · ${speedTestResult.latencyMs}ms`
-                        : 'Measure download, upload & latency'}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  disabled={speedTestRunning}
-                  onClick={async () => {
-                    setSpeedTestRunning(true);
-                    setSpeedTestResult(null);
-                    try {
-                      const result = await invoke<{
-                        downloadMbps: number;
-                        uploadMbps: number;
-                        latencyMs: number;
-                        jitterMs: number;
-                      }>('run_speed_test_command');
-                      setSpeedTestResult(result);
-                    } catch {
-                      // silent — user can retry
-                    } finally {
-                      setSpeedTestRunning(false);
-                    }
-                  }}
-                  className="rounded-lg bg-white/10 px-3 py-1.5 text-sm text-white transition hover:bg-white/20 disabled:opacity-50"
-                >
-                  {speedTestRunning ? <Loader2 size={14} className="animate-spin" /> : 'Run'}
-                </button>
+              <div className="mt-0.5 text-xs" style={{ color: white.w60 }}>
+                {speedTestResult
+                  ? `↓ ${speedTestResult.downloadMbps.toFixed(1)} / ↑ ${speedTestResult.uploadMbps.toFixed(1)} Mbps · ${speedTestResult.latencyMs}ms`
+                  : 'Measure download, upload & latency'}
               </div>
             </div>
+            <button
+              type="button"
+              onClick={runSpeedTest}
+              disabled={speedTestRunning}
+              className="shrink-0 rounded-birdo-sm px-3.5 py-2 text-[13px] font-semibold transition-colors disabled:opacity-60"
+              style={{ backgroundColor: brand.purpleBg, color: brand.purpleSoft }}
+            >
+              {speedTestRunning ? 'Running…' : 'Run'}
+            </button>
           </div>
-        </Section>
+        </BirdoCard>
 
-        {/* ── Updates Section ── */}
-        <Section title="Updates">
-          <UpdateChecker />
-        </Section>
+        {/* ── ABOUT ──────────────────────────────────────────────────── */}
+        <BirdoSectionHeader title="About" className="mt-2" />
 
-        {/* ── Links Section ── */}
-        <Section title="Support">
-          <div className="space-y-1">
-            <SettingLink
-              title="Manage Subscription"
-              href="https://dashboard.birdo.app"
-            />
-            <SettingLink
-              title="Privacy Policy"
-              href="https://birdo.app/privacy"
-            />
-            <SettingLink
-              title="Terms of Service"
-              href="https://birdo.app/terms"
-            />
-          </div>
-        </Section>
+        <UpdateChecker />
 
-        {/* ── Account Management ── */}
-        <Section title="Account">
-          <div className="space-y-1">
-            <SettingLink
-              title="Change Password"
-              href="https://dashboard.birdo.app/settings"
-            />
-            <SettingLink
-              title="Two-Factor Authentication"
-              href="https://dashboard.birdo.app/settings"
-            />
-            <DataExportButton />
-          </div>
-        </Section>
+        <div className="h-1" />
+        <BirdoCard padding="0.25rem">
+          <BirdoNavRow
+            title="Privacy Policy"
+            subtitle="birdo.app/privacy"
+            leadingIcon={ShieldCheck}
+            leadingTint={brand.purpleSoft}
+            onClick={() => openExternal(PRIVACY_URL)}
+          />
+          <BirdoNavRow
+            title="Terms of Service"
+            subtitle="birdo.app/terms"
+            leadingIcon={FileText}
+            leadingTint={brand.purpleSoft}
+            onClick={() => openExternal(TERMS_URL)}
+          />
+          <BirdoNavRow
+            title="Manage on web"
+            subtitle="Open dashboard.birdo.app in browser"
+            leadingIcon={ExternalLink}
+            leadingTint={brand.purpleSoft}
+            onClick={() => openExternal(DASHBOARD_URL)}
+          />
+        </BirdoCard>
 
-        {/* ── Account Deletion (GDPR) ── */}
-        <Section title="Danger Zone">
-          <DeleteAccountButton />
-        </Section>
-
-        {/* ── About Section ── */}
-        <div className="glass-card rounded-xl p-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-white/10">
-              <Info size={20} className="text-white" />
-            </div>
-            <div>
-              <p className="font-medium text-white">Birdo VPN</p>
-              <p className="text-xs text-white/50">
-                Version {appVersion || '...'}
-              </p>
-            </div>
-          </div>
+        {/* App version footer */}
+        <div className="mt-3 flex items-center gap-2 px-1">
+          <Palette size={14} color={white.w40} aria-hidden />
+          <span className="text-xs" style={{ color: white.w40 }}>
+            Birdo VPN · v{appVersion || '...'}
+          </span>
         </div>
-
-        {/* Bottom spacer */}
-        <div className="h-2" />
       </div>
     </div>
   );
 }
 
-/* ── Sub-components ── */
-
-function Section({
-  title,
-  children,
+/** Segmented dark / light / system theme picker inside a BirdoCard. */
+function ThemeSelector({
+  theme,
+  onSelect,
 }: {
-  title: string;
-  children: React.ReactNode;
+  theme: ThemeMode;
+  onSelect: (mode: ThemeMode) => void;
 }) {
   return (
-    <div>
-      <h3
-        className="mb-2 px-1 text-[11px] font-semibold uppercase"
-        style={{ color: 'rgba(255,255,255,0.60)', letterSpacing: '1.4px' }}
-      >
-        {title}
-      </h3>
-      <div className="space-y-2">{children}</div>
-    </div>
-  );
-}
-
-interface SettingToggleProps {
-  icon: React.ElementType;
-  title: string;
-  description: string;
-  enabled: boolean;
-  onChange: (enabled: boolean) => void;
-  disabled?: boolean;
-}
-
-function SettingToggle({
-  icon: Icon,
-  title,
-  description,
-  enabled,
-  onChange,
-  disabled,
-}: SettingToggleProps) {
-  return (
-    <div
-      className={`flex items-center justify-between rounded-2xl px-3.5 py-3 ${disabled ? 'opacity-50' : ''}`}
-      style={{
-        backgroundColor: '#0B0B10',
-        border: '1px solid rgba(255,255,255,0.08)',
-      }}
-    >
-      <div className="flex items-center gap-3">
+    <BirdoCard>
+      <div className="flex items-center gap-3.5">
         <div
-          className="flex h-9 w-9 items-center justify-center rounded-full"
-          style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
+          style={{ backgroundColor: white.w05 }}
         >
-          <Icon size={16} className="text-white" />
+          <Palette size={18} color={brand.purple} aria-hidden />
         </div>
-        <div>
-          <p className="text-sm font-medium text-white">{title}</p>
-          <p className="text-xs" style={{ color: 'rgba(255,255,255,0.60)' }}>
-            {description}
-          </p>
-        </div>
-      </div>
-      <button
-        role="switch"
-        aria-checked={enabled}
-        aria-label={title}
-        onClick={() => !disabled && onChange(!enabled)}
-        disabled={disabled}
-        className={`relative h-7 w-12 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 ${
-          disabled ? 'cursor-not-allowed' : ''
-        }`}
-        style={{
-          backgroundColor: enabled && !disabled ? '#A855F7' : 'rgba(255,255,255,0.20)',
-        }}
-      >
-        <div
-          className="absolute top-1 h-5 w-5 rounded-full bg-white transition-all"
-          style={{ left: enabled ? '24px' : '4px' }}
-        />
-      </button>
-    </div>
-  );
-}
-
-interface SettingExpandableProps {
-  icon: React.ElementType;
-  title: string;
-  description: string;
-  expanded: boolean;
-  onToggle: () => void;
-  children: React.ReactNode;
-}
-
-function SettingExpandable({
-  icon: Icon,
-  title,
-  description,
-  expanded,
-  onToggle,
-  children,
-}: SettingExpandableProps) {
-  return (
-    <div
-      className="rounded-2xl px-3.5 py-3"
-      style={{
-        backgroundColor: '#0B0B10',
-        border: '1px solid rgba(255,255,255,0.08)',
-      }}
-    >
-      <button
-        onClick={onToggle}
-        className="flex w-full items-center justify-between"
-      >
-        <div className="flex items-center gap-3">
-          <div
-            className="flex h-9 w-9 items-center justify-center rounded-full"
-            style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}
-          >
-            <Icon size={16} className="text-white" />
-          </div>
-          <div className="text-left">
-            <p className="text-sm font-medium text-white">{title}</p>
-            <p className="text-xs" style={{ color: 'rgba(255,255,255,0.60)' }}>
-              {description}
-            </p>
+        <div className="min-w-0 flex-1">
+          <div className="text-[15px] font-medium text-white">Theme</div>
+          <div className="mt-0.5 text-xs" style={{ color: white.w60 }}>
+            Dark, light, or follow system
           </div>
         </div>
-        <ChevronRight
-          size={16}
-          className={`transition-transform ${expanded ? 'rotate-90' : ''}`}
-          style={{ color: 'rgba(255,255,255,0.40)' }}
-        />
-      </button>
-      <AnimatePresence>
-        {expanded && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            className="overflow-hidden"
-          >
-            {children}
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
-
-interface SettingLinkProps {
-  title: string;
-  href: string;
-}
-
-function SettingLink({ title, href }: SettingLinkProps) {
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="flex items-center justify-between rounded-2xl px-3.5 py-3 transition hover:bg-white/[0.04]"
-      style={{
-        backgroundColor: '#0B0B10',
-        border: '1px solid rgba(255,255,255,0.08)',
-      }}
-    >
-      <span className="text-sm font-medium text-white">{title}</span>
-      <ExternalLink size={14} style={{ color: 'rgba(255,255,255,0.40)' }} />
-    </a>
-  );
-}
-
-function DataExportButton() {
-  const [loading, setLoading] = useState(false);
-  const [done, setDone] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const handleExport = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await invoke<Record<string, unknown>>('export_user_data');
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `birdo-data-export-${new Date().toISOString().slice(0, 10)}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      setDone(true);
-    } catch (err) {
-      setError(typeof err === 'string' ? err : 'Export failed');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <button
-      onClick={handleExport}
-      disabled={loading}
-      className="glass flex w-full items-center justify-between rounded-lg p-3 transition hover:bg-white/10 disabled:opacity-50"
-    >
-      <span className="text-sm font-medium text-white">
-        {done ? 'Data Exported ✓' : 'Export My Data (GDPR)'}
-      </span>
-      {loading ? (
-        <Loader2 size={14} className="animate-spin text-white/40" />
-      ) : (
-        <ChevronRight size={14} className="text-white/40" />
-      )}
-      {error && <span className="text-xs text-red-400 ml-2">{error}</span>}
-    </button>
-  );
-}
-
-function DeleteAccountButton() {
-  const [step, setStep] = useState<'idle' | 'confirm' | 'password'>('idle');
-  const [password, setPassword] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const handleDelete = async () => {
-    if (!password) return;
-    setLoading(true);
-    setError(null);
-    try {
-      await invoke('delete_account', { request: { password } });
-      // Account deleted — force reload to return to login screen
-      window.location.reload();
-    } catch (e: unknown) {
-      setError(typeof e === 'string' ? e : 'Deletion failed');
-      setLoading(false);
-    }
-  };
-
-  if (step === 'idle') {
-    return (
-      <button
-        onClick={() => setStep('confirm')}
-        className="glass flex w-full items-center gap-3 rounded-lg p-3 text-left transition hover:bg-red-500/20"
+      </div>
+      <div
+        className="mt-3 grid grid-cols-3 gap-1 rounded-birdo-sm p-1"
+        style={{ backgroundColor: white.w05 }}
       >
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-red-500/20">
-          <Trash2 size={18} className="text-red-400" />
-        </div>
-        <div>
-          <p className="text-sm font-medium text-red-400">Delete Account</p>
-          <p className="text-xs text-white/50">Permanently delete your account and all data</p>
-        </div>
-      </button>
-    );
-  }
-
-  if (step === 'confirm') {
-    return (
-      <div className="glass rounded-lg p-4 space-y-3">
-        <div className="flex items-center gap-2 text-red-400">
-          <AlertTriangle size={18} />
-          <p className="text-sm font-semibold">Are you sure?</p>
-        </div>
-        <p className="text-xs text-white/60">
-          This will permanently delete your account, VPN configurations, and all associated data. This action cannot be undone.
-        </p>
-        <div className="flex gap-2">
-          <button
-            onClick={() => setStep('idle')}
-            className="flex-1 rounded-lg bg-white/10 px-3 py-2 text-xs font-medium text-white transition hover:bg-white/20"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => setStep('password')}
-            className="flex-1 rounded-lg bg-red-500/80 px-3 py-2 text-xs font-medium text-white transition hover:bg-red-500"
-          >
-            Continue
-          </button>
-        </div>
+        {THEME_OPTIONS.map((opt) => {
+          const active = theme === opt.value;
+          const Icon = opt.icon;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => onSelect(opt.value)}
+              className="flex items-center justify-center gap-1.5 rounded-birdo-xs px-3 py-2 text-[13px] font-medium transition-colors"
+              style={{
+                backgroundColor: active ? brand.purpleBg : 'transparent',
+                border: active ? `1px solid ${brand.purple}` : '1px solid transparent',
+                color: active ? brand.purpleSoft : white.w60,
+              }}
+            >
+              <Icon size={14} aria-hidden />
+              {opt.label}
+            </button>
+          );
+        })}
       </div>
-    );
-  }
-
-  return (
-    <div className="glass rounded-lg p-4 space-y-3">
-      <p className="text-sm font-medium text-red-400">Enter your password to confirm</p>
-      {error && (
-        <p className="text-xs text-red-400">{error}</p>
-      )}
-      <input
-        type="password"
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        placeholder="Password"
-        className="w-full rounded-lg bg-white/10 px-3 py-2 text-sm text-white placeholder-white/30 outline-none focus:ring-1 focus:ring-red-400/50"
-        autoFocus
-        onKeyDown={(e) => e.key === 'Enter' && handleDelete()}
-      />
-      <div className="flex gap-2">
-        <button
-          onClick={() => { setStep('idle'); setPassword(''); setError(null); }}
-          className="flex-1 rounded-lg bg-white/10 px-3 py-2 text-xs font-medium text-white transition hover:bg-white/20"
-        >
-          Cancel
-        </button>
-        <button
-          onClick={handleDelete}
-          disabled={loading || !password}
-          className="flex-1 rounded-lg bg-red-500/80 px-3 py-2 text-xs font-medium text-white transition hover:bg-red-500 disabled:opacity-50"
-        >
-          {loading ? <Loader2 size={14} className="mx-auto animate-spin" /> : 'Delete Forever'}
-        </button>
-      </div>
-    </div>
+    </BirdoCard>
   );
 }

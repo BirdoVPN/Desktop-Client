@@ -2,9 +2,10 @@
  * BirdoBadge — pill-shaped status badge with optional pulsing dot.
  * Mirrors mobile's `BirdoBadge.kt` (BadgeTone enum + PulsingDot).
  */
-import { motion } from 'framer-motion';
 import type { LucideIcon } from 'lucide-react';
+import { RefreshCw, AlertCircle, WifiOff } from 'lucide-react';
 import { brand, status, white, hairline } from '@/lib/birdo-theme';
+import type { ConnectionState } from '@/store/app-store';
 
 export type BadgeTone = 'neutral' | 'success' | 'warning' | 'danger' | 'info' | 'brand';
 
@@ -71,16 +72,9 @@ export function PulsingDot({ color, size = 8 }: PulsingDotProps) {
       style={{ width: size, height: size }}
       aria-hidden
     >
-      <motion.span
-        className="absolute inset-0 rounded-full"
+      <span
+        className="absolute inset-0 rounded-full animate-birdo-pulse-ring"
         style={{ backgroundColor: color }}
-        initial={{ scale: 1, opacity: 0.6 }}
-        animate={{ scale: 2, opacity: 0 }}
-        transition={{
-          duration: 1.1,
-          repeat: Infinity,
-          ease: 'linear',
-        }}
       />
       <span
         className="relative rounded-full"
@@ -91,5 +85,50 @@ export function PulsingDot({ color, size = 8 }: PulsingDotProps) {
         }}
       />
     </span>
+  );
+}
+
+// ── StatusPill (VPN connection state) ─────────────────────────────────────
+
+export interface StatusPillProps {
+  state: ConnectionState;
+  className?: string;
+}
+
+interface StatusConfig {
+  tone: BadgeTone;
+  text: string;
+  icon?: LucideIcon;
+  pulse?: boolean;
+}
+
+const STATUS_CONFIG: Record<ConnectionState, StatusConfig> = {
+  connected:          { tone: 'success', text: 'Protected',     pulse: true },
+  connecting:         { tone: 'warning', text: 'Connecting',    icon: RefreshCw },
+  authenticating:     { tone: 'warning', text: 'Authenticating', icon: RefreshCw },
+  stealth_connecting: { tone: 'warning', text: 'Connecting',    icon: RefreshCw },
+  reconnecting:       { tone: 'warning', text: 'Reconnecting',  icon: RefreshCw },
+  rekeying:           { tone: 'warning', text: 'Rekeying',      icon: RefreshCw },
+  disconnecting:      { tone: 'warning', text: 'Disconnecting', icon: RefreshCw },
+  kill_switch_active: { tone: 'danger',  text: 'Kill Switch',   icon: AlertCircle },
+  error:              { tone: 'danger',  text: 'Error',         icon: AlertCircle },
+  disconnected:       { tone: 'neutral', text: 'Disconnected',  icon: WifiOff },
+};
+
+/**
+ * VPN connection-state pill. Maps the polled `get_vpn_status` state to a tone,
+ * label and icon (Connected pulses, busy states sync, faults alert).
+ */
+export function StatusPill({ state, className = '' }: StatusPillProps) {
+  const cfg = STATUS_CONFIG[state];
+  return (
+    <div data-testid="vpn-status" className={className}>
+      <BirdoBadge
+        text={cfg.text}
+        tone={cfg.tone}
+        icon={cfg.icon}
+        pulseDot={cfg.pulse}
+      />
+    </div>
   );
 }

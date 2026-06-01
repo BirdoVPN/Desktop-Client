@@ -108,6 +108,7 @@ export function friendlyVpnError(error: unknown): string {
   if (raw.includes('connection refused') || raw.includes('connect to')) return 'Unable to reach the VPN server. Please try another server.';
   if (raw.includes('handshake') || raw.includes('timeout')) return 'Connection timed out. The server may be busy — try again or switch servers.';
   if (raw.includes('authentication') || raw.includes('unauthorized') || raw.includes('401')) return 'Authentication failed. Please log in again.';
+  if (raw.includes('access denied') || raw.includes('forbidden') || raw.includes('403')) return 'Access denied for this connection. Please check your subscription, device limit, or account permissions.';
   if (raw.includes('no servers') || raw.includes('server list')) return 'No servers available. Check your internet connection.';
   if (raw.includes('already connected') || raw.includes('already active')) return 'VPN is already connected.';
   if (raw.includes('dns') || raw.includes('resolve')) return 'DNS resolution failed. Check your network settings.';
@@ -150,6 +151,11 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     autostart: rs.autostart ?? false,
     startMinimized: rs.start_minimized ?? false,
     notifications: rs.notifications_enabled ?? true,
+    // Frontend-only notification detail sub-toggles: the Rust backend doesn't
+    // round-trip these, so default them here. The store's hydrateSettings
+    // preserves any localStorage-persisted value on top of this.
+    showIpInNotification: false,
+    showLocationInNotification: false,
     preferredServerId: rs.preferred_server_id ?? null,
     splitTunnelingEnabled: rs.split_tunneling_enabled ?? false,
     splitTunnelApps: rs.split_tunnel_apps ?? [],

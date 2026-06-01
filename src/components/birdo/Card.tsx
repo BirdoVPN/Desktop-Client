@@ -3,7 +3,7 @@
  * Mirrors mobile's `BirdoCard.kt` (BirdoCard, BirdoSubCard, BirdoSectionHeader).
  */
 import type { CSSProperties, ReactNode } from 'react';
-import { surface, white, hairline, gradient } from '@/lib/birdo-theme';
+import { surface, white, hairline, gradient, brand } from '@/lib/birdo-theme';
 
 export interface BirdoCardProps {
   children: ReactNode;
@@ -80,7 +80,7 @@ export function BirdoSubCard({
       className={className}
       style={{
         borderRadius: cornerRadius,
-        backgroundColor: white.w05,
+        backgroundColor: white.w03,
         border: `1px solid ${hairline.soft}`,
         padding,
       }}
@@ -115,8 +115,8 @@ export function BirdoSectionHeader({
         <button
           type="button"
           onClick={onActionClick}
-          className="rounded-md px-1.5 py-1 text-xs font-medium hover:bg-white/5"
-          style={{ color: 'rgb(196,181,253)' /* purpleSoft */ }}
+          className="rounded-birdo-xs px-1.5 py-1 text-xs font-medium hover:bg-white/5"
+          style={{ color: brand.purpleSoft }}
         >
           {actionLabel}
         </button>

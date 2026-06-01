@@ -16,6 +16,7 @@ export interface Server {
   isStreaming: boolean;
   isP2p: boolean;
   isOnline: boolean;
+  isAccessible: boolean;
 }
 
 export interface ConnectionStats {
@@ -53,12 +54,27 @@ export type Protocol = 'wireguard';
 
 export type ThemeMode = 'dark' | 'light' | 'system';
 
+// ── Navigation (mobile-parity 3-tab bottom nav + push sub-screens) ──────────
+export type TabId = 'profile' | 'home' | 'settings';
+export type RouteId =
+  | 'serverList'
+  | 'vpnSettings'
+  | 'splitTunnel'
+  | 'portForward'
+  | 'subscription';
+
 export interface AppSettings {
   killSwitchEnabled: boolean;
   autoConnect: boolean;
   autostart: boolean;
   startMinimized: boolean;
   notifications: boolean;
+  // Notification detail sub-toggles. Frontend-only preference (persisted in
+  // localStorage), NOT part of the Rust `save_settings` payload — the backend
+  // `AppSettings` struct has no matching fields, so these never go through
+  // `settingsToRust`.
+  showIpInNotification: boolean;
+  showLocationInNotification: boolean;
   preferredServerId: string | null;
   splitTunnelingEnabled: boolean;
   splitTunnelApps: string[];
@@ -177,6 +193,15 @@ interface AppState {
   deepLinkAction: { action: string; serverId?: string } | null;
   setDeepLinkAction: (action: { action: string; serverId?: string } | null) => void;
 
+  // ── Navigation (mobile-parity router; NOT persisted) ──────────────────
+  // Bottom-nav tabs + a per-session push stack for slide-in sub-screens.
+  tab: TabId;
+  navStack: RouteId[];
+  setTab: (tab: TabId) => void;
+  pushRoute: (route: RouteId) => void;
+  popRoute: () => void;
+  resetNav: () => void;
+
   // Actions — Logout
   logout: () => void;
 }
@@ -199,6 +224,8 @@ const defaultSettings: AppSettings = {
   autostart: false,
   startMinimized: false,
   notifications: true,
+  showIpInNotification: false,
+  showLocationInNotification: false,
   preferredServerId: null,
   splitTunnelingEnabled: false,
   splitTunnelApps: [],
@@ -232,6 +259,16 @@ export const useAppStore = create<AppState>()(
       // Deep link
       deepLinkAction: null,
       setDeepLinkAction: (action) => set({ deepLinkAction: action }),
+
+      // Navigation (not persisted — see partialize)
+      tab: 'home' as TabId,
+      navStack: [],
+      setTab: (tab) => set({ tab, navStack: [] }),
+      pushRoute: (route) =>
+        set((state) => ({ navStack: [...state.navStack, route] })),
+      popRoute: () =>
+        set((state) => ({ navStack: state.navStack.slice(0, -1) })),
+      resetNav: () => set({ tab: 'home', navStack: [] }),
 
       connectionState: 'disconnected' as ConnectionState,
       currentServer: null,
@@ -304,10 +341,21 @@ export const useAppStore = create<AppState>()(
           settings: { ...state.settings, ...partial },
         })),
       hydrateSettings: (s) =>
-        set({
-          settings: { ...defaultSettings, ...s },
+        set((state) => ({
+          // Keep frontend-only preferences (notification detail sub-toggles)
+          // that the Rust backend doesn't round-trip; merge the Rust-owned
+          // fields on top of defaults + the current (localStorage) state.
+          settings: {
+            ...defaultSettings,
+            ...s,
+            // These come back as `false` from settingsFromRust (the Rust
+            // backend doesn't store them) — re-apply the live localStorage
+            // value so the user's choice survives a get_settings hydrate.
+            showIpInNotification: state.settings.showIpInNotification,
+            showLocationInNotification: state.settings.showLocationInNotification,
+          },
           settingsHydrated: true,
-        }),
+        })),
 
       // Settings shortcuts
       setKillSwitch: (enabled) =>

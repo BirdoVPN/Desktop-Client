@@ -709,6 +709,7 @@ impl AutoReconnectService {
         ConnectResponse {
             success: response.success,
             message: response.message,
+            error_code: None,
             config: response.config,
             key_id: response.key_id,
             private_key: response.private_key,
