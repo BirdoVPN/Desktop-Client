@@ -266,6 +266,23 @@ jobs:
           }
           if ($failed) { throw "One or more artifacts are not properly signed" }
 
+      # Confirm Tauri emitted the per-installer minisign updater signatures.
+      # bundle.createUpdaterArtifacts=true makes `tauri build` write a
+      # <setup>.exe.sig (NSIS) and <name>.msi.sig (MSI) next to each
+      # installer, signed with TAURI_SIGNING_PRIVATE_KEY. These are what the
+      # in-app updater verifies against the embedded pubkey.
+      - name: Verify Tauri updater signatures (.sig) exist
+        if: steps.sign-mode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $sigs = @()
+          $sigs += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe.sig" -ErrorAction SilentlyContinue
+          $sigs += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi.sig" -ErrorAction SilentlyContinue
+          if ($sigs.Count -eq 0) {
+            throw "No updater .sig files found — createUpdaterArtifacts/TAURI_SIGNING_PRIVATE_KEY not applied"
+          }
+          foreach ($s in $sigs) { Write-Host "Updater signature: $($s.Name)" }
+
       # ── Sigstore keyless signing ──────────────────────────────────────
       # Provenance layer — proves GitHub Actions built this artifact.
       # Each artifact gets a .sigstore bundle (Fulcio cert + Rekor log).
@@ -320,8 +337,10 @@ jobs:
           name: birdo-vpn-windows-installers
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
             src-tauri/target/release/bundle/nsis/*.sigstore
             src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
             src-tauri/target/release/bundle/msi/*.sigstore
             src-tauri/target/release/bundle/SHA256SUMS.txt
             src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore
