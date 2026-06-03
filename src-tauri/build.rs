@@ -1,17 +1,23 @@
 use std::env;
 
 fn main() {
-    // Embed Windows-specific manifest (admin privileges, OS compatibility)
+    // Embed the Windows application manifest (requireAdministrator + OS
+    // compatibility) through Tauri's own build mechanism.
+    //
+    // IMPORTANT: do NOT also embed a manifest via `winres` (the previous
+    // approach). tauri-build already injects its own application manifest, so a
+    // second winres-embedded manifest collides at link time and the
+    // `requestedExecutionLevel` is silently dropped from the final exe — that
+    // was the root cause of "the VPN doesn't run as administrator". Feeding our
+    // manifest to tauri-build makes it the single source of truth.
     #[cfg(windows)]
     {
-        let winres = winres::WindowsResource::new();
-        let mut res = winres;
-        res.set_manifest_file("app.manifest");
-        if let Err(e) = res.compile() {
-            println!("cargo:warning=Failed to compile Windows resource: {}", e);
-        }
+        let win = tauri_build::WindowsAttributes::new().app_manifest(include_str!("app.manifest"));
+        let attrs = tauri_build::Attributes::new().windows_attributes(win);
+        tauri_build::try_build(attrs).expect("failed to run tauri-build with custom manifest");
     }
 
+    #[cfg(not(windows))]
     tauri_build::build();
 
     // Warn if SENTRY_DSN is missing on release builds

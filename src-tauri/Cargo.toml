@@ -1,6 +1,6 @@
 [package]
 name = "birdo-vpn-desktop"
-version = "1.3.8"
+version = "1.3.9"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
 license = "Proprietary"
@@ -13,10 +13,10 @@ name = "birdo_vpn_desktop_lib"
 crate-type = ["rlib"]
 
 [build-dependencies]
+# The Windows app manifest (requireAdministrator) is embedded via tauri-build's
+# WindowsAttributes::app_manifest — NOT winres — to avoid a double-manifest
+# link collision that drops the elevation level. See build.rs.
 tauri-build = { version = "2.0", features = [] }
-
-[target.'cfg(windows)'.build-dependencies]
-winres = "0.1"
 
 [dependencies]
 # Tauri
