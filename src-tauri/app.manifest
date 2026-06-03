@@ -7,6 +7,25 @@
     type="win32"
   />
   <description>Birdo VPN Client</description>
+  <!-- Common Controls v6. REQUIRED: this is the one thing tauri-build's default
+       manifest provides. Because we now feed our own manifest to
+       WindowsAttributes::app_manifest (to embed requireAdministrator reliably),
+       it fully REPLACES tauri's default — so this dependency MUST be carried
+       here too. Without it the process loads comctl32 v5, which lacks
+       TaskDialogIndirect, and the exe fails to launch with
+       "Entry Point Not Found: TaskDialogIndirect" (regression in v1.3.9). -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
   <!-- Birdo VPN requires administrator privileges for:
        - Creating/opening the Wintun virtual network adapter (in-process FFI)
        - Configuring network routes and DNS via netsh
