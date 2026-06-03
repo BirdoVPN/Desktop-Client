@@ -433,7 +433,9 @@ impl WfpEngine {
         let err = unsafe {
             FwpmGetAppIdFromFileName0(windows::core::PCWSTR(wide_path.as_ptr()), &mut app_id)
         };
-        if err != 0 {
+        // Null-guard the out-param so the later `&mut *app_id` is provably sound
+        // (see add_permit_app / CodeQL rust/access-invalid-pointer).
+        if err != 0 || app_id.is_null() {
             return Ok(0); // Non-fatal: skip (already warned at V4 level)
         }
 
@@ -766,7 +768,11 @@ impl WfpEngine {
         let err = unsafe {
             FwpmGetAppIdFromFileName0(windows::core::PCWSTR(wide_path.as_ptr()), &mut app_id)
         };
-        if err != 0 {
+        // Treat a null out-param as failure too: FwpmGetAppIdFromFileName0 is
+        // documented to populate `app_id` on ERROR_SUCCESS, but guarding the
+        // pointer explicitly makes the later `&mut *app_id` deref provably sound
+        // (and silences CodeQL rust/access-invalid-pointer).
+        if err != 0 || app_id.is_null() {
             tracing::warn!(
                 "FwpmGetAppIdFromFileName0 failed for '{}': 0x{:08X} — skipping",
                 exe_path,
