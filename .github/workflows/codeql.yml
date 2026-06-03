@@ -1,0 +1,60 @@
+name: "CodeQL Security Scan"
+
+# Static analysis for the desktop client. Covers the TypeScript/React frontend
+# (the webview + IPC attack surface) and the Rust backend (Tauri commands, VPN
+# core). Results show up under the repo's Security → Code scanning tab.
+#
+# build-mode: none — CodeQL extracts source without a full compile, so the Rust
+# scan does NOT need the GTK/WebKit system libraries or the pinned 1.83 toolchain
+# (those would make the analysis job slow + flaky). This trades a little depth
+# for a reliable, dependency-free scan.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Weekly catch-all so new CodeQL queries run even without a push.
+    - cron: "27 3 * * 1"
+
+# Least privilege by default; the analyze job grants only what it needs.
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      security-events: write   # upload SARIF results to the Security tab
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: rust
+            build-mode: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Run the security-extended suite for a deeper set of queries than the
+          # default. Drop to "security" if scan time becomes a problem.
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
