@@ -276,10 +276,14 @@ pub(crate) async fn start_stealth_tunnel(
         .xray_sni
         .clone()
         .unwrap_or_else(|| "www.microsoft.com".to_string());
-    let flow = response
-        .xray_flow
-        .clone()
-        .unwrap_or_else(|| "xtls-rprx-vision".to_string());
+    // The stealth tunnel wraps WireGuard UDP in a dokodemo-door → VLESS stream.
+    // XTLS Vision (xtls-rprx-vision) is TCP-ONLY and silently drops the UDP
+    // RETURN path → the classic "upload works, ~0 download" stealth bug. A
+    // UDP-carrying VLESS tunnel MUST use an empty flow. Force it here regardless
+    // of the server's advertised xrayFlow (mirrors the Android XrayManager fix
+    // shipped in v1.3.30 / mobile #108).
+    let _server_flow = response.xray_flow.clone(); // intentionally ignored
+    let flow = String::new();
 
     // UUID: RFC 4122 format
     if uuid.is_empty()
