@@ -110,6 +110,10 @@ windows = { version = "0.58", features = [
 # Wintun driver bindings
 wintun = "0.5"
 
+# Registry read for enumerating installed apps (split-tunnel picker). Simple,
+# pure-Rust wrapper over windows-sys; builds on the pinned 1.83 toolchain.
+winreg = "0.52"
+
 # macOS-specific dependencies
 [target.'cfg(target_os = "macos")'.dependencies]
 # nix crate for utun/socket/ioctl operations

@@ -5,9 +5,9 @@
  *  - BirdoTopBar (title "Split Tunneling", back → popRoute)
  *  - Master enable toggle (gated to Operative+, like SplitTunnelCard)
  *  - Purple info banner (Info icon + "… N apps excluded.")
- *  - "Add by path/name" BirdoTextField + Add button — desktop CANNOT enumerate
- *    installed Windows apps, so apps are added manually instead of picked from a
- *    system list.
+ *  - "Add by path/name" BirdoTextField + Add button, plus an "Installed apps"
+ *    picker (enumerated from the Windows registry by `list_installed_apps`) and
+ *    a native "Browse…" .exe file dialog.
  *  - Search BirdoTextField to filter the added entries.
  *  - Each excluded app renders as a mobile-style list row: icon + label + a
  *    BYPASS pill + a remove action (the desktop analogue of mobile's AppItem).
@@ -20,7 +20,7 @@ import { useCallback, useMemo, useState, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useShallow } from 'zustand/react/shallow';
-import { FolderOpen, Info, Lock, Plus, Scissors, Search, X } from 'lucide-react';
+import { AppWindow, FolderOpen, Info, Lock, Plus, Scissors, Search, X } from 'lucide-react';
 import { useAppStore, type AppSettings } from '@/store/app-store';
 import {
   BirdoTopBar,
@@ -32,6 +32,15 @@ import {
 } from '@/components/birdo';
 import { settingsToRust } from '@/utils/helpers';
 import { brand, white, hairline } from '@/lib/birdo-theme';
+
+/** An installed app returned by the Rust `list_installed_apps` command. */
+interface InstalledApp {
+  name: string;
+  path: string;
+}
+
+/** Display the basename of a stored entry (which may be a full path). */
+const baseName = (s: string): string => s.split(/[\\/]/).pop() || s;
 
 // Operative (1) or Sovereign (2) unlock split tunneling — matches SplitTunnelCard.
 const planLevel = (plan: string | null | undefined): number => {
@@ -57,6 +66,11 @@ export function SplitTunnel() {
 
   const [appInput, setAppInput] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Installed-app picker (enumerated from the Windows registry by Rust).
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [installed, setInstalled] = useState<InstalledApp[] | null>(null);
+  const [pickerSearch, setPickerSearch] = useState('');
 
   const isOperative = planLevel(account?.plan) >= 1;
   const enabled = settings.splitTunnelingEnabled && isOperative;
@@ -119,6 +133,40 @@ export function SplitTunnel() {
     },
     [apps, enabled, persist],
   );
+
+  // ── Installed-app picker: enumerate once, then add by full path ──
+  const openInstalledPicker = useCallback(async () => {
+    if (!enabled) return;
+    setPickerSearch('');
+    setPickerOpen(true);
+    if (installed === null) {
+      try {
+        const list = await invoke<InstalledApp[]>('list_installed_apps');
+        setInstalled(list);
+      } catch {
+        setInstalled([]); // best-effort; empty list shows the empty state
+      }
+    }
+  }, [enabled, installed]);
+
+  const addInstalled = useCallback(
+    (path: string) => {
+      if (!enabled || apps.includes(path)) return;
+      persist({ splitTunnelApps: [...apps, path] });
+    },
+    [apps, enabled, persist],
+  );
+
+  const pickerResults = useMemo(() => {
+    if (!installed) return [];
+    const q = pickerSearch.trim().toLowerCase();
+    const base = q
+      ? installed.filter(
+          (a) => a.name.toLowerCase().includes(q) || a.path.toLowerCase().includes(q),
+        )
+      : installed;
+    return base;
+  }, [installed, pickerSearch]);
 
   const handleInputKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key !== 'Enter') return;
@@ -197,7 +245,7 @@ export function SplitTunnel() {
 
         {enabled && (
           <>
-            {/* ── Add by path/name (desktop can't enumerate installed apps) ── */}
+            {/* ── Add by path/name, installed-app picker, or file browse ── */}
             <div className="mt-3">
               <label className="mb-1.5 block pl-1 text-xs font-medium" style={{ color: white.w60 }}>
                 Add by path or name
@@ -232,7 +280,18 @@ export function SplitTunnel() {
                   ariaLabel="Add split tunnel app"
                 />
               </div>
-              <div className="mt-2">
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <BirdoButton
+                  text="Installed apps"
+                  icon={AppWindow}
+                  onClick={() => {
+                    void openInstalledPicker();
+                  }}
+                  variant="secondary"
+                  size="medium"
+                  fullWidth
+                  ariaLabel="Choose from installed apps"
+                />
                 <BirdoButton
                   text="Browse…"
                   icon={FolderOpen}
@@ -283,12 +342,12 @@ export function SplitTunnel() {
                   }}
                 >
                   <AppIconMark size={36} />
-                  <div className="min-w-0 flex-1">
+                  <div className="min-w-0 flex-1" title={appName}>
                     <div
                       className="truncate text-[15px] font-medium"
                       style={{ color: white.w80 }}
                     >
-                      {appName}
+                      {baseName(appName)}
                     </div>
                   </div>
                   <span
@@ -325,6 +384,96 @@ export function SplitTunnel() {
           </>
         )}
       </div>
+
+      {/* ── Installed-apps picker overlay ── */}
+      {pickerOpen && (
+        <div
+          className="fixed inset-0 z-50 flex flex-col"
+          style={{ backgroundColor: 'rgba(11,11,16,0.97)', backdropFilter: 'blur(4px)' }}
+        >
+          <div className="flex items-center gap-2 px-4 pb-2 pt-4">
+            <AppWindow size={18} color={brand.purple} aria-hidden />
+            <span className="flex-1 text-[15px] font-semibold" style={{ color: white.w100 }}>
+              Installed apps
+            </span>
+            <button
+              type="button"
+              onClick={() => setPickerOpen(false)}
+              aria-label="Close installed apps"
+              className="flex h-7 w-7 items-center justify-center rounded-full transition-colors hover:bg-white/10"
+            >
+              <X size={18} color={white.w60} aria-hidden />
+            </button>
+          </div>
+          <div className="px-4 pb-2">
+            <BirdoTextField
+              value={pickerSearch}
+              onChange={setPickerSearch}
+              placeholder="Search installed apps…"
+              ariaLabel="Search installed apps"
+              leadingIcon={Search}
+            />
+          </div>
+          <div className="flex-1 overflow-y-auto px-4 pb-4">
+            {installed === null ? (
+              <p className="pt-6 text-center text-sm" style={{ color: white.w40 }}>
+                Scanning installed apps…
+              </p>
+            ) : pickerResults.length === 0 ? (
+              <BirdoEmptyState
+                icon={AppWindow}
+                title={pickerSearch.trim() ? 'No matches' : 'No apps found'}
+                description={
+                  pickerSearch.trim()
+                    ? `Nothing matches "${pickerSearch.trim()}".`
+                    : 'Use Browse… to pick an .exe directly.'
+                }
+                className="pt-6"
+              />
+            ) : (
+              <div className="space-y-1.5">
+                {pickerResults.map((app) => {
+                  const added = apps.includes(app.path);
+                  return (
+                    <button
+                      key={app.path}
+                      type="button"
+                      disabled={added}
+                      onClick={() => {
+                        addInstalled(app.path);
+                        setPickerOpen(false);
+                      }}
+                      title={app.path}
+                      className="flex w-full items-center gap-3 rounded-birdo-md px-3.5 py-2.5 text-left transition-colors hover:bg-white/[0.06] disabled:opacity-50"
+                      style={{ backgroundColor: white.w04, border: `1px solid ${hairline.soft}` }}
+                    >
+                      <AppIconMark size={32} />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-[14px] font-medium" style={{ color: white.w80 }}>
+                          {app.name}
+                        </div>
+                        <div className="truncate text-[11px]" style={{ color: white.w40 }}>
+                          {baseName(app.path)}
+                        </div>
+                      </div>
+                      {added ? (
+                        <span
+                          className="shrink-0 text-[10px] font-semibold"
+                          style={{ color: brand.purple }}
+                        >
+                          ADDED
+                        </span>
+                      ) : (
+                        <Plus size={16} color={white.w40} aria-hidden className="shrink-0" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

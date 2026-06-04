@@ -297,6 +297,7 @@ fn main() {
             commands::split_tunnel::add_split_tunnel_app,
             commands::split_tunnel::remove_split_tunnel_app,
             commands::split_tunnel::clear_split_tunnel_apps,
+            commands::split_tunnel::list_installed_apps,
             // Auto-updater
             commands::updater::check_for_updates,
             commands::updater::install_update,
