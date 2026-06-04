@@ -9,6 +9,7 @@ pub mod servers;
 pub mod settings;
 pub mod speed_test;
 pub mod split_tunnel;
+pub mod tray;
 pub mod updater;
 pub mod vpn;
 pub mod vpn_multi_hop;

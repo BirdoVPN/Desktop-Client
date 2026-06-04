@@ -1,6 +1,6 @@
 [package]
 name = "birdo-vpn-desktop"
-version = "1.3.10"
+version = "1.3.11"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
 license = "Proprietary"
@@ -21,6 +21,11 @@ tauri-build = { version = "2.0", features = [] }
 [dependencies]
 # Tauri
 tauri = { version = "2.1", features = ["tray-icon"] }
+# Decode the embedded tray PNGs into raw RGBA ourselves (Image::new_owned).
+# NOT tauri's "image-png" feature — that pulls moxcms/pxfm which require the
+# edition2024 Cargo feature / Rust 1.85, incompatible with our pinned 1.83.
+# png 0.17 builds cleanly on 1.83.
+png = "0.17"
 tauri-plugin-shell = "2.0"
 tauri-plugin-notification = "2.0"
 tauri-plugin-autostart = "2.0"

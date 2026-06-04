@@ -21,7 +21,7 @@ use storage::CredentialStore;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Listener, Manager, RunEvent, WindowEvent,
+    Emitter, LogicalPosition, Listener, Manager, RunEvent, WindowEvent,
 };
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -170,12 +170,15 @@ fn main() {
 
             let menu = Menu::with_items(app, &[&connect, &disconnect, &show, &quit])?;
 
-            // Build system tray
-            let tray_icon = app
-                .default_window_icon()
-                .ok_or("default window icon not set in tauri.conf.json")?
-                .clone();
-            let _tray = TrayIconBuilder::new()
+            // Build system tray. The icon starts in the "disconnected" state and
+            // is updated live (icon + tooltip) by the `set_tray_state` command as
+            // the connection state changes. The id "main" lets that command find
+            // this tray via `app.tray_by_id("main")`.
+            let tray_icon = commands::tray::load_tray_image(include_bytes!(
+                "../icons/tray-disconnected.png"
+            ))
+            .expect("embedded tray-disconnected.png is a valid image");
+            let _tray = TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -222,8 +225,11 @@ fn main() {
                 })
                 .build(app)?;
 
-            // Show main window after setup
+            // Pin the window to the top-left corner and show it. The window is
+            // frameless (decorations:false) and has no drag regions, so it is
+            // not movable by the user — we anchor it here once at startup.
             if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_position(LogicalPosition::new(0.0, 0.0));
                 let _ = window.show();
             }
 
@@ -279,6 +285,8 @@ fn main() {
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::set_autostart,
+            // System tray
+            commands::tray::set_tray_state,
             // Kill switch
             commands::killswitch::enable_killswitch,
             commands::killswitch::disable_killswitch,

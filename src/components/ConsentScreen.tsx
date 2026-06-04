@@ -16,9 +16,8 @@ interface ConsentScreenProps {
 export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
   return (
     <div className="flex h-full flex-col">
-      {/* Header drag region */}
+      {/* Header (window is fixed / non-draggable) */}
       <div
-        data-tauri-drag-region
         className="flex h-8 shrink-0 items-center justify-center"
       >
         <span className="text-[10px] font-semibold uppercase tracking-widest text-w40">

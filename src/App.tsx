@@ -6,6 +6,7 @@ import { Login } from '@/components/Login';
 import { AppShell } from '@/components/AppShell';
 import { OfflineBanner } from '@/components/OfflineBanner';
 import { PixelCanvas } from '@/components/PixelCanvas';
+import { WindowControls } from '@/components/WindowControls';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
@@ -28,6 +29,8 @@ function App() {
     setAccount,
     setConsent,
     theme,
+    connectionState,
+    currentServerName,
   } = useAppStore(
     useShallow((s) => ({
       isAuthenticated: s.isAuthenticated,
@@ -38,9 +41,33 @@ function App() {
       setAccount: s.setAccount,
       setConsent: s.setConsent,
       theme: s.theme,
+      connectionState: s.connectionState,
+      currentServerName: s.currentServer?.name ?? null,
     }))
   );
   const [initializing, setInitializing] = useState(true);
+
+  // Keep the system-tray icon + tooltip in sync with the live connection state.
+  // The Rust `set_tray_state` command swaps the embedded status icon (green /
+  // amber / slate) and the hover tooltip. Every in-progress phase maps to the
+  // amber "connecting" icon.
+  useEffect(() => {
+    const trayState =
+      connectionState === 'connected'
+        ? 'connected'
+        : connectionState === 'disconnected' || connectionState === 'error'
+          ? 'disconnected'
+          : 'connecting';
+    const tooltip =
+      trayState === 'connected'
+        ? `Birdo VPN — Connected${currentServerName ? ` · ${currentServerName}` : ''}`
+        : trayState === 'connecting'
+          ? 'Birdo VPN — Connecting…'
+          : 'Birdo VPN — Disconnected';
+    invoke('set_tray_state', { state: trayState, tooltip }).catch(() => {
+      /* tray not ready / non-fatal */
+    });
+  }, [connectionState, currentServerName]);
 
   // Apply theme class to <html> element
   useEffect(() => {
@@ -118,8 +145,9 @@ function App() {
     return (
       <div className="relative flex h-screen items-center justify-center overflow-hidden bg-[#000000]">
         <PixelCanvas />
-        
-        <motion.div 
+        <WindowControls />
+
+        <motion.div
           className="relative z-10 flex flex-col items-center gap-4"
           initial={{ opacity: 0, scale: 0.9 }}
           animate={{ opacity: 1, scale: 1 }}
@@ -151,6 +179,7 @@ function App() {
     <MotionConfig reducedMotion="user">
     <div className="relative h-screen overflow-hidden bg-birdo-black">
       <PixelCanvas />
+      <WindowControls />
 
       {/* Global offline banner — shows on every screen (matches mobile's
           above-NavHost placement), not just the dashboard. */}

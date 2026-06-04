@@ -548,9 +548,6 @@ export function Dashboard() {
 
   return (
     <div className="relative h-full overflow-hidden" style={{ backgroundColor: surface.s0 }}>
-      {/* Drag region */}
-      <div data-tauri-drag-region className="absolute inset-x-0 top-0 z-50 h-8" />
-
       {/* Globe background — hidden while server sheet open to avoid flicker */}
       {!showServerSheet && multiHopPickerTarget === null && (
         <WorldGlobe
