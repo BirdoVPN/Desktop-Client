@@ -287,6 +287,8 @@ fn main() {
             commands::settings::set_autostart,
             // System tray
             commands::tray::set_tray_state,
+            // Window placement (corner anchor / draggable)
+            commands::window::set_window_position,
             // Kill switch
             commands::killswitch::enable_killswitch,
             commands::killswitch::disable_killswitch,

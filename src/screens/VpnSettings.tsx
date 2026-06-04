@@ -198,7 +198,9 @@ export function VpnSettings() {
   const mtuAuto = settings.wireGuardMtu === 0;
 
   return (
-    <div className="flex h-full flex-col bg-birdo-s0">
+    // Transparent so the App-level PixelCanvas backdrop shows through (matches
+    // the Settings / Profile tab roots).
+    <div className="flex h-full flex-col">
       <BirdoTopBar title="VPN Settings" onBack={popRoute} />
 
       <div className="flex-1 overflow-y-auto px-4 pb-8 pt-2">

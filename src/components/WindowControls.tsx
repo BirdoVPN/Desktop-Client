@@ -1,24 +1,40 @@
 /**
  * WindowControls — minimize + close-to-tray buttons.
  *
- * The window is frameless (decorations:false) and pinned to the top-left
- * corner, so the native title-bar buttons are gone. This tiny overlay restores
- * those affordances: minimize sends the window to the taskbar; close hides it
- * to the system tray (mirroring the CloseRequested handler in main.rs — the app
- * keeps running in the tray, where "Quit Birdo VPN" fully exits).
+ * The window is frameless (decorations:false) and pinned to a corner, so the
+ * native title-bar buttons are gone. This overlay restores them: minimize sends
+ * the window to the taskbar; close hides it to the system tray (mirroring the
+ * CloseRequested handler in main.rs — the app keeps running in the tray, where
+ * "Quit Birdo VPN" fully exits).
  *
- * Rendered once at the App root so it sits above every screen. It is the only
- * interactive chrome at the very top of the window; nothing here is a drag
- * region (the window is intentionally non-movable).
+ * Positioned bottom-right. When the bottom tab nav is visible (authenticated
+ * tab-root screens) the cluster lifts above it so it never overlaps the Settings
+ * tab; on login / consent / pushed sub-screens it sits in the very corner.
  */
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, X } from 'lucide-react';
+import { useAppStore } from '@/store/app-store';
+import { useShallow } from 'zustand/react/shallow';
 
 const win = getCurrentWindow();
 
 export function WindowControls() {
+  const { navVisible, isFree } = useAppStore(
+    useShallow((s) => ({
+      navVisible: s.isAuthenticated && s.hasAcceptedConsent && s.navStack.length === 0,
+      isFree: s.windowCorner === 'free',
+    })),
+  );
+
+  // In "free" mode the native title bar is back, so its buttons handle this.
+  if (isFree) return null;
+
   return (
-    <div className="absolute right-1.5 top-1.5 z-[100] flex items-center gap-1">
+    <div
+      className={`absolute right-1.5 z-[100] flex items-center gap-1 ${
+        navVisible ? 'bottom-[66px]' : 'bottom-1.5'
+      }`}
+    >
       <button
         type="button"
         aria-label="Minimize"

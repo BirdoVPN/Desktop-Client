@@ -54,6 +54,18 @@ export type Protocol = 'wireguard';
 
 export type ThemeMode = 'dark' | 'light' | 'system';
 
+/**
+ * Where the (frameless) window sits. The four corners pin it to that corner of
+ * the monitor it's currently on (non-movable); 'free' restores the native title
+ * bar so it can be dragged anywhere. Frontend-only preference (persisted).
+ */
+export type WindowCorner =
+  | 'top-left'
+  | 'top-right'
+  | 'bottom-left'
+  | 'bottom-right'
+  | 'free';
+
 // ── Navigation (mobile-parity 3-tab bottom nav + push sub-screens) ──────────
 export type TabId = 'profile' | 'home' | 'settings';
 export type RouteId =
@@ -189,6 +201,10 @@ interface AppState {
   theme: ThemeMode;
   setTheme: (theme: ThemeMode) => void;
 
+  // Window position (frameless corner anchor / draggable). Persisted.
+  windowCorner: WindowCorner;
+  setWindowCorner: (corner: WindowCorner) => void;
+
   // Deep link
   deepLinkAction: { action: string; serverId?: string } | null;
   setDeepLinkAction: (action: { action: string; serverId?: string } | null) => void;
@@ -255,6 +271,9 @@ export const useAppStore = create<AppState>()(
       // Theme
       theme: 'dark' as ThemeMode,
       setTheme: (theme) => set({ theme }),
+
+      windowCorner: 'top-left' as WindowCorner,
+      setWindowCorner: (windowCorner) => set({ windowCorner }),
 
       // Deep link
       deepLinkAction: null,
@@ -402,6 +421,7 @@ export const useAppStore = create<AppState>()(
         settings: state.settings,
         hasAcceptedConsent: state.hasAcceptedConsent,
         theme: state.theme,
+        windowCorner: state.windowCorner,
       }),
     }
   )

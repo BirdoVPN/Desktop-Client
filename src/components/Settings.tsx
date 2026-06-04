@@ -52,6 +52,11 @@ import {
   Sun,
   Laptop,
   Gauge,
+  ArrowUpLeft,
+  ArrowUpRight,
+  ArrowDownLeft,
+  ArrowDownRight,
+  Move,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import { settingsToRust, settingsFromRust, type RustSettings } from '@/utils/helpers';
@@ -69,7 +74,7 @@ import {
   hairline,
   motion as motionTokens,
 } from '@/lib/birdo-theme';
-import type { ThemeMode } from '@/store/app-store';
+import type { ThemeMode, WindowCorner } from '@/store/app-store';
 
 const DASHBOARD_URL = 'https://dashboard.birdo.app';
 const PRIVACY_URL = 'https://birdo.app/privacy';
@@ -95,6 +100,13 @@ const THEME_OPTIONS: { value: ThemeMode; label: string; icon: typeof Moon }[] = 
   { value: 'system', label: 'System', icon: Laptop },
 ];
 
+const CORNER_OPTIONS: { value: WindowCorner; label: string; icon: typeof Moon }[] = [
+  { value: 'top-left', label: 'Top L', icon: ArrowUpLeft },
+  { value: 'top-right', label: 'Top R', icon: ArrowUpRight },
+  { value: 'bottom-left', label: 'Bot L', icon: ArrowDownLeft },
+  { value: 'bottom-right', label: 'Bot R', icon: ArrowDownRight },
+];
+
 export function Settings() {
   const {
     settings,
@@ -102,6 +114,8 @@ export function Settings() {
     hydrateSettings,
     theme,
     setTheme,
+    windowCorner,
+    setWindowCorner,
     pushRoute,
   } = useAppStore(
     useShallow((s) => ({
@@ -110,6 +124,8 @@ export function Settings() {
       hydrateSettings: s.hydrateSettings,
       theme: s.theme,
       setTheme: s.setTheme,
+      windowCorner: s.windowCorner,
+      setWindowCorner: s.setWindowCorner,
       pushRoute: s.pushRoute,
     })),
   );
@@ -254,6 +270,7 @@ export function Settings() {
         {/* ── APPEARANCE ─────────────────────────────────────────────── */}
         <BirdoSectionHeader title="Appearance" />
         <ThemeSelector theme={theme} onSelect={setTheme} />
+        <WindowPositionSelector corner={windowCorner} onSelect={setWindowCorner} />
 
         {/* ── CONNECTION ─────────────────────────────────────────────── */}
         {/* Kill Switch lives in VPN Settings (Security), matching mobile — not
@@ -513,6 +530,73 @@ function ThemeSelector({
           );
         })}
       </div>
+    </BirdoCard>
+  );
+}
+
+/** Window-position picker: pin to a screen corner, or "free" (draggable). */
+function WindowPositionSelector({
+  corner,
+  onSelect,
+}: {
+  corner: WindowCorner;
+  onSelect: (c: WindowCorner) => void;
+}) {
+  const free = corner === 'free';
+  return (
+    <BirdoCard className="mt-2">
+      <div className="flex items-center gap-3.5">
+        <div
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
+          style={{ backgroundColor: white.w05 }}
+        >
+          <Monitor size={18} color={brand.purple} aria-hidden />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-[15px] font-medium text-white">Window position</div>
+          <div className="mt-0.5 text-xs" style={{ color: white.w60 }}>
+            Pin to a screen corner, or free to drag
+          </div>
+        </div>
+      </div>
+      <div
+        className="mt-3 grid grid-cols-4 gap-1 rounded-birdo-sm p-1"
+        style={{ backgroundColor: white.w05 }}
+      >
+        {CORNER_OPTIONS.map((opt) => {
+          const active = corner === opt.value;
+          const Icon = opt.icon;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => onSelect(opt.value)}
+              className="flex items-center justify-center gap-1 rounded-birdo-xs px-2 py-2 text-[12px] font-medium transition-colors"
+              style={{
+                backgroundColor: active ? brand.purpleBg : 'transparent',
+                border: active ? `1px solid ${brand.purple}` : '1px solid transparent',
+                color: active ? brand.purpleSoft : white.w60,
+              }}
+            >
+              <Icon size={14} aria-hidden />
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+      <button
+        type="button"
+        onClick={() => onSelect('free')}
+        className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-birdo-xs px-3 py-2 text-[13px] font-medium transition-colors"
+        style={{
+          backgroundColor: free ? brand.purpleBg : white.w05,
+          border: free ? `1px solid ${brand.purple}` : '1px solid transparent',
+          color: free ? brand.purpleSoft : white.w60,
+        }}
+      >
+        <Move size={14} aria-hidden />
+        Free (draggable)
+      </button>
     </BirdoCard>
   );
 }

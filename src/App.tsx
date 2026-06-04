@@ -31,6 +31,7 @@ function App() {
     theme,
     connectionState,
     currentServerName,
+    windowCorner,
   } = useAppStore(
     useShallow((s) => ({
       isAuthenticated: s.isAuthenticated,
@@ -43,9 +44,20 @@ function App() {
       theme: s.theme,
       connectionState: s.connectionState,
       currentServerName: s.currentServer?.name ?? null,
+      windowCorner: s.windowCorner,
     }))
   );
   const [initializing, setInitializing] = useState(true);
+
+  // Apply the saved window-position preference (corner anchor / draggable).
+  // Runs on startup and whenever the user changes it in Settings. main.rs pins
+  // top-left at launch as the pre-load default, so non-default corners reposition
+  // once on first paint.
+  useEffect(() => {
+    invoke('set_window_position', { corner: windowCorner }).catch(() => {
+      /* window not ready / non-fatal */
+    });
+  }, [windowCorner]);
 
   // Keep the system-tray icon + tooltip in sync with the live connection state.
   // The Rust `set_tray_state` command swaps the embedded status icon (green /
