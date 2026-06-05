@@ -16,16 +16,8 @@ interface ConsentScreenProps {
 export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
   return (
     <div className="flex h-full flex-col">
-      {/* Header (window is fixed / non-draggable) */}
-      <div
-        className="flex h-8 shrink-0 items-center justify-center"
-      >
-        <span className="text-[10px] font-semibold uppercase tracking-widest text-w40">
-          Birdo VPN
-        </span>
-      </div>
-
-      <div className="flex-1 overflow-y-auto px-6 pb-6">
+      {/* Brand now lives in the window TitleBar. */}
+      <div className="flex-1 overflow-y-auto px-6 pb-6 pt-3">
         <motion.div
           className="flex flex-col items-center"
           initial={{ opacity: 0, y: 20 }}

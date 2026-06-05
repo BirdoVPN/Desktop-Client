@@ -264,7 +264,11 @@ export function WorldGlobe({
     const canvas = canvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
-    const ctx = canvas.getContext('2d');
+    // Opaque context: the globe always paints a full opaque frame (space fill +
+    // sphere). Declaring it non-alpha stops the compositor from alpha-blending
+    // it against layers behind, which is what produced the translucent vertical
+    // banding / ghosting on some GPUs. Also lets the browser skip a clear.
+    const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
 
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;

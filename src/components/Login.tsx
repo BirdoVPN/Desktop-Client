@@ -177,15 +177,7 @@ export function Login() {
     // Transparent root so the App-level PixelCanvas shows through behind the
     // login content (opaque bg-birdo-s0 here was hiding the animated backdrop).
     <div className="flex h-full flex-col">
-      {/* ── Thin header (window is fixed / non-draggable) ── */}
-      <div
-        className="flex h-12 shrink-0 items-center justify-center gap-2.5 border-b border-birdo-hairline-soft"
-        style={{ backgroundColor: 'rgba(11,11,16,0.65)', backdropFilter: 'blur(8px)' }}
-      >
-        <AppIconMark size={24} style={{ borderRadius: 8, pointerEvents: 'none' }} />
-        <span className="text-base font-semibold text-w100">Birdo VPN</span>
-      </div>
-
+      {/* Brand now lives in the window TitleBar — no duplicate header here. */}
       {/* ── Centered phone column ── */}
       <div className="flex flex-1 flex-col items-center justify-center px-8">
         <motion.div

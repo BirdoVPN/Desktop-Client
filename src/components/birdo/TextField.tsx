@@ -8,7 +8,7 @@ import { useState } from 'react';
 import type { ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { Eye, EyeOff } from 'lucide-react';
-import { status, white, hairline } from '@/lib/birdo-theme';
+import { status, white, brand } from '@/lib/birdo-theme';
 
 export interface BirdoTextFieldProps {
   value: string;
@@ -45,31 +45,43 @@ export function BirdoTextField({
   const isPassword = type === 'password';
   const inputType = isPassword ? (revealed ? 'text' : 'password') : type;
 
+  // Resting border is a touch more present than a hairline; focus goes solid
+  // brand-purple, error red. The "lift" comes from the box-shadow ring below,
+  // not a flat border — that's what made the old field read as a basic box.
   const borderColor = error
     ? status.red
     : focused
-    ? `rgba(196,181,253,0.6)` /* purpleSoft @ 60% */
+    ? brand.purple
     : disabled
-    ? white.w05
-    : hairline.soft;
+    ? 'rgba(255,255,255,0.05)'
+    : 'rgba(255,255,255,0.10)';
+
+  // Soft focus glow ring (purple), red ring on error, gentle inner highlight at
+  // rest — a modern glass field instead of a flat outlined box.
+  const boxShadow = error
+    ? '0 0 0 3px rgba(248,113,113,0.14)'
+    : focused
+    ? '0 0 0 3px rgba(168,85,247,0.18), 0 4px 16px rgba(168,85,247,0.10)'
+    : 'inset 0 1px 0 rgba(255,255,255,0.04)';
 
   return (
     <div className={className}>
       {label && (
         <label
-          className="mb-1.5 block pl-1 text-xs font-medium"
+          className="mb-1.5 block pl-1 text-xs font-medium tracking-tight"
           style={{ color: white.w60 }}
         >
           {label}
         </label>
       )}
       <div
-        className="flex items-center gap-2 px-3"
+        className="flex items-center gap-2.5 px-3.5 transition-all duration-150"
         style={{
           minHeight: 48,
-          borderRadius: 12,
-          backgroundColor: white.w04,
+          borderRadius: 14,
+          backgroundColor: focused ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.035)',
           border: `1px solid ${borderColor}`,
+          boxShadow,
           opacity: disabled ? 0.6 : 1,
         }}
       >

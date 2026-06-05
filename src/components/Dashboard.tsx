@@ -34,7 +34,6 @@ import {
   Lock,
 } from 'lucide-react';
 import {
-  AppIconMark,
   BirdoCard,
   BirdoIconAction,
   CompactConnectButton,
@@ -810,7 +809,7 @@ function HomeTopBar({
 }: HomeTopBarProps) {
   return (
     <div
-      className="relative z-20 flex items-center gap-2 px-4 pt-9 pb-2"
+      className="relative z-20 flex items-center gap-2 px-4 pt-3 pb-2"
       style={{ backgroundColor: 'rgba(11,11,16,0.55)', backdropFilter: 'blur(8px)' }}
     >
       <MultiHopTopAction
@@ -818,7 +817,6 @@ function HomeTopBar({
         unlocked={multiHopUnlocked}
         onClick={onToggleMultiHop}
       />
-      <BrandLockup />
       <div className="flex-1" />
       {userEmail && (
         <span
@@ -870,17 +868,6 @@ function MultiHopTopAction({ armed, unlocked, onClick }: MultiHopTopActionProps)
         </span>
       )}
     </button>
-  );
-}
-
-function BrandLockup() {
-  return (
-    <div className="flex items-center gap-2.5">
-      <AppIconMark size={32} style={{ borderRadius: 10 }} />
-      <span className="text-base font-semibold" style={{ color: white.w100 }}>
-        Birdo VPN
-      </span>
-    </div>
   );
 }
 

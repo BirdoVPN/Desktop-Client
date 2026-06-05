@@ -6,7 +6,7 @@ import { Login } from '@/components/Login';
 import { AppShell } from '@/components/AppShell';
 import { OfflineBanner } from '@/components/OfflineBanner';
 import { PixelCanvas } from '@/components/PixelCanvas';
-import { WindowControls } from '@/components/WindowControls';
+import { TitleBar } from '@/components/TitleBar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
@@ -155,21 +155,23 @@ function App() {
 
   if (initializing) {
     return (
-      <div className="relative flex h-screen items-center justify-center overflow-hidden bg-[#000000]">
+      <div className="relative flex h-screen flex-col overflow-hidden bg-[#000000]">
         <PixelCanvas />
-        <WindowControls />
+        <TitleBar />
 
-        <motion.div
-          className="relative z-10 flex flex-col items-center gap-4"
-          initial={{ opacity: 0, scale: 0.9 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 0.5 }}
-        >
-          <div className="relative">
-            <div className="h-16 w-16 animate-spin rounded-full border-2 border-white/10 border-t-white" />
-          </div>
-          <p className="text-sm text-white/60">Loading...</p>
-        </motion.div>
+        <div className="relative z-10 flex flex-1 flex-col items-center justify-center">
+          <motion.div
+            className="flex flex-col items-center gap-4"
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.5 }}
+          >
+            <div className="relative">
+              <div className="h-16 w-16 animate-spin rounded-full border-2 border-white/10 border-t-white" />
+            </div>
+            <p className="text-sm text-white/60">Loading...</p>
+          </motion.div>
+        </div>
       </div>
     );
   }
@@ -189,10 +191,11 @@ function App() {
 
   return (
     <MotionConfig reducedMotion="user">
-    <div className="relative h-screen overflow-hidden bg-birdo-black">
+    <div className="relative flex h-screen flex-col overflow-hidden bg-birdo-black">
       <PixelCanvas />
-      <WindowControls />
+      <TitleBar />
 
+      <div className="relative z-10 flex-1 overflow-hidden">
       {/* Global offline banner — shows on every screen (matches mobile's
           above-NavHost placement), not just the dashboard. */}
       <OfflineBanner />
@@ -236,6 +239,7 @@ function App() {
           </motion.div>
         )}
       </AnimatePresence>
+      </div>
     </div>
     </MotionConfig>
   );

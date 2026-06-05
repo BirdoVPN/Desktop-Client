@@ -253,8 +253,8 @@ const defaultSettings: AppSettings = {
   multiHopEnabled: false,
   multiHopEntryNodeId: null,
   multiHopExitNodeId: null,
-  stealthMode: false,
-  quantumProtection: false,
+  stealthMode: true,
+  quantumProtection: true,
 };
 
 export const useAppStore = create<AppState>()(
@@ -272,7 +272,7 @@ export const useAppStore = create<AppState>()(
       theme: 'dark' as ThemeMode,
       setTheme: (theme) => set({ theme }),
 
-      windowCorner: 'top-left' as WindowCorner,
+      windowCorner: 'bottom-left' as WindowCorner,
       setWindowCorner: (windowCorner) => set({ windowCorner }),
 
       // Deep link
@@ -377,9 +377,12 @@ export const useAppStore = create<AppState>()(
         })),
 
       // Settings shortcuts
-      setKillSwitch: (enabled) =>
+      // Kill switch is always-on and locked: ignore any attempt to disable it
+      // (the toggle is rendered locked-on; the backend arms it from this
+      // persisted preference on every connect).
+      setKillSwitch: () =>
         set((state) => ({
-          settings: { ...state.settings, killSwitchEnabled: enabled },
+          settings: { ...state.settings, killSwitchEnabled: true },
         })),
       setAutoConnect: (enabled) =>
         set((state) => ({
