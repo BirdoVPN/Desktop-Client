@@ -274,9 +274,10 @@ input {
   width: 400%;
   will-change: transform;
   animation: birdo-globe-spin 120s linear infinite;
-  /* Soft circular falloff so continents fade toward the limb, not a hard box. */
-  -webkit-mask-image: radial-gradient(circle at 50% 50%, #000 54%, transparent 78%);
-  mask-image: radial-gradient(circle at 50% 50%, #000 54%, transparent 78%);
+  /* No mask here: a mask on the SCROLLING layer slides with it, which showed a
+   * blue crescent on the limb that swept around as it rotated. The globe's own
+   * `overflow:hidden; border-radius:50%` already clips to the sphere, and the
+   * static `.birdo-globe__limb` overlay below provides the soft edge falloff. */
 }
 .birdo-globe__map {
   background-repeat: repeat-x;
@@ -319,6 +320,33 @@ input {
   inset: 0;
   border-radius: 50%;
   box-shadow: inset 0 0 0 1px rgba(123, 178, 230, 0.28);
+}
+/* Static soft limb falloff (does NOT scroll) — fades continents into the rim
+ * so the sphere reads as round without a moving mask artifact. */
+.birdo-globe__limb {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 50%, transparent 60%, rgba(6, 18, 37, 0.55) 80%, rgba(6, 18, 37, 0.9) 100%);
+}
+/* user -> VPN connection arc overlay (lives in the scrolling dots layer) */
+.birdo-globe__arc {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+.birdo-globe__arc path {
+  fill: none;
+  stroke: var(--birdo-globe-dot, #44d17e);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  /* constant visual width despite the non-uniform viewBox stretch */
+  vector-effect: non-scaling-stroke;
+  opacity: 0.9;
 }
 .birdo-globe__atmo {
   position: absolute;

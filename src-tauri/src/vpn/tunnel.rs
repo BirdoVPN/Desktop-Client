@@ -28,6 +28,13 @@ fn cmd(program: &str) -> Command {
 pub(super) const ADAPTER_NAME: &str = "Birdo VPN";
 const TUNNEL_TYPE: &str = "Birdo";
 
+/// True when IPv6 leak protection had to fall back to disabling the ms_tcpip6
+/// adapter binding via PowerShell (because the fast netsh ::/0 firewall rules
+/// didn't take). Only then does disconnect need to re-enable the binding — so
+/// the common (netsh-worked) path keeps disconnect fast. Process-global: one
+/// tunnel is active at a time.
+static IPV6_BINDING_DISABLED: AtomicBool = AtomicBool::new(false);
+
 /// Fixed GUID for the Birdo VPN adapter, so we can reliably reopen/delete
 /// stale adapters across restarts and crashes.
 /// Generated once — do not change after release.
@@ -966,105 +973,77 @@ impl WintunTunnel {
     /// outbound rule is mandatory — if it fails, the function returns an error
     /// to prevent IPv6 leaks from going undetected.
     async fn block_ipv6_leaks(&self) -> Result<(), String> {
-        tracing::info!("Blocking IPv6 to prevent leaks (comprehensive)");
-        let mut succeeded = 0u32;
-        let mut warnings: Vec<&str> = Vec::new();
+        tracing::info!("Blocking IPv6 to prevent leaks (netsh firewall)");
 
-        // PERF-CONNECT: Combined all PowerShell IPv6 work into a SINGLE invocation.
-        // Previously this was 3 separate PowerShell calls (~1-2s startup each = 3-6s).
-        // Now a single script does adapter binding disable + outbound + inbound rules.
-        match cmd("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-Command",
-                // METHOD 1: Disable IPv6 bindings on all adapters
-                "try { Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Disable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue; Write-Output 'BIND_OK' } catch { Write-Output 'BIND_FAIL' }; \
-                 # METHOD 2+3: Firewall rules for outbound and inbound IPv6 \
-                 try { \
-                   Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 Out' -ErrorAction SilentlyContinue; \
-                   Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 Out UDP' -ErrorAction SilentlyContinue; \
-                   Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 In' -ErrorAction SilentlyContinue; \
-                   Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 In UDP' -ErrorAction SilentlyContinue; \
-                   New-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 Out' -Direction Outbound -Action Block -Protocol TCP -RemoteAddress ::/0 -ErrorAction Stop | Out-Null; \
-                   New-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 Out UDP' -Direction Outbound -Action Block -Protocol UDP -RemoteAddress ::/0 -ErrorAction Stop | Out-Null; \
-                   New-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 In' -Direction Inbound -Action Block -Protocol TCP -RemoteAddress ::/0 -ErrorAction Stop | Out-Null; \
-                   New-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 In UDP' -Direction Inbound -Action Block -Protocol UDP -RemoteAddress ::/0 -ErrorAction Stop | Out-Null; \
-                   Write-Output 'FW_OK' \
-                 } catch { Write-Output 'FW_FAIL' }",
-            ])
-            .output()
-        {
-            Ok(o) => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                if stdout.contains("BIND_OK") { succeeded += 1; }
-                else { warnings.push("adapter-binding"); }
-                if stdout.contains("FW_OK") { succeeded += 2; } // counts as 2 (in+out)
-                else { warnings.push("fw-rules"); }
-            }
-            Err(e) => {
-                tracing::warn!("PowerShell IPv6 blocking failed: {}", e);
-                warnings.push("powershell");
+        // PERF-CONNECT: All-netsh primary path. The old code shelled out to
+        // PowerShell (New-NetFirewallRule + Disable-NetAdapterBinding), which
+        // cost ~14s of cold-start on AV-heavy machines AND its firewall rules
+        // were observed failing. netsh advfirewall rules blocking ::/0 in/out
+        // (TCP+UDP) plus ICMPv6 and 6in4 fully prevent IPv6 leaks at ~50ms each.
+        IPV6_BINDING_DISABLED.store(false, Ordering::SeqCst);
+        let rules: &[(&str, &[&str])] = &[
+            ("Birdo VPN Block IPv6 Out",     &["dir=out", "action=block", "protocol=tcp", "remoteip=::/0"]),
+            ("Birdo VPN Block IPv6 Out UDP", &["dir=out", "action=block", "protocol=udp", "remoteip=::/0"]),
+            ("Birdo VPN Block IPv6 In",      &["dir=in",  "action=block", "protocol=tcp", "remoteip=::/0"]),
+            ("Birdo VPN Block IPv6 In UDP",  &["dir=in",  "action=block", "protocol=udp", "remoteip=::/0"]),
+            ("Birdo VPN Block ICMPv6",       &["dir=out", "action=block", "protocol=icmpv6"]),
+            ("Birdo VPN Block 6in4",         &["dir=out", "action=block", "protocol=41"]),
+        ];
+
+        let mut succeeded = 0u32;
+        let mut critical_out_ok = 0u32; // the two outbound ::/0 rules (tcp + udp)
+        for (name, args) in rules {
+            // Remove any stale rule of the same name first (ignore errors).
+            let _ = cmd("netsh")
+                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={}", name)])
+                .output();
+            let mut full: Vec<String> =
+                ["advfirewall", "firewall", "add", "rule"].iter().map(|s| s.to_string()).collect();
+            full.push(format!("name={}", name));
+            full.extend(args.iter().map(|s| (*s).to_string()));
+            match cmd("netsh").args(&full).output() {
+                Ok(o) if o.status.success() => {
+                    succeeded += 1;
+                    if name.starts_with("Birdo VPN Block IPv6 Out") {
+                        critical_out_ok += 1;
+                    }
+                }
+                _ => tracing::warn!("netsh IPv6 rule failed: {}", name),
             }
         }
 
-        // PERF-CONNECT: Combined both netsh firewall rules into one call.
-        // METHOD 4+5: Block ICMPv6 + protocol 41 (6in4 tunneling)
-        for (name, protocol) in [
-            ("Birdo VPN Block ICMPv6", "icmpv6"),
-            ("Birdo VPN Block 6in4", "41"),
-        ] {
-            match cmd("netsh")
+        // Safety net: if the critical OUTBOUND ::/0 blocks didn't take (e.g. an
+        // older netsh that rejects ::/0), fall back to disabling the ms_tcpip6
+        // adapter binding via PowerShell. Slower, but guarantees no IPv6 leak.
+        // Flag it so disconnect re-enables the binding (kept fast otherwise).
+        if critical_out_ok < 2 {
+            tracing::warn!(
+                "netsh ::/0 outbound block incomplete ({}/2) — falling back to adapter-binding disable",
+                critical_out_ok
+            );
+            match cmd("powershell")
                 .args([
-                    "advfirewall",
-                    "firewall",
-                    "add",
-                    "rule",
-                    &format!("name={}", name),
-                    "dir=out",
-                    "action=block",
-                    &format!("protocol={}", protocol),
+                    "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | \
+                     Disable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue",
                 ])
                 .output()
             {
-                Ok(o) if o.status.success() => {
+                Ok(_) => {
+                    IPV6_BINDING_DISABLED.store(true, Ordering::SeqCst);
                     succeeded += 1;
                 }
-                Ok(_) => {
-                    warnings.push(if protocol == "icmpv6" {
-                        "ICMPv6"
-                    } else {
-                        "6in4"
-                    });
-                }
-                Err(_) => {
-                    warnings.push(if protocol == "icmpv6" {
-                        "ICMPv6"
-                    } else {
-                        "6in4"
-                    });
-                }
+                Err(e) => tracing::warn!("IPv6 adapter-binding fallback failed: {}", e),
             }
         }
 
-        // At least one method must succeed to proceed
         if succeeded == 0 {
             return Err("Critical: All IPv6 leak prevention methods failed. \
                  Ensure the app is running as administrator."
                 .to_string());
         }
 
-        if !warnings.is_empty() {
-            tracing::warn!(
-                "IPv6 protection: {}/{} methods succeeded, failed: {:?}",
-                succeeded,
-                succeeded + warnings.len() as u32,
-                warnings
-            );
-        }
-
-        tracing::info!(
-            "IPv6 leak protection enabled ({} methods active)",
-            succeeded
-        );
+        tracing::info!("IPv6 leak protection enabled ({} rules active)", succeeded);
         Ok(())
     }
 
@@ -1094,24 +1073,22 @@ impl WintunTunnel {
                 .output();
         }
 
-        // Re-enable IPv6 adapter bindings via PowerShell (no netsh equivalent).
-        // Spawn it non-blocking — adapter re-binding is not critical for VPN disconnect.
-        tokio::task::spawn_blocking(|| {
-            match cmd("powershell")
-                .args([
-                    "-NoProfile", "-NonInteractive", "-Command",
-                    "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | \
-                     Enable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue",
-                ])
-                .output()
-            {
-                Ok(o) if !o.status.success() => {
-                    tracing::warn!("IPv6 re-enable failed: {}", String::from_utf8_lossy(&o.stderr));
-                }
-                Err(e) => tracing::warn!("IPv6 re-enable failed: {}", e),
-                _ => {}
-            }
-        });
+        // Only re-enable IPv6 adapter bindings if the connect path actually
+        // disabled them (the rare netsh-::/0-failed fallback). In the common
+        // fast path we never touched bindings, so disconnect skips the slow
+        // (~seconds, AV cold-start) PowerShell call entirely.
+        if IPV6_BINDING_DISABLED.swap(false, Ordering::SeqCst) {
+            // Non-blocking — adapter re-binding is not critical for disconnect.
+            tokio::task::spawn_blocking(|| {
+                let _ = cmd("powershell")
+                    .args([
+                        "-NoProfile", "-NonInteractive", "-Command",
+                        "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | \
+                         Enable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue",
+                    ])
+                    .output();
+            });
+        }
 
         tracing::debug!("IPv6 block rules removed");
         Ok(())

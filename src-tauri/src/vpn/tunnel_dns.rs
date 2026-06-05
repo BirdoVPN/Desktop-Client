@@ -23,45 +23,63 @@ fn base64_encode_utf16le(script: &str) -> String {
 }
 
 impl WintunTunnel {
-    /// Get list of non-VPN adapter names using PowerShell Get-NetAdapter.
+    /// List connected non-VPN adapter names.
+    ///
+    /// PERF: parse `netsh interface ipv4 show interfaces` instead of PowerShell
+    /// `Get-NetAdapter` — the PowerShell cold-start cost ~9s on AV-heavy
+    /// machines and was the single slowest step of a connect. netsh is ~50ms.
+    /// Columns are: Idx  Met  MTU  State  Name — Name is everything from the 5th
+    /// token on, so multi-word names like "WiFi 2" are preserved.
     pub(super) fn get_non_vpn_adapters() -> Vec<String> {
+        let parsed: Vec<String> = match cmd("netsh")
+            .args(["interface", "ipv4", "show", "interfaces"])
+            .output()
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout
+                    .lines()
+                    .filter_map(|line| {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        // Data rows start with a numeric Idx and have >= 5 cols.
+                        if parts.len() < 5 || parts[0].parse::<u32>().is_err() {
+                            return None;
+                        }
+                        // State is col 4 ("connected"/"disconnected"); name is the rest.
+                        if !parts[3].eq_ignore_ascii_case("connected") {
+                            return None;
+                        }
+                        let name = parts[4..].join(" ");
+                        if name == super::tunnel::ADAPTER_NAME || name.contains("Loopback") {
+                            None
+                        } else {
+                            Some(name)
+                        }
+                    })
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        if !parsed.is_empty() {
+            return parsed;
+        }
+
+        // Fallback: PowerShell Get-NetAdapter (only if netsh parsing found none).
         let ps_script = format!(
             "Get-NetAdapter -Physical | Where-Object {{ $_.Name -ne '{}' -and $_.Status -eq 'Up' }} | Select-Object -ExpandProperty Name",
             super::tunnel::ADAPTER_NAME
         );
         let encoded = base64_encode_utf16le(&ps_script);
-
         match cmd("powershell")
             .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
             .output()
         {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout
-                    .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect()
-            }
-            _ => {
-                // Fallback: use netsh
-                match cmd("netsh")
-                    .args(["interface", "show", "interface"])
-                    .output()
-                {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        stdout
-                            .lines()
-                            .filter(|l| {
-                                l.contains("Connected") && !l.contains(super::tunnel::ADAPTER_NAME)
-                            })
-                            .filter_map(|l| l.split_whitespace().last().map(String::from))
-                            .collect()
-                    }
-                    Err(_) => Vec::new(),
-                }
-            }
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            _ => Vec::new(),
         }
     }
 

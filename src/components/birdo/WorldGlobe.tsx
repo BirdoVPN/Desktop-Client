@@ -146,6 +146,24 @@ export function WorldGlobe({
     return out;
   }, [servers, selectedServerId]);
 
+  // user → selected-server connection arc, in the same tile coordinate space
+  // as the dots (x in 0..50% per tile). London is the fixed user origin.
+  const USER_LAT = 51.51;
+  const USER_LON = -0.13;
+  const arc = useMemo(() => {
+    if (!selectedServerId) return null;
+    const srv = servers.find((s) => s.id === selectedServerId);
+    const ll = srv ? countryCoords(srv.countryCode) : null;
+    if (!ll) return null;
+    const [sLat, sLon] = ll;
+    return {
+      ux: ((USER_LON + 180) / 360) * 50,
+      uy: ((90 - USER_LAT) / 180) * 100,
+      sx: ((sLon + 180) / 360) * 50,
+      sy: ((90 - sLat) / 180) * 100,
+    };
+  }, [servers, selectedServerId]);
+
   const playState = autoRotate ? 'running' : 'paused';
 
   return (
@@ -172,8 +190,22 @@ export function WorldGlobe({
               />
             )),
           )}
+          {isConnected && arc && (
+            <svg className="birdo-globe__arc" viewBox="0 0 100 100" preserveAspectRatio="none">
+              {[0, 50].map((off) => {
+                const ux = off + arc.ux;
+                const sx = off + arc.sx;
+                const cx = (ux + sx) / 2;
+                const cy = Math.min(arc.uy, arc.sy) - 12; // lift the arc upward
+                return (
+                  <path key={off} d={`M${ux} ${arc.uy} Q ${cx} ${cy} ${sx} ${arc.sy}`} />
+                );
+              })}
+            </svg>
+          )}
         </div>
         <div className="birdo-globe__shade" />
+        <div className="birdo-globe__limb" />
         <div className="birdo-globe__rim" />
       </div>
       <div
