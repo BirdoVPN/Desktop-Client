@@ -163,7 +163,7 @@ export function Subscription() {
   const hasSubscription = currentPlan.length > 0;
 
   return (
-    <div className="flex h-full flex-col bg-birdo-s0">
+    <div className="flex h-full flex-col">
       <BirdoTopBar
         title="Subscription"
         onBack={popRoute}

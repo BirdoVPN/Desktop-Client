@@ -92,10 +92,11 @@ function formatRenewalDate(raw: string | null): string | null {
 }
 
 export function Profile() {
-  const { account, connectionState, vpnIp, setAccount, logout, setAuthenticated } =
+  const { account, userEmail, connectionState, vpnIp, setAccount, logout, setAuthenticated } =
     useAppStore(
       useShallow((s) => ({
         account: s.account,
+        userEmail: s.userEmail,
         connectionState: s.connectionState,
         vpnIp: s.vpnIp,
         setAccount: s.setAccount,
@@ -103,6 +104,10 @@ export function Profile() {
         setAuthenticated: s.setAuthenticated,
       }))
     );
+  // The signed-in email is mirrored in both `account.email` and the top-level
+  // `userEmail` (set at login). Fall back to userEmail so the identity card can
+  // never render "Anonymous" for a logged-in user even if one source is null.
+  const resolvedEmail = account.email ?? userEmail ?? null;
   const pushRoute = useAppStore((s) => s.pushRoute);
 
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -186,7 +191,7 @@ export function Profile() {
 
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
         <IdentityCard
-          email={account.email}
+          email={resolvedEmail}
           plan={account.plan}
           isConnected={isConnected}
           publicIp={vpnIp}
@@ -250,7 +255,7 @@ export function Profile() {
           <BirdoCard padding="0.25rem">
             <BirdoNavRow
               title="Sign out"
-              subtitle={account.email ?? 'Sign out of this device'}
+              subtitle={resolvedEmail ?? 'Sign out of this device'}
               leadingIcon={LogOut}
               leadingTint={statusTokens.red}
               onClick={handleLogout}

@@ -24,7 +24,10 @@ export function TitleBar() {
   return (
     <div
       className="relative z-[100] flex h-8 shrink-0 select-none items-center justify-between border-b border-white/[0.06] px-2.5"
-      style={{ backgroundColor: 'rgba(11,11,16,0.85)', backdropFilter: 'blur(8px)' }}
+      // No backdrop-filter: a blur() that samples the continuously-repainting
+      // globe canvas behind it smears into vertical "stretched line" streaks on
+      // many WebView2 GPUs. A near-opaque solid fill reads the same and is safe.
+      style={{ backgroundColor: 'rgba(11,11,16,0.97)' }}
     >
       <div className="flex items-center gap-1.5">
         <AppIconMark size={15} style={{ borderRadius: 4 }} />

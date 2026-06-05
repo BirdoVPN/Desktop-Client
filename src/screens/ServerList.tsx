@@ -231,7 +231,7 @@ export function ServerListScreen() {
   const showRetry = servers.length === 0 && !isLoading;
 
   return (
-    <div className="flex h-full flex-col" style={{ backgroundColor: 'var(--birdo-s0)' }}>
+    <div className="flex h-full flex-col">
       {/* ── Header ── */}
       <BirdoTopBar
         title="Servers"

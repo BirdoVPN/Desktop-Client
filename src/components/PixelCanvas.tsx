@@ -1,6 +1,18 @@
 import { useEffect, useRef } from 'react';
 
-export function PixelCanvas() {
+interface PixelCanvasProps {
+  /**
+   * Positioning class for the canvas. Defaults to a fixed full-window backdrop
+   * (App.tsx's global ambient layer). Pass `absolute inset-0 h-full w-full` to
+   * embed it as the background of a positioned container (e.g. a pushed
+   * settings sub-screen) so the grid fills that box instead of the viewport.
+   */
+  className?: string;
+}
+
+export function PixelCanvas({
+  className = 'fixed inset-0 h-full w-full',
+}: PixelCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -28,11 +40,18 @@ export function PixelCanvas() {
     let mouseY = -1000;
 
     const initGrid = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      // Size to the canvas's own box, NOT window.innerWidth. Sizing to the
+      // window while the element is a narrow column would squash the square
+      // backing store into thin vertical lines when scaled to fit — which is
+      // itself a "stretched line" artifact. Bounding box keeps squares square.
+      const rect = canvas.getBoundingClientRect();
+      const w = Math.max(1, Math.round(rect.width));
+      const h = Math.max(1, Math.round(rect.height));
+      canvas.width = w;
+      canvas.height = h;
 
       // Smaller squares: 15px - 25px range
-      pixelSize = Math.max(15, Math.min(25, window.innerWidth / 80));
+      pixelSize = Math.max(15, Math.min(25, w / 80));
 
       columns = Math.ceil(canvas.width / pixelSize);
       rows = Math.ceil(canvas.height / pixelSize);
@@ -111,11 +130,14 @@ export function PixelCanvas() {
       mouseY = e.clientY - rect.top;
     };
 
+    // Re-init on element resize (window resize, column reflow, etc.).
     let resizeTimer: ReturnType<typeof setTimeout>;
-    const handleResize = () => {
+    const scheduleInit = () => {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(initGrid, 150);
     };
+    const ro = new ResizeObserver(scheduleInit);
+    ro.observe(canvas);
 
     // Pause animation when window is hidden to save CPU/GPU
     const handleVisibilityChange = () => {
@@ -127,7 +149,6 @@ export function PixelCanvas() {
       }
     };
 
-    window.addEventListener('resize', handleResize);
     window.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
@@ -135,22 +156,23 @@ export function PixelCanvas() {
     animate();
 
     return () => {
-      window.removeEventListener('resize', handleResize);
       window.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       cancelAnimationFrame(animationFrameId);
       clearTimeout(resizeTimer);
+      ro.disconnect();
     };
   }, []);
 
   return (
     <canvas
       ref={canvasRef}
-      className="fixed inset-0 h-full w-full"
-      // No CSS blur filter: a blur() on a fixed full-window canvas forces a
-      // large GPU compositing layer that, under WebView2, smears vertical
-      // banding / stretched lines across the globe above it. The pixels are
-      // already very low-alpha, so they read fine as an ambient grid unblurred.
+      className={className}
+      aria-hidden
+      // No CSS blur filter: a blur() on a full-window canvas forces a large GPU
+      // compositing layer that, under WebView2, smears vertical banding across
+      // layers above it. The pixels are already very low-alpha so they read
+      // fine as an ambient grid unblurred.
       style={{ background: '#000000', zIndex: 0, pointerEvents: 'none' }}
     />
   );

@@ -182,7 +182,7 @@ export function SplitTunnel() {
   }, [apps, searchQuery]);
 
   return (
-    <div className="flex h-full flex-col" style={{ backgroundColor: 'var(--birdo-s0)' }}>
+    <div className="flex h-full flex-col">
       {/* ── Header ── */}
       <BirdoTopBar title="Split Tunneling" onBack={popRoute} />
 
@@ -389,7 +389,7 @@ export function SplitTunnel() {
       {pickerOpen && (
         <div
           className="fixed inset-0 z-50 flex flex-col"
-          style={{ backgroundColor: 'rgba(11,11,16,0.97)', backdropFilter: 'blur(4px)' }}
+          style={{ backgroundColor: 'rgba(11,11,16,0.985)' }}
         >
           <div className="flex items-center gap-2 px-4 pb-2 pt-4">
             <AppWindow size={18} color={brand.purple} aria-hidden />

@@ -17,6 +17,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { useAppStore, type RouteId } from '@/store/app-store';
 import { motion as motionTokens } from '@/lib/birdo-theme';
 import { BottomNav } from '@/components/BottomNav';
+import { PixelCanvas } from '@/components/PixelCanvas';
 import { Dashboard } from '@/components/Dashboard';
 import { Profile } from '@/screens/Profile';
 import { Settings } from '@/components/Settings';
@@ -56,16 +57,24 @@ export function AppShell() {
           {topRoute && (
             <motion.div
               key={topRoute}
-              className="absolute inset-0 z-20 bg-birdo-s0"
+              // Solid black base occludes the tab rendered behind it, then its
+              // own PixelCanvas paints the same ambient grid as the rest of the
+              // app so pushed sub-screens (VPN settings, split tunnel, etc.)
+              // aren't missing the backdrop. Screen roots are transparent so the
+              // grid shows through.
+              className="absolute inset-0 z-20 overflow-hidden bg-birdo-black"
               initial={{ x: '100%' }}
               animate={{ x: 0 }}
               exit={{ x: '100%' }}
               transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
             >
-              {(() => {
-                const Screen = PUSH_SCREENS[topRoute];
-                return <Screen />;
-              })()}
+              <PixelCanvas className="absolute inset-0 h-full w-full" />
+              <div className="relative z-10 h-full">
+                {(() => {
+                  const Screen = PUSH_SCREENS[topRoute];
+                  return <Screen />;
+                })()}
+              </div>
             </motion.div>
           )}
         </AnimatePresence>

@@ -578,9 +578,11 @@ export function Dashboard() {
         <div
           className="pointer-events-auto rounded-t-[24px] px-5 pt-4 pb-4"
           style={{
-            backgroundColor: 'rgba(11,11,16,0.92)',
+            // Near-opaque fill instead of backdrop-filter blur — the blur
+            // shader smears the repainting globe canvas into vertical streaks
+            // on WebView2 GPUs (the "lines stretching" artifact).
+            backgroundColor: 'rgba(11,11,16,0.97)',
             borderTop: `1px solid ${hairline.soft}`,
-            backdropFilter: 'blur(12px)',
           }}
         >
           {/* Stats (connected) */}
@@ -726,7 +728,7 @@ export function Dashboard() {
       <AnimatePresence>
         {showLogoutConfirm && (
           <motion.div
-            className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+            className="absolute inset-0 z-50 flex items-center justify-center bg-black/85"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -810,7 +812,9 @@ function HomeTopBar({
   return (
     <div
       className="relative z-20 flex items-center gap-2 px-4 pt-3 pb-2"
-      style={{ backgroundColor: 'rgba(11,11,16,0.55)', backdropFilter: 'blur(8px)' }}
+      // No backdrop-filter blur (smears the animating globe into vertical
+      // streaks on WebView2 GPUs); a near-opaque fill reads the same.
+      style={{ backgroundColor: 'rgba(11,11,16,0.92)' }}
     >
       <MultiHopTopAction
         armed={multiHopArmed}

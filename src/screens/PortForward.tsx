@@ -123,7 +123,7 @@ export function PortForward() {
   );
 
   return (
-    <div className="flex h-full flex-col bg-birdo-s0">
+    <div className="flex h-full flex-col">
       <BirdoTopBar title="Port Forwarding" onBack={popRoute} />
 
       <div className="flex-1 overflow-y-auto px-4 py-2">
