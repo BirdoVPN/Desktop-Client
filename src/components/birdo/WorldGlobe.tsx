@@ -106,6 +106,11 @@ function worldMapUrl(landColor: string, outlineColor: string): string {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
+// Fixed user origin for the connection arc (London). Module scope so it's a
+// stable reference and not flagged as a useMemo dependency.
+const USER_LAT = 51.51;
+const USER_LON = -0.13;
+
 export function WorldGlobe({
   servers,
   selectedServerId = null,
@@ -148,8 +153,6 @@ export function WorldGlobe({
 
   // user → selected-server connection arc, in the same tile coordinate space
   // as the dots (x in 0..50% per tile). London is the fixed user origin.
-  const USER_LAT = 51.51;
-  const USER_LON = -0.13;
   const arc = useMemo(() => {
     if (!selectedServerId) return null;
     const srv = servers.find((s) => s.id === selectedServerId);
