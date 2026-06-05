@@ -24,6 +24,56 @@ fn cmd(program: &str) -> Command {
     crate::utils::hidden_cmd(program)
 }
 
+/// Read the lowest-metric IPv4 default-route next hop via the IP Helper API
+/// (`GetIpForwardTable2`). Returns `None` on any failure so the caller can fall
+/// back to parsing `route print`. Native + instant; no subprocess.
+#[cfg(windows)]
+fn default_gateway_native() -> Option<String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET;
+
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    // SAFETY: `table` is a valid out-pointer; on success the OS allocates the
+    // table and we release it with `FreeMibTable` below.
+    let err = unsafe { GetIpForwardTable2(AF_INET, &mut table) };
+    if err.0 != 0 || table.is_null() {
+        return None;
+    }
+
+    let result = (|| {
+        // SAFETY: `table` is non-null and points to a valid table allocated by
+        // the OS; `NumEntries` describes the length of the trailing `Table` array.
+        let t = unsafe { &*table };
+        let rows = unsafe { std::slice::from_raw_parts(t.Table.as_ptr(), t.NumEntries as usize) };
+        let mut best: Option<(u32, Ipv4Addr)> = None;
+        for row in rows {
+            if row.DestinationPrefix.PrefixLength != 0 {
+                continue; // not a default route (0.0.0.0/0)
+            }
+            // SAFETY: union access — we only read the IPv4 view and verify family.
+            let nh = unsafe { row.NextHop.Ipv4 };
+            if nh.sin_family != AF_INET {
+                continue;
+            }
+            let o = unsafe { nh.sin_addr.S_un.S_un_b };
+            let ip = Ipv4Addr::new(o.s_b1, o.s_b2, o.s_b3, o.s_b4);
+            if ip.is_unspecified() {
+                continue;
+            }
+            if best.map_or(true, |(m, _)| row.Metric < m) {
+                best = Some((row.Metric, ip));
+            }
+        }
+        best.map(|(_, ip)| ip.to_string())
+    })();
+
+    // SAFETY: `table` was allocated by `GetIpForwardTable2` and is non-null.
+    unsafe { FreeMibTable(table as *const core::ffi::c_void) };
+    result
+}
+
 /// Wintun adapter configuration
 pub(super) const ADAPTER_NAME: &str = "Birdo VPN";
 const TUNNEL_TYPE: &str = "Birdo";
@@ -1107,6 +1157,14 @@ impl WintunTunnel {
 
     /// Get the default gateway from the routing table
     async fn get_default_gateway(&self) -> Result<String, String> {
+        // Native fast path: read the IPv4 routing table via the IP Helper API
+        // and pick the lowest-metric default route's next hop. Avoids spawning
+        // `route.exe` (~3s under AV). Falls back to `route print` parsing if the
+        // native read finds nothing, so routing is never left mis-resolved.
+        if let Some(gw) = default_gateway_native() {
+            return Ok(gw);
+        }
+
         let output = cmd("route")
             .args(["print", "0.0.0.0"])
             .output()
@@ -1131,48 +1189,20 @@ impl WintunTunnel {
         Err("Could not find default gateway".to_string())
     }
 
-    /// Get the interface index of the Wintun adapter
+    /// Get the interface index of the Wintun adapter.
+    ///
+    /// Native: ask the wintun adapter directly (it resolves the index from its
+    /// NET_LUID under the hood) instead of spawning `netsh show interfaces` and
+    /// parsing it (with a PowerShell fallback). Instant, no subprocess, and not
+    /// fooled by duplicate/locale-dependent adapter rows.
     async fn get_adapter_index(&self) -> Result<u32, String> {
-        // Use netsh to get interface info
-        let output = cmd("netsh")
-            .args(["interface", "ipv4", "show", "interfaces"])
-            .output()
-            .map_err(|e| format!("Failed to get interfaces: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Parse the output to find our adapter
-        for line in stdout.lines() {
-            if line.contains(ADAPTER_NAME) {
-                // Format: "   Idx     Met         MTU          State                Name"
-                // Example: "   42       1        1500  connected     Birdo VPN"
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(idx_str) = parts.first() {
-                    if let Ok(idx) = idx_str.parse::<u32>() {
-                        return Ok(idx);
-                    }
-                }
-            }
-        }
-
-        // Fallback: try to use PowerShell
-        let ps_output = cmd("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    "(Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue).ifIndex",
-                    ADAPTER_NAME
-                ),
-            ])
-            .output()
-            .map_err(|e| format!("Failed to get adapter index via PowerShell: {}", e))?;
-
-        let idx_str = String::from_utf8_lossy(&ps_output.stdout)
-            .trim()
-            .to_string();
-        idx_str
-            .parse::<u32>()
-            .map_err(|_| format!("Could not find interface index for {}", ADAPTER_NAME))
+        let guard = self.adapter.read().await;
+        let adapter = guard
+            .as_ref()
+            .ok_or("Wintun adapter not created yet")?;
+        adapter
+            .get_adapter_index()
+            .map_err(|e| format!("Failed to get adapter index: {}", e))
     }
 
     /// Parse CIDR notation into network and mask
