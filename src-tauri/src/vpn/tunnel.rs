@@ -74,6 +74,40 @@ fn default_gateway_native() -> Option<String> {
     result
 }
 
+/// Set the resolver list on an interface (by adapter GUID) via the native
+/// `SetInterfaceDnsSettings` API — instant, no `netsh` subprocess. Returns Err
+/// on any failure so the caller can fall back to netsh (DNS is never left unset).
+#[cfg(windows)]
+fn set_dns_native(adapter_guid: u128, servers: &[String]) -> Result<(), String> {
+    use windows::core::{GUID, PWSTR};
+    use windows::Win32::NetworkManagement::IpHelper::{
+        SetInterfaceDnsSettings, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+        DNS_SETTING_NAMESERVER,
+    };
+
+    if servers.is_empty() {
+        return Err("no DNS servers to set".to_string());
+    }
+
+    // SetInterfaceDnsSettings takes a comma-separated nameserver list.
+    let ns = servers.join(",");
+    let mut ns_w: Vec<u16> = ns.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut settings = DNS_INTERFACE_SETTINGS::default();
+    settings.Version = DNS_INTERFACE_SETTINGS_VERSION1;
+    settings.Flags = DNS_SETTING_NAMESERVER as u64;
+    settings.NameServer = PWSTR(ns_w.as_mut_ptr());
+
+    let guid = GUID::from_u128(adapter_guid);
+    // SAFETY: `settings` is a fully-initialised struct; `NameServer` points to a
+    // NUL-terminated wide buffer that outlives this call.
+    let err = unsafe { SetInterfaceDnsSettings(guid, &settings) };
+    if err.0 != 0 {
+        return Err(format!("SetInterfaceDnsSettings failed: 0x{:08X}", err.0));
+    }
+    Ok(())
+}
+
 /// Wintun adapter configuration
 pub(super) const ADAPTER_NAME: &str = "Birdo VPN";
 const TUNNEL_TYPE: &str = "Birdo";
@@ -959,46 +993,50 @@ impl WintunTunnel {
             tracing::debug!("Disabled DNS on adapter: {}", iface_name);
         }
 
-        // STEP 2: Set DNS on VPN adapter (validate=no — see STEP 1).
-        for (i, dns) in self.config.dns.iter().enumerate() {
-            let args: Vec<&str> = if i == 0 {
-                vec![
-                    "interface",
-                    "ip",
-                    "set",
-                    "dns",
-                    &adapter_name,
-                    "static",
-                    dns,
-                    "validate=no",
-                ]
-            } else {
-                vec![
-                    "interface",
-                    "ip",
-                    "add",
-                    "dns",
-                    &adapter_name,
-                    dns,
-                    "index=2",
-                    "validate=no",
-                ]
-            };
+        // STEP 2: Set DNS on the VPN adapter. Native fast path first
+        // (SetInterfaceDnsSettings via the adapter GUID — instant, no
+        // subprocess), then fall back to netsh if the native call errors so DNS
+        // is never left unset.
+        let adapter_guid = {
+            let guard = self.adapter.read().await;
+            guard.as_ref().map(|a| a.get_guid())
+        };
+        let native_ok = match adapter_guid {
+            Some(guid) => match set_dns_native(guid, &self.config.dns) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("Native DNS set failed ({}); falling back to netsh", e);
+                    false
+                }
+            },
+            None => false,
+        };
 
-            let output = cmd("netsh")
-                .args(&args)
-                .output()
-                .map_err(|e| format!("Failed to set DNS: {}", e))?;
-
-            if !output.status.success() {
-                tracing::warn!(
-                    "DNS configuration warning: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+        if !native_ok {
+            for (i, dns) in self.config.dns.iter().enumerate() {
+                let args: Vec<&str> = if i == 0 {
+                    vec!["interface", "ip", "set", "dns", &adapter_name, "static", dns, "validate=no"]
+                } else {
+                    vec!["interface", "ip", "add", "dns", &adapter_name, dns, "index=2", "validate=no"]
+                };
+                let output = cmd("netsh")
+                    .args(&args)
+                    .output()
+                    .map_err(|e| format!("Failed to set DNS: {}", e))?;
+                if !output.status.success() {
+                    tracing::warn!(
+                        "DNS configuration warning: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
             }
         }
 
-        tracing::debug!("DNS configured (VPN-only): {:?}", self.config.dns);
+        tracing::debug!(
+            "DNS configured (VPN-only, {}): {:?}",
+            if native_ok { "native" } else { "netsh" },
+            self.config.dns
+        );
         Ok(())
     }
 
