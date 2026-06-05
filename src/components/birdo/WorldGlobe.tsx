@@ -21,7 +21,9 @@
  */
 import { useMemo } from 'react';
 import { feature } from 'topojson-client';
-import worldData from 'world-atlas/countries-110m.json';
+// 50m resolution (vs 110m) — far more coastline/border detail for a crisp,
+// fully-outlined map. Heavier JSON but it's projected once at module load.
+import worldData from 'world-atlas/countries-50m.json';
 import type { Feature, FeatureCollection, GeometryObject } from 'geojson';
 import { brand } from '@/lib/birdo-theme';
 import { countryCoords } from '@/utils/country-coords';
@@ -82,13 +84,25 @@ function buildWorldPath(): string {
   return parts.join('');
 }
 
-const WORLD_PATH = buildWorldPath();
+// Built lazily on first globe mount (after login) — not at module load — so
+// projecting the 50m dataset never delays app startup. Cached after the first call.
+let _worldPath: string | null = null;
+function getWorldPath(): string {
+  if (_worldPath === null) _worldPath = buildWorldPath();
+  return _worldPath;
+}
 
-/** Equirectangular world map as an SVG data-URI for use as a CSS background. */
-function worldMapUrl(landColor: string): string {
+/**
+ * Equirectangular world map as an SVG data-URI for a CSS background. Land is
+ * filled and the same path is stroked so every coastline/border is outlined —
+ * the "fully outlined" detailed look. stroke-width is in viewBox units (360
+ * wide), so ~0.3 renders as a sub-pixel hairline once scaled.
+ */
+function worldMapUrl(landColor: string, outlineColor: string): string {
   const svg =
     `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 360 180' preserveAspectRatio='none'>` +
-    `<path d='${WORLD_PATH}' fill='${landColor}'/></svg>`;
+    `<path d='${getWorldPath()}' fill='${landColor}' stroke='${outlineColor}' ` +
+    `stroke-width='0.3' stroke-linejoin='round' vector-effect='non-scaling-stroke'/></svg>`;
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
@@ -99,7 +113,10 @@ export function WorldGlobe({
   autoRotate = true,
   className = '',
 }: WorldGlobeProps) {
-  const mapUrl = useMemo(() => worldMapUrl('rgba(95,168,224,0.62)'), []);
+  const mapUrl = useMemo(
+    () => worldMapUrl('rgba(89,168,224,0.55)', 'rgba(150,205,245,0.9)'),
+    [],
+  );
 
   const atmo = isConnected
     ? 'rgba(68, 209, 126, 0.22)' // green when connected

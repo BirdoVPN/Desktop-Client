@@ -289,12 +289,22 @@ input {
 }
 .birdo-globe__dot {
   position: absolute;
-  width: 7px;
-  height: 7px;
-  margin: -3.5px 0 0 -3.5px;
+  width: 6px;
+  height: 6px;
+  margin: -3px 0 0 -3px;
   border-radius: 50%;
   background: var(--birdo-globe-dot, #a855f7);
-  box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.22), 0 0 7px 1px rgba(168, 85, 247, 0.5);
+  /* crisp white ring + tight dark contrast halo so the marker reads on land */
+  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.92), 0 0 5px 1px rgba(0, 0, 0, 0.4);
+}
+/* soft colored glow in the marker's own colour */
+.birdo-globe__dot::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--birdo-globe-dot, #a855f7) 0%, transparent 68%);
+  opacity: 0.38;
 }
 .birdo-globe__shade {
   position: absolute;

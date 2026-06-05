@@ -888,7 +888,10 @@ impl WintunTunnel {
             non_vpn_adapters.len()
         );
 
-        // STEP 1: Disable DNS on all other adapters to prevent SMHNR leak
+        // STEP 1: Disable DNS on all other adapters to prevent SMHNR leak.
+        // `validate=no` is critical: without it netsh synchronously validates
+        // the change against the network (NLA re-evaluation), which blocks for
+        // 10-25s per call on some machines — the dominant cause of slow connects.
         for iface_name in &non_vpn_adapters {
             let _ = cmd("netsh")
                 .args([
@@ -899,12 +902,13 @@ impl WintunTunnel {
                     &format!("name={}", iface_name),
                     "static",
                     "none",
+                    "validate=no",
                 ])
                 .output();
             tracing::debug!("Disabled DNS on adapter: {}", iface_name);
         }
 
-        // STEP 2: Set DNS on VPN adapter
+        // STEP 2: Set DNS on VPN adapter (validate=no — see STEP 1).
         for (i, dns) in self.config.dns.iter().enumerate() {
             let args: Vec<&str> = if i == 0 {
                 vec![
@@ -915,6 +919,7 @@ impl WintunTunnel {
                     &adapter_name,
                     "static",
                     dns,
+                    "validate=no",
                 ]
             } else {
                 vec![
@@ -925,6 +930,7 @@ impl WintunTunnel {
                     &adapter_name,
                     dns,
                     "index=2",
+                    "validate=no",
                 ]
             };
 
