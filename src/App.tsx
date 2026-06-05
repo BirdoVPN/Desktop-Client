@@ -102,16 +102,17 @@ function App() {
         setAuthenticated(authState.is_authenticated);
 
         if (authState.is_authenticated) {
-          // Populate user email + account info from auth state
+          // Populate user email + account info from auth state. Always set the
+          // account when authenticated — gating on plan/account_id meant a
+          // stored session that returns only an email left `account` null, so
+          // the Profile screen rendered "Anonymous" for a real email login.
           if (authState.email) setUserEmail(authState.email);
-          if (authState.plan || authState.account_id) {
-            setAccount({
-              email: authState.email,
-              accountId: authState.account_id,
-              plan: authState.plan,
-              status: 'active',
-            });
-          }
+          setAccount({
+            email: authState.email,
+            accountId: authState.account_id,
+            plan: authState.plan,
+            status: 'active',
+          });
         }
       } catch {
         // Auth check failed - assume not authenticated
