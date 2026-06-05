@@ -89,6 +89,9 @@ const WEIGHT_BLOCK_STUN: u8 = 15; // STUN block overrides permits
 // ── Global state ─────────────────────────────────────────────────────
 static IS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static IS_BLOCKING: AtomicBool = AtomicBool::new(false);
+/// True when a STANDALONE IPv6 leak block (not the full kill switch) is active.
+/// Lets the tunnel block IPv6 natively via WFP instead of slow netsh/PowerShell.
+static IPV6_ONLY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VPN_SERVER_IP: once_cell::sync::Lazy<Arc<RwLock<Option<Ipv4Addr>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
@@ -1013,6 +1016,76 @@ pub async fn deactivate_blocking() -> Result<(), String> {
 
     IS_BLOCKING.store(false, Ordering::SeqCst);
     tracing::info!("Kill switch deactivated — normal traffic restored");
+    Ok(())
+}
+
+/// Block ALL outbound IPv6 natively via WFP, WITHOUT the full kill switch.
+///
+/// This is the fast path for IPv6 leak prevention on connect: a kernel WFP
+/// filter at the ALE_AUTH_CONNECT_V6 layer (plus localhost/DHCPv6 permits) added
+/// in a single transaction — microseconds, no netsh/PowerShell subprocess. The
+/// old netsh `remoteip=::/0` rules were rejected by netsh and fell back to a
+/// ~14s PowerShell `Disable-NetAdapterBinding`; this replaces all of that.
+///
+/// No-op if the full kill switch is already active (it blocks IPv6 already).
+pub async fn block_ipv6() -> Result<(), String> {
+    if IS_BLOCKING.load(Ordering::SeqCst) {
+        IPV6_ONLY_ACTIVE.store(false, Ordering::SeqCst); // kill switch owns the block
+        tracing::debug!("Kill switch active — standalone IPv6 block not needed");
+        return Ok(());
+    }
+    if !IS_INITIALIZED.load(Ordering::SeqCst) {
+        initialize().await?;
+    }
+
+    let mut guard = ENGINE
+        .lock()
+        .map_err(|e| format!("engine lock poisoned: {}", e))?;
+    let engine = guard.as_mut().ok_or("WFP engine not open")?;
+
+    engine.begin_transaction()?;
+    let result = (|| -> Result<(), String> {
+        engine.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
+        engine.add_block_all_v6()?;
+        engine.add_permit_localhost_v6()?;
+        engine.add_permit_dhcpv6()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            engine.commit_transaction()?;
+            IPV6_ONLY_ACTIVE.store(true, Ordering::SeqCst);
+            tracing::info!("IPv6 leak protection enabled (native WFP)");
+            Ok(())
+        }
+        Err(e) => {
+            engine.abort_transaction();
+            Err(e)
+        }
+    }
+}
+
+/// Remove the standalone IPv6 block added by [`block_ipv6`]. Fast, native.
+/// No-op if we never added it, or if the full kill switch owns the filters.
+pub async fn unblock_ipv6() -> Result<(), String> {
+    if !IPV6_ONLY_ACTIVE.swap(false, Ordering::SeqCst) {
+        return Ok(());
+    }
+    if IS_BLOCKING.load(Ordering::SeqCst) {
+        // Full kill switch is active — leave its filters intact.
+        return Ok(());
+    }
+    let mut guard = ENGINE
+        .lock()
+        .map_err(|e| format!("engine lock poisoned: {}", e))?;
+    if let Some(engine) = guard.as_mut() {
+        // Standalone block runs only when the kill switch is NOT active, so the
+        // engine holds only our IPv6 filters here.
+        engine.remove_all_filters();
+        engine.delete_sublayer();
+    }
+    tracing::debug!("Standalone IPv6 block removed (native WFP)");
     Ok(())
 }
 
