@@ -31,18 +31,42 @@ fn main() {
     // Set custom panic hook for crash recovery
     setup_panic_hook();
 
-    // Initialize logging
+    // Initialize logging.
+    //
+    // A release GUI build has no console attached, so the stdout fmt layer is
+    // invisible in the field — connection failures were undiagnosable. We add a
+    // second fmt layer that appends to <data_dir>/BirdoVPN/logs/birdo.log so the
+    // real error (e.g. the raw /vpn/connect failure) is always recoverable from
+    // disk. No new dependency: `dirs` + std::fs + a closure MakeWriter.
+    let file_layer = dirs::data_dir().and_then(|mut p| {
+        p.push("BirdoVPN");
+        p.push("logs");
+        std::fs::create_dir_all(&p).ok()?;
+        p.push("birdo.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .ok()?;
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || file.try_clone().expect("clone log file handle")),
+        )
+    });
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| {
                 if cfg!(target_os = "windows") {
-                    "birdo_vpn_desktop=info,wintun=info,wintun_dll=info".into()
+                    "birdo_vpn_desktop=debug,wintun=info,wintun_dll=info".into()
                 } else {
-                    "birdo_vpn_desktop=info".into()
+                    "birdo_vpn_desktop=debug".into()
                 }
             }),
         ))
         .with(tracing_subscriber::fmt::layer())
+        .with(file_layer)
         .init();
 
     info!("Birdo VPN Client starting...");

@@ -236,6 +236,77 @@ input {
   background: rgba(255, 255, 255, 0.1);
 }
 
+/* ── CSS/SVG world globe ──────────────────────────────────────────────────
+ * Replaces the old <canvas> globe, which produced vertical texture-atlas
+ * banding under WebView2 that could not be eliminated. This version is pure
+ * DOM/CSS: a circular sphere, an equirectangular world-map SVG scrolled with a
+ * GPU-clean `transform: translateX` (the one animation path WebView2 renders
+ * cleanly), plus radial shading + an atmosphere ring for the 3D read.
+ * Window is a fixed 380x640 (non-resizable) so px positioning is safe. */
+.birdo-globe-wrap {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.birdo-globe {
+  position: absolute;
+  left: 50%;
+  top: 248px;
+  width: 300px;
+  height: 300px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  overflow: hidden;
+  background: radial-gradient(circle at 38% 30%, #1f3a5e 0%, #0d2038 52%, #061325 100%);
+  box-shadow: inset 0 0 56px rgba(0, 0, 0, 0.62);
+}
+.birdo-globe__map {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 200%;
+  background-repeat: repeat-x;
+  background-size: 50% 100%;
+  will-change: transform;
+  animation: birdo-globe-spin 96s linear infinite;
+  /* Soft circular falloff so continents fade toward the limb, not a hard box. */
+  -webkit-mask-image: radial-gradient(circle at center, #000 58%, transparent 80%);
+  mask-image: radial-gradient(circle at center, #000 58%, transparent 80%);
+}
+@keyframes birdo-globe-spin {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.birdo-globe__shade {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.12), transparent 46%),
+    radial-gradient(circle at 68% 74%, rgba(0, 0, 0, 0.55), transparent 62%);
+}
+.birdo-globe__rim {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(123, 178, 230, 0.28);
+}
+.birdo-globe__atmo {
+  position: absolute;
+  left: 50%;
+  top: 248px;
+  width: 360px;
+  height: 360px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle, transparent 60%, var(--birdo-globe-atmo, rgba(73, 131, 199, 0.20)) 73%, transparent 82%);
+}
+@media (prefers-reduced-motion: reduce) {
+  .birdo-globe__map { animation: none; }
+}
+
 /* Status dot animation */
 @keyframes blink {
   0%, 100% { opacity: 1; }
