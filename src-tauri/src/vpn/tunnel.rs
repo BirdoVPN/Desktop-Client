@@ -1138,13 +1138,16 @@ impl WintunTunnel {
                         "dns",
                         &format!("name={}", name),
                         "dhcp",
+                        "validate=no",
                     ])
                     .output();
             }
         } else {
             for snapshot in &snapshots {
                 if snapshot.dns_servers.is_empty() {
-                    // Was DHCP — restore to DHCP
+                    // Was DHCP — restore to DHCP. validate=no skips the slow
+                    // synchronous network re-validation (~12s) that made
+                    // disconnect feel stuck while "recovering".
                     let _ = cmd("netsh")
                         .args([
                             "interface",
@@ -1153,6 +1156,7 @@ impl WintunTunnel {
                             "dns",
                             &format!("name={}", snapshot.adapter_name),
                             "dhcp",
+                            "validate=no",
                         ])
                         .output();
                     tracing::debug!("Restored {} to DHCP", snapshot.adapter_name);
@@ -1169,6 +1173,7 @@ impl WintunTunnel {
                                     &format!("name={}", snapshot.adapter_name),
                                     "static",
                                     dns,
+                                    "validate=no",
                                 ])
                                 .output();
                         } else {
@@ -1181,6 +1186,7 @@ impl WintunTunnel {
                                     &format!("name={}", snapshot.adapter_name),
                                     dns,
                                     &format!("index={}", i + 1),
+                                    "validate=no",
                                 ])
                                 .output();
                         }
