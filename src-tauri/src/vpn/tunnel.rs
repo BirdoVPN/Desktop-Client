@@ -212,11 +212,19 @@ impl WintunTunnel {
         // TOCTOU window between hash verification and DLL load.
         let _exclusive_handle = {
             use std::io::Read;
+            // FILE_SHARE_READ (0x1) — NOT 0 (deny-all). The previous deny-all
+            // mode blocked LoadLibraryExW itself: the Windows image loader must
+            // open the DLL to map it as a section, and an exclusive handle made
+            // that open fail with a sharing violation ("LoadLibraryExW failed"),
+            // breaking every VPN connection. Allowing only READ still denies
+            // WRITE and DELETE, so the file cannot be swapped/replaced during
+            // the hash→load window — the anti-TOCTOU intent is preserved.
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
             let mut exclusive_handle = OpenOptions::new()
                 .read(true)
-                .share_mode(0) // Exclusive — no other process can modify
+                .share_mode(FILE_SHARE_READ) // deny write/delete, allow the loader to read
                 .open(&dll_path)
-                .map_err(|e| format!("Failed to open wintun.dll exclusively: {}", e))?;
+                .map_err(|e| format!("Failed to open wintun.dll: {}", e))?;
             // Read bytes from the exclusive handle directly (not a second open)
             // to avoid OS error 32 (sharing violation) self-deadlock.
             let mut bytes = Vec::new();

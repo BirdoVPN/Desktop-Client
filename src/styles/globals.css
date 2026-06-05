@@ -261,23 +261,40 @@ input {
   background: radial-gradient(circle at 38% 30%, #1f3a5e 0%, #0d2038 52%, #061325 100%);
   box-shadow: inset 0 0 56px rgba(0, 0, 0, 0.62);
 }
-.birdo-globe__map {
+.birdo-globe__map,
+.birdo-globe__dots {
   position: absolute;
   top: 0;
   left: 0;
   height: 100%;
-  width: 200%;
+  /* 400% wide holding two full world maps (each 200% of the globe). Only the
+   * centre ~180° of longitude is visible at once, so continents keep their
+   * natural 2:1 aspect instead of being squashed (the old 200% width made the
+   * map look stretched vertically). */
+  width: 400%;
+  will-change: transform;
+  animation: birdo-globe-spin 120s linear infinite;
+  /* Soft circular falloff so continents fade toward the limb, not a hard box. */
+  -webkit-mask-image: radial-gradient(circle at 50% 50%, #000 54%, transparent 78%);
+  mask-image: radial-gradient(circle at 50% 50%, #000 54%, transparent 78%);
+}
+.birdo-globe__map {
   background-repeat: repeat-x;
   background-size: 50% 100%;
-  will-change: transform;
-  animation: birdo-globe-spin 96s linear infinite;
-  /* Soft circular falloff so continents fade toward the limb, not a hard box. */
-  -webkit-mask-image: radial-gradient(circle at center, #000 58%, transparent 80%);
-  mask-image: radial-gradient(circle at center, #000 58%, transparent 80%);
+  opacity: 0.9;
 }
 @keyframes birdo-globe-spin {
   from { transform: translateX(0); }
   to { transform: translateX(-50%); }
+}
+.birdo-globe__dot {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  background: var(--birdo-globe-dot, #a855f7);
+  box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.22), 0 0 7px 1px rgba(168, 85, 247, 0.5);
 }
 .birdo-globe__shade {
   position: absolute;

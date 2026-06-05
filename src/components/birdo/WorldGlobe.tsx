@@ -24,6 +24,7 @@ import { feature } from 'topojson-client';
 import worldData from 'world-atlas/countries-110m.json';
 import type { Feature, FeatureCollection, GeometryObject } from 'geojson';
 import { brand } from '@/lib/birdo-theme';
+import { countryCoords } from '@/utils/country-coords';
 import type { Server } from '@/store/app-store';
 
 export interface WorldGlobeProps {
@@ -92,6 +93,8 @@ function worldMapUrl(landColor: string): string {
 }
 
 export function WorldGlobe({
+  servers,
+  selectedServerId = null,
   isConnected = false,
   autoRotate = true,
   className = '',
@@ -101,17 +104,58 @@ export function WorldGlobe({
   const atmo = isConnected
     ? 'rgba(68, 209, 126, 0.22)' // green when connected
     : 'rgba(73, 131, 199, 0.20)'; // brand blue idle
+  const dotColor = isConnected ? '#44D17E' : brand.purple;
+
+  // Unique server locations → offsets within ONE map tile (0..50% of the
+  // 400%-wide scroller). Rendered twice (tile 0 and +50%) so a marker stays on
+  // screen through the seamless scroll. Deduped by rounded lat/lon.
+  const dots = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { key: string; left: number; top: number; selected: boolean }[] = [];
+    for (const s of servers) {
+      const ll = countryCoords(s.countryCode);
+      if (!ll) continue;
+      const [lat, lon] = ll;
+      const k = `${lat.toFixed(1)},${lon.toFixed(1)}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({
+        key: k,
+        left: ((lon + 180) / 360) * 50, // % within the scroller (one tile = 50%)
+        top: ((90 - lat) / 180) * 100,
+        selected: s.id === selectedServerId,
+      });
+    }
+    return out;
+  }, [servers, selectedServerId]);
+
+  const playState = autoRotate ? 'running' : 'paused';
 
   return (
     <div className={`birdo-globe-wrap ${className}`} aria-hidden>
       <div className="birdo-globe">
         <div
           className="birdo-globe__map"
-          style={{
-            backgroundImage: `url("${mapUrl}")`,
-            animationPlayState: autoRotate ? 'running' : 'paused',
-          }}
+          style={{ backgroundImage: `url("${mapUrl}")`, animationPlayState: playState }}
         />
+        <div
+          className="birdo-globe__dots"
+          style={{ animationPlayState: playState, '--birdo-globe-dot': dotColor } as React.CSSProperties}
+        >
+          {[0, 50].map((tileOffset) =>
+            dots.map((d) => (
+              <span
+                key={`${tileOffset}-${d.key}`}
+                className="birdo-globe__dot"
+                style={{
+                  left: `${tileOffset + d.left}%`,
+                  top: `${d.top}%`,
+                  transform: d.selected ? 'scale(1.5)' : undefined,
+                }}
+              />
+            )),
+          )}
+        </div>
         <div className="birdo-globe__shade" />
         <div className="birdo-globe__rim" />
       </div>

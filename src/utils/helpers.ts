@@ -113,6 +113,7 @@ export function friendlyVpnError(error: unknown): string {
   if (raw.includes('already connected') || raw.includes('already active')) return 'VPN is already connected.';
   if (raw.includes('dns') || raw.includes('resolve')) return 'DNS resolution failed. Check your network settings.';
   if (raw.includes('permission') || raw.includes('elevation') || raw.includes('privilege')) return 'Administrator permission is required for this operation.';
+  if (raw.includes('wintun') || raw.includes('loadlibrary') || raw.includes('driver') || raw.includes('adapter') || raw.includes('tunnel')) return 'Could not start the VPN network adapter. Try reinstalling, or temporarily disable antivirus blocking the Wintun driver.';
   if (raw.includes('kill switch') || raw.includes('killswitch')) return 'Kill switch error. Please disconnect and try again.';
   if (raw.includes('subscription') || raw.includes('plan') || raw.includes('device limit')) return 'Subscription limit reached. Upgrade your plan or disconnect other devices.';
   return 'Connection failed. Please try again.';
