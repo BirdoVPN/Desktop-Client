@@ -492,6 +492,12 @@ impl WintunTunnel {
         // adapter is already Arc<Adapter> from wintun crate
         tracing::info!("Wintun adapter ready");
 
+        // Store the adapter handle NOW — BEFORE IP/route/DNS configuration — so
+        // methods that read it natively (get_adapter_index via the adapter LUID,
+        // configure_dns via the adapter GUID) see it. It used to be stored only
+        // at the very end, so those reads saw None and errored / fell back.
+        *self.adapter.write().await = Some(adapter.clone());
+
         // Start a session with ring buffer
         let session = adapter
             .start_session(wintun::MAX_RING_CAPACITY)
@@ -538,8 +544,7 @@ impl WintunTunnel {
         // Block IPv6 to prevent leaks (IPv6 traffic would bypass VPN tunnel)
         self.block_ipv6_leaks().await?;
 
-        // Store state
-        *self.adapter.write().await = Some(adapter);
+        // Store remaining state (adapter was already stored above, pre-config).
         *self.session.write().await = Some(session.clone());
         *self.wg_session.write().await = Some(wg_session);
         self.running.store(true, Ordering::SeqCst);
