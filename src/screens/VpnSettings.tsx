@@ -85,10 +85,8 @@ export function VpnSettings() {
   useEffect(() => {
     invoke<KillSwitchStatus>('get_killswitch_status')
       .then((s) => {
-        // Kill switch is locked on — only ever reconcile UP (never disable the
-        // persisted preference if the backend reports it briefly inactive).
-        if (s.enabled && !settings.killSwitchEnabled) {
-          updateSettings({ killSwitchEnabled: true });
+        if (s.enabled !== settings.killSwitchEnabled) {
+          updateSettings({ killSwitchEnabled: s.enabled });
         }
       })
       .catch(() => {
@@ -212,11 +210,10 @@ export function VpnSettings() {
         <BirdoCard padding="0" className="overflow-visible">
           <BirdoToggleRow
             title="Kill Switch"
-            subtitle="Always on — blocks all internet traffic if the VPN drops, preventing data leaks."
+            subtitle="Block all internet traffic if the VPN connection drops, preventing data leaks."
             leadingIcon={Shield}
             leadingTint={status.green}
-            checked={true}
-            enabled={false}
+            checked={settings.killSwitchEnabled}
             onCheckedChange={handleKillSwitch}
           />
         </BirdoCard>

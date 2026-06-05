@@ -190,11 +190,9 @@ describe('useAppStore', () => {
       expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true)
     })
 
-    it('keeps the kill switch locked on (cannot be disabled)', () => {
-      // Kill switch is always-on by product decision: setKillSwitch ignores
-      // attempts to disable it and the preference stays true.
+    it('should toggle kill switch', () => {
       useAppStore.getState().setKillSwitch(false)
-      expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true)
+      expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false)
     })
 
     it('should have auto-connect disabled by default', () => {

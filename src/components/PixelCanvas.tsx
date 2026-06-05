@@ -147,7 +147,11 @@ export function PixelCanvas() {
     <canvas
       ref={canvasRef}
       className="fixed inset-0 h-full w-full"
-      style={{ background: '#000000', zIndex: 0, pointerEvents: 'none', filter: 'blur(10px) contrast(0.9)' }}
+      // No CSS blur filter: a blur() on a fixed full-window canvas forces a
+      // large GPU compositing layer that, under WebView2, smears vertical
+      // banding / stretched lines across the globe above it. The pixels are
+      // already very low-alpha, so they read fine as an ambient grid unblurred.
+      style={{ background: '#000000', zIndex: 0, pointerEvents: 'none' }}
     />
   );
 }

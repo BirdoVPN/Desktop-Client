@@ -253,8 +253,8 @@ const defaultSettings: AppSettings = {
   multiHopEnabled: false,
   multiHopEntryNodeId: null,
   multiHopExitNodeId: null,
-  stealthMode: true,
-  quantumProtection: true,
+  stealthMode: false,
+  quantumProtection: false,
 };
 
 export const useAppStore = create<AppState>()(
@@ -377,12 +377,9 @@ export const useAppStore = create<AppState>()(
         })),
 
       // Settings shortcuts
-      // Kill switch is always-on and locked: ignore any attempt to disable it
-      // (the toggle is rendered locked-on; the backend arms it from this
-      // persisted preference on every connect).
-      setKillSwitch: () =>
+      setKillSwitch: (enabled) =>
         set((state) => ({
-          settings: { ...state.settings, killSwitchEnabled: true },
+          settings: { ...state.settings, killSwitchEnabled: enabled },
         })),
       setAutoConnect: (enabled) =>
         set((state) => ({
