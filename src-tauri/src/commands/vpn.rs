@@ -174,7 +174,9 @@ pub fn build_vpn_config(
         allowed_ips,
         dns,
         client_ip: assigned_ip,
-        client_ipv6: None, // P3-21: Set from backend response when server supports IPv6
+        // Present only for ipv6Enabled nodes — drives the tunnel to ROUTE IPv6
+        // instead of blocking it.
+        client_ipv6: response.client_ipv6,
         allowed_ips_v6,
         mtu,
         persistent_keepalive,

@@ -115,6 +115,7 @@ pub async fn connect_multi_hop(
         public_key: mh_response.public_key,
         preshared_key: mh_response.preshared_key,
         assigned_ip: mh_response.assigned_ip,
+        client_ipv6: None, // multi-hop is IPv4-only for now
         server_public_key: mh_response.server_public_key,
         endpoint: mh_response.endpoint,
         dns: mh_response.dns,

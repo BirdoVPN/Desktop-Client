@@ -495,6 +495,7 @@ mod tests {
             public_key: None,
             preshared_key: None,
             assigned_ip: None,
+            client_ipv6: None,
             server_public_key: None,
             endpoint: None,
             dns: None,

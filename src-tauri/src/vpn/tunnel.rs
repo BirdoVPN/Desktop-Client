@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -115,6 +115,58 @@ fn add_route_native(
     let e = unsafe { CreateIpForwardEntry2(&row) };
     if e.0 != 0 && e.0 != 5010 {
         return Err(format!("CreateIpForwardEntry2 failed: 0x{:08X}", e.0));
+    }
+    Ok(())
+}
+
+/// Assign an IPv6 address to an interface natively (CreateUnicastIpAddressEntry,
+/// AF_INET6). Used for dual-stack nodes; Err on failure so the caller can fall
+/// back to blocking IPv6.
+#[cfg(windows)]
+fn set_adapter_ipv6_native(if_index: u32, ip: Ipv6Addr, prefix: u8) -> Result<(), String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET6;
+
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: fills the row with valid defaults.
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceIndex = if_index;
+    row.OnLinkPrefixLength = prefix;
+    // Writes to the SOCKADDR_INET / IN6_ADDR union fields are safe in Rust.
+    row.Address.Ipv6.sin6_family = AF_INET6;
+    row.Address.Ipv6.sin6_addr.u.Byte = ip.octets();
+    // SAFETY: `row` is fully initialised; InterfaceIndex identifies the adapter.
+    let e = unsafe { CreateUnicastIpAddressEntry(&row) };
+    if e.0 != 0 && e.0 != 5010 {
+        return Err(format!("CreateUnicastIpAddressEntry (v6) failed: 0x{:08X}", e.0));
+    }
+    Ok(())
+}
+
+/// Add an IPv6 route natively (CreateIpForwardEntry2, AF_INET6). `:: ` next hop
+/// (all-zero) means on-link via the given interface. Err on failure.
+#[cfg(windows)]
+fn add_route6_native(dest: Ipv6Addr, prefix_len: u8, if_index: u32, metric: u32) -> Result<(), String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        CreateIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET6;
+
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    // SAFETY: fills the row with valid defaults.
+    unsafe { InitializeIpForwardEntry(&mut row) };
+    row.InterfaceIndex = if_index;
+    row.DestinationPrefix.PrefixLength = prefix_len;
+    row.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
+    row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte = dest.octets();
+    row.NextHop.Ipv6.sin6_family = AF_INET6; // :: → on-link
+    row.Metric = metric;
+    // SAFETY: `row` is fully initialised by InitializeIpForwardEntry + our fields.
+    let e = unsafe { CreateIpForwardEntry2(&row) };
+    if e.0 != 0 && e.0 != 5010 {
+        return Err(format!("CreateIpForwardEntry2 (v6) failed: 0x{:08X}", e.0));
     }
     Ok(())
 }
@@ -636,8 +688,17 @@ impl WintunTunnel {
         // Configure DNS
         self.configure_dns().await?;
 
-        // Block IPv6 to prevent leaks (IPv6 traffic would bypass VPN tunnel)
-        self.block_ipv6_leaks().await?;
+        // IPv6: if the node is dual-stacked (backend sent a client_ipv6), ROUTE
+        // IPv6 through the tunnel; otherwise BLOCK it to prevent leaks. If routing
+        // setup fails, fall back to blocking (never leak).
+        if self.config.client_ipv6.is_some() {
+            if let Err(e) = self.configure_ipv6().await {
+                tracing::warn!("IPv6 routing setup failed ({}); blocking IPv6 instead", e);
+                self.block_ipv6_leaks().await?;
+            }
+        } else {
+            self.block_ipv6_leaks().await?;
+        }
 
         // Store remaining state (adapter was already stored above, pre-config).
         *self.session.write().await = Some(session.clone());
@@ -1188,9 +1249,47 @@ impl WintunTunnel {
     }
 
     // ===================================================================
-    // SECTION: IPv6 — block_ipv6_leaks, unblock_ipv6
+    // SECTION: IPv6 — configure_ipv6 (dual-stack), block_ipv6_leaks, unblock_ipv6
     //   (consider future tunnel_ipv6.rs extraction)
     // ===================================================================
+
+    /// Dual-stack: route IPv6 through the tunnel (for nodes that advertise IPv6
+    /// via `client_ipv6`). Assigns the IPv6 tunnel address and adds the IPv6
+    /// default route (::/0 split into ::/1 + 8000::/1, mirroring the IPv4 split)
+    /// on the Wintun interface. All native (IP Helper) — no subprocess. The v4
+    /// resolver already answers AAAA queries, so no separate IPv6 DNS is needed.
+    async fn configure_ipv6(&self) -> Result<(), String> {
+        let client_ipv6 = match &self.config.client_ipv6 {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+        let ip_str = client_ipv6.split('/').next().unwrap_or(&client_ipv6);
+        let ip: Ipv6Addr = ip_str
+            .parse()
+            .map_err(|_| format!("invalid client_ipv6: {}", client_ipv6))?;
+
+        let if_index = self.get_adapter_index().await?;
+        set_adapter_ipv6_native(if_index, ip, 128)?;
+
+        for cidr in &self.config.allowed_ips_v6 {
+            if cidr == "::/0" {
+                add_route6_native(Ipv6Addr::UNSPECIFIED, 1, if_index, 5)?; // ::/1
+                add_route6_native(
+                    Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0),
+                    1,
+                    if_index,
+                    5,
+                )?; // 8000::/1
+            } else if let Some((net, plen)) = cidr.split_once('/') {
+                if let (Ok(addr), Ok(len)) = (net.parse::<Ipv6Addr>(), plen.parse::<u8>()) {
+                    add_route6_native(addr, len, if_index, 5)?;
+                }
+            }
+        }
+
+        tracing::info!("IPv6 routed through tunnel (dual-stack): {}", ip_str);
+        Ok(())
+    }
 
     /// Block IPv6 traffic to prevent leaks
     /// IPv6 traffic would bypass the VPN tunnel since we only route IPv4

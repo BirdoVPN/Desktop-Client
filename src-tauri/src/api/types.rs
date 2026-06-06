@@ -421,6 +421,10 @@ pub struct ConnectResponse {
     pub preshared_key: Option<String>,
     #[serde(default)]
     pub assigned_ip: Option<String>,
+    /// IPv6 tunnel address — present only for ipv6Enabled nodes (camelCase
+    /// `clientIpv6` from the backend). Its presence makes the client route IPv6.
+    #[serde(default)]
+    pub client_ipv6: Option<String>,
     #[serde(default)]
     pub server_public_key: Option<String>,
     #[serde(default)]
@@ -530,6 +534,10 @@ pub struct MultiHopConnectResponse {
     pub preshared_key: Option<String>,
     #[serde(default)]
     pub assigned_ip: Option<String>,
+    /// IPv6 tunnel address — present only for ipv6Enabled nodes (camelCase
+    /// `clientIpv6` from the backend). Its presence makes the client route IPv6.
+    #[serde(default)]
+    pub client_ipv6: Option<String>,
     #[serde(default)]
     pub server_public_key: Option<String>,
     #[serde(default)]

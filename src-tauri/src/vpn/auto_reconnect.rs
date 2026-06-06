@@ -716,6 +716,7 @@ impl AutoReconnectService {
             public_key: response.public_key,
             preshared_key: response.preshared_key,
             assigned_ip: response.assigned_ip,
+            client_ipv6: response.client_ipv6.clone(),
             server_public_key: response.server_public_key,
             endpoint: response.endpoint,
             dns: response.dns,
