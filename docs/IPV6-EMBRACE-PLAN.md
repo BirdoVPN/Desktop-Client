@@ -103,3 +103,49 @@ already supports IPv6 addresses + routes; add them when `node_supports_ipv6`).
 
 **~1 week of focused work**, sequenced so production is never at risk (one node
 first, client gated on capability).
+
+---
+
+## 8. IMPLEMENTATION STATUS — 2026-06-06
+
+The **code is done and gated across all repos** (every path defaults to today's
+behaviour; nothing changes until a node is flagged). Committed locally, **not yet
+deployed**.
+
+Done:
+- **DB** (`birdo-web` migration `20270606000000_add_ipv6_dualstack`): additive +
+  safe. `ServerNode.ipv6Enabled` (default false), `ServerNode.ipv6Subnet`,
+  `WireguardKey.assignedIpv6` (+ unique per node).
+- **Backend** (`vpn.service.ts`, `wireguard.service.ts`): `deriveClientIpv6`
+  (IPv6 = `<prefix>::<ipv4-octet>`), dual-stack `buildConfigFile` + peer
+  allowed-ips, and the connect response returns `clientIpv6` **only** when
+  `node.ipv6Enabled`. Typechecks (prisma generate run).
+- **Desktop client** (`tunnel.rs`): `configure_ipv6` (native IP Helper — assigns
+  the IPv6 address + ::/1 + 8000::/1 routes on Wintun) runs when `client_ipv6`
+  is present; otherwise the WFP IPv6 block stays. Falls back to blocking on any
+  error (never leaks). cargo-check clean. **Dormant** until backend sends it.
+- **Node-agent** (`reconcile.rs`, `config.rs`): `BIRDO_AGENT_IPV6_ENABLED`
+  (default false) → ensures `ip6tables` MASQUERADE on egress. cargo-check clean.
+
+### Pilot rollout (one node — all prod-touching, do with the owner)
+
+1. **Deploy backend** with the migration (adds nullable/defaulted columns — safe;
+   no node enabled yet → identical behaviour).
+2. **Release a desktop client** containing the dormant IPv6 code (next `win-v*`).
+3. **Pick a pilot node.** Provision IPv6 on it:
+   - Confirm the VPS has a routed IPv6 (/64).
+   - Give `wg0` an IPv6: `ip -6 addr add fd00:b1d0::1/64 dev wg0`.
+   - Stop disabling IPv6: remove `net.ipv6.conf.all.disable_ipv6=1` (init-server.sh
+     / docker-compose sysctls) and set `net.ipv6.conf.all.forwarding=1`.
+   - Deploy the updated **node-agent** with `BIRDO_AGENT_IPV6_ENABLED=true`
+     (it then adds the `ip6tables` MASQUERADE; forwarding is already reconciled).
+4. **Flip the flag in the DB** for that node only:
+   `UPDATE "ServerNode" SET "ipv6Enabled"=true, "ipv6Subnet"='fd00:b1d0::/64' WHERE name='<pilot>';`
+5. **Test** on the pilot: connect, then verify on test-ipv6.com / ipleak.net that
+   IPv6 shows the **node's** address (not the user's) — and on a NON-pilot node,
+   confirm IPv6 is still blocked. Check kill-switch + disconnect.
+6. **Roll out** node-by-node, flipping `ipv6Enabled` per node only after each is
+   verified. Mirror the client logic in `birdo-client-mobile` for parity.
+
+Rollback for any node: `UPDATE "ServerNode" SET "ipv6Enabled"=false …` — clients
+immediately go back to blocking IPv6 for it on the next connect.
