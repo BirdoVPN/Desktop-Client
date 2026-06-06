@@ -70,6 +70,7 @@ Gate everything on `node_supports_ipv6`:
 
 Mirror the client logic in `birdo-client-mobile` (the WireGuard/Android VpnService
 already supports IPv6 addresses + routes; add them when `node_supports_ipv6`).
+**✅ Done — see §8** (commit `e8f9bc1`, gated on `clientIpv6`, held local).
 
 ## 5. Rollout
 
@@ -126,6 +127,15 @@ Done:
   error (never leaks). cargo-check clean. **Dormant** until backend sends it.
 - **Node-agent** (`reconcile.rs`, `config.rs`): `BIRDO_AGENT_IPV6_ENABLED`
   (default false) → ensures `ip6tables` MASQUERADE on egress. cargo-check clean.
+- **Mobile client** (`birdo-client-mobile`, commit `e8f9bc1`, local): `clientIpv6`
+  added to the shared `ConnectResponse`/`MultiHopConnectResponse` (defaulted →
+  older payloads safe). `WireGuardConfigBuilder` assigns the IPv6 address on the
+  wg-go Interface and `BirdoVpnService.buildVpnInterface` adds it to the Android
+  `VpnService.Builder` — both only when `clientIpv6` is present. Routes already
+  capture `::/0` in both tunnel branches, so IPv6 is blackholed (leak-safe) until
+  a node is flagged. **Dormant** until backend sends it. Build not run locally
+  (mobile gradle toolchain is parked post-launch — see launch CI landmines);
+  changes are additive and mirror the proven desktop path.
 
 ### Pilot rollout (one node — all prod-touching, do with the owner)
 
@@ -145,7 +155,8 @@ Done:
    IPv6 shows the **node's** address (not the user's) — and on a NON-pilot node,
    confirm IPv6 is still blocked. Check kill-switch + disconnect.
 6. **Roll out** node-by-node, flipping `ipv6Enabled` per node only after each is
-   verified. Mirror the client logic in `birdo-client-mobile` for parity.
+   verified. (Mobile client parity is already implemented — §8 — so an Android
+   release picks it up the same way as the desktop build.)
 
 Rollback for any node: `UPDATE "ServerNode" SET "ipv6Enabled"=false …` — clients
 immediately go back to blocking IPv6 for it on the next connect.
