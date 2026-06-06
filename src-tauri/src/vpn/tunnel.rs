@@ -108,6 +108,56 @@ fn set_dns_native(adapter_guid: u128, servers: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+/// Set an interface's IPv4 address + MTU natively via the IP Helper API
+/// (addressed by interface index, so no cross-crate LUID type concerns).
+/// Returns Err on failure so the caller can fall back to netsh.
+#[cfg(windows)]
+fn set_adapter_ip_mtu_native(if_index: u32, ip: &str, prefix: u8, mtu: u32) -> Result<(), String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        CreateUnicastIpAddressEntry, GetIpInterfaceEntry, InitializeUnicastIpAddressEntry,
+        SetIpInterfaceEntry, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET;
+
+    let addr: Ipv4Addr = ip.parse().map_err(|_| format!("invalid client IP: {}", ip))?;
+
+    // ── IPv4 unicast address ──
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: fills the row with valid defaults (DAD state, lifetimes, etc.).
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceIndex = if_index;
+    row.OnLinkPrefixLength = prefix;
+    // Writing the IPv4 view of the SOCKADDR_INET union (writes to union fields
+    // are safe in Rust). Octets stored in network byte order via from_ne_bytes.
+    row.Address.Ipv4.sin_family = AF_INET;
+    row.Address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(addr.octets());
+    // SAFETY: `row` is fully initialised; InterfaceIndex identifies the adapter.
+    let e = unsafe { CreateUnicastIpAddressEntry(&row) };
+    // 0 = OK; 5010 = ERROR_OBJECT_ALREADY_EXISTS (same IP from a prior connect).
+    if e.0 != 0 && e.0 != 5010 {
+        return Err(format!("CreateUnicastIpAddressEntry failed: 0x{:08X}", e.0));
+    }
+
+    // ── MTU (read-modify-write the interface row) ──
+    let mut irow = MIB_IPINTERFACE_ROW::default();
+    irow.Family = AF_INET;
+    irow.InterfaceIndex = if_index;
+    // SAFETY: Family + InterfaceIndex are set; the call fills the remaining fields.
+    let g = unsafe { GetIpInterfaceEntry(&mut irow) };
+    if g.0 != 0 {
+        return Err(format!("GetIpInterfaceEntry failed: 0x{:08X}", g.0));
+    }
+    irow.NlMtu = mtu;
+    // Required for IPv4: SitePrefixLength must be 0 or SetIpInterfaceEntry rejects it.
+    irow.SitePrefixLength = 0;
+    // SAFETY: `irow` was populated by GetIpInterfaceEntry; we only adjusted NlMtu.
+    let s = unsafe { SetIpInterfaceEntry(&mut irow) };
+    if s.0 != 0 {
+        return Err(format!("SetIpInterfaceEntry failed: 0x{:08X}", s.0));
+    }
+    Ok(())
+}
+
 /// Wintun adapter configuration
 pub(super) const ADAPTER_NAME: &str = "Birdo VPN";
 const TUNNEL_TYPE: &str = "Birdo";
@@ -645,60 +695,73 @@ impl WintunTunnel {
         Ok(())
     }
 
-    /// Configure the adapter's IP address using netsh
+    /// Configure the adapter's IP address + MTU.
+    ///
+    /// Native fast path via the IP Helper API (CreateUnicastIpAddressEntry +
+    /// SetIpInterfaceEntry) addressed by interface index — instant, no netsh.
+    /// Falls back to netsh if the native calls error, so the adapter is never
+    /// left unconfigured.
     async fn configure_adapter(&self) -> Result<(), String> {
         let client_ip = &self.config.client_ip;
         tracing::debug!("Configuring adapter IP: {}", client_ip);
 
-        // Use netsh to set IP address
-        let output = cmd("netsh")
-            .args([
-                "interface",
-                "ip",
-                "set",
-                "address",
-                &format!("name={}", ADAPTER_NAME),
-                "static",
-                client_ip,
-                "255.255.255.0", // Subnet mask
-            ])
-            .output()
-            .map_err(|e| format!("Failed to run netsh: {}", e))?;
+        let if_index = self.get_adapter_index().await.ok();
+        let native_ok = match if_index {
+            Some(idx) => match set_adapter_ip_mtu_native(idx, client_ip, 24, self.config.mtu.into()) {
+                Ok(()) => {
+                    tracing::debug!("Adapter IP + MTU set natively (MTU {})", self.config.mtu);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("Native IP/MTU set failed ({}); falling back to netsh", e);
+                    false
+                }
+            },
+            None => false,
+        };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "already configured" errors
-            if !stderr.contains("already") && !stderr.is_empty() {
-                tracing::warn!("netsh set address output: {}", stderr);
+        if !native_ok {
+            // Fallback: netsh set address + MTU.
+            let output = cmd("netsh")
+                .args([
+                    "interface",
+                    "ip",
+                    "set",
+                    "address",
+                    &format!("name={}", ADAPTER_NAME),
+                    "static",
+                    client_ip,
+                    "255.255.255.0",
+                ])
+                .output()
+                .map_err(|e| format!("Failed to run netsh: {}", e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("already") && !stderr.is_empty() {
+                    tracing::warn!("netsh set address output: {}", stderr);
+                }
+            }
+
+            let mtu_value = format!("mtu={}", self.config.mtu);
+            let mtu_output = cmd("netsh")
+                .args([
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "subinterface",
+                    ADAPTER_NAME,
+                    &mtu_value,
+                    "store=active",
+                ])
+                .output();
+            if let Ok(output) = mtu_output {
+                if !output.status.success() {
+                    tracing::warn!("Failed to set MTU: {}", String::from_utf8_lossy(&output.stderr));
+                }
             }
         }
 
-        // P3-4: Use the MTU from config (which may be the user's custom value or the server default)
-        let mtu_value = format!("mtu={}", self.config.mtu);
-        let mtu_output = cmd("netsh")
-            .args([
-                "interface",
-                "ipv4",
-                "set",
-                "subinterface",
-                ADAPTER_NAME,
-                &mtu_value,
-                "store=active",
-            ])
-            .output();
-
-        if let Ok(output) = mtu_output {
-            if output.status.success() {
-                tracing::debug!("MTU set to {}", self.config.mtu);
-            } else {
-                tracing::warn!(
-                    "Failed to set MTU: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-
-        tracing::debug!("Adapter IP configured");
+        tracing::debug!("Adapter IP configured ({})", if native_ok { "native" } else { "netsh" });
         Ok(())
     }
 
