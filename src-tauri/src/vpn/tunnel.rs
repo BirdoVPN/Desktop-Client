@@ -29,6 +29,14 @@ fn cmd(program: &str) -> Command {
 /// back to parsing `route print`. Native + instant; no subprocess.
 #[cfg(windows)]
 fn default_gateway_native() -> Option<String> {
+    default_route_native().map(|(gw, _idx)| gw.to_string())
+}
+
+/// Lowest-metric IPv4 default route: returns `(gateway, physical_interface_index)`
+/// via `GetIpForwardTable2`. The interface index is needed to pin the endpoint
+/// host route to the physical NIC natively. `None` on any failure.
+#[cfg(windows)]
+fn default_route_native() -> Option<(Ipv4Addr, u32)> {
     use windows::Win32::NetworkManagement::IpHelper::{
         FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
     };
@@ -47,7 +55,7 @@ fn default_gateway_native() -> Option<String> {
         // the OS; `NumEntries` describes the length of the trailing `Table` array.
         let t = unsafe { &*table };
         let rows = unsafe { std::slice::from_raw_parts(t.Table.as_ptr(), t.NumEntries as usize) };
-        let mut best: Option<(u32, Ipv4Addr)> = None;
+        let mut best: Option<(u32, Ipv4Addr, u32)> = None; // (metric, gateway, if_index)
         for row in rows {
             if row.DestinationPrefix.PrefixLength != 0 {
                 continue; // not a default route (0.0.0.0/0)
@@ -62,16 +70,53 @@ fn default_gateway_native() -> Option<String> {
             if ip.is_unspecified() {
                 continue;
             }
-            if best.map_or(true, |(m, _)| row.Metric < m) {
-                best = Some((row.Metric, ip));
+            if best.map_or(true, |(m, _, _)| row.Metric < m) {
+                best = Some((row.Metric, ip, row.InterfaceIndex));
             }
         }
-        best.map(|(_, ip)| ip.to_string())
+        best.map(|(_, ip, idx)| (ip, idx))
     })();
 
     // SAFETY: `table` was allocated by `GetIpForwardTable2` and is non-null.
     unsafe { FreeMibTable(table as *const core::ffi::c_void) };
     result
+}
+
+/// Add an IPv4 route natively via `CreateIpForwardEntry2`. `next_hop` 0.0.0.0
+/// means on-link (point-to-point, e.g. the Wintun adapter). Returns Err on
+/// failure so the caller can fall back to `route.exe`. ERROR_OBJECT_ALREADY_EXISTS
+/// is treated as success.
+#[cfg(windows)]
+fn add_route_native(
+    dest: Ipv4Addr,
+    prefix_len: u8,
+    next_hop: Ipv4Addr,
+    if_index: u32,
+    metric: u32,
+) -> Result<(), String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        CreateIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET;
+
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    // SAFETY: fills the row with valid defaults.
+    unsafe { InitializeIpForwardEntry(&mut row) };
+    row.InterfaceIndex = if_index;
+    row.DestinationPrefix.PrefixLength = prefix_len;
+    // Writes to SOCKADDR_INET union fields are safe; octets in network order.
+    row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+    row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(dest.octets());
+    row.NextHop.Ipv4.sin_family = AF_INET;
+    row.NextHop.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(next_hop.octets());
+    row.Metric = metric;
+
+    // SAFETY: `row` is fully initialised by InitializeIpForwardEntry + our fields.
+    let e = unsafe { CreateIpForwardEntry2(&row) };
+    if e.0 != 0 && e.0 != 5010 {
+        return Err(format!("CreateIpForwardEntry2 failed: 0x{:08X}", e.0));
+    }
+    Ok(())
 }
 
 /// Set the resolver list on an interface (by adapter GUID) via the native
@@ -814,43 +859,63 @@ impl WintunTunnel {
         // Without this, the /1 split routes would capture the WireGuard UDP
         // traffic itself, creating a routing loop (encrypted packets re-enter
         // Wintun, get double-encrypted, server can't decrypt → no responses).
-        match cmd("route")
-            .args([
-                "add",
-                endpoint_ip,
-                "mask",
-                "255.255.255.255",
-                &default_gateway,
-                "metric",
-                "1",
-            ])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                tracing::info!(
-                    "Endpoint host route added: {} via {} (metric 1)",
-                    redact_ip(endpoint_ip),
-                    redact_ip(&default_gateway)
-                );
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                tracing::error!(
-                    "CRITICAL: Endpoint host route FAILED for {}: exit={:?}, stderr={}, stdout={}",
-                    redact_ip(endpoint_ip),
-                    output.status.code(),
-                    stderr.trim(),
-                    stdout.trim()
-                );
-                return Err(format!(
-                    "Failed to add endpoint host route — VPN would create a routing loop: {}",
-                    stderr.trim()
-                ));
-            }
-            Err(e) => {
-                tracing::error!("CRITICAL: Could not execute route command: {}", e);
-                return Err(format!("Failed to execute route add for endpoint: {}", e));
+        //
+        // Native first (CreateIpForwardEntry2 pinned to the physical interface),
+        // then route.exe fallback; failing BOTH is fatal.
+        let phys_idx = default_route_native().map(|(_, idx)| idx);
+        let endpoint_native_ok = match (
+            phys_idx,
+            endpoint_ip.parse::<Ipv4Addr>(),
+            default_gateway.parse::<Ipv4Addr>(),
+        ) {
+            (Some(idx), Ok(ep), Ok(gw)) => add_route_native(ep, 32, gw, idx, 1).is_ok(),
+            _ => false,
+        };
+        if endpoint_native_ok {
+            tracing::info!(
+                "Endpoint host route added (native): {} via {}",
+                redact_ip(endpoint_ip),
+                redact_ip(&default_gateway)
+            );
+        } else {
+            match cmd("route")
+                .args([
+                    "add",
+                    endpoint_ip,
+                    "mask",
+                    "255.255.255.255",
+                    &default_gateway,
+                    "metric",
+                    "1",
+                ])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    tracing::info!(
+                        "Endpoint host route added: {} via {} (metric 1)",
+                        redact_ip(endpoint_ip),
+                        redact_ip(&default_gateway)
+                    );
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    tracing::error!(
+                        "CRITICAL: Endpoint host route FAILED for {}: exit={:?}, stderr={}, stdout={}",
+                        redact_ip(endpoint_ip),
+                        output.status.code(),
+                        stderr.trim(),
+                        stdout.trim()
+                    );
+                    return Err(format!(
+                        "Failed to add endpoint host route — VPN would create a routing loop: {}",
+                        stderr.trim()
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!("CRITICAL: Could not execute route command: {}", e);
+                    return Err(format!("Failed to execute route add for endpoint: {}", e));
+                }
             }
         }
 
@@ -875,6 +940,20 @@ impl WintunTunnel {
 
         for (network, mask) in &routes_to_add {
             tracing::debug!("Adding route: {} mask {} IF {}", network, mask, if_index);
+
+            // Native first (CreateIpForwardEntry2 on the Wintun interface, on-link
+            // next hop 0.0.0.0). Fall back to route.exe on any error.
+            let native_ok = match (network.parse::<Ipv4Addr>(), mask.parse::<Ipv4Addr>()) {
+                (Ok(net), Ok(m)) => {
+                    let prefix = u32::from(m).count_ones() as u8;
+                    add_route_native(net, prefix, Ipv4Addr::UNSPECIFIED, if_index, 5).is_ok()
+                }
+                _ => false,
+            };
+            if native_ok {
+                tracing::debug!("Route added natively: {} mask {}", network, mask);
+                continue;
+            }
 
             // Use interface index for Wintun adapter - gateway 0.0.0.0 with IF parameter
             match cmd("route")
