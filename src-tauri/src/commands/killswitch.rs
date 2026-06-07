@@ -284,10 +284,20 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
         .spawn()
         .map_err(|e| format!("pfctl spawn failed: {}", e))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(rules.as_bytes())
-            .map_err(|e| format!("Failed to write pf rules to stdin: {}", e))?;
+    match child.stdin.take() {
+        Some(mut stdin) => {
+            stdin
+                .write_all(rules.as_bytes())
+                .map_err(|e| format!("Failed to write pf rules to stdin: {}", e))?;
+            // Explicitly close stdin to signal EOF to pfctl before waiting
+            drop(stdin);
+        }
+        None => {
+            // stdin was unavailable: rules can never be loaded, so do not
+            // claim the kill switch is active. Kill the child and fail loudly.
+            let _ = child.kill();
+            return Err("pfctl stdin unavailable; pf rules not loaded".to_string());
+        }
     }
 
     let output = child

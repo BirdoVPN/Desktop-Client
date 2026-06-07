@@ -184,6 +184,12 @@ pub async fn connect_multi_hop(
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
         }
+    } else {
+        tracing::warn!(
+            "Could not resolve kill switch endpoint IP from '{}'; kill switch may not filter \
+             traffic to the VPN server correctly",
+            killswitch_endpoint
+        );
     }
 
     vpn_manager

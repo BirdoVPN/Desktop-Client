@@ -153,8 +153,18 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
                 Err("Windows Hello is not configured on this device".to_string())
             }
             other => {
-                error!("Unexpected Windows Hello result: {}", other);
-                Err(format!("Authentication failed: {other}"))
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    error!("Unexpected Windows Hello result: {}", other);
+                    Err(format!("Authentication failed: {other}"))
+                } else {
+                    error!(
+                        "Unexpected Windows Hello result: {} (stderr: {})",
+                        other, stderr
+                    );
+                    Err(format!("Authentication failed: {stderr}"))
+                }
             }
         }
     }
@@ -208,8 +218,18 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
                 Err("Touch ID is not configured on this device".to_string())
             }
             other => {
-                error!("Unexpected Touch ID result: {}", other);
-                Err(format!("Authentication failed: {other}"))
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    error!("Unexpected Touch ID result: {}", other);
+                    Err(format!("Authentication failed: {other}"))
+                } else {
+                    error!(
+                        "Unexpected Touch ID result: {} (stderr: {})",
+                        other, stderr
+                    );
+                    Err(format!("Authentication failed: {stderr}"))
+                }
             }
         }
     }
@@ -253,7 +273,10 @@ fn is_windows_hello_available() -> bool {
             let result = String::from_utf8_lossy(&o.stdout).trim().to_string();
             result == "Available"
         }
-        Err(_) => false,
+        Err(e) => {
+            warn!("Windows Hello availability check failed to run powershell: {e}");
+            false
+        }
     }
 }
 
@@ -283,6 +306,9 @@ fn is_touch_id_available() -> bool {
             let result = String::from_utf8_lossy(&o.stdout).trim().to_string();
             result == "Available"
         }
-        Err(_) => false,
+        Err(e) => {
+            warn!("Touch ID availability check failed to run osascript: {e}");
+            false
+        }
     }
 }

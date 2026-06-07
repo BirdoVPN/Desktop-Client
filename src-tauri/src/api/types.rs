@@ -135,6 +135,15 @@ pub struct QualityReport {
     pub platform: String,
 }
 
+/// Zeroize key_id from heap memory when a QualityReport is dropped. These
+/// reports are sent every ~60s while connected, so without this the sensitive
+/// key_id accumulates copies in freed memory at a high rate.
+impl Drop for QualityReport {
+    fn drop(&mut self) {
+        self.key_id.zeroize();
+    }
+}
+
 // ============================================================================
 // Authentication Types
 // ============================================================================
@@ -195,6 +204,15 @@ pub struct TwoFactorVerifyRequest {
     pub token: String,
 }
 
+/// Zeroize sensitive 2FA material (challenge token + TOTP code) from heap
+/// memory when the request is dropped, consistent with LoginRequest/TokenPair.
+impl Drop for TwoFactorVerifyRequest {
+    fn drop(&mut self) {
+        self.challenge_token.zeroize();
+        self.token.zeroize();
+    }
+}
+
 /// FIX C-2: Response from 2FA verification — returns tokens on success
 #[derive(Debug, Deserialize)]
 pub struct TwoFactorVerifyResponse {
@@ -229,6 +247,14 @@ pub struct PasswordResetRequest {
 #[derive(Debug, Serialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,
+}
+
+/// Zeroize the refresh token from heap memory when the request is dropped,
+/// consistent with the TokenPair/LoginRequest patterns above.
+impl Drop for RefreshRequest {
+    fn drop(&mut self) {
+        self.refresh_token.zeroize();
+    }
 }
 
 /// FIX C-1: Updated refresh response to include new refresh token when server returns it

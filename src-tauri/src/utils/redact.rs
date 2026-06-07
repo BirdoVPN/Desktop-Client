@@ -63,8 +63,10 @@ pub fn redact_email(email: &str) -> String {
         if parts.len() == 2 {
             let name = parts[0];
             let domain = parts[1];
-            let redacted_name = if name.len() > 2 {
-                format!("{}***", &name[..2])
+            // Take first 2 chars (char-boundary safe to avoid panic on multibyte UTF-8)
+            let prefix: String = name.chars().take(2).collect();
+            let redacted_name = if name.chars().count() > 2 {
+                format!("{}***", prefix)
             } else {
                 "***".to_string()
             };
@@ -195,7 +197,14 @@ pub fn sanitize_error(msg: &str) -> String {
 
         let result = IPV4_RE
             .replace_all(&result, |caps: &regex::Captures| {
-                format!("{}.x.x.x", &caps[1])
+                // Only redact if all four octets are valid (0-255); otherwise
+                // leave the (non-IP) text untouched to preserve message clarity.
+                let valid = (1..=4).all(|i| caps[i].parse::<u8>().is_ok());
+                if valid {
+                    format!("{}.x.x.x", &caps[1])
+                } else {
+                    caps[0].to_string()
+                }
             })
             .to_string();
 

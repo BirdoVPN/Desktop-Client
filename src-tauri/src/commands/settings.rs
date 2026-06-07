@@ -165,8 +165,15 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
     match serde_json::from_str::<AppSettings>(&content) {
         Ok(settings) => {
             tracing::info!("Migrating unsigned settings to HMAC-protected format");
-            // Re-save with HMAC (best effort)
-            let _ = save_settings_inner(&app, &settings);
+            // Re-save with HMAC (best effort). Log on failure so a persistent
+            // failure to upgrade (disk full, permissions, credential store down)
+            // is observable rather than silently leaving settings unprotected.
+            if let Err(e) = save_settings_inner(&app, &settings) {
+                tracing::warn!(
+                    "Failed to migrate settings to HMAC-protected format: {}. Settings remain unsigned and will be retried on next load.",
+                    e
+                );
+            }
             Ok(settings)
         }
         Err(e) => Err(format!("Failed to parse settings: {}", e)),
@@ -198,7 +205,11 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
     // FIX-2-6: Atomic write — write to temp file then rename.
     // Prevents corruption if process crashes or power is lost mid-write.
     let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &content).map_err(|e| format!("Failed to write temp settings: {}", e))?;
+    fs::write(&tmp_path, &content).map_err(|e| {
+        // Clean up partial temp file on write failure
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to write temp settings: {}", e)
+    })?;
     fs::rename(&tmp_path, &path).map_err(|e| {
         // Clean up temp file on rename failure
         let _ = fs::remove_file(&tmp_path);

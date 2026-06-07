@@ -45,6 +45,10 @@ pub fn load_tray_image(bytes: &[u8]) -> Result<Image<'static>, String> {
 pub fn set_tray_state(app: AppHandle, state: String, tooltip: String) -> Result<(), String> {
     // Tray may not exist yet during very early startup — treat as a no-op.
     let Some(tray) = app.tray_by_id("main") else {
+        tracing::debug!(
+            state = %state,
+            "set_tray_state: tray 'main' not initialized yet — discarding update"
+        );
         return Ok(());
     };
 

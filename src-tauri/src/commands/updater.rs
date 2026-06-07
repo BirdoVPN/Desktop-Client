@@ -82,6 +82,10 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
                 if let Some(total) = content_length {
                     let percent = (downloaded as f64 / total as f64) * 100.0;
                     tracing::debug!("Download progress: {:.1}%", percent);
+                } else {
+                    // No Content-Length header: report bytes downloaded so far
+                    // instead of leaving progress silent at 0%.
+                    tracing::debug!("Download progress: {} bytes", downloaded);
                 }
             },
             || {

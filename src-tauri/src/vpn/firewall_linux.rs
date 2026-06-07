@@ -91,8 +91,13 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
 
     ensure_chain()?;
 
-    // Flush our chain first (idempotent)
-    let _ = iptables(&["-F", CHAIN_NAME]);
+    // Flush our chain first (idempotent). A failure here is non-fatal (the
+    // chain may have just been freshly created and thus already empty), but we
+    // surface it as a warning so a permission loss / corrupted firewall state
+    // doesn't only show up later as a cryptic append error.
+    if let Err(e) = iptables(&["-F", CHAIN_NAME]) {
+        tracing::warn!("iptables flush of {} failed (continuing): {}", CHAIN_NAME, e);
+    }
 
     // Allow loopback
     iptables(&["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"])?;

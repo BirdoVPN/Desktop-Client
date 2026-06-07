@@ -380,13 +380,30 @@ pub async fn verify_2fa(
     {
         Ok(response) => {
             if response.ok {
-                if let Some(ref tokens) = response.tokens {
-                    // Persist tokens to Windows Credential Manager
-                    if let Err(e) =
-                        credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
-                    {
-                        tracing::warn!("Failed to persist credentials after 2FA: {}", e);
+                // A successful (ok=true) response MUST carry tokens; otherwise the
+                // user would be left unauthenticated (no creds in the store or the
+                // in-memory client) while the frontend treats login as succeeded.
+                let tokens = match response.tokens {
+                    Some(ref tokens) => tokens,
+                    None => {
+                        tracing::warn!("2FA reported success but returned no tokens");
+                        return Ok(LoginResponse {
+                            success: false,
+                            message: Some(
+                                "2FA verification did not return credentials".to_string(),
+                            ),
+                            user: None,
+                            requires_two_factor: true,
+                            challenge_token: Some(request.challenge_token),
+                        });
                     }
+                };
+
+                // Persist tokens to Windows Credential Manager
+                if let Err(e) =
+                    credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
+                {
+                    tracing::warn!("Failed to persist credentials after 2FA: {}", e);
                 }
 
                 tracing::info!("2FA verification successful");

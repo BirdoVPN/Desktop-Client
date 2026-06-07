@@ -94,8 +94,13 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        if !output.status.success() && !stderr.is_empty() {
+        if !output.status.success() {
             tracing::debug!("Elevated command stderr: {}", stderr);
+            return Err(format!(
+                "Command {} failed: {}",
+                program,
+                if stderr.is_empty() { &stdout } else { &stderr }
+            ));
         }
 
         return Ok(format!("{}{}", stdout, stderr));
@@ -173,8 +178,9 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        // On Linux, use pkexec (PolicyKit) for graphical sudo prompt
-        let escaped_args: Vec<&str> = args.to_vec();
+        // On Linux, use pkexec (PolicyKit) for graphical sudo prompt.
+        // No shell escaping is needed: Command passes each arg as a distinct
+        // argv entry, so there is no shell to interpret metacharacters.
         tracing::debug!(
             "Elevating command on Linux via pkexec: {} {}",
             program,
@@ -183,7 +189,7 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
 
         let output = super::hidden_cmd("pkexec")
             .arg(program)
-            .args(&escaped_args)
+            .args(args)
             .output()
             .map_err(|e| format!("Failed to elevate via pkexec: {}", e))?;
 

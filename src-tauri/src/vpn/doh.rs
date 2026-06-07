@@ -203,6 +203,17 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
         return Ok(ip);
     }
 
+    // Validate hostname before sending it to DoH providers as a query parameter.
+    // A DNS name is 1..=253 chars; empty or oversized input is rejected early to
+    // avoid unexpected provider behavior or parse failures. This is purely an
+    // additive guard and does not alter resolution of valid hostnames.
+    if hostname.is_empty() || hostname.len() > 253 {
+        return Err(format!(
+            "Invalid hostname for DoH resolution: length {} out of bounds (1..=253)",
+            hostname.len()
+        ));
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .https_only(true) // Enforce HTTPS only
@@ -392,8 +403,8 @@ mod tests {
             // SEC: Pins must be regenerated using DER cert hash (see generate-cert-pins.sh)
             for pin in provider.pins {
                 assert!(
-                    (pin.len() == 43 || pin.len() == 44) && pin.ends_with('='),
-                    "Pin '{}' for {} has invalid format (expected 43-or-44-char base64)",
+                    pin.len() == 44 && pin.ends_with('='),
+                    "Pin '{}' for {} has invalid format (expected 44-char padded base64 SHA-256)",
                     pin,
                     provider.url
                 );

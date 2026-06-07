@@ -40,7 +40,7 @@ impl fmt::Display for ApiError {
             ApiError::RateLimited => write!(f, "Too many requests, please slow down"),
             ApiError::ServerError(code) => write!(f, "Server error ({})", code),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),
-            ApiError::CertificatePinningFailed(_msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update Birdo VPN to the latest version."),
+            ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update Birdo VPN to the latest version. ({})", msg),
             ApiError::Protocol(code) => write!(f, "{}", code.user_message()),
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }

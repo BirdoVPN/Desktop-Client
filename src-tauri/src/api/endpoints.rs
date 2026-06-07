@@ -33,20 +33,43 @@ pub mod vpn {
     pub const MULTI_HOP_CONNECT: &str = "/vpn/multi-hop/connect";
     pub const PORT_FORWARDS: &str = "/vpn/port-forwards";
 
+    /// Percent-encodes a single path segment for defense-in-depth.
+    ///
+    /// `key_id` originates from server responses, but encoding any character
+    /// outside the unreserved set (RFC 3986 `ALPHA / DIGIT / "-" / "." / "_" / "~"`)
+    /// prevents a stray `/`, `?`, `#`, or `%` from producing a malformed path or
+    /// enabling path traversal. Kept dependency-free intentionally.
+    fn encode_segment(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        for &byte in input.as_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(byte as char);
+                }
+                _ => {
+                    out.push('%');
+                    out.push(char::from_digit((byte >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                    out.push(char::from_digit((byte & 0xF) as u32, 16).unwrap().to_ascii_uppercase());
+                }
+            }
+        }
+        out
+    }
+
     /// Returns the path for disconnecting a specific VPN connection
     pub fn connection(key_id: &str) -> String {
-        format!("/vpn/connections/{}", key_id)
+        format!("/vpn/connections/{}", encode_segment(key_id))
     }
 
     /// Returns the path for heartbeating a specific VPN connection
     pub fn heartbeat(key_id: &str) -> String {
-        format!("/vpn/heartbeat/{}", key_id)
+        format!("/vpn/heartbeat/{}", encode_segment(key_id))
     }
 
     /// Returns the path for rotating the WireGuard key of an active connection
     #[allow(dead_code)] // Used by ApiClient::rotate_key (reserved auto-rotate surface)
     pub fn rotate_key(key_id: &str) -> String {
-        format!("/vpn/connections/{}/rotate", key_id)
+        format!("/vpn/connections/{}/rotate", encode_segment(key_id))
     }
 
     /// P2-15: Client quality telemetry reporting endpoint

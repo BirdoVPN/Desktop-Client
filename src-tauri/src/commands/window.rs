@@ -34,6 +34,10 @@ pub fn set_window_position(app: AppHandle, corner: String) -> Result<(), String>
         None => win.primary_monitor().map_err(|e| e.to_string())?,
     };
     let Some(mon) = monitor else {
+        tracing::warn!(
+            "set_window_position: no monitor found (current/primary both None) — \
+             falling back to position (0, 0)"
+        );
         let _ = win.set_position(PhysicalPosition::new(0, 0));
         return Ok(());
     };

@@ -216,19 +216,23 @@ fn read_keypair(path: &PathBuf) -> Result<Option<StaticKeypair>, String> {
     f.read_to_end(&mut buf)
         .map_err(|e| format!("read {path:?}: {e}"))?;
     if buf.len() != FILE_MAGIC.len() + 4 + PUBLIC_KEY_BYTES + SECRET_KEY_BYTES {
+        let n = buf.len();
+        buf.fill(0);
         return Err(format!(
             "unexpected keypair file size {} (expected {})",
-            buf.len(),
+            n,
             FILE_MAGIC.len() + 4 + PUBLIC_KEY_BYTES + SECRET_KEY_BYTES
         ));
     }
     if &buf[..FILE_MAGIC.len()] != FILE_MAGIC {
+        buf.fill(0);
         return Err("bad keypair magic".to_string());
     }
     let mut ver = [0u8; 4];
     ver.copy_from_slice(&buf[FILE_MAGIC.len()..FILE_MAGIC.len() + 4]);
     let v = u32::from_le_bytes(ver);
     if v != FILE_VERSION {
+        buf.fill(0);
         return Err(format!("unsupported keypair file version {v}"));
     }
     let pk_off = FILE_MAGIC.len() + 4;

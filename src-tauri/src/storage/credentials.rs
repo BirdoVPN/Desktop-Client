@@ -62,11 +62,14 @@ impl CredentialStore {
         #[cfg(debug_assertions)]
         {
             match entry.get_password() {
-                Ok(stored) => {
-                    if stored.len() != value.len() {
+                Ok(mut stored) => {
+                    // Verify content equality, not just length, then zeroize the
+                    // read-back copy so the credential does not linger on the heap.
+                    let matches = stored == value;
+                    stored.zeroize();
+                    if !matches {
                         tracing::error!(
-                            "Credential verification failed: stored len {} != original len {}",
-                            stored.len(),
+                            "Credential verification failed: stored value != original (len {})",
                             value.len()
                         );
                         return Err("Credential verification failed".to_string());
@@ -153,6 +156,7 @@ impl CredentialStore {
         };
 
         tracing::trace!("get_tokens: retrieving refresh_token");
+        let mut access = access;
         let refresh = match Self::retrieve(CredentialKey::RefreshToken) {
             Ok(Some(token)) => {
                 tracing::trace!("get_tokens: got refresh_token (len={})", token.len());
@@ -160,10 +164,14 @@ impl CredentialStore {
             }
             Ok(None) => {
                 tracing::trace!("get_tokens: refresh_token is None");
+                // Zeroize the already-retrieved access token: the early return
+                // bypasses TokenPair's Drop impl that would normally wipe it.
+                access.zeroize();
                 return Err("No refresh token stored".to_string());
             }
             Err(e) => {
                 tracing::warn!("get_tokens: error retrieving refresh_token: {}", e);
+                access.zeroize();
                 return Err(e);
             }
         };

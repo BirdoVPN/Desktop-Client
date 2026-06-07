@@ -221,7 +221,20 @@ pub struct VpnSettings {
 
 /// Read VPN-related settings and configure WFP split tunneling / local network sharing.
 pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
-    let settings = get_settings(app.clone()).await.ok();
+    // Settings failing to load means security-relevant flags (stealth_mode,
+    // quantum_protection) fall back to their defaults. We keep the resilient
+    // fallback behaviour, but surface the cause instead of silently swallowing it.
+    let settings = match get_settings(app.clone()).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load VPN settings ({}); falling back to defaults \
+                 (stealth/quantum disabled)",
+                e
+            );
+            None
+        }
+    };
     let custom_dns = settings.as_ref().and_then(|s| s.custom_dns.clone());
     let local_network_sharing = settings
         .as_ref()

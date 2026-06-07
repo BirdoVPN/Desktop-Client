@@ -43,6 +43,12 @@ pub async fn create_port_forward(
         return Err("Invalid protocol: must be 'tcp' or 'udp'".to_string());
     }
 
+    // Reject port 0 (OS-assigned) and privileged ports (1-1023) — these are not
+    // suitable for user-initiated port forwarding.
+    if port < 1024 {
+        return Err("Invalid port: must be in range 1024-65535".to_string());
+    }
+
     if !api.is_authenticated().await {
         if let Ok(tokens) = credentials.get_tokens() {
             api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
@@ -53,9 +59,19 @@ pub async fn create_port_forward(
         return Err("Not authenticated. Please log in first.".to_string());
     }
 
-    api.create_port_forward(port, &protocol, None)
+    let response = api
+        .create_port_forward(port, &protocol, None)
         .await
-        .map_err(|e| sanitize_error(&format!("Failed to create port forward: {}", e)))
+        .map_err(|e| sanitize_error(&format!("Failed to create port forward: {}", e)))?;
+
+    // Surface any backend-provided context (e.g. "Port already in use") for debugging.
+    if let Some(message) = response.message.as_deref() {
+        if !message.trim().is_empty() {
+            tracing::info!("Create port forward response: {}", message);
+        }
+    }
+
+    Ok(response)
 }
 
 /// Delete an existing port forward
