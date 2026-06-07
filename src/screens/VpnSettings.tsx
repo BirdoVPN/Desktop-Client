@@ -41,7 +41,7 @@ import {
   BirdoTextField,
 } from '@/components/birdo';
 import { useAppStore } from '@/store/app-store';
-import { settingsToRust, isValidPort } from '@/utils/helpers';
+import { settingsToRust, isValidPort, isValidDnsAddress } from '@/utils/helpers';
 import { white, status, brand, hairline, motion as motionTokens } from '@/lib/birdo-theme';
 
 interface KillSwitchStatus {
@@ -67,6 +67,12 @@ export function VpnSettings() {
 
   const [killSwitchError, setKillSwitchError] = useState<string | null>(null);
   const [dnsExpanded, setDnsExpanded] = useState(false);
+  const [dnsErrors, setDnsErrors] = useState<{ primary: string | null; secondary: string | null }>({
+    primary: null,
+    secondary: null,
+  });
+  const [dnsPrimaryInput, setDnsPrimaryInput] = useState((settings.customDns ?? [])[0] ?? '');
+  const [dnsSecondaryInput, setDnsSecondaryInput] = useState((settings.customDns ?? [])[1] ?? '');
   const [customPortInput, setCustomPortInput] = useState(
     !['auto', '51820', '53'].includes(settings.wireGuardPort) ? settings.wireGuardPort : '',
   );
@@ -105,6 +111,16 @@ export function VpnSettings() {
       setCustomMtuInput(String(settings.wireGuardMtu));
     }
   }, [settings.wireGuardPort, settings.wireGuardMtu]);
+
+  // Mirror persisted custom DNS into the local inputs if it changes elsewhere
+  // (e.g. another window). Only persisted (already-valid) values flow back in,
+  // so this never clobbers an in-progress invalid edit with a stale value.
+  const persistedDnsPrimary = (settings.customDns ?? [])[0] ?? '';
+  const persistedDnsSecondary = (settings.customDns ?? [])[1] ?? '';
+  useEffect(() => {
+    setDnsPrimaryInput(persistedDnsPrimary);
+    setDnsSecondaryInput(persistedDnsSecondary);
+  }, [persistedDnsPrimary, persistedDnsSecondary]);
 
   // Persist the FULL settings object via the shared settingsToRust path.
   const saveSettingsToBackend = useCallback(async (next: typeof settings) => {
@@ -158,15 +174,49 @@ export function VpnSettings() {
   // ── DNS helpers (custom DNS expandable: primary / secondary) ──────────────
   const dnsList = settings.customDns ?? [];
   const customDnsEnabled = dnsList.length > 0;
-  const dnsPrimary = dnsList[0] ?? '';
-  const dnsSecondary = dnsList[1] ?? '';
 
+  // Re-validate the local inputs and persist only valid entries. An empty field
+  // is allowed (it clears that entry / falls back to the VPN server's DNS).
+  // Invalid entries are surfaced inline and are NEVER persisted, so a malformed
+  // or special-use address can't silently reach the tunnel config and cause a
+  // DNS failure or leak.
   const setDns = useCallback(
     (primary: string, secondary: string) => {
-      const next = [primary.trim(), secondary.trim()].filter((v) => v.length > 0);
+      const p = primary.trim();
+      const s = secondary.trim();
+
+      const pCheck = p.length > 0 ? isValidDnsAddress(p) : { valid: true as const };
+      const sCheck = s.length > 0 ? isValidDnsAddress(s) : { valid: true as const };
+
+      setDnsErrors({
+        primary: pCheck.valid ? null : pCheck.error ?? 'Invalid DNS address',
+        secondary: sCheck.valid ? null : sCheck.error ?? 'Invalid DNS address',
+      });
+
+      // Persist only entries that are present AND valid, preserving order.
+      const next = [
+        p.length > 0 && pCheck.valid ? p : '',
+        s.length > 0 && sCheck.valid ? s : '',
+      ].filter((v) => v.length > 0);
       persist({ customDns: next.length > 0 ? next : null });
     },
     [persist],
+  );
+
+  const onChangeDnsPrimary = useCallback(
+    (raw: string) => {
+      setDnsPrimaryInput(raw);
+      setDns(raw, dnsSecondaryInput);
+    },
+    [setDns, dnsSecondaryInput],
+  );
+
+  const onChangeDnsSecondary = useCallback(
+    (raw: string) => {
+      setDnsSecondaryInput(raw);
+      setDns(dnsPrimaryInput, raw);
+    },
+    [setDns, dnsPrimaryInput],
   );
 
   // ── WireGuard port selection ──────────────────────────────────────────────
@@ -323,18 +373,34 @@ export function VpnSettings() {
                 transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
               >
                 <div className="space-y-3 px-3.5 pb-3.5 pt-1">
-                  <BirdoTextField
-                    label="Primary DNS"
-                    placeholder="e.g. 1.1.1.1"
-                    value={dnsPrimary}
-                    onChange={(v) => setDns(v, dnsSecondary)}
-                  />
-                  <BirdoTextField
-                    label="Secondary DNS (optional)"
-                    placeholder="e.g. 1.0.0.1"
-                    value={dnsSecondary}
-                    onChange={(v) => setDns(dnsPrimary, v)}
-                  />
+                  <div>
+                    <BirdoTextField
+                      label="Primary DNS"
+                      placeholder="e.g. 1.1.1.1"
+                      value={dnsPrimaryInput}
+                      onChange={onChangeDnsPrimary}
+                      error={!!dnsErrors.primary}
+                    />
+                    {dnsErrors.primary && (
+                      <p className="mt-1 pl-1 text-xs" style={{ color: status.red }}>
+                        {dnsErrors.primary}
+                      </p>
+                    )}
+                  </div>
+                  <div>
+                    <BirdoTextField
+                      label="Secondary DNS (optional)"
+                      placeholder="e.g. 1.0.0.1"
+                      value={dnsSecondaryInput}
+                      onChange={onChangeDnsSecondary}
+                      error={!!dnsErrors.secondary}
+                    />
+                    {dnsErrors.secondary && (
+                      <p className="mt-1 pl-1 text-xs" style={{ color: status.red }}>
+                        {dnsErrors.secondary}
+                      </p>
+                    )}
+                  </div>
                   <p className="text-xs" style={{ color: white.w40 }}>
                     Leave empty to use the VPN server&apos;s DNS. Popular options: 1.1.1.1
                     (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9).

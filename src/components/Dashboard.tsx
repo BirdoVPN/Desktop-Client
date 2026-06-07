@@ -458,6 +458,13 @@ export function Dashboard() {
 
     // Multi-hop
     if (settings.multiHopEnabled && settings.multiHopEntryNodeId && settings.multiHopExitNodeId) {
+      // Defense-in-depth: never invoke a multi-hop connect with identical
+      // entry/exit (the UI already blocks this via multiHopBlocked, but guard
+      // here too so no future caller can send an invalid route to Rust).
+      if (settings.multiHopEntryNodeId === settings.multiHopExitNodeId) {
+        setErrorMessage('Entry and exit must be different servers.');
+        return;
+      }
       const entry = servers.find((s) => s.id === settings.multiHopEntryNodeId);
       const exit = servers.find((s) => s.id === settings.multiHopExitNodeId);
       setConnectionState('connecting');

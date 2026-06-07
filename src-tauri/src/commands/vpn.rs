@@ -99,9 +99,16 @@ pub fn build_vpn_config(
     // FIX-R7: Validate DNS addresses to prevent command injection via netsh
     // F-05 FIX: Use custom DNS from user settings if provided, otherwise fall back to server response
     let dns_source = custom_dns.filter(|d| !d.is_empty()).unwrap_or_else(|| {
-        response
-            .dns
-            .unwrap_or_else(|| vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()])
+        response.dns.unwrap_or_else(|| {
+            // Server supplied no DNS and the user set none — fall back to public
+            // resolvers. Log this for transparency: the user's resolver in this
+            // case is not one they (or the server) explicitly chose.
+            tracing::warn!(
+                "No DNS provided by user settings or server response; \
+                 falling back to public resolvers (1.1.1.1, 1.0.0.1)"
+            );
+            vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
+        })
     });
     let dns: Vec<String> = dns_source
         .into_iter()

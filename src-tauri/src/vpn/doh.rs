@@ -50,7 +50,10 @@ const _DNS_TYPE_AAAA: i32 = 28; // IPv6 (reserved for future use)
 struct DoHProvider {
     url: &'static str,
     /// SPKI SHA-256 pin hashes (base64-encoded). At least one must match.
-    /// Include both the leaf certificate pin AND the issuing CA pin for rotation safety.
+    /// Only LEAF certificate pins are effective: reqwest's `peer_certificate()`
+    /// exposes only the leaf cert, so intermediate/CA pins can never match and
+    /// must NOT be listed here (they would provide false confidence, not security).
+    /// For rotation safety, add the NEW leaf pin alongside the old leaf pin.
     /// Set to empty slice to disable pinning for this provider (emergency only).
     pins: &'static [&'static str],
 }
@@ -77,27 +80,34 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         url: "https://cloudflare-dns.com/dns-query",
         // Chain: cloudflare-dns.com → SSL.com SSL Intermediate CA ECC R2 → SSL.com Root CA ECC
         // Pins regenerated 2025-07-16 from live cloudflare-dns.com certificate.
+        // Only the LEAF pin is listed — reqwest's peer_certificate() exposes only the
+        // leaf cert, so an intermediate/CA pin can never match and would be dead weight.
+        // Intermediate hash (SSL.com SSL Intermediate CA ECC R2), kept for reference only
+        // and NOT used as a pin: lItxEa9C9UbVec/1ziveyCE03ZkUhCvdsMUocutgTjk=
         pins: &[
             "47AoJnidZT0iTT7ay+Tod8tyhvxMkiZy9iJnQcpXrWU=", // leaf: cloudflare-dns.com (expires 2026-12-21)
-            "lItxEa9C9UbVec/1ziveyCE03ZkUhCvdsMUocutgTjk=", // intermediate: SSL.com SSL Intermediate CA ECC R2
         ],
     },
     DoHProvider {
         url: "https://dns.google/resolve",
         // Chain: dns.google → WR2 (Google Trust Services) → GTS Root R1
         // Pins regenerated 2025-07-16 from live dns.google certificate.
+        // Only the LEAF pin is listed (see note above on peer_certificate()).
+        // Intermediate hash (WR2, Google Trust Services), kept for reference only
+        // and NOT used as a pin: 5v4iv0Xk8NO4XFngLA9JVBjh640yEPeI1IzV4ctUfNQ=
         pins: &[
             "ACUte493Q17uULD+DmOIon7nIx0FUDnohxxMNNlA/Pg=", // leaf: dns.google (expires 2026-04-27)
-            "5v4iv0Xk8NO4XFngLA9JVBjh640yEPeI1IzV4ctUfNQ=", // intermediate: WR2 (Google Trust Services)
         ],
     },
     DoHProvider {
         url: "https://dns.quad9.net/dns-query",
         // Chain: dns.quad9.net → DigiCert Global G3 TLS ECC SHA384 2020 CA1 → DigiCert Global Root G3
         // Pins regenerated 2025-07-16 from live dns.quad9.net certificate.
+        // Only the LEAF pin is listed (see note above on peer_certificate()).
+        // Intermediate hash (DigiCert Global G3 TLS ECC SHA384 2020 CA1), kept for
+        // reference only and NOT used as a pin: BYfWvSgZWHq5D7WWSApXk72fdQaj6s5z9eqzZgF/4lk=
         pins: &[
             "SCxBhlVQMlGdPR2qQI+sDmPHCvMNIq0+V8LUnjtP29w=", // leaf: dns.quad9.net (expires 2026-07-27)
-            "BYfWvSgZWHq5D7WWSApXk72fdQaj6s5z9eqzZgF/4lk=", // intermediate: DigiCert Global G3 TLS ECC SHA384 2020 CA1
         ],
     },
 ];
@@ -108,8 +118,9 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
 /// SEC: This hashes the full DER-encoded leaf certificate. Pins must be
 /// regenerated whenever the certificate is renewed (even with the same key).
 /// This is intentional — for DoH providers that rotate certs regularly,
-/// we include both the leaf cert pin AND the issuing CA intermediate cert pin
-/// as a backup, ensuring smooth rotation.
+/// add the new leaf cert pin alongside the old one during the rotation window.
+/// Only leaf pins are checked here: reqwest exposes only the leaf certificate,
+/// so intermediate/CA pins would never match and are not used.
 ///
 /// To generate a pin for a DoH provider:
 ///   echo | openssl s_client -connect <host>:443 -servername <host> 2>/dev/null \

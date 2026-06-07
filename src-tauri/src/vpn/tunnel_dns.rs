@@ -95,8 +95,18 @@ impl WintunTunnel {
             .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
-                if trimmed.starts_with(|c: char| c.is_ascii_digit()) {
-                    Some(trimmed.to_string())
+                if !trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+                    return None;
+                }
+                // netsh may annotate entries (e.g. "1.1.1.1 (Preferred)") or, on
+                // localized Windows, emit non-IP rows that happen to start with a
+                // digit. Take only the first whitespace token and require it to be a
+                // valid IP — these values are fed back verbatim into
+                // `netsh set/add dns static <ip>` on restore, so storing anything
+                // that is not a bare IP would silently break DNS restoration.
+                let candidate = trimmed.split_whitespace().next()?;
+                if candidate.parse::<std::net::IpAddr>().is_ok() {
+                    Some(candidate.to_string())
                 } else {
                     None
                 }

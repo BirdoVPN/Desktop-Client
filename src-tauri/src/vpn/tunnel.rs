@@ -754,16 +754,21 @@ impl WintunTunnel {
             .next()
             .ok_or_else(|| "Invalid endpoint format: missing host".to_string())?;
         // Endpoint host can be an IP or a hostname. Validate that hostnames
-        // contain only safe characters (alphanumeric, dots, hyphens).
+        // contain only safe characters (alphanumeric, dots, hyphens) AND form a
+        // well-formed FQDN: per-label length 1-63, no empty labels ('..'), no
+        // leading/trailing hyphen per label, no trailing dot. This rejects
+        // malformed values (e.g. 'a..b', 'a.-b', 'a-.b') before they reach any
+        // system command. Valid endpoint FQDNs are unaffected.
         if endpoint_host.parse::<Ipv4Addr>().is_err() {
-            if endpoint_host.is_empty()
-                || endpoint_host.len() > 253
-                || !endpoint_host
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-                || endpoint_host.starts_with('-')
-                || endpoint_host.starts_with('.')
-            {
+            let labels: Vec<&str> = endpoint_host.split('.').collect();
+            let valid_labels = labels.iter().all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+            if endpoint_host.is_empty() || endpoint_host.len() > 253 || !valid_labels {
                 return Err(format!("Invalid endpoint hostname: '{}'", endpoint_host));
             }
         }

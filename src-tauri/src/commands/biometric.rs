@@ -123,11 +123,20 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
             "#
         );
 
-        let output = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("Failed to launch Windows Hello: {e}"))?;
+        // Run the blocking PowerShell invocation on a dedicated blocking thread so a
+        // hung Windows Hello bridge (e.g. a stuck biometric daemon) cannot starve the
+        // async runtime / stall other tasks. The OS prompt itself waits for user input,
+        // so we deliberately do NOT impose a hard timeout that could cut off a legitimate
+        // (slow) verification attempt.
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+        })
+        .await
+        .map_err(|e| format!("Windows Hello task failed: {e}"))?
+        .map_err(|e| format!("Failed to launch Windows Hello: {e}"))?;
 
         let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
         match result.as_str() {
@@ -171,10 +180,18 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
             end if
         "#;
 
-        let output = Command::new("osascript")
-            .args(["-l", "AppleScript", "-e", script])
-            .output()
-            .map_err(|e| format!("Failed to launch Touch ID: {e}"))?;
+        // Run the blocking osascript invocation on a dedicated blocking thread so a
+        // hung Touch ID daemon cannot starve the async runtime / stall other tasks. The
+        // OS prompt itself waits for user input, so we deliberately do NOT impose a hard
+        // timeout that could cut off a legitimate (slow) verification attempt.
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new("osascript")
+                .args(["-l", "AppleScript", "-e", script])
+                .output()
+        })
+        .await
+        .map_err(|e| format!("Touch ID task failed: {e}"))?
+        .map_err(|e| format!("Failed to launch Touch ID: {e}"))?;
 
         let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
         match result.as_str() {

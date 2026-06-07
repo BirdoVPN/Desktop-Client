@@ -469,11 +469,17 @@ function PlanPill({ plan }: { plan: string }) {
 
 function DeleteAccountDialog({ onDismiss }: { onDismiss: () => void }) {
   const [password, setPassword] = useState('');
+  const [confirmText, setConfirmText] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Require an explicit typed acknowledgement in addition to the password so an
+  // irreversible deletion can never happen from a single accidental click.
+  const confirmed = confirmText.trim().toUpperCase() === 'DELETE';
+  const canSubmit = !!password.trim() && confirmed && !deleting;
+
   const handleConfirm = async () => {
-    if (!password.trim() || deleting) return;
+    if (!canSubmit) return;
     setDeleting(true);
     setError(null);
     try {
@@ -517,8 +523,8 @@ function DeleteAccountDialog({ onDismiss }: { onDismiss: () => void }) {
           </div>
           <p className="text-[13px]" style={{ color: white.w60 }}>
             This will permanently delete your account, VPN configurations, and all
-            associated data. This action cannot be undone. Enter your password to
-            confirm.
+            associated data. This action cannot be undone. Enter your password and
+            type DELETE to confirm.
           </p>
           <BirdoTextField
             value={password}
@@ -531,6 +537,15 @@ function DeleteAccountDialog({ onDismiss }: { onDismiss: () => void }) {
             error={error != null}
             disabled={deleting}
             autoComplete="current-password"
+          />
+          <BirdoTextField
+            value={confirmText}
+            onChange={setConfirmText}
+            label="Type DELETE to confirm"
+            type="text"
+            placeholder="DELETE"
+            disabled={deleting}
+            autoComplete="off"
           />
           {error && (
             <p className="text-[12px]" style={{ color: statusTokens.red }}>
@@ -550,7 +565,7 @@ function DeleteAccountDialog({ onDismiss }: { onDismiss: () => void }) {
               variant="danger"
               fullWidth
               isLoading={deleting}
-              disabled={!password.trim()}
+              disabled={!canSubmit}
               onClick={handleConfirm}
             />
           </div>

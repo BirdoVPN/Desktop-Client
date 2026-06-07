@@ -1,11 +1,15 @@
 //! Split Tunnel commands
 //!
 //! Exposes platform-specific split tunneling as Tauri IPC commands.
-//! - Windows: WFP (Windows Filtering Platform) permit filters
-//! - macOS: pf (packet filter) pass rules per application
+//! - Windows: WFP (Windows Filtering Platform) permit filters — fully implemented.
+//! - macOS / Linux: NOT yet implemented. The commands accept and track app
+//!   paths in memory but DO NOT install any pf/iptables/routing rules, so no
+//!   traffic actually bypasses the tunnel on these platforms. This fails
+//!   SAFE: with no bypass installed, every app's traffic stays inside the VPN
+//!   (the private default) rather than leaking outside it.
 //!
-//! Apps added here bypass the kill switch block filters — their traffic
-//! goes outside the VPN tunnel.
+//! On Windows, apps added here bypass the kill switch block filters — their
+//! traffic goes outside the VPN tunnel.
 
 #[cfg(target_os = "windows")]
 use crate::vpn::wfp;
@@ -17,6 +21,10 @@ use crate::vpn::wfp;
 /// Returns a permit ID (u64) that can later be passed to
 /// `remove_split_tunnel_app` to revoke the exception.  Returns 0 if the
 /// kill switch is not currently active (the app is queued for when it activates).
+///
+/// NOTE: only Windows actually installs a bypass. On macOS / Linux this is a
+/// stub — it records the path but installs no rule, so the app's traffic still
+/// goes through the VPN (fails safe; no leak).
 #[tauri::command]
 pub async fn add_split_tunnel_app(app_path: String) -> Result<u64, String> {
     // PFA-M8: defence-in-depth path validation. A compromised renderer or
@@ -97,24 +105,31 @@ pub async fn add_split_tunnel_app(app_path: String) -> Result<u64, String> {
 
     #[cfg(target_os = "macos")]
     {
-        // macOS split tunneling: resolve the binary and add a pf pass rule
-        // by matching outgoing traffic from the process. Since pf doesn't
-        // directly support per-app filtering, we use route-based split tunneling
-        // via the default gateway for specific destination IPs.
-        // For now, queue the app path and return a synthetic ID.
+        // NOT IMPLEMENTED. macOS split tunneling would require pf rules and/or
+        // route-based exclusions; none of that exists yet. We still record the
+        // path in memory (so remove/clear stay consistent) but DO NOT install
+        // any bypass — this fails safe (traffic stays inside the tunnel).
         let id = MACOS_SPLIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         MACOS_SPLIT_APPS.lock().await.insert(id, app_path);
-        tracing::info!("macOS split tunnel: queued app with id={}", id);
+        tracing::warn!(
+            "macOS split tunnel is not implemented; app id={} recorded but NO bypass installed (traffic stays inside the tunnel)",
+            id
+        );
         Ok(id)
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        // Linux: use cgroup-based or iptables mark-based split tunneling
-        // For now, queue the app path similar to macOS implementation
+        // NOT IMPLEMENTED. Linux split tunneling would require cgroup- or
+        // iptables-mark-based routing; none of that exists yet. We still record
+        // the path in memory (so remove/clear stay consistent) but DO NOT
+        // install any bypass — this fails safe (traffic stays inside the tunnel).
         let id = LINUX_SPLIT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         LINUX_SPLIT_APPS.lock().await.insert(id, app_path);
-        tracing::info!("Linux split tunnel: queued app with id={}", id);
+        tracing::warn!(
+            "Linux split tunnel is not implemented; app id={} recorded but NO bypass installed (traffic stays inside the tunnel)",
+            id
+        );
         Ok(id)
     }
 }

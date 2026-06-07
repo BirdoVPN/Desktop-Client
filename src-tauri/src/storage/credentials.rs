@@ -2,8 +2,6 @@
 //!
 //! Securely stores authentication tokens and VPN keys.
 
-#![allow(dead_code)]
-
 use keyring::Entry;
 use serde::{de::DeserializeOwned, Serialize};
 use zeroize::Zeroize;
@@ -113,6 +111,7 @@ impl CredentialStore {
     }
 
     /// Clear all stored credentials
+    #[allow(dead_code)] // Reserved: bulk wipe (logout uses clear_tokens; not yet wired)
     pub fn clear_all() -> Result<(), String> {
         let keys = [CredentialKey::AccessToken, CredentialKey::RefreshToken];
 
@@ -184,6 +183,7 @@ impl CredentialStore {
     }
 
     /// Store a serializable value as JSON
+    #[allow(dead_code)] // Reserved: generic JSON credential storage (not yet wired)
     pub fn store_json<T: Serialize>(key: CredentialKey, value: &T) -> Result<(), String> {
         let json = serde_json::to_string(value)
             .map_err(|e| format!("Failed to serialize value: {}", e))?;
@@ -191,6 +191,7 @@ impl CredentialStore {
     }
 
     /// Retrieve and deserialize a JSON value
+    #[allow(dead_code)] // Reserved: generic JSON credential retrieval (not yet wired)
     pub fn retrieve_json<T: DeserializeOwned>(key: CredentialKey) -> Result<Option<T>, String> {
         match Self::retrieve(key)? {
             Some(json) => {

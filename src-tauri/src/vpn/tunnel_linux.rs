@@ -274,8 +274,6 @@ impl LinuxTunnel {
 
         const MAX_PACKET_SIZE: usize = 65536;
 
-        let mut read_buf = vec![0u8; MAX_PACKET_SIZE];
-
         loop {
             if !running.load(Ordering::SeqCst) {
                 tracing::info!("Packet loop: running flag cleared, exiting");
@@ -290,7 +288,12 @@ impl LinuxTunnel {
                 // Read from TUN (async via spawn_blocking for the fd read)
                 result = tokio::task::spawn_blocking({
                     let fd = tun_fd;
-                    let mut buf = read_buf.clone();
+                    // Allocate a fresh zeroed buffer per read. alloc_zeroed for a
+                    // large buffer is typically backed by lazily-faulted zero pages,
+                    // avoiding the eager 64KiB memcpy that `read_buf.clone()` incurred.
+                    // Behaviour is identical: the buffer is overwritten by `read` up to
+                    // `n` bytes and then truncated to `n`, so initial contents never matter.
+                    let mut buf = vec![0u8; MAX_PACKET_SIZE];
                     move || {
                         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                         if n > 0 {

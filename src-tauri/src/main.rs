@@ -51,7 +51,17 @@ fn main() {
         Some(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(move || file.try_clone().expect("clone log file handle")),
+                // Resilient writer: a per-write try_clone() can fail (FD
+                // exhaustion, transient OS error). Panicking here would take
+                // down the whole process from inside the logging path — and
+                // possibly before earlier logs are flushed. Degrade gracefully
+                // by dropping that single log line (io::sink) instead.
+                .with_writer(move || -> Box<dyn std::io::Write> {
+                    match file.try_clone() {
+                        Ok(f) => Box::new(f),
+                        Err(_) => Box::new(std::io::sink()),
+                    }
+                }),
         )
     });
 

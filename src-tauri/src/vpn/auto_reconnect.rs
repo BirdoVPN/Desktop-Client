@@ -3,8 +3,6 @@
 //! Monitors VPN connection health and automatically attempts reconnection
 //! when the connection drops unexpectedly.
 
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,6 +122,7 @@ impl AutoReconnectService {
     }
 
     /// Update auto-reconnect configuration
+    #[allow(dead_code)] // Reserved: runtime config replacement (settings UI not yet wired)
     pub async fn set_config(&self, config: AutoReconnectConfig) {
         *self.config.write().await = config;
     }
@@ -137,6 +136,7 @@ impl AutoReconnectService {
     }
 
     /// Enable or disable auto-reconnect
+    #[allow(dead_code)] // Reserved: toggle auto-reconnect at runtime (settings UI not yet wired)
     pub async fn set_enabled(&self, enabled: bool) {
         self.config.write().await.enabled = enabled;
         tracing::info!(
@@ -146,6 +146,7 @@ impl AutoReconnectService {
     }
 
     /// Check if auto-reconnect is enabled
+    #[allow(dead_code)] // Reserved: query auto-reconnect state (settings UI not yet wired)
     pub async fn is_enabled(&self) -> bool {
         self.config.read().await.enabled
     }
@@ -544,6 +545,19 @@ impl AutoReconnectService {
                                                             }
                                                         }
 
+                                                        // AR-2 FIX: Re-check the user-disconnect flag immediately
+                                                        // before committing the tunnel. The user could have
+                                                        // disconnected during the (potentially slow) config build /
+                                                        // stealth / PQ setup phase above. The kill switch stays
+                                                        // active, so bailing here cannot cause a leak — it only
+                                                        // avoids re-establishing a tunnel the user just tore down.
+                                                        // (local_private_key was already moved into `config`, so
+                                                        // there is nothing left to zeroize on this path.)
+                                                        if user_disconnected.load(Ordering::SeqCst) {
+                                                            tracing::info!("User disconnected during reconnect setup — aborting before connect");
+                                                            continue;
+                                                        }
+
                                                         match vpn_manager.connect(config, info.server_name.clone(), info.local_network_sharing).await {
                                                             Ok(_) => {
                                                                 tracing::info!("Auto-reconnect successful on attempt {}", attempts + 1);
@@ -738,6 +752,7 @@ impl AutoReconnectService {
     }
 
     /// Get current reconnect status
+    #[allow(dead_code)] // Reserved: status surface for a diagnostics command (not yet wired)
     pub fn get_status(&self) -> AutoReconnectStatus {
         AutoReconnectStatus {
             is_reconnecting: self.is_reconnecting.load(Ordering::SeqCst),
@@ -747,6 +762,7 @@ impl AutoReconnectService {
     }
 }
 
+#[allow(dead_code)] // Reserved: returned by get_status (diagnostics surface, not yet wired)
 #[derive(Debug, Clone)]
 pub struct AutoReconnectStatus {
     pub is_reconnecting: bool,

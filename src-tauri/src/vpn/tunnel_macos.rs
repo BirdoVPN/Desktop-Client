@@ -286,45 +286,55 @@ impl UtunTunnel {
                 break;
             }
 
+            // The read buffer is moved into the blocking read task below and normally
+            // returned for reuse. If it was not returned (e.g. the shutdown branch of the
+            // select won, or the blocking task failed to join), restore it to full size so
+            // the next read is never issued against a zero-length buffer.
+            if read_buf.len() != MAX_PACKET_SIZE + UTUN_HEADER_SIZE {
+                read_buf = vec![0u8; MAX_PACKET_SIZE + UTUN_HEADER_SIZE];
+            }
+
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     tracing::info!("Packet loop: shutdown signal received");
                     break;
                 }
-                // Read from utun (async via tokio::task::spawn_blocking for the fd read)
+                // Read from utun (async via tokio::task::spawn_blocking for the fd read).
+                // The owned read buffer is moved into the blocking task and returned back
+                // together with the byte count, so it is reused across iterations instead of
+                // cloning ~64KB every loop cycle (including idle EAGAIN polls).
                 result = tokio::task::spawn_blocking({
                     let fd = utun_fd;
-                    let mut buf = read_buf.clone();
+                    let mut buf = std::mem::take(&mut read_buf);
                     move || {
                         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                        if n > UTUN_HEADER_SIZE as isize {
-                            buf.truncate(n as usize);
-                            Some(buf)
-                        } else if n < 0 {
+                        if n < 0 {
                             let err = std::io::Error::last_os_error();
                             if err.raw_os_error() != Some(libc::EAGAIN) {
                                 tracing::debug!("utun read error: {}", err);
                             }
-                            None
-                        } else {
-                            None
                         }
+                        (buf, n)
                     }
                 }) => {
-                    if let Ok(Some(data)) = result {
-                        // Strip 4-byte utun header to get raw IP packet
-                        let ip_packet = &data[UTUN_HEADER_SIZE..];
-                        let packet_len = ip_packet.len() as u64;
+                    if let Ok((buf, n)) = result {
+                        // Return the buffer to the loop for reuse on the next iteration.
+                        read_buf = buf;
+                        if n > UTUN_HEADER_SIZE as isize {
+                            // Strip 4-byte utun header to get raw IP packet
+                            let ip_packet = &read_buf[UTUN_HEADER_SIZE..n as usize];
+                            let packet_len = ip_packet.len() as u64;
 
-                        // Encrypt and send via WireGuard
-                        if let Some(session) = wg_session.read().await.as_ref() {
-                            match session.send_packet(ip_packet).await {
-                                Ok(_) => {
-                                    bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
-                                    packets_sent.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Failed to send WG packet: {}", e);
+                            // Encrypt and send via WireGuard
+                            if let Some(session) = wg_session.read().await.as_ref() {
+                                match session.send_packet(ip_packet).await {
+                                    Ok(_) => {
+                                        bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
+                                        packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("Failed to send WG packet: {}", e);
+                                    }
                                 }
                             }
                         }

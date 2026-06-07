@@ -83,6 +83,16 @@ pub async fn login(
         let window = std::time::Duration::from_secs(LOGIN_WINDOW_SECS);
         // Remove expired attempts
         attempts.retain(|t| now.duration_since(*t) < window);
+        // Hard cap on vector length (defense-in-depth): the decision below only
+        // depends on the most recent MAX_LOGIN_ATTEMPTS timestamps, so never keep
+        // more than that even under rapid bursts. Timestamps are pushed in
+        // monotonic order, so draining the front retains the most recent ones.
+        // No-op in the normal flow (the early return below prevents growth past
+        // the cap); this purely bounds memory if that invariant ever changes.
+        if attempts.len() > MAX_LOGIN_ATTEMPTS {
+            let excess = attempts.len() - MAX_LOGIN_ATTEMPTS;
+            attempts.drain(0..excess);
+        }
         if attempts.len() >= MAX_LOGIN_ATTEMPTS {
             let oldest = attempts[0];
             let wait = window.saturating_sub(now.duration_since(oldest));
@@ -338,6 +348,14 @@ pub async fn verify_2fa(
         let now = Instant::now();
         let window = std::time::Duration::from_secs(TOTP_WINDOW_SECS);
         attempts.retain(|t| now.duration_since(*t) < window);
+        // Hard cap on vector length (defense-in-depth): mirrors the login limiter.
+        // Only the most recent MAX_TOTP_ATTEMPTS timestamps affect the decision
+        // below, so never retain more than that even under rapid bursts. No-op in
+        // the normal flow; purely bounds memory under pathological bursts.
+        if attempts.len() > MAX_TOTP_ATTEMPTS {
+            let excess = attempts.len() - MAX_TOTP_ATTEMPTS;
+            attempts.drain(0..excess);
+        }
         if attempts.len() >= MAX_TOTP_ATTEMPTS {
             let oldest = attempts[0];
             let wait = window.saturating_sub(now.duration_since(oldest));
