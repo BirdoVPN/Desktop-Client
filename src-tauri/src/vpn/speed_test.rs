@@ -40,12 +40,16 @@ pub async fn measure_download(
     client: &reqwest::Client,
     speed_test_url: &str,
     size_bytes: u64,
+    token: Option<&str>,
 ) -> Result<(f64, u64), String> {
     let url = format!("{}/download?size={}", speed_test_url, size_bytes);
 
     let start = Instant::now();
-    let response = client
-        .get(&url)
+    let mut req = client.get(&url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let response = req
         .send()
         .await
         .map_err(|e| format!("Download request failed: {}", e))?;
@@ -75,15 +79,18 @@ pub async fn measure_upload(
     client: &reqwest::Client,
     speed_test_url: &str,
     size_bytes: usize,
+    token: Option<&str>,
 ) -> Result<(f64, u64), String> {
     let url = format!("{}/upload", speed_test_url);
     // Generate random payload
     let payload = vec![0u8; size_bytes];
 
     let start = Instant::now();
-    let response = client
-        .post(&url)
-        .body(payload)
+    let mut req = client.post(&url).body(payload);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let response = req
         .send()
         .await
         .map_err(|e| format!("Upload request failed: {}", e))?;
@@ -108,13 +115,18 @@ pub async fn measure_latency(
     client: &reqwest::Client,
     speed_test_url: &str,
     samples: u32,
+    token: Option<&str>,
 ) -> (u32, u32) {
     let mut latencies = Vec::with_capacity(samples as usize);
 
     for _ in 0..samples {
         let url = format!("{}/ping", speed_test_url);
         let start = Instant::now();
-        if client.get(&url).send().await.is_ok() {
+        let mut req = client.get(&url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        if req.send().await.is_ok() {
             latencies.push(start.elapsed().as_millis() as f64);
         }
     }
@@ -136,19 +148,20 @@ pub async fn run_speed_test(
     client: &reqwest::Client,
     speed_test_url: &str,
     server_endpoint: &str,
+    token: Option<&str>,
 ) -> Result<SpeedTestResult, String> {
     let start = Instant::now();
 
     // 1. Latency (5 samples)
-    let (latency_ms, jitter_ms) = measure_latency(client, speed_test_url, 5).await;
+    let (latency_ms, jitter_ms) = measure_latency(client, speed_test_url, 5, token).await;
 
     // 2. Download test (10MB)
     let (download_mbps, bytes_downloaded) =
-        measure_download(client, speed_test_url, 10 * 1024 * 1024).await?;
+        measure_download(client, speed_test_url, 10 * 1024 * 1024, token).await?;
 
     // 3. Upload test (5MB)
     let (upload_mbps, bytes_uploaded) =
-        measure_upload(client, speed_test_url, 5 * 1024 * 1024).await?;
+        measure_upload(client, speed_test_url, 5 * 1024 * 1024, token).await?;
 
     let duration_seconds = start.elapsed().as_secs_f64();
 

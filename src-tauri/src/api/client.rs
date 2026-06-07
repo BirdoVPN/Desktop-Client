@@ -138,6 +138,12 @@ impl BirdoApi {
         self.access_token.read().await.is_some()
     }
 
+    /// Return the current access token (for commands like the speed test that
+    /// hit Bearer-authed endpoints with the shared hardened client).
+    pub async fn access_token_value(&self) -> Option<String> {
+        self.access_token.read().await.as_ref().map(|t| t.to_string())
+    }
+
     /// Return a clone of the hardened reqwest Client for reuse by other commands.
     /// This avoids creating secondary un-hardened clients that bypass TLS pinning.
     pub fn http_client(&self) -> Client {
