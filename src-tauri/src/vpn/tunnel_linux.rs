@@ -337,18 +337,32 @@ impl LinuxTunnel {
                     // Linux TUN with IFF_NO_PI: write raw IP packet directly (no header)
                     let fd = tun_fd;
                     let buf = decrypted;
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let buf_len = buf.len();
+                    let write_result = tokio::task::spawn_blocking(move || {
                         let written = unsafe {
                             libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
                         };
                         if written < 0 {
                             tracing::debug!("TUN write error: {}", std::io::Error::last_os_error());
+                        } else if (written as usize) < buf.len() {
+                            tracing::warn!(
+                                "Partial TUN write: {} of {} bytes",
+                                written,
+                                buf.len()
+                            );
                         }
+                        written
                     })
                     .await;
 
-                    bytes_received.fetch_add(packet_len, Ordering::Relaxed);
-                    packets_received.fetch_add(1, Ordering::Relaxed);
+                    // Only count statistics when the full packet was written to TUN.
+                    // Partial writes or errors must not inflate received counters.
+                    if let Ok(written) = write_result {
+                        if written >= 0 && (written as usize) == buf_len {
+                            bytes_received.fetch_add(packet_len, Ordering::Relaxed);
+                            packets_received.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         }
@@ -473,7 +487,18 @@ fn create_tun_device() -> Result<(String, i32), String> {
     // Set non-blocking mode
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags >= 0 {
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        let set_ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if set_ret < 0 {
+            tracing::warn!(
+                "Failed to set O_NONBLOCK on TUN fd: {} (device may remain blocking)",
+                std::io::Error::last_os_error()
+            );
+        }
+    } else {
+        tracing::warn!(
+            "fcntl F_GETFL failed on TUN fd: {} (could not set non-blocking mode)",
+            std::io::Error::last_os_error()
+        );
     }
 
     tracing::info!("Successfully created TUN device: {} (fd={})", tun_name, fd);

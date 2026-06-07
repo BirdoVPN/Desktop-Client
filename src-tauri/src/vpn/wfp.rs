@@ -439,7 +439,15 @@ impl WfpEngine {
         // Null-guard the out-param so the later `&mut *app_id` is provably sound
         // (see add_permit_app / CodeQL rust/access-invalid-pointer).
         if err != 0 || app_id.is_null() {
-            return Ok(0); // Non-fatal: skip (already warned at V4 level)
+            // Non-fatal: skip. The V4 layer only warns when V4 *also* fails, so
+            // surface the V6-only failure here — otherwise a split-tunnel app that
+            // resolved on V4 but not V6 is left silently IPv4-only.
+            tracing::warn!(
+                "FwpmGetAppIdFromFileName0 (v6) failed for '{}': 0x{:08X} — split tunnel will be IPv4-only for this app",
+                exe_path,
+                err
+            );
+            return Ok(0);
         }
 
         let label = format!(
@@ -951,6 +959,16 @@ pub async fn activate_blocking() -> Result<(), String> {
 
         // Split tunneling: permit traffic from excluded apps (IPv4 + IPv6)
         let split_apps = SPLIT_TUNNEL_APPS.try_read();
+        if let Err(e) = &split_apps {
+            // Lock poisoned (prior writer panicked) or momentarily contended:
+            // split-tunnel permits are skipped this activation. Warn rather than
+            // disable silently — otherwise excluded apps get killed by the switch
+            // with no indication why.
+            tracing::warn!(
+                "Split tunnel apps lock unavailable ({}) — skipping split-tunnel permits this activation",
+                e
+            );
+        }
         if let Ok(apps) = split_apps {
             if !apps.is_empty() {
                 tracing::info!("Adding split tunnel permits for {} app(s)", apps.len());

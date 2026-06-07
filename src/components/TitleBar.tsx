@@ -44,9 +44,9 @@ export function TitleBar() {
           aria-label="Minimize"
           title="Minimize"
           onClick={() => {
-            void win.minimize();
+            win.minimize().catch((e) => console.error('Failed to minimize window:', e));
           }}
-          className="flex h-6 w-7 items-center justify-center rounded text-white/45 transition-colors hover:bg-white/10 hover:text-white/90 focus:outline-none"
+          className="flex h-6 w-7 items-center justify-center rounded text-white/45 transition-colors hover:bg-white/10 hover:text-white/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
         >
           <Minus size={13} strokeWidth={2.5} />
         </button>
@@ -55,9 +55,9 @@ export function TitleBar() {
           aria-label="Close to tray"
           title="Close to tray"
           onClick={() => {
-            void win.hide();
+            win.hide().catch((e) => console.error('Failed to hide window:', e));
           }}
-          className="flex h-6 w-7 items-center justify-center rounded text-white/45 transition-colors hover:bg-red-500/80 hover:text-white focus:outline-none"
+          className="flex h-6 w-7 items-center justify-center rounded text-white/45 transition-colors hover:bg-red-500/80 hover:text-white focus:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
         >
           <X size={13} strokeWidth={2.5} />
         </button>

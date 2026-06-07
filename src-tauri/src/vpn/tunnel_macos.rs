@@ -130,20 +130,43 @@ impl UtunTunnel {
         );
         *self.endpoint_ip.write().await = Some(endpoint_ip.to_string());
 
+        // Helper: on a startup configuration failure after the utun fd has been
+        // created, close the fd so it does not leak until the next stop()/drop.
+        // This only runs on the error path; the success path is unchanged.
+        let close_fd_on_err = |fd: i32| {
+            let _ = unsafe { libc::close(fd) };
+            tracing::warn!("Closed utun file descriptor after startup failure");
+        };
+
         // Configure the utun interface IP
-        configure_utun_address(&utun_name, &self.config.client_ip, &self.config.mtu)?;
+        if let Err(e) =
+            configure_utun_address(&utun_name, &self.config.client_ip, &self.config.mtu)
+        {
+            close_fd_on_err(utun_fd);
+            *self.utun_fd.write().await = None;
+            return Err(e);
+        }
 
         // Configure routing
-        configure_routes(
+        if let Err(e) = configure_routes(
             &utun_name,
             &endpoint_ip.to_string(),
             &self.config.allowed_ips,
             self.local_network_sharing,
         )
-        .await?;
+        .await
+        {
+            close_fd_on_err(utun_fd);
+            *self.utun_fd.write().await = None;
+            return Err(e);
+        }
 
         // Configure DNS
-        configure_dns(&self.config.dns).await?;
+        if let Err(e) = configure_dns(&self.config.dns).await {
+            close_fd_on_err(utun_fd);
+            *self.utun_fd.write().await = None;
+            return Err(e);
+        }
 
         // Store WireGuard session
         *self.wg_session.write().await = Some(wg_session);
@@ -516,10 +539,22 @@ fn create_utun_device() -> Result<(String, i32), String> {
                 fd
             );
 
-            // Set non-blocking mode
+            // Set non-blocking mode. Failure here is logged: a blocking fd would
+            // cause the packet_loop read() to hang, so surface it for diagnosis.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags >= 0 {
-                unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                let set_ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                if set_ret < 0 {
+                    tracing::warn!(
+                        "Failed to set O_NONBLOCK on utun fd: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "Failed to read flags (F_GETFL) on utun fd; cannot set non-blocking mode: {}",
+                    std::io::Error::last_os_error()
+                );
             }
 
             return Ok((utun_name, fd));
@@ -593,11 +628,24 @@ async fn configure_routes(
     for cidr in allowed_ips {
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
+            tracing::warn!(
+                "Skipping malformed allowed_ip (expected CIDR notation): {}",
+                cidr
+            );
             continue;
         }
 
         let network = parts[0];
-        let prefix: u8 = parts[1].parse().unwrap_or(32);
+        let prefix: u8 = match parts[1].parse() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "Skipping allowed_ip with invalid CIDR prefix: {}",
+                    cidr
+                );
+                continue;
+            }
+        };
         let mask = prefix_to_mask(prefix);
 
         // route -n add -net <network> -netmask <mask> -interface <utun>
@@ -704,9 +752,23 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
     for cidr in allowed_ips {
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
+            tracing::warn!(
+                "Skipping malformed allowed_ip during route removal: {}",
+                cidr
+            );
             continue;
         }
-        let mask = prefix_to_mask(parts[1].parse().unwrap_or(32));
+        let prefix: u8 = match parts[1].parse() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "Skipping allowed_ip with invalid CIDR prefix during route removal: {}",
+                    cidr
+                );
+                continue;
+            }
+        };
+        let mask = prefix_to_mask(prefix);
         let _ = cmd("route")
             .args(["-n", "delete", "-net", parts[0], "-netmask", &mask])
             .output();

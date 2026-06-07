@@ -14,7 +14,7 @@
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use std::net::TcpListener;
+use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -408,11 +408,19 @@ impl Drop for XrayManager {
     }
 }
 
-/// Find an available TCP/UDP port starting from the given port
+/// Find an available TCP/UDP port starting from the given port.
+///
+/// The dokodemo-door inbound binds the chosen port for UDP, so a port that is
+/// only free for TCP would still fail at runtime. Require the port to be
+/// bindable for BOTH TCP and UDP before selecting it. Probe sockets are dropped
+/// immediately, so the port is released before Xray binds it (best-effort, same
+/// as the prior TCP-only check).
 fn find_available_port(start: u16) -> Option<u16> {
     let end = start.saturating_add(100).min(u16::MAX);
     for port in start..=end {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        let tcp_ok = TcpListener::bind(("127.0.0.1", port)).is_ok();
+        let udp_ok = UdpSocket::bind(("127.0.0.1", port)).is_ok();
+        if tcp_ok && udp_ok {
             return Some(port);
         }
     }

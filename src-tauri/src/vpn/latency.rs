@@ -31,8 +31,6 @@ pub async fn check_server_latency(
     port: u16,
     timeout_ms: u64,
 ) -> LatencyResult {
-    let _addr_str = format!("{}:{}", hostname, port);
-
     // FIX-2-3: Resolve hostname via DNS-over-HTTPS to prevent leaking VPN server
     // hostnames to the ISP's DNS resolver. Falls back gracefully on parse if it's an IP.
     let socket_addr: SocketAddr = match hostname.parse::<std::net::IpAddr>() {
@@ -98,14 +96,26 @@ pub async fn check_multiple_servers(
     let mut handles = Vec::new();
 
     for (server_id, hostname, port) in servers {
+        // Keep the server metadata alongside the handle so a panicked task can
+        // still surface a result instead of silently disappearing.
+        let meta = (server_id.clone(), hostname.clone());
         let handle = tokio::spawn(check_server_latency(server_id, hostname, port, timeout_ms));
-        handles.push(handle);
+        handles.push((meta, handle));
     }
 
     let mut results = Vec::new();
-    for handle in handles {
-        if let Ok(result) = handle.await {
-            results.push(result);
+    for ((server_id, hostname), handle) in handles {
+        match handle.await {
+            Ok(result) => results.push(result),
+            // A JoinError means the task panicked or was cancelled. Surface it as
+            // an unreachable result rather than dropping the server silently.
+            Err(e) => results.push(LatencyResult {
+                server_id,
+                hostname,
+                latency_ms: None,
+                is_reachable: false,
+                error: Some(format!("Latency check task failed: {}", e)),
+            }),
         }
     }
 
@@ -176,6 +186,11 @@ pub async fn check_latency_icmp(hostname: &str, timeout_ms: u64) -> Result<u32, 
                         Some(pos) => &after_eq[..pos],
                         None => after_eq,
                     };
+                    // Skip when no digits followed the '='/'<' separator; an empty
+                    // string would always fail to parse and mask the real cause.
+                    if ms_str.is_empty() {
+                        continue;
+                    }
                     if let Ok(ms) = ms_str.parse::<u32>() {
                         return Ok(ms);
                     }

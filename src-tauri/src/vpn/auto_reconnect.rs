@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tauri::AppHandle;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 
 // FIX-1-1: Client-side keygen for auto-reconnect
 use base64::Engine as _;
@@ -361,10 +361,19 @@ impl AutoReconnectService {
                                         connection_state: "connected".to_string(),
                                         platform: std::env::consts::OS.to_string(),
                                     };
-                                    // Snapshot packet counters for the next loss window
+                                    // Snapshot packet counters for the next loss window.
+                                    // Match the 5s lock-timeout discipline used across manager.rs
+                                    // so a stuck stats lock can't hang the health-check loop.
+                                    match timeout(
+                                        Duration::from_secs(5),
+                                        vpn_manager.stats.write(),
+                                    )
+                                    .await
                                     {
-                                        let mut stats_w = vpn_manager.stats.write().await;
-                                        stats_w.snapshot_packets();
+                                        Ok(mut stats_w) => stats_w.snapshot_packets(),
+                                        Err(_) => tracing::error!(
+                                            "Stats write lock timeout in quality report snapshot"
+                                        ),
                                     }
                                     if let Err(e) = api.report_quality(&report).await {
                                         tracing::debug!("Quality report failed (non-fatal): {}", e);
@@ -656,6 +665,14 @@ impl AutoReconnectService {
         multiplier: f64,
     ) -> u64 {
         let delay = initial_delay as f64 * multiplier.powi(attempts as i32);
+        // P3: Guard against a non-finite intermediate (e.g. f64 overflow to
+        // +inf with a large attempt count under unlimited max_attempts). The
+        // `as u64` cast already saturates, but treating a non-finite value as
+        // the clamp ceiling keeps the result well-defined and identical to the
+        // existing clamped behaviour.
+        if !delay.is_finite() {
+            return max_delay;
+        }
         (delay as u64).min(max_delay)
     }
 

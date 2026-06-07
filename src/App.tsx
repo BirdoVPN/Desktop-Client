@@ -185,8 +185,13 @@ function App() {
   const handleDeclineConsent = async () => {
     try {
       await exit(0);
-    } catch {
-      window.close();
+    } catch (err) {
+      console.error('Failed to exit after consent decline; falling back to window.close()', err);
+      try {
+        window.close();
+      } catch (closeErr) {
+        console.error('window.close() also failed after consent decline', closeErr);
+      }
     }
   };
 

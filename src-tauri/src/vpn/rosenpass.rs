@@ -20,7 +20,7 @@ use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -56,14 +56,18 @@ pub fn derive_hybrid_psk(config: &RosenpassConfig) -> Result<String, String> {
 
     // If server provided a PSK, mix it in
     if let Some(ref psk) = config.server_psk {
-        if let Ok(psk_bytes) = base64::engine::general_purpose::STANDARD.decode(psk) {
-            ikm.extend_from_slice(&psk_bytes);
+        match base64::engine::general_purpose::STANDARD.decode(psk) {
+            Ok(psk_bytes) => ikm.extend_from_slice(&psk_bytes),
+            Err(e) => tracing::warn!(
+                "Rosenpass server_psk failed Base64 decode ({}); proceeding without it (reduced entropy)",
+                e
+            ),
         }
     }
 
     // HKDF using HMAC-SHA256
     let salt = b"birdo-rosenpass-hybrid-v1";
-    let prk = hkdf_extract(salt, &ikm)?;
+    let prk = Zeroizing::new(hkdf_extract(salt, &ikm)?);
     let mut okm = hkdf_expand(&prk, b"wireguard-psk", 32)?;
 
     // Encode as Base64

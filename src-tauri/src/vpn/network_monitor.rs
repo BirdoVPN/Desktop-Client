@@ -84,7 +84,12 @@ impl NetworkMonitor {
                         last_state,
                         new_state
                     );
-                    let _ = tx.send(new_state);
+                    if let Err(e) = tx.send(new_state) {
+                        tracing::warn!(
+                            "Failed to broadcast connectivity change (no active receivers): {}",
+                            e
+                        );
+                    }
                     last_state = new_state;
                 }
             }
@@ -101,11 +106,18 @@ impl NetworkMonitor {
 /// Uses multiple resolvers to avoid single-point failures.
 async fn check_connectivity() -> bool {
     use tokio::net::lookup_host;
+    use tokio::time::timeout;
+
+    // Bound each lookup so a non-responsive DNS / blackhole route cannot hang
+    // the check indefinitely. Keeps the check interval and stop() responsive.
+    const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
     let probes = ["birdo.app:443", "1.1.1.1:443", "9.9.9.9:443"];
     for probe in probes {
-        if lookup_host(probe).await.is_ok() {
-            return true;
+        match timeout(LOOKUP_TIMEOUT, lookup_host(probe)).await {
+            Ok(Ok(_)) => return true,
+            Ok(Err(_)) => {}
+            Err(_) => {} // lookup timed out; try next probe
         }
     }
     false

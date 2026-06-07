@@ -28,10 +28,12 @@ export function ServerCard({
   isFavorite,
 }: ServerCardProps) {
   const isOnline = server.isOnline;
-  const loadFraction = Math.min(Math.max(server.load / 100, 0), 1);
-  const loadCol = loadColor(server.load);
+  const safeLoad = Number.isFinite(server.load) ? server.load : 0;
+  const loadFraction = Math.min(Math.max(safeLoad / 100, 0), 1);
+  const loadCol = loadColor(safeLoad);
   const flag = countryCodeToFlag(server.countryCode);
-  const location = server.city ? `${server.city}, ${server.country}` : server.country;
+  const location =
+    (server.city ? `${server.city}, ${server.country}` : server.country) || 'Unknown location';
 
   return (
     <div
@@ -83,7 +85,7 @@ export function ServerCard({
           className="font-mono text-[11px] font-semibold"
           style={{ color: loadCol }}
         >
-          {server.load}%
+          {safeLoad}%
         </span>
         <span
           className="mt-[3px] block h-1 w-9 overflow-hidden"
@@ -99,6 +101,7 @@ export function ServerCard({
       {/* Favorite star */}
       <button
         type="button"
+        tabIndex={isOnline ? 0 : -1}
         aria-label={isFavorite ? 'Remove favorite' : 'Add favorite'}
         onClick={(e) => {
           e.stopPropagation();

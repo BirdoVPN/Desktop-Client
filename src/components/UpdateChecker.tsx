@@ -25,6 +25,18 @@ export function UpdateChecker() {
   const [error, setError] = useState<string | null>(null);
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Guard against a hung/unreachable update server leaving the UI stuck in
+  // 'checking'/'downloading' forever. Reject after 10s so the catch handler
+  // can surface an error state the user can retry from.
+  const checkWithTimeout = useCallback(() => {
+    return Promise.race([
+      check(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Update check timed out.')), 10000)
+      ),
+    ]);
+  }, []);
+
   useEffect(() => {
     return () => {
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
@@ -36,8 +48,8 @@ export function UpdateChecker() {
     setError(null);
 
     try {
-      const update = await check();
-      
+      const update = await checkWithTimeout();
+
       if (update) {
         setUpdateInfo({
           version: update.version,
@@ -57,7 +69,7 @@ export function UpdateChecker() {
       setError('Update check unavailable right now.');
       setStatus('error');
     }
-  }, []);
+  }, [checkWithTimeout]);
 
   const downloadAndInstall = useCallback(async () => {
     if (status !== 'available') return;
@@ -66,7 +78,7 @@ export function UpdateChecker() {
     setDownloadProgress(0);
 
     try {
-      const update = await check();
+      const update = await checkWithTimeout();
       if (!update) {
         setStatus('up-to-date');
         return;
@@ -98,7 +110,7 @@ export function UpdateChecker() {
       setError('Download failed. Please try again.');
       setStatus('error');
     }
-  }, [status]);
+  }, [status, checkWithTimeout]);
 
   const restartApp = useCallback(async () => {
     try {

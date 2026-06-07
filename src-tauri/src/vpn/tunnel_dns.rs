@@ -50,7 +50,9 @@ impl WintunTunnel {
                             return None;
                         }
                         let name = parts[4..].join(" ");
-                        if name == super::tunnel::ADAPTER_NAME || name.contains("Loopback") {
+                        if name.eq_ignore_ascii_case(super::tunnel::ADAPTER_NAME)
+                            || name.contains("Loopback")
+                        {
                             None
                         } else {
                             Some(name)
@@ -85,10 +87,24 @@ impl WintunTunnel {
 
     /// Capture current DNS configuration for an adapter before modification.
     pub(super) fn snapshot_adapter_dns(adapter_name: &str) -> Option<AdapterDnsSnapshot> {
-        let output = cmd("netsh")
+        let output = match cmd("netsh")
             .args(["interface", "ipv4", "show", "dns", adapter_name])
             .output()
-            .ok()?;
+        {
+            Ok(output) => output,
+            Err(e) => {
+                // Returning None here causes the caller to fall back to DHCP for
+                // this adapter on restore, silently dropping any static DNS the
+                // user had configured. Surface the failure so incomplete DNS
+                // restoration is debuggable.
+                tracing::warn!(
+                    "snapshot_adapter_dns: netsh failed for adapter '{}': {} — DNS for this adapter may not be restored",
+                    adapter_name,
+                    e
+                );
+                return None;
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         let servers: Vec<String> = stdout
@@ -108,6 +124,15 @@ impl WintunTunnel {
                 if candidate.parse::<std::net::IpAddr>().is_ok() {
                     Some(candidate.to_string())
                 } else {
+                    // A row started with a digit but its first token is not a
+                    // valid IP. Dropping it (by design) means one fewer DNS
+                    // server is restored on disconnect; log it so partial DNS
+                    // restoration is diagnosable.
+                    tracing::warn!(
+                        "snapshot_adapter_dns: adapter '{}' had a digit-prefixed line that is not a valid IP ('{}'); skipping — DNS restoration may be incomplete",
+                        adapter_name,
+                        candidate
+                    );
                     None
                 }
             })

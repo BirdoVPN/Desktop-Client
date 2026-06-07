@@ -22,8 +22,6 @@ export interface CompactConnectButtonProps {
   label: string;
   onClick: () => void;
   busy: boolean;
-  multiHopReady?: boolean;
-  multiHopBlocked?: boolean;
 }
 
 export function CompactConnectButton({
@@ -47,8 +45,7 @@ export function CompactConnectButton({
       type="button"
       data-testid="connect-button"
       onClick={onClick}
-      disabled={busy}
-      aria-label={label}
+      disabled={busy || state === 'multiHopBlocked'}
       whileTap={!busy ? { scale: 0.98 } : undefined}
       transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
       className="relative flex h-[60px] w-full items-center justify-center gap-2.5 rounded-2xl transition-opacity disabled:cursor-not-allowed"

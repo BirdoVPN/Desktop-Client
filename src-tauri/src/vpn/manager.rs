@@ -355,11 +355,16 @@ impl VpnManager {
             match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
                 Ok(mut guard) => {
                     if let Some(tunnel) = guard.take() {
-                        if let Err(e) = timeout(Duration::from_secs(10), tunnel.stop())
-                            .await
-                            .unwrap_or(Err("Tunnel stop timed out".into()))
-                        {
-                            tracing::warn!("Old tunnel teardown error (continuing): {}", e);
+                        match timeout(Duration::from_secs(10), tunnel.stop()).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!("Old tunnel teardown error (continuing): {}", e);
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Old tunnel teardown timed out (continuing): Tunnel stop timed out"
+                                );
+                            }
                         }
                     }
                 }

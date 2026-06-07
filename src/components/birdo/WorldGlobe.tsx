@@ -199,7 +199,7 @@ export function WorldGlobe({
                 const ux = off + arc.ux;
                 const sx = off + arc.sx;
                 const cx = (ux + sx) / 2;
-                const cy = Math.min(arc.uy, arc.sy) - 12; // lift the arc upward
+                const cy = Math.max(0, Math.min(arc.uy, arc.sy) - 12); // lift the arc upward, clamped to viewBox
                 return (
                   <path key={off} d={`M${ux} ${arc.uy} Q ${cx} ${cy} ${sx} ${arc.sy}`} />
                 );

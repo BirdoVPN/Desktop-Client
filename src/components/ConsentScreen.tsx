@@ -91,6 +91,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             href="https://birdo.app/privacy"
             target="_blank"
             rel="noopener noreferrer"
+            aria-label="Read the full Privacy Policy (opens in a new tab)"
             className="mb-6 text-sm underline underline-offset-2 transition hover:opacity-80"
             style={{ color: brand.purpleSoft }}
             initial={{ opacity: 0 }}

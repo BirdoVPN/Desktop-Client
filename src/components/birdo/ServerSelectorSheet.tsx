@@ -292,9 +292,12 @@ function ServerRow({
               Locked
             </span>
           )}
-          {server.ping != null && server.isAccessible && (
-            <span style={{ color: white.w60 }}>{server.ping}ms</span>
-          )}
+          {server.ping != null &&
+            Number.isFinite(server.ping) &&
+            server.ping >= 0 &&
+            server.isAccessible && (
+              <span style={{ color: white.w60 }}>{server.ping}ms</span>
+            )}
           <span className="flex items-center gap-1" style={{ color: loadColor }}>
             <Signal size={11} />
             {server.load}%

@@ -139,6 +139,15 @@ export function Profile() {
       });
   }, [setAccount]);
 
+  // Fire-and-forget external open: the shell plugin can reject (permission
+  // denied, bad URL, OS error). Swallow it locally so it never surfaces as an
+  // unhandled promise rejection / app-level crash.
+  const safeOpenExternal = (target: string) => {
+    void openExternal(target).catch(() => {
+      /* best effort — opening a browser is non-critical */
+    });
+  };
+
   const handleExport = async () => {
     setExportState('loading');
     try {
@@ -147,11 +156,15 @@ export function Profile() {
         type: 'application/json',
       });
       const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `birdo-data-export-${new Date().toISOString().slice(0, 10)}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
+      try {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `birdo-data-export-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+      } finally {
+        // Always release the blob URL, even if anchor creation / click throws.
+        URL.revokeObjectURL(url);
+      }
       setExportState('done');
     } catch {
       setExportState('idle');
@@ -215,28 +228,28 @@ export function Profile() {
               subtitle="Activate a 30 / 90-day code"
               leadingIcon={Gift}
               leadingTint={brand.purpleSoft}
-              onClick={() => openExternal(DASHBOARD_URL)}
+              onClick={() => safeOpenExternal(DASHBOARD_URL)}
             />
             <BirdoNavRow
               title="Manage on web"
               subtitle="Open dashboard.birdo.app in browser"
               leadingIcon={ExternalLink}
               leadingTint={brand.purpleSoft}
-              onClick={() => openExternal(DASHBOARD_URL)}
+              onClick={() => safeOpenExternal(DASHBOARD_URL)}
             />
             <BirdoNavRow
               title="Privacy Policy"
               subtitle="birdo.app/privacy"
               leadingIcon={ShieldCheck}
               leadingTint={brand.purpleSoft}
-              onClick={() => openExternal(PRIVACY_URL)}
+              onClick={() => safeOpenExternal(PRIVACY_URL)}
             />
             <BirdoNavRow
               title="Terms of Service"
               subtitle="birdo.app/terms"
               leadingIcon={FileText}
               leadingTint={brand.purpleSoft}
-              onClick={() => openExternal(TERMS_URL)}
+              onClick={() => safeOpenExternal(TERMS_URL)}
             />
             <BirdoNavRow
               title={exportState === 'done' ? 'Data exported' : 'Export my data'}
@@ -487,7 +500,19 @@ function DeleteAccountDialog({ onDismiss }: { onDismiss: () => void }) {
       // Account deleted — force reload to return to the login screen.
       window.location.reload();
     } catch (e: unknown) {
-      setError(typeof e === 'string' ? e : 'Deletion failed');
+      // Tauri invoke() may reject with a string, an Error, or a structured
+      // object carrying a `.message`. Surface the most specific text we can.
+      const message =
+        typeof e === 'string'
+          ? e
+          : e instanceof Error
+            ? e.message
+            : typeof e === 'object' &&
+                e !== null &&
+                typeof (e as { message?: unknown }).message === 'string'
+              ? (e as { message: string }).message
+              : 'Deletion failed';
+      setError(message);
       setDeleting(false);
     }
   };

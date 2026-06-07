@@ -17,6 +17,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { useAppStore, type RouteId } from '@/store/app-store';
 import { motion as motionTokens } from '@/lib/birdo-theme';
 import { BottomNav } from '@/components/BottomNav';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { PixelCanvas } from '@/components/PixelCanvas';
 import { Dashboard } from '@/components/Dashboard';
 import { Profile } from '@/screens/Profile';
@@ -72,7 +73,15 @@ export function AppShell() {
               <div className="relative z-10 h-full">
                 {(() => {
                   const Screen = PUSH_SCREENS[topRoute];
-                  return <Screen />;
+                  // Guard against PUSH_SCREENS drifting out of sync with RouteId
+                  // (a route pushed with no mapped component would render
+                  // <undefined /> and crash the shell).
+                  if (!Screen) return null;
+                  return (
+                    <ErrorBoundary>
+                      <Screen />
+                    </ErrorBoundary>
+                  );
                 })()}
               </div>
             </motion.div>

@@ -410,6 +410,10 @@ export const useAppStore = create<AppState>()(
             connectedAt: null,
             serverName: null,
           },
+          // Reset navigation so a logged-out user doesn't return to a stale
+          // deep screen (settings/server list) on next login.
+          tab: 'home' as TabId,
+          navStack: [],
         }),
     }),
     {

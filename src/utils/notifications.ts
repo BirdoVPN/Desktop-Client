@@ -32,17 +32,18 @@ export async function initNotifications(): Promise<void> {
 /** Send a notification if the user has notifications enabled */
 function notify(title: string, body: string): void {
   if (!permissionReady) return;
-  if (!useAppStore.getState().settings.notifications) return;
+  if (!(useAppStore.getState().settings?.notifications ?? false)) return;
 
   try {
     sendNotification({ title, body });
-  } catch {
-    // Silently ignore notification failures
+  } catch (err) {
+    // Notification failures are non-fatal; log for debuggability.
+    console.error('Failed to send notification:', err);
   }
 }
 
 export function notifyConnected(serverName: string): void {
-  notify('VPN Connected', `Secured via ${serverName}`);
+  notify('VPN Connected', `Secured via ${serverName || 'VPN Server'}`);
 }
 
 export function notifyDisconnected(): void {
@@ -58,5 +59,5 @@ export function notifyKillSwitchActive(): void {
 }
 
 export function notifyReconnected(serverName: string): void {
-  notify('VPN Reconnected', `Back online via ${serverName}`);
+  notify('VPN Reconnected', `Back online via ${serverName || 'VPN Server'}`);
 }

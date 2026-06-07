@@ -70,6 +70,7 @@ export function SplitTunnel() {
   // Installed-app picker (enumerated from the Windows registry by Rust).
   const [pickerOpen, setPickerOpen] = useState(false);
   const [installed, setInstalled] = useState<InstalledApp[] | null>(null);
+  const [pickerError, setPickerError] = useState(false);
   const [pickerSearch, setPickerSearch] = useState('');
 
   const isOperative = planLevel(account?.plan) >= 1;
@@ -135,19 +136,28 @@ export function SplitTunnel() {
   );
 
   // ── Installed-app picker: enumerate once, then add by full path ──
+  const loadInstalled = useCallback(async () => {
+    setPickerError(false);
+    setInstalled(null);
+    try {
+      const list = await invoke<InstalledApp[]>('list_installed_apps');
+      setInstalled(list);
+    } catch {
+      // Distinguish a genuine failure from an empty result so the picker can
+      // surface an error + retry instead of a misleading "No apps found".
+      setPickerError(true);
+      setInstalled([]);
+    }
+  }, []);
+
   const openInstalledPicker = useCallback(async () => {
     if (!enabled) return;
     setPickerSearch('');
     setPickerOpen(true);
     if (installed === null) {
-      try {
-        const list = await invoke<InstalledApp[]>('list_installed_apps');
-        setInstalled(list);
-      } catch {
-        setInstalled([]); // best-effort; empty list shows the empty state
-      }
+      await loadInstalled();
     }
-  }, [enabled, installed]);
+  }, [enabled, installed, loadInstalled]);
 
   const addInstalled = useCallback(
     (path: string) => {
@@ -419,6 +429,24 @@ export function SplitTunnel() {
               <p className="pt-6 text-center text-sm" style={{ color: white.w40 }}>
                 Scanning installed apps…
               </p>
+            ) : pickerError ? (
+              <BirdoEmptyState
+                icon={AppWindow}
+                title="Couldn’t scan apps"
+                description="Something went wrong reading installed apps. Use Browse… to pick an .exe directly, or try again."
+                action={
+                  <BirdoButton
+                    text="Try again"
+                    onClick={() => {
+                      void loadInstalled();
+                    }}
+                    variant="secondary"
+                    size="medium"
+                    ariaLabel="Retry scanning installed apps"
+                  />
+                }
+                className="pt-6"
+              />
             ) : pickerResults.length === 0 ? (
               <BirdoEmptyState
                 icon={AppWindow}

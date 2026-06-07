@@ -26,14 +26,23 @@ export function BottomNav() {
       role="tablist"
       aria-label="Main navigation"
     >
-      {TABS.map(({ id, label, icon: Icon }) => {
+      {TABS.map(({ id, label, icon: Icon }, index) => {
         const active = tab === id;
         return (
           <button
             key={id}
             role="tab"
             aria-selected={active}
+            tabIndex={active ? 0 : -1}
             onClick={() => setTab(id)}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                e.preventDefault();
+                const dir = e.key === 'ArrowRight' ? 1 : -1;
+                const next = (index + dir + TABS.length) % TABS.length;
+                setTab(TABS[next].id);
+              }
+            }}
             className="flex flex-1 flex-col items-center justify-center gap-1 py-2.5 transition-colors"
             style={{ color: active ? brand.purple : white.w60 }}
           >

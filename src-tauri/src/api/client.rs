@@ -206,6 +206,11 @@ impl BirdoApi {
     /// FIX C-1: Updated to persist the new refresh token when server returns one
     /// (server now returns tokens in JSON body for desktop clients).
     pub async fn refresh_token(&self) -> Result<RefreshResponse, ApiError> {
+        // H-1 FIX: Serialize all token refresh operations (including this public
+        // entry point) so concurrent callers cannot race and overwrite each
+        // other's tokens with stale values.
+        let _guard = self.refresh_lock.lock().await;
+
         let refresh = self
             .refresh_token
             .read()
@@ -607,7 +612,13 @@ impl BirdoApi {
         }
 
         // Parse the body once for typed protocol errors and backend-provided messages.
-        let error_text = response.text().await.unwrap_or_default();
+        let error_text = response.text().await.unwrap_or_else(|e| {
+            // The body read itself failed (broken stream/timeout). We still fall
+            // through to status-based mapping, but surface the underlying I/O
+            // error so it is not silently masked as a bare "HTTP {status}".
+            tracing::warn!("Failed to read error response body for HTTP {}: {}", status, e);
+            String::new()
+        });
         if let Ok(body) = serde_json::from_str::<super::types::ApiErrorBody>(&error_text) {
             if let Some(code) = body.error_code {
                 return Err(ApiError::Protocol(code));

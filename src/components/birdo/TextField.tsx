@@ -95,7 +95,7 @@ export function BirdoTextField({
           placeholder={placeholder}
           disabled={disabled}
           aria-label={ariaLabel ?? label}
-          aria-invalid={error || undefined}
+          aria-invalid={error ? 'true' : undefined}
           autoComplete={autoComplete}
           className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[color:var(--placeholder)] disabled:cursor-not-allowed"
           style={{

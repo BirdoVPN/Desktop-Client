@@ -675,8 +675,6 @@ export function Dashboard() {
             state={connectState}
             label={connectLabel}
             busy={busy}
-            multiHopReady={multiHopReady}
-            multiHopBlocked={multiHopBlocked}
             onClick={handleConnectClick}
           />
         </div>

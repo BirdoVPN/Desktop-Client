@@ -311,7 +311,7 @@ export function Settings() {
                     leadingIcon={Eye}
                     leadingTint={white.w60}
                     checked={settings.showIpInNotification}
-                    onCheckedChange={(v) => updateSettings({ showIpInNotification: v })}
+                    onCheckedChange={(v) => persist({ showIpInNotification: v })}
                   />
                   <BirdoToggleRow
                     title="Show location in notification"
@@ -319,7 +319,7 @@ export function Settings() {
                     leadingIcon={MapPin}
                     leadingTint={white.w60}
                     checked={settings.showLocationInNotification}
-                    onCheckedChange={(v) => updateSettings({ showLocationInNotification: v })}
+                    onCheckedChange={(v) => persist({ showLocationInNotification: v })}
                   />
                 </div>
               </motion.div>

@@ -143,8 +143,9 @@ export function ServerListScreen() {
           )
         );
       }
-    } catch {
-      /* silent — the empty state offers a manual retry */
+    } catch (err) {
+      // Surface for debugging; the empty state still offers a manual retry.
+      console.error('ServerList: failed to load servers', err);
     } finally {
       setIsLoading(false);
     }

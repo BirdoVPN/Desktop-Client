@@ -172,7 +172,9 @@ export function Subscription() {
             icon={Globe}
             contentDescription="Manage on Web"
             onClick={() => {
-              openExternal(MANAGE_URL).catch(() => {});
+              openExternal(MANAGE_URL).catch((err) => {
+                console.error('Failed to open Manage URL:', err);
+              });
             }}
             tint={white.w60}
           />
@@ -195,6 +197,8 @@ export function Subscription() {
 
         {/* Billing period toggle */}
         <div
+          role="tablist"
+          aria-label="Billing period"
           className="flex w-full gap-1 rounded-birdo-sub p-1"
           style={{ backgroundColor: surface.s2 }}
         >
@@ -209,6 +213,8 @@ export function Subscription() {
               <button
                 key={key}
                 type="button"
+                role="tab"
+                aria-selected={active}
                 onClick={() => setBillingPeriod(key)}
                 className="flex-1 rounded-birdo-sm py-2.5 text-center text-[13px] transition-colors"
                 style={{
@@ -237,7 +243,9 @@ export function Subscription() {
                 price={price}
                 onSelect={() => {
                   openExternal(upgradeUrl(plan.id, billingPeriod)).catch(
-                    () => {}
+                    (err) => {
+                      console.error('Failed to open upgrade URL:', err);
+                    }
                   );
                 }}
               />

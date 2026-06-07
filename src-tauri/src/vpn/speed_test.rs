@@ -58,6 +58,19 @@ pub async fn measure_download(
         return Err(format!("Download returned status {}", response.status()));
     }
 
+    // Guard against a malicious/misbehaving server returning a far larger body
+    // than requested, which would otherwise be buffered entirely into RAM.
+    // Allow some slack (4x + 1MB) over the requested size before rejecting.
+    let max_bytes = size_bytes.saturating_mul(4).saturating_add(1024 * 1024);
+    if let Some(content_length) = response.content_length() {
+        if content_length > max_bytes {
+            return Err(format!(
+                "Download body too large: {} bytes (max {})",
+                content_length, max_bytes
+            ));
+        }
+    }
+
     let bytes = response
         .bytes()
         .await
@@ -82,7 +95,7 @@ pub async fn measure_upload(
     token: Option<&str>,
 ) -> Result<(f64, u64), String> {
     let url = format!("{}/upload", speed_test_url);
-    // Generate random payload
+    // Zero-filled payload — speed-test content is irrelevant (no user data is sent).
     let payload = vec![0u8; size_bytes];
 
     let start = Instant::now();
@@ -116,7 +129,7 @@ pub async fn measure_latency(
     speed_test_url: &str,
     samples: u32,
     token: Option<&str>,
-) -> (u32, u32) {
+) -> Result<(u32, u32), String> {
     let mut latencies = Vec::with_capacity(samples as usize);
 
     for _ in 0..samples {
@@ -126,13 +139,17 @@ pub async fn measure_latency(
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        if req.send().await.is_ok() {
-            latencies.push(start.elapsed().as_millis() as f64);
+        match req.send().await {
+            Ok(_) => latencies.push(start.elapsed().as_millis() as f64),
+            Err(e) => tracing::warn!("Latency ping sample failed: {}", e),
         }
     }
 
+    // Distinguish "all samples failed" (endpoint unreachable) from a genuine 0ms
+    // result. Returning Err lets the frontend surface a real failure instead of
+    // displaying misleading zero metrics.
     if latencies.is_empty() {
-        return (0, 0);
+        return Err("All latency samples failed (speed-test endpoint unreachable)".to_string());
     }
 
     let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
@@ -140,7 +157,7 @@ pub async fn measure_latency(
         latencies.iter().map(|l| (l - avg).powi(2)).sum::<f64>() / latencies.len() as f64;
     let jitter = variance.sqrt();
 
-    (avg as u32, jitter as u32)
+    Ok((avg as u32, jitter as u32))
 }
 
 /// Run a complete speed test
@@ -153,7 +170,7 @@ pub async fn run_speed_test(
     let start = Instant::now();
 
     // 1. Latency (5 samples)
-    let (latency_ms, jitter_ms) = measure_latency(client, speed_test_url, 5, token).await;
+    let (latency_ms, jitter_ms) = measure_latency(client, speed_test_url, 5, token).await?;
 
     // 2. Download test (10MB)
     let (download_mbps, bytes_downloaded) =

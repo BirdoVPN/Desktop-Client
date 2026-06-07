@@ -110,8 +110,8 @@ export function Login() {
   const handleForgotPassword = async () => {
     try {
       await open('https://auth.birdo.app/reset-password');
-    } catch {
-      setError('Failed to open browser');
+    } catch (err) {
+      setError(`Failed to open browser: ${friendlyError(err)}`);
     }
   };
 
@@ -129,7 +129,7 @@ export function Login() {
       });
 
       if (result.success) {
-        setUserEmail(result.user?.email || email);
+        setUserEmail(result.user?.email || null);
         setPassword('');
         setChallengeToken(null);
         setAuthenticated(true);
