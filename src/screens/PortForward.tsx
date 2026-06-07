@@ -52,6 +52,7 @@ export function PortForward() {
   const [protocol, setProtocol] = useState<Protocol>('tcp');
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
+  const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
   const portValue = Number.parseInt(portText, 10);
@@ -111,15 +112,24 @@ export function PortForward() {
   // ── Delete ──────────────────────────────────────────────────────────────
   const handleDelete = useCallback(
     async (id: string) => {
+      // Guard against rapid-fire / concurrent deletes of the same rule.
+      if (deletingIds.has(id)) return;
       setError(null);
+      setDeletingIds((prev) => new Set(prev).add(id));
       try {
         await invoke('delete_port_forward', { id });
         setPortForwards(portForwards.filter((pf) => pf.id !== id));
       } catch (e) {
         setError(typeof e === 'string' ? e : 'Failed to delete port forwarding rule.');
+      } finally {
+        setDeletingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
       }
     },
-    [portForwards, setPortForwards]
+    [deletingIds, portForwards, setPortForwards]
   );
 
   return (
@@ -241,7 +251,12 @@ export function PortForward() {
         ) : (
           <div className="flex flex-col gap-1">
             {portForwards.map((pf) => (
-              <PortForwardRow key={pf.id} rule={pf} onDelete={handleDelete} />
+              <PortForwardRow
+                key={pf.id}
+                rule={pf}
+                onDelete={handleDelete}
+                deleting={deletingIds.has(pf.id)}
+              />
             ))}
           </div>
         )}
@@ -256,9 +271,10 @@ export function PortForward() {
 interface PortForwardRowProps {
   rule: PortForwardRule;
   onDelete: (id: string) => void;
+  deleting: boolean;
 }
 
-function PortForwardRow({ rule, onDelete }: PortForwardRowProps) {
+function PortForwardRow({ rule, onDelete, deleting }: PortForwardRowProps) {
   return (
     <div
       className="flex items-center gap-3.5 px-4 py-3.5"
@@ -286,10 +302,20 @@ function PortForwardRow({ rule, onDelete }: PortForwardRowProps) {
       <button
         type="button"
         onClick={() => onDelete(rule.id)}
+        disabled={deleting}
         aria-label={`Delete rule ${rule.externalPort}`}
-        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-white/5"
+        aria-busy={deleting}
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-white/5 disabled:opacity-50"
       >
-        <Trash2 size={18} color={status.red} aria-hidden />
+        {deleting ? (
+          <span
+            className="h-4 w-4 animate-spin rounded-full border-2"
+            style={{ borderColor: status.red, borderTopColor: 'transparent' }}
+            aria-hidden
+          />
+        ) : (
+          <Trash2 size={18} color={status.red} aria-hidden />
+        )}
       </button>
     </div>
   );

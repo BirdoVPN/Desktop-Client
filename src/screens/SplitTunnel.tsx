@@ -72,6 +72,10 @@ export function SplitTunnel() {
   const [installed, setInstalled] = useState<InstalledApp[] | null>(null);
   const [pickerError, setPickerError] = useState(false);
   const [pickerSearch, setPickerSearch] = useState('');
+  const [pickerLoading, setPickerLoading] = useState(false);
+
+  // Surfaced when save_settings rejects so the user knows the change didn't stick.
+  const [persistError, setPersistError] = useState(false);
 
   const isOperative = planLevel(account?.plan) >= 1;
   const enabled = settings.splitTunnelingEnabled && isOperative;
@@ -82,11 +86,19 @@ export function SplitTunnel() {
   const persist = useCallback(
     async (patch: Partial<AppSettings>) => {
       const next = { ...settings, ...patch };
+      // Snapshot the keys we're optimistically changing so we can roll back if
+      // the save rejects, keeping the UI in sync with what's actually stored.
+      const rollback = Object.fromEntries(
+        (Object.keys(patch) as (keyof AppSettings)[]).map((k) => [k, settings[k]]),
+      ) as Partial<AppSettings>;
+      setPersistError(false);
       updateSettings(patch);
       try {
         await invoke('save_settings', { settings: settingsToRust(next) });
       } catch {
-        /* Rust backend logs the failure. */
+        // Revert the optimistic update and tell the user it didn't persist.
+        updateSettings(rollback);
+        setPersistError(true);
       }
     },
     [settings, updateSettings],
@@ -139,6 +151,7 @@ export function SplitTunnel() {
   const loadInstalled = useCallback(async () => {
     setPickerError(false);
     setInstalled(null);
+    setPickerLoading(true);
     try {
       const list = await invoke<InstalledApp[]>('list_installed_apps');
       setInstalled(list);
@@ -147,6 +160,8 @@ export function SplitTunnel() {
       // surface an error + retry instead of a misleading "No apps found".
       setPickerError(true);
       setInstalled([]);
+    } finally {
+      setPickerLoading(false);
     }
   }, []);
 
@@ -154,10 +169,12 @@ export function SplitTunnel() {
     if (!enabled) return;
     setPickerSearch('');
     setPickerOpen(true);
-    if (installed === null) {
+    // Guard against rapid re-clicks stacking concurrent list_installed_apps
+    // calls before the first resolves (installed stays null until it returns).
+    if (installed === null && !pickerLoading) {
       await loadInstalled();
     }
-  }, [enabled, installed, loadInstalled]);
+  }, [enabled, installed, loadInstalled, pickerLoading]);
 
   const addInstalled = useCallback(
     (path: string) => {
@@ -252,6 +269,20 @@ export function SplitTunnel() {
             {excludedCount === 1 ? 'app' : 'apps'} excluded.
           </p>
         </div>
+
+        {/* ── Persist-failure banner ── */}
+        {persistError && (
+          <div
+            className="mt-3 flex items-start gap-2.5 rounded-birdo-md px-3 py-3"
+            style={{ backgroundColor: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.35)' }}
+            role="alert"
+          >
+            <Info size={18} color="#ef4444" aria-hidden className="mt-px shrink-0" />
+            <p className="text-xs leading-relaxed" style={{ color: 'rgba(248,113,113,0.95)' }}>
+              Couldn’t save your split-tunnel changes. The last change was reverted — please try again.
+            </p>
+          </div>
+        )}
 
         {enabled && (
           <>
