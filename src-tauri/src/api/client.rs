@@ -2,10 +2,8 @@
 //!
 //! Handles all HTTP communication with the Birdo VPN backend.
 
-use base64::Engine as _;
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -26,58 +24,10 @@ use erased_serde;
 const API_BASE_URL: &str = "https://api.birdo.app";
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Windows)");
 
-/// SEC-C1: SHA-256 hashes of the full DER-encoded **leaf** certificate for birdo.app.
-///
-/// **IMPORTANT**: reqwest's `TlsInfo::peer_certificate()` returns ONLY the leaf
-/// certificate, NOT the full chain. Therefore ONLY leaf cert hashes should be
-/// listed here — intermediate/root CA hashes will never match and provide zero
-/// backup protection.
-///
-/// Generate the current leaf pin with:
-///   openssl s_client -connect birdo.app:443 </dev/null 2>/dev/null | \
-///     openssl x509 -outform DER | \
-///     openssl dgst -sha256 -binary | \
-///     openssl enc -base64
-///
-/// Or use the helper script:
-///   ./scripts/generate-cert-pins.sh birdo.app
-///   (Look for the "Full DER SHA-256 Pin" / "Rust (client.rs)" output lines)
-///
-/// **PIN ROTATION PROCEDURE** (do this BEFORE Cloudflare rotates the cert):
-/// 1. Provision the next certificate on Cloudflare (Advanced Certificate Manager
-///    or custom cert upload — aim for ≥1 year validity to reduce churn).
-/// 2. Run `./scripts/generate-cert-pins.sh birdo.app` against the NEW cert.
-/// 3. Add the new hash to this array alongside the current one ("next" slot).
-/// 4. Ship the update so existing clients accept both old and new certs.
-/// 5. Activate the new cert on Cloudflare.
-/// 6. In a follow-up release, remove the old pin.
-///
-/// When this array is empty, pinning is DISABLED and a warning is logged on
-/// every request. Populate before public release.
-const CERT_PINS_SHA256: &[&str] = &[
-    // Pins are full DER cert SHA-256 hashes (NOT SPKI).
-    //
-    // LEAF ONLY — reqwest peer_certificate() does not expose the chain,
-    // so intermediate/root pins are omitted (they would never match).
-    //
-    // Cloudflare auto-rotates the edge cert every ~90 days; we keep an
-    // overlap window of (current + previous) pins so in-flight clients
-    // that haven't auto-updated keep working.
-    //
-    // ROTATION: run `scripts/rotate-cert-pins.sh birdo.app --write` from the
-    // monorepo root and follow docs/CERT-PIN-ROTATION.md (overlap method).
-    "hObTwNVt08WYElPDYs2wHT2Ec/+8OYssiRcCmFHg0A0=", // current leaf: birdo.app (Google WE1, expires 2026-07-31). NEXT ROTATION DEADLINE: 2026-07-01 — see docs/CERT-PIN-ROTATION.md.
-    "EQul2kftgtOaU85XCKuj4SK3DW5256uxNdEvZXZbuJM=", // previous leaf (expired ~2026-05; kept for in-flight clients, remove next release)
-];
-
-/// FIX H-3: Build-time guard — release builds MUST have certificate pins populated.
-/// This prevents accidentally shipping an unpinned client to production.
-#[cfg(not(debug_assertions))]
-const _: () = {
-    if CERT_PINS_SHA256.is_empty() {
-        panic!("SEC-C1: CERT_PINS_SHA256 must be populated before release builds. Run the openssl command in the comment above to generate pins.");
-    }
-};
+// SEC-C1: TLS certificate pinning lives in `super::cert_pin`. It pins the
+// **CA-chain SPKI** (the stable intermediate/root public keys, matching the
+// Android client) via a custom rustls verifier, so Cloudflare/Google leaf
+// rotations NO LONGER require a desktop release. See src/api/cert_pin.rs.
 
 pub struct BirdoApi {
     client: Client,
@@ -93,21 +43,18 @@ pub struct BirdoApi {
 impl BirdoApi {
     /// Create a new API client instance
     pub fn new() -> Self {
-        // SEC-C1 FIX: TLS hardening — enforce HTTPS, set minimum TLS version,
-        // and enable certificate info for runtime SPKI/cert pinning.
-        // The Android client has dual-layer pinning; the Windows client must match.
-        use reqwest::tls::Version;
-
+        // SEC-C1 FIX: TLS hardening — enforce HTTPS and install the CA-chain
+        // SPKI pinning rustls config (see super::cert_pin). The custom rustls
+        // ServerCertVerifier does full standard validation (chain/hostname/
+        // expiry) AND pins the intermediate/root public keys during the
+        // handshake — matching the Android client and surviving leaf rotations.
+        // TLS 1.2 minimum + versions are set by the rustls config itself.
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(USER_AGENT)
             .pool_max_idle_per_host(5)
             .https_only(true)
-            .min_tls_version(Version::TLS_1_2)
-            // SEC-C1: Enable TLS info so we can verify the peer certificate
-            // hash against CERT_PINS_SHA256 after every handshake.
-            .tls_info(true)
-            .tls_built_in_root_certs(true)
+            .use_preconfigured_tls(super::cert_pin::rustls_config())
             .build()
             // SEC-C1 FIX: Do NOT fall back to Client::new() — that would
             // silently downgrade to an unpinned, un-hardened client.
@@ -612,9 +559,8 @@ impl BirdoApi {
         &self,
         response: reqwest::Response,
     ) -> Result<T, ApiError> {
-        // SEC-C1: Verify certificate pin before processing the response.
-        self.verify_certificate_pin(&response)?;
-
+        // SEC-C1: certificate pinning now happens during the TLS handshake
+        // (see super::cert_pin) — no post-response check is required.
         let status = response.status();
 
         if matches!(status, StatusCode::OK | StatusCode::CREATED) {
@@ -662,60 +608,6 @@ impl BirdoApi {
         }
     }
 
-    /// SEC-C1: Verify the leaf certificate's SHA-256 hash against pinned values.
-    ///
-    /// NOTE: reqwest only exposes the leaf via `peer_certificate()`, NOT the full
-    /// chain. Only leaf cert hashes should be in CERT_PINS_SHA256.
-    ///
-    /// If `CERT_PINS_SHA256` is empty (development mode), this logs a warning
-    /// and allows the connection.  In production, populate the array and this
-    /// function will reject connections whose certificate doesn't match any pin.
-    fn verify_certificate_pin(&self, response: &reqwest::Response) -> Result<(), ApiError> {
-        if CERT_PINS_SHA256.is_empty() {
-            // Development mode — pinning disabled.  Log once per session
-            // via tracing (deduplication is handled at the subscriber level).
-            tracing::warn!(
-                "SEC-C1: CERT_PINS_SHA256 is empty — certificate pinning is DISABLED. \
-                 Populate the array before public release."
-            );
-            return Ok(());
-        }
-
-        // reqwest exposes TLS info only if `.tls_info(true)` was set on the builder.
-        let tls_info = response
-            .extensions()
-            .get::<reqwest::tls::TlsInfo>()
-            .ok_or_else(|| {
-                ApiError::CertificatePinningFailed(
-                    "TLS info unavailable — cannot verify pin".into(),
-                )
-            })?;
-
-        let peer_cert_der = tls_info.peer_certificate().ok_or_else(|| {
-            ApiError::CertificatePinningFailed("No peer certificate in TLS info".into())
-        })?;
-
-        // Compute SHA-256 of the full DER-encoded certificate.
-        let hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(peer_cert_der);
-            base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
-        };
-
-        if CERT_PINS_SHA256.iter().any(|pin| *pin == hash) {
-            Ok(())
-        } else {
-            tracing::error!(
-                "SEC-C1: Certificate pin mismatch! Computed hash: {}. \
-                 This may indicate a MITM attack or an un-pinned certificate rotation.",
-                hash,
-            );
-            Err(ApiError::CertificatePinningFailed(format!(
-                "Peer cert hash {} does not match any pinned value",
-                hash,
-            )))
-        }
-    }
 }
 
 impl Default for BirdoApi {

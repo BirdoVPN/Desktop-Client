@@ -518,6 +518,7 @@ mod tests {
             quantum_enabled: Some(false),
             rosenpass_public_key: Some("anything".into()),
             rosenpass_endpoint: None,
+            error_code: None,
         };
         assert!(try_decapsulate(&resp).is_none());
     }
