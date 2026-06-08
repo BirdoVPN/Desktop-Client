@@ -32,6 +32,7 @@ import {
   ChevronRight,
   Route as AltRoute,
   Lock,
+  EyeOff,
 } from 'lucide-react';
 import {
   BirdoCard,
@@ -52,7 +53,14 @@ import {
   friendlyVpnError,
   type RustSettings,
 } from '@/utils/helpers';
-import { initNotifications, notifyConnected, notifyDisconnected } from '@/utils/notifications';
+import {
+  initNotifications,
+  notifyConnected,
+  notifyDisconnected,
+  notifyReconnected,
+  notifyConnectionLost,
+  notifyKillSwitchActive,
+} from '@/utils/notifications';
 import { brand, status, white, hairline, surface } from '@/lib/birdo-theme';
 
 interface RustVpnStats {
@@ -112,6 +120,13 @@ export function Dashboard() {
   const [showServerSheet, setShowServerSheet] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [liveStats, setLiveStats] = useState<RustVpnStats | null>(null);
+  // Live security posture from get_vpn_status — surfaced as chips under the
+  // status pill so the user can SEE that stealth / post-quantum are actually
+  // engaged on the tunnel (not just toggled in settings).
+  const [liveSecurity, setLiveSecurity] = useState<{ stealth: boolean; quantum: boolean }>({
+    stealth: false,
+    quantum: false,
+  });
   /** Which hop the multi-hop picker sheet is editing (null = closed). */
   const [multiHopPickerTarget, setMultiHopPickerTarget] = useState<MultiHopTarget | null>(null);
   /** Transient toast shown when a locked feature is tapped. */
@@ -330,11 +345,29 @@ export function Dashboard() {
 
   const prevConnectionState = useRef(connectionState);
   useEffect(() => {
-    if (prevConnectionState.current !== connectionState) {
+    const prev = prevConnectionState.current;
+    if (prev !== connectionState) {
+      const serverName = currentServer?.name ?? 'VPN Server';
+      const details = {
+        ip: currentServer?.ipAddress ?? null,
+        location: currentServer
+          ? [currentServer.city, currentServer.country].filter(Boolean).join(', ')
+          : null,
+      };
       if (connectionState === 'connected') {
-        notifyConnected(currentServer?.name ?? 'VPN Server');
-      } else if (connectionState === 'disconnected' && prevConnectionState.current === 'connected') {
+        // Distinguish a fresh connect from recovery after a drop so the toast
+        // copy matches what actually happened.
+        if (prev === 'reconnecting' || prev === 'rekeying') {
+          notifyReconnected(serverName, details);
+        } else {
+          notifyConnected(serverName, details);
+        }
+      } else if (connectionState === 'disconnected' && prev === 'connected') {
         notifyDisconnected();
+      } else if (connectionState === 'reconnecting' && prev === 'connected') {
+        notifyConnectionLost();
+      } else if (connectionState === 'kill_switch_active') {
+        notifyKillSwitchActive();
       }
       prevConnectionState.current = connectionState;
     }
@@ -345,6 +378,7 @@ export function Dashboard() {
   useEffect(() => {
     if (!isActive) {
       setLiveStats(null);
+      setLiveSecurity({ stealth: false, quantum: false });
       if (statsInterval.current) {
         clearInterval(statsInterval.current);
         statsInterval.current = null;
@@ -370,6 +404,7 @@ export function Dashboard() {
         }
         if (st.state === 'connected' || st.state === 'rekeying') {
           setLiveStats(stats);
+          setLiveSecurity({ stealth: !!st.stealthActive, quantum: !!st.quantumActive });
         }
       } catch { /* silent */ }
     };
@@ -577,6 +612,22 @@ export function Dashboard() {
       <div className="relative z-10 mt-3 flex justify-center">
         <StatusPill state={connectionState} />
       </div>
+
+      {/* Live security chips — show what's actually engaged on the tunnel. */}
+      <AnimatePresence>
+        {isConnected && (liveSecurity.stealth || liveSecurity.quantum) && (
+          <motion.div
+            className="relative z-10 mt-2 flex justify-center gap-2"
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+          >
+            {liveSecurity.stealth && <SecurityChip icon={EyeOff} label="Stealth" />}
+            {liveSecurity.quantum && <SecurityChip icon={Lock} label="Post-Quantum" />}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Spacer to push panel to bottom */}
       <div className="absolute inset-0 flex flex-col pointer-events-none">
@@ -902,6 +953,22 @@ function BannerRow({ icon: Icon, color, bg, border, text }: BannerRowProps) {
       <p className="flex-1 text-xs leading-tight" style={{ color }}>
         {text}
       </p>
+    </div>
+  );
+}
+
+// A small pill shown under the status indicator when stealth / post-quantum is
+// actively engaged on the live tunnel (driven by get_vpn_status).
+function SecurityChip({ icon: Icon, label }: { icon: typeof Lock; label: string }) {
+  return (
+    <div
+      className="flex items-center gap-1.5 rounded-full px-2.5 py-1"
+      style={{ backgroundColor: brand.purpleBg, border: `1px solid ${hairline.soft}` }}
+    >
+      <Icon size={12} color={brand.purpleLight} className="shrink-0" />
+      <span className="text-[11px] font-medium" style={{ color: brand.purpleLight }}>
+        {label}
+      </span>
     </div>
   );
 }

@@ -25,6 +25,13 @@ pub mod users {
     pub const SUBSCRIPTION: &str = "/auth/me";
 }
 
+/// Voucher endpoints
+pub mod vouchers {
+    /// Authenticated user redeems a 30/90-day time-extension code.
+    /// Backend: NestJS `POST /vouchers/redeem` (birdo-web backend/src/vouchers).
+    pub const REDEEM: &str = "/vouchers/redeem";
+}
+
 /// VPN endpoints
 pub mod vpn {
     pub const SERVERS: &str = "/vpn/servers";

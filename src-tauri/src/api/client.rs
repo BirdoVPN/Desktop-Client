@@ -369,6 +369,19 @@ impl BirdoApi {
         self.get(endpoints::users::SUBSCRIPTION, true).await
     }
 
+    /// Redeem a voucher code (30/90-day time-extension). Authenticated.
+    /// On an invalid/used/expired code the backend returns a non-2xx status,
+    /// which surfaces here as an `ApiError` for the command layer to map.
+    pub async fn redeem_voucher(
+        &self,
+        code: &str,
+    ) -> Result<super::types::RedeemVoucherResponse, ApiError> {
+        let payload = super::types::RedeemVoucherRequest {
+            code: code.to_string(),
+        };
+        self.post(endpoints::vouchers::REDEEM, &payload, true).await
+    }
+
     // ========================================================================
     // Anonymous Login
     // ========================================================================
