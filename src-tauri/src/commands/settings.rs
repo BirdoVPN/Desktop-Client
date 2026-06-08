@@ -24,13 +24,16 @@ struct SignedSettings {
     hmac: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// Start Birdo VPN when Windows starts
     pub autostart: bool,
     /// Start minimized to system tray
     pub start_minimized: bool,
-    /// Enable kill switch (block all traffic if VPN disconnects)
+    /// Enable kill switch (block all traffic if VPN disconnects).
+    /// ALWAYS ON for all users — defaults true AND is forced true on load; the
+    /// UI cannot turn it off.
+    #[serde(default = "default_true")]
     pub killswitch_enabled: bool,
     /// Show notifications for connection events
     pub notifications_enabled: bool,
@@ -58,13 +61,40 @@ pub struct AppSettings {
     /// Enable Xray Reality stealth tunnel (bypass DPI/censorship)
     #[serde(default)]
     pub stealth_mode: bool,
-    /// Enable Rosenpass post-quantum key exchange
-    #[serde(default)]
+    /// Enable Rosenpass post-quantum key exchange. ON by default for all users
+    /// (available on every plan, negligible overhead).
+    #[serde(default = "default_true")]
     pub quantum_protection: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            autostart: false,
+            start_minimized: false,
+            killswitch_enabled: true, // always-on protection
+            notifications_enabled: false,
+            auto_connect: false,
+            preferred_server_id: None,
+            split_tunneling_enabled: false,
+            split_tunnel_apps: Vec::new(),
+            custom_dns: None,
+            protocol: Protocol::default(),
+            local_network_sharing: false,
+            wireguard_port: default_wireguard_port(),
+            wireguard_mtu: 0,
+            stealth_mode: false,      // premium — off by default
+            quantum_protection: true, // post-quantum on by default
+        }
+    }
 }
 
 fn default_wireguard_port() -> String {
     "auto".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -148,7 +178,11 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
                 let settings_json = serde_json::to_string(&signed.settings)
                     .map_err(|e| format!("Failed to re-serialize settings: {}", e))?;
                 if verify_hmac(&settings_json, &signed.hmac, &key) {
-                    return Ok(signed.settings);
+                    // Kill switch is ALWAYS ON for all users, regardless of any
+                    // previously-stored value.
+                    let mut settings = signed.settings;
+                    settings.killswitch_enabled = true;
+                    return Ok(settings);
                 } else {
                     tracing::warn!("Settings HMAC verification failed — possible tampering. Resetting to defaults.");
                     return Ok(AppSettings::default());
@@ -163,8 +197,10 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
 
     // Legacy format (unsigned) — migrate by parsing and re-saving with HMAC
     match serde_json::from_str::<AppSettings>(&content) {
-        Ok(settings) => {
+        Ok(mut settings) => {
             tracing::info!("Migrating unsigned settings to HMAC-protected format");
+            // Kill switch is ALWAYS ON for all users.
+            settings.killswitch_enabled = true;
             // Re-save with HMAC (best effort). Log on failure so a persistent
             // failure to upgrade (disk full, permissions, credential store down)
             // is observable rather than silently leaving settings unprotected.
