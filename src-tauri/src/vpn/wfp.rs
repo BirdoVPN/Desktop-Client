@@ -917,7 +917,7 @@ pub async fn activate_blocking() -> Result<(), String> {
         return Err("Kill switch not initialized".to_string());
     }
 
-    let vpn_ip = VPN_SERVER_IP.read().await.clone();
+    let vpn_ip = *VPN_SERVER_IP.read().await;
 
     let mut guard = ENGINE
         .lock()

@@ -504,7 +504,7 @@ fn write_crash_report(location: &str, message: &str) {
         let _ = writeln!(file, "Time: {}", chrono::Utc::now().to_rfc3339());
         let _ = writeln!(file, "Location: {}", location);
         let _ = writeln!(file, "Message: {}", message);
-        let _ = writeln!(file, "");
+        let _ = writeln!(file);
         let _ = writeln!(file, "Backtrace:");
         let _ = writeln!(file, "{:?}", std::backtrace::Backtrace::capture());
 

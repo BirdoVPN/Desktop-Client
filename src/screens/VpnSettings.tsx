@@ -11,9 +11,9 @@
  * SAME full-object `invoke('save_settings', { settings: settingsToRust(...) })`
  * path used by Settings.tsx / MultiHopCard.tsx. Changes apply on next connect.
  *
- * Kill Switch is special: the Rust `disable_killswitch` command is REJECTED
- * while the VPN is connected/connecting, so we surface that inline and read the
- * live armed state from `get_killswitch_status` on mount.
+ * Kill Switch is ALWAYS ON for every user (enforced in the Rust backend on
+ * every settings load) — the row is rendered locked-on and cannot be toggled
+ * off. We still reconcile the armed flag from `get_killswitch_status` on mount.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -30,7 +30,6 @@ import {
   Info,
   ArrowLeftRight,
   ChevronRight,
-  AlertTriangle,
 } from 'lucide-react';
 import {
   BirdoTopBar,
@@ -42,7 +41,7 @@ import {
 } from '@/components/birdo';
 import { useAppStore } from '@/store/app-store';
 import { settingsToRust, isValidPort, isValidDnsAddress } from '@/utils/helpers';
-import { white, status, brand, hairline, motion as motionTokens } from '@/lib/birdo-theme';
+import { white, status, brand, motion as motionTokens } from '@/lib/birdo-theme';
 
 interface KillSwitchStatus {
   enabled: boolean;
@@ -51,21 +50,15 @@ interface KillSwitchStatus {
 }
 
 export function VpnSettings() {
-  const { settings, updateSettings, connectionState, popRoute, pushRoute } = useAppStore(
+  const { settings, updateSettings, popRoute, pushRoute } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
-      connectionState: s.connectionState,
       popRoute: s.popRoute,
       pushRoute: s.pushRoute,
     })),
   );
 
-  // The Rust `disable_killswitch` command is rejected unless the tunnel is fully
-  // down. Mirror that here (anything other than disconnected/error counts as up).
-  const vpnActive = connectionState !== 'disconnected' && connectionState !== 'error';
-
-  const [killSwitchError, setKillSwitchError] = useState<string | null>(null);
   const [dnsExpanded, setDnsExpanded] = useState(false);
   const [dnsErrors, setDnsErrors] = useState<{ primary: string | null; secondary: string | null }>({
     primary: null,
@@ -139,36 +132,6 @@ export function VpnSettings() {
       saveSettingsToBackend(next);
     },
     [updateSettings, saveSettingsToBackend],
-  );
-
-  // ── Kill Switch (special: armed via enable/disable_killswitch) ────────────
-  const handleKillSwitch = useCallback(
-    async (value: boolean) => {
-      setKillSwitchError(null);
-      try {
-        if (value) {
-          await invoke('enable_killswitch');
-        } else {
-          await invoke('disable_killswitch');
-        }
-      } catch (err) {
-        const msg = String(err);
-        const lower = msg.toLowerCase();
-        if (lower.includes('administrator') || lower.includes('admin') || lower.includes('root') || lower.includes('privilege')) {
-          setKillSwitchError('Kill switch requires running Birdo as administrator.');
-        } else if (
-          !value &&
-          (lower.includes('connected') || lower.includes('connecting') || lower.includes('disconnect'))
-        ) {
-          setKillSwitchError('Disconnect before turning off the kill switch.');
-        } else {
-          setKillSwitchError(msg);
-        }
-        return;
-      }
-      persist({ killSwitchEnabled: value });
-    },
-    [persist],
   );
 
   // ── DNS helpers (custom DNS expandable: primary / secondary) ──────────────
@@ -258,41 +221,19 @@ export function VpnSettings() {
         <BirdoSectionHeader title="Security" />
 
         <BirdoCard padding="0" className="overflow-visible">
+          {/* Kill switch is ALWAYS ON for every user and cannot be toggled off
+              (enforced in the Rust backend on every settings load). The row is
+              rendered locked-on as an informational affordance only. */}
           <BirdoToggleRow
             title="Kill Switch · Always on"
             subtitle="Always on for your protection — blocks all internet traffic if the VPN connection drops, preventing data leaks. This cannot be turned off."
             leadingIcon={Shield}
             leadingTint={status.green}
             checked={true}
-            onCheckedChange={handleKillSwitch}
+            onCheckedChange={() => {}}
             enabled={false}
           />
         </BirdoCard>
-
-        <AnimatePresence>
-          {killSwitchError && (
-            <motion.div
-              className="mt-2 flex items-start gap-2 rounded-birdo-sm px-3 py-2 text-xs"
-              style={{
-                backgroundColor: status.yellowBg,
-                border: `1px solid ${hairline.soft}`,
-                color: status.yellowLight,
-              }}
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-            >
-              <AlertTriangle size={14} className="mt-0.5 shrink-0" aria-hidden />
-              <span>{killSwitchError}</span>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {vpnActive && (
-          <p className="mt-1.5 px-1 text-[11px]" style={{ color: white.w40 }}>
-            The kill switch can&apos;t be turned off while the VPN is connected. Disconnect first.
-          </p>
-        )}
 
         <div className="h-2" />
         <BirdoCard padding="0">
