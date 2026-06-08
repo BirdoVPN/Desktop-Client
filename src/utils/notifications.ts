@@ -42,8 +42,29 @@ function notify(title: string, body: string): void {
   }
 }
 
-export function notifyConnected(serverName: string): void {
-  notify('VPN Connected', `Secured via ${serverName || 'VPN Server'}`);
+/** Optional connection detail appended to connect/reconnect notifications. */
+export interface ConnectionDetails {
+  ip?: string | null;
+  location?: string | null;
+}
+
+/**
+ * Build a connect/reconnect body, appending IP and/or location only when the
+ * user has the corresponding "show in notification" toggle enabled. Order:
+ * location first, then IP — matching the order of the toggles in Settings.
+ */
+function connectionBody(prefix: string, serverName: string, details?: ConnectionDetails): string {
+  const settings = useAppStore.getState().settings;
+  let body = `${prefix} ${serverName || 'VPN Server'}`;
+  const extras: string[] = [];
+  if (settings?.showLocationInNotification && details?.location) extras.push(details.location);
+  if (settings?.showIpInNotification && details?.ip) extras.push(details.ip);
+  if (extras.length > 0) body += ` · ${extras.join(' · ')}`;
+  return body;
+}
+
+export function notifyConnected(serverName: string, details?: ConnectionDetails): void {
+  notify('VPN Connected', connectionBody('Secured via', serverName, details));
 }
 
 export function notifyDisconnected(): void {
@@ -58,6 +79,6 @@ export function notifyKillSwitchActive(): void {
   notify('Kill Switch Active', 'Internet traffic is blocked for your protection');
 }
 
-export function notifyReconnected(serverName: string): void {
-  notify('VPN Reconnected', `Back online via ${serverName || 'VPN Server'}`);
+export function notifyReconnected(serverName: string, details?: ConnectionDetails): void {
+  notify('VPN Reconnected', connectionBody('Back online via', serverName, details));
 }

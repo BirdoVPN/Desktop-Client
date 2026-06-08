@@ -169,7 +169,9 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     multiHopEntryNodeId: rs.multi_hop_entry_node_id ?? null,
     multiHopExitNodeId: rs.multi_hop_exit_node_id ?? null,
     stealthMode: rs.stealth_mode ?? false,
-    quantumProtection: rs.quantum_protection ?? false,
+    // Post-quantum is ON by default (matches Rust `AppSettings::default()`); the
+    // `?? true` only applies if the field is absent from an older settings file.
+    quantumProtection: rs.quantum_protection ?? true,
   };
 }
 

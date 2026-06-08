@@ -11,7 +11,7 @@
  *   disconnect_vpn, logout, delete_account { request: { password } }.
  * Web links open via @tauri-apps/plugin-shell `open()`.
  */
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -30,6 +30,7 @@ import {
   Trash2,
   AlertTriangle,
   Loader2,
+  CheckCircle2,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import {
@@ -111,13 +112,15 @@ export function Profile() {
   const pushRoute = useAppStore((s) => s.pushRoute);
 
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [showVoucherDialog, setShowVoucherDialog] = useState(false);
   const [exportState, setExportState] = useState<'idle' | 'loading' | 'done'>('idle');
 
   const isConnected = connectionState === 'connected';
 
   // Hydrate subscription details (devices / bandwidth / renewal) the same way
   // the Dashboard does — the mobile ProfileScreen renders the same fields.
-  useEffect(() => {
+  // Extracted so a successful voucher redemption can refresh the card in place.
+  const hydrateSubscription = useCallback(() => {
     invoke<RustSubscription>('get_subscription_status')
       .then((sub) => {
         setAccount({
@@ -138,6 +141,10 @@ export function Profile() {
         /* silent — Dashboard also fetches this; offline is non-fatal */
       });
   }, [setAccount]);
+
+  useEffect(() => {
+    hydrateSubscription();
+  }, [hydrateSubscription]);
 
   // Fire-and-forget external open: the shell plugin can reject (permission
   // denied, bad URL, OS error). Swallow it locally so it never surfaces as an
@@ -228,7 +235,7 @@ export function Profile() {
               subtitle="Activate a 30 / 90-day code"
               leadingIcon={Gift}
               leadingTint={brand.purpleSoft}
-              onClick={() => safeOpenExternal(DASHBOARD_URL)}
+              onClick={() => setShowVoucherDialog(true)}
             />
             <BirdoNavRow
               title="Manage on web"
@@ -287,6 +294,12 @@ export function Profile() {
       <AnimatePresence>
         {showDeleteDialog && (
           <DeleteAccountDialog onDismiss={() => setShowDeleteDialog(false)} />
+        )}
+        {showVoucherDialog && (
+          <VoucherRedeemDialog
+            onDismiss={() => setShowVoucherDialog(false)}
+            onRedeemed={hydrateSubscription}
+          />
         )}
       </AnimatePresence>
     </div>
@@ -593,6 +606,156 @@ function DeleteAccountDialog({ onDismiss }: { onDismiss: () => void }) {
               disabled={!canSubmit}
               onClick={handleConfirm}
             />
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+// ── Voucher redemption dialog ───────────────────────────────────────────────
+//
+// In-app parity with mobile's VoucherRedeemDialog. Calls the Rust
+// `redeem_voucher` command (→ POST /vouchers/redeem). On success it shows the
+// days added / new plan and refreshes the subscription card via `onRedeemed`.
+
+function VoucherRedeemDialog({
+  onDismiss,
+  onRedeemed,
+}: {
+  onDismiss: () => void;
+  onRedeemed: () => void;
+}) {
+  const [code, setCode] = useState('');
+  const [redeeming, setRedeeming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<{ plan: string; days: number } | null>(null);
+
+  const canSubmit = code.trim().length > 0 && !redeeming && !success;
+
+  const handleConfirm = async () => {
+    if (!canSubmit) return;
+    setRedeeming(true);
+    setError(null);
+    try {
+      const res = await invoke<{
+        ok: boolean;
+        plan: string;
+        durationDays: number;
+        extended: boolean;
+      }>('redeem_voucher', { code: code.trim() });
+      setSuccess({ plan: res.plan, days: res.durationDays });
+      // Refresh the subscription card so the new plan/expiry shows immediately.
+      onRedeemed();
+    } catch (e: unknown) {
+      const message =
+        typeof e === 'string'
+          ? e
+          : e instanceof Error
+            ? e.message
+            : typeof e === 'object' &&
+                e !== null &&
+                typeof (e as { message?: unknown }).message === 'string'
+              ? (e as { message: string }).message
+              : 'Could not redeem that voucher.';
+      setError(message);
+      setRedeeming(false);
+    }
+  };
+
+  return (
+    <motion.div
+      className="absolute inset-0 z-50 flex items-center justify-center p-5"
+      style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
+      onClick={() => !redeeming && onDismiss()}
+    >
+      <motion.div
+        className="w-full max-w-[360px] overflow-hidden rounded-birdo-lg"
+        style={{
+          background: `linear-gradient(${surface.s3}, ${surface.s3}) padding-box, ${gradient.glassStroke} border-box`,
+          border: '1px solid transparent',
+        }}
+        initial={{ scale: 0.94, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.94, opacity: 0 }}
+        transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex flex-col gap-4 p-5">
+          <div className="flex items-center gap-2">
+            {success ? (
+              <CheckCircle2 size={22} color={statusTokens.green} aria-hidden />
+            ) : (
+              <Gift size={22} color={brand.purple} aria-hidden />
+            )}
+            <h2
+              className="text-[16px] font-bold"
+              style={{ color: success ? statusTokens.green : '#FFFFFF' }}
+            >
+              {success ? 'Voucher redeemed' : 'Redeem voucher'}
+            </h2>
+          </div>
+
+          {success ? (
+            <p className="text-[13px]" style={{ color: white.w60 }}>
+              {success.days > 0
+                ? `${success.days} days added to your ${success.plan} plan.`
+                : `Your ${success.plan} plan has been updated.`}
+            </p>
+          ) : (
+            <>
+              <p className="text-[13px]" style={{ color: white.w60 }}>
+                Enter a 30 or 90-day voucher code to extend your subscription.
+                Payments are handled on the web — vouchers add time to your plan.
+              </p>
+              <BirdoTextField
+                value={code}
+                onChange={(v) => {
+                  // Codes are case-insensitive; uppercase for display + matching.
+                  setCode(v.toUpperCase());
+                  if (error) setError(null);
+                }}
+                label="Voucher code"
+                type="text"
+                placeholder="BIRD-XXXX-XXXX-XXXX"
+                error={error != null}
+                disabled={redeeming}
+                autoComplete="off"
+              />
+              {error && (
+                <p className="text-[12px]" style={{ color: statusTokens.red }}>
+                  {error}
+                </p>
+              )}
+            </>
+          )}
+
+          <div className="flex gap-2.5">
+            {success ? (
+              <BirdoButton text="Done" variant="primary" fullWidth onClick={onDismiss} />
+            ) : (
+              <>
+                <BirdoButton
+                  text="Cancel"
+                  variant="secondary"
+                  fullWidth
+                  disabled={redeeming}
+                  onClick={onDismiss}
+                />
+                <BirdoButton
+                  text={redeeming ? 'Redeeming…' : 'Redeem'}
+                  variant="primary"
+                  fullWidth
+                  isLoading={redeeming}
+                  disabled={!canSubmit}
+                  onClick={handleConfirm}
+                />
+              </>
+            )}
           </div>
         </div>
       </motion.div>

@@ -349,6 +349,8 @@ fn main() {
             commands::vpn_port_forward::get_port_forwards,
             commands::vpn_port_forward::create_port_forward,
             commands::vpn_port_forward::delete_port_forward,
+            // Vouchers
+            commands::vouchers::redeem_voucher,
             // Speed Test
             commands::speed_test::run_speed_test_command,
             // Biometric (Windows Hello)

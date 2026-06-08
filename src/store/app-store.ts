@@ -254,7 +254,10 @@ const defaultSettings: AppSettings = {
   multiHopEntryNodeId: null,
   multiHopExitNodeId: null,
   stealthMode: false,
-  quantumProtection: false,
+  // Post-quantum protection (BirdoPQ / ML-KEM-1024) is ON by default for all
+  // users — available on every plan, negligible overhead. Matches the Rust
+  // `AppSettings::default()` so a fresh install agrees on both sides.
+  quantumProtection: true,
 };
 
 export const useAppStore = create<AppState>()(

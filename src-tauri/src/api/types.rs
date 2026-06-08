@@ -651,3 +651,27 @@ pub struct CreatePortForwardResponse {
     #[serde(default)]
     pub port_forward: Option<PortForward>,
 }
+
+/// Request body for `POST /vouchers/redeem`.
+#[derive(Debug, Serialize)]
+pub struct RedeemVoucherRequest {
+    pub code: String,
+}
+
+/// Success body from `POST /vouchers/redeem`. On failure the backend returns a
+/// non-2xx status with `{ error: <slug> }`; that is surfaced as an `ApiError`
+/// and mapped to a friendly message in the command layer (see commands/vouchers.rs).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedeemVoucherResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default = "default_plan")]
+    pub plan: String,
+    #[serde(default)]
+    pub duration_days: i32,
+    #[serde(default)]
+    pub new_period_end: Option<String>,
+    #[serde(default)]
+    pub extended: bool,
+}
