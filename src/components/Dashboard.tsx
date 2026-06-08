@@ -123,9 +123,8 @@ export function Dashboard() {
   // Live security posture from get_vpn_status — surfaced as chips under the
   // status pill so the user can SEE that stealth / post-quantum are actually
   // engaged on the tunnel (not just toggled in settings).
-  const [liveSecurity, setLiveSecurity] = useState<{ stealth: boolean; quantum: boolean }>({
+  const [liveSecurity, setLiveSecurity] = useState<{ stealth: boolean }>({
     stealth: false,
-    quantum: false,
   });
   /** Which hop the multi-hop picker sheet is editing (null = closed). */
   const [multiHopPickerTarget, setMultiHopPickerTarget] = useState<MultiHopTarget | null>(null);
@@ -378,7 +377,7 @@ export function Dashboard() {
   useEffect(() => {
     if (!isActive) {
       setLiveStats(null);
-      setLiveSecurity({ stealth: false, quantum: false });
+      setLiveSecurity({ stealth: false });
       if (statsInterval.current) {
         clearInterval(statsInterval.current);
         statsInterval.current = null;
@@ -404,7 +403,7 @@ export function Dashboard() {
         }
         if (st.state === 'connected' || st.state === 'rekeying') {
           setLiveStats(stats);
-          setLiveSecurity({ stealth: !!st.stealthActive, quantum: !!st.quantumActive });
+          setLiveSecurity({ stealth: !!st.stealthActive });
         }
       } catch { /* silent */ }
     };
@@ -613,9 +612,10 @@ export function Dashboard() {
         <StatusPill state={connectionState} />
       </div>
 
-      {/* Live security chips — show what's actually engaged on the tunnel. */}
+      {/* Live security chip — Stealth only. (Post-Quantum chip removed per
+          owner request; PQ is still on by default, just not badged here.) */}
       <AnimatePresence>
-        {isConnected && (liveSecurity.stealth || liveSecurity.quantum) && (
+        {isConnected && liveSecurity.stealth && (
           <motion.div
             className="relative z-10 mt-2 flex justify-center gap-2"
             initial={{ opacity: 0, y: -4 }}
@@ -623,8 +623,7 @@ export function Dashboard() {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.2 }}
           >
-            {liveSecurity.stealth && <SecurityChip icon={EyeOff} label="Stealth" />}
-            {liveSecurity.quantum && <SecurityChip icon={Lock} label="Post-Quantum" />}
+            <SecurityChip icon={EyeOff} label="Stealth" />
           </motion.div>
         )}
       </AnimatePresence>
