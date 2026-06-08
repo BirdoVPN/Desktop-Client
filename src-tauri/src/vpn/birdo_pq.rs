@@ -493,6 +493,7 @@ mod tests {
         let resp = ConnectResponse {
             success: true,
             message: None,
+            error_code: None,
             config: None,
             key_id: None,
             private_key: None,

@@ -71,3 +71,34 @@ pub async fn redeem_voucher(
         .await
         .map_err(|e| friendly_redeem_error(&e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Locks the user-facing copy for each backend failure mode. The backend
+    // signals failure via HTTP status (+ `{error: slug}` body); the shared API
+    // layer collapses 400/409/410 to `ApiError::Unknown("HTTP <code>")`, which
+    // these branches key off of — so this also guards that contract.
+    #[test]
+    fn maps_known_failures_to_friendly_copy() {
+        assert!(friendly_redeem_error(&ApiError::NotFound).contains("couldn't find"));
+        assert!(friendly_redeem_error(&ApiError::RateLimited).contains("Too many attempts"));
+        assert!(friendly_redeem_error(&ApiError::Unauthorized).contains("session has expired"));
+        assert!(friendly_redeem_error(&ApiError::NotAuthenticated).contains("session has expired"));
+
+        // 400 invalid_format / 409 already-redeemed|downgrade / 410 expired
+        assert!(friendly_redeem_error(&ApiError::Unknown("HTTP 400".into())).contains("format"));
+        let conflict = friendly_redeem_error(&ApiError::Unknown("HTTP 409".into()));
+        assert!(conflict.contains("already") || conflict.contains("downgrade"));
+        assert!(friendly_redeem_error(&ApiError::Unknown("HTTP 410".into())).contains("expired"));
+    }
+
+    #[test]
+    fn unmapped_errors_fall_through_to_their_own_text() {
+        // A network error keeps its descriptive Display text rather than being
+        // masked by a voucher-specific message.
+        let msg = friendly_redeem_error(&ApiError::Network("dns failure".into()));
+        assert!(msg.contains("Network error"));
+    }
+}

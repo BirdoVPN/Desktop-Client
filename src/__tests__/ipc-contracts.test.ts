@@ -230,3 +230,31 @@ describe('IPC Contract: Port Forwarding', () => {
     });
   });
 });
+
+describe('IPC Contract: Vouchers', () => {
+  it('redeem_voucher sends the code and returns the redemption result', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ok: true,
+      plan: 'OPERATIVE',
+      durationDays: 30,
+      extended: true,
+    });
+
+    const res = await invoke('redeem_voucher', { code: 'BIRD-AAAA-BBBB-CCCC' });
+
+    expect(mockedInvoke).toHaveBeenCalledWith('redeem_voucher', {
+      code: 'BIRD-AAAA-BBBB-CCCC',
+    });
+    expect(res).toMatchObject({ ok: true, plan: 'OPERATIVE', durationDays: 30 });
+  });
+
+  it('redeem_voucher surfaces a backend rejection (mapped error string)', async () => {
+    mockedInvoke.mockRejectedValueOnce(
+      "We couldn't find that voucher code. Double-check it and try again.",
+    );
+
+    await expect(invoke('redeem_voucher', { code: 'BAD' })).rejects.toContain(
+      "couldn't find",
+    );
+  });
+});

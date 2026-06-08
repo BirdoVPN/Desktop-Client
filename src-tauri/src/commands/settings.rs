@@ -158,6 +158,17 @@ fn verify_hmac(settings_json: &str, expected_hmac: &str, key: &[u8]) -> bool {
     mac.verify_slice(&expected_bytes).is_ok()
 }
 
+/// Normalize settings loaded from disk to enforce non-negotiable invariants.
+///
+/// The kill switch is ALWAYS ON for every user, regardless of any value
+/// previously persisted (or tampered into) the settings file. Centralizing
+/// this here keeps the signed and legacy load paths in lock-step and makes the
+/// guarantee unit-testable without a Tauri `AppHandle`/filesystem.
+fn normalize_loaded_settings(mut settings: AppSettings) -> AppSettings {
+    settings.killswitch_enabled = true;
+    settings
+}
+
 /// Get current application settings
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
@@ -178,11 +189,7 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
                 let settings_json = serde_json::to_string(&signed.settings)
                     .map_err(|e| format!("Failed to re-serialize settings: {}", e))?;
                 if verify_hmac(&settings_json, &signed.hmac, &key) {
-                    // Kill switch is ALWAYS ON for all users, regardless of any
-                    // previously-stored value.
-                    let mut settings = signed.settings;
-                    settings.killswitch_enabled = true;
-                    return Ok(settings);
+                    return Ok(normalize_loaded_settings(signed.settings));
                 } else {
                     tracing::warn!("Settings HMAC verification failed — possible tampering. Resetting to defaults.");
                     return Ok(AppSettings::default());
@@ -197,10 +204,9 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
 
     // Legacy format (unsigned) — migrate by parsing and re-saving with HMAC
     match serde_json::from_str::<AppSettings>(&content) {
-        Ok(mut settings) => {
+        Ok(settings) => {
             tracing::info!("Migrating unsigned settings to HMAC-protected format");
-            // Kill switch is ALWAYS ON for all users.
-            settings.killswitch_enabled = true;
+            let settings = normalize_loaded_settings(settings);
             // Re-save with HMAC (best effort). Log on failure so a persistent
             // failure to upgrade (disk full, permissions, credential store down)
             // is observable rather than silently leaving settings unprotected.
@@ -285,4 +291,60 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     save_settings(app, settings).await?;
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two non-negotiable defaults shipped in v1.3.30/31: kill switch and
+    /// post-quantum protection are both ON for a brand-new install.
+    #[test]
+    fn default_settings_enforce_killswitch_and_pq_on() {
+        let d = AppSettings::default();
+        assert!(d.killswitch_enabled, "kill switch must default ON");
+        assert!(d.quantum_protection, "post-quantum must default ON");
+        assert!(!d.stealth_mode, "stealth (premium) stays off by default");
+    }
+
+    /// An older settings file that predates these fields must still load with
+    /// kill switch + post-quantum ON, via the `default_true` serde defaults —
+    /// so upgrading users inherit the protection without re-saving.
+    #[test]
+    fn serde_defaults_killswitch_and_pq_true_when_absent() {
+        // JSON omits `killswitch_enabled` and `quantum_protection` entirely.
+        let json = r#"{
+            "autostart": false,
+            "start_minimized": false,
+            "notifications_enabled": false,
+            "auto_connect": false,
+            "preferred_server_id": null,
+            "split_tunneling_enabled": false,
+            "split_tunnel_apps": [],
+            "custom_dns": null,
+            "protocol": "wireguard"
+        }"#;
+        let s: AppSettings = serde_json::from_str(json).expect("legacy settings should deserialize");
+        assert!(s.killswitch_enabled, "absent kill switch must default ON");
+        assert!(s.quantum_protection, "absent post-quantum must default ON");
+    }
+
+    /// Loading must force the kill switch ON even if a stored (or tampered)
+    /// value says false, while leaving other preferences untouched.
+    #[test]
+    fn normalize_loaded_settings_forces_killswitch_on() {
+        let stored = AppSettings {
+            killswitch_enabled: false, // somehow persisted off
+            quantum_protection: false, // user opted out of PQ — respected
+            stealth_mode: true,
+            ..AppSettings::default()
+        };
+        let loaded = normalize_loaded_settings(stored);
+        assert!(loaded.killswitch_enabled, "kill switch is always forced ON");
+        assert!(
+            !loaded.quantum_protection,
+            "PQ is a real preference — normalize must not flip it"
+        );
+        assert!(loaded.stealth_mode, "other prefs pass through untouched");
+    }
 }
