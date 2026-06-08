@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { settingsFromRust, type RustSettings } from './helpers';
+import { settingsFromRust, friendlyVpnError, type RustSettings } from './helpers';
 
 // A complete RustSettings payload; individual tests override single fields
 // (and cast to RustSettings when deliberately omitting one to exercise the
@@ -54,5 +54,38 @@ describe('settingsFromRust — v1.3.30/31 default guarantees', () => {
     expect(out.wireGuardMtu).toBe(1380);
     expect(out.stealthMode).toBe(true);
     expect(out.multiHopEnabled).toBe(true);
+  });
+});
+
+describe('friendlyVpnError — surfaces the real reason', () => {
+  it('maps known patterns to friendly copy', () => {
+    expect(friendlyVpnError('Device limit reached (1 devices for RECON plan)')).toMatch(
+      /Subscription limit|device/i,
+    );
+    expect(friendlyVpnError('handshake did not complete')).toMatch(/timed out|busy/i);
+  });
+
+  it("surfaces the server's clean message instead of the generic fallback", () => {
+    // This is exactly the message the live outage produced — it must reach the user.
+    expect(friendlyVpnError('Failed to configure VPN server. Please try again.')).toBe(
+      'Failed to configure VPN server. Please try again.',
+    );
+    expect(
+      friendlyVpnError('All VPN servers are currently offline. Please try again shortly.'),
+    ).toBe('All VPN servers are currently offline. Please try again shortly.');
+  });
+
+  it('adds trailing punctuation to a clean fragment', () => {
+    expect(friendlyVpnError('Server is rebooting')).toBe('Server is rebooting.');
+  });
+
+  it('falls back to generic for empty or obviously-technical errors', () => {
+    expect(friendlyVpnError('')).toBe('Connection failed. Please try again.');
+    expect(
+      friendlyVpnError("thread 'main' panicked at src/x.rs:1:1: boom"),
+    ).toBe('Connection failed. Please try again.');
+    expect(friendlyVpnError('connect: os error 10061')).toBe(
+      'Connection failed. Please try again.',
+    );
   });
 });

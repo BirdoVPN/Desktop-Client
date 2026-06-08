@@ -101,7 +101,8 @@ export function extractErrorMessage(error: unknown): string {
  * Prevents leaking server IPs, hostnames, or internal details in the UI.
  */
 export function friendlyVpnError(error: unknown): string {
-  const raw = extractErrorMessage(error).toLowerCase();
+  const original = extractErrorMessage(error).trim();
+  const raw = original.toLowerCase();
   if (raw.includes('multi-hop is temporarily unavailable') || raw.includes('multi-hop unavailable')) return 'Multi-Hop unavailable on this route. Try a different entry or exit server.';
   if (raw.includes('mesh') && raw.includes('forwarding')) return 'Failed to set up Multi-Hop forwarding between servers. Try a different exit.';
   if (raw.includes('sovereign')) return 'Multi-Hop requires a Sovereign subscription.';
@@ -116,6 +117,21 @@ export function friendlyVpnError(error: unknown): string {
   if (raw.includes('wintun') || raw.includes('loadlibrary') || raw.includes('driver') || raw.includes('adapter') || raw.includes('tunnel')) return 'Could not start the VPN network adapter. Try reinstalling, or temporarily disable antivirus blocking the Wintun driver.';
   if (raw.includes('kill switch') || raw.includes('killswitch')) return 'Kill switch error. Please disconnect and try again.';
   if (raw.includes('subscription') || raw.includes('plan') || raw.includes('device limit')) return 'Subscription limit reached. Upgrade your plan or disconnect other devices.';
+
+  // Fallback: surface the server's OWN message when it reads like a clean,
+  // user-facing sentence. The backend's connect rejections (e.g. "Failed to
+  // configure VPN server. Please try again.", "All VPN servers are currently
+  // offline…") and the Rust layer's errors are already PII-sanitized, so
+  // showing them tells the user the actual reason instead of an opaque
+  // "Connection failed". Guard against empty / oversized / obviously-technical
+  // strings (stack traces, raw "error:" dumps) which we'd rather not surface.
+  const looksTechnical = /\b(panic|thread '|stack backtrace|os error|0x[0-9a-f]{4}|undefined|null pointer|\bat\s+[A-Za-z]:\\)/i.test(
+    original,
+  );
+  if (original && original.length <= 160 && /\s/.test(original) && !looksTechnical) {
+    // Ensure it ends with sentence punctuation for a tidy toast.
+    return /[.!?]$/.test(original) ? original : `${original}.`;
+  }
   return 'Connection failed. Please try again.';
 }
 
