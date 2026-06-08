@@ -259,12 +259,13 @@ export function VpnSettings() {
 
         <BirdoCard padding="0" className="overflow-visible">
           <BirdoToggleRow
-            title="Kill Switch"
-            subtitle="Block all internet traffic if the VPN connection drops, preventing data leaks."
+            title="Kill Switch · Always on"
+            subtitle="Always on for your protection — blocks all internet traffic if the VPN connection drops, preventing data leaks. This cannot be turned off."
             leadingIcon={Shield}
             leadingTint={status.green}
-            checked={settings.killSwitchEnabled}
+            checked={true}
             onCheckedChange={handleKillSwitch}
+            enabled={false}
           />
         </BirdoCard>
 
@@ -296,8 +297,8 @@ export function VpnSettings() {
         <div className="h-2" />
         <BirdoCard padding="0">
           <BirdoToggleRow
-            title="Stealth Mode"
-            subtitle="Route through Xray Reality to bypass deep packet inspection. Makes VPN traffic look like normal HTTPS."
+            title="Stealth Mode · Premium"
+            subtitle="Premium feature — available on the Operative and Sovereign plans. Routes through Xray Reality to bypass deep packet inspection, making VPN traffic look like normal HTTPS. Free (Recon) accounts can enable it here, but it only activates with a paid subscription."
             leadingIcon={EyeOff}
             leadingTint={status.blue}
             checked={settings.stealthMode}
