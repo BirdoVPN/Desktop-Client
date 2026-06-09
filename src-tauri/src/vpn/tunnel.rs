@@ -351,6 +351,11 @@ pub struct WintunTunnel {
     session: Arc<RwLock<Option<Arc<Session>>>>,
     wg_session: Arc<RwLock<Option<WireGuardSession>>>,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
+    /// Handle to the packet-processing task. stop() joins this so the task's
+    /// Arc<Session> (which keeps the Wintun adapter alive) is dropped BEFORE we
+    /// release the adapter — otherwise a server switch fails to recreate the
+    /// adapter ("Could not start the VPN network adapter").
+    packet_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// H-4 FIX: Snapshot of original DNS config for all adapters,
     /// captured before we modify them. Used in restore_dns().
     dns_snapshots: Arc<RwLock<Vec<AdapterDnsSnapshot>>>,
@@ -384,6 +389,7 @@ impl WintunTunnel {
             session: Arc::new(RwLock::new(None)),
             wg_session: Arc::new(RwLock::new(None)),
             shutdown_tx: Arc::new(RwLock::new(None)),
+            packet_task: Arc::new(RwLock::new(None)),
             dns_snapshots: Arc::new(RwLock::new(Vec::new())),
             resolved_endpoint_ip: Arc::new(RwLock::new(None)),
             saved_default_gateway: Arc::new(RwLock::new(None)),
@@ -718,7 +724,7 @@ impl WintunTunnel {
         let wg_session = self.wg_session.clone();
         let session_clone = session.clone();
 
-        tokio::spawn(async move {
+        let packet_handle = tokio::spawn(async move {
             Self::packet_loop(
                 session_clone,
                 wg_session,
@@ -731,6 +737,7 @@ impl WintunTunnel {
             )
             .await;
         });
+        *self.packet_task.write().await = Some(packet_handle);
 
         tracing::info!("Tunnel started successfully");
         Ok(())
@@ -1737,7 +1744,25 @@ impl WintunTunnel {
             tracing::warn!("Route cleanup error: {}", e);
         }
 
-        // STEP 4: Close Wintun adapter
+        // STEP 3.5: Join the packet loop BEFORE releasing the adapter. The loop
+        // holds an Arc<Session> that keeps the Wintun adapter alive; the loop is
+        // biased on the shutdown signal so it exits within ~1 poll cycle. If we
+        // dropped the adapter while the task were still alive, the OS adapter
+        // wouldn't be released and the NEXT tunnel (a server switch) would fail
+        // to recreate it. 3s cap + abort is a safety net for a wedged task.
+        if let Some(handle) = self.packet_task.write().await.take() {
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(3), handle).await.is_err() {
+                tracing::warn!("Packet loop did not exit within 3s — aborting it");
+                abort.abort();
+                // Give the abort a moment to unwind + drop the Arc<Session>.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } else {
+                tracing::debug!("Packet loop joined cleanly");
+            }
+        }
+
+        // STEP 4: Close Wintun adapter (now the only remaining Arc<Session>/Adapter)
         *self.session.write().await = None;
         if let Some(adapter) = self.adapter.write().await.take() {
             drop(adapter);
