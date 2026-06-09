@@ -554,6 +554,46 @@ export function Dashboard() {
     setConnectionState, setCurrentServer, setErrorMessage, setVpnIp,
   ]);
 
+  // Picking a server from the sheet. When already on the tunnel this performs a
+  // real SWITCH, not just a label change: connect_vpn to the new node, which (in
+  // Rust) tears down the old tunnel and brings up a FRESH session with new
+  // WireGuard keys, while the always-on WFP kill switch stays armed across the
+  // gap — so traffic is fully blocked until the new tunnel is up (no leak).
+  const handleSelectServer = useCallback(
+    async (s: Server) => {
+      const prev = useAppStore.getState().currentServer;
+      const st = useAppStore.getState().connectionState;
+      const onTunnel =
+        st === 'connected' ||
+        st === 'reconnecting' ||
+        st === 'rekeying' ||
+        st === 'kill_switch_active';
+
+      setCurrentServer(s);
+
+      // Not connected, or re-picking the node we're already on → just selection.
+      if (!onTunnel || prev?.id === s.id) return;
+
+      if (!s.isOnline || !s.isAccessible) {
+        setErrorMessage('That server is offline or not included in your plan.');
+        return;
+      }
+
+      setConnectionState('connecting');
+      setErrorMessage(null);
+      setVpnIp(null);
+      try {
+        await invoke<boolean>('connect_vpn', { serverId: s.id });
+        setConnectionState('connected');
+      } catch (err) {
+        setErrorMessage(friendlyVpnError(err));
+        setConnectionState('error');
+        setCurrentServer(null);
+      }
+    },
+    [setCurrentServer, setConnectionState, setErrorMessage, setVpnIp],
+  );
+
   const handleLogout = useCallback(async () => {
     const cur = useAppStore.getState().connectionState;
     if (cur === 'connected' || cur === 'connecting' || cur === 'reconnecting') {
@@ -759,7 +799,7 @@ export function Dashboard() {
         servers={servers}
         selectedServerId={currentServer?.id ?? null}
         favoriteServers={favoriteServers}
-        onSelect={(s) => setCurrentServer(s)}
+        onSelect={handleSelectServer}
         onToggleFavorite={(id) => toggleFavorite(id)}
         onDismiss={() => setShowServerSheet(false)}
       />
