@@ -11,7 +11,6 @@ pub mod doh; // DNS-over-HTTPS resolver for SEC-002
 pub mod latency;
 pub mod manager;
 pub mod network_monitor; // P2-15: System network connectivity monitor
-pub mod rosenpass; // Post-quantum PSK derivation (matching Android RosenpassManager)
 pub mod speed_test; // On-device speed test (P3-26)
 pub mod xray; // Xray Reality stealth tunnel (matching Android XrayManager)
 

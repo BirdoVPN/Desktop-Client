@@ -14,13 +14,6 @@ pub struct UpdateInfo {
     pub date: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UpdateProgress {
-    pub downloaded: u64,
-    pub total: Option<u64>,
-    pub percent: Option<f32>,
-}
-
 /// Check for available updates
 #[tauri::command]
 pub async fn check_for_updates(app: AppHandle) -> Result<UpdateInfo, String> {

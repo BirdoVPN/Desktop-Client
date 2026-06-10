@@ -2,10 +2,9 @@
 
 pub mod elevation;
 pub mod redact;
-pub mod telemetry;
 
-// elevation and telemetry are scaffolding — used when specific operations
-// need UAC elevation or crash reporting. Re-exports here for convenience.
+// elevation is scaffolding — used when specific operations need UAC elevation.
+// Re-exports here for convenience.
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 pub use elevation::run_netsh_elevated;
@@ -14,8 +13,6 @@ pub use elevation::{is_elevated, run_elevated};
 pub use redact::redact_email;
 pub use redact::redact_endpoint;
 pub use redact::redact_ip;
-#[allow(unused_imports)]
-pub use telemetry::{breadcrumb as telemetry_breadcrumb, report as telemetry_report};
 
 /// Create a `std::process::Command` that runs hidden on Windows (no console popup).
 ///
