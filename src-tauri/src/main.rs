@@ -204,6 +204,15 @@ fn main() {
 
             let menu = Menu::with_items(app, &[&connect, &disconnect, &show, &quit])?;
 
+            // Hold handles to the state-dependent menu items so `set_tray_state`
+            // can enable/disable them as the connection state changes. Without
+            // this, "Disconnect" (created disabled above) would stay permanently
+            // greyed out and the tray Disconnect would never work.
+            app.manage(commands::tray::TrayMenuItems {
+                connect: connect.clone(),
+                disconnect: disconnect.clone(),
+            });
+
             // Build system tray. The icon starts in the "disconnected" state and
             // is updated live (icon + tooltip) by the `set_tray_state` command as
             // the connection state changes. The id "main" lets that command find

@@ -10,7 +10,19 @@
 //! embedded at build time so they ship inside the exe.
 
 use tauri::image::Image;
-use tauri::AppHandle;
+use tauri::menu::MenuItem;
+use tauri::{AppHandle, Manager, Wry};
+
+/// Handles to the tray context-menu items whose `enabled` state must track the
+/// live VPN connection state. Stored in Tauri-managed state at setup time so
+/// `set_tray_state` can flip them.
+///
+/// Without this, the tray "Disconnect" item was created `enabled: false` and
+/// never re-enabled — so it was permanently greyed out even while connected.
+pub struct TrayMenuItems {
+    pub connect: MenuItem<Wry>,
+    pub disconnect: MenuItem<Wry>,
+}
 
 /// Decode an embedded PNG (RGBA, as emitted by `tauri icon`) into a Tauri
 /// `Image`. Uses the `png` crate directly so we avoid tauri's `image-png`
@@ -62,5 +74,17 @@ pub fn set_tray_state(app: AppHandle, state: String, tooltip: String) -> Result<
     tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
     tray.set_tooltip(Some(tooltip.as_str()))
         .map_err(|e| e.to_string())?;
+
+    // Keep the tray context-menu items in sync with the connection state.
+    // "Disconnect" is only actionable while there's an active tunnel
+    // ("connected" or the in-progress "connecting" phase); "Quick Connect"
+    // is only actionable while idle. If the menu-item handles aren't managed
+    // yet (very early startup), this is a harmless no-op.
+    if let Some(items) = app.try_state::<TrayMenuItems>() {
+        let active = matches!(state.as_str(), "connected" | "connecting");
+        let _ = items.disconnect.set_enabled(active);
+        let _ = items.connect.set_enabled(!active);
+    }
+
     Ok(())
 }
