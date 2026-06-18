@@ -1,7 +1,14 @@
 name: Cert Pin Expiry Watchdog
 
-# Runs daily and warns/fails when the leaf cert pinned in
-# `src-tauri/src/api/client.rs` is within 30 / 7 days of expiry.
+# Runs daily and FAILS only when NONE of the SPKI pins baked into
+# `src-tauri/src/api/cert_pin.rs` (PINNED_SPKI_SHA256) are present in the live
+# birdo.app certificate chain — the genuine "clients will reject connections"
+# condition under CA-chain SPKI pinning.
+#
+# Pinning moved from the volatile LEAF DER hash (old client.rs) to the stable
+# CA-chain SPKI hashes (cert_pin.rs, PR #15). The leaf rotates ~every 90 days
+# WITHOUT a client release, so leaf expiry is reported as an FYI warning only,
+# never a hard failure.
 
 on:
   schedule:
@@ -18,41 +25,68 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Check leaf cert expiry vs pinned hash
+      - name: Check live chain SPKI pins vs cert_pin.rs
         env:
           HOST: birdo.app
         run: |
           set -euo pipefail
-          # Fetch live cert metadata
-          NOT_AFTER=$(echo | openssl s_client -servername "$HOST" -connect "$HOST:443" 2>/dev/null \
+
+          PINS_FILE="src-tauri/src/api/cert_pin.rs"
+
+          # --- Fetch the live cert chain (leaf + intermediates the server sends) ---
+          CHAIN_PEM=$(echo | openssl s_client -servername "$HOST" -connect "$HOST:443" -showcerts 2>/dev/null)
+
+          # --- Leaf expiry (FYI only) ---
+          NOT_AFTER=$(echo "$CHAIN_PEM" \
             | openssl x509 -noout -enddate \
             | sed 's/notAfter=//')
-          LIVE_PIN=$(echo | openssl s_client -servername "$HOST" -connect "$HOST:443" 2>/dev/null \
-            | openssl x509 -outform DER \
-            | openssl dgst -sha256 -binary \
-            | openssl enc -base64)
-
           NOT_AFTER_TS=$(date -u -d "$NOT_AFTER" +%s)
           NOW_TS=$(date -u +%s)
           DAYS_LEFT=$(( (NOT_AFTER_TS - NOW_TS) / 86400 ))
 
-          echo "Live cert for $HOST:"
+          echo "Live leaf cert for $HOST:"
           echo "  not_after: $NOT_AFTER"
-          echo "  days_left: $DAYS_LEFT"
-          echo "  live pin : $LIVE_PIN"
+          echo "  days_left: $DAYS_LEFT (FYI — leaf rotates without a client release)"
 
-          # Compare to pins baked into client.rs
-          PINS_FILE="src-tauri/src/api/client.rs"
-          if ! grep -q "$LIVE_PIN" "$PINS_FILE"; then
-            echo "::error file=$PINS_FILE::Live cert pin $LIVE_PIN is NOT present in client.rs — clients will reject connections!"
+          # --- Compute SPKI SHA-256 (base64) for EACH cert in the chain ---
+          # Identical to the Rust extraction in cert_pin.rs and OkHttp's sha256/ pin:
+          #   openssl x509 -pubkey | openssl pkey -pubin -outform DER \
+          #     | openssl dgst -sha256 -binary | openssl base64
+          # Split the chain into individual PEM certs, then hash each one's SPKI.
+          CHAIN_SPKIS=$(echo "$CHAIN_PEM" \
+            | awk 'BEGIN{c=0} /-----BEGIN CERTIFICATE-----/{c++} {print > ("cert_" c ".pem")}' \
+            && for f in cert_*.pem; do
+                 # cert_0.pem (if any) is pre-certificate preamble — skip non-certs.
+                 if grep -q "BEGIN CERTIFICATE" "$f"; then
+                   openssl x509 -in "$f" -pubkey -noout 2>/dev/null \
+                     | openssl pkey -pubin -outform DER 2>/dev/null \
+                     | openssl dgst -sha256 -binary \
+                     | openssl base64
+                 fi
+               done)
+
+          echo "Live chain SPKI SHA-256 pins:"
+          echo "$CHAIN_SPKIS" | sed 's/^/  /'
+
+          # --- Assert at least one live chain SPKI is pinned in cert_pin.rs ---
+          MATCHED=""
+          while IFS= read -r spki; do
+            [ -z "$spki" ] && continue
+            if grep -q "$spki" "$PINS_FILE"; then
+              MATCHED="$spki"
+              break
+            fi
+          done <<< "$CHAIN_SPKIS"
+
+          if [ -z "$MATCHED" ]; then
+            echo "::error file=$PINS_FILE::NONE of the live $HOST chain SPKI hashes are in PINNED_SPKI_SHA256 — clients will reject connections! Live chain pins: $(echo "$CHAIN_SPKIS" | tr '\n' ' ')"
             exit 1
           fi
+          echo "OK — live chain SPKI '$MATCHED' is present in PINNED_SPKI_SHA256."
 
-          if [ "$DAYS_LEFT" -lt 7 ]; then
-            echo "::error::Pinned cert expires in $DAYS_LEFT days — rotate IMMEDIATELY"
-            exit 1
-          elif [ "$DAYS_LEFT" -lt 30 ]; then
-            echo "::warning::Pinned cert expires in $DAYS_LEFT days — schedule rotation"
+          # --- Leaf expiry as an FYI warning only (never a hard failure) ---
+          if [ "$DAYS_LEFT" -lt 30 ]; then
+            echo "::warning::Live leaf cert for $HOST expires in $DAYS_LEFT days. This does NOT break pinned clients (chain SPKI still matches), but schedule the edge rotation."
           else
-            echo "Pinned cert OK — $DAYS_LEFT days remaining"
+            echo "Leaf cert OK — $DAYS_LEFT days remaining (informational)."
           fi
