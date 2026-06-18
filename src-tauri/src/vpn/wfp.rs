@@ -1128,6 +1128,11 @@ pub fn is_blocking() -> bool {
 }
 
 /// Check if the kill switch is initialized.
+///
+/// DT-6: the `get_wfp_status` IPC command that read this was removed (never
+/// invoked from the UI). Kept as a public status accessor alongside
+/// `is_blocking`; allow dead_code until a caller is re-added.
+#[allow(dead_code)]
 pub fn is_initialized() -> bool {
     IS_INITIALIZED.load(Ordering::SeqCst)
 }
@@ -1158,6 +1163,10 @@ pub async fn cleanup() -> Result<(), String> {
 }
 
 /// Get kill switch status for display.
+///
+/// DT-6: previously surfaced via the removed `get_wfp_status` IPC command.
+/// Kept as a public status accessor; allow dead_code until a caller is re-added.
+#[allow(dead_code)]
 pub fn get_status() -> KillSwitchStatus {
     KillSwitchStatus {
         initialized: IS_INITIALIZED.load(Ordering::SeqCst),
@@ -1195,160 +1204,6 @@ pub async fn set_split_tunnel_apps(app_names: Vec<String>) {
 
     let mut apps = SPLIT_TUNNEL_APPS.write().await;
     *apps = resolved_paths;
-}
-
-/// Add a dynamic split tunnel permit for a specific application.
-///
-/// - Resolves the app path (accepts short names like "chrome.exe" or full paths).
-/// - Adds to `SPLIT_TUNNEL_APPS` so the app persists across kill switch rebuilds.
-/// - If the kill switch is currently blocking, immediately installs WFP filters.
-/// - Returns a permit ID (the V4 filter ID) that can be used with
-///   `remove_split_tunnel_permit`. Returns 0 if the kill switch is not active
-///   (the app is queued and will be applied when blocking activates).
-pub async fn add_split_tunnel_permit(app_path: String) -> Result<u64, String> {
-    let resolved = resolve_app_path(&app_path)
-        .ok_or_else(|| format!("Could not resolve app path: {}", app_path))?;
-
-    // Add to persistent list so it survives kill switch rebuilds
-    {
-        let mut apps = SPLIT_TUNNEL_APPS.write().await;
-        if !apps.contains(&resolved) {
-            apps.push(resolved.clone());
-        }
-    }
-
-    // If kill switch is not active, just queue — filters will be added on next activate
-    if !IS_BLOCKING.load(Ordering::SeqCst) {
-        tracing::info!(
-            "Split tunnel: queued '{}' (kill switch not active)",
-            resolved
-        );
-        return Ok(0);
-    }
-
-    if !IS_INITIALIZED.load(Ordering::SeqCst) {
-        return Err("Kill switch not initialized".to_string());
-    }
-
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
-    let engine = guard.as_mut().ok_or("WFP engine not open")?;
-
-    let v4_id = engine.add_permit_app(&resolved)?;
-    if v4_id == 0 {
-        return Err(format!("Failed to create WFP app ID for: {}", resolved));
-    }
-
-    let mut ids = vec![v4_id];
-    let v6_id = engine.add_permit_app_v6(&resolved)?;
-    if v6_id != 0 {
-        ids.push(v6_id);
-    }
-
-    engine
-        .split_tunnel_map
-        .insert(v4_id, (resolved.clone(), ids));
-    tracing::info!(
-        "Split tunnel permit added for '{}' (permit_id={})",
-        resolved,
-        v4_id
-    );
-
-    Ok(v4_id)
-}
-
-/// Remove a specific split tunnel permit by its permit ID.
-///
-/// Removes the WFP filters and also removes the app from `SPLIT_TUNNEL_APPS`.
-pub async fn remove_split_tunnel_permit(permit_id: u64) -> Result<(), String> {
-    if permit_id == 0 {
-        return Err("Invalid permit ID (0)".to_string());
-    }
-
-    if !IS_INITIALIZED.load(Ordering::SeqCst) {
-        return Err("Kill switch not initialized".to_string());
-    }
-
-    let app_to_remove;
-
-    {
-        let mut guard = ENGINE
-            .lock()
-            .map_err(|e| format!("engine lock poisoned: {}", e))?;
-        let engine = guard.as_mut().ok_or("WFP engine not open")?;
-
-        let (app_path, filter_ids) = engine
-            .split_tunnel_map
-            .remove(&permit_id)
-            .ok_or_else(|| format!("Split tunnel permit {} not found", permit_id))?;
-
-        for id in &filter_ids {
-            // SAFETY: `engine.handle` is a valid WFP engine handle.
-            // `id` was returned by a prior successful `FwpmFilterAdd0` call.
-            let err = unsafe { FwpmFilterDeleteById0(engine.handle, *id) };
-            // 0x80320003 = FWP_E_FILTER_NOT_FOUND — benign
-            if err != 0 && err != 0x80320003 {
-                tracing::warn!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
-            }
-            engine.filter_ids.retain(|&fid| fid != *id);
-        }
-
-        app_to_remove = app_path;
-    } // guard dropped — safe to acquire async lock
-
-    {
-        let mut apps = SPLIT_TUNNEL_APPS.write().await;
-        apps.retain(|a| a != &app_to_remove);
-    }
-
-    tracing::info!(
-        "Split tunnel permit removed for '{}' (permit_id={})",
-        app_to_remove,
-        permit_id
-    );
-    Ok(())
-}
-
-/// Remove all split tunnel permits.
-///
-/// Clears `SPLIT_TUNNEL_APPS` and removes all tracked split tunnel WFP filters.
-pub async fn clear_split_tunnel_permits() -> Result<(), String> {
-    // Clear the persistent list
-    {
-        let mut apps = SPLIT_TUNNEL_APPS.write().await;
-        apps.clear();
-    }
-
-    if !IS_INITIALIZED.load(Ordering::SeqCst) {
-        return Ok(()); // Nothing to clean up in WFP
-    }
-
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
-    if let Some(engine) = guard.as_mut() {
-        let entries: Vec<(u64, Vec<u64>)> = engine
-            .split_tunnel_map
-            .drain()
-            .map(|(k, (_, ids))| (k, ids))
-            .collect();
-
-        for (permit_id, filter_ids) in entries {
-            for id in &filter_ids {
-                // SAFETY: `engine.handle` is a valid WFP engine handle.
-                let err = unsafe { FwpmFilterDeleteById0(engine.handle, *id) };
-                if err != 0 && err != 0x80320003 {
-                    tracing::warn!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
-                }
-                engine.filter_ids.retain(|&fid| fid != *id);
-            }
-            tracing::debug!("Cleared split tunnel permit_id={}", permit_id);
-        }
-    }
-
-    tracing::info!("All split tunnel permits cleared");
-    Ok(())
 }
 
 /// Resolve an app name or path to a full executable path.

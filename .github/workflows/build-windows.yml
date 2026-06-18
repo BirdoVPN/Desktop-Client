@@ -240,6 +240,9 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
+          # the shipped binary (owner sets the SENTRY_DSN repo secret).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: npx tauri build
 
       # Sanity-check: confirm the unbundled main .exe AND the installers

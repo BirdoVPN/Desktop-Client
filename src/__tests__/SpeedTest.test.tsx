@@ -67,7 +67,6 @@ const mockStoreState = {
   },
   servers: [],
   multiHopRoutes: [],
-  setMultiHopRoutes: vi.fn(),
   portForwards: [],
   setPortForwards: vi.fn(),
   theme: 'system',

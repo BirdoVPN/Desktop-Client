@@ -127,9 +127,11 @@ pub async fn disable_killswitch(vpn_manager: State<'_, VpnManager>) -> Result<bo
     Ok(true)
 }
 
-/// Activate the kill switch (block all non-VPN traffic)
-/// Called automatically when VPN disconnects unexpectedly
-#[tauri::command]
+/// Activate the kill switch (block all non-VPN traffic).
+///
+/// DT-7: Not a Tauri IPC command — called internally by the auto-reconnect
+/// service when the VPN drops unexpectedly. Kept as a plain async fn to shrink
+/// the IPC attack surface (the frontend never invoked it).
 pub async fn activate_killswitch() -> Result<bool, String> {
     if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
         return Ok(false);
@@ -172,9 +174,11 @@ pub async fn activate_killswitch() -> Result<bool, String> {
     Ok(true)
 }
 
-/// Deactivate the kill switch (restore normal traffic)
-/// Called when VPN connects successfully
-#[tauri::command]
+/// Deactivate the kill switch (restore normal traffic).
+///
+/// DT-7: Not a Tauri IPC command — called internally by the auto-reconnect
+/// service when the VPN reconnects. Kept as a plain async fn (the frontend
+/// never invoked it).
 pub async fn deactivate_killswitch() -> Result<bool, String> {
     tracing::info!("Deactivating kill switch - restoring normal traffic");
 

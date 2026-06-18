@@ -294,39 +294,6 @@ pub async fn get_auth_state(
     }
 }
 
-/// Refresh the access token
-#[tauri::command]
-pub async fn refresh_token(
-    api: State<'_, BirdoApi>,
-    credentials: State<'_, CredentialStore>,
-) -> Result<bool, String> {
-    let tokens = credentials
-        .get_tokens()
-        .map_err(|_| "Not authenticated".to_string())?;
-
-    // Set tokens in API client first
-    api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-        .await;
-
-    match api.refresh_token().await {
-        Ok(new_tokens) => {
-            // FIX C-1: Use updated refresh token if server returned one, else keep existing
-            let refresh_to_store = new_tokens
-                .refresh_token
-                .as_deref()
-                .unwrap_or(&tokens.refresh_token);
-            credentials
-                .store_tokens(&new_tokens.access_token, refresh_to_store)
-                .map_err(|e| format!("Failed to store new tokens: {}", e))?;
-            Ok(true)
-        }
-        Err(e) => {
-            tracing::warn!("Token refresh failed: {}", e);
-            Err(format!("Token refresh failed: {}", e))
-        }
-    }
-}
-
 /// FIX C-2: Verify a TOTP code for two-factor authentication.
 /// Called after login returns `requires_two_factor: true` with a challenge token.
 #[derive(Debug, Deserialize)]

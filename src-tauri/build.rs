@@ -22,10 +22,8 @@ fn main() {
 
     // Warn if SENTRY_DSN is missing on release builds
     let profile = env::var("PROFILE").unwrap_or_default();
-    if profile == "release" {
-        if env::var("SENTRY_DSN").unwrap_or_default().is_empty() {
-            println!("cargo:warning=SENTRY_DSN is not set — crash reporting will be disabled in this release build");
-        }
+    if profile == "release" && env::var("SENTRY_DSN").unwrap_or_default().is_empty() {
+        println!("cargo:warning=SENTRY_DSN is not set — crash reporting will be disabled in this release build");
     }
 
     // Linux: check for required system libraries

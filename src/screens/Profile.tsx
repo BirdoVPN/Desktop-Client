@@ -62,7 +62,6 @@ interface RustSubscription {
   expires_at: string | null;
   devices_used: number;
   devices_limit: number;
-  bandwidth_used: number;
   bandwidth_limit: number | null;
 }
 
@@ -133,7 +132,8 @@ export function Profile() {
           expiresAt: sub.expires_at ?? null,
           activeDevices: sub.devices_used ?? 0,
           maxDevices: sub.devices_limit ?? 1,
-          bandwidthUsed: sub.bandwidth_used ?? 0,
+          // Backend no longer reports bandwidth usage (always 0).
+          bandwidthUsed: 0,
           bandwidthLimit: sub.bandwidth_limit ?? 0,
         });
       })

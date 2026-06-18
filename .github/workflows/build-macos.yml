@@ -54,6 +54,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  XRAY_VERSION: v26.2.6
+  # SHA2-256 of the official Xray-core v26.2.6 macOS release zips
+  # (from Xray-macos-arm64-v8a.zip.dgst / Xray-macos-64.zip.dgst).
+  XRAY_MACOS_ARM64_SHA256: adec4685084a7481c8acad93bb2024abe6db46535aec3a7bd6903d462961861d
+  XRAY_MACOS_AMD64_SHA256: 2baa1914c3ff93f66801e93556c9562099f469f812c9cff3dc7aff8aedda9f1b
 
 jobs:
   build-macos:
@@ -114,6 +119,34 @@ jobs:
           mkdir -p src-tauri/resources
           touch src-tauri/resources/.gitkeep
 
+      # Download + SHA-verify + bundle the pinned Xray Reality engine, mirroring
+      # the Windows pipeline. Picks the asset for the matrix arch. Without this
+      # the release fails closed: xray.rs refuses to exec an unverified binary
+      # and XRAY_BINARY_SHA256 stays unset.
+      - name: Download pinned Xray Reality engine
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.label }}" = "arm64" ]; then
+            ASSET="Xray-macos-arm64-v8a.zip"
+            EXPECTED="$XRAY_MACOS_ARM64_SHA256"
+          else
+            ASSET="Xray-macos-64.zip"
+            EXPECTED="$XRAY_MACOS_AMD64_SHA256"
+          fi
+          XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${ASSET}"
+          ZIP_PATH="${RUNNER_TEMP}/${ASSET}"
+          curl -fsSL "$XRAY_URL" -o "$ZIP_PATH"
+          ACTUAL=$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Xray zip SHA256 mismatch for $ASSET. Expected $EXPECTED, got $ACTUAL"
+            exit 1
+          fi
+          unzip -o "$ZIP_PATH" -d "${RUNNER_TEMP}/xray"
+          install -m 0755 "${RUNNER_TEMP}/xray/xray" src-tauri/resources/xray
+          BINARY_SHA=$(shasum -a 256 src-tauri/resources/xray | awk '{print $1}')
+          echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
+          echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
+
       # ── Apple codesign keychain setup ──────────────────────────────
       - name: Detect Apple signing capability
         id: signcap
@@ -166,6 +199,11 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
+          # the shipped binary (owner sets the SENTRY_DSN repo secret).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
+          XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
         run: npx tauri build --target ${{ matrix.arch }}
 
       - name: Build Tauri application (unsigned fallback)
@@ -173,6 +211,11 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
+          # the shipped binary (owner sets the SENTRY_DSN repo secret).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
+          XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
         run: npx tauri build --target ${{ matrix.arch }}
 
       # ── Notarize + Staple ──────────────────────────────────────────

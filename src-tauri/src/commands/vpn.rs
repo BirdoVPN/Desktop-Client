@@ -970,14 +970,6 @@ pub(crate) fn parse_endpoint_ip(endpoint: &str) -> Option<std::net::Ipv4Addr> {
     host.parse::<std::net::Ipv4Addr>().ok()
 }
 
-/// Measure latency to the connected VPN server
-#[tauri::command]
-pub async fn measure_vpn_latency(
-    vpn_manager: State<'_, VpnManager>,
-) -> Result<Option<u32>, String> {
-    Ok(vpn_manager.measure_latency().await)
-}
-
 /// Get subscription status from the API
 #[tauri::command]
 pub async fn get_subscription_status(
@@ -999,37 +991,6 @@ pub async fn get_subscription_status(
     api.get_subscription()
         .await
         .map_err(|e| sanitize_error(&format!("Failed to get subscription: {}", e)))
-}
-
-/// Get detailed kill switch / firewall status
-#[tauri::command]
-pub fn get_wfp_status() -> serde_json::Value {
-    #[cfg(target_os = "windows")]
-    {
-        let status = crate::vpn::wfp::get_status();
-        tracing::debug!(
-            "WFP status: initialized={}, active={}, method={}",
-            crate::vpn::wfp::is_initialized(),
-            status.active,
-            status.method
-        );
-        serde_json::to_value(status).unwrap_or_default()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let (method, active) = if cfg!(target_os = "macos") {
-            ("pf", false)
-        } else if cfg!(target_os = "linux") {
-            ("iptables", crate::vpn::firewall_linux::is_blocking())
-        } else {
-            ("none", false)
-        };
-        serde_json::json!({
-            "active": active,
-            "method": method,
-            "initialized": false
-        })
-    }
 }
 
 // Multi-hop and port forwarding commands extracted to vpn_multi_hop.rs and vpn_port_forward.rs

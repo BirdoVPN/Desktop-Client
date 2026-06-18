@@ -191,7 +191,7 @@ describe('useAppStore', () => {
     })
 
     it('should toggle kill switch', () => {
-      useAppStore.getState().setKillSwitch(false)
+      useAppStore.getState().updateSettings({ killSwitchEnabled: false })
       expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false)
     })
 
@@ -200,7 +200,7 @@ describe('useAppStore', () => {
     })
 
     it('should toggle auto-connect', () => {
-      useAppStore.getState().setAutoConnect(true)
+      useAppStore.getState().updateSettings({ autoConnect: true })
       expect(useAppStore.getState().settings.autoConnect).toBe(true)
     })
 
@@ -209,7 +209,7 @@ describe('useAppStore', () => {
     })
 
     it('should toggle notifications', () => {
-      useAppStore.getState().setNotifications(false)
+      useAppStore.getState().updateSettings({ notifications: false })
       expect(useAppStore.getState().settings.notifications).toBe(false)
     })
   })

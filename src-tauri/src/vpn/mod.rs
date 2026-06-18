@@ -8,7 +8,6 @@ pub mod auto_reconnect;
 pub mod birdo_pq; // AUDIT-C1: BirdoPQ v1 ML-KEM-1024 PSK derivation (mirror of Android RosenpassManager)
 pub mod buffer_pool; // FIX-2-4: Reduced to packet size constants only
 pub mod doh; // DNS-over-HTTPS resolver for SEC-002
-pub mod latency;
 pub mod manager;
 pub mod network_monitor; // P2-15: System network connectivity monitor
 pub mod speed_test; // On-device speed test (P3-26)
@@ -47,10 +46,6 @@ pub use doh::resolve_via_doh;
 // Public API for auto-reconnect (may be used by external consumers)
 #[allow(unused_imports)]
 pub use auto_reconnect::{AutoReconnectConfig, AutoReconnectService, AutoReconnectStatus};
-
-// Public API for latency checking (may be used by external consumers)
-#[allow(unused_imports)]
-pub use latency::{check_multiple_servers, check_server_latency, find_best_server, LatencyResult};
 
 // Unit tests for auto-reconnect, kill switch, tunnel health
 #[cfg(test)]

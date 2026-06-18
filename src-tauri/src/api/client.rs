@@ -261,30 +261,6 @@ impl BirdoApi {
             .await
     }
 
-    /// P3-25: Rotate the WireGuard key for an active connection.
-    /// Sends a new client public key; server returns new server public key and key_id.
-    /// The old key is deactivated server-side after rotation succeeds.
-    #[allow(dead_code)] // Wired to auto-rotate timer in P3-25 follow-up
-    pub async fn rotate_key(
-        &self,
-        key_id: &str,
-        new_public_key: &str,
-    ) -> Result<super::types::KeyRotationResponse, ApiError> {
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RotateRequest<'a> {
-            client_public_key: &'a str,
-        }
-        self.post(
-            &endpoints::vpn::rotate_key(key_id),
-            &RotateRequest {
-                client_public_key: new_public_key,
-            },
-            true,
-        )
-        .await
-    }
-
     /// P2-15: Report connection quality telemetry to the backend.
     /// Fire-and-forget — callers should not block on failure.
     pub async fn report_quality(&self, report: &QualityReport) -> Result<(), ApiError> {

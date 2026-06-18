@@ -610,7 +610,13 @@ impl VpnManager {
         }
     }
 
-    /// Measure latency to the VPN server
+    /// Measure latency to the VPN server.
+    ///
+    /// DT-6: the `measure_vpn_latency` IPC command that called this was removed
+    /// (never invoked from the UI). Retained because it is still exercised by a
+    /// unit test and remains a useful manager-level accessor; allow dead_code in
+    /// non-test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn measure_latency(&self) -> Option<u32> {
         match timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
             Ok(tunnel_guard) => {

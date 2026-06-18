@@ -285,13 +285,13 @@ mod types_serialization_tests {
         let json = r#"{
             "plan": "OPERATIVE", "status": "ACTIVE",
             "expiresAt": "2026-12-31", "devicesUsed": 2,
-            "devicesLimit": 5, "bandwidthUsed": 1073741824,
+            "devicesLimit": 5,
             "bandwidthLimit": 10737418240
         }"#;
         let status: SubscriptionStatus = serde_json::from_str(json).unwrap();
         assert_eq!(status.plan, "OPERATIVE");
         assert_eq!(status.devices_used, 2);
-        assert_eq!(status.bandwidth_used, 1073741824);
+        assert_eq!(status.bandwidth_limit, Some(10737418240));
     }
 }
 
