@@ -46,6 +46,19 @@ jobs:
 
       - name: Run Rust unit tests
         working-directory: src-tauri
+        # The shipping app binary gets the ComCtl32 v6 manifest dependency via
+        # tauri-build (app.manifest), so it loads ComCtl32 v6 — where
+        # TaskDialogIndirect lives (pulled in transitively by a native-dialog
+        # crate). The unit-TEST binary gets no such manifest, so that import binds
+        # against ComCtl32 v5, the function is absent, and the harness fails to
+        # even start: STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) — on every Windows
+        # machine, including clean runners (which is why the suite never ran).
+        # Delay-load comctl32 so the symbol binds lazily; unit tests never raise a
+        # task dialog. Scoped to THIS job's build only — the app build is untouched.
+        # (cargo 1.83 has no `rustc-link-arg-tests` build-script instruction, so we
+        #  use RUSTFLAGS here rather than build.rs.)
+        env:
+          RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
         run: cargo test --lib
 
   frontend-tests:
