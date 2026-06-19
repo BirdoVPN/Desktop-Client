@@ -104,6 +104,34 @@ Disconnect button — that's a clean user disconnect):
   offline indefinitely behind an un-removable block. (Both the Disconnected and
   Error give-up paths now deactivate symmetrically.)
 
+## 3e. Lockdown / always-on mode (OPT-IN — verify before enabling by default)
+
+Lockdown mode (`lockdown_mode` setting, **off by default**) keeps the WFP
+block-all active the *entire* time you're connected and permits tunneled traffic
+by the Wintun interface LUID — eliminating the ~5–30s reactive window. It **must**
+pass this test before being shipped on, because a wrong interface LUID would
+block your own tunneled traffic.
+
+Enable it: set `"lockdown_mode": true` in the persisted settings JSON (or via the
+UI toggle once exposed), then connect.
+
+- **3e-1. Browsing still works (the critical check):** while connected in lockdown
+  mode, browse normally for a few minutes (load several sites, stream something).
+  - EXPECT: **everything works.** If pages hang/fail, the tunnel-interface permit
+    is wrong (LUID not resolved) — do NOT ship lockdown on. Confirm the permit
+    exists: `netsh wfp show state | Select-String 'tunnel interface'`.
+- **3e-2. Block is continuously active:** while connected (no drop), check
+  `netsh wfp show state | Select-String 'Birdo'` — the block-all + permits
+  (including "Permit tunnel interface v4/v6") must be present **the whole time**
+  (in reactive mode they're absent in steady state).
+- **3e-3. Zero-window on drop:** run the Terminal-A loop from §3, then force a drop
+  (disable Wintun). EXPECT: traffic is blocked **immediately** (no ~5s window —
+  the block was already active), then reconnects. It must never print your real IP.
+- **3e-4. Disconnect releases everything:** Disconnect → real IP returns, no Birdo
+  filters remain (`disarm()` → `wfp::cleanup()`).
+
+If all four pass on real hardware, lockdown is safe to enable by default.
+
 ## 4. Reconnect & server switch
 
 1. Connect, then pick a **different** server while connected.

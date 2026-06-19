@@ -320,7 +320,12 @@ impl AutoReconnectService {
                                 attempt_count.store(0, Ordering::SeqCst);
 
                                 // Deactivate kill switch now that we're connected
-                                let _ = killswitch::deactivate_killswitch().await;
+                                // — UNLESS lockdown (always-on) mode is enabled,
+                                // where the block stays active continuously to
+                                // close the reactive detection window.
+                                if !killswitch::is_lockdown_mode() {
+                                    let _ = killswitch::deactivate_killswitch().await;
+                                }
 
                                 // Reset the liveness watchdog — byte counters reset
                                 // to 0 on a fresh connection, so old deltas are stale.

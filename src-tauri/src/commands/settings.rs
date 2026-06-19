@@ -65,6 +65,15 @@ pub struct AppSettings {
     /// (available on every plan, negligible overhead).
     #[serde(default = "default_true")]
     pub quantum_protection: bool,
+    /// LOCKDOWN: always-on kill switch (Mullvad-style). When true the WFP
+    /// block-all stays active the entire time the tunnel is up, permitting
+    /// tunneled traffic by interface so there is ZERO leak window — including
+    /// across reconnects. OFF by default: it must be device-verified first
+    /// (an always-on block that mis-resolves the tunnel interface would block
+    /// the user's own traffic). The default reactive kill switch has a small
+    /// (~5-30s) drop window but cannot mis-block steady-state browsing.
+    #[serde(default)]
+    pub lockdown_mode: bool,
 }
 
 impl Default for AppSettings {
@@ -85,6 +94,7 @@ impl Default for AppSettings {
             wireguard_mtu: 0,
             stealth_mode: false,      // premium — off by default
             quantum_protection: true, // post-quantum on by default
+            lockdown_mode: false,     // always-on kill switch — opt-in, device-verified
         }
     }
 }

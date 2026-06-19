@@ -246,6 +246,20 @@ pub fn is_enabled() -> bool {
     KILLSWITCH_ENABLED.load(Ordering::SeqCst)
 }
 
+/// Whether the kill switch is in lockdown (always-on) mode. Cross-platform
+/// accessor used by the auto-reconnect loop so it keeps the block active
+/// continuously instead of deactivating in steady Connected state.
+pub fn is_lockdown_mode() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        wfp::is_lockdown_mode()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 /// Arm the kill switch for an active VPN session.
 ///
 /// AUDIT-2026-06-19 FIX (CRITICAL): the WFP kill switch was effectively dead.
@@ -282,7 +296,29 @@ pub async fn arm() -> Result<bool, String> {
     }
 
     KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
-    tracing::info!("Kill switch armed for active session");
+
+    // LOCKDOWN (always-on) mode: activate the block-all NOW and keep it on for
+    // the whole session, so there is ZERO reactive detection window. (Reactive
+    // mode — the default — leaves the block off in steady state and only
+    // activates during a reconnect gap.) The tunnel is already up by the time
+    // arm() runs on the connect path, so its interface LUID is published and
+    // activate_blocking can permit tunneled traffic; if it cannot, it fails
+    // loudly rather than blocking the user's own traffic.
+    #[cfg(target_os = "windows")]
+    if wfp::is_lockdown_mode() {
+        if let Err(e) = activate_killswitch().await {
+            tracing::error!(
+                "Lockdown activation failed ({}) — leaving kill switch disarmed for safety",
+                e
+            );
+            KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        tracing::info!("Kill switch armed in LOCKDOWN (always-on) mode");
+        return Ok(true);
+    }
+
+    tracing::info!("Kill switch armed for active session (reactive)");
     Ok(true)
 }
 

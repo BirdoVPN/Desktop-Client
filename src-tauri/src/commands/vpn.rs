@@ -258,10 +258,17 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         .as_ref()
         .map(|s| s.quantum_protection)
         .unwrap_or(false);
+    // Lockdown (always-on kill switch) — OFF by default; needs device verification
+    // before being enabled (see wfp::LOCKDOWN_MODE).
+    let lockdown_mode = settings
+        .as_ref()
+        .map(|s| s.lockdown_mode)
+        .unwrap_or(false);
 
     #[cfg(target_os = "windows")]
     {
         crate::vpn::wfp::set_local_network_sharing(local_network_sharing);
+        crate::vpn::wfp::set_lockdown_mode(lockdown_mode);
         if split_tunneling_enabled && !split_tunnel_apps.is_empty() {
             crate::vpn::wfp::set_split_tunnel_apps(split_tunnel_apps).await;
         } else {

@@ -824,6 +824,45 @@ impl WintunTunnel {
         tracing::debug!("Configuring adapter IP: {}", client_ip);
 
         let if_index = self.get_adapter_index().await.ok();
+
+        // LOCKDOWN: publish the tunnel interface LUID to the kill switch so
+        // always-on mode can permit tunneled traffic by interface. Best-effort —
+        // only lockdown mode (off by default) depends on it.
+        #[cfg(windows)]
+        if let Some(idx) = if_index {
+            let mut luid = windows::Win32::NetworkManagement::Ndis::NET_LUID_LH::default();
+            // SAFETY: `idx` is the Wintun adapter's interface index; the call
+            // fills `luid` and returns NO_ERROR (0) on success.
+            let rc = unsafe {
+                windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid(
+                    idx, &mut luid,
+                )
+            };
+            if rc.0 == 0 {
+                // SAFETY: on success the union's `Value` field holds the LUID.
+                crate::vpn::wfp::set_tunnel_luid(unsafe { luid.Value });
+                // LOCKDOWN server-switch / reconnect: if the block is already
+                // active (lockdown holds it on continuously), rebuild it NOW with
+                // this NEW interface LUID + the new server IP, so the active block
+                // never permits a stale/freed LUID. On a fresh connect the block
+                // is not active yet — arm() does the first activation.
+                if crate::vpn::wfp::is_lockdown_mode() && crate::vpn::wfp::is_blocking() {
+                    if let Err(e) = crate::vpn::wfp::activate_blocking().await {
+                        tracing::error!(
+                            "Lockdown: failed to re-activate kill switch with new tunnel LUID: {}",
+                            e
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Could not resolve tunnel LUID from interface index {} (rc=0x{:08X}); lockdown mode unavailable this session",
+                    idx,
+                    rc.0
+                );
+            }
+        }
+
         let native_ok = match if_index {
             Some(idx) => match set_adapter_ip_mtu_native(idx, client_ip, 24, self.config.mtu.into()) {
                 Ok(()) => {
@@ -1724,6 +1763,11 @@ impl WintunTunnel {
             wg.close().await;
         }
         tracing::debug!("WireGuard session closed");
+
+        // LOCKDOWN: the tunnel interface is going away — clear its LUID so a
+        // stale value can never be permitted on a future kill-switch activation.
+        #[cfg(windows)]
+        crate::vpn::wfp::clear_tunnel_luid();
 
         // STEP 3: Network cleanup — run all three in parallel since they
         // are independent and each spawns external processes.

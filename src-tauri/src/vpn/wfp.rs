@@ -60,7 +60,7 @@
 //!      `FwpmTransactionBegin0` / `FwpmTransactionCommit0` pair.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -101,6 +101,30 @@ static SPLIT_TUNNEL_APPS: once_cell::sync::Lazy<Arc<RwLock<Vec<String>>>> =
 
 /// Whether local network sharing (RFC1918) is permitted through the kill switch.
 static LOCAL_NETWORK_SHARING: AtomicBool = AtomicBool::new(false);
+
+/// LOCKDOWN ("always-on") MODE — gated behind a user setting, OFF by default.
+///
+/// When false (default): the kill switch is REACTIVE — the block-all is only
+/// installed during a reconnect gap, and steady-state Connected traffic is
+/// contained by routing. Small (~5-30s) detection window on a drop, but the
+/// block is never active during normal browsing, so it cannot mis-block.
+///
+/// When true: Mullvad-style ALWAYS-ON. The block-all stays installed the whole
+/// time the tunnel is up, and an INTERFACE-scoped permit on the tunnel adapter
+/// LUID (see TUNNEL_LUID / add_permit_tunnel_interface) lets tunneled traffic
+/// through while everything on the physical NIC stays blocked — so there is NO
+/// leak window, including across reconnects. This is the correct zero-window
+/// design, but it MUST be device-verified before being enabled by default: an
+/// always-on block that mis-resolves the tunnel LUID would block the user's own
+/// tunneled traffic. The dynamic WFP session still guarantees crash-safety
+/// (filters auto-removed if the process dies).
+static LOCKDOWN_MODE: AtomicBool = AtomicBool::new(false);
+
+/// The WireGuard tunnel adapter's interface LUID, published by the tunnel layer
+/// once the Wintun adapter exists (0 = unknown). Lockdown mode permits all
+/// traffic egressing this interface so tunneled browsing keeps working under the
+/// always-on block-all.
+static TUNNEL_LUID: AtomicU64 = AtomicU64::new(0);
 
 /// Engine state protected by a standard mutex (WFP calls are blocking FFI,
 /// not async, so a tokio mutex would add unnecessary overhead).
@@ -632,6 +656,44 @@ impl WfpEngine {
         Ok(())
     }
 
+    /// LOCKDOWN: permit ALL outbound traffic that egresses the tunnel (Wintun)
+    /// interface, matched by its interface LUID. This is the load-bearing
+    /// primitive for always-on mode: it lets tunneled traffic through while a
+    /// block-all on the physical NIC stays in force, so there is no leak window.
+    /// Call once per ALE layer (v4 and v6).
+    ///
+    /// `IP_LOCAL_INTERFACE` matches on the 64-bit interface LUID (FWP_UINT64).
+    fn add_permit_tunnel_interface(
+        &mut self,
+        luid: u64,
+        layer: GUID,
+        label: &str,
+    ) -> Result<(), String> {
+        let name = wide_nul(label);
+        // The condition value holds a POINTER to the u64; keep it alive until
+        // add_filter() copies the filter into WFP (same pattern as the
+        // V4_ADDR_AND_MASK in add_permit_vpn_server).
+        let mut luid_val: u64 = luid;
+
+        let mut condition = FWPM_FILTER_CONDITION0::default();
+        condition.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
+        condition.matchType = FWP_MATCH_EQUAL;
+        condition.conditionValue.r#type = FWP_UINT64;
+        condition.conditionValue.Anonymous.uint64 = &mut luid_val;
+
+        let mut filter = self.make_base_filter(
+            &name,
+            layer,
+            FWP_ACTION_PERMIT,
+            WEIGHT_PERMIT,
+        );
+        filter.numFilterConditions = 1;
+        filter.filterCondition = &mut condition;
+
+        self.add_filter(&filter)?;
+        Ok(())
+    }
+
     /// Block WebRTC STUN/TURN ports to prevent IP leak via WebRTC.
     /// - UDP 3478-3497 (standard STUN/TURN)
     /// - TCP 3478-3497 (TURN over TCP)
@@ -983,6 +1045,37 @@ pub async fn activate_blocking() -> Result<(), String> {
             }
         }
 
+        // LOCKDOWN (always-on): permit the tunnel interface so tunneled traffic
+        // flows while the block-all on the physical NIC stays in force. This is
+        // what makes a continuously-active block-all safe — without it, an
+        // always-on block would block the user's own tunneled browsing. We refuse
+        // to install the block in lockdown if the tunnel LUID is unknown (aborts
+        // the transaction → no filters), rather than silently block everything.
+        if LOCKDOWN_MODE.load(Ordering::SeqCst) {
+            let luid = TUNNEL_LUID.load(Ordering::SeqCst);
+            if luid == 0 {
+                return Err(
+                    "Lockdown mode: tunnel interface LUID unknown — refusing to install \
+                     block-all without a tunnel-interface permit (would block tunneled traffic)"
+                        .to_string(),
+                );
+            }
+            engine.add_permit_tunnel_interface(
+                luid,
+                FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                "Birdo: Permit tunnel interface (v4)",
+            )?;
+            engine.add_permit_tunnel_interface(
+                luid,
+                FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                "Birdo: Permit tunnel interface (v6)",
+            )?;
+            tracing::info!(
+                "Lockdown: permitted tunnel interface LUID {} (zero-window always-on)",
+                luid
+            );
+        }
+
         // Local network sharing: permit RFC1918 private ranges
         if LOCAL_NETWORK_SHARING.load(Ordering::SeqCst) {
             engine.add_permit_local_networks()?;
@@ -1144,7 +1237,15 @@ pub async fn unblock_ipv6() -> Result<(), String> {
 pub async fn update_vpn_server(ip: Ipv4Addr) -> Result<(), String> {
     set_vpn_server(ip).await;
 
-    if IS_BLOCKING.load(Ordering::SeqCst) {
+    // In LOCKDOWN mode, do NOT re-activate here: this is called on the connect
+    // path BEFORE the new tunnel exists, so TUNNEL_LUID still holds the OLD
+    // (about-to-be-freed) adapter's LUID — re-activating now would permit a stale
+    // interface LUID that Windows may reassign to a physical NIC. Re-activation
+    // in lockdown is driven by the tunnel layer once the NEW adapter publishes
+    // its LUID (see tunnel.rs configure_adapter), so the active block always
+    // permits the CURRENT tunnel interface. Reactive mode re-activates here as
+    // before to swap the server permit.
+    if IS_BLOCKING.load(Ordering::SeqCst) && !LOCKDOWN_MODE.load(Ordering::SeqCst) {
         // Re-activate atomically with the new VPN server IP
         activate_blocking().await?;
         tracing::info!("Updated VPN server permit: {}", ip);
@@ -1166,6 +1267,32 @@ pub fn is_blocking() -> bool {
 #[allow(dead_code)]
 pub fn is_initialized() -> bool {
     IS_INITIALIZED.load(Ordering::SeqCst)
+}
+
+/// Enable/disable lockdown (always-on) mode. Takes effect on the next
+/// `activate_blocking()`. Driven by the `lockdown_mode` user setting (OFF by
+/// default). See LOCKDOWN_MODE for the full semantics.
+pub fn set_lockdown_mode(enabled: bool) {
+    LOCKDOWN_MODE.store(enabled, Ordering::SeqCst);
+    tracing::info!("Kill switch lockdown (always-on) mode set to: {}", enabled);
+}
+
+/// Whether lockdown (always-on) mode is enabled.
+pub fn is_lockdown_mode() -> bool {
+    LOCKDOWN_MODE.load(Ordering::SeqCst)
+}
+
+/// Publish the tunnel adapter's interface LUID (from the tunnel layer once the
+/// Wintun adapter exists). Lockdown mode permits this interface so tunneled
+/// traffic flows under the always-on block-all.
+pub fn set_tunnel_luid(luid: u64) {
+    TUNNEL_LUID.store(luid, Ordering::SeqCst);
+    tracing::debug!("Kill switch tunnel LUID set to: {}", luid);
+}
+
+/// Clear the published tunnel LUID (on tunnel teardown).
+pub fn clear_tunnel_luid() {
+    TUNNEL_LUID.store(0, Ordering::SeqCst);
 }
 
 /// Clean up and release all resources.
