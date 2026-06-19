@@ -952,6 +952,37 @@ pub async fn activate_blocking() -> Result<(), String> {
             tracing::debug!("VPN server {} permitted through kill switch", ip);
         }
 
+        // CRITICAL (AUDIT-2026-06-19): permit the Birdo client's OWN process.
+        //
+        // The kill switch's block-all is active during the reconnect gap, but
+        // auto-reconnect must reach api.birdo.app — over the PHYSICAL adapter,
+        // since the tunnel is down — to fetch a fresh config, and that control
+        // plane is NOT the VPN server /32. Without this permit, arming the kill
+        // switch blocks auto-reconnect's own API call and reconnect can never
+        // succeed. Permitting our own executable lets the client's cert-pinned
+        // control-plane HTTPS, its DoH lookups, and its in-process WireGuard
+        // socket through, while every OTHER application stays blocked — so user
+        // traffic still cannot leak. (We bypass the kill switch only for the VPN
+        // client itself, which is exactly the process that must keep talking to
+        // the VPN infrastructure to restore the tunnel.)
+        match std::env::current_exe().ok().and_then(|p| p.to_str().map(String::from)) {
+            Some(self_exe) => {
+                let v4 = engine.add_permit_app(&self_exe)?;
+                if v4 != 0 {
+                    let _ = engine.add_permit_app_v6(&self_exe)?;
+                }
+                tracing::info!("Kill switch: permitted own process for control-plane / reconnect access");
+            }
+            None => {
+                // Fail loud but do not abort the whole transaction: a kill switch
+                // that cannot self-permit will break reconnect, but we still want
+                // user traffic blocked. Surface it so it is not silent.
+                tracing::error!(
+                    "Kill switch: could NOT determine own exe path — reconnect may be blocked while the kill switch is active"
+                );
+            }
+        }
+
         // Local network sharing: permit RFC1918 private ranges
         if LOCAL_NETWORK_SHARING.load(Ordering::SeqCst) {
             engine.add_permit_local_networks()?;
