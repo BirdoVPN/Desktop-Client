@@ -205,6 +205,12 @@ pub async fn connect_multi_hop(
         .await
         .map_err(|e| sanitize_error(&format!("Multi-hop connection failed: {}", e)))?;
 
+    // AUDIT-2026-06-19 FIX (CRITICAL): arm the kill switch once the multi-hop
+    // tunnel is up so a drop fails closed (see connect_vpn for the full rationale).
+    if let Err(e) = crate::commands::killswitch::arm().await {
+        tracing::warn!("Failed to arm kill switch after multi-hop connect: {}", e);
+    }
+
     auto_reconnect.clear_user_disconnected();
     tracing::info!("Multi-hop VPN connected: {} → {}", entryNodeId, exitNodeId);
     auto_reconnect

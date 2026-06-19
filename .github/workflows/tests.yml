@@ -1,0 +1,73 @@
+name: Tests
+
+# Runs the automated test suites on every push to main and every PR.
+#
+# WHY THIS EXISTS: the build-* workflows only ever *build* the app (release
+# bundle). Building excludes `#[cfg(test)]` modules, so the Rust unit tests were
+# never executed by CI — which is exactly how a duplicate-field compile error in
+# a test module (birdo_pq.rs) survived on main undetected. This workflow runs
+# `cargo test` (Windows — the supported launch target) and the frontend vitest
+# suite so a broken test can never silently land again.
+#
+# Linux is intentionally NOT run here: the pinned toolchain (1.83) does not build
+# the GTK/tao desktop dependency chain that now requires edition2024 (CD-1).
+# macOS/iOS are descoped for this launch.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-tests:
+    name: Rust unit tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # rust-toolchain.toml pins the channel (1.83); this action just ensures a
+      # toolchain is present so the pin resolves.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          workspaces: src-tauri
+
+      - name: Run Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+  frontend-tests:
+    name: Frontend unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Unit tests
+        run: npm run test:run

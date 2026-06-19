@@ -640,6 +640,15 @@ pub async fn connect_vpn(
         .await
         .map_err(|e| sanitize_error(&format!("Connection failed: {}", e)))?;
 
+    // AUDIT-2026-06-19 FIX (CRITICAL): now that the tunnel is up, arm the kill
+    // switch so an unexpected drop fails CLOSED — the auto-reconnect health loop
+    // installs the WFP block-all during the reconnect gap (it previously
+    // short-circuited because the kill switch was never armed). Best-effort: a
+    // failure to arm must not tear down a working tunnel.
+    if let Err(e) = crate::commands::killswitch::arm().await {
+        tracing::warn!("Failed to arm kill switch after connect: {}", e);
+    }
+
     // Wire up auto-reconnect: store reconnect info and start health monitoring
     auto_reconnect.clear_user_disconnected();
     auto_reconnect
@@ -704,6 +713,11 @@ pub async fn disconnect_vpn(
         .disconnect()
         .await
         .map_err(|e| sanitize_error(&format!("Disconnect failed: {}", e)))?;
+
+    // AUDIT-2026-06-19 FIX: disarm the kill switch on user-initiated disconnect so
+    // the WFP block-all filters (if active) are removed and the machine is never
+    // stranded behind the firewall. Best-effort; disarm() logs its own failures.
+    let _ = crate::commands::killswitch::disarm().await;
 
     tracing::info!("VPN disconnected");
     Ok(true)
@@ -933,6 +947,12 @@ pub async fn quick_connect(
         )
         .await
         .map_err(|e| sanitize_error(&format!("Connection failed: {}", e)))?;
+
+    // AUDIT-2026-06-19 FIX (CRITICAL): arm the kill switch once the tunnel is up
+    // so a drop fails closed (see connect_vpn for the full rationale).
+    if let Err(e) = crate::commands::killswitch::arm().await {
+        tracing::warn!("Failed to arm kill switch after quick-connect: {}", e);
+    }
 
     // Wire up auto-reconnect for quick-connect too
     auto_reconnect.clear_user_disconnected();

@@ -54,6 +54,11 @@ impl BirdoApi {
             .user_agent(USER_AGENT)
             .pool_max_idle_per_host(5)
             .https_only(true)
+            // F5 FIX: resolve the control plane via the cert-pinned DoH resolver
+            // (system-resolver fallback) so a censoring ISP / captive portal that
+            // hijacks or blocks DNS for api.birdo.app can no longer block desktop
+            // login — matching the Android client. See super::doh_resolver.
+            .dns_resolver(std::sync::Arc::new(super::doh_resolver::DohApiResolver::new()))
             .use_preconfigured_tls(super::cert_pin::rustls_config())
             .build()
             // SEC-C1 FIX: Do NOT fall back to Client::new() — that would
