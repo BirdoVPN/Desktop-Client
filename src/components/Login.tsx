@@ -317,7 +317,10 @@ export function Login() {
                       className="flex flex-1 items-center justify-center gap-1.5 rounded-birdo-sm py-2 text-xs font-medium transition-all"
                       style={{
                         backgroundColor: active ? white.w10 : 'transparent',
-                        color: active ? white.w100 : white.w40,
+                        color: active ? white.w100 : white.w60,
+                        boxShadow: active
+                          ? 'inset 0 1px 0 rgba(255,255,255,0.12), 0 2px 8px -2px rgba(0,0,0,0.45)'
+                          : 'none',
                       }}
                     >
                       {tab.icon}
@@ -353,7 +356,7 @@ export function Login() {
                         <button
                           type="button"
                           onClick={handleForgotPassword}
-                          className="text-xs text-w40 transition hover:text-w80"
+                          className="text-xs text-w60 transition hover:text-w100"
                         >
                           Forgot password?
                         </button>

@@ -81,11 +81,42 @@ export function BirdoButton({
       break;
   }
 
+  // Elevation / glow per variant — gives the CTA genuine presence on the dark
+  // glass surface and a clear hover affordance (lift + brighter bloom).
+  let boxShadow: string | undefined;
+  let hoverShadow: string | undefined;
+  if (!isInactive) {
+    switch (variant) {
+      case 'brand':
+        boxShadow = '0 8px 24px -6px rgba(124,58,237,0.55), inset 0 1px 0 rgba(255,255,255,0.20)';
+        hoverShadow = '0 12px 34px -6px rgba(124,58,237,0.78), inset 0 1px 0 rgba(255,255,255,0.26)';
+        break;
+      case 'primary':
+        boxShadow = '0 6px 18px -6px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.65)';
+        hoverShadow = '0 10px 26px -6px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.75)';
+        break;
+      case 'danger':
+        boxShadow = '0 6px 18px -8px rgba(248,113,113,0.5)';
+        hoverShadow = '0 10px 26px -8px rgba(248,113,113,0.68)';
+        break;
+      case 'secondary':
+        boxShadow = '0 4px 14px -8px rgba(0,0,0,0.6)';
+        hoverShadow = '0 8px 20px -8px rgba(0,0,0,0.7)';
+        break;
+      default:
+        break;
+    }
+  }
+
   if (disabled) {
     bg = white.w10;
     fg = white.w40;
     backgroundImage = undefined;
   }
+
+  const hoverAnim = !isInactive
+    ? { y: -1, ...(hoverShadow ? { boxShadow: hoverShadow } : {}) }
+    : undefined;
 
   return (
     <motion.button
@@ -93,8 +124,9 @@ export function BirdoButton({
       onClick={onClick}
       disabled={isInactive}
       aria-label={ariaLabel ?? text}
-      whileTap={!isInactive ? { scale: 0.97 } : undefined}
-      transition={{ duration: 0.12, ease: motionTokens.ease }}
+      whileHover={hoverAnim}
+      whileTap={!isInactive ? { scale: 0.97, y: 0 } : undefined}
+      transition={{ duration: 0.14, ease: motionTokens.ease }}
       className={`relative flex items-center justify-center rounded-birdo-md font-semibold transition-opacity disabled:cursor-not-allowed ${
         fullWidth ? 'w-full' : ''
       } ${className}`}
@@ -107,6 +139,7 @@ export function BirdoButton({
         backgroundImage,
         color: fg,
         border,
+        boxShadow,
         opacity: disabled ? 0.7 : 1,
       }}
     >
