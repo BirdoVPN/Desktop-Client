@@ -266,8 +266,8 @@ input {
   /* Directional inset shadows wrap the sphere: a soft cool light on the
      top-left, a deep shadow on the bottom-right — the core of the 3D illusion. */
   box-shadow:
-    inset 18px 16px 44px rgba(150, 200, 255, 0.10),
-    inset -24px -28px 64px rgba(0, 3, 10, 0.80);
+    inset 20px 18px 46px rgba(150, 205, 255, 0.12),
+    inset -26px -30px 72px rgba(0, 2, 8, 0.85);
 }
 .birdo-globe__map,
 .birdo-globe__dots {
@@ -320,19 +320,23 @@ input {
   inset: 0;
   border-radius: 50%;
   background:
-    /* tight specular highlight — the "sun glint" near the top-left */
-    radial-gradient(circle at 31% 25%, rgba(190, 224, 255, 0.42) 0%, rgba(190, 224, 255, 0.10) 16%, transparent 32%),
+    /* glossy specular glint — small + bright, the sun reflection on the ocean */
+    radial-gradient(circle at 30% 24%, rgba(225, 240, 255, 0.55) 0%, rgba(200, 230, 255, 0.16) 11%, transparent 26%),
     /* terminator: a large soft shadow on the bottom-right that also dims the
        continents on the far side, so the land curves with the sphere */
-    radial-gradient(circle at 74% 80%, rgba(2, 8, 20, 0.80) 0%, rgba(2, 8, 20, 0.42) 34%, transparent 66%),
+    radial-gradient(circle at 76% 82%, rgba(1, 6, 16, 0.85) 0%, rgba(1, 6, 16, 0.45) 34%, transparent 66%),
     /* gentle overall depth vignette */
-    radial-gradient(circle at 50% 44%, transparent 50%, rgba(2, 8, 20, 0.45) 100%);
+    radial-gradient(circle at 50% 44%, transparent 48%, rgba(1, 6, 16, 0.50) 100%);
 }
 .birdo-globe__rim {
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  box-shadow: inset 0 0 0 1px rgba(123, 178, 230, 0.28);
+  /* Thin base ring + a bright rim-light crescent hugging the top-left
+     (lit) limb — the strongest single "this is a sphere" cue. */
+  box-shadow:
+    inset 0 0 0 1px rgba(140, 190, 240, 0.30),
+    inset 11px 12px 20px -9px rgba(190, 228, 255, 0.65);
 }
 /* Static soft limb falloff (does NOT scroll) — fades continents into the rim
  * so the sphere reads as round without a moving mask artifact. */
