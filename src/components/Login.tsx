@@ -394,8 +394,12 @@ export function Login() {
                 )}
 
                 {activeTab === 'anonymous' && (
-                  <motion.div
+                  <motion.form
                     key="anon-form"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      handleAnonymousLogin();
+                    }}
                     className="flex min-h-[232px] flex-col gap-4"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
@@ -419,15 +423,16 @@ export function Login() {
                     {error && <ErrorBanner message={error} />}
 
                     <BirdoButton
+                      type="submit"
                       text={isLoading ? 'Signing in…' : 'Initialize Uplink'}
-                      onClick={handleAnonymousLogin}
+                      onClick={() => {}}
                       variant="brand"
                       size="large"
                       fullWidth
                       isLoading={isLoading}
                       className="mt-auto"
                     />
-                  </motion.div>
+                  </motion.form>
                 )}
               </AnimatePresence>
 

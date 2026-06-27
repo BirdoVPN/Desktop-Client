@@ -40,13 +40,15 @@ export function OfflineBanner() {
     <AnimatePresence>
       {!isOnline && (
         <motion.div
+          role="status"
+          aria-live="polite"
           className="flex items-center justify-center gap-2 bg-red-500/90 px-3 py-1.5 text-xs font-medium text-white"
           initial={{ opacity: 0, height: 0 }}
           animate={{ opacity: 1, height: 'auto' }}
           exit={{ opacity: 0, height: 0 }}
           transition={{ duration: 0.2 }}
         >
-          <WifiOff size={14} />
+          <WifiOff size={14} aria-hidden />
           <span>No internet connection</span>
         </motion.div>
       )}

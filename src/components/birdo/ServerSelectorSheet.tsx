@@ -7,7 +7,7 @@ import { useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, Star, Film, Download, Signal, Lock } from 'lucide-react';
 import type { Server } from '@/store/app-store';
-import { surface, white, hairline, brand } from '@/lib/birdo-theme';
+import { surface, white, hairline, brand, status } from '@/lib/birdo-theme';
 import { countryCodeToFlag } from '@/utils/helpers';
 
 type Filter = 'all' | 'favorites' | 'streaming' | 'p2p';
@@ -140,7 +140,7 @@ export function ServerSelectorSheet({
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="Search by country or city"
                   aria-label="Search servers"
-                  className="w-full rounded-xl py-2.5 pl-9 pr-9 text-sm outline-none transition focus:ring-1"
+                  className="w-full rounded-xl py-2.5 pl-9 pr-9 text-sm outline-none transition"
                   style={{
                     backgroundColor: white.w05,
                     color: white.w100,
@@ -246,7 +246,7 @@ function ServerRow({
   onToggleFavorite,
 }: ServerRowProps) {
   const loadColor =
-    server.load < 50 ? '#4ADE80' : server.load < 80 ? '#FACC15' : '#F87171';
+    server.load < 50 ? status.greenLight : server.load < 80 ? status.yellowLight : status.red;
 
   return (
     <li>
@@ -278,7 +278,7 @@ function ServerRow({
               {server.city}
             </span>
             {server.isStreaming && <Film size={11} color={brand.purple} />}
-            {server.isP2p && <Download size={11} color="#3B82F6" />}
+            {server.isP2p && <Download size={11} color={status.blue} />}
           </span>
           <span className="block truncate text-xs" style={{ color: white.w60 }}>
             {server.country}
@@ -323,8 +323,8 @@ function ServerRow({
         >
           <Star
             size={14}
-            color={isFavorite ? '#FACC15' : white.w40}
-            fill={isFavorite ? '#FACC15' : 'none'}
+            color={isFavorite ? status.yellowLight : white.w40}
+            fill={isFavorite ? status.yellowLight : 'none'}
           />
         </span>
       </button>

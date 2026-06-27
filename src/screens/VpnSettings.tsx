@@ -281,6 +281,7 @@ export function VpnSettings() {
           <button
             type="button"
             onClick={() => setDnsExpanded((v) => !v)}
+            aria-expanded={dnsExpanded}
             className="flex w-full items-center gap-3.5 rounded-birdo-md px-3.5 py-3 text-left transition-colors hover:bg-white/5"
           >
             <div

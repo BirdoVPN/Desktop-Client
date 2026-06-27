@@ -337,7 +337,7 @@ export function Settings() {
               </div>
               <div className="mt-0.5 text-xs" style={{ color: white.w60 }}>
                 {speedTestResult
-                  ? `↓ ${speedTestResult.downloadMbps.toFixed(1)} / ↑ ${speedTestResult.uploadMbps.toFixed(1)} Mbps · ${speedTestResult.latencyMs}ms`
+                  ? `↓ ${speedTestResult.downloadMbps.toFixed(1)} / ↑ ${speedTestResult.uploadMbps.toFixed(1)} Mbps · ${Math.round(speedTestResult.latencyMs)}ms`
                   : 'Measure download, upload & latency'}
               </div>
             </div>
@@ -345,7 +345,7 @@ export function Settings() {
               type="button"
               onClick={runSpeedTest}
               disabled={speedTestRunning}
-              className="shrink-0 rounded-birdo-sm px-3.5 py-2 text-[13px] font-semibold transition-colors disabled:opacity-60"
+              className="shrink-0 rounded-birdo-sm px-3.5 py-2 text-[13px] font-semibold transition-all hover:brightness-125 active:scale-95 disabled:opacity-60"
               style={{ backgroundColor: brand.purpleBg, color: brand.purpleSoft }}
             >
               {speedTestRunning ? 'Running…' : 'Run'}
@@ -437,7 +437,7 @@ function WindowPositionSelector({
               key={opt.value}
               type="button"
               onClick={() => onSelect(opt.value)}
-              className="flex items-center justify-center gap-1 rounded-birdo-xs px-2 py-2 text-[12px] font-medium transition-colors"
+              className="flex items-center justify-center gap-1 rounded-birdo-xs px-2 py-2 text-[12px] font-medium transition-all hover:shadow-[inset_0_0_0_1px_#ffffff29]"
               style={{
                 backgroundColor: active ? brand.purpleBg : 'transparent',
                 border: active ? `1px solid ${brand.purple}` : '1px solid transparent',
@@ -453,7 +453,7 @@ function WindowPositionSelector({
       <button
         type="button"
         onClick={() => onSelect('free')}
-        className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-birdo-xs px-3 py-2 text-[13px] font-medium transition-colors"
+        className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-birdo-xs px-3 py-2 text-[13px] font-medium transition-all hover:shadow-[inset_0_0_0_1px_#ffffff29]"
         style={{
           backgroundColor: free ? brand.purpleBg : white.w05,
           border: free ? `1px solid ${brand.purple}` : '1px solid transparent',

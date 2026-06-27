@@ -46,7 +46,12 @@ export function CompactConnectButton({
       data-testid="connect-button"
       onClick={onClick}
       disabled={busy || state === 'multiHopBlocked'}
-      whileTap={!busy ? { scale: 0.98 } : undefined}
+      whileHover={
+        !busy && state !== 'multiHopBlocked'
+          ? { y: -1, boxShadow: `0 18px 44px -10px ${shadowColor}` }
+          : undefined
+      }
+      whileTap={!busy && state !== 'multiHopBlocked' ? { scale: 0.98, y: 0 } : undefined}
       transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
       className="relative flex h-[60px] w-full items-center justify-center gap-2.5 rounded-2xl transition-opacity disabled:cursor-not-allowed"
       style={{

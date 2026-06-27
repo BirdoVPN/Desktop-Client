@@ -615,8 +615,8 @@ export function Dashboard() {
     : 'idle';
   const connectLabel =
     isConnected ? 'Disconnect'
-    : isConnecting ? 'Connecting...'
-    : isDisconnecting ? 'Disconnecting...'
+    : isConnecting ? 'Connecting…'
+    : isDisconnecting ? 'Disconnecting…'
     : multiHopBlocked ? 'Choose entry & exit'
     : multiHopReady ? 'Connect Multi-Hop'
     : 'Connect';
