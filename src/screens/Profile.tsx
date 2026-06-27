@@ -1,37 +1,21 @@
 /**
- * Profile — mobile-parity top-level tab root.
+ * Profile — top-level tab root.
  *
- * Mirrors mobile's `ProfileScreen.kt`: identity card, subscription summary, and
- * all Account actions (subscription, voucher, privacy, terms, sign out, delete
- * account). As a TAB ROOT it renders its own header/title area — NOT a pushed
- * BirdoTopBar with a back button.
+ * Identity card (avatar + name/email + plan), a subscription summary, and the
+ * few account actions kept IN-APP: redeem voucher + sign out. Everything else —
+ * managing the subscription, deleting the account, exporting data, and the
+ * legal links — lives on the web (dashboard.birdo.app), so it's intentionally
+ * NOT duplicated here.
  *
  * IPC (unchanged contracts):
- *   get_subscription_status (snake_case fields), export_user_data,
- *   disconnect_vpn, logout, delete_account { request: { password } }.
- * Web links open via @tauri-apps/plugin-shell `open()`.
+ *   get_subscription_status (snake_case fields), disconnect_vpn, logout,
+ *   redeem_voucher.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
-import {
-  Shield,
-  Star,
-  CreditCard,
-  ChevronRight,
-  Gift,
-  ExternalLink,
-  ShieldCheck,
-  FileText,
-  Download,
-  LogOut,
-  Trash2,
-  AlertTriangle,
-  Loader2,
-  CheckCircle2,
-} from 'lucide-react';
+import { Star, Gift, LogOut, CheckCircle2 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import {
   BirdoCard,
@@ -39,7 +23,6 @@ import {
   BirdoNavRow,
   BirdoButton,
   BirdoTextField,
-  AppIconMark,
 } from '@/components/birdo';
 import {
   brand,
@@ -50,10 +33,6 @@ import {
   gradient,
   motion as motionTokens,
 } from '@/lib/birdo-theme';
-
-const DASHBOARD_URL = 'https://dashboard.birdo.app';
-const PRIVACY_URL = 'https://birdo.app/privacy';
-const TERMS_URL = 'https://birdo.app/terms';
 
 /** Subscription status as returned by the Rust `get_subscription_status` command. */
 interface RustSubscription {
@@ -92,33 +71,25 @@ function formatRenewalDate(raw: string | null): string | null {
 }
 
 export function Profile() {
-  const { account, userEmail, connectionState, vpnIp, setAccount, logout, setAuthenticated } =
-    useAppStore(
-      useShallow((s) => ({
-        account: s.account,
-        userEmail: s.userEmail,
-        connectionState: s.connectionState,
-        vpnIp: s.vpnIp,
-        setAccount: s.setAccount,
-        logout: s.logout,
-        setAuthenticated: s.setAuthenticated,
-      }))
-    );
+  const { account, userEmail, setAccount, logout, setAuthenticated } = useAppStore(
+    useShallow((s) => ({
+      account: s.account,
+      userEmail: s.userEmail,
+      setAccount: s.setAccount,
+      logout: s.logout,
+      setAuthenticated: s.setAuthenticated,
+    }))
+  );
   // The signed-in email is mirrored in both `account.email` and the top-level
   // `userEmail` (set at login). Fall back to userEmail so the identity card can
   // never render "Anonymous" for a logged-in user even if one source is null.
   const resolvedEmail = account.email ?? userEmail ?? null;
-  const pushRoute = useAppStore((s) => s.pushRoute);
 
-  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [showVoucherDialog, setShowVoucherDialog] = useState(false);
-  const [exportState, setExportState] = useState<'idle' | 'loading' | 'done'>('idle');
-
-  const isConnected = connectionState === 'connected';
 
   // Hydrate subscription details (devices / bandwidth / renewal) the same way
-  // the Dashboard does — the mobile ProfileScreen renders the same fields.
-  // Extracted so a successful voucher redemption can refresh the card in place.
+  // the Dashboard does. Extracted so a successful voucher redemption can refresh
+  // the card in place.
   const hydrateSubscription = useCallback(() => {
     invoke<RustSubscription>('get_subscription_status')
       .then((sub) => {
@@ -145,38 +116,6 @@ export function Profile() {
   useEffect(() => {
     hydrateSubscription();
   }, [hydrateSubscription]);
-
-  // Fire-and-forget external open: the shell plugin can reject (permission
-  // denied, bad URL, OS error). Swallow it locally so it never surfaces as an
-  // unhandled promise rejection / app-level crash.
-  const safeOpenExternal = (target: string) => {
-    void openExternal(target).catch(() => {
-      /* best effort — opening a browser is non-critical */
-    });
-  };
-
-  const handleExport = async () => {
-    setExportState('loading');
-    try {
-      const data = await invoke<Record<string, unknown>>('export_user_data');
-      const blob = new Blob([JSON.stringify(data, null, 2)], {
-        type: 'application/json',
-      });
-      const url = URL.createObjectURL(blob);
-      try {
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `birdo-data-export-${new Date().toISOString().slice(0, 10)}.json`;
-        a.click();
-      } finally {
-        // Always release the blob URL, even if anchor creation / click throws.
-        URL.revokeObjectURL(url);
-      }
-      setExportState('done');
-    } catch {
-      setExportState('idle');
-    }
-  };
 
   const handleLogout = async () => {
     const cur = useAppStore.getState().connectionState;
@@ -210,12 +149,7 @@ export function Profile() {
       </div>
 
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
-        <IdentityCard
-          email={resolvedEmail}
-          plan={account.plan}
-          isConnected={isConnected}
-          publicIp={vpnIp}
-        />
+        <IdentityCard email={resolvedEmail} plan={account.plan} />
 
         <SubscriptionCard
           plan={account.plan}
@@ -223,7 +157,6 @@ export function Profile() {
           expiresAt={account.expiresAt}
           maxDevices={account.maxDevices}
           bandwidthLimit={account.bandwidthLimit}
-          onManage={() => pushRoute('subscription')}
         />
 
         {/* ── ACCOUNT ─────────────────────────────────────────────────── */}
@@ -236,35 +169,6 @@ export function Profile() {
               leadingIcon={Gift}
               leadingTint={brand.purpleSoft}
               onClick={() => setShowVoucherDialog(true)}
-            />
-            <BirdoNavRow
-              title="Manage on web"
-              subtitle="Open dashboard.birdo.app in browser"
-              leadingIcon={ExternalLink}
-              leadingTint={brand.purpleSoft}
-              onClick={() => safeOpenExternal(DASHBOARD_URL)}
-            />
-            <BirdoNavRow
-              title="Privacy Policy"
-              subtitle="birdo.app/privacy"
-              leadingIcon={ShieldCheck}
-              leadingTint={brand.purpleSoft}
-              onClick={() => safeOpenExternal(PRIVACY_URL)}
-            />
-            <BirdoNavRow
-              title="Terms of Service"
-              subtitle="birdo.app/terms"
-              leadingIcon={FileText}
-              leadingTint={brand.purpleSoft}
-              onClick={() => safeOpenExternal(TERMS_URL)}
-            />
-            <BirdoNavRow
-              title={exportState === 'done' ? 'Data exported' : 'Export my data'}
-              subtitle="Download a GDPR copy of your account data"
-              leadingIcon={exportState === 'loading' ? Loader2 : Download}
-              leadingTint={brand.purpleSoft}
-              enabled={exportState !== 'loading'}
-              onClick={handleExport}
             />
           </BirdoCard>
         </div>
@@ -280,21 +184,11 @@ export function Profile() {
               leadingTint={statusTokens.red}
               onClick={handleLogout}
             />
-            <BirdoNavRow
-              title="Delete account"
-              subtitle="Permanently delete your account and all data"
-              leadingIcon={Trash2}
-              leadingTint={statusTokens.red}
-              onClick={() => setShowDeleteDialog(true)}
-            />
           </BirdoCard>
         </div>
       </div>
 
       <AnimatePresence>
-        {showDeleteDialog && (
-          <DeleteAccountDialog onDismiss={() => setShowDeleteDialog(false)} />
-        )}
         {showVoucherDialog && (
           <VoucherRedeemDialog
             onDismiss={() => setShowVoucherDialog(false)}
@@ -311,62 +205,41 @@ export function Profile() {
 interface IdentityCardProps {
   email: string | null;
   plan: string | null;
-  isConnected: boolean;
-  publicIp: string | null;
 }
 
-function IdentityCard({ email, plan, isConnected, publicIp }: IdentityCardProps) {
+function IdentityCard({ email, plan }: IdentityCardProps) {
   const displayEmail = email ?? 'Anonymous';
   const name = (email?.split('@')[0] || displayEmail).trim();
   const planLabel = plan ?? 'RECON';
+  const initial = (name.charAt(0) || '?').toUpperCase();
 
   return (
     <BirdoCard cornerRadius={22} padding="20px">
-      <div className="flex flex-col gap-3.5">
-        <div className="flex items-center">
-          <AppIconMark size={56} style={{ borderRadius: 18 }} />
-          <div className="ml-3.5 min-w-0 flex-1">
-            <div
-              className="truncate text-[18px] font-semibold"
-              style={{ color: '#FFFFFF' }}
-            >
-              {name}
-            </div>
-            <div className="truncate text-[13px]" style={{ color: white.w60 }}>
-              {displayEmail}
-            </div>
-          </div>
-          <PlanPill plan={planLabel} />
-        </div>
-
-        {/* Connection / public-IP row */}
+      <div className="flex items-center">
+        {/* User avatar — initial on the plan-tinted gradient (the brand mark is
+            the window's title bar; this slot represents the signed-in user). */}
         <div
-          className="flex items-center rounded-birdo-md px-3.5 py-2.5"
-          style={{ backgroundColor: surface.s2 }}
+          className="flex h-14 w-14 shrink-0 items-center justify-center rounded-[18px] text-[22px] font-bold text-white"
+          style={{
+            backgroundImage: planGradient(planLabel),
+            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.18)',
+          }}
+          aria-hidden
         >
-          <span
-            className="h-2.5 w-2.5 shrink-0 rounded-full"
-            style={{ backgroundColor: isConnected ? statusTokens.green : white.w40 }}
-          />
-          <div className="ml-2.5 min-w-0 flex-1">
-            <div
-              className="truncate text-[13px] font-semibold"
-              style={{ color: '#FFFFFF' }}
-            >
-              {isConnected ? 'Protected' : 'Not connected'}
-            </div>
-            <div className="truncate text-[11px]" style={{ color: white.w60 }}>
-              {isConnected && publicIp
-                ? `Public IP · ${publicIp}`
-                : 'Tap Connect to reveal'}
-            </div>
-          </div>
-          <Shield
-            size={20}
-            color={isConnected ? statusTokens.green : white.w40}
-            aria-hidden
-          />
+          {initial}
         </div>
+        <div className="ml-3.5 min-w-0 flex-1">
+          <div
+            className="truncate text-[18px] font-semibold"
+            style={{ color: '#FFFFFF' }}
+          >
+            {name}
+          </div>
+          <div className="truncate text-[13px]" style={{ color: white.w60 }}>
+            {displayEmail}
+          </div>
+        </div>
+        <PlanPill plan={planLabel} />
       </div>
     </BirdoCard>
   );
@@ -380,7 +253,6 @@ interface SubscriptionCardProps {
   expiresAt: string | null;
   maxDevices: number;
   bandwidthLimit: number;
-  onManage: () => void;
 }
 
 function SubscriptionCard({
@@ -389,7 +261,6 @@ function SubscriptionCard({
   expiresAt,
   maxDevices,
   bandwidthLimit,
-  onManage,
 }: SubscriptionCardProps) {
   const planLabel = plan ?? 'RECON';
   const isActive = accountStatus === 'active';
@@ -432,20 +303,6 @@ function SubscriptionCard({
             label={bandwidthLimit > 0 ? `${bandwidthLimit} GB / mo` : 'Unlimited'}
           />
         </div>
-
-        {/* CTA → pushes the subscription sub-screen */}
-        <button
-          type="button"
-          onClick={onManage}
-          className="flex items-center rounded-birdo-sub px-3.5 py-3 transition-opacity hover:opacity-90"
-          style={{ backgroundImage: planGradient(planLabel) }}
-        >
-          <CreditCard size={18} color="#FFFFFF" aria-hidden />
-          <span className="ml-2.5 flex-1 text-left text-[14px] font-semibold text-white">
-            {isActive ? 'Manage subscription' : 'Upgrade plan'}
-          </span>
-          <ChevronRight size={20} color="#FFFFFF" aria-hidden />
-        </button>
       </div>
     </BirdoCard>
   );
@@ -488,128 +345,6 @@ function PlanPill({ plan }: { plan: string }) {
     >
       {plan.toUpperCase()}
     </span>
-  );
-}
-
-// ── Delete-account dialog ──────────────────────────────────────────────────
-
-function DeleteAccountDialog({ onDismiss }: { onDismiss: () => void }) {
-  const [password, setPassword] = useState('');
-  const [confirmText, setConfirmText] = useState('');
-  const [deleting, setDeleting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Require an explicit typed acknowledgement in addition to the password so an
-  // irreversible deletion can never happen from a single accidental click.
-  const confirmed = confirmText.trim().toUpperCase() === 'DELETE';
-  const canSubmit = !!password.trim() && confirmed && !deleting;
-
-  const handleConfirm = async () => {
-    if (!canSubmit) return;
-    setDeleting(true);
-    setError(null);
-    try {
-      await invoke('delete_account', { request: { password } });
-      // Account deleted — force reload to return to the login screen.
-      window.location.reload();
-    } catch (e: unknown) {
-      // Tauri invoke() may reject with a string, an Error, or a structured
-      // object carrying a `.message`. Surface the most specific text we can.
-      const message =
-        typeof e === 'string'
-          ? e
-          : e instanceof Error
-            ? e.message
-            : typeof e === 'object' &&
-                e !== null &&
-                typeof (e as { message?: unknown }).message === 'string'
-              ? (e as { message: string }).message
-              : 'Deletion failed';
-      setError(message);
-      setDeleting(false);
-    }
-  };
-
-  return (
-    <motion.div
-      className="absolute inset-0 z-50 flex items-center justify-center p-5"
-      style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
-      onClick={() => !deleting && onDismiss()}
-    >
-      <motion.div
-        className="w-full max-w-[360px] overflow-hidden rounded-birdo-lg"
-        style={{
-          background: `linear-gradient(${surface.s3}, ${surface.s3}) padding-box, ${gradient.glassStroke} border-box`,
-          border: '1px solid transparent',
-        }}
-        initial={{ scale: 0.94, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.94, opacity: 0 }}
-        transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex flex-col gap-4 p-5">
-          <div className="flex items-center gap-2">
-            <AlertTriangle size={22} color={statusTokens.red} aria-hidden />
-            <h2 className="text-[16px] font-bold" style={{ color: statusTokens.red }}>
-              Delete account
-            </h2>
-          </div>
-          <p className="text-[13px]" style={{ color: white.w60 }}>
-            This will permanently delete your account, VPN configurations, and all
-            associated data. This action cannot be undone. Enter your password and
-            type DELETE to confirm.
-          </p>
-          <BirdoTextField
-            value={password}
-            onChange={(v) => {
-              setPassword(v);
-              if (error) setError(null);
-            }}
-            label="Password"
-            type="password"
-            error={error != null}
-            disabled={deleting}
-            autoComplete="current-password"
-          />
-          <BirdoTextField
-            value={confirmText}
-            onChange={setConfirmText}
-            label="Type DELETE to confirm"
-            type="text"
-            placeholder="DELETE"
-            disabled={deleting}
-            autoComplete="off"
-          />
-          {error && (
-            <p className="text-[12px]" style={{ color: statusTokens.red }}>
-              {error}
-            </p>
-          )}
-          <div className="flex gap-2.5">
-            <BirdoButton
-              text="Cancel"
-              variant="secondary"
-              fullWidth
-              disabled={deleting}
-              onClick={onDismiss}
-            />
-            <BirdoButton
-              text={deleting ? 'Deleting…' : 'Delete forever'}
-              variant="danger"
-              fullWidth
-              isLoading={deleting}
-              disabled={!canSubmit}
-              onClick={handleConfirm}
-            />
-          </div>
-        </div>
-      </motion.div>
-    </motion.div>
   );
 }
 

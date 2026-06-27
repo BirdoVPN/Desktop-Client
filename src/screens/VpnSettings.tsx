@@ -29,6 +29,7 @@ import {
   SlidersHorizontal,
   Info,
   ArrowLeftRight,
+  Split,
   ChevronRight,
 } from 'lucide-react';
 import {
@@ -516,6 +517,13 @@ export function VpnSettings() {
         <BirdoSectionHeader title="Features" className="mt-4" />
 
         <BirdoCard padding="0">
+          <BirdoNavRow
+            title="Split Tunneling"
+            subtitle="Choose which apps bypass the VPN and connect directly."
+            leadingIcon={Split}
+            leadingTint={white.w60}
+            onClick={() => pushRoute('splitTunnel')}
+          />
           <BirdoNavRow
             title="Port Forwarding"
             subtitle="Forward external ports to your device for gaming, torrents, or servers."
