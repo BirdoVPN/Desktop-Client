@@ -45,21 +45,21 @@ export function BirdoTextField({
   const isPassword = type === 'password';
   const inputType = isPassword ? (revealed ? 'text' : 'password') : type;
 
-  // Neutral focus: a brighter white border on focus (no purple, no glow ring),
-  // red on error. The subtle fill change + inner highlight give it depth without
-  // the coloured glow.
+  // Focus = a soft, layered brand-violet glow (a brighter violet edge + a tight
+  // ring + an outer bloom). Error = red. Otherwise a calm hairline. The glow
+  // makes the active field unmistakable without a hard outline.
   const borderColor = error
     ? status.red
     : focused
-    ? 'rgba(255,255,255,0.30)'
+    ? 'rgba(168,85,247,0.55)'
     : disabled
     ? 'rgba(255,255,255,0.05)'
     : 'rgba(255,255,255,0.10)';
 
-  // No coloured focus glow — only a faint red ring on error; otherwise just a
-  // gentle inner top highlight at all times.
   const boxShadow = error
-    ? '0 0 0 3px rgba(248,113,113,0.14)'
+    ? '0 0 0 3px rgba(248,113,113,0.16), inset 0 1px 0 rgba(255,255,255,0.04)'
+    : focused
+    ? '0 0 0 3px rgba(168,85,247,0.16), 0 0 22px -2px rgba(168,85,247,0.45), inset 0 1px 0 rgba(255,255,255,0.06)'
     : 'inset 0 1px 0 rgba(255,255,255,0.04)';
 
   return (
@@ -97,11 +97,12 @@ export function BirdoTextField({
           aria-label={ariaLabel ?? label}
           aria-invalid={error ? 'true' : undefined}
           autoComplete={autoComplete}
-          className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[color:var(--placeholder)] disabled:cursor-not-allowed"
+          className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[color:var(--placeholder)] disabled:cursor-not-allowed"
           style={{
             color: focused ? white.w100 : white.w80,
-            // expose placeholder color to the pseudo-element
-            ['--placeholder' as string]: white.w20,
+            // expose placeholder color to the pseudo-element (clearer than w20
+            // so the hint text is legible, not a ghost)
+            ['--placeholder' as string]: 'rgba(255,255,255,0.34)',
           }}
         />
         {isPassword && (

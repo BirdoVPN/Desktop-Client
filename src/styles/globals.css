@@ -195,9 +195,11 @@ input {
 }
 
 .glass-input:focus {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(255, 255, 255, 0.2);
-  box-shadow: 0 0 20px rgba(168, 85, 247, 0.15);
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(168, 85, 247, 0.55);
+  box-shadow:
+    0 0 0 3px rgba(168, 85, 247, 0.16),
+    0 0 22px -2px rgba(168, 85, 247, 0.42);
 }
 
 /* Button hover effect */
@@ -441,10 +443,31 @@ input {
   }
 }
 
-/* Focus-visible outlines for keyboard navigation */
+/* Focus-visible: keyboard-nav ring for non-text controls (buttons, links).
+   A clean violet ring — only shows for keyboard users, never on mouse click. */
 :focus-visible {
-  outline: 2px solid rgba(168, 85, 247, 0.8);
+  outline: 2px solid rgba(168, 85, 247, 0.7);
   outline-offset: 2px;
+}
+
+/* Text fields glow softly in brand violet on focus instead of a hard outline. */
+input:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: rgba(168, 85, 247, 0.55);
+  box-shadow:
+    0 0 0 3px rgba(168, 85, 247, 0.16),
+    0 0 18px -2px rgba(168, 85, 247, 0.42);
+}
+
+/* BirdoTextField wraps its <input> in a styled shell that carries the focus
+   glow, so the bare inner input opts out — otherwise the glow would render as a
+   rectangle INSIDE the field box. The shell's own glow is the focus indicator. */
+.birdo-field-input:focus,
+.birdo-field-input:focus-visible {
+  outline: none;
+  border-color: transparent;
+  box-shadow: none;
 }
 
 /* Light mode adjustments for glass elements */
