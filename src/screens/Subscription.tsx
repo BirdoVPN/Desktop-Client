@@ -138,7 +138,6 @@ interface RustSubscription {
   expires_at: string | null;
   devices_used: number;
   devices_limit: number;
-  bandwidth_used: number;
   bandwidth_limit: number | null;
 }
 

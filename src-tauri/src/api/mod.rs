@@ -4,6 +4,7 @@
 
 pub mod cert_pin;
 pub mod client;
+pub mod doh_resolver;
 pub mod endpoints;
 pub mod error;
 pub mod types;

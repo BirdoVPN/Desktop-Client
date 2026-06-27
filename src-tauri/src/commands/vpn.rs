@@ -258,10 +258,17 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         .as_ref()
         .map(|s| s.quantum_protection)
         .unwrap_or(false);
+    // Lockdown (always-on kill switch) — OFF by default; needs device verification
+    // before being enabled (see wfp::LOCKDOWN_MODE).
+    let lockdown_mode = settings
+        .as_ref()
+        .map(|s| s.lockdown_mode)
+        .unwrap_or(false);
 
     #[cfg(target_os = "windows")]
     {
         crate::vpn::wfp::set_local_network_sharing(local_network_sharing);
+        crate::vpn::wfp::set_lockdown_mode(lockdown_mode);
         if split_tunneling_enabled && !split_tunnel_apps.is_empty() {
             crate::vpn::wfp::set_split_tunnel_apps(split_tunnel_apps).await;
         } else {
@@ -640,6 +647,15 @@ pub async fn connect_vpn(
         .await
         .map_err(|e| sanitize_error(&format!("Connection failed: {}", e)))?;
 
+    // AUDIT-2026-06-19 FIX (CRITICAL): now that the tunnel is up, arm the kill
+    // switch so an unexpected drop fails CLOSED — the auto-reconnect health loop
+    // installs the WFP block-all during the reconnect gap (it previously
+    // short-circuited because the kill switch was never armed). Best-effort: a
+    // failure to arm must not tear down a working tunnel.
+    if let Err(e) = crate::commands::killswitch::arm().await {
+        tracing::warn!("Failed to arm kill switch after connect: {}", e);
+    }
+
     // Wire up auto-reconnect: store reconnect info and start health monitoring
     auto_reconnect.clear_user_disconnected();
     auto_reconnect
@@ -704,6 +720,11 @@ pub async fn disconnect_vpn(
         .disconnect()
         .await
         .map_err(|e| sanitize_error(&format!("Disconnect failed: {}", e)))?;
+
+    // AUDIT-2026-06-19 FIX: disarm the kill switch on user-initiated disconnect so
+    // the WFP block-all filters (if active) are removed and the machine is never
+    // stranded behind the firewall. Best-effort; disarm() logs its own failures.
+    let _ = crate::commands::killswitch::disarm().await;
 
     tracing::info!("VPN disconnected");
     Ok(true)
@@ -934,6 +955,12 @@ pub async fn quick_connect(
         .await
         .map_err(|e| sanitize_error(&format!("Connection failed: {}", e)))?;
 
+    // AUDIT-2026-06-19 FIX (CRITICAL): arm the kill switch once the tunnel is up
+    // so a drop fails closed (see connect_vpn for the full rationale).
+    if let Err(e) = crate::commands::killswitch::arm().await {
+        tracing::warn!("Failed to arm kill switch after quick-connect: {}", e);
+    }
+
     // Wire up auto-reconnect for quick-connect too
     auto_reconnect.clear_user_disconnected();
     auto_reconnect
@@ -970,14 +997,6 @@ pub(crate) fn parse_endpoint_ip(endpoint: &str) -> Option<std::net::Ipv4Addr> {
     host.parse::<std::net::Ipv4Addr>().ok()
 }
 
-/// Measure latency to the connected VPN server
-#[tauri::command]
-pub async fn measure_vpn_latency(
-    vpn_manager: State<'_, VpnManager>,
-) -> Result<Option<u32>, String> {
-    Ok(vpn_manager.measure_latency().await)
-}
-
 /// Get subscription status from the API
 #[tauri::command]
 pub async fn get_subscription_status(
@@ -999,37 +1018,6 @@ pub async fn get_subscription_status(
     api.get_subscription()
         .await
         .map_err(|e| sanitize_error(&format!("Failed to get subscription: {}", e)))
-}
-
-/// Get detailed kill switch / firewall status
-#[tauri::command]
-pub fn get_wfp_status() -> serde_json::Value {
-    #[cfg(target_os = "windows")]
-    {
-        let status = crate::vpn::wfp::get_status();
-        tracing::debug!(
-            "WFP status: initialized={}, active={}, method={}",
-            crate::vpn::wfp::is_initialized(),
-            status.active,
-            status.method
-        );
-        serde_json::to_value(status).unwrap_or_default()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let (method, active) = if cfg!(target_os = "macos") {
-            ("pf", false)
-        } else if cfg!(target_os = "linux") {
-            ("iptables", crate::vpn::firewall_linux::is_blocking())
-        } else {
-            ("none", false)
-        };
-        serde_json::json!({
-            "active": active,
-            "method": method,
-            "initialized": false
-        })
-    }
 }
 
 // Multi-hop and port forwarding commands extracted to vpn_multi_hop.rs and vpn_port_forward.rs

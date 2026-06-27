@@ -20,6 +20,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  XRAY_VERSION: v26.2.6
+  # SHA2-256 of the official Xray-core v26.2.6 Linux x86_64 release zip
+  # (from Xray-linux-64.zip.dgst). Mirrors the Windows pipeline's pin.
+  XRAY_LINUX_SHA256: 29ce535b56e207a406ffa1c2d4842dcc410be003eff8ec508bb732abc9f8e385
 
 jobs:
   build-linux:
@@ -71,10 +75,35 @@ jobs:
           mkdir -p src-tauri/resources
           touch src-tauri/resources/.gitkeep
 
+      # Download + SHA-verify + bundle the pinned Xray Reality engine, mirroring
+      # the Windows pipeline. Without this the release fails closed: xray.rs
+      # refuses to exec an unverified binary and XRAY_BINARY_SHA256 stays unset.
+      - name: Download pinned Xray Reality engine
+        run: |
+          set -euo pipefail
+          XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
+          ZIP_PATH="${RUNNER_TEMP}/xray-linux-64.zip"
+          curl -fsSL "$XRAY_URL" -o "$ZIP_PATH"
+          ACTUAL=$(sha256sum "$ZIP_PATH" | awk '{print $1}')
+          if [ "$ACTUAL" != "$XRAY_LINUX_SHA256" ]; then
+            echo "::error::Xray zip SHA256 mismatch. Expected $XRAY_LINUX_SHA256, got $ACTUAL"
+            exit 1
+          fi
+          unzip -o "$ZIP_PATH" -d "${RUNNER_TEMP}/xray"
+          install -m 0755 "${RUNNER_TEMP}/xray/xray" src-tauri/resources/xray
+          BINARY_SHA=$(sha256sum src-tauri/resources/xray | awk '{print $1}')
+          echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
+          echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
+
       - name: Build Tauri application
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
+          # the shipped binary (owner sets the SENTRY_DSN repo secret).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
+          XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
         run: npx tauri build --target ${{ matrix.arch }}
 
       # ── Sigstore keyless signing ──────────────────────────────────────

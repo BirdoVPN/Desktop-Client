@@ -127,9 +127,11 @@ pub async fn disable_killswitch(vpn_manager: State<'_, VpnManager>) -> Result<bo
     Ok(true)
 }
 
-/// Activate the kill switch (block all non-VPN traffic)
-/// Called automatically when VPN disconnects unexpectedly
-#[tauri::command]
+/// Activate the kill switch (block all non-VPN traffic).
+///
+/// DT-7: Not a Tauri IPC command — called internally by the auto-reconnect
+/// service when the VPN drops unexpectedly. Kept as a plain async fn to shrink
+/// the IPC attack surface (the frontend never invoked it).
 pub async fn activate_killswitch() -> Result<bool, String> {
     if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
         return Ok(false);
@@ -172,9 +174,11 @@ pub async fn activate_killswitch() -> Result<bool, String> {
     Ok(true)
 }
 
-/// Deactivate the kill switch (restore normal traffic)
-/// Called when VPN connects successfully
-#[tauri::command]
+/// Deactivate the kill switch (restore normal traffic).
+///
+/// DT-7: Not a Tauri IPC command — called internally by the auto-reconnect
+/// service when the VPN reconnects. Kept as a plain async fn (the frontend
+/// never invoked it).
 pub async fn deactivate_killswitch() -> Result<bool, String> {
     tracing::info!("Deactivating kill switch - restoring normal traffic");
 
@@ -240,6 +244,116 @@ pub async fn set_vpn_server_ip(ip: Option<Ipv4Addr>) {
 /// Check if kill switch is currently enabled
 pub fn is_enabled() -> bool {
     KILLSWITCH_ENABLED.load(Ordering::SeqCst)
+}
+
+/// Whether the kill switch is in lockdown (always-on) mode. Cross-platform
+/// accessor used by the auto-reconnect loop so it keeps the block active
+/// continuously instead of deactivating in steady Connected state.
+pub fn is_lockdown_mode() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        wfp::is_lockdown_mode()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Arm the kill switch for an active VPN session.
+///
+/// AUDIT-2026-06-19 FIX (CRITICAL): the WFP kill switch was effectively dead.
+/// `enable_killswitch` — the ONLY setter of `KILLSWITCH_ENABLED` and the only
+/// caller of `wfp::initialize` — is registered as an IPC command (main.rs) but
+/// was never invoked by the frontend or at startup. So `KILLSWITCH_ENABLED`
+/// stayed `false` for the whole session and `activate_killswitch()` (called by
+/// the auto-reconnect health loop on a drop) short-circuited to `Ok(false)`,
+/// installing NO block-all filters. On an unexpected tunnel drop the OS routing
+/// table fell back to the physical adapter and IPv4 traffic egressed in the
+/// clear — while the UI promised an always-on kill switch.
+///
+/// This arms the INTENT and initializes the WFP engine as part of the connect
+/// lifecycle, so the existing reactive protection actually engages. It does NOT
+/// install the block-all filters itself: the auto-reconnect health loop owns the
+/// activate/deactivate transitions (it deactivates while healthy-Connected and
+/// activates during a drop/reconnect gap), so arming here must not fight that
+/// state machine.
+///
+/// Best-effort: a non-elevated host (should not happen — the app manifest
+/// requires administrator) logs and returns `Ok(false)` rather than failing the
+/// whole connection.
+pub async fn arm() -> Result<bool, String> {
+    if !is_elevated() {
+        tracing::warn!("Kill switch NOT armed: insufficient privileges (admin/root required)");
+        return Ok(false);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        wfp::initialize()
+            .await
+            .map_err(|e| format!("Failed to initialize kill-switch firewall: {}", e))?;
+    }
+
+    KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+
+    // LOCKDOWN (always-on) mode: activate the block-all NOW and keep it on for
+    // the whole session, so there is ZERO reactive detection window. (Reactive
+    // mode — the default — leaves the block off in steady state and only
+    // activates during a reconnect gap.) The tunnel is already up by the time
+    // arm() runs on the connect path, so its interface LUID is published and
+    // activate_blocking can permit tunneled traffic; if it cannot, it fails
+    // loudly rather than blocking the user's own traffic.
+    #[cfg(target_os = "windows")]
+    if wfp::is_lockdown_mode() {
+        if let Err(e) = activate_killswitch().await {
+            tracing::error!(
+                "Lockdown activation failed ({}) — leaving kill switch disarmed for safety",
+                e
+            );
+            KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        tracing::info!("Kill switch armed in LOCKDOWN (always-on) mode");
+        return Ok(true);
+    }
+
+    tracing::info!("Kill switch armed for active session (reactive)");
+    Ok(true)
+}
+
+/// Disarm the kill switch when the user ends the session: clear the intent flag
+/// and remove all firewall filters so connectivity is fully restored.
+///
+/// Always safe to call (no-op if never armed). MUST be called from the
+/// user-initiated disconnect path so disconnecting can never strand the machine
+/// behind an active block-all filter set.
+pub async fn disarm() -> Result<(), String> {
+    KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = wfp::cleanup().await {
+            tracing::warn!("Failed to clean up WFP filters on disarm: {}", e);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = pf_deactivate_blocking().await {
+            tracing::warn!("Failed to remove pf rules on disarm: {}", e);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = firewall_linux::deactivate_blocking().await {
+            tracing::warn!("Failed to remove iptables rules on disarm: {}", e);
+        }
+    }
+
+    tracing::info!("Kill switch disarmed");
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────

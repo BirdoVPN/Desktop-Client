@@ -3,7 +3,7 @@
  *
  * Mirrors mobile's BirdoNavGraph.kt: a 3-tab bottom nav (Profile / Connect /
  * Settings) hosting tab roots, with slide-in push sub-screens layered on top
- * (VpnSettings, SplitTunnel, PortForward, Subscription, ServerList).
+ * (VpnSettings, SplitTunnel, PortForward, Subscription).
  *
  * Visually: the whole Tauri window is pure black (with PixelCanvas behind, owned
  * by App.tsx); this shell renders a centered ~420px column so the desktop app
@@ -22,14 +22,12 @@ import { PixelCanvas } from '@/components/PixelCanvas';
 import { Dashboard } from '@/components/Dashboard';
 import { Profile } from '@/screens/Profile';
 import { Settings } from '@/components/Settings';
-import { ServerListScreen } from '@/screens/ServerList';
 import { VpnSettings } from '@/screens/VpnSettings';
 import { SplitTunnel } from '@/screens/SplitTunnel';
 import { PortForward } from '@/screens/PortForward';
 import { Subscription } from '@/screens/Subscription';
 
 const PUSH_SCREENS: Record<RouteId, React.ComponentType> = {
-  serverList: ServerListScreen,
   vpnSettings: VpnSettings,
   splitTunnel: SplitTunnel,
   portForward: PortForward,

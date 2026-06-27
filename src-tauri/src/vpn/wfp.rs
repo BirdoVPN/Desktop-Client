@@ -60,7 +60,7 @@
 //!      `FwpmTransactionBegin0` / `FwpmTransactionCommit0` pair.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -101,6 +101,30 @@ static SPLIT_TUNNEL_APPS: once_cell::sync::Lazy<Arc<RwLock<Vec<String>>>> =
 
 /// Whether local network sharing (RFC1918) is permitted through the kill switch.
 static LOCAL_NETWORK_SHARING: AtomicBool = AtomicBool::new(false);
+
+/// LOCKDOWN ("always-on") MODE — gated behind a user setting, OFF by default.
+///
+/// When false (default): the kill switch is REACTIVE — the block-all is only
+/// installed during a reconnect gap, and steady-state Connected traffic is
+/// contained by routing. Small (~5-30s) detection window on a drop, but the
+/// block is never active during normal browsing, so it cannot mis-block.
+///
+/// When true: Mullvad-style ALWAYS-ON. The block-all stays installed the whole
+/// time the tunnel is up, and an INTERFACE-scoped permit on the tunnel adapter
+/// LUID (see TUNNEL_LUID / add_permit_tunnel_interface) lets tunneled traffic
+/// through while everything on the physical NIC stays blocked — so there is NO
+/// leak window, including across reconnects. This is the correct zero-window
+/// design, but it MUST be device-verified before being enabled by default: an
+/// always-on block that mis-resolves the tunnel LUID would block the user's own
+/// tunneled traffic. The dynamic WFP session still guarantees crash-safety
+/// (filters auto-removed if the process dies).
+static LOCKDOWN_MODE: AtomicBool = AtomicBool::new(false);
+
+/// The WireGuard tunnel adapter's interface LUID, published by the tunnel layer
+/// once the Wintun adapter exists (0 = unknown). Lockdown mode permits all
+/// traffic egressing this interface so tunneled browsing keeps working under the
+/// always-on block-all.
+static TUNNEL_LUID: AtomicU64 = AtomicU64::new(0);
 
 /// Engine state protected by a standard mutex (WFP calls are blocking FFI,
 /// not async, so a tokio mutex would add unnecessary overhead).
@@ -632,6 +656,44 @@ impl WfpEngine {
         Ok(())
     }
 
+    /// LOCKDOWN: permit ALL outbound traffic that egresses the tunnel (Wintun)
+    /// interface, matched by its interface LUID. This is the load-bearing
+    /// primitive for always-on mode: it lets tunneled traffic through while a
+    /// block-all on the physical NIC stays in force, so there is no leak window.
+    /// Call once per ALE layer (v4 and v6).
+    ///
+    /// `IP_LOCAL_INTERFACE` matches on the 64-bit interface LUID (FWP_UINT64).
+    fn add_permit_tunnel_interface(
+        &mut self,
+        luid: u64,
+        layer: GUID,
+        label: &str,
+    ) -> Result<(), String> {
+        let name = wide_nul(label);
+        // The condition value holds a POINTER to the u64; keep it alive until
+        // add_filter() copies the filter into WFP (same pattern as the
+        // V4_ADDR_AND_MASK in add_permit_vpn_server).
+        let mut luid_val: u64 = luid;
+
+        let mut condition = FWPM_FILTER_CONDITION0::default();
+        condition.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
+        condition.matchType = FWP_MATCH_EQUAL;
+        condition.conditionValue.r#type = FWP_UINT64;
+        condition.conditionValue.Anonymous.uint64 = &mut luid_val;
+
+        let mut filter = self.make_base_filter(
+            &name,
+            layer,
+            FWP_ACTION_PERMIT,
+            WEIGHT_PERMIT,
+        );
+        filter.numFilterConditions = 1;
+        filter.filterCondition = &mut condition;
+
+        self.add_filter(&filter)?;
+        Ok(())
+    }
+
     /// Block WebRTC STUN/TURN ports to prevent IP leak via WebRTC.
     /// - UDP 3478-3497 (standard STUN/TURN)
     /// - TCP 3478-3497 (TURN over TCP)
@@ -952,6 +1014,68 @@ pub async fn activate_blocking() -> Result<(), String> {
             tracing::debug!("VPN server {} permitted through kill switch", ip);
         }
 
+        // CRITICAL (AUDIT-2026-06-19): permit the Birdo client's OWN process.
+        //
+        // The kill switch's block-all is active during the reconnect gap, but
+        // auto-reconnect must reach api.birdo.app — over the PHYSICAL adapter,
+        // since the tunnel is down — to fetch a fresh config, and that control
+        // plane is NOT the VPN server /32. Without this permit, arming the kill
+        // switch blocks auto-reconnect's own API call and reconnect can never
+        // succeed. Permitting our own executable lets the client's cert-pinned
+        // control-plane HTTPS, its DoH lookups, and its in-process WireGuard
+        // socket through, while every OTHER application stays blocked — so user
+        // traffic still cannot leak. (We bypass the kill switch only for the VPN
+        // client itself, which is exactly the process that must keep talking to
+        // the VPN infrastructure to restore the tunnel.)
+        match std::env::current_exe().ok().and_then(|p| p.to_str().map(String::from)) {
+            Some(self_exe) => {
+                let v4 = engine.add_permit_app(&self_exe)?;
+                if v4 != 0 {
+                    let _ = engine.add_permit_app_v6(&self_exe)?;
+                }
+                tracing::info!("Kill switch: permitted own process for control-plane / reconnect access");
+            }
+            None => {
+                // Fail loud but do not abort the whole transaction: a kill switch
+                // that cannot self-permit will break reconnect, but we still want
+                // user traffic blocked. Surface it so it is not silent.
+                tracing::error!(
+                    "Kill switch: could NOT determine own exe path — reconnect may be blocked while the kill switch is active"
+                );
+            }
+        }
+
+        // LOCKDOWN (always-on): permit the tunnel interface so tunneled traffic
+        // flows while the block-all on the physical NIC stays in force. This is
+        // what makes a continuously-active block-all safe — without it, an
+        // always-on block would block the user's own tunneled browsing. We refuse
+        // to install the block in lockdown if the tunnel LUID is unknown (aborts
+        // the transaction → no filters), rather than silently block everything.
+        if LOCKDOWN_MODE.load(Ordering::SeqCst) {
+            let luid = TUNNEL_LUID.load(Ordering::SeqCst);
+            if luid == 0 {
+                return Err(
+                    "Lockdown mode: tunnel interface LUID unknown — refusing to install \
+                     block-all without a tunnel-interface permit (would block tunneled traffic)"
+                        .to_string(),
+                );
+            }
+            engine.add_permit_tunnel_interface(
+                luid,
+                FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                "Birdo: Permit tunnel interface (v4)",
+            )?;
+            engine.add_permit_tunnel_interface(
+                luid,
+                FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                "Birdo: Permit tunnel interface (v6)",
+            )?;
+            tracing::info!(
+                "Lockdown: permitted tunnel interface LUID {} (zero-window always-on)",
+                luid
+            );
+        }
+
         // Local network sharing: permit RFC1918 private ranges
         if LOCAL_NETWORK_SHARING.load(Ordering::SeqCst) {
             engine.add_permit_local_networks()?;
@@ -1113,7 +1237,15 @@ pub async fn unblock_ipv6() -> Result<(), String> {
 pub async fn update_vpn_server(ip: Ipv4Addr) -> Result<(), String> {
     set_vpn_server(ip).await;
 
-    if IS_BLOCKING.load(Ordering::SeqCst) {
+    // In LOCKDOWN mode, do NOT re-activate here: this is called on the connect
+    // path BEFORE the new tunnel exists, so TUNNEL_LUID still holds the OLD
+    // (about-to-be-freed) adapter's LUID — re-activating now would permit a stale
+    // interface LUID that Windows may reassign to a physical NIC. Re-activation
+    // in lockdown is driven by the tunnel layer once the NEW adapter publishes
+    // its LUID (see tunnel.rs configure_adapter), so the active block always
+    // permits the CURRENT tunnel interface. Reactive mode re-activates here as
+    // before to swap the server permit.
+    if IS_BLOCKING.load(Ordering::SeqCst) && !LOCKDOWN_MODE.load(Ordering::SeqCst) {
         // Re-activate atomically with the new VPN server IP
         activate_blocking().await?;
         tracing::info!("Updated VPN server permit: {}", ip);
@@ -1128,8 +1260,39 @@ pub fn is_blocking() -> bool {
 }
 
 /// Check if the kill switch is initialized.
+///
+/// DT-6: the `get_wfp_status` IPC command that read this was removed (never
+/// invoked from the UI). Kept as a public status accessor alongside
+/// `is_blocking`; allow dead_code until a caller is re-added.
+#[allow(dead_code)]
 pub fn is_initialized() -> bool {
     IS_INITIALIZED.load(Ordering::SeqCst)
+}
+
+/// Enable/disable lockdown (always-on) mode. Takes effect on the next
+/// `activate_blocking()`. Driven by the `lockdown_mode` user setting (OFF by
+/// default). See LOCKDOWN_MODE for the full semantics.
+pub fn set_lockdown_mode(enabled: bool) {
+    LOCKDOWN_MODE.store(enabled, Ordering::SeqCst);
+    tracing::info!("Kill switch lockdown (always-on) mode set to: {}", enabled);
+}
+
+/// Whether lockdown (always-on) mode is enabled.
+pub fn is_lockdown_mode() -> bool {
+    LOCKDOWN_MODE.load(Ordering::SeqCst)
+}
+
+/// Publish the tunnel adapter's interface LUID (from the tunnel layer once the
+/// Wintun adapter exists). Lockdown mode permits this interface so tunneled
+/// traffic flows under the always-on block-all.
+pub fn set_tunnel_luid(luid: u64) {
+    TUNNEL_LUID.store(luid, Ordering::SeqCst);
+    tracing::debug!("Kill switch tunnel LUID set to: {}", luid);
+}
+
+/// Clear the published tunnel LUID (on tunnel teardown).
+pub fn clear_tunnel_luid() {
+    TUNNEL_LUID.store(0, Ordering::SeqCst);
 }
 
 /// Clean up and release all resources.
@@ -1158,6 +1321,10 @@ pub async fn cleanup() -> Result<(), String> {
 }
 
 /// Get kill switch status for display.
+///
+/// DT-6: previously surfaced via the removed `get_wfp_status` IPC command.
+/// Kept as a public status accessor; allow dead_code until a caller is re-added.
+#[allow(dead_code)]
 pub fn get_status() -> KillSwitchStatus {
     KillSwitchStatus {
         initialized: IS_INITIALIZED.load(Ordering::SeqCst),
@@ -1195,160 +1362,6 @@ pub async fn set_split_tunnel_apps(app_names: Vec<String>) {
 
     let mut apps = SPLIT_TUNNEL_APPS.write().await;
     *apps = resolved_paths;
-}
-
-/// Add a dynamic split tunnel permit for a specific application.
-///
-/// - Resolves the app path (accepts short names like "chrome.exe" or full paths).
-/// - Adds to `SPLIT_TUNNEL_APPS` so the app persists across kill switch rebuilds.
-/// - If the kill switch is currently blocking, immediately installs WFP filters.
-/// - Returns a permit ID (the V4 filter ID) that can be used with
-///   `remove_split_tunnel_permit`. Returns 0 if the kill switch is not active
-///   (the app is queued and will be applied when blocking activates).
-pub async fn add_split_tunnel_permit(app_path: String) -> Result<u64, String> {
-    let resolved = resolve_app_path(&app_path)
-        .ok_or_else(|| format!("Could not resolve app path: {}", app_path))?;
-
-    // Add to persistent list so it survives kill switch rebuilds
-    {
-        let mut apps = SPLIT_TUNNEL_APPS.write().await;
-        if !apps.contains(&resolved) {
-            apps.push(resolved.clone());
-        }
-    }
-
-    // If kill switch is not active, just queue — filters will be added on next activate
-    if !IS_BLOCKING.load(Ordering::SeqCst) {
-        tracing::info!(
-            "Split tunnel: queued '{}' (kill switch not active)",
-            resolved
-        );
-        return Ok(0);
-    }
-
-    if !IS_INITIALIZED.load(Ordering::SeqCst) {
-        return Err("Kill switch not initialized".to_string());
-    }
-
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
-    let engine = guard.as_mut().ok_or("WFP engine not open")?;
-
-    let v4_id = engine.add_permit_app(&resolved)?;
-    if v4_id == 0 {
-        return Err(format!("Failed to create WFP app ID for: {}", resolved));
-    }
-
-    let mut ids = vec![v4_id];
-    let v6_id = engine.add_permit_app_v6(&resolved)?;
-    if v6_id != 0 {
-        ids.push(v6_id);
-    }
-
-    engine
-        .split_tunnel_map
-        .insert(v4_id, (resolved.clone(), ids));
-    tracing::info!(
-        "Split tunnel permit added for '{}' (permit_id={})",
-        resolved,
-        v4_id
-    );
-
-    Ok(v4_id)
-}
-
-/// Remove a specific split tunnel permit by its permit ID.
-///
-/// Removes the WFP filters and also removes the app from `SPLIT_TUNNEL_APPS`.
-pub async fn remove_split_tunnel_permit(permit_id: u64) -> Result<(), String> {
-    if permit_id == 0 {
-        return Err("Invalid permit ID (0)".to_string());
-    }
-
-    if !IS_INITIALIZED.load(Ordering::SeqCst) {
-        return Err("Kill switch not initialized".to_string());
-    }
-
-    let app_to_remove;
-
-    {
-        let mut guard = ENGINE
-            .lock()
-            .map_err(|e| format!("engine lock poisoned: {}", e))?;
-        let engine = guard.as_mut().ok_or("WFP engine not open")?;
-
-        let (app_path, filter_ids) = engine
-            .split_tunnel_map
-            .remove(&permit_id)
-            .ok_or_else(|| format!("Split tunnel permit {} not found", permit_id))?;
-
-        for id in &filter_ids {
-            // SAFETY: `engine.handle` is a valid WFP engine handle.
-            // `id` was returned by a prior successful `FwpmFilterAdd0` call.
-            let err = unsafe { FwpmFilterDeleteById0(engine.handle, *id) };
-            // 0x80320003 = FWP_E_FILTER_NOT_FOUND — benign
-            if err != 0 && err != 0x80320003 {
-                tracing::warn!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
-            }
-            engine.filter_ids.retain(|&fid| fid != *id);
-        }
-
-        app_to_remove = app_path;
-    } // guard dropped — safe to acquire async lock
-
-    {
-        let mut apps = SPLIT_TUNNEL_APPS.write().await;
-        apps.retain(|a| a != &app_to_remove);
-    }
-
-    tracing::info!(
-        "Split tunnel permit removed for '{}' (permit_id={})",
-        app_to_remove,
-        permit_id
-    );
-    Ok(())
-}
-
-/// Remove all split tunnel permits.
-///
-/// Clears `SPLIT_TUNNEL_APPS` and removes all tracked split tunnel WFP filters.
-pub async fn clear_split_tunnel_permits() -> Result<(), String> {
-    // Clear the persistent list
-    {
-        let mut apps = SPLIT_TUNNEL_APPS.write().await;
-        apps.clear();
-    }
-
-    if !IS_INITIALIZED.load(Ordering::SeqCst) {
-        return Ok(()); // Nothing to clean up in WFP
-    }
-
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
-    if let Some(engine) = guard.as_mut() {
-        let entries: Vec<(u64, Vec<u64>)> = engine
-            .split_tunnel_map
-            .drain()
-            .map(|(k, (_, ids))| (k, ids))
-            .collect();
-
-        for (permit_id, filter_ids) in entries {
-            for id in &filter_ids {
-                // SAFETY: `engine.handle` is a valid WFP engine handle.
-                let err = unsafe { FwpmFilterDeleteById0(engine.handle, *id) };
-                if err != 0 && err != 0x80320003 {
-                    tracing::warn!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
-                }
-                engine.filter_ids.retain(|&fid| fid != *id);
-            }
-            tracing::debug!("Cleared split tunnel permit_id={}", permit_id);
-        }
-    }
-
-    tracing::info!("All split tunnel permits cleared");
-    Ok(())
 }
 
 /// Resolve an app name or path to a full executable path.

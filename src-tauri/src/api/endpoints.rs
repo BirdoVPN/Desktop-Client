@@ -73,12 +73,6 @@ pub mod vpn {
         format!("/vpn/heartbeat/{}", encode_segment(key_id))
     }
 
-    /// Returns the path for rotating the WireGuard key of an active connection
-    #[allow(dead_code)] // Used by ApiClient::rotate_key (reserved auto-rotate surface)
-    pub fn rotate_key(key_id: &str) -> String {
-        format!("/vpn/connections/{}/rotate", encode_segment(key_id))
-    }
-
     /// P2-15: Client quality telemetry reporting endpoint
     pub const QUALITY_REPORT: &str = "/vpn/quality-report";
 }

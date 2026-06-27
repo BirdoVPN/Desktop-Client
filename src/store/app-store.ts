@@ -69,7 +69,6 @@ export type WindowCorner =
 // ── Navigation (mobile-parity 3-tab bottom nav + push sub-screens) ──────────
 export type TabId = 'profile' | 'home' | 'settings';
 export type RouteId =
-  | 'serverList'
   | 'vpnSettings'
   | 'splitTunnel'
   | 'portForward'
@@ -185,12 +184,8 @@ interface AppState {
   // Actions — Settings
   updateSettings: (settings: Partial<AppSettings>) => void;
   hydrateSettings: (settings: AppSettings) => void;
-  setKillSwitch: (enabled: boolean) => void;
-  setAutoConnect: (enabled: boolean) => void;
-  setNotifications: (enabled: boolean) => void;
 
   // Actions — Multi-Hop & Port Forwarding
-  setMultiHopRoutes: (routes: MultiHopRoute[]) => void;
   setPortForwards: (forwards: PortForward[]) => void;
 
   // Network
@@ -216,7 +211,6 @@ interface AppState {
   setTab: (tab: TabId) => void;
   pushRoute: (route: RouteId) => void;
   popRoute: () => void;
-  resetNav: () => void;
 
   // Actions — Logout
   logout: () => void;
@@ -290,7 +284,6 @@ export const useAppStore = create<AppState>()(
         set((state) => ({ navStack: [...state.navStack, route] })),
       popRoute: () =>
         set((state) => ({ navStack: state.navStack.slice(0, -1) })),
-      resetNav: () => set({ tab: 'home', navStack: [] }),
 
       connectionState: 'disconnected' as ConnectionState,
       currentServer: null,
@@ -379,22 +372,7 @@ export const useAppStore = create<AppState>()(
           settingsHydrated: true,
         })),
 
-      // Settings shortcuts
-      setKillSwitch: (enabled) =>
-        set((state) => ({
-          settings: { ...state.settings, killSwitchEnabled: enabled },
-        })),
-      setAutoConnect: (enabled) =>
-        set((state) => ({
-          settings: { ...state.settings, autoConnect: enabled },
-        })),
-      setNotifications: (enabled) =>
-        set((state) => ({
-          settings: { ...state.settings, notifications: enabled },
-        })),
-
       // Multi-Hop & Port Forwarding actions
-      setMultiHopRoutes: (routes) => set({ multiHopRoutes: routes }),
       setPortForwards: (forwards) => set({ portForwards: forwards }),
 
       // Logout

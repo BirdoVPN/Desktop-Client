@@ -310,7 +310,6 @@ fn main() {
             commands::auth::login_anonymous,
             commands::auth::logout,
             commands::auth::get_auth_state,
-            commands::auth::refresh_token,
             commands::auth::verify_2fa, // FIX C-2: 2FA TOTP verification
             commands::auth::delete_account, // GDPR account deletion
             commands::auth::export_user_data, // GDPR data export
@@ -335,22 +334,13 @@ fn main() {
             // Kill switch
             commands::killswitch::enable_killswitch,
             commands::killswitch::disable_killswitch,
-            commands::killswitch::activate_killswitch,
-            commands::killswitch::deactivate_killswitch,
             commands::killswitch::get_killswitch_status,
             // Split Tunneling
-            commands::split_tunnel::add_split_tunnel_app,
-            commands::split_tunnel::remove_split_tunnel_app,
-            commands::split_tunnel::clear_split_tunnel_apps,
             commands::split_tunnel::list_installed_apps,
             // Auto-updater
-            commands::updater::check_for_updates,
-            commands::updater::install_update,
             commands::updater::get_app_version,
             // Extended VPN info
-            commands::vpn::measure_vpn_latency,
             commands::vpn::get_subscription_status,
-            commands::vpn::get_wfp_status,
             // Multi-Hop (Double VPN)
             commands::vpn_multi_hop::get_multi_hop_routes,
             commands::vpn_multi_hop::connect_multi_hop,

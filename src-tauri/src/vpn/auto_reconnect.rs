@@ -278,6 +278,20 @@ impl AutoReconnectService {
         let mut quality_tick_count: u32 = 0;
         const QUALITY_EVERY_N_TICKS: u32 = 12;
 
+        // AUDIT-2026-06-19 FIX (HIGH): tunnel liveness watchdog state. The manager
+        // only leaves Connected on an explicit disconnect or a server-invalidated
+        // heartbeat, so a SILENTLY dropped tunnel stayed Connected forever and
+        // auto-reconnect never fired. Detection uses TWO independent signals to be
+        // false-positive-proof: a failed heartbeat (control plane, routed THROUGH
+        // the tunnel) AND flat inbound tunnel payload for RX_STALL_LIMIT ticks
+        // (data plane). See the Connected arm for the full rationale.
+        let mut last_rx: u64 = 0;
+        let mut rx_flat_ticks: u32 = 0;
+        let mut recent_heartbeat_failed = false;
+        // ~30s (6 ticks × 5s) of no inbound payload (paired with a failed
+        // heartbeat) => tunnel is unreachable.
+        const RX_STALL_LIMIT: u32 = 6;
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -306,7 +320,67 @@ impl AutoReconnectService {
                                 attempt_count.store(0, Ordering::SeqCst);
 
                                 // Deactivate kill switch now that we're connected
-                                let _ = killswitch::deactivate_killswitch().await;
+                                // — UNLESS lockdown (always-on) mode is enabled,
+                                // where the block stays active continuously to
+                                // close the reactive detection window.
+                                if !killswitch::is_lockdown_mode() {
+                                    let _ = killswitch::deactivate_killswitch().await;
+                                }
+
+                                // Reset the liveness watchdog — byte counters reset
+                                // to 0 on a fresh connection, so old deltas are stale.
+                                last_rx = 0;
+                                rx_flat_ticks = 0;
+                                recent_heartbeat_failed = false;
+                            }
+
+                            // AUDIT-2026-06-19 FIX (HIGH, hardened after review):
+                            // tunnel liveness watchdog. Detect a SILENTLY dropped
+                            // tunnel (dead peer / expired NAT mapping / broken path)
+                            // that the state machine would otherwise never notice.
+                            // We require TWO independent failure signals so we never
+                            // false-positive on a healthy tunnel:
+                            //   (a) control plane — the most recent heartbeat (an
+                            //       HTTPS call routed THROUGH the tunnel) FAILED; and
+                            //   (b) data plane — zero inbound tunnel payload for
+                            //       ~RX_STALL_LIMIT ticks.
+                            // A healthy-but-idle or upload-only tunnel still answers
+                            // the heartbeat, so (a) is false → no trip. A backend API
+                            // outage with a LIVE tunnel still delivers inbound user
+                            // traffic, so (b) is false → no trip. Only a tunnel that
+                            // is BOTH unreachable AND delivering nothing is treated as
+                            // dead. update_stats() pulls the live tunnel atomics so
+                            // detection does not depend on the UI polling (get_stats
+                            // alone returns a cache the frontend refreshes).
+                            if !is_reconnecting.load(Ordering::SeqCst) {
+                                vpn_manager.update_stats().await;
+                                let rx = vpn_manager.get_stats().await.bytes_received;
+                                if rx == last_rx {
+                                    rx_flat_ticks += 1;
+                                } else {
+                                    rx_flat_ticks = 0;
+                                }
+                                last_rx = rx;
+                                if recent_heartbeat_failed && rx_flat_ticks >= RX_STALL_LIMIT {
+                                    tracing::warn!(
+                                        "Tunnel liveness watchdog: heartbeat failing AND no inbound \
+                                         traffic for ~{}s — treating tunnel as dropped and reconnecting",
+                                        (RX_STALL_LIMIT as u64) * (check_interval / 1000)
+                                    );
+                                    rx_flat_ticks = 0;
+                                    recent_heartbeat_failed = false;
+                                    // Fresh drop → fresh reconnect budget.
+                                    attempt_count.store(0, Ordering::SeqCst);
+                                    let _ = vpn_manager
+                                        .set_state(ConnectionState::Error(
+                                            "Tunnel unreachable (no inbound traffic) — reconnecting"
+                                                .to_string(),
+                                        ))
+                                        .await;
+                                    // Don't run heartbeat/quality this tick against a
+                                    // tunnel we just declared dead.
+                                    continue;
+                                }
                             }
 
                             // FIX-2-13: Periodic heartbeat to backend while connected.
@@ -318,6 +392,10 @@ impl AutoReconnectService {
                                 if let Some(key_id) = vpn_manager.get_key_id().await {
                                     match api.heartbeat(&key_id).await {
                                         Ok(resp) => {
+                                            // The heartbeat reached the server THROUGH
+                                            // the tunnel → the tunnel is alive. Clears
+                                            // the watchdog's control-plane signal.
+                                            recent_heartbeat_failed = false;
                                             if !resp.valid {
                                                 tracing::warn!("Heartbeat: session invalidated by server — disconnecting");
                                                 let _ = vpn_manager.disconnect().await;
@@ -332,6 +410,11 @@ impl AutoReconnectService {
                                             }
                                         }
                                         Err(e) => {
+                                            // AUDIT-2026-06-19: a heartbeat that cannot
+                                            // reach the server (it routes through the
+                                            // tunnel) is one half of the liveness
+                                            // watchdog's dead-tunnel signal.
+                                            recent_heartbeat_failed = true;
                                             tracing::warn!("Heartbeat failed: {}", e);
                                         }
                                     }
@@ -468,6 +551,11 @@ impl AutoReconnectService {
                                                         "Post-quantum engine unavailable during auto-reconnect; refusing downgrade"
                                                     );
                                                     local_private_key.zeroize();
+                                                    // AUDIT-2026-06-19 FIX (stuck-Reconnecting lockout):
+                                                    // reset state so the retry/give-up machine advances
+                                                    // instead of idling in Reconnecting with the kill
+                                                    // switch armed.
+                                                    let _ = vpn_manager.set_state(ConnectionState::Disconnected).await;
                                                     continue;
                                                 }
                                             }
@@ -499,6 +587,8 @@ impl AutoReconnectService {
                                                 ) {
                                                     tracing::error!("Auto-reconnect aborted: {}", e);
                                                     local_private_key.zeroize();
+                                                    // AUDIT-2026-06-19 FIX (stuck-Reconnecting lockout)
+                                                    let _ = vpn_manager.set_state(ConnectionState::Disconnected).await;
                                                     continue;
                                                 }
 
@@ -511,6 +601,8 @@ impl AutoReconnectService {
                                                     Err(e) => {
                                                         tracing::error!("Auto-reconnect stealth setup failed: {}", e);
                                                         local_private_key.zeroize();
+                                                        // AUDIT-2026-06-19 FIX (stuck-Reconnecting lockout)
+                                                        let _ = vpn_manager.set_state(ConnectionState::Disconnected).await;
                                                         continue;
                                                     }
                                                 };
@@ -526,6 +618,8 @@ impl AutoReconnectService {
                                                     Err(e) => {
                                                         tracing::error!("Auto-reconnect PQ setup failed: {}", e);
                                                         local_private_key.zeroize();
+                                                        // AUDIT-2026-06-19 FIX (stuck-Reconnecting lockout)
+                                                        let _ = vpn_manager.set_state(ConnectionState::Disconnected).await;
                                                         continue;
                                                     }
                                                 };
@@ -578,6 +672,15 @@ impl AutoReconnectService {
                                                     }
                                                     Err(e) => {
                                                         tracing::warn!("Auto-reconnect config build failed: {}", e);
+                                                        // AUDIT-2026-06-19 FIX (stuck-Reconnecting lockout):
+                                                        // reset to Disconnected so the next tick retries (or
+                                                        // eventually hits the give-up branch that deactivates
+                                                        // the kill switch). Otherwise state stays Reconnecting
+                                                        // forever and the loop idles in the `_ => {}` arm with
+                                                        // block-all active = lockout.
+                                                        let _ = vpn_manager
+                                                            .set_state(ConnectionState::Disconnected)
+                                                            .await;
                                                     }
                                                 }
                                             }
@@ -585,6 +688,13 @@ impl AutoReconnectService {
                                                 // AR-1 FIX: Zeroize key material on API error path
                                                 local_private_key.zeroize();
                                                 tracing::warn!("Auto-reconnect API call failed on attempt {}: {}", attempts + 1, e);
+                                                // AUDIT-2026-06-19 FIX (stuck-Reconnecting lockout): same
+                                                // as above — return to Disconnected so the retry/give-up
+                                                // state machine keeps advancing instead of idling in
+                                                // Reconnecting with the kill switch armed.
+                                                let _ = vpn_manager
+                                                    .set_state(ConnectionState::Disconnected)
+                                                    .await;
                                             }
                                         }
                                     }
@@ -596,6 +706,13 @@ impl AutoReconnectService {
                                             cfg.max_attempts
                                         );
                                         is_reconnecting.store(false, Ordering::SeqCst);
+                                        // AUDIT-2026-06-19 FIX (lockout regression): deactivate the
+                                        // kill switch when we give up, SYMMETRIC with the Error arm
+                                        // below (line ~698). Without this, arming the (previously
+                                        // dead) kill switch would strand the user behind an active
+                                        // block-all with no automatic recovery after a flaky network
+                                        // exhausted all reconnect attempts.
+                                        let _ = killswitch::deactivate_killswitch().await;
                                     }
                                 }
                             }

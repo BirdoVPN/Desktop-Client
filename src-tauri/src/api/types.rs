@@ -295,8 +295,6 @@ pub struct SubscriptionStatus {
     pub devices_used: u32,
     #[serde(default = "default_one")]
     pub devices_limit: u32,
-    #[serde(default)]
-    pub bandwidth_used: u64,
     pub bandwidth_limit: Option<u64>,
 }
 
@@ -497,19 +495,6 @@ pub struct ServerNodeInfo {
     pub region: String,
     pub country: String,
     pub hostname: String,
-}
-
-/// P3-25: Response from key rotation endpoint
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyRotationResponse {
-    pub success: bool,
-    pub new_key_id: String,
-    pub server_public_key: String,
-    #[serde(default)]
-    pub preshared_key: Option<String>,
-    /// Expiration of the new key (ISO8601)
-    pub expires_at: String,
 }
 
 // ============================================================================

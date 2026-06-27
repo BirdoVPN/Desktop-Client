@@ -36,9 +36,6 @@ export type { BirdoEmptyStateProps } from './EmptyState';
 export { CompactConnectButton } from './CompactConnectButton';
 export type { CompactConnectButtonProps, ConnectButtonState } from './CompactConnectButton';
 
-export { ServerCard } from './ServerCard';
-export type { ServerCardProps } from './ServerCard';
-
 export { AppIconMark } from './AppIconMark';
 export type { AppIconMarkProps } from './AppIconMark';
 

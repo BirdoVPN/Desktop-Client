@@ -54,6 +54,11 @@ impl BirdoApi {
             .user_agent(USER_AGENT)
             .pool_max_idle_per_host(5)
             .https_only(true)
+            // F5 FIX: resolve the control plane via the cert-pinned DoH resolver
+            // (system-resolver fallback) so a censoring ISP / captive portal that
+            // hijacks or blocks DNS for api.birdo.app can no longer block desktop
+            // login — matching the Android client. See super::doh_resolver.
+            .dns_resolver(std::sync::Arc::new(super::doh_resolver::DohApiResolver::new()))
             .use_preconfigured_tls(super::cert_pin::rustls_config())
             .build()
             // SEC-C1 FIX: Do NOT fall back to Client::new() — that would
@@ -259,30 +264,6 @@ impl BirdoApi {
     pub async fn heartbeat(&self, key_id: &str) -> Result<HeartbeatResponse, ApiError> {
         self.post::<_, HeartbeatResponse>(&endpoints::vpn::heartbeat(key_id), &(), true)
             .await
-    }
-
-    /// P3-25: Rotate the WireGuard key for an active connection.
-    /// Sends a new client public key; server returns new server public key and key_id.
-    /// The old key is deactivated server-side after rotation succeeds.
-    #[allow(dead_code)] // Wired to auto-rotate timer in P3-25 follow-up
-    pub async fn rotate_key(
-        &self,
-        key_id: &str,
-        new_public_key: &str,
-    ) -> Result<super::types::KeyRotationResponse, ApiError> {
-        #[derive(serde::Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RotateRequest<'a> {
-            client_public_key: &'a str,
-        }
-        self.post(
-            &endpoints::vpn::rotate_key(key_id),
-            &RotateRequest {
-                client_public_key: new_public_key,
-            },
-            true,
-        )
-        .await
     }
 
     /// P2-15: Report connection quality telemetry to the backend.
