@@ -627,7 +627,10 @@ export function Dashboard() {
   }, [multiHopBlocked, handleConnect]);
 
   return (
-    <div className="relative h-full overflow-hidden" style={{ backgroundColor: surface.s0 }}>
+    // Transparent root so the App-level PixelCanvas backdrop shows through
+    // behind/around the globe (matches the Profile / Settings tab roots — an
+    // opaque surface.s0 here was hiding the animated pixel grid).
+    <div className="relative h-full overflow-hidden">
       {/* Globe background — hidden while server sheet open to avoid flicker */}
       {!showServerSheet && multiHopPickerTarget === null && (
         <WorldGlobe
