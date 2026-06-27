@@ -366,6 +366,15 @@ function VoucherRedeemDialog({
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<{ plan: string; days: number } | null>(null);
 
+  // Escape closes the modal (standard desktop affordance), but not mid-redeem.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !redeeming) onDismiss();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [redeeming, onDismiss]);
+
   const canSubmit = code.trim().length > 0 && !redeeming && !success;
 
   const handleConfirm = async () => {
@@ -409,6 +418,9 @@ function VoucherRedeemDialog({
       onClick={() => !redeeming && onDismiss()}
     >
       <motion.div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Redeem voucher"
         className="w-full max-w-[360px] overflow-hidden rounded-birdo-lg"
         style={{
           background: `linear-gradient(${surface.s3}, ${surface.s3}) padding-box, ${gradient.glassStroke} border-box`,

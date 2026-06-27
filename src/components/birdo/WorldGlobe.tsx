@@ -15,9 +15,8 @@
  *  - A circular clip + radial shading + atmosphere ring sell the 3D sphere.
  *
  * It is a presentational background only (reads `isConnected` to tint the
- * atmosphere green vs purple); it never calls invoke(). Server dots and the
- * connection arc from the old canvas globe are intentionally dropped — the
- * connection state is already conveyed by the StatusPill + connect button.
+ * atmosphere green vs purple); it never calls invoke(). It renders deduped
+ * server-location dots and, when connected, a user→server connection arc.
  */
 import { useMemo } from 'react';
 import { feature } from 'topojson-client';
@@ -218,7 +217,3 @@ export function WorldGlobe({
     </div>
   );
 }
-
-// `brand` re-export touch so the import is used even if the palette is later
-// inlined; keeps the connected/idle tint colours discoverable in one place.
-export const GLOBE_ACCENT = { idle: brand.purple, connected: '#44D17E' } as const;

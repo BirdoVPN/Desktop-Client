@@ -31,7 +31,7 @@ import {
   AppIconMark,
 } from '@/components/birdo';
 import { settingsToRust } from '@/utils/helpers';
-import { brand, white, hairline } from '@/lib/birdo-theme';
+import { brand, white, hairline, status } from '@/lib/birdo-theme';
 
 /** An installed app returned by the Rust `list_installed_apps` command. */
 interface InstalledApp {
@@ -274,11 +274,11 @@ export function SplitTunnel() {
         {persistError && (
           <div
             className="mt-3 flex items-start gap-2.5 rounded-birdo-md px-3 py-3"
-            style={{ backgroundColor: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.35)' }}
+            style={{ backgroundColor: status.redBg, border: `1px solid rgba(248,113,113,0.30)` }}
             role="alert"
           >
-            <Info size={18} color="#ef4444" aria-hidden className="mt-px shrink-0" />
-            <p className="text-xs leading-relaxed" style={{ color: 'rgba(248,113,113,0.95)' }}>
+            <Info size={18} color={status.red} aria-hidden className="mt-px shrink-0" />
+            <p className="text-xs leading-relaxed" style={{ color: status.red }}>
               Couldn’t save your split-tunnel changes. The last change was reverted — please try again.
             </p>
           </div>
@@ -293,7 +293,7 @@ export function SplitTunnel() {
               </label>
               <div className="flex gap-2">
                 <div
-                  className="flex min-w-0 flex-1 items-center gap-2 px-3"
+                  className="flex min-w-0 flex-1 items-center gap-2 px-3 transition-shadow focus-within:shadow-[0_0_0_2px_#a855f780]"
                   style={{
                     minHeight: 48,
                     borderRadius: 12,
@@ -309,7 +309,7 @@ export function SplitTunnel() {
                     onKeyDown={handleInputKeyDown}
                     placeholder="e.g. chrome.exe"
                     aria-label="App path or name"
-                    className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-w20"
+                    className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-w40"
                     style={{ color: white.w100 }}
                   />
                 </div>
@@ -427,9 +427,11 @@ export function SplitTunnel() {
       </div>
 
       {/* ── Installed-apps picker overlay ── */}
+      {/* top-8 clears the 32px custom TitleBar (z-100) so the header isn't
+          rendered under the window chrome. */}
       {pickerOpen && (
         <div
-          className="fixed inset-0 z-50 flex flex-col"
+          className="fixed inset-0 top-8 z-50 flex flex-col"
           style={{ backgroundColor: 'rgba(11,11,16,0.985)' }}
         >
           <div className="flex items-center gap-2 px-4 pb-2 pt-4">
