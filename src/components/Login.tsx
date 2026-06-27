@@ -85,6 +85,14 @@ export function Login() {
 
   const handleAnonymousLogin = async () => {
     setError(null);
+
+    // Validate on submit so the button stays visually active (matching the Email
+    // tab) instead of sitting disabled/greyed until the ID is complete.
+    if (anonId.replace(/\D/g, '').length < 24) {
+      setError('Enter your full 24-digit anonymous ID.');
+      return;
+    }
+
     setIsLoading(true);
 
     try {
@@ -151,7 +159,6 @@ export function Login() {
     setError(null);
   };
 
-  const anonDigits = anonId.replace(/\D/g, '');
   const tabs: { id: AuthTab; label: string; icon: React.ReactNode }[] = [
     { id: 'email', label: 'Email', icon: <KeyRound size={14} /> },
     { id: 'anonymous', label: 'Anonymous', icon: <UserRound size={14} /> },
@@ -335,7 +342,7 @@ export function Login() {
                   <motion.form
                     key="email-form"
                     onSubmit={handleLogin}
-                    className="space-y-4"
+                    className="flex min-h-[232px] flex-col gap-4"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -381,6 +388,7 @@ export function Login() {
                       size="large"
                       fullWidth
                       isLoading={isLoading}
+                      className="mt-auto"
                     />
                   </motion.form>
                 )}
@@ -388,7 +396,7 @@ export function Login() {
                 {activeTab === 'anonymous' && (
                   <motion.div
                     key="anon-form"
-                    className="space-y-4"
+                    className="flex min-h-[232px] flex-col gap-4"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -417,20 +425,8 @@ export function Login() {
                       size="large"
                       fullWidth
                       isLoading={isLoading}
-                      disabled={anonDigits.length < 24}
+                      className="mt-auto"
                     />
-
-                    <p className="text-center text-xs text-w40">
-                      Don&apos;t have an anonymous ID?{' '}
-                      <a
-                        href="https://auth.birdo.app/register"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-w60 transition hover:text-w80"
-                      >
-                        Register at birdo.app
-                      </a>
-                    </p>
                   </motion.div>
                 )}
               </AnimatePresence>
