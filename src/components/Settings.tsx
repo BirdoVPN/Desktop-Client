@@ -30,27 +30,17 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openExternal } from '@tauri-apps/plugin-shell';
-import { motion, AnimatePresence } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
 import {
   Wifi,
-  Bell,
-  Eye,
-  MapPin,
   Fingerprint,
   Zap,
   Monitor,
   SlidersHorizontal,
-  Split,
-  Router,
-  CreditCard,
   ExternalLink,
   ShieldCheck,
   FileText,
   Palette,
-  Moon,
-  Sun,
-  Laptop,
   Gauge,
   ArrowUpLeft,
   ArrowUpRight,
@@ -71,10 +61,8 @@ import {
   brand,
   status as statusTokens,
   white,
-  hairline,
-  motion as motionTokens,
 } from '@/lib/birdo-theme';
-import type { ThemeMode, WindowCorner } from '@/store/app-store';
+import type { WindowCorner } from '@/store/app-store';
 
 const DASHBOARD_URL = 'https://dashboard.birdo.app';
 const PRIVACY_URL = 'https://birdo.app/privacy';
@@ -94,13 +82,7 @@ interface SpeedTestResult {
   latencyMs: number;
 }
 
-const THEME_OPTIONS: { value: ThemeMode; label: string; icon: typeof Moon }[] = [
-  { value: 'dark', label: 'Dark', icon: Moon },
-  { value: 'light', label: 'Light', icon: Sun },
-  { value: 'system', label: 'System', icon: Laptop },
-];
-
-const CORNER_OPTIONS: { value: WindowCorner; label: string; icon: typeof Moon }[] = [
+const CORNER_OPTIONS: { value: WindowCorner; label: string; icon: typeof ArrowUpLeft }[] = [
   { value: 'top-left', label: 'Top L', icon: ArrowUpLeft },
   { value: 'top-right', label: 'Top R', icon: ArrowUpRight },
   { value: 'bottom-left', label: 'Bot L', icon: ArrowDownLeft },
@@ -112,8 +94,6 @@ export function Settings() {
     settings,
     updateSettings,
     hydrateSettings,
-    theme,
-    setTheme,
     windowCorner,
     setWindowCorner,
     pushRoute,
@@ -122,8 +102,6 @@ export function Settings() {
       settings: s.settings,
       updateSettings: s.updateSettings,
       hydrateSettings: s.hydrateSettings,
-      theme: s.theme,
-      setTheme: s.setTheme,
       windowCorner: s.windowCorner,
       setWindowCorner: s.setWindowCorner,
       pushRoute: s.pushRoute,
@@ -269,12 +247,12 @@ export function Settings() {
       <div className="flex flex-col gap-1 px-5 pb-12 pt-2">
         {/* ── APPEARANCE ─────────────────────────────────────────────── */}
         <BirdoSectionHeader title="Appearance" />
-        <ThemeSelector theme={theme} onSelect={setTheme} />
         <WindowPositionSelector corner={windowCorner} onSelect={setWindowCorner} />
 
         {/* ── CONNECTION ─────────────────────────────────────────────── */}
         {/* Kill Switch lives in VPN Settings (Security), matching mobile — not
-            duplicated here. Connection here is just Auto-Connect + Notifications. */}
+            duplicated here. Desktop has no notification surface, so Connection
+            here is just Auto-Connect. */}
         <BirdoSectionHeader title="Connection" className="mt-2" />
         <BirdoCard padding="0.25rem">
           <BirdoToggleRow
@@ -285,46 +263,6 @@ export function Settings() {
             checked={settings.autoConnect}
             onCheckedChange={(v) => persist({ autoConnect: v })}
           />
-          <BirdoToggleRow
-            title="Notifications"
-            subtitle="Show connection status notifications"
-            leadingIcon={Bell}
-            leadingTint={statusTokens.yellow}
-            checked={settings.notifications}
-            onCheckedChange={(v) => persist({ notifications: v })}
-          />
-
-          {/* Expandable show-IP / show-location sub-toggles. */}
-          <AnimatePresence initial={false}>
-            {settings.notifications && (
-              <motion.div
-                className="overflow-hidden"
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
-              >
-                <div className="ml-2 border-l" style={{ borderColor: hairline.soft }}>
-                  <BirdoToggleRow
-                    title="Show IP in notification"
-                    subtitle="Display your VPN IP address"
-                    leadingIcon={Eye}
-                    leadingTint={white.w60}
-                    checked={settings.showIpInNotification}
-                    onCheckedChange={(v) => persist({ showIpInNotification: v })}
-                  />
-                  <BirdoToggleRow
-                    title="Show location in notification"
-                    subtitle="Display the server city / country"
-                    leadingIcon={MapPin}
-                    leadingTint={white.w60}
-                    checked={settings.showLocationInNotification}
-                    onCheckedChange={(v) => persist({ showLocationInNotification: v })}
-                  />
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </BirdoCard>
 
         {/* ── SECURITY (biometric — hidden when unavailable) ───────────── */}
@@ -370,35 +308,16 @@ export function Settings() {
         </BirdoCard>
 
         {/* ── MANAGE (push rows) ─────────────────────────────────────── */}
+        {/* Split Tunneling + Port Forwarding now live INSIDE VPN Settings
+            (Features). Subscription / billing is managed on the web. */}
         <BirdoSectionHeader title="Manage" className="mt-2" />
         <BirdoCard padding="0.25rem">
           <BirdoNavRow
             title="VPN Settings"
-            subtitle="Protocol, DNS, kill switch & WireGuard tuning"
+            subtitle="Protocol, DNS, kill switch, split tunnel & port forwarding"
             leadingIcon={SlidersHorizontal}
             leadingTint={statusTokens.blue}
             onClick={() => pushRoute('vpnSettings')}
-          />
-          <BirdoNavRow
-            title="Split Tunneling"
-            subtitle="Choose which apps bypass the VPN"
-            leadingIcon={Split}
-            leadingTint={white.w60}
-            onClick={() => pushRoute('splitTunnel')}
-          />
-          <BirdoNavRow
-            title="Port Forwarding"
-            subtitle="Forward external ports to your device"
-            leadingIcon={Router}
-            leadingTint={white.w60}
-            onClick={() => pushRoute('portForward')}
-          />
-          <BirdoNavRow
-            title="Subscription"
-            subtitle="Manage your plan & billing"
-            leadingIcon={CreditCard}
-            leadingTint={brand.purpleSoft}
-            onClick={() => pushRoute('subscription')}
           />
         </BirdoCard>
 
@@ -478,59 +397,6 @@ export function Settings() {
         </div>
       </div>
     </div>
-  );
-}
-
-/** Segmented dark / light / system theme picker inside a BirdoCard. */
-function ThemeSelector({
-  theme,
-  onSelect,
-}: {
-  theme: ThemeMode;
-  onSelect: (mode: ThemeMode) => void;
-}) {
-  return (
-    <BirdoCard>
-      <div className="flex items-center gap-3.5">
-        <div
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
-          style={{ backgroundColor: white.w05 }}
-        >
-          <Palette size={18} color={brand.purple} aria-hidden />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="text-[15px] font-medium text-white">Theme</div>
-          <div className="mt-0.5 text-xs" style={{ color: white.w60 }}>
-            Dark, light, or follow system
-          </div>
-        </div>
-      </div>
-      <div
-        className="mt-3 grid grid-cols-3 gap-1 rounded-birdo-sm p-1"
-        style={{ backgroundColor: white.w05 }}
-      >
-        {THEME_OPTIONS.map((opt) => {
-          const active = theme === opt.value;
-          const Icon = opt.icon;
-          return (
-            <button
-              key={opt.value}
-              type="button"
-              onClick={() => onSelect(opt.value)}
-              className="flex items-center justify-center gap-1.5 rounded-birdo-xs px-3 py-2 text-[13px] font-medium transition-colors"
-              style={{
-                backgroundColor: active ? brand.purpleBg : 'transparent',
-                border: active ? `1px solid ${brand.purple}` : '1px solid transparent',
-                color: active ? brand.purpleSoft : white.w60,
-              }}
-            >
-              <Icon size={14} aria-hidden />
-              {opt.label}
-            </button>
-          );
-        })}
-      </div>
-    </BirdoCard>
   );
 }
 
