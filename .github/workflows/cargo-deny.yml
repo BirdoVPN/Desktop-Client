@@ -9,9 +9,9 @@ on:
     - cron: '0 9 * * 1' # Every Monday at 09:00 UTC
   pull_request:
     paths:
-      - 'birdo-client-desktop/src-tauri/Cargo.toml'
-      - 'birdo-client-desktop/src-tauri/Cargo.lock'
-      - 'birdo-client-desktop/src-tauri/deny.toml'
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/deny.toml'
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,10 @@ permissions:
 
 defaults:
   run:
-    working-directory: birdo-client-desktop/src-tauri
+    # src-tauri lives at the repo root (the repo IS the desktop client), so the
+    # working dir is just src-tauri — the old birdo-client-desktop/ prefix
+    # pointed at a non-existent path and failed every scheduled run.
+    working-directory: src-tauri
 
 jobs:
   cargo-deny:
