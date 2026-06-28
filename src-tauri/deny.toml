@@ -1,36 +1,28 @@
-# cargo-deny configuration for Birdo VPN client
+# cargo-deny configuration for Birdo VPN client (schema v2; cargo-deny >=0.18)
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
-# Track allowed advisories with expiration dates and justifications.
-# Format: "RUSTSEC-YYYY-NNNN"
-# Review these monthly and remove once upstream patches land.
-#
-# Example (uncomment when needed):
-# ignore = [
-#   # RUSTSEC-2024-XXXX: curve25519-dalek timing side-channel
-#   # Tracked: https://github.com/nickel-ai/boringtun/issues/XXX
-#   # Expires: 2025-09-01 — re-evaluate at that time
-#   "RUSTSEC-2024-XXXX",
-# ]
+# In v2 vulnerabilities are always denied; this lists advisories we've reviewed
+# and consciously accept (with justification + a review-by date).
 ignore = [
-    # RUSTSEC-2024-0344: boringtun timing side-channel in curve25519-dalek
-    # Upstream fix still pending. No practical exploit for VPN traffic:
-    # - The side-channel requires co-located attacker with microsecond timing
-    # - WireGuard handshake already has 500ms minimum duration (CRYPTO-001 in wireguard_new.rs)
-    # - Our handshake_with_retry() masks timing via exponential backoff
-    # Mitigation: constant-time handshake padding applied in our code layer.
+    # RUSTSEC-2024-0344: boringtun timing side-channel in curve25519-dalek.
+    # No practical exploit for VPN traffic — it needs a co-located attacker with
+    # microsecond timing, while our WireGuard handshake has a 500ms minimum
+    # (CRYPTO-001 in wireguard_new.rs) and handshake_with_retry() masks timing
+    # via exponential backoff + constant-time handshake padding in our code layer.
     # Tracked: https://github.com/cloudflare/boringtun/issues/396
-    # Review-by: 2026-07-01 — escalate to crate replacement if still unpatched
+    # Review-by: 2026-07-01 — escalate to crate replacement if still unpatched.
     "RUSTSEC-2024-0344",
 ]
+# v2: `unmaintained` is a scope enum, not a severity. We gate on vulnerabilities
+# (always denied) and yanked crates; unmaintained advisories are not enforced
+# (we can't control transitive maintenance), matching the old `unmaintained=warn`.
+unmaintained = "none"
+yanked = "warn"
 
 [licenses]
-unlicensed = "deny"
+# v2 denies any license not in this allow-list by default (the old
+# unlicensed/copyleft/allow-osi-fsf-free keys were removed from the schema).
 allow = [
     "MIT",
     "Apache-2.0",
@@ -38,20 +30,19 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-DFS-2016",
+    "Unicode-3.0",
     "Zlib",
     "BSL-1.0",
     "OpenSSL",
     "CC0-1.0",
-    "Unicode-3.0",
 ]
-copyleft = "deny"
-allow-osi-fsf-free = "neither"
+confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
-# Deny known-problematic crates
+# Deny known-problematic crates here, e.g. { name = "openssl", version = "*" }.
 deny = []
 
 [sources]
