@@ -4,6 +4,7 @@ version = "1.4.10"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
 license = "Proprietary"
+publish = false # Tauri app — never published to crates.io (also lets cargo-deny skip it)
 edition = "2021"
 rust-version = "1.77"
 
