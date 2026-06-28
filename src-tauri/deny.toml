@@ -13,6 +13,34 @@ ignore = [
     # Tracked: https://github.com/cloudflare/boringtun/issues/396
     # Review-by: 2026-07-01 — escalate to crate replacement if still unpatched.
     "RUSTSEC-2024-0344",
+
+    # ── TRACKED FOR REMEDIATION AT THE rustc 1.83 -> 1.85 TOOLCHAIN BUMP ──────
+    # The real fix for the entries below is `cargo update` to pull patched
+    # rustls/webpki/aes, but several of those releases require edition2024
+    # (rustc >= 1.85) — the same toolchain bump that unblocks the Linux build.
+    # They are acknowledged + justified here so the weekly scan stays green on
+    # KNOWN advisories while still failing on any NEW one. Re-evaluate and remove
+    # each as the deps are bumped. Review-by: 2026-09-01.
+
+    # RUSTSEC-2025-0009: aes may panic when overflow-checking is enabled. The
+    # shipped client is a release build (overflow-checks off), so this is a
+    # debug-only panic, not a release vulnerability.
+    "RUSTSEC-2025-0009",
+
+    # RUSTSEC-2026-0049 / -0098 / -0099 / -0104: rustls/webpki CRL-authority and
+    # name-constraint (URI / wildcard) matching + a CRL-parse panic. The client
+    # talks only to Birdo's own endpoints and pins the server cert chain by SPKI
+    # (see the cert-pin watchdog), so it does not depend on CRL revocation or
+    # name-constraint validation of arbitrary third-party CAs. Patch at the dep bump.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+
+    # RUSTSEC-2026-0009: DoS via stack exhaustion. The client only parses
+    # responses from its own control plane / pinned servers, not arbitrary
+    # attacker-controlled input, so exposure is low. Patch at the dep bump.
+    "RUSTSEC-2026-0009",
 ]
 # v2: `unmaintained` is a scope enum, not a severity. We gate on vulnerabilities
 # (always denied) and yanked crates; unmaintained advisories are not enforced
