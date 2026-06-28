@@ -72,6 +72,15 @@ confidence-threshold = 0.8
 # isn't a third-party dependency whose license we need to vet.
 private = { ignore = true }
 
+# `ring` ships a custom LICENSE that doesn't resolve to a single SPDX id
+# (cargo-deny scores it 0.66 < the 0.8 threshold -> "unlicensed"). Clarify it to
+# its actual license mix; MIT/ISC/OpenSSL are all allow-listed above. The hash
+# matches ring 0.16.20's LICENSE file (from the cargo-deny output).
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
