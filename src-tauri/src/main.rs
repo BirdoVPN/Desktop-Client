@@ -21,7 +21,7 @@ use storage::CredentialStore;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, LogicalPosition, Listener, Manager, RunEvent, WindowEvent,
+    Emitter, Listener, LogicalPosition, Manager, RunEvent, WindowEvent,
 };
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -217,10 +217,9 @@ fn main() {
             // is updated live (icon + tooltip) by the `set_tray_state` command as
             // the connection state changes. The id "main" lets that command find
             // this tray via `app.tray_by_id("main")`.
-            let tray_icon = commands::tray::load_tray_image(include_bytes!(
-                "../icons/tray-disconnected.png"
-            ))
-            .expect("embedded tray-disconnected.png is a valid image");
+            let tray_icon =
+                commands::tray::load_tray_image(include_bytes!("../icons/tray-disconnected.png"))
+                    .expect("embedded tray-disconnected.png is a valid image");
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
                 .menu(&menu)

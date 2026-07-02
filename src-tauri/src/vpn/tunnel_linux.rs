@@ -345,11 +345,7 @@ impl LinuxTunnel {
                         if written < 0 {
                             tracing::debug!("TUN write error: {}", std::io::Error::last_os_error());
                         } else if (written as usize) < buf.len() {
-                            tracing::warn!(
-                                "Partial TUN write: {} of {} bytes",
-                                written,
-                                buf.len()
-                            );
+                            tracing::warn!("Partial TUN write: {} of {} bytes", written, buf.len());
                         }
                         written
                     })

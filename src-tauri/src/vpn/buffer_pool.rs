@@ -14,6 +14,7 @@ pub const MAX_PACKET_SIZE: usize = 65536;
 /// - 4 bytes: receiver index
 /// - 8 bytes: nonce (counter)
 /// - 16 bytes: AEAD (Poly1305) tag
+///
 /// (transport padding rounds the inner packet up to a 16-byte boundary, adding
 /// at most 15 further bytes on the plaintext side).
 ///

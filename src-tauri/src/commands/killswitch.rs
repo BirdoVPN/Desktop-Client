@@ -141,7 +141,7 @@ pub async fn activate_killswitch() -> Result<bool, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let server_ip = VPN_SERVER_IP.read().await.clone();
+        let server_ip = *VPN_SERVER_IP.read().await;
         // Set the VPN server IP before activating
         if let Some(ip) = server_ip {
             wfp::set_vpn_server(ip).await;

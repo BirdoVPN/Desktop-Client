@@ -50,7 +50,7 @@ fn default_route_native() -> Option<(Ipv4Addr, u32)> {
         return None;
     }
 
-    let result = (|| {
+    let result = {
         // SAFETY: `table` is non-null and points to a valid table allocated by
         // the OS; `NumEntries` describes the length of the trailing `Table` array.
         let t = unsafe { &*table };
@@ -75,7 +75,7 @@ fn default_route_native() -> Option<(Ipv4Addr, u32)> {
             }
         }
         best.map(|(_, ip, idx)| (ip, idx))
-    })();
+    };
 
     // SAFETY: `table` was allocated by `GetIpForwardTable2` and is non-null.
     unsafe { FreeMibTable(table as *const core::ffi::c_void) };
@@ -140,7 +140,10 @@ fn set_adapter_ipv6_native(if_index: u32, ip: Ipv6Addr, prefix: u8) -> Result<()
     // SAFETY: `row` is fully initialised; InterfaceIndex identifies the adapter.
     let e = unsafe { CreateUnicastIpAddressEntry(&row) };
     if e.0 != 0 && e.0 != 5010 {
-        return Err(format!("CreateUnicastIpAddressEntry (v6) failed: 0x{:08X}", e.0));
+        return Err(format!(
+            "CreateUnicastIpAddressEntry (v6) failed: 0x{:08X}",
+            e.0
+        ));
     }
     Ok(())
 }
@@ -148,7 +151,12 @@ fn set_adapter_ipv6_native(if_index: u32, ip: Ipv6Addr, prefix: u8) -> Result<()
 /// Add an IPv6 route natively (CreateIpForwardEntry2, AF_INET6). `:: ` next hop
 /// (all-zero) means on-link via the given interface. Err on failure.
 #[cfg(windows)]
-fn add_route6_native(dest: Ipv6Addr, prefix_len: u8, if_index: u32, metric: u32) -> Result<(), String> {
+fn add_route6_native(
+    dest: Ipv6Addr,
+    prefix_len: u8,
+    if_index: u32,
+    metric: u32,
+) -> Result<(), String> {
     use windows::Win32::NetworkManagement::IpHelper::{
         CreateIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
     };
@@ -174,6 +182,9 @@ fn add_route6_native(dest: Ipv6Addr, prefix_len: u8, if_index: u32, metric: u32)
 /// Set the resolver list on an interface (by adapter GUID) via the native
 /// `SetInterfaceDnsSettings` API — instant, no `netsh` subprocess. Returns Err
 /// on any failure so the caller can fall back to netsh (DNS is never left unset).
+// Clippy: DNS_INTERFACE_SETTINGS is an FFI struct — default-then-assign matches
+// the Windows API documentation examples.
+#[allow(clippy::field_reassign_with_default)]
 #[cfg(windows)]
 fn set_dns_native(adapter_guid: u128, servers: &[String]) -> Result<(), String> {
     use windows::core::{GUID, PWSTR};
@@ -208,6 +219,9 @@ fn set_dns_native(adapter_guid: u128, servers: &[String]) -> Result<(), String> 
 /// Set an interface's IPv4 address + MTU natively via the IP Helper API
 /// (addressed by interface index, so no cross-crate LUID type concerns).
 /// Returns Err on failure so the caller can fall back to netsh.
+// Clippy: MIB_* FFI rows must be default-initialised and then populated
+// (InitializeUnicastIpAddressEntry fills the row between the two steps).
+#[allow(clippy::field_reassign_with_default)]
 #[cfg(windows)]
 fn set_adapter_ip_mtu_native(if_index: u32, ip: &str, prefix: u8, mtu: u32) -> Result<(), String> {
     use windows::Win32::NetworkManagement::IpHelper::{
@@ -216,7 +230,9 @@ fn set_adapter_ip_mtu_native(if_index: u32, ip: &str, prefix: u8, mtu: u32) -> R
     };
     use windows::Win32::Networking::WinSock::AF_INET;
 
-    let addr: Ipv4Addr = ip.parse().map_err(|_| format!("invalid client IP: {}", ip))?;
+    let addr: Ipv4Addr = ip
+        .parse()
+        .map_err(|_| format!("invalid client IP: {}", ip))?;
 
     // ── IPv4 unicast address ──
     let mut row = MIB_UNICASTIPADDRESS_ROW::default();
@@ -259,10 +275,10 @@ fn set_adapter_ip_mtu_native(if_index: u32, ip: &str, prefix: u8, mtu: u32) -> R
 pub(super) const ADAPTER_NAME: &str = "Birdo VPN";
 const TUNNEL_TYPE: &str = "Birdo";
 
-
 /// Fixed GUID for the Birdo VPN adapter, so we can reliably reopen/delete
 /// stale adapters across restarts and crashes.
 /// Generated once — do not change after release.
+#[allow(clippy::unusual_byte_groupings)] // grouping mirrors GUID segment layout
 const ADAPTER_GUID: u128 = 0xB1BD0_0000_0001_0000_0000_B1BD0B1Du128;
 
 /// Get the Win32 last error code and format it as a human-readable string.
@@ -864,16 +880,18 @@ impl WintunTunnel {
         }
 
         let native_ok = match if_index {
-            Some(idx) => match set_adapter_ip_mtu_native(idx, client_ip, 24, self.config.mtu.into()) {
-                Ok(()) => {
-                    tracing::debug!("Adapter IP + MTU set natively (MTU {})", self.config.mtu);
-                    true
+            Some(idx) => {
+                match set_adapter_ip_mtu_native(idx, client_ip, 24, self.config.mtu.into()) {
+                    Ok(()) => {
+                        tracing::debug!("Adapter IP + MTU set natively (MTU {})", self.config.mtu);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!("Native IP/MTU set failed ({}); falling back to netsh", e);
+                        false
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Native IP/MTU set failed ({}); falling back to netsh", e);
-                    false
-                }
-            },
+            }
             None => false,
         };
 
@@ -913,12 +931,18 @@ impl WintunTunnel {
                 .output();
             if let Ok(output) = mtu_output {
                 if !output.status.success() {
-                    tracing::warn!("Failed to set MTU: {}", String::from_utf8_lossy(&output.stderr));
+                    tracing::warn!(
+                        "Failed to set MTU: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
             }
         }
 
-        tracing::debug!("Adapter IP configured ({})", if native_ok { "native" } else { "netsh" });
+        tracing::debug!(
+            "Adapter IP configured ({})",
+            if native_ok { "native" } else { "netsh" }
+        );
         Ok(())
     }
 
@@ -1201,7 +1225,7 @@ impl WintunTunnel {
         Ok(())
     }
 
-    /// H-3 FIX: Get list of non-VPN adapter names using PowerShell Get-NetAdapter.
+    // H-3 FIX: Get list of non-VPN adapter names using PowerShell Get-NetAdapter.
     // ===================================================================
     // SECTION: DNS — configure_dns, restore_dns
     // Static helpers (get_non_vpn_adapters, snapshot_adapter_dns) are in tunnel_dns.rs
@@ -1274,9 +1298,27 @@ impl WintunTunnel {
         if !native_ok {
             for (i, dns) in self.config.dns.iter().enumerate() {
                 let args: Vec<&str> = if i == 0 {
-                    vec!["interface", "ip", "set", "dns", &adapter_name, "static", dns, "validate=no"]
+                    vec![
+                        "interface",
+                        "ip",
+                        "set",
+                        "dns",
+                        &adapter_name,
+                        "static",
+                        dns,
+                        "validate=no",
+                    ]
                 } else {
-                    vec!["interface", "ip", "add", "dns", &adapter_name, dns, "index=2", "validate=no"]
+                    vec![
+                        "interface",
+                        "ip",
+                        "add",
+                        "dns",
+                        &adapter_name,
+                        dns,
+                        "index=2",
+                        "validate=no",
+                    ]
                 };
                 let output = cmd("netsh")
                     .args(&args)
@@ -1325,12 +1367,8 @@ impl WintunTunnel {
         for cidr in &self.config.allowed_ips_v6 {
             if cidr == "::/0" {
                 add_route6_native(Ipv6Addr::UNSPECIFIED, 1, if_index, 5)?; // ::/1
-                add_route6_native(
-                    Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0),
-                    1,
-                    if_index,
-                    5,
-                )?; // 8000::/1
+                add_route6_native(Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0), 1, if_index, 5)?;
+            // 8000::/1
             } else if let Some((net, plen)) = cidr.split_once('/') {
                 if let (Ok(addr), Ok(len)) = (net.parse::<Ipv6Addr>(), plen.parse::<u8>()) {
                     add_route6_native(addr, len, if_index, 5)?;
@@ -1381,7 +1419,13 @@ impl WintunTunnel {
                 "Birdo VPN Block 6in4",
             ] {
                 let _ = cmd("netsh")
-                    .args(["advfirewall", "firewall", "delete", "rule", &format!("name={}", rule)])
+                    .args([
+                        "advfirewall",
+                        "firewall",
+                        "delete",
+                        "rule",
+                        &format!("name={}", rule),
+                    ])
                     .output();
             }
             let _ = cmd("powershell")
@@ -1538,9 +1582,7 @@ impl WintunTunnel {
     /// fooled by duplicate/locale-dependent adapter rows.
     async fn get_adapter_index(&self) -> Result<u32, String> {
         let guard = self.adapter.read().await;
-        let adapter = guard
-            .as_ref()
-            .ok_or("Wintun adapter not created yet")?;
+        let adapter = guard.as_ref().ok_or("Wintun adapter not created yet")?;
         adapter
             .get_adapter_index()
             .map_err(|e| format!("Failed to get adapter index: {}", e))
@@ -1583,6 +1625,7 @@ impl WintunTunnel {
     /// Under high throughput (50k+ pps during speed tests), the previous design
     /// acquired the RwLock twice per packet (TX + RX), creating 100k lock acquisitions/sec.
     /// This version acquires once per batch of up to MAX_BATCH_SIZE packets.
+    #[allow(clippy::too_many_arguments)] // spawned-task plumbing: each Arc is moved in individually
     async fn packet_loop(
         session: Arc<Session>,
         wg_session: Arc<RwLock<Option<WireGuardSession>>>,
@@ -1796,7 +1839,10 @@ impl WintunTunnel {
         // to recreate it. 3s cap + abort is a safety net for a wedged task.
         if let Some(handle) = self.packet_task.write().await.take() {
             let abort = handle.abort_handle();
-            if tokio::time::timeout(Duration::from_secs(3), handle).await.is_err() {
+            if tokio::time::timeout(Duration::from_secs(3), handle)
+                .await
+                .is_err()
+            {
                 tracing::warn!("Packet loop did not exit within 3s — aborting it");
                 abort.abort();
                 // Give the abort a moment to unwind + drop the Arc<Session>.

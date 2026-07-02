@@ -96,7 +96,11 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
     // surface it as a warning so a permission loss / corrupted firewall state
     // doesn't only show up later as a cryptic append error.
     if let Err(e) = iptables(&["-F", CHAIN_NAME]) {
-        tracing::warn!("iptables flush of {} failed (continuing): {}", CHAIN_NAME, e);
+        tracing::warn!(
+            "iptables flush of {} failed (continuing): {}",
+            CHAIN_NAME,
+            e
+        );
     }
 
     // Allow loopback

@@ -55,8 +55,16 @@ pub mod vpn {
                 }
                 _ => {
                     out.push('%');
-                    out.push(char::from_digit((byte >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-                    out.push(char::from_digit((byte & 0xF) as u32, 16).unwrap().to_ascii_uppercase());
+                    out.push(
+                        char::from_digit((byte >> 4) as u32, 16)
+                            .unwrap()
+                            .to_ascii_uppercase(),
+                    );
+                    out.push(
+                        char::from_digit((byte & 0xF) as u32, 16)
+                            .unwrap()
+                            .to_ascii_uppercase(),
+                    );
                 }
             }
         }

@@ -73,13 +73,24 @@ jobs:
       - name: Run unit tests (single-run)
         run: npm run test:run
 
-      # Download wintun.dll (gitignored — must be fetched at build time)
+      # Download wintun.dll (gitignored — must be fetched at build time).
+      # Supply-chain: the zip is verified against a pinned SHA-256 before any
+      # file from it is used (same pattern as the Xray download below).
       - name: Download Wintun
         shell: pwsh
         run: |
           $wintunUrl = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          # Official wintun-0.14.1.zip SHA-256 (verified against wireguard-windows'
+          # embedded prerequisite hash). Bump together with the URL version.
+          $expectedSha = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
           $zipPath = "$env:RUNNER_TEMP\wintun.zip"
           Invoke-WebRequest -Uri $wintunUrl -OutFile $zipPath
+          $actualSha = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -ne $expectedSha) {
+            Write-Error "Wintun zip SHA-256 mismatch! expected=$expectedSha actual=$actualSha — refusing to bundle."
+            exit 1
+          }
+          Write-Host "Wintun zip SHA-256 verified: $actualSha"
           Expand-Archive -Path $zipPath -DestinationPath "$env:RUNNER_TEMP\wintun"
           # Copy to resources/ for Tauri bundling
           New-Item -ItemType Directory -Force -Path "src-tauri/resources"
@@ -354,7 +365,9 @@ jobs:
   # build job via Tauri's signCommand, so no separate signing job is needed).
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    # Defensive: only publish for this workflow's own tag namespace (win-v*),
+    # never for tags belonging to other platforms' release pipelines.
+    if: startsWith(github.ref, 'refs/tags/win-v')
     runs-on: ubuntu-latest
     permissions:
       contents: write

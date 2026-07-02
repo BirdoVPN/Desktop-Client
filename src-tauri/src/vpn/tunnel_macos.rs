@@ -139,8 +139,7 @@ impl UtunTunnel {
         };
 
         // Configure the utun interface IP
-        if let Err(e) =
-            configure_utun_address(&utun_name, &self.config.client_ip, &self.config.mtu)
+        if let Err(e) = configure_utun_address(&utun_name, &self.config.client_ip, &self.config.mtu)
         {
             close_fd_on_err(utun_fd);
             *self.utun_fd.write().await = None;
@@ -639,10 +638,7 @@ async fn configure_routes(
         let prefix: u8 = match parts[1].parse() {
             Ok(p) => p,
             Err(_) => {
-                tracing::warn!(
-                    "Skipping allowed_ip with invalid CIDR prefix: {}",
-                    cidr
-                );
+                tracing::warn!("Skipping allowed_ip with invalid CIDR prefix: {}", cidr);
                 continue;
             }
         };

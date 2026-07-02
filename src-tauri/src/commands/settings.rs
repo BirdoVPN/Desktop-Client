@@ -133,7 +133,7 @@ fn get_hmac_key() -> Result<Vec<u8>, String> {
             // First run — generate a random 32-byte key
             use rand::Rng;
             let key: [u8; 32] = rand::thread_rng().gen();
-            let key_hex = hex::encode(&key);
+            let key_hex = hex::encode(key);
             entry
                 .set_password(&key_hex)
                 .map_err(|e| format!("Failed to store HMAC key: {}", e))?;
@@ -334,7 +334,8 @@ mod tests {
             "custom_dns": null,
             "protocol": "wireguard"
         }"#;
-        let s: AppSettings = serde_json::from_str(json).expect("legacy settings should deserialize");
+        let s: AppSettings =
+            serde_json::from_str(json).expect("legacy settings should deserialize");
         assert!(s.killswitch_enabled, "absent kill switch must default ON");
         assert!(s.quantum_protection, "absent post-quantum must default ON");
     }

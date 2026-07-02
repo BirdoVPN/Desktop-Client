@@ -507,6 +507,10 @@ mod vpn_manager_tests {
 // ── Buffer pool constant tests ──────────────────────────────────
 
 #[cfg(test)]
+// Clippy flags these as assertions on constants (compile-time folded). That is
+// the point: they are regression guards that start failing if the constants
+// are ever edited out of spec.
+#[allow(clippy::assertions_on_constants)]
 mod buffer_pool_tests {
     use super::super::buffer_pool::{MAX_PACKET_SIZE, WIREGUARD_OVERHEAD};
 

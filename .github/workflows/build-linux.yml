@@ -225,7 +225,8 @@ jobs:
   # ── GitHub Release ─────────────────────────────────────────────────
   release:
     needs: build-linux
-    if: startsWith(github.ref, 'refs/tags/')
+    # Defensive: only publish for this workflow's own tag namespace (linux-v*).
+    if: startsWith(github.ref, 'refs/tags/linux-v')
     runs-on: ubuntu-latest
     permissions:
       contents: write

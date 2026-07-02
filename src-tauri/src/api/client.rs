@@ -58,7 +58,9 @@ impl BirdoApi {
             // (system-resolver fallback) so a censoring ISP / captive portal that
             // hijacks or blocks DNS for api.birdo.app can no longer block desktop
             // login — matching the Android client. See super::doh_resolver.
-            .dns_resolver(std::sync::Arc::new(super::doh_resolver::DohApiResolver::new()))
+            .dns_resolver(std::sync::Arc::new(
+                super::doh_resolver::DohApiResolver::new(),
+            ))
             .use_preconfigured_tls(super::cert_pin::rustls_config())
             .build()
             // SEC-C1 FIX: Do NOT fall back to Client::new() — that would
@@ -93,7 +95,11 @@ impl BirdoApi {
     /// Return the current access token (for commands like the speed test that
     /// hit Bearer-authed endpoints with the shared hardened client).
     pub async fn access_token_value(&self) -> Option<String> {
-        self.access_token.read().await.as_ref().map(|t| t.to_string())
+        self.access_token
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.to_string())
     }
 
     /// Return a clone of the hardened reqwest Client for reuse by other commands.
@@ -342,6 +348,7 @@ impl BirdoApi {
     }
 
     /// Connect via multi-hop (entry + exit nodes)
+    #[allow(clippy::too_many_arguments)] // mirrors the backend endpoint's parameter surface 1:1
     pub async fn connect_multi_hop(
         &self,
         entry_node_id: &str,
@@ -556,7 +563,11 @@ impl BirdoApi {
             // The body read itself failed (broken stream/timeout). We still fall
             // through to status-based mapping, but surface the underlying I/O
             // error so it is not silently masked as a bare "HTTP {status}".
-            tracing::warn!("Failed to read error response body for HTTP {}: {}", status, e);
+            tracing::warn!(
+                "Failed to read error response body for HTTP {}: {}",
+                status,
+                e
+            );
             String::new()
         });
         if let Ok(body) = serde_json::from_str::<super::types::ApiErrorBody>(&error_text) {
@@ -588,7 +599,6 @@ impl BirdoApi {
             }
         }
     }
-
 }
 
 impl Default for BirdoApi {

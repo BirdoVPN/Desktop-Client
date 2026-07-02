@@ -49,7 +49,12 @@ fn connect_failure_message(response: &ConnectResponse) -> String {
     response
         .message
         .clone()
-        .or_else(|| response.error_code.as_ref().map(|code| code.user_message().to_string()))
+        .or_else(|| {
+            response
+                .error_code
+                .as_ref()
+                .map(|code| code.user_message().to_string())
+        })
         .unwrap_or_else(|| "Connection failed".to_string())
 }
 
@@ -198,7 +203,7 @@ pub(super) fn generate_wireguard_keypair() -> (String, String) {
     let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let public = PublicKey::from(&secret);
     let mut private_key_bytes = secret.to_bytes();
-    let local_private_key = base64::engine::general_purpose::STANDARD.encode(&private_key_bytes);
+    let local_private_key = base64::engine::general_purpose::STANDARD.encode(private_key_bytes);
     let client_public_key = base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
     private_key_bytes.zeroize();
     (local_private_key, client_public_key)
@@ -260,10 +265,7 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         .unwrap_or(false);
     // Lockdown (always-on kill switch) — OFF by default; needs device verification
     // before being enabled (see wfp::LOCKDOWN_MODE).
-    let lockdown_mode = settings
-        .as_ref()
-        .map(|s| s.lockdown_mode)
-        .unwrap_or(false);
+    let lockdown_mode = settings.as_ref().map(|s| s.lockdown_mode).unwrap_or(false);
 
     #[cfg(target_os = "windows")]
     {

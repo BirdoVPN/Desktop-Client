@@ -224,10 +224,7 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
                     error!("Unexpected Touch ID result: {}", other);
                     Err(format!("Authentication failed: {other}"))
                 } else {
-                    error!(
-                        "Unexpected Touch ID result: {} (stderr: {})",
-                        other, stderr
-                    );
+                    error!("Unexpected Touch ID result: {} (stderr: {})", other, stderr);
                     Err(format!("Authentication failed: {stderr}"))
                 }
             }

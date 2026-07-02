@@ -19,7 +19,9 @@ use base64::Engine as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
+};
 use sha2::{Digest, Sha256};
 
 /// SPKI SHA-256 pins (base64). Kept in sync with the Android client
@@ -69,8 +71,13 @@ impl ServerCertVerifier for SpkiPinningVerifier {
     ) -> Result<ServerCertVerified, TlsError> {
         // 1) Full standard validation first — chain to a trusted root, hostname
         //    match, validity period. A failure here rejects the connection.
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
 
         // 2) SPKI pin check across the presented chain (leaf + intermediates).
         let mut parsed_any = false;
@@ -96,7 +103,9 @@ impl ServerCertVerifier for SpkiPinningVerifier {
         tracing::error!(
             "cert-pin: no pinned SPKI matched the presented chain — refusing connection (possible MITM or un-pinned CA change)"
         );
-        Err(TlsError::General("certificate SPKI pin mismatch".to_string()))
+        Err(TlsError::General(
+            "certificate SPKI pin mismatch".to_string(),
+        ))
     }
 
     fn verify_tls12_signature(
@@ -156,7 +165,10 @@ mod tests {
     fn spki_extraction_matches_known_pin() {
         let cert = CertificateDer::from(ISRG_X1_DER.to_vec());
         let spki = spki_sha256_b64(&cert).expect("ISRG X1 should parse");
-        assert_eq!(spki, ISRG_X1_SPKI, "SPKI extraction must match the canonical pin");
+        assert_eq!(
+            spki, ISRG_X1_SPKI,
+            "SPKI extraction must match the canonical pin"
+        );
     }
 
     #[test]

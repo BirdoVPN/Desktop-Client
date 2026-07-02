@@ -107,11 +107,12 @@ fn exe_from_app_key(app: &winreg::RegKey) -> Option<String> {
     let raw = icon.trim().trim_matches('"');
     // Strip a trailing ",<index>" icon selector if present.
     let candidate = match raw.rfind(',') {
-        Some(idx) if !raw[idx + 1..].trim().is_empty()
-            && raw[idx + 1..]
-                .trim()
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == '-') =>
+        Some(idx)
+            if !raw[idx + 1..].trim().is_empty()
+                && raw[idx + 1..]
+                    .trim()
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '-') =>
         {
             &raw[..idx]
         }

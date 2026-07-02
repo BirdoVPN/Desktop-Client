@@ -44,6 +44,18 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # Lint gates: keep the public repo rustfmt-clean and clippy-clean.
+      # (Validated against the pinned toolchain, so local == CI results.)
+      - name: rustfmt check
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        working-directory: src-tauri
+        env:
+          RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Run Rust unit tests
         working-directory: src-tauri
         # The shipping app binary gets the ComCtl32 v6 manifest dependency via
@@ -78,6 +90,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Lint
+        run: npm run lint
 
       - name: Type-check
         run: npm run type-check

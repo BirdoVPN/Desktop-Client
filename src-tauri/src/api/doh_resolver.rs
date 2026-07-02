@@ -175,10 +175,10 @@ mod tests {
         let past = Instant::now()
             .checked_sub(CACHE_TTL + Duration::from_secs(1))
             .expect("clock far enough from boot for the test");
-        cache
-            .lock()
-            .unwrap()
-            .insert("api.birdo.app".to_owned(), (past, vec![sample_addr()], CACHE_TTL));
+        cache.lock().unwrap().insert(
+            "api.birdo.app".to_owned(),
+            (past, vec![sample_addr()], CACHE_TTL),
+        );
         assert!(cache_get(&cache, "api.birdo.app").is_none());
     }
 

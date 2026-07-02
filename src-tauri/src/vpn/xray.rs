@@ -130,6 +130,12 @@ pub struct XrayManager {
     health_cancel: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
+impl Default for XrayManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl XrayManager {
     pub fn new() -> Self {
         Self {
@@ -140,7 +146,11 @@ impl XrayManager {
     }
 
     /// Start the Xray Reality tunnel. Returns the local port to use as WireGuard endpoint.
-    pub async fn start(&self, app_data_dir: &PathBuf, config: &XrayConfig) -> Result<u16, String> {
+    pub async fn start(
+        &self,
+        app_data_dir: &std::path::Path,
+        config: &XrayConfig,
+    ) -> Result<u16, String> {
         // Stop any existing instance
         self.stop().await;
 
@@ -416,7 +426,7 @@ impl Drop for XrayManager {
 /// immediately, so the port is released before Xray binds it (best-effort, same
 /// as the prior TCP-only check).
 fn find_available_port(start: u16) -> Option<u16> {
-    let end = start.saturating_add(100).min(u16::MAX);
+    let end = start.saturating_add(100);
     for port in start..=end {
         let tcp_ok = TcpListener::bind(("127.0.0.1", port)).is_ok();
         let udp_ok = UdpSocket::bind(("127.0.0.1", port)).is_ok();
@@ -440,6 +450,7 @@ fn parse_endpoint(endpoint: &str) -> Result<(String, u16), String> {
 }
 
 /// Build the Xray JSON configuration
+#[allow(clippy::too_many_arguments)] // flat REALITY parameter set; a struct would be built and destructured once
 fn build_xray_config(
     local_port: u16,
     server_host: &str,
@@ -508,7 +519,7 @@ fn build_xray_config(
 /// elevated rights. We now refuse user-writable lookup paths entirely.
 /// Bundled binaries must live next to the app exe (admin-installed) or in
 /// the system PATH (administrator-controlled).
-fn find_xray_binary(_app_data_dir: &PathBuf) -> Result<PathBuf, String> {
+fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     const XRAY_BIN: &str = "xray.exe";
     #[cfg(not(target_os = "windows"))]

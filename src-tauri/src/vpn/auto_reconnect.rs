@@ -154,6 +154,7 @@ impl AutoReconnectService {
     /// H-5 FIX: Store only the reconnect metadata (server_id + name).
     /// The full VpnConfig with key material is NOT stored because keys are
     /// zeroized after WireGuard session creation. Reconnect fetches fresh keys.
+    #[allow(clippy::too_many_arguments)] // mirrors ReconnectInfo's fields 1:1
     pub async fn store_last_config(
         &self,
         server_id: String,
@@ -254,6 +255,7 @@ impl AutoReconnectService {
     }
 
     /// Health check loop - monitors connection and triggers reconnect
+    #[allow(clippy::too_many_arguments)] // spawned-task plumbing: each Arc is moved in individually
     async fn health_check_loop(
         config: Arc<RwLock<AutoReconnectConfig>>,
         vpn_manager: Arc<VpnManager>,
@@ -539,7 +541,7 @@ impl AutoReconnectService {
                                         let mut private_key_bytes = secret.to_bytes();
                                         // AR-1 FIX: Use `mut` so we can zeroize the base64-encoded
                                         // private key on error paths (it's moved on success path).
-                                        let mut local_private_key = base64::engine::general_purpose::STANDARD.encode(&private_key_bytes);
+                                        let mut local_private_key = base64::engine::general_purpose::STANDARD.encode(private_key_bytes);
                                         let client_public_key = base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
                                         private_key_bytes.zeroize();
 

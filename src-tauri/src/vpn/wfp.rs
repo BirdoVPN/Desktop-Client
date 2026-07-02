@@ -1,5 +1,12 @@
 //! Windows Filtering Platform (WFP) Kill Switch Implementation
 //!
+//! Clippy: WFP FFI structs (`FWPM_*`) are canonically initialised as
+//! `..Default::default()` followed by field assignment — the C-style pattern
+//! the Windows API docs use. Restructuring into struct literals would obscure
+//! the correspondence with the Microsoft examples, so the lint is disabled
+//! for this module.
+#![allow(clippy::field_reassign_with_default)]
+//!
 //! FIX-2-1: Migrated from `netsh advfirewall` shell commands to direct WFP API
 //! calls via `fwpuclnt.dll` for:
 //!
@@ -504,13 +511,12 @@ impl WfpEngine {
             FwpmFreeMemory0(&mut (app_id as *mut std::ffi::c_void));
         }
 
-        result.map(|id| {
+        result.inspect(|&id| {
             tracing::debug!(
                 "Split tunnel permit v6 added for: {} (filter_id={})",
                 exe_path,
                 id
             );
-            id
         })
     }
 
@@ -681,12 +687,7 @@ impl WfpEngine {
         condition.conditionValue.r#type = FWP_UINT64;
         condition.conditionValue.Anonymous.uint64 = &mut luid_val;
 
-        let mut filter = self.make_base_filter(
-            &name,
-            layer,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
+        let mut filter = self.make_base_filter(&name, layer, FWP_ACTION_PERMIT, WEIGHT_PERMIT);
         filter.numFilterConditions = 1;
         filter.filterCondition = &mut condition;
 
@@ -888,13 +889,12 @@ impl WfpEngine {
             FwpmFreeMemory0(&mut (app_id as *mut std::ffi::c_void));
         }
 
-        result.map(|id| {
+        result.inspect(|&id| {
             tracing::debug!(
                 "Split tunnel permit added for: {} (filter_id={})",
                 exe_path,
                 id
             );
-            id
         })
     }
 
@@ -1027,13 +1027,18 @@ pub async fn activate_blocking() -> Result<(), String> {
         // traffic still cannot leak. (We bypass the kill switch only for the VPN
         // client itself, which is exactly the process that must keep talking to
         // the VPN infrastructure to restore the tunnel.)
-        match std::env::current_exe().ok().and_then(|p| p.to_str().map(String::from)) {
+        match std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+        {
             Some(self_exe) => {
                 let v4 = engine.add_permit_app(&self_exe)?;
                 if v4 != 0 {
                     let _ = engine.add_permit_app_v6(&self_exe)?;
                 }
-                tracing::info!("Kill switch: permitted own process for control-plane / reconnect access");
+                tracing::info!(
+                    "Kill switch: permitted own process for control-plane / reconnect access"
+                );
             }
             None => {
                 // Fail loud but do not abort the whole transaction: a kill switch

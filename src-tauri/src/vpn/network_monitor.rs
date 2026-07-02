@@ -36,6 +36,12 @@ pub struct NetworkMonitor {
     rx: watch::Receiver<ConnectivityState>,
 }
 
+impl Default for NetworkMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetworkMonitor {
     pub fn new() -> Self {
         let (tx, rx) = watch::channel(ConnectivityState::Unknown);
