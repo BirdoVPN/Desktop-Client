@@ -137,11 +137,15 @@ pub fn rustls_config() -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let inner = WebPkiServerVerifier::builder(Arc::new(roots))
+    // Select the ring CryptoProvider EXPLICITLY (for both the verifier and the
+    // client config) instead of relying on rustls' process-level default.
+    // Other dependencies (e.g. sentry's transport) may enable the aws-lc-rs
+    // feature too, and with both features enabled rustls refuses to guess.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+    let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
         .build()
         .expect("cert-pin: failed to build WebPKI verifier from Mozilla roots");
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()

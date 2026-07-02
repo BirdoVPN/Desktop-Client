@@ -81,6 +81,19 @@ fn main() {
 
     info!("Birdo VPN Client starting...");
 
+    // Install ring as the process-level rustls CryptoProvider. Our own client
+    // configs select ring explicitly (see api/cert_pin.rs), but library code we
+    // don't control (e.g. the updater plugin's reqwest) may build rustls configs
+    // from the process default — and with BOTH `ring` and `aws-lc-rs` features
+    // present in the dependency graph (sentry 0.48 enables aws-lc), rustls
+    // panics rather than guessing. Installing a default removes that ambiguity.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::warn!("rustls CryptoProvider was already installed — continuing");
+    }
+
     // Initialize Sentry crash reporting (release builds only).
     // The DSN is public — it only identifies the project. The guard must
     // live for the entire process so panics / crashes are flushed before exit.

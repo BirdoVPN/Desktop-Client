@@ -2,6 +2,8 @@
 # Pinned for reproducible builds across all CI runners (Windows MSVC, macOS, Linux)
 # and local dev. Bumping this requires a deliberate review of the boringtun and
 # tauri compatibility matrix and triggers a fresh `cargo audit` pass.
-channel = "1.83.0"
+# 2026-07-02: 1.83 -> 1.96 (deliberate review): unblocks the `time` RUSTSEC fix
+# (needs 1.88+) and edition2024 dependencies (tauri Linux GTK chain, cargo-deny).
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

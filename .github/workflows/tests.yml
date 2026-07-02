@@ -9,8 +9,9 @@ name: Tests
 # `cargo test` (Windows — the supported launch target) and the frontend vitest
 # suite so a broken test can never silently land again.
 #
-# Linux is intentionally NOT run here: the pinned toolchain (1.83) does not build
-# the GTK/tao desktop dependency chain that now requires edition2024 (CD-1).
+# Linux is intentionally NOT run here: Windows is the supported launch target
+# and the GTK/WebKit system-dev packages make the job slow for little signal.
+# (The old 1.83-vs-edition2024 blocker is gone — the pin is 1.96 now.)
 # macOS/iOS are descoped for this launch.
 
 on:
@@ -34,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # rust-toolchain.toml pins the channel (1.83); this action just ensures a
+      # rust-toolchain.toml pins the channel (1.96); this action just ensures a
       # toolchain is present so the pin resolves.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -67,7 +68,7 @@ jobs:
         # machine, including clean runners (which is why the suite never ran).
         # Delay-load comctl32 so the symbol binds lazily; unit tests never raise a
         # task dialog. Scoped to THIS job's build only — the app build is untouched.
-        # (cargo 1.83 has no `rustc-link-arg-tests` build-script instruction, so we
+        # (cargo has no `rustc-link-arg-tests` build-script instruction, so we
         #  use RUSTFLAGS here rather than build.rs.)
         env:
           RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
