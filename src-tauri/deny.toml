@@ -5,17 +5,6 @@
 # In v2 vulnerabilities are always denied; this lists advisories we've reviewed
 # and consciously accept (with justification + a review-by date).
 ignore = [
-    # RUSTSEC-2024-0344: boringtun timing side-channel in curve25519-dalek.
-    # No practical exploit for VPN traffic — it needs a co-located attacker with
-    # microsecond timing, while our WireGuard handshake has a 500ms minimum
-    # (CRYPTO-001 in wireguard_new.rs) and handshake_with_retry() masks timing
-    # via exponential backoff + constant-time handshake padding in our code layer.
-    # Tracked: https://github.com/cloudflare/boringtun/issues/396
-    # 2026-07-02 review: boringtun 0.7.1 released (fixes this + ring 0.16).
-    # Upgrade swaps the WireGuard crypto core -> scheduled as the next release
-    # with a live-tunnel E2E pass. Review-by: 2026-08-15.
-    "RUSTSEC-2024-0344",
-
     # RUSTSEC-2025-0009: aes may panic when overflow-checking is enabled. The
     # shipped client is a release build (overflow-checks off), so this is a
     # debug-only panic, not a release vulnerability.

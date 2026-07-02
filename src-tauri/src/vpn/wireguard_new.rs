@@ -191,6 +191,7 @@ impl WireGuardSession {
             arr
         });
 
+        // boringtun 0.7: Tunn::new is infallible (0.6 returned Result).
         let tunnel = Tunn::new(
             StaticSecret::from(private_key_arr),
             PublicKey::from(server_key_arr),
@@ -198,8 +199,7 @@ impl WireGuardSession {
             Some(25), // Persistent keepalive
             0,        // Tunnel index
             None,     // Rate limiter
-        )
-        .map_err(|e| format!("Failed to create WireGuard tunnel: {:?}", e))?;
+        );
 
         // MEM-003: Zeroize our copies of keys after tunnel creation
         // The keys have been moved into the Tunn struct
