@@ -256,18 +256,29 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: npx tauri build
 
-      # Sanity-check: confirm the unbundled main .exe AND the installers
-      # carry an Authenticode signature. Fails the build loudly if any
-      # artifact is unsigned, so we never ship "Unknown publisher" again.
+      # Sanity-check the artifacts we actually SHIP: both installers must be
+      # Authenticode-signed, and so must the app .exe packed INSIDE the NSIS
+      # installer (extracted with 7-Zip). The loose target/release exe is NOT
+      # checked: since tauri 2.10 the bundler patches + signs a copy per bundle
+      # type and then RESTORES the original unsigned bytes afterwards (to keep
+      # cargo fingerprints stable), so an unsigned loose exe is expected.
       - name: Verify Authenticode signatures
         if: steps.sign-mode.outputs.enabled == 'true'
         shell: pwsh
         run: |
           $files = @()
-          $files += Get-ChildItem "src-tauri/target/release/birdo-vpn-desktop.exe" -ErrorAction SilentlyContinue
           $files += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
           $files += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue
-          if ($files.Count -eq 0) { throw "No artifacts found to verify" }
+          if ($files.Count -eq 0) { throw "No installer artifacts found to verify" }
+
+          # Extract the NSIS installer and add the inner app exe to the check list.
+          $nsis = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" | Select-Object -First 1
+          $extractDir = "$env:RUNNER_TEMP\nsis-extract"
+          & 7z x $nsis.FullName "-o$extractDir" -y | Out-Null
+          $innerExe = Get-ChildItem -Path $extractDir -Recurse -Filter "birdo-vpn-desktop.exe" | Select-Object -First 1
+          if (-not $innerExe) { throw "birdo-vpn-desktop.exe not found inside the NSIS installer" }
+          $files += $innerExe
+
           $failed = $false
           foreach ($f in $files) {
             $sig = Get-AuthenticodeSignature -FilePath $f.FullName
