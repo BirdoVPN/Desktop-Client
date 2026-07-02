@@ -45,6 +45,17 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # tauri::generate_context!() in main.rs requires the frontendDist dir
+      # (../dist) to EXIST at macro-expansion time. The lint/test job doesn't
+      # build the real frontend (that's the release workflow's job), so give
+      # the macro a stub. Without this, clippy on the bin target panics with
+      # "frontendDist is set to ../dist but this path doesn't exist".
+      - name: Stub frontend dist for macro expansion
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Set-Content -Path dist/index.html -Value '<!doctype html><title>stub</title>'
+
       # Lint gates: keep the public repo rustfmt-clean and clippy-clean.
       # (Validated against the pinned toolchain, so local == CI results.)
       - name: rustfmt check
