@@ -178,6 +178,7 @@ jobs:
 
       - name: GPG-sign .deb (detached .asc)
         if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
+        continue-on-error: true
         run: |
           DEB_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/deb -name '*.deb' | head -1)
           if [ -n "$DEB_FILE" ]; then
@@ -190,6 +191,7 @@ jobs:
 
       - name: GPG-sign AppImage (detached .asc)
         if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
+        continue-on-error: true
         run: |
           APPIMAGE_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/appimage -name '*.AppImage' | head -1)
           if [ -n "$APPIMAGE_FILE" ]; then
@@ -202,6 +204,7 @@ jobs:
 
       - name: GPG-sign SHA256SUMS (detached .asc)
         if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
+        continue-on-error: true
         run: |
           SUMS="src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt"
           if [ -f "$SUMS" ]; then

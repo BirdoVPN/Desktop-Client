@@ -171,13 +171,15 @@ mod tests {
     #[test]
     fn expired_entry_is_not_returned() {
         let cache = Mutex::new(CacheMap::new());
-        // Stamp an entry in the past, beyond the TTL, by inserting directly.
-        let past = Instant::now()
-            .checked_sub(CACHE_TTL + Duration::from_secs(1))
-            .expect("clock far enough from boot for the test");
+        // A zero-TTL entry is expired the instant it is stored: cache_get keeps
+        // an entry only while `stamped_at.elapsed() < ttl`, and elapsed() is
+        // always >= 0, so ttl == 0 is never fresh. This is deterministic and,
+        // unlike Instant::now().checked_sub(CACHE_TTL) — which returns None and
+        // panics on a freshly-booted machine whose uptime < CACHE_TTL (the CI
+        // flake this replaces) — it never underflows the monotonic clock.
         cache.lock().unwrap().insert(
             "api.birdo.app".to_owned(),
-            (past, vec![sample_addr()], CACHE_TTL),
+            (Instant::now(), vec![sample_addr()], Duration::ZERO),
         );
         assert!(cache_get(&cache, "api.birdo.app").is_none());
     }
