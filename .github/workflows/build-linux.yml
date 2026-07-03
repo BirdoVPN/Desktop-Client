@@ -165,14 +165,19 @@ jobs:
           fi
 
       - name: Import GPG signing key
+        id: gpg_import
         if: ${{ env.HAS_GPG == 'true' }}
+        # Best-effort: a missing/malformed LINUX_GPG_PRIVATE_KEY must not fail the
+        # whole release. Sigstore (keyless), SHA256SUMS, and the minisign updater
+        # .sig are the primary integrity artifacts; the GPG .asc is supplementary.
+        continue-on-error: true
         uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
         with:
           gpg_private_key: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
           passphrase:      ${{ secrets.LINUX_GPG_PASSPHRASE }}
 
       - name: GPG-sign .deb (detached .asc)
-        if: ${{ env.HAS_GPG == 'true' }}
+        if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
         run: |
           DEB_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/deb -name '*.deb' | head -1)
           if [ -n "$DEB_FILE" ]; then
@@ -184,7 +189,7 @@ jobs:
           fi
 
       - name: GPG-sign AppImage (detached .asc)
-        if: ${{ env.HAS_GPG == 'true' }}
+        if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
         run: |
           APPIMAGE_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/appimage -name '*.AppImage' | head -1)
           if [ -n "$APPIMAGE_FILE" ]; then
@@ -196,7 +201,7 @@ jobs:
           fi
 
       - name: GPG-sign SHA256SUMS (detached .asc)
-        if: ${{ env.HAS_GPG == 'true' }}
+        if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
         run: |
           SUMS="src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt"
           if [ -f "$SUMS" ]; then
@@ -215,6 +220,7 @@ jobs:
             src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.deb.asc
             src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.sigstore
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage
+            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.sig
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.asc
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.sigstore
             src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt
