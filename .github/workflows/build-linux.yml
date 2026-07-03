@@ -215,6 +215,7 @@ jobs:
             src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.deb.asc
             src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.sigstore
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage
+            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.sig
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.asc
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.sigstore
             src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt
