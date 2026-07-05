@@ -262,13 +262,15 @@ export function Login() {
               <input
                 id="totp"
                 type="text"
-                inputMode="numeric"
+                inputMode="text"
                 autoComplete="one-time-code"
                 value={totpCode}
-                onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                placeholder="000000"
+                // Accept a 6-digit TOTP OR a hex backup code (16 hex, 19 chars
+                // with dashes). Keep digits, hex letters and dashes; cap at 19.
+                onChange={(e) => setTotpCode(e.target.value.replace(/[^0-9A-Fa-f-]/g, '').slice(0, 19))}
+                placeholder="000000 or backup code"
                 required
-                maxLength={6}
+                maxLength={19}
                 autoFocus
                 className="w-full rounded-birdo-sub px-4 py-3 text-center text-2xl tracking-[0.3em] outline-none"
                 style={{
@@ -278,11 +280,12 @@ export function Login() {
                 }}
               />
               <p className="text-center text-xs text-w40">
-                Enter the 6-digit code from your authenticator app
+                Enter the 6-digit code from your authenticator, or a backup code
               </p>
 
               {error && <ErrorBanner message={error} />}
 
+              {/* Enable once a 6-digit TOTP or a hex backup code (>=2 groups of 4) is entered. */}
               <BirdoButton
                 type="submit"
                 text={isLoading ? 'Verifying…' : 'Verify'}
@@ -291,7 +294,7 @@ export function Login() {
                 size="large"
                 fullWidth
                 isLoading={isLoading}
-                disabled={totpCode.length !== 6}
+                disabled={!(/^\d{6}$/.test(totpCode) || /^[0-9A-Fa-f]{4}(?:-?[0-9A-Fa-f]{4})+$/.test(totpCode))}
               />
 
               <button
