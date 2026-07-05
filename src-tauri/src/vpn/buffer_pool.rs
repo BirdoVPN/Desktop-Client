@@ -4,8 +4,16 @@
 //! `thread_local!` + `RefCell` which is incompatible with Tokio's
 //! work-stealing runtime. Only the size constants are used (by wireguard_new.rs).
 
-/// Maximum WireGuard packet size (MTU 1420 + WireGuard overhead)
-pub const MAX_PACKET_SIZE: usize = 65536;
+/// Upper bound for a received (encrypted) WireGuard UDP datagram buffer.
+///
+/// Real traffic is ≤ MTU 1420 + WireGuard's 32-byte data-message overhead;
+/// `recv_packet` additionally drops anything over 9000 bytes (jumbo-frame
+/// headroom). This is sized to the next power of two above that 9148-byte
+/// jumbo+overhead ceiling — 16 KiB — rather than the theoretical 64 KiB UDP
+/// max, so the per-recv buffer that lives in the recv future is 4× smaller
+/// while still comfortably holding any datagram we would actually accept.
+/// (Kept a power of two and ≥ 9000 + WIREGUARD_OVERHEAD; see tests.rs.)
+pub const MAX_PACKET_SIZE: usize = 16384;
 
 /// WireGuard encapsulation overhead.
 ///

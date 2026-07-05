@@ -506,6 +506,15 @@ impl WireGuardSession {
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            // An oversized datagram (larger than our recv buffer) surfaces as
+            // WSAEMSGSIZE (Windows, 10040) / EMSGSIZE (unix, 90). Real WireGuard
+            // traffic is ≤ MTU + overhead and this socket is connect()ed to the
+            // server, so such a datagram is malformed/spoofed — drop it like the
+            // >9000 guard above rather than tearing down the tunnel over it.
+            Err(ref e) if matches!(e.raw_os_error(), Some(10040) | Some(90)) => {
+                tracing::warn!(error = %e, "Dropping oversized UDP datagram (message too long)");
+                Ok(None)
+            }
             Err(e) => Err(format!("Receive error: {}", e)),
         }
     }
