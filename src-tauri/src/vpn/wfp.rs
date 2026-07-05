@@ -986,17 +986,29 @@ pub async fn activate_blocking() -> Result<(), String> {
         .map_err(|e| format!("engine lock poisoned: {}", e))?;
     let engine = guard.as_mut().ok_or("WFP engine not open")?;
 
-    // If already blocking, tear down existing filters and rebuild.
-    if IS_BLOCKING.load(Ordering::SeqCst) {
-        tracing::debug!("Kill switch already active — refreshing filters");
-        engine.remove_all_filters();
-        engine.delete_sublayer();
-    }
+    // Snapshot the current WFP bookkeeping so it can be restored if a REFRESH
+    // transaction aborts. The teardown of the existing filters now runs INSIDE
+    // the transaction (below), so an abort rolls those deletes back and the OLD
+    // filter set survives in WFP — our in-memory tracking must then match it.
+    let was_blocking = IS_BLOCKING.load(Ordering::SeqCst);
+    let saved_filter_ids = engine.filter_ids.clone();
+    let saved_sublayer_added = engine.sublayer_added;
+    let saved_split_tunnel_map = engine.split_tunnel_map.clone();
 
     tracing::info!("Activating kill switch (WFP atomic transaction)");
     engine.begin_transaction()?;
 
     let result = (|| -> Result<(), String> {
+        // Refresh path: tear down the existing filters INSIDE the transaction so
+        // the delete is atomic with the rebuild. On commit the old->new swap has
+        // ZERO gap; on abort the deletes roll back so the old filters keep
+        // blocking — closing the leak window that existed when the teardown ran
+        // BEFORE begin_transaction().
+        if was_blocking {
+            tracing::debug!("Kill switch already active — refreshing filters in-transaction");
+            engine.remove_all_filters();
+            engine.delete_sublayer();
+        }
         engine.add_sublayer()?;
 
         // Block-all rules (low weight, evaluated last)
@@ -1137,8 +1149,23 @@ pub async fn activate_blocking() -> Result<(), String> {
         Err(e) => {
             tracing::error!("Filter setup failed, aborting transaction: {}", e);
             engine.abort_transaction();
-            engine.filter_ids.clear();
-            engine.sublayer_added = false;
+            if was_blocking {
+                // The abort rolled back the in-transaction deletes, so the OLD
+                // filter set is still active in WFP. Restore the bookkeeping to
+                // match and stay blocking — no leak; IS_BLOCKING stays true.
+                engine.filter_ids = saved_filter_ids;
+                engine.sublayer_added = saved_sublayer_added;
+                engine.split_tunnel_map = saved_split_tunnel_map;
+                tracing::warn!(
+                    "Kill-switch refresh failed; retained the previous filter set (still blocking)"
+                );
+            } else {
+                // Fresh activation failed and nothing was blocking before — clear
+                // bookkeeping and remain unblocked.
+                engine.filter_ids.clear();
+                engine.sublayer_added = false;
+                IS_BLOCKING.store(false, Ordering::SeqCst);
+            }
             Err(e)
         }
     }
