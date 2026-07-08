@@ -81,7 +81,6 @@ function App() {
         }
       })
       .catch(() => setBioLock('open'));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Apply the saved window-position preference (corner anchor / draggable).
