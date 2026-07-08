@@ -137,6 +137,7 @@ export function Dashboard() {
     connectionState,
     currentServer,
     servers,
+    deepLinkAction,
     favoriteServers,
     userEmail,
     settings,
@@ -161,6 +162,7 @@ export function Dashboard() {
       connectionState: s.connectionState,
       currentServer: s.currentServer,
       servers: s.servers,
+      deepLinkAction: s.deepLinkAction,
       favoriteServers: s.favoriteServers,
       userEmail: s.userEmail,
       settings: s.settings,
@@ -593,6 +595,63 @@ export function Dashboard() {
     },
     [setCurrentServer, setConnectionState, setErrorMessage, setVpnIp],
   );
+
+  // ── Deep links (birdo://connect/<server-id>) ──────────────────────
+  // App.tsx validates the URL and stages { action:'connect', serverId } in the
+  // store; this effect is the consumer that actually connects. If the server
+  // list hasn't loaded yet the action is kept until it has (the effect re-runs
+  // on `servers`), so a cold-start deep link still works. Declared after
+  // handleSelectServer because it participates in the deps array.
+  useEffect(() => {
+    if (!deepLinkAction) return;
+    if (deepLinkAction.action !== 'connect' || !deepLinkAction.serverId) {
+      // 'settings' etc. are handled by App.tsx's setTab — nothing to do here.
+      if (deepLinkAction.action !== 'connect') {
+        useAppStore.getState().setDeepLinkAction(null);
+      }
+      return;
+    }
+
+    const target = servers.find((s) => s.id === deepLinkAction.serverId);
+    if (!target) {
+      if (servers.length > 0) {
+        // List is loaded and the id isn't in it — surface and drop the action.
+        setErrorMessage('The server in that link is unknown for this account.');
+        useAppStore.getState().setDeepLinkAction(null);
+      }
+      return;
+    }
+
+    useAppStore.getState().setDeepLinkAction(null);
+
+    if (!target.isOnline || !target.isAccessible) {
+      setErrorMessage('That server is offline or not included in your plan.');
+      return;
+    }
+
+    const st = useAppStore.getState().connectionState;
+    if (st === 'connected' || st === 'reconnecting' || st === 'rekeying' || st === 'kill_switch_active') {
+      // On-tunnel: handleSelectServer performs a real switch to the target.
+      handleSelectServer(target);
+      return;
+    }
+    if (st !== 'disconnected' && st !== 'error') return; // mid-transition — ignore
+
+    setCurrentServer(target);
+    (async () => {
+      setConnectionState('connecting');
+      setErrorMessage(null);
+      setVpnIp(null);
+      try {
+        await invoke<boolean>('connect_vpn', { serverId: target.id });
+        setConnectionState('connected');
+      } catch (err) {
+        setErrorMessage(friendlyVpnError(err));
+        setConnectionState('error');
+        setCurrentServer(null);
+      }
+    })();
+  }, [deepLinkAction, servers, handleSelectServer, setCurrentServer, setConnectionState, setErrorMessage, setVpnIp]);
 
   const handleLogout = useCallback(async () => {
     const cur = useAppStore.getState().connectionState;

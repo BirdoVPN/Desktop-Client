@@ -30,7 +30,7 @@ import {
   BirdoEmptyState,
   AppIconMark,
 } from '@/components/birdo';
-import { settingsToRust } from '@/utils/helpers';
+import { settingsToRust, isWindowsPlatform } from '@/utils/helpers';
 import { brand, white, hairline, status } from '@/lib/birdo-theme';
 
 /** An installed app returned by the Rust `list_installed_apps` command. */
@@ -207,6 +207,26 @@ export function SplitTunnel() {
     if (!q) return apps;
     return apps.filter((app) => app.toLowerCase().includes(q));
   }, [apps, searchQuery]);
+
+  // WFP enforcement is Windows-only; the nav row is hidden elsewhere, but
+  // guard the screen too so a stale route can never present dead controls
+  // (Linux/macOS users would configure exclusions that silently do nothing).
+  if (!isWindowsPlatform()) {
+    return (
+      <div className="flex h-full flex-col">
+        <BirdoTopBar title="Split Tunneling" onBack={popRoute} />
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 px-8 text-center">
+          <p className="text-sm font-medium" style={{ color: white.w100 }}>
+            Windows only (for now)
+          </p>
+          <p className="max-w-xs text-xs" style={{ color: white.w60 }}>
+            Split tunneling is enforced by the Windows Filtering Platform and
+            isn&apos;t available on this operating system yet.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col">

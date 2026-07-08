@@ -320,9 +320,17 @@ impl BirdoApi {
     // Anonymous Login
     // ========================================================================
 
-    /// Login anonymously with a device ID (creates a new RECON account)
-    pub async fn login_anonymous(&self, device_id: &str) -> Result<AnonymousLoginResult, ApiError> {
+    /// Login to an EXISTING anonymous account by its 24-digit ID (+ optional
+    /// password set on the website). The endpoint never creates accounts.
+    pub async fn login_anonymous(
+        &self,
+        anonymous_id: &str,
+        password: Option<String>,
+        device_id: &str,
+    ) -> Result<AnonymousLoginResult, ApiError> {
         let payload = AnonymousLoginRequest {
+            anonymous_id: anonymous_id.to_string(),
+            password,
             device_id: device_id.to_string(),
         };
 

@@ -55,6 +55,7 @@ export function Login() {
 
   // Anonymous login state
   const [anonId, setAnonId] = useState('');
+  const [anonPassword, setAnonPassword] = useState('');
 
   const { setAuthenticated, setUserEmail } = useAppStore();
 
@@ -96,14 +97,21 @@ export function Login() {
     setIsLoading(true);
 
     try {
-      // The backend derives the account from a stable device ID — no args.
-      const result = await invoke<LoginResponse>('login_anonymous');
+      // Send the typed 24-digit ID (+ optional password set on the website).
+      // The backend logs in to that EXISTING account — it never creates one.
+      const result = await invoke<LoginResponse>('login_anonymous', {
+        request: {
+          anonymousId: anonId.replace(/\D/g, ''),
+          password: anonPassword || null,
+        },
+      });
 
       if (result.requires_two_factor && result.challenge_token) {
         setTwoFactorRequired(true);
         setChallengeToken(result.challenge_token);
       } else if (result.success) {
         setUserEmail(result.user?.email || null);
+        setAnonPassword('');
         setAuthenticated(true);
       } else {
         setError(result.message || result.error || 'Login failed. Check your anonymous ID.');
@@ -423,6 +431,16 @@ export function Login() {
                       </p>
                     </div>
 
+                    <BirdoTextField
+                      label="Password (only if you set one)"
+                      type="password"
+                      value={anonPassword}
+                      onChange={setAnonPassword}
+                      placeholder="••••••••"
+                      autoComplete="current-password"
+                      ariaLabel="Anonymous account password"
+                    />
+
                     {error && <ErrorBanner message={error} />}
 
                     <BirdoButton
@@ -447,7 +465,7 @@ export function Login() {
               >
                 Don&apos;t have an account?{' '}
                 <a
-                  href="https://auth.birdo.app/register"
+                  href="https://auth.birdo.app/login"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="font-medium text-w100 transition hover:text-w80"

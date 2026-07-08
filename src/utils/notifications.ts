@@ -82,3 +82,21 @@ export function notifyKillSwitchActive(): void {
 export function notifyReconnected(serverName: string, details?: ConnectionDetails): void {
   notify('VPN Reconnected', connectionBody('Back online via', serverName, details));
 }
+
+/**
+ * Update-available notice from the daily background check. Deliberately NOT
+ * gated on the connection-notifications preference: shipping security fixes
+ * to a VPN client matters more than notification quiet, and it fires at most
+ * once per app run.
+ */
+export function notifyUpdateAvailable(version: string): void {
+  if (!permissionReady) return;
+  try {
+    sendNotification({
+      title: 'Birdo VPN update available',
+      body: `Version ${version} is ready — open Settings → Software Updates to install.`,
+    });
+  } catch (err) {
+    console.error('Failed to send update notification:', err);
+  }
+}

@@ -10,6 +10,8 @@ import { TitleBar } from '@/components/TitleBar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
+import { check as checkForUpdate } from '@tauri-apps/plugin-updater';
+import { notifyUpdateAvailable } from '@/utils/notifications';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 
 interface AuthState {
@@ -48,6 +50,38 @@ function App() {
     }))
   );
   const [initializing, setInitializing] = useState(true);
+
+  // Biometric app-lock. When "Biometric Unlock" is enabled in Settings the
+  // entire UI must stay behind an unlock screen until Windows Hello / Touch ID
+  // succeeds — previously the flag was persisted but never enforced, so the
+  // advertised lock was a no-op (same class of bug as the Android fix in
+  // Mobile #146). 'checking' avoids a flash of unlocked content at boot.
+  const [bioLock, setBioLock] = useState<'checking' | 'locked' | 'open'>('checking');
+
+  const requestBiometricUnlock = async () => {
+    try {
+      const ok = await invoke<boolean>('authenticate_biometric', {
+        reason: 'Unlock Birdo VPN',
+      });
+      if (ok) setBioLock('open');
+    } catch {
+      // Prompt failed/cancelled — remain locked; the user can retry or quit.
+    }
+  };
+
+  useEffect(() => {
+    invoke<{ available: boolean; enabled: boolean }>('check_biometric_available')
+      .then((st) => {
+        if (st?.available && st?.enabled) {
+          setBioLock('locked');
+          // Prompt immediately at launch; the lock screen offers a retry.
+          requestBiometricUnlock();
+        } else {
+          setBioLock('open');
+        }
+      })
+      .catch(() => setBioLock('open'));
+  }, []);
 
   // Apply the saved window-position preference (corner anchor / draggable).
   // Runs on startup and whenever the user changes it in Settings. main.rs pins
@@ -126,6 +160,36 @@ function App() {
     checkAuth();
   }, [setAuthenticated, setLoading, setUserEmail, setAccount]);
 
+  // Daily background update check. The per-platform update endpoint is live
+  // (api.birdo.app/updates/…), but the only in-app check used to be the manual
+  // button in Settings → Software Updates — users who never opened it would
+  // never learn about security fixes. Checks shortly after startup and then
+  // every 24h; notifies at most once per app run.
+  useEffect(() => {
+    let notified = false;
+    const runCheck = async () => {
+      if (notified) return;
+      try {
+        const update = await Promise.race([
+          checkForUpdate(),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 15000)),
+        ]);
+        if (update) {
+          notified = true;
+          notifyUpdateAvailable(update.version);
+        }
+      } catch {
+        // Offline / endpoint hiccup — silent; the next interval retries.
+      }
+    };
+    const initial = setTimeout(runCheck, 20_000); // let startup settle first
+    const daily = setInterval(runCheck, 24 * 60 * 60 * 1000);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(daily);
+    };
+  }, []);
+
   // Listen for birdo:// deep link events from the Rust backend
   useEffect(() => {
     const unlisten = listen<string>('deep-link', (event) => {
@@ -154,7 +218,7 @@ function App() {
     return () => { unlisten.then((fn) => fn()).catch(() => {}); };
   }, []);
 
-  if (initializing) {
+  if (initializing || bioLock === 'checking') {
     return (
       <div className="relative flex h-screen flex-col overflow-hidden bg-[#000000]">
         <PixelCanvas />
@@ -172,6 +236,46 @@ function App() {
             </div>
             <p className="text-sm text-white/60">Loading...</p>
           </motion.div>
+        </div>
+      </div>
+    );
+  }
+
+  // Biometric lock screen — nothing behind it renders until unlock succeeds.
+  if (bioLock === 'locked') {
+    return (
+      <div className="relative flex h-screen flex-col overflow-hidden bg-[#000000]">
+        <PixelCanvas />
+        <TitleBar />
+
+        <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-6 px-8">
+          <motion.div
+            className="flex flex-col items-center gap-3 text-center"
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.3 }}
+          >
+            <h1 className="text-lg font-semibold text-white">Birdo VPN is locked</h1>
+            <p className="max-w-xs text-sm text-white/60">
+              Biometric Unlock is enabled for this app. Authenticate to continue.
+            </p>
+          </motion.div>
+          <div className="flex flex-col items-center gap-3">
+            <button
+              type="button"
+              onClick={requestBiometricUnlock}
+              className="rounded-lg bg-white px-6 py-2.5 text-sm font-semibold text-black transition hover:bg-white/90"
+            >
+              Unlock
+            </button>
+            <button
+              type="button"
+              onClick={() => exit(0).catch(() => window.close())}
+              className="text-xs text-white/50 transition hover:text-white/80"
+            >
+              Quit
+            </button>
+          </div>
         </div>
       </div>
     );

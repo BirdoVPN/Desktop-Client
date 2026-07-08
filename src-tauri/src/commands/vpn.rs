@@ -493,11 +493,7 @@ pub async fn connect_vpn(
     // administrator — failing early with a clear message is better than
     // a cryptic Win32 error deep in the tunnel code.
     if !crate::utils::elevation::is_elevated() {
-        return Err(
-            "Administrator privileges required. Please right-click the app \
-             and select \"Run as administrator\", or restart from an elevated terminal."
-                .to_string(),
-        );
+        return Err(crate::utils::elevation::elevation_required_message().to_string());
     }
 
     // Restore tokens from credential store if not in memory
@@ -821,11 +817,7 @@ pub async fn quick_connect(
 
     // Pre-flight admin check
     if !crate::utils::elevation::is_elevated() {
-        return Err(
-            "Administrator privileges required. Please right-click the app \
-             and select \"Run as administrator\", or restart from an elevated terminal."
-                .to_string(),
-        );
+        return Err(crate::utils::elevation::elevation_required_message().to_string());
     }
 
     // Check if we have a valid token

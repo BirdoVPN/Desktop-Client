@@ -63,9 +63,8 @@ export function UpdateChecker() {
         idleTimerRef.current = setTimeout(() => setStatus('idle'), 3000);
       }
     } catch (_err) {
-      // The update endpoint isn't deployed yet, so check() can 404. This is
-      // expected until the update server ships — keep the tone neutral and
-      // avoid implying the user is (or isn't) on the latest version.
+      // Endpoint unreachable (offline, server hiccup). Keep the tone neutral
+      // and avoid implying the user is (or isn't) on the latest version.
       setError('Update check unavailable right now.');
       setStatus('error');
     }
@@ -121,8 +120,14 @@ export function UpdateChecker() {
     }
   }, []);
 
-  // Don't auto-check on mount — update server may not be available yet.
-  // Users can manually check via the "Check" button.
+  // Auto-check when the panel opens: the per-platform update endpoint is live
+  // (api.birdo.app/updates/…, verified with v1.4.11), so surfacing the state
+  // immediately beats a manual-only "Check" button. App.tsx additionally runs
+  // a daily background check with a native notification.
+  useEffect(() => {
+    checkForUpdates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="space-y-3">

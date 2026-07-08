@@ -222,20 +222,33 @@ pub struct TwoFactorVerifyResponse {
     pub backup_code_used: bool,
 }
 
-/// Anonymous login request — only requires a device ID
+/// Anonymous login request. The backend's AnonymousLoginSchema requires the
+/// account's 24-digit anonymousId (this endpoint NEVER creates accounts) plus
+/// an optional password (if one was set on the website). deviceId is optional
+/// context the backend uses for trusted-device 2FA skip + device tracking.
 #[derive(Debug, Serialize)]
 pub struct AnonymousLoginRequest {
+    #[serde(rename = "anonymousId")]
+    pub anonymous_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
     #[serde(rename = "deviceId")]
     pub device_id: String,
 }
 
-/// Anonymous login response
+/// Anonymous login response. Success = { ok, anonymousId, tokens }; accounts
+/// with 2FA enabled instead return { requiresTwoFactor, challengeToken }.
 #[derive(Debug, Deserialize)]
 pub struct AnonymousLoginResult {
+    #[serde(default)]
     pub ok: bool,
     #[serde(rename = "anonymousId")]
     pub anonymous_id: Option<String>,
     pub tokens: Option<TokenPair>,
+    #[serde(default, rename = "requiresTwoFactor")]
+    pub requires_two_factor: bool,
+    #[serde(rename = "challengeToken")]
+    pub challenge_token: Option<String>,
 }
 
 /// Password reset request

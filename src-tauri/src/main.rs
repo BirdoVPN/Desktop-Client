@@ -283,9 +283,18 @@ fn main() {
             // Pin the window to the top-left corner and show it. The window is
             // frameless (decorations:false) and has no drag regions, so it is
             // not movable by the user — we anchor it here once at startup.
+            // Honor the "Start Minimized" setting: when enabled the app stays
+            // in the tray (the tray click / "Show Window" item restores it).
+            let start_minimized = commands::settings::load_settings_sync(&app.handle().clone())
+                .map(|s| s.start_minimized)
+                .unwrap_or(false);
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_position(LogicalPosition::new(0.0, 0.0));
-                let _ = window.show();
+                if start_minimized {
+                    info!("start_minimized enabled — staying in tray");
+                } else {
+                    let _ = window.show();
+                }
             }
 
             // Listen for deep link events (birdo:// protocol)

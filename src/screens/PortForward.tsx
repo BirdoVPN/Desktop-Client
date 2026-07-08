@@ -4,7 +4,7 @@
  * Pixel-faithful port of mobile's `PortForwardScreen.kt`:
  *   • BirdoTopBar "Port Forwarding" + back (popRoute).
  *   • Info row explaining the feature.
- *   • "NEW RULE" BirdoSubCard — port field (1-65535) + TCP/UDP segmented
+ *   • "NEW RULE" BirdoSubCard — port field (1024-65535) + TCP/UDP segmented
  *     toggle + Add button → invoke('create_port_forward', { port, protocol }).
  *   • "ACTIVE RULES" — loading / empty (BirdoEmptyState) / list of rules,
  *     each row external → internal with a Delete →
@@ -56,10 +56,13 @@ export function PortForward() {
   const [error, setError] = useState<string | null>(null);
 
   const portValue = Number.parseInt(portText, 10);
+  // Must match the Rust command's range (vpn_port_forward rejects <1024 —
+  // privileged ports); accepting 1-1023 here just deferred the error to a
+  // confusing backend message after submit.
   const isPortValid =
     portText.length > 0 &&
     !Number.isNaN(portValue) &&
-    portValue >= 1 &&
+    portValue >= 1024 &&
     portValue <= 65535;
   const showPortError = portText.length > 0 && !isPortValid;
 
@@ -177,7 +180,7 @@ export function PortForward() {
           />
           {showPortError && (
             <p className="mt-1.5 pl-1 text-xs" style={{ color: status.red }}>
-              Port must be 1-65535
+              Port must be 1024-65535
             </p>
           )}
 
