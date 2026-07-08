@@ -404,22 +404,87 @@ pub async fn verify_2fa(
     }
 }
 
-/// Login anonymously (creates a new anonymous account with device ID)
+/// Anonymous login request from the frontend: the account's 24-digit ID plus
+/// an optional password (set on the website). The endpoint never creates
+/// accounts — the old device-ID-only flow could not succeed at all (the
+/// backend requires anonymousId), which left the whole tab a dead end.
+#[derive(Debug, Deserialize)]
+pub struct AnonymousLoginCommandRequest {
+    #[serde(rename = "anonymousId")]
+    pub anonymous_id: String,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+/// Zeroize the optional password from heap memory on drop (same rationale as
+/// LoginRequest / FIX-1-3).
+impl Drop for AnonymousLoginCommandRequest {
+    fn drop(&mut self) {
+        if let Some(ref mut p) = self.password {
+            p.zeroize();
+        }
+    }
+}
+
+/// Login to an existing anonymous account with its 24-digit ID
 #[tauri::command]
 pub async fn login_anonymous(
+    request: AnonymousLoginCommandRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<LoginResponse, String> {
-    // Generate a stable device ID from machine identity
+    // Same client-side rate limit as email login (compromised-webview guard).
+    {
+        let mut guard = LOGIN_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
+        let attempts = guard.get_or_insert_with(Vec::new);
+        let now = Instant::now();
+        attempts.retain(|t| now.duration_since(*t).as_secs() < LOGIN_WINDOW_SECS);
+        if attempts.len() >= MAX_LOGIN_ATTEMPTS {
+            return Ok(LoginResponse {
+                success: false,
+                message: Some("Too many login attempts. Please wait a minute.".to_string()),
+                user: None,
+                requires_two_factor: false,
+                challenge_token: None,
+            });
+        }
+        attempts.push(now);
+    }
+
+    let anonymous_id: String = request
+        .anonymous_id
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if anonymous_id.len() != 24 {
+        return Ok(LoginResponse {
+            success: false,
+            message: Some("Anonymous ID must be exactly 24 digits.".to_string()),
+            user: None,
+            requires_two_factor: false,
+            challenge_token: None,
+        });
+    }
+
+    // Device ID gives the backend trusted-device 2FA context (never identity).
     let device_id = crate::utils::get_device_id();
+    tracing::info!("Anonymous login attempt (id: …{})", &anonymous_id[20..]);
 
-    tracing::info!(
-        "Anonymous login attempt (device: {}...)",
-        &device_id[..8.min(device_id.len())]
-    );
-
-    match api.login_anonymous(&device_id).await {
+    match api
+        .login_anonymous(&anonymous_id, request.password.clone(), &device_id)
+        .await
+    {
         Ok(result) => {
+            if result.requires_two_factor {
+                tracing::info!("Anonymous login requires 2FA");
+                return Ok(LoginResponse {
+                    success: false,
+                    message: None,
+                    user: None,
+                    requires_two_factor: true,
+                    challenge_token: result.challenge_token,
+                });
+            }
             if result.ok {
                 if let Some(ref tokens) = result.tokens {
                     if let Err(e) =
@@ -436,7 +501,7 @@ pub async fn login_anonymous(
                     is_anonymous: true,
                 };
 
-                tracing::info!("Anonymous login successful: {:?}", result.anonymous_id);
+                tracing::info!("Anonymous login successful");
                 Ok(LoginResponse {
                     success: true,
                     message: None,

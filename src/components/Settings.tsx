@@ -33,6 +33,7 @@ import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { useShallow } from 'zustand/react/shallow';
 import {
   Wifi,
+  Bell,
   Fingerprint,
   Zap,
   Monitor,
@@ -251,8 +252,7 @@ export function Settings() {
 
         {/* ── CONNECTION ─────────────────────────────────────────────── */}
         {/* Kill Switch lives in VPN Settings (Security), matching mobile — not
-            duplicated here. Desktop has no notification surface, so Connection
-            here is just Auto-Connect. */}
+            duplicated here. */}
         <BirdoSectionHeader title="Connection" className="mt-2" />
         <BirdoCard padding="0.25rem">
           <BirdoToggleRow
@@ -263,6 +263,34 @@ export function Settings() {
             checked={settings.autoConnect}
             onCheckedChange={(v) => persist({ autoConnect: v })}
           />
+          <BirdoToggleRow
+            title="Connection Notifications"
+            subtitle="Notify on connect, disconnect and kill-switch events"
+            leadingIcon={Bell}
+            leadingTint={statusTokens.yellow}
+            checked={settings.notifications}
+            onCheckedChange={(v) => persist({ notifications: v })}
+          />
+          {settings.notifications && (
+            <>
+              <BirdoToggleRow
+                title="Show Location"
+                subtitle="Include the server location in notifications"
+                leadingIcon={Bell}
+                leadingTint={white.w60}
+                checked={settings.showLocationInNotification}
+                onCheckedChange={(v) => persist({ showLocationInNotification: v })}
+              />
+              <BirdoToggleRow
+                title="Show IP Address"
+                subtitle="Include the VPN IP in notifications"
+                leadingIcon={Bell}
+                leadingTint={white.w60}
+                checked={settings.showIpInNotification}
+                onCheckedChange={(v) => persist({ showIpInNotification: v })}
+              />
+            </>
+          )}
         </BirdoCard>
 
         {/* ── SECURITY (biometric — hidden when unavailable) ───────────── */}

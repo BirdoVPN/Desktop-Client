@@ -74,6 +74,79 @@ pub struct AppSettings {
     /// (~5-30s) drop window but cannot mis-block steady-state browsing.
     #[serde(default)]
     pub lockdown_mode: bool,
+    /// Multi-hop (double VPN) armed state. The frontend has always sent these
+    /// three fields (helpers.ts settingsToRust) — before they existed here,
+    /// serde silently dropped them, so the user's multi-hop arm + entry/exit
+    /// selection was wiped on every settings round-trip/restart.
+    #[serde(default)]
+    pub multi_hop_enabled: bool,
+    /// Entry node ID for multi-hop (None = not selected)
+    #[serde(default)]
+    pub multi_hop_entry_node_id: Option<String>,
+    /// Exit node ID for multi-hop (None = not selected)
+    #[serde(default)]
+    pub multi_hop_exit_node_id: Option<String>,
+}
+
+/// The exact `AppSettings` shape (fields + order + serde attributes) BEFORE the
+/// multi-hop fields were added. Used ONLY as an HMAC-verification fallback:
+/// `get_settings` verifies the HMAC over a RE-serialization of the parsed
+/// struct, so a settings file signed by an older build re-serializes with the
+/// new fields included and fails the primary check. Without this fallback,
+/// every existing install would silently reset to defaults on upgrade (losing
+/// split-tunnel apps, autostart, DNS, …). When fields are added to
+/// `AppSettings` again, snapshot the pre-change shape here the same way.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyAppSettingsV1 {
+    autostart: bool,
+    start_minimized: bool,
+    #[serde(default = "default_true")]
+    killswitch_enabled: bool,
+    notifications_enabled: bool,
+    auto_connect: bool,
+    preferred_server_id: Option<String>,
+    split_tunneling_enabled: bool,
+    split_tunnel_apps: Vec<String>,
+    custom_dns: Option<Vec<String>>,
+    protocol: Protocol,
+    #[serde(default)]
+    local_network_sharing: bool,
+    #[serde(default = "default_wireguard_port")]
+    wireguard_port: String,
+    #[serde(default)]
+    wireguard_mtu: u16,
+    #[serde(default)]
+    stealth_mode: bool,
+    #[serde(default = "default_true")]
+    quantum_protection: bool,
+    #[serde(default)]
+    lockdown_mode: bool,
+}
+
+impl From<LegacyAppSettingsV1> for AppSettings {
+    fn from(l: LegacyAppSettingsV1) -> Self {
+        Self {
+            autostart: l.autostart,
+            start_minimized: l.start_minimized,
+            killswitch_enabled: l.killswitch_enabled,
+            notifications_enabled: l.notifications_enabled,
+            auto_connect: l.auto_connect,
+            preferred_server_id: l.preferred_server_id,
+            split_tunneling_enabled: l.split_tunneling_enabled,
+            split_tunnel_apps: l.split_tunnel_apps,
+            custom_dns: l.custom_dns,
+            protocol: l.protocol,
+            local_network_sharing: l.local_network_sharing,
+            wireguard_port: l.wireguard_port,
+            wireguard_mtu: l.wireguard_mtu,
+            stealth_mode: l.stealth_mode,
+            quantum_protection: l.quantum_protection,
+            lockdown_mode: l.lockdown_mode,
+            multi_hop_enabled: false,
+            multi_hop_entry_node_id: None,
+            multi_hop_exit_node_id: None,
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -95,6 +168,9 @@ impl Default for AppSettings {
             stealth_mode: false,      // premium — off by default
             quantum_protection: true, // post-quantum on by default
             lockdown_mode: false,     // always-on kill switch — opt-in, device-verified
+            multi_hop_enabled: false,
+            multi_hop_entry_node_id: None,
+            multi_hop_exit_node_id: None,
         }
     }
 }
@@ -182,7 +258,14 @@ fn normalize_loaded_settings(mut settings: AppSettings) -> AppSettings {
 /// Get current application settings
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
-    let path = get_settings_path(&app)?;
+    load_settings_sync(&app)
+}
+
+/// Synchronous settings loader shared by the `get_settings` command and Rust
+/// callers that need settings before the frontend is up (e.g. main.rs setup
+/// honoring `start_minimized`).
+pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
+    let path = get_settings_path(app)?;
 
     if !path.exists() {
         return Ok(AppSettings::default());
@@ -200,10 +283,36 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
                     .map_err(|e| format!("Failed to re-serialize settings: {}", e))?;
                 if verify_hmac(&settings_json, &signed.hmac, &key) {
                     return Ok(normalize_loaded_settings(signed.settings));
-                } else {
-                    tracing::warn!("Settings HMAC verification failed — possible tampering. Resetting to defaults.");
-                    return Ok(AppSettings::default());
                 }
+
+                // Fallback: the file may have been signed by a build whose
+                // AppSettings predates newer fields — the HMAC covers the OLD
+                // shape's serialization, which the primary check (serialized
+                // with the new fields present) can never reproduce. Re-verify
+                // against the legacy shape before declaring tampering, else
+                // every upgrade would silently reset user settings.
+                if let Ok(legacy) = serde_json::to_value(&signed.settings)
+                    .and_then(serde_json::from_value::<LegacyAppSettingsV1>)
+                {
+                    let legacy_json = serde_json::to_string(&legacy)
+                        .map_err(|e| format!("Failed to serialize legacy settings: {}", e))?;
+                    if verify_hmac(&legacy_json, &signed.hmac, &key) {
+                        tracing::info!(
+                            "Settings verified against pre-multi-hop shape — migrating signature"
+                        );
+                        let settings = normalize_loaded_settings(AppSettings::from(legacy));
+                        if let Err(e) = save_settings_inner(app, &settings) {
+                            tracing::warn!(
+                                "Failed to re-sign migrated settings: {} (will retry next load)",
+                                e
+                            );
+                        }
+                        return Ok(settings);
+                    }
+                }
+
+                tracing::warn!("Settings HMAC verification failed — possible tampering. Resetting to defaults.");
+                return Ok(AppSettings::default());
             }
             Err(e) => {
                 tracing::error!("HMAC key unavailable ({}). Resetting to secure defaults to prevent tampered settings from loading.", e);
@@ -220,7 +329,7 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
             // Re-save with HMAC (best effort). Log on failure so a persistent
             // failure to upgrade (disk full, permissions, credential store down)
             // is observable rather than silently leaving settings unprotected.
-            if let Err(e) = save_settings_inner(&app, &settings) {
+            if let Err(e) = save_settings_inner(app, &settings) {
                 tracing::warn!(
                     "Failed to migrate settings to HMAC-protected format: {}. Settings remain unsigned and will be retried on next load.",
                     e
@@ -306,6 +415,60 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A settings file signed by a pre-multi-hop build must still verify via
+    /// the legacy-shape fallback — otherwise every upgrade silently resets
+    /// user settings (the primary check re-serializes with the new fields
+    /// present, which can never reproduce the old signed JSON).
+    #[test]
+    fn legacy_signed_settings_verify_via_fallback_after_field_additions() {
+        let key: &[u8] = b"unit-test-hmac-key-32-bytes-pad!";
+        // What an old build serialized and signed (no multi_hop_* fields).
+        let legacy = LegacyAppSettingsV1 {
+            autostart: true,
+            start_minimized: true,
+            killswitch_enabled: true,
+            notifications_enabled: true,
+            auto_connect: false,
+            preferred_server_id: Some("node-7".into()),
+            split_tunneling_enabled: true,
+            split_tunnel_apps: vec!["C:\\games\\x.exe".into()],
+            custom_dns: None,
+            protocol: Protocol::Wireguard,
+            local_network_sharing: false,
+            wireguard_port: "auto".into(),
+            wireguard_mtu: 0,
+            stealth_mode: false,
+            quantum_protection: true,
+            lockdown_mode: false,
+        };
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        let hmac = compute_hmac(&legacy_json, key).unwrap();
+
+        // The new build parses the same stored JSON into the CURRENT struct.
+        let current: AppSettings = serde_json::from_str(&legacy_json).unwrap();
+
+        // Primary verification fails (re-serialization now includes new fields)…
+        let current_json = serde_json::to_string(&current).unwrap();
+        assert!(
+            !verify_hmac(&current_json, &hmac, key),
+            "primary check should fail for a legacy-signed file (this test guards the fallback's reason to exist)"
+        );
+
+        // …but the legacy-shape fallback reproduces the signed JSON exactly.
+        let roundtrip: LegacyAppSettingsV1 = serde_json::to_value(&current)
+            .and_then(serde_json::from_value)
+            .unwrap();
+        let roundtrip_json = serde_json::to_string(&roundtrip).unwrap();
+        assert!(
+            verify_hmac(&roundtrip_json, &hmac, key),
+            "legacy fallback must verify a pre-multi-hop signed settings file"
+        );
+        // And the migrated settings keep the user's values.
+        assert!(current.autostart && current.start_minimized);
+        assert_eq!(current.preferred_server_id.as_deref(), Some("node-7"));
+        assert!(!current.multi_hop_enabled);
+    }
 
     /// The two non-negotiable defaults shipped in v1.3.30/31: kill switch and
     /// post-quantum protection are both ON for a brand-new install.

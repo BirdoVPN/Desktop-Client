@@ -137,6 +137,15 @@ export function friendlyVpnError(error: unknown): string {
 
 // ── Settings snake_case ↔ camelCase mapping ────────────────────────
 
+/**
+ * Platform gate for Windows-only features (split tunneling is enforced via
+ * WFP, which has no Linux/macOS implementation yet). The Tauri webview UA
+ * reliably contains "Windows" on Windows builds.
+ */
+export function isWindowsPlatform(): boolean {
+  return typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows');
+}
+
 /** Shape returned by the Rust `get_settings` command (snake_case). */
 export interface RustSettings {
   killswitch_enabled: boolean;

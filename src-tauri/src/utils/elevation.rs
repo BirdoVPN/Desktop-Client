@@ -20,6 +20,27 @@
 
 // Command::new replaced by super::hidden_cmd() for CREATE_NO_WINDOW
 
+/// Platform-appropriate copy for the "you must run elevated" pre-flight error.
+/// The old Windows-only wording ("right-click → Run as administrator") shipped
+/// verbatim to Linux users, where it is meaningless.
+pub fn elevation_required_message() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Administrator privileges required. Please right-click the app \
+         and select \"Run as administrator\", or restart from an elevated terminal."
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "Root privileges required to manage the tunnel. Launch Birdo VPN \
+         with pkexec or sudo (e.g. `sudo ./BirdoVPN.AppImage`)."
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        "Elevated privileges are required to manage the VPN tunnel. \
+         Please restart the app with administrator rights."
+    }
+}
+
 /// Check if the current process is running with elevated (admin) privileges.
 pub fn is_elevated() -> bool {
     #[cfg(target_os = "windows")]

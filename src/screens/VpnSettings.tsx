@@ -41,7 +41,7 @@ import {
   BirdoTextField,
 } from '@/components/birdo';
 import { useAppStore } from '@/store/app-store';
-import { settingsToRust, isValidPort, isValidDnsAddress } from '@/utils/helpers';
+import { settingsToRust, isValidPort, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
 import { white, status, brand, motion as motionTokens } from '@/lib/birdo-theme';
 
 interface KillSwitchStatus {
@@ -518,13 +518,18 @@ export function VpnSettings() {
         <BirdoSectionHeader title="Features" className="mt-4" />
 
         <BirdoCard padding="0">
-          <BirdoNavRow
-            title="Split Tunneling"
-            subtitle="Choose which apps bypass the VPN and connect directly."
-            leadingIcon={Split}
-            leadingTint={white.w60}
-            onClick={() => pushRoute('splitTunnel')}
-          />
+          {/* Split tunneling is enforced via WFP — Windows only. Offering it
+              on Linux/macOS let users configure exclusions that silently did
+              nothing (apps they believed bypassed the VPN were tunnelled). */}
+          {isWindowsPlatform() && (
+            <BirdoNavRow
+              title="Split Tunneling"
+              subtitle="Choose which apps bypass the VPN and connect directly."
+              leadingIcon={Split}
+              leadingTint={white.w60}
+              onClick={() => pushRoute('splitTunnel')}
+            />
+          )}
           <BirdoNavRow
             title="Port Forwarding"
             subtitle="Forward external ports to your device for gaming, torrents, or servers."
