@@ -4,8 +4,8 @@ This document lists every GitHub Actions secret required for the three
 production release pipelines (`build-windows.yml`, `build-macos.yml`,
 `build-linux.yml`) and how to provision each one.
 
-> Configure each secret under **Repo → Settings → Secrets and variables →
-> Actions → New repository secret**.
+> Configure each secret under **Repo -> Settings -> Secrets and variables ->
+> Actions -> New repository secret**.
 
 ---
 
@@ -43,8 +43,8 @@ GitHub OIDC token is exchanged for an Azure access token at runtime.
 
 ## 3. macOS — Apple Developer ID + Notarization
 
-Generate the `.p12` from Xcode → Settings → Accounts → Manage Certificates
-→ "Developer ID Application" → right-click → Export. Then base64-encode:
+Generate the `.p12` from Xcode -> Settings -> Accounts -> Manage Certificates
+-> "Developer ID Application" -> right-click -> Export. Then base64-encode:
 
 ```bash
 base64 -i developer_id.p12 -o developer_id.b64
@@ -56,7 +56,7 @@ base64 -i developer_id.p12 -o developer_id.b64
 | `APPLE_CERTIFICATE_PASSWORD` | Export password set in Xcode |
 | `APPLE_SIGNING_IDENTITY` | e.g. `Developer ID Application: Birdo Ltd (ABCDE12345)` |
 | `APPLE_ID` | Apple-ID email account |
-| `APPLE_ID_PASSWORD` | App-specific password from <https://appleid.apple.com> → Sign-In and Security |
+| `APPLE_ID_PASSWORD` | App-specific password from <https://appleid.apple.com> -> Sign-In and Security |
 | `APPLE_TEAM_ID` | 10-character team identifier |
 | `APPLE_KEYCHAIN_PASSWORD` | Random ≥20-char string — used only inside the runner |
 

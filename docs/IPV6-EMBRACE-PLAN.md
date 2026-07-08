@@ -70,7 +70,7 @@ Gate everything on `node_supports_ipv6`:
 
 Mirror the client logic in `birdo-client-mobile` (the WireGuard/Android VpnService
 already supports IPv6 addresses + routes; add them when `node_supports_ipv6`).
-**✅ Done — see §8** (commit `e8f9bc1`, gated on `clientIpv6`, held local).
+**  Done — see §8** (commit `e8f9bc1`, gated on `clientIpv6`, held local).
 
 ## 5. Rollout
 
@@ -126,9 +126,9 @@ Done:
   is present; otherwise the WFP IPv6 block stays. Falls back to blocking on any
   error (never leaks). cargo-check clean. **Dormant** until backend sends it.
 - **Node-agent** (`reconcile.rs`, `config.rs`): `BIRDO_AGENT_IPV6_ENABLED`
-  (default false) → ensures `ip6tables` MASQUERADE on egress. cargo-check clean.
+  (default false) -> ensures `ip6tables` MASQUERADE on egress. cargo-check clean.
 - **Mobile client** (`birdo-client-mobile`, commit `e8f9bc1`, local): `clientIpv6`
-  added to the shared `ConnectResponse`/`MultiHopConnectResponse` (defaulted →
+  added to the shared `ConnectResponse`/`MultiHopConnectResponse` (defaulted ->
   older payloads safe). `WireGuardConfigBuilder` assigns the IPv6 address on the
   wg-go Interface and `BirdoVpnService.buildVpnInterface` adds it to the Android
   `VpnService.Builder` — both only when `clientIpv6` is present. Routes already
@@ -140,7 +140,7 @@ Done:
 ### Pilot rollout (one node — all prod-touching, do with the owner)
 
 1. **Deploy backend** with the migration (adds nullable/defaulted columns — safe;
-   no node enabled yet → identical behaviour).
+   no node enabled yet -> identical behaviour).
 2. **Release a desktop client** containing the dormant IPv6 code (next `win-v*`).
 3. **Pick a pilot node.** Provision IPv6 on it:
    - Confirm the VPS has a routed IPv6 (/64).

@@ -18,43 +18,43 @@ Sovereign VPN with WireGuard® — no activity logs, stealth mode, blazing fast.
 
 Birdo VPN protects your internet connection with WireGuard® encryption. Browse privately, access content freely, and stay secure on any network.
 
-🔒 **No Activity Logs**
+**No Activity Logs**
 Birdo VPN operates a strict zero-logs policy on RAM-only volatile infrastructure. No browsing activity, DNS queries, traffic content, connection timestamps, or IP addresses are logged. All VPN servers run exclusively in volatile memory with automated memory scrubbing.
 
-⚡ **WireGuard® Protocol**
+**WireGuard® Protocol**
 Built on the modern WireGuard protocol for blazing-fast speeds with minimal CPU overhead. Connect in under a second.
 
-🌍 **Global Server Network**
+**Global Server Network**
 Access servers across multiple regions. Each server shows real-time load so you can pick the fastest option.
 
-🛡️ **WFP Kill Switch**
+**WFP Kill Switch**
 Windows Filtering Platform-based kill switch blocks all traffic outside the VPN tunnel — prevents leaks even if the VPN connection drops momentarily.
 
-📱 **Split Tunneling**
+**Split Tunneling**
 Choose which apps go through the VPN and which use your regular connection using Windows Filtering Platform per-app rules. Perfect for banking apps or local streaming.
 
-🕵️ **Stealth Mode**
+**Stealth Mode**
 Bypass VPN detection and deep packet inspection using XRAY Reality obfuscation. Your VPN traffic looks like regular HTTPS to a major website — essential in censored regions.
 
-🔗 **Multi-Hop Routing**
+**Multi-Hop Routing**
 Route your traffic through two or more servers in different jurisdictions for extra anonymity. Even if one server is compromised, your real IP stays hidden.
 
-🔬 **Post-Quantum Encryption**
+**Post-Quantum Encryption**
 Rosenpass quantum-resistant key exchange layered on top of WireGuard. Future-proof your privacy against quantum computing threats.
 
-🔑 **Two-Factor Authentication**
+**Two-Factor Authentication**
 TOTP-based 2FA to protect your account. Works with any authenticator app.
 
-🖥️ **System Tray Integration**
+**System Tray Integration**
 Runs quietly in the system tray. Connect, disconnect, and switch servers without opening the main window.
 
-🔄 **Auto-Connect**
+**Auto-Connect**
 Automatically connect to VPN when Windows starts. Never forget to protect your connection.
 
-📡 **Port Forwarding**
+**Port Forwarding**
 Expose local services through the VPN tunnel — useful for game servers, remote access, and P2P.
 
-🎨 **Beautiful Dark Interface**
+**Beautiful Dark Interface**
 A stunning dark-mode interface with smooth animations, built with modern design principles.
 
 **Why Birdo VPN?**
