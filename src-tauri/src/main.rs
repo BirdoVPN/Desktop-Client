@@ -140,7 +140,7 @@ fn main() {
                 }
             }
         } else {
-            info!("Running with administrator privileges ✓");
+            info!("Running with administrator privileges [OK]");
         }
     }
 
@@ -149,10 +149,10 @@ fn main() {
     {
         use crate::utils::elevation::is_elevated;
         if is_elevated() {
-            info!("Running with administrator privileges ✓");
+            info!("Running with administrator privileges [OK]");
         } else {
             error!(
-                "⚠ NOT running as administrator — VPN will fail. \
+                "[WARN] NOT running as administrator — VPN will fail. \
                  Run your terminal as Administrator and retry `npm run tauri dev`."
             );
         }
@@ -165,7 +165,7 @@ fn main() {
     {
         use crate::utils::elevation::is_elevated;
         if is_elevated() {
-            info!("Running with root privileges ✓");
+            info!("Running with root privileges [OK]");
         } else {
             info!(
                 "Not running as root — TUN creation will require pkexec elevation. \

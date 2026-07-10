@@ -30,7 +30,7 @@ No private keys to manage. No certificates to purchase or renew.
 
 Sigstore does **not** replace Windows Authenticode. Windows users will still see:
 
-1. **SmartScreen:** "Windows protected your PC" → click "More info" → "Run anyway"
+1. **SmartScreen:** "Windows protected your PC" -> click "More info" -> "Run anyway"
 2. **UAC prompt:** "Unknown publisher" (yellow shield)
 
 This is normal for open-source software. The Sigstore signature lets users
@@ -40,8 +40,8 @@ can't tell them.
 ### macOS Gatekeeper
 
 macOS users will see a Gatekeeper warning for unsigned apps. To bypass:
-1. Right-click → Open → "Open" (first launch only)
-2. Or: System Settings → Privacy & Security → "Open Anyway"
+1. Right-click -> Open -> "Open" (first launch only)
+2. Or: System Settings -> Privacy & Security -> "Open Anyway"
 
 If macOS code signing (Apple Developer ID) becomes needed, it can be layered
 on top of Sigstore in the `build-macos.yml` workflow.
@@ -82,7 +82,7 @@ The `build-windows.yml` and `build-macos.yml` workflows handle signing automatic
 
 ### Required GitHub Settings
 
-1. **Repository Settings → Actions → General:**
+1. **Repository Settings -> Actions -> General:**
    - Under "Workflow permissions", the `id-token: write` permission must be allowed
    - This is set per-job in the workflow file
 

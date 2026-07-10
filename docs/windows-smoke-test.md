@@ -41,7 +41,7 @@ Install it. Launch from the Start menu (elevation prompt should appear).
 ## 2. Connect (data plane)
 
 1. Note your public IP first: `(Invoke-RestMethod https://api.ipify.org?format=json).ip`
-2. Connect to a server. State → Connected.
+2. Connect to a server. State -> Connected.
 3. Re-check public IP — it must now be the **VPN server's** IP.
 4. Confirm the WFP filters and Wintun adapter exist:
    ```powershell
@@ -89,7 +89,7 @@ Disconnect button — that's a clean user disconnect):
     byte counters.
   - **False-positive guard test:** leave a healthy tunnel **idle** for 5 minutes
     (no browsing). EXPECT: it stays Connected, NO spurious reconnect (heartbeat
-    keeps succeeding → watchdog never fires).
+    keeps succeeding -> watchdog never fires).
 
 - **3c. Clean disconnect releases the firewall:** press Disconnect in the app.
   - EXPECT: Terminal A returns to your **real** IP (kill switch disarmed,
@@ -127,8 +127,8 @@ UI toggle once exposed), then connect.
 - **3e-3. Zero-window on drop:** run the Terminal-A loop from §3, then force a drop
   (disable Wintun). EXPECT: traffic is blocked **immediately** (no ~5s window —
   the block was already active), then reconnects. It must never print your real IP.
-- **3e-4. Disconnect releases everything:** Disconnect → real IP returns, no Birdo
-  filters remain (`disarm()` → `wfp::cleanup()`).
+- **3e-4. Disconnect releases everything:** Disconnect -> real IP returns, no Birdo
+  filters remain (`disarm()` -> `wfp::cleanup()`).
 
 If all four pass on real hardware, lockdown is safe to enable by default.
 
@@ -153,7 +153,7 @@ If all four pass on real hardware, lockdown is safe to enable by default.
 ## 6. Updater + signing (release artifact only)
 
 1. Confirm the installed `BirdoVPN.exe` and the NSIS installer are Authenticode
-   signed: `Get-AuthenticodeSignature <path>` → Status `Valid`, publisher Birdo.
+   signed: `Get-AuthenticodeSignature <path>` -> Status `Valid`, publisher Birdo.
    (Authenticode is applied by the **tag** build via Tauri `signCommand`; a local
    `cargo tauri build` is unsigned — that's expected.)
 2. Confirm crash reporting: set the `SENTRY_DSN` repo secret, cut a tagged

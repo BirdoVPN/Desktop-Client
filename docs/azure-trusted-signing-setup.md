@@ -149,14 +149,14 @@ az codesigning account show \
 
 ## Step 6 — Configure GitHub Repository
 
-### Secrets (Settings → Secrets and variables → Actions → Secrets)
+### Secrets (Settings -> Secrets and variables -> Actions -> Secrets)
 
 | Secret name | Value |
 |---|---|
 | `AZURE_TENANT_ID` | Azure AD tenant ID (from Step 2) |
 | `AZURE_CLIENT_ID` | App registration client ID (from Step 2) |
 
-### Variables (Settings → Secrets and variables → Actions → Variables)
+### Variables (Settings -> Secrets and variables -> Actions -> Variables)
 
 | Variable name | Example value |
 |---|---|
@@ -213,4 +213,4 @@ Look for:
 | `AADSTS70021: No matching federated identity record` | Subject claim mismatch | Verify the federated credential subject matches the tag format exactly |
 | `AuthorizationFailed` | Missing role assignment | Re-run Step 4; allow 5 min for RBAC propagation |
 | `CertificateProfileNotFound` | Wrong profile name | Check `AZURE_TRUSTED_SIGNING_CERT_PROFILE` variable value |
-| SmartScreen still warns after signing | PublicTrust profile pending verification | Complete identity verification in Azure Portal → Trusted Signing |
+| SmartScreen still warns after signing | PublicTrust profile pending verification | Complete identity verification in Azure Portal -> Trusted Signing |
