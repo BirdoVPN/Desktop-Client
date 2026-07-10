@@ -68,11 +68,23 @@ pub struct AppSettings {
     /// LOCKDOWN: always-on kill switch (Mullvad-style). When true the WFP
     /// block-all stays active the entire time the tunnel is up, permitting
     /// tunneled traffic by interface so there is ZERO leak window — including
-    /// across reconnects. OFF by default: it must be device-verified first
-    /// (an always-on block that mis-resolves the tunnel interface would block
-    /// the user's own traffic). The default reactive kill switch has a small
-    /// (~5-30s) drop window but cannot mis-block steady-state browsing.
-    #[serde(default)]
+    /// across reconnects.
+    ///
+    /// ON by default. The reactive (block-only-during-reconnect-gap) mode holds
+    /// traffic in the tunnel with ROUTING alone during steady-state Connected,
+    /// which is decloakable by TunnelVision (CVE-2024-3661): a rogue DHCP
+    /// server pushing option-121 classless routes installs more-specific routes
+    /// on the physical NIC that win longest-prefix-match and steer traffic
+    /// around the tunnel below the WireGuard layer — WITHOUT dropping the
+    /// tunnel, so the reactive switch never triggers. The always-on interface-
+    /// scoped WFP block cannot be bypassed that way (option-121 routes can't move
+    /// traffic past a block keyed on the physical interface). Fail-safe:
+    /// activate_blocking() refuses to install a block-all when the tunnel LUID is
+    /// unknown (wfp.rs), and arm() disarms + the connect is best-effort on any
+    /// activation error, so lockdown can never brick or block a connect — worst
+    /// case it degrades to the reactive behavior. Trade-off: LAN devices on the
+    /// physical NIC are blocked unless local_network_sharing is enabled.
+    #[serde(default = "default_true")]
     pub lockdown_mode: bool,
     /// Multi-hop (double VPN) armed state. The frontend has always sent these
     /// three fields (helpers.ts settingsToRust) — before they existed here,
@@ -167,7 +179,7 @@ impl Default for AppSettings {
             wireguard_mtu: 0,
             stealth_mode: false,      // premium — off by default
             quantum_protection: true, // post-quantum on by default
-            lockdown_mode: false,     // always-on kill switch — opt-in, device-verified
+            lockdown_mode: true,      // always-on kill switch ON by default (TunnelVision-safe; see field doc)
             multi_hop_enabled: false,
             multi_hop_entry_node_id: None,
             multi_hop_exit_node_id: None,
@@ -501,6 +513,9 @@ mod tests {
             serde_json::from_str(json).expect("legacy settings should deserialize");
         assert!(s.killswitch_enabled, "absent kill switch must default ON");
         assert!(s.quantum_protection, "absent post-quantum must default ON");
+        // TunnelVision fix: a stored config predating lockdown_mode must upgrade
+        // to the always-on kill switch, not the routing-only reactive default.
+        assert!(s.lockdown_mode, "absent lockdown_mode must default ON");
     }
 
     /// Loading must force the kill switch ON even if a stored (or tampered)
