@@ -22,6 +22,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::buffer_pool::WIREGUARD_OVERHEAD;
 
+/// Persistent-keepalive bounds (seconds) applied to the server-provided value.
+const KEEPALIVE_MIN_SECS: u16 = 15;
+const KEEPALIVE_MAX_SECS: u16 = 120;
+
 /// Wrapper for sensitive key bytes that zeroizes on drop
 /// MEM-003: Ensures key material doesn't remain in memory
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -73,6 +77,7 @@ impl WireGuardSession {
         server_public_key_b64: &str,
         endpoint: &str,
         preshared_key_b64: Option<&str>,
+        persistent_keepalive: u16,
     ) -> Result<Self, String> {
         // MEM-003: Use SensitiveKey wrapper for automatic zeroization
         let private_key_bytes = BASE64
@@ -191,14 +196,20 @@ impl WireGuardSession {
             arr
         });
 
+        // The server-provided keepalive was previously computed, plumbed through
+        // ReconnectInfo, and then DROPPED — Tunn::new got a hardcoded 25s. Honour
+        // it, clamped: under 15s the keepalives themselves keep the NIC/radio busy;
+        // over 120s a NAT mapping typically expires before the next one arrives.
+        let keepalive = persistent_keepalive.clamp(KEEPALIVE_MIN_SECS, KEEPALIVE_MAX_SECS);
+
         // boringtun 0.7: Tunn::new is infallible (0.6 returned Result).
         let tunnel = Tunn::new(
             StaticSecret::from(private_key_arr),
             PublicKey::from(server_key_arr),
-            psk_arr,  // Preshared key for additional security
-            Some(25), // Persistent keepalive
-            0,        // Tunnel index
-            None,     // Rate limiter
+            psk_arr,         // Preshared key for additional security
+            Some(keepalive), // Persistent keepalive (seconds)
+            0,               // Tunnel index
+            None,            // Rate limiter
         );
 
         // MEM-003: Zeroize our copies of keys after tunnel creation

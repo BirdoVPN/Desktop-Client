@@ -99,6 +99,21 @@ static IS_BLOCKING: AtomicBool = AtomicBool::new(false);
 /// True when a STANDALONE IPv6 leak block (not the full kill switch) is active.
 /// Lets the tunnel block IPv6 natively via WFP instead of slow netsh/PowerShell.
 static IPV6_ONLY_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Session INTENT: the VPN session wants outbound IPv6 blocked.
+///
+/// Distinct from `IPV6_ONLY_ACTIVE`, which only says whether OUR standalone
+/// filters are installed *right now*. The two diverge during a reactive
+/// kill-switch cycle, where the kill switch's own block-all temporarily owns the
+/// IPv6 block — and the intent is what must survive that cycle, because
+/// `deactivate_blocking()` removes EVERY filter including the v6 block.
+static IPV6_BLOCK_WANTED: AtomicBool = AtomicBool::new(false);
+
+/// True while a tunnel is being torn down with a replacement already committed
+/// (server switch). `unblock_ipv6()` must not drop the block in that window, or
+/// IPv6 egresses the physical NIC for the whole teardown + setup of the new
+/// tunnel.
+static IPV6_BLOCK_HELD: AtomicBool = AtomicBool::new(false);
 static VPN_SERVER_IP: once_cell::sync::Lazy<Arc<RwLock<Option<Ipv4Addr>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
@@ -456,6 +471,29 @@ impl WfpEngine {
 
         self.add_filter(&filter)?;
         Ok(())
+    }
+
+    /// Install the STANDALONE IPv6 block (block-all v6 + localhost/DHCPv6
+    /// permits) in a single transaction. Shared by `block_ipv6()` and by
+    /// `deactivate_blocking()`, which must rebuild this block after tearing down
+    /// the kill switch's filters if the session still wants IPv6 contained.
+    fn install_standalone_v6_block(&mut self) -> Result<(), String> {
+        self.begin_transaction()?;
+        let result = (|| -> Result<(), String> {
+            self.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
+            self.add_block_all_v6()?;
+            self.add_permit_localhost_v6()?;
+            self.add_permit_dhcpv6()?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.commit_transaction(),
+            Err(e) => {
+                self.abort_transaction();
+                Err(e)
+            }
+        }
     }
 
     /// Permit a split-tunnel app on the IPv6 layer.
@@ -1189,8 +1227,111 @@ pub async fn deactivate_blocking() -> Result<(), String> {
     }
 
     IS_BLOCKING.store(false, Ordering::SeqCst);
+
+    // The filters just removed included the kill switch's own IPv6 block. If the
+    // session still wants IPv6 contained (a tunnel is up or coming up), rebuild
+    // the standalone block in the same call — otherwise a reconnect cycle ends
+    // with IPv6 wide open for the rest of the session.
+    if v6_state::on_deactivate() {
+        let reinstalled = match guard.as_mut() {
+            Some(engine) => engine.install_standalone_v6_block(),
+            None => Err("WFP engine not open".to_string()),
+        };
+        match reinstalled {
+            Ok(()) => {
+                v6_state::mark_installed(true);
+                tracing::info!("Standalone IPv6 block re-installed after kill-switch deactivation");
+            }
+            Err(e) => {
+                v6_state::mark_installed(false);
+                tracing::error!(
+                    "Kill switch deactivated but the standalone IPv6 block could NOT be re-installed: {} — IPv6 may leak",
+                    e
+                );
+                return Err(format!("IPv6 block re-install failed: {}", e));
+            }
+        }
+    }
+
     tracing::info!("Kill switch deactivated — normal traffic restored");
     Ok(())
+}
+
+/// Ownership rules for the standalone IPv6 block, kept engine-free so they can
+/// be unit-tested without an elevated WFP session (CI runners are not elevated).
+/// Every public IPv6 entry point below routes its decision through here.
+mod v6_state {
+    use super::{IPV6_BLOCK_HELD, IPV6_BLOCK_WANTED, IPV6_ONLY_ACTIVE, IS_BLOCKING};
+    use std::sync::atomic::Ordering;
+
+    /// `block_ipv6()` — record the session intent UNCONDITIONALLY, then report
+    /// whether standalone filters still need installing.
+    ///
+    /// When the kill switch is active it already blocks IPv6, so no standalone
+    /// filters are added; the intent is still recorded so `deactivate_blocking()`
+    /// re-installs the block when the kill switch's filters go away. Without the
+    /// intent, a reconnect cycle (block → kill switch → new tunnel → kill switch
+    /// off) left IPv6 unblocked for the rest of the session.
+    pub(super) fn on_block() -> bool {
+        IPV6_BLOCK_WANTED.store(true, Ordering::SeqCst);
+        if IS_BLOCKING.load(Ordering::SeqCst) {
+            IPV6_ONLY_ACTIVE.store(false, Ordering::SeqCst); // kill switch owns the block
+            return false;
+        }
+        // Already installed — adding a second identical filter set would just
+        // duplicate kernel filters (a server switch re-enters here with the block
+        // still held).
+        !IPV6_ONLY_ACTIVE.load(Ordering::SeqCst)
+    }
+
+    /// `unblock_ipv6()` — report whether the standalone filters must be removed.
+    ///
+    /// While the kill switch owns the block, or a server switch is holding it
+    /// across a teardown, the intent AND `IPV6_ONLY_ACTIVE` are left untouched:
+    /// consuming either here is what permanently deleted the block on a reactive
+    /// kill-switch cycle.
+    pub(super) fn on_unblock() -> bool {
+        if IS_BLOCKING.load(Ordering::SeqCst) || IPV6_BLOCK_HELD.load(Ordering::SeqCst) {
+            return false;
+        }
+        IPV6_BLOCK_WANTED.store(false, Ordering::SeqCst);
+        IPV6_ONLY_ACTIVE.swap(false, Ordering::SeqCst)
+    }
+
+    /// `unblock_ipv6_dual_stack()` — the tunnel ROUTES IPv6, so the session no
+    /// longer wants it blocked. Drops the intent even while the kill switch owns
+    /// the block (its block-all still covers v6 during the gap, but once it is
+    /// deactivated IPv6 must be free to flow through the tunnel), and reports
+    /// whether our own standalone filters still need removing.
+    pub(super) fn on_dual_stack() -> bool {
+        IPV6_BLOCK_WANTED.store(false, Ordering::SeqCst);
+        IPV6_BLOCK_HELD.store(false, Ordering::SeqCst);
+        if IS_BLOCKING.load(Ordering::SeqCst) {
+            return false; // kill switch owns every filter — leave them alone
+        }
+        IPV6_ONLY_ACTIVE.swap(false, Ordering::SeqCst)
+    }
+
+    /// `deactivate_blocking()` — the kill switch's filters (its v6 block
+    /// included) have just been removed. Report whether the standalone block must
+    /// be rebuilt to honour the session intent.
+    pub(super) fn on_deactivate() -> bool {
+        IPV6_BLOCK_WANTED.load(Ordering::SeqCst)
+    }
+
+    /// `cleanup()` — the session is over (user disconnect / disarm). Drop the
+    /// intent BEFORE anything can act on it, so a disconnect never leaves IPv6
+    /// blocked with no tunnel to remove the block.
+    pub(super) fn on_cleanup() {
+        IPV6_BLOCK_WANTED.store(false, Ordering::SeqCst);
+        IPV6_BLOCK_HELD.store(false, Ordering::SeqCst);
+        IPV6_ONLY_ACTIVE.store(false, Ordering::SeqCst);
+    }
+
+    /// Record whether the standalone filters are installed (post-transaction).
+    pub(super) fn mark_installed(installed: bool) {
+        IPV6_ONLY_ACTIVE.store(installed, Ordering::SeqCst);
+    }
 }
 
 /// Block ALL outbound IPv6 natively via WFP, WITHOUT the full kill switch.
@@ -1201,11 +1342,12 @@ pub async fn deactivate_blocking() -> Result<(), String> {
 /// old netsh `remoteip=::/0` rules were rejected by netsh and fell back to a
 /// ~14s PowerShell `Disable-NetAdapterBinding`; this replaces all of that.
 ///
-/// No-op if the full kill switch is already active (it blocks IPv6 already).
+/// Records the session's IPv6-block intent even when the full kill switch is
+/// active (it blocks IPv6 already) so the block is rebuilt if the kill switch is
+/// later deactivated.
 pub async fn block_ipv6() -> Result<(), String> {
-    if IS_BLOCKING.load(Ordering::SeqCst) {
-        IPV6_ONLY_ACTIVE.store(false, Ordering::SeqCst); // kill switch owns the block
-        tracing::debug!("Kill switch active — standalone IPv6 block not needed");
+    if !v6_state::on_block() {
+        tracing::debug!("IPv6 block already in force — intent recorded, no filters added");
         return Ok(());
     }
     if !IS_INITIALIZED.load(Ordering::SeqCst) {
@@ -1217,50 +1359,57 @@ pub async fn block_ipv6() -> Result<(), String> {
         .map_err(|e| format!("engine lock poisoned: {}", e))?;
     let engine = guard.as_mut().ok_or("WFP engine not open")?;
 
-    engine.begin_transaction()?;
-    let result = (|| -> Result<(), String> {
-        engine.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
-        engine.add_block_all_v6()?;
-        engine.add_permit_localhost_v6()?;
-        engine.add_permit_dhcpv6()?;
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            engine.commit_transaction()?;
-            IPV6_ONLY_ACTIVE.store(true, Ordering::SeqCst);
-            tracing::info!("IPv6 leak protection enabled (native WFP)");
-            Ok(())
-        }
-        Err(e) => {
-            engine.abort_transaction();
-            Err(e)
-        }
-    }
+    engine.install_standalone_v6_block()?;
+    v6_state::mark_installed(true);
+    tracing::info!("IPv6 leak protection enabled (native WFP)");
+    Ok(())
 }
 
 /// Remove the standalone IPv6 block added by [`block_ipv6`]. Fast, native.
-/// No-op if we never added it, or if the full kill switch owns the filters.
+/// No-op if we never added it, if the full kill switch owns the filters, or if a
+/// server switch is holding the block across a tunnel teardown.
 pub async fn unblock_ipv6() -> Result<(), String> {
-    if !IPV6_ONLY_ACTIVE.swap(false, Ordering::SeqCst) {
+    if !v6_state::on_unblock() {
         return Ok(());
     }
-    if IS_BLOCKING.load(Ordering::SeqCst) {
-        // Full kill switch is active — leave its filters intact.
+    remove_standalone_v6_filters()
+}
+
+/// Lift the IPv6 block for a DUAL-STACK tunnel, which routes IPv6 through the
+/// tunnel instead of blocking it.
+///
+/// Unlike [`unblock_ipv6`], this also drops the session's block intent while the
+/// kill switch is active, so deactivating the kill switch after a reconnect does
+/// not re-install a block that a dual-stack tunnel must not have.
+pub async fn unblock_ipv6_dual_stack() -> Result<(), String> {
+    if !v6_state::on_dual_stack() {
         return Ok(());
     }
+    remove_standalone_v6_filters()
+}
+
+/// Drop every filter we hold. Only ever called when the kill switch is NOT
+/// active, so the engine holds our standalone IPv6 filters and nothing else.
+fn remove_standalone_v6_filters() -> Result<(), String> {
     let mut guard = ENGINE
         .lock()
         .map_err(|e| format!("engine lock poisoned: {}", e))?;
     if let Some(engine) = guard.as_mut() {
-        // Standalone block runs only when the kill switch is NOT active, so the
-        // engine holds only our IPv6 filters here.
         engine.remove_all_filters();
         engine.delete_sublayer();
     }
     tracing::debug!("Standalone IPv6 block removed (native WFP)");
     Ok(())
+}
+
+/// Hold the IPv6 block across a tunnel teardown that is immediately followed by
+/// a new tunnel (server switch): `unblock_ipv6()` becomes a no-op until the hold
+/// is released, so IPv6 stays contained for the whole switch.
+///
+/// The caller MUST release the hold once the teardown is done, otherwise a later
+/// disconnect could not remove the block. `cleanup()` clears it unconditionally.
+pub fn hold_ipv6_block(held: bool) {
+    IPV6_BLOCK_HELD.store(held, Ordering::SeqCst);
 }
 
 /// Update the VPN server IP in an active kill switch.
@@ -1334,6 +1483,12 @@ pub fn clear_tunnel_luid() {
 /// filters automatically.
 pub async fn cleanup() -> Result<(), String> {
     tracing::info!("Cleaning up kill switch resources");
+
+    // Drop the IPv6-block intent FIRST: cleanup() is the end of the session (a
+    // user-initiated disconnect calls it via killswitch::disarm(), including one
+    // issued mid-reconnect), so the deactivate_blocking() below must NOT rebuild
+    // a standalone IPv6 block that no tunnel would ever remove.
+    v6_state::on_cleanup();
 
     if IS_BLOCKING.load(Ordering::SeqCst) {
         deactivate_blocking().await?;
@@ -1468,4 +1623,187 @@ pub struct KillSwitchStatus {
     pub initialized: bool,
     pub active: bool,
     pub method: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The kill-switch flags are process-global statics, so the tests that drive
+    /// them must not interleave (cargo test runs them on separate threads).
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Mirrors what the WFP engine holds, so a full reactive kill-switch cycle can
+    /// be walked without an elevated WFP session (CI runners are not elevated).
+    /// Each method performs exactly the state transitions its real counterpart
+    /// does — the decisions all come from `v6_state`, which is the code under test.
+    #[derive(Default)]
+    struct FakeEngine {
+        /// Standalone IPv6 filters (block_all_v6 + localhost/DHCPv6 permits).
+        standalone_v6: bool,
+        /// The kill switch's own filter set, which includes a block_all_v6.
+        killswitch_filters: bool,
+    }
+
+    impl FakeEngine {
+        /// wfp::block_ipv6()
+        fn block_ipv6(&mut self) {
+            if v6_state::on_block() {
+                self.standalone_v6 = true;
+                v6_state::mark_installed(true);
+            }
+        }
+
+        /// wfp::activate_blocking()
+        fn activate_blocking(&mut self) {
+            self.killswitch_filters = true;
+            IS_BLOCKING.store(true, Ordering::SeqCst);
+        }
+
+        /// wfp::unblock_ipv6()
+        fn unblock_ipv6(&mut self) {
+            if v6_state::on_unblock() {
+                self.standalone_v6 = false;
+            }
+        }
+
+        /// wfp::deactivate_blocking() — removes ALL filters, then honours intent.
+        fn deactivate_blocking(&mut self) {
+            if !IS_BLOCKING.load(Ordering::SeqCst) {
+                return;
+            }
+            self.killswitch_filters = false;
+            self.standalone_v6 = false;
+            IS_BLOCKING.store(false, Ordering::SeqCst);
+            if v6_state::on_deactivate() {
+                self.standalone_v6 = true;
+                v6_state::mark_installed(true);
+            }
+        }
+
+        /// wfp::cleanup() — engine closed, dynamic session drops every filter.
+        fn cleanup(&mut self) {
+            v6_state::on_cleanup();
+            self.killswitch_filters = false;
+            self.standalone_v6 = false;
+            IS_BLOCKING.store(false, Ordering::SeqCst);
+        }
+
+        /// Is outbound IPv6 blocked by SOME filter set right now?
+        fn ipv6_blocked(&self) -> bool {
+            self.standalone_v6 || self.killswitch_filters
+        }
+    }
+
+    fn reset_state() {
+        IS_BLOCKING.store(false, Ordering::SeqCst);
+        IPV6_ONLY_ACTIVE.store(false, Ordering::SeqCst);
+        IPV6_BLOCK_WANTED.store(false, Ordering::SeqCst);
+        IPV6_BLOCK_HELD.store(false, Ordering::SeqCst);
+    }
+
+    /// LEAK-1: a reactive kill-switch cycle must NOT permanently delete the
+    /// standalone IPv6 block. Walks the exact sequence that used to lose it:
+    /// connect → drop → kill switch → teardown → new tunnel → reconnect success.
+    #[test]
+    fn reactive_killswitch_cycle_keeps_ipv6_blocked() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_state();
+        let mut engine = FakeEngine::default();
+
+        // Connect: standalone v6 block installed.
+        engine.block_ipv6();
+        assert!(engine.ipv6_blocked(), "connect must block IPv6");
+        assert!(IPV6_ONLY_ACTIVE.load(Ordering::SeqCst));
+
+        // Tunnel drops: auto-reconnect arms the kill switch.
+        engine.activate_blocking();
+        assert!(engine.ipv6_blocked());
+
+        // Old tunnel torn down — the kill switch owns the block, so the intent
+        // must survive (this swap is what used to consume it).
+        engine.unblock_ipv6();
+        assert!(engine.ipv6_blocked(), "kill switch still blocks IPv6");
+        assert!(
+            IPV6_BLOCK_WANTED.load(Ordering::SeqCst),
+            "intent must survive a kill-switch-owned teardown"
+        );
+
+        // New tunnel starts while the kill switch is still up: no filters added,
+        // but the intent is re-affirmed.
+        engine.block_ipv6();
+        assert!(engine.ipv6_blocked());
+
+        // Reconnect succeeded: kill switch deactivates and removes ALL filters.
+        engine.deactivate_blocking();
+        assert!(
+            engine.ipv6_blocked(),
+            "IPv6 must STILL be blocked after the kill switch is deactivated"
+        );
+        assert!(IPV6_ONLY_ACTIVE.load(Ordering::SeqCst));
+
+        // And a normal disconnect still lifts it.
+        engine.unblock_ipv6();
+        assert!(!engine.ipv6_blocked(), "disconnect must restore IPv6");
+    }
+
+    /// LEAK-1 edge: a user-initiated disconnect DURING a reconnect goes through
+    /// disarm() → cleanup(), which must clear the intent — otherwise IPv6 is left
+    /// blocked with no tunnel and nothing to remove the block.
+    #[test]
+    fn cleanup_clears_ipv6_block_intent() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_state();
+        let mut engine = FakeEngine::default();
+
+        engine.block_ipv6();
+        engine.activate_blocking(); // reconnect gap
+        engine.unblock_ipv6(); // old tunnel torn down, intent held
+        assert!(IPV6_BLOCK_WANTED.load(Ordering::SeqCst));
+
+        // User hits Disconnect mid-reconnect.
+        engine.cleanup();
+        assert!(
+            !IPV6_BLOCK_WANTED.load(Ordering::SeqCst),
+            "cleanup must clear the IPv6 block intent"
+        );
+        assert!(!IPV6_ONLY_ACTIVE.load(Ordering::SeqCst));
+        assert!(
+            !engine.ipv6_blocked(),
+            "disconnect must not strand IPv6 blocked"
+        );
+
+        // A deactivation after cleanup must not resurrect the block.
+        engine.deactivate_blocking();
+        assert!(!engine.ipv6_blocked());
+    }
+
+    /// LEAK-2(d): a server switch tears the old tunnel down with a new one
+    /// already committed. The hold keeps IPv6 blocked across the whole switch.
+    #[test]
+    fn server_switch_hold_keeps_ipv6_blocked_across_teardown() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_state();
+        let mut engine = FakeEngine::default();
+
+        engine.block_ipv6();
+
+        // Manager: hold the block, tear the old tunnel down (stop() unblocks).
+        hold_ipv6_block(true);
+        engine.unblock_ipv6();
+        assert!(
+            engine.ipv6_blocked(),
+            "IPv6 must stay blocked while the switch holds it"
+        );
+
+        // New tunnel's start() re-affirms the block; hold released.
+        hold_ipv6_block(false);
+        engine.block_ipv6();
+        assert!(engine.ipv6_blocked());
+
+        // Normal disconnect afterwards still works.
+        engine.unblock_ipv6();
+        assert!(!engine.ipv6_blocked());
+        reset_state();
+    }
 }

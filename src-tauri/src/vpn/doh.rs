@@ -12,7 +12,8 @@
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// DoH response format (Cloudflare JSON API)
@@ -49,6 +50,22 @@ const _DNS_TYPE_AAAA: i32 = 28; // IPv6 (reserved for future use)
 /// The generate-cert-pins.sh script automates this process.
 struct DoHProvider {
     url: &'static str,
+    /// Hostname in `url` — the key for the bootstrap resolver override below.
+    host: &'static str,
+    /// Hardcoded bootstrap addresses (LEAK-6).
+    ///
+    /// Without these, resolving the provider's own hostname goes through
+    /// `getaddrinfo`, which Windows transmits from svchost (Dnscache) — a process
+    /// the kill switch does NOT permit (only our own exe is). Under an active
+    /// block-all the bootstrap lookup therefore needs the very UDP/53 that is
+    /// blocked, DoH fails, and `resolve_via_doh` fails OPEN. Pinning the addresses
+    /// keeps resolution inside our permitted process.
+    ///
+    /// MULTIPLE addresses per provider: a single pinned anycast IP would take the
+    /// provider down globally for us if it were ever retired. TLS still uses SNI +
+    /// the hostname, so the certificate pin below is unaffected by which address
+    /// is dialled. IPv4 only — the client blocks IPv6 while connecting.
+    bootstrap: &'static [Ipv4Addr],
     /// SPKI SHA-256 pin hashes (base64-encoded). At least one must match.
     /// Only LEAF certificate pins are effective: reqwest's `peer_certificate()`
     /// exposes only the leaf cert, so intermediate/CA pins can never match and
@@ -78,6 +95,16 @@ struct DoHProvider {
 const DOH_PROVIDERS: &[DoHProvider] = &[
     DoHProvider {
         url: "https://cloudflare-dns.com/dns-query",
+        host: "cloudflare-dns.com",
+        // 104.16.248.249/104.16.249.249 are the published A records; 1.1.1.1 and
+        // 1.0.0.1 serve the same DoH endpoint and present the cloudflare-dns.com
+        // certificate for that SNI.
+        bootstrap: &[
+            Ipv4Addr::new(104, 16, 248, 249),
+            Ipv4Addr::new(104, 16, 249, 249),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(1, 0, 0, 1),
+        ],
         // Chain: cloudflare-dns.com → SSL.com SSL Intermediate CA ECC R2 → SSL.com Root CA ECC
         // Pins regenerated 2025-07-16 from live cloudflare-dns.com certificate.
         // Only the LEAF pin is listed — reqwest's peer_certificate() exposes only the
@@ -90,6 +117,8 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
     },
     DoHProvider {
         url: "https://dns.google/resolve",
+        host: "dns.google",
+        bootstrap: &[Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
         // Chain: dns.google → WR2 (Google Trust Services) → GTS Root R1
         // Pins regenerated 2025-07-16 from live dns.google certificate.
         // Only the LEAF pin is listed (see note above on peer_certificate()).
@@ -101,6 +130,11 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
     },
     DoHProvider {
         url: "https://dns.quad9.net/dns-query",
+        host: "dns.quad9.net",
+        bootstrap: &[
+            Ipv4Addr::new(9, 9, 9, 9),
+            Ipv4Addr::new(149, 112, 112, 112),
+        ],
         // Chain: dns.quad9.net → DigiCert Global G3 TLS ECC SHA384 2020 CA1 → DigiCert Global Root G3
         // Pins regenerated 2025-07-16 from live dns.quad9.net certificate.
         // Only the LEAF pin is listed (see note above on peer_certificate()).
@@ -214,20 +248,13 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
         ));
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .https_only(true) // Enforce HTTPS only
-        .danger_accept_invalid_certs(false) // Reject invalid certs
-        .min_tls_version(reqwest::tls::Version::TLS_1_2) // Minimum TLS 1.2
-        .tls_info(true) // PROD: Enable TLS info for pinning
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let client = doh_client()?;
 
     let mut last_error = String::new();
     let mut pinning_failures = 0u32;
 
     for provider in DOH_PROVIDERS {
-        match resolve_single_provider(&client, provider, hostname).await {
+        match resolve_single_provider(client, provider, hostname).await {
             Ok(ip) => {
                 tracing::debug!("DoH resolved {} via {}", hostname, provider.url);
                 return Ok(ip);
@@ -266,6 +293,48 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
         "All DoH providers failed. Last error: {}",
         last_error
     ))
+}
+
+/// The process-wide DoH client.
+///
+/// PWR-6: previously a fresh `reqwest::Client` (and therefore a fresh TLS
+/// handshake and connection pool) was built on EVERY resolution. Hoisting it also
+/// lets the bootstrap overrides be installed exactly once.
+static DOH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// Build (once) the DoH client with hardcoded bootstrap addresses for every
+/// provider, so resolving a provider's own hostname never falls back to the
+/// system resolver (see `DoHProvider::bootstrap`).
+fn doh_client() -> Result<&'static reqwest::Client, String> {
+    if let Some(client) = DOH_CLIENT.get() {
+        return Ok(client);
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .https_only(true) // Enforce HTTPS only
+        .danger_accept_invalid_certs(false) // Reject invalid certs
+        .min_tls_version(reqwest::tls::Version::TLS_1_2) // Minimum TLS 1.2
+        .tls_info(true); // PROD: Enable TLS info for pinning
+
+    for provider in DOH_PROVIDERS {
+        let addrs: Vec<SocketAddr> = provider
+            .bootstrap
+            .iter()
+            .map(|ip| SocketAddr::new(IpAddr::V4(*ip), 443))
+            .collect();
+        builder = builder.resolve_to_addrs(provider.host, &addrs);
+    }
+
+    let client = builder
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    // A concurrent caller may have won the race; either client is equivalent.
+    let _ = DOH_CLIENT.set(client);
+    DOH_CLIENT
+        .get()
+        .ok_or_else(|| "DoH client unavailable".to_string())
 }
 
 /// Internal error type to distinguish pinning failures from network errors
@@ -409,6 +478,46 @@ mod tests {
                     provider.url
                 );
             }
+        }
+    }
+
+    /// LEAK-6: every provider needs bootstrap addresses (the system resolver is
+    /// unreachable under an active kill switch), and MORE THAN ONE — a single
+    /// pinned anycast IP would kill the provider for us if it were ever retired.
+    #[test]
+    fn test_doh_providers_have_multiple_bootstrap_addrs() {
+        for provider in DOH_PROVIDERS {
+            assert!(
+                provider.bootstrap.len() >= 2,
+                "Provider {} needs >= 2 bootstrap addresses (single-IP pinning is a global outage risk)",
+                provider.url
+            );
+            for ip in provider.bootstrap {
+                assert!(
+                    !is_private_ip(*ip),
+                    "Bootstrap address {} for {} is not a public resolver address",
+                    ip,
+                    provider.url
+                );
+            }
+        }
+    }
+
+    /// The bootstrap override is keyed by host, so `host` must be exactly the
+    /// authority in `url` or the override silently never applies.
+    #[test]
+    fn test_doh_provider_host_matches_url() {
+        for provider in DOH_PROVIDERS {
+            let expected = provider
+                .url
+                .strip_prefix("https://")
+                .and_then(|rest| rest.split('/').next())
+                .expect("provider URL must be https with a host");
+            assert_eq!(
+                provider.host, expected,
+                "host '{}' does not match the authority in {}",
+                provider.host, provider.url
+            );
         }
     }
 

@@ -352,7 +352,20 @@ impl VpnManager {
                 .write_state_with_timeout(ConnectionState::Disconnecting)
                 .await;
 
-            match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
+            // LEAK-2: this is a server switch — a new tunnel is already committed.
+            // Hold the IPv6 block across the teardown, otherwise the old tunnel's
+            // stop() lifts it and IPv6 egresses the physical NIC for the whole
+            // teardown + setup window. Released below, once the new tunnel's
+            // start() is about to re-install it.
+            #[cfg(target_os = "windows")]
+            {
+                if let Err(e) = crate::vpn::wfp::block_ipv6().await {
+                    tracing::warn!("Could not block IPv6 before server switch: {}", e);
+                }
+                crate::vpn::wfp::hold_ipv6_block(true);
+            }
+
+            let teardown = match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
                 Ok(mut guard) => {
                     if let Some(tunnel) = guard.take() {
                         match timeout(Duration::from_secs(10), tunnel.stop()).await {
@@ -367,16 +380,28 @@ impl VpnManager {
                             }
                         }
                     }
+                    Ok(())
                 }
-                Err(_) => {
-                    tracing::error!("Tunnel lock timeout during auto-disconnect — cannot safely create new tunnel");
-                    let _ = self
-                        .write_state_with_timeout(ConnectionState::Error(
-                            "Tunnel lock timeout".into(),
-                        ))
-                        .await;
-                    return Err("Tunnel lock timeout during teardown — please try again".into());
+                Err(_) => Err(()),
+            };
+
+            // Release the hold in BOTH outcomes: a held block with no tunnel and no
+            // connect in flight could never be lifted.
+            #[cfg(target_os = "windows")]
+            crate::vpn::wfp::hold_ipv6_block(false);
+
+            if teardown.is_err() {
+                tracing::error!(
+                    "Tunnel lock timeout during auto-disconnect — cannot safely create new tunnel"
+                );
+                let _ = self
+                    .write_state_with_timeout(ConnectionState::Error("Tunnel lock timeout".into()))
+                    .await;
+                #[cfg(target_os = "windows")]
+                if let Err(e) = crate::vpn::wfp::unblock_ipv6().await {
+                    tracing::warn!("Failed to lift IPv6 block after a failed teardown: {}", e);
                 }
+                return Err("Tunnel lock timeout during teardown — please try again".into());
             }
         } else if !current_state.can_connect() {
             let err = VpnError::InvalidStateTransition {
@@ -465,6 +490,7 @@ impl VpnManager {
                 let _ = self
                     .write_state_with_timeout(ConnectionState::Error(err.to_string()))
                     .await;
+                self.lift_ipv6_block_after_failed_connect().await;
                 Err(err.to_string())
             }
             Err(_) => {
@@ -476,8 +502,21 @@ impl VpnManager {
                 let _ = self
                     .write_state_with_timeout(ConnectionState::Error(err.to_string()))
                     .await;
+                self.lift_ipv6_block_after_failed_connect().await;
                 Err(err.to_string())
             }
+        }
+    }
+
+    /// A connect that never produced a live tunnel must not leave IPv6 blocked
+    /// (the tunnel blocks it up-front, and only a tunnel teardown lifts it).
+    ///
+    /// Safe on every failure path: `unblock_ipv6` is a no-op while the kill switch
+    /// owns the block, so a failed RECONNECT still keeps IPv6 contained.
+    async fn lift_ipv6_block_after_failed_connect(&self) {
+        #[cfg(target_os = "windows")]
+        if let Err(e) = crate::vpn::wfp::unblock_ipv6().await {
+            tracing::warn!("Failed to lift IPv6 block after a failed connect: {}", e);
         }
     }
 
