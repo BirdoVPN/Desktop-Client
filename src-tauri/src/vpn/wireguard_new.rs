@@ -198,18 +198,24 @@ impl WireGuardSession {
 
         // The server-provided keepalive was previously computed, plumbed through
         // ReconnectInfo, and then DROPPED — Tunn::new got a hardcoded 25s. Honour
-        // it, clamped: under 15s the keepalives themselves keep the NIC/radio busy;
-        // over 120s a NAT mapping typically expires before the next one arrives.
-        let keepalive = persistent_keepalive.clamp(KEEPALIVE_MIN_SECS, KEEPALIVE_MAX_SECS);
+        // it: 0 is WireGuard's "keepalive disabled" and is passed through as such
+        // (never promoted to a floor, and never as Some(0), which boringtun would
+        // not read as disabled); any other value is clamped, because under 15s the
+        // keepalives themselves keep the NIC/radio busy and over 120s a NAT mapping
+        // typically expires before the next one arrives.
+        let keepalive = match persistent_keepalive {
+            0 => None,
+            n => Some(n.clamp(KEEPALIVE_MIN_SECS, KEEPALIVE_MAX_SECS)),
+        };
 
         // boringtun 0.7: Tunn::new is infallible (0.6 returned Result).
         let tunnel = Tunn::new(
             StaticSecret::from(private_key_arr),
             PublicKey::from(server_key_arr),
-            psk_arr,         // Preshared key for additional security
-            Some(keepalive), // Persistent keepalive (seconds)
-            0,               // Tunnel index
-            None,            // Rate limiter
+            psk_arr,   // Preshared key for additional security
+            keepalive, // Persistent keepalive (seconds); None = disabled
+            0,         // Tunnel index
+            None,      // Rate limiter
         );
 
         // MEM-003: Zeroize our copies of keys after tunnel creation

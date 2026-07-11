@@ -1412,6 +1412,20 @@ pub fn hold_ipv6_block(held: bool) {
     IPV6_BLOCK_HELD.store(held, Ordering::SeqCst);
 }
 
+/// Forget the session's IPv6-block intent WITHOUT tearing down the WFP engine.
+///
+/// For the one path where the session ends but the kill switch is still armed and
+/// about to be deactivated: auto-reconnect giving up. There, the caller wants full
+/// connectivity restored, so the intent must be dropped BEFORE `deactivate_blocking()`
+/// runs — otherwise it removes the kill-switch filters and then, seeing the intent
+/// still set, RE-INSTALLS a standalone IPv6 block for a session that no longer
+/// exists, blackholing IPv6 for the rest of the run with nothing left to remove it.
+/// (`cleanup()` also clears the intent, but it closes the engine, which the give-up
+/// path is not doing.)
+pub fn clear_ipv6_block_intent() {
+    v6_state::on_cleanup();
+}
+
 /// Update the VPN server IP in an active kill switch.
 ///
 /// Rebuilds all filters atomically to swap the permitted server.
@@ -1783,6 +1797,38 @@ mod tests {
         // A deactivation after cleanup must not resurrect the block.
         engine.deactivate_blocking();
         assert!(!engine.ipv6_blocked());
+    }
+
+    /// LEAK-1 regression (review): auto-reconnect GIVING UP must not re-install a
+    /// standalone IPv6 block for a session that is over. The give-up branch clears
+    /// the intent (clear_ipv6_block_intent → on_cleanup) BEFORE deactivating, so
+    /// deactivate_blocking() sees no intent and leaves IPv6 open. Without the
+    /// clear, deactivation would rebuild the block with no tunnel behind it and
+    /// blackhole IPv6 for the rest of the run.
+    #[test]
+    fn give_up_branch_does_not_reinstall_ipv6_block() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_state();
+        let mut engine = FakeEngine::default();
+
+        // Connect (non-dual-stack — every production session today), then a flaky
+        // network: drop, arm kill switch, each failed retry no-ops the unblock.
+        engine.block_ipv6();
+        engine.activate_blocking();
+        engine.unblock_ipv6(); // old tunnel torn down; intent held under kill switch
+        assert!(IPV6_BLOCK_WANTED.load(Ordering::SeqCst));
+
+        // Max attempts reached: the give-up branch clears the intent, THEN
+        // deactivates the kill switch to restore connectivity.
+        clear_ipv6_block_intent();
+        engine.deactivate_blocking();
+
+        assert!(
+            !engine.ipv6_blocked(),
+            "give-up must leave IPv6 OPEN — a rebuilt block would have no tunnel to remove it"
+        );
+        assert!(!IPV6_BLOCK_WANTED.load(Ordering::SeqCst));
+        assert!(!IPV6_ONLY_ACTIVE.load(Ordering::SeqCst));
     }
 
     /// LEAK-2(d): a server switch tears the old tunnel down with a new one

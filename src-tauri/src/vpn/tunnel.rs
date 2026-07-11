@@ -375,52 +375,6 @@ pub(super) struct AdapterDnsSnapshot {
     pub(super) dns_servers_v6: Vec<String>,
 }
 
-/// LEAK-2: RAII guard for the pre-emptive IPv6 block installed at the very top of
-/// [`WintunTunnel::start`]. `start()` disarms it once the tunnel is up; on ANY
-/// other exit — the ~10 early `?` returns, or a cancelled future (the manager
-/// drops the connect after CONNECT_TIMEOUT) — the block is lifted, so a FAILED
-/// connect cannot leave IPv6 blocked with no tunnel to unblock it.
-///
-/// Lifting is delegated to `wfp::unblock_ipv6`, which is itself a no-op while the
-/// kill switch owns the block or a server switch is holding it — so a failure
-/// mid-reconnect correctly KEEPS IPv6 contained.
-struct Ipv6BlockGuard {
-    armed: bool,
-}
-
-impl Ipv6BlockGuard {
-    fn armed() -> Self {
-        Self { armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for Ipv6BlockGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Drop cannot await, so hand the unblock to the runtime we are running
-        // on. Best-effort: the WFP session is dynamic, so the filters also go away
-        // with the process.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async {
-                    if let Err(e) = crate::vpn::wfp::unblock_ipv6().await {
-                        tracing::warn!("Failed to lift IPv6 block after failed connect: {}", e);
-                    }
-                });
-            }
-            Err(_) => tracing::warn!(
-                "No async runtime available to lift the IPv6 block after a failed connect"
-            ),
-        }
-    }
-}
-
 pub struct WintunTunnel {
     config: VpnConfig,
     /// Lock-free running flag for high-throughput packet loop
@@ -497,14 +451,21 @@ impl WintunTunnel {
         // Validate all config values that will be passed to system commands
         self.validate_config()?;
 
+        // Pre-emptive IPv6 block, installed BEFORE any of start_inner()'s
+        // multi-second setup (DLL load, adapter, handshake, route/DNS netsh), so
+        // IPv6 cannot egress the physical NIC during the connect window.
+        //
+        // A FAILED connect must not strand IPv6 blocked with no tunnel. That
+        // lift is owned by the manager (VpnManager::connect), which wraps this
+        // start() in a timeout and calls lift_ipv6_block_after_failed_connect()
+        // on BOTH the error-return and the timeout-cancellation paths — the only
+        // two ways start() fails under the manager. A previous RAII guard here
+        // also lifted, but from a detached Drop task that raced a subsequent
+        // connect's fresh block (removing a live block = the exact leak this
+        // guards against); the manager's synchronous lift is the single, race-free
+        // mechanism.
         self.block_ipv6_leaks().await?;
-        let mut ipv6_guard = Ipv6BlockGuard::armed();
-
-        let result = self.start_inner().await;
-        if result.is_ok() {
-            ipv6_guard.disarm();
-        }
-        result
+        self.start_inner().await
     }
 
     async fn start_inner(&self) -> Result<(), String> {
@@ -2124,6 +2085,19 @@ impl Drop for WintunTunnel {
                 "dhcp",
             ])
             .output();
+
+        // Best-effort: restore the PHYSICAL adapters to DHCP for BOTH families.
+        // configure_dns() set every non-VPN adapter to `static none` (IPv4 and
+        // IPv6) to suppress SMHNR. The clean teardown (restore_dns) undoes that,
+        // but a crash/panic bypasses it — without this, the machine is left with
+        // no resolvers on its real NICs (both families) until the user reconnects
+        // and cleanly disconnects. DHCP is the safe emergency default; a static
+        // resolver the user set will be re-applied by DHCP/RA. The IPv6 half of
+        // this restore matches configure_dns's IPv6 `static none`.
+        for name in &Self::get_non_vpn_adapters() {
+            Self::restore_adapter_dns(name, "ip", &[]);
+            Self::restore_adapter_dns(name, "ipv6", &[]);
+        }
 
         // Best-effort: remove server-specific route
         if let Some(endpoint_ip) = self.config.endpoint.split(':').next() {
