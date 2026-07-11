@@ -1638,11 +1638,19 @@ impl WintunTunnel {
     ) {
         tracing::debug!("Starting packet processing loop (batch mode)");
 
-        // Adaptive polling: start fast, slow down when idle
+        // Adaptive polling: start fast, slow down when idle, then back off HARD
+        // when idle is sustained. A connected-but-idle tunnel (screen off, no
+        // traffic) previously busy-polled at 500us = 2000 wakeups/s forever; the
+        // deep-idle tier drops that to 5ms = 200 wakeups/s after ~1s of silence,
+        // a 10x cut in steady-state CPU wakeups. Any packet resets idle_cycles to
+        // 0 (below), so only the FIRST packet after >1s idle sees the extra
+        // latency; the timer task (update_timers, every 250ms) is unaffected.
         let mut idle_cycles: u32 = 0;
-        const IDLE_THRESHOLD: u32 = 100; // Switch to slow mode after 100 idle cycles
+        const IDLE_THRESHOLD: u32 = 100; // brief idle -> slow tier
+        const DEEP_IDLE_THRESHOLD: u32 = 2_000; // ~1s sustained idle -> deep-idle tier
         const FAST_POLL_US: u64 = 10; // 10 microseconds when active
-        const SLOW_POLL_US: u64 = 500; // 500 microseconds when idle
+        const SLOW_POLL_US: u64 = 500; // 500 microseconds when briefly idle
+        const DEEP_POLL_US: u64 = 5_000; // 5ms when idle >1s (200 wakeups/s)
 
         // FIX-DL: Timer task — boringtun requires periodic update_timers() calls
         // to send keepalives, manage rekeys, and handle cookie responses.
@@ -1667,7 +1675,13 @@ impl WintunTunnel {
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_micros(
-                    if idle_cycles > IDLE_THRESHOLD { SLOW_POLL_US } else { FAST_POLL_US }
+                    if idle_cycles > DEEP_IDLE_THRESHOLD {
+                        DEEP_POLL_US
+                    } else if idle_cycles > IDLE_THRESHOLD {
+                        SLOW_POLL_US
+                    } else {
+                        FAST_POLL_US
+                    }
                 )) => {
                     // Use lock-free check for running state (major performance improvement)
                     if !running.load(Ordering::Relaxed) {

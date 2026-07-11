@@ -307,12 +307,20 @@ pub async fn arm() -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     if wfp::is_lockdown_mode() {
         if let Err(e) = activate_killswitch().await {
-            tracing::error!(
-                "Lockdown activation failed ({}) — leaving kill switch disarmed for safety",
+            // Lockdown could not install the always-on block-all (e.g. the tunnel
+            // interface LUID was not published yet, so activate_blocking refused
+            // rather than block the user's own traffic). DON'T disable protection
+            // entirely — that would leave a later drop fully unprotected, which is
+            // worse than reactive. Degrade to the reactive kill switch (block-all
+            // installed on drop; it does not need the tunnel LUID) for this
+            // session. KILLSWITCH_ENABLED stays true; set_lockdown_mode is an
+            // in-memory session flag, so the user's saved preference is untouched.
+            tracing::warn!(
+                "Lockdown activation failed ({}); falling back to reactive kill switch for this session",
                 e
             );
-            KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
-            return Err(e);
+            wfp::set_lockdown_mode(false);
+            return Ok(false);
         }
         tracing::info!("Kill switch armed in LOCKDOWN (always-on) mode");
         return Ok(true);
