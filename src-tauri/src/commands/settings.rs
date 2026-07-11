@@ -179,7 +179,7 @@ impl Default for AppSettings {
             wireguard_mtu: 0,
             stealth_mode: false,      // premium — off by default
             quantum_protection: true, // post-quantum on by default
-            lockdown_mode: true,      // always-on kill switch ON by default (TunnelVision-safe; see field doc)
+            lockdown_mode: true, // always-on kill switch ON by default (TunnelVision-safe; see field doc)
             multi_hop_enabled: false,
             multi_hop_entry_node_id: None,
             multi_hop_exit_node_id: None,
