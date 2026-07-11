@@ -35,7 +35,7 @@ jobs:
       # stable Rust; RUSTUP_TOOLCHAIN overrides the pinned toml for this job only.
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Ensure a recent stable Rust toolchain
         run: rustup toolchain install stable --profile minimal
