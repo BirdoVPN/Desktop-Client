@@ -2,7 +2,7 @@
  * BirdoTextField — labeled glass text field used across login, settings, and
  * DNS screens. Mirrors mobile's `BirdoTextField.kt`.
  *
- * Border: soft hairline → purpleSoft@60% on focus → red on error.
+ * Border: soft hairline → emerald on focus → red on error.
  */
 import { useState } from 'react';
 import type { ReactNode } from 'react';
@@ -45,13 +45,13 @@ export function BirdoTextField({
   const isPassword = type === 'password';
   const inputType = isPassword ? (revealed ? 'text' : 'password') : type;
 
-  // Focus = a soft, layered brand-violet glow (a brighter violet edge + a tight
+  // Focus = a soft, layered brand-emerald glow (a brighter emerald edge + a tight
   // ring + an outer bloom). Error = red. Otherwise a calm hairline. The glow
   // makes the active field unmistakable without a hard outline.
   const borderColor = error
     ? status.red
     : focused
-    ? 'rgba(168,85,247,0.55)'
+    ? 'rgba(16,185,129,0.55)'
     : disabled
     ? 'rgba(255,255,255,0.05)'
     : 'rgba(255,255,255,0.10)';
@@ -59,7 +59,7 @@ export function BirdoTextField({
   const boxShadow = error
     ? '0 0 0 3px rgba(248,113,113,0.16), inset 0 1px 0 rgba(255,255,255,0.04)'
     : focused
-    ? '0 0 0 3px rgba(168,85,247,0.16), 0 0 22px -2px rgba(168,85,247,0.45), inset 0 1px 0 rgba(255,255,255,0.06)'
+    ? '0 0 0 3px rgba(16,185,129,0.16), 0 0 22px -2px rgba(16,185,129,0.45), inset 0 1px 0 rgba(255,255,255,0.06)'
     : 'inset 0 1px 0 rgba(255,255,255,0.04)';
 
   return (

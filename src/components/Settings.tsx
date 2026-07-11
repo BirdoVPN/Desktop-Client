@@ -321,7 +321,7 @@ export function Settings() {
             title="Launch at Login"
             subtitle="Start Birdo VPN when your computer starts"
             leadingIcon={Zap}
-            leadingTint={brand.purple}
+            leadingTint={brand.accent}
             checked={settings.autostart}
             onCheckedChange={handleAutostart}
           />
@@ -374,7 +374,7 @@ export function Settings() {
               onClick={runSpeedTest}
               disabled={speedTestRunning}
               className="shrink-0 rounded-birdo-sm px-3.5 py-2 text-[13px] font-semibold transition-all hover:brightness-125 active:scale-95 disabled:opacity-60"
-              style={{ backgroundColor: brand.purpleBg, color: brand.purpleSoft }}
+              style={{ backgroundColor: brand.accentBg, color: brand.accentSoft }}
             >
               {speedTestRunning ? 'Running…' : 'Run'}
             </button>
@@ -397,21 +397,21 @@ export function Settings() {
             title="Privacy Policy"
             subtitle="birdo.app/privacy"
             leadingIcon={ShieldCheck}
-            leadingTint={brand.purpleSoft}
+            leadingTint={brand.accentSoft}
             onClick={() => openExternal(PRIVACY_URL)}
           />
           <BirdoNavRow
             title="Terms of Service"
             subtitle="birdo.app/terms"
             leadingIcon={FileText}
-            leadingTint={brand.purpleSoft}
+            leadingTint={brand.accentSoft}
             onClick={() => openExternal(TERMS_URL)}
           />
           <BirdoNavRow
             title="Manage on web"
             subtitle="Open dashboard.birdo.app in browser"
             leadingIcon={ExternalLink}
-            leadingTint={brand.purpleSoft}
+            leadingTint={brand.accentSoft}
             onClick={() => openExternal(DASHBOARD_URL)}
           />
         </BirdoCard>
@@ -444,7 +444,7 @@ function WindowPositionSelector({
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
           style={{ backgroundColor: white.w05 }}
         >
-          <Monitor size={18} color={brand.purple} aria-hidden />
+          <Monitor size={18} color={brand.accent} aria-hidden />
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[15px] font-medium text-white">Window position</div>
@@ -467,9 +467,9 @@ function WindowPositionSelector({
               onClick={() => onSelect(opt.value)}
               className="flex items-center justify-center gap-1 rounded-birdo-xs px-2 py-2 text-[12px] font-medium transition-all hover:shadow-[inset_0_0_0_1px_#ffffff29]"
               style={{
-                backgroundColor: active ? brand.purpleBg : 'transparent',
-                border: active ? `1px solid ${brand.purple}` : '1px solid transparent',
-                color: active ? brand.purpleSoft : white.w60,
+                backgroundColor: active ? brand.accentBg : 'transparent',
+                border: active ? `1px solid ${brand.accent}` : '1px solid transparent',
+                color: active ? brand.accentSoft : white.w60,
               }}
             >
               <Icon size={14} aria-hidden />
@@ -483,9 +483,9 @@ function WindowPositionSelector({
         onClick={() => onSelect('free')}
         className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-birdo-xs px-3 py-2 text-[13px] font-medium transition-all hover:shadow-[inset_0_0_0_1px_#ffffff29]"
         style={{
-          backgroundColor: free ? brand.purpleBg : white.w05,
-          border: free ? `1px solid ${brand.purple}` : '1px solid transparent',
-          color: free ? brand.purpleSoft : white.w60,
+          backgroundColor: free ? brand.accentBg : white.w05,
+          border: free ? `1px solid ${brand.accent}` : '1px solid transparent',
+          color: free ? brand.accentSoft : white.w60,
         }}
       >
         <Move size={14} aria-hidden />

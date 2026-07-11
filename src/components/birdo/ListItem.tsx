@@ -149,7 +149,7 @@ export function BirdoNavRow({
   );
 }
 
-// ── Switch (purple track) ─────────────────────────────────────────────────
+// ── Switch (emerald track) ────────────────────────────────────────────────
 
 export interface BirdoSwitchProps {
   checked: boolean;
@@ -172,7 +172,7 @@ export function BirdoSwitch({ checked, onChange, disabled = false, ariaLabel }: 
       }}
       className="relative inline-flex h-[28px] w-[48px] shrink-0 cursor-pointer items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
       style={{
-        backgroundColor: checked ? brand.purple : white.w10,
+        backgroundColor: checked ? brand.accent : white.w10,
         border: `1px solid ${checked ? 'transparent' : hairline.soft}`,
       }}
     >

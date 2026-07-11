@@ -18,7 +18,6 @@ import { useAppStore, type RouteId } from '@/store/app-store';
 import { motion as motionTokens } from '@/lib/birdo-theme';
 import { BottomNav } from '@/components/BottomNav';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
-import { PixelCanvas } from '@/components/PixelCanvas';
 import { Dashboard } from '@/components/Dashboard';
 import { Profile } from '@/screens/Profile';
 import { Settings } from '@/components/Settings';
@@ -54,18 +53,20 @@ export function AppShell() {
           {topRoute && (
             <motion.div
               key={topRoute}
-              // Solid black base occludes the tab rendered behind it, then its
-              // own PixelCanvas paints the same ambient grid as the rest of the
-              // app so pushed sub-screens (VPN settings, split tunnel, etc.)
-              // aren't missing the backdrop. Screen roots are transparent so the
-              // grid shows through.
-              className="absolute inset-0 z-20 overflow-hidden bg-birdo-black"
+              // Translucent base rather than an opaque one: the App-level
+              // PixelCanvas (App.tsx) shows through, so a pushed sub-screen keeps
+              // the same ambient backdrop WITHOUT stacking a second canvas on top
+              // of it. The previous opaque bg + own <PixelCanvas /> ran two full
+              // grid animations at once — the App-level one kept painting even
+              // though it was completely occluded (rAF doesn't know about
+              // occlusion, only document.hidden).
+              className="absolute inset-0 z-20 overflow-hidden"
+              style={{ backgroundColor: 'rgba(0,0,0,0.92)' }}
               initial={{ x: '100%' }}
               animate={{ x: 0 }}
               exit={{ x: '100%' }}
               transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
             >
-              <PixelCanvas className="absolute inset-0 h-full w-full" />
               <div className="relative z-10 h-full">
                 {(() => {
                   const Screen = PUSH_SCREENS[topRoute];

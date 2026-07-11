@@ -254,7 +254,7 @@ export function VpnSettings() {
             title="Quantum Protection"
             subtitle="Add post-quantum pre-shared key exchange via BirdoPQ v1 (ML-KEM-1024, NIST FIPS 203). Protects against future quantum attacks."
             leadingIcon={Lock}
-            leadingTint={brand.purple}
+            leadingTint={brand.accent}
             checked={settings.quantumProtection}
             onCheckedChange={(v) => persist({ quantumProtection: v })}
           />
@@ -288,7 +288,7 @@ export function VpnSettings() {
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
               style={{ backgroundColor: white.w05 }}
             >
-              <Globe size={18} color={brand.purple} aria-hidden />
+              <Globe size={18} color={brand.accent} aria-hidden />
             </div>
             <div className="min-w-0 flex-1">
               <div className="truncate text-[15px] font-medium text-white">Custom DNS Servers</div>

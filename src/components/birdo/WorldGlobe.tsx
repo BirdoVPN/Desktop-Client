@@ -15,16 +15,22 @@
  *  - A circular clip + radial shading + atmosphere ring sell the 3D sphere.
  *
  * It is a presentational background only (reads `isConnected` to tint the
- * atmosphere green vs purple); it never calls invoke(). It renders deduped
+ * atmosphere and dots green vs blue); it never calls invoke(). It renders deduped
  * server-location dots and, when connected, a user→server connection arc.
+ *
+ * COLOUR: idle dots are BLUE, not the emerald brand accent. Green on the globe
+ * means "connected to this node" — emerald idle dots would erase that signal
+ * (see the green budget note in birdo-theme.ts).
  */
 import { useMemo } from 'react';
 import { feature } from 'topojson-client';
-// 50m resolution (vs 110m) — far more coastline/border detail for a crisp,
-// fully-outlined map. Heavier JSON but it's projected once at module load.
-import worldData from 'world-atlas/countries-50m.json';
+// 110m resolution: the globe renders inside a 300px circle, where the 50m
+// dataset's extra coastline detail is sub-pixel — but its JSON is 756KB vs 108KB
+// and Vite inlines it into the main chunk, so 50m cost ~650KB of startup parse
+// (before the Login screen even paints) for no visible gain at this size.
+import worldData from 'world-atlas/countries-110m.json';
 import type { Feature, FeatureCollection, GeometryObject } from 'geojson';
-import { brand } from '@/lib/birdo-theme';
+import { status } from '@/lib/birdo-theme';
 import { countryCoords } from '@/utils/country-coords';
 import type { Server } from '@/store/app-store';
 
@@ -124,8 +130,10 @@ export function WorldGlobe({
 
   const atmo = isConnected
     ? 'rgba(68, 209, 126, 0.22)' // green when connected
-    : 'rgba(73, 131, 199, 0.20)'; // brand blue idle
-  const dotColor = isConnected ? '#44D17E' : brand.purple;
+    : 'rgba(73, 131, 199, 0.20)'; // blue idle
+  // Idle dots are blue (NOT the emerald accent) so green stays exclusive to the
+  // connected state — see the file header.
+  const dotColor = isConnected ? '#44D17E' : status.blue;
 
   // Unique server locations → offsets within ONE map tile (0..50% of the
   // 400%-wide scroller). Rendered twice (tile 0 and +50%) so a marker stays on

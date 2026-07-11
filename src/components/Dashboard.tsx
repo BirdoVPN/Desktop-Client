@@ -24,6 +24,7 @@ import {
   ArrowDown,
   ArrowUp,
   Clock,
+  Gauge,
   LogOut,
   ShieldAlert,
   ShieldOff,
@@ -193,7 +194,6 @@ export function Dashboard() {
     || connectionState === 'authenticating'
     || connectionState === 'stealth_connecting';
   const isDisconnecting = connectionState === 'disconnecting';
-  const isError = connectionState === 'error';
   const isKillSwitchActive = connectionState === 'kill_switch_active';
 
   // ── Multi-Hop arm state (mirrors mobile's top-bar toggle) ─────────────
@@ -271,6 +271,18 @@ export function Dashboard() {
         }));
         setServers(mapped);
 
+        // Restore the server the user last connected to. Without this the app
+        // forgets the choice on every launch, shows "Choose a server", and — if
+        // the user just hits Connect — silently picks whichever accessible server
+        // sorts first, so the same click lands them somewhere different each day.
+        const st = useAppStore.getState();
+        if (!st.currentServer && st.lastServerId) {
+          const remembered = mapped.find(
+            (srv) => srv.id === st.lastServerId && srv.isOnline && srv.isAccessible,
+          );
+          if (remembered) setCurrentServer(remembered);
+        }
+
         const PING_BATCH = 5;
         const pingable = mapped.filter((srv) => srv.hostname || srv.ipAddress);
         for (let i = 0; i < pingable.length; i += PING_BATCH) {
@@ -286,7 +298,7 @@ export function Dashboard() {
         }
       })
       .catch(() => { /* silent */ });
-  }, [setServers, setServerPing]);
+  }, [setServers, setServerPing, setCurrentServer]);
 
   // ── Auto-connect ──────────────────────────────────────────────────
   useEffect(() => {
@@ -375,6 +387,17 @@ export function Dashboard() {
   }, [connectionState, currentServer]);
 
   // ── Status polling ────────────────────────────────────────────────
+  // Closing the window only HIDES it (minimize-to-tray), so this interval used to
+  // keep firing two IPC round-trips every 2s — waking the WebView2 renderer, the
+  // Rust side, and the CPU ~43k times a day to refresh byte counters nobody can
+  // see. The cadence is now visibility-aware: 2s while the window is on screen,
+  // 15s while it is in the tray. It cannot stop entirely when hidden because the
+  // tray icon + tooltip are driven off `connectionState`, which only this poll
+  // feeds — a reconnect or kill-switch trip must still reach the one surface the
+  // user can actually see. On re-show we poll immediately so the UI is never
+  // stale by more than a frame.
+  const VISIBLE_POLL_MS = 2_000;
+  const HIDDEN_POLL_MS = 15_000;
   const isActive = isConnected || isConnecting;
   useEffect(() => {
     if (!isActive) {
@@ -409,10 +432,25 @@ export function Dashboard() {
         }
       } catch { /* silent */ }
     };
+
+    const schedule = () => {
+      if (statsInterval.current) clearInterval(statsInterval.current);
+      statsInterval.current = setInterval(
+        poll,
+        document.hidden ? HIDDEN_POLL_MS : VISIBLE_POLL_MS,
+      );
+    };
+    const onVisibility = () => {
+      if (!document.hidden) poll(); // catch up the instant we're seen again
+      schedule();
+    };
+
     poll();
-    statsInterval.current = setInterval(poll, 2000);
+    schedule();
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
       cancelled = true;
+      document.removeEventListener('visibilitychange', onVisibility);
       if (statsInterval.current) clearInterval(statsInterval.current);
     };
   }, [isActive, setConnectionState]);
@@ -696,7 +734,11 @@ export function Dashboard() {
           servers={servers}
           selectedServerId={currentServer?.id ?? null}
           isConnected={isConnected}
-          autoRotate
+          // Rotate only while idle (what the header has always claimed). Connected
+          // is the steady state a VPN client sits in for days — an infinite
+          // transform animation there means the compositor never idles, burning
+          // battery on a background decoration nobody is watching.
+          autoRotate={!isConnected}
         />
       )}
 
@@ -787,8 +829,12 @@ export function Dashboard() {
             </>
           )}
 
-          {/* Error */}
-          {isError && errorMessage && (
+          {/* Error. Gated on errorMessage alone, NOT on connectionState==='error':
+              a connect failure that leaves the state untouched (e.g. a mid-tunnel
+              switch to a server that turns out to be offline) still has something
+              to tell the user. The store clears errorMessage on every non-error
+              transition, so a stale message can't outlive the condition. */}
+          {errorMessage && (
             <>
               <BannerRow
                 icon={AlertCircle}
@@ -1006,9 +1052,9 @@ interface MultiHopTopActionProps {
 /** Compact 40px icon toggle in the top-left that arms Multi-Hop. */
 function MultiHopTopAction({ armed, unlocked, onClick }: MultiHopTopActionProps) {
   const active = armed && unlocked;
-  const tint = !unlocked ? white.w40 : active ? brand.purple : white.w80;
-  const bg = active ? brand.purpleBg : white.w05;
-  const border = active ? 'rgba(168,85,247,0.55)' : hairline.soft;
+  const tint = !unlocked ? white.w40 : active ? brand.accent : white.w80;
+  const bg = active ? brand.accentBg : white.w05;
+  const border = active ? 'rgba(16,185,129,0.55)' : hairline.soft;
 
   return (
     <button
@@ -1064,10 +1110,10 @@ function SecurityChip({ icon: Icon, label }: { icon: typeof Lock; label: string 
   return (
     <div
       className="flex items-center gap-1.5 rounded-full px-2.5 py-1"
-      style={{ backgroundColor: brand.purpleBg, border: `1px solid ${hairline.soft}` }}
+      style={{ backgroundColor: brand.accentBg, border: `1px solid ${hairline.soft}` }}
     >
-      <Icon size={12} color={brand.purpleLight} className="shrink-0" />
-      <span className="text-[11px] font-medium" style={{ color: brand.purpleLight }}>
+      <Icon size={12} color={brand.accentLight} className="shrink-0" />
+      <span className="text-[11px] font-medium" style={{ color: brand.accentLight }}>
         {label}
       </span>
     </div>
@@ -1082,14 +1128,36 @@ interface StatsRowProps {
   stats: RustVpnStats | null;
 }
 
+/**
+ * Four tiles: duration, latency, down, up. Latency is the newcomer — the Rust
+ * side has been reporting `current_latency_ms` on every 2s poll since forever and
+ * the UI threw it away, so the one number a VPN user actually watches was the one
+ * number we didn't show.
+ *
+ * Each tile carries a visible caption. Down vs Up used to be distinguishable only
+ * by arrow direction and a green/blue tint, which is no signal at all for a
+ * colour-blind user glancing at two byte counts.
+ */
 function StatsRow({ stats }: StatsRowProps) {
+  const latency = stats?.current_latency_ms;
   return (
-    <div className="grid grid-cols-3 gap-2">
+    <div className="grid grid-cols-4 gap-2">
       <StatTile
         icon={Clock}
-        tint={brand.purpleSoft}
-        label="Duration"
+        tint={brand.accentSoft}
+        label="Uptime"
         value={stats ? formatUptime(stats.uptime_seconds) : '—'}
+      />
+      <StatTile
+        icon={Gauge}
+        tint={
+          latency == null ? white.w60
+          : latency < 80 ? status.greenLight
+          : latency < 160 ? status.yellowLight
+          : status.red
+        }
+        label="Ping"
+        value={latency != null && Number.isFinite(latency) ? `${Math.round(latency)}ms` : '—'}
       />
       <StatTile
         icon={ArrowDown}
@@ -1116,14 +1184,22 @@ interface StatTileProps {
 
 function StatTile({ icon: Icon, tint, label, value }: StatTileProps) {
   return (
-    <BirdoCard cornerRadius={12} padding="0.5rem 0.5rem">
-      <div className="flex items-center justify-center gap-1.5">
-        <Icon size={14} color={tint} aria-label={label} />
+    <BirdoCard cornerRadius={12} padding="0.4rem 0.35rem">
+      <div className="flex flex-col items-center gap-0.5">
+        <div className="flex items-center gap-1">
+          <Icon size={12} color={tint} aria-hidden />
+          <span
+            className="truncate text-xs font-semibold tabular-nums"
+            style={{ color: white.w100 }}
+          >
+            {value}
+          </span>
+        </div>
         <span
-          className="truncate text-xs font-semibold"
-          style={{ color: white.w100 }}
+          className="text-[9px] font-medium uppercase tracking-wide"
+          style={{ color: white.w55 }}
         >
-          {value}
+          {label}
         </span>
       </div>
     </BirdoCard>
@@ -1235,7 +1311,7 @@ function MultiHopServerCard({ label, server, disabled, onClick }: MultiHopServer
           <div className="min-w-0 flex-1">
             <div
               className="text-[10px] font-bold uppercase tracking-wider"
-              style={{ color: brand.purple }}
+              style={{ color: brand.accent }}
             >
               {label}
             </div>

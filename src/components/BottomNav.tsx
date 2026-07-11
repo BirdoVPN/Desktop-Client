@@ -1,7 +1,7 @@
 /**
  * BottomNav — 3-tab bottom navigation bar.
  * Mirrors mobile's BirdoNavGraph.kt:150-204 (Profile / Connect / Settings).
- * w06 glass bg + 1px soft top divider; active tab = purple icon+label, inactive w60.
+ * w06 glass bg + 1px soft top divider; active tab = emerald icon+label, inactive w60.
  */
 import { User, Power, Settings as SettingsIcon, type LucideIcon } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
@@ -44,7 +44,7 @@ export function BottomNav() {
               }
             }}
             className="flex flex-1 flex-col items-center justify-center gap-1 py-2.5 transition-colors"
-            style={{ color: active ? brand.purple : white.w60 }}
+            style={{ color: active ? brand.accent : white.w60 }}
           >
             <Icon size={22} strokeWidth={active ? 2.4 : 2} />
             <span className="text-[10px] font-medium tracking-[0.05em]">{label}</span>

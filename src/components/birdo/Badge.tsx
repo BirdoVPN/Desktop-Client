@@ -21,7 +21,7 @@ const TONE: Record<BadgeTone, ToneStyle> = {
   warning: { bg: status.yellowBg, fg: status.yellowLight, border: 'rgba(234,179,8,0.30)' },
   danger:  { bg: status.redBg,    fg: status.red,         border: 'rgba(248,113,113,0.30)' },
   info:    { bg: status.blueBg,   fg: status.blue,        border: 'rgba(59,130,246,0.30)' },
-  brand:   { bg: 'rgba(168,85,247,0.10)', fg: brand.purpleSoft, border: 'rgba(168,85,247,0.30)' },
+  brand:   { bg: 'rgba(16,185,129,0.10)', fg: brand.accentSoft, border: 'rgba(16,185,129,0.30)' },
 };
 
 export interface BirdoBadgeProps {
@@ -65,6 +65,13 @@ interface PulsingDotProps {
   size?: number;
 }
 
+/**
+ * The ring animates a few times on mount and then stops. It used to loop forever
+ * (`infinite`), which meant the compositor could never idle during the connected
+ * steady state — the exact state a VPN client spends days in. The pulse exists to
+ * draw the eye when the status CHANGES, and it still does that; a permanently
+ * throbbing dot is just battery drain nobody looks at.
+ */
 export function PulsingDot({ color, size = 8 }: PulsingDotProps) {
   return (
     <span
@@ -73,7 +80,7 @@ export function PulsingDot({ color, size = 8 }: PulsingDotProps) {
       aria-hidden
     >
       <span
-        className="absolute inset-0 rounded-full animate-birdo-pulse-ring"
+        className="absolute inset-0 rounded-full animate-birdo-pulse-ring-3x"
         style={{ backgroundColor: color }}
       />
       <span

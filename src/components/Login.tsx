@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '@/store/app-store';
+import { useShallow } from 'zustand/react/shallow';
 import { ShieldCheck, UserRound, KeyRound } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { BirdoBadge, BirdoButton, BirdoTextField, AppIconMark } from './birdo';
@@ -57,7 +58,12 @@ export function Login() {
   const [anonId, setAnonId] = useState('');
   const [anonPassword, setAnonPassword] = useState('');
 
-  const { setAuthenticated, setUserEmail } = useAppStore();
+  const { setAuthenticated, setUserEmail } = useAppStore(
+    useShallow((s) => ({
+      setAuthenticated: s.setAuthenticated,
+      setUserEmail: s.setUserEmail,
+    }))
+  );
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -218,7 +224,7 @@ export function Login() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: motionTokens.emphasis, delay: 0.1 }}
           >
-            <BirdoBadge text="Secure Connection" tone="success" pulseDot />
+            <BirdoBadge text="End-to-end encrypted" tone="neutral" />
           </motion.div>
 
           {/* Gradient headline */}
@@ -245,7 +251,7 @@ export function Login() {
           >
             {twoFactorRequired
               ? 'Enter your authenticator code'
-              : 'Sign in to access the sovereign network'}
+              : 'Sign in to your Birdo account'}
           </motion.p>
 
           {twoFactorRequired ? (
@@ -393,7 +399,7 @@ export function Login() {
 
                     <BirdoButton
                       type="submit"
-                      text={isLoading ? 'Connecting…' : 'Initialize Uplink'}
+                      text={isLoading ? 'Signing in…' : 'Sign in'}
                       onClick={() => {}}
                       variant="brand"
                       size="large"
@@ -445,7 +451,7 @@ export function Login() {
 
                     <BirdoButton
                       type="submit"
-                      text={isLoading ? 'Signing in…' : 'Initialize Uplink'}
+                      text={isLoading ? 'Signing in…' : 'Sign in'}
                       onClick={() => {}}
                       variant="brand"
                       size="large"
@@ -464,14 +470,15 @@ export function Login() {
                 transition={{ duration: motionTokens.emphasis, delay: 0.3 }}
               >
                 Don&apos;t have an account?{' '}
-                <a
-                  href="https://auth.birdo.app/login"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="font-medium text-w100 transition hover:text-w80"
+                <button
+                  type="button"
+                  onClick={() => {
+                    open('https://auth.birdo.app/login').catch(() => {});
+                  }}
+                  className="font-medium text-w100 underline-offset-2 transition hover:text-w80 hover:underline"
                 >
                   Register at birdo.app
-                </a>
+                </button>
               </motion.p>
             </>
           )}

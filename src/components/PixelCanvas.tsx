@@ -73,16 +73,27 @@ export function PixelCanvas({
       }
     };
 
-    let lastFrameTime = 0;
-    const animate = (now: number = 0) => {
-      // Throttle to ~30fps — ample for ambient decoration, saves CPU/battery
-      if (now && now - lastFrameTime < 33) {
-        animationFrameId = requestAnimationFrame(animate);
-        return;
-      }
-      lastFrameTime = now;
+    // Frame pacing. The previous loop skip-framed inside rAF, so the JS thread
+    // still woke at the display's 60Hz forever while the window was on screen —
+    // for an ambient grid whose pixels top out at 0.25 alpha. A VPN client sits
+    // open for days, so the loop now:
+    //   - schedules the next frame via setTimeout (a real ~20fps sleep, not a
+    //     60Hz wake-and-discard), and
+    //   - stops entirely once the grid has settled (no pointer nearby and every
+    //     cell has reached its target alpha), restarting on the next mousemove.
+    // A frozen frame of a barely-visible grid is indistinguishable from a live
+    // one, so nothing is lost visually.
+    const FRAME_MS = 50; // ~20fps while animating
+    let frameTimer: ReturnType<typeof setTimeout> | undefined;
+    let running = false;
 
+    const step = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Set while painting if any cell is still in motion (alpha chasing its
+      // target, or a hover trail decaying). When nothing moved, the frame we just
+      // drew is final and we can stop scheduling.
+      let settled = true;
 
       for (let y = 0; y < rows; y++) {
         for (let x = 0; x < columns; x++) {
@@ -99,6 +110,7 @@ export function PixelCanvas({
           } else {
             pixel.hoverDecay = Math.max(0, pixel.hoverDecay - 0.004);
           }
+          if (pixel.hoverDecay > 0) settled = false;
 
           // Twinkling logic - much slower and subtler
           if (Math.random() < 0.001) pixel.targetAlpha = Math.random() * 0.15;
@@ -106,9 +118,11 @@ export function PixelCanvas({
           if (pixel.alpha < pixel.targetAlpha) {
             pixel.alpha += pixel.speed;
             if (pixel.alpha > pixel.targetAlpha) pixel.alpha = pixel.targetAlpha;
+            settled = false;
           } else if (pixel.alpha > pixel.targetAlpha) {
             pixel.alpha -= pixel.speed;
             if (pixel.alpha < pixel.targetAlpha) pixel.alpha = pixel.targetAlpha;
+            settled = false;
           }
 
           // Combine effects - subtler max alpha for ambient feel
@@ -119,22 +133,39 @@ export function PixelCanvas({
         }
       }
 
-      if (isVisible) {
-        animationFrameId = requestAnimationFrame(animate);
+      if (!isVisible || settled) {
+        // Park. A mousemove (or a re-show) wakes us again.
+        running = false;
+        return;
       }
+      frameTimer = setTimeout(
+        () => { animationFrameId = requestAnimationFrame(step); },
+        FRAME_MS,
+      );
+    };
+
+    /** Start the loop if it isn't already running (idempotent). */
+    const wake = () => {
+      if (running || !isVisible) return;
+      running = true;
+      animationFrameId = requestAnimationFrame(step);
     };
 
     const handleMouseMove = (e: MouseEvent) => {
       const rect = canvas.getBoundingClientRect();
       mouseX = e.clientX - rect.left;
       mouseY = e.clientY - rect.top;
+      wake();
     };
 
     // Re-init on element resize (window resize, column reflow, etc.).
     let resizeTimer: ReturnType<typeof setTimeout>;
     const scheduleInit = () => {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(initGrid, 150);
+      resizeTimer = setTimeout(() => {
+        initGrid();
+        wake(); // repaint the new grid at least once
+      }, 150);
     };
     const ro = new ResizeObserver(scheduleInit);
     ro.observe(canvas);
@@ -143,9 +174,11 @@ export function PixelCanvas({
     const handleVisibilityChange = () => {
       isVisible = !document.hidden;
       if (isVisible) {
-        animationFrameId = requestAnimationFrame(animate);
+        wake();
       } else {
         cancelAnimationFrame(animationFrameId);
+        clearTimeout(frameTimer);
+        running = false;
       }
     };
 
@@ -153,12 +186,13 @@ export function PixelCanvas({
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     initGrid();
-    animate();
+    wake();
 
     return () => {
       window.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       cancelAnimationFrame(animationFrameId);
+      clearTimeout(frameTimer);
       clearTimeout(resizeTimer);
       ro.disconnect();
     };
