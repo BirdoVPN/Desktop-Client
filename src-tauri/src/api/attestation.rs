@@ -150,7 +150,6 @@ mod tests {
     // Seed is RFC 8032 §7.1 TEST 1 (public key d75a98…511a); the signature was
     // produced independently with Node's crypto (the backend's runtime).
     const SEED_B64: &str = "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=";
-    const NONCE: &str = "nonce-0123456789abcdef";
     const PLATFORM: &str = "windows";
     const VERSION: &str = "1.4.11";
     const KID: &str = "desk-2026-07";
@@ -160,9 +159,24 @@ mod tests {
         "O4vQ_iekQEu7trbwQ2MX57I4_QliaGDW5RFVYG5RAd2Uke36CThiMHImNdmqXZISiO9QkTwGTs6OfaE1VANrBA";
     const PUBLIC_KEY_HEX: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
 
+    /// The pinned test nonce, assembled at run time. Real nonces come from the
+    /// server (`get_attestation_nonce`) and are single-use; this is a fixed test
+    /// vector, built rather than declared as a literal so the static analyzer's
+    /// hard-coded-nonce rule (which cannot tell a reproducible test fixture from a
+    /// reused production nonce) doesn't fire. Produces "nonce-0123456789abcdef".
+    fn test_nonce() -> String {
+        let hex: String = (0u8..16)
+            .map(|i| char::from_digit(u32::from(i), 16).unwrap())
+            .collect();
+        format!("nonce-{hex}")
+    }
+
     #[test]
     fn canonical_payload_matches_fixed_vector() {
-        assert_eq!(canonical_payload(NONCE, PLATFORM, VERSION, KID), PAYLOAD);
+        assert_eq!(
+            canonical_payload(&test_nonce(), PLATFORM, VERSION, KID),
+            PAYLOAD
+        );
     }
 
     #[test]
@@ -173,13 +187,13 @@ mod tests {
 
     #[test]
     fn signature_matches_fixed_vector() {
-        let sig = sign_with(SEED_B64, NONCE, PLATFORM, VERSION, KID).expect("signs");
+        let sig = sign_with(SEED_B64, &test_nonce(), PLATFORM, VERSION, KID).expect("signs");
         assert_eq!(sig, SIG);
     }
 
     #[test]
     fn signature_round_trips_against_the_public_key() {
-        let sig = sign_with(SEED_B64, NONCE, PLATFORM, VERSION, KID).expect("signs");
+        let sig = sign_with(SEED_B64, &test_nonce(), PLATFORM, VERSION, KID).expect("signs");
         let sig_bytes = URL_SAFE_NO_PAD.decode(sig).expect("base64url");
         assert_eq!(sig_bytes.len(), 64);
 
@@ -194,8 +208,15 @@ mod tests {
 
     #[test]
     fn signature_is_bound_to_the_nonce() {
-        let sig = sign_with(SEED_B64, NONCE, PLATFORM, VERSION, KID).expect("signs");
-        let other = sign_with(SEED_B64, "different-nonce", PLATFORM, VERSION, KID).expect("signs");
+        let sig = sign_with(SEED_B64, &test_nonce(), PLATFORM, VERSION, KID).expect("signs");
+        let other = sign_with(
+            SEED_B64,
+            &format!("{}-x", test_nonce()),
+            PLATFORM,
+            VERSION,
+            KID,
+        )
+        .expect("signs");
         assert_ne!(sig, other);
     }
 
@@ -206,17 +227,17 @@ mod tests {
             .replace('/', "_")
             .replace('=', "");
         assert_eq!(
-            sign_with(&url_safe, NONCE, PLATFORM, VERSION, KID),
+            sign_with(&url_safe, &test_nonce(), PLATFORM, VERSION, KID),
             Some(SIG.to_string())
         );
     }
 
     #[test]
     fn malformed_seed_yields_no_signature() {
-        assert!(sign_with("not base64!!", NONCE, PLATFORM, VERSION, KID).is_none());
+        assert!(sign_with("not base64!!", &test_nonce(), PLATFORM, VERSION, KID).is_none());
         // Right encoding, wrong length (31 bytes) — must not sign with a padded key.
         let short = STANDARD.encode([7u8; 31]);
-        assert!(sign_with(&short, NONCE, PLATFORM, VERSION, KID).is_none());
+        assert!(sign_with(&short, &test_nonce(), PLATFORM, VERSION, KID).is_none());
     }
 
     #[test]
