@@ -405,6 +405,19 @@ impl AutoReconnectService {
                                                     ConnectionState::Error("Session expired — please reconnect".to_string())
                                                 ).await;
                                                 *last_reconnect_info.write().await = None;
+                                                // PWR-8: with no reconnect info left, this loop has
+                                                // nothing further to do — it would otherwise keep
+                                                // ticking every `check_interval` (waking the CPU/timer)
+                                                // forever until the user manually reconnects.
+                                                // connect_vpn/quick_connect call
+                                                // `auto_reconnect.start()` on every connect, which spawns
+                                                // a fresh loop, so stopping here is not a permanent loss.
+                                                running.store(false, Ordering::SeqCst);
+                                                is_reconnecting.store(false, Ordering::SeqCst);
+                                                tracing::info!(
+                                                    "Auto-reconnect loop stopping — session invalidated, nothing left to monitor"
+                                                );
+                                                break;
                                             } else if !resp.server_online {
                                                 tracing::warn!("Heartbeat: server going offline");
                                             } else {
@@ -715,6 +728,18 @@ impl AutoReconnectService {
                                         // block-all with no automatic recovery after a flaky network
                                         // exhausted all reconnect attempts.
                                         let _ = killswitch::deactivate_killswitch().await;
+                                        // PWR-8: after giving up there is nothing left for this loop
+                                        // to do — without stopping it, it ticks every
+                                        // `check_interval` FOREVER (waking the CPU/timer for no
+                                        // reason). connect_vpn/quick_connect call
+                                        // `auto_reconnect.start()` on every connect, spawning a fresh
+                                        // loop, so this is not a permanent loss of monitoring.
+                                        running.store(false, Ordering::SeqCst);
+                                        tracing::info!(
+                                            "Auto-reconnect loop stopping — gave up after {} attempts",
+                                            cfg.max_attempts
+                                        );
+                                        break;
                                     }
                                 }
                             }
@@ -764,6 +789,17 @@ impl AutoReconnectService {
                                     is_reconnecting.store(false, Ordering::SeqCst);
                                     // Deactivate kill switch since we're giving up
                                     let _ = killswitch::deactivate_killswitch().await;
+                                    // PWR-8: symmetric with the Disconnected arm's give-up branch
+                                    // above — stop the loop instead of ticking forever with
+                                    // nothing left to do. `auto_reconnect.start()` is called again
+                                    // on every future connect_vpn/quick_connect, so this is not a
+                                    // permanent loss of monitoring.
+                                    running.store(false, Ordering::SeqCst);
+                                    tracing::info!(
+                                        "Auto-reconnect loop stopping — gave up after {} attempts",
+                                        cfg.max_attempts
+                                    );
+                                    break;
                                 }
                             }
                         }

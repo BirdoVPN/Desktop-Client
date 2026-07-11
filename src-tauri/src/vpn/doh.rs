@@ -131,10 +131,7 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
     DoHProvider {
         url: "https://dns.quad9.net/dns-query",
         host: "dns.quad9.net",
-        bootstrap: &[
-            Ipv4Addr::new(9, 9, 9, 9),
-            Ipv4Addr::new(149, 112, 112, 112),
-        ],
+        bootstrap: &[Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(149, 112, 112, 112)],
         // Chain: dns.quad9.net → DigiCert Global G3 TLS ECC SHA384 2020 CA1 → DigiCert Global Root G3
         // Pins regenerated 2025-07-16 from live dns.quad9.net certificate.
         // Only the LEAF pin is listed (see note above on peer_certificate()).

@@ -1667,6 +1667,13 @@ mod tests {
             }
         }
 
+        /// wfp::unblock_ipv6_dual_stack() — the new tunnel routes IPv6 itself.
+        fn unblock_ipv6_dual_stack(&mut self) {
+            if v6_state::on_dual_stack() {
+                self.standalone_v6 = false;
+            }
+        }
+
         /// wfp::deactivate_blocking() — removes ALL filters, then honours intent.
         fn deactivate_blocking(&mut self) {
             if !IS_BLOCKING.load(Ordering::SeqCst) {
@@ -1804,6 +1811,50 @@ mod tests {
         // Normal disconnect afterwards still works.
         engine.unblock_ipv6();
         assert!(!engine.ipv6_blocked());
+        reset_state();
+    }
+
+    /// LEAK-2: a dual-stack tunnel (backend sent `client_ipv6`) routes IPv6
+    /// itself, so `unblock_ipv6_dual_stack()` must drop the session's block
+    /// INTENT even while the kill switch still owns the filters — otherwise a
+    /// later `deactivate_blocking()` would re-install a standalone block that a
+    /// dual-stack tunnel must not have (it would fight the tunnel's own IPv6
+    /// routes).
+    #[test]
+    fn dual_stack_route_clears_intent_even_under_killswitch() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_state();
+        let mut engine = FakeEngine::default();
+
+        // Pre-emptive block at the top of start(), same as any other tunnel.
+        engine.block_ipv6();
+        assert!(IPV6_BLOCK_WANTED.load(Ordering::SeqCst));
+
+        // Tunnel drops mid-session; auto-reconnect arms the kill switch.
+        engine.activate_blocking();
+        engine.unblock_ipv6(); // old tunnel's stop(); kill switch still owns v6
+        assert!(engine.ipv6_blocked(), "kill switch still blocks IPv6");
+
+        // The NEW tunnel is dual-stack: it routes IPv6 itself, so it lifts the
+        // pre-emptive block right before installing its own IPv6 routes.
+        engine.unblock_ipv6_dual_stack();
+        assert!(
+            !IPV6_BLOCK_WANTED.load(Ordering::SeqCst),
+            "dual-stack tunnel must clear the block intent"
+        );
+        assert!(
+            !IPV6_BLOCK_HELD.load(Ordering::SeqCst),
+            "dual-stack tunnel must also release any server-switch hold"
+        );
+
+        // Reconnect succeeds — deactivating the kill switch must NOT rebuild a
+        // standalone block now that the tunnel wants to route IPv6 itself.
+        engine.deactivate_blocking();
+        assert!(
+            !engine.ipv6_blocked(),
+            "a dual-stack tunnel's IPv6 must be free to flow once the kill switch is gone"
+        );
+
         reset_state();
     }
 }
