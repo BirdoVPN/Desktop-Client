@@ -20,7 +20,7 @@
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
-use ring::signature::{Ed25519KeyPair, KeyPair};
+use ring::signature::Ed25519KeyPair;
 use zeroize::Zeroizing;
 
 /// Domain-separation prefix. Bump the version suffix only in lock-step with the
@@ -135,6 +135,7 @@ fn decode_seed(seed_b64: &str) -> Option<Vec<u8>> {
 /// The public key for a seed — used by the release pipeline / tests, never sent.
 #[cfg(test)]
 fn public_key_bytes(seed_b64: &str) -> Option<Vec<u8>> {
+    use ring::signature::KeyPair;
     let seed = Zeroizing::new(decode_seed(seed_b64)?);
     let keypair = Ed25519KeyPair::from_seed_unchecked(seed.as_slice()).ok()?;
     Some(keypair.public_key().as_ref().to_vec())
