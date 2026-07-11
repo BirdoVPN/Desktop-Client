@@ -147,6 +147,22 @@ jobs:
           echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
           echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
 
+      # A tagged release MUST be able to attest itself: without the secret,
+      # option_env! is None and the shipped client silently sends no signature,
+      # which an `enforce` server policy refuses. Fail here rather than ship it.
+      - name: Require the desktop attestation key on tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BIRDO_DESKTOP_ATTEST_SK}" ] || [ -z "${BIRDO_DESKTOP_ATTEST_KID}" ]; then
+            echo "::error::BIRDO_DESKTOP_ATTEST_SK/KID secret is empty — a tagged release cannot ship unattestable. See docs/CLIENT-ATTESTATION.md"
+            exit 1
+          fi
+          echo "Attestation key present (kid: ${BIRDO_DESKTOP_ATTEST_KID})"
+
       # ── Apple codesign keychain setup ──────────────────────────────
       - name: Detect Apple signing capability
         id: signcap
@@ -204,6 +220,10 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
           XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
+          # Ed25519 client-attestation key baked in by option_env! — see
+          # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
         run: npx tauri build --target ${{ matrix.arch }}
 
       - name: Build Tauri application (unsigned fallback)
@@ -216,6 +236,10 @@ jobs:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
           XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
+          # Attestation must ride the fallback too — an unsigned DMG that also
+          # could not attest would be refused by an `enforce` server policy.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
         run: npx tauri build --target ${{ matrix.arch }}
 
       # ── Notarize + Staple ──────────────────────────────────────────

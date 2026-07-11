@@ -2,6 +2,7 @@
 //!
 //! HTTP client for communicating with the Birdo VPN backend.
 
+pub mod attestation;
 pub mod cert_pin;
 pub mod client;
 pub mod doh_resolver;

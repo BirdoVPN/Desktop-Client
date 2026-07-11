@@ -66,6 +66,10 @@ sha2 = "0.10"  # DLL integrity verification (already a transitive dep via tauri)
 hmac = "0.12"  # FIX-1-7: Settings file HMAC integrity
 hex = "0.4"    # FIX-1-7: Hex encoding for HMAC key storage
 rand = "0.8"
+# Ed25519 client attestation (src/api/attestation.rs). Already in the graph —
+# rustls uses its ring provider and boringtun 0.7.1 links ring 0.17 — so this
+# is a re-export of an existing dependency, not new compiled code.
+ring = "0.17"
 base64 = "0.22"
 zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). Same crate as the Android JNI
