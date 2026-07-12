@@ -680,6 +680,14 @@ jobs:
         with:
           targets: ${{ matrix.arch }}
 
+      # dtolnay adds the target to `stable`, but rust-toolchain.toml pins a
+      # specific toolchain that rustup switches to inside the repo — so the cross
+      # target (x86_64-apple-darwin on the arm64 runner) must be added to the
+      # PINNED toolchain explicitly, or `tauri build` fails "target not installed".
+      - name: Add cross-compile target to the pinned toolchain
+        working-directory: src-tauri
+        run: rustup target add ${{ matrix.arch }}
+
       - name: Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -985,6 +993,30 @@ jobs:
         with:
           name: birdo-vpn-macos-x64
           path: release-files/macos-x64/
+
+      # Every platform emits a `SHA256SUMS.txt` (+ .sigstore/.asc) and macOS emits
+      # a generic `BirdoVPN.app.tar.gz` — identical basenames. A GitHub release
+      # cannot hold two assets with the same name (softprops uploads by basename),
+      # so the second upload 404s on the asset-metadata update and fails the job.
+      # Scope those colliding names per-platform; installer names already carry
+      # the version+arch and are unique.
+      - name: Disambiguate colliding filenames across platforms
+        shell: bash
+        run: |
+          disambig() {
+            local root="$1" suffix="$2"
+            [ -d "$root" ] || return 0
+            find "$root" -type f -name 'SHA256SUMS.txt*' | while read -r f; do
+              mv "$f" "$(dirname "$f")/$(basename "$f" | sed "s/^SHA256SUMS/SHA256SUMS-$suffix/")"
+            done
+            find "$root" -type f -name 'BirdoVPN.app.tar.gz*' | while read -r f; do
+              mv "$f" "$(dirname "$f")/$(basename "$f" | sed "s/^BirdoVPN\.app/BirdoVPN-$suffix.app/")"
+            done
+          }
+          disambig release-files/windows    windows
+          disambig release-files/linux      linux
+          disambig release-files/macos-arm64 macos-arm64
+          disambig release-files/macos-x64   macos-x64
 
       - name: List all release files
         shell: bash
