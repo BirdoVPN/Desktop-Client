@@ -36,6 +36,9 @@ pub mod vouchers {
 pub mod vpn {
     pub const SERVERS: &str = "/vpn/servers";
     pub const CONNECT: &str = "/vpn/connect";
+    /// Single-use nonce the Ed25519 client attestation signs (anti-replay).
+    /// Matches the Android client's `vpn/attestation/nonce`.
+    pub const ATTESTATION_NONCE: &str = "/vpn/attestation/nonce";
     pub const MULTI_HOP_ROUTES: &str = "/vpn/multi-hop/routes";
     pub const MULTI_HOP_CONNECT: &str = "/vpn/multi-hop/connect";
     pub const PORT_FORWARDS: &str = "/vpn/port-forwards";

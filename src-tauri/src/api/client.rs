@@ -233,6 +233,39 @@ impl BirdoApi {
         self.get(endpoints::vpn::SERVERS, true).await
     }
 
+    /// Get a single-use nonce for the Ed25519 client attestation
+    pub async fn get_attestation_nonce(&self) -> Result<AttestationNonceResponse, ApiError> {
+        self.get(endpoints::vpn::ATTESTATION_NONCE, true).await
+    }
+
+    /// Best-effort desktop attestation (`BIRDO-DESKTOP-ATTEST-v1`).
+    ///
+    /// Returns None without a round-trip on builds compiled without the signing
+    /// key (dev / fork), and swallows a failed nonce fetch: while the server
+    /// policy is `off`/`log` an unreachable nonce endpoint must never be the
+    /// reason a connect fails — same best-effort contract as the Android client.
+    ///
+    /// Called from `connect_vpn` / `connect_multi_hop` rather than the command
+    /// layer so quick-connect and auto-reconnect's unattended re-dial are signed
+    /// too; an unsigned re-dial would be refused under `enforce` exactly when the
+    /// user is not watching.
+    async fn desktop_attestation(&self) -> Option<super::attestation::DesktopAttestation> {
+        if !super::attestation::is_configured() {
+            return None;
+        }
+
+        match self.get_attestation_nonce().await {
+            Ok(response) => super::attestation::sign(&response.nonce),
+            Err(e) => {
+                tracing::warn!(
+                    "Attestation nonce fetch failed, connecting unattested: {}",
+                    e
+                );
+                None
+            }
+        }
+    }
+
     /// Connect to a VPN server and get WireGuard configuration
     /// FIX-1-1: Accepts optional client_public_key for client-side keygen
     pub async fn connect_vpn(
@@ -244,6 +277,8 @@ impl BirdoApi {
         quantum_protection: Option<bool>,
         pq_client_public_key: Option<String>,
     ) -> Result<ConnectResponse, ApiError> {
+        let attestation = self.desktop_attestation().await;
+
         let payload = ConnectRequest {
             server_node_id: Some(server_id.to_string()),
             device_name: Some(device_name.to_string()),
@@ -252,6 +287,11 @@ impl BirdoApi {
             stealth_mode,
             quantum_protection,
             pq_client_public_key,
+            desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
+            desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
+            desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
+            desktop_attest_platform: attestation.as_ref().map(|a| a.platform.to_string()),
+            desktop_attest_version: attestation.as_ref().map(|a| a.version.to_string()),
         };
 
         self.post(endpoints::vpn::CONNECT, &payload, true).await
@@ -367,6 +407,8 @@ impl BirdoApi {
         quantum_protection: bool,
         pq_client_public_key: Option<String>,
     ) -> Result<MultiHopConnectResponse, ApiError> {
+        let attestation = self.desktop_attestation().await;
+
         let payload = MultiHopConnectRequest {
             entry_node_id: entry_node_id.to_string(),
             exit_node_id: exit_node_id.to_string(),
@@ -375,6 +417,11 @@ impl BirdoApi {
             stealth_mode: Some(stealth_mode),
             quantum_protection: Some(quantum_protection),
             pq_client_public_key,
+            desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
+            desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
+            desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
+            desktop_attest_platform: attestation.as_ref().map(|a| a.platform.to_string()),
+            desktop_attest_version: attestation.as_ref().map(|a| a.version.to_string()),
         };
 
         self.post(endpoints::vpn::MULTI_HOP_CONNECT, &payload, true)

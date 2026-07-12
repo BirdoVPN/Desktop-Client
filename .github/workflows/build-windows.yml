@@ -119,6 +119,21 @@ jobs:
           "XRAY_BINARY_SHA256=$binarySha" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Xray ready: src-tauri/resources/xray.exe ($binarySha)"
 
+      # ── Client attestation key (release builds only) ─────────────────
+      # A tagged release MUST be able to attest itself: without the secret,
+      # option_env! is None and the shipped client silently sends no signature,
+      # which an `enforce` server policy refuses. Fail here rather than ship it.
+      - name: Require the desktop attestation key on tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: |
+          if (-not $env:BIRDO_DESKTOP_ATTEST_SK) { throw "BIRDO_DESKTOP_ATTEST_SK secret is empty — a tagged release cannot ship unattestable. See docs/CLIENT-ATTESTATION.md" }
+          if (-not $env:BIRDO_DESKTOP_ATTEST_KID) { throw "BIRDO_DESKTOP_ATTEST_KID secret is empty — a tagged release cannot ship unattestable. See docs/CLIENT-ATTESTATION.md" }
+          Write-Host "Attestation key present (kid: $env:BIRDO_DESKTOP_ATTEST_KID)"
+
       # ── Authenticode signing setup (only on tag builds) ──────────────
       # Skip for PR/dispatch builds — those produce unsigned binaries that
       # are still Sigstore-signed. Only tagged releases get Authenticode.
@@ -254,6 +269,10 @@ jobs:
           # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
           # the shipped binary (owner sets the SENTRY_DSN repo secret).
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # Ed25519 client-attestation key baked in by option_env! — see
+          # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
         run: npx tauri build
 
       # Sanity-check the artifacts we actually SHIP: both installers must be

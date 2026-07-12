@@ -436,6 +436,26 @@ pub struct ConnectRequest {
     /// Closes B1 (PQ claimed but not implemented on desktop).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pq_client_public_key: Option<String>,
+    /// Ed25519 client attestation (`BIRDO-DESKTOP-ATTEST-v1`, see api::attestation).
+    /// All five are absent on builds compiled without the signing key, so the
+    /// request body is byte-identical to a pre-attestation client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_nonce: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_kid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_sig: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_version: Option<String>,
+}
+
+/// Single-use nonce the client signs (`GET /vpn/attestation/nonce`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationNonceResponse {
+    pub nonce: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -538,6 +558,17 @@ pub struct MultiHopConnectRequest {
     pub quantum_protection: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pq_client_public_key: Option<String>,
+    /// Ed25519 client attestation — see `ConnectRequest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_nonce: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_kid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_sig: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_attest_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

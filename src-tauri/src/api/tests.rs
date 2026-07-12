@@ -38,6 +38,11 @@ mod endpoint_tests {
     }
 
     #[test]
+    fn attestation_nonce_endpoint_is_correct() {
+        assert_eq!(endpoints::vpn::ATTESTATION_NONCE, "/vpn/attestation/nonce");
+    }
+
+    #[test]
     fn user_endpoints_are_correct() {
         assert_eq!(endpoints::users::SUBSCRIPTION, "/auth/me");
     }
@@ -261,11 +266,91 @@ mod types_serialization_tests {
             stealth_mode: None,
             quantum_protection: None,
             pq_client_public_key: None,
+            desktop_attest_nonce: None,
+            desktop_attest_kid: None,
+            desktop_attest_sig: None,
+            desktop_attest_platform: None,
+            desktop_attest_version: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["serverNodeId"], "node-1");
         assert!(json.get("deviceName").is_none());
         assert!(json.get("preferredRegion").is_none());
+    }
+
+    /// A build without the attestation key must emit the pre-attestation body
+    /// byte-for-byte — no empty/null desktopAttest* keys.
+    #[test]
+    fn connect_request_without_attestation_omits_all_attest_fields() {
+        let req = ConnectRequest {
+            server_node_id: Some("node-1".to_string()),
+            device_name: Some("desktop".to_string()),
+            preferred_region: None,
+            client_public_key: Some("pub=".to_string()),
+            stealth_mode: Some(false),
+            quantum_protection: Some(false),
+            pq_client_public_key: None,
+            desktop_attest_nonce: None,
+            desktop_attest_kid: None,
+            desktop_attest_sig: None,
+            desktop_attest_platform: None,
+            desktop_attest_version: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"serverNodeId":"node-1","deviceName":"desktop","clientPublicKey":"pub=","stealthMode":false,"quantumProtection":false}"#
+        );
+    }
+
+    #[test]
+    fn connect_request_serializes_attestation_in_camel_case() {
+        let req = ConnectRequest {
+            server_node_id: Some("node-1".to_string()),
+            device_name: None,
+            preferred_region: None,
+            client_public_key: None,
+            stealth_mode: None,
+            quantum_protection: None,
+            pq_client_public_key: None,
+            desktop_attest_nonce: Some("nonce".to_string()),
+            desktop_attest_kid: Some("desk-2026-07".to_string()),
+            desktop_attest_sig: Some("sig".to_string()),
+            desktop_attest_platform: Some("windows".to_string()),
+            desktop_attest_version: Some("1.4.11".to_string()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["desktopAttestNonce"], "nonce");
+        assert_eq!(json["desktopAttestKid"], "desk-2026-07");
+        assert_eq!(json["desktopAttestSig"], "sig");
+        assert_eq!(json["desktopAttestPlatform"], "windows");
+        assert_eq!(json["desktopAttestVersion"], "1.4.11");
+    }
+
+    #[test]
+    fn multi_hop_request_without_attestation_omits_all_attest_fields() {
+        let req = MultiHopConnectRequest {
+            entry_node_id: "entry".to_string(),
+            exit_node_id: "exit".to_string(),
+            device_name: None,
+            client_public_key: None,
+            stealth_mode: None,
+            quantum_protection: None,
+            pq_client_public_key: None,
+            desktop_attest_nonce: None,
+            desktop_attest_kid: None,
+            desktop_attest_sig: None,
+            desktop_attest_platform: None,
+            desktop_attest_version: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"entryNodeId":"entry","exitNodeId":"exit"}"#);
+    }
+
+    #[test]
+    fn attestation_nonce_response_deserializes() {
+        let resp: AttestationNonceResponse = serde_json::from_str(r#"{"nonce":"abc123"}"#).unwrap();
+        assert_eq!(resp.nonce, "abc123");
     }
 
     #[test]
