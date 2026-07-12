@@ -18,6 +18,7 @@ import { useAppStore, type RouteId } from '@/store/app-store';
 import { motion as motionTokens } from '@/lib/birdo-theme';
 import { BottomNav } from '@/components/BottomNav';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { PixelCanvas } from '@/components/PixelCanvas';
 import { Dashboard } from '@/components/Dashboard';
 import { Profile } from '@/screens/Profile';
 import { Settings } from '@/components/Settings';
@@ -53,20 +54,21 @@ export function AppShell() {
           {topRoute && (
             <motion.div
               key={topRoute}
-              // Translucent base rather than an opaque one: the App-level
-              // PixelCanvas (App.tsx) shows through, so a pushed sub-screen keeps
-              // the same ambient backdrop WITHOUT stacking a second canvas on top
-              // of it. The previous opaque bg + own <PixelCanvas /> ran two full
-              // grid animations at once — the App-level one kept painting even
-              // though it was completely occluded (rAF doesn't know about
-              // occlusion, only document.hidden).
-              className="absolute inset-0 z-20 overflow-hidden"
-              style={{ backgroundColor: 'rgba(0,0,0,0.92)' }}
+              // Fully OPAQUE base so the pushed sub-screen completely occludes the
+              // tab behind it (a translucent base let ~8% of the live tab bleed
+              // through). Its own PixelCanvas paints the same ambient grid so the
+              // sub-screen matches the tabs. This does mean two canvases exist
+              // while a sub-screen is open, but both park once the pointer stops
+              // moving (see PixelCanvas), so the occluded App-level one is not a
+              // persistent draw — the idle cost is ~0, which is what matters for a
+              // tray-resident app.
+              className="absolute inset-0 z-20 overflow-hidden bg-birdo-black"
               initial={{ x: '100%' }}
               animate={{ x: 0 }}
               exit={{ x: '100%' }}
               transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
             >
+              <PixelCanvas className="absolute inset-0 h-full w-full" />
               <div className="relative z-10 h-full">
                 {(() => {
                   const Screen = PUSH_SCREENS[topRoute];

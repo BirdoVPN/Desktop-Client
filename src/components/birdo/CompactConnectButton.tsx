@@ -84,7 +84,9 @@ export function CompactConnectButton({
         backgroundImage,
         border: `1px solid ${borderColor}`,
         boxShadow: `0 14px 32px -10px ${shadowColor}`,
-        opacity: busy ? 0.85 : 1,
+        // multiHopBlocked is dimmed so it reads as clearly non-interactive next
+        // to the idle state (both are pale fills; without the dim they look alike).
+        opacity: state === 'multiHopBlocked' ? 0.5 : busy ? 0.85 : 1,
       }}
     >
       {busy ? (

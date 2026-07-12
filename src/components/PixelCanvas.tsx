@@ -182,7 +182,12 @@ export function PixelCanvas({
       }
     };
 
+    // Also wake on focus so a keyboard-only or otherwise pointerless session
+    // gets a fresh twinkle when the window comes forward, not a frozen frame.
+    const handleFocus = () => wake();
+
     window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('focus', handleFocus);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     initGrid();
@@ -190,6 +195,7 @@ export function PixelCanvas({
 
     return () => {
       window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('focus', handleFocus);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       cancelAnimationFrame(animationFrameId);
       clearTimeout(frameTimer);
