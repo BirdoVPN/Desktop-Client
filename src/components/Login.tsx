@@ -214,7 +214,7 @@ export function Login() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: motionTokens.emphasis, delay: 0.06 }}
           >
-            <AppIconMark size={72} style={{ borderRadius: 20 }} />
+            <AppIconMark mark size={84} />
           </motion.div>
 
           {/* Status badge */}

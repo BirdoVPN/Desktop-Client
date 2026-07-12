@@ -31,7 +31,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.5, delay: 0.1 }}
           >
-            <AppIconMark size={64} style={{ borderRadius: 20 }} />
+            <AppIconMark mark size={76} />
           </motion.div>
 
           {/* Title */}

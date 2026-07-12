@@ -110,7 +110,7 @@ export function ServerSelectorSheet({
           />
           {/* Sheet */}
           <motion.div
-            className="absolute inset-x-0 bottom-0 z-50 flex max-h-[88%] flex-col rounded-t-3xl"
+            className="absolute inset-x-0 bottom-0 z-50 flex h-[92%] flex-col rounded-t-3xl"
             style={{
               backgroundColor: surface.s3,
               border: `1px solid ${hairline.soft}`,
@@ -132,7 +132,7 @@ export function ServerSelectorSheet({
             </div>
 
             {/* Header */}
-            <div className="flex items-center justify-between px-5 py-1">
+            <div className="flex items-center justify-between px-5 py-2">
               <div className="min-w-0">
                 <h2 className="text-lg font-semibold" style={{ color: white.w100 }}>
                   Choose a server
@@ -166,11 +166,13 @@ export function ServerSelectorSheet({
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="Search by country or city"
                   aria-label="Search servers"
-                  className="w-full rounded-xl py-2.5 pl-9 pr-9 text-sm outline-none transition"
+                  className="w-full rounded-xl py-3 pl-9 pr-9 text-sm outline-none transition"
                   style={{
-                    backgroundColor: white.w05,
+                    // Solid well (matches the login fields) — the ~5% white fill
+                    // let the background grid bleed through.
+                    backgroundColor: 'rgba(16,16,23,0.85)',
                     color: white.w100,
-                    border: `1px solid ${hairline.soft}`,
+                    border: `1px solid ${hairline.strong}`,
                   }}
                 />
                 {query && (
@@ -187,7 +189,7 @@ export function ServerSelectorSheet({
             </div>
 
             {/* Filter pills */}
-            <div className="flex gap-2 overflow-x-auto px-4 py-1">
+            <div className="flex gap-2 overflow-x-auto px-4 py-2">
               {FILTERS.map((f) => {
                 const active = f.key === filter;
                 const favCount = f.key === 'favorites' ? favoriteServers.length : null;
@@ -296,10 +298,10 @@ function ServerRow({
         onClick={onSelect}
         disabled={!selectable}
         aria-label={`Connect to ${server.city}, ${server.country}`}
-        className="flex min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-3.5 text-left transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex min-w-0 flex-1 items-center gap-3.5 rounded-xl px-3.5 py-4 text-left transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
       >
         <span
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-lg"
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-2xl"
           style={{ backgroundColor: white.w10 }}
           title={server.country}
         >
@@ -309,15 +311,15 @@ function ServerRow({
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-1.5">
             <span
-              className="truncate text-sm font-medium"
+              className="truncate text-[15px] font-semibold"
               style={{ color: white.w100 }}
             >
               {server.city}
             </span>
-            {server.isStreaming && <Film size={11} color={brand.accent} />}
-            {server.isP2p && <Download size={11} color={status.blue} />}
+            {server.isStreaming && <Film size={12} color={brand.accent} />}
+            {server.isP2p && <Download size={12} color={status.blue} />}
           </span>
-          <span className="block truncate text-xs" style={{ color: white.w60 }}>
+          <span className="mt-0.5 block truncate text-xs" style={{ color: white.w60 }}>
             {server.country}
           </span>
         </span>

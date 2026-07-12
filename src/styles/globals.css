@@ -485,6 +485,15 @@ textarea:focus-visible {
   box-shadow: none;
 }
 
+/* WebView2 (Edge/Chromium on Windows) renders its OWN native password reveal +
+   clear controls inside password/search inputs. The field already provides a
+   custom show/hide eye button, so the native one is a duplicate — hide it (this
+   is what produced the "two eyes" on the password field). */
+input::-ms-reveal,
+input::-ms-clear {
+  display: none;
+}
+
 /* Light mode adjustments for glass elements */
 :root.light body {
   background: var(--background);

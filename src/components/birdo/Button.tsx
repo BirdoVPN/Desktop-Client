@@ -88,8 +88,8 @@ export function BirdoButton({
   if (!isInactive) {
     switch (variant) {
       case 'brand':
-        boxShadow = '0 8px 24px -6px rgba(124,58,237,0.55), inset 0 1px 0 rgba(255,255,255,0.20)';
-        hoverShadow = '0 12px 34px -6px rgba(124,58,237,0.78), inset 0 1px 0 rgba(255,255,255,0.26)';
+        boxShadow = '0 8px 24px -6px rgba(5,150,105,0.55), inset 0 1px 0 rgba(255,255,255,0.20)';
+        hoverShadow = '0 12px 34px -6px rgba(5,150,105,0.78), inset 0 1px 0 rgba(255,255,255,0.26)';
         break;
       case 'primary':
         boxShadow = '0 6px 18px -6px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.65)';
