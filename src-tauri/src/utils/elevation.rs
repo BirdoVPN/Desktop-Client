@@ -167,7 +167,7 @@ pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
         // Any literal ' in an argument is safely represented as '\'' .
         let posix_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
         let shell_cmd = std::iter::once(posix_quote(program))
-            .chain(args.iter().map(|a| posix_quote(a.as_str())))
+            .chain(args.iter().map(|a| posix_quote(a)))
             .collect::<Vec<_>>()
             .join(" ");
 

@@ -725,6 +725,8 @@ impl AutoReconnectService {
                                         // deactivating, or deactivate_blocking() would re-install a
                                         // standalone IPv6 block for a tunnel that will never come back
                                         // and silently blackhole IPv6 for the rest of the run.
+                                        // (WFP is Windows-only; no-op elsewhere.)
+                                        #[cfg(target_os = "windows")]
                                         crate::vpn::wfp::clear_ipv6_block_intent();
                                         // AUDIT-2026-06-19 FIX (lockout regression): deactivate the
                                         // kill switch when we give up, SYMMETRIC with the Error arm
@@ -794,7 +796,8 @@ impl AutoReconnectService {
                                     is_reconnecting.store(false, Ordering::SeqCst);
                                     // As in the Disconnected give-up branch: drop the IPv6-block
                                     // intent before deactivating so no standalone block is rebuilt
-                                    // for a session that is over.
+                                    // for a session that is over. (WFP is Windows-only.)
+                                    #[cfg(target_os = "windows")]
                                     crate::vpn::wfp::clear_ipv6_block_intent();
                                     // Deactivate kill switch since we're giving up
                                     let _ = killswitch::deactivate_killswitch().await;
