@@ -1,7 +1,7 @@
 /**
  * BirdoButton — unified button with 5 variants matching mobile's `BirdoButton.kt`.
  *   Primary   — solid white on dark
- *   Brand     — purple gradient (hero CTA)
+ *   Brand     — emerald gradient (hero CTA)
  *   Secondary — bordered glass
  *   Ghost     — text only
  *   Danger    — red

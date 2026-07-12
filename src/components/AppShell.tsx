@@ -54,11 +54,14 @@ export function AppShell() {
           {topRoute && (
             <motion.div
               key={topRoute}
-              // Solid black base occludes the tab rendered behind it, then its
-              // own PixelCanvas paints the same ambient grid as the rest of the
-              // app so pushed sub-screens (VPN settings, split tunnel, etc.)
-              // aren't missing the backdrop. Screen roots are transparent so the
-              // grid shows through.
+              // Fully OPAQUE base so the pushed sub-screen completely occludes the
+              // tab behind it (a translucent base let ~8% of the live tab bleed
+              // through). Its own PixelCanvas paints the same ambient grid so the
+              // sub-screen matches the tabs. This does mean two canvases exist
+              // while a sub-screen is open, but both park once the pointer stops
+              // moving (see PixelCanvas), so the occluded App-level one is not a
+              // persistent draw — the idle cost is ~0, which is what matters for a
+              // tray-resident app.
               className="absolute inset-0 z-20 overflow-hidden bg-birdo-black"
               initial={{ x: '100%' }}
               animate={{ x: 0 }}

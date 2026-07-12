@@ -116,7 +116,7 @@ export function BirdoSectionHeader({
           type="button"
           onClick={onActionClick}
           className="rounded-birdo-xs px-1.5 py-1 text-xs font-medium hover:bg-white/5"
-          style={{ color: brand.purpleSoft }}
+          style={{ color: brand.accentSoft }}
         >
           {actionLabel}
         </button>

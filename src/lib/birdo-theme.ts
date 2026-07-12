@@ -1,10 +1,22 @@
 /**
- * Birdo design tokens — mirrors mobile's `Color.kt` / `Brand.kt` / `Theme.kt`
- * so the desktop client renders the exact same palette + gradients.
+ * Birdo design tokens.
  *
- * If you change a value here, also update the matching token in:
- *   birdo-client-mobile/app/src/main/java/app/birdo/vpn/ui/theme/Color.kt
- *   birdo-client-mobile/app/src/main/java/app/birdo/vpn/ui/theme/Brand.kt
+ * COLOR DIVERGENCE (2026-07 brand pivot, web #201): desktop is EMERALD; mobile's
+ * Color.kt / Brand.kt are still violet until the mobile rebrand round lands. The
+ * structure, motion and radius scales below still mirror mobile — only the accent
+ * family diverges. Do NOT copy colour values across the two clients until mobile
+ * is rebranded.
+ *
+ * GREEN BUDGET. Emerald is the brand accent, but green already means "connected"
+ * in this app, so the two must never be confusable:
+ *   - `status.green` (#22C55E) is reserved for CONNECTED surfaces (the connect
+ *     button fill, the Protected pill, the tray icon). It is the only opaque
+ *     green fill in the UI.
+ *   - `brand.*` emerald is for chrome accents only (tabs, switches, focus rings,
+ *     outlines, badges). The idle connect button is neutral glass with an emerald
+ *     OUTLINE — never an emerald fill.
+ *   - The globe's idle server dots are BLUE, not emerald, so the globe keeps its
+ *     own connected-vs-idle signal (see WorldGlobe.tsx).
  */
 
 // ── Surface elevation tiers (dark) ───────────────────────────────────────
@@ -17,18 +29,32 @@ export const surface = {
   cardGlass: 'rgba(20,20,25,0.70)', // BirdoCard glass fill
 } as const;
 
-// ── Brand stops ───────────────────────────────────────────────────────────
+// ── Brand stops (emerald — shade-for-shade with web #201) ─────────────────
 export const brand = {
-  purpleDeep: '#6D28D9', // violet-700
-  purpleMid: '#7C3AED', // violet-600 (BirdoPurpleDark)
-  purple: '#A855F7',
-  purpleLight: '#C084FC', // violet-300 (BirdoPurpleLight)
-  purpleSoft: '#C4B5FD', // violet-300 (Brand.PurpleSoft)
-  purpleBg: 'rgba(168,85,247,0.10)', // accent fill / brand badge bg
+  accentDeep: '#047857', // emerald-700
+  accentMid: '#059669', // emerald-600
+  accent: '#10B981', // emerald-500 — the brand primary
+  accentLight: '#34D399', // emerald-400
+  accentSoft: '#6EE7B7', // emerald-300 — accent text on dark
+  accentBg: 'rgba(16,185,129,0.10)', // accent fill / brand badge bg
   pink: '#EC4899',
   cyan: '#22D3EE',
   teal: '#14B8A6',
   indigo: '#6366F1',
+} as const;
+
+/**
+ * Accent rgba at an arbitrary alpha. Every accent tint in the app goes through
+ * this so the brand colour lives in exactly one place (the swap to emerald left
+ * ~25 hardcoded `rgba(168,85,247,…)` literals scattered across components).
+ */
+export const accentA = (alpha: number): string => `rgba(16,185,129,${alpha})`;
+
+/** Shared focus treatment — border + ring + bloom, one definition. */
+export const focus = {
+  border: accentA(0.55),
+  ring: accentA(0.16),
+  bloom: accentA(0.45),
 } as const;
 
 // ── Status colors ─────────────────────────────────────────────────────────
@@ -55,11 +81,14 @@ export const primary = {
 } as const;
 
 // ── White-scale alphas ───────────────────────────────────────────────────
+// w40 is BELOW WCAG AA (~3.4:1 on #050507) — it is for decorative icons and
+// dividers only. Any text under 14px must use w55 or brighter.
 export const white = {
   w100: '#F2F2F2',
   w80: 'rgba(255,255,255,0.80)',
   w60: 'rgba(255,255,255,0.60)',
-  w40: 'rgba(255,255,255,0.40)',
+  w55: 'rgba(255,255,255,0.55)', // caption tier — smallest AA-passing text
+  w40: 'rgba(255,255,255,0.40)', // decorative only (fails AA for small text)
   w20: 'rgba(255,255,255,0.20)',
   w10: 'rgba(255,255,255,0.10)',
   w06: 'rgba(255,255,255,0.06)', // GlassStrong — secondary btn / topbar bg
@@ -68,8 +97,7 @@ export const white = {
   w03: 'rgba(255,255,255,0.03)',
 } as const;
 
-// ── Dim-light theme (mobile's "light" = dark slate, NOT white) ────────────
-// Mirrors mobile Color.kt:67-76,135. Applied under the `.light` class.
+// ── Dim theme (a lighter slate, NOT white) — applied under the `.light` class.
 export const lightSurface = {
   s0: '#1B1C24', // app bg
   s1: '#22232C', // cards
@@ -80,8 +108,8 @@ export const lightSurface = {
   onSurfaceFaint: '#7A7C8E', // faint text
   outline: 'rgba(255,255,255,0.20)', // strong border
   outlineSoft: 'rgba(255,255,255,0.10)', // soft divider
-  primary: '#B794F6', // softer violet accent
-  accentBg: 'rgba(168,85,247,0.16)', // accent fill
+  primary: '#6EE7B7', // softer emerald accent on slate
+  accentBg: 'rgba(16,185,129,0.16)', // accent fill
 } as const;
 
 // ── Hairlines (borders / dividers) ───────────────────────────────────────
@@ -92,14 +120,14 @@ export const hairline = {
 
 // ── Brushes / gradients (CSS strings) ────────────────────────────────────
 export const gradient = {
-  /** Primary brand fill — restrained deep-purple matching the app icon. */
-  primary: 'linear-gradient(135deg, #7C3AED 0%, #4C1D95 100%)',
+  /** Primary brand fill — emerald CTA (Login / Consent / Split-Tunnel apply). */
+  primary: 'linear-gradient(135deg, #059669 0%, #064E3B 100%)',
   /** Cool secondary — info / tech accents. */
   info: `linear-gradient(135deg, ${brand.indigo} 0%, ${brand.cyan} 100%)`,
   /** Connected (green disc → transparent). */
   connected: `radial-gradient(circle, rgba(34,197,94,0.28) 0%, transparent 70%)`,
-  /** Idle ambient (purple bloom). */
-  idle: `radial-gradient(circle, rgba(168,85,247,0.18) 0%, transparent 70%)`,
+  /** Idle ambient — BLUE, never emerald (green must stay = connected). */
+  idle: `radial-gradient(circle, rgba(59,130,246,0.14) 0%, transparent 70%)`,
   /** Error halo. */
   error: `radial-gradient(circle, rgba(248,113,113,0.25) 0%, transparent 70%)`,
   /** Glass card stroke — silver-to-transparent border. */
@@ -108,16 +136,24 @@ export const gradient = {
   /** Headline text gradient — white → soft white. */
   headlineText:
     'linear-gradient(180deg, #FFFFFF 0%, rgba(255,255,255,0.55) 100%)',
-  /** Brand text gradient — purple → pink for accent words. */
-  brandText: `linear-gradient(135deg, ${brand.purpleSoft} 0%, ${brand.pink} 100%)`,
-  /** Connect button gradient (idle). */
-  connectIdle: 'linear-gradient(135deg, #7C3AED 0%, #4C1D95 100%)',
-  /** Connect button gradient (busy). */
-  connectBusy: `linear-gradient(135deg, ${brand.purpleSoft} 0%, ${brand.purpleDeep} 100%)`,
-  /** Connect button gradient (connected). */
+  /** Brand text gradient — emerald → cyan for accent words. */
+  brandText: `linear-gradient(135deg, ${brand.accentSoft} 0%, ${brand.cyan} 100%)`,
+
+  // ── Connect button states ──────────────────────────────────────────────
+  // These four must be instantly distinguishable at a glance. Only `connectGreen`
+  // is an opaque green fill; idle is neutral glass (emerald shows in the border
+  // only), busy is a translucent emerald wash behind a spinner, and multi-hop is
+  // teal — a different hue from both the idle glass and the connected green.
+  /** Idle — neutral glass. The emerald lives in the BORDER, not the fill. */
+  connectIdle:
+    'linear-gradient(135deg, rgba(255,255,255,0.10) 0%, rgba(255,255,255,0.04) 100%)',
+  /** Busy — translucent emerald wash (never mistakable for the connected fill). */
+  connectBusy:
+    'linear-gradient(135deg, rgba(110,231,183,0.22) 0%, rgba(4,120,87,0.30) 100%)',
+  /** Connected — the ONE opaque green fill in the app. */
   connectGreen: `linear-gradient(135deg, ${status.green} 0%, #166534 100%)`,
-  /** Connect button gradient (multi-hop ready). */
-  connectMultiHop: `linear-gradient(135deg, ${brand.purple} 0%, ${brand.purpleDeep} 100%)`,
+  /** Multi-hop ready — teal, hue-separated from connected green. */
+  connectMultiHop: `linear-gradient(135deg, #0D9488 0%, #115E59 100%)`,
 } as const;
 
 // ── Motion timings (mirrors mobile's BirdoMotion.kt) ─────────────────────

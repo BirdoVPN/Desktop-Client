@@ -135,6 +135,13 @@ interface AppState {
   // Connection
   connectionState: ConnectionState;
   currentServer: Server | null;
+  /**
+   * The server the user last actually connected to. Persisted (currentServer is
+   * not), so a cold start restores the node you always use instead of showing
+   * "Choose a server" and then silently connecting you to whichever server
+   * happens to sort first in the list.
+   */
+  lastServerId: string | null;
   stats: ConnectionStats;
   vpnIp: string | null;
 
@@ -286,6 +293,7 @@ export const useAppStore = create<AppState>()(
 
       connectionState: 'disconnected' as ConnectionState,
       currentServer: null,
+      lastServerId: null,
       isAdmin: false,
       errorMessage: null,
       stats: {
@@ -328,7 +336,8 @@ export const useAppStore = create<AppState>()(
 
       // Connection actions
       setConnectionState: (connectionState) => set({ connectionState, ...(connectionState !== 'error' ? { errorMessage: null } : {}) }),
-      setCurrentServer: (server) => set({ currentServer: server }),
+      setCurrentServer: (server) =>
+        set(server ? { currentServer: server, lastServerId: server.id } : { currentServer: null }),
       setStats: (stats) => set({ stats }),
       setVpnIp: (ip) => set({ vpnIp: ip }),
 
@@ -382,6 +391,9 @@ export const useAppStore = create<AppState>()(
           account: { ...defaultAccount },
           connectionState: 'disconnected' as ConnectionState,
           currentServer: null,
+          // Cleared on logout: the next account to sign in on this machine must
+          // not inherit the previous user's server choice.
+          lastServerId: null,
           vpnIp: null,
           errorMessage: null,
           stats: {
@@ -402,6 +414,7 @@ export const useAppStore = create<AppState>()(
       // Auth tokens and VPN keys remain in Rust-side native secure storage.
       partialize: (state) => ({
         favoriteServers: state.favoriteServers,
+        lastServerId: state.lastServerId,
         settings: state.settings,
         hasAcceptedConsent: state.hasAcceptedConsent,
         theme: state.theme,

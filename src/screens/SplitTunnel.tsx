@@ -4,7 +4,7 @@
  * Layout (mobile parity, adapted for desktop):
  *  - BirdoTopBar (title "Split Tunneling", back → popRoute)
  *  - Master enable toggle (gated to Operative+, like SplitTunnelCard)
- *  - Purple info banner (Info icon + "… N apps excluded.")
+ *  - Accent info banner (Info icon + "… N apps excluded.")
  *  - "Add by path/name" BirdoTextField + Add button, plus an "Installed apps"
  *    picker (enumerated from the Windows registry by `list_installed_apps`) and
  *    a native "Browse…" .exe file dialog.
@@ -239,15 +239,15 @@ export function SplitTunnel() {
           className="flex items-center gap-3 rounded-birdo-md px-3.5 py-3"
           style={{
             backgroundColor: white.w05,
-            border: `1px solid ${enabled ? brand.purple : hairline.soft}`,
+            border: `1px solid ${enabled ? brand.accent : hairline.soft}`,
           }}
         >
           <div
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
-            style={{ backgroundColor: enabled ? brand.purpleBg : white.w05 }}
+            style={{ backgroundColor: enabled ? brand.accentBg : white.w05 }}
           >
             {isOperative ? (
-              <Scissors size={18} color={enabled ? brand.purple : white.w60} aria-hidden />
+              <Scissors size={18} color={enabled ? brand.accent : white.w60} aria-hidden />
             ) : (
               <Lock size={16} color={white.w40} aria-hidden />
             )}
@@ -260,7 +260,7 @@ export function SplitTunnel() {
               {!isOperative && (
                 <span
                   className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
-                  style={{ backgroundColor: brand.purpleBg, color: brand.purple }}
+                  style={{ backgroundColor: brand.accentBg, color: brand.accent }}
                 >
                   Operative
                 </span>
@@ -278,13 +278,13 @@ export function SplitTunnel() {
           />
         </div>
 
-        {/* ── Purple info banner ── */}
+        {/* ── Accent info banner ── */}
         <div
           className="mt-3 flex items-start gap-2.5 rounded-birdo-md px-3 py-3"
-          style={{ backgroundColor: brand.purpleBg }}
+          style={{ backgroundColor: brand.accentBg }}
         >
-          <Info size={18} color={brand.purple} aria-hidden className="mt-px shrink-0" />
-          <p className="text-xs leading-relaxed" style={{ color: 'rgba(168,85,247,0.85)' }}>
+          <Info size={18} color={brand.accent} aria-hidden className="mt-px shrink-0" />
+          <p className="text-xs leading-relaxed" style={{ color: 'rgba(16,185,129,0.85)' }}>
             Selected apps will bypass VPN and use your regular internet connection. {excludedCount}{' '}
             {excludedCount === 1 ? 'app' : 'apps'} excluded.
           </p>
@@ -313,7 +313,7 @@ export function SplitTunnel() {
               </label>
               <div className="flex gap-2">
                 <div
-                  className="flex min-w-0 flex-1 items-center gap-2 px-3 transition-shadow focus-within:shadow-[0_0_0_2px_#a855f780]"
+                  className="flex min-w-0 flex-1 items-center gap-2 px-3 transition-shadow focus-within:shadow-[0_0_0_2px_#10b98180]"
                   style={{
                     minHeight: 48,
                     borderRadius: 12,
@@ -398,7 +398,7 @@ export function SplitTunnel() {
                   key={appName}
                   className="flex items-center gap-3 rounded-birdo-md px-3.5 py-2.5"
                   style={{
-                    backgroundColor: 'rgba(168,85,247,0.08)',
+                    backgroundColor: 'rgba(16,185,129,0.08)',
                     border: `1px solid ${hairline.soft}`,
                   }}
                 >
@@ -413,7 +413,7 @@ export function SplitTunnel() {
                   </div>
                   <span
                     className="shrink-0 rounded-md px-1.5 py-0.5 text-[9px] font-bold tracking-wide"
-                    style={{ backgroundColor: 'rgba(168,85,247,0.20)', color: brand.purple }}
+                    style={{ backgroundColor: 'rgba(16,185,129,0.20)', color: brand.accent }}
                   >
                     BYPASS
                   </span>
@@ -455,7 +455,7 @@ export function SplitTunnel() {
           style={{ backgroundColor: 'rgba(11,11,16,0.985)' }}
         >
           <div className="flex items-center gap-2 px-4 pb-2 pt-4">
-            <AppWindow size={18} color={brand.purple} aria-hidden />
+            <AppWindow size={18} color={brand.accent} aria-hidden />
             <span className="flex-1 text-[15px] font-semibold" style={{ color: white.w100 }}>
               Installed apps
             </span>
@@ -540,7 +540,7 @@ export function SplitTunnel() {
                       {added ? (
                         <span
                           className="shrink-0 text-[10px] font-semibold"
-                          style={{ color: brand.purple }}
+                          style={{ color: brand.accent }}
                         >
                           ADDED
                         </span>

@@ -48,7 +48,7 @@ interface RustSubscription {
 function planGradient(plan: string): string {
   switch (plan.toUpperCase()) {
     case 'SOVEREIGN':
-      return 'linear-gradient(135deg, #7C3AED 0%, #4C1D95 100%)';
+      return 'linear-gradient(135deg, #059669 0%, #064E3B 100%)';
     case 'OPERATIVE':
       return 'linear-gradient(135deg, #6366F1 0%, #4338CA 100%)';
     default:
@@ -167,7 +167,7 @@ export function Profile() {
               title="Redeem voucher"
               subtitle="Activate a 30 / 90-day code"
               leadingIcon={Gift}
-              leadingTint={brand.purpleSoft}
+              leadingTint={brand.accentSoft}
               onClick={() => setShowVoucherDialog(true)}
             />
           </BirdoCard>
@@ -437,7 +437,7 @@ function VoucherRedeemDialog({
             {success ? (
               <CheckCircle2 size={22} color={statusTokens.green} aria-hidden />
             ) : (
-              <Gift size={22} color={brand.purple} aria-hidden />
+              <Gift size={22} color={brand.accent} aria-hidden />
             )}
             <h2
               className="text-[16px] font-bold"

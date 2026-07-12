@@ -5,24 +5,24 @@ export default {
     extend: {
       colors: {
         primary: {
-          50: '#faf5ff',
-          100: '#f3e8ff',
-          200: '#e9d5ff',
-          300: '#d8b4fe',
-          400: '#c084fc',
-          500: '#a855f7',
-          600: '#9333ea',
-          700: '#7c3aed',
-          800: '#6b21a8',
-          900: '#581c87',
-          950: '#3b0764',
+          50: '#ecfdf5',
+          100: '#d1fae5',
+          200: '#a7f3d0',
+          300: '#6ee7b7',
+          400: '#34d399',
+          500: '#10b981',
+          600: '#059669',
+          700: '#047857',
+          800: '#065f46',
+          900: '#064e3b',
+          950: '#022c22',
         },
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
         mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
-      // ── Birdo design tokens exposed as utilities (mirror mobile) ──────────
+      // ── Birdo design tokens exposed as utilities ──────────────────────────
       // Backed by CSS vars in globals.css so `.light` (dark-slate) overrides work.
       backgroundColor: {
         'birdo-black': 'var(--birdo-black)',
@@ -30,7 +30,7 @@ export default {
         'birdo-s1': 'var(--birdo-s1)',
         'birdo-s2': 'var(--birdo-s2)',
         'birdo-s3': 'var(--birdo-s3)',
-        'birdo-purple-bg': 'var(--birdo-purple-bg)',
+        'birdo-accent-bg': 'var(--birdo-accent-bg)',
         'birdo-green-bg': 'var(--birdo-green-bg)',
         'birdo-red-bg': 'var(--birdo-red-bg)',
         'birdo-primary': 'var(--birdo-primary)',
@@ -46,8 +46,8 @@ export default {
         w60: 'var(--w60)',
         w40: 'var(--w40)',
         w20: 'var(--w20)',
-        'birdo-purple': 'var(--birdo-purple)',
-        'birdo-purple-soft': 'var(--birdo-purple-soft)',
+        'birdo-accent': 'var(--birdo-accent)',
+        'birdo-accent-soft': 'var(--birdo-accent-soft)',
         'birdo-green': 'var(--birdo-green)',
         'birdo-on-primary': 'var(--birdo-on-primary)',
       },
@@ -73,7 +73,10 @@ export default {
       animation: {
         'spin-slow': 'spin 3s linear infinite',
         'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-        'birdo-pulse-ring': 'birdo-pulse-ring 1100ms linear infinite',
+        // Finite: three rings, then the dot settles. See PulsingDot in Badge.tsx —
+        // an infinite ring keeps the compositor awake for the whole connected
+        // session. `forwards` holds the final (invisible) ring frame.
+        'birdo-pulse-ring-3x': 'birdo-pulse-ring 1100ms linear 3 forwards',
       },
       keyframes: {
         'birdo-pulse-ring': {

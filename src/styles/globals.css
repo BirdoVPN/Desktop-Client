@@ -6,7 +6,7 @@
 @tailwind utilities;
 
 :root {
-  --color-primary: 168 85 247;
+  --color-primary: 16 185 129;
   --color-secondary: 99 102 241;
   --background: #050505;
   --foreground: #f2f2f2;
@@ -17,7 +17,7 @@
   --border: rgba(255, 255, 255, 0.08);
   --ring: rgba(255, 255, 255, 0.2);
 
-  /* ── Birdo design tokens (mirror mobile Color.kt/Brand.kt) ─────────────
+  /* ── Birdo design tokens (desktop is emerald since web #201; mobile is still violet) ─────────────
      Consumed by tailwind.config.js utilities + components. Dark is default. */
   --birdo-black: #000000;
   --birdo-s0: #050507;
@@ -26,12 +26,12 @@
   --birdo-s3: #1a1a24;
   --birdo-card-glass: rgba(20, 20, 25, 0.7);
 
-  --birdo-purple: #a855f7;
-  --birdo-purple-mid: #7c3aed;
-  --birdo-purple-deep: #6d28d9;
-  --birdo-purple-light: #c084fc;
-  --birdo-purple-soft: #c4b5fd;
-  --birdo-purple-bg: rgba(168, 85, 247, 0.1);
+  --birdo-accent: #10b981;
+  --birdo-accent-mid: #059669;
+  --birdo-accent-deep: #047857;
+  --birdo-accent-light: #34d399;
+  --birdo-accent-soft: #6ee7b7;
+  --birdo-accent-bg: rgba(16, 185, 129, 0.1);
 
   --birdo-green: #22c55e;
   --birdo-green-light: #4ade80;
@@ -59,8 +59,8 @@
 }
 
 /* Light mode = mobile's "dim-light" DARK-SLATE theme (NOT white).
-   Mirrors mobile Color.kt:67-76. We re-point the Birdo surface/text/border
-   vars to slate; brand/status accents stay the same family (softer violet). */
+   Dim slate theme. We re-point the Birdo surface/text/border
+   vars to slate; brand/status accents stay the same family (softer emerald). */
 :root.light {
   --background: #1b1c24;
   --foreground: #e8e9f0;
@@ -78,8 +78,8 @@
   --birdo-s3: #2f3040;
   --birdo-card-glass: rgba(42, 43, 54, 0.7);
 
-  --birdo-purple: #b794f6; /* softer violet accent on slate */
-  --birdo-purple-bg: rgba(168, 85, 247, 0.16);
+  --birdo-accent: #6ee7b7; /* softer emerald accent on slate */
+  --birdo-accent-bg: rgba(16, 185, 129, 0.16);
 
   --w100: #e8e9f0;
   --w80: #b7b9c9;
@@ -126,12 +126,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(168, 85, 247, 0.5);
+  background: rgba(16, 185, 129, 0.5);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(168, 85, 247, 0.7);
+  background: rgba(16, 185, 129, 0.7);
 }
 
 /* Titlebar drag region */
@@ -196,10 +196,10 @@ input {
 
 .glass-input:focus {
   background: rgba(255, 255, 255, 0.07);
-  border-color: rgba(168, 85, 247, 0.55);
+  border-color: rgba(16, 185, 129, 0.55);
   box-shadow:
-    0 0 0 3px rgba(168, 85, 247, 0.16),
-    0 0 22px -2px rgba(168, 85, 247, 0.42);
+    0 0 0 3px rgba(16, 185, 129, 0.16),
+    0 0 22px -2px rgba(16, 185, 129, 0.42);
 }
 
 /* Button hover effect */
@@ -209,7 +209,7 @@ input {
 
 .btn-hover:hover {
   transform: translateY(-1px);
-  box-shadow: 0 8px 24px rgba(168, 85, 247, 0.25);
+  box-shadow: 0 8px 24px rgba(16, 185, 129, 0.25);
 }
 
 /* Primary button style */
@@ -302,7 +302,7 @@ input {
   height: 6px;
   margin: -3px 0 0 -3px;
   border-radius: 50%;
-  background: var(--birdo-globe-dot, #a855f7);
+  background: var(--birdo-globe-dot, #3b82f6);
   /* crisp white ring + tight dark contrast halo so the marker reads on land */
   box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.92), 0 0 5px 1px rgba(0, 0, 0, 0.4);
 }
@@ -312,7 +312,7 @@ input {
   position: absolute;
   inset: -6px;
   border-radius: 50%;
-  background: radial-gradient(circle, var(--birdo-globe-dot, #a855f7) 0%, transparent 68%);
+  background: radial-gradient(circle, var(--birdo-globe-dot, #3b82f6) 0%, transparent 68%);
   opacity: 0.38;
 }
 .birdo-globe__shade {
@@ -424,7 +424,7 @@ input {
   position: absolute;
   width: 500px;
   height: 500px;
-  background: rgba(168, 85, 247, 0.08);
+  background: rgba(16, 185, 129, 0.08);
   border-radius: 50%;
   filter: blur(120px);
   pointer-events: none;
@@ -459,20 +459,20 @@ input {
 }
 
 /* Focus-visible: keyboard-nav ring for non-text controls (buttons, links).
-   A clean violet ring — only shows for keyboard users, never on mouse click. */
+   A clean emerald ring — only shows for keyboard users, never on mouse click. */
 :focus-visible {
-  outline: 2px solid rgba(168, 85, 247, 0.7);
+  outline: 2px solid rgba(16, 185, 129, 0.7);
   outline-offset: 2px;
 }
 
-/* Text fields glow softly in brand violet on focus instead of a hard outline. */
+/* Text fields glow softly in brand emerald on focus instead of a hard outline. */
 input:focus-visible,
 textarea:focus-visible {
   outline: none;
-  border-color: rgba(168, 85, 247, 0.55);
+  border-color: rgba(16, 185, 129, 0.55);
   box-shadow:
-    0 0 0 3px rgba(168, 85, 247, 0.16),
-    0 0 18px -2px rgba(168, 85, 247, 0.42);
+    0 0 0 3px rgba(16, 185, 129, 0.16),
+    0 0 18px -2px rgba(16, 185, 129, 0.42);
 }
 
 /* BirdoTextField wraps its <input> in a styled shell that carries the focus
@@ -525,7 +525,7 @@ textarea:focus-visible {
 }
 
 :root.light ::-webkit-scrollbar-thumb {
-  background: rgba(168, 85, 247, 0.3);
+  background: rgba(16, 185, 129, 0.3);
 }
 
 :root.light ::-webkit-scrollbar-track {
