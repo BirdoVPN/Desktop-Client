@@ -141,6 +141,47 @@ impl WintunTunnel {
         Some(AdapterDnsSnapshot {
             adapter_name: adapter_name.to_string(),
             dns_servers: servers,
+            dns_servers_v6: Self::snapshot_adapter_dns_v6(adapter_name),
         })
+    }
+
+    /// Capture an adapter's IPv6 resolvers before we disable them.
+    ///
+    /// Separate from the IPv4 snapshot because netsh's `ipv4`/`ipv6` contexts hold
+    /// separate resolver lists — the IPv6 one (usually a link-local from
+    /// RA/RDNSS) was previously neither disabled nor restored, so SMHNR kept
+    /// querying it on the physical NIC.
+    ///
+    /// Any token on the line may be the address (netsh prints the first server on
+    /// the same line as the label and the rest on continuation lines), so match on
+    /// parseability rather than position. The zone suffix on a link-local
+    /// (`fe80::1%13`) is preserved: it is part of the address netsh accepts back.
+    fn snapshot_adapter_dns_v6(adapter_name: &str) -> Vec<String> {
+        let output = match cmd("netsh")
+            .args(["interface", "ipv6", "show", "dns", adapter_name])
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) => {
+                tracing::warn!(
+                    "snapshot_adapter_dns_v6: netsh failed for adapter '{}': {} — IPv6 DNS for this adapter may not be restored",
+                    adapter_name,
+                    e
+                );
+                return Vec::new();
+            }
+        };
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace().find_map(|token| {
+                    let bare = token.split('%').next()?;
+                    bare.parse::<std::net::Ipv6Addr>()
+                        .ok()
+                        .map(|_| token.to_string())
+                })
+            })
+            .collect()
     }
 }

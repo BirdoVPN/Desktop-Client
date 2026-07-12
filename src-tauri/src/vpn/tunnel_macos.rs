@@ -118,6 +118,7 @@ impl UtunTunnel {
             &self.config.server_public_key,
             &self.config.endpoint,
             self.config.preshared_key.as_deref(),
+            self.config.persistent_keepalive,
         )
         .await
         .map_err(|e| format!("Failed to create WireGuard session: {}", e))?;

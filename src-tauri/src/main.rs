@@ -43,6 +43,13 @@ fn main() {
         p.push("logs");
         std::fs::create_dir_all(&p).ok()?;
         p.push("birdo.log");
+        // PWR-5: birdo.log is opened in append mode for the life of the
+        // process, so a long-running session (this is a VPN client — it can
+        // stay connected for weeks) grows it unbounded. A simple one-generation
+        // rotation caps the damage: once the log has already grown past
+        // MAX_LOG_BYTES, move it aside to birdo.log.1 (clobbering any older
+        // one) before we start appending to a fresh file.
+        rotate_log_if_large(&p);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -68,10 +75,19 @@ fn main() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| {
-                if cfg!(target_os = "windows") {
-                    "birdo_vpn_desktop=debug,wintun=info,wintun_dll=info".into()
+                // PWR-5: the filter used to default to `debug` unconditionally,
+                // including in release builds — every user's machine logging at
+                // debug verbosity to disk forever. `RUST_LOG` still overrides
+                // this for anyone who needs verbose field diagnostics.
+                let level = if cfg!(debug_assertions) {
+                    "debug"
                 } else {
-                    "birdo_vpn_desktop=debug".into()
+                    "info"
+                };
+                if cfg!(target_os = "windows") {
+                    format!("birdo_vpn_desktop={level},wintun=info,wintun_dll=info")
+                } else {
+                    format!("birdo_vpn_desktop={level}")
                 }
             }),
         ))
@@ -386,6 +402,37 @@ fn main() {
                 info!("Application exit requested, allowing exit");
             }
         });
+}
+
+/// PWR-5: cap for `birdo.log` before it gets rotated aside.
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+
+/// If `path` already exists and has grown past [`MAX_LOG_BYTES`], move it to
+/// `<path>.1` (clobbering any previous `.1`) so the caller can open a fresh,
+/// empty file at `path`. Best-effort: any failure here just means we keep
+/// appending to the existing file, which is the pre-existing (unbounded)
+/// behaviour — never worth failing startup over a log file.
+fn rotate_log_if_large(path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return; // doesn't exist yet (first run) — nothing to rotate
+    };
+    if meta.len() <= MAX_LOG_BYTES {
+        return;
+    }
+    let rotated = path.with_file_name(format!(
+        "{}.1",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("birdo.log")
+    ));
+    // std::fs::rename replaces an existing destination on both Windows
+    // (MoveFileExW with MOVEFILE_REPLACE_EXISTING) and Unix, so this is a
+    // single atomic step — no separate "delete old .1 first" required.
+    if let Err(e) = std::fs::rename(path, &rotated) {
+        // Can't log through tracing yet (this runs before the subscriber is
+        // installed) — stderr is the best available diagnostic.
+        eprintln!("birdo.log rotation failed (continuing to append): {}", e);
+    }
 }
 
 /// Set up a custom panic hook for crash recovery

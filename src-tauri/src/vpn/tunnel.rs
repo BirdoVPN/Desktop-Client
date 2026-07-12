@@ -344,13 +344,35 @@ fn base64_encode_utf16le(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(&utf16)
 }
 
+/// Whether an IPv6 resolver address is link-local (`fe80::/10`), i.e. learned
+/// from a Router Advertisement rather than configured by the user. Accepts the
+/// zone suffix netsh prints on link-local addresses (`fe80::1%13`).
+///
+/// Hand-rolled rather than `Ipv6Addr::is_unicast_link_local`, which is still
+/// unstable on the toolchain this crate pins.
+fn is_link_local_v6(addr: &str) -> bool {
+    let bare = addr.split('%').next().unwrap_or(addr);
+    match bare.parse::<Ipv6Addr>() {
+        Ok(ip) => {
+            let o = ip.octets();
+            o[0] == 0xfe && (o[1] & 0xc0) == 0x80
+        }
+        Err(_) => false,
+    }
+}
+
 /// H-4 FIX: Stores original DNS configuration for an adapter, enabling
 /// precise restoration on disconnect instead of blindly setting DHCP.
 #[derive(Debug, Clone)]
 pub(super) struct AdapterDnsSnapshot {
     pub(super) adapter_name: String,
-    /// Original DNS servers (empty = was DHCP)
+    /// Original IPv4 DNS servers (empty = was DHCP)
     pub(super) dns_servers: Vec<String>,
+    /// Original IPv6 DNS servers (empty = was DHCP/RA). Snapshotted separately
+    /// because the netsh `ip` context is IPv4-only: without this the IPv6
+    /// resolvers (usually a link-local from RA/RDNSS) are neither disabled during
+    /// the session nor restored afterwards.
+    pub(super) dns_servers_v6: Vec<String>,
 }
 
 pub struct WintunTunnel {
@@ -414,7 +436,13 @@ impl WintunTunnel {
         })
     }
 
-    /// Start the tunnel
+    /// Start the tunnel.
+    ///
+    /// LEAK-2: IPv6 is blocked BEFORE any network setup and stays blocked for the
+    /// whole connect window. It used to be blocked as the LAST network step, so
+    /// IPv6 egressed the physical NIC throughout DLL load, adapter creation, the
+    /// WireGuard handshake and the route/DNS netsh calls — which this module
+    /// itself documents as taking 10-25s on AV-heavy machines.
     pub async fn start(&self) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("Tunnel is already running".to_string());
@@ -423,6 +451,24 @@ impl WintunTunnel {
         // Validate all config values that will be passed to system commands
         self.validate_config()?;
 
+        // Pre-emptive IPv6 block, installed BEFORE any of start_inner()'s
+        // multi-second setup (DLL load, adapter, handshake, route/DNS netsh), so
+        // IPv6 cannot egress the physical NIC during the connect window.
+        //
+        // A FAILED connect must not strand IPv6 blocked with no tunnel. That
+        // lift is owned by the manager (VpnManager::connect), which wraps this
+        // start() in a timeout and calls lift_ipv6_block_after_failed_connect()
+        // on BOTH the error-return and the timeout-cancellation paths — the only
+        // two ways start() fails under the manager. A previous RAII guard here
+        // also lifted, but from a detached Drop task that raced a subsequent
+        // connect's fresh block (removing a live block = the exact leak this
+        // guards against); the manager's synchronous lift is the single, race-free
+        // mechanism.
+        self.block_ipv6_leaks().await?;
+        self.start_inner().await
+    }
+
+    async fn start_inner(&self) -> Result<(), String> {
         tracing::info!(
             "Starting Wintun tunnel to {}",
             redact_ip(&self.config.endpoint)
@@ -682,6 +728,7 @@ impl WintunTunnel {
             &self.config.server_public_key,
             &self.config.endpoint,
             self.config.preshared_key.as_deref(),
+            self.config.persistent_keepalive,
         )
         .await
         .map_err(|e| format!("Failed to create WireGuard session: {}", e))?;
@@ -711,15 +758,16 @@ impl WintunTunnel {
         self.configure_dns().await?;
 
         // IPv6: if the node is dual-stacked (backend sent a client_ipv6), ROUTE
-        // IPv6 through the tunnel; otherwise BLOCK it to prevent leaks. If routing
-        // setup fails, fall back to blocking (never leak).
+        // IPv6 through the tunnel — lift the block installed at the top of start()
+        // only now, immediately before the tunnel's own IPv6 address and routes go
+        // in. Otherwise the block simply stays in force. If routing setup fails,
+        // re-block (never leak).
         if self.config.client_ipv6.is_some() {
+            crate::vpn::wfp::unblock_ipv6_dual_stack().await?;
             if let Err(e) = self.configure_ipv6().await {
                 tracing::warn!("IPv6 routing setup failed ({}); blocking IPv6 instead", e);
                 self.block_ipv6_leaks().await?;
             }
-        } else {
-            self.block_ipv6_leaks().await?;
         }
 
         // Store remaining state (adapter was already stored above, pre-config).
@@ -1260,20 +1308,29 @@ impl WintunTunnel {
         // `validate=no` is critical: without it netsh synchronously validates
         // the change against the network (NLA re-evaluation), which blocks for
         // 10-25s per call on some machines — the dominant cause of slow connects.
+        //
+        // The `ipv6` pass is NOT optional: the `ip` context is IPv4-only, so IPv6
+        // resolvers (RA/RDNSS, usually a fe80:: link-local) stayed registered and
+        // SMHNR kept querying them on the physical NIC. On a dual-stack session the
+        // ::/1 + 8000::/1 tunnel routes do not capture link-local scope, so those
+        // queries egress in the clear.
         for iface_name in &non_vpn_adapters {
-            let _ = cmd("netsh")
-                .args([
-                    "interface",
-                    "ip",
-                    "set",
-                    "dns",
-                    &format!("name={}", iface_name),
-                    "static",
-                    "none",
-                    "validate=no",
-                ])
-                .output();
-            tracing::debug!("Disabled DNS on adapter: {}", iface_name);
+            let name_arg = format!("name={}", iface_name);
+            for family in ["ip", "ipv6"] {
+                let _ = cmd("netsh")
+                    .args([
+                        "interface",
+                        family,
+                        "set",
+                        "dns",
+                        &name_arg,
+                        "static",
+                        "none",
+                        "validate=no",
+                    ])
+                    .output();
+            }
+            tracing::debug!("Disabled IPv4 + IPv6 DNS on adapter: {}", iface_name);
         }
 
         // STEP 2: Set DNS on the VPN adapter. Native fast path first
@@ -1446,17 +1503,19 @@ impl WintunTunnel {
     async fn restore_dns(&self) -> Result<(), String> {
         tracing::debug!("Restoring DNS from snapshots");
 
-        // Restore DNS on VPN adapter
-        let _ = cmd("netsh")
-            .args([
-                "interface",
-                "ip",
-                "set",
-                "dns",
-                &format!("name={}", ADAPTER_NAME),
-                "dhcp",
-            ])
-            .output();
+        // Restore DNS on VPN adapter (both families — configure_dns disabled both)
+        for family in ["ip", "ipv6"] {
+            let _ = cmd("netsh")
+                .args([
+                    "interface",
+                    family,
+                    "set",
+                    "dns",
+                    &format!("name={}", ADAPTER_NAME),
+                    "dhcp",
+                ])
+                .output();
+        }
 
         // H-4 FIX: Restore from snapshots instead of blindly setting DHCP
         let snapshots = self.dns_snapshots.read().await.clone();
@@ -1466,78 +1525,92 @@ impl WintunTunnel {
             tracing::warn!("No DNS snapshots found, falling back to DHCP restoration");
             let adapters = Self::get_non_vpn_adapters();
             for name in &adapters {
-                let _ = cmd("netsh")
-                    .args([
-                        "interface",
-                        "ip",
-                        "set",
-                        "dns",
-                        &format!("name={}", name),
-                        "dhcp",
-                        "validate=no",
-                    ])
-                    .output();
+                Self::restore_adapter_dns(name, "ip", &[]);
+                Self::restore_adapter_dns(name, "ipv6", &[]);
             }
         } else {
             for snapshot in &snapshots {
-                if snapshot.dns_servers.is_empty() {
-                    // Was DHCP — restore to DHCP. validate=no skips the slow
-                    // synchronous network re-validation (~12s) that made
-                    // disconnect feel stuck while "recovering".
-                    let _ = cmd("netsh")
-                        .args([
-                            "interface",
-                            "ip",
-                            "set",
-                            "dns",
-                            &format!("name={}", snapshot.adapter_name),
-                            "dhcp",
-                            "validate=no",
-                        ])
-                        .output();
-                    tracing::debug!("Restored {} to DHCP", snapshot.adapter_name);
-                } else {
-                    // Had static DNS — restore exact servers
-                    for (i, dns) in snapshot.dns_servers.iter().enumerate() {
-                        if i == 0 {
-                            let _ = cmd("netsh")
-                                .args([
-                                    "interface",
-                                    "ip",
-                                    "set",
-                                    "dns",
-                                    &format!("name={}", snapshot.adapter_name),
-                                    "static",
-                                    dns,
-                                    "validate=no",
-                                ])
-                                .output();
-                        } else {
-                            let _ = cmd("netsh")
-                                .args([
-                                    "interface",
-                                    "ip",
-                                    "add",
-                                    "dns",
-                                    &format!("name={}", snapshot.adapter_name),
-                                    dns,
-                                    &format!("index={}", i + 1),
-                                    "validate=no",
-                                ])
-                                .output();
-                        }
-                    }
-                    tracing::debug!(
-                        "Restored {} to static DNS: {:?}",
-                        snapshot.adapter_name,
-                        snapshot.dns_servers
-                    );
-                }
+                Self::restore_adapter_dns(&snapshot.adapter_name, "ip", &snapshot.dns_servers);
+
+                // IPv6: restore only resolvers the user actually configured. A
+                // fe80:: resolver was learned from a Router Advertisement (RDNSS);
+                // Windows re-learns it the moment the adapter is back on DHCP/RA,
+                // and pinning a zone-scoped address statically would outlive the
+                // router that advertised it.
+                let v6_static: Vec<String> = snapshot
+                    .dns_servers_v6
+                    .iter()
+                    .filter(|dns| !is_link_local_v6(dns))
+                    .cloned()
+                    .collect();
+                Self::restore_adapter_dns(&snapshot.adapter_name, "ipv6", &v6_static);
+
+                tracing::debug!(
+                    "Restored {} — IPv4: {:?}, IPv6: {:?}",
+                    snapshot.adapter_name,
+                    snapshot.dns_servers,
+                    v6_static
+                );
             }
         }
 
         tracing::debug!("DNS restoration complete");
         Ok(())
+    }
+
+    /// Restore one address family's resolvers on an adapter.
+    /// `servers` empty = back to DHCP/RA. `family` is the netsh context
+    /// ("ip" for IPv4, "ipv6" for IPv6).
+    ///
+    /// `validate=no` skips the slow synchronous network re-validation (~12s) that
+    /// made disconnect feel stuck while "recovering".
+    fn restore_adapter_dns(adapter_name: &str, family: &str, servers: &[String]) {
+        let name_arg = format!("name={}", adapter_name);
+
+        if servers.is_empty() {
+            let _ = cmd("netsh")
+                .args([
+                    "interface",
+                    family,
+                    "set",
+                    "dns",
+                    &name_arg,
+                    "dhcp",
+                    "validate=no",
+                ])
+                .output();
+            return;
+        }
+
+        for (i, dns) in servers.iter().enumerate() {
+            if i == 0 {
+                let _ = cmd("netsh")
+                    .args([
+                        "interface",
+                        family,
+                        "set",
+                        "dns",
+                        &name_arg,
+                        "static",
+                        dns,
+                        "validate=no",
+                    ])
+                    .output();
+            } else {
+                let _ = cmd("netsh")
+                    .args([
+                        "interface",
+                        family,
+                        "add",
+                        "dns",
+                        &name_arg,
+                        dns,
+                        &format!("index={}", i + 1),
+                        "validate=no",
+                    ])
+                    .output();
+            }
+        }
     }
 
     /// Get the default gateway from the routing table
@@ -1658,9 +1731,13 @@ impl WintunTunnel {
         let mut last_timer_update = Instant::now();
         const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
-        // Diagnostic: periodic stats log to verify bidirectional traffic
+        // Diagnostic: periodic stats log to verify bidirectional traffic.
+        // POWER: at info/5s this was a guaranteed disk write every 5 seconds for
+        // the whole session (the file logger appends), which alone keeps the drive
+        // from idling. Debug + 60s means release builds (info default) write
+        // nothing while connected, and a debug session still gets the diagnostic.
         let mut last_stats_log = Instant::now();
-        const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+        const STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
         // PERF-001: Batch size — process up to this many packets per wakeup
         // to amortize timer and lock overhead across multiple packets
@@ -1775,7 +1852,7 @@ impl WintunTunnel {
                             let r = bytes_received.load(Ordering::Relaxed);
                             let ps = packets_sent.load(Ordering::Relaxed);
                             let pr = packets_received.load(Ordering::Relaxed);
-                            tracing::info!(
+                            tracing::debug!(
                                 "VPN traffic stats — TX: {} pkts / {} bytes, RX: {} pkts / {} bytes",
                                 ps, s, pr, r
                             );
@@ -2008,6 +2085,19 @@ impl Drop for WintunTunnel {
                 "dhcp",
             ])
             .output();
+
+        // Best-effort: restore the PHYSICAL adapters to DHCP for BOTH families.
+        // configure_dns() set every non-VPN adapter to `static none` (IPv4 and
+        // IPv6) to suppress SMHNR. The clean teardown (restore_dns) undoes that,
+        // but a crash/panic bypasses it — without this, the machine is left with
+        // no resolvers on its real NICs (both families) until the user reconnects
+        // and cleanly disconnects. DHCP is the safe emergency default; a static
+        // resolver the user set will be re-applied by DHCP/RA. The IPv6 half of
+        // this restore matches configure_dns's IPv6 `static none`.
+        for name in &Self::get_non_vpn_adapters() {
+            Self::restore_adapter_dns(name, "ip", &[]);
+            Self::restore_adapter_dns(name, "ipv6", &[]);
+        }
 
         // Best-effort: remove server-specific route
         if let Some(endpoint_ip) = self.config.endpoint.split(':').next() {
