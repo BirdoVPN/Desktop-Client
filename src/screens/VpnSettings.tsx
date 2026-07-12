@@ -70,6 +70,14 @@ export function VpnSettings() {
   const [customPortInput, setCustomPortInput] = useState(
     !['auto', '51820', '53'].includes(settings.wireGuardPort) ? settings.wireGuardPort : '',
   );
+  // Whether the "Custom" port radio is selected. Tracked as UI state (not derived
+  // purely from the persisted port) so choosing Custom can REVEAL the input field
+  // before a valid port exists — otherwise clicking Custom with an empty input
+  // persisted "auto", which snapped the selection straight back to Automatic and
+  // the input never appeared (Custom was impossible to select).
+  const [customPortMode, setCustomPortMode] = useState(
+    !['auto', '51820', '53'].includes(settings.wireGuardPort),
+  );
   const [customMtuInput, setCustomMtuInput] = useState(
     settings.wireGuardMtu > 0 ? String(settings.wireGuardMtu) : '',
   );
@@ -185,14 +193,21 @@ export function VpnSettings() {
 
   // ── WireGuard port selection ──────────────────────────────────────────────
   const portOptions = ['auto', '51820', '53', 'custom'] as const;
-  const selectedPort = ['auto', '51820', '53'].includes(settings.wireGuardPort)
-    ? settings.wireGuardPort
-    : 'custom';
+  const persistedIsCustom = !['auto', '51820', '53'].includes(settings.wireGuardPort);
+  const selectedPort =
+    customPortMode || persistedIsCustom ? 'custom' : settings.wireGuardPort;
 
   const onSelectPort = (option: (typeof portOptions)[number]) => {
     if (option === 'custom') {
-      persist({ wireGuardPort: isValidPort(customPortInput) ? customPortInput : 'auto' });
+      // Enter custom mode and reveal the input. Only persist if a valid port is
+      // already typed; otherwise wait for the input's onChange (persisting "auto"
+      // here would revert the selection and hide the field).
+      setCustomPortMode(true);
+      if (isValidPort(customPortInput)) {
+        persist({ wireGuardPort: customPortInput });
+      }
     } else {
+      setCustomPortMode(false);
       persist({ wireGuardPort: option });
     }
   };

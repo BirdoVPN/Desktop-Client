@@ -47,7 +47,13 @@ pub struct AppSettings {
     pub split_tunnel_apps: Vec<String>,
     /// DNS servers to use while connected (None = use VPN's DNS)
     pub custom_dns: Option<Vec<String>>,
-    /// Protocol preference
+    /// Protocol preference. `#[serde(default)]` is REQUIRED: the frontend's
+    /// settingsToRust() has never sent this field, so without a default every
+    /// save_settings() call fails deserialization at the command boundary with
+    /// "missing field `protocol`" — silently breaking ALL persistence (custom
+    /// port, MTU, split-tunnel apps never reached the connect path). Protocol has
+    /// a single Wireguard variant (`#[default]`), so a missing value is correct.
+    #[serde(default)]
     pub protocol: Protocol,
     /// Allow LAN access while connected (printers, NAS, etc.)
     #[serde(default)]
@@ -516,6 +522,41 @@ mod tests {
         // TunnelVision fix: a stored config predating lockdown_mode must upgrade
         // to the always-on kill switch, not the routing-only reactive default.
         assert!(s.lockdown_mode, "absent lockdown_mode must default ON");
+    }
+
+    /// REGRESSION: the frontend's settingsToRust() payload omits `protocol`
+    /// entirely. Without `#[serde(default)]` on the field this fails to
+    /// deserialize at the save_settings command boundary ("missing field
+    /// protocol"), silently breaking ALL persistence — the exact split-tunnel /
+    /// custom-port save failures reported on a fresh install. This asserts the
+    /// real frontend shape (no protocol) round-trips.
+    #[test]
+    fn deserializes_frontend_payload_without_protocol() {
+        // Mirrors src/utils/helpers.ts settingsToRust() — note: no `protocol`.
+        let json = r#"{
+            "killswitch_enabled": true,
+            "auto_connect": false,
+            "autostart": false,
+            "start_minimized": false,
+            "notifications_enabled": true,
+            "preferred_server_id": null,
+            "split_tunneling_enabled": true,
+            "split_tunnel_apps": ["chrome.exe"],
+            "custom_dns": null,
+            "local_network_sharing": false,
+            "wireguard_port": "51820",
+            "wireguard_mtu": 0,
+            "multi_hop_enabled": false,
+            "multi_hop_entry_node_id": null,
+            "multi_hop_exit_node_id": null,
+            "stealth_mode": false,
+            "quantum_protection": true
+        }"#;
+        let s: AppSettings = serde_json::from_str(json)
+            .expect("frontend settings payload (no protocol) must deserialize");
+        assert!(matches!(s.protocol, Protocol::Wireguard));
+        assert!(s.split_tunneling_enabled);
+        assert_eq!(s.wireguard_port, "51820");
     }
 
     /// Loading must force the kill switch ON even if a stored (or tampered)
