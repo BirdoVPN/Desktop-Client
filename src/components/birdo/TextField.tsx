@@ -77,7 +77,10 @@ export function BirdoTextField({
         style={{
           minHeight: 48,
           borderRadius: 14,
-          backgroundColor: focused ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.035)',
+          // A solid, slightly-recessed dark well. The old ~3.5% white fill let the
+          // animated background grid bleed straight through, so the field read as
+          // barely-there; a near-opaque dark surface makes it a clear input.
+          backgroundColor: focused ? 'rgba(24,24,34,0.92)' : 'rgba(16,16,23,0.85)',
           border: `1px solid ${borderColor}`,
           boxShadow,
           opacity: disabled ? 0.6 : 1,
@@ -100,9 +103,9 @@ export function BirdoTextField({
           className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[color:var(--placeholder)] disabled:cursor-not-allowed"
           style={{
             color: focused ? white.w100 : white.w80,
-            // expose placeholder color to the pseudo-element (clearer than w20
-            // so the hint text is legible, not a ghost)
-            ['--placeholder' as string]: 'rgba(255,255,255,0.34)',
+            // expose placeholder color to the pseudo-element (raised to ~0.45 so
+            // the hint text is legible on the solid field, not a ghost)
+            ['--placeholder' as string]: 'rgba(255,255,255,0.45)',
           }}
         />
         {isPassword && (

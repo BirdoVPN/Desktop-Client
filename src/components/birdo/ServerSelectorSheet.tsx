@@ -230,7 +230,7 @@ export function ServerSelectorSheet({
                   </p>
                 </div>
               ) : (
-                <ul className="space-y-1.5">
+                <ul className="space-y-2.5 pb-2">
                   {filtered.map((server) => (
                     <ServerRow
                       key={server.id}
@@ -296,10 +296,10 @@ function ServerRow({
         onClick={onSelect}
         disabled={!selectable}
         aria-label={`Connect to ${server.city}, ${server.country}`}
-        className="flex min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-3.5 text-left transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
       >
         <span
-          className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-base"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-lg"
           style={{ backgroundColor: white.w10 }}
           title={server.country}
         >
