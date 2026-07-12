@@ -30,7 +30,6 @@ function App() {
     setUserEmail,
     setAccount,
     setConsent,
-    theme,
     connectionState,
     currentServerName,
     windowCorner,
@@ -43,7 +42,6 @@ function App() {
       setUserEmail: s.setUserEmail,
       setAccount: s.setAccount,
       setConsent: s.setConsent,
-      theme: s.theme,
       connectionState: s.connectionState,
       currentServerName: s.currentServer?.name ?? null,
       windowCorner: s.windowCorner,
@@ -114,18 +112,6 @@ function App() {
       /* tray not ready / non-fatal */
     });
   }, [connectionState, currentServerName]);
-
-  // Apply theme class to <html> element
-  useEffect(() => {
-    const root = document.documentElement;
-    root.classList.remove('light', 'dark');
-    if (theme === 'system') {
-      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-      root.classList.add(prefersDark ? 'dark' : 'light');
-    } else {
-      root.classList.add(theme);
-    }
-  }, [theme]);
 
   useEffect(() => {
     // Check for stored authentication on startup

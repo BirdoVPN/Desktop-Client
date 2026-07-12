@@ -1,0 +1,1010 @@
+# ============================================================================
+# UNIFIED release workflow — Windows + Linux + macOS build TOGETHER and
+# publish into ONE draft GitHub Release from a SINGLE tag (v*.*.* e.g. v1.4.16).
+#
+# This supersedes the three separate per-platform pipelines:
+#   - build-windows.yml (trigger win-v*)
+#   - build-linux.yml   (trigger linux-v*)
+#   - build-macos.yml   (workflow_dispatch only, PAUSED)
+#
+# ACTION REQUIRED (not done by this commit): those three files still have
+# their OLD tag triggers wired up (win-v*/linux-v*). To avoid double-building
+# and double-releasing if someone pushes an old-style tag, they should be
+# either deleted or have their `push.tags` trigger removed (workflow_dispatch
+# can stay, for manual single-platform debugging). See PR description /
+# accompanying notes for the exact list.
+#
+# Each build job below is a faithful copy of the corresponding job from the
+# file it replaces (same steps, same pinned action SHAs, same env, same
+# signing/attestation behavior). Only the job ids/names and the top-level
+# trigger/env/concurrency and the final release job are new.
+# ============================================================================
+
+name: Release (Windows + Linux + macOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.4.16)'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+# Minimum permissions — each job declares its own
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  XRAY_VERSION: v26.2.6
+  XRAY_WINDOWS_SHA256: 50e0e08032f3ff4d14c46c9adb3edc7a969fbbbc54a9188cce71378e23ed3eaa
+  XRAY_LINUX_SHA256: 29ce535b56e207a406ffa1c2d4842dcc410be003eff8ec508bb732abc9f8e385
+  XRAY_MACOS_ARM64_SHA256: adec4685084a7481c8acad93bb2024abe6db46535aec3a7bd6903d462961861d
+  XRAY_MACOS_AMD64_SHA256: 2baa1914c3ff93f66801e93556c9562099f469f812c9cff3dc7aff8aedda9f1b
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════
+  # WINDOWS — faithful copy of build-windows.yml's `build` job.
+  # Authenticode (Azure OIDC Trusted Signing) + Sigstore + updater .sig.
+  # ══════════════════════════════════════════════════════════════════════
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 35  # Hard cap. Rust compile ~12m + signing ~3m. If we hit 35m, signing hung.
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    permissions:
+      contents: write
+      id-token: write  # Required for both Sigstore Fulcio AND Azure OIDC
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Type-check frontend
+        run: npm run type-check
+
+      - name: Run unit tests (single-run)
+        run: npm run test:run
+
+      # Download wintun.dll (gitignored — must be fetched at build time).
+      # Supply-chain: the zip is verified against a pinned SHA-256 before any
+      # file from it is used (same pattern as the Xray download below).
+      - name: Download Wintun
+        shell: pwsh
+        run: |
+          $wintunUrl = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          # Official wintun-0.14.1.zip SHA-256 (verified against wireguard-windows'
+          # embedded prerequisite hash). Bump together with the URL version.
+          $expectedSha = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+          $zipPath = "$env:RUNNER_TEMP\wintun.zip"
+          Invoke-WebRequest -Uri $wintunUrl -OutFile $zipPath
+          $actualSha = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -ne $expectedSha) {
+            Write-Error "Wintun zip SHA-256 mismatch! expected=$expectedSha actual=$actualSha — refusing to bundle."
+            exit 1
+          }
+          Write-Host "Wintun zip SHA-256 verified: $actualSha"
+          Expand-Archive -Path $zipPath -DestinationPath "$env:RUNNER_TEMP\wintun"
+          # Copy to resources/ for Tauri bundling
+          New-Item -ItemType Directory -Force -Path "src-tauri/resources"
+          Copy-Item "$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" "src-tauri/resources/wintun.dll"
+          # Also copy to wintun-extract for build.rs
+          New-Item -ItemType Directory -Force -Path "src-tauri/wintun-extract/wintun/bin/amd64"
+          Copy-Item "$env:RUNNER_TEMP\wintun\wintun\bin\amd64\wintun.dll" "src-tauri/wintun-extract/wintun/bin/amd64/wintun.dll"
+          Write-Host "Wintun DLL ready ($(Get-Item src-tauri/resources/wintun.dll | Select-Object -ExpandProperty Length) bytes)"
+
+      - name: Download pinned Xray Reality engine
+        shell: pwsh
+        run: |
+          $xrayUrl = "https://github.com/XTLS/Xray-core/releases/download/$env:XRAY_VERSION/Xray-windows-64.zip"
+          $zipPath = "$env:RUNNER_TEMP\xray-windows-64.zip"
+          Invoke-WebRequest -Uri $xrayUrl -OutFile $zipPath
+          $actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:XRAY_WINDOWS_SHA256) {
+            throw "Xray zip SHA256 mismatch. Expected $env:XRAY_WINDOWS_SHA256, got $actual"
+          }
+          Expand-Archive -Path $zipPath -DestinationPath "$env:RUNNER_TEMP\xray" -Force
+          $xrayExe = Get-ChildItem "$env:RUNNER_TEMP\xray" -Recurse -Filter xray.exe | Select-Object -First 1
+          if (-not $xrayExe) { throw "xray.exe not found in release archive" }
+          New-Item -ItemType Directory -Force -Path "src-tauri/resources" | Out-Null
+          Copy-Item $xrayExe.FullName "src-tauri/resources/xray.exe" -Force
+          $binarySha = (Get-FileHash -Path "src-tauri/resources/xray.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "XRAY_BINARY_SHA256=$binarySha" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Xray ready: src-tauri/resources/xray.exe ($binarySha)"
+
+      # ── Client attestation key (release builds only) ─────────────────
+      # A tagged release MUST be able to attest itself: without the secret,
+      # option_env! is None and the shipped client silently sends no signature,
+      # which an `enforce` server policy refuses. Fail here rather than ship it.
+      - name: Require the desktop attestation key on tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: |
+          if (-not $env:BIRDO_DESKTOP_ATTEST_SK) { throw "BIRDO_DESKTOP_ATTEST_SK secret is empty — a tagged release cannot ship unattestable. See docs/CLIENT-ATTESTATION.md" }
+          if (-not $env:BIRDO_DESKTOP_ATTEST_KID) { throw "BIRDO_DESKTOP_ATTEST_KID secret is empty — a tagged release cannot ship unattestable. See docs/CLIENT-ATTESTATION.md" }
+          Write-Host "Attestation key present (kid: $env:BIRDO_DESKTOP_ATTEST_KID)"
+
+      # ── Authenticode signing setup (only on tag builds) ──────────────
+      # Skip for PR/dispatch builds — those produce unsigned binaries that
+      # are still Sigstore-signed. Only tagged releases get Authenticode.
+      - name: Determine if this build should be Authenticode-signed
+        id: sign-mode
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}".StartsWith("refs/tags/")) {
+            "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Tag build — Authenticode signing ENABLED"
+          } else {
+            "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Non-tag build — Authenticode signing DISABLED (Sigstore only)"
+          }
+
+      - name: Azure Login (OIDC) for Trusted Signing
+        if: steps.sign-mode.outputs.enabled == 'true'
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true
+
+      # Install Microsoft.Trusted.Signing.Client (provides Azure.CodeSigning.Dlib.dll
+      # which signtool.exe loads via the /dlib parameter to talk to Trusted Signing).
+      - name: Install Trusted Signing Client tools
+        if: steps.sign-mode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $pkgDir = "$env:RUNNER_TEMP\trusted-signing"
+          New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+          # Pull the Microsoft.Trusted.Signing.Client NuGet package
+          nuget install Microsoft.Trusted.Signing.Client -Version 1.0.95 -OutputDirectory $pkgDir -ExcludeVersion
+          $dlibPath = Get-ChildItem -Path $pkgDir -Recurse -Filter "Azure.CodeSigning.Dlib.dll" |
+                      Where-Object { $_.FullName -match "x64" } |
+                      Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dlibPath) { throw "Azure.CodeSigning.Dlib.dll (x64) not found" }
+          "TRUSTED_SIGNING_DLIB=$dlibPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Dlib at: $dlibPath"
+
+      # Write the signing metadata JSON that the dlib reads at sign time.
+      - name: Write Trusted Signing metadata
+        if: steps.sign-mode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $metadata = @{
+            Endpoint = "${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}"
+            CodeSigningAccountName = "${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}"
+            CertificateProfileName = "${{ vars.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}"
+            ExcludeCredentials = @(
+              "ManagedIdentityCredential",
+              "EnvironmentCredential",
+              "WorkloadIdentityCredential",
+              "SharedTokenCacheCredential",
+              "VisualStudioCredential",
+              "VisualStudioCodeCredential",
+              "AzurePowerShellCredential",
+              "AzureDeveloperCliCredential",
+              "InteractiveBrowserCredential"
+            )
+          }
+          $metadataPath = "$env:RUNNER_TEMP\trusted-signing-metadata.json"
+          $metadata | ConvertTo-Json | Out-File -FilePath $metadataPath -Encoding utf8
+          "TRUSTED_SIGNING_METADATA=$metadataPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Inject signCommand into tauri.conf.json so Tauri signs every
+      # signable artifact (main .exe BEFORE bundling, then NSIS, then MSI).
+      # We use the OBJECT notation { cmd, args } which bypasses Tauri's
+      # shlex string parsing entirely — no quoting/escaping issues.
+      # signtool is invoked DIRECTLY (no cmd.exe / no .cmd wrapper).
+      - name: Inject Tauri signCommand for Authenticode
+        if: steps.sign-mode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          # Locate signtool.exe (Windows 10 SDK x64)
+          $sdkRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $signtool = Get-ChildItem -Path $sdkRoot -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match '\\x64\\' } |
+                      Sort-Object { [version]($_.Directory.Parent.Name) } -Descending |
+                      Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe (x64) not found under $sdkRoot" }
+          Write-Host "Using signtool: $signtool"
+          "SIGNTOOL_PATH=$signtool" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          $confPath = "src-tauri/tauri.conf.json"
+          $conf = Get-Content $confPath -Raw | ConvertFrom-Json
+          $signCmd = [pscustomobject]@{
+            cmd  = $signtool
+            args = @(
+              'sign',
+              '/v',
+              '/debug',
+              '/fd', 'SHA256',
+              '/tr', 'http://timestamp.acs.microsoft.com',
+              '/td', 'SHA256',
+              '/dlib', $env:TRUSTED_SIGNING_DLIB,
+              '/dmdf', $env:TRUSTED_SIGNING_METADATA,
+              '%1'
+            )
+          }
+          if (-not $conf.bundle.windows) { $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{}) -Force }
+          $conf.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $signCmd -Force
+          $conf | ConvertTo-Json -Depth 32 | Out-File -FilePath $confPath -Encoding utf8
+          Write-Host "signCommand (object form):"
+          $signCmd | ConvertTo-Json -Depth 6
+
+      # Smoke-test signtool BEFORE the long Rust build, so any Azure auth or
+      # dlib issue surfaces in seconds, not 12+ minutes (or 4 hours of hang).
+      - name: Smoke-test signtool against a dummy binary
+        if: steps.sign-mode.outputs.enabled == 'true'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          # Make a small valid PE file by copying an existing exe.
+          $dummy = "$env:RUNNER_TEMP\dummy-sign-test.exe"
+          Copy-Item -Path "$env:WINDIR\System32\notepad.exe" -Destination $dummy -Force
+          Write-Host "Calling: $env:SIGNTOOL_PATH sign ... $dummy"
+          & $env:SIGNTOOL_PATH sign /v /debug /fd SHA256 `
+            /tr http://timestamp.acs.microsoft.com /td SHA256 `
+            /dlib $env:TRUSTED_SIGNING_DLIB `
+            /dmdf $env:TRUSTED_SIGNING_METADATA `
+            $dummy
+          if ($LASTEXITCODE -ne 0) { throw "signtool smoke-test failed with exit $LASTEXITCODE" }
+          $sig = Get-AuthenticodeSignature -FilePath $dummy
+          if ($sig.Status -ne 'Valid') { throw "Smoke-test artifact has invalid signature: $($sig.Status)" }
+          Write-Host "Smoke-test OK: signed by $($sig.SignerCertificate.Subject)"
+
+      - name: Build Tauri application
+        timeout-minutes: 25
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
+          # the shipped binary (owner sets the SENTRY_DSN repo secret).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # Ed25519 client-attestation key baked in by option_env! — see
+          # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: npx tauri build
+
+      # Sanity-check the artifacts we actually SHIP: both installers must be
+      # Authenticode-signed, and so must the app .exe packed INSIDE the NSIS
+      # installer (extracted with 7-Zip). The loose target/release exe is NOT
+      # checked: since tauri 2.10 the bundler patches + signs a copy per bundle
+      # type and then RESTORES the original unsigned bytes afterwards (to keep
+      # cargo fingerprints stable), so an unsigned loose exe is expected.
+      - name: Verify Authenticode signatures
+        if: steps.sign-mode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $files = @()
+          $files += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
+          $files += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue
+          if ($files.Count -eq 0) { throw "No installer artifacts found to verify" }
+
+          # Extract the NSIS installer and add the inner app exe to the check list.
+          $nsis = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" | Select-Object -First 1
+          $extractDir = "$env:RUNNER_TEMP\nsis-extract"
+          & 7z x $nsis.FullName "-o$extractDir" -y | Out-Null
+          $innerExe = Get-ChildItem -Path $extractDir -Recurse -Filter "birdo-vpn-desktop.exe" | Select-Object -First 1
+          if (-not $innerExe) { throw "birdo-vpn-desktop.exe not found inside the NSIS installer" }
+          $files += $innerExe
+
+          $failed = $false
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature -FilePath $f.FullName
+            if ($sig.Status -ne 'Valid') {
+              Write-Error "UNSIGNED or INVALID: $($f.Name) (status=$($sig.Status))"
+              $failed = $true
+            } else {
+              Write-Host "OK: $($f.Name) signed by $($sig.SignerCertificate.Subject)"
+            }
+          }
+          if ($failed) { throw "One or more artifacts are not properly signed" }
+
+      # Confirm Tauri emitted the per-installer minisign updater signatures.
+      # bundle.createUpdaterArtifacts=true makes `tauri build` write a
+      # <setup>.exe.sig (NSIS) and <name>.msi.sig (MSI) next to each
+      # installer, signed with TAURI_SIGNING_PRIVATE_KEY. These are what the
+      # in-app updater verifies against the embedded pubkey.
+      - name: Verify Tauri updater signatures (.sig) exist
+        if: steps.sign-mode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $sigs = @()
+          $sigs += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe.sig" -ErrorAction SilentlyContinue
+          $sigs += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi.sig" -ErrorAction SilentlyContinue
+          if ($sigs.Count -eq 0) {
+            throw "No updater .sig files found — createUpdaterArtifacts/TAURI_SIGNING_PRIVATE_KEY not applied"
+          }
+          foreach ($s in $sigs) { Write-Host "Updater signature: $($s.Name)" }
+
+      # ── Sigstore keyless signing ──────────────────────────────────────
+      # Provenance layer — proves GitHub Actions built this artifact.
+      # Each artifact gets a .sigstore bundle (Fulcio cert + Rekor log).
+      # Users verify with: cosign verify-blob --bundle <file>.sigstore <file>
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign NSIS installer with Sigstore
+        shell: pwsh
+        run: |
+          $nsisExe = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" | Select-Object -First 1
+          if ($nsisExe) {
+            cosign sign-blob --yes --bundle "$($nsisExe.FullName).sigstore" $nsisExe.FullName
+            Write-Host "Signed $($nsisExe.Name) → $($nsisExe.Name).sigstore"
+          } else {
+            Write-Error "NSIS installer not found"
+            exit 1
+          }
+
+      - name: Sign MSI installer with Sigstore
+        shell: pwsh
+        run: |
+          $msiFile = Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1
+          if ($msiFile) {
+            cosign sign-blob --yes --bundle "$($msiFile.FullName).sigstore" $msiFile.FullName
+            Write-Host "Signed $($msiFile.Name) → $($msiFile.Name).sigstore"
+          } else {
+            Write-Error "MSI installer not found"
+            exit 1
+          }
+
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.exe, *.msi
+          $checksums = @()
+          foreach ($file in $artifacts) {
+            $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash.ToLower()
+            $checksums += "$hash  $($file.Name)"
+            Write-Host "$hash  $($file.Name)"
+          }
+          $checksums | Out-File -FilePath "src-tauri/target/release/bundle/SHA256SUMS.txt" -Encoding utf8
+
+      - name: Sign checksums file with Sigstore
+        run: |
+          cosign sign-blob --yes --bundle "src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore" "src-tauri/target/release/bundle/SHA256SUMS.txt"
+
+      - name: Upload build artifacts
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: birdo-vpn-windows-installers
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
+            src-tauri/target/release/bundle/nsis/*.sigstore
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
+            src-tauri/target/release/bundle/msi/*.sigstore
+            src-tauri/target/release/bundle/SHA256SUMS.txt
+            src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════════════════
+  # LINUX — faithful copy of build-linux.yml's `build-linux` job.
+  # AppImage + .deb, minisign updater .sig, Sigstore, optional GPG .asc.
+  # ══════════════════════════════════════════════════════════════════════
+  build-linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64-unknown-linux-gnu
+            label: amd64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+      id-token: write  # Required for Sigstore keyless signing
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.arch }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Prepare resources directory
+        run: |
+          mkdir -p src-tauri/resources
+          touch src-tauri/resources/.gitkeep
+
+      # Download + SHA-verify + bundle the pinned Xray Reality engine, mirroring
+      # the Windows pipeline. Without this the release fails closed: xray.rs
+      # refuses to exec an unverified binary and XRAY_BINARY_SHA256 stays unset.
+      - name: Download pinned Xray Reality engine
+        run: |
+          set -euo pipefail
+          XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
+          ZIP_PATH="${RUNNER_TEMP}/xray-linux-64.zip"
+          curl -fsSL "$XRAY_URL" -o "$ZIP_PATH"
+          ACTUAL=$(sha256sum "$ZIP_PATH" | awk '{print $1}')
+          if [ "$ACTUAL" != "$XRAY_LINUX_SHA256" ]; then
+            echo "::error::Xray zip SHA256 mismatch. Expected $XRAY_LINUX_SHA256, got $ACTUAL"
+            exit 1
+          fi
+          unzip -o "$ZIP_PATH" -d "${RUNNER_TEMP}/xray"
+          install -m 0755 "${RUNNER_TEMP}/xray/xray" src-tauri/resources/xray
+          BINARY_SHA=$(sha256sum src-tauri/resources/xray | awk '{print $1}')
+          echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
+          echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
+
+      # A tagged release MUST be able to attest itself: without the secret,
+      # option_env! is None and the shipped client silently sends no signature,
+      # which an `enforce` server policy refuses. Fail here rather than ship it.
+      - name: Require the desktop attestation key on tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BIRDO_DESKTOP_ATTEST_SK}" ] || [ -z "${BIRDO_DESKTOP_ATTEST_KID}" ]; then
+            echo "::error::BIRDO_DESKTOP_ATTEST_SK/KID secret is empty — a tagged release cannot ship unattestable. See docs/CLIENT-ATTESTATION.md"
+            exit 1
+          fi
+          echo "Attestation key present (kid: ${BIRDO_DESKTOP_ATTEST_KID})"
+
+      - name: Build Tauri application
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
+          # the shipped binary (owner sets the SENTRY_DSN repo secret).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
+          XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
+          # Ed25519 client-attestation key baked in by option_env! — see
+          # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: npx tauri build --target ${{ matrix.arch }}
+
+      # ── Sigstore keyless signing ──────────────────────────────────────
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign .deb with Sigstore
+        run: |
+          DEB_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/deb -name '*.deb' | head -1)
+          if [ -n "$DEB_FILE" ]; then
+            cosign sign-blob --yes --bundle "${DEB_FILE}.sigstore" "$DEB_FILE"
+            echo "Signed $(basename $DEB_FILE)"
+          else
+            echo "::warning::DEB not found"
+          fi
+
+      - name: Sign AppImage with Sigstore
+        run: |
+          APPIMAGE_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/appimage -name '*.AppImage' | head -1)
+          if [ -n "$APPIMAGE_FILE" ]; then
+            cosign sign-blob --yes --bundle "${APPIMAGE_FILE}.sigstore" "$APPIMAGE_FILE"
+            echo "Signed $(basename $APPIMAGE_FILE)"
+          else
+            echo "::warning::AppImage not found"
+          fi
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd src-tauri/target/${{ matrix.arch }}/release/bundle
+          find . -type f \( -name '*.deb' -o -name '*.AppImage' \) | while read f; do
+            sha256sum "$f" >> SHA256SUMS.txt
+          done
+          cat SHA256SUMS.txt || echo "No artifacts to checksum"
+
+      - name: Sign checksums with Sigstore
+        run: |
+          SUMS="src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt"
+          if [ -f "$SUMS" ]; then
+            cosign sign-blob --yes --bundle "${SUMS}.sigstore" "$SUMS"
+          fi
+
+      # ── GPG signing (detached .asc, classic Linux distribution model) ───
+      # Required GitHub secrets (Settings → Secrets and variables → Actions):
+      #   LINUX_GPG_PRIVATE_KEY       — ASCII-armoured private key block
+      #   LINUX_GPG_PASSPHRASE        — passphrase for the private key
+      #   LINUX_GPG_KEY_ID            — long key ID (e.g. ABCDEF0123456789)
+      # The public key must be published at https://birdo.app/.well-known/birdo-release.asc
+      # so users can verify with:  gpg --verify file.asc file
+      - name: Detect GPG availability
+        id: gpg-detect
+        env:
+          GPG_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          GPG_KID: ${{ secrets.LINUX_GPG_KEY_ID }}
+        run: |
+          if [ -n "$GPG_KEY" ] && [ -n "$GPG_KID" ]; then
+            echo "HAS_GPG=true"  >> "$GITHUB_ENV"
+          else
+            echo "HAS_GPG=false" >> "$GITHUB_ENV"
+            echo "::warning::LINUX_GPG_PRIVATE_KEY / LINUX_GPG_KEY_ID not configured — skipping GPG signing"
+          fi
+
+      - name: Import GPG signing key
+        id: gpg_import
+        if: ${{ env.HAS_GPG == 'true' }}
+        # Best-effort: a missing/malformed LINUX_GPG_PRIVATE_KEY must not fail the
+        # whole release. Sigstore (keyless), SHA256SUMS, and the minisign updater
+        # .sig are the primary integrity artifacts; the GPG .asc is supplementary.
+        continue-on-error: true
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          passphrase:      ${{ secrets.LINUX_GPG_PASSPHRASE }}
+
+      - name: GPG-sign .deb (detached .asc)
+        if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          DEB_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/deb -name '*.deb' | head -1)
+          if [ -n "$DEB_FILE" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "${{ secrets.LINUX_GPG_PASSPHRASE }}" \
+                --local-user "${{ secrets.LINUX_GPG_KEY_ID }}" \
+                --armor --detach-sign --output "${DEB_FILE}.asc" "$DEB_FILE"
+            echo "GPG-signed $(basename $DEB_FILE) → $(basename $DEB_FILE).asc"
+          fi
+
+      - name: GPG-sign AppImage (detached .asc)
+        if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          APPIMAGE_FILE=$(find src-tauri/target/${{ matrix.arch }}/release/bundle/appimage -name '*.AppImage' | head -1)
+          if [ -n "$APPIMAGE_FILE" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "${{ secrets.LINUX_GPG_PASSPHRASE }}" \
+                --local-user "${{ secrets.LINUX_GPG_KEY_ID }}" \
+                --armor --detach-sign --output "${APPIMAGE_FILE}.asc" "$APPIMAGE_FILE"
+            echo "GPG-signed $(basename $APPIMAGE_FILE) → $(basename $APPIMAGE_FILE).asc"
+          fi
+
+      - name: GPG-sign SHA256SUMS (detached .asc)
+        if: ${{ env.HAS_GPG == 'true' && steps.gpg_import.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          SUMS="src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt"
+          if [ -f "$SUMS" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "${{ secrets.LINUX_GPG_PASSPHRASE }}" \
+                --local-user "${{ secrets.LINUX_GPG_KEY_ID }}" \
+                --armor --detach-sign --output "${SUMS}.asc" "$SUMS"
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: birdo-vpn-linux-${{ matrix.label }}
+          path: |
+            src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.deb.asc
+            src-tauri/target/${{ matrix.arch }}/release/bundle/deb/*.sigstore
+            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage
+            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.sig
+            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.asc
+            src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.sigstore
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt.asc
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt.sigstore
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════════════════
+  # MACOS — faithful copy of build-macos.yml's `build-macos` job, with the
+  # owner's explicit instruction: NO Apple Developer account exists, so this
+  # MUST always build UNSIGNED (no codesign, no notarization). The job
+  # already self-guards on APPLE_CERTIFICATE being present/absent (see
+  # "Detect Apple signing capability" below) — since that secret is not
+  # configured, it naturally always takes the unsigned-fallback path and
+  # skips the notarize/staple step. Sigstore keyless attestation still runs.
+  #
+  # `continue-on-error: true` is added at job level (new) so a macOS build
+  # failure NEVER blocks the Windows/Linux release (see the `release` job's
+  # required-platforms guard at the bottom of this file).
+  # ══════════════════════════════════════════════════════════════════════
+  build-macos:
+    continue-on-error: true  # macOS is best-effort; must never gate the release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14        # Apple Silicon (M1+)
+            arch: aarch64-apple-darwin
+            label: arm64
+          - runner: macos-15        # Intel x86_64 (macos-13 deprecated)
+            arch: x86_64-apple-darwin
+            label: x64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write   # Sigstore keyless OIDC
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Rust (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.arch }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Generate macOS icon (icns) from PNG
+        run: |
+          set -euo pipefail
+          mkdir -p icon.iconset
+          sips -z 16 16     src-tauri/icons/icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     src-tauri/icons/icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     src-tauri/icons/icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     src-tauri/icons/icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   src-tauri/icons/icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   src-tauri/icons/icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   src-tauri/icons/icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   src-tauri/icons/icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   src-tauri/icons/icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 src-tauri/icons/icon.png --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o src-tauri/icons/icon.icns
+
+      - name: Prepare resources directory
+        run: |
+          mkdir -p src-tauri/resources
+          touch src-tauri/resources/.gitkeep
+
+      # Download + SHA-verify + bundle the pinned Xray Reality engine, mirroring
+      # the Windows pipeline. Picks the asset for the matrix arch. Without this
+      # the release fails closed: xray.rs refuses to exec an unverified binary
+      # and XRAY_BINARY_SHA256 stays unset.
+      - name: Download pinned Xray Reality engine
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.label }}" = "arm64" ]; then
+            ASSET="Xray-macos-arm64-v8a.zip"
+            EXPECTED="$XRAY_MACOS_ARM64_SHA256"
+          else
+            ASSET="Xray-macos-64.zip"
+            EXPECTED="$XRAY_MACOS_AMD64_SHA256"
+          fi
+          XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${ASSET}"
+          ZIP_PATH="${RUNNER_TEMP}/${ASSET}"
+          curl -fsSL "$XRAY_URL" -o "$ZIP_PATH"
+          ACTUAL=$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Xray zip SHA256 mismatch for $ASSET. Expected $EXPECTED, got $ACTUAL"
+            exit 1
+          fi
+          unzip -o "$ZIP_PATH" -d "${RUNNER_TEMP}/xray"
+          install -m 0755 "${RUNNER_TEMP}/xray/xray" src-tauri/resources/xray
+          BINARY_SHA=$(shasum -a 256 src-tauri/resources/xray | awk '{print $1}')
+          echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
+          echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
+
+      # A tagged release MUST be able to attest itself: without the secret,
+      # option_env! is None and the shipped client silently sends no signature,
+      # which an `enforce` server policy refuses. Fail here rather than ship it.
+      - name: Require the desktop attestation key on tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BIRDO_DESKTOP_ATTEST_SK}" ] || [ -z "${BIRDO_DESKTOP_ATTEST_KID}" ]; then
+            echo "::error::BIRDO_DESKTOP_ATTEST_SK/KID secret is empty — a tagged release cannot ship unattestable. See docs/CLIENT-ATTESTATION.md"
+            exit 1
+          fi
+          echo "Attestation key present (kid: ${BIRDO_DESKTOP_ATTEST_KID})"
+
+      # ── Apple codesign keychain setup ──────────────────────────────
+      # Owner has no Apple Developer account: APPLE_CERTIFICATE is never
+      # configured, so have_apple_signing is always "false" here and every
+      # step below gated on it is always skipped. Kept intact (rather than
+      # deleted) so signing can be turned on later just by adding secrets.
+      - name: Detect Apple signing capability
+        id: signcap
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            echo "have_apple_signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_apple_signing=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::APPLE_CERTIFICATE secret not set — building UNSIGNED DMG. Gatekeeper will quarantine it."
+          fi
+
+      - name: Import Apple Developer ID certificate
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/birdo-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+      # ── Tauri build ────────────────────────────────────────────────
+      - name: Build Tauri application (signed)
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
+          # the shipped binary (owner sets the SENTRY_DSN repo secret).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
+          XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
+          # Ed25519 client-attestation key baked in by option_env! — see
+          # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: npx tauri build --target ${{ matrix.arch }}
+
+      - name: Build Tauri application (unsigned fallback)
+        if: steps.signcap.outputs.have_apple_signing != 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
+          # the shipped binary (owner sets the SENTRY_DSN repo secret).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
+          XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
+          # Attestation must ride the fallback too — an unsigned DMG that also
+          # could not attest would be refused by an `enforce` server policy.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: npx tauri build --target ${{ matrix.arch }}
+
+      # ── Notarize + Staple ──────────────────────────────────────────
+      - name: Notarize and staple DMG
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          DMG_FILE=$(find "src-tauri/target/${{ matrix.arch }}/release/bundle/dmg" -name '*.dmg' -print -quit || true)
+          if [ -z "${DMG_FILE:-}" ]; then
+            echo "::error::No DMG produced by Tauri build"
+            exit 1
+          fi
+
+          echo "Notarizing $DMG_FILE ..."
+          xcrun notarytool submit "$DMG_FILE" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 30m
+
+          echo "Stapling notarization ticket ..."
+          xcrun stapler staple "$DMG_FILE"
+          xcrun stapler validate "$DMG_FILE"
+
+          echo "Verifying Gatekeeper acceptance ..."
+          spctl --assess --type open --context context:primary-signature -vv "$DMG_FILE" || \
+            echo "::warning::spctl assessment did not pass — investigate before release"
+
+      # ── Sigstore keyless attestation ────────────────────────────────
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign DMG with Sigstore (transparency log)
+        run: |
+          set -euo pipefail
+          DMG_FILE=$(find "src-tauri/target/${{ matrix.arch }}/release/bundle/dmg" -name '*.dmg' -print -quit || true)
+          if [ -n "${DMG_FILE:-}" ]; then
+            cosign sign-blob --yes --bundle "${DMG_FILE}.sigstore" "$DMG_FILE"
+            echo "Sigstore-signed $(basename "$DMG_FILE")"
+          else
+            echo "::warning::DMG not found"
+          fi
+
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.arch }}/release/bundle"
+          cd "$BUNDLE_DIR"
+          : > SHA256SUMS.txt
+          while IFS= read -r f; do
+            shasum -a 256 "$f" >> SHA256SUMS.txt
+          done < <(find . -type f \( -name '*.dmg' -o -name '*.app.tar.gz' \))
+          cat SHA256SUMS.txt || true
+
+      - name: Sign checksums with Sigstore
+        run: |
+          SUMS="src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt"
+          if [ -s "$SUMS" ]; then
+            cosign sign-blob --yes --bundle "${SUMS}.sigstore" "$SUMS"
+          fi
+
+      - name: Cleanup keychain
+        if: always() && steps.signcap.outputs.have_apple_signing == 'true'
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/birdo-build.keychain-db"
+          [ -f "$KEYCHAIN_PATH" ] && security delete-keychain "$KEYCHAIN_PATH" || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: birdo-vpn-macos-${{ matrix.label }}
+          path: |
+            src-tauri/target/${{ matrix.arch }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.arch }}/release/bundle/dmg/*.sigstore
+            src-tauri/target/${{ matrix.arch }}/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/${{ matrix.arch }}/release/bundle/macos/*.app.tar.gz.sig
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt
+            src-tauri/target/${{ matrix.arch }}/release/bundle/SHA256SUMS.txt.sigstore
+          retention-days: 30
+          if-no-files-found: error
+
+  # ══════════════════════════════════════════════════════════════════════
+  # ONE GitHub Release for ALL platforms, from ONE tag.
+  # Windows + Linux are REQUIRED (the release step refuses to run if either
+  # did not succeed). macOS is best-effort: its artifacts are attached IF
+  # present, but a macOS failure never blocks or is required for this job
+  # (build-macos also carries `continue-on-error: true` above, belt-and-braces).
+  # ══════════════════════════════════════════════════════════════════════
+  release:
+    needs: [build-windows, build-linux, build-macos]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Require Windows + Linux builds to have succeeded
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.build-windows.result }}" != "success" ]; then
+            echo "::error::build-windows result=${{ needs.build-windows.result }} — Windows is a REQUIRED platform, refusing to publish a release"
+            exit 1
+          fi
+          if [ "${{ needs.build-linux.result }}" != "success" ]; then
+            echo "::error::build-linux result=${{ needs.build-linux.result }} — Linux is a REQUIRED platform, refusing to publish a release"
+            exit 1
+          fi
+          echo "Windows + Linux OK. macOS (best-effort) result: ${{ needs.build-macos.result }}"
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: birdo-vpn-windows-installers
+          path: release-files/windows/
+
+      - name: Flatten Windows artifacts
+        shell: bash
+        run: |
+          # Flatten any nested directories (nsis/, msi/) from the artifact upload
+          find release-files/windows -type f -exec mv {} release-files/windows/ \; 2>/dev/null || true
+          ls -la release-files/windows/
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: birdo-vpn-linux-amd64
+          path: release-files/linux/
+
+      # macOS is best-effort: if build-macos failed entirely (no artifact was
+      # ever uploaded), these downloads 404 — continue-on-error keeps that
+      # from failing the release job. softprops/action-gh-release's `files:`
+      # glob patterns below simply match nothing in that case (default
+      # fail_on_unmatched_files is false), so the release still publishes
+      # Windows + Linux only.
+      - name: Download macOS arm64 artifacts (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: birdo-vpn-macos-arm64
+          path: release-files/macos-arm64/
+
+      - name: Download macOS x64 artifacts (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: birdo-vpn-macos-x64
+          path: release-files/macos-x64/
+
+      - name: List all release files
+        shell: bash
+        run: find release-files -type f -print || true
+
+      # Only actually publish on a real tag push. workflow_dispatch runs
+      # (used for manual/debug builds off a branch) build artifacts above
+      # but intentionally do NOT cut a release — there is no version tag to
+      # attach it to. This mirrors the tag-gating the three old per-platform
+      # release jobs each had (win-v*/linux-v*/mac-v*).
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            release-files/windows/*
+            release-files/linux/**/*
+            release-files/macos-arm64/**/*
+            release-files/macos-x64/**/*
+          generate_release_notes: true
+          draft: true
+          make_latest: false

@@ -97,21 +97,6 @@ export const white = {
   w03: 'rgba(255,255,255,0.03)',
 } as const;
 
-// ── Dim theme (a lighter slate, NOT white) — applied under the `.light` class.
-export const lightSurface = {
-  s0: '#1B1C24', // app bg
-  s1: '#22232C', // cards
-  s2: '#2A2B36', // raised cards / inputs
-  s3: '#2F3040', // modals / sheet
-  onBackground: '#E8E9F0', // body text
-  onSurfaceVariant: '#B7B9C9', // secondary text
-  onSurfaceFaint: '#7A7C8E', // faint text
-  outline: 'rgba(255,255,255,0.20)', // strong border
-  outlineSoft: 'rgba(255,255,255,0.10)', // soft divider
-  primary: '#6EE7B7', // softer emerald accent on slate
-  accentBg: 'rgba(16,185,129,0.16)', // accent fill
-} as const;
-
 // ── Hairlines (borders / dividers) ───────────────────────────────────────
 export const hairline = {
   strong: 'rgba(255,255,255,0.12)',

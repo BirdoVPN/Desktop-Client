@@ -52,7 +52,6 @@ export interface AccountInfo {
 
 export type Protocol = 'wireguard';
 
-export type ThemeMode = 'dark' | 'light' | 'system';
 
 /**
  * Where the (frameless) window sits. The four corners pin it to that corner of
@@ -198,9 +197,6 @@ interface AppState {
   isOnline: boolean;
   setOnline: (online: boolean) => void;
 
-  // Theme
-  theme: ThemeMode;
-  setTheme: (theme: ThemeMode) => void;
 
   // Window position (frameless corner anchor / draggable). Persisted.
   windowCorner: WindowCorner;
@@ -271,9 +267,6 @@ export const useAppStore = create<AppState>()(
       isOnline: true,
       account: { ...defaultAccount },
 
-      // Theme
-      theme: 'dark' as ThemeMode,
-      setTheme: (theme) => set({ theme }),
 
       windowCorner: 'bottom-left' as WindowCorner,
       setWindowCorner: (windowCorner) => set({ windowCorner }),
@@ -417,7 +410,6 @@ export const useAppStore = create<AppState>()(
         lastServerId: state.lastServerId,
         settings: state.settings,
         hasAcceptedConsent: state.hasAcceptedConsent,
-        theme: state.theme,
         windowCorner: state.windowCorner,
       }),
     }

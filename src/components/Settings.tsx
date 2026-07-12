@@ -9,7 +9,7 @@
  * As a TAB ROOT it renders its OWN title header (no pushed BirdoTopBar / back
  * button) — matching `ProfileScreen.kt` / Profile.tsx.
  *
- * Sections (mobile order): APPEARANCE (theme), CONNECTION (auto-connect,
+ * Sections (mobile order): APPEARANCE (window position), CONNECTION (auto-connect,
  * notifications + show-IP / show-location sub-toggles), SECURITY (biometric
  * unlock — hidden when unavailable), STARTUP (launch at login, start
  * minimized), MANAGE (push rows), ABOUT (version + updates + support links).

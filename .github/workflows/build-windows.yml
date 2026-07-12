@@ -7,9 +7,9 @@ on:
         description: 'Release version (e.g., 1.0.0)'
         required: true
         type: string
-  push:
-    tags:
-      - 'win-v*'
+  # Tag trigger removed — releases now go through release.yml (single `v*` tag,
+  # all platforms in one release). This file is kept as a manual single-platform
+  # fallback via workflow_dispatch only.
 
 # Minimum permissions — each job declares its own
 permissions: {}

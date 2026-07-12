@@ -2,11 +2,30 @@
 
 The desktop firewall/routing changes below cannot be exercised in CI (no WFP,
 no real adapter). They **must be validated on a real Windows box before the next
-`win-v*` release tag is published**. This one checklist covers the shipped
-lockdown-default change *and* two IPv6 hardening items that are deliberately
-**not yet implemented** — they should be implemented and validated together in
-the same on-device pass, because they touch the same WFP/route setup window and
-carry real strand-the-adapter risk if landed blind.
+release tag is published**. This one checklist covers the shipped
+lockdown-default change *and* the IPv6 hardening items (now implemented in #37).
+
+## Validation status (2026-07-12)
+
+Machine-level pieces that DON'T need a live elevated tunnel have been confirmed on
+a Windows 11 box, and CI runs the compiled Rust suite on `windows-latest`:
+
+- ✅ **LEAK-1 kill-switch state machine** — the `v6_state` intent-flag logic
+  (block → kill switch → teardown → reconnect, plus the auto-reconnect give-up
+  path and `cleanup`) passes as a standalone harness, incl. a control asserting
+  the pre-fix path would have leaked. CI's "Rust unit tests (Windows)" runs the
+  in-tree version green.
+- ✅ **LEAK-3 is a real condition here** — `netsh interface ipv6 show dnsservers`
+  shows live IPv6 resolvers (`fec0:0:0:ffff::1%1`) that a v4-only suppression
+  would leave registered; the `netsh interface ipv6 set dns … static none` form
+  parses on this OS build.
+- ✅ **LEAK-6 DoH bootstrap** — resolving via the hardcoded bootstrap IPs returns
+  200 from Cloudflare + Google (Quad9 reachable), i.e. resolution works without
+  the system resolver.
+
+Still REQUIRES an elevated, interactive session with a live tunnel (cannot be done
+non-elevated — `netsh wfp show` and running the VPN both need admin): every
+checkbox in sections A and B below. Run them on install of the release build.
 
 ## A. Already merged — must be validated before release
 
