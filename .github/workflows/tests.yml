@@ -85,6 +85,60 @@ jobs:
           RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
         run: cargo test --lib
 
+  # Cross-platform compile guard. The rust-tests job above only compiles the
+  # Windows cfg branches, so Linux/macOS-only code (`#[cfg(target_os = ...)]`
+  # blocks, and shared code that calls Windows-only modules like vpn::wfp) was
+  # NEVER compiled until a release tag built those platforms — which is how four
+  # cross-platform breaks (an ungated wfp:: call in the shipped leak fix, a
+  # macOS str_as_str, an Intel cross-target, a release asset collision) reached
+  # release. `cargo check` (no bundling, no run) is fast and catches them on PRs.
+  cross-check:
+    name: Cross-platform compile check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+          - runner: macos-latest
+            os: macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.os }}
+
+      # generate_context!() needs ../dist to exist at macro-expansion time.
+      - name: Stub frontend dist for macro expansion
+        run: |
+          mkdir -p dist
+          echo '<!doctype html><title>stub</title>' > dist/index.html
+
+      - name: cargo check (all targets)
+        working-directory: src-tauri
+        run: cargo check --all-targets
+
   frontend-tests:
     name: Frontend unit tests
     runs-on: ubuntu-latest
