@@ -126,8 +126,9 @@ describe('IPC Contract: Servers', () => {
         city: 'New York',
         load: 42,
         isPremium: false,
-        isStreaming: false,
-        isP2p: false,
+        minPlan: 'RECON',
+        isHighSpeed: false,
+        isPortForwarding: false,
         isOnline: true,
       },
     ]);

@@ -5,18 +5,22 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, X, Star, Film, Download, Signal, Lock } from 'lucide-react';
+import { Search, X, Star, Gauge, ArrowRightLeft, Signal, Lock } from 'lucide-react';
 import type { Server } from '@/store/app-store';
 import { surface, white, hairline, brand, status } from '@/lib/birdo-theme';
 import { countryCodeToFlag } from '@/utils/helpers';
 
-type Filter = 'all' | 'favorites' | 'streaming' | 'p2p';
+// "Streaming" and "P2P" are gone on purpose. Every exit IP is a datacenter ASN,
+// so streaming-unblocking is undeliverable, and Birdo does not advertise
+// torrenting. These two name capabilities Birdo actually ships: a low-load
+// high-throughput node, and inbound port forwarding.
+type Filter = 'all' | 'favorites' | 'highSpeed' | 'portForwarding';
 
 const FILTERS: { key: Filter; label: string; emoji?: string }[] = [
-  { key: 'all',        label: 'All' },
-  { key: 'favorites',  label: 'Favorites', emoji: '★' },
-  { key: 'streaming',  label: 'Streaming', emoji: '🎬' },
-  { key: 'p2p',        label: 'P2P',       emoji: '⇅' },
+  { key: 'all',            label: 'All' },
+  { key: 'favorites',      label: 'Favorites',       emoji: '★' },
+  { key: 'highSpeed',      label: 'High-Speed',      emoji: '⚡' },
+  { key: 'portForwarding', label: 'Port Forwarding', emoji: '⇄' },
 ];
 
 export interface ServerSelectorSheetProps {
@@ -78,8 +82,8 @@ export function ServerSelectorSheet({
         const matchesFilter =
           filter === 'all' ? true
           : filter === 'favorites' ? favoriteServers.includes(s.id)
-          : filter === 'streaming' ? s.isStreaming
-          : filter === 'p2p' ? s.isP2p
+          : filter === 'highSpeed' ? s.isHighSpeed
+          : filter === 'portForwarding' ? s.isPortForwarding
           : true;
         return matchesSearch && matchesFilter;
       })
@@ -258,6 +262,11 @@ export function ServerSelectorSheet({
 
 // ── Row ───────────────────────────────────────────────────────────────────
 
+/** 'OPERATIVE' -> 'Operative'. Plan names arrive from the API as SCREAMING_CASE. */
+function titleCasePlan(plan: string): string {
+  return plan.charAt(0).toUpperCase() + plan.slice(1).toLowerCase();
+}
+
 interface ServerRowProps {
   server: Server;
   isSelected: boolean;
@@ -280,6 +289,20 @@ function ServerRow({
   const hasPing =
     server.ping != null && Number.isFinite(server.ping) && server.ping >= 0;
 
+  // A plan-locked row is disabled, so "Connect to Frankfurt" is a lie to a screen
+  // reader — say why it can't be picked instead. minPlan is the node's own
+  // requirement, so the copy stays right if the owner re-tiers a node.
+  const lockedReason = !server.isAccessible
+    ? server.minPlan
+      ? `Locked — requires the ${titleCasePlan(server.minPlan)} plan`
+      : 'Locked — requires a higher plan'
+    : !server.isOnline
+      ? 'Offline'
+      : null;
+  const rowLabel = lockedReason
+    ? `${server.city}, ${server.country} — ${lockedReason}`
+    : `Connect to ${server.city}, ${server.country}`;
+
   // The star is a SIBLING of the row button, not a child of it. It used to be a
   // span[role=button] nested inside the row <button> — invalid HTML, a doubled
   // tab stop, and, because the row is disabled for offline/plan-locked servers,
@@ -297,7 +320,7 @@ function ServerRow({
         type="button"
         onClick={onSelect}
         disabled={!selectable}
-        aria-label={`Connect to ${server.city}, ${server.country}`}
+        aria-label={rowLabel}
         className="flex min-w-0 flex-1 items-center gap-3.5 rounded-xl px-3.5 py-4 text-left transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
       >
         <span
@@ -316,8 +339,17 @@ function ServerRow({
             >
               {server.city}
             </span>
-            {server.isStreaming && <Film size={12} color={brand.accent} />}
-            {server.isP2p && <Download size={12} color={status.blue} />}
+            {server.isHighSpeed && (
+              <Gauge size={12} color={brand.accent} role="img" aria-label="High-speed" />
+            )}
+            {server.isPortForwarding && (
+              <ArrowRightLeft
+                size={12}
+                color={status.blue}
+                role="img"
+                aria-label="Port forwarding"
+              />
+            )}
           </span>
           <span className="mt-0.5 block truncate text-xs" style={{ color: white.w60 }}>
             {server.country}
@@ -326,7 +358,11 @@ function ServerRow({
 
         <span className="flex shrink-0 items-center gap-2.5 text-xs">
           {!server.isAccessible && (
-            <span className="flex items-center gap-1" style={{ color: white.w55 }}>
+            <span
+              className="flex items-center gap-1"
+              style={{ color: white.w55 }}
+              title={lockedReason ?? undefined}
+            >
               <Lock size={11} />
               Locked
             </span>

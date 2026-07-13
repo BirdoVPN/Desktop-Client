@@ -13,8 +13,12 @@ export interface Server {
   load: number;
   ping?: number;
   isPremium: boolean;
-  isStreaming: boolean;
-  isP2p: boolean;
+  /** Minimum plan required to connect: 'RECON' | 'OPERATIVE' | 'SOVEREIGN'. */
+  minPlan?: string;
+  /** Low-load / high-throughput node. Not a streaming-unblocking claim. */
+  isHighSpeed: boolean;
+  /** Node supports inbound port forwarding. Not a torrenting offer. */
+  isPortForwarding: boolean;
   isOnline: boolean;
   isAccessible: boolean;
 }

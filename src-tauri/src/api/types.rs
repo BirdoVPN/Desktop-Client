@@ -345,10 +345,19 @@ pub struct VpnServer {
     pub load: u8,
     #[serde(default)]
     pub is_premium: bool,
+    /// Minimum plan required to connect: RECON | OPERATIVE | SOVEREIGN.
+    /// Absent on pre-minPlan backends; `accessible` (computed server-side) is
+    /// what gates the UI, so this is display/telemetry only.
     #[serde(default)]
-    pub is_streaming: bool,
+    pub min_plan: Option<String>,
+    /// Low-load / high-throughput node. Replaces the old `isStreaming` flag —
+    /// Birdo does not and cannot promise streaming-service unblocking.
     #[serde(default)]
-    pub is_p2p: bool,
+    pub is_high_speed: bool,
+    /// Node supports inbound port forwarding. Replaces the old `isP2p` flag —
+    /// this is the real capability; it is NOT an invitation to torrent.
+    #[serde(default)]
+    pub is_port_forwarding: bool,
     #[serde(default = "default_true")]
     pub is_online: bool,
     #[serde(default = "default_true")]
