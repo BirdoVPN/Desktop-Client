@@ -84,6 +84,12 @@ interface RustVpnStatus {
   pqMode?: 'disabled' | 'server_provided' | 'bilateral';
 }
 
+/**
+ * Shape of `get_servers`. The Rust `ServerInfo` is `#[serde(rename_all =
+ * "camelCase")]`, so the wire fields are camelCase; the snake_case spellings are
+ * kept only as a defensive fallback. Reading snake_case *first* is what made
+ * `isOnline` fall through to its `?? true` default for every server.
+ */
 interface RustServer {
   id: string;
   name: string;
@@ -97,9 +103,15 @@ interface RustServer {
   port?: number;
   load?: number;
   is_premium?: boolean;
-  is_streaming?: boolean;
-  is_p2p?: boolean;
+  isPremium?: boolean;
+  min_plan?: string | null;
+  minPlan?: string | null;
+  is_high_speed?: boolean;
+  isHighSpeed?: boolean;
+  is_port_forwarding?: boolean;
+  isPortForwarding?: boolean;
   is_online?: boolean;
+  isOnline?: boolean;
   accessible?: boolean;
 }
 
@@ -263,10 +275,11 @@ export function Dashboard() {
           port: s.port,
           load: s.load ?? 0,
           ping: undefined,
-          isPremium: s.is_premium ?? false,
-          isStreaming: s.is_streaming ?? false,
-          isP2p: s.is_p2p ?? false,
-          isOnline: s.is_online ?? true,
+          isPremium: s.isPremium ?? s.is_premium ?? false,
+          minPlan: s.minPlan ?? s.min_plan ?? undefined,
+          isHighSpeed: s.isHighSpeed ?? s.is_high_speed ?? false,
+          isPortForwarding: s.isPortForwarding ?? s.is_port_forwarding ?? false,
+          isOnline: s.isOnline ?? s.is_online ?? true,
           isAccessible: s.accessible ?? true,
         }));
         setServers(mapped);

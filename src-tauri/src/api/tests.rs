@@ -217,28 +217,56 @@ mod types_serialization_tests {
             "id": "s1", "name": "US East", "country": "United States",
             "countryCode": "US", "city": "New York", "hostname": "us-east.birdo.app",
             "ipAddress": "1.2.3.4", "port": 51820, "load": 45,
-            "isPremium": true, "isStreaming": false, "isP2p": true, "isOnline": true
+            "minPlan": "OPERATIVE", "isPremium": true,
+            "isHighSpeed": true, "isPortForwarding": true, "isOnline": true
         }"#;
         let server: VpnServer = serde_json::from_str(json).unwrap();
         assert_eq!(server.country_code, "US");
         assert!(server.is_premium);
+        assert_eq!(server.min_plan.as_deref(), Some("OPERATIVE"));
+        assert!(server.is_high_speed);
+        assert!(server.is_port_forwarding);
         assert!(server.is_online);
         assert_eq!(server.port, Some(51820));
     }
 
     #[test]
     fn vpn_server_deserializes_public_listing_shape() {
+        // `tier` is derived+deprecated and `isStreaming`/`isP2p` are hard-coded
+        // deprecated literals the backend still emits for already-shipped
+        // clients. All three must decode-and-ignore cleanly here.
         let json = r#"{
             "id": "s1", "name": "US East", "region": "us-east",
             "country": "United States", "countryCode": "US", "city": "New York",
-            "load": 45, "tier": "FREE", "isPremium": false,
-            "isStreaming": false, "isP2p": true, "isOnline": true, "accessible": true
+            "load": 45, "tier": "FREE", "minPlan": "RECON", "isPremium": false,
+            "isHighSpeed": true, "isPortForwarding": false,
+            "isStreaming": false, "isP2p": false,
+            "isOnline": true, "accessible": true
         }"#;
         let server: VpnServer = serde_json::from_str(json).unwrap();
         assert_eq!(server.country_code, "US");
         assert_eq!(server.hostname, None);
         assert_eq!(server.ip_address, None);
         assert_eq!(server.port, None);
+        assert_eq!(server.min_plan.as_deref(), Some("RECON"));
+        assert!(server.is_high_speed);
+        assert!(!server.is_port_forwarding);
+        assert!(server.accessible);
+    }
+
+    /// A pre-minPlan backend omits every new field. The client must still
+    /// decode, fail closed on the tags, and leave `accessible` at its default.
+    #[test]
+    fn vpn_server_tolerates_legacy_payload_without_new_fields() {
+        let json = r#"{
+            "id": "s1", "name": "US East", "country": "United States",
+            "countryCode": "US", "city": "New York", "load": 45,
+            "isStreaming": true, "isP2p": true, "isOnline": true
+        }"#;
+        let server: VpnServer = serde_json::from_str(json).unwrap();
+        assert_eq!(server.min_plan, None);
+        assert!(!server.is_high_speed);
+        assert!(!server.is_port_forwarding);
         assert!(server.accessible);
     }
 
