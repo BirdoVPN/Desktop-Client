@@ -11,9 +11,9 @@
  * SAME full-object `invoke('save_settings', { settings: settingsToRust(...) })`
  * path used by Settings.tsx / MultiHopCard.tsx. Changes apply on next connect.
  *
- * Kill Switch is ALWAYS ON for every user (enforced in the Rust backend on
- * every settings load) — the row is rendered locked-on and cannot be toggled
- * off. We still reconcile the armed flag from `get_killswitch_status` on mount.
+ * Kill Switch defaults ON but is user-toggleable: the Rust connect path only
+ * arms the firewall block when the persisted setting is on (killswitch::arm),
+ * so turning it off genuinely lets traffic through if the tunnel drops.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -43,12 +43,6 @@ import {
 import { useAppStore } from '@/store/app-store';
 import { settingsToRust, isValidPort, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
 import { white, status, brand, motion as motionTokens } from '@/lib/birdo-theme';
-
-interface KillSwitchStatus {
-  enabled: boolean;
-  active: boolean;
-  blocking_connections: number;
-}
 
 export function VpnSettings() {
   const { settings, updateSettings, popRoute, pushRoute } = useAppStore(
@@ -89,20 +83,13 @@ export function VpnSettings() {
     };
   }, []);
 
-  // Reconcile the armed kill-switch flag with the backend's source of truth.
-  useEffect(() => {
-    invoke<KillSwitchStatus>('get_killswitch_status')
-      .then((s) => {
-        if (s.enabled !== settings.killSwitchEnabled) {
-          updateSettings({ killSwitchEnabled: s.enabled });
-        }
-      })
-      .catch(() => {
-        /* Rust logs; keep persisted preference */
-      });
-    // Run once on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // NOTE: we deliberately do NOT reconcile the toggle against
+  // `get_killswitch_status` here. That command reports the RUNTIME armed flag
+  // (true only while a session is actively armed), which is distinct from the
+  // user's persisted preference. Now that the kill switch is user-toggleable,
+  // the persisted setting is the source of truth for this row; syncing it to the
+  // armed flag would silently flip a user's ON preference to OFF whenever they
+  // are disconnected (not armed).
 
   // Keep DNS-derived custom port/MTU inputs in sync if settings change elsewhere.
   useEffect(() => {
@@ -237,17 +224,17 @@ export function VpnSettings() {
         <BirdoSectionHeader title="Security" />
 
         <BirdoCard padding="0" className="overflow-visible">
-          {/* Kill switch is ALWAYS ON for every user and cannot be toggled off
-              (enforced in the Rust backend on every settings load). The row is
-              rendered locked-on as an informational affordance only. */}
+          {/* Kill switch defaults ON (the safe choice) but is user-toggleable.
+              The Rust connect path only arms the firewall block when this is on
+              (killswitch::arm reads the persisted setting), so turning it off
+              genuinely lets traffic through if the tunnel drops. */}
           <BirdoToggleRow
-            title="Kill Switch · Always on"
-            subtitle="Always on for your protection — blocks all internet traffic if the VPN connection drops, preventing data leaks. This cannot be turned off."
+            title="Kill Switch"
+            subtitle="Blocks all internet traffic if the VPN connection drops, preventing data leaks. On by default. Turn it off to stay online (unprotected) when the VPN disconnects."
             leadingIcon={Shield}
             leadingTint={status.green}
-            checked={true}
-            onCheckedChange={() => {}}
-            enabled={false}
+            checked={settings.killSwitchEnabled}
+            onCheckedChange={(v) => persist({ killSwitchEnabled: v })}
           />
         </BirdoCard>
 

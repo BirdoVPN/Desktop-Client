@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{AppHandle, State};
 use tokio::sync::RwLock;
 
 use crate::utils::elevation::is_elevated;
@@ -282,7 +282,18 @@ pub fn is_lockdown_mode() -> bool {
 /// Best-effort: a non-elevated host (should not happen — the app manifest
 /// requires administrator) logs and returns `Ok(false)` rather than failing the
 /// whole connection.
-pub async fn arm() -> Result<bool, String> {
+pub async fn arm(app: &AppHandle) -> Result<bool, String> {
+    // Respect the user's kill-switch preference (default ON). Reading it here —
+    // the single choke-point every connect path funnels through — keeps all call
+    // sites consistent. Fail SAFE: if settings can't be read, treat as enabled.
+    let enabled = crate::commands::settings::load_settings_sync(app)
+        .map(|s| s.killswitch_enabled)
+        .unwrap_or(true);
+    if !enabled {
+        tracing::info!("Kill switch disabled by user preference — not arming");
+        return Ok(false);
+    }
+
     if !is_elevated() {
         tracing::warn!("Kill switch NOT armed: insufficient privileges (admin/root required)");
         return Ok(false);

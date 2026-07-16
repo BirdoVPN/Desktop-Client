@@ -650,7 +650,7 @@ pub async fn connect_vpn(
     // installs the WFP block-all during the reconnect gap (it previously
     // short-circuited because the kill switch was never armed). Best-effort: a
     // failure to arm must not tear down a working tunnel.
-    if let Err(e) = crate::commands::killswitch::arm().await {
+    if let Err(e) = crate::commands::killswitch::arm(&app).await {
         tracing::warn!("Failed to arm kill switch after connect: {}", e);
     }
 
@@ -951,7 +951,7 @@ pub async fn quick_connect(
 
     // AUDIT-2026-06-19 FIX (CRITICAL): arm the kill switch once the tunnel is up
     // so a drop fails closed (see connect_vpn for the full rationale).
-    if let Err(e) = crate::commands::killswitch::arm().await {
+    if let Err(e) = crate::commands::killswitch::arm(&app).await {
         tracing::warn!("Failed to arm kill switch after quick-connect: {}", e);
     }
 
