@@ -137,6 +137,32 @@ export function Login() {
     }
   };
 
+  // Native SSO: the Rust command opens the system browser to the Birdo broker,
+  // catches the loopback redirect, and exchanges the code for tokens — so an
+  // SSO user never needs a password. Same response shape as password login, so
+  // the 2FA branch is handled identically.
+  const handleSsoLogin = async (provider: 'google' | 'github') => {
+    setError(null);
+    setIsLoading(true);
+    try {
+      const result = await invoke<LoginResponse>('native_oauth_login', { provider });
+
+      if (result.requires_two_factor && result.challenge_token) {
+        setTwoFactorRequired(true);
+        setChallengeToken(result.challenge_token);
+      } else if (result.success) {
+        setUserEmail(result.user?.email || null);
+        setAuthenticated(true);
+      } else {
+        setError(result.message || result.error || 'Sign-in was cancelled or failed.');
+      }
+    } catch (err) {
+      setError(friendlyError(err));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const handleVerify2FA = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -462,6 +488,36 @@ export function Login() {
                   </motion.form>
                 )}
               </AnimatePresence>
+
+              {/* Native SSO — sign in with Google/GitHub via the system browser,
+                  no password required. */}
+              <div className="mt-5 flex items-center gap-3" aria-hidden="true">
+                <span className="h-px flex-1" style={{ background: hairline.soft }} />
+                <span className="text-xs text-w40">or continue with</span>
+                <span className="h-px flex-1" style={{ background: hairline.soft }} />
+              </div>
+              <div className="mt-4 flex flex-col gap-2.5">
+                <BirdoButton
+                  type="button"
+                  text="Continue with Google"
+                  onClick={() => handleSsoLogin('google')}
+                  variant="secondary"
+                  size="large"
+                  fullWidth
+                  disabled={isLoading}
+                  ariaLabel="Continue with Google"
+                />
+                <BirdoButton
+                  type="button"
+                  text="Continue with GitHub"
+                  onClick={() => handleSsoLogin('github')}
+                  variant="secondary"
+                  size="large"
+                  fullWidth
+                  disabled={isLoading}
+                  ariaLabel="Continue with GitHub"
+                />
+              </div>
 
               <motion.p
                 className="mt-6 text-center text-sm text-w60"

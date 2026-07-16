@@ -7,6 +7,9 @@
 pub mod auth {
     pub const LOGIN_DESKTOP: &str = "/auth/login/desktop";
     pub const LOGIN_ANONYMOUS: &str = "/auth/login/anonymous";
+    /// Native SSO handoff exchange: swap the web broker's single-use PKCE-bound
+    /// code (delivered to our loopback redirect) for real tokens.
+    pub const NATIVE_EXCHANGE: &str = "/auth/native/exchange";
     pub const LOGOUT: &str = "/auth/logout";
     pub const REFRESH: &str = "/auth/refresh";
     pub const ME: &str = "/auth/me";

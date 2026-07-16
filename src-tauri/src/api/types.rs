@@ -222,6 +222,26 @@ pub struct TwoFactorVerifyResponse {
     pub backup_code_used: bool,
 }
 
+/// Native SSO exchange request. Presents the single-use handoff code the web
+/// broker delivered to our loopback redirect, plus the PKCE code_verifier this
+/// process generated at the start of the flow (proves we are the same client the
+/// challenge was bound to). deviceId is the usual trusted-device context.
+#[derive(Debug, Serialize)]
+pub struct NativeExchangeRequest {
+    pub code: String,
+    #[serde(rename = "code_verifier")]
+    pub code_verifier: String,
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+}
+
+impl Drop for NativeExchangeRequest {
+    fn drop(&mut self) {
+        self.code.zeroize();
+        self.code_verifier.zeroize();
+    }
+}
+
 /// Anonymous login request. The backend's AnonymousLoginSchema requires the
 /// account's 24-digit anonymousId (this endpoint NEVER creates accounts) plus
 /// an optional password (if one was set on the website). deviceId is optional

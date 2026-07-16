@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod biometric;
+pub mod oauth;
 pub mod killswitch;
 pub mod servers;
 pub mod settings;

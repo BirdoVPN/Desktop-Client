@@ -345,6 +345,7 @@ fn main() {
             // Authentication
             commands::auth::login,
             commands::auth::login_anonymous,
+            commands::oauth::native_oauth_login, // native Google/GitHub SSO
             commands::auth::logout,
             commands::auth::get_auth_state,
             commands::auth::verify_2fa, // FIX C-2: 2FA TOTP verification
