@@ -135,6 +135,34 @@ impl BirdoApi {
         Ok(result)
     }
 
+    /// Native SSO handoff exchange. Swaps the web broker's single-use, PKCE-bound
+    /// code (delivered to our loopback redirect after the Google/GitHub flow) for
+    /// real tokens. Returns the same LoginResult shape as password login, so a 2FA
+    /// challenge is handled by the identical downstream path.
+    pub async fn native_exchange(
+        &self,
+        code: &str,
+        code_verifier: &str,
+        device_id: &str,
+    ) -> Result<LoginResult, ApiError> {
+        let payload = NativeExchangeRequest {
+            code: code.to_string(),
+            code_verifier: code_verifier.to_string(),
+            device_id: device_id.to_string(),
+        };
+
+        let result: LoginResult = self
+            .post(endpoints::auth::NATIVE_EXCHANGE, &payload, false)
+            .await?;
+
+        if let LoginResult::Success { ref tokens, .. } = result {
+            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
+        }
+
+        Ok(result)
+    }
+
     /// FIX C-2: Verify TOTP code for 2FA challenge.
     /// Called after login returns LoginResult::TwoFactorChallenge.
     pub async fn verify_2fa(
