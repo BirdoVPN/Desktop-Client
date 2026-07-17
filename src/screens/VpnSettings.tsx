@@ -45,14 +45,22 @@ import { settingsToRust, isValidPort, isValidDnsAddress, isWindowsPlatform } fro
 import { white, status, brand, motion as motionTokens } from '@/lib/birdo-theme';
 
 export function VpnSettings() {
-  const { settings, updateSettings, popRoute, pushRoute } = useAppStore(
+  const { settings, updateSettings, popRoute, pushRoute, account } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
       popRoute: s.popRoute,
       pushRoute: s.pushRoute,
+      account: s.account,
     })),
   );
+
+  // Stealth mode is OPERATIVE+. Gated by PLAN only (an anonymous RECON user is
+  // treated identically to an email/SSO RECON user). Enforced server-side too
+  // (birdo-web): a non-entitled connect with stealth is refused.
+  const planRank = (plan: string | null | undefined): number =>
+    plan === 'SOVEREIGN' ? 2 : plan === 'OPERATIVE' ? 1 : 0;
+  const isOperativeOrAbove = planRank(account?.plan) >= 1;
 
   const [dnsExpanded, setDnsExpanded] = useState(false);
   const [dnsErrors, setDnsErrors] = useState<{ primary: string | null; secondary: string | null }>({
@@ -242,11 +250,18 @@ export function VpnSettings() {
         <BirdoCard padding="0">
           <BirdoToggleRow
             title="Stealth Mode · Premium"
-            subtitle="Premium feature — available on the Operative and Sovereign plans. Routes through Xray Reality to bypass deep packet inspection, making VPN traffic look like normal HTTPS. Free (Recon) accounts can enable it here, but it only activates with a paid subscription."
+            subtitle={
+              isOperativeOrAbove
+                ? 'Routes through Xray Reality to bypass deep packet inspection, making VPN traffic look like normal HTTPS.'
+                : 'Available on the Operative and Sovereign plans. Upgrade to route through Xray Reality and bypass deep packet inspection.'
+            }
             leadingIcon={EyeOff}
             leadingTint={status.blue}
-            checked={settings.stealthMode}
+            // `&& isOperativeOrAbove` so a persisted-on state can't resurface
+            // after a downgrade; disabled for RECON (also enforced server-side).
+            checked={settings.stealthMode && isOperativeOrAbove}
             onCheckedChange={(v) => persist({ stealthMode: v })}
+            enabled={isOperativeOrAbove}
           />
         </BirdoCard>
 
