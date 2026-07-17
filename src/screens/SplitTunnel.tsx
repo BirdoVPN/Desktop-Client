@@ -20,7 +20,7 @@ import { useCallback, useMemo, useState, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useShallow } from 'zustand/react/shallow';
-import { AppWindow, FolderOpen, Info, Lock, Plus, Scissors, Search, X } from 'lucide-react';
+import { AppWindow, FolderOpen, Info, Plus, Scissors, Search, X } from 'lucide-react';
 import { useAppStore, type AppSettings } from '@/store/app-store';
 import {
   BirdoTopBar,
@@ -42,24 +42,11 @@ interface InstalledApp {
 /** Display the basename of a stored entry (which may be a full path). */
 const baseName = (s: string): string => s.split(/[\\/]/).pop() || s;
 
-// Operative (1) or Sovereign (2) unlock split tunneling — matches SplitTunnelCard.
-const planLevel = (plan: string | null | undefined): number => {
-  switch (plan?.toUpperCase()) {
-    case 'SOVEREIGN':
-      return 2;
-    case 'OPERATIVE':
-      return 1;
-    default:
-      return 0;
-  }
-};
-
 export function SplitTunnel() {
-  const { settings, updateSettings, account, popRoute } = useAppStore(
+  const { settings, updateSettings, popRoute } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
-      account: s.account,
       popRoute: s.popRoute,
     })),
   );
@@ -77,8 +64,8 @@ export function SplitTunnel() {
   // Surfaced when save_settings rejects so the user knows the change didn't stick.
   const [persistError, setPersistError] = useState(false);
 
-  const isOperative = planLevel(account?.plan) >= 1;
-  const enabled = settings.splitTunnelingEnabled && isOperative;
+  // Split tunneling is available on every tier (not gated by plan).
+  const enabled = settings.splitTunnelingEnabled;
   const apps = settings.splitTunnelApps;
   const excludedCount = apps.length;
 
@@ -105,9 +92,8 @@ export function SplitTunnel() {
   );
 
   const toggleEnabled = useCallback(() => {
-    if (!isOperative) return;
     persist({ splitTunnelingEnabled: !settings.splitTunnelingEnabled });
-  }, [isOperative, persist, settings.splitTunnelingEnabled]);
+  }, [persist, settings.splitTunnelingEnabled]);
 
   const addApp = useCallback(() => {
     if (!enabled) return;
@@ -246,34 +232,21 @@ export function SplitTunnel() {
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
             style={{ backgroundColor: enabled ? brand.accentBg : white.w05 }}
           >
-            {isOperative ? (
-              <Scissors size={18} color={enabled ? brand.accent : white.w60} aria-hidden />
-            ) : (
-              <Lock size={16} color={white.w40} aria-hidden />
-            )}
+            <Scissors size={18} color={enabled ? brand.accent : white.w60} aria-hidden />
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <p className="text-sm font-medium" style={{ color: white.w100 }}>
                 Split Tunneling
               </p>
-              {!isOperative && (
-                <span
-                  className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
-                  style={{ backgroundColor: brand.accentBg, color: brand.accent }}
-                >
-                  Operative
-                </span>
-              )}
             </div>
             <p className="truncate text-xs" style={{ color: white.w60 }}>
-              {isOperative ? 'Choose which apps bypass VPN' : 'Requires Operative plan or higher'}
+              Choose which apps bypass VPN
             </p>
           </div>
           <BirdoSwitch
             checked={enabled}
             onChange={toggleEnabled}
-            disabled={!isOperative}
             ariaLabel="Split Tunneling"
           />
         </div>
