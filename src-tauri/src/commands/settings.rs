@@ -31,8 +31,9 @@ pub struct AppSettings {
     /// Start minimized to system tray
     pub start_minimized: bool,
     /// Enable kill switch (block all traffic if VPN disconnects).
-    /// ALWAYS ON for all users — defaults true AND is forced true on load; the
-    /// UI cannot turn it off.
+    /// User preference — defaults ON (serde default_true + Default), but the user
+    /// may turn it OFF in VPN Settings. When OFF, connect does not arm the
+    /// firewall block and an unexpected drop is NOT failed closed.
     #[serde(default = "default_true")]
     pub killswitch_enabled: bool,
     /// Show notifications for connection events
@@ -264,12 +265,13 @@ fn verify_hmac(settings_json: &str, expected_hmac: &str, key: &[u8]) -> bool {
 
 /// Normalize settings loaded from disk to enforce non-negotiable invariants.
 ///
-/// The kill switch is ALWAYS ON for every user, regardless of any value
-/// previously persisted (or tampered into) the settings file. Centralizing
-/// this here keeps the signed and legacy load paths in lock-step and makes the
-/// guarantee unit-testable without a Tauri `AppHandle`/filesystem.
-fn normalize_loaded_settings(mut settings: AppSettings) -> AppSettings {
-    settings.killswitch_enabled = true;
+/// The kill switch defaults ON (via the `default_true` serde default when the
+/// field is absent) but is user-toggleable, so a persisted `false` is honored
+/// here — unlike before, when it was force-reset to `true`. Kept as the single
+/// choke-point for both the signed and legacy load paths so any future
+/// invariants stay in lock-step and remain unit-testable without a Tauri
+/// `AppHandle`/filesystem.
+fn normalize_loaded_settings(settings: AppSettings) -> AppSettings {
     settings
 }
 
@@ -559,18 +561,22 @@ mod tests {
         assert_eq!(s.wireguard_port, "51820");
     }
 
-    /// Loading must force the kill switch ON even if a stored (or tampered)
-    /// value says false, while leaving other preferences untouched.
+    /// The kill switch is now a real user preference: a persisted `false` must
+    /// be HONORED on load (not force-reset to true), while every other pref also
+    /// passes through untouched. Default remains ON (see the two tests above).
     #[test]
-    fn normalize_loaded_settings_forces_killswitch_on() {
+    fn normalize_loaded_settings_honors_persisted_killswitch_off() {
         let stored = AppSettings {
-            killswitch_enabled: false, // somehow persisted off
+            killswitch_enabled: false, // user turned it off — must be respected
             quantum_protection: false, // user opted out of PQ — respected
             stealth_mode: true,
             ..AppSettings::default()
         };
         let loaded = normalize_loaded_settings(stored);
-        assert!(loaded.killswitch_enabled, "kill switch is always forced ON");
+        assert!(
+            !loaded.killswitch_enabled,
+            "kill switch is a user preference — a persisted OFF must be honored"
+        );
         assert!(
             !loaded.quantum_protection,
             "PQ is a real preference — normalize must not flip it"
