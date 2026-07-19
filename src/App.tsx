@@ -19,6 +19,8 @@ interface AuthState {
   email: string | null;
   account_id: string | null;
   plan: string | null;
+  /** Optional: absent when talking to a backend that predates the field. */
+  has_password?: boolean;
 }
 
 function App() {
@@ -159,6 +161,9 @@ function App() {
             accountId: authState.account_id,
             plan: authState.plan,
             status: 'active',
+            // `?? true` keeps the password prompt when the backend predates the
+            // field — never drop a confirmation because a value went missing.
+            hasPassword: authState.has_password ?? true,
           });
         }
       } catch {

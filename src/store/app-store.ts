@@ -52,6 +52,12 @@ export interface AccountInfo {
   bandwidthUsed: number;
   bandwidthLimit: number;
   status: 'active' | 'expired' | 'cancelled' | 'unknown';
+  /**
+   * Whether the account has a password. SSO accounts have none, so the UI must
+   * not demand one from them. Defaults to `true` so an unknown identity keeps
+   * the confirmation prompt rather than silently dropping it.
+   */
+  hasPassword: boolean;
 }
 
 export type Protocol = 'wireguard';
@@ -233,6 +239,7 @@ const defaultAccount: AccountInfo = {
   bandwidthUsed: 0,
   bandwidthLimit: 0,
   status: 'unknown',
+  hasPassword: true,
 };
 
 const defaultSettings: AppSettings = {

@@ -33,6 +33,10 @@ pub struct AuthState {
     pub email: Option<String>,
     pub account_id: Option<String>,
     pub plan: Option<String>,
+    /// Mirrors `UserProfile::has_password` so the UI can avoid demanding a
+    /// password from SSO accounts, which have none. `true` whenever the profile
+    /// is unknown, so an unresolved identity never silently drops the prompt.
+    pub has_password: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +257,7 @@ pub async fn get_auth_state(
                     email: Some(profile.email),
                     account_id: Some(profile.id),
                     plan: None,
+                    has_password: profile.has_password,
                 }),
                 Err(_) => {
                     // Token might be expired, try refresh
@@ -276,12 +281,14 @@ pub async fn get_auth_state(
                                     email: Some(profile.email),
                                     account_id: Some(profile.id),
                                     plan: None,
+                                    has_password: profile.has_password,
                                 }),
                                 Err(_) => Ok(AuthState {
                                     is_authenticated: true,
                                     email: None,
                                     account_id: None,
                                     plan: None,
+                                    has_password: true,
                                 }),
                             }
                         }
@@ -292,6 +299,7 @@ pub async fn get_auth_state(
                                 email: None,
                                 account_id: None,
                                 plan: None,
+                                has_password: true,
                             })
                         }
                     }
@@ -303,6 +311,7 @@ pub async fn get_auth_state(
             email: None,
             account_id: None,
             plan: None,
+            has_password: true,
         }),
     }
 }
