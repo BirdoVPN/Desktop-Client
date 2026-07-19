@@ -402,11 +402,13 @@ function AccountNumberCard({ accountNumber }: { accountNumber: string }) {
   );
 }
 
-// ── Data-usage meter ─────────────────────────────────────────────────────────
+// ── Data / Limit section ─────────────────────────────────────────────────────
 //
-// Renders ONLY for a real capped plan (bandwidthLimitGb > 0). Sources live
-// per-user usage from `get_usage_stats` (/vpn/stats); honours the freshness flag
-// so a never-synced node shows "awaiting first sync" rather than a misleading 0.
+// The desktop equivalent of mobile's LimitScreen: shown for EVERY user type.
+// Free (capped) plans get a Used / Left / Resets meter of their monthly cap;
+// paid (uncapped) plans get the "Unlimited" state. Sources live per-user usage
+// from `get_usage_stats` (/vpn/stats) and honours the freshness flag so a
+// never-synced node shows "awaiting first sync" rather than a misleading 0.
 
 interface RustUsageStats {
   plan: string | null;
@@ -427,22 +429,24 @@ function UsageMeter() {
         if (alive) setUsage(u);
       })
       .catch(() => {
-        /* offline / non-fatal — the meter simply doesn't render */
+        /* offline / non-fatal — the section simply doesn't render yet */
       });
     return () => {
       alive = false;
     };
   }, []);
 
-  const limit = usage?.bandwidthLimitGb ?? null;
-  // Only capped plans get a meter; an uncapped (null / <=0) limit means unlimited.
-  if (limit == null || limit <= 0) return null;
+  // Still loading (or offline) — nothing to show yet.
+  if (!usage) return null;
 
-  const fresh = usage?.bandwidthIsFresh === true;
-  const used = fresh ? Math.max(0, usage?.bandwidthUsedGb ?? 0) : 0;
-  const pct = Math.max(0, Math.min(100, (used / limit) * 100));
-  const left = Math.max(0, limit - used);
-  const resets = formatRenewalDate(usage?.bandwidthPeriodEnd ?? null);
+  const limit = usage.bandwidthLimitGb;
+  const hasCap = limit != null && limit > 0;
+  const limitGb = limit ?? 0;
+  const fresh = usage.bandwidthIsFresh === true;
+  const used = fresh ? Math.max(0, usage.bandwidthUsedGb ?? 0) : 0;
+  const pct = limitGb > 0 ? Math.max(0, Math.min(100, (used / limitGb) * 100)) : 0;
+  const left = Math.max(0, limitGb - used);
+  const resets = formatRenewalDate(usage.bandwidthPeriodEnd ?? null);
   const nearCap = pct >= 90;
 
   return (
@@ -454,14 +458,24 @@ function UsageMeter() {
         </span>
       </div>
 
-      {fresh ? (
+      {!hasCap ? (
+        // Paid / uncapped plan — mobile shows the "Unlimited" state for everyone.
+        <div className="mt-2.5 flex items-baseline gap-2">
+          <span className="text-[18px] font-semibold" style={{ color: brand.accent }}>
+            Unlimited
+          </span>
+          <span className="text-[12px]" style={{ color: white.w60 }}>
+            data on your plan
+          </span>
+        </div>
+      ) : fresh ? (
         <>
           <div className="mt-2.5 flex items-baseline justify-between">
             <span className="text-[16px] font-semibold" style={{ color: '#FFFFFF' }}>
               {used.toFixed(1)} GB
             </span>
             <span className="text-[12px]" style={{ color: white.w60 }}>
-              of {limit} GB
+              of {limitGb} GB
             </span>
           </div>
           <div className="mt-2 h-2 w-full overflow-hidden rounded-full" style={{ backgroundColor: surface.s2 }}>
@@ -480,7 +494,8 @@ function UsageMeter() {
         </>
       ) : (
         <p className="mt-2 text-[13px]" style={{ color: white.w60 }}>
-          Usage of your {limit} GB monthly allowance will appear here after your first sync.
+          Usage of your {limitGb} GB monthly allowance will appear here after your
+          first sync — connect to start counting.
         </p>
       )}
     </BirdoCard>

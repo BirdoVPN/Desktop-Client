@@ -1017,10 +1017,16 @@ pub async fn reapply_vpn_settings(
     // tunnel is torn down and the new one comes up. No-op if the kill switch is
     // disabled by preference.
     if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
-        tracing::warn!("Kill switch activation before settings reapply failed: {}", e);
+        tracing::warn!(
+            "Kill switch activation before settings reapply failed: {}",
+            e
+        );
     }
 
-    tracing::info!("Reapplying VPN settings — rebuilding tunnel to {}", server_id);
+    tracing::info!(
+        "Reapplying VPN settings — rebuilding tunnel to {}",
+        server_id
+    );
 
     // Reuse the tested connect path with the freshly-persisted settings.
     match multi_hop_exit {
@@ -1036,7 +1042,17 @@ pub async fn reapply_vpn_settings(
             )
             .await
         }
-        None => connect_vpn(server_id, app, api, vpn_manager, credentials, auto_reconnect).await,
+        None => {
+            connect_vpn(
+                server_id,
+                app,
+                api,
+                vpn_manager,
+                credentials,
+                auto_reconnect,
+            )
+            .await
+        }
     }
 }
 
