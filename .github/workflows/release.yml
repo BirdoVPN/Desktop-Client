@@ -51,10 +51,81 @@ env:
 
 jobs:
   # ══════════════════════════════════════════════════════════════════════
+  # TEST GATE — a release must never BUILD or PUBLISH if tests fail.
+  #
+  # WHY THIS EXISTS: before this job, release.yml only ever *built* the app.
+  # Building excludes `#[cfg(test)]` modules, so a tag push shipped installers
+  # whose Rust unit tests were never run on that ref (tests.yml gates PRs and
+  # pushes to main, but a tag push does not re-run it). This job mirrors
+  # tests.yml (Rust unit tests on Windows + the frontend vitest suite); the
+  # three build jobs below all `needs: test`, so a red test aborts the whole
+  # release before a single installer is produced, and the final `release` job
+  # refuses to publish unless this job succeeded.
+  # ══════════════════════════════════════════════════════════════════════
+  test:
+    name: Test gate (Rust unit tests + frontend vitest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # rust-toolchain.toml pins the channel (1.96); this action just ensures a
+      # toolchain is present so the pin resolves.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # tauri::generate_context!() in main.rs requires the frontendDist dir
+      # (../dist) to EXIST at macro-expansion time. The test job doesn't build
+      # the real frontend, so give the macro a stub (same as tests.yml).
+      - name: Stub frontend dist for macro expansion
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Set-Content -Path dist/index.html -Value '<!doctype html><title>stub</title>'
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Type-check frontend
+        run: npm run type-check
+
+      - name: Frontend unit tests (vitest)
+        run: npm run test:run
+
+      - name: Run Rust unit tests
+        working-directory: src-tauri
+        # The unit-TEST binary gets no ComCtl32 v6 manifest (only the shipped app
+        # gets one via tauri-build), so a transitive TaskDialogIndirect import
+        # binds against ComCtl32 v5 (absent) and the harness aborts pre-main with
+        # STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) on every Windows runner. Delay-
+        # load comctl32 so the symbol binds lazily; unit tests never raise a task
+        # dialog. Same workaround tests.yml uses; scoped to this job's build only.
+        env:
+          RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
+        run: cargo test --lib
+
+  # ══════════════════════════════════════════════════════════════════════
   # WINDOWS — faithful copy of build-windows.yml's `build` job.
   # Authenticode (Azure OIDC Trusted Signing) + Sigstore + updater .sig.
   # ══════════════════════════════════════════════════════════════════════
   build-windows:
+    needs: test  # never build/sign/publish on a red test suite
     runs-on: windows-latest
     timeout-minutes: 35  # Hard cap. Rust compile ~12m + signing ~3m. If we hit 35m, signing hung.
     outputs:
@@ -413,6 +484,7 @@ jobs:
   # AppImage + .deb, minisign updater .sig, Sigstore, optional GPG .asc.
   # ══════════════════════════════════════════════════════════════════════
   build-linux:
+    needs: test  # never build/publish on a red test suite
     strategy:
       matrix:
         include:
@@ -651,6 +723,7 @@ jobs:
   # required-platforms guard at the bottom of this file).
   # ══════════════════════════════════════════════════════════════════════
   build-macos:
+    needs: test  # gate on tests too, but stays best-effort (continue-on-error below)
     continue-on-error: true  # macOS is best-effort; must never gate the release
     strategy:
       fail-fast: false
@@ -936,15 +1009,19 @@ jobs:
   # (build-macos also carries `continue-on-error: true` above, belt-and-braces).
   # ══════════════════════════════════════════════════════════════════════
   release:
-    needs: [build-windows, build-linux, build-macos]
+    needs: [test, build-windows, build-linux, build-macos]
     if: always()
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Require Windows + Linux builds to have succeeded
+      - name: Require the test gate + Windows + Linux builds to have succeeded
         run: |
           set -euo pipefail
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "::error::test result=${{ needs.test.result }} — the Rust unit tests / vitest gate did not pass, refusing to publish a release"
+            exit 1
+          fi
           if [ "${{ needs.build-windows.result }}" != "success" ]; then
             echo "::error::build-windows result=${{ needs.build-windows.result }} — Windows is a REQUIRED platform, refusing to publish a release"
             exit 1

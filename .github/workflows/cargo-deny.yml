@@ -29,10 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # cargo-deny never builds the app, but the `cargo metadata` it runs must
-      # parse dependency manifests that use edition2024 (e.g. dlopen2_derive) —
-      # which the repo's pinned rustc 1.83 (src-tauri/rust-toolchain.toml, kept
-      # for the Windows build) cannot do. Run this advisory scan on the runner's
-      # stable Rust; RUSTUP_TOOLCHAIN overrides the pinned toml for this job only.
+      # parse dependency manifests that use edition2024 (e.g. dlopen2_derive).
+      # The repo's pinned toolchain is 1.96 now (src-tauri/rust-toolchain.toml),
+      # which parses those fine; this advisory scan still runs on the runner's
+      # own stable Rust (it needs no reproducible app build), so RUSTUP_TOOLCHAIN
+      # overrides the pinned toml for this job only.
       RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

@@ -16,6 +16,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useShallow } from 'zustand/react/shallow';
+import { motion, AnimatePresence } from 'framer-motion';
 import { Info, Plus, Trash2, ArrowRightLeft, Network } from 'lucide-react';
 import {
   BirdoTopBar,
@@ -27,7 +28,7 @@ import {
   BirdoEmptyState,
 } from '@/components/birdo';
 import { useAppStore, type PortForward as PortForwardRule } from '@/store/app-store';
-import { white, status, hairline } from '@/lib/birdo-theme';
+import { white, status, hairline, surface, gradient, motion as motionTokens } from '@/lib/birdo-theme';
 
 type Protocol = 'tcp' | 'udp';
 
@@ -54,6 +55,9 @@ export function PortForward() {
   const [adding, setAdding] = useState(false);
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  // Deleting a rule tears down a live DNAT mapping — confirm before it happens
+  // (mobile parity; a mis-click otherwise silently removes a rule).
+  const [pendingDelete, setPendingDelete] = useState<PortForwardRule | null>(null);
 
   const portValue = Number.parseInt(portText, 10);
   // Must match the Rust command's range (vpn_port_forward rejects <1024 —
@@ -257,7 +261,7 @@ export function PortForward() {
               <PortForwardRow
                 key={pf.id}
                 rule={pf}
-                onDelete={handleDelete}
+                onRequestDelete={setPendingDelete}
                 deleting={deletingIds.has(pf.id)}
               />
             ))}
@@ -266,18 +270,99 @@ export function PortForward() {
 
         <div className="h-8" />
       </div>
+
+      <AnimatePresence>
+        {pendingDelete && (
+          <DeleteRuleDialog
+            rule={pendingDelete}
+            onCancel={() => setPendingDelete(null)}
+            onConfirm={() => {
+              const id = pendingDelete.id;
+              setPendingDelete(null);
+              void handleDelete(id);
+            }}
+          />
+        )}
+      </AnimatePresence>
     </div>
+  );
+}
+
+// ── Delete confirmation dialog ──────────────────────────────────────────────
+function DeleteRuleDialog({
+  rule,
+  onCancel,
+  onConfirm,
+}: {
+  rule: PortForwardRule;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+
+  return (
+    <motion.div
+      className="absolute inset-0 z-50 flex items-center justify-center p-5"
+      style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
+      onClick={onCancel}
+    >
+      <motion.div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Delete port forwarding rule"
+        className="w-full max-w-[340px] overflow-hidden rounded-birdo-lg"
+        style={{
+          background: `linear-gradient(${surface.s3}, ${surface.s3}) padding-box, ${gradient.glassStroke} border-box`,
+          border: '1px solid transparent',
+        }}
+        initial={{ scale: 0.94, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.94, opacity: 0 }}
+        transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex flex-col gap-4 p-5">
+          <div className="flex items-center gap-2">
+            <Trash2 size={20} color={status.red} aria-hidden />
+            <h2 className="text-[16px] font-bold" style={{ color: '#FFFFFF' }}>
+              Delete rule?
+            </h2>
+          </div>
+          <p className="text-[13px]" style={{ color: white.w60 }}>
+            Remove the {rule.protocol.toUpperCase()} forward{' '}
+            <span className="font-medium" style={{ color: white.w80 }}>
+              {rule.externalPort} → {rule.internalPort}
+            </span>
+            ? This tears down the live mapping immediately.
+          </p>
+          <div className="flex gap-2.5">
+            <BirdoButton text="Cancel" variant="secondary" fullWidth onClick={onCancel} />
+            <BirdoButton text="Delete" variant="danger" fullWidth onClick={onConfirm} />
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
   );
 }
 
 // ── Single active-rule row (external → internal + protocol badge + delete) ──
 interface PortForwardRowProps {
   rule: PortForwardRule;
-  onDelete: (id: string) => void;
+  onRequestDelete: (rule: PortForwardRule) => void;
   deleting: boolean;
 }
 
-function PortForwardRow({ rule, onDelete, deleting }: PortForwardRowProps) {
+function PortForwardRow({ rule, onRequestDelete, deleting }: PortForwardRowProps) {
   return (
     <div
       className="flex items-center gap-3.5 px-4 py-3.5"
@@ -304,7 +389,7 @@ function PortForwardRow({ rule, onDelete, deleting }: PortForwardRowProps) {
 
       <button
         type="button"
-        onClick={() => onDelete(rule.id)}
+        onClick={() => onRequestDelete(rule)}
         disabled={deleting}
         aria-label={`Delete rule ${rule.externalPort}`}
         aria-busy={deleting}

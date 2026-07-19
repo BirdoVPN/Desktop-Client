@@ -111,6 +111,7 @@ export function Settings() {
 
   const [appVersion, setAppVersion] = useState('');
   const [biometric, setBiometric] = useState<BiometricStatus | null>(null);
+  const [biometricError, setBiometricError] = useState<string | null>(null);
 
   // ── Speed test (on-device, through the tunnel via Rust) ───────────────────
   // The Rust test measures throughput THROUGH the VPN tunnel, so it only works
@@ -210,15 +211,20 @@ export function Settings() {
   // ── Biometric Unlock (special: keyring-backed + optional confirm) ───────────
   const handleBiometric = useCallback(
     async (value: boolean) => {
+      setBiometricError(null);
       // When enabling, confirm the user can actually authenticate first.
       if (value) {
         try {
           const ok = await invoke<boolean>('authenticate_biometric', {
             reason: 'Confirm to enable biometric unlock',
           });
-          if (!ok) return; // user cancelled — leave it off
+          if (!ok) {
+            // User cancelled — leave it off, but say so (previously silent).
+            setBiometricError('Verification was cancelled — biometric unlock stays off.');
+            return;
+          }
         } catch {
-          /* Auth failed/unavailable — abort enabling */
+          setBiometricError('Could not verify with Windows Hello. Biometric unlock stays off.');
           return;
         }
       }
@@ -226,7 +232,7 @@ export function Settings() {
         await invoke('set_biometric_enabled', { enabled: value });
         setBiometric((prev) => (prev ? { ...prev, enabled: value } : prev));
       } catch {
-        /* Persist failed — Rust logs the error */
+        setBiometricError('Could not save that change. Please try again.');
       }
     },
     [],
@@ -310,6 +316,11 @@ export function Settings() {
                 checked={biometric.enabled}
                 onCheckedChange={handleBiometric}
               />
+              {biometricError && (
+                <p className="px-3.5 pb-2.5 text-xs" style={{ color: statusTokens.red }}>
+                  {biometricError}
+                </p>
+              )}
             </BirdoCard>
           </>
         )}

@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
-import { ShieldCheck, UserRound, KeyRound } from 'lucide-react';
+import { ShieldCheck, UserRound, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { BirdoBadge, BirdoButton, BirdoTextField, AppIconMark } from './birdo';
 import { gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
@@ -57,6 +57,12 @@ export function Login() {
   // Anonymous login state
   const [anonId, setAnonId] = useState('');
   const [anonPassword, setAnonPassword] = useState('');
+
+  // Newly-created anonymous account: show its 24-digit recovery ID once so the
+  // user can save it before we sign them in (the account is already created +
+  // its tokens stored by the backend command).
+  const [createdId, setCreatedId] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState(false);
 
   const { setAuthenticated, setUserEmail } = useAppStore(
     useShallow((s) => ({
@@ -126,6 +132,37 @@ export function Login() {
       setError(friendlyError(err));
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // Create a brand-new anonymous account in-app (no email/SSO). The backend mints
+  // the 24-digit ID and stores tokens, so we only need to show the ID to save and
+  // then flip authenticated.
+  const handleCreateAnonymous = async () => {
+    setError(null);
+    setIsLoading(true);
+    try {
+      const result = await invoke<LoginResponse>('register_anonymous');
+      if (result.success && result.user?.account_id) {
+        setCreatedId(result.user.account_id);
+      } else {
+        setError(result.message || result.error || 'Could not create an account. Please try again.');
+      }
+    } catch (err) {
+      setError(friendlyError(err));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const copyCreatedId = async () => {
+    if (!createdId) return;
+    try {
+      await navigator.clipboard.writeText(createdId);
+      setCopiedId(true);
+      setTimeout(() => setCopiedId(false), 2000);
+    } catch {
+      /* clipboard unavailable — the ID is still on screen to copy manually */
     }
   };
 
@@ -266,7 +303,7 @@ export function Login() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: motionTokens.emphasis, delay: 0.15 }}
           >
-            {twoFactorRequired ? 'Two-Factor Auth' : 'Welcome Back'}
+            {createdId ? 'Account created' : twoFactorRequired ? 'Two-Factor Auth' : 'Welcome Back'}
           </motion.h2>
 
           <motion.p
@@ -275,12 +312,69 @@ export function Login() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: motionTokens.emphasis, delay: 0.2 }}
           >
-            {twoFactorRequired
-              ? 'Enter your authenticator code'
-              : 'Sign in to your Birdo account'}
+            {createdId
+              ? 'Save your recovery ID'
+              : twoFactorRequired
+                ? 'Enter your authenticator code'
+                : 'Sign in to your Birdo account'}
           </motion.p>
 
-          {twoFactorRequired ? (
+          {createdId ? (
+            /* ── New anonymous account: show the recovery ID once ── */
+            <motion.div
+              className="flex flex-col gap-4"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: motionTokens.standard }}
+            >
+              <div className="flex flex-col items-center gap-2 text-center">
+                <div
+                  className="flex h-12 w-12 items-center justify-center rounded-full"
+                  style={{ backgroundColor: white.w05 }}
+                >
+                  <KeyRound size={24} color={status.green} />
+                </div>
+                <p className="text-sm text-w60">
+                  Your anonymous account is ready. This ID is the{' '}
+                  <span className="font-semibold text-w100">only</span> way back in.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={copyCreatedId}
+                className="flex w-full items-center gap-3 rounded-birdo-sub px-4 py-3 text-left transition-colors hover:bg-white/5"
+                style={{ backgroundColor: white.w04, border: `1px solid ${hairline.soft}` }}
+                aria-label="Copy account ID"
+              >
+                <span className="min-w-0 flex-1 break-all font-mono text-sm tracking-wide text-w100">
+                  {createdId}
+                </span>
+                {copiedId ? (
+                  <Check size={18} color={status.green} aria-hidden />
+                ) : (
+                  <Copy size={18} color={white.w60} aria-hidden />
+                )}
+              </button>
+
+              <p className="flex items-start gap-1.5 text-xs text-w40">
+                <ShieldAlert size={14} color={status.yellow} aria-hidden className="mt-0.5 shrink-0" />
+                <span>Save it somewhere safe — we can&apos;t reset it if you lose it.</span>
+              </p>
+
+              <BirdoButton
+                type="button"
+                text="I've saved it — continue"
+                onClick={() => {
+                  setUserEmail(null);
+                  setAuthenticated(true);
+                }}
+                variant="brand"
+                size="large"
+                fullWidth
+              />
+            </motion.div>
+          ) : twoFactorRequired ? (
             /* ── 2FA Verification Form ── */
             <motion.form
               onSubmit={handleVerify2FA}
@@ -484,6 +578,24 @@ export function Login() {
                       fullWidth
                       isLoading={isLoading}
                       className="mt-auto"
+                    />
+
+                    {/* Create a brand-new anonymous account in-app — no email,
+                        no website round-trip (mobile parity). */}
+                    <div className="flex items-center gap-3" aria-hidden="true">
+                      <span className="h-px flex-1" style={{ background: hairline.soft }} />
+                      <span className="text-xs text-w40">new here?</span>
+                      <span className="h-px flex-1" style={{ background: hairline.soft }} />
+                    </div>
+                    <BirdoButton
+                      type="button"
+                      text={isLoading ? 'Creating…' : 'Create anonymous account'}
+                      onClick={handleCreateAnonymous}
+                      variant="secondary"
+                      size="large"
+                      fullWidth
+                      disabled={isLoading}
+                      ariaLabel="Create a new anonymous account"
                     />
                   </motion.form>
                 )}

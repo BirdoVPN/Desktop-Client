@@ -45,15 +45,17 @@ import { settingsToRust, isValidPort, isValidDnsAddress, isWindowsPlatform } fro
 import { white, status, brand, motion as motionTokens } from '@/lib/birdo-theme';
 
 export function VpnSettings() {
-  const { settings, updateSettings, popRoute, pushRoute, account } = useAppStore(
+  const { settings, updateSettings, popRoute, pushRoute, account, connectionState } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
       popRoute: s.popRoute,
       pushRoute: s.pushRoute,
       account: s.account,
+      connectionState: s.connectionState,
     })),
   );
+  const connected = connectionState === 'connected';
 
   // Stealth mode is OPERATIVE+. Gated by PLAN only (an anonymous RECON user is
   // treated identically to an email/SSO RECON user). Enforced server-side too
@@ -84,11 +86,34 @@ export function VpnSettings() {
     settings.wireGuardMtu > 0 ? String(settings.wireGuardMtu) : '',
   );
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reapplyDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [reapplying, setReapplying] = useState(false);
 
   useEffect(() => {
     return () => {
       if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+      if (reapplyDebounceRef.current) clearTimeout(reapplyDebounceRef.current);
     };
+  }, []);
+
+  // Live-apply tunnel-affecting changes to an ACTIVE session (mobile parity):
+  // a debounced fail-closed tunnel rebuild. The kill switch is pushed live as a
+  // flag (no rebuild). Both no-op when disconnected — the persisted setting then
+  // applies at the next connect. Reads live connection state to avoid a stale
+  // closure. See the Rust `reapply_vpn_settings` / `set_killswitch_live`.
+  const scheduleReapply = useCallback(() => {
+    if (useAppStore.getState().connectionState !== 'connected') return;
+    if (reapplyDebounceRef.current) clearTimeout(reapplyDebounceRef.current);
+    reapplyDebounceRef.current = setTimeout(async () => {
+      setReapplying(true);
+      try {
+        await invoke('reapply_vpn_settings');
+      } catch {
+        /* Rust backend logs the error */
+      } finally {
+        setReapplying(false);
+      }
+    }, 900);
   }, []);
 
   // NOTE: we deliberately do NOT reconcile the toggle against
@@ -128,14 +153,25 @@ export function VpnSettings() {
     }
   }, []);
 
-  // Patch the store + persist the full object.
+  // Patch the store + persist the full object, then live-apply to an active
+  // session. The kill switch is a live flag push (set_killswitch_live); every
+  // other setting on this screen is tunnel-affecting, so it triggers a debounced
+  // fail-closed rebuild (reapply_vpn_settings). No-op when disconnected.
   const persist = useCallback(
     (patch: Partial<typeof settings>) => {
       const next = { ...useAppStore.getState().settings, ...patch };
       updateSettings(patch);
       saveSettingsToBackend(next);
+
+      if (useAppStore.getState().connectionState === 'connected') {
+        if ('killSwitchEnabled' in patch) {
+          invoke('set_killswitch_live', { enabled: !!patch.killSwitchEnabled }).catch(() => {});
+        } else {
+          scheduleReapply();
+        }
+      }
     },
-    [updateSettings, saveSettingsToBackend],
+    [updateSettings, saveSettingsToBackend, scheduleReapply],
   );
 
   // ── DNS helpers (custom DNS expandable: primary / secondary) ──────────────
@@ -263,6 +299,16 @@ export function VpnSettings() {
             onCheckedChange={(v) => persist({ stealthMode: v })}
             enabled={isOperativeOrAbove}
           />
+          {!isOperativeOrAbove && (
+            <button
+              type="button"
+              onClick={() => pushRoute('pricing')}
+              className="px-3.5 pb-3 pt-0 text-xs font-semibold transition-opacity hover:opacity-80"
+              style={{ color: brand.accent }}
+            >
+              View plans →
+            </button>
+          )}
         </BirdoCard>
 
         <div className="h-2" />
@@ -426,6 +472,7 @@ export function VpnSettings() {
                           ...useAppStore.getState().settings,
                           wireGuardPort: filtered,
                         });
+                        scheduleReapply();
                       }, 500);
                     }
                   }}
@@ -508,6 +555,7 @@ export function VpnSettings() {
                           ...useAppStore.getState().settings,
                           wireGuardMtu: n,
                         });
+                        scheduleReapply();
                       }, 500);
                     }
                   }}
@@ -527,7 +575,11 @@ export function VpnSettings() {
         >
           <Info size={16} color={white.w40} aria-hidden className="shrink-0" />
           <p className="text-xs" style={{ color: white.w60 }}>
-            Changes take effect on the next connection.
+            {reapplying
+              ? 'Applying changes to your live connection…'
+              : connected
+                ? 'Changes apply to your current connection automatically (brief reconnect).'
+                : 'Changes take effect on the next connection.'}
           </p>
         </div>
 

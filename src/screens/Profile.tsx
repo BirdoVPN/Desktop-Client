@@ -15,7 +15,19 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
-import { Star, Gift, LogOut, CheckCircle2 } from 'lucide-react';
+import {
+  Star,
+  Gift,
+  LogOut,
+  CheckCircle2,
+  Copy,
+  Check,
+  Trash2,
+  Download,
+  KeyRound,
+  ShieldAlert,
+  Gauge,
+} from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import {
   BirdoCard,
@@ -56,6 +68,19 @@ function planGradient(plan: string): string {
   }
 }
 
+/**
+ * Anonymous accounts carry a synthetic email `anon_<24-digit-id>@anonymous.local`.
+ * The 24-digit id is the account's ONLY recovery credential. Extract it so the
+ * UI can surface it cleanly + copyably (mirrors mobile) instead of leaking the
+ * raw synthetic email — which reads as a bug.
+ */
+const ANON_EMAIL_RE = /^anon_(\d{24})@anonymous\.local$/i;
+function anonAccountNumber(email: string | null): string | null {
+  if (!email) return null;
+  const m = ANON_EMAIL_RE.exec(email.trim());
+  return m ? m[1] : null;
+}
+
 /** Backend renewal date → plain `yyyy-MM-dd` (mirrors mobile's `formatRenewalDate`). */
 function formatRenewalDate(raw: string | null): string | null {
   const v = (raw ?? '').trim();
@@ -84,8 +109,39 @@ export function Profile() {
   // `userEmail` (set at login). Fall back to userEmail so the identity card can
   // never render "Anonymous" for a logged-in user even if one source is null.
   const resolvedEmail = account.email ?? userEmail ?? null;
+  // Anonymous accounts have no real email; derive the 24-digit recovery id from
+  // the synthetic address so we can surface it cleanly (and never render the raw
+  // `anon_…@anonymous.local` string, which reads as a bug).
+  const accountNumber = anonAccountNumber(resolvedEmail);
+  const isAnon = accountNumber != null;
 
   const [showVoucherDialog, setShowVoucherDialog] = useState(false);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [exportState, setExportState] = useState<'idle' | 'working' | 'done' | 'error'>('idle');
+
+  // GDPR data export (Art. 20). The backend command returns the full JSON blob;
+  // save it via a webview download so the user gets a file with no extra plugin.
+  const handleExportData = useCallback(async () => {
+    if (exportState === 'working') return;
+    setExportState('working');
+    try {
+      const data = await invoke<unknown>('export_user_data');
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'birdo-account-data.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setExportState('done');
+      setTimeout(() => setExportState('idle'), 2500);
+    } catch {
+      setExportState('error');
+      setTimeout(() => setExportState('idle'), 3000);
+    }
+  }, [exportState]);
 
   // Hydrate subscription details (devices / bandwidth / renewal) the same way
   // the Dashboard does. Extracted so a successful voucher redemption can refresh
@@ -103,7 +159,8 @@ export function Profile() {
           expiresAt: sub.expires_at ?? null,
           activeDevices: sub.devices_used ?? 0,
           maxDevices: sub.devices_limit ?? 1,
-          // Backend no longer reports bandwidth usage (always 0).
+          // Live monthly usage is sourced separately by <UsageMeter/> from
+          // get_usage_stats (/vpn/stats); this summary card only needs the cap.
           bandwidthUsed: 0,
           bandwidthLimit: sub.bandwidth_limit ?? 0,
         });
@@ -149,7 +206,9 @@ export function Profile() {
       </div>
 
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
-        <IdentityCard email={resolvedEmail} plan={account.plan} />
+        <IdentityCard email={resolvedEmail} plan={account.plan} isAnon={isAnon} />
+
+        {isAnon && accountNumber && <AccountNumberCard accountNumber={accountNumber} />}
 
         <SubscriptionCard
           plan={account.plan}
@@ -158,6 +217,8 @@ export function Profile() {
           maxDevices={account.maxDevices}
           bandwidthLimit={account.bandwidthLimit}
         />
+
+        <UsageMeter />
 
         {/* ── ACCOUNT ─────────────────────────────────────────────────── */}
         <div className="mt-1">
@@ -170,6 +231,28 @@ export function Profile() {
               leadingTint={brand.accentSoft}
               onClick={() => setShowVoucherDialog(true)}
             />
+            <BirdoNavRow
+              title="Export my data"
+              subtitle={
+                exportState === 'working'
+                  ? 'Preparing your data…'
+                  : exportState === 'done'
+                    ? 'Saved to your downloads'
+                    : exportState === 'error'
+                      ? 'Export failed — try again'
+                      : 'Download all your account data (GDPR)'
+              }
+              leadingIcon={Download}
+              leadingTint={statusTokens.blue}
+              onClick={handleExportData}
+            />
+            <BirdoNavRow
+              title="Delete account"
+              subtitle="Permanently erase your account and data"
+              leadingIcon={Trash2}
+              leadingTint={statusTokens.red}
+              onClick={() => setShowDeleteDialog(true)}
+            />
           </BirdoCard>
         </div>
 
@@ -179,7 +262,7 @@ export function Profile() {
           <BirdoCard padding="0.25rem">
             <BirdoNavRow
               title="Sign out"
-              subtitle={resolvedEmail ?? 'Sign out of this device'}
+              subtitle={isAnon ? 'Anonymous account' : (resolvedEmail ?? 'Sign out of this device')}
               leadingIcon={LogOut}
               leadingTint={statusTokens.red}
               onClick={handleLogout}
@@ -195,6 +278,21 @@ export function Profile() {
             onRedeemed={hydrateSubscription}
           />
         )}
+        {showDeleteDialog && (
+          <DeleteAccountDialog
+            isAnon={isAnon}
+            onDismiss={() => setShowDeleteDialog(false)}
+            onDeleted={async () => {
+              try {
+                await invoke('logout');
+              } catch {
+                /* best effort — account is already gone server-side */
+              }
+              logout();
+              setAuthenticated(false);
+            }}
+          />
+        )}
       </AnimatePresence>
     </div>
   );
@@ -205,13 +303,16 @@ export function Profile() {
 interface IdentityCardProps {
   email: string | null;
   plan: string | null;
+  isAnon: boolean;
 }
 
-function IdentityCard({ email, plan }: IdentityCardProps) {
-  const displayEmail = email ?? 'Anonymous';
-  const name = (email?.split('@')[0] || displayEmail).trim();
+function IdentityCard({ email, plan, isAnon }: IdentityCardProps) {
   const planLabel = plan ?? 'RECON';
-  const initial = (name.charAt(0) || '?').toUpperCase();
+  // Anonymous: show a clean "Anonymous account" name and NO synthetic email
+  // subtitle (the recovery id lives in its own copyable card below).
+  const name = isAnon ? 'Anonymous account' : (email?.split('@')[0] || email || 'Anonymous').trim();
+  const subtitle = isAnon ? 'No email — private account' : (email ?? 'Anonymous');
+  const initial = isAnon ? '·' : (name.charAt(0) || '?').toUpperCase();
 
   return (
     <BirdoCard cornerRadius={22} padding="20px">
@@ -236,12 +337,298 @@ function IdentityCard({ email, plan }: IdentityCardProps) {
             {name}
           </div>
           <div className="truncate text-[13px]" style={{ color: white.w60 }}>
-            {displayEmail}
+            {subtitle}
           </div>
         </div>
         <PlanPill plan={planLabel} />
       </div>
     </BirdoCard>
+  );
+}
+
+// ── Anonymous account-number card (recovery credential) ──────────────────────
+//
+// The 24-digit id is the ONLY way back into an anonymous account. Surface it
+// prominently and copyably (mirrors mobile), with an explicit "save this" note.
+
+function AccountNumberCard({ accountNumber }: { accountNumber: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(accountNumber);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard unavailable — the number is still visible to copy manually */
+    }
+  };
+
+  return (
+    <BirdoCard cornerRadius={20} padding="16px">
+      <div className="flex items-center gap-2">
+        <KeyRound size={16} color={brand.accent} aria-hidden />
+        <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color: white.w60 }}>
+          Account number
+        </span>
+      </div>
+      <button
+        type="button"
+        onClick={copy}
+        className="mt-2.5 flex w-full items-center gap-3 rounded-birdo-sm px-3 py-2.5 text-left transition-colors hover:bg-white/5"
+        style={{ backgroundColor: surface.s2, border: `1px solid ${hairline.soft}` }}
+        aria-label="Copy account number"
+      >
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-[13px] tracking-wide"
+          style={{ color: '#FFFFFF' }}
+        >
+          {accountNumber}
+        </span>
+        {copied ? (
+          <Check size={16} color={statusTokens.green} aria-hidden />
+        ) : (
+          <Copy size={16} color={white.w60} aria-hidden />
+        )}
+      </button>
+      <p className="mt-2 flex items-start gap-1.5 text-[12px]" style={{ color: white.w60 }}>
+        <ShieldAlert size={14} color={statusTokens.yellow} aria-hidden className="mt-0.5 shrink-0" />
+        <span>
+          This is your <strong style={{ color: white.w80 }}>only</strong> way to recover this account.
+          Save it somewhere safe — we can&apos;t reset it.
+        </span>
+      </p>
+    </BirdoCard>
+  );
+}
+
+// ── Data-usage meter ─────────────────────────────────────────────────────────
+//
+// Renders ONLY for a real capped plan (bandwidthLimitGb > 0). Sources live
+// per-user usage from `get_usage_stats` (/vpn/stats); honours the freshness flag
+// so a never-synced node shows "awaiting first sync" rather than a misleading 0.
+
+interface RustUsageStats {
+  plan: string | null;
+  bandwidthLimitGb: number | null;
+  bandwidthUsedGb: number | null;
+  bandwidthPeriodEnd: string | null;
+  bandwidthLastSyncAt: string | null;
+  bandwidthIsFresh: boolean | null;
+}
+
+function UsageMeter() {
+  const [usage, setUsage] = useState<RustUsageStats | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    invoke<RustUsageStats>('get_usage_stats')
+      .then((u) => {
+        if (alive) setUsage(u);
+      })
+      .catch(() => {
+        /* offline / non-fatal — the meter simply doesn't render */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const limit = usage?.bandwidthLimitGb ?? null;
+  // Only capped plans get a meter; an uncapped (null / <=0) limit means unlimited.
+  if (limit == null || limit <= 0) return null;
+
+  const fresh = usage?.bandwidthIsFresh === true;
+  const used = fresh ? Math.max(0, usage?.bandwidthUsedGb ?? 0) : 0;
+  const pct = Math.max(0, Math.min(100, (used / limit) * 100));
+  const left = Math.max(0, limit - used);
+  const resets = formatRenewalDate(usage?.bandwidthPeriodEnd ?? null);
+  const nearCap = pct >= 90;
+
+  return (
+    <BirdoCard cornerRadius={20} padding="18px">
+      <div className="flex items-center gap-2">
+        <Gauge size={16} color={brand.accent} aria-hidden />
+        <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color: white.w60 }}>
+          Data this month
+        </span>
+      </div>
+
+      {fresh ? (
+        <>
+          <div className="mt-2.5 flex items-baseline justify-between">
+            <span className="text-[16px] font-semibold" style={{ color: '#FFFFFF' }}>
+              {used.toFixed(1)} GB
+            </span>
+            <span className="text-[12px]" style={{ color: white.w60 }}>
+              of {limit} GB
+            </span>
+          </div>
+          <div className="mt-2 h-2 w-full overflow-hidden rounded-full" style={{ backgroundColor: surface.s2 }}>
+            <div
+              className="h-full rounded-full transition-all"
+              style={{
+                width: `${pct}%`,
+                backgroundColor: nearCap ? statusTokens.red : brand.accent,
+              }}
+            />
+          </div>
+          <div className="mt-2 flex items-center justify-between text-[12px]" style={{ color: white.w60 }}>
+            <span>{left.toFixed(1)} GB left</span>
+            {resets && <span>Resets {resets}</span>}
+          </div>
+        </>
+      ) : (
+        <p className="mt-2 text-[13px]" style={{ color: white.w60 }}>
+          Usage of your {limit} GB monthly allowance will appear here after your first sync.
+        </p>
+      )}
+    </BirdoCard>
+  );
+}
+
+// ── Delete-account dialog (GDPR Art.17) ──────────────────────────────────────
+//
+// Email/SSO accounts re-confirm with their password (defense-in-depth against a
+// compromised webview). Anonymous accounts have no password, so we require a
+// typed "DELETE" confirmation instead. Backend: delete_account.
+
+function DeleteAccountDialog({
+  isAnon,
+  onDismiss,
+  onDeleted,
+}: {
+  isAnon: boolean;
+  onDismiss: () => void;
+  onDeleted: () => void;
+}) {
+  const [password, setPassword] = useState('');
+  const [confirmText, setConfirmText] = useState('');
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !deleting) onDismiss();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [deleting, onDismiss]);
+
+  const canSubmit = !deleting && (isAnon ? confirmText.trim().toUpperCase() === 'DELETE' : password.length > 0);
+
+  const handleConfirm = async () => {
+    if (!canSubmit) return;
+    setDeleting(true);
+    setError(null);
+    try {
+      // The backend requires a password. Anonymous accounts have none, so we
+      // send the typed confirmation token — the server treats an anonymous
+      // delete as password-less; sending a non-empty value keeps the command
+      // contract satisfied without leaking a real secret.
+      await invoke('delete_account', { request: { password: isAnon ? confirmText.trim() : password } });
+      onDeleted();
+    } catch (e: unknown) {
+      const message =
+        typeof e === 'string' ? e : e instanceof Error ? e.message : 'Could not delete the account.';
+      setError(message);
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <motion.div
+      className="absolute inset-0 z-50 flex items-center justify-center p-5"
+      style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
+      onClick={() => !deleting && onDismiss()}
+    >
+      <motion.div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Delete account"
+        className="w-full max-w-[360px] overflow-hidden rounded-birdo-lg"
+        style={{
+          background: `linear-gradient(${surface.s3}, ${surface.s3}) padding-box, ${gradient.glassStroke} border-box`,
+          border: '1px solid transparent',
+        }}
+        initial={{ scale: 0.94, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.94, opacity: 0 }}
+        transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex flex-col gap-4 p-5">
+          <div className="flex items-center gap-2">
+            <ShieldAlert size={22} color={statusTokens.red} aria-hidden />
+            <h2 className="text-[16px] font-bold" style={{ color: statusTokens.red }}>
+              Delete account
+            </h2>
+          </div>
+          <p className="text-[13px]" style={{ color: white.w60 }}>
+            This permanently erases your account and all associated data. This
+            cannot be undone.
+            {isAnon
+              ? ' Type DELETE below to confirm.'
+              : ' Enter your password to confirm.'}
+          </p>
+          {isAnon ? (
+            <BirdoTextField
+              value={confirmText}
+              onChange={(v) => {
+                setConfirmText(v);
+                if (error) setError(null);
+              }}
+              label="Type DELETE to confirm"
+              type="text"
+              placeholder="DELETE"
+              error={error != null}
+              disabled={deleting}
+              autoComplete="off"
+            />
+          ) : (
+            <BirdoTextField
+              value={password}
+              onChange={(v) => {
+                setPassword(v);
+                if (error) setError(null);
+              }}
+              label="Password"
+              type="password"
+              placeholder="••••••••"
+              error={error != null}
+              disabled={deleting}
+              autoComplete="current-password"
+            />
+          )}
+          {error && (
+            <p className="text-[12px]" style={{ color: statusTokens.red }}>
+              {error}
+            </p>
+          )}
+          <div className="flex gap-2.5">
+            <BirdoButton
+              text="Cancel"
+              variant="secondary"
+              fullWidth
+              disabled={deleting}
+              onClick={onDismiss}
+            />
+            <BirdoButton
+              text={deleting ? 'Deleting…' : 'Delete forever'}
+              variant="danger"
+              fullWidth
+              isLoading={deleting}
+              disabled={!canSubmit}
+              onClick={handleConfirm}
+            />
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
   );
 }
 

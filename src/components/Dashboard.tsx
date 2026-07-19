@@ -34,6 +34,7 @@ import {
   Route as AltRoute,
   Lock,
   EyeOff,
+  Globe,
 } from 'lucide-react';
 import {
   BirdoCard,
@@ -170,10 +171,12 @@ export function Dashboard() {
     setErrorMessage,
     setIsAdmin,
     setVpnIp,
+    vpnIp,
   } = useAppStore(
     useShallow((s) => ({
       connectionState: s.connectionState,
       currentServer: s.currentServer,
+      vpnIp: s.vpnIp,
       servers: s.servers,
       deepLinkAction: s.deepLinkAction,
       favoriteServers: s.favoriteServers,
@@ -498,7 +501,10 @@ export function Dashboard() {
   const handleToggleMultiHop = useCallback(() => {
     if (isConnecting || isDisconnecting) return;
     if (!isSovereign) {
-      showToast('Multi-Hop is a SOVEREIGN feature. Upgrade to enable.');
+      // Route to the plans screen (Multi-Hop is Sovereign) instead of a
+      // dead-end toast — give the upsell an actual destination.
+      showToast('Multi-Hop is a Sovereign feature.');
+      useAppStore.getState().pushRoute('pricing');
       return;
     }
     if (multiHopArmed) {
@@ -571,6 +577,9 @@ export function Dashboard() {
             name: `${entry.city || entry.country} → ${exit.city || exit.country}`,
           });
         }
+        // Apparent public IP = the EXIT node's endpoint (matches mobile's
+        // extractServerIp — the exit is where traffic egresses).
+        setVpnIp(exit?.ipAddress ?? exit?.hostname ?? null);
       } catch (err) {
         setErrorMessage(friendlyVpnError(err));
         setConnectionState('error');
@@ -594,6 +603,7 @@ export function Dashboard() {
     try {
       await invoke<boolean>('connect_vpn', { serverId: target.id });
       setConnectionState('connected');
+      setVpnIp(target.ipAddress ?? target.hostname ?? null);
     } catch (err) {
       setErrorMessage(friendlyVpnError(err));
       setConnectionState('error');
@@ -638,6 +648,7 @@ export function Dashboard() {
       try {
         await invoke<boolean>('connect_vpn', { serverId: s.id });
         setConnectionState('connected');
+        setVpnIp(s.ipAddress ?? s.hostname ?? null);
       } catch (err) {
         setErrorMessage(friendlyVpnError(err));
         setConnectionState('error');
@@ -696,6 +707,7 @@ export function Dashboard() {
       try {
         await invoke<boolean>('connect_vpn', { serverId: target.id });
         setConnectionState('connected');
+        setVpnIp(target.ipAddress ?? target.hostname ?? null);
       } catch (err) {
         setErrorMessage(friendlyVpnError(err));
         setConnectionState('error');
@@ -809,6 +821,18 @@ export function Dashboard() {
                 transition={{ duration: 0.24, delay: 0.08 }}
               >
                 <StatsRow stats={liveStats} />
+                {vpnIp && (
+                  <div
+                    className="mt-2 flex items-center justify-center gap-1.5 text-xs"
+                    style={{ color: white.w60 }}
+                  >
+                    <Globe size={12} aria-hidden />
+                    <span>Public IP</span>
+                    <span className="font-mono" style={{ color: white.w80 }}>
+                      {vpnIp}
+                    </span>
+                  </div>
+                )}
                 <div className="h-2.5" />
               </motion.div>
             )}

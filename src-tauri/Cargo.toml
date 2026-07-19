@@ -1,6 +1,6 @@
 [package]
 name = "birdo-vpn-desktop"
-version = "1.4.17"
+version = "1.4.18"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
 license = "Proprietary"
@@ -23,9 +23,10 @@ tauri-build = { version = "2.0", features = [] }
 # Tauri
 tauri = { version = "2.11.5", features = ["tray-icon"] }
 # Decode the embedded tray PNGs into raw RGBA ourselves (Image::new_owned).
-# NOT tauri's "image-png" feature — that pulls moxcms/pxfm which require the
-# edition2024 Cargo feature / Rust 1.85, incompatible with our pinned 1.83.
-# png 0.17 builds cleanly on 1.83.
+# NOT tauri's "image-png" feature — that pulls the moxcms/pxfm colour chain
+# (edition2024 Cargo feature / Rust 1.85+). That WOULD build now under our 1.96
+# pin, but png 0.17 stays a leaner, known-good decode path we keep to avoid
+# dragging that graph in. png 0.17 builds cleanly on 1.96.
 png = "0.17"
 tauri-plugin-shell = "2.0"
 tauri-plugin-notification = "2.0"
@@ -131,7 +132,7 @@ windows = { version = "0.58", features = [
 wintun = "0.5"
 
 # Registry read for enumerating installed apps (split-tunnel picker). Simple,
-# pure-Rust wrapper over windows-sys; builds on the pinned 1.83 toolchain.
+# pure-Rust wrapper over windows-sys; builds on the pinned 1.96 toolchain.
 winreg = "0.52"
 
 # macOS-specific dependencies
