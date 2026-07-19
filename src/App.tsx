@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ConsentScreen } from '@/components/ConsentScreen';
@@ -79,6 +79,33 @@ function App() {
         }
       })
       .catch(() => setBioLock('open'));
+  }, []);
+
+  // Re-arm the biometric lock when the app is hidden to the tray and re-prompt
+  // when it returns. Without this the opt-in lock only guarded the cold start —
+  // close-to-tray then reopen left the authenticated UI one tray-click away for
+  // anyone at the machine. Mirrors mobile's onStop re-arm + onResume re-prompt.
+  // (Keyed off hide-to-tray, not plain blur, so alt-tabbing never re-locks.)
+  const bioLockRef = useRef(bioLock);
+  bioLockRef.current = bioLock;
+  useEffect(() => {
+    const unlistenHidden = listen('app-hidden', async () => {
+      try {
+        const st = await invoke<{ available: boolean; enabled: boolean }>(
+          'check_biometric_available'
+        );
+        if (st?.available && st?.enabled) setBioLock('locked');
+      } catch {
+        /* non-fatal — leave current lock state */
+      }
+    });
+    const unlistenShown = listen('app-shown', () => {
+      if (bioLockRef.current === 'locked') requestBiometricUnlock();
+    });
+    return () => {
+      unlistenHidden.then((fn) => fn()).catch(() => {});
+      unlistenShown.then((fn) => fn()).catch(() => {});
+    };
   }, []);
 
   // Apply the saved window-position preference (corner anchor / draggable).
@@ -176,33 +203,43 @@ function App() {
     };
   }, []);
 
-  // Listen for birdo:// deep link events from the Rust backend
-  useEffect(() => {
-    const unlisten = listen<string>('deep-link', (event) => {
-      const url = event.payload;
-      try {
-        const parsed = new URL(url);
-        const action = parsed.hostname;
-        const path = parsed.pathname.replace(/^\//, '');
+  // Parse and route a birdo:// deep link. Shared by the runtime event listener
+  // and the cold-start path (a URL the app was launched with).
+  const handleDeepLinkUrl = useCallback((url: string) => {
+    try {
+      const parsed = new URL(url);
+      const action = parsed.hostname;
+      const path = parsed.pathname.replace(/^\//, '');
 
-        if (action === 'connect' && path) {
-          // birdo://connect/<server-id>
-          // Validate: allow only alphanumeric, dashes, underscores, max 64 chars
-          if (!/^[a-zA-Z0-9_-]{1,64}$/.test(path)) return;
-          // Ensure the Home tab is foregrounded so Dashboard handles the connect.
-          useAppStore.getState().setTab('home');
-          useAppStore.getState().setDeepLinkAction({ action: 'connect', serverId: path });
-        } else if (action === 'settings') {
-          // birdo://settings → route to the Settings tab (router refactor).
-          useAppStore.getState().setTab('settings');
-          useAppStore.getState().setDeepLinkAction({ action: 'settings' });
-        }
-      } catch {
-        // Malformed deep-link URL — ignore silently
+      if (action === 'connect' && path) {
+        // birdo://connect/<server-id>
+        // Validate: allow only alphanumeric, dashes, underscores, max 64 chars
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(path)) return;
+        // Ensure the Home tab is foregrounded so Dashboard handles the connect.
+        useAppStore.getState().setTab('home');
+        useAppStore.getState().setDeepLinkAction({ action: 'connect', serverId: path });
+      } else if (action === 'settings') {
+        // birdo://settings → route to the Settings tab (router refactor).
+        useAppStore.getState().setTab('settings');
+        useAppStore.getState().setDeepLinkAction({ action: 'settings' });
       }
-    });
-    return () => { unlisten.then((fn) => fn()).catch(() => {}); };
+    } catch {
+      // Malformed deep-link URL — ignore silently
+    }
   }, []);
+
+  // Listen for birdo:// deep link events from the Rust backend, and pull any
+  // link the app was cold-launched with (Windows delivers that via launch argv,
+  // which the runtime listener never sees).
+  useEffect(() => {
+    const unlisten = listen<string>('deep-link', (event) => handleDeepLinkUrl(event.payload));
+    invoke<string | null>('take_pending_deep_link')
+      .then((url) => {
+        if (url) handleDeepLinkUrl(url);
+      })
+      .catch(() => {});
+    return () => { unlisten.then((fn) => fn()).catch(() => {}); };
+  }, [handleDeepLinkUrl]);
 
   if (initializing || bioLock === 'checking') {
     return (

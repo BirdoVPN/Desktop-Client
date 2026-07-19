@@ -7,8 +7,12 @@
 //! Emits connectivity state changes that the auto-reconnect module
 //! uses to pause/resume reconnection attempts.
 //!
-//! NOTE: Public API is exposed but not yet wired to `auto_reconnect.rs`.
-//! Suppress dead-code warnings until the integration ticket lands.
+//! Wired into `auto_reconnect.rs`: the health-check loop subscribes to this
+//! monitor so an offline machine does not burn its finite reconnect budget (and
+//! then tear down the kill switch) while it was never going to succeed, and
+//! reconnects promptly when connectivity returns. A couple of pure accessors
+//! (`current`, `stop`) are retained for completeness though not every call site
+//! uses them, so keep the module-level dead-code allowance.
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,22 +112,29 @@ impl NetworkMonitor {
     }
 }
 
-/// Probe connectivity by attempting DNS resolution of well-known hosts.
-/// Uses multiple resolvers to avoid single-point failures.
+/// Probe connectivity with a real TCP handshake to well-known anycast resolvers
+/// on :443. Uses multiple IPs to avoid single-point failures.
+///
+/// Deliberately NOT a DNS lookup: `lookup_host("1.1.1.1:443")` parses an IP
+/// literal and returns instantly WITHOUT touching the network, so it would
+/// report "online" even with the cable unplugged. A TCP connect is a genuine
+/// reachability test. It also works while the kill-switch block-all is active:
+/// the connect originates in THIS process (which the block permits by
+/// ALE_APP_ID), whereas a getaddrinfo lookup would be serviced by the DNS Client
+/// service — a different process — and denied, which would falsely read as
+/// "offline" and deadlock the reconnect pause. No user data crosses the probe.
 async fn check_connectivity() -> bool {
-    use tokio::net::lookup_host;
+    use tokio::net::TcpStream;
     use tokio::time::timeout;
 
-    // Bound each lookup so a non-responsive DNS / blackhole route cannot hang
-    // the check indefinitely. Keeps the check interval and stop() responsive.
-    const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+    // Bound each connect so a blackhole route cannot hang the check. Keeps the
+    // check interval and stop() responsive.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-    let probes = ["birdo.app:443", "1.1.1.1:443", "9.9.9.9:443"];
+    let probes = ["1.1.1.1:443", "9.9.9.9:443", "8.8.8.8:443"];
     for probe in probes {
-        match timeout(LOOKUP_TIMEOUT, lookup_host(probe)).await {
-            Ok(Ok(_)) => return true,
-            Ok(Err(_)) => {}
-            Err(_) => {} // lookup timed out; try next probe
+        if let Ok(Ok(_stream)) = timeout(CONNECT_TIMEOUT, TcpStream::connect(probe)).await {
+            return true;
         }
     }
     false

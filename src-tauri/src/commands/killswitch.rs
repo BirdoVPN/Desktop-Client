@@ -210,6 +210,52 @@ pub async fn deactivate_killswitch() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Live-apply a kill-switch preference change to the CURRENT session.
+///
+/// The Settings toggle persists the preference via `save_settings`, but that only
+/// takes effect at the next connect (arm() reads it there). Without this, a user
+/// who connects with the kill switch OFF and toggles it ON mid-session would see
+/// the toggle ON while WFP was never initialized and `KILLSWITCH_ENABLED` stayed
+/// false — so an unexpected drop would NOT fail closed. This mirrors mobile,
+/// which pushes the flag into the running service live.
+///
+/// The frontend persists the preference first, then calls this. Behaviour:
+/// - enabled=true, session active  → arm now (init WFP + set intent; activate
+///   immediately in lockdown mode).
+/// - enabled=false, session active → clear the intent so a later drop won't
+///   block, and lift any block currently active; WFP stays initialized and the
+///   disconnect path fully cleans up.
+/// - no active session → no-op; the persisted preference applies at next connect.
+#[tauri::command]
+pub async fn set_killswitch_live(
+    enabled: bool,
+    app: AppHandle,
+    vpn_manager: State<'_, VpnManager>,
+) -> Result<bool, String> {
+    let state = vpn_manager.get_state().await;
+    let active = state.is_tunnel_active() || state.can_disconnect();
+    if !active {
+        tracing::debug!("set_killswitch_live: no active session — applies at next connect");
+        return Ok(false);
+    }
+
+    if enabled {
+        // arm() re-reads the (already-persisted) preference and initializes WFP,
+        // engaging the reactive protection for the live session.
+        arm(&app).await
+    } else {
+        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+        #[cfg(target_os = "windows")]
+        {
+            if wfp::is_blocking() {
+                let _ = deactivate_killswitch().await;
+            }
+        }
+        tracing::info!("Kill switch softened live for the active session (intent cleared)");
+        Ok(true)
+    }
+}
+
 /// Get kill switch status
 /// SEC-C3 FIX: Active state now reads from wfp.rs (single source of truth)
 #[tauri::command]

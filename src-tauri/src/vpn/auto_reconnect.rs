@@ -8,8 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::AppHandle;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio::time::{interval, timeout};
+
+use super::network_monitor::{ConnectivityState, NetworkMonitor};
 
 // FIX-1-1: Client-side keygen for auto-reconnect
 use base64::Engine as _;
@@ -102,6 +104,12 @@ pub struct AutoReconnectService {
 
     /// STATE-FIX: When true, the user explicitly disconnected — do NOT auto-reconnect.
     user_disconnected: Arc<AtomicBool>,
+
+    /// Network connectivity watcher. The reconnect loop consults this so it does
+    /// not consume the retry budget (or trip the give-up branch that tears down
+    /// the kill switch) while the machine simply has no network — and reconnects
+    /// promptly when connectivity returns.
+    network_monitor: Arc<NetworkMonitor>,
 }
 
 impl AutoReconnectService {
@@ -118,6 +126,7 @@ impl AutoReconnectService {
             shutdown_tx: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             user_disconnected: Arc::new(AtomicBool::new(false)),
+            network_monitor: Arc::new(NetworkMonitor::new()),
         }
     }
 
@@ -183,6 +192,18 @@ impl AutoReconnectService {
         tracing::debug!("Stored reconnect info for: {}", server_name_log);
     }
 
+    /// The server the current session is bound to: (server_id, multi_hop_exit).
+    /// `multi_hop_exit` is Some only for a multi-hop session. Used by
+    /// `reapply_vpn_settings` to rebuild the live tunnel to the same target with
+    /// freshly-changed settings. None when there is no active session on record.
+    pub async fn current_target(&self) -> Option<(String, Option<String>)> {
+        self.last_reconnect_info
+            .read()
+            .await
+            .as_ref()
+            .map(|i| (i.server_id.clone(), i.multi_hop_exit_node_id.clone()))
+    }
+
     /// Clear stored config (called on intentional disconnect)
     pub async fn clear_last_config(&self) {
         *self.last_reconnect_info.write().await = None;
@@ -214,6 +235,11 @@ impl AutoReconnectService {
         *self.shutdown_tx.write().await = Some(shutdown_tx);
         self.running.store(true, Ordering::SeqCst);
 
+        // Start (idempotently) the connectivity monitor and hand a receiver to the
+        // loop. Cheap 5s in-process TCP probe; it runs for the app's lifetime.
+        self.network_monitor.start();
+        let connectivity_rx = self.network_monitor.subscribe();
+
         let config = Arc::clone(&self.config);
         let vpn_manager = Arc::clone(&self.vpn_manager);
         let last_reconnect_info = Arc::clone(&self.last_reconnect_info);
@@ -235,6 +261,7 @@ impl AutoReconnectService {
                 is_reconnecting,
                 running,
                 user_disconnected,
+                connectivity_rx,
                 shutdown_rx,
             )
             .await;
@@ -266,10 +293,15 @@ impl AutoReconnectService {
         is_reconnecting: Arc<AtomicBool>,
         running: Arc<AtomicBool>,
         user_disconnected: Arc<AtomicBool>,
+        connectivity_rx: watch::Receiver<ConnectivityState>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         // Import killswitch here to avoid circular module dependency at struct level
         use crate::commands::killswitch;
+
+        // Tracks the previous connectivity reading so an Offline->Online edge can
+        // reset the reconnect budget for a prompt retry when the network returns.
+        let mut was_offline = false;
 
         let check_interval = config.read().await.health_check_interval_ms;
         let mut interval = interval(Duration::from_millis(check_interval));
@@ -312,6 +344,19 @@ impl AutoReconnectService {
 
                     let state = vpn_manager.get_state().await;
                     let cfg = config.read().await.clone();
+
+                    // Network awareness (read once per tick). On an Offline->Online
+                    // edge, reset the retry budget so a machine that was merely
+                    // offline reconnects promptly with a full budget rather than
+                    // resuming near an exhausted count. `Unknown` (monitor warming
+                    // up, ~5s) is treated as online so behaviour is unchanged when
+                    // no reading is available yet.
+                    let connectivity = *connectivity_rx.borrow();
+                    if was_offline && connectivity == ConnectivityState::Online {
+                        tracing::info!("Network connectivity restored — resetting reconnect budget");
+                        attempt_count.store(0, Ordering::SeqCst);
+                    }
+                    was_offline = connectivity == ConnectivityState::Offline;
 
                     match state {
                         ConnectionState::Connected => {
@@ -486,6 +531,31 @@ impl AutoReconnectService {
                             // Check if we should auto-reconnect
                             if cfg.enabled && info_snapshot.is_some() {
                                 let attempts = attempt_count.load(Ordering::SeqCst);
+
+                                // Network-aware pause: while the machine is offline a
+                                // reconnect cannot succeed. Keep failing closed (kill
+                                // switch stays active) but do NOT consume the retry
+                                // budget or advance toward the give-up branch that
+                                // would tear the kill switch down. Wait for the
+                                // network to return (which resets the budget above).
+                                if connectivity == ConnectivityState::Offline {
+                                    if let Err(e) = killswitch::activate_killswitch().await {
+                                        tracing::warn!(
+                                            "Kill switch activation during offline pause failed: {}",
+                                            e
+                                        );
+                                    }
+                                    is_reconnecting.store(true, Ordering::SeqCst);
+                                    let _ = vpn_manager
+                                        .set_state(ConnectionState::Reconnecting {
+                                            attempt: attempts + 1,
+                                        })
+                                        .await;
+                                    tracing::debug!(
+                                        "Auto-reconnect paused — no network connectivity; waiting"
+                                    );
+                                    continue;
+                                }
 
                                 if cfg.max_attempts == 0 || attempts < cfg.max_attempts {
                                     // Trigger reconnect
@@ -764,6 +834,28 @@ impl AutoReconnectService {
                                     attempts + 1
                                 );
 
+                                // Network-aware pause (same rationale as the
+                                // Disconnected arm): don't recover / consume budget
+                                // while offline; stay failed closed and wait.
+                                if connectivity == ConnectivityState::Offline {
+                                    if let Err(e) = killswitch::activate_killswitch().await {
+                                        tracing::warn!(
+                                            "Kill switch activation during offline pause failed: {}",
+                                            e
+                                        );
+                                    }
+                                    is_reconnecting.store(true, Ordering::SeqCst);
+                                    let _ = vpn_manager
+                                        .set_state(ConnectionState::Reconnecting {
+                                            attempt: attempts + 1,
+                                        })
+                                        .await;
+                                    tracing::debug!(
+                                        "Error recovery paused — no network connectivity; waiting"
+                                    );
+                                    continue;
+                                }
+
                                 if cfg.max_attempts == 0 || attempts < cfg.max_attempts {
                                     // SECURITY FIX (PB-4): Handle kill switch activation failure.
                                     // If kill switch fails during error recovery, abort to prevent leak.
@@ -967,6 +1059,7 @@ impl Clone for AutoReconnectService {
             shutdown_tx: Arc::clone(&self.shutdown_tx),
             running: Arc::clone(&self.running),
             user_disconnected: Arc::clone(&self.user_disconnected),
+            network_monitor: Arc::clone(&self.network_monitor),
         }
     }
 }

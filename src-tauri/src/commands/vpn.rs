@@ -977,6 +977,69 @@ pub async fn quick_connect(
     Ok(true)
 }
 
+/// Live-reapply tunnel-affecting settings to the ACTIVE session (mobile parity).
+///
+/// Desktop used to read custom DNS / MTU / port / stealth / quantum / LAN only
+/// at connect time, so a change while connected did nothing until the user
+/// manually reconnected (the UI even said "takes effect on the next
+/// connection"). Mobile rebuilds the live tunnel as one debounced ~2s
+/// fail-closed blip; this mirrors that.
+///
+/// The frontend persists the change via `save_settings` first, then calls this
+/// (debounced). We rebuild by re-running the SAME fully-tested connect
+/// orchestration for the currently-connected target — `apply_vpn_settings`
+/// re-reads the fresh settings and `vpn_manager.connect()` disconnect-firsts, so
+/// no parallel, never-exercised rebuild path is introduced. The kill-switch
+/// block is activated first so the brief tear-down/bring-up window cannot leak.
+///
+/// Returns Ok(false) when there is no active session (nothing to reapply — the
+/// persisted change already applies at the next connect).
+#[tauri::command]
+pub async fn reapply_vpn_settings(
+    app: AppHandle,
+    api: State<'_, BirdoApi>,
+    vpn_manager: State<'_, VpnManager>,
+    credentials: State<'_, CredentialStore>,
+    auto_reconnect: State<'_, AutoReconnectService>,
+) -> Result<bool, String> {
+    let state = vpn_manager.get_state().await;
+    if !(matches!(state, ConnectionState::Connected) || state.is_tunnel_active()) {
+        tracing::debug!("reapply_vpn_settings: no active session — applies at next connect");
+        return Ok(false);
+    }
+
+    let Some((server_id, multi_hop_exit)) = auto_reconnect.current_target().await else {
+        tracing::warn!("reapply_vpn_settings: no stored target — cannot rebuild");
+        return Ok(false);
+    };
+
+    // Fail closed across the rebuild blip: keep the block-all active while the old
+    // tunnel is torn down and the new one comes up. No-op if the kill switch is
+    // disabled by preference.
+    if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+        tracing::warn!("Kill switch activation before settings reapply failed: {}", e);
+    }
+
+    tracing::info!("Reapplying VPN settings — rebuilding tunnel to {}", server_id);
+
+    // Reuse the tested connect path with the freshly-persisted settings.
+    match multi_hop_exit {
+        Some(exit_id) => {
+            crate::commands::vpn_multi_hop::connect_multi_hop(
+                server_id,
+                exit_id,
+                app,
+                api,
+                vpn_manager,
+                credentials,
+                auto_reconnect,
+            )
+            .await
+        }
+        None => connect_vpn(server_id, app, api, vpn_manager, credentials, auto_reconnect).await,
+    }
+}
+
 /// Parse the endpoint IP from a "host:port" string.
 /// Returns None if the host part is not a valid IPv4 address (e.g. a hostname).
 pub(crate) fn parse_endpoint_ip(endpoint: &str) -> Option<std::net::Ipv4Addr> {
@@ -1012,6 +1075,29 @@ pub async fn get_subscription_status(
     api.get_subscription()
         .await
         .map_err(|e| sanitize_error(&format!("Failed to get subscription: {}", e)))
+}
+
+/// Get per-user monthly bandwidth usage + cap for the data-usage meter.
+/// Distinct from `get_vpn_stats` (local live-tunnel throughput counters).
+#[tauri::command]
+pub async fn get_usage_stats(
+    api: State<'_, BirdoApi>,
+    credentials: State<'_, CredentialStore>,
+) -> Result<crate::api::types::UsageStats, String> {
+    if !api.is_authenticated().await {
+        if let Ok(tokens) = credentials.get_tokens() {
+            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
+        }
+    }
+
+    if !api.is_authenticated().await {
+        return Err("Not authenticated. Please log in first.".to_string());
+    }
+
+    api.get_usage_stats()
+        .await
+        .map_err(|e| sanitize_error(&format!("Failed to get usage stats: {}", e)))
 }
 
 // Multi-hop and port forwarding commands extracted to vpn_multi_hop.rs and vpn_port_forward.rs

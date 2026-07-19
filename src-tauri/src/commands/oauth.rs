@@ -23,7 +23,7 @@ use base64::Engine as _;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tauri::State;
+use tauri::{Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -202,6 +202,14 @@ pub async fn native_oauth_login(
     // 5. Anti-CSRF: the state we sent must come back unchanged.
     if returned_state != state {
         return Err("Sign-in could not be verified (state mismatch).".into());
+    }
+
+    // The browser now holds focus; bring our window back to the foreground so the
+    // user lands in the app after signing in rather than behind the browser.
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
     }
 
     // 6. Exchange the handoff code (+ our verifier) for real tokens.

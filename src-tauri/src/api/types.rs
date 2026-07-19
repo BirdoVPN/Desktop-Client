@@ -256,6 +256,43 @@ pub struct AnonymousLoginRequest {
     pub device_id: String,
 }
 
+/// Per-user monthly bandwidth usage + cap (backend GET /vpn/stats), for the
+/// data-usage meter. All bandwidth fields are nullable: a plan with no cap, or a
+/// node that has never synced usage, leaves them null so the UI can show
+/// "unlimited" / "awaiting first sync" instead of a misleading 0.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageStats {
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(rename = "bandwidthLimitGb", default)]
+    pub bandwidth_limit_gb: Option<f64>,
+    #[serde(rename = "bandwidthUsedGb", default)]
+    pub bandwidth_used_gb: Option<f64>,
+    #[serde(rename = "bandwidthPeriodEnd", default)]
+    pub bandwidth_period_end: Option<String>,
+    #[serde(rename = "bandwidthLastSyncAt", default)]
+    pub bandwidth_last_sync_at: Option<String>,
+    #[serde(rename = "bandwidthIsFresh", default)]
+    pub bandwidth_is_fresh: Option<bool>,
+}
+
+/// In-app anonymous account creation (native clients). Body is device info only;
+/// the server generates the 24-digit ID (matches backend DeviceInfoSchema — all
+/// fields optional). Reuses `AnonymousLoginResult` for the response shape
+/// ({ ok, anonymousId, tokens }).
+#[derive(Debug, Serialize)]
+pub struct AnonymousRegisterRequest {
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    #[serde(rename = "deviceName", skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(rename = "deviceType")]
+    pub device_type: String,
+    pub platform: String,
+    #[serde(rename = "appVersion", skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+}
+
 /// Anonymous login response. Success = { ok, anonymousId, tokens }; accounts
 /// with 2FA enabled instead return { requiresTwoFactor, challengeToken }.
 #[derive(Debug, Deserialize)]

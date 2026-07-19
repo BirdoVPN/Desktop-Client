@@ -27,6 +27,42 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use vpn::{AutoReconnectService, VpnManager};
 
+/// A birdo:// URL captured from the launch argv at cold start, held until the
+/// frontend has mounted its "deep-link" listener and pulls it via
+/// `take_pending_deep_link`. Emitting the event at `setup()` time would be lost
+/// because the webview's listener is not attached until React mounts.
+#[derive(Default)]
+struct PendingDeepLink(std::sync::Mutex<Option<String>>);
+
+/// Frontend calls this once on mount to retrieve (and clear) any deep link the
+/// app was launched with. Returns None on a normal launch.
+#[tauri::command]
+fn take_pending_deep_link(pending: tauri::State<'_, PendingDeepLink>) -> Option<String> {
+    pending.0.lock().ok().and_then(|mut g| g.take())
+}
+
+/// Bring the main window back to the foreground (tray click, "Show", quick
+/// actions, deep link, single-instance relaunch, post-SSO). Emits "app-shown"
+/// so the biometric app-lock can re-challenge after a close-to-tray.
+fn restore_and_focus(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("app-shown", ());
+    }
+}
+
+/// Surface the window and hand a birdo:// URL to the frontend router. Shared by
+/// the runtime deep-link listener and the cold-start path.
+fn deliver_deep_link(app: &tauri::AppHandle, url: &str) {
+    info!("Deep link received: {}", url);
+    restore_and_focus(app);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("deep-link", url);
+    }
+}
+
 fn main() {
     // Set custom panic hook for crash recovery
     setup_panic_hook();
@@ -191,6 +227,15 @@ fn main() {
     }
 
     tauri::Builder::default()
+        // MUST be the first plugin. A VPN client must never run twice — a second
+        // process would fight the first over the WFP filters and the tunnel
+        // adapter. On a relaunch we surface the existing window instead; the
+        // "deep-link" feature auto-forwards any birdo:// argv to this instance's
+        // deep-link handler (fixing warm-start deep links on Windows).
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            info!("Second instance launch intercepted — focusing the running window");
+            restore_and_focus(app);
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
@@ -206,6 +251,7 @@ fn main() {
         .manage(CredentialStore)
         .manage(VpnManager::new())
         .manage(crate::vpn::xray::XrayManager::new())
+        .manage(PendingDeepLink::default())
         .setup(|app| {
             info!("Setting up Birdo VPN application...");
 
@@ -260,20 +306,22 @@ fn main() {
                         app.exit(0);
                     }
                     "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        restore_and_focus(app);
                     }
                     "connect" => {
                         info!("Quick connect triggered from tray");
-                        // Emit event to frontend
+                        // Surface the window first so the action is never silent —
+                        // the connect executor (Dashboard) only exists once the user
+                        // is past the login / consent / biometric-lock screens, and
+                        // the tray click previously did nothing visible there.
+                        restore_and_focus(app);
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.emit("tray-quick-connect", ());
                         }
                     }
                     "disconnect" => {
                         info!("Disconnect triggered from tray");
+                        restore_and_focus(app);
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.emit("tray-disconnect", ());
                         }
@@ -287,11 +335,7 @@ fn main() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        restore_and_focus(tray.app_handle());
                     }
                 })
                 .build(app)?;
@@ -313,7 +357,9 @@ fn main() {
                 }
             }
 
-            // Listen for deep link events (birdo:// protocol)
+            // Runtime deep links (birdo:// protocol) while the app is running.
+            // On Windows these arrive via the single-instance "deep-link" feature
+            // forwarding the second-launch argv into this instance.
             let handle = app.handle().clone();
             app.listen("deep-link://new-url", move |event| {
                 if let Some(urls) = event
@@ -321,14 +367,27 @@ fn main() {
                     .strip_prefix('"')
                     .and_then(|s| s.strip_suffix('"'))
                 {
-                    info!("Deep link received: {}", urls);
-                    if let Some(window) = handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                        let _ = window.emit("deep-link", urls);
-                    }
+                    deliver_deep_link(&handle, urls);
                 }
             });
+
+            // Cold start: if the app was launched *by* a birdo:// URL, the runtime
+            // listener above never fires (the URL arrives as launch argv, not an
+            // event). Capture it and stash it for the frontend to pull on mount —
+            // emitting now would be lost since the webview listener isn't attached
+            // yet. Fixes deep links that were silently dropped on a cold Windows
+            // launch.
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    if let Some(first) = urls.into_iter().next() {
+                        info!("Launch deep link captured: {}", first);
+                        if let Ok(mut g) = app.state::<PendingDeepLink>().0.lock() {
+                            *g = Some(first.to_string());
+                        }
+                    }
+                }
+            }
 
             info!("Birdo VPN Client initialized successfully");
             Ok(())
@@ -338,6 +397,9 @@ fn main() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 // FIX: Use non-panicking hide — window may already be destroyed
                 let _ = window.hide();
+                // Re-arm the biometric app-lock: closing to tray must not leave the
+                // authenticated UI one tray-click away for anyone at the machine.
+                let _ = window.emit("app-hidden", ());
                 api.prevent_close();
             }
         })
@@ -345,6 +407,7 @@ fn main() {
             // Authentication
             commands::auth::login,
             commands::auth::login_anonymous,
+            commands::auth::register_anonymous,
             commands::oauth::native_oauth_login, // native Google/GitHub SSO
             commands::auth::logout,
             commands::auth::get_auth_state,
@@ -357,6 +420,7 @@ fn main() {
             commands::vpn::get_vpn_status,
             commands::vpn::get_vpn_stats,
             commands::vpn::quick_connect,
+            commands::vpn::reapply_vpn_settings,
             commands::vpn::get_admin_status,
             // Server management
             commands::servers::get_servers,
@@ -373,12 +437,14 @@ fn main() {
             commands::killswitch::enable_killswitch,
             commands::killswitch::disable_killswitch,
             commands::killswitch::get_killswitch_status,
+            commands::killswitch::set_killswitch_live,
             // Split Tunneling
             commands::split_tunnel::list_installed_apps,
             // Auto-updater
             commands::updater::get_app_version,
             // Extended VPN info
             commands::vpn::get_subscription_status,
+            commands::vpn::get_usage_stats,
             // Multi-Hop (Double VPN)
             commands::vpn_multi_hop::get_multi_hop_routes,
             commands::vpn_multi_hop::connect_multi_hop,
@@ -394,6 +460,8 @@ fn main() {
             commands::biometric::check_biometric_available,
             commands::biometric::set_biometric_enabled,
             commands::biometric::authenticate_biometric,
+            // Deep link captured at cold start
+            take_pending_deep_link,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

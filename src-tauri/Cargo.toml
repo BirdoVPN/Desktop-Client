@@ -33,6 +33,11 @@ tauri-plugin-autostart = "2.0"
 tauri-plugin-updater = "2.0"
 tauri-plugin-deep-link = "2.0"
 tauri-plugin-dialog = "2.0"  # Native file picker for split-tunnel .exe selection
+# Single-instance guard: a VPN client must never run twice (a 2nd process would
+# fight the first over the WFP filters / tunnel adapter). The single-instance
+# callback also forwards a birdo:// deep-link argv to the already-running
+# instance on Windows, where a fresh process would otherwise be spawned.
+tauri-plugin-single-instance = { version = "2.0", features = ["deep-link"] }
 
 # Async runtime
 tokio = { version = "1.41", features = ["full"] }

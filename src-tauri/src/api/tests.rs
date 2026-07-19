@@ -406,6 +406,51 @@ mod types_serialization_tests {
         assert_eq!(status.devices_used, 2);
         assert_eq!(status.bandwidth_limit, Some(10737418240));
     }
+
+    /// The in-app anonymous-registration body must serialize with the exact
+    /// camelCase keys the backend's DeviceInfoSchema expects.
+    #[test]
+    fn anonymous_register_request_serializes_camel_case() {
+        let req = AnonymousRegisterRequest {
+            device_id: "dev-123".to_string(),
+            device_name: Some("Birdo PC".to_string()),
+            device_type: "DESKTOP".to_string(),
+            platform: "WINDOWS".to_string(),
+            app_version: Some("1.4.18".to_string()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["deviceId"], "dev-123");
+        assert_eq!(v["deviceName"], "Birdo PC");
+        assert_eq!(v["deviceType"], "DESKTOP");
+        assert_eq!(v["platform"], "WINDOWS");
+        assert_eq!(v["appVersion"], "1.4.18");
+    }
+
+    /// The /vpn/stats usage payload must deserialize, and its bandwidth fields
+    /// must stay nullable — a plan with no cap / a node that never synced leaves
+    /// them null so the UI can show "unlimited" / "awaiting first sync" rather
+    /// than a misleading 0.
+    #[test]
+    fn usage_stats_deserializes_with_nullable_bandwidth() {
+        let full = r#"{
+            "plan": "RECON", "status": "ACTIVE",
+            "bandwidthLimitGb": 10.0, "bandwidthUsedGb": 3.5,
+            "bandwidthPeriodEnd": "2026-08-01T00:00:00Z",
+            "bandwidthLastSyncAt": "2026-07-19T12:00:00Z",
+            "bandwidthIsFresh": true
+        }"#;
+        let s: UsageStats = serde_json::from_str(full).unwrap();
+        assert_eq!(s.bandwidth_limit_gb, Some(10.0));
+        assert_eq!(s.bandwidth_used_gb, Some(3.5));
+        assert_eq!(s.bandwidth_is_fresh, Some(true));
+
+        // Unlimited plan / never-synced node: bandwidth fields absent or null.
+        let sparse = r#"{ "plan": "SOVEREIGN", "bandwidthLimitGb": null }"#;
+        let s2: UsageStats = serde_json::from_str(sparse).unwrap();
+        assert_eq!(s2.bandwidth_limit_gb, None);
+        assert_eq!(s2.bandwidth_used_gb, None);
+        assert_eq!(s2.bandwidth_is_fresh, None);
+    }
 }
 
 #[cfg(test)]
