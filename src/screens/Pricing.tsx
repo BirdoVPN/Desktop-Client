@@ -112,7 +112,8 @@ export function Pricing() {
     useShallow((s) => ({ account: s.account, popRoute: s.popRoute })),
   );
   const currentPlan = normalizePlan(account.plan);
-  const [period, setPeriod] = useState<BillingPeriod>('monthly');
+  // Default to yearly (matches mobile) so the discounted annual price leads.
+  const [period, setPeriod] = useState<BillingPeriod>('yearly');
 
   const openBilling = () => openExternal(`${DASHBOARD_URL}/billing`);
 

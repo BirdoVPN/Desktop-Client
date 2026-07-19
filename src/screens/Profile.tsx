@@ -13,6 +13,7 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-shell';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -27,6 +28,7 @@ import {
   KeyRound,
   ShieldAlert,
   Gauge,
+  CreditCard,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import {
@@ -96,15 +98,17 @@ function formatRenewalDate(raw: string | null): string | null {
 }
 
 export function Profile() {
-  const { account, userEmail, setAccount, logout, setAuthenticated } = useAppStore(
+  const { account, userEmail, setAccount, logout, setAuthenticated, pushRoute } = useAppStore(
     useShallow((s) => ({
       account: s.account,
       userEmail: s.userEmail,
       setAccount: s.setAccount,
       logout: s.logout,
       setAuthenticated: s.setAuthenticated,
+      pushRoute: s.pushRoute,
     }))
   );
+  const isFreeTier = (account.plan ?? 'RECON').toUpperCase() === 'RECON';
   // The signed-in email is mirrored in both `account.email` and the top-level
   // `userEmail` (set at login). Fall back to userEmail so the identity card can
   // never render "Anonymous" for a logged-in user even if one source is null.
@@ -224,6 +228,19 @@ export function Profile() {
         <div className="mt-1">
           <BirdoSectionHeader title="Account" />
           <BirdoCard padding="0.25rem">
+            <BirdoNavRow
+              title={isFreeTier ? 'View plans & pricing' : 'Manage subscription'}
+              subtitle={isFreeTier ? 'Compare plans and upgrade' : 'Billing is managed on the web'}
+              leadingIcon={CreditCard}
+              leadingTint={brand.accent}
+              onClick={
+                isFreeTier
+                  ? () => pushRoute('pricing')
+                  : () => {
+                      void open('https://dashboard.birdo.app/billing').catch(() => {});
+                    }
+              }
+            />
             <BirdoNavRow
               title="Redeem voucher"
               subtitle="Activate a 30 / 90-day code"
@@ -665,14 +682,24 @@ function SubscriptionCard({
   bandwidthLimit,
 }: SubscriptionCardProps) {
   const planLabel = plan ?? 'RECON';
+  // Friendly display name — mobile shows "Free" for RECON, not the raw code.
+  const planDisplay =
+    planLabel.toUpperCase() === 'RECON'
+      ? 'Free'
+      : planLabel.charAt(0).toUpperCase() + planLabel.slice(1).toLowerCase();
   const isActive = accountStatus === 'active';
   const endsAtFormatted = formatRenewalDate(expiresAt);
 
-  const subtitle = endsAtFormatted
-    ? `Renews ${endsAtFormatted}`
-    : isActive
-    ? 'Active subscription'
-    : 'Free tier — upgrade for premium';
+  // Three-way (mirrors mobile): only an ACTIVE sub "Renews"; a cancelled/expired
+  // sub with an end date shows "Access until" (calling it "Renews" would be a lie).
+  const subtitle =
+    endsAtFormatted && isActive
+      ? `Renews ${endsAtFormatted}`
+      : endsAtFormatted
+        ? `Access until ${endsAtFormatted}`
+        : isActive
+          ? 'Active subscription'
+          : 'Free tier — upgrade for premium';
 
   return (
     <BirdoCard cornerRadius={20} padding="18px">
@@ -689,7 +716,7 @@ function SubscriptionCard({
               className="truncate text-[16px] font-semibold"
               style={{ color: '#FFFFFF' }}
             >
-              {planLabel} plan
+              {planDisplay} plan
             </div>
             <div className="truncate text-[12px]" style={{ color: white.w60 }}>
               {subtitle}

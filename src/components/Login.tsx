@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
-import { ShieldCheck, UserRound, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
+import { ShieldCheck, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { BirdoBadge, BirdoButton, BirdoTextField, AppIconMark } from './birdo';
 import { gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
@@ -31,7 +31,7 @@ function friendlyError(raw: unknown): string {
   return msg.length > 120 ? `${msg.slice(0, 120)}…` : msg;
 }
 
-type AuthTab = 'email' | 'anonymous';
+type AuthTab = 'email' | 'anonymous' | 'sso';
 
 interface LoginResponse {
   success: boolean;
@@ -236,9 +236,10 @@ export function Login() {
     setError(null);
   };
 
-  const tabs: { id: AuthTab; label: string; icon: React.ReactNode }[] = [
-    { id: 'email', label: 'Email', icon: <KeyRound size={14} /> },
-    { id: 'anonymous', label: 'Anonymous', icon: <UserRound size={14} /> },
+  const tabs: { id: AuthTab; label: string }[] = [
+    { id: 'email', label: 'Email' },
+    { id: 'anonymous', label: 'Anonymous' },
+    { id: 'sso', label: 'SSO' },
   ];
 
   const ErrorBanner = ({ message }: { message: string }) => (
@@ -283,7 +284,7 @@ export function Login() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: motionTokens.emphasis, delay: 0.06 }}
           >
-            <AppIconMark mark size={84} />
+            <AppIconMark mark size={72} />
           </motion.div>
 
           {/* Status badge */}
@@ -464,7 +465,7 @@ export function Login() {
                         setActiveTab(tab.id);
                         setError(null);
                       }}
-                      className="flex flex-1 items-center justify-center gap-1.5 rounded-birdo-sm py-2 text-xs font-medium transition-all"
+                      className="flex flex-1 items-center justify-center rounded-birdo-sm py-2 text-xs font-medium transition-all"
                       style={{
                         backgroundColor: active ? white.w10 : 'transparent',
                         color: active ? white.w100 : white.w60,
@@ -473,7 +474,6 @@ export function Login() {
                           : 'none',
                       }}
                     >
-                      {tab.icon}
                       {tab.label}
                     </button>
                   );
@@ -485,7 +485,7 @@ export function Login() {
                   <motion.form
                     key="email-form"
                     onSubmit={handleLogin}
-                    className="flex min-h-[200px] flex-col gap-4"
+                    className="flex min-h-[200px] flex-col gap-3"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -543,7 +543,7 @@ export function Login() {
                       e.preventDefault();
                       handleAnonymousLogin();
                     }}
-                    className="flex min-h-[200px] flex-col gap-4"
+                    className="flex min-h-[200px] flex-col gap-3"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -605,55 +605,66 @@ export function Login() {
                     />
                   </motion.form>
                 )}
+
+                {activeTab === 'sso' && (
+                  <motion.div
+                    key="sso-form"
+                    className="flex min-h-[200px] flex-col justify-center gap-3"
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: 10 }}
+                    transition={{ duration: motionTokens.fast }}
+                  >
+                    <p className="text-center text-sm text-w40">
+                      Continue with your Google or GitHub account — no password needed.
+                    </p>
+                    {error && <ErrorBanner message={error} />}
+                    <BirdoButton
+                      type="button"
+                      text="Continue with Google"
+                      onClick={() => handleSsoLogin('google')}
+                      variant="secondary"
+                      size="large"
+                      fullWidth
+                      disabled={isLoading}
+                      ariaLabel="Continue with Google"
+                    />
+                    <BirdoButton
+                      type="button"
+                      text="Continue with GitHub"
+                      onClick={() => handleSsoLogin('github')}
+                      variant="secondary"
+                      size="large"
+                      fullWidth
+                      disabled={isLoading}
+                      ariaLabel="Continue with GitHub"
+                    />
+                  </motion.div>
+                )}
               </AnimatePresence>
 
-              {/* Native SSO — sign in with Google/GitHub via the system browser,
-                  no password required. */}
-              <div className="mt-5 flex items-center gap-3" aria-hidden="true">
-                <span className="h-px flex-1" style={{ background: hairline.soft }} />
-                <span className="text-xs text-w40">or continue with</span>
-                <span className="h-px flex-1" style={{ background: hairline.soft }} />
-              </div>
-              <div className="mt-4 flex flex-col gap-2.5">
-                <BirdoButton
-                  type="button"
-                  text="Continue with Google"
-                  onClick={() => handleSsoLogin('google')}
-                  variant="secondary"
-                  size="large"
-                  fullWidth
-                  disabled={isLoading}
-                  ariaLabel="Continue with Google"
-                />
-                <BirdoButton
-                  type="button"
-                  text="Continue with GitHub"
-                  onClick={() => handleSsoLogin('github')}
-                  variant="secondary"
-                  size="large"
-                  fullWidth
-                  disabled={isLoading}
-                  ariaLabel="Continue with GitHub"
-                />
-              </div>
-
-              <motion.p
-                className="mt-6 text-center text-sm text-w60"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ duration: motionTokens.emphasis, delay: 0.3 }}
-              >
-                Don&apos;t have an account?{' '}
-                <button
-                  type="button"
-                  onClick={() => {
-                    open('https://auth.birdo.app/login').catch(() => {});
-                  }}
-                  className="font-medium text-w100 underline-offset-2 transition hover:text-w80 hover:underline"
+              {/* Register prompt — hidden on the Anonymous tab (the Create button
+                  is right there, so a "register" link is redundant/misleading),
+                  matching mobile. SSO auto-creates an account, so it's kept there. */}
+              {activeTab !== 'anonymous' && (
+                <motion.p
+                  className="mt-5 text-center text-sm text-w60"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: motionTokens.emphasis, delay: 0.3 }}
                 >
-                  Register at birdo.app
-                </button>
-              </motion.p>
+                  Don&apos;t have an account?{' '}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      open('https://auth.birdo.app/login').catch(() => {});
+                    }}
+                    className="font-medium text-w100 underline-offset-2 transition hover:text-w80 hover:underline"
+                  >
+                    Register at birdo.app
+                  </button>
+                </motion.p>
+              )}
             </>
           )}
         </motion.div>

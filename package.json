@@ -1,6 +1,6 @@
 {
   "name": "birdo-vpn-desktop",
-  "version": "1.4.18",
+  "version": "1.4.19",
   "type": "module",
   "description": "Birdo VPN Desktop Client (Windows & macOS)",
   "private": true,
