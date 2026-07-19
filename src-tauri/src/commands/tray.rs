@@ -26,8 +26,9 @@ pub struct TrayMenuItems {
 
 /// Decode an embedded PNG (RGBA, as emitted by `tauri icon`) into a Tauri
 /// `Image`. Uses the `png` crate directly so we avoid tauri's `image-png`
-/// feature (which pulls edition2024 deps incompatible with the pinned 1.83
-/// toolchain). Returns an owned image so it can outlive the byte slice.
+/// feature (the moxcms/pxfm colour chain); png 0.17 stays the leaner, known-good
+/// decode path on the pinned 1.96 toolchain. Returns an owned image so it can
+/// outlive the byte slice.
 pub fn load_tray_image(bytes: &[u8]) -> Result<Image<'static>, String> {
     let decoder = png::Decoder::new(bytes);
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;

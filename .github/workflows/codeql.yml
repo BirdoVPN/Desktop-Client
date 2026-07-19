@@ -5,7 +5,7 @@ name: "CodeQL Security Scan"
 # core). Results show up under the repo's Security → Code scanning tab.
 #
 # build-mode: none — CodeQL extracts source without a full compile, so the Rust
-# scan does NOT need the GTK/WebKit system libraries or the pinned 1.83 toolchain
+# scan does NOT need the GTK/WebKit system libraries or the pinned 1.96 toolchain
 # (those would make the analysis job slow + flaky). This trades a little depth
 # for a reliable, dependency-free scan.
 

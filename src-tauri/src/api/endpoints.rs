@@ -7,6 +7,10 @@
 pub mod auth {
     pub const LOGIN_DESKTOP: &str = "/auth/login/desktop";
     pub const LOGIN_ANONYMOUS: &str = "/auth/login/anonymous";
+    /// In-app anonymous account creation for native clients: the server mints a
+    /// fresh 24-digit ID and returns tokens (signed in immediately). Requires the
+    /// X-Desktop-Client header (sent on all POSTs).
+    pub const REGISTER_ANONYMOUS: &str = "/auth/register/anonymous";
     /// Native SSO handoff exchange: swap the web broker's single-use PKCE-bound
     /// code (delivered to our loopback redirect) for real tokens.
     pub const NATIVE_EXCHANGE: &str = "/auth/native/exchange";
@@ -45,6 +49,9 @@ pub mod vpn {
     pub const MULTI_HOP_ROUTES: &str = "/vpn/multi-hop/routes";
     pub const MULTI_HOP_CONNECT: &str = "/vpn/multi-hop/connect";
     pub const PORT_FORWARDS: &str = "/vpn/port-forwards";
+    /// Per-user monthly bandwidth usage + cap for the data-usage meter (distinct
+    /// from local live-tunnel throughput). Backend GET /vpn/stats.
+    pub const USAGE_STATS: &str = "/vpn/stats";
 
     /// Percent-encodes a single path segment for defense-in-depth.
     ///

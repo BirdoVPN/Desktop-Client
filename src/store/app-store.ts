@@ -74,7 +74,8 @@ export type TabId = 'profile' | 'home' | 'settings';
 export type RouteId =
   | 'vpnSettings'
   | 'splitTunnel'
-  | 'portForward';
+  | 'portForward'
+  | 'pricing';
 
 export interface AppSettings {
   killSwitchEnabled: boolean;

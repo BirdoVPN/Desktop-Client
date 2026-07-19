@@ -371,6 +371,12 @@ impl BirdoApi {
         self.get(endpoints::users::SUBSCRIPTION, true).await
     }
 
+    /// Get per-user monthly bandwidth usage + cap for the data-usage meter.
+    /// Distinct from `get_vpn_stats` (local live-tunnel throughput).
+    pub async fn get_usage_stats(&self) -> Result<super::types::UsageStats, ApiError> {
+        self.get(endpoints::vpn::USAGE_STATS, true).await
+    }
+
     /// Redeem a voucher code (30/90-day time-extension). Authenticated.
     /// On an invalid/used/expired code the backend returns a non-2xx status,
     /// which surfaces here as an `ApiError` for the command layer to map.
@@ -404,6 +410,41 @@ impl BirdoApi {
 
         let result: AnonymousLoginResult = self
             .post(endpoints::auth::LOGIN_ANONYMOUS, &payload, false)
+            .await?;
+
+        if let Some(ref tokens) = result.tokens {
+            self.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+                .await;
+        }
+
+        Ok(result)
+    }
+
+    /// Create a BRAND-NEW anonymous account in-app (native clients). The server
+    /// mints the 24-digit ID and returns tokens, so the app is signed in
+    /// immediately — the no-email privacy path without a website round-trip.
+    /// Requires the X-Desktop-Client header, which `do_request` adds to all POSTs.
+    pub async fn register_anonymous(
+        &self,
+        device_id: &str,
+        device_name: Option<String>,
+    ) -> Result<AnonymousLoginResult, ApiError> {
+        let payload = crate::api::types::AnonymousRegisterRequest {
+            device_id: device_id.to_string(),
+            device_name,
+            device_type: "DESKTOP".to_string(),
+            platform: match std::env::consts::OS {
+                "windows" => "WINDOWS",
+                "macos" => "MACOS",
+                "linux" => "LINUX",
+                _ => "UNKNOWN",
+            }
+            .to_string(),
+            app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        };
+
+        let result: AnonymousLoginResult = self
+            .post(endpoints::auth::REGISTER_ANONYMOUS, &payload, false)
             .await?;
 
         if let Some(ref tokens) = result.tokens {

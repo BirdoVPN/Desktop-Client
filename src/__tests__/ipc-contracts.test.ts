@@ -2,14 +2,25 @@
  * L-10: IPC contract integration test scaffold
  *
  * These tests verify that the frontend's invoke() calls match the
- * Rust #[tauri::command] signatures. They use the shared Tauri mock
- * to ensure invoke is called with the correct command names and
- * argument shapes.
+ * Rust #[tauri::command] signatures.
+ *
+ * Two layers:
+ *  1. The per-command describe blocks below exercise the invoke() call
+ *     SHAPES (command name + argument object) against the shared Tauri mock.
+ *  2. The "command registry cross-check" block at the bottom reads the real
+ *     Rust `generate_handler!` list out of src-tauri/src/main.rs and asserts
+ *     every command the frontend invokes is actually registered there. That
+ *     turns this file from a mock-only tautology into a genuine cross-language
+ *     contract: a frontend invoke('foo') whose #[tauri::command] was never
+ *     wired into generate_handler! now fails CI instead of only blowing up at
+ *     runtime with "command foo not found".
  *
  * Run: npx vitest run src/__tests__/ipc-contracts.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
+import { readFileSync, existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 // Auto-mock via __mocks__/@tauri-apps/api/core.ts
 vi.mock('@tauri-apps/api/core');
@@ -258,4 +269,170 @@ describe('IPC Contract: Vouchers', () => {
       "couldn't find",
     );
   });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// REAL contract cross-check: frontend invoke() names ⊆ Rust generate_handler!
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Command names the frontend calls via invoke(). Keep this in sync whenever a
+ * new invoke() call site is added — every entry MUST have a matching
+ * #[tauri::command] registered in src-tauri/src/main.rs's generate_handler!
+ * block, or the call rejects at runtime with "command <name> not found".
+ *
+ * (This is the SSOT the old tests lacked: previously each test only proved the
+ * mock echoed back whatever name it was handed — it could never catch a
+ * command that the Rust side never registered.)
+ */
+const FRONTEND_COMMANDS = [
+  // Authentication
+  'login',
+  'login_anonymous',
+  'register_anonymous',
+  'native_oauth_login',
+  'logout',
+  'get_auth_state',
+  'verify_2fa',
+  'delete_account',
+  'export_user_data',
+  // VPN operations
+  'connect_vpn',
+  'disconnect_vpn',
+  'get_vpn_status',
+  'get_vpn_stats',
+  'quick_connect',
+  'reapply_vpn_settings',
+  'get_admin_status',
+  // Server management
+  'get_servers',
+  'ping_server',
+  // Settings
+  'get_settings',
+  'save_settings',
+  'set_autostart',
+  // System tray / window
+  'set_tray_state',
+  'set_window_position',
+  // Kill switch
+  'enable_killswitch',
+  'disable_killswitch',
+  'get_killswitch_status',
+  'set_killswitch_live',
+  // Split tunneling
+  'list_installed_apps',
+  // Auto-updater
+  'get_app_version',
+  // Extended VPN info
+  'get_subscription_status',
+  'get_usage_stats',
+  // Multi-hop (Double VPN)
+  'get_multi_hop_routes',
+  'connect_multi_hop',
+  // Port forwarding
+  'get_port_forwards',
+  'create_port_forward',
+  'delete_port_forward',
+  // Vouchers
+  'redeem_voucher',
+  // Speed test
+  'run_speed_test_command',
+  // Biometric (Windows Hello)
+  'check_biometric_available',
+  'set_biometric_enabled',
+  'authenticate_biometric',
+  // Deep link captured at cold start
+  'take_pending_deep_link',
+] as const;
+
+/**
+ * Parse the Rust `generate_handler![ ... ]` list in src-tauri/src/main.rs and
+ * return the registered command idents (the last `::` path segment of each
+ * entry). Reads from disk — vitest runs under Node, so node:fs is available
+ * even in the jsdom test environment. vitest runs from the repo root (its
+ * config's include globs are root-relative), so resolve from process.cwd();
+ * fall back to a short upward walk in case a runner starts elsewhere.
+ */
+function resolveMainRs(): string {
+  const rel = 'src-tauri/src/main.rs';
+  let dir = process.cwd();
+  for (let i = 0; i < 6; i++) {
+    const candidate = resolve(dir, rel);
+    if (existsSync(candidate)) return candidate;
+    const parent = resolve(dir, '..');
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Last resort: return the cwd-relative path so readFileSync throws a clear
+  // ENOENT naming the path it looked for, rather than failing silently.
+  return resolve(process.cwd(), rel);
+}
+
+function loadRegisteredCommands(): string[] {
+  const src = readFileSync(resolveMainRs(), 'utf8');
+
+  const marker = 'generate_handler![';
+  const start = src.indexOf(marker);
+  if (start === -1) {
+    throw new Error('generate_handler![ block not found in main.rs');
+  }
+  const from = start + marker.length;
+  const end = src.indexOf(']', from);
+  if (end === -1) {
+    throw new Error('generate_handler![ block was not terminated in main.rs');
+  }
+
+  const commands: string[] = [];
+  for (const rawLine of src.slice(from, end).split('\n')) {
+    // Drop `// ...` line comments before tokenising.
+    const line = rawLine.replace(/\/\/.*$/, '');
+    for (const token of line.split(',')) {
+      const entry = token.trim();
+      if (!entry) continue;
+      // `commands::auth::login` -> `login`; a bare `take_pending_deep_link`
+      // stays as-is.
+      const ident = entry.split('::').pop()!.trim();
+      if (/^[a-z_][a-z0-9_]*$/.test(ident)) {
+        commands.push(ident);
+      }
+    }
+  }
+  return commands;
+}
+
+describe('IPC Contract: command registry cross-check (frontend ↔ Rust)', () => {
+  const registered = loadRegisteredCommands();
+  const registeredSet = new Set(registered);
+
+  it('parses a non-trivial command set from main.rs generate_handler!', () => {
+    // Guards the parser itself: if extraction silently returned nothing (the
+    // block was renamed/moved), every ⊆ assertion below would vacuously pass.
+    expect(registered.length).toBeGreaterThan(20);
+  });
+
+  it('registers no command twice in generate_handler!', () => {
+    const duplicates = registered.filter(
+      (cmd, i) => registered.indexOf(cmd) !== i,
+    );
+    expect(duplicates).toEqual([]);
+  });
+
+  it('every registered command is a valid snake_case ident', () => {
+    const invalid = registered.filter((cmd) => !/^[a-z_][a-z0-9_]*$/.test(cmd));
+    expect(invalid).toEqual([]);
+  });
+
+  it('the frontend command list has no duplicates', () => {
+    const duplicates = FRONTEND_COMMANDS.filter(
+      (cmd, i) => FRONTEND_COMMANDS.indexOf(cmd) !== i,
+    );
+    expect(duplicates).toEqual([]);
+  });
+
+  it.each(FRONTEND_COMMANDS)(
+    "frontend command '%s' is registered in main.rs generate_handler!",
+    (cmd) => {
+      expect(registeredSet.has(cmd)).toBe(true);
+    },
+  );
 });

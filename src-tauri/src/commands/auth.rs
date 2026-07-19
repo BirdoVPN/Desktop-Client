@@ -426,6 +426,88 @@ impl Drop for AnonymousLoginCommandRequest {
     }
 }
 
+/// Create a BRAND-NEW anonymous account in-app and sign in.
+///
+/// Desktop could previously only LOG IN to an existing 24-digit anonymous ID;
+/// creating one forced the user out to the website. Mobile can create one in
+/// app (registerAnonymous). This closes that parity gap: the server mints the
+/// ID and returns tokens, so the app is signed in immediately. The returned
+/// 24-digit ID is the account's ONLY recovery credential — the frontend must
+/// surface it prominently ("save this") before proceeding.
+#[tauri::command]
+pub async fn register_anonymous(
+    api: State<'_, BirdoApi>,
+    credentials: State<'_, CredentialStore>,
+) -> Result<LoginResponse, String> {
+    // Same client-side rate limit as login (compromised-webview guard). The
+    // backend also enforces a strict per-IP creation cap.
+    {
+        let mut guard = LOGIN_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
+        let attempts = guard.get_or_insert_with(Vec::new);
+        let now = Instant::now();
+        attempts.retain(|t| now.duration_since(*t).as_secs() < LOGIN_WINDOW_SECS);
+        if attempts.len() >= MAX_LOGIN_ATTEMPTS {
+            return Ok(LoginResponse {
+                success: false,
+                message: Some("Too many attempts. Please wait a minute.".to_string()),
+                user: None,
+                requires_two_factor: false,
+                challenge_token: None,
+            });
+        }
+        attempts.push(now);
+    }
+
+    let device_id = crate::utils::get_device_id();
+    tracing::info!("Anonymous account creation requested");
+
+    match api
+        .register_anonymous(&device_id, Some(crate::commands::vpn::get_device_name()))
+        .await
+    {
+        Ok(result) if result.ok => {
+            if let Some(ref tokens) = result.tokens {
+                if let Err(e) =
+                    credentials.store_tokens(&tokens.access_token, &tokens.refresh_token)
+                {
+                    tracing::warn!("Failed to persist new anonymous credentials: {}", e);
+                }
+            }
+            tracing::info!("Anonymous account created and signed in");
+            Ok(LoginResponse {
+                success: true,
+                message: None,
+                user: Some(UserInfo {
+                    // account_id carries the 24-digit ID for the "save this" step.
+                    email: None,
+                    account_id: result.anonymous_id.clone(),
+                    plan: "RECON".to_string(),
+                    is_anonymous: true,
+                }),
+                requires_two_factor: false,
+                challenge_token: None,
+            })
+        }
+        Ok(_) => Ok(LoginResponse {
+            success: false,
+            message: Some("Could not create an anonymous account. Please try again.".to_string()),
+            user: None,
+            requires_two_factor: false,
+            challenge_token: None,
+        }),
+        Err(e) => {
+            tracing::warn!("Anonymous account creation failed: {}", e);
+            Ok(LoginResponse {
+                success: false,
+                message: Some(e.to_string()),
+                user: None,
+                requires_two_factor: false,
+                challenge_token: None,
+            })
+        }
+    }
+}
+
 /// Login to an existing anonymous account with its 24-digit ID
 #[tauri::command]
 pub async fn login_anonymous(

@@ -165,3 +165,57 @@ jobs:
 
       - name: Unit tests
         run: npm run test:run
+
+  # Version-consistency gate. The app version is declared in THREE places:
+  # package.json, src-tauri/tauri.conf.json, and src-tauri/Cargo.toml
+  # ([package] version). The in-app updater matches installed-vs-release by
+  # exact string, so any drift ships a client that either can't self-update or
+  # loops re-installing. Fail the build the moment they disagree. Node is the
+  # repo's lingua franca — it parses the two JSON files natively and we pull
+  # [package].version out of the TOML with a scoped regex (no TOML dep needed).
+  version-consistency:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Assert package.json / tauri.conf.json / Cargo.toml versions match
+        shell: bash
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          const conf = JSON.parse(
+            fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'),
+          ).version;
+
+          // Extract the [package] table's `version = "..."` from Cargo.toml,
+          // scoped to that table so a dependency's `version = ...` can't match.
+          const toml = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          const pkgTable = toml
+            .split(/^\[/m)
+            .find((s) => s.startsWith('package]'));
+          const m = pkgTable && pkgTable.match(/^\s*version\s*=\s*"([^"]+)"/m);
+          const cargo = m ? m[1] : undefined;
+
+          const versions = {
+            'package.json': pkg,
+            'src-tauri/tauri.conf.json': conf,
+            'src-tauri/Cargo.toml [package]': cargo,
+          };
+          console.log('Detected versions:', JSON.stringify(versions, null, 2));
+
+          const unique = [...new Set(Object.values(versions))];
+          if (unique.length !== 1 || !unique[0]) {
+            console.error(
+              '::error::App version strings disagree across sources of truth: ' +
+                JSON.stringify(versions),
+            );
+            process.exit(1);
+          }
+          console.log('OK — all version strings match: ' + unique[0]);
+          EOF
