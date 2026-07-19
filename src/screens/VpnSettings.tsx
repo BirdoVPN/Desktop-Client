@@ -158,10 +158,13 @@ export function VpnSettings() {
   // other setting on this screen is tunnel-affecting, so it triggers a debounced
   // fail-closed rebuild (reapply_vpn_settings). No-op when disconnected.
   const persist = useCallback(
-    (patch: Partial<typeof settings>) => {
+    async (patch: Partial<typeof settings>) => {
       const next = { ...useAppStore.getState().settings, ...patch };
       updateSettings(patch);
-      saveSettingsToBackend(next);
+      // AWAIT the persist before any live-apply: set_killswitch_live -> arm()
+      // re-reads killswitch_enabled from disk, so arming ON must not race the
+      // write (else it reads the stale value and silently doesn't arm).
+      await saveSettingsToBackend(next);
 
       if (useAppStore.getState().connectionState === 'connected') {
         if ('killSwitchEnabled' in patch) {
