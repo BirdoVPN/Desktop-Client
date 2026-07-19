@@ -39,10 +39,11 @@ import {
   BirdoToggleRow,
   BirdoNavRow,
   BirdoTextField,
+  BirdoButton,
 } from '@/components/birdo';
 import { useAppStore } from '@/store/app-store';
 import { settingsToRust, isValidPort, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
-import { white, status, brand, motion as motionTokens } from '@/lib/birdo-theme';
+import { white, status, brand, surface, gradient, motion as motionTokens } from '@/lib/birdo-theme';
 
 export function VpnSettings() {
   const { settings, updateSettings, popRoute, pushRoute, account, connectionState } = useAppStore(
@@ -88,6 +89,9 @@ export function VpnSettings() {
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reapplyDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [reapplying, setReapplying] = useState(false);
+  // Disabling the kill switch removes leak protection — gate it behind an
+  // explicit confirmation (mobile parity). Enabling stays immediate.
+  const [showKsConfirm, setShowKsConfirm] = useState(false);
 
   useEffect(() => {
     return () => {
@@ -281,7 +285,12 @@ export function VpnSettings() {
             leadingIcon={Shield}
             leadingTint={status.green}
             checked={settings.killSwitchEnabled}
-            onCheckedChange={(v) => persist({ killSwitchEnabled: v })}
+            onCheckedChange={(v) => {
+              // Enabling is immediate; disabling removes leak protection, so
+              // require an explicit confirmation first (mobile parity).
+              if (v) persist({ killSwitchEnabled: true });
+              else setShowKsConfirm(true);
+            }}
           />
         </BirdoCard>
 
@@ -611,6 +620,67 @@ export function VpnSettings() {
           />
         </BirdoCard>
       </div>
+
+      <AnimatePresence>
+        {showKsConfirm && (
+          <motion.div
+            className="absolute inset-0 z-50 flex items-center justify-center p-5"
+            style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
+            onClick={() => setShowKsConfirm(false)}
+          >
+            <motion.div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Disable kill switch"
+              className="w-full max-w-[340px] overflow-hidden rounded-birdo-lg"
+              style={{
+                background: `linear-gradient(${surface.s3}, ${surface.s3}) padding-box, ${gradient.glassStroke} border-box`,
+                border: '1px solid transparent',
+              }}
+              initial={{ scale: 0.94, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.94, opacity: 0 }}
+              transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex flex-col gap-4 p-5">
+                <div className="flex items-center gap-2">
+                  <Shield size={20} color={status.red} aria-hidden />
+                  <h2 className="text-[16px] font-bold" style={{ color: '#FFFFFF' }}>
+                    Disable kill switch?
+                  </h2>
+                </div>
+                <p className="text-[13px]" style={{ color: white.w60 }}>
+                  Without the kill switch, your internet keeps flowing in the clear
+                  if the VPN drops — apps can leak your real IP. Leave it on unless
+                  you have a specific reason to turn it off.
+                </p>
+                <div className="flex gap-2.5">
+                  <BirdoButton
+                    text="Keep it on"
+                    variant="secondary"
+                    fullWidth
+                    onClick={() => setShowKsConfirm(false)}
+                  />
+                  <BirdoButton
+                    text="Turn off"
+                    variant="danger"
+                    fullWidth
+                    onClick={() => {
+                      setShowKsConfirm(false);
+                      persist({ killSwitchEnabled: false });
+                    }}
+                  />
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
