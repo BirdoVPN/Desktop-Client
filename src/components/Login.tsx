@@ -262,8 +262,14 @@ export function Login() {
     // login content (opaque bg-birdo-s0 here was hiding the animated backdrop).
     <div className="flex h-full flex-col">
       {/* Brand now lives in the window TitleBar — no duplicate header here. */}
-      {/* ── Centered phone column ── */}
-      <div className="flex flex-1 flex-col items-center justify-center px-8">
+      {/* ── Centered phone column ──
+          Scrollable: on the fixed 380x640 non-resizable window the auth content
+          (tabs + form + SSO buttons + register link) can exceed the height. The
+          outer scrolls; `min-h-full` keeps it centered when it fits and lets it
+          grow (so the SSO buttons at the bottom are always reachable) when it
+          doesn't. Without this the SSO section was clipped below the fold. */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="flex min-h-full flex-col items-center justify-center px-8 py-6">
         <motion.div
           className="w-full max-w-sm"
           initial={{ opacity: 0, y: 20 }}
@@ -272,7 +278,7 @@ export function Login() {
         >
           {/* Brand mark */}
           <motion.div
-            className="mb-5 flex justify-center"
+            className="mb-3 flex justify-center"
             initial={{ opacity: 0, y: 16 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: motionTokens.emphasis, delay: 0.06 }}
@@ -282,7 +288,7 @@ export function Login() {
 
           {/* Status badge */}
           <motion.div
-            className="mb-6 flex justify-center"
+            className="mb-4 flex justify-center"
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: motionTokens.emphasis, delay: 0.1 }}
@@ -307,7 +313,7 @@ export function Login() {
           </motion.h2>
 
           <motion.p
-            className="mb-7 text-center text-sm text-w40"
+            className="mb-5 text-center text-sm text-w40"
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: motionTokens.emphasis, delay: 0.2 }}
@@ -479,7 +485,7 @@ export function Login() {
                   <motion.form
                     key="email-form"
                     onSubmit={handleLogin}
-                    className="flex min-h-[232px] flex-col gap-4"
+                    className="flex min-h-[200px] flex-col gap-4"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -537,7 +543,7 @@ export function Login() {
                       e.preventDefault();
                       handleAnonymousLogin();
                     }}
-                    className="flex min-h-[232px] flex-col gap-4"
+                    className="flex min-h-[200px] flex-col gap-4"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -651,6 +657,7 @@ export function Login() {
             </>
           )}
         </motion.div>
+        </div>
       </div>
     </div>
   );
