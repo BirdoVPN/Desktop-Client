@@ -655,7 +655,7 @@ export function Login() {
                           type="button"
                           text="Continue with Google"
                           onClick={() => handleSsoLogin('google')}
-                          variant="secondary"
+                          variant="brand"
                           size="large"
                           fullWidth
                           disabled={isLoading}
@@ -665,7 +665,7 @@ export function Login() {
                           type="button"
                           text="Continue with GitHub"
                           onClick={() => handleSsoLogin('github')}
-                          variant="secondary"
+                          variant="brand"
                           size="large"
                           fullWidth
                           disabled={isLoading}
