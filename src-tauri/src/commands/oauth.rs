@@ -37,8 +37,55 @@ const OAUTH_WEB_BASE: &str = "https://birdo.app";
 /// How long to wait for the user to finish in the browser before giving up.
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(300);
 
-const RESPONSE_OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<!doctype html><meta charset=utf-8><title>Birdo VPN</title><body style=\"font-family:system-ui;background:#0a0a0a;color:#e5e5e5;display:grid;place-items:center;height:100vh;margin:0\"><div style=\"text-align:center\"><h2>Signed in to Birdo VPN</h2><p>You can close this window and return to the app.</p></div>";
-const RESPONSE_ERR: &str = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nMissing sign-in code. You can close this window.";
+// Branded loopback pages shown in the system browser after the SSO round-trip.
+// Fully self-contained (inline CSS + inline SVG, no external resources) because
+// the loopback closes immediately after serving them — nothing else can load.
+const RESPONSE_OK: &str = concat!(
+    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+    r##"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Signed in · Birdo VPN</title><style>
+:root{color-scheme:dark}*{margin:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px;color:#e9ebea;background:#060707;background:radial-gradient(1100px 720px at 50% -12%,#0c1c16 0%,#060707 62%)}
+.card{position:relative;width:100%;max-width:390px;text-align:center;padding:46px 34px 34px;border-radius:24px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.08);box-shadow:0 30px 80px -28px rgba(0,0,0,.75);overflow:hidden}
+.card::before{content:"";position:absolute;inset:0 0 auto 0;height:2px;background:linear-gradient(90deg,transparent,#10b981,transparent);opacity:.7}
+.badge{position:relative;width:80px;height:80px;margin:0 auto 26px;border-radius:50%;display:grid;place-items:center;background:rgba(5,150,105,.15);border:1px solid rgba(16,185,129,.5);box-shadow:0 0 0 7px rgba(16,185,129,.06),0 12px 30px -10px rgba(16,185,129,.45);animation:pop .55s cubic-bezier(.2,.9,.3,1.35) both}
+.badge svg{width:38px;height:38px;fill:none;stroke:#10b981;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.badge path{stroke-dasharray:30;stroke-dashoffset:30;animation:draw .5s .28s ease forwards}
+h1{font-size:23px;font-weight:700;letter-spacing:-.015em;margin-bottom:11px}
+p{font-size:14.5px;line-height:1.55;color:rgba(233,235,234,.62)}
+.foot{margin-top:28px;padding-top:18px;border-top:1px solid rgba(255,255,255,.06);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(233,235,234,.36)}
+.foot b{color:#10b981;font-weight:800}
+@keyframes pop{0%{transform:scale(.5);opacity:0}70%{transform:scale(1.07)}100%{transform:scale(1);opacity:1}}
+@keyframes draw{to{stroke-dashoffset:0}}
+@media(prefers-reduced-motion:reduce){.badge{animation:none}.badge path{animation:none;stroke-dashoffset:0}.card::before{opacity:.4}}
+</style></head><body><main class=card>
+<div class=badge><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></div>
+<h1>Signed in to Birdo VPN</h1>
+<p>You&rsquo;re all set. You can close this tab and head back to the app &mdash; it&rsquo;s already signing you in.</p>
+<div class=foot><b>Birdo</b> VPN &middot; secure by default</div>
+</main></body></html>"##
+);
+const RESPONSE_ERR: &str = concat!(
+    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+    r##"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign-in problem · Birdo VPN</title><style>
+:root{color-scheme:dark}*{margin:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px;color:#e9ebea;background:#060707;background:radial-gradient(1100px 720px at 50% -12%,#241605 0%,#060707 62%)}
+.card{position:relative;width:100%;max-width:390px;text-align:center;padding:46px 34px 34px;border-radius:24px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.08);box-shadow:0 30px 80px -28px rgba(0,0,0,.75);overflow:hidden}
+.card::before{content:"";position:absolute;inset:0 0 auto 0;height:2px;background:linear-gradient(90deg,transparent,#f59e0b,transparent);opacity:.7}
+.badge{width:80px;height:80px;margin:0 auto 26px;border-radius:50%;display:grid;place-items:center;background:rgba(245,158,11,.14);border:1px solid rgba(245,158,11,.5);box-shadow:0 0 0 7px rgba(245,158,11,.06);animation:pop .5s cubic-bezier(.2,.9,.3,1.3) both}
+.badge svg{width:36px;height:36px;fill:none;stroke:#f59e0b;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
+h1{font-size:23px;font-weight:700;letter-spacing:-.015em;margin-bottom:11px}
+p{font-size:14.5px;line-height:1.55;color:rgba(233,235,234,.62)}
+.foot{margin-top:28px;padding-top:18px;border-top:1px solid rgba(255,255,255,.06);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(233,235,234,.36)}
+.foot b{color:#f59e0b;font-weight:800}
+@keyframes pop{0%{transform:scale(.5);opacity:0}70%{transform:scale(1.06)}100%{transform:scale(1);opacity:1}}
+@media(prefers-reduced-motion:reduce){.badge{animation:none}.card::before{opacity:.4}}
+</style></head><body><main class=card>
+<div class=badge><svg viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg></div>
+<h1>Sign-in didn&rsquo;t finish</h1>
+<p>Something interrupted the sign-in. Close this tab and try again from the Birdo VPN app.</p>
+<div class=foot><b>Birdo</b> VPN</div>
+</main></body></html>"##
+);
 const RESPONSE_IGNORE: &str = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
 
 fn b64url(bytes: &[u8]) -> String {
