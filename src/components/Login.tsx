@@ -5,7 +5,7 @@ import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ShieldCheck, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { BirdoBadge, BirdoButton, BirdoTextField, AppIconMark } from './birdo';
+import { BirdoButton, BirdoTextField, AppIconMark } from './birdo';
 import { gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
 
 /** Map raw backend error strings to user-friendly messages */
@@ -287,16 +287,6 @@ export function Login() {
             <AppIconMark mark size={72} />
           </motion.div>
 
-          {/* Status badge */}
-          <motion.div
-            className="mb-4 flex justify-center"
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: motionTokens.emphasis, delay: 0.1 }}
-          >
-            <BirdoBadge text="End-to-end encrypted" tone="neutral" />
-          </motion.div>
-
           {/* Gradient headline */}
           <motion.h2
             className="mb-2 text-center text-3xl font-bold"
@@ -485,7 +475,7 @@ export function Login() {
                   <motion.form
                     key="email-form"
                     onSubmit={handleLogin}
-                    className="flex min-h-[200px] flex-col gap-3"
+                    className="flex min-h-[256px] flex-col gap-3"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -543,7 +533,7 @@ export function Login() {
                       e.preventDefault();
                       handleAnonymousLogin();
                     }}
-                    className="flex min-h-[200px] flex-col gap-3"
+                    className="flex min-h-[256px] flex-col gap-3"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -586,30 +576,24 @@ export function Login() {
                       className="mt-auto"
                     />
 
-                    {/* Create a brand-new anonymous account in-app — no email,
-                        no website round-trip (mobile parity). */}
-                    <div className="flex items-center gap-3" aria-hidden="true">
-                      <span className="h-px flex-1" style={{ background: hairline.soft }} />
-                      <span className="text-xs text-w40">new here?</span>
-                      <span className="h-px flex-1" style={{ background: hairline.soft }} />
-                    </div>
-                    <BirdoButton
+                    {/* Create a brand-new anonymous account in-app — a compact
+                        text link (not a full button) so the Anonymous tab is the
+                        same height as the others and never needs to scroll. */}
+                    <button
                       type="button"
-                      text={isLoading ? 'Creating…' : 'Create anonymous account'}
                       onClick={handleCreateAnonymous}
-                      variant="secondary"
-                      size="large"
-                      fullWidth
                       disabled={isLoading}
-                      ariaLabel="Create a new anonymous account"
-                    />
+                      className="text-center text-xs text-w60 transition hover:text-w100 disabled:opacity-50"
+                    >
+                      {isLoading ? 'Creating…' : 'New here? Create an anonymous account'}
+                    </button>
                   </motion.form>
                 )}
 
                 {activeTab === 'sso' && (
                   <motion.div
                     key="sso-form"
-                    className="flex min-h-[200px] flex-col justify-center gap-3"
+                    className="flex min-h-[256px] flex-col justify-center gap-3"
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
