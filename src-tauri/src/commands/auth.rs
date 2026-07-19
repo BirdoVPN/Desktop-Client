@@ -265,12 +265,25 @@ pub async fn get_auth_state(
                                 .unwrap_or(&tokens.refresh_token);
                             let _ = credentials
                                 .store_tokens(&new_tokens.access_token, refresh_to_store);
-                            Ok(AuthState {
-                                is_authenticated: true,
-                                email: None,
-                                account_id: None,
-                                plan: None,
-                            })
+                            // Re-fetch the profile with the refreshed access token so the
+                            // identity is populated. Previously this returned email:None,
+                            // so any auth check that hit the refresh path (e.g. app restart
+                            // once the access token had expired) made the app show
+                            // "Anonymous" for a real signed-in account.
+                            match api.get_profile().await {
+                                Ok(profile) => Ok(AuthState {
+                                    is_authenticated: true,
+                                    email: Some(profile.email),
+                                    account_id: Some(profile.id),
+                                    plan: None,
+                                }),
+                                Err(_) => Ok(AuthState {
+                                    is_authenticated: true,
+                                    email: None,
+                                    account_id: None,
+                                    plan: None,
+                                }),
+                            }
                         }
                         Err(_) => {
                             let _ = credentials.clear_tokens();
