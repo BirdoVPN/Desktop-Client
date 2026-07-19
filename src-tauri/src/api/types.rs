@@ -351,6 +351,17 @@ pub struct UserProfile {
     pub email_verified: bool,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Whether the account has a password at all. SSO accounts sign in through
+    /// Google/GitHub and have none, so a delete dialog that demands one can
+    /// never be satisfied by them.
+    ///
+    /// Defaults to `true`: if the field is missing because we're talking to a
+    /// backend that predates it, keep the old always-ask behaviour rather than
+    /// dropping the prompt for accounts that genuinely need it.
+    #[serde(default = "default_true")]
+    pub has_password: bool,
+    #[serde(default)]
+    pub is_sso: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

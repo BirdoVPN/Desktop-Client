@@ -297,7 +297,10 @@ export function Profile() {
         )}
         {showDeleteDialog && (
           <DeleteAccountDialog
-            isAnon={isAnon}
+            // Authoritative from /auth/me, and deliberately NOT combined with
+            // `isAnon`: an anonymous user who set a password on the website
+            // still has one, and the backend will demand it.
+            hasPassword={account.hasPassword}
             onDismiss={() => setShowDeleteDialog(false)}
             onDeleted={async () => {
               try {
@@ -521,16 +524,19 @@ function UsageMeter() {
 
 // ── Delete-account dialog (GDPR Art.17) ──────────────────────────────────────
 //
-// Email/SSO accounts re-confirm with their password (defense-in-depth against a
-// compromised webview). Anonymous accounts have no password, so we require a
-// typed "DELETE" confirmation instead. Backend: delete_account.
+// Accounts WITH a password re-confirm with it (defense-in-depth against a
+// compromised webview). Accounts without one — anonymous, and SSO accounts that
+// sign in through Google/GitHub — type "DELETE" instead. Grouping SSO with
+// email here used to trap SSO users: the dialog demanded a password they had
+// never set, so Delete stayed disabled and they could not exercise erasure at
+// all. Backend: delete_account.
 
 function DeleteAccountDialog({
-  isAnon,
+  hasPassword,
   onDismiss,
   onDeleted,
 }: {
-  isAnon: boolean;
+  hasPassword: boolean;
   onDismiss: () => void;
   onDeleted: () => void;
 }) {
@@ -547,18 +553,19 @@ function DeleteAccountDialog({
     return () => window.removeEventListener('keydown', onKey);
   }, [deleting, onDismiss]);
 
-  const canSubmit = !deleting && (isAnon ? confirmText.trim().toUpperCase() === 'DELETE' : password.length > 0);
+  const canSubmit =
+    !deleting && (hasPassword ? password.length > 0 : confirmText.trim().toUpperCase() === 'DELETE');
 
   const handleConfirm = async () => {
     if (!canSubmit) return;
     setDeleting(true);
     setError(null);
     try {
-      // The backend requires a password. Anonymous accounts have none, so we
-      // send the typed confirmation token — the server treats an anonymous
-      // delete as password-less; sending a non-empty value keeps the command
-      // contract satisfied without leaking a real secret.
-      await invoke('delete_account', { request: { password: isAnon ? confirmText.trim() : password } });
+      // Password-less accounts (anonymous and SSO) send the typed confirmation
+      // token: the server skips the password check for them entirely, and the
+      // Tauri command's request type is non-optional, so a non-empty value
+      // keeps the contract satisfied without inventing a fake secret.
+      await invoke('delete_account', { request: { password: hasPassword ? password : confirmText.trim() } });
       onDeleted();
     } catch (e: unknown) {
       const message =
@@ -603,11 +610,11 @@ function DeleteAccountDialog({
           <p className="text-[13px]" style={{ color: white.w60 }}>
             This permanently erases your account and all associated data. This
             cannot be undone.
-            {isAnon
-              ? ' Type DELETE below to confirm.'
-              : ' Enter your password to confirm.'}
+            {hasPassword
+              ? ' Enter your password to confirm.'
+              : ' Type DELETE below to confirm.'}
           </p>
-          {isAnon ? (
+          {!hasPassword ? (
             <BirdoTextField
               value={confirmText}
               onChange={(v) => {
