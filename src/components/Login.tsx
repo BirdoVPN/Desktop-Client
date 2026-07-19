@@ -79,6 +79,31 @@ export function Login() {
     }))
   );
 
+  // After a login that doesn't carry the email in its response (native SSO
+  // exchange, 2FA, anonymous create), fetch the canonical profile so the app
+  // shows the REAL identity immediately instead of falling back to "Anonymous"
+  // until the next launch. get_auth_state -> get_profile returns email +
+  // account_id + plan from the freshly-stored tokens.
+  const hydrateIdentity = async () => {
+    try {
+      const st = await invoke<{
+        is_authenticated: boolean;
+        email: string | null;
+        account_id: string | null;
+        plan: string | null;
+      }>('get_auth_state');
+      if (st?.email) setUserEmail(st.email);
+      useAppStore.getState().setAccount({
+        email: st?.email ?? null,
+        accountId: st?.account_id ?? null,
+        plan: st?.plan ?? null,
+        status: 'active',
+      });
+    } catch {
+      /* non-fatal — App startup re-hydrates identity from get_auth_state */
+    }
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -130,7 +155,7 @@ export function Login() {
         setTwoFactorRequired(true);
         setChallengeToken(result.challenge_token);
       } else if (result.success) {
-        setUserEmail(result.user?.email || null);
+        await hydrateIdentity();
         setAnonPassword('');
         setAuthenticated(true);
       } else {
@@ -201,7 +226,9 @@ export function Login() {
         setTwoFactorRequired(true);
         setChallengeToken(result.challenge_token);
       } else if (result.success) {
-        setUserEmail(result.user?.email || null);
+        // The SSO exchange doesn't return the email — fetch the profile so the
+        // app shows the real account, not "Anonymous".
+        await hydrateIdentity();
         setAuthenticated(true);
       } else {
         setError(result.message || result.error || 'Sign-in was cancelled or failed.');
@@ -241,7 +268,7 @@ export function Login() {
       });
 
       if (result.success) {
-        setUserEmail(result.user?.email || null);
+        await hydrateIdentity();
         setPassword('');
         setChallengeToken(null);
         setAuthenticated(true);
@@ -389,8 +416,8 @@ export function Login() {
               <BirdoButton
                 type="button"
                 text="I've saved it — continue"
-                onClick={() => {
-                  setUserEmail(null);
+                onClick={async () => {
+                  await hydrateIdentity();
                   setAuthenticated(true);
                 }}
                 variant="brand"
