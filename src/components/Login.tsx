@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '@/store/app-store';
@@ -63,6 +63,14 @@ export function Login() {
   // its tokens stored by the backend command).
   const [createdId, setCreatedId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState(false);
+
+  // SSO in-progress state: which provider we're waiting on the browser for.
+  // `ssoAttemptRef` lets Cancel invalidate the in-flight attempt so a late
+  // resolve (or the ~5-min loopback timeout) can't clobber the UI after the user
+  // has moved on — previously an SSO click left the buttons disabled with no way
+  // out until it timed out.
+  const [ssoWaiting, setSsoWaiting] = useState<'google' | 'github' | null>(null);
+  const ssoAttemptRef = useRef(0);
 
   const { setAuthenticated, setUserEmail } = useAppStore(
     useShallow((s) => ({
@@ -181,8 +189,13 @@ export function Login() {
   const handleSsoLogin = async (provider: 'google' | 'github') => {
     setError(null);
     setIsLoading(true);
+    setSsoWaiting(provider);
+    const attempt = ++ssoAttemptRef.current;
     try {
       const result = await invoke<LoginResponse>('native_oauth_login', { provider });
+      // Ignore a result the user already cancelled (they may have switched to
+      // email login, or hit Cancel while the browser flow stalled).
+      if (attempt !== ssoAttemptRef.current) return;
 
       if (result.requires_two_factor && result.challenge_token) {
         setTwoFactorRequired(true);
@@ -194,10 +207,24 @@ export function Login() {
         setError(result.message || result.error || 'Sign-in was cancelled or failed.');
       }
     } catch (err) {
+      if (attempt !== ssoAttemptRef.current) return;
       setError(friendlyError(err));
     } finally {
-      setIsLoading(false);
+      if (attempt === ssoAttemptRef.current) {
+        setIsLoading(false);
+        setSsoWaiting(null);
+      }
     }
+  };
+
+  // Abandon an in-flight SSO attempt and return to the buttons. The backend
+  // loopback keeps waiting harmlessly until it times out; we just stop blocking
+  // the UI on it (the attempt guard makes its eventual result a no-op).
+  const cancelSso = () => {
+    ssoAttemptRef.current += 1;
+    setSsoWaiting(null);
+    setIsLoading(false);
+    setError(null);
   };
 
   const handleVerify2FA = async (e: React.FormEvent) => {
@@ -599,30 +626,53 @@ export function Login() {
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: motionTokens.fast }}
                   >
-                    <p className="text-center text-sm text-w40">
-                      Continue with your Google or GitHub account — no password needed.
-                    </p>
-                    {error && <ErrorBanner message={error} />}
-                    <BirdoButton
-                      type="button"
-                      text="Continue with Google"
-                      onClick={() => handleSsoLogin('google')}
-                      variant="secondary"
-                      size="large"
-                      fullWidth
-                      disabled={isLoading}
-                      ariaLabel="Continue with Google"
-                    />
-                    <BirdoButton
-                      type="button"
-                      text="Continue with GitHub"
-                      onClick={() => handleSsoLogin('github')}
-                      variant="secondary"
-                      size="large"
-                      fullWidth
-                      disabled={isLoading}
-                      ariaLabel="Continue with GitHub"
-                    />
+                    {ssoWaiting ? (
+                      <div className="flex flex-col items-center gap-4 text-center">
+                        <div className="h-9 w-9 animate-spin rounded-full border-2 border-white/10 border-t-white" />
+                        <p className="text-sm text-w60">
+                          Finish signing in with {ssoWaiting === 'google' ? 'Google' : 'GitHub'} in
+                          your browser, then return here.
+                        </p>
+                        <p className="text-xs text-w40">
+                          Tip: if the browser is signed into a different account, pick the right one
+                          there.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={cancelSso}
+                          className="text-xs text-w60 underline transition hover:text-w100"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="text-center text-sm text-w40">
+                          Continue with your Google or GitHub account — no password needed.
+                        </p>
+                        {error && <ErrorBanner message={error} />}
+                        <BirdoButton
+                          type="button"
+                          text="Continue with Google"
+                          onClick={() => handleSsoLogin('google')}
+                          variant="secondary"
+                          size="large"
+                          fullWidth
+                          disabled={isLoading}
+                          ariaLabel="Continue with Google"
+                        />
+                        <BirdoButton
+                          type="button"
+                          text="Continue with GitHub"
+                          onClick={() => handleSsoLogin('github')}
+                          variant="secondary"
+                          size="large"
+                          fullWidth
+                          disabled={isLoading}
+                          ariaLabel="Continue with GitHub"
+                        />
+                      </>
+                    )}
                   </motion.div>
                 )}
               </AnimatePresence>
