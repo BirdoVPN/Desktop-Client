@@ -264,7 +264,16 @@ pub async fn native_oauth_login(
     match api.native_exchange(&code, &verifier, &device_id).await {
         Ok(LoginResult::Success { tokens, .. }) => {
             if let Err(e) = credentials.store_tokens(&tokens.access_token, &tokens.refresh_token) {
-                tracing::warn!("Failed to persist SSO credentials: {e}");
+                // ERROR, not warn: the login itself succeeded, but a session that
+                // cannot be persisted is one the user must repeat on every launch.
+                // Logged at warn this was invisible in the shipped log level, which
+                // is precisely how a keystore that discarded every write went
+                // unnoticed. Surfacing it is the difference between a diagnosable
+                // bug and a silent one.
+                tracing::error!(
+                    "SSO succeeded but credentials could NOT be persisted to the OS keystore \
+                     ({e}) — the user will have to sign in again after restarting"
+                );
             }
             tracing::info!("Native SSO login successful via {provider}");
             Ok(LoginResponse {

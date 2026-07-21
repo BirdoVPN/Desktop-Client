@@ -639,10 +639,44 @@ impl BirdoApi {
             )
             .await?;
 
-        *self.access_token.write().await = Some(Zeroizing::new(response.access_token));
+        *self.access_token.write().await = Some(Zeroizing::new(response.access_token.clone()));
         // FIX C-1: Also update refresh token if rotated
-        if let Some(new_refresh) = response.refresh_token {
+        if let Some(new_refresh) = response.refresh_token.clone() {
             *self.refresh_token.write().await = Some(Zeroizing::new(new_refresh));
+        }
+
+        // Persist the rotated pair to the OS keystore.
+        //
+        // The server ROTATES refresh tokens and treats a second use of a consumed
+        // one as token THEFT — which revokes the whole session server-side. This
+        // path (the 401 retry interceptor) is the common in-session refresh, so if
+        // the rotated token stays in memory only, the keystore keeps the CONSUMED
+        // one and the next app launch replays it: the user is force-signed-out and
+        // the backend records a theft event against a legitimate client.
+        //
+        // Latent until now only because the keystore was a mock that persisted
+        // nothing; making persistence work makes this reachable, so the two must
+        // ship together. Best-effort: a keystore failure must not fail the request
+        // that triggered the refresh — the in-memory tokens are still valid for
+        // this session — but it is logged loudly because it costs the next one.
+        {
+            use crate::storage::credentials::{CredentialKey, CredentialStore};
+            // `None` means the server did not rotate, so the stored refresh
+            // token is still current and must be left alone.
+            let refresh_to_store = response.refresh_token.clone();
+            if let Err(e) =
+                CredentialStore::store(CredentialKey::AccessToken, &response.access_token)
+            {
+                tracing::error!("Could not persist refreshed access token ({e})");
+            }
+            if let Some(rotated) = refresh_to_store {
+                if let Err(e) = CredentialStore::store(CredentialKey::RefreshToken, &rotated) {
+                    tracing::error!(
+                        "Could not persist ROTATED refresh token ({e}) — the next launch will \
+                         replay a consumed token and the session will be revoked"
+                    );
+                }
+            }
         }
         Ok(())
     }

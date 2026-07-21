@@ -259,7 +259,8 @@ pub async fn get_auth_state(
                     plan: None,
                     has_password: profile.has_password,
                 }),
-                Err(_) => {
+                Err(e) => {
+                    tracing::info!("Profile fetch failed ({e}) — attempting token refresh");
                     // Token might be expired, try refresh
                     match api.refresh_token().await {
                         Ok(new_tokens) => {
@@ -268,8 +269,17 @@ pub async fn get_auth_state(
                                 .refresh_token
                                 .as_deref()
                                 .unwrap_or(&tokens.refresh_token);
-                            let _ = credentials
-                                .store_tokens(&new_tokens.access_token, refresh_to_store);
+                            if let Err(e) =
+                                credentials.store_tokens(&new_tokens.access_token, refresh_to_store)
+                            {
+                                // Not fatal for THIS call (the in-memory tokens still
+                                // work), but it means the session dies at the next
+                                // launch — so say so instead of discarding it.
+                                tracing::error!(
+                                    "Refreshed tokens could not be persisted to the OS keystore \
+                                     ({e}) — this session will not survive a restart"
+                                );
+                            }
                             // Re-fetch the profile with the refreshed access token so the
                             // identity is populated. Previously this returned email:None,
                             // so any auth check that hit the refresh path (e.g. app restart
@@ -283,16 +293,31 @@ pub async fn get_auth_state(
                                     plan: None,
                                     has_password: profile.has_password,
                                 }),
-                                Err(_) => Ok(AuthState {
-                                    is_authenticated: true,
-                                    email: None,
-                                    account_id: None,
-                                    plan: None,
-                                    has_password: true,
-                                }),
+                                // The refresh succeeded, so the session IS valid — do
+                                // not sign the user out over what is almost always a
+                                // transient network error. The identity is reported as
+                                // unknown (not as "no account"); the UI must render
+                                // that as a pending state rather than inventing one.
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Profile fetch failed after a successful token refresh \
+                                         ({e}) — session kept, identity unknown this cycle"
+                                    );
+                                    Ok(AuthState {
+                                        is_authenticated: true,
+                                        email: None,
+                                        account_id: None,
+                                        plan: None,
+                                        // Unknown → assume a password exists, so the
+                                        // delete dialog keeps asking for it. Never drop
+                                        // a confirmation because a fetch failed.
+                                        has_password: true,
+                                    })
+                                }
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            tracing::info!("Token refresh failed ({e}) — clearing stored session");
                             let _ = credentials.clear_tokens();
                             Ok(AuthState {
                                 is_authenticated: false,
@@ -306,13 +331,28 @@ pub async fn get_auth_state(
                 }
             }
         }
-        Err(_) => Ok(AuthState {
-            is_authenticated: false,
-            email: None,
-            account_id: None,
-            plan: None,
-            has_password: true,
-        }),
+        // No usable stored session. "No access/refresh token stored" is the normal
+        // first-run case; anything else means the OS keystore itself refused us,
+        // which silently ends every session and MUST be visible in the log. This
+        // arm previously swallowed both cases without a word, which is why a
+        // keystore that discarded every write produced no diagnostic at all.
+        Err(e) => {
+            if e.starts_with("No access token") || e.starts_with("No refresh token") {
+                tracing::debug!("No stored session found ({e}) — starting signed out");
+            } else {
+                tracing::error!(
+                    "OS keystore read failed ({e}) — cannot restore the session; the user \
+                     will appear signed out despite having logged in"
+                );
+            }
+            Ok(AuthState {
+                is_authenticated: false,
+                email: None,
+                account_id: None,
+                plan: None,
+                has_password: true,
+            })
+        }
     }
 }
 

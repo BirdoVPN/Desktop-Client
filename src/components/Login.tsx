@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
-import { useAppStore } from '@/store/app-store';
+import { useAppStore, type AccountInfo } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ShieldCheck, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -93,12 +93,18 @@ export function Login() {
         plan: string | null;
       }>('get_auth_state');
       if (st?.email) setUserEmail(st.email);
-      useAppStore.getState().setAccount({
-        email: st?.email ?? null,
-        accountId: st?.account_id ?? null,
-        plan: st?.plan ?? null,
-        status: 'active',
-      });
+      // Only write back what we actually received. `setAccount` MERGES, so
+      // spreading explicit nulls here would overwrite a known-good identity with
+      // null whenever hydration came back empty (a transient profile-fetch
+      // failure, say) — turning a recoverable blip into a wrong identity that
+      // sticks until the next successful fetch. Absent means "unchanged", not
+      // "cleared".
+      const patch: Partial<AccountInfo> = {};
+      if (st?.email) patch.email = st.email;
+      if (st?.account_id) patch.accountId = st.account_id;
+      if (st?.plan) patch.plan = st.plan;
+      if (st?.is_authenticated) patch.status = 'active';
+      if (Object.keys(patch).length > 0) useAppStore.getState().setAccount(patch);
     } catch {
       /* non-fatal — App startup re-hydrates identity from get_auth_state */
     }
