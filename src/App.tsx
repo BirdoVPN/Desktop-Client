@@ -186,6 +186,40 @@ function App() {
     checkAuth();
   }, [setAuthenticated, setLoading, setUserEmail, setAccount]);
 
+  // Retry identity hydration when we are signed in but the email never arrived.
+  //
+  // `get_auth_state` deliberately keeps a valid session alive when the profile
+  // fetch fails (a rate-limit or a network blip) and reports the identity as
+  // unknown rather than signing the user out. Nothing re-fetched it though, so a
+  // single transient failure left the Profile stuck on "Loading your account…"
+  // until the app was restarted — a momentary error turned permanent.
+  //
+  // Backs off (4s, 8s, 16s) so a retry cannot itself become the thing keeping
+  // the rate-limit window saturated, and stops after 3 attempts.
+  const identityRetries = useRef(0);
+  const accountEmail = useAppStore((s) => s.account.email);
+  useEffect(() => {
+    if (!isAuthenticated || accountEmail || identityRetries.current >= 3) return;
+    const attempt = identityRetries.current;
+    const delayMs = 4000 * 2 ** attempt;
+    const timer = setTimeout(async () => {
+      identityRetries.current += 1;
+      try {
+        const st = await invoke<AuthState>('get_auth_state');
+        if (st?.email) {
+          setUserEmail(st.email);
+          const patch: Partial<AccountInfo> = { email: st.email };
+          if (st.account_id) patch.accountId = st.account_id;
+          if (st.plan) patch.plan = st.plan;
+          setAccount(patch);
+        }
+      } catch {
+        /* non-fatal — the backoff above bounds how often this runs */
+      }
+    }, delayMs);
+    return () => clearTimeout(timer);
+  }, [isAuthenticated, accountEmail, setUserEmail, setAccount]);
+
   // Daily background update check. The per-platform update endpoint is live
   // (api.birdo.app/updates/…), but the only in-app check used to be the manual
   // button in Settings → Software Updates — users who never opened it would
