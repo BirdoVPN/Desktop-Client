@@ -1077,23 +1077,94 @@ jobs:
       # so the second upload 404s on the asset-metadata update and fails the job.
       # Scope those colliding names per-platform; installer names already carry
       # the version+arch and are unique.
-      - name: Disambiguate colliding filenames across platforms
+      # Name every asset for the platform it runs on, and disambiguate the
+      # basenames that would otherwise collide.
+      #
+      # Two jobs in one pass:
+      #  * The bundlers emit `BirdoVPN_<ver>_<arch>.<ext>` with no OS token, so
+      #    `_x64-setup.exe` vs `_amd64.AppImage` vs `_x64.dmg` were only
+      #    distinguishable if you already knew which bundler produced which
+      #    extension. Insert an OS token: `BirdoVPN_<ver>_<OS>_<arch>.<ext>`.
+      #  * Every platform emits `SHA256SUMS.txt` and macOS emits a generic
+      #    `BirdoVPN.app.tar.gz` — identical basenames. A GitHub release cannot
+      #    hold two assets with the same name (softprops uploads by basename),
+      #    so the second upload 404s on the metadata update and fails the job.
+      #
+      # !! DO NOT rename in a way that breaks the updater !!
+      # `backend/src/updates/updates.controller.ts` resolves the bundle to serve
+      # by matching, on the asset FILENAME:
+      #   1. an installer suffix — /-setup\.exe$/, /\.AppImage$/, /\.app\.tar\.gz$/
+      #   2. an arch token anywhere in the name — x86_64|x64|amd64 / aarch64|arm64
+      #   3. the detached signature by EXACT `<installer-name>.sig`
+      # So the OS token may only be INSERTED (never replacing the arch token or
+      # the extension), and companions (.sig/.sigstore/.asc) must be renamed in
+      # lockstep with their installer — which the shared `BirdoVPN_<ver>_` prefix
+      # rule below does automatically, since a companion is just the installer
+      # name plus a suffix. `updates.controller.spec.ts` asserts the patterns
+      # still match these exact names; run it if you touch this.
+      - name: Name assets per platform (and disambiguate collisions)
         shell: bash
         run: |
-          disambig() {
-            local root="$1" suffix="$2"
+          set -euo pipefail
+          label() {
+            local root="$1" os="$2" suffix="$3"
             [ -d "$root" ] || return 0
-            find "$root" -type f -name 'SHA256SUMS.txt*' | while read -r f; do
-              mv "$f" "$(dirname "$f")/$(basename "$f" | sed "s/^SHA256SUMS/SHA256SUMS-$suffix/")"
+            # Insert the OS token after the version: BirdoVPN_1.2.3_x64-setup.exe
+            # -> BirdoVPN_1.2.3_Windows_x64-setup.exe. Applies to installers AND
+            # their .sig/.sigstore/.asc companions, keeping the pairing intact.
+            find "$root" -type f -name 'BirdoVPN_*' | while read -r f; do
+              b="$(basename "$f")"
+              n="$(printf '%s' "$b" | sed -E "s/^BirdoVPN_([0-9][^_]*)_/BirdoVPN_\1_${os}_/")"
+              [ "$b" = "$n" ] || mv "$f" "$(dirname "$f")/$n"
             done
+            # macOS updater bundle ships as a generic `BirdoVPN.app.tar.gz`.
             find "$root" -type f -name 'BirdoVPN.app.tar.gz*' | while read -r f; do
               mv "$f" "$(dirname "$f")/$(basename "$f" | sed "s/^BirdoVPN\.app/BirdoVPN-$suffix.app/")"
             done
+            find "$root" -type f -name 'SHA256SUMS.txt*' | while read -r f; do
+              mv "$f" "$(dirname "$f")/$(basename "$f" | sed "s/^SHA256SUMS/SHA256SUMS-$suffix/")"
+            done
           }
-          disambig release-files/windows    windows
-          disambig release-files/linux      linux
-          disambig release-files/macos-arm64 macos-arm64
-          disambig release-files/macos-x64   macos-x64
+          label release-files/windows     Windows windows
+          label release-files/linux       Linux   linux
+          label release-files/macos-arm64 macOS   macos-arm64
+          label release-files/macos-x64   macOS   macos-x64
+
+      # Fail the release rather than publish assets the updater cannot resolve.
+      # A mis-rename is otherwise SILENT: the release looks fine and every
+      # installed client simply stops being offered updates.
+      - name: Verify updater can still resolve each installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local dir="$1" desc="$2" installer_re="$3" arch_re="$4"
+            [ -d "$dir" ] || return 0
+            local hit
+            hit="$(find "$dir" -type f | grep -E "$installer_re" | grep -vE '\.(sig|sigstore|asc)$' || true)"
+            if [ -z "$hit" ]; then
+              echo "::error::no $desc installer matching $installer_re in $dir"
+              fail=1; return 0
+            fi
+            while read -r f; do
+              local b; b="$(basename "$f")"
+              if ! printf '%s' "$b" | grep -qE "$arch_re"; then
+                echo "::error::$b has no arch token matching $arch_re — updater cannot serve it"
+                fail=1
+              fi
+              if [ ! -f "$f.sig" ]; then
+                echo "::error::$b is missing its detached signature $b.sig"
+                fail=1
+              fi
+              echo "ok: $b (+ $b.sig)"
+            done <<< "$hit"
+          }
+          check release-files/windows     "Windows NSIS" '\-setup\.exe$'   '(x86[_-]?64|x64|amd64)'
+          check release-files/linux       "Linux AppImage" '\.AppImage$'   '(x86[_-]?64|x64|amd64)'
+          check release-files/macos-arm64 "macOS arm64"  '\.app\.tar\.gz$' '(aarch64|arm64)'
+          check release-files/macos-x64   "macOS x64"    '\.app\.tar\.gz$' '(x86[_-]?64|x64|amd64)'
+          [ "$fail" -eq 0 ] || { echo "Updater asset contract violated — refusing to publish"; exit 1; }
 
       - name: List all release files
         shell: bash

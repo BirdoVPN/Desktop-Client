@@ -259,6 +259,25 @@ pub async fn get_auth_state(
                     plan: None,
                     has_password: profile.has_password,
                 }),
+                // Rate limited — the token is FINE, the server is just asking us
+                // to slow down. Refreshing here would spend another request on
+                // the same exhausted budget (and `/auth/refresh` is itself in the
+                // strict bucket), so a 429 would amplify into two. Keep the
+                // session and report the identity as unknown for this cycle; the
+                // next poll succeeds once the window rolls over.
+                Err(crate::api::error::ApiError::RateLimited) => {
+                    tracing::warn!(
+                        "Profile fetch rate limited (429) — NOT refreshing; session kept, \
+                         identity unknown this cycle"
+                    );
+                    Ok(AuthState {
+                        is_authenticated: true,
+                        email: None,
+                        account_id: None,
+                        plan: None,
+                        has_password: true,
+                    })
+                }
                 Err(e) => {
                     tracing::info!("Profile fetch failed ({e}) — attempting token refresh");
                     // Token might be expired, try refresh
