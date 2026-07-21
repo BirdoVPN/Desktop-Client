@@ -328,11 +328,28 @@ interface IdentityCardProps {
 
 function IdentityCard({ email, plan, isAnon }: IdentityCardProps) {
   const planLabel = plan ?? 'RECON';
-  // Anonymous: show a clean "Anonymous account" name and NO synthetic email
-  // subtitle (the recovery id lives in its own copyable card below).
-  const name = isAnon ? 'Anonymous account' : (email?.split('@')[0] || email || 'Anonymous').trim();
-  const subtitle = isAnon ? 'No email — private account' : (email ?? 'Anonymous');
-  const initial = isAnon ? '·' : (name.charAt(0) || '?').toUpperCase();
+  // Three distinct states — a real email, a genuinely anonymous account, and an
+  // identity we simply could not load. They must never be conflated: falling
+  // back to the word "Anonymous" for a null email told users with a real,
+  // verified email address that they had no account, which is a false statement
+  // about their identity, not a cosmetic glitch. When the email is unknown, say
+  // it is unknown.
+  // Written as a branch rather than nested ternaries so TypeScript narrows
+  // `email` to a string in the final case — no non-null assertions needed.
+  let name: string;
+  let subtitle: string;
+  if (isAnon) {
+    name = 'Anonymous account';
+    subtitle = 'No email — private account';
+  } else if (!email) {
+    name = 'Signed in';
+    subtitle = 'Loading your account…';
+  } else {
+    name = (email.split('@')[0] || email).trim();
+    subtitle = email;
+  }
+  const identityUnknown = !isAnon && !email;
+  const initial = isAnon || identityUnknown ? '·' : (name.charAt(0) || '?').toUpperCase();
 
   return (
     <BirdoCard cornerRadius={22} padding="20px">

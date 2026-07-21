@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useAppStore } from '@/store/app-store';
+import { useAppStore, type AccountInfo } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ConsentScreen } from '@/components/ConsentScreen';
 import { Login } from '@/components/Login';
@@ -156,15 +156,23 @@ function App() {
           // stored session that returns only an email left `account` null, so
           // the Profile screen rendered "Anonymous" for a real email login.
           if (authState.email) setUserEmail(authState.email);
-          setAccount({
-            email: authState.email,
-            accountId: authState.account_id,
-            plan: authState.plan,
+          // Merge only the fields we actually received. `setAccount` MERGES, so
+          // passing explicit nulls would wipe a good identity whenever the
+          // profile fetch failed transiently (get_auth_state deliberately keeps
+          // the session alive with an unknown identity in that case rather than
+          // signing the user out). Absent means "unchanged", not "cleared".
+          const patch: Partial<AccountInfo> = {
             status: 'active',
-            // `?? true` keeps the password prompt when the backend predates the
-            // field — never drop a confirmation because a value went missing.
+            // Always set, and `?? true` keeps the password prompt when the
+            // backend predates the field — never drop a confirmation because a
+            // value went missing. Unlike the identity fields, a stale `false`
+            // here would REMOVE a safety prompt, so absent must mean "ask".
             hasPassword: authState.has_password ?? true,
-          });
+          };
+          if (authState.email) patch.email = authState.email;
+          if (authState.account_id) patch.accountId = authState.account_id;
+          if (authState.plan) patch.plan = authState.plan;
+          setAccount(patch);
         }
       } catch {
         // Auth check failed - assume not authenticated

@@ -211,6 +211,59 @@ mod types_serialization_tests {
         assert_eq!(user.created_at, Some("2026-01-01".to_string()));
     }
 
+    /// Parse the EXACT shape the live `GET /auth/me` returns.
+    ///
+    /// The test above is a fiction: it feeds a hand-written payload containing
+    /// `name` and `createdAt`, neither of which the real endpoint sends. A test
+    /// that only ever sees an invented payload cannot catch a contract drift
+    /// between client and server, so this one pins the real thing instead.
+    ///
+    /// Keep this payload in lock-step with `auth.controller.ts` `@Get("me")`:
+    /// it omits `name`/`createdAt` and carries extra subscription fields that
+    /// the client must ignore rather than choke on. If someone later adds a
+    /// field to `UserProfile` WITHOUT a default, or the server drops a field
+    /// this struct requires, this test fails instead of the app silently
+    /// rendering a signed-in user with a blank identity.
+    #[test]
+    fn user_profile_parses_real_auth_me_payload() {
+        let json = r#"{
+            "id": "cmnz74oyc0000o001dgr9gwec",
+            "email": "someone@gmail.com",
+            "role": "USER",
+            "emailVerified": true,
+            "plan": "recon",
+            "status": "active",
+            "expiresAt": null,
+            "devicesUsed": 1,
+            "devicesLimit": 1,
+            "bandwidthLimit": 10737418240,
+            "hasPassword": false,
+            "isSSO": true
+        }"#;
+        let user: UserProfile = serde_json::from_str(json)
+            .expect("the live /auth/me payload must deserialize — a strict field here blanks the user's identity");
+        // The identity the whole app hangs off of.
+        assert_eq!(user.email, "someone@gmail.com");
+        assert_eq!(user.id, "cmnz74oyc0000o001dgr9gwec");
+        // Absent optional fields must degrade to None, not fail the parse.
+        assert_eq!(user.name, None);
+        assert_eq!(user.created_at, None);
+        assert!(user.email_verified);
+        // Casing traps: the backend sends `hasPassword` (matches camelCase) but
+        // `isSSO` (does NOT — camelCase derives `isSso`). Both are `#[serde(default)]`,
+        // so a mismatch yields a silently WRONG value rather than an error. Assert
+        // the values, not just that parsing succeeded.
+        assert!(
+            !user.has_password,
+            "hasPassword must be read, not defaulted"
+        );
+        assert!(
+            user.is_sso,
+            "isSSO must be read via alias — camelCase alone derives `isSso` and would \
+             silently leave every SSO account looking like a password account"
+        );
+    }
+
     #[test]
     fn vpn_server_deserializes_with_camel_case() {
         let json = r#"{

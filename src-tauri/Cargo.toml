@@ -1,6 +1,6 @@
 [package]
 name = "birdo-vpn-desktop"
-version = "1.4.25"
+version = "1.4.26"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
 license = "Proprietary"
@@ -61,8 +61,16 @@ x509-parser = "0.16"
 # Socket configuration (for buffer sizes)
 socket2 = "0.5"
 
-# Secure storage (Windows Credential Manager / macOS Keychain)
-keyring = "3.2"
+# Secure storage — see the per-target `keyring` entries below.
+#
+# DO NOT add `keyring` here as a plain dependency. keyring 3.x ships NO default
+# features and picks its backend at COMPILE time: without an explicit
+# `*-native`/secret-service feature it silently resolves to the `mock` backend
+# (keyring src/lib.rs: `pub use mock as default`), which is an in-memory store
+# that accepts every write and returns NoEntry for every read. Nothing fails
+# loudly — tokens simply never persist. That shipped as `keyring = "3.2"` and
+# left every platform unable to remember a login. Backends are declared per
+# target so each OS links its real keystore and nothing else.
 
 # Crypto (for WireGuard)
 # Note: Using versions compatible with boringtun
@@ -135,6 +143,9 @@ wintun = "0.5"
 # pure-Rust wrapper over windows-sys; builds on the pinned 1.96 toolchain.
 winreg = "0.52"
 
+# Real Windows Credential Manager (wincred) instead of keyring's mock backend.
+keyring = { version = "3.2", features = ["windows-native"] }
+
 # macOS-specific dependencies
 [target.'cfg(target_os = "macos")'.dependencies]
 # nix crate for utun/socket/ioctl operations
@@ -145,10 +156,20 @@ libc = "0.2"
 core-foundation = "0.10"
 system-configuration = "0.6"
 
+# Real macOS Keychain instead of keyring's mock backend.
+keyring = { version = "3.2", features = ["apple-native"] }
+
 # Linux-specific dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 # libc for TUN fd read/write and ioctl
 libc = "0.2"
+
+# Real Secret Service (GNOME Keyring / KWallet over D-Bus) instead of keyring's
+# mock backend. `sync-secret-service` keeps keyring's blocking API — the async
+# backend would need a nested runtime from inside Tauri's tokio context.
+# `crypto-rust` avoids an OpenSSL system dependency and `vendored` builds libdbus
+# from source, so the Linux CI runner needs no extra apt packages.
+keyring = { version = "3.2", features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [features]
 default = ["custom-protocol"]

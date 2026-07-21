@@ -360,7 +360,13 @@ pub struct UserProfile {
     /// dropping the prompt for accounts that genuinely need it.
     #[serde(default = "default_true")]
     pub has_password: bool,
-    #[serde(default)]
+    /// `alias` is REQUIRED here. The struct's `rename_all = "camelCase"` derives
+    /// `isSso`, but the backend sends `isSSO` (auth.controller.ts `@Get("me")`),
+    /// so without the alias this silently stayed `false` for every SSO account —
+    /// a wrong value rather than a loud failure, because `#[serde(default)]`
+    /// quietly fills the gap. The field is currently unused; the alias is here so
+    /// the first consumer gets the truth instead of a plausible lie.
+    #[serde(default, alias = "isSSO")]
     pub is_sso: bool,
 }
 
