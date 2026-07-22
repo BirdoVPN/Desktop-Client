@@ -204,9 +204,6 @@ export function Profile() {
         <h1 className="text-[22px] font-semibold" style={{ color: '#FFFFFF' }}>
           Profile
         </h1>
-        <p className="mt-0.5 text-[13px]" style={{ color: white.w60 }}>
-          Identity, subscription &amp; account
-        </p>
       </div>
 
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
@@ -230,7 +227,6 @@ export function Profile() {
           <BirdoCard padding="0.25rem">
             <BirdoNavRow
               title={isFreeTier ? 'View plans & pricing' : 'Manage subscription'}
-              subtitle={isFreeTier ? 'Compare plans and upgrade' : 'Billing is managed on the web'}
               leadingIcon={CreditCard}
               leadingTint={brand.accent}
               onClick={
@@ -243,7 +239,6 @@ export function Profile() {
             />
             <BirdoNavRow
               title="Redeem voucher"
-              subtitle="Activate a 30 / 90-day code"
               leadingIcon={Gift}
               leadingTint={brand.accentSoft}
               onClick={() => setShowVoucherDialog(true)}
@@ -257,7 +252,7 @@ export function Profile() {
                     ? 'Saved to your downloads'
                     : exportState === 'error'
                       ? 'Export failed — try again'
-                      : 'Download all your account data (GDPR)'
+                      : undefined
               }
               leadingIcon={Download}
               leadingTint={statusTokens.blue}
@@ -265,7 +260,6 @@ export function Profile() {
             />
             <BirdoNavRow
               title="Delete account"
-              subtitle="Permanently erase your account and data"
               leadingIcon={Trash2}
               leadingTint={statusTokens.red}
               onClick={() => setShowDeleteDialog(true)}
@@ -279,7 +273,7 @@ export function Profile() {
           <BirdoCard padding="0.25rem">
             <BirdoNavRow
               title="Sign out"
-              subtitle={isAnon ? 'Anonymous account' : (resolvedEmail ?? 'Sign out of this device')}
+              subtitle={isAnon ? 'Anonymous account' : (resolvedEmail ?? undefined)}
               leadingIcon={LogOut}
               leadingTint={statusTokens.red}
               onClick={handleLogout}
@@ -531,8 +525,7 @@ function UsageMeter() {
         </>
       ) : (
         <p className="mt-2 text-[13px]" style={{ color: white.w60 }}>
-          Usage of your {limitGb} GB monthly allowance will appear here after your
-          first sync — connect to start counting.
+          Connect to start counting your {limitGb} GB monthly allowance.
         </p>
       )}
     </BirdoCard>

@@ -281,7 +281,6 @@ export function VpnSettings() {
               genuinely lets traffic through if the tunnel drops. */}
           <BirdoToggleRow
             title="Kill Switch"
-            subtitle="Blocks all internet traffic if the VPN connection drops, preventing data leaks. On by default. Turn it off to stay online (unprotected) when the VPN disconnects."
             leadingIcon={Shield}
             leadingTint={status.green}
             checked={settings.killSwitchEnabled}
@@ -298,11 +297,6 @@ export function VpnSettings() {
         <BirdoCard padding="0">
           <BirdoToggleRow
             title="Stealth Mode · Premium"
-            subtitle={
-              isOperativeOrAbove
-                ? 'Routes through Xray Reality to bypass deep packet inspection, making VPN traffic look like normal HTTPS.'
-                : 'Available on the Operative and Sovereign plans. Upgrade to route through Xray Reality and bypass deep packet inspection.'
-            }
             leadingIcon={EyeOff}
             leadingTint={status.blue}
             // `&& isOperativeOrAbove` so a persisted-on state can't resurface
@@ -327,7 +321,6 @@ export function VpnSettings() {
         <BirdoCard padding="0">
           <BirdoToggleRow
             title="Quantum Protection"
-            subtitle="Add post-quantum pre-shared key exchange via BirdoPQ v1 (ML-KEM-1024, NIST FIPS 203). Protects against future quantum attacks."
             leadingIcon={Lock}
             leadingTint={brand.accent}
             checked={settings.quantumProtection}
@@ -341,7 +334,6 @@ export function VpnSettings() {
         <BirdoCard padding="0">
           <BirdoToggleRow
             title="Local Network Sharing"
-            subtitle="Allow access to devices on your local network (printers, NAS) while connected."
             leadingIcon={Network}
             leadingTint={status.blue}
             checked={settings.localNetworkSharing}
@@ -421,8 +413,7 @@ export function VpnSettings() {
                     )}
                   </div>
                   <p className="text-xs" style={{ color: white.w40 }}>
-                    Leave empty to use the VPN server&apos;s DNS. Popular options: 1.1.1.1
-                    (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9).
+                    Popular: 1.1.1.1 (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9).
                   </p>
                 </div>
               </motion.div>
@@ -605,7 +596,6 @@ export function VpnSettings() {
           {isWindowsPlatform() && (
             <BirdoNavRow
               title="Split Tunneling"
-              subtitle="Choose which apps bypass the VPN and connect directly."
               leadingIcon={Split}
               leadingTint={white.w60}
               onClick={() => pushRoute('splitTunnel')}
@@ -613,7 +603,6 @@ export function VpnSettings() {
           )}
           <BirdoNavRow
             title="Port Forwarding"
-            subtitle="Forward external ports to your device for gaming, torrents, or servers."
             leadingIcon={ArrowLeftRight}
             leadingTint={status.blue}
             onClick={() => pushRoute('portForward')}
