@@ -206,8 +206,7 @@ export function SplitTunnel() {
             Windows only (for now)
           </p>
           <p className="max-w-xs text-xs" style={{ color: white.w60 }}>
-            Split tunneling is enforced by the Windows Filtering Platform and
-            isn&apos;t available on this operating system yet.
+            Not available on this operating system yet.
           </p>
         </div>
       </div>
@@ -240,9 +239,6 @@ export function SplitTunnel() {
                 Split Tunneling
               </p>
             </div>
-            <p className="truncate text-xs" style={{ color: white.w60 }}>
-              Choose which apps bypass VPN
-            </p>
           </div>
           <BirdoSwitch
             checked={enabled}
@@ -258,8 +254,7 @@ export function SplitTunnel() {
         >
           <Info size={18} color={brand.accent} aria-hidden className="mt-px shrink-0" />
           <p className="text-xs leading-relaxed" style={{ color: 'rgba(16,185,129,0.85)' }}>
-            Selected apps will bypass VPN and use your regular internet connection. {excludedCount}{' '}
-            {excludedCount === 1 ? 'app' : 'apps'} excluded.
+            {excludedCount} {excludedCount === 1 ? 'app' : 'apps'} excluded.
           </p>
         </div>
 
@@ -409,7 +404,7 @@ export function SplitTunnel() {
                   description={
                     searchQuery.trim()
                       ? `Nothing matches "${searchQuery.trim()}".`
-                      : 'Add an app above to route it around the VPN on the next connection.'
+                      : 'Add an app above to exclude it.'
                   }
                   className="pt-6"
                 />
@@ -459,7 +454,7 @@ export function SplitTunnel() {
               <BirdoEmptyState
                 icon={AppWindow}
                 title="Couldn’t scan apps"
-                description="Something went wrong reading installed apps. Use Browse… to pick an .exe directly, or try again."
+                description="Use Browse… to pick an .exe directly, or try again."
                 action={
                   <BirdoButton
                     text="Try again"

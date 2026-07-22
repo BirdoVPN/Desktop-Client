@@ -3,7 +3,6 @@
  *
  * Pixel-faithful port of mobile's `PortForwardScreen.kt`:
  *   • BirdoTopBar "Port Forwarding" + back (popRoute).
- *   • Info row explaining the feature.
  *   • "NEW RULE" BirdoSubCard — port field (1024-65535) + TCP/UDP segmented
  *     toggle + Add button → invoke('create_port_forward', { port, protocol }).
  *   • "ACTIVE RULES" — loading / empty (BirdoEmptyState) / list of rules,
@@ -17,7 +16,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useShallow } from 'zustand/react/shallow';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Info, Plus, Trash2, ArrowRightLeft, Network } from 'lucide-react';
+import { Plus, Trash2, ArrowRightLeft, Network } from 'lucide-react';
 import {
   BirdoTopBar,
   BirdoSubCard,
@@ -144,18 +143,6 @@ export function PortForward() {
       <BirdoTopBar title="Port Forwarding" onBack={popRoute} />
 
       <div className="flex-1 overflow-y-auto px-4 py-2">
-        {/* ── Info row ─────────────────────────────────────────────────── */}
-        <div
-          className="flex items-start gap-2.5 p-3"
-          style={{ borderRadius: 12, backgroundColor: white.w10 }}
-        >
-          <Info size={18} color={white.w40} aria-hidden className="mt-0.5 shrink-0" />
-          <p className="text-[13px]" style={{ color: white.w60 }}>
-            Forward external ports on your VPN server to a local port on your
-            device. Useful for hosting services behind the VPN.
-          </p>
-        </div>
-
         {/* ── Error display ────────────────────────────────────────────── */}
         {error && (
           <div

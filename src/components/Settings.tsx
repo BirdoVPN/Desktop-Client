@@ -246,9 +246,6 @@ export function Settings() {
         <h1 className="text-[22px] font-semibold" style={{ color: '#FFFFFF' }}>
           Settings
         </h1>
-        <p className="mt-0.5 text-[13px]" style={{ color: white.w60 }}>
-          App preferences &amp; account
-        </p>
       </div>
 
       <div className="flex flex-col gap-1 px-5 pb-12 pt-2">
@@ -263,7 +260,6 @@ export function Settings() {
         <BirdoCard padding="0.25rem">
           <BirdoToggleRow
             title="Auto-Connect"
-            subtitle="Connect to the VPN when the app starts"
             leadingIcon={Wifi}
             leadingTint={statusTokens.blue}
             checked={settings.autoConnect}
@@ -271,7 +267,6 @@ export function Settings() {
           />
           <BirdoToggleRow
             title="Connection Notifications"
-            subtitle="Notify on connect, disconnect and kill-switch events"
             leadingIcon={Bell}
             leadingTint={statusTokens.yellow}
             checked={settings.notifications}
@@ -281,7 +276,6 @@ export function Settings() {
             <>
               <BirdoToggleRow
                 title="Show Location"
-                subtitle="Include the server location in notifications"
                 leadingIcon={Bell}
                 leadingTint={white.w60}
                 checked={settings.showLocationInNotification}
@@ -289,7 +283,6 @@ export function Settings() {
               />
               <BirdoToggleRow
                 title="Show IP Address"
-                subtitle="Include the VPN IP in notifications"
                 leadingIcon={Bell}
                 leadingTint={white.w60}
                 checked={settings.showIpInNotification}
@@ -306,11 +299,6 @@ export function Settings() {
             <BirdoCard padding="0.25rem">
               <BirdoToggleRow
                 title="Biometric Unlock"
-                subtitle={
-                  biometric.method === 'touch_id'
-                    ? 'Require Touch ID to open the app'
-                    : 'Require Windows Hello to open the app'
-                }
                 leadingIcon={Fingerprint}
                 leadingTint={statusTokens.green}
                 checked={biometric.enabled}
@@ -330,7 +318,6 @@ export function Settings() {
         <BirdoCard padding="0.25rem">
           <BirdoToggleRow
             title="Launch at Login"
-            subtitle="Start Birdo VPN when your computer starts"
             leadingIcon={Zap}
             leadingTint={brand.accent}
             checked={settings.autostart}
@@ -338,7 +325,6 @@ export function Settings() {
           />
           <BirdoToggleRow
             title="Start Minimized"
-            subtitle="Start in the system tray instead of a full window"
             leadingIcon={Monitor}
             leadingTint={white.w60}
             checked={settings.startMinimized}
@@ -353,7 +339,6 @@ export function Settings() {
         <BirdoCard padding="0.25rem">
           <BirdoNavRow
             title="VPN Settings"
-            subtitle="Protocol, DNS, kill switch, split tunnel & port forwarding"
             leadingIcon={SlidersHorizontal}
             leadingTint={statusTokens.blue}
             onClick={() => pushRoute('vpnSettings')}
@@ -374,11 +359,11 @@ export function Settings() {
               <div className="text-[15px] font-medium" style={{ color: white.w100 }}>
                 Connection Speed
               </div>
-              <div className="mt-0.5 text-xs" style={{ color: white.w60 }}>
-                {speedTestResult
-                  ? `↓ ${speedTestResult.downloadMbps.toFixed(1)} / ↑ ${speedTestResult.uploadMbps.toFixed(1)} Mbps · ${Math.round(speedTestResult.latencyMs)}ms`
-                  : 'Measure download, upload & latency'}
-              </div>
+              {speedTestResult && (
+                <div className="mt-0.5 text-xs" style={{ color: white.w60 }}>
+                  {`↓ ${speedTestResult.downloadMbps.toFixed(1)} / ↑ ${speedTestResult.uploadMbps.toFixed(1)} Mbps · ${Math.round(speedTestResult.latencyMs)}ms`}
+                </div>
+              )}
             </div>
             <button
               type="button"
@@ -420,7 +405,7 @@ export function Settings() {
           />
           <BirdoNavRow
             title="Manage on web"
-            subtitle="Open dashboard.birdo.app in browser"
+            subtitle="dashboard.birdo.app"
             leadingIcon={ExternalLink}
             leadingTint={brand.accentSoft}
             onClick={() => openExternal(DASHBOARD_URL)}
@@ -459,9 +444,6 @@ function WindowPositionSelector({
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[15px] font-medium text-white">Window position</div>
-          <div className="mt-0.5 text-xs" style={{ color: white.w60 }}>
-            Pin to a screen corner, or free to drag
-          </div>
         </div>
       </div>
       <div
