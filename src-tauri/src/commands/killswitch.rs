@@ -429,34 +429,70 @@ pub async fn disarm() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 static PF_BLOCKING: AtomicBool = AtomicBool::new(false);
 
-/// Anchor name for Birdo VPN pf rules
+/// True when WE enabled pf (it was disabled before us). Governs whether
+/// deactivation should `pfctl -d` — we must never disable pf if the user or
+/// another tool had it running.
 #[cfg(target_os = "macos")]
-const PF_ANCHOR: &str = "com.birdo.vpn.killswitch";
+static PF_WE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Is pf currently enabled? Parses `pfctl -s info` ("Status: Enabled").
+#[cfg(target_os = "macos")]
+fn pf_is_enabled() -> bool {
+    crate::utils::hidden_cmd("pfctl")
+        .args(["-s", "info"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("Status: Enabled"))
+        .unwrap_or(false)
+}
 
 /// Activate pf blocking: block all traffic except to the VPN server and localhost.
+///
+/// CRITICAL FIX: the rules are loaded as pf's **main ruleset** (`pfctl -f -`),
+/// not into a named anchor. A named anchor is only evaluated when the main
+/// ruleset contains a matching `anchor "..."` line, and macOS's default
+/// `/etc/pf.conf` has no such line — so the previous anchor-only approach loaded
+/// rules pf never evaluated, and the kill switch silently failed OPEN (all
+/// traffic leaked while the UI reported it active). The main ruleset is always
+/// evaluated. `pf_deactivate_blocking` restores `/etc/pf.conf`.
 #[cfg(target_os = "macos")]
 async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
     use std::io::Write;
 
+    // Let the tunnel re-establish while blocked by permitting the VPN server.
+    // WireGuard is UDP; allow the server on both transports so a stealth/TCP
+    // fallback can also reconnect through the block.
     let server_rule = if let Some(ip) = server_ip {
-        format!("pass out quick proto udp to {} no state\n", ip)
+        format!("pass out quick inet proto {{ udp tcp }} to {} no state\n", ip)
     } else {
         String::new()
     };
 
-    // Build pf rules for the anchor
+    // Default-deny with `quick` passes short-circuiting for the allow-list.
+    // Also permit any utun* WireGuard interface so that, if the tunnel comes
+    // back up before deactivation lands, traffic already inside the VPN is not
+    // dropped by this main ruleset.
     let rules = format!(
-        "# Birdo VPN Kill Switch\n\
+        "# Birdo VPN Kill Switch (main ruleset — pf evaluates this directly)\n\
+         set block-policy drop\n\
          block drop all\n\
-         pass on lo0 all\n\
+         pass quick on lo0 all\n\
+         pass quick on utun0 all\n\
+         pass quick on utun1 all\n\
+         pass quick on utun2 all\n\
+         pass quick on utun3 all\n\
          pass out quick proto udp to any port 67 no state\n\
          pass in quick proto udp from any port 68 no state\n\
          {server_rule}"
     );
 
+    // Record pf's pre-existing state BEFORE we change it, so deactivation only
+    // disables pf if we were the ones who enabled it.
+    let was_enabled = pf_is_enabled();
+
     // Pipe rules directly to pfctl via stdin — avoids TOCTOU race and world-readable temp file
     let mut child = crate::utils::hidden_cmd("pfctl")
-        .args(["-a", PF_ANCHOR, "-f", "-"])
+        .args(["-f", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -485,29 +521,48 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("pfctl load anchor failed: {}", stderr));
+        return Err(format!("pfctl load ruleset failed: {}", stderr));
     }
 
-    // Enable pf if not already enabled
-    let _ = crate::utils::hidden_cmd("pfctl").args(["-e"]).output();
+    // Enable pf if it wasn't already, and remember that we did so.
+    if !was_enabled {
+        let en = crate::utils::hidden_cmd("pfctl").args(["-e"]).output();
+        // `pfctl -e` returns non-zero if pf was already enabled; we already
+        // guarded on was_enabled, so treat a spawn failure as fatal — an
+        // un-enabled pf means the loaded block ruleset is not enforced.
+        match en {
+            Ok(_) => PF_WE_ENABLED.store(true, Ordering::SeqCst),
+            Err(e) => return Err(format!("pfctl enable failed: {}", e)),
+        }
+    }
 
     PF_BLOCKING.store(true, Ordering::SeqCst);
-    tracing::info!("macOS pf kill switch activated");
+    tracing::info!("macOS pf kill switch activated (main ruleset enforced)");
     Ok(())
 }
 
-/// Deactivate pf blocking: flush the Birdo anchor rules.
+/// Deactivate pf blocking: restore the system default ruleset (which replaces
+/// our block-all main ruleset), and disable pf only if we were the ones who
+/// enabled it.
 #[cfg(target_os = "macos")]
 async fn pf_deactivate_blocking() -> Result<(), String> {
-    // Flush the anchor
+    // Reload the default ruleset, dropping our block-all rules. This is the
+    // correct inverse of loading a main ruleset (a per-anchor flush would leave
+    // our main-ruleset block rules in place and keep blocking).
     let output = crate::utils::hidden_cmd("pfctl")
-        .args(["-a", PF_ANCHOR, "-F", "all"])
+        .args(["-f", "/etc/pf.conf"])
         .output()
-        .map_err(|e| format!("pfctl flush failed: {}", e))?;
+        .map_err(|e| format!("pfctl restore failed: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!("pfctl flush anchor: {}", stderr);
+        tracing::warn!("pfctl restore /etc/pf.conf: {}", stderr);
+    }
+
+    // Only disable pf if we enabled it (never disable pf out from under the
+    // user or another tool that had it running).
+    if PF_WE_ENABLED.swap(false, Ordering::SeqCst) {
+        let _ = crate::utils::hidden_cmd("pfctl").args(["-d"]).output();
     }
 
     PF_BLOCKING.store(false, Ordering::SeqCst);
