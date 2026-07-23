@@ -463,7 +463,10 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
     // WireGuard is UDP; allow the server on both transports so a stealth/TCP
     // fallback can also reconnect through the block.
     let server_rule = if let Some(ip) = server_ip {
-        format!("pass out quick inet proto {{ udp tcp }} to {} no state\n", ip)
+        format!(
+            "pass out quick inet proto {{ udp tcp }} to {} no state\n",
+            ip
+        )
     } else {
         String::new()
     };
