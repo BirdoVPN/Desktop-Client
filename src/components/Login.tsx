@@ -603,8 +603,15 @@ export function Login() {
                       <BirdoTextField
                         label="Anonymous ID"
                         value={anonId}
-                        onChange={(next) => setAnonId(next.replace(/[^\d-]/g, '').slice(0, 29))}
-                        placeholder="000000-000000-000000-000000"
+                        onChange={(next) =>
+                          setAnonId(
+                            next
+                              .replace(/\D/g, '')
+                              .slice(0, 24)
+                              .replace(/(\d{4})(?=\d)/g, '$1|'),
+                          )
+                        }
+                        placeholder="0000|0000|0000|0000|0000|0000"
                         className="font-mono"
                         ariaLabel="Anonymous ID"
                       />
