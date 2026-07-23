@@ -387,7 +387,7 @@ function AccountNumberCard({ accountNumber }: { accountNumber: string }) {
 
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(accountNumber);
+      await navigator.clipboard.writeText(accountNumber.replace(/\D/g, '').replace(/(\d{4})(?=\d)/g, '$1|'));
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
