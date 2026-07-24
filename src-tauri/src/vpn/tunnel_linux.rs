@@ -25,6 +25,63 @@ fn cmd(program: &str) -> Command {
 /// TUN device name prefix
 const TUN_DEVICE_NAME: &str = "birdo0";
 
+/// F-001: dedicated chain for the steady-state IPv6 leak block. Deliberately
+/// SEPARATE from the kill switch's BIRDO_KILLSWITCH chain so the two never
+/// interfere — this block must persist for the whole Connected session, whereas
+/// the kill-switch chain is torn down once the tunnel is healthy.
+const IPV6_BLOCK_CHAIN: &str = "BIRDO_IPV6_LEAK_BLOCK";
+
+/// Run an ip6tables command, tolerating ip6tables being absent (IPv4-only host).
+/// Mirrors firewall_linux.rs's ip6tables() so behaviour is identical.
+fn ip6t(args: &[&str]) -> Result<(), String> {
+    match cmd("ip6tables").args(args).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "ip6tables {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("ip6tables not present — skipping IPv6 leak block (IPv4-only host)");
+            Ok(())
+        }
+        Err(e) => Err(format!("ip6tables spawn failed: {e}")),
+    }
+}
+
+/// F-001: install a default-deny IPv6 egress block for the whole connect window.
+///
+/// The tunnel is IPv4-only (the relay fleet has no IPv6), so any IPv6-capable
+/// app would otherwise egress via the physical NIC's untouched IPv6 default
+/// route while the UI reports "Protected" — a continuous de-anonymisation leak
+/// that the kill switch never catches (WireGuard never drops). Windows has done
+/// this unconditionally since the LEAK-2 fix (tunnel.rs); this is the Linux port.
+///
+/// Loopback, link-local and NDP/ICMPv6 stay permitted so the host keeps working;
+/// everything routable is dropped. Idempotent (flush + recreate each call).
+fn install_ipv6_leak_block() -> Result<(), String> {
+    let _ = ip6t(&["-N", IPV6_BLOCK_CHAIN]); // create (ignore "already exists")
+    let _ = ip6t(&["-F", IPV6_BLOCK_CHAIN]); // clean slate
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-o", "lo", "-j", "ACCEPT"])?;
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-d", "fe80::/10", "-j", "ACCEPT"])?;
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-d", "ff02::/16", "-j", "ACCEPT"])?;
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-p", "ipv6-icmp", "-j", "ACCEPT"])?;
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-j", "DROP"])?;
+    // Jump OUTPUT -> our chain (delete first so repeated starts don't stack).
+    let _ = ip6t(&["-D", "OUTPUT", "-j", IPV6_BLOCK_CHAIN]);
+    ip6t(&["-I", "OUTPUT", "1", "-j", IPV6_BLOCK_CHAIN])?;
+    tracing::info!("F-001: IPv6 egress blocked for the connect window");
+    Ok(())
+}
+
+/// F-001: lift the IPv6 block at teardown. Best-effort — never fail teardown.
+fn remove_ipv6_leak_block() {
+    let _ = ip6t(&["-D", "OUTPUT", "-j", IPV6_BLOCK_CHAIN]);
+    let _ = ip6t(&["-F", IPV6_BLOCK_CHAIN]);
+    let _ = ip6t(&["-X", IPV6_BLOCK_CHAIN]);
+    tracing::info!("F-001: IPv6 egress block removed");
+}
+
 /// Stores original DNS and default route info for restoration on disconnect
 #[derive(Debug, Clone)]
 struct NetworkSnapshot {
@@ -140,6 +197,13 @@ impl LinuxTunnel {
         )
         .await?;
 
+        // F-001 (P0): block IPv6 egress for the whole Connected session. Done here
+        // — at tunnel start, INDEPENDENT of the kill-switch enabled/lockdown
+        // setting — exactly as Windows does (tunnel.rs LEAK-2). The reactive kill
+        // switch cannot cover this: it is torn down once the tunnel is healthy, and
+        // an IPv6 leak never drops the (IPv4-only) tunnel so it never triggers.
+        install_ipv6_leak_block()?;
+
         // Configure DNS
         let snapshot = self.network_snapshot.read().await;
         let uses_resolved = snapshot.as_ref().map_or(false, |s| s.uses_systemd_resolved);
@@ -196,6 +260,10 @@ impl LinuxTunnel {
         if let Some(snapshot) = self.network_snapshot.read().await.as_ref() {
             restore_dns(snapshot).await;
         }
+
+        // F-001: lift the IPv6 block. Best-effort so it can never fail teardown
+        // (a stuck block would leave the host without IPv6 after disconnect).
+        remove_ipv6_leak_block();
 
         // Remove routes
         if let Some(ep_ip) = self.endpoint_ip.read().await.as_ref() {
