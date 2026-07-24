@@ -161,8 +161,23 @@ impl UtunTunnel {
             return Err(e);
         }
 
+        // F-001 (P0): block IPv6 egress for the whole Connected session. Installed
+        // here — at tunnel start, INDEPENDENT of the kill-switch enabled/lockdown
+        // setting — exactly as Windows does (tunnel.rs LEAK-2). The reactive kill
+        // switch cannot cover this: it is torn down once the tunnel is healthy, and
+        // an IPv6 leak never drops the (IPv4-only) tunnel so it never trips.
+        //
+        // The tunnel is IPv4-only (the relay fleet has no IPv6), so there is no
+        // in-tunnel IPv6 to route; black-holing it is the only leak-safe option.
+        if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
+            close_fd_on_err(utun_fd);
+            *self.utun_fd.write().await = None;
+            return Err(format!("Failed to block IPv6 leaks: {}", e));
+        }
+
         // Configure DNS
         if let Err(e) = configure_dns(&self.config.dns).await {
+            crate::commands::killswitch::ipv6_block_deactivate().await;
             close_fd_on_err(utun_fd);
             *self.utun_fd.write().await = None;
             return Err(e);
@@ -218,6 +233,10 @@ impl UtunTunnel {
         if let Some(snapshot) = self.network_snapshot.read().await.as_ref() {
             restore_dns(snapshot).await;
         }
+
+        // F-001: lift the IPv6 block. Best-effort so it can never fail teardown
+        // (a stuck block would leave the host without IPv6 after disconnect).
+        crate::commands::killswitch::ipv6_block_deactivate().await;
 
         // Remove routes
         if let Some(ep_ip) = self.endpoint_ip.read().await.as_ref() {

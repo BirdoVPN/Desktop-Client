@@ -63,9 +63,15 @@ fn install_ipv6_leak_block() -> Result<(), String> {
     let _ = ip6t(&["-N", IPV6_BLOCK_CHAIN]); // create (ignore "already exists")
     let _ = ip6t(&["-F", IPV6_BLOCK_CHAIN]); // clean slate
     ip6t(&["-A", IPV6_BLOCK_CHAIN, "-o", "lo", "-j", "ACCEPT"])?;
+    // Link-local and link-scoped multicast only: this covers NDP (NS/NA/RS/RA),
+    // DAD, MLD and DHCPv6, which is everything the host needs to stay functional.
+    // NOTE: deliberately NO blanket `-p ipv6-icmp ACCEPT`. That would permit
+    // ICMPv6 echo to GLOBAL destinations, i.e. `ping6 <any host>` would still
+    // egress the physical NIC and disclose the real IPv6 address — a smaller
+    // version of the very leak this chain exists to close. Inbound ICMPv6 (PMTUD
+    // "Packet Too Big") is unaffected: this chain is hooked into OUTPUT only.
     ip6t(&["-A", IPV6_BLOCK_CHAIN, "-d", "fe80::/10", "-j", "ACCEPT"])?;
     ip6t(&["-A", IPV6_BLOCK_CHAIN, "-d", "ff02::/16", "-j", "ACCEPT"])?;
-    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-p", "ipv6-icmp", "-j", "ACCEPT"])?;
     ip6t(&["-A", IPV6_BLOCK_CHAIN, "-j", "DROP"])?;
     // Jump OUTPUT -> our chain (delete first so repeated starts don't stack).
     let _ = ip6t(&["-D", "OUTPUT", "-j", IPV6_BLOCK_CHAIN]);
@@ -75,7 +81,10 @@ fn install_ipv6_leak_block() -> Result<(), String> {
 }
 
 /// F-001: lift the IPv6 block at teardown. Best-effort — never fail teardown.
-fn remove_ipv6_leak_block() {
+///
+/// Also used to reconcile state a crashed or failed run left behind: the chain
+/// name is ours alone, so removing it is unconditionally safe and idempotent.
+pub(crate) fn remove_ipv6_leak_block() {
     let _ = ip6t(&["-D", "OUTPUT", "-j", IPV6_BLOCK_CHAIN]);
     let _ = ip6t(&["-F", IPV6_BLOCK_CHAIN]);
     let _ = ip6t(&["-X", IPV6_BLOCK_CHAIN]);
