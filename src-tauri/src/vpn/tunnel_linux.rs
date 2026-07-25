@@ -876,3 +876,91 @@ fn get_default_interface() -> Result<String, String> {
         .map(|s| s.to_string())
         .ok_or_else(|| "Could not determine default interface".to_string())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F-001 verification
+//
+// This exercises the REAL install/remove functions against the REAL ip6tables
+// binary, rather than asserting on a duplicated copy of the argv. It is the only
+// part of the F-001 Linux fix that can be checked without a dual-stack network,
+// and CI runs it as root on ubuntu-latest (see .github/workflows/tests.yml).
+//
+// Ignored by default so a normal `cargo test` on a dev box never touches the
+// host firewall: run explicitly with `--ignored`, as root.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod ipv6_leak_block_tests {
+    use super::*;
+
+    fn ip6tables_available() -> bool {
+        cmd("ip6tables")
+            .arg("-L")
+            .arg("-n")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    fn chain_dump() -> String {
+        cmd("ip6tables")
+            .args(["-S"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[ignore = "mutates the host firewall; run as root via --ignored (CI does)"]
+    fn install_then_remove_leaves_no_trace() {
+        assert!(
+            ip6tables_available(),
+            "ip6tables must be present and usable (are we root?)"
+        );
+
+        // Clean slate in case a previous run died mid-way.
+        remove_ipv6_leak_block();
+
+        install_ipv6_leak_block().expect("install_ipv6_leak_block failed");
+
+        let dump = chain_dump();
+        assert!(
+            dump.contains(&format!("-N {IPV6_BLOCK_CHAIN}")),
+            "chain was not created:\n{dump}"
+        );
+        assert!(
+            dump.contains(&format!("-A OUTPUT -j {IPV6_BLOCK_CHAIN}")),
+            "OUTPUT jump was not installed — the chain would never be evaluated:\n{dump}"
+        );
+        // The whole point: routable IPv6 must terminate in DROP.
+        assert!(
+            dump.contains(&format!("-A {IPV6_BLOCK_CHAIN} -j DROP")),
+            "default-deny rule missing — the block would pass everything:\n{dump}"
+        );
+        // Link-local must stay permitted or the host's own NDP breaks.
+        assert!(
+            dump.contains("fe80::/10") && dump.contains("ff02::/16"),
+            "link-local/multicast allowances missing — NDP would break:\n{dump}"
+        );
+        // Regression guard: a blanket ICMPv6 accept would let `ping6 <global>`
+        // out and disclose the real address — a smaller version of this leak.
+        assert!(
+            !dump.contains("-p ipv6-icmp -j ACCEPT"),
+            "blanket ICMPv6 ACCEPT is back; global ping6 would leak:\n{dump}"
+        );
+
+        // Idempotent: installing twice must not stack duplicate OUTPUT jumps.
+        install_ipv6_leak_block().expect("second install failed");
+        let dump2 = chain_dump();
+        let jumps = dump2
+            .lines()
+            .filter(|l| l.trim() == format!("-A OUTPUT -j {IPV6_BLOCK_CHAIN}"))
+            .count();
+        assert_eq!(jumps, 1, "duplicate OUTPUT jumps stacked:\n{dump2}");
+
+        remove_ipv6_leak_block();
+        let after = chain_dump();
+        assert!(
+            !after.contains(IPV6_BLOCK_CHAIN),
+            "teardown left state behind — the host would stay without IPv6:\n{after}"
+        );
+    }
+}

@@ -500,58 +500,24 @@ fn pf_is_enabled() -> bool {
 #[cfg(target_os = "macos")]
 const PF_MARKER_ANCHOR: &str = "com.birdo.vpn";
 
-/// Filter rules that black-hole routable IPv6 while keeping the host functional.
+/// The leak-block rulesets live in `resources/pf/` rather than in this source
+/// file, so that CI can parse-check the EXACT bytes we ship with `pfctl -n -f` on
+/// a real macOS runner (see .github/workflows/tests.yml). A pf syntax error here
+/// would fail every macOS connect, and it is not otherwise reachable from a
+/// Windows dev box — this is the one thing about F-001 that can be verified
+/// without a dual-stack network.
 ///
-/// IPv4 is deliberately NOT mentioned: pf's implicit default is *pass*, so a
-/// ruleset containing only `inet6` rules cannot break IPv4 connectivity. Link-local
-/// and link-scoped multicast stay permitted so NDP/RA/DAD/DHCPv6/MLD keep working.
+/// Preferred ruleset: re-declares the stock `/etc/pf.conf` anchors so Apple's own
+/// pf rules (application firewall / Internet Sharing) keep working for the
+/// session, then appends our IPv6 block.
 #[cfg(target_os = "macos")]
-/// Kept to the smallest set that is provably sufficient, because this ruleset
-/// cannot be unit-tested — every extra rule is another chance for a pfctl parse
-/// error that would fail the connect. Link-local↔link-local covers NDP
-/// (NS/NA/RS/RA unicast); `any → ff02::/16` covers every link-scoped multicast
-/// case including DAD (source `::`), router solicitation, MLD and DHCPv6.
-const PF_IPV6_FILTER_RULES: &str = "\
-pass quick inet6 from fe80::/10 to fe80::/10 no state\n\
-pass quick inet6 from any to ff02::/16 no state\n\
-block drop quick inet6 all\n";
+const PF_IPV6_RULESET_FULL: &str = include_str!("../../resources/pf/ipv6-block.conf");
 
-/// Preferred leak-block ruleset: re-declares the stock `/etc/pf.conf` anchors so
-/// Apple's own pf rules (application firewall / Internet Sharing) keep working
-/// for the duration of the session, then appends our IPv6 block.
-///
-/// pf requires rule types in order: options → normalization → queueing →
-/// translation → filtering. This mirrors stock `/etc/pf.conf` ordering exactly.
+/// Fallback for hosts where the stock Apple anchor file is missing or unreadable
+/// (the `load anchor` line would fail the whole load). Same protection, minus the
+/// Apple anchors for the session.
 #[cfg(target_os = "macos")]
-fn pf_ipv6_ruleset_full() -> String {
-    format!(
-        "# Birdo VPN — IPv6 leak block (main ruleset; pf evaluates this directly)\n\
-         set block-policy drop\n\
-         set skip on lo0\n\
-         scrub-anchor \"com.apple/*\"\n\
-         nat-anchor \"com.apple/*\"\n\
-         rdr-anchor \"com.apple/*\"\n\
-         dummynet-anchor \"com.apple/*\"\n\
-         anchor \"com.apple/*\"\n\
-         load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"\n\
-         anchor \"{PF_MARKER_ANCHOR}\"\n\
-         {PF_IPV6_FILTER_RULES}"
-    )
-}
-
-/// Fallback leak-block ruleset for hosts where the stock Apple anchor file is
-/// missing or unparseable (the `load anchor` line would fail the whole load).
-/// Same protection, minus the Apple anchors for the session.
-#[cfg(target_os = "macos")]
-fn pf_ipv6_ruleset_minimal() -> String {
-    format!(
-        "# Birdo VPN — IPv6 leak block (minimal fallback)\n\
-         set block-policy drop\n\
-         set skip on lo0\n\
-         anchor \"{PF_MARKER_ANCHOR}\"\n\
-         {PF_IPV6_FILTER_RULES}"
-    )
-}
+const PF_IPV6_RULESET_MINIMAL: &str = include_str!("../../resources/pf/ipv6-block-minimal.conf");
 
 /// Load `rules` as pf's main ruleset via `pfctl -f -`.
 ///
@@ -620,12 +586,12 @@ fn pf_live_rules() -> String {
 fn pf_apply_ipv6_baseline() -> Result<(), String> {
     let was_enabled = pf_is_enabled();
 
-    if let Err(primary) = pf_load_ruleset(&pf_ipv6_ruleset_full()) {
+    if let Err(primary) = pf_load_ruleset(PF_IPV6_RULESET_FULL) {
         tracing::warn!(
             "F-001: anchor-preserving IPv6 ruleset failed to load ({}); trying the minimal ruleset",
             primary
         );
-        pf_load_ruleset(&pf_ipv6_ruleset_minimal()).map_err(|e| {
+        pf_load_ruleset(PF_IPV6_RULESET_MINIMAL).map_err(|e| {
             format!("IPv6 leak block failed to load ({primary}); fallback also failed: {e}")
         })?;
     }

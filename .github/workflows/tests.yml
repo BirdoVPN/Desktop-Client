@@ -139,6 +139,45 @@ jobs:
         working-directory: src-tauri
         run: cargo check --all-targets
 
+      # ── F-001 verification ────────────────────────────────────────────────
+      # The IPv6 leak fix is kernel-firewall code that a Windows dev box cannot
+      # exercise at all, and full leak-testing needs a dual-stack network we do
+      # not have. These two steps verify everything that CAN be verified without
+      # one, on the real OS, on every push.
+
+      # macOS: parse-check the EXACT ruleset bytes we ship. A pf syntax error
+      # here would fail every macOS connect, and pfctl is the only thing that can
+      # tell us. `-n` parses without loading, so this never touches the runner's
+      # own firewall. Both variants are checked, including the fallback that
+      # exists precisely for when `load anchor` fails.
+      - name: pf ruleset parse-check (macOS)
+        if: matrix.os == 'macos'
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          for f in resources/pf/ipv6-block.conf resources/pf/ipv6-block-minimal.conf; do
+            echo "── pfctl -n -f $f"
+            sudo pfctl -n -f "$f"
+            echo "   OK"
+          done
+          # Guard the property the whole design rests on: these rulesets must
+          # never mention inet/IPv4. pf's implicit default is pass, so an
+          # inet6-only ruleset cannot break IPv4 — that is what makes loading it
+          # as the MAIN ruleset safe for a whole session.
+          if grep -nE '\binet\b' resources/pf/*.conf; then
+            echo "::error::pf leak-block ruleset references IPv4 — it could break IPv4 connectivity"
+            exit 1
+          fi
+
+      # Linux: run the real install/remove functions against real ip6tables as
+      # root, asserting the chain, the OUTPUT jump, the default-deny, that NDP
+      # stays permitted, that repeat installs don't stack, and that teardown
+      # leaves nothing behind (a stuck chain = host with no IPv6).
+      - name: IPv6 leak-block functional test (Linux, root)
+        if: matrix.os == 'linux'
+        working-directory: src-tauri
+        run: sudo -E "$(command -v cargo)" test --lib ipv6_leak_block_tests -- --ignored --nocapture
+
   frontend-tests:
     name: Frontend unit tests
     runs-on: ubuntu-latest
