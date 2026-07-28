@@ -320,6 +320,13 @@ pub fn set_lan_sharing(enabled: bool) {
 }
 
 /// Whether LAN traffic should be permitted through an active block.
+///
+/// Only the pf (macOS) and iptables (Linux) backends consult this. Windows
+/// carries the same preference through `wfp::set_local_network_sharing`, so this
+/// getter genuinely has no caller there — cfg-gated rather than
+/// `#[allow(dead_code)]`, so it stays a real dead-code signal if a future caller
+/// disappears.
+#[cfg(not(target_os = "windows"))]
 pub fn lan_sharing_enabled() -> bool {
     LAN_SHARING_ENABLED.load(Ordering::SeqCst)
 }
