@@ -51,11 +51,18 @@ fn ip6t(args: &[&str]) -> Result<(), String> {
 
 /// F-001: install a default-deny IPv6 egress block for the whole connect window.
 ///
-/// The tunnel is IPv4-only (the relay fleet has no IPv6), so any IPv6-capable
-/// app would otherwise egress via the physical NIC's untouched IPv6 default
-/// route while the UI reports "Protected" — a continuous de-anonymisation leak
-/// that the kill switch never catches (WireGuard never drops). Windows has done
-/// this unconditionally since the LEAK-2 fix (tunnel.rs); this is the Linux port.
+/// Without this, any IPv6-capable app egresses via the physical NIC's untouched
+/// IPv6 default route while the UI reports "Protected" — a continuous
+/// de-anonymisation leak the kill switch never catches (WireGuard never drops,
+/// so nothing trips). Windows has done this since the LEAK-2 fix (tunnel.rs);
+/// this is the Linux port.
+///
+/// This is the DEFAULT state, not the final one. It is installed unconditionally
+/// at tunnel start so every failure path fails closed, and lifted by
+/// `remove_ipv6_leak_block` only once `configure_ipv6` has actually put the
+/// tunnel's own v6 address and routes in place — which happens only when the
+/// backend issued a `client_ipv6` (i.e. the node is genuinely dual-stack).
+/// On an IPv4-only node the block simply stays for the whole session.
 ///
 /// Loopback, link-local and NDP/ICMPv6 stay permitted so the host keeps working;
 /// everything routable is dropped. Idempotent (flush + recreate each call).
@@ -669,7 +676,14 @@ async fn configure_ipv6(tun_name: &str, config: &VpnConfig) -> Result<(), String
     }
 
     let output = cmd("ip")
-        .args(["-6", "addr", "add", &format!("{}/128", addr), "dev", tun_name])
+        .args([
+            "-6",
+            "addr",
+            "add",
+            &format!("{}/128", addr),
+            "dev",
+            tun_name,
+        ])
         .output()
         .map_err(|e| format!("Failed to configure TUN IPv6 address: {}", e))?;
     if !output.status.success() {
