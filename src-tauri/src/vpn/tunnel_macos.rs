@@ -384,6 +384,19 @@ impl UtunTunnel {
 
         // Same cadence Windows uses (tunnel.rs). 250ms is comfortably finer than
         // boringtun's shortest timer, so no deadline is ever missed.
+        // Idle backoff, mirroring Windows (tunnel.rs). The fd is O_NONBLOCK and
+        // recv_packet returns Ok(None) immediately on WouldBlock, so an idle
+        // tunnel previously spun a core at 100% forever. Any packet in either
+        // direction resets the counter, so only the FIRST packet after a
+        // sustained idle pays the extra latency.
+        let mut idle_cycles: u32 = 0;
+        const IDLE_THRESHOLD: u32 = 100;
+        const DEEP_IDLE_THRESHOLD: u32 = 2_000;
+        const SLOW_POLL_US: u64 = 500;
+        const DEEP_POLL_US: u64 = 5_000;
+        // Drain up to this many decrypted packets per wake, so a burst is not
+        // paced one packet per loop iteration.
+        const MAX_BATCH_SIZE: usize = 64;
         let mut last_timer_update = std::time::Instant::now();
         const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -391,6 +404,7 @@ impl UtunTunnel {
         let mut write_buf = vec![0u8; MAX_PACKET_SIZE + UTUN_HEADER_SIZE];
 
         loop {
+            let mut did_work = false;
             if !running.load(Ordering::SeqCst) {
                 tracing::info!("Packet loop: running flag cleared, exiting");
                 break;
@@ -441,6 +455,7 @@ impl UtunTunnel {
                                     Ok(_) => {
                                         bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
                                         packets_sent.fetch_add(1, Ordering::Relaxed);
+                                        did_work = true;
                                     }
                                     Err(e) => {
                                         tracing::debug!("Failed to send WG packet: {}", e);
@@ -453,32 +468,39 @@ impl UtunTunnel {
             }
 
             // Read from WireGuard and write decrypted packets to utun
-            if let Some(session) = wg_session.read().await.as_ref() {
-                if let Ok(Some(decrypted)) = session.recv_packet().await {
-                    let packet_len = decrypted.len() as u64;
+            for _ in 0..MAX_BATCH_SIZE {
+                if let Some(session) = wg_session.read().await.as_ref() {
+                    if let Ok(Some(decrypted)) = session.recv_packet().await {
+                        did_work = true;
+                        let packet_len = decrypted.len() as u64;
 
-                    // Prepend utun header (AF_INET = 0x00000002 for IPv4)
-                    write_buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
-                    write_buf[4..4 + decrypted.len()].copy_from_slice(&decrypted);
+                        // Prepend utun header (AF_INET = 0x00000002 for IPv4)
+                        write_buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
+                        write_buf[4..4 + decrypted.len()].copy_from_slice(&decrypted);
 
-                    let write_len = 4 + decrypted.len();
-                    let fd = utun_fd;
-                    let buf = write_buf[..write_len].to_vec();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let written = unsafe {
-                            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-                        };
-                        if written < 0 {
-                            tracing::debug!(
-                                "utun write error: {}",
-                                std::io::Error::last_os_error()
-                            );
-                        }
-                    })
-                    .await;
+                        let write_len = 4 + decrypted.len();
+                        let fd = utun_fd;
+                        let buf = write_buf[..write_len].to_vec();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let written = unsafe {
+                                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+                            };
+                            if written < 0 {
+                                tracing::debug!(
+                                    "utun write error: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            }
+                        })
+                        .await;
 
-                    bytes_received.fetch_add(packet_len, Ordering::Relaxed);
-                    packets_received.fetch_add(1, Ordering::Relaxed);
+                        bytes_received.fetch_add(packet_len, Ordering::Relaxed);
+                        packets_received.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        break; // nothing queued — stop draining
+                    }
+                } else {
+                    break;
                 }
             }
 
@@ -502,6 +524,17 @@ impl UtunTunnel {
                     if let Err(e) = session.update_timers().await {
                         tracing::trace!("Timer update error: {}", e);
                     }
+                }
+            }
+
+            if did_work {
+                idle_cycles = 0;
+            } else {
+                idle_cycles = idle_cycles.saturating_add(1);
+                if idle_cycles > DEEP_IDLE_THRESHOLD {
+                    tokio::time::sleep(std::time::Duration::from_micros(DEEP_POLL_US)).await;
+                } else if idle_cycles > IDLE_THRESHOLD {
+                    tokio::time::sleep(std::time::Duration::from_micros(SLOW_POLL_US)).await;
                 }
             }
         }

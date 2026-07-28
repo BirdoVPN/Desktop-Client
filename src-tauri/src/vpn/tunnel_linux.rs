@@ -386,10 +386,25 @@ impl LinuxTunnel {
 
         // Same cadence Windows uses (tunnel.rs). 250ms is comfortably finer than
         // boringtun's shortest timer, so no deadline is ever missed.
+        // Idle backoff, mirroring Windows (tunnel.rs). Both fds are O_NONBLOCK
+        // and recv_packet returns Ok(None) immediately on WouldBlock, so an idle
+        // tunnel previously spun a core at 100% and churned the blocking pool
+        // with a spawn_blocking round trip per iteration, forever. Any packet in
+        // either direction resets the counter, so only the FIRST packet after a
+        // sustained idle pays the extra latency.
+        let mut idle_cycles: u32 = 0;
+        const IDLE_THRESHOLD: u32 = 100;
+        const DEEP_IDLE_THRESHOLD: u32 = 2_000;
+        const SLOW_POLL_US: u64 = 500;
+        const DEEP_POLL_US: u64 = 5_000;
+        // Drain up to this many decrypted packets per wake, so a burst is not
+        // paced one packet per loop iteration.
+        const MAX_BATCH_SIZE: usize = 64;
         let mut last_timer_update = std::time::Instant::now();
         const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
         loop {
+            let mut did_work = false;
             if !running.load(Ordering::SeqCst) {
                 tracing::info!("Packet loop: running flag cleared, exiting");
                 break;
@@ -426,6 +441,7 @@ impl LinuxTunnel {
                     }
                 }) => {
                     if let Ok(Some(ip_packet)) = result {
+                        did_work = true;
                         // Linux TUN with IFF_NO_PI: data is already a raw IP packet
                         let packet_len = ip_packet.len() as u64;
 
@@ -445,35 +461,49 @@ impl LinuxTunnel {
             }
 
             // Read from WireGuard and write decrypted packets to TUN
-            if let Some(session) = wg_session.read().await.as_ref() {
-                if let Ok(Some(decrypted)) = session.recv_packet().await {
-                    let packet_len = decrypted.len() as u64;
+            for _ in 0..MAX_BATCH_SIZE {
+                if let Some(session) = wg_session.read().await.as_ref() {
+                    if let Ok(Some(decrypted)) = session.recv_packet().await {
+                        did_work = true;
+                        let packet_len = decrypted.len() as u64;
 
-                    // Linux TUN with IFF_NO_PI: write raw IP packet directly (no header)
-                    let fd = tun_fd;
-                    let buf = decrypted;
-                    let buf_len = buf.len();
-                    let write_result = tokio::task::spawn_blocking(move || {
-                        let written = unsafe {
-                            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-                        };
-                        if written < 0 {
-                            tracing::debug!("TUN write error: {}", std::io::Error::last_os_error());
-                        } else if (written as usize) < buf.len() {
-                            tracing::warn!("Partial TUN write: {} of {} bytes", written, buf.len());
-                        }
-                        written
-                    })
-                    .await;
+                        // Linux TUN with IFF_NO_PI: write raw IP packet directly (no header)
+                        let fd = tun_fd;
+                        let buf = decrypted;
+                        let buf_len = buf.len();
+                        let write_result = tokio::task::spawn_blocking(move || {
+                            let written = unsafe {
+                                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+                            };
+                            if written < 0 {
+                                tracing::debug!(
+                                    "TUN write error: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            } else if (written as usize) < buf.len() {
+                                tracing::warn!(
+                                    "Partial TUN write: {} of {} bytes",
+                                    written,
+                                    buf.len()
+                                );
+                            }
+                            written
+                        })
+                        .await;
 
-                    // Only count statistics when the full packet was written to TUN.
-                    // Partial writes or errors must not inflate received counters.
-                    if let Ok(written) = write_result {
-                        if written >= 0 && (written as usize) == buf_len {
-                            bytes_received.fetch_add(packet_len, Ordering::Relaxed);
-                            packets_received.fetch_add(1, Ordering::Relaxed);
+                        // Only count statistics when the full packet was written to TUN.
+                        // Partial writes or errors must not inflate received counters.
+                        if let Ok(written) = write_result {
+                            if written >= 0 && (written as usize) == buf_len {
+                                bytes_received.fetch_add(packet_len, Ordering::Relaxed);
+                                packets_received.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
+                    } else {
+                        break; // nothing queued — stop draining
                     }
+                } else {
+                    break;
                 }
             }
 
@@ -497,6 +527,17 @@ impl LinuxTunnel {
                     if let Err(e) = session.update_timers().await {
                         tracing::trace!("Timer update error: {}", e);
                     }
+                }
+            }
+
+            if did_work {
+                idle_cycles = 0;
+            } else {
+                idle_cycles = idle_cycles.saturating_add(1);
+                if idle_cycles > DEEP_IDLE_THRESHOLD {
+                    tokio::time::sleep(std::time::Duration::from_micros(DEEP_POLL_US)).await;
+                } else if idle_cycles > IDLE_THRESHOLD {
+                    tokio::time::sleep(std::time::Duration::from_micros(SLOW_POLL_US)).await;
                 }
             }
         }
