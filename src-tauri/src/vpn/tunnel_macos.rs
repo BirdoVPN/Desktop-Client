@@ -39,6 +39,50 @@ struct NetworkSnapshot {
     default_gateway: Option<String>,
     /// Original default interface
     default_interface: Option<String>,
+    /// EVERY enabled network service and its original resolvers, so each can be
+    /// restored exactly. Repointing only the primary service leaks: with Wi-Fi
+    /// and Ethernet both active, unscoped queries can still go to the other
+    /// service's ISP resolvers.
+    all_dns: Vec<(String, Vec<String>)>,
+}
+
+/// Every ENABLED network service, in the order macOS prefers them.
+///
+/// `networksetup -listallnetworkservices` prints a header line, and prefixes
+/// disabled services with `*` — both are filtered out here. Disabled services
+/// carry no traffic, and calling -setdnsservers on one errors.
+fn list_network_services() -> Vec<String> {
+    let output = match cmd("networksetup")
+        .args(["-listallnetworkservices"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1) // "An asterisk (*) denotes that a network service is disabled."
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('*'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Current resolvers for one service, normalised to "empty means DHCP".
+fn dns_servers_for(service: &str) -> Vec<String> {
+    let output = match cmd("networksetup")
+        .args(["-getdnsservers", service])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.contains("aren't any") || text.is_empty() {
+        Vec::new()
+    } else {
+        text.lines().map(|l| l.trim().to_string()).collect()
+    }
 }
 
 /// macOS utun tunnel for WireGuard VPN
@@ -803,24 +847,78 @@ async fn configure_routes(
 
 /// Configure DNS servers on macOS via networksetup.
 async fn configure_dns(dns_servers: &[String]) -> Result<(), String> {
-    // Get the primary network service
-    let service = get_primary_network_service()?;
-
-    // Set DNS servers via networksetup
-    let mut args = vec!["-setdnsservers".to_string(), service.clone()];
-    args.extend(dns_servers.iter().cloned());
-
-    let output = cmd("networksetup")
-        .args(&args)
-        .output()
-        .map_err(|e| format!("Failed to set DNS: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("networksetup DNS failed: {}", stderr));
+    // Point EVERY enabled service at the tunnel resolvers, not just the primary.
+    //
+    // The leak this closes: with Wi-Fi and Ethernet both active, only the service
+    // owning the default route was repointed. Plug in Ethernet while Wi-Fi stays
+    // associated and the primary flips — the utun routes and the endpoint route
+    // both remain valid so traffic keeps flowing and the UI stays green, but the
+    // newly-primary service's ISP resolvers become resolver #1 for every unscoped
+    // query. `get_primary_network_service` is evaluated once at connect, so
+    // nothing notices.
+    //
+    // Windows disables DNS on all non-VPN adapters for exactly this reason.
+    let services = list_network_services();
+    if services.is_empty() {
+        // Fall back to the old behaviour rather than silently configuring nothing.
+        let service = get_primary_network_service()?;
+        let mut args = vec!["-setdnsservers".to_string(), service.clone()];
+        args.extend(dns_servers.iter().cloned());
+        let output = cmd("networksetup")
+            .args(&args)
+            .output()
+            .map_err(|e| format!("Failed to set DNS: {}", e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "networksetup DNS failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        tracing::warn!(
+            "Could not enumerate network services; configured DNS on '{}' only",
+            service
+        );
+        let _ = cmd("dscacheutil").args(["-flushcache"]).output();
+        let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
+        return Ok(());
     }
 
-    tracing::info!("Configured DNS on service '{}': {:?}", service, dns_servers);
+    let mut configured = 0usize;
+    let mut first_error: Option<String> = None;
+    for service in &services {
+        let mut args = vec!["-setdnsservers".to_string(), service.clone()];
+        args.extend(dns_servers.iter().cloned());
+        match cmd("networksetup").args(&args).output() {
+            Ok(o) if o.status.success() => configured += 1,
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                tracing::warn!("Could not set DNS on '{}': {}", service, err);
+                first_error.get_or_insert(err);
+            }
+            Err(e) => {
+                tracing::warn!("Could not set DNS on '{}': {}", service, e);
+                first_error.get_or_insert(e.to_string());
+            }
+        }
+    }
+
+    // Zero services configured means DNS is entirely unprotected — fail the
+    // connect rather than proceed with a leak. A partial failure is tolerated:
+    // some services (inactive adapters, Thunderbolt bridges) legitimately reject
+    // the call, and the ones carrying traffic are configured.
+    if configured == 0 {
+        return Err(format!(
+            "Failed to configure DNS on any network service: {}",
+            first_error.unwrap_or_else(|| "unknown error".into())
+        ));
+    }
+
+    tracing::info!(
+        "Configured DNS on {}/{} network services: {:?}",
+        configured,
+        services.len(),
+        dns_servers
+    );
 
     // Flush DNS cache
     let _ = cmd("dscacheutil").args(["-flushcache"]).output();
@@ -831,8 +929,32 @@ async fn configure_dns(dns_servers: &[String]) -> Result<(), String> {
 
 /// Restore original DNS configuration.
 async fn restore_dns(snapshot: &NetworkSnapshot) {
-    if snapshot.dns_servers.is_empty() {
-        // Was using DHCP DNS — set to "empty" which restores DHCP
+    // Restore EVERY service we touched, each to exactly what it had.
+    //
+    // This must mirror configure_dns precisely. Restoring only the primary would
+    // leave every other service pinned to tunnel resolvers that stop existing at
+    // disconnect — the user's DNS would simply break, on an interface Birdo
+    // never appeared to touch.
+    if !snapshot.all_dns.is_empty() {
+        for (service, servers) in &snapshot.all_dns {
+            if servers.is_empty() {
+                // "empty" is networksetup's way of saying "go back to DHCP".
+                let _ = cmd("networksetup")
+                    .args(["-setdnsservers", service, "empty"])
+                    .output();
+            } else {
+                let mut args = vec!["-setdnsservers".to_string(), service.clone()];
+                args.extend(servers.iter().cloned());
+                let _ = cmd("networksetup").args(&args).output();
+            }
+        }
+        tracing::info!(
+            "Restored DNS on {} network services",
+            snapshot.all_dns.len()
+        );
+    } else if snapshot.dns_servers.is_empty() {
+        // Legacy single-service path, kept for a snapshot captured before the
+        // all-services change (e.g. an upgrade mid-session).
         let _ = cmd("networksetup")
             .args(["-setdnsservers", &snapshot.service_name, "empty"])
             .output();
@@ -845,8 +967,6 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
     // Flush DNS cache
     let _ = cmd("dscacheutil").args(["-flushcache"]).output();
     let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
-
-    tracing::info!("Restored DNS configuration for '{}'", snapshot.service_name);
 }
 
 /// Remove VPN-specific routes.
@@ -914,11 +1034,23 @@ async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
     let default_gateway = get_default_gateway().ok();
     let default_interface = get_default_interface().ok();
 
+    // Snapshot every enabled service BEFORE anything is changed, so each can be
+    // put back exactly. Captured even for services that already use DHCP — an
+    // empty vec is meaningful here and restores as "empty".
+    let all_dns: Vec<(String, Vec<String>)> = list_network_services()
+        .into_iter()
+        .map(|s| {
+            let servers = dns_servers_for(&s);
+            (s, servers)
+        })
+        .collect();
+
     Ok(NetworkSnapshot {
         service_name: service,
         dns_servers,
         default_gateway,
         default_interface,
+        all_dns,
     })
 }
 
