@@ -263,7 +263,20 @@ fn main() {
             #[cfg(target_os = "macos")]
             crate::commands::killswitch::reconcile_stale_pf_state();
             #[cfg(target_os = "linux")]
-            crate::vpn::tunnel_linux::remove_ipv6_leak_block();
+            {
+                crate::vpn::tunnel_linux::remove_ipv6_leak_block();
+                // The v6 chain was reconciled here but BIRDO_KILLSWITCH was not —
+                // and that is the one that blocks EVERYTHING. A SIGKILL or power
+                // loss with the kill switch armed left the host with a
+                // default-deny chain wired into OUTPUT/INPUT/FORWARD that nothing
+                // ever removed: no internet at all, surviving restarts of the app,
+                // with no indication the VPN client was responsible.
+                //
+                // Safe unconditionally at this point for the same reason the v6
+                // reconcile is: no tunnel can be up this early, so any chain we
+                // find is stale by definition. The chain name is ours alone.
+                crate::vpn::firewall_linux::emergency_cleanup();
+            }
 
             // Wire up AutoReconnectService with references to managed state.
             // BirdoApi and VpnManager use Arc<RwLock<..>> internally, so Clone

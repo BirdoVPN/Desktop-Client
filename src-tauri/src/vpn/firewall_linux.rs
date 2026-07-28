@@ -137,6 +137,48 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
         "ACCEPT",
     ])?;
 
+    // SELF-PERMIT: let OUR OWN process reach the control plane.
+    //
+    // Without this the kill switch makes reconnection impossible, which is the
+    // opposite of what it is for. auto_reconnect arms the block and then calls
+    // https://api.birdo.app for a fresh config — a DIFFERENT host from the
+    // permitted relay /32, over the physical NIC. DNS is blocked too (DoH to
+    // 1.1.1.1/8.8.8.8/9.9.9.9:443, then UDP 53 fallback — all dropped). So every
+    // attempt in the backoff ladder fails for a reason that is not the network,
+    // the user sits behind a total block for the whole ladder, and the loop then
+    // gives up and tears the block down — leaving the machine fully open.
+    //
+    // Windows solved this with a per-app WFP permit keyed on ALE_APP_ID. iptables
+    // has no app identity, so match on the euid we run as. That is coarser (the
+    // client runs elevated, so this permits root-owned traffic generally); a
+    // cgroup2 match would be tighter and is the obvious follow-up. Coarse and
+    // reconnectable beats precise and bricked.
+    let euid = unsafe { libc::geteuid() };
+    let uid_str = euid.to_string();
+    match iptables(&[
+        "-A",
+        CHAIN_NAME,
+        "-m",
+        "owner",
+        "--uid-owner",
+        &uid_str,
+        "-j",
+        "ACCEPT",
+    ]) {
+        Ok(()) => tracing::info!("Kill switch: self-permit installed for uid {}", euid),
+        Err(e) => {
+            // Loudly, like Windows does — a kill switch the client cannot escape
+            // is a support incident, not a silent degradation.
+            tracing::error!(
+                "Kill switch: could NOT install the self-permit for uid {} ({}). \
+                 Auto-reconnect will not be able to reach the control plane while \
+                 the block is armed.",
+                euid,
+                e
+            );
+        }
+    }
+
     // Drop everything else
     iptables(&["-A", CHAIN_NAME, "-j", "DROP"])?;
 

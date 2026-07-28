@@ -732,6 +732,25 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
         String::new()
     };
 
+    // SELF-PERMIT: let OUR OWN process reach the control plane.
+    //
+    // Without this the kill switch makes reconnection impossible, which is the
+    // opposite of what it is for. auto_reconnect arms the block and then calls
+    // https://api.birdo.app for a fresh config — a DIFFERENT host from the
+    // permitted relay, over the physical NIC — and DNS is blocked too. macOS is
+    // worse than Linux here: `block drop all` with no state-passing rule kills
+    // even an already-established socket. So every reconnect attempt fails for a
+    // reason that is not the network, and the loop eventually gives up and drops
+    // the block, leaving the machine fully open.
+    //
+    // Windows uses a per-app WFP permit (ALE_APP_ID). pf has no app condition, so
+    // match the euid we run as and scope it to TCP/443 — narrow enough to be
+    // meaningful, broad enough to survive the control plane changing address.
+    // `keep state` so replies come back.
+    let euid = unsafe { libc::geteuid() };
+    let self_permit = format!("pass out quick proto tcp to any port 443 user {euid} keep state\n");
+    tracing::info!("Kill switch: self-permit for uid {} on tcp/443", euid);
+
     // Default-deny with `quick` passes short-circuiting for the allow-list.
     // Also permit any utun* WireGuard interface so that, if the tunnel comes
     // back up before deactivation lands, traffic already inside the VPN is not
@@ -748,6 +767,7 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
          pass quick on utun3 all\n\
          pass out quick proto udp to any port 67 no state\n\
          pass in quick proto udp from any port 68 no state\n\
+         {self_permit}\
          {server_rule}"
     );
 
