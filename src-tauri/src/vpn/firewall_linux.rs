@@ -137,6 +137,29 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
         "ACCEPT",
     ])?;
 
+    // LAN PERMIT: honour Local Network Sharing while the block is engaged.
+    //
+    // LAN sharing was implemented as ROUTING only, so the moment the kill switch
+    // fired, printers, NAS, Chromecast and SSH went dark despite the toggle being
+    // on — and the toggle is not platform-gated in the UI, so it simply appeared
+    // broken. Windows treats LAN sharing as two halves; this is the missing one.
+    //
+    // 169.254/16 is included for mDNS/Bonjour, which is what actually makes
+    // discovery work rather than just raw IP reachability.
+    if crate::commands::killswitch::lan_sharing_enabled() {
+        for cidr in [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+        ] {
+            // Both directions: outbound to the LAN, and replies coming back.
+            let _ = iptables(&["-A", CHAIN_NAME, "-d", cidr, "-j", "ACCEPT"]);
+            let _ = iptables(&["-A", CHAIN_NAME, "-s", cidr, "-j", "ACCEPT"]);
+        }
+        tracing::info!("Kill switch: LAN sharing permitted (RFC1918 + link-local)");
+    }
+
     // SELF-PERMIT: let OUR OWN process reach the control plane.
     //
     // Without this the kill switch makes reconnection impossible, which is the

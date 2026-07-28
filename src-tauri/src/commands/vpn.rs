@@ -267,6 +267,11 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     // before being enabled (see wfp::LOCKDOWN_MODE).
     let lockdown_mode = settings.as_ref().map(|s| s.lockdown_mode).unwrap_or(false);
 
+    // Mirror Local Network Sharing to the kill switch on every platform, so an
+    // engaged block still permits the LAN when the user asked for that. Lives
+    // here rather than at the connect sites so a settings CHANGE takes effect
+    // too, matching the Windows call directly below.
+    crate::commands::killswitch::set_lan_sharing(local_network_sharing);
     #[cfg(target_os = "windows")]
     {
         crate::vpn::wfp::set_local_network_sharing(local_network_sharing);

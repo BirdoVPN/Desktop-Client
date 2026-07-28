@@ -828,6 +828,17 @@ async fn configure_ipv6(tun_name: &str, config: &VpnConfig) -> Result<(), String
 ///
 /// Shared by configure_routes and remove_routes so the two can never disagree
 /// about what was installed.
+/// Networks routed around the tunnel when Local Network Sharing is on.
+///
+/// Shared between install and teardown so the two cannot drift. These used to
+/// be installed and then NEVER removed — leaving routes pointing at a gateway
+/// that stops existing the moment the user changes network.
+const LAN_SHARING_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
 fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
     allowed_ips
         .iter()
@@ -908,7 +919,10 @@ async fn configure_routes(
 
     // If local network sharing is enabled, add RFC1918 routes via the real gateway
     if local_network_sharing {
-        let rfc1918 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+        // 169.254/16 included for mDNS/Bonjour, matching Windows. Without it
+        // printer and AirPlay DISCOVERY fails even though the LAN itself is
+        // reachable, which reads as "Local Network Sharing is broken".
+        let rfc1918 = LAN_SHARING_CIDRS;
         for cidr in &rfc1918 {
             let _ = cmd("ip")
                 .args([
@@ -1117,6 +1131,16 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
         let _ = cmd("ip").args(["route", "del", cidr]).output();
     }
 
+    // Remove the Local Network Sharing routes too.
+    //
+    // These were installed and NEVER removed, so they outlived the session
+    // pointing at a gateway that stops existing the moment the user changes
+    // network — a stale RFC1918 route to a dead gateway silently blackholes LAN
+    // traffic long after Birdo is closed. Unconditional and best-effort: if LAN
+    // sharing was off there is nothing to delete and the command simply fails.
+    for cidr in LAN_SHARING_CIDRS {
+        let _ = cmd("ip").args(["route", "del", cidr]).output();
+    }
     tracing::info!("Removed VPN routes");
 }
 

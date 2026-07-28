@@ -725,6 +725,17 @@ fn configure_utun_address(utun_name: &str, client_ip: &str, mtu: &u16) -> Result
 ///
 /// Shared by configure_routes and remove_routes so the two can never disagree
 /// about what was installed.
+/// Networks routed around the tunnel when Local Network Sharing is on.
+///
+/// Shared between install and teardown so the two cannot drift. These used to
+/// be installed and then NEVER removed — leaving routes pointing at a gateway
+/// that stops existing the moment the user changes network.
+const LAN_SHARING_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
 fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
     allowed_ips
         .iter()
@@ -823,7 +834,10 @@ async fn configure_routes(
 
     // If local network sharing is enabled, add RFC1918 routes via the real gateway
     if local_network_sharing {
-        let rfc1918 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+        // 169.254/16 included for mDNS/Bonjour, matching Windows. Without it
+        // printer and AirPlay DISCOVERY fails even though the LAN itself is
+        // reachable, which reads as "Local Network Sharing is broken".
+        let rfc1918 = LAN_SHARING_CIDRS;
         for cidr in &rfc1918 {
             let parts: Vec<&str> = cidr.split('/').collect();
             let mask = prefix_to_mask(parts[1].parse().unwrap_or(8));
@@ -1011,6 +1025,19 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
             .output();
     }
 
+    // Remove the Local Network Sharing routes too — see the Linux twin. They
+    // were installed and never removed, outliving the session and pointing at a
+    // gateway that stops existing when the user changes network.
+    for cidr in LAN_SHARING_CIDRS {
+        if let Some((net, prefix)) = cidr.split_once('/') {
+            if let Ok(p) = prefix.parse::<u8>() {
+                let mask = prefix_to_mask(p);
+                let _ = cmd("route")
+                    .args(["-n", "delete", "-net", net, "-netmask", &mask])
+                    .output();
+            }
+        }
+    }
     tracing::info!("Removed VPN routes");
 }
 

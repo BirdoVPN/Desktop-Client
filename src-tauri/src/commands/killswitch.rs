@@ -300,6 +300,29 @@ pub async fn get_killswitch_status() -> Result<KillSwitchStatus, String> {
 }
 
 /// Set the allowed VPN server IP (called when connecting)
+/// Whether the user has Local Network Sharing on, mirrored here so the firewall
+/// backends can honour it.
+///
+/// The kill switch had no idea this setting existed: LAN sharing was implemented
+/// as ROUTING only, so when the block engaged, printers, NAS, Chromecast and SSH
+/// went dark despite the toggle being on — and the toggle is not platform-gated
+/// in the UI. Windows treats LAN sharing as two halves (routes AND firewall
+/// permits); the Unix backends only ever had the first.
+///
+/// A global rather than a parameter because activate_killswitch() is reached
+/// from the auto-reconnect loop with no AppHandle to read settings through — the
+/// same reason VPN_SERVER_IP is a global.
+static LAN_SHARING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Record the current Local Network Sharing preference for the firewall backends.
+pub fn set_lan_sharing(enabled: bool) {
+    LAN_SHARING_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+/// Whether LAN traffic should be permitted through an active block.
+pub fn lan_sharing_enabled() -> bool {
+    LAN_SHARING_ENABLED.load(Ordering::SeqCst)
+}
 pub async fn set_vpn_server_ip(ip: Option<Ipv4Addr>) {
     *VPN_SERVER_IP.write().await = ip;
     tracing::debug!("Kill switch VPN server IP set to: {:?}", ip);
@@ -748,6 +771,15 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
     // meaningful, broad enough to survive the control plane changing address.
     // `keep state` so replies come back.
     let euid = unsafe { libc::geteuid() };
+    // LAN permit: honour Local Network Sharing while the block is engaged, so a
+    // dropped tunnel does not also take out the printer and the NAS. Includes
+    // 169.254/16 for mDNS/Bonjour, which is what actually makes AirPlay and
+    // printer discovery work.
+    let lan_permit = if lan_sharing_enabled() {
+        "pass quick to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } no state\n"
+    } else {
+        ""
+    };
     let self_permit = format!("pass out quick proto tcp to any port 443 user {euid} keep state\n");
     tracing::info!("Kill switch: self-permit for uid {} on tcp/443", euid);
 
@@ -767,6 +799,7 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
          pass quick on utun3 all\n\
          pass out quick proto udp to any port 67 no state\n\
          pass in quick proto udp from any port 68 no state\n\
+         {lan_permit}\
          {self_permit}\
          {server_rule}"
     );
