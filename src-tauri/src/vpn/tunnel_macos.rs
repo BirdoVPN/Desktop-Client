@@ -668,6 +668,29 @@ fn configure_utun_address(utun_name: &str, client_ip: &str, mtu: &u16) -> Result
 }
 
 /// Configure routing to send traffic through the VPN tunnel.
+/// Expand a default route into two halves, leaving everything else untouched.
+///
+/// The BSD routing table keys on (destination, netmask) with no metric tiebreak,
+/// so a second `0.0.0.0/0` can never be installed — `route add` returns
+/// "File exists" and the host's own default keeps winning. That is why the old
+/// code reported Connected while every packet still left via the physical NIC.
+///
+/// `0.0.0.0/1` + `128.0.0.0/1` cover the same space but are MORE SPECIFIC, so
+/// longest-prefix match picks them over the existing default without deleting
+/// it — which also means teardown has nothing to restore.
+///
+/// Shared by configure_routes and remove_routes so the two can never disagree
+/// about what was installed.
+fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
+    allowed_ips
+        .iter()
+        .flat_map(|cidr| match cidr.trim() {
+            "0.0.0.0/0" => vec!["0.0.0.0/1".to_string(), "128.0.0.0/1".to_string()],
+            other => vec![other.to_string()],
+        })
+        .collect()
+}
+
 async fn configure_routes(
     utun_name: &str,
     endpoint_ip: &str,
@@ -687,11 +710,24 @@ async fn configure_routes(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!("Endpoint route may already exist: {}", stderr);
+        // MUST be fatal (except an existing identical route). Once the default
+        // below is genuinely captured, a missing endpoint route sends WireGuard's
+        // own outer UDP back into the tunnel — an encapsulation loop that reaches
+        // Connected and carries zero traffic. Warning here would convert a visible
+        // failure into an invisible one.
+        if !stderr.contains("File exists") {
+            return Err(format!(
+                "Failed to pin the endpoint route: {}",
+                stderr.trim()
+            ));
+        }
+        tracing::debug!("Endpoint route already present");
     }
 
+    let allowed_ips = expand_default_v4(allowed_ips);
+
     // Add routes for allowed_ips via the utun interface
-    for cidr in allowed_ips {
+    for cidr in &allowed_ips {
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
             tracing::warn!(
@@ -728,7 +764,16 @@ async fn configure_routes(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("Route add for {} may already exist: {}", cidr, stderr);
+            // Fatal now that defaults are split. Before the split a `0.0.0.0/0`
+            // collision was expected and warning was survivable-looking; after it,
+            // a collision on `0.0.0.0/1` or `128.0.0.0/1` means the tunnel did NOT
+            // capture traffic, and continuing would report Connected while
+            // everything egresses the physical NIC.
+            return Err(format!(
+                "Failed to route {} into the tunnel: {}",
+                cidr,
+                stderr.trim()
+            ));
         }
     }
 
@@ -811,8 +856,17 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
         .args(["-n", "delete", "-host", endpoint_ip])
         .output();
 
-    // Remove allowed_ip routes
-    for cidr in allowed_ips {
+    // Remove allowed_ip routes.
+    //
+    // Expanded through the SAME helper configure_routes used, so we delete
+    // exactly the routes we installed and nothing else. Previously this emitted
+    // an unqualified `route -n delete -net 0.0.0.0 -netmask 0.0.0.0`, which does
+    // not match anything we added (we never managed to add a default) and instead
+    // deletes the HOST'S OWN default — stranding the machine with no internet
+    // after every disconnect.
+    let allowed_ips = expand_default_v4(allowed_ips);
+
+    for cidr in &allowed_ips {
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
             tracing::warn!(
