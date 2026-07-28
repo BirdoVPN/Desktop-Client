@@ -211,7 +211,32 @@ impl LinuxTunnel {
         // setting — exactly as Windows does (tunnel.rs LEAK-2). The reactive kill
         // switch cannot cover this: it is torn down once the tunnel is healthy, and
         // an IPv6 leak never drops the (IPv4-only) tunnel so it never triggers.
+        //
+        // Block FIRST, unconditionally, then lift only if we can actually carry
+        // IPv6 — so every failure path between here and a working dual-stack
+        // tunnel fails CLOSED.
         install_ipv6_leak_block()?;
+
+        // Dual-stack: the fleet DOES have routable IPv6 now (nodes provisioned
+        // with enable_ipv6 get a real /64), so when the backend issues a
+        // client_ipv6 the correct behaviour is to ROUTE IPv6 through the tunnel,
+        // not to black-hole it. Mirrors tunnel.rs (Windows) exactly: lift the
+        // block immediately before the tunnel's own v6 address and routes go in,
+        // and re-block if any of that fails.
+        //
+        // Absent client_ipv6 the block simply stays in force, which is the
+        // leak-safe behaviour for an IPv4-only node.
+        if self.config.client_ipv6.is_some() {
+            match configure_ipv6(&tun_name, &self.config).await {
+                Ok(()) => {
+                    remove_ipv6_leak_block();
+                    tracing::info!("IPv6 routed through the tunnel (dual-stack node)");
+                }
+                Err(e) => {
+                    tracing::warn!("IPv6 routing setup failed ({}); leaving IPv6 blocked", e);
+                }
+            }
+        }
 
         // Configure DNS
         let snapshot = self.network_snapshot.read().await;
@@ -616,6 +641,88 @@ fn configure_tun_address(tun_name: &str, client_ip: &str, mtu: &u16) -> Result<(
 }
 
 /// Configure routing to send traffic through the VPN tunnel.
+/// Give the TUN device its IPv6 address and route IPv6 through it.
+///
+/// Called ONLY when the backend issued a `client_ipv6` (i.e. the node is
+/// genuinely dual-stack). Runs while the IPv6 leak block is still in force —
+/// ip6tables filters packets, it does not prevent address or route
+/// configuration — so a failure part-way through leaves IPv6 blocked rather
+/// than leaking. The caller lifts the block only after this returns Ok.
+///
+/// Routes `::/1` + `8000::/1` rather than `::/0`, for the same reason the IPv4
+/// path splits the default route: two more-specific routes beat the host's
+/// existing `::/0` without deleting it, so teardown does not have to restore it.
+async fn configure_ipv6(tun_name: &str, config: &VpnConfig) -> Result<(), String> {
+    if !tun_name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!("Invalid TUN device name: {}", tun_name));
+    }
+    let client_ipv6 = config
+        .client_ipv6
+        .as_deref()
+        .ok_or_else(|| "configure_ipv6 called without a client_ipv6".to_string())?;
+
+    // Accept "addr" or "addr/prefix"; normalise to a /128 host address on the
+    // tunnel, matching how the IPv4 side assigns /32.
+    let addr = client_ipv6.split('/').next().unwrap_or(client_ipv6);
+    if addr.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(format!("Invalid client IPv6 address: {}", addr));
+    }
+
+    let output = cmd("ip")
+        .args(["-6", "addr", "add", &format!("{}/128", addr), "dev", tun_name])
+        .output()
+        .map_err(|e| format!("Failed to configure TUN IPv6 address: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            return Err(format!("ip -6 addr add failed: {}", stderr));
+        }
+    }
+
+    // Default to the split default when the backend sent no explicit v6
+    // allowed-ips, so a dual-stack node routes all IPv6 rather than none.
+    let v6_routes: Vec<String> = if config.allowed_ips_v6.is_empty() {
+        vec!["::/1".to_string(), "8000::/1".to_string()]
+    } else {
+        config.allowed_ips_v6.clone()
+    };
+
+    for route in &v6_routes {
+        // Same shape of validation the IPv4 path applies to allowed_ips, so a
+        // malformed value from the backend can never reach the `ip` command line.
+        let parts: Vec<&str> = route.split('/').collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid IPv6 CIDR format: '{}'", route));
+        }
+        parts[0]
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("Invalid network in IPv6 CIDR: '{}'", route))?;
+        let prefix: u8 = parts[1]
+            .parse()
+            .map_err(|_| format!("Invalid prefix in IPv6 CIDR: '{}'", route))?;
+        if prefix > 128 {
+            return Err(format!("Prefix out of range in IPv6 CIDR: '{}'", route));
+        }
+        let output = cmd("ip")
+            .args(["-6", "route", "add", route, "dev", tun_name])
+            .output()
+            .map_err(|e| format!("Failed to add IPv6 route {}: {}", route, e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("File exists") {
+                return Err(format!("ip -6 route add {} failed: {}", route, stderr));
+            }
+        }
+    }
+
+    tracing::info!(
+        "Configured {} with IPv6 and {} route(s)",
+        tun_name,
+        v6_routes.len()
+    );
+    Ok(())
+}
+
 async fn configure_routes(
     tun_name: &str,
     endpoint_ip: &str,

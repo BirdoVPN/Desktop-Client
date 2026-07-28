@@ -167,8 +167,27 @@ impl UtunTunnel {
         // switch cannot cover this: it is torn down once the tunnel is healthy, and
         // an IPv6 leak never drops the (IPv4-only) tunnel so it never trips.
         //
-        // The tunnel is IPv4-only (the relay fleet has no IPv6), so there is no
-        // in-tunnel IPv6 to route; black-holing it is the only leak-safe option.
+        // macOS blocks IPv6 unconditionally — including on dual-stack nodes —
+        // and that is deliberate, not an oversight.
+        //
+        // The fleet DOES have routable IPv6 now, and Linux/Windows route it
+        // through the tunnel when the backend issues a client_ipv6. macOS cannot
+        // yet, because the utun write path hard-codes the 4-byte protocol header
+        // to AF_INET:
+        //
+        //     write_buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
+        //
+        // Every decrypted IPv6 reply would be handed to the kernel labelled as
+        // IPv4 and dropped, so "routing" v6 here would build a ONE-WAY tunnel:
+        // requests leave, nothing comes back. `validate_config` also parses
+        // client_ip, every DNS entry and every allowed-ip as Ipv4Addr and rejects
+        // prefix > 32.
+        //
+        // Until that is addressed (AF header derived from the first nibble, inet6
+        // addressing, v6 routes, relaxed validation), black-holing IPv6 is the
+        // only leak-safe option on this platform. A macOS user on a dual-stack
+        // node therefore gets working IPv4 and no IPv6 — degraded, but never
+        // leaking their real address.
         if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
             close_fd_on_err(utun_fd);
             *self.utun_fd.write().await = None;
