@@ -518,6 +518,16 @@ impl VpnManager {
         if let Err(e) = crate::vpn::wfp::unblock_ipv6().await {
             tracing::warn!("Failed to lift IPv6 block after a failed connect: {}", e);
         }
+
+        // F-001: same contract on macOS/Linux. `start()` installs the block before
+        // DNS configuration, so a connect that fails after that point (or that
+        // trips CONNECT_TIMEOUT) would otherwise strand the host with no IPv6
+        // until the next successful connect+disconnect cycle.
+        #[cfg(target_os = "macos")]
+        crate::commands::killswitch::ipv6_block_deactivate().await;
+
+        #[cfg(target_os = "linux")]
+        crate::vpn::tunnel_linux::remove_ipv6_leak_block();
     }
 
     /// Disconnect from VPN

@@ -186,7 +186,24 @@ impl Default for AppSettings {
             wireguard_mtu: 0,
             stealth_mode: false,      // premium — off by default
             quantum_protection: true, // post-quantum on by default
-            lockdown_mode: true, // always-on kill switch ON by default (TunnelVision-safe; see field doc)
+            // Always-on kill switch. ON by default where it is REAL (Windows),
+            // OFF elsewhere — because on macOS and Linux `is_lockdown_mode()`
+            // returns a hard-coded `false` (killswitch.rs), so nothing ever
+            // installs a steady-state block. Defaulting it to `true` there made
+            // the stored settings, and the UI reading them, claim a protection
+            // that did not exist: a user could see "always-on" enabled while the
+            // only containment was split-default routing — exactly the
+            // configuration TunnelVision (CVE-2024-3661) defeats.
+            //
+            // This is the honesty half of the fix. The protection half (wiring
+            // lockdown through on Unix) is deliberately NOT done here: it must
+            // come after routes reliably capture traffic and after the kill
+            // switch permits our own control plane, or an always-on block locks
+            // users out with no reconnect path.
+            #[cfg(target_os = "windows")]
+            lockdown_mode: true,
+            #[cfg(not(target_os = "windows"))]
+            lockdown_mode: false,
             multi_hop_enabled: false,
             multi_hop_entry_node_id: None,
             multi_hop_exit_node_id: None,

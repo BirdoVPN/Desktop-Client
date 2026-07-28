@@ -255,6 +255,29 @@ fn main() {
         .setup(|app| {
             info!("Setting up Birdo VPN application...");
 
+            // F-001/F-032: reconcile leak-protection state a previous run may have
+            // left in the kernel. pf rulesets and ip6tables chains survive process
+            // exit, so a crash, a SIGKILL or a power loss mid-session would
+            // otherwise leave this host firewalled off or without IPv6 forever.
+            // No tunnel can be up this early, so anything we find is stale.
+            #[cfg(target_os = "macos")]
+            crate::commands::killswitch::reconcile_stale_pf_state();
+            #[cfg(target_os = "linux")]
+            {
+                crate::vpn::tunnel_linux::remove_ipv6_leak_block();
+                // The v6 chain was reconciled here but BIRDO_KILLSWITCH was not —
+                // and that is the one that blocks EVERYTHING. A SIGKILL or power
+                // loss with the kill switch armed left the host with a
+                // default-deny chain wired into OUTPUT/INPUT/FORWARD that nothing
+                // ever removed: no internet at all, surviving restarts of the app,
+                // with no indication the VPN client was responsible.
+                //
+                // Safe unconditionally at this point for the same reason the v6
+                // reconcile is: no tunnel can be up this early, so any chain we
+                // find is stale by definition. The chain name is ours alone.
+                crate::vpn::firewall_linux::emergency_cleanup();
+            }
+
             // Wire up AutoReconnectService with references to managed state.
             // BirdoApi and VpnManager use Arc<RwLock<..>> internally, so Clone
             // shares the same underlying state — exactly what we need.
@@ -590,7 +613,30 @@ fn cleanup_on_crash() {
 
     #[cfg(target_os = "macos")]
     {
-        // Flush the Birdo VPN pf anchor rules on crash
+        // F-032: restore pf's MAIN RULESET, not a named anchor.
+        //
+        // This used to run `pfctl -a com.birdo.vpn.killswitch -F all`, which flushes
+        // an anchor that has been inert since #59 moved the kill switch to the main
+        // ruleset (macOS's stock /etc/pf.conf never references the anchor, so pf
+        // never evaluates it). Meanwhile pf rules loaded with `pfctl -f` live in the
+        // kernel and SURVIVE process exit — unlike Windows WFP dynamic sessions,
+        // which self-clean. So a panic while the kill switch was blocking left the
+        // machine fully firewalled off, and a panic during a normal session left it
+        // without IPv6, with no recovery short of a manual pfctl or a reboot.
+        //
+        // Only revert a ruleset carrying our marker anchor, so a third-party pf
+        // configuration (LuLu, Murus, a hand-rolled /etc/pf.conf) is never clobbered.
+        let ours = std::process::Command::new("pfctl")
+            .args(["-s", "rules"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("com.birdo.vpn"))
+            .unwrap_or(false);
+        if ours {
+            let _ = std::process::Command::new("pfctl")
+                .args(["-f", "/etc/pf.conf"])
+                .output();
+        }
+        // Legacy anchor flush — harmless no-op, kept for mixed-upgrade hosts.
         let _ = std::process::Command::new("pfctl")
             .args(["-a", "com.birdo.vpn.killswitch", "-F", "all"])
             .output();
@@ -610,6 +656,12 @@ fn cleanup_on_crash() {
     {
         // Remove iptables kill switch rules
         vpn::firewall_linux::emergency_cleanup();
+
+        // F-001: and the connect-window IPv6 leak block, which lives in its own
+        // chain and is NOT touched by the kill switch's cleanup. ip6tables rules
+        // survive process exit, so without this a crash leaves the host with no
+        // IPv6 until the next successful connect/disconnect cycle.
+        vpn::tunnel_linux::remove_ipv6_leak_block();
 
         // Restore DNS: revert systemd-resolved or restore resolv.conf
         let _ = std::process::Command::new("resolvectl")

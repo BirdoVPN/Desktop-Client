@@ -25,6 +25,79 @@ fn cmd(program: &str) -> Command {
 /// TUN device name prefix
 const TUN_DEVICE_NAME: &str = "birdo0";
 
+/// F-001: dedicated chain for the steady-state IPv6 leak block. Deliberately
+/// SEPARATE from the kill switch's BIRDO_KILLSWITCH chain so the two never
+/// interfere — this block must persist for the whole Connected session, whereas
+/// the kill-switch chain is torn down once the tunnel is healthy.
+const IPV6_BLOCK_CHAIN: &str = "BIRDO_IPV6_LEAK_BLOCK";
+
+/// Run an ip6tables command, tolerating ip6tables being absent (IPv4-only host).
+/// Mirrors firewall_linux.rs's ip6tables() so behaviour is identical.
+fn ip6t(args: &[&str]) -> Result<(), String> {
+    match cmd("ip6tables").args(args).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "ip6tables {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("ip6tables not present — skipping IPv6 leak block (IPv4-only host)");
+            Ok(())
+        }
+        Err(e) => Err(format!("ip6tables spawn failed: {e}")),
+    }
+}
+
+/// F-001: install a default-deny IPv6 egress block for the whole connect window.
+///
+/// Without this, any IPv6-capable app egresses via the physical NIC's untouched
+/// IPv6 default route while the UI reports "Protected" — a continuous
+/// de-anonymisation leak the kill switch never catches (WireGuard never drops,
+/// so nothing trips). Windows has done this since the LEAK-2 fix (tunnel.rs);
+/// this is the Linux port.
+///
+/// This is the DEFAULT state, not the final one. It is installed unconditionally
+/// at tunnel start so every failure path fails closed, and lifted by
+/// `remove_ipv6_leak_block` only once `configure_ipv6` has actually put the
+/// tunnel's own v6 address and routes in place — which happens only when the
+/// backend issued a `client_ipv6` (i.e. the node is genuinely dual-stack).
+/// On an IPv4-only node the block simply stays for the whole session.
+///
+/// Loopback, link-local and NDP/ICMPv6 stay permitted so the host keeps working;
+/// everything routable is dropped. Idempotent (flush + recreate each call).
+fn install_ipv6_leak_block() -> Result<(), String> {
+    let _ = ip6t(&["-N", IPV6_BLOCK_CHAIN]); // create (ignore "already exists")
+    let _ = ip6t(&["-F", IPV6_BLOCK_CHAIN]); // clean slate
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-o", "lo", "-j", "ACCEPT"])?;
+    // Link-local and link-scoped multicast only: this covers NDP (NS/NA/RS/RA),
+    // DAD, MLD and DHCPv6, which is everything the host needs to stay functional.
+    // NOTE: deliberately NO blanket `-p ipv6-icmp ACCEPT`. That would permit
+    // ICMPv6 echo to GLOBAL destinations, i.e. `ping6 <any host>` would still
+    // egress the physical NIC and disclose the real IPv6 address — a smaller
+    // version of the very leak this chain exists to close. Inbound ICMPv6 (PMTUD
+    // "Packet Too Big") is unaffected: this chain is hooked into OUTPUT only.
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-d", "fe80::/10", "-j", "ACCEPT"])?;
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-d", "ff02::/16", "-j", "ACCEPT"])?;
+    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-j", "DROP"])?;
+    // Jump OUTPUT -> our chain (delete first so repeated starts don't stack).
+    let _ = ip6t(&["-D", "OUTPUT", "-j", IPV6_BLOCK_CHAIN]);
+    ip6t(&["-I", "OUTPUT", "1", "-j", IPV6_BLOCK_CHAIN])?;
+    tracing::info!("F-001: IPv6 egress blocked for the connect window");
+    Ok(())
+}
+
+/// F-001: lift the IPv6 block at teardown. Best-effort — never fail teardown.
+///
+/// Also used to reconcile state a crashed or failed run left behind: the chain
+/// name is ours alone, so removing it is unconditionally safe and idempotent.
+pub(crate) fn remove_ipv6_leak_block() {
+    let _ = ip6t(&["-D", "OUTPUT", "-j", IPV6_BLOCK_CHAIN]);
+    let _ = ip6t(&["-F", IPV6_BLOCK_CHAIN]);
+    let _ = ip6t(&["-X", IPV6_BLOCK_CHAIN]);
+    tracing::info!("F-001: IPv6 egress block removed");
+}
+
 /// Stores original DNS and default route info for restoration on disconnect
 #[derive(Debug, Clone)]
 struct NetworkSnapshot {
@@ -140,6 +213,38 @@ impl LinuxTunnel {
         )
         .await?;
 
+        // F-001 (P0): block IPv6 egress for the whole Connected session. Done here
+        // — at tunnel start, INDEPENDENT of the kill-switch enabled/lockdown
+        // setting — exactly as Windows does (tunnel.rs LEAK-2). The reactive kill
+        // switch cannot cover this: it is torn down once the tunnel is healthy, and
+        // an IPv6 leak never drops the (IPv4-only) tunnel so it never triggers.
+        //
+        // Block FIRST, unconditionally, then lift only if we can actually carry
+        // IPv6 — so every failure path between here and a working dual-stack
+        // tunnel fails CLOSED.
+        install_ipv6_leak_block()?;
+
+        // Dual-stack: the fleet DOES have routable IPv6 now (nodes provisioned
+        // with enable_ipv6 get a real /64), so when the backend issues a
+        // client_ipv6 the correct behaviour is to ROUTE IPv6 through the tunnel,
+        // not to black-hole it. Mirrors tunnel.rs (Windows) exactly: lift the
+        // block immediately before the tunnel's own v6 address and routes go in,
+        // and re-block if any of that fails.
+        //
+        // Absent client_ipv6 the block simply stays in force, which is the
+        // leak-safe behaviour for an IPv4-only node.
+        if self.config.client_ipv6.is_some() {
+            match configure_ipv6(&tun_name, &self.config).await {
+                Ok(()) => {
+                    remove_ipv6_leak_block();
+                    tracing::info!("IPv6 routed through the tunnel (dual-stack node)");
+                }
+                Err(e) => {
+                    tracing::warn!("IPv6 routing setup failed ({}); leaving IPv6 blocked", e);
+                }
+            }
+        }
+
         // Configure DNS
         let snapshot = self.network_snapshot.read().await;
         let uses_resolved = snapshot.as_ref().map_or(false, |s| s.uses_systemd_resolved);
@@ -196,6 +301,10 @@ impl LinuxTunnel {
         if let Some(snapshot) = self.network_snapshot.read().await.as_ref() {
             restore_dns(snapshot).await;
         }
+
+        // F-001: lift the IPv6 block. Best-effort so it can never fail teardown
+        // (a stuck block would leave the host without IPv6 after disconnect).
+        remove_ipv6_leak_block();
 
         // Remove routes
         if let Some(ep_ip) = self.endpoint_ip.read().await.as_ref() {
@@ -275,7 +384,27 @@ impl LinuxTunnel {
 
         const MAX_PACKET_SIZE: usize = 65536;
 
+        // Same cadence Windows uses (tunnel.rs). 250ms is comfortably finer than
+        // boringtun's shortest timer, so no deadline is ever missed.
+        // Idle backoff, mirroring Windows (tunnel.rs). Both fds are O_NONBLOCK
+        // and recv_packet returns Ok(None) immediately on WouldBlock, so an idle
+        // tunnel previously spun a core at 100% and churned the blocking pool
+        // with a spawn_blocking round trip per iteration, forever. Any packet in
+        // either direction resets the counter, so only the FIRST packet after a
+        // sustained idle pays the extra latency.
+        let mut idle_cycles: u32 = 0;
+        const IDLE_THRESHOLD: u32 = 100;
+        const DEEP_IDLE_THRESHOLD: u32 = 2_000;
+        const SLOW_POLL_US: u64 = 500;
+        const DEEP_POLL_US: u64 = 5_000;
+        // Drain up to this many decrypted packets per wake, so a burst is not
+        // paced one packet per loop iteration.
+        const MAX_BATCH_SIZE: usize = 64;
+        let mut last_timer_update = std::time::Instant::now();
+        const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
         loop {
+            let mut did_work = false;
             if !running.load(Ordering::SeqCst) {
                 tracing::info!("Packet loop: running flag cleared, exiting");
                 break;
@@ -312,6 +441,7 @@ impl LinuxTunnel {
                     }
                 }) => {
                     if let Ok(Some(ip_packet)) = result {
+                        did_work = true;
                         // Linux TUN with IFF_NO_PI: data is already a raw IP packet
                         let packet_len = ip_packet.len() as u64;
 
@@ -331,35 +461,83 @@ impl LinuxTunnel {
             }
 
             // Read from WireGuard and write decrypted packets to TUN
-            if let Some(session) = wg_session.read().await.as_ref() {
-                if let Ok(Some(decrypted)) = session.recv_packet().await {
-                    let packet_len = decrypted.len() as u64;
+            for _ in 0..MAX_BATCH_SIZE {
+                if let Some(session) = wg_session.read().await.as_ref() {
+                    if let Ok(Some(decrypted)) = session.recv_packet().await {
+                        did_work = true;
+                        let packet_len = decrypted.len() as u64;
 
-                    // Linux TUN with IFF_NO_PI: write raw IP packet directly (no header)
-                    let fd = tun_fd;
-                    let buf = decrypted;
-                    let buf_len = buf.len();
-                    let write_result = tokio::task::spawn_blocking(move || {
-                        let written = unsafe {
-                            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-                        };
-                        if written < 0 {
-                            tracing::debug!("TUN write error: {}", std::io::Error::last_os_error());
-                        } else if (written as usize) < buf.len() {
-                            tracing::warn!("Partial TUN write: {} of {} bytes", written, buf.len());
-                        }
-                        written
-                    })
-                    .await;
+                        // Linux TUN with IFF_NO_PI: write raw IP packet directly (no header)
+                        let fd = tun_fd;
+                        let buf = decrypted;
+                        let buf_len = buf.len();
+                        let write_result = tokio::task::spawn_blocking(move || {
+                            let written = unsafe {
+                                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+                            };
+                            if written < 0 {
+                                tracing::debug!(
+                                    "TUN write error: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            } else if (written as usize) < buf.len() {
+                                tracing::warn!(
+                                    "Partial TUN write: {} of {} bytes",
+                                    written,
+                                    buf.len()
+                                );
+                            }
+                            written
+                        })
+                        .await;
 
-                    // Only count statistics when the full packet was written to TUN.
-                    // Partial writes or errors must not inflate received counters.
-                    if let Ok(written) = write_result {
-                        if written >= 0 && (written as usize) == buf_len {
-                            bytes_received.fetch_add(packet_len, Ordering::Relaxed);
-                            packets_received.fetch_add(1, Ordering::Relaxed);
+                        // Only count statistics when the full packet was written to TUN.
+                        // Partial writes or errors must not inflate received counters.
+                        if let Ok(written) = write_result {
+                            if written >= 0 && (written as usize) == buf_len {
+                                bytes_received.fetch_add(packet_len, Ordering::Relaxed);
+                                packets_received.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
+                    } else {
+                        break; // nothing queued — stop draining
                     }
+                } else {
+                    break;
+                }
+            }
+
+            // Drive boringtun's timers — WITHOUT this the session dies.
+            //
+            // boringtun advances all session state inside update_timers():
+            // persistent keepalives, REKEY_AFTER_TIME rekeys, and dead-peer
+            // detection. `encapsulate` reads the current keypair with no age
+            // check, so once the server discards it at REJECT_AFTER_TIME the
+            // client keeps happily encrypting to a session that no longer exists
+            // — upload appears to work, download stops, and there is no
+            // client-side recovery. Windows found this (FIX-DL, tunnel.rs:1834)
+            // and fixed it; the Unix tunnels were never given the same tick, so
+            // the keepalive plumbed in at start() was never actually emitted.
+            //
+            // The fd is O_NONBLOCK, so this is reached every iteration even when
+            // the tunnel is completely idle — which is exactly when it matters.
+            if last_timer_update.elapsed() >= TIMER_INTERVAL {
+                last_timer_update = std::time::Instant::now();
+                if let Some(session) = wg_session.read().await.as_ref() {
+                    if let Err(e) = session.update_timers().await {
+                        tracing::trace!("Timer update error: {}", e);
+                    }
+                }
+            }
+
+            if did_work {
+                idle_cycles = 0;
+            } else {
+                idle_cycles = idle_cycles.saturating_add(1);
+                if idle_cycles > DEEP_IDLE_THRESHOLD {
+                    tokio::time::sleep(std::time::Duration::from_micros(DEEP_POLL_US)).await;
+                } else if idle_cycles > IDLE_THRESHOLD {
+                    tokio::time::sleep(std::time::Duration::from_micros(SLOW_POLL_US)).await;
                 }
             }
         }
@@ -539,6 +717,179 @@ fn configure_tun_address(tun_name: &str, client_ip: &str, mtu: &u16) -> Result<(
 }
 
 /// Configure routing to send traffic through the VPN tunnel.
+/// Give the TUN device its IPv6 address and route IPv6 through it.
+///
+/// Called ONLY when the backend issued a `client_ipv6` (i.e. the node is
+/// genuinely dual-stack). Runs while the IPv6 leak block is still in force —
+/// ip6tables filters packets, it does not prevent address or route
+/// configuration — so a failure part-way through leaves IPv6 blocked rather
+/// than leaking. The caller lifts the block only after this returns Ok.
+///
+/// Routes `::/1` + `8000::/1` rather than `::/0`, for the same reason the IPv4
+/// path splits the default route: two more-specific routes beat the host's
+/// existing `::/0` without deleting it, so teardown does not have to restore it.
+async fn configure_ipv6(tun_name: &str, config: &VpnConfig) -> Result<(), String> {
+    if !tun_name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!("Invalid TUN device name: {}", tun_name));
+    }
+    let client_ipv6 = config
+        .client_ipv6
+        .as_deref()
+        .ok_or_else(|| "configure_ipv6 called without a client_ipv6".to_string())?;
+
+    // Accept "addr" or "addr/prefix"; normalise to a /128 host address on the
+    // tunnel, matching how the IPv4 side assigns /32.
+    let addr = client_ipv6.split('/').next().unwrap_or(client_ipv6);
+    if addr.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(format!("Invalid client IPv6 address: {}", addr));
+    }
+
+    let output = cmd("ip")
+        .args([
+            "-6",
+            "addr",
+            "add",
+            &format!("{}/128", addr),
+            "dev",
+            tun_name,
+        ])
+        .output()
+        .map_err(|e| format!("Failed to configure TUN IPv6 address: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            return Err(format!("ip -6 addr add failed: {}", stderr));
+        }
+    }
+
+    // Expand any default-scoped entry into ::/1 + 8000::/1.
+    //
+    // This MUST happen for whatever the backend actually sends, not only when the
+    // list is empty. The backend always sends `::/0` (vpn.service.ts), so an
+    // is-empty fallback would be dead code — and using `::/0` verbatim is worse
+    // than useless here: on any normal SLAAC host the kernel already holds a
+    // `::/0` default, so `ip -6 route add ::/0 dev <tun>` returns "File exists".
+    // Swallowing that (as the IPv4 path does) would make configure_ipv6 report
+    // success with NO tunnel route installed, and the caller would then lift the
+    // leak block — leaving the physical default winning and nothing blocking it.
+    // That is strictly worse than never having routed v6 at all.
+    //
+    // Two more-specific halves beat an existing ::/0 on longest-prefix match
+    // without deleting it, so teardown has nothing to restore. Same trick the
+    // IPv4 side uses.
+    let v6_routes: Vec<String> = if config.allowed_ips_v6.is_empty() {
+        vec!["::/1".to_string(), "8000::/1".to_string()]
+    } else {
+        config
+            .allowed_ips_v6
+            .iter()
+            .flat_map(|r| {
+                if r.trim() == "::/0" {
+                    vec!["::/1".to_string(), "8000::/1".to_string()]
+                } else {
+                    vec![r.clone()]
+                }
+            })
+            .collect()
+    };
+
+    for route in &v6_routes {
+        // Same shape of validation the IPv4 path applies to allowed_ips, so a
+        // malformed value from the backend can never reach the `ip` command line.
+        let parts: Vec<&str> = route.split('/').collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid IPv6 CIDR format: '{}'", route));
+        }
+        parts[0]
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("Invalid network in IPv6 CIDR: '{}'", route))?;
+        let prefix: u8 = parts[1]
+            .parse()
+            .map_err(|_| format!("Invalid prefix in IPv6 CIDR: '{}'", route))?;
+        if prefix > 128 {
+            return Err(format!("Prefix out of range in IPv6 CIDR: '{}'", route));
+        }
+        let output = cmd("ip")
+            .args(["-6", "route", "add", route, "dev", tun_name])
+            .output()
+            .map_err(|e| format!("Failed to add IPv6 route {}: {}", route, e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Deliberately do NOT tolerate "File exists" here, unlike the IPv4
+            // path. After the split above, a collision means something else
+            // already owns ::/1 or 8000::/1 on this host — so our route is not
+            // in place, and reporting success would cause the caller to lift the
+            // leak block over an unrouted tunnel. Fail instead: the block stays,
+            // and the user gets working IPv4 with IPv6 safely dead.
+            return Err(format!(
+                "ip -6 route add {} failed: {}",
+                route,
+                stderr.trim()
+            ));
+        }
+    }
+
+    // Confirm the tunnel actually won the route, rather than trusting exit codes.
+    // A route add can succeed and still lose: with a pre-existing default at a
+    // better metric the kernel accepts the new route and keeps preferring the old
+    // one. `ip -6 route get` asks the kernel what it would ACTUALLY do, which is
+    // the only answer that matters before we take the leak block down.
+    let probe = cmd("ip")
+        .args(["-6", "route", "get", "2606:4700:4700::1111"])
+        .output()
+        .map_err(|e| format!("Failed to verify IPv6 routing: {}", e))?;
+    let probe_out = String::from_utf8_lossy(&probe.stdout);
+    if !probe.status.success() || !probe_out.contains(tun_name) {
+        return Err(format!(
+            "IPv6 route verification failed: kernel would not route via {} ({})",
+            tun_name,
+            probe_out.trim()
+        ));
+    }
+
+    tracing::info!(
+        "Configured {} with IPv6 and {} route(s)",
+        tun_name,
+        v6_routes.len()
+    );
+    Ok(())
+}
+
+/// Expand a default route into two halves, leaving everything else untouched.
+///
+/// The Linux FIB keys on (destination, metric), so a second `0.0.0.0/0` only
+/// installs when the host default has a non-zero metric. Against a metric-0
+/// default (dhclient, ifupdown, containers, netplan without `metric:`) the add
+/// returns "File exists" — which the old code SWALLOWED, so the tunnel reported
+/// Connected while every packet left via the physical NIC.
+///
+/// `0.0.0.0/1` + `128.0.0.0/1` cover the same space but are MORE SPECIFIC, so
+/// longest-prefix match picks them regardless of metric, without deleting the
+/// host default — so teardown has nothing to restore.
+///
+/// Shared by configure_routes and remove_routes so the two can never disagree
+/// about what was installed.
+/// Networks routed around the tunnel when Local Network Sharing is on.
+///
+/// Shared between install and teardown so the two cannot drift. These used to
+/// be installed and then NEVER removed — leaving routes pointing at a gateway
+/// that stops existing the moment the user changes network.
+const LAN_SHARING_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
+fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
+    allowed_ips
+        .iter()
+        .flat_map(|cidr| match cidr.trim() {
+            "0.0.0.0/0" => vec!["0.0.0.0/1".to_string(), "128.0.0.0/1".to_string()],
+            other => vec![other.to_string()],
+        })
+        .collect()
+}
+
 async fn configure_routes(
     tun_name: &str,
     endpoint_ip: &str,
@@ -571,13 +922,22 @@ async fn configure_routes(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // MUST be fatal (except an existing identical route). Once the default
+        // below is genuinely captured, a missing endpoint route sends WireGuard's
+        // own outer UDP back into the tunnel — an encapsulation loop that reaches
+        // Connected and carries zero traffic. Warning here would convert a visible
+        // failure into an invisible one.
         if !stderr.contains("File exists") {
-            tracing::warn!("Endpoint route warning: {}", stderr);
+            return Err(format!(
+                "Failed to pin the endpoint route: {}",
+                stderr.trim()
+            ));
         }
     }
 
     // Add routes for allowed_ips via the TUN interface
-    for cidr in allowed_ips {
+    let allowed_ips = expand_default_v4(allowed_ips);
+    for cidr in &allowed_ips {
         let output = cmd("ip")
             .args(["route", "add", cidr, "dev", tun_name])
             .output()
@@ -585,15 +945,25 @@ async fn configure_routes(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("File exists") {
-                tracing::warn!("Route add for {} warning: {}", cidr, stderr);
-            }
+            // Fatal now that defaults are split. Before the split a `0.0.0.0/0`
+            // collision was routine and swallowing it looked harmless; after it, a
+            // collision on `0.0.0.0/1` or `128.0.0.0/1` means the tunnel did NOT
+            // capture traffic, and continuing would report Connected while
+            // everything egresses the physical NIC.
+            return Err(format!(
+                "Failed to route {} into the tunnel: {}",
+                cidr,
+                stderr.trim()
+            ));
         }
     }
 
     // If local network sharing is enabled, add RFC1918 routes via the real gateway
     if local_network_sharing {
-        let rfc1918 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+        // 169.254/16 included for mDNS/Bonjour, matching Windows. Without it
+        // printer and AirPlay DISCOVERY fails even though the LAN itself is
+        // reachable, which reads as "Local Network Sharing is broken".
+        let rfc1918 = LAN_SHARING_CIDRS;
         for cidr in &rfc1918 {
             let _ = cmd("ip")
                 .args([
@@ -616,11 +986,92 @@ async fn configure_routes(
 /// Configure DNS servers on Linux.
 ///
 /// Prefers systemd-resolved (resolvectl) when available, falls back to /etc/resolv.conf.
+/// Is systemd-resolved ACTUALLY the resolver applications use on this host?
+///
+/// `systemctl is-active systemd-resolved` answers a different question — whether
+/// the unit is running — and the two diverge constantly: Ubuntu Server images with
+/// a replaced resolv.conf, Debian with `resolvconf`, NetworkManager with
+/// `dns=default`, WSL, containers. On all of those, resolved runs, the old code
+/// took the resolvectl branch, configured DNS on the tun link only, left
+/// /etc/resolv.conf untouched — and EVERY query on the machine kept going to the
+/// original resolver while the UI said Connected. With Local Network Sharing on,
+/// RFC1918 is routed via the real gateway, so a query to a router resolver leaves
+/// the physical NIC in plaintext.
+///
+/// The reliable signal is what /etc/resolv.conf actually points at: the stub
+/// resolver 127.0.0.53, or a file under /run/systemd/resolve/ once symlinks are
+/// followed.
+fn resolv_conf_uses_resolved() -> bool {
+    if let Ok(target) = std::fs::canonicalize("/etc/resolv.conf") {
+        if target.starts_with("/run/systemd/resolve/") {
+            return true;
+        }
+    }
+    match std::fs::read_to_string("/etc/resolv.conf") {
+        Ok(contents) => contents
+            .lines()
+            .filter(|l| l.trim_start().starts_with("nameserver"))
+            .any(|l| l.contains("127.0.0.53")),
+        Err(_) => false,
+    }
+}
+
 async fn configure_dns(
     dns_servers: &[String],
     tun_name: &str,
     uses_resolved: bool,
 ) -> Result<(), String> {
+    // Deliberately configure BOTH paths rather than choosing one.
+    //
+    // Picking a branch is what caused the leak: whichever signal you trust, some
+    // real distro disagrees with it. On Fedora/Arch, `resolve` in nsswitch.conf
+    // makes the resolvectl branch authoritative EVEN WITH a non-stub resolv.conf,
+    // so switching to resolv.conf-only would regress those. Doing both is correct
+    // everywhere and costs one extra file write.
+    let stub_in_use = resolv_conf_uses_resolved();
+    if uses_resolved && !stub_in_use {
+        tracing::warn!(
+            "systemd-resolved is running but /etc/resolv.conf does not point at it — configuring BOTH so DNS cannot bypass the tunnel"
+        );
+    }
+
+    // Pin resolv.conf too, unless it IS the systemd stub (rewriting the stub file
+    // would fight resolved and break resolution once we revert).
+    if !stub_in_use {
+        let mut contents = String::from(
+            "# Generated by Birdo VPN — will be restored on disconnect
+",
+        );
+        for dns in dns_servers {
+            contents.push_str(&format!(
+                "nameserver {}
+",
+                dns
+            ));
+        }
+        // Temp file + rename: a reader never sees a half-written file, and a
+        // SYMLINKED resolv.conf is replaced rather than followed — following it
+        // would rewrite whatever it points at, including a /run file owned by
+        // another daemon.
+        let tmp = "/etc/.resolv.conf.birdo";
+        match std::fs::write(tmp, &contents).and_then(|_| std::fs::rename(tmp, "/etc/resolv.conf"))
+        {
+            Ok(()) => tracing::info!("Pinned /etc/resolv.conf to the tunnel resolvers"),
+            Err(e) => {
+                let _ = std::fs::remove_file(tmp);
+                // Survivable IF resolved is genuinely in charge; otherwise nothing
+                // is protecting DNS and we must fail the connect.
+                if !uses_resolved {
+                    return Err(format!("Failed to write /etc/resolv.conf: {}", e));
+                }
+                tracing::warn!(
+                    "Could not pin /etc/resolv.conf ({}), relying on systemd-resolved",
+                    e
+                );
+            }
+        }
+    }
+
     if uses_resolved {
         // systemd-resolved: set DNS for our TUN interface
         let mut args = vec!["dns".to_string(), tun_name.to_string()];
@@ -652,30 +1103,36 @@ async fn configure_dns(
             tun_name,
             dns_servers
         );
-    } else {
-        // Fallback: write /etc/resolv.conf directly
-        let mut contents =
-            String::from("# Generated by Birdo VPN — will be restored on disconnect\n");
-        for dns in dns_servers {
-            contents.push_str(&format!("nameserver {}\n", dns));
-        }
-
-        std::fs::write("/etc/resolv.conf", contents)
-            .map_err(|e| format!("Failed to write /etc/resolv.conf: {}", e))?;
-
-        tracing::info!("Configured DNS via /etc/resolv.conf: {:?}", dns_servers);
     }
+    // No `else` branch any more: /etc/resolv.conf is pinned above on every host
+    // where that is the right thing to do, INCLUDING when systemd-resolved is
+    // running but is not what applications actually consult. Choosing one branch
+    // is precisely what allowed DNS to bypass the tunnel entirely.
 
     Ok(())
 }
 
 /// Restore original DNS configuration.
 async fn restore_dns(snapshot: &NetworkSnapshot) {
+    // Mirror configure_dns: it now pins BOTH resolvectl and /etc/resolv.conf on
+    // hosts where resolved is running but is not what applications consult, so
+    // restore must undo BOTH. Reverting only resolvectl would leave the machine
+    // pointed at tunnel resolvers that no longer exist after disconnect — DNS
+    // dead until something else rewrote the file.
     if snapshot.uses_systemd_resolved {
         // systemd-resolved: revert the TUN interface DNS (device is being torn down,
         // systemd-resolved will automatically drop configuration for removed interfaces)
         let _ = cmd("resolvectl").args(["revert", TUN_DEVICE_NAME]).output();
         tracing::info!("Reverted systemd-resolved DNS for {}", TUN_DEVICE_NAME);
+
+        // And put resolv.conf back if we pinned it (we only ever did so when it
+        // was NOT the systemd stub, which is exactly when a backup exists).
+        if let Some(ref backup) = snapshot.resolv_conf_backup {
+            if !backup.contains("127.0.0.53") {
+                let _ = std::fs::write("/etc/resolv.conf", backup);
+                tracing::info!("Restored /etc/resolv.conf alongside the resolved revert");
+            }
+        }
     } else if let Some(ref backup) = snapshot.resolv_conf_backup {
         // Restore original /etc/resolv.conf
         let _ = std::fs::write("/etc/resolv.conf", backup);
@@ -703,11 +1160,28 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
         .args(["route", "del", &format!("{}/32", endpoint_ip)])
         .output();
 
-    // Remove allowed_ip routes
-    for cidr in allowed_ips {
+    // Remove allowed_ip routes.
+    //
+    // Expanded through the SAME helper configure_routes used, so we delete exactly
+    // the routes we installed. Previously this emitted `ip route del 0.0.0.0/0`,
+    // which on a metric-0 host does not match anything we added (the add had
+    // failed) and instead deletes the HOST'S OWN default — stranding the machine
+    // with no internet after disconnect.
+    let allowed_ips = expand_default_v4(allowed_ips);
+    for cidr in &allowed_ips {
         let _ = cmd("ip").args(["route", "del", cidr]).output();
     }
 
+    // Remove the Local Network Sharing routes too.
+    //
+    // These were installed and NEVER removed, so they outlived the session
+    // pointing at a gateway that stops existing the moment the user changes
+    // network — a stale RFC1918 route to a dead gateway silently blackholes LAN
+    // traffic long after Birdo is closed. Unconditional and best-effort: if LAN
+    // sharing was off there is nothing to delete and the command simply fails.
+    for cidr in LAN_SHARING_CIDRS {
+        let _ = cmd("ip").args(["route", "del", cidr]).output();
+    }
     tracing::info!("Removed VPN routes");
 }
 
@@ -798,4 +1272,92 @@ fn get_default_interface() -> Result<String, String> {
         .nth(1)
         .map(|s| s.to_string())
         .ok_or_else(|| "Could not determine default interface".to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F-001 verification
+//
+// This exercises the REAL install/remove functions against the REAL ip6tables
+// binary, rather than asserting on a duplicated copy of the argv. It is the only
+// part of the F-001 Linux fix that can be checked without a dual-stack network,
+// and CI runs it as root on ubuntu-latest (see .github/workflows/tests.yml).
+//
+// Ignored by default so a normal `cargo test` on a dev box never touches the
+// host firewall: run explicitly with `--ignored`, as root.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod ipv6_leak_block_tests {
+    use super::*;
+
+    fn ip6tables_available() -> bool {
+        cmd("ip6tables")
+            .arg("-L")
+            .arg("-n")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    fn chain_dump() -> String {
+        cmd("ip6tables")
+            .args(["-S"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[ignore = "mutates the host firewall; run as root via --ignored (CI does)"]
+    fn install_then_remove_leaves_no_trace() {
+        assert!(
+            ip6tables_available(),
+            "ip6tables must be present and usable (are we root?)"
+        );
+
+        // Clean slate in case a previous run died mid-way.
+        remove_ipv6_leak_block();
+
+        install_ipv6_leak_block().expect("install_ipv6_leak_block failed");
+
+        let dump = chain_dump();
+        assert!(
+            dump.contains(&format!("-N {IPV6_BLOCK_CHAIN}")),
+            "chain was not created:\n{dump}"
+        );
+        assert!(
+            dump.contains(&format!("-A OUTPUT -j {IPV6_BLOCK_CHAIN}")),
+            "OUTPUT jump was not installed — the chain would never be evaluated:\n{dump}"
+        );
+        // The whole point: routable IPv6 must terminate in DROP.
+        assert!(
+            dump.contains(&format!("-A {IPV6_BLOCK_CHAIN} -j DROP")),
+            "default-deny rule missing — the block would pass everything:\n{dump}"
+        );
+        // Link-local must stay permitted or the host's own NDP breaks.
+        assert!(
+            dump.contains("fe80::/10") && dump.contains("ff02::/16"),
+            "link-local/multicast allowances missing — NDP would break:\n{dump}"
+        );
+        // Regression guard: a blanket ICMPv6 accept would let `ping6 <global>`
+        // out and disclose the real address — a smaller version of this leak.
+        assert!(
+            !dump.contains("-p ipv6-icmp -j ACCEPT"),
+            "blanket ICMPv6 ACCEPT is back; global ping6 would leak:\n{dump}"
+        );
+
+        // Idempotent: installing twice must not stack duplicate OUTPUT jumps.
+        install_ipv6_leak_block().expect("second install failed");
+        let dump2 = chain_dump();
+        let jumps = dump2
+            .lines()
+            .filter(|l| l.trim() == format!("-A OUTPUT -j {IPV6_BLOCK_CHAIN}"))
+            .count();
+        assert_eq!(jumps, 1, "duplicate OUTPUT jumps stacked:\n{dump2}");
+
+        remove_ipv6_leak_block();
+        let after = chain_dump();
+        assert!(
+            !after.contains(IPV6_BLOCK_CHAIN),
+            "teardown left state behind — the host would stay without IPv6:\n{after}"
+        );
+    }
 }

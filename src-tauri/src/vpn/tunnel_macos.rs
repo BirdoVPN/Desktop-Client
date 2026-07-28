@@ -39,6 +39,50 @@ struct NetworkSnapshot {
     default_gateway: Option<String>,
     /// Original default interface
     default_interface: Option<String>,
+    /// EVERY enabled network service and its original resolvers, so each can be
+    /// restored exactly. Repointing only the primary service leaks: with Wi-Fi
+    /// and Ethernet both active, unscoped queries can still go to the other
+    /// service's ISP resolvers.
+    all_dns: Vec<(String, Vec<String>)>,
+}
+
+/// Every ENABLED network service, in the order macOS prefers them.
+///
+/// `networksetup -listallnetworkservices` prints a header line, and prefixes
+/// disabled services with `*` — both are filtered out here. Disabled services
+/// carry no traffic, and calling -setdnsservers on one errors.
+fn list_network_services() -> Vec<String> {
+    let output = match cmd("networksetup")
+        .args(["-listallnetworkservices"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1) // "An asterisk (*) denotes that a network service is disabled."
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('*'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Current resolvers for one service, normalised to "empty means DHCP".
+fn dns_servers_for(service: &str) -> Vec<String> {
+    let output = match cmd("networksetup")
+        .args(["-getdnsservers", service])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.contains("aren't any") || text.is_empty() {
+        Vec::new()
+    } else {
+        text.lines().map(|l| l.trim().to_string()).collect()
+    }
 }
 
 /// macOS utun tunnel for WireGuard VPN
@@ -161,8 +205,42 @@ impl UtunTunnel {
             return Err(e);
         }
 
+        // F-001 (P0): block IPv6 egress for the whole Connected session. Installed
+        // here — at tunnel start, INDEPENDENT of the kill-switch enabled/lockdown
+        // setting — exactly as Windows does (tunnel.rs LEAK-2). The reactive kill
+        // switch cannot cover this: it is torn down once the tunnel is healthy, and
+        // an IPv6 leak never drops the (IPv4-only) tunnel so it never trips.
+        //
+        // macOS blocks IPv6 unconditionally — including on dual-stack nodes —
+        // and that is deliberate, not an oversight.
+        //
+        // The fleet DOES have routable IPv6 now, and Linux/Windows route it
+        // through the tunnel when the backend issues a client_ipv6. macOS cannot
+        // yet, because the utun write path hard-codes the 4-byte protocol header
+        // to AF_INET:
+        //
+        //     write_buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
+        //
+        // Every decrypted IPv6 reply would be handed to the kernel labelled as
+        // IPv4 and dropped, so "routing" v6 here would build a ONE-WAY tunnel:
+        // requests leave, nothing comes back. `validate_config` also parses
+        // client_ip, every DNS entry and every allowed-ip as Ipv4Addr and rejects
+        // prefix > 32.
+        //
+        // Until that is addressed (AF header derived from the first nibble, inet6
+        // addressing, v6 routes, relaxed validation), black-holing IPv6 is the
+        // only leak-safe option on this platform. A macOS user on a dual-stack
+        // node therefore gets working IPv4 and no IPv6 — degraded, but never
+        // leaking their real address.
+        if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
+            close_fd_on_err(utun_fd);
+            *self.utun_fd.write().await = None;
+            return Err(format!("Failed to block IPv6 leaks: {}", e));
+        }
+
         // Configure DNS
         if let Err(e) = configure_dns(&self.config.dns).await {
+            crate::commands::killswitch::ipv6_block_deactivate().await;
             close_fd_on_err(utun_fd);
             *self.utun_fd.write().await = None;
             return Err(e);
@@ -218,6 +296,10 @@ impl UtunTunnel {
         if let Some(snapshot) = self.network_snapshot.read().await.as_ref() {
             restore_dns(snapshot).await;
         }
+
+        // F-001: lift the IPv6 block. Best-effort so it can never fail teardown
+        // (a stuck block would leave the host without IPv6 after disconnect).
+        crate::commands::killswitch::ipv6_block_deactivate().await;
 
         // Remove routes
         if let Some(ep_ip) = self.endpoint_ip.read().await.as_ref() {
@@ -300,10 +382,29 @@ impl UtunTunnel {
         const UTUN_HEADER_SIZE: usize = 4;
         const MAX_PACKET_SIZE: usize = 65536;
 
+        // Same cadence Windows uses (tunnel.rs). 250ms is comfortably finer than
+        // boringtun's shortest timer, so no deadline is ever missed.
+        // Idle backoff, mirroring Windows (tunnel.rs). The fd is O_NONBLOCK and
+        // recv_packet returns Ok(None) immediately on WouldBlock, so an idle
+        // tunnel previously spun a core at 100% forever. Any packet in either
+        // direction resets the counter, so only the FIRST packet after a
+        // sustained idle pays the extra latency.
+        let mut idle_cycles: u32 = 0;
+        const IDLE_THRESHOLD: u32 = 100;
+        const DEEP_IDLE_THRESHOLD: u32 = 2_000;
+        const SLOW_POLL_US: u64 = 500;
+        const DEEP_POLL_US: u64 = 5_000;
+        // Drain up to this many decrypted packets per wake, so a burst is not
+        // paced one packet per loop iteration.
+        const MAX_BATCH_SIZE: usize = 64;
+        let mut last_timer_update = std::time::Instant::now();
+        const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
         let mut read_buf = vec![0u8; MAX_PACKET_SIZE + UTUN_HEADER_SIZE];
         let mut write_buf = vec![0u8; MAX_PACKET_SIZE + UTUN_HEADER_SIZE];
 
         loop {
+            let mut did_work = false;
             if !running.load(Ordering::SeqCst) {
                 tracing::info!("Packet loop: running flag cleared, exiting");
                 break;
@@ -354,6 +455,7 @@ impl UtunTunnel {
                                     Ok(_) => {
                                         bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
                                         packets_sent.fetch_add(1, Ordering::Relaxed);
+                                        did_work = true;
                                     }
                                     Err(e) => {
                                         tracing::debug!("Failed to send WG packet: {}", e);
@@ -366,32 +468,73 @@ impl UtunTunnel {
             }
 
             // Read from WireGuard and write decrypted packets to utun
-            if let Some(session) = wg_session.read().await.as_ref() {
-                if let Ok(Some(decrypted)) = session.recv_packet().await {
-                    let packet_len = decrypted.len() as u64;
+            for _ in 0..MAX_BATCH_SIZE {
+                if let Some(session) = wg_session.read().await.as_ref() {
+                    if let Ok(Some(decrypted)) = session.recv_packet().await {
+                        did_work = true;
+                        let packet_len = decrypted.len() as u64;
 
-                    // Prepend utun header (AF_INET = 0x00000002 for IPv4)
-                    write_buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
-                    write_buf[4..4 + decrypted.len()].copy_from_slice(&decrypted);
+                        // Prepend utun header (AF_INET = 0x00000002 for IPv4)
+                        write_buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
+                        write_buf[4..4 + decrypted.len()].copy_from_slice(&decrypted);
 
-                    let write_len = 4 + decrypted.len();
-                    let fd = utun_fd;
-                    let buf = write_buf[..write_len].to_vec();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let written = unsafe {
-                            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-                        };
-                        if written < 0 {
-                            tracing::debug!(
-                                "utun write error: {}",
-                                std::io::Error::last_os_error()
-                            );
-                        }
-                    })
-                    .await;
+                        let write_len = 4 + decrypted.len();
+                        let fd = utun_fd;
+                        let buf = write_buf[..write_len].to_vec();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let written = unsafe {
+                                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+                            };
+                            if written < 0 {
+                                tracing::debug!(
+                                    "utun write error: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            }
+                        })
+                        .await;
 
-                    bytes_received.fetch_add(packet_len, Ordering::Relaxed);
-                    packets_received.fetch_add(1, Ordering::Relaxed);
+                        bytes_received.fetch_add(packet_len, Ordering::Relaxed);
+                        packets_received.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        break; // nothing queued — stop draining
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Drive boringtun's timers — WITHOUT this the session dies.
+            //
+            // boringtun advances all session state inside update_timers():
+            // persistent keepalives, REKEY_AFTER_TIME rekeys, and dead-peer
+            // detection. `encapsulate` reads the current keypair with no age
+            // check, so once the server discards it at REJECT_AFTER_TIME the
+            // client keeps happily encrypting to a session that no longer exists
+            // — upload appears to work, download stops, and there is no
+            // client-side recovery. Windows found this (FIX-DL, tunnel.rs:1834)
+            // and fixed it; the Unix tunnels were never given the same tick, so
+            // the keepalive plumbed in at start() was never actually emitted.
+            //
+            // The fd is O_NONBLOCK, so this is reached every iteration even when
+            // the tunnel is completely idle — which is exactly when it matters.
+            if last_timer_update.elapsed() >= TIMER_INTERVAL {
+                last_timer_update = std::time::Instant::now();
+                if let Some(session) = wg_session.read().await.as_ref() {
+                    if let Err(e) = session.update_timers().await {
+                        tracing::trace!("Timer update error: {}", e);
+                    }
+                }
+            }
+
+            if did_work {
+                idle_cycles = 0;
+            } else {
+                idle_cycles = idle_cycles.saturating_add(1);
+                if idle_cycles > DEEP_IDLE_THRESHOLD {
+                    tokio::time::sleep(std::time::Duration::from_micros(DEEP_POLL_US)).await;
+                } else if idle_cycles > IDLE_THRESHOLD {
+                    tokio::time::sleep(std::time::Duration::from_micros(SLOW_POLL_US)).await;
                 }
             }
         }
@@ -602,6 +745,40 @@ fn configure_utun_address(utun_name: &str, client_ip: &str, mtu: &u16) -> Result
 }
 
 /// Configure routing to send traffic through the VPN tunnel.
+/// Expand a default route into two halves, leaving everything else untouched.
+///
+/// The BSD routing table keys on (destination, netmask) with no metric tiebreak,
+/// so a second `0.0.0.0/0` can never be installed — `route add` returns
+/// "File exists" and the host's own default keeps winning. That is why the old
+/// code reported Connected while every packet still left via the physical NIC.
+///
+/// `0.0.0.0/1` + `128.0.0.0/1` cover the same space but are MORE SPECIFIC, so
+/// longest-prefix match picks them over the existing default without deleting
+/// it — which also means teardown has nothing to restore.
+///
+/// Shared by configure_routes and remove_routes so the two can never disagree
+/// about what was installed.
+/// Networks routed around the tunnel when Local Network Sharing is on.
+///
+/// Shared between install and teardown so the two cannot drift. These used to
+/// be installed and then NEVER removed — leaving routes pointing at a gateway
+/// that stops existing the moment the user changes network.
+const LAN_SHARING_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
+fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
+    allowed_ips
+        .iter()
+        .flat_map(|cidr| match cidr.trim() {
+            "0.0.0.0/0" => vec!["0.0.0.0/1".to_string(), "128.0.0.0/1".to_string()],
+            other => vec![other.to_string()],
+        })
+        .collect()
+}
+
 async fn configure_routes(
     utun_name: &str,
     endpoint_ip: &str,
@@ -621,11 +798,24 @@ async fn configure_routes(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!("Endpoint route may already exist: {}", stderr);
+        // MUST be fatal (except an existing identical route). Once the default
+        // below is genuinely captured, a missing endpoint route sends WireGuard's
+        // own outer UDP back into the tunnel — an encapsulation loop that reaches
+        // Connected and carries zero traffic. Warning here would convert a visible
+        // failure into an invisible one.
+        if !stderr.contains("File exists") {
+            return Err(format!(
+                "Failed to pin the endpoint route: {}",
+                stderr.trim()
+            ));
+        }
+        tracing::debug!("Endpoint route already present");
     }
 
+    let allowed_ips = expand_default_v4(allowed_ips);
+
     // Add routes for allowed_ips via the utun interface
-    for cidr in allowed_ips {
+    for cidr in &allowed_ips {
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
             tracing::warn!(
@@ -662,13 +852,25 @@ async fn configure_routes(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("Route add for {} may already exist: {}", cidr, stderr);
+            // Fatal now that defaults are split. Before the split a `0.0.0.0/0`
+            // collision was expected and warning was survivable-looking; after it,
+            // a collision on `0.0.0.0/1` or `128.0.0.0/1` means the tunnel did NOT
+            // capture traffic, and continuing would report Connected while
+            // everything egresses the physical NIC.
+            return Err(format!(
+                "Failed to route {} into the tunnel: {}",
+                cidr,
+                stderr.trim()
+            ));
         }
     }
 
     // If local network sharing is enabled, add RFC1918 routes via the real gateway
     if local_network_sharing {
-        let rfc1918 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+        // 169.254/16 included for mDNS/Bonjour, matching Windows. Without it
+        // printer and AirPlay DISCOVERY fails even though the LAN itself is
+        // reachable, which reads as "Local Network Sharing is broken".
+        let rfc1918 = LAN_SHARING_CIDRS;
         for cidr in &rfc1918 {
             let parts: Vec<&str> = cidr.split('/').collect();
             let mask = prefix_to_mask(parts[1].parse().unwrap_or(8));
@@ -692,24 +894,78 @@ async fn configure_routes(
 
 /// Configure DNS servers on macOS via networksetup.
 async fn configure_dns(dns_servers: &[String]) -> Result<(), String> {
-    // Get the primary network service
-    let service = get_primary_network_service()?;
-
-    // Set DNS servers via networksetup
-    let mut args = vec!["-setdnsservers".to_string(), service.clone()];
-    args.extend(dns_servers.iter().cloned());
-
-    let output = cmd("networksetup")
-        .args(&args)
-        .output()
-        .map_err(|e| format!("Failed to set DNS: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("networksetup DNS failed: {}", stderr));
+    // Point EVERY enabled service at the tunnel resolvers, not just the primary.
+    //
+    // The leak this closes: with Wi-Fi and Ethernet both active, only the service
+    // owning the default route was repointed. Plug in Ethernet while Wi-Fi stays
+    // associated and the primary flips — the utun routes and the endpoint route
+    // both remain valid so traffic keeps flowing and the UI stays green, but the
+    // newly-primary service's ISP resolvers become resolver #1 for every unscoped
+    // query. `get_primary_network_service` is evaluated once at connect, so
+    // nothing notices.
+    //
+    // Windows disables DNS on all non-VPN adapters for exactly this reason.
+    let services = list_network_services();
+    if services.is_empty() {
+        // Fall back to the old behaviour rather than silently configuring nothing.
+        let service = get_primary_network_service()?;
+        let mut args = vec!["-setdnsservers".to_string(), service.clone()];
+        args.extend(dns_servers.iter().cloned());
+        let output = cmd("networksetup")
+            .args(&args)
+            .output()
+            .map_err(|e| format!("Failed to set DNS: {}", e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "networksetup DNS failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        tracing::warn!(
+            "Could not enumerate network services; configured DNS on '{}' only",
+            service
+        );
+        let _ = cmd("dscacheutil").args(["-flushcache"]).output();
+        let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
+        return Ok(());
     }
 
-    tracing::info!("Configured DNS on service '{}': {:?}", service, dns_servers);
+    let mut configured = 0usize;
+    let mut first_error: Option<String> = None;
+    for service in &services {
+        let mut args = vec!["-setdnsservers".to_string(), service.clone()];
+        args.extend(dns_servers.iter().cloned());
+        match cmd("networksetup").args(&args).output() {
+            Ok(o) if o.status.success() => configured += 1,
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                tracing::warn!("Could not set DNS on '{}': {}", service, err);
+                first_error.get_or_insert(err);
+            }
+            Err(e) => {
+                tracing::warn!("Could not set DNS on '{}': {}", service, e);
+                first_error.get_or_insert(e.to_string());
+            }
+        }
+    }
+
+    // Zero services configured means DNS is entirely unprotected — fail the
+    // connect rather than proceed with a leak. A partial failure is tolerated:
+    // some services (inactive adapters, Thunderbolt bridges) legitimately reject
+    // the call, and the ones carrying traffic are configured.
+    if configured == 0 {
+        return Err(format!(
+            "Failed to configure DNS on any network service: {}",
+            first_error.unwrap_or_else(|| "unknown error".into())
+        ));
+    }
+
+    tracing::info!(
+        "Configured DNS on {}/{} network services: {:?}",
+        configured,
+        services.len(),
+        dns_servers
+    );
 
     // Flush DNS cache
     let _ = cmd("dscacheutil").args(["-flushcache"]).output();
@@ -720,8 +976,32 @@ async fn configure_dns(dns_servers: &[String]) -> Result<(), String> {
 
 /// Restore original DNS configuration.
 async fn restore_dns(snapshot: &NetworkSnapshot) {
-    if snapshot.dns_servers.is_empty() {
-        // Was using DHCP DNS — set to "empty" which restores DHCP
+    // Restore EVERY service we touched, each to exactly what it had.
+    //
+    // This must mirror configure_dns precisely. Restoring only the primary would
+    // leave every other service pinned to tunnel resolvers that stop existing at
+    // disconnect — the user's DNS would simply break, on an interface Birdo
+    // never appeared to touch.
+    if !snapshot.all_dns.is_empty() {
+        for (service, servers) in &snapshot.all_dns {
+            if servers.is_empty() {
+                // "empty" is networksetup's way of saying "go back to DHCP".
+                let _ = cmd("networksetup")
+                    .args(["-setdnsservers", service, "empty"])
+                    .output();
+            } else {
+                let mut args = vec!["-setdnsservers".to_string(), service.clone()];
+                args.extend(servers.iter().cloned());
+                let _ = cmd("networksetup").args(&args).output();
+            }
+        }
+        tracing::info!(
+            "Restored DNS on {} network services",
+            snapshot.all_dns.len()
+        );
+    } else if snapshot.dns_servers.is_empty() {
+        // Legacy single-service path, kept for a snapshot captured before the
+        // all-services change (e.g. an upgrade mid-session).
         let _ = cmd("networksetup")
             .args(["-setdnsservers", &snapshot.service_name, "empty"])
             .output();
@@ -734,8 +1014,6 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
     // Flush DNS cache
     let _ = cmd("dscacheutil").args(["-flushcache"]).output();
     let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
-
-    tracing::info!("Restored DNS configuration for '{}'", snapshot.service_name);
 }
 
 /// Remove VPN-specific routes.
@@ -745,8 +1023,17 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
         .args(["-n", "delete", "-host", endpoint_ip])
         .output();
 
-    // Remove allowed_ip routes
-    for cidr in allowed_ips {
+    // Remove allowed_ip routes.
+    //
+    // Expanded through the SAME helper configure_routes used, so we delete
+    // exactly the routes we installed and nothing else. Previously this emitted
+    // an unqualified `route -n delete -net 0.0.0.0 -netmask 0.0.0.0`, which does
+    // not match anything we added (we never managed to add a default) and instead
+    // deletes the HOST'S OWN default — stranding the machine with no internet
+    // after every disconnect.
+    let allowed_ips = expand_default_v4(allowed_ips);
+
+    for cidr in &allowed_ips {
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
             tracing::warn!(
@@ -771,6 +1058,19 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
             .output();
     }
 
+    // Remove the Local Network Sharing routes too — see the Linux twin. They
+    // were installed and never removed, outliving the session and pointing at a
+    // gateway that stops existing when the user changes network.
+    for cidr in LAN_SHARING_CIDRS {
+        if let Some((net, prefix)) = cidr.split_once('/') {
+            if let Ok(p) = prefix.parse::<u8>() {
+                let mask = prefix_to_mask(p);
+                let _ = cmd("route")
+                    .args(["-n", "delete", "-net", net, "-netmask", &mask])
+                    .output();
+            }
+        }
+    }
     tracing::info!("Removed VPN routes");
 }
 
@@ -794,11 +1094,23 @@ async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
     let default_gateway = get_default_gateway().ok();
     let default_interface = get_default_interface().ok();
 
+    // Snapshot every enabled service BEFORE anything is changed, so each can be
+    // put back exactly. Captured even for services that already use DHCP — an
+    // empty vec is meaningful here and restores as "empty".
+    let all_dns: Vec<(String, Vec<String>)> = list_network_services()
+        .into_iter()
+        .map(|s| {
+            let servers = dns_servers_for(&s);
+            (s, servers)
+        })
+        .collect();
+
     Ok(NetworkSnapshot {
         service_name: service,
         dns_servers,
         default_gateway,
         default_interface,
+        all_dns,
     })
 }
 
