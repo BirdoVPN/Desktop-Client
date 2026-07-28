@@ -1058,16 +1058,23 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
             .output();
     }
 
-    // Remove the Local Network Sharing routes too — see the Linux twin. They
-    // were installed and never removed, outliving the session and pointing at a
-    // gateway that stops existing when the user changes network.
-    for cidr in LAN_SHARING_CIDRS {
-        if let Some((net, prefix)) = cidr.split_once('/') {
-            if let Ok(p) = prefix.parse::<u8>() {
-                let mask = prefix_to_mask(p);
-                let _ = cmd("route")
-                    .args(["-n", "delete", "-net", net, "-netmask", &mask])
-                    .output();
+    // Remove the Local Network Sharing routes — ONLY if we added them, and only
+    // the ones we could actually own.
+    //
+    // This was unconditional, which repeated on the LAN routes the exact mistake
+    // that had just been fixed for the default route: deleting something we never
+    // installed. With sharing OFF we add nothing, so every delete here targeted
+    // the USER'S own routes — `route delete -net <cidr>` matches on destination
+    // alone and does not care who created it.
+    if local_network_sharing {
+        for cidr in LAN_SHARING_CIDRS_OWNED {
+            if let Some((net, prefix)) = cidr.split_once('/') {
+                if let Ok(p) = prefix.parse::<u8>() {
+                    let mask = prefix_to_mask(p);
+                    let _ = cmd("route")
+                        .args(["-n", "delete", "-net", net, "-netmask", &mask])
+                        .output();
+                }
             }
         }
     }

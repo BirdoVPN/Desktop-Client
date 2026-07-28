@@ -6,7 +6,13 @@
 //! Provides biometric lock functionality matching Android's BiometricPrompt.
 
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+// `info!` is used unconditionally; `error!`/`warn!` only inside the Windows Hello
+// and Touch ID blocks. Importing all three unconditionally is an unused_imports
+// warning on Linux — which nothing catches locally, because the dev machine is
+// Windows and CI only runs clippy there.
+use tracing::info;
+#[cfg(any(windows, target_os = "macos"))]
+use tracing::{error, warn};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BiometricStatus {

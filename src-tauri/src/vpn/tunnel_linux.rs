@@ -306,9 +306,22 @@ impl LinuxTunnel {
         // (a stuck block would leave the host without IPv6 after disconnect).
         remove_ipv6_leak_block();
 
-        // Remove routes
+        // Remove routes. The snapshot supplies the gateway/interface the LAN
+        // routes were added through, so their deletion can be qualified the same
+        // way and cannot match a route belonging to something else.
         if let Some(ep_ip) = self.endpoint_ip.read().await.as_ref() {
-            remove_routes(ep_ip, &self.config.allowed_ips).await;
+            let snap = self.network_snapshot.read().await;
+            let gw = snap.as_ref().and_then(|s| s.default_gateway.clone());
+            let iface = snap.as_ref().and_then(|s| s.default_interface.clone());
+            drop(snap);
+            remove_routes(
+                ep_ip,
+                &self.config.allowed_ips,
+                self.local_network_sharing,
+                gw.as_deref(),
+                iface.as_deref(),
+            )
+            .await;
         }
 
         // Close the TUN file descriptor (kernel auto-removes the device)
@@ -1154,7 +1167,13 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
 }
 
 /// Remove VPN-specific routes.
-async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
+async fn remove_routes(
+    endpoint_ip: &str,
+    allowed_ips: &[String],
+    local_network_sharing: bool,
+    default_gateway: Option<&str>,
+    default_interface: Option<&str>,
+) {
     // Remove endpoint route
     let _ = cmd("ip")
         .args(["route", "del", &format!("{}/32", endpoint_ip)])
@@ -1179,8 +1198,25 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
     // network — a stale RFC1918 route to a dead gateway silently blackholes LAN
     // traffic long after Birdo is closed. Unconditional and best-effort: if LAN
     // sharing was off there is nothing to delete and the command simply fails.
-    for cidr in LAN_SHARING_CIDRS {
-        let _ = cmd("ip").args(["route", "del", cidr]).output();
+    // ONLY if we added them, and QUALIFIED by gateway + device.
+    //
+    // Unconditional deletion repeated the mistake just fixed for the default
+    // route: removing something we never installed. With sharing OFF we add
+    // nothing, so every delete targeted the user's own routes. And a bare
+    // `ip route del <prefix>` matches the lowest-metric entry regardless of
+    // device — on a normal desktop that is NetworkManager's link-scope
+    // 169.254.0.0/16, which we must never touch.
+    //
+    // Qualifying with via/dev is the same argv shape the ADD uses, so a delete
+    // can only ever match a route of ours.
+    if local_network_sharing {
+        if let (Some(gw), Some(iface)) = (default_gateway, default_interface) {
+            for cidr in LAN_SHARING_CIDRS {
+                let _ = cmd("ip")
+                    .args(["route", "del", cidr, "via", gw, "dev", iface])
+                    .output();
+            }
+        }
     }
     tracing::info!("Removed VPN routes");
 }
