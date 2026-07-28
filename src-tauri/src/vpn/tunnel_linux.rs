@@ -384,6 +384,11 @@ impl LinuxTunnel {
 
         const MAX_PACKET_SIZE: usize = 65536;
 
+        // Same cadence Windows uses (tunnel.rs). 250ms is comfortably finer than
+        // boringtun's shortest timer, so no deadline is ever missed.
+        let mut last_timer_update = std::time::Instant::now();
+        const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
         loop {
             if !running.load(Ordering::SeqCst) {
                 tracing::info!("Packet loop: running flag cleared, exiting");
@@ -468,6 +473,29 @@ impl LinuxTunnel {
                             bytes_received.fetch_add(packet_len, Ordering::Relaxed);
                             packets_received.fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+                }
+            }
+
+            // Drive boringtun's timers — WITHOUT this the session dies.
+            //
+            // boringtun advances all session state inside update_timers():
+            // persistent keepalives, REKEY_AFTER_TIME rekeys, and dead-peer
+            // detection. `encapsulate` reads the current keypair with no age
+            // check, so once the server discards it at REJECT_AFTER_TIME the
+            // client keeps happily encrypting to a session that no longer exists
+            // — upload appears to work, download stops, and there is no
+            // client-side recovery. Windows found this (FIX-DL, tunnel.rs:1834)
+            // and fixed it; the Unix tunnels were never given the same tick, so
+            // the keepalive plumbed in at start() was never actually emitted.
+            //
+            // The fd is O_NONBLOCK, so this is reached every iteration even when
+            // the tunnel is completely idle — which is exactly when it matters.
+            if last_timer_update.elapsed() >= TIMER_INTERVAL {
+                last_timer_update = std::time::Instant::now();
+                if let Some(session) = wg_session.read().await.as_ref() {
+                    if let Err(e) = session.update_timers().await {
+                        tracing::trace!("Timer update error: {}", e);
                     }
                 }
             }
@@ -693,12 +721,35 @@ async fn configure_ipv6(tun_name: &str, config: &VpnConfig) -> Result<(), String
         }
     }
 
-    // Default to the split default when the backend sent no explicit v6
-    // allowed-ips, so a dual-stack node routes all IPv6 rather than none.
+    // Expand any default-scoped entry into ::/1 + 8000::/1.
+    //
+    // This MUST happen for whatever the backend actually sends, not only when the
+    // list is empty. The backend always sends `::/0` (vpn.service.ts), so an
+    // is-empty fallback would be dead code — and using `::/0` verbatim is worse
+    // than useless here: on any normal SLAAC host the kernel already holds a
+    // `::/0` default, so `ip -6 route add ::/0 dev <tun>` returns "File exists".
+    // Swallowing that (as the IPv4 path does) would make configure_ipv6 report
+    // success with NO tunnel route installed, and the caller would then lift the
+    // leak block — leaving the physical default winning and nothing blocking it.
+    // That is strictly worse than never having routed v6 at all.
+    //
+    // Two more-specific halves beat an existing ::/0 on longest-prefix match
+    // without deleting it, so teardown has nothing to restore. Same trick the
+    // IPv4 side uses.
     let v6_routes: Vec<String> = if config.allowed_ips_v6.is_empty() {
         vec!["::/1".to_string(), "8000::/1".to_string()]
     } else {
-        config.allowed_ips_v6.clone()
+        config
+            .allowed_ips_v6
+            .iter()
+            .flat_map(|r| {
+                if r.trim() == "::/0" {
+                    vec!["::/1".to_string(), "8000::/1".to_string()]
+                } else {
+                    vec![r.clone()]
+                }
+            })
+            .collect()
     };
 
     for route in &v6_routes {
@@ -723,10 +774,36 @@ async fn configure_ipv6(tun_name: &str, config: &VpnConfig) -> Result<(), String
             .map_err(|e| format!("Failed to add IPv6 route {}: {}", route, e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("File exists") {
-                return Err(format!("ip -6 route add {} failed: {}", route, stderr));
-            }
+            // Deliberately do NOT tolerate "File exists" here, unlike the IPv4
+            // path. After the split above, a collision means something else
+            // already owns ::/1 or 8000::/1 on this host — so our route is not
+            // in place, and reporting success would cause the caller to lift the
+            // leak block over an unrouted tunnel. Fail instead: the block stays,
+            // and the user gets working IPv4 with IPv6 safely dead.
+            return Err(format!(
+                "ip -6 route add {} failed: {}",
+                route,
+                stderr.trim()
+            ));
         }
+    }
+
+    // Confirm the tunnel actually won the route, rather than trusting exit codes.
+    // A route add can succeed and still lose: with a pre-existing default at a
+    // better metric the kernel accepts the new route and keeps preferring the old
+    // one. `ip -6 route get` asks the kernel what it would ACTUALLY do, which is
+    // the only answer that matters before we take the leak block down.
+    let probe = cmd("ip")
+        .args(["-6", "route", "get", "2606:4700:4700::1111"])
+        .output()
+        .map_err(|e| format!("Failed to verify IPv6 routing: {}", e))?;
+    let probe_out = String::from_utf8_lossy(&probe.stdout);
+    if !probe.status.success() || !probe_out.contains(tun_name) {
+        return Err(format!(
+            "IPv6 route verification failed: kernel would not route via {} ({})",
+            tun_name,
+            probe_out.trim()
+        ));
     }
 
     tracing::info!(

@@ -338,6 +338,11 @@ impl UtunTunnel {
         const UTUN_HEADER_SIZE: usize = 4;
         const MAX_PACKET_SIZE: usize = 65536;
 
+        // Same cadence Windows uses (tunnel.rs). 250ms is comfortably finer than
+        // boringtun's shortest timer, so no deadline is ever missed.
+        let mut last_timer_update = std::time::Instant::now();
+        const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
         let mut read_buf = vec![0u8; MAX_PACKET_SIZE + UTUN_HEADER_SIZE];
         let mut write_buf = vec![0u8; MAX_PACKET_SIZE + UTUN_HEADER_SIZE];
 
@@ -430,6 +435,29 @@ impl UtunTunnel {
 
                     bytes_received.fetch_add(packet_len, Ordering::Relaxed);
                     packets_received.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            // Drive boringtun's timers — WITHOUT this the session dies.
+            //
+            // boringtun advances all session state inside update_timers():
+            // persistent keepalives, REKEY_AFTER_TIME rekeys, and dead-peer
+            // detection. `encapsulate` reads the current keypair with no age
+            // check, so once the server discards it at REJECT_AFTER_TIME the
+            // client keeps happily encrypting to a session that no longer exists
+            // — upload appears to work, download stops, and there is no
+            // client-side recovery. Windows found this (FIX-DL, tunnel.rs:1834)
+            // and fixed it; the Unix tunnels were never given the same tick, so
+            // the keepalive plumbed in at start() was never actually emitted.
+            //
+            // The fd is O_NONBLOCK, so this is reached every iteration even when
+            // the tunnel is completely idle — which is exactly when it matters.
+            if last_timer_update.elapsed() >= TIMER_INTERVAL {
+                last_timer_update = std::time::Instant::now();
+                if let Some(session) = wg_session.read().await.as_ref() {
+                    if let Err(e) = session.update_timers().await {
+                        tracing::trace!("Timer update error: {}", e);
+                    }
                 }
             }
         }
