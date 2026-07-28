@@ -537,6 +537,46 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
             if resources.exists() {
                 return Ok(resources);
             }
+
+            // macOS .app bundle: the executable sits in Contents/MacOS, and
+            // Tauri stages resources in Contents/Resources — a SIBLING of the
+            // exe's directory, not a child. `exe_dir/resources` resolves to
+            // Contents/MacOS/resources, which never exists, so the bundled
+            // binary was unreachable and stealth fell through to PATH (where a
+            // user normally has no xray at all).
+            #[cfg(target_os = "macos")]
+            if let Some(contents) = exe_dir.parent() {
+                let bundled = contents.join("Resources").join(XRAY_BIN);
+                if bundled.exists() {
+                    return Ok(bundled);
+                }
+            }
+
+            // Linux .deb / AppImage: the exe is installed to /usr/bin (or
+            // usr/bin inside the AppImage mount) while resources land under
+            // /usr/lib/<app>/. Same failure mode as macOS — `exe_dir/resources`
+            // would be /usr/bin/resources.
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(prefix) = exe_dir.parent() {
+                    let exe_name = exe_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    for candidate in [
+                        prefix.join("lib").join(&exe_name).join(XRAY_BIN),
+                        prefix
+                            .join("lib")
+                            .join(&exe_name)
+                            .join("resources")
+                            .join(XRAY_BIN),
+                    ] {
+                        if candidate.exists() {
+                            return Ok(candidate);
+                        }
+                    }
+                }
+            }
         }
     }
 

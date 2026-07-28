@@ -323,13 +323,26 @@ pub(crate) async fn start_stealth_tunnel(
     {
         return Err("Invalid Xray UUID format from server".to_string());
     }
-    // Public key: 64-char hex (Curve25519 key in X25519 Reality format)
-    if public_key.is_empty()
-        || public_key.len() > 64
-        || !public_key.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    // Public key: the X25519 Reality public key, as `xray x25519` emits it —
+    // 43 chars of UNPADDED BASE64URL, not hex.
+    //
+    // This validator previously required `is_ascii_hexdigit()`, which every real
+    // key fails: they contain `-`, `_` and letters outside a-f. Verified against
+    // the live fleet, e.g. `ZUBWf8z7esYVrRZy4XaYJ02f6OnlKjOVaPf07_mahTo`.
+    // So stealth mode was rejected CLIENT-SIDE for every node on every desktop
+    // platform — the feature has never worked here, while Android accepts
+    // base64url and works fine.
+    //
+    // Hex is still accepted so an older/alternate encoding cannot regress.
+    let is_b64url_key = public_key.len() == 43
+        && public_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let is_hex_key = public_key.len() <= 64 && public_key.chars().all(|c| c.is_ascii_hexdigit());
+    if public_key.is_empty() || !(is_b64url_key || is_hex_key) {
         return Err(
-            "Invalid Xray public key format from server (expected ≤64 hex chars)".to_string(),
+            "Invalid Xray public key format from server (expected 43-char base64url or hex)"
+                .to_string(),
         );
     }
     // Short ID: hex string, max 16 chars (8 bytes)
