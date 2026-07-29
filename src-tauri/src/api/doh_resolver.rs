@@ -140,7 +140,21 @@ async fn system_resolve(
     if addrs.is_empty() {
         return Err(format!("system resolver returned no addresses for {host}").into());
     }
-    Ok(addrs)
+    // PREFER IPv4 — this is a self-inflicted-stall fix, not a policy choice.
+    //
+    // Our own F-001 IPv6 leak block (pf on macOS, ip6tables on Linux) blackholes
+    // routable IPv6 for the whole tunnel session and across a server switch. The
+    // control plane is dual-stack (api.birdo.app publishes an AAAA), and the
+    // system resolver returns IPv6 FIRST under RFC 6724. reqwest tries addresses
+    // in order with no Happy-Eyeballs race, so it would open the AAAA first and
+    // sit on a silently-dropped connection until the request timeout — a server
+    // switch then never fetches its new config and the UI appears frozen.
+    //
+    // The control plane is always IPv4-reachable, so drop IPv6 when we have any
+    // IPv4. IPv6 is kept as the tail fallback so an IPv6-only network still
+    // resolves (there the block is not what stands in the way).
+    let (v4, v6): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs.into_iter().partition(|a| a.is_ipv4());
+    Ok(if v4.is_empty() { v6 } else { v4 })
 }
 
 #[cfg(test)]
