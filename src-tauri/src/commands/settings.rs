@@ -42,9 +42,11 @@ pub struct AppSettings {
     pub auto_connect: bool,
     /// Preferred server ID for auto-connect (None = best server)
     pub preferred_server_id: Option<String>,
-    /// Enable split tunneling
+    /// Enable kill-switch exceptions (field keeps the historical
+    /// split-tunnel name for settings-file/HMAC compat)
     pub split_tunneling_enabled: bool,
-    /// Apps to exclude from VPN (split tunneling)
+    /// Apps exempt from the kill-switch block (WFP permits — traffic still
+    /// routes through the VPN while connected; see wfp.rs)
     pub split_tunnel_apps: Vec<String>,
     /// DNS servers to use while connected (None = use VPN's DNS)
     pub custom_dns: Option<Vec<String>>,
@@ -427,18 +429,24 @@ pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool
 /// Enable or disable autostart
 #[tauri::command]
 pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    use tauri_plugin_autostart::ManagerExt;
+    #[cfg(windows)]
+    set_autostart_windows(&app, enabled)?;
 
-    let autostart = app.autolaunch();
+    #[cfg(not(windows))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
 
-    if enabled {
-        autostart
-            .enable()
-            .map_err(|e| format!("Failed to enable autostart: {}", e))?;
-    } else {
-        autostart
-            .disable()
-            .map_err(|e| format!("Failed to disable autostart: {}", e))?;
+        let autostart = app.autolaunch();
+
+        if enabled {
+            autostart
+                .enable()
+                .map_err(|e| format!("Failed to enable autostart: {}", e))?;
+        } else {
+            autostart
+                .disable()
+                .map_err(|e| format!("Failed to disable autostart: {}", e))?;
+        }
     }
 
     // Also update settings file
@@ -447,6 +455,66 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     save_settings(app, settings).await?;
 
     Ok(true)
+}
+
+/// Windows launch-at-login via a logon-triggered Scheduled Task.
+///
+/// The exe manifest is `requireAdministrator`, and Windows never launches an
+/// elevated binary from the HKCU Run key (where tauri-plugin-autostart writes)
+/// — the entry is silently skipped with ERROR_ELEVATION_REQUIRED, so the
+/// toggle appeared to work but the app never started. A Scheduled Task with
+/// `/RL HIGHEST` is the supported way to autostart elevated without a UAC
+/// prompt; creating one needs admin, which this process always has.
+#[cfg(windows)]
+fn set_autostart_windows(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    const TASK_NAME: &str = "BirdoVPN Launch At Login";
+
+    // Older builds wrote the useless Run-key entry; clear it on either toggle
+    // so it stops logging an elevation failure at every logon.
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        let _ = app.autolaunch().disable();
+    }
+
+    let run = |args: &[&str]| -> Result<std::process::Output, String> {
+        crate::utils::hidden_cmd("schtasks")
+            .args(args)
+            .output()
+            .map_err(|e| format!("Failed to run schtasks: {}", e))
+    };
+
+    if enabled {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("Failed to resolve the app path: {}", e))?;
+        // Quote the action ourselves — Task Scheduler splits an unquoted
+        // "C:\Program Files\…" at the first space.
+        let action = format!("\"{}\"", exe.display());
+        let out = run(&[
+            "/Create", "/F", "/TN", TASK_NAME, "/TR", &action, "/SC", "ONLOGON", "/RL", "HIGHEST",
+        ])?;
+        if !out.status.success() {
+            return Err(format!(
+                "Failed to register the launch-at-login task: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        tracing::info!("Registered elevated launch-at-login task");
+    } else {
+        // schtasks error text is localized, so probe existence by exit code
+        // instead of parsing "cannot find" out of /Delete's stderr.
+        let exists = run(&["/Query", "/TN", TASK_NAME])?.status.success();
+        if exists {
+            let out = run(&["/Delete", "/F", "/TN", TASK_NAME])?;
+            if !out.status.success() {
+                return Err(format!(
+                    "Failed to remove the launch-at-login task: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            tracing::info!("Removed launch-at-login task");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

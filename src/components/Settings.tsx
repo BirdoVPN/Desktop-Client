@@ -4,7 +4,7 @@
  * Mirrors mobile's `SettingsScreen.kt`: a short scrollable list of
  * `BirdoSectionHeader` + `BirdoCard` groups built from `BirdoToggleRow` /
  * `BirdoNavRow`, with the heavy/configurable surfaces PUSHED to their own
- * sub-screens (VPN Settings, Split Tunneling, Port Forwarding, Subscription).
+ * sub-screens (VPN Settings, Kill Switch Exceptions, Port Forwarding, Subscription).
  *
  * As a TAB ROOT it renders its OWN title header (no pushed BirdoTopBar / back
  * button) — matching `ProfileScreen.kt` / Profile.tsx.
@@ -333,8 +333,8 @@ export function Settings() {
         </BirdoCard>
 
         {/* ── MANAGE (push rows) ─────────────────────────────────────── */}
-        {/* Split Tunneling + Port Forwarding now live INSIDE VPN Settings
-            (Features). Subscription / billing is managed on the web. */}
+        {/* Kill Switch Exceptions + Port Forwarding now live INSIDE VPN
+            Settings (Features). Subscription / billing is managed on the web. */}
         <BirdoSectionHeader title="Manage" className="mt-2" />
         <BirdoCard padding="0.25rem">
           <BirdoNavRow
