@@ -51,6 +51,13 @@ impl BirdoApi {
         // TLS 1.2 minimum + versions are set by the rustls config itself.
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
+            // Bound the TCP handshake separately from the overall request budget.
+            // Without this, ONE unreachable address (e.g. an IPv6 candidate that
+            // our own leak block rejects, or a black-holing middlebox) could eat
+            // the entire 30 s timeout before reqwest ever tried the next address,
+            // which is what made a server switch look frozen instead of simply
+            // retrying over IPv4.
+            .connect_timeout(Duration::from_secs(8))
             .user_agent(USER_AGENT)
             .pool_max_idle_per_host(5)
             .https_only(true)

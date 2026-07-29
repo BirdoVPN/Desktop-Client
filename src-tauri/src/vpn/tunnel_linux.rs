@@ -79,7 +79,26 @@ pub(crate) fn install_ipv6_leak_block() -> Result<(), String> {
     // "Packet Too Big") is unaffected: this chain is hooked into OUTPUT only.
     ip6t(&["-A", IPV6_BLOCK_CHAIN, "-d", "fe80::/10", "-j", "ACCEPT"])?;
     ip6t(&["-A", IPV6_BLOCK_CHAIN, "-d", "ff02::/16", "-j", "ACCEPT"])?;
-    ip6t(&["-A", IPV6_BLOCK_CHAIN, "-j", "DROP"])?;
+    // REJECT, not DROP: the packet is still never allowed out (identical leak
+    // protection — the ICMPv6 rejection is generated locally), but the sender
+    // fails IMMEDIATELY instead of waiting out a TCP timeout. A silent DROP
+    // stalled our OWN dual-stack control-plane HTTPS (api.birdo.app publishes an
+    // AAAA) and DoH until the request timeout, so a server switch could not
+    // fetch its new config. Fall back to DROP if the REJECT target is
+    // unavailable (some minimal kernels lack ip6t_REJECT) — never leave IPv6
+    // unblocked just because we could not install the nicer variant.
+    if ip6t(&[
+        "-A",
+        IPV6_BLOCK_CHAIN,
+        "-j",
+        "REJECT",
+        "--reject-with",
+        "icmp6-adm-prohibited",
+    ])
+    .is_err()
+    {
+        ip6t(&["-A", IPV6_BLOCK_CHAIN, "-j", "DROP"])?;
+    }
     // Jump OUTPUT -> our chain (delete first so repeated starts don't stack).
     let _ = ip6t(&["-D", "OUTPUT", "-j", IPV6_BLOCK_CHAIN]);
     ip6t(&["-I", "OUTPUT", "1", "-j", IPV6_BLOCK_CHAIN])?;
