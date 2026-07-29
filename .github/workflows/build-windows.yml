@@ -28,7 +28,6 @@ jobs:
   # Uses Tauri 2's bundle.windows.signCommand so signtool runs on:
   #   1. The main birdo-vpn-desktop.exe BEFORE it's bundled
   #   2. The NSIS installer .exe
-  #   3. The MSI
   # Result: post-install, the launched VPN .exe shows Birdo VPN as the
   # publisher (no "Unknown publisher" warning).
   #
@@ -200,7 +199,7 @@ jobs:
           "TRUSTED_SIGNING_METADATA=$metadataPath" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # Inject signCommand into tauri.conf.json so Tauri signs every
-      # signable artifact (main .exe BEFORE bundling, then NSIS, then MSI).
+      # signable artifact (main .exe BEFORE bundling, then NSIS).
       # We use the OBJECT notation { cmd, args } which bypasses Tauri's
       # shlex string parsing entirely — no quoting/escaping issues.
       # signtool is invoked DIRECTLY (no cmd.exe / no .cmd wrapper).
@@ -287,7 +286,6 @@ jobs:
         run: |
           $files = @()
           $files += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
-          $files += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue
           if ($files.Count -eq 0) { throw "No installer artifacts found to verify" }
 
           # Extract the NSIS installer and add the inner app exe to the check list.
@@ -310,18 +308,17 @@ jobs:
           }
           if ($failed) { throw "One or more artifacts are not properly signed" }
 
-      # Confirm Tauri emitted the per-installer minisign updater signatures.
+      # Confirm Tauri emitted the per-installer minisign updater signature.
       # bundle.createUpdaterArtifacts=true makes `tauri build` write a
-      # <setup>.exe.sig (NSIS) and <name>.msi.sig (MSI) next to each
-      # installer, signed with TAURI_SIGNING_PRIVATE_KEY. These are what the
-      # in-app updater verifies against the embedded pubkey.
+      # <setup>.exe.sig next to the NSIS installer, signed with
+      # TAURI_SIGNING_PRIVATE_KEY. This is what the in-app updater verifies
+      # against the embedded pubkey.
       - name: Verify Tauri updater signatures (.sig) exist
         if: steps.sign-mode.outputs.enabled == 'true'
         shell: pwsh
         run: |
           $sigs = @()
           $sigs += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe.sig" -ErrorAction SilentlyContinue
-          $sigs += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi.sig" -ErrorAction SilentlyContinue
           if ($sigs.Count -eq 0) {
             throw "No updater .sig files found — createUpdaterArtifacts/TAURI_SIGNING_PRIVATE_KEY not applied"
           }
@@ -346,22 +343,10 @@ jobs:
             exit 1
           }
 
-      - name: Sign MSI installer with Sigstore
-        shell: pwsh
-        run: |
-          $msiFile = Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" | Select-Object -First 1
-          if ($msiFile) {
-            cosign sign-blob --yes --bundle "$($msiFile.FullName).sigstore" $msiFile.FullName
-            Write-Host "Signed $($msiFile.Name) → $($msiFile.Name).sigstore"
-          } else {
-            Write-Error "MSI installer not found"
-            exit 1
-          }
-
       - name: Generate SHA256 checksums
         shell: pwsh
         run: |
-          $artifacts = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.exe, *.msi
+          $artifacts = Get-ChildItem "src-tauri/target/release/bundle" -Recurse -Include *.exe
           $checksums = @()
           foreach ($file in $artifacts) {
             $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash.ToLower()
@@ -383,9 +368,6 @@ jobs:
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/nsis/*.exe.sig
             src-tauri/target/release/bundle/nsis/*.sigstore
-            src-tauri/target/release/bundle/msi/*.msi
-            src-tauri/target/release/bundle/msi/*.msi.sig
-            src-tauri/target/release/bundle/msi/*.sigstore
             src-tauri/target/release/bundle/SHA256SUMS.txt
             src-tauri/target/release/bundle/SHA256SUMS.txt.sigstore
           retention-days: 30
