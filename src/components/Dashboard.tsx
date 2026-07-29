@@ -241,10 +241,17 @@ export function Dashboard() {
     invoke<{
       plan: string;
       status: string;
-      expires_at: string | null;
-      devices_used: number;
-      devices_limit: number;
-      bandwidth_limit: number | null;
+      // camelCase on the wire (#[serde(rename_all = "camelCase")] on the Rust
+      // SubscriptionStatus). snake_case kept only as a defensive fallback — see
+      // the same fix in Profile.tsx, which is this bug written twice.
+      expiresAt?: string | null;
+      devicesUsed?: number;
+      devicesLimit?: number;
+      bandwidthLimit?: number | null;
+      expires_at?: string | null;
+      devices_used?: number;
+      devices_limit?: number;
+      bandwidth_limit?: number | null;
     }>('get_subscription_status')
       .then((sub) => {
         setAccount({
@@ -252,12 +259,12 @@ export function Dashboard() {
           status: (['active', 'expired', 'cancelled'] as const).includes(sub.status as 'active')
             ? (sub.status as 'active' | 'expired' | 'cancelled')
             : 'unknown',
-          expiresAt: sub.expires_at ?? null,
-          activeDevices: sub.devices_used ?? 0,
-          maxDevices: sub.devices_limit ?? 1,
+          expiresAt: sub.expiresAt ?? sub.expires_at ?? null,
+          activeDevices: sub.devicesUsed ?? sub.devices_used ?? 0,
+          maxDevices: sub.devicesLimit ?? sub.devices_limit ?? 1,
           // Backend no longer reports bandwidth usage (always 0).
           bandwidthUsed: 0,
-          bandwidthLimit: sub.bandwidth_limit ?? 0,
+          bandwidthLimit: sub.bandwidthLimit ?? sub.bandwidth_limit ?? 0,
         });
       })
       .catch(() => { /* silent */ });
