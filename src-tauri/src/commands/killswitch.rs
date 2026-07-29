@@ -791,7 +791,18 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
     tracing::info!("Kill switch: self-permit for uid {} on tcp/443", euid);
 
     // Default-deny with `quick` passes short-circuiting for the allow-list.
-    // Also permit any utun* WireGuard interface so that, if the tunnel comes
+    // Permit utun0..utun15. create_utun_device() probes `for unit in 0..256` and
+    // takes the FIRST FREE unit, so on a Mac where system services already hold
+    // utun0-3 (VPNs, Continuity, Handoff — common) our tunnel lands on utun4+
+    // and `block drop all` ate its traffic. The worst path is not the reconnect
+    // gap: reapply_vpn_settings arms the block and never deactivates, so
+    // CHANGING ANY VPN SETTING WHILE CONNECTED killed all internet for the rest
+    // of the session.
+    //
+    // pfctl tolerates naming absent interfaces (which is how utun2/utun3 already
+    // loaded), so listing 16 is safe. The live device name cannot be used
+    // instead: reapply_vpn_settings arms the block BEFORE the new tunnel exists,
+    // so there is no name to bind at rule-load time.
     // back up before deactivation lands, traffic already inside the VPN is not
     // dropped by this main ruleset.
     let rules = format!(
@@ -804,6 +815,18 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
          pass quick on utun1 all\n\
          pass quick on utun2 all\n\
          pass quick on utun3 all\n\
+         pass quick on utun4 all\n\
+         pass quick on utun5 all\n\
+         pass quick on utun6 all\n\
+         pass quick on utun7 all\n\
+         pass quick on utun8 all\n\
+         pass quick on utun9 all\n\
+         pass quick on utun10 all\n\
+         pass quick on utun11 all\n\
+         pass quick on utun12 all\n\
+         pass quick on utun13 all\n\
+         pass quick on utun14 all\n\
+         pass quick on utun15 all\n\
          pass out quick proto udp to any port 67 no state\n\
          pass in quick proto udp from any port 68 no state\n\
          {lan_permit}\

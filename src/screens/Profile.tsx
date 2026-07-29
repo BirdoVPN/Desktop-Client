@@ -52,10 +52,20 @@ import {
 interface RustSubscription {
   plan: string;
   status: string;
-  expires_at: string | null;
-  devices_used: number;
-  devices_limit: number;
-  bandwidth_limit: number | null;
+  // The Rust `SubscriptionStatus` is #[serde(rename_all = "camelCase")], so the
+  // wire fields are camelCase. Reading snake_case made all four permanently
+  // undefined and silently fall back to defaults — so a Sovereign buyer saw
+  // "1 device", "Unlimited" data above a meter reading "of 100 GB", and no
+  // renewal date. Same class as the documented ServerInfo bug in Dashboard.tsx.
+  // snake_case kept only as a defensive fallback.
+  expiresAt?: string | null;
+  devicesUsed?: number;
+  devicesLimit?: number;
+  bandwidthLimit?: number | null;
+  expires_at?: string | null;
+  devices_used?: number;
+  devices_limit?: number;
+  bandwidth_limit?: number | null;
 }
 
 /** Per-plan gradient stops — mirrors mobile's `planGradient`. */
@@ -160,13 +170,13 @@ export function Profile() {
           )
             ? (sub.status as 'active' | 'expired' | 'cancelled')
             : 'unknown',
-          expiresAt: sub.expires_at ?? null,
-          activeDevices: sub.devices_used ?? 0,
-          maxDevices: sub.devices_limit ?? 1,
+          expiresAt: sub.expiresAt ?? sub.expires_at ?? null,
+          activeDevices: sub.devicesUsed ?? sub.devices_used ?? 0,
+          maxDevices: sub.devicesLimit ?? sub.devices_limit ?? 1,
           // Live monthly usage is sourced separately by <UsageMeter/> from
           // get_usage_stats (/vpn/stats); this summary card only needs the cap.
           bandwidthUsed: 0,
-          bandwidthLimit: sub.bandwidth_limit ?? 0,
+          bandwidthLimit: sub.bandwidthLimit ?? sub.bandwidth_limit ?? 0,
         });
       })
       .catch(() => {
