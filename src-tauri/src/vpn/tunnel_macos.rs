@@ -303,7 +303,7 @@ impl UtunTunnel {
 
         // Remove routes
         if let Some(ep_ip) = self.endpoint_ip.read().await.as_ref() {
-            remove_routes(ep_ip, &self.config.allowed_ips).await;
+            remove_routes(ep_ip, &self.config.allowed_ips, self.local_network_sharing).await;
         }
 
         // Close the utun file descriptor
@@ -769,6 +769,18 @@ const LAN_SHARING_CIDRS: [&str; 4] = [
     "192.168.0.0/16",
     "169.254.0.0/16",
 ];
+
+/// Teardown subset — deliberately EXCLUDES 169.254.0.0/16.
+///
+/// macOS installs its own link-local route on the primary interface, so our
+/// `route add` for it always fails with "File exists". We therefore never owned
+/// it, and deleting it at teardown would remove the OS's route rather than ours —
+/// breaking mDNS/Bonjour for every other app on the machine.
+///
+/// Kept adjacent to the add-side list above so any drift between them is visible
+/// in one screen.
+const LAN_SHARING_CIDRS_OWNED: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+
 fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
     allowed_ips
         .iter()
@@ -1017,7 +1029,7 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
 }
 
 /// Remove VPN-specific routes.
-async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String]) {
+async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String], local_network_sharing: bool) {
     // Remove endpoint route
     let _ = cmd("route")
         .args(["-n", "delete", "-host", endpoint_ip])

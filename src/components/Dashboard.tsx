@@ -404,7 +404,11 @@ export function Dashboard() {
       unlistenConnect.then((f) => f()).catch(() => {});
       unlistenDisconnect.then((f) => f()).catch(() => {});
     };
-  }, []);
+    // refreshCurrentServerFromStatus is a useCallback with an empty dep list, so
+    // it is referentially stable and listing it cannot re-register the tray
+    // listeners. Declared rather than suppressed, so a future change that gives
+    // it real dependencies is caught here instead of silently going stale.
+  }, [refreshCurrentServerFromStatus]);
 
   // ── Notifications ─────────────────────────────────────────────────
   useEffect(() => { initNotifications(); }, []);
