@@ -403,6 +403,24 @@ impl VpnManager {
                 }
                 return Err("Tunnel lock timeout during teardown — please try again".into());
             }
+
+            // LEAK-2 (macOS/Linux): the old tunnel's stop() just lifted the F-001
+            // IPv6 leak block. Windows holds the block across the teardown above;
+            // Unix has no hold, so on a dual-stack network IPv6 egressed the
+            // physical NIC (real address) for the whole switch window. Re-engage
+            // the block NOW — before the new tunnel's multi-second create+handshake
+            // — so nothing leaks during the gap. The new tunnel's start() re-owns
+            // it idempotently (and lifts it only if the new node is dual-stack),
+            // and every connect-failure path already lifts it via
+            // lift_ipv6_block_after_failed_connect(), so it can never get stuck.
+            #[cfg(target_os = "macos")]
+            if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
+                tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
+            }
+            #[cfg(target_os = "linux")]
+            if let Err(e) = crate::vpn::tunnel_linux::install_ipv6_leak_block() {
+                tracing::warn!("Could not re-engage IPv6 block during server switch: {}", e);
+            }
         } else if !current_state.can_connect() {
             let err = VpnError::InvalidStateTransition {
                 from: format!("{:?}", current_state),

@@ -91,6 +91,18 @@ export function SplitTunnel() {
       updateSettings(patch);
       try {
         await invoke('save_settings', { settings: settingsToRust(next) });
+        // Live-apply to an active session. The WFP kill-switch-exception permits
+        // are populated ONCE at connect from saved settings (apply_vpn_settings →
+        // set_split_tunnel_apps), so a mid-session add/remove/toggle here never
+        // reached the live engine: a just-removed app kept its permit and could
+        // still bypass the block-all on a tunnel drop until the next reconnect.
+        // Trigger the same fail-closed rebuild VpnSettings uses so the change
+        // takes effect immediately. No-op when disconnected (applies at connect).
+        if (useAppStore.getState().connectionState === 'connected') {
+          invoke('reapply_vpn_settings').catch(() => {
+            /* Rust backend logs the error */
+          });
+        }
       } catch {
         // Revert the optimistic update and tell the user it didn't persist.
         updateSettings(rollback);
