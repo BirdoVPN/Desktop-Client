@@ -610,3 +610,81 @@ mod client_construction_tests {
         assert!(!api.is_authenticated().await);
     }
 }
+
+/// Regression tests for HTTP error classification.
+///
+/// These exist because a 401 stopped mapping to `ApiError::Unauthorized` and
+/// nothing caught it. That variant is the ONLY thing `request_with_retry`
+/// matches on to run the transparent token refresh, so the refresh interceptor
+/// became unreachable code and every desktop user lost API access roughly an
+/// hour after launch — when the 1h access token expired — with a valid 30-day
+/// refresh token sitting unused in the keystore. Restarting the app was the
+/// only recovery.
+///
+/// The trap: the backend registers GlobalExceptionFilter globally and it puts a
+/// non-empty `message` on EVERY error response, so the "use the backend's
+/// message" shortcut swallowed 401s before the status was ever consulted.
+#[cfg(test)]
+mod error_classification_tests {
+    use super::super::client::BirdoApi;
+    use super::super::error::ApiError;
+    use reqwest::StatusCode;
+
+    /// Exactly what the backend's GlobalExceptionFilter emits for a 401.
+    const REAL_401_BODY: &str = r#"{"statusCode":401,"message":"Unauthorized","error":"Unauthorized","timestamp":"2026-07-29T18:00:00.000Z","path":"/vpn/connect"}"#;
+
+    #[test]
+    fn a_401_carrying_a_message_still_maps_to_unauthorized() {
+        // THE REGRESSION. Before the fix this returned Unknown("Unauthorized").
+        let err = BirdoApi::classify_error_response(StatusCode::UNAUTHORIZED, REAL_401_BODY);
+        assert!(
+            matches!(err, ApiError::Unauthorized),
+            "401 must map to Unauthorized so request_with_retry refreshes the token, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_401_with_an_empty_body_maps_to_unauthorized() {
+        let err = BirdoApi::classify_error_response(StatusCode::UNAUTHORIZED, "");
+        assert!(matches!(err, ApiError::Unauthorized));
+    }
+
+    #[test]
+    fn other_statuses_keep_the_backend_message() {
+        // Load-bearing the other way: these variants carry no payload, so
+        // mapping them by status alone would replace a specific, actionable
+        // explanation with a generic one.
+        let body = r#"{"statusCode":403,"message":"Stealth mode requires an Operative or Sovereign subscription"}"#;
+        let err = BirdoApi::classify_error_response(StatusCode::FORBIDDEN, body);
+        match err {
+            ApiError::Unknown(msg) => assert!(msg.contains("Stealth mode requires")),
+            other => panic!("403 should surface the backend's explanation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_status_without_a_message_falls_back_to_its_variant() {
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::FORBIDDEN, ""),
+            ApiError::Forbidden
+        ));
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::NOT_FOUND, ""),
+            ApiError::NotFound
+        ));
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::TOO_MANY_REQUESTS, ""),
+            ApiError::RateLimited
+        ));
+        assert!(matches!(
+            BirdoApi::classify_error_response(StatusCode::BAD_GATEWAY, ""),
+            ApiError::ServerError(502)
+        ));
+    }
+
+    #[test]
+    fn a_blank_message_does_not_shadow_the_status_variant() {
+        let err = BirdoApi::classify_error_response(StatusCode::FORBIDDEN, r#"{"message":"   "}"#);
+        assert!(matches!(err, ApiError::Forbidden));
+    }
+}

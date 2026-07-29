@@ -701,6 +701,64 @@ impl BirdoApi {
             .await
     }
 
+    /// Map a non-2xx response to an `ApiError`.
+    ///
+    /// Split out of `handle_response` so it can be unit-tested without standing
+    /// up an HTTP server: the 401 rule below is load-bearing for session
+    /// survival and was silently broken for a long time precisely because
+    /// nothing could assert on it.
+    ///
+    /// Ordering is the whole point of this function:
+    ///
+    ///  1. A typed `error_code` always wins — it is a deliberate protocol signal.
+    ///  2. **401 maps to `ApiError::Unauthorized` before anything else**, because
+    ///     that variant is the ONLY thing `request_with_retry` keys on to run the
+    ///     transparent token refresh. The backend registers GlobalExceptionFilter
+    ///     globally and it puts a non-empty `message` on EVERY error
+    ///     ("Unauthorized" for a 401 from JwtAuthGuard) — so when the
+    ///     backend-message shortcut in step 3 ran first, every 401 collapsed into
+    ///     `Unknown("Unauthorized")` and the refresh interceptor became
+    ///     unreachable code. Symptom: roughly an hour after launch, when the 1h
+    ///     access token expired, Connect / server list / heartbeat all failed
+    ///     with "Unknown error: Unauthorized" while a valid 30-day refresh token
+    ///     sat unused in the OS keystore, and only a full restart recovered.
+    ///  3. Any other status keeps the backend's message. Deliberate: those
+    ///     `ApiError` variants carry no payload, so mapping 403 to
+    ///     `ApiError::Forbidden` would replace a specific, actionable explanation
+    ///     ("Stealth mode requires an Operative or Sovereign subscription") with
+    ///     a bare "Access denied".
+    pub(crate) fn classify_error_response(status: StatusCode, error_text: &str) -> ApiError {
+        let body = serde_json::from_str::<super::types::ApiErrorBody>(error_text).ok();
+
+        if let Some(code) = body.as_ref().and_then(|b| b.error_code.clone()) {
+            return ApiError::Protocol(code);
+        }
+
+        if status == StatusCode::UNAUTHORIZED {
+            return ApiError::Unauthorized;
+        }
+
+        if let Some(message) = body.as_ref().and_then(|b| b.message.as_deref()) {
+            let message = message.trim();
+            if !message.is_empty() {
+                return ApiError::Unknown(message.to_string());
+            }
+        }
+
+        match status {
+            StatusCode::FORBIDDEN => ApiError::Forbidden,
+            StatusCode::NOT_FOUND => ApiError::NotFound,
+            StatusCode::TOO_MANY_REQUESTS => ApiError::RateLimited,
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE => ApiError::ServerError(status.as_u16()),
+            _ => {
+                tracing::debug!("Unhandled HTTP {}: {}", status, error_text);
+                ApiError::Unknown(format!("HTTP {}", status.as_u16()))
+            }
+        }
+    }
+
     async fn handle_response<T: DeserializeOwned>(
         &self,
         response: reqwest::Response,
@@ -728,34 +786,7 @@ impl BirdoApi {
             );
             String::new()
         });
-        if let Ok(body) = serde_json::from_str::<super::types::ApiErrorBody>(&error_text) {
-            if let Some(code) = body.error_code {
-                return Err(ApiError::Protocol(code));
-            }
-            if let Some(message) = body.message {
-                let message = message.trim();
-                if !message.is_empty() {
-                    return Err(ApiError::Unknown(message.to_string()));
-                }
-            }
-        }
-
-        match status {
-            StatusCode::UNAUTHORIZED => {
-                // Try to refresh token
-                Err(ApiError::Unauthorized)
-            }
-            StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
-            StatusCode::NOT_FOUND => Err(ApiError::NotFound),
-            StatusCode::TOO_MANY_REQUESTS => Err(ApiError::RateLimited),
-            StatusCode::INTERNAL_SERVER_ERROR
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE => Err(ApiError::ServerError(status.as_u16())),
-            _ => {
-                tracing::debug!("Unhandled HTTP {}: {}", status, error_text);
-                Err(ApiError::Unknown(format!("HTTP {}", status.as_u16())))
-            }
-        }
+        Err(Self::classify_error_response(status, &error_text))
     }
 }
 
