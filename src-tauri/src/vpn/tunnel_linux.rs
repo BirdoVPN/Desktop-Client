@@ -66,7 +66,7 @@ fn ip6t(args: &[&str]) -> Result<(), String> {
 ///
 /// Loopback, link-local and NDP/ICMPv6 stay permitted so the host keeps working;
 /// everything routable is dropped. Idempotent (flush + recreate each call).
-fn install_ipv6_leak_block() -> Result<(), String> {
+pub(crate) fn install_ipv6_leak_block() -> Result<(), String> {
     let _ = ip6t(&["-N", IPV6_BLOCK_CHAIN]); // create (ignore "already exists")
     let _ = ip6t(&["-F", IPV6_BLOCK_CHAIN]); // clean slate
     ip6t(&["-A", IPV6_BLOCK_CHAIN, "-o", "lo", "-j", "ACCEPT"])?;
