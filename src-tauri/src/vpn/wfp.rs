@@ -1443,7 +1443,16 @@ pub async fn update_vpn_server(ip: Ipv4Addr) -> Result<(), String> {
     if IS_BLOCKING.load(Ordering::SeqCst) && !LOCKDOWN_MODE.load(Ordering::SeqCst) {
         // Re-activate atomically with the new VPN server IP
         activate_blocking().await?;
-        tracing::info!("Updated VPN server permit: {}", ip);
+        // Redacted like every neighbouring site. `ip` is the upstream EXIT node
+        // (config.endpoint has been swapped to loopback by then), release builds log
+        // at info, and the file logger appends to disk — so this wrote the chosen
+        // exit node into birdo.log for the whole session. macOS and Linux log
+        // nothing containing the IP here, making Windows the outlier. Invisible in
+        // development because redact_ip is a no-op under debug_assertions.
+        tracing::info!(
+            "Updated VPN server permit: {}",
+            crate::utils::redact_ip(&ip.to_string())
+        );
     }
 
     Ok(())

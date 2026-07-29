@@ -316,6 +316,32 @@ export function Dashboard() {
       .catch(() => { /* silent */ });
   }, [setServers, setServerPing, setCurrentServer]);
 
+  /**
+   * Label the current server after a quick-connect.
+   *
+   * `quick_connect` picks the node on the Rust side, so unlike the explicit
+   * connect paths the UI never learns which one it got. Without this the header
+   * shows no server at all after auto-connect or a tray connect. Matches the
+   * chosen node by name against the loaded list so we keep full server metadata
+   * (flag, city, load) rather than just a string.
+   *
+   * Deliberately best-effort: a failure here must never turn a WORKING tunnel
+   * into a UI error, which is the failure mode this whole area just had.
+   */
+  const refreshCurrentServerFromStatus = useCallback(async () => {
+    try {
+      const st = await invoke<RustVpnStatus>('get_vpn_status');
+      if (!st.server_name) return;
+      const list = useAppStore.getState().servers;
+      const match = list.find((sv) => sv.name === st.server_name);
+      useAppStore.getState().setCurrentServer(
+        match ?? ({ name: st.server_name } as (typeof list)[number]),
+      );
+    } catch {
+      /* label only — never fail a live connection over it */
+    }
+  }, []);
+
   // ── Auto-connect ──────────────────────────────────────────────────
   useEffect(() => {
     if (!settings.autoConnect) return;
@@ -326,6 +352,13 @@ export function Dashboard() {
       try {
         setConnectionState('connecting');
         await invoke('quick_connect');
+        // MUST settle the optimistic state here. The status poll deliberately
+        // refuses to promote out of 'connecting' (it would otherwise stomp a
+        // real in-progress connect back to disconnected), so leaving it set
+        // makes the UI terminal: Connect/Disconnect inert, tray actions gated
+        // out, tunnel actually up and bytes flowing, locked until relaunch.
+        setConnectionState('connected');
+        await refreshCurrentServerFromStatus();
       } catch (err) {
         setErrorMessage(friendlyVpnError(err));
         setConnectionState('error');
@@ -343,6 +376,10 @@ export function Dashboard() {
       s.setConnectionState('connecting');
       try {
         await invoke('quick_connect');
+        // Same reason as the auto-connect path above: the poll will not
+        // promote out of 'connecting', so this must settle it itself.
+        useAppStore.getState().setConnectionState('connected');
+        await refreshCurrentServerFromStatus();
       } catch (err) {
         useAppStore.getState().setErrorMessage(friendlyVpnError(err));
         useAppStore.getState().setConnectionState('error');
@@ -367,7 +404,11 @@ export function Dashboard() {
       unlistenConnect.then((f) => f()).catch(() => {});
       unlistenDisconnect.then((f) => f()).catch(() => {});
     };
-  }, []);
+    // refreshCurrentServerFromStatus is a useCallback with an empty dep list, so
+    // it is referentially stable and listing it cannot re-register the tray
+    // listeners. Declared rather than suppressed, so a future change that gives
+    // it real dependencies is caught here instead of silently going stale.
+  }, [refreshCurrentServerFromStatus]);
 
   // ── Notifications ─────────────────────────────────────────────────
   useEffect(() => { initNotifications(); }, []);

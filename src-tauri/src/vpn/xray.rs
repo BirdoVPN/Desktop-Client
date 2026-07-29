@@ -546,9 +546,18 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
             // user normally has no xray at all).
             #[cfg(target_os = "macos")]
             if let Some(contents) = exe_dir.parent() {
-                let bundled = contents.join("Resources").join(XRAY_BIN);
-                if bundled.exists() {
-                    return Ok(bundled);
+                // tauri.conf.json bundles with the GLOB "resources/*", and Tauri
+                // keeps the pattern's relative path — so the staged layout is
+                // Contents/Resources/resources/xray, NOT Contents/Resources/xray.
+                // Probing only the latter (the first attempt at this fix) still
+                // missed the bundled binary on every Mac.
+                for bundled in [
+                    contents.join("Resources").join("resources").join(XRAY_BIN),
+                    contents.join("Resources").join(XRAY_BIN),
+                ] {
+                    if bundled.exists() {
+                        return Ok(bundled);
+                    }
                 }
             }
 
@@ -559,18 +568,30 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
             #[cfg(target_os = "linux")]
             {
                 if let Some(prefix) = exe_dir.parent() {
+                    // The runtime resource dir is /usr/lib/<productName>, i.e.
+                    // /usr/lib/BirdoVPN — NOT the crate/binary name
+                    // (birdo-vpn-desktop), which is what the first attempt at
+                    // this fix used. The shipped .deb has usr/bin/<crate> and
+                    // usr/lib/BirdoVPN/resources/xray, so that probe never hit.
+                    // productName first, crate name kept as a fallback in case
+                    // mainBinaryName is ever set to match.
                     let exe_name = exe_path
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    for candidate in [
-                        prefix.join("lib").join(&exe_name).join(XRAY_BIN),
-                        prefix
-                            .join("lib")
-                            .join(&exe_name)
-                            .join("resources")
-                            .join(XRAY_BIN),
-                    ] {
+                    let app_dirs = ["BirdoVPN".to_string(), exe_name];
+                    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+                    for dir in &app_dirs {
+                        candidates.push(
+                            prefix
+                                .join("lib")
+                                .join(dir)
+                                .join("resources")
+                                .join(XRAY_BIN),
+                        );
+                        candidates.push(prefix.join("lib").join(dir).join(XRAY_BIN));
+                    }
+                    for candidate in candidates {
                         if candidate.exists() {
                             return Ok(candidate);
                         }

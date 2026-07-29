@@ -119,10 +119,16 @@ export function SplitTunnel() {
       return;
     }
     if (typeof selected !== 'string') return;
-    // Derive the basename from the returned path (handles \ and /).
-    const appName = selected.split(/[\\/]/).pop()?.trim();
-    if (!appName || apps.includes(appName)) return;
-    persist({ splitTunnelApps: [...apps, appName] });
+    // Store the FULL path. split_tunnel.rs documents full paths as the contract,
+    // and the installed-apps picker on this same screen already stores them.
+    // Reducing to a basename made the Rust side fall back to a bounded search
+    // (absolute shortcut, then where.exe, then only two directory levels under
+    // ProgramFiles / ProgramFiles(x86) / LOCALAPPDATA) — so anything deeper, e.g.
+    // Steam\steamapps\common\<Game>\game.exe, silently never matched, while the
+    // row still displayed as configured. The list renders baseName() anyway, so
+    // nothing changes visually.
+    if (apps.includes(selected)) return;
+    persist({ splitTunnelApps: [...apps, selected] });
   }, [apps, enabled, persist]);
 
   const removeApp = useCallback(
