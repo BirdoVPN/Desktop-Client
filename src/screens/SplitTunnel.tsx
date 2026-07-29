@@ -1,20 +1,29 @@
 /**
- * SplitTunnel — pushed sub-screen mirroring mobile's `SplitTunnelScreen.kt`.
+ * SplitTunnel — pushed sub-screen, presented as "Kill Switch Exceptions".
  *
- * Layout (mobile parity, adapted for desktop):
- *  - BirdoTopBar (title "Split Tunneling", back → popRoute)
- *  - Master enable toggle (gated to Operative+, like SplitTunnelCard)
- *  - Accent info banner (Info icon + "… N apps excluded.")
+ * NAMING: mobile's `SplitTunnelScreen.kt` is REAL split tunneling (Android's
+ * `addDisallowedApplication` routes the app outside the VPN). The desktop
+ * enforcement is WFP permit filters (wfp.rs), which can only EXEMPT an app
+ * from the kill-switch block — while connected, its traffic still uses the
+ * VPN. Labelling this screen "Split Tunneling" claimed behaviour it does not
+ * have, so the UI now says what it does; true per-app split tunneling on
+ * Windows needs a signed WFP redirect callout driver (separate project).
+ * Route id + settings keys keep the historical split_tunnel names for
+ * storage/wire compat.
+ *
+ * Layout (adapted from mobile):
+ *  - BirdoTopBar (title "Kill Switch Exceptions", back → popRoute)
+ *  - Master enable toggle
+ *  - Accent info banner explaining what an exception actually does
  *  - "Add by path/name" BirdoTextField + Add button, plus an "Installed apps"
  *    picker (enumerated from the Windows registry by `list_installed_apps`) and
  *    a native "Browse…" .exe file dialog.
  *  - Search BirdoTextField to filter the added entries.
- *  - Each excluded app renders as a mobile-style list row: icon + label + a
- *    BYPASS pill + a remove action (the desktop analogue of mobile's AppItem).
+ *  - Each excepted app renders as a mobile-style list row: icon + label + an
+ *    EXEMPT pill + a remove action (the desktop analogue of mobile's AppItem).
  *
  * Persists split_tunnel_apps + split_tunneling_enabled by sending the FULL
- * settings object through `settingsToRust` to `invoke('save_settings', …)`,
- * exactly like `SplitTunnelCard.tsx`.
+ * settings object through `settingsToRust` to `invoke('save_settings', …)`.
  */
 import { useCallback, useMemo, useState, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -64,10 +73,10 @@ export function SplitTunnel() {
   // Surfaced when save_settings rejects so the user knows the change didn't stick.
   const [persistError, setPersistError] = useState(false);
 
-  // Split tunneling is available on every tier (not gated by plan).
+  // Kill-switch exceptions are available on every tier (not gated by plan).
   const enabled = settings.splitTunnelingEnabled;
   const apps = settings.splitTunnelApps;
-  const excludedCount = apps.length;
+  const exceptionCount = apps.length;
 
   // ── Persist: always send the FULL settings object (mirrors SplitTunnelCard) ──
   const persist = useCallback(
@@ -202,11 +211,11 @@ export function SplitTunnel() {
 
   // WFP enforcement is Windows-only; the nav row is hidden elsewhere, but
   // guard the screen too so a stale route can never present dead controls
-  // (Linux/macOS users would configure exclusions that silently do nothing).
+  // (Linux/macOS users would configure exceptions that silently do nothing).
   if (!isWindowsPlatform()) {
     return (
       <div className="flex h-full flex-col">
-        <BirdoTopBar title="Split Tunneling" onBack={popRoute} />
+        <BirdoTopBar title="Kill Switch Exceptions" onBack={popRoute} />
         <div className="flex flex-1 flex-col items-center justify-center gap-2 px-8 text-center">
           <p className="text-sm font-medium" style={{ color: white.w100 }}>
             Windows only (for now)
@@ -222,10 +231,10 @@ export function SplitTunnel() {
   return (
     <div className="flex h-full flex-col">
       {/* ── Header ── */}
-      <BirdoTopBar title="Split Tunneling" onBack={popRoute} />
+      <BirdoTopBar title="Kill Switch Exceptions" onBack={popRoute} />
 
       <div className="flex-1 overflow-y-auto px-4 py-3">
-        {/* ── Master enable toggle (gated to Operative+) ── */}
+        {/* ── Master enable toggle ── */}
         <div
           className="flex items-center gap-3 rounded-birdo-md px-3.5 py-3"
           style={{
@@ -242,14 +251,14 @@ export function SplitTunnel() {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <p className="text-sm font-medium" style={{ color: white.w100 }}>
-                Split Tunneling
+                Kill Switch Exceptions
               </p>
             </div>
           </div>
           <BirdoSwitch
             checked={enabled}
             onChange={toggleEnabled}
-            ariaLabel="Split Tunneling"
+            ariaLabel="Kill Switch Exceptions"
           />
         </div>
 
@@ -260,7 +269,9 @@ export function SplitTunnel() {
         >
           <Info size={18} color={brand.accent} aria-hidden className="mt-px shrink-0" />
           <p className="text-xs leading-relaxed" style={{ color: 'rgba(16,185,129,0.85)' }}>
-            {excludedCount} {excludedCount === 1 ? 'app' : 'apps'} excluded.
+            {exceptionCount} {exceptionCount === 1 ? 'app keeps' : 'apps keep'} internet access when
+            the kill switch blocks traffic. While the VPN is connected, their traffic still goes
+            through the VPN.
           </p>
         </div>
 
@@ -273,7 +284,7 @@ export function SplitTunnel() {
           >
             <Info size={18} color={status.red} aria-hidden className="mt-px shrink-0" />
             <p className="text-xs leading-relaxed" style={{ color: status.red }}>
-              Couldn’t save your split-tunnel changes. The last change was reverted — please try again.
+              Couldn’t save your exception changes. The last change was reverted — please try again.
             </p>
           </div>
         )}
@@ -312,7 +323,7 @@ export function SplitTunnel() {
                   onClick={addApp}
                   variant="brand"
                   size="medium"
-                  ariaLabel="Add split tunnel app"
+                  ariaLabel="Add kill switch exception"
                 />
               </div>
               <div className="mt-2 grid grid-cols-2 gap-2">
@@ -365,7 +376,7 @@ export function SplitTunnel() {
               />
             )}
 
-            {/* ── Excluded-app rows (mobile AppItem analogue) ── */}
+            {/* ── Excepted-app rows (mobile AppItem analogue) ── */}
             <div className="mt-3 space-y-1.5">
               {filteredApps.map((appName) => (
                 <div
@@ -389,7 +400,7 @@ export function SplitTunnel() {
                     className="shrink-0 rounded-md px-1.5 py-0.5 text-[9px] font-bold tracking-wide"
                     style={{ backgroundColor: 'rgba(16,185,129,0.20)', color: brand.accent }}
                   >
-                    BYPASS
+                    EXEMPT
                   </span>
                   <button
                     type="button"
@@ -406,11 +417,11 @@ export function SplitTunnel() {
               {filteredApps.length === 0 && (
                 <BirdoEmptyState
                   icon={Scissors}
-                  title={searchQuery.trim() ? 'No apps match' : 'No apps excluded'}
+                  title={searchQuery.trim() ? 'No apps match' : 'No exceptions yet'}
                   description={
                     searchQuery.trim()
                       ? `Nothing matches "${searchQuery.trim()}".`
-                      : 'Add an app above to exclude it.'
+                      : 'Add an app above to keep it online when the kill switch engages.'
                   }
                   className="pt-6"
                 />

@@ -1136,7 +1136,11 @@ pub async fn activate_blocking() -> Result<(), String> {
             engine.add_permit_local_networks()?;
         }
 
-        // Split tunneling: permit traffic from excluded apps (IPv4 + IPv6)
+        // Kill-switch exceptions (stored under the historical split_tunnel
+        // names): permit traffic from excepted apps (IPv4 + IPv6). A permit
+        // filter EXEMPTS the app from the block — it cannot route the app
+        // outside the tunnel, which is why the UI calls this "Kill Switch
+        // Exceptions" and not split tunneling.
         let split_apps = SPLIT_TUNNEL_APPS.try_read();
         if let Err(e) = &split_apps {
             // Lock poisoned (prior writer panicked) or momentarily contended:

@@ -590,12 +590,15 @@ export function VpnSettings() {
         <BirdoSectionHeader title="Features" className="mt-4" />
 
         <BirdoCard padding="0">
-          {/* Split tunneling is enforced via WFP — Windows only. Offering it
-              on Linux/macOS let users configure exclusions that silently did
-              nothing (apps they believed bypassed the VPN were tunnelled). */}
+          {/* WFP enforcement is Windows-only. Offering it on Linux/macOS let
+              users configure exceptions that silently did nothing. Presented
+              as "Kill Switch Exceptions", not "Split Tunneling": WFP permit
+              filters exempt an app from the kill-switch block — they cannot
+              route it outside the VPN (that needs a signed redirect callout
+              driver), so the old name claimed behaviour that didn't exist. */}
           {isWindowsPlatform() && (
             <BirdoNavRow
-              title="Split Tunneling"
+              title="Kill Switch Exceptions"
               leadingIcon={Split}
               leadingTint={white.w60}
               onClick={() => pushRoute('splitTunnel')}
