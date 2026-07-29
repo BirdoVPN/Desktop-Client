@@ -631,8 +631,7 @@ mod error_classification_tests {
     use reqwest::StatusCode;
 
     /// Exactly what the backend's GlobalExceptionFilter emits for a 401.
-    const REAL_401_BODY: &str =
-        r#"{"statusCode":401,"message":"Unauthorized","error":"Unauthorized","timestamp":"2026-07-29T18:00:00.000Z","path":"/vpn/connect"}"#;
+    const REAL_401_BODY: &str = r#"{"statusCode":401,"message":"Unauthorized","error":"Unauthorized","timestamp":"2026-07-29T18:00:00.000Z","path":"/vpn/connect"}"#;
 
     #[test]
     fn a_401_carrying_a_message_still_maps_to_unauthorized() {
