@@ -302,6 +302,17 @@ impl AutoReconnectService {
         // Tracks the previous connectivity reading so an Offline->Online edge can
         // reset the reconnect budget for a prompt retry when the network returns.
         let mut was_offline = false;
+        // When the offline pause first parked us in `Reconnecting`. Used to bound
+        // how long we hold ALL traffic behind the kill-switch block-all: the pause
+        // deliberately does not spend the retry budget, so without a wall-clock cap
+        // it could hold the machine hostage indefinitely (see the Reconnecting arm).
+        let mut offline_pause_since: Option<std::time::Instant> = None;
+        /// Longest we keep the block-all engaged waiting for connectivity to return
+        /// before falling back to the ordinary retry/give-up path. Chosen so a
+        /// genuine short outage (train tunnel, lid closed) still fails closed, while
+        /// a MISREAD outage — e.g. the connectivity probes are routed into a dead
+        /// tunnel and so can never answer — cannot strand the user forever.
+        const OFFLINE_PAUSE_CAP: Duration = Duration::from_secs(120);
 
         let check_interval = config.read().await.health_check_interval_ms;
         let mut interval = interval(Duration::from_millis(check_interval));
@@ -546,6 +557,11 @@ impl AutoReconnectService {
                                         );
                                     }
                                     is_reconnecting.store(true, Ordering::SeqCst);
+                                    // Stamp when the pause began so the Reconnecting
+                                    // arm can bound how long the block-all is held.
+                                    if offline_pause_since.is_none() {
+                                        offline_pause_since = Some(std::time::Instant::now());
+                                    }
                                     let _ = vpn_manager
                                         .set_state(ConnectionState::Reconnecting {
                                             attempt: attempts + 1,
@@ -845,6 +861,11 @@ impl AutoReconnectService {
                                         );
                                     }
                                     is_reconnecting.store(true, Ordering::SeqCst);
+                                    // Stamp when the pause began so the Reconnecting
+                                    // arm can bound how long the block-all is held.
+                                    if offline_pause_since.is_none() {
+                                        offline_pause_since = Some(std::time::Instant::now());
+                                    }
                                     let _ = vpn_manager
                                         .set_state(ConnectionState::Reconnecting {
                                             attempt: attempts + 1,
@@ -905,6 +926,48 @@ impl AutoReconnectService {
                                     );
                                     break;
                                 }
+                            }
+                        }
+                        // The offline pause parks the machine HERE. Without an
+                        // explicit arm this fell into the catch-all below and
+                        // nothing ever moved the state again: the loop idled
+                        // forever with the kill-switch block-all loaded, the retry
+                        // budget unspent, and the give-up branch — the only thing
+                        // that would have released the block — unreachable. The UI
+                        // folds "reconnecting" into `isConnecting`, so the
+                        // Connect/Disconnect button was inert too. Net effect: no
+                        // VPN, no plain internet, dead button, only quitting the
+                        // app escaped. Always advance from here.
+                        ConnectionState::Reconnecting { .. } => {
+                            let waited = offline_pause_since
+                                .map(|t| t.elapsed())
+                                .unwrap_or_default();
+                            if connectivity != ConnectivityState::Offline {
+                                tracing::info!(
+                                    "Auto-reconnect resuming — connectivity is back after {:?}",
+                                    waited
+                                );
+                                offline_pause_since = None;
+                                let _ = vpn_manager.set_state(ConnectionState::Disconnected).await;
+                            } else if waited >= OFFLINE_PAUSE_CAP {
+                                // The outage may be real, or the probes may be
+                                // unanswerable because they are routed into a dead
+                                // tunnel. Either way, stop holding every packet
+                                // hostage: release the block and rejoin the normal
+                                // retry/give-up path, which can actually recover.
+                                tracing::warn!(
+                                    "Offline pause exceeded {:?} — releasing the kill switch and \
+                                     resuming the normal retry path",
+                                    OFFLINE_PAUSE_CAP
+                                );
+                                if let Err(e) = killswitch::deactivate_killswitch().await {
+                                    tracing::warn!(
+                                        "Kill switch release after the offline-pause cap failed: {}",
+                                        e
+                                    );
+                                }
+                                offline_pause_since = None;
+                                let _ = vpn_manager.set_state(ConnectionState::Disconnected).await;
                             }
                         }
                         _ => {

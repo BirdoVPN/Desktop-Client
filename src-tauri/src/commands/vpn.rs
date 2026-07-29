@@ -1047,7 +1047,7 @@ pub async fn reapply_vpn_settings(
     );
 
     // Reuse the tested connect path with the freshly-persisted settings.
-    match multi_hop_exit {
+    let result = match multi_hop_exit {
         Some(exit_id) => {
             crate::commands::vpn_multi_hop::connect_multi_hop(
                 server_id,
@@ -1071,7 +1071,28 @@ pub async fn reapply_vpn_settings(
             )
             .await
         }
+    };
+
+    // RELEASE the block we engaged above. Nothing else on macOS does: the only
+    // happy-path deactivation lives in auto-reconnect's Connected arm and is
+    // gated on `is_reconnecting`, which a USER-initiated reapply/switch never
+    // sets. So the block-all main ruleset stayed loaded for the rest of the
+    // session — and because it drops the relay's inbound replies, every later
+    // connect attempt could never complete a handshake. That is the "changed a
+    // setting / switched server, now it is frozen and cannot connect" report.
+    //
+    // Only release on SUCCESS: a rebuild that failed must stay failed CLOSED, and
+    // the auto-reconnect loop then owns recovery.
+    if matches!(result, Ok(true)) {
+        if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
+            tracing::warn!(
+                "Kill switch deactivation after a successful settings reapply failed: {}",
+                e
+            );
+        }
     }
+
+    result
 }
 
 /// Parse the endpoint IP from a "host:port" string.

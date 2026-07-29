@@ -753,10 +753,21 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
     // Let the tunnel re-establish while blocked by permitting the VPN server.
     // WireGuard is UDP; allow the server on both transports so a stealth/TCP
     // fallback can also reconnect through the block.
+    // RELAY PERMIT — must be STATEFUL, and must also permit the INBOUND reply.
+    //
+    // This rule used to be `... to <ip> no state`. `no state` suppresses pf's
+    // implicit state creation, and the ruleset below has no `pass in` rule for
+    // the relay, so the relay's reply packets matched only the non-quick
+    // `block drop all` (pf is last-match) and were silently dropped. The
+    // WireGuard handshake is a REQUEST/RESPONSE exchange, so with the block
+    // engaged no tunnel could EVER be established — the kill switch became a
+    // permanent "cannot connect" rather than a fail-closed gap. `keep state`
+    // plus the explicit inbound permit fixes that; both are scoped to the one
+    // relay IP, so this does not widen the block for anything else.
     let server_rule = if let Some(ip) = server_ip {
         format!(
-            "pass out quick inet proto {{ udp tcp }} to {} no state\n",
-            ip
+            "pass out quick inet proto {{ udp tcp }} to {ip} keep state\n\
+             pass in quick inet proto {{ udp tcp }} from {ip} keep state\n"
         )
     } else {
         String::new()
