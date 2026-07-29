@@ -653,6 +653,18 @@ pub async fn connect_vpn(
         }
     }
 
+    // Suppress auto-reconnect for the duration of this USER-initiated connect.
+    //
+    // `store_last_config` only runs AFTER a successful connect (below), and this
+    // command never stopped the health loop — so throughout a server switch the
+    // loop kept running with the PREVIOUS target. If the switch then failed, the
+    // loop's Error arm reconnected using that stale info: the app silently went
+    // back to the server the user had just switched AWAY from, with the old
+    // stealth/quantum/MTU/DNS values. Stopping it first makes the failure visible
+    // and keeps the user's intent authoritative; it is restarted with the NEW
+    // target once the connect succeeds.
+    auto_reconnect.stop().await;
+
     // Connect using VPN manager
     vpn_manager
         .connect(

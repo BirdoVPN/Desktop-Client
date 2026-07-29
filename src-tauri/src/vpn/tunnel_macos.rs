@@ -107,6 +107,37 @@ pub struct UtunTunnel {
     endpoint_ip: Arc<RwLock<Option<String>>>,
 }
 
+/// LAST-RESORT teardown. `stop()` closes the utun fd at the very END, after
+/// `restore_dns()` — which shells out to `networksetup` once per network service
+/// and routinely takes longer than the 10 s cap `VpnManager::connect()` puts on a
+/// server-switch teardown. When that cap fires, the manager logs and CONTINUES,
+/// dropping the `stop()` future before it ever reaches the fd close. With no
+/// `Drop` (Windows' `WintunTunnel` has one; this type did not) the fd stayed
+/// open, so the utun device survived — still holding the `0.0.0.0/1` +
+/// `128.0.0.0/1` half-defaults with a dead packet loop. That is a total IPv4
+/// blackhole: the next connect then failed with "File exists" adding its own
+/// half-defaults, the connectivity probes (routed INTO the tunnel) could not
+/// answer, and the app was declared offline — the start of the frozen-switch
+/// cascade. Closing the fd destroys the interface, and the kernel drops its
+/// routes with it.
+impl Drop for UtunTunnel {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        // Drop cannot await. `try_write` is enough: by the time the tunnel is
+        // being dropped nothing else legitimately holds this lock, and failing to
+        // acquire it must never panic or block a teardown.
+        if let Ok(mut guard) = self.utun_fd.try_write() {
+            if let Some(fd) = guard.take() {
+                let _ = unsafe { libc::close(fd) };
+                tracing::warn!(
+                    "UtunTunnel dropped with the utun fd still open — closed it to \
+                     destroy the interface and release its routes"
+                );
+            }
+        }
+    }
+}
+
 impl UtunTunnel {
     /// Create a new utun tunnel with the given VPN configuration.
     pub async fn create(config: &VpnConfig, local_network_sharing: bool) -> Result<Self, String> {
@@ -864,16 +895,57 @@ async fn configure_routes(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Fatal now that defaults are split. Before the split a `0.0.0.0/0`
-            // collision was expected and warning was survivable-looking; after it,
-            // a collision on `0.0.0.0/1` or `128.0.0.0/1` means the tunnel did NOT
-            // capture traffic, and continuing would report Connected while
-            // everything egresses the physical NIC.
-            return Err(format!(
-                "Failed to route {} into the tunnel: {}",
-                cidr,
-                stderr.trim()
-            ));
+            // A collision is usually OUR OWN leaked state: if a previous teardown
+            // was cut short (e.g. the switch teardown cap fired while restore_dns
+            // was still running), the old utun's `0.0.0.0/1` + `128.0.0.0/1`
+            // survive and every later connect fails here forever — the machine
+            // becomes permanently unable to connect until reboot. Reclaim the route
+            // instead: delete it and retry ONCE. Ownership is still verified,
+            // because a retry that fails is treated exactly as before.
+            let mut recovered = false;
+            if stderr.contains("File exists") {
+                tracing::warn!(
+                    "Route {} already exists (stale from an interrupted teardown?) — \
+                     reclaiming it",
+                    cidr
+                );
+                let _ = cmd("route")
+                    .args(["-n", "delete", "-net", network, "-netmask", &mask])
+                    .output();
+                let retry = cmd("route")
+                    .args([
+                        "-n",
+                        "add",
+                        "-net",
+                        network,
+                        "-netmask",
+                        &mask,
+                        "-interface",
+                        utun_name,
+                    ])
+                    .output()
+                    .map_err(|e| format!("Failed to re-add route for {}: {}", cidr, e))?;
+                recovered = retry.status.success();
+                if !recovered {
+                    tracing::error!(
+                        "Reclaiming route {} failed: {}",
+                        cidr,
+                        String::from_utf8_lossy(&retry.stderr).trim()
+                    );
+                }
+            }
+            if !recovered {
+                // Fatal now that defaults are split. Before the split a `0.0.0.0/0`
+                // collision was expected and warning was survivable-looking; after
+                // it, a collision on `0.0.0.0/1` or `128.0.0.0/1` means the tunnel
+                // did NOT capture traffic, and continuing would report Connected
+                // while everything egresses the physical NIC.
+                return Err(format!(
+                    "Failed to route {} into the tunnel: {}",
+                    cidr,
+                    stderr.trim()
+                ));
+            }
         }
     }
 
