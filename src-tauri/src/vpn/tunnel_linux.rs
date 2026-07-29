@@ -1382,9 +1382,15 @@ mod ipv6_leak_block_tests {
             dump.contains(&format!("-A OUTPUT -j {IPV6_BLOCK_CHAIN}")),
             "OUTPUT jump was not installed — the chain would never be evaluated:\n{dump}"
         );
-        // The whole point: routable IPv6 must terminate in DROP.
+        // The whole point: routable IPv6 must terminate in a DENY rule. REJECT is
+        // preferred over DROP — a silent drop made our OWN dual-stack
+        // control-plane requests stall until timeout instead of falling through
+        // to IPv4 — but a kernel without ip6t_REJECT falls back to DROP. Either
+        // satisfies the default-deny guarantee this test exists to protect, so
+        // assert on the guarantee rather than on one specific target.
         assert!(
-            dump.contains(&format!("-A {IPV6_BLOCK_CHAIN} -j DROP")),
+            dump.contains(&format!("-A {IPV6_BLOCK_CHAIN} -j REJECT"))
+                || dump.contains(&format!("-A {IPV6_BLOCK_CHAIN} -j DROP")),
             "default-deny rule missing — the block would pass everything:\n{dump}"
         );
         // Link-local must stay permitted or the host's own NDP breaks.
