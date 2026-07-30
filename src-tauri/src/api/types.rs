@@ -148,10 +148,79 @@ impl Drop for QualityReport {
 // Authentication Types
 // ============================================================================
 
+/// Email + password body for POST /auth/login/desktop.
+///
+/// This used to be `{ email, password }` and NOTHING else, even though the
+/// backend's LoginSchema merges DeviceInfoSchema and every other native
+/// sign-in path (SSO handoff, anonymous register/login) already sent device
+/// context. Two things broke because of it:
+///
+///  * The trusted-device 2FA skip is keyed on `deviceId`. With no id in the
+///    body the backend's `isTrustedDevice` short-circuits to false, so a user
+///    who ticked "trust this device" was still challenged for a TOTP code on
+///    every single desktop login — the feature could not work at all.
+///  * With `deviceId` absent the backend falls back to hashing
+///    `userId|x-desktop-client|user-agent`, and our User-Agent embeds
+///    CARGO_PKG_VERSION. Every app update therefore minted a BRAND-NEW device
+///    row: the account's device list filled up with duplicates of one machine
+///    and "revoke this device" could no longer target the right one.
+///
+/// So the body now carries the same stable identity as the rest of the client
+/// (`utils::get_device_id`) plus the descriptive fields. The descriptors are
+/// not optional politeness: `registerDevice` refreshes `deviceName`/`platform`
+/// on every upsert, so a login that sent only the id would rename the row to
+/// the backend's generic "Desktop client" / UNKNOWN placeholders and undo the
+/// labels anonymous registration set.
+///
+/// Fields are private on purpose — construct via `LoginRequest::new` so no
+/// future caller can rebuild this body and drop the device context again.
 #[derive(Debug, Serialize)]
 pub struct LoginRequest {
-    pub email: String,
-    pub password: String,
+    email: String,
+    password: String,
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(rename = "deviceName")]
+    device_name: String,
+    #[serde(rename = "deviceType")]
+    device_type: String,
+    platform: String,
+    #[serde(rename = "appVersion")]
+    app_version: String,
+}
+
+/// Clamp a device label to what DeviceInfoSchema accepts: 1..=`max` characters.
+/// Byte slicing would panic mid-codepoint on a non-ASCII hostname, and an empty
+/// label fails the schema's `.min(1)` — either would reject the whole login
+/// before the credentials are even looked at, so both are handled here.
+pub(super) fn clamp_device_name(s: &str, max: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return "Desktop".to_string();
+    }
+    trimmed.chars().take(max).collect()
+}
+
+impl LoginRequest {
+    /// Build the desktop login body, deriving the device context here rather
+    /// than taking it from the caller. `get_device_id()` is the same value the
+    /// SSO exchange and the anonymous flows send, which is what keeps all of a
+    /// machine's sign-ins on one `(userId, deviceId)` row.
+    pub fn new(email: &str, password: &str) -> Self {
+        Self {
+            email: email.to_string(),
+            password: password.to_string(),
+            device_id: crate::utils::get_device_id(),
+            // DeviceInfoSchema caps deviceName at 100 chars and the whole body
+            // is validated before the password is ever checked — an unusually
+            // long hostname must not turn a valid login into a 400. Truncate on
+            // a char boundary (hostnames can be non-ASCII).
+            device_name: clamp_device_name(&crate::utils::get_device_name(), 100),
+            device_type: "DESKTOP".to_string(),
+            platform: crate::utils::device_platform().to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
 }
 
 /// FIX-1-3: Zeroize password from heap memory when LoginRequest is dropped.

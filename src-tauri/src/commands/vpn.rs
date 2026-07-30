@@ -30,19 +30,14 @@ pub struct ConnectionStats {
     pub current_latency_ms: Option<u32>,
 }
 
-/// Get the device name for this machine
+/// Get the device name for this machine.
+///
+/// The derivation moved to `crate::utils` so the auth payloads (which live in
+/// `api::types` and cannot reach a `pub(super)` item in `commands`) label a
+/// machine exactly the way the VPN commands do. Kept as a thin alias because
+/// the connect paths below and `commands::auth` already call it by this name.
 pub(super) fn get_device_name() -> String {
-    hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| {
-            if cfg!(target_os = "macos") {
-                "Mac".to_string()
-            } else if cfg!(target_os = "linux") {
-                "Linux".to_string()
-            } else {
-                "Desktop".to_string()
-            }
-        })
+    crate::utils::get_device_name()
 }
 
 fn connect_failure_message(response: &ConnectResponse) -> String {
