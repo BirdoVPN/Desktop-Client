@@ -2,6 +2,7 @@
 //!
 //! Handles login, logout, token refresh, and auth state management.
 
+use crate::api::error::ApiError;
 use crate::api::types::LoginResult;
 use crate::api::BirdoApi;
 use crate::storage::CredentialStore;
@@ -335,11 +336,50 @@ pub async fn get_auth_state(
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::info!("Token refresh failed ({e}) — clearing stored session");
+                        // Only a DEFINITIVE rejection may destroy the stored session.
+                        //
+                        // This arm used to clear the keystore on ANY refresh error, so
+                        // launching with no connectivity — on a plane, behind a captive
+                        // portal, or simply while the backend was mid-deploy — threw
+                        // away a valid 30-day refresh token and signed the user out for
+                        // good. They had to type their password again, and an anonymous
+                        // account whose 24-digit ID they had not written down was gone
+                        // permanently. The cost is asymmetric: keeping a dead token
+                        // costs one failed request next launch, discarding a live one
+                        // costs the account.
+                        //
+                        // ApiError::Unauthorized specifically means the server rejected
+                        // the refresh token — that token will never work again, so
+                        // clearing is right. Everything else (Network, ServerError,
+                        // RateLimited, CertificatePinningFailed, Parse) may well succeed
+                        // on the next attempt, so the session is kept and reported as
+                        // signed-in-with-unknown-identity, exactly as the profile-fetch
+                        // failure above already does.
+                        //
+                        // NOTE: this distinction only became reliable once
+                        // classify_error_response stopped collapsing every backend 401
+                        // into ApiError::Unknown. Before that, Unauthorized was
+                        // unreachable and this arm could not have told the cases apart.
+                        Err(ApiError::Unauthorized) => {
+                            tracing::info!(
+                                "Refresh token rejected by the server — clearing stored session"
+                            );
                             let _ = credentials.clear_tokens();
                             Ok(AuthState {
                                 is_authenticated: false,
+                                email: None,
+                                account_id: None,
+                                plan: None,
+                                has_password: true,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Token refresh failed transiently ({e}) — KEEPING the stored \
+                                 session; identity unknown this cycle"
+                            );
+                            Ok(AuthState {
+                                is_authenticated: true,
                                 email: None,
                                 account_id: None,
                                 plan: None,
