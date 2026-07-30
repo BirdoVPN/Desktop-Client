@@ -134,13 +134,90 @@ mod types_serialization_tests {
 
     #[test]
     fn login_request_serializes_correctly() {
-        let req = LoginRequest {
-            email: "user@test.com".to_string(),
-            password: "s3cret".to_string(),
-        };
+        let req = LoginRequest::new("user@test.com", "s3cret");
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["email"], "user@test.com");
         assert_eq!(json["password"], "s3cret");
+    }
+
+    /// The desktop login body MUST carry a deviceId. Without it the backend's
+    /// `isTrustedDevice` returns false unconditionally (trusted-device 2FA skip
+    /// dead) and it falls back to hashing the User-Agent, which embeds the app
+    /// version — so every update forked a new device row.
+    ///
+    /// Asserting equality with `utils::get_device_id()` (not merely "non-empty")
+    /// is the point: it pins the login body to the SAME identity the SSO
+    /// exchange and the anonymous flows send, so all of a machine's sign-ins
+    /// land on one row that "revoke this device" can actually target.
+    #[test]
+    fn login_request_sends_the_shared_stable_device_id() {
+        let json = serde_json::to_value(LoginRequest::new("user@test.com", "s3cret")).unwrap();
+        let sent = json["deviceId"].as_str().expect("deviceId must be sent");
+
+        assert!(!sent.is_empty(), "deviceId must not be blank");
+        assert_eq!(
+            sent,
+            crate::utils::get_device_id(),
+            "login must reuse the client-wide device identity, not a second scheme"
+        );
+        // DeviceInfoSchema caps deviceId at 128 chars; a body over the cap is
+        // rejected with a 400 before the password is ever checked.
+        assert!(sent.chars().count() <= 128);
+    }
+
+    /// The identity has to survive an app update and a restart. Re-deriving it
+    /// must produce the same string, and it must not embed the app version —
+    /// version-derived ids were exactly how the duplicate device rows appeared.
+    #[test]
+    fn login_device_id_is_stable_across_calls_and_app_versions() {
+        let first = serde_json::to_value(LoginRequest::new("user@test.com", "s3cret")).unwrap();
+        let second = serde_json::to_value(LoginRequest::new("user@test.com", "s3cret")).unwrap();
+        assert_eq!(first["deviceId"], second["deviceId"]);
+
+        let id = first["deviceId"].as_str().unwrap();
+        assert!(
+            !id.contains(env!("CARGO_PKG_VERSION")),
+            "deviceId must not change when the app version does"
+        );
+    }
+
+    /// `registerDevice` refreshes deviceName/platform on every upsert, so a
+    /// login that sent only the id would relabel the row with the backend's
+    /// generic "Desktop client" / UNKNOWN placeholders. The descriptors must
+    /// ride along, in the exact camelCase keys DeviceInfoSchema expects, and
+    /// within its length limits.
+    #[test]
+    fn login_request_sends_device_descriptors_within_schema_limits() {
+        let json = serde_json::to_value(LoginRequest::new("user@test.com", "s3cret")).unwrap();
+
+        assert_eq!(json["deviceType"], "DESKTOP");
+        assert_eq!(json["platform"], crate::utils::device_platform());
+        assert_eq!(json["appVersion"], env!("CARGO_PKG_VERSION"));
+
+        let name = json["deviceName"]
+            .as_str()
+            .expect("deviceName must be sent");
+        assert!(
+            !name.is_empty() && name.chars().count() <= 100,
+            "deviceName must satisfy DeviceInfoSchema's 1..=100 chars, got {} chars",
+            name.chars().count()
+        );
+    }
+
+    /// A hostname longer than the schema's 100-char cap, or a blank one, must
+    /// not turn a valid login into a 400. Non-ASCII names must be cut on a char
+    /// boundary rather than panicking on a byte slice.
+    #[test]
+    fn device_name_is_clamped_to_schema_bounds() {
+        assert_eq!(super::super::types::clamp_device_name("  ", 100), "Desktop");
+        assert_eq!(
+            super::super::types::clamp_device_name("MACBOOK-PRO", 100),
+            "MACBOOK-PRO"
+        );
+
+        let long = "é".repeat(200);
+        let clamped = super::super::types::clamp_device_name(&long, 100);
+        assert_eq!(clamped.chars().count(), 100);
     }
 
     #[test]

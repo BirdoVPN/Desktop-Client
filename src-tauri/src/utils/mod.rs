@@ -35,6 +35,15 @@ pub fn hidden_cmd(program: &str) -> std::process::Command {
 
 /// Generate a stable, anonymous device identifier.
 /// Uses SHA-256 of the hostname + OS family + username for a non-reversible but consistent ID.
+///
+/// This is the ONE device identity the desktop client presents — SSO handoff,
+/// anonymous register/login and email+password login all send this exact value,
+/// so every sign-in on a machine lands on the same `(userId, deviceId)` row in
+/// the account's device list. Deliberately derived from install-invariant facts
+/// only (no app version, no random seed, nothing written to disk): it must
+/// survive an app update, a reinstall and a restart, otherwise the backend
+/// creates a fresh device row each time and per-device revocation can no longer
+/// target the machine the user means.
 pub fn get_device_id() -> String {
     use sha2::{Digest, Sha256};
 
@@ -50,4 +59,39 @@ pub fn get_device_id() -> String {
     hasher.update(std::env::var("USERNAME").unwrap_or_default().as_bytes());
 
     hex::encode(hasher.finalize())
+}
+
+/// Human-readable name for this machine, shown in the account's device list
+/// ("Revoke MACBOOK-PRO"). Lives here next to `get_device_id` because every
+/// auth payload that carries the id also carries this label — they have to be
+/// derived from the same place or a login can relabel the row a registration
+/// just named. `commands::vpn::get_device_name` delegates here.
+pub fn get_device_name() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "Mac".to_string()
+            } else if cfg!(target_os = "linux") {
+                "Linux".to_string()
+            } else {
+                "Desktop".to_string()
+            }
+        })
+}
+
+/// This build's value for the backend `platform` enum
+/// (WINDOWS | MACOS | LINUX | IOS | ANDROID | UNKNOWN).
+///
+/// The backend only infers the platform from the User-Agent for mobile; a
+/// desktop body that omits the field is stored as UNKNOWN. Every desktop auth
+/// payload therefore sends it explicitly, from this single mapping, so login
+/// and anonymous registration can never disagree about what this machine is.
+pub fn device_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "WINDOWS",
+        "macos" => "MACOS",
+        "linux" => "LINUX",
+        _ => "UNKNOWN",
+    }
 }

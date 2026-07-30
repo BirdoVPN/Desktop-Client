@@ -123,10 +123,12 @@ impl BirdoApi {
     /// FIX C-2: Returns LoginResult which may be either Success (with tokens)
     /// or TwoFactorChallenge (requiring TOTP code submission).
     pub async fn login(&self, email: &str, password: &str) -> Result<LoginResult, ApiError> {
-        let payload = LoginRequest {
-            email: email.to_string(),
-            password: password.to_string(),
-        };
+        // LoginRequest::new attaches this installation's stable deviceId (plus
+        // the device descriptors). Without it the backend could never honour a
+        // trusted-device 2FA skip, and its User-Agent-derived fallback id
+        // changed on every app update, spawning a duplicate device row each
+        // release. See the type's doc comment.
+        let payload = LoginRequest::new(email, password);
 
         // Use desktop-specific endpoint that returns tokens in body
         let result: LoginResult = self
@@ -440,13 +442,9 @@ impl BirdoApi {
             device_id: device_id.to_string(),
             device_name,
             device_type: "DESKTOP".to_string(),
-            platform: match std::env::consts::OS {
-                "windows" => "WINDOWS",
-                "macos" => "MACOS",
-                "linux" => "LINUX",
-                _ => "UNKNOWN",
-            }
-            .to_string(),
+            // Shared with the login body via utils::device_platform so the two
+            // payloads can never label the same machine differently.
+            platform: crate::utils::device_platform().to_string(),
             app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
 
