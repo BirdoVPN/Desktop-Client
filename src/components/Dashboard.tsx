@@ -306,6 +306,7 @@ export function Dashboard() {
           if (remembered) setCurrentServer(remembered);
         }
 
+
         const PING_BATCH = 5;
         const pingable = mapped.filter((srv) => srv.hostname || srv.ipAddress);
         for (let i = 0; i < pingable.length; i += PING_BATCH) {
@@ -545,6 +546,38 @@ export function Dashboard() {
     [updateSettings]
   );
 
+  // ── Prune Multi-Hop selections whose node no longer exists ────────────
+  // These ids are persisted and nothing ever removed them. When a node was
+  // destroyed the saved pair simply stopped resolving, so the picker sat blank
+  // and Connect refused with no explanation — leaving the user to work out for
+  // themselves that a server they never touched had gone.
+  //
+  // Only prunes on a NON-EMPTY list: an empty result is far more likely to be a
+  // failed or unauthorized fetch than a fleet that ceased to exist, and wiping
+  // the user's saved route on a transient error would be its own bug. Skipped
+  // while on-tunnel so a live session's route is never rewritten underneath it.
+  useEffect(() => {
+    if (servers.length === 0 || isConnected) return;
+    const { multiHopEntryNodeId, multiHopExitNodeId } = useAppStore.getState().settings;
+    const live = new Set(servers.map((srv) => srv.id));
+    const entryGone = !!multiHopEntryNodeId && !live.has(multiHopEntryNodeId);
+    const exitGone = !!multiHopExitNodeId && !live.has(multiHopExitNodeId);
+    if (!entryGone && !exitGone) return;
+
+    persistSettings({
+      ...(entryGone ? { multiHopEntryNodeId: null } : {}),
+      ...(exitGone ? { multiHopExitNodeId: null } : {}),
+    });
+    // Name which end went, rather than leaving a silently half-empty picker.
+    setErrorMessage(
+      entryGone && exitGone
+        ? 'Both of your Multi-Hop servers were retired. Pick a new entry and exit.'
+        : entryGone
+          ? 'Your Multi-Hop entry server was retired. Pick a new one.'
+          : 'Your Multi-Hop exit server was retired. Pick a new one.',
+    );
+  }, [servers, isConnected, persistSettings, setErrorMessage]);
+
   // ── Handlers ──────────────────────────────────────────────────────
   const handleToggleMultiHop = useCallback(() => {
     if (isConnecting || isDisconnecting) return;
@@ -740,8 +773,28 @@ export function Dashboard() {
     }
 
     const st = useAppStore.getState().connectionState;
-    if (st === 'connected' || st === 'reconnecting' || st === 'rekeying' || st === 'kill_switch_active') {
-      // On-tunnel: handleSelectServer performs a real switch to the target.
+    const onTunnel =
+      st === 'connected' || st === 'reconnecting' || st === 'rekeying' || st === 'kill_switch_active';
+
+    // REFUSE to downgrade a live Multi-Hop session.
+    //
+    // handleSelectServer performs a SINGLE-HOP switch. Run against an active
+    // two-hop session it silently dropped the second hop, and the user kept
+    // paying for — and believing in — a separation that no longer existed. A
+    // deep link names one server, so it cannot express a pair; there is no
+    // honest way to satisfy it here.
+    //
+    // Anyone can hand a user a birdo:// link, which makes this reachable by a
+    // third party, not just by the user's own bookmark.
+    if (onTunnel && multiHopReady) {
+      setErrorMessage(
+        'That link would replace your Multi-Hop route with a single hop. Disconnect first if you meant to switch.',
+      );
+      return;
+    }
+
+    if (onTunnel) {
+      // Single-hop session: handleSelectServer performs a real switch.
       handleSelectServer(target);
       return;
     }
@@ -762,7 +815,7 @@ export function Dashboard() {
         setCurrentServer(null);
       }
     })();
-  }, [deepLinkAction, servers, handleSelectServer, setCurrentServer, setConnectionState, setErrorMessage, setVpnIp]);
+  }, [deepLinkAction, servers, multiHopReady, handleSelectServer, setCurrentServer, setConnectionState, setErrorMessage, setVpnIp]);
 
   const handleLogout = useCallback(async () => {
     const cur = useAppStore.getState().connectionState;
