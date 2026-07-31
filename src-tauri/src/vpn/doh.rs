@@ -125,7 +125,7 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         // Intermediate hash (WR2, Google Trust Services), kept for reference only
         // and NOT used as a pin: 5v4iv0Xk8NO4XFngLA9JVBjh640yEPeI1IzV4ctUfNQ=
         pins: &[
-            "ACUte493Q17uULD+DmOIon7nIx0FUDnohxxMNNlA/Pg=", // leaf: dns.google (expires 2026-04-27)
+            "V9M+lXJXpft4z4ZbRwpSC1i/L+Vw5ORP1nykdPD7i2o=", // leaf: dns.google (expires 2026-09-21)
         ],
     },
     DoHProvider {
@@ -138,7 +138,7 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         // Intermediate hash (DigiCert Global G3 TLS ECC SHA384 2020 CA1), kept for
         // reference only and NOT used as a pin: BYfWvSgZWHq5D7WWSApXk72fdQaj6s5z9eqzZgF/4lk=
         pins: &[
-            "SCxBhlVQMlGdPR2qQI+sDmPHCvMNIq0+V8LUnjtP29w=", // leaf: dns.quad9.net (expires 2026-07-27)
+            "N9wT18BDxvC/OFDK4xMwUfKiYJQdLDWrC102do1Ila4=", // leaf: dns.quad9.net (expires 2027-01-31)
         ],
     },
 ];

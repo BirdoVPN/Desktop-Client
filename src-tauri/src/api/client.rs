@@ -291,7 +291,29 @@ impl BirdoApi {
             return None;
         }
 
-        match self.get_attestation_nonce().await {
+        // Bound this separately from the client's 30 s request budget. It is a
+        // BEST-EFFORT extra round-trip that runs SERIALLY in front of every
+        // connect, so on a degraded network it used to add up to the full 30 s
+        // (plus DoH resolution) before the connect POST was even attempted —
+        // doubling the stall on a server switch while the UI sat on
+        // "Connecting…". Timing out here just means we connect unattested, which
+        // is exactly what the failure branch below already does.
+        const ATTESTATION_NONCE_TIMEOUT: Duration = Duration::from_secs(5);
+        let nonce =
+            match tokio::time::timeout(ATTESTATION_NONCE_TIMEOUT, self.get_attestation_nonce())
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::debug!(
+                        "Attestation nonce fetch exceeded {:?}, connecting unattested",
+                        ATTESTATION_NONCE_TIMEOUT
+                    );
+                    return None;
+                }
+            };
+
+        match nonce {
             Ok(response) => super::attestation::sign(&response.nonce),
             Err(e) => {
                 tracing::warn!(
