@@ -104,6 +104,47 @@ pub async fn connect_multi_hop(
         return Err(msg);
     }
 
+    // VERIFY THE ROUTE WE ASKED FOR IS THE ROUTE WE GOT.
+    //
+    // `success: true` only says the request was handled. The client then built a
+    // tunnel and displayed the entry -> exit pair from its OWN settings, never
+    // reading the `multi_hop` block the backend returns describing what was
+    // actually installed. So every failure mode that yields a working single-hop
+    // tunnel — the forwarding install being skipped, a fallback path, a
+    // response for a different pair — was rendered to the user as their chosen
+    // multi-hop route.
+    //
+    // That is the one thing a privacy product must never do: the user cannot
+    // observe their own egress country, so the client is the only thing that can
+    // tell them. Refuse rather than display a route we cannot confirm.
+    let Some(ref mh) = mh_response.multi_hop else {
+        tracing::error!(
+            entry = %entryNodeId,
+            exit = %exitNodeId,
+            "Multi-hop connect returned success but NO route block — refusing to present an \
+             unconfirmed route as multi-hop"
+        );
+        return Err(
+            "The server did not confirm the Multi-Hop route. Not connecting, because this \
+             could leave you on a single-hop tunnel while the app showed two."
+                .to_string(),
+        );
+    };
+    if mh.entry_node.id != entryNodeId || mh.exit_node.id != exitNodeId {
+        tracing::error!(
+            requested_entry = %entryNodeId,
+            requested_exit = %exitNodeId,
+            got_entry = %mh.entry_node.id,
+            got_exit = %mh.exit_node.id,
+            "Multi-hop route MISMATCH — refusing"
+        );
+        return Err(format!(
+            "The server established a different Multi-Hop route ({}) than the one selected. \
+             Not connecting.",
+            mh.route
+        ));
+    }
+
     // Convert MultiHopConnectResponse → ConnectResponse so we can reuse build_vpn_config
     let connect_response = ConnectResponse {
         success: mh_response.success,
