@@ -1102,6 +1102,10 @@ pub async fn reapply_vpn_settings(
         server_id
     );
 
+    // The connect calls below consume `vpn_manager`, but the failure branch has
+    // to record an Error state afterwards. Keep a handle to re-resolve it.
+    let app_for_state = app.clone();
+
     // Reuse the tested connect path with the freshly-persisted settings.
     let result = match multi_hop_exit {
         Some(exit_id) => {
@@ -1145,6 +1149,40 @@ pub async fn reapply_vpn_settings(
                 "Kill switch deactivation after a successful settings reapply failed: {}",
                 e
             );
+        }
+    } else {
+        // FAILED REBUILD MUST LEAVE A FAILED STATE.
+        //
+        // Staying fail-closed above is right — but "auto-reconnect then owns
+        // recovery" only holds if the state actually says something went wrong.
+        // A rebuild can fail BEFORE the tunnel is touched at all (not
+        // authenticated, post-quantum engine unavailable, the multi-hop API
+        // returning success:false, a mesh-identity 409), and on every one of
+        // those paths connect_* returns early without changing ConnectionState.
+        //
+        // So the state stayed `Connected`, auto-reconnect saw nothing to
+        // recover, and the block-all engaged at the top of this function was
+        // never released by anyone. Net effect: the machine is firewalled off
+        // the internet, the UI still claims Connected, and the Connect button is
+        // disabled because it keys off that same state. That is the
+        // "changed a setting and now I have no internet and cannot reconnect"
+        // report — and it needs a restart to clear.
+        //
+        // Moving to Error keeps the block (correct — we are not routing) while
+        // making the failure visible, re-enabling Connect, and handing
+        // auto-reconnect a state it will actually act on, including its give-up
+        // branch which releases the block.
+        let reason = match &result {
+            Err(e) => e.clone(),
+            _ => "Settings reapply did not rebuild the tunnel".to_string(),
+        };
+        tracing::error!(
+            "Settings reapply FAILED: {reason}. Moving to Error so the kill-switch block is \
+             owned by the reconnect/give-up path instead of stranding the machine offline."
+        );
+        let vm = app_for_state.state::<VpnManager>();
+        if let Err(e) = vm.set_state(ConnectionState::Error(reason.clone())).await {
+            tracing::warn!("Failed to record reapply failure state: {e}");
         }
     }
 
