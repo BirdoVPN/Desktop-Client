@@ -9,7 +9,7 @@ use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -236,29 +236,91 @@ fn get_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("settings.json"))
 }
 
-/// Get or generate the HMAC key from Windows Credential Manager
-fn get_hmac_key() -> Result<Vec<u8>, String> {
-    let entry = Entry::new(SETTINGS_HMAC_SERVICE, SETTINGS_HMAC_KEY_NAME)
-        .map_err(|e| format!("Failed to create HMAC key entry: {}", e))?;
-
-    match entry.get_password() {
-        Ok(key_hex) => hex::decode(&key_hex).map_err(|e| format!("Corrupted HMAC key: {}", e)),
-        Err(keyring::Error::NoEntry) => {
-            // First run — generate a random 32-byte key
-            use rand::Rng;
-            let key: [u8; 32] = rand::thread_rng().gen();
-            let key_hex = hex::encode(key);
-            entry
-                .set_password(&key_hex)
-                .map_err(|e| format!("Failed to store HMAC key: {}", e))?;
-            tracing::info!("Generated new settings HMAC key");
-            Ok(key.to_vec())
+/// Get or generate the key used to sign `settings.json`.
+///
+/// The OS credential store is tried FIRST, so existing installs keep the key
+/// (and therefore the signature) they already have.
+///
+/// It then FALLS BACK to a 0600 file beside settings.json, which macOS needs:
+/// every VPN operation requires euid 0 (`is_elevated()`), but keyring's
+/// apple-native backend addresses the keychain of the EFFECTIVE user, and root's
+/// login keychain is normally absent or locked with no Aqua session to unlock
+/// it. `get_password()` therefore failed on essentially every load, and the
+/// caller turned that failure into `Ok(AppSettings::default())` — so the user's
+/// custom DNS, MTU, port, local-network-sharing and kill-switch preference were
+/// silently discarded on EVERY launch, and the next save wrote those defaults
+/// over settings.json permanently. It also produced the stream of "HMAC key
+/// unavailable" errors in Console.
+///
+/// This key only has to make local tampering DETECTABLE. It is not a secret from
+/// root, and settings.json already lives in the same root-owned directory, so a
+/// sibling 0600 file is exactly as strong as the keychain was pretending to be
+/// here.
+fn get_hmac_key(settings_path: &Path) -> Result<Vec<u8>, String> {
+    match Entry::new(SETTINGS_HMAC_SERVICE, SETTINGS_HMAC_KEY_NAME) {
+        Ok(entry) => match entry.get_password() {
+            Ok(key_hex) => {
+                return hex::decode(&key_hex).map_err(|e| format!("Corrupted HMAC key: {}", e));
+            }
+            Err(keyring::Error::NoEntry) => {
+                // First run — generate a random 32-byte key.
+                use rand::Rng;
+                let key: [u8; 32] = rand::thread_rng().gen();
+                if entry.set_password(&hex::encode(key)).is_ok() {
+                    tracing::info!("Generated new settings HMAC key (credential store)");
+                    return Ok(key.to_vec());
+                }
+                // The store accepted no write (root on macOS, typically). Fall
+                // through to the key file rather than minting a fresh key on
+                // every load, which would make verification fail forever.
+                tracing::debug!(
+                    "Credential store would not persist the settings HMAC key; using the key file"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Credential store unavailable for the settings HMAC key ({}); using the key file",
+                    e
+                );
+            }
+        },
+        Err(e) => {
+            tracing::debug!(
+                "Could not open the credential store ({}); using the key file",
+                e
+            );
         }
-        Err(e) => Err(format!(
-            "Cannot access HMAC key from credential store: {}",
-            e
-        )),
     }
+    hmac_key_from_file(settings_path)
+}
+
+/// Read — or create — the 0600 HMAC key file that sits beside settings.json.
+fn hmac_key_from_file(settings_path: &Path) -> Result<Vec<u8>, String> {
+    let key_path = settings_path.with_file_name("settings_hmac.key");
+
+    if let Ok(existing) = fs::read_to_string(&key_path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return hex::decode(trimmed).map_err(|e| format!("Corrupted HMAC key file: {}", e));
+        }
+    }
+
+    use rand::Rng;
+    let key: [u8; 32] = rand::thread_rng().gen();
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
+    }
+    fs::write(&key_path, hex::encode(key))
+        .map_err(|e| format!("Failed to write HMAC key file: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Best-effort: the directory is already root-owned, so a failure here
+        // does not widen access beyond what settings.json itself has.
+        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+    }
+    tracing::info!("Generated new settings HMAC key (local key file)");
+    Ok(key.to_vec())
 }
 
 /// Compute HMAC-SHA256 over serialized settings JSON
@@ -316,7 +378,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
     // Try to parse as signed settings (new format)
     if let Ok(signed) = serde_json::from_str::<SignedSettings>(&content) {
         // Verify HMAC
-        match get_hmac_key() {
+        match get_hmac_key(&path) {
             Ok(key) => {
                 let settings_json = serde_json::to_string(&signed.settings)
                     .map_err(|e| format!("Failed to re-serialize settings: {}", e))?;
@@ -391,7 +453,7 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
     let settings_json =
         serde_json::to_string(settings).map_err(|e| format!("Failed to serialize: {}", e))?;
 
-    let hmac_key = get_hmac_key()?;
+    let hmac_key = get_hmac_key(&path)?;
     let hmac = compute_hmac(&settings_json, &hmac_key)?;
 
     let signed = SignedSettings {
