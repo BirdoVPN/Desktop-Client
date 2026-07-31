@@ -9,6 +9,7 @@ use crate::api::types::ConnectResponse;
 use crate::api::types::VpnConfig;
 use crate::api::BirdoApi;
 use crate::commands::settings::get_settings;
+use crate::commands::vpn_multi_hop::connect_multi_hop;
 use crate::storage::CredentialStore;
 use crate::utils::redact::sanitize_error;
 use crate::vpn::manager::{ConnectionState, VpnManager};
@@ -836,6 +837,7 @@ pub async fn quick_connect(
     app: AppHandle,
     api: State<'_, BirdoApi>,
     vpn_manager: State<'_, VpnManager>,
+    credentials: State<'_, CredentialStore>,
     auto_reconnect: State<'_, AutoReconnectService>,
 ) -> Result<bool, String> {
     tracing::info!("Quick connect triggered");
@@ -848,6 +850,53 @@ pub async fn quick_connect(
     // Check if we have a valid token
     if !api.is_authenticated().await {
         return Err("Not authenticated. Please log in first.".to_string());
+    }
+
+    // MULTI-HOP HONOURED HERE, NOT IN THE UI.
+    //
+    // Quick-connect is reached from the tray, the auto-connect-on-launch path and
+    // the dashboard button. Every one of them built a SINGLE-HOP tunnel while the
+    // Multi-Hop cards stayed on screen showing the entry->exit pair the user had
+    // chosen — so the app told them their traffic was leaving from the exit
+    // country when it was leaving from the entry. For a feature bought
+    // specifically for jurisdictional separation, silently serving the other
+    // thing is the worst possible failure: the user cannot detect it, and the
+    // client is the only thing that could have told them.
+    //
+    // The branch lives in Rust rather than in each caller because the tray and
+    // the launch path have no UI to gate on, and duplicating it per call site is
+    // how it went missing in the first place.
+    let settings = get_settings(app.clone()).await?;
+    if settings.multi_hop_enabled {
+        match (
+            settings.multi_hop_entry_node_id.as_deref(),
+            settings.multi_hop_exit_node_id.as_deref(),
+        ) {
+            (Some(entry), Some(exit)) if !entry.is_empty() && !exit.is_empty() => {
+                tracing::info!(%entry, %exit, "Quick connect: multi-hop armed, delegating");
+                return connect_multi_hop(
+                    entry.to_string(),
+                    exit.to_string(),
+                    app,
+                    api,
+                    vpn_manager,
+                    credentials,
+                    auto_reconnect,
+                )
+                .await;
+            }
+            _ => {
+                // Armed but incomplete — a node was destroyed, or settings were
+                // half-written. REFUSE. Falling through to single-hop here is
+                // exactly the silent downgrade this branch exists to prevent, and
+                // it would be indistinguishable from success to the user.
+                return Err(
+                    "Multi-Hop is enabled but no entry/exit pair is selected. Choose both in \
+                     Settings, or turn Multi-Hop off to use a single-hop connection."
+                        .to_string(),
+                );
+            }
+        }
     }
 
     // Get available servers
