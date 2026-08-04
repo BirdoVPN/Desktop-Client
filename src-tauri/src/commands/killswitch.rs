@@ -738,6 +738,28 @@ pub fn reconcile_stale_pf_state() {
     let _ = crate::utils::hidden_cmd("pfctl")
         .args(["-f", "/etc/pf.conf"])
         .output();
+
+    // OBSERVE the result — do not infer it from having asked.
+    //
+    // This used to store `false` unconditionally. If the restore failed (an
+    // unreadable /etc/pf.conf, pfctl missing, not root) the kernel kept OUR
+    // block-all ruleset loaded while the app recorded "not blocking" — so the
+    // user had no network at all, the UI said the kill switch was off, and
+    // nothing ever retried, because every recovery path is gated on
+    // PF_BLOCKING. A reboot was the only way out, which is the exact failure
+    // this function exists to prevent.
+    //
+    // The marker anchor is the ground truth: still present means still blocking.
+    if pf_live_rules().contains(PF_MARKER_ANCHOR) {
+        tracing::error!(
+            "Failed to restore /etc/pf.conf — the stale Birdo ruleset is STILL LOADED and this \
+             machine's traffic remains blocked. Leaving the kill switch marked active so the \
+             normal teardown path can retry; `sudo pfctl -f /etc/pf.conf` clears it manually."
+        );
+        PF_BLOCKING.store(true, Ordering::SeqCst);
+        return;
+    }
+
     PF_BLOCKING.store(false, Ordering::SeqCst);
     PF_IPV6_BLOCK_ACTIVE.store(false, Ordering::SeqCst);
 }
