@@ -146,6 +146,26 @@ pub fn redact_endpoint(endpoint: &str) -> String {
     }
 }
 
+/// Cap a sanitized message at 200 characters, cutting on a CHARACTER boundary.
+///
+/// Byte-slicing (`s[..197]`) panics whenever the cut lands inside a multibyte
+/// sequence, and `sanitize_error` is called from the panic hook (main.rs) — a
+/// panic there aborts the process (release profile is `panic = "abort"`), which
+/// takes the tunnel and the kill switch down with it. Any non-ASCII text in an
+/// OS error message was enough to trigger it.
+///
+/// Split out of the `not(debug_assertions)` branch so it is reachable from tests.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn truncate_for_display(result: String) -> String {
+    if result.chars().count() > 200 {
+        let mut truncated: String = result.chars().take(197).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        result
+    }
+}
+
 /// Sanitize an error message by redacting any embedded PII (IP addresses, emails, hostnames).
 ///
 /// P3-FIX-17: Error messages returned to users or logged may accidentally contain
@@ -215,13 +235,7 @@ pub fn sanitize_error(msg: &str) -> String {
         let result = HOST_RE.replace_all(&result, "[redacted-host]").to_string();
 
         // P2-20: Truncate to 200 chars (aligned with Android InputValidator.sanitizeErrorMessage)
-        if result.len() > 200 {
-            let mut truncated = result[..197].to_string();
-            truncated.push_str("...");
-            truncated
-        } else {
-            result
-        }
+        truncate_for_display(result)
     }
 }
 
@@ -260,6 +274,24 @@ mod tests {
         let result = sanitize_error(msg);
         // In debug builds, returns as-is
         assert_eq!(result, msg);
+    }
+
+    /// The release-build truncation used to byte-slice at 197 and panicked on any
+    /// message whose cut point landed inside a multibyte character. Exercised
+    /// directly because the truncation itself is `not(debug_assertions)`-only.
+    #[test]
+    fn test_truncate_for_display_multibyte_does_not_panic() {
+        // 300 three-byte characters: every byte index in 195..=197 is mid-character.
+        let msg: String = std::iter::repeat('世').take(300).collect();
+        let result = truncate_for_display(msg);
+        assert_eq!(result.chars().count(), 200);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_for_display_short_message_untouched() {
+        let msg = "Connection timed out — retrying".to_string();
+        assert_eq!(truncate_for_display(msg.clone()), msg);
     }
 
     #[test]
