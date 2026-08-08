@@ -229,6 +229,13 @@ pub async fn connect_multi_hop(
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
         }
+        // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+        // scoped to tcp/443, so a reconnect onto a different server needs the
+        // live block re-armed or its handshake is dropped.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+            tracing::warn!("Failed to update iptables VPN server: {}", e);
+        }
     } else {
         tracing::warn!(
             "Could not resolve kill switch endpoint IP from '{}'; kill switch may not filter \

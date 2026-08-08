@@ -747,6 +747,13 @@ impl AutoReconnectService {
                                                             if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
                                                                 tracing::warn!("Failed to update WFP VPN server during reconnect: {}", e);
                                                             }
+                                                            // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+                                                            // scoped to tcp/443, so a reconnect onto a different server needs the
+                                                            // live block re-armed or its handshake is dropped.
+                                                            #[cfg(target_os = "linux")]
+                                                            if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+                                                                tracing::warn!("Failed to update iptables VPN server: {}", e);
+                                                            }
                                                         }
 
                                                         // AR-2 FIX: Re-check the user-disconnect flag immediately

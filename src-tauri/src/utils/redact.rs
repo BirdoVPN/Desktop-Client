@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn test_truncate_for_display_multibyte_does_not_panic() {
         // 300 three-byte characters: every byte index in 195..=197 is mid-character.
-        let msg: String = std::iter::repeat('世').take(300).collect();
+        let msg = "世".repeat(300);
         let result = truncate_for_display(msg);
         assert_eq!(result.chars().count(), 200);
         assert!(result.ends_with("..."));

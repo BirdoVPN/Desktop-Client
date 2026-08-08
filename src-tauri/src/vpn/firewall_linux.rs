@@ -1,20 +1,65 @@
 //! Linux firewall (iptables) kill switch implementation
 //!
 //! Blocks all non-VPN traffic using iptables when the VPN disconnects unexpectedly.
-//! Uses a dedicated chain (BIRDO_KILLSWITCH) to avoid conflicting with user rules.
+//! Uses dedicated chains to avoid conflicting with user rules.
 //!
 //! Equivalent to WFP on Windows and pf on macOS.
+//!
+//! Two design rules this module now follows, both learned from audit findings:
+//!
+//! 1. **Never flush a chain that is still hooked.** Re-arming used to `-F` the
+//!    live chain while its OUTPUT/INPUT jumps were in place, so every reconnect
+//!    tick opened a full allow-all window for as long as it took to re-append
+//!    ~20 rules (one process spawn each). Activation now builds a *second*
+//!    generation of chains off to the side and swaps the jumps onto it, then
+//!    tears the old generation down — the equivalent of the WFP transaction on
+//!    Windows.
+//!
+//! 2. **Separate OUT and IN chains.** One chain hooked into OUTPUT, INPUT and
+//!    FORWARD forced every rule to be written for all three directions at once.
+//!    That produced a blanket `ESTABLISHED,RELATED` accept (which let
+//!    pre-existing plaintext flows keep running straight through the block) and
+//!    an `-m owner` rule in a chain hooked into INPUT/FORWARD, where xt_owner is
+//!    not valid at all.
 
 #![allow(dead_code)]
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 
 /// Tracks whether iptables blocking rules are active
 pub(crate) static IPTABLES_BLOCKING: AtomicBool = AtomicBool::new(false);
 
-/// Custom chain name for Birdo VPN kill switch rules
-const CHAIN_NAME: &str = "BIRDO_KILLSWITCH";
+/// Which generation of chains is currently hooked into the built-in chains:
+/// `-1` = none, `0`/`1` = the live generation. Activation always builds the
+/// OTHER generation and swaps the jumps onto it.
+static LIVE_GEN: AtomicI8 = AtomicI8::new(-1);
+
+/// Chain carrying the OUTPUT policy for generation `gen`.
+fn chain_out(gen: i8) -> String {
+    format!("BIRDO_KS_OUT{gen}")
+}
+
+/// Chain carrying the INPUT/FORWARD policy for generation `gen`.
+fn chain_in(gen: i8) -> String {
+    format!("BIRDO_KS_IN{gen}")
+}
+
+/// Every chain name we may ever have installed, including the single-chain name
+/// used before the OUT/IN split — an upgrade over a build that crashed while
+/// blocking must still be able to clean up.
+fn all_chain_names() -> Vec<String> {
+    vec![
+        chain_out(0),
+        chain_in(0),
+        chain_out(1),
+        chain_in(1),
+        "BIRDO_KILLSWITCH".to_string(),
+    ]
+}
+
+/// Built-in chains we hook into.
+const HOOKS: [&str; 3] = ["OUTPUT", "INPUT", "FORWARD"];
 
 /// Run an iptables command, returning Ok on success.
 fn iptables(args: &[&str]) -> Result<(), String> {
@@ -51,111 +96,87 @@ fn ip6tables(args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Check if our custom chain exists.
-fn chain_exists() -> bool {
+/// Check if one of our chains exists in the IPv4 table.
+fn chain_exists(name: &str) -> bool {
     crate::utils::hidden_cmd("iptables")
-        .args(["-L", CHAIN_NAME, "-n"])
+        .args(["-L", name, "-n"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// AUDIT-N5: Check if our custom chain exists in the IPv6 table.
-fn chain_exists_v6() -> bool {
+/// AUDIT-N5: Check if one of our chains exists in the IPv6 table.
+fn chain_exists_v6(name: &str) -> bool {
     crate::utils::hidden_cmd("ip6tables")
-        .args(["-L", CHAIN_NAME, "-n"])
+        .args(["-L", name, "-n"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// Create the BIRDO_KILLSWITCH chain if it doesn't exist.
-fn ensure_chain() -> Result<(), String> {
-    if !chain_exists() {
-        iptables(&["-N", CHAIN_NAME])?;
+/// Whether a jump from `hook` to `name` is currently installed (IPv4).
+fn jump_present(hook: &str, name: &str) -> bool {
+    crate::utils::hidden_cmd("iptables")
+        .args(["-C", hook, "-j", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Create (or empty) a chain that is NOT currently hooked. Safe to flush
+/// precisely because nothing jumps to it yet.
+fn reset_chain(name: &str) -> Result<(), String> {
+    if !chain_exists(name) {
+        iptables(&["-N", name])?;
+    } else {
+        iptables(&["-F", name])?;
     }
     Ok(())
 }
 
-/// AUDIT-N5: Create the BIRDO_KILLSWITCH chain in ip6tables if it doesn't exist.
-fn ensure_chain_v6() -> Result<(), String> {
-    if !chain_exists_v6() {
-        ip6tables(&["-N", CHAIN_NAME])?;
+/// IPv6 twin of [`reset_chain`].
+fn reset_chain_v6(name: &str) -> Result<(), String> {
+    if !chain_exists_v6(name) {
+        ip6tables(&["-N", name])?;
+    } else {
+        ip6tables(&["-F", name])?;
     }
     Ok(())
 }
 
-/// Activate blocking: block all traffic except loopback, DHCP, and VPN server.
-pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
-    tracing::info!("Activating Linux iptables kill switch");
+/// Build the fully-populated rule set for `gen` in both address families.
+///
+/// Nothing here is reachable from a built-in chain yet, so a failure part-way
+/// through cannot leave a half-armed policy in the packet path: the caller
+/// deletes the staging chains and the previous generation (if any) is untouched.
+fn build_chains(gen: i8, server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    let out = chain_out(gen);
+    let inn = chain_in(gen);
+    let lan = crate::commands::killswitch::lan_sharing_enabled();
 
-    ensure_chain()?;
-
-    // Flush our chain first (idempotent). A failure here is non-fatal (the
-    // chain may have just been freshly created and thus already empty), but we
-    // surface it as a warning so a permission loss / corrupted firewall state
-    // doesn't only show up later as a cryptic append error.
-    if let Err(e) = iptables(&["-F", CHAIN_NAME]) {
-        tracing::warn!(
-            "iptables flush of {} failed (continuing): {}",
-            CHAIN_NAME,
-            e
-        );
-    }
-
-    // Allow loopback
-    iptables(&["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"])?;
-    iptables(&["-A", CHAIN_NAME, "-i", "lo", "-j", "ACCEPT"])?;
-
-    // Allow DHCP (UDP 67/68) so the system can maintain its network lease
-    iptables(&[
-        "-A", CHAIN_NAME, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
-    ])?;
-    iptables(&[
-        "-A", CHAIN_NAME, "-p", "udp", "--dport", "68", "-j", "ACCEPT",
-    ])?;
-
-    // Allow traffic to VPN server IP
+    // ---------------------------------------------------------------- IPv4 OUT
+    reset_chain(&out)?;
+    iptables(&["-A", &out, "-o", "lo", "-j", "ACCEPT"])?;
+    // DHCP client → server, so the machine can keep its lease.
+    iptables(&["-A", &out, "-p", "udp", "--dport", "67", "-j", "ACCEPT"])?;
+    // Traffic to the VPN relay (WireGuard handshake + stealth fallback).
     if let Some(ip) = server_ip {
-        iptables(&["-A", CHAIN_NAME, "-d", &ip.to_string(), "-j", "ACCEPT"])?;
-        iptables(&["-A", CHAIN_NAME, "-s", &ip.to_string(), "-j", "ACCEPT"])?;
+        iptables(&["-A", &out, "-d", &ip.to_string(), "-j", "ACCEPT"])?;
     }
+    // Traffic on the TUN interface.
+    iptables(&["-A", &out, "-o", "birdo0", "-j", "ACCEPT"])?;
 
-    // Allow traffic on the TUN interface (birdo0)
-    iptables(&["-A", CHAIN_NAME, "-o", "birdo0", "-j", "ACCEPT"])?;
-    iptables(&["-A", CHAIN_NAME, "-i", "birdo0", "-j", "ACCEPT"])?;
-
-    // Allow established/related connections (for responses to allowed traffic)
-    iptables(&[
-        "-A",
-        CHAIN_NAME,
-        "-m",
-        "conntrack",
-        "--ctstate",
-        "ESTABLISHED,RELATED",
-        "-j",
-        "ACCEPT",
-    ])?;
-
-    // LAN PERMIT: honour Local Network Sharing while the block is engaged.
-    //
-    // LAN sharing was implemented as ROUTING only, so the moment the kill switch
-    // fired, printers, NAS, Chromecast and SSH went dark despite the toggle being
-    // on — and the toggle is not platform-gated in the UI, so it simply appeared
-    // broken. Windows treats LAN sharing as two halves; this is the missing one.
-    //
-    // 169.254/16 is included for mDNS/Bonjour, which is what actually makes
-    // discovery work rather than just raw IP reachability.
-    if crate::commands::killswitch::lan_sharing_enabled() {
+    // LAN PERMIT: honour Local Network Sharing while the block is engaged, so a
+    // dropped tunnel does not also take out the printer, the NAS and SSH.
+    // 169.254/16 is included for mDNS/Bonjour discovery.
+    if lan {
         for cidr in [
             "10.0.0.0/8",
             "172.16.0.0/12",
             "192.168.0.0/16",
             "169.254.0.0/16",
         ] {
-            // Both directions: outbound to the LAN, and replies coming back.
-            let _ = iptables(&["-A", CHAIN_NAME, "-d", cidr, "-j", "ACCEPT"]);
-            let _ = iptables(&["-A", CHAIN_NAME, "-s", cidr, "-j", "ACCEPT"]);
+            iptables(&["-A", &out, "-d", cidr, "-j", "ACCEPT"])?;
         }
         tracing::info!("Kill switch: LAN sharing permitted (RFC1918 + link-local)");
     }
@@ -163,24 +184,30 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
     // SELF-PERMIT: let OUR OWN process reach the control plane.
     //
     // Without this the kill switch makes reconnection impossible, which is the
-    // opposite of what it is for. auto_reconnect arms the block and then calls
+    // opposite of what it is for: auto_reconnect arms the block and then calls
     // https://api.birdo.app for a fresh config — a DIFFERENT host from the
-    // permitted relay /32, over the physical NIC. DNS is blocked too (DoH to
-    // 1.1.1.1/8.8.8.8/9.9.9.9:443, then UDP 53 fallback — all dropped). So every
-    // attempt in the backoff ladder fails for a reason that is not the network,
-    // the user sits behind a total block for the whole ladder, and the loop then
-    // gives up and tears the block down — leaving the machine fully open.
+    // permitted relay — with DoH (tcp/443) for name resolution.
     //
-    // Windows solved this with a per-app WFP permit keyed on ALE_APP_ID. iptables
-    // has no app identity, so match on the euid we run as. That is coarser (the
-    // client runs elevated, so this permits root-owned traffic generally); a
-    // cgroup2 match would be tighter and is the obvious follow-up. Coarse and
-    // reconnectable beats precise and bricked.
+    // Windows keys the equivalent permit on ALE_APP_ID. iptables has no app
+    // identity, so we match the euid we run as; but the client runs as root, so
+    // `--uid-owner 0` on its own exempts EVERY root-owned process on every port
+    // and protocol — plaintext DNS, http, any daemon that phones home. It is
+    // scoped to tcp/443 to match what the control plane actually needs (and what
+    // the macOS pf rule already did). A cgroup2 match (`-m cgroup --path`) would
+    // narrow this to our own process and is the obvious follow-up.
+    //
+    // Note this permit deliberately does NOT cover the WireGuard handshake: the
+    // relay is permitted by address above, and `update_vpn_server` re-arms with
+    // the new relay before a reconnect uses it.
     let euid = unsafe { libc::geteuid() };
     let uid_str = euid.to_string();
     match iptables(&[
         "-A",
-        CHAIN_NAME,
+        &out,
+        "-p",
+        "tcp",
+        "--dport",
+        "443",
         "-m",
         "owner",
         "--uid-owner",
@@ -188,7 +215,10 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
         "-j",
         "ACCEPT",
     ]) {
-        Ok(()) => tracing::info!("Kill switch: self-permit installed for uid {}", euid),
+        Ok(()) => tracing::info!(
+            "Kill switch: self-permit installed for uid {} (tcp/443 only)",
+            euid
+        ),
         Err(e) => {
             // Loudly, like Windows does — a kill switch the client cannot escape
             // is a support incident, not a silent degradation.
@@ -202,76 +232,258 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
         }
     }
 
-    // Drop everything else
-    iptables(&["-A", CHAIN_NAME, "-j", "DROP"])?;
+    iptables(&["-A", &out, "-j", "DROP"])?;
 
-    // Insert our chain into the OUTPUT and INPUT chains at the top
-    // First remove any existing references (ignore errors)
-    let _ = iptables(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
-    let _ = iptables(&["-D", "INPUT", "-j", CHAIN_NAME]);
-    let _ = iptables(&["-D", "FORWARD", "-j", CHAIN_NAME]);
-
-    iptables(&["-I", "OUTPUT", "1", "-j", CHAIN_NAME])?;
-    iptables(&["-I", "INPUT", "1", "-j", CHAIN_NAME])?;
-    iptables(&["-I", "FORWARD", "1", "-j", CHAIN_NAME])?;
-
-    // AUDIT-N5: parity rules for IPv6 (ip6tables). Without these, dual-stack
-    // Linux hosts leak IPv6 traffic outside the tunnel — a real-IP leak the
-    // WFP code on Windows explicitly closes via block_all_v6. The WireGuard
-    // tunnel itself is IPv4-only on this client, so the policy is: allow
-    // loopback + DHCPv6 + ICMPv6 (NDP), drop everything else on the wire.
-    ensure_chain_v6()?;
-    let _ = ip6tables(&["-F", CHAIN_NAME]);
-    ip6tables(&["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"])?;
-    ip6tables(&["-A", CHAIN_NAME, "-i", "lo", "-j", "ACCEPT"])?;
-    // DHCPv6 client/server (UDP 546/547) so the host can keep a v6 lease
-    // without leaking app traffic.
-    ip6tables(&[
-        "-A", CHAIN_NAME, "-p", "udp", "--dport", "546", "-j", "ACCEPT",
+    // ----------------------------------------------------------- IPv4 IN/FWD
+    reset_chain(&inn)?;
+    iptables(&["-A", &inn, "-i", "lo", "-j", "ACCEPT"])?;
+    // DHCP server → client.
+    iptables(&["-A", &inn, "-p", "udp", "--dport", "68", "-j", "ACCEPT"])?;
+    if let Some(ip) = server_ip {
+        iptables(&["-A", &inn, "-s", &ip.to_string(), "-j", "ACCEPT"])?;
+    }
+    iptables(&["-A", &inn, "-i", "birdo0", "-j", "ACCEPT"])?;
+    if lan {
+        for cidr in [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+        ] {
+            iptables(&["-A", &inn, "-s", cidr, "-j", "ACCEPT"])?;
+        }
+    }
+    // Replies to traffic we permitted outbound (control plane, relay, LAN).
+    //
+    // This used to be an unscoped `ESTABLISHED,RELATED` accept in the single
+    // shared chain, i.e. it also applied to OUTPUT — so any plaintext flow
+    // opened over the physical NIC before the block kept running through it for
+    // the whole outage. Accepting established traffic INBOUND only is enough for
+    // replies while still killing those flows, because their outbound direction
+    // (including the TCP ACKs) now hits the DROP.
+    iptables(&[
+        "-A",
+        &inn,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "ESTABLISHED",
+        "-j",
+        "ACCEPT",
     ])?;
-    ip6tables(&[
-        "-A", CHAIN_NAME, "-p", "udp", "--dport", "547", "-j", "ACCEPT",
-    ])?;
-    // ICMPv6 NDP / RA / RS — required for IPv6 to function at all on the LAN.
-    ip6tables(&["-A", CHAIN_NAME, "-p", "ipv6-icmp", "-j", "ACCEPT"])?;
-    // Drop everything else (no v6 traffic survives the kill switch).
-    ip6tables(&["-A", CHAIN_NAME, "-j", "DROP"])?;
-    let _ = ip6tables(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
-    let _ = ip6tables(&["-D", "INPUT", "-j", CHAIN_NAME]);
-    let _ = ip6tables(&["-D", "FORWARD", "-j", CHAIN_NAME]);
-    ip6tables(&["-I", "OUTPUT", "1", "-j", CHAIN_NAME])?;
-    ip6tables(&["-I", "INPUT", "1", "-j", CHAIN_NAME])?;
-    ip6tables(&["-I", "FORWARD", "1", "-j", CHAIN_NAME])?;
+    iptables(&["-A", &inn, "-j", "DROP"])?;
 
+    // ---------------------------------------------------------------- IPv6
+    // AUDIT-N5: parity rules for IPv6. Without these, dual-stack Linux hosts
+    // leak IPv6 traffic outside the tunnel — a real-IP leak the WFP code on
+    // Windows explicitly closes via block_all_v6. The WireGuard tunnel itself is
+    // IPv4-only on this client, so nothing but link-local housekeeping survives.
+    reset_chain_v6(&out)?;
+    ip6tables(&["-A", &out, "-o", "lo", "-j", "ACCEPT"])?;
+    ip6tables(&["-A", &out, "-p", "udp", "--dport", "547", "-j", "ACCEPT"])?;
+    // ICMPv6 NDP / RA / RS — required for IPv6 to function at all on the LAN,
+    // but scoped to link-local and multicast destinations. A blanket
+    // `-p ipv6-icmp -j ACCEPT` here would sit in front of the tunnel's
+    // BIRDO_IPV6_LEAK_BLOCK chain (see tunnel_linux.rs) and re-permit ICMPv6 to
+    // GLOBAL destinations, disclosing the host's real IPv6 address at exactly
+    // the moment protection matters most.
+    for dst in ["fe80::/10", "ff02::/16"] {
+        ip6tables(&["-A", &out, "-p", "ipv6-icmp", "-d", dst, "-j", "ACCEPT"])?;
+    }
+    ip6tables(&["-A", &out, "-j", "DROP"])?;
+
+    reset_chain_v6(&inn)?;
+    ip6tables(&["-A", &inn, "-i", "lo", "-j", "ACCEPT"])?;
+    ip6tables(&["-A", &inn, "-p", "udp", "--dport", "546", "-j", "ACCEPT"])?;
+    for src in ["fe80::/10", "ff02::/16"] {
+        ip6tables(&["-A", &inn, "-p", "ipv6-icmp", "-s", src, "-j", "ACCEPT"])?;
+    }
+    ip6tables(&["-A", &inn, "-j", "DROP"])?;
+
+    Ok(())
+}
+
+/// Hook generation `gen` into OUTPUT/INPUT/FORWARD in both families.
+fn hook_chains(gen: i8) -> Result<(), String> {
+    let out = chain_out(gen);
+    let inn = chain_in(gen);
+
+    iptables(&["-I", "OUTPUT", "1", "-j", &out])?;
+    iptables(&["-I", "INPUT", "1", "-j", &inn])?;
+    iptables(&["-I", "FORWARD", "1", "-j", &inn])?;
+
+    ip6tables(&["-I", "OUTPUT", "1", "-j", &out])?;
+    ip6tables(&["-I", "INPUT", "1", "-j", &inn])?;
+    ip6tables(&["-I", "FORWARD", "1", "-j", &inn])?;
+    Ok(())
+}
+
+/// Remove every jump to generation `gen`, then delete its chains.
+fn retire_chains(gen: i8) {
+    if gen < 0 {
+        return;
+    }
+    for name in [chain_out(gen), chain_in(gen)] {
+        remove_chain(&name);
+    }
+}
+
+/// Delete `name` in whichever family it exists in: every jump to it first (a
+/// chain cannot be deleted while referenced), then the chain itself.
+///
+/// A jump can only exist if its target chain does, so the existence probe also
+/// tells us whether the unhook attempts are worth spawning at all.
+fn remove_chain(name: &str) {
+    let v4 = chain_exists(name);
+    let v6 = chain_exists_v6(name);
+    if !v4 && !v6 {
+        return;
+    }
+
+    for hook in HOOKS {
+        // `-D` removes ONE matching rule; loop (bounded) so a duplicate jump
+        // left by an interrupted activation cannot survive teardown. The first
+        // failure means there is nothing left to delete.
+        if v4 {
+            for _ in 0..8 {
+                if iptables(&["-D", hook, "-j", name]).is_err() {
+                    break;
+                }
+            }
+        }
+        if v6 {
+            for _ in 0..8 {
+                if ip6tables(&["-D", hook, "-j", name]).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    if v4 {
+        let _ = iptables(&["-F", name]);
+        let _ = iptables(&["-X", name]);
+    }
+    if v6 {
+        let _ = ip6tables(&["-F", name]);
+        let _ = ip6tables(&["-X", name]);
+    }
+}
+
+/// Unhook and delete every chain we know about, in both families.
+fn remove_all_chains() {
+    for name in all_chain_names() {
+        remove_chain(&name);
+    }
+}
+
+/// Chains that survived a teardown attempt (empty == fully removed).
+fn leftover_chains() -> Vec<String> {
+    all_chain_names()
+        .into_iter()
+        .filter(|n| chain_exists(n) || chain_exists_v6(n))
+        .collect()
+}
+
+/// Activate blocking: block all traffic except loopback, DHCP, and VPN server.
+///
+/// Builds a fresh generation of chains, swaps the built-in jumps onto it, and
+/// only then tears down the previous generation — so re-arming (which happens on
+/// every reconnect tick) never opens a window where traffic is unfiltered.
+pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    tracing::info!("Activating Linux iptables kill switch");
+
+    let live = LIVE_GEN.load(Ordering::SeqCst);
+    if live < 0 {
+        // First activation of this process. Anything still installed is debris
+        // from a crash or a previous build; clear it before we start, so the
+        // staging generation we are about to flush cannot be one that is still
+        // referenced from a built-in chain.
+        let stale = leftover_chains();
+        if !stale.is_empty() {
+            tracing::warn!(
+                "Found kill-switch chains from a previous run ({}) — removing before re-arming",
+                stale.join(", ")
+            );
+        }
+        remove_all_chains();
+    }
+    let next: i8 = if live == 0 { 1 } else { 0 };
+
+    if let Err(e) = build_chains(next, server_ip) {
+        // Nothing was hooked, so this cannot leak: drop the staging chains and
+        // leave the previous generation (if any) exactly as it was.
+        retire_chains(next);
+        tracing::error!("Kill switch: rule build failed, block NOT changed: {}", e);
+        return Err(e);
+    }
+
+    if let Err(e) = hook_chains(next) {
+        // Part of the swap landed. Do NOT roll back into an unprotected state —
+        // every chain involved terminates in DROP, so leaving them hooked fails
+        // closed. Report the truth: `blocking` reflects whether OUTPUT is
+        // actually filtered, not whether we finished.
+        let blocking = jump_present("OUTPUT", &chain_out(next))
+            || (live >= 0 && jump_present("OUTPUT", &chain_out(live)));
+        LIVE_GEN.store(next, Ordering::SeqCst);
+        IPTABLES_BLOCKING.store(blocking, Ordering::SeqCst);
+        tracing::error!(
+            "Kill switch: only part of the rule set could be hooked ({}); blocking={}",
+            e,
+            blocking
+        );
+        return Err(e);
+    }
+
+    // New generation is live in every hook — retire the old one.
+    retire_chains(live);
+
+    LIVE_GEN.store(next, Ordering::SeqCst);
     IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
     tracing::info!("Linux iptables kill switch activated");
     Ok(())
 }
 
-/// Deactivate blocking: remove our chain from the filter table.
+/// Re-arm the live block around a NEW relay address.
+///
+/// The relay is permitted by address, and the self-permit is scoped to tcp/443,
+/// so a reconnect that lands on a different server would have its WireGuard
+/// handshake dropped until the next re-arm. Windows has `wfp::update_vpn_server`
+/// for exactly this; this is the iptables equivalent. No-op when not blocking.
+pub async fn update_vpn_server(ip: Ipv4Addr) -> Result<(), String> {
+    if !IPTABLES_BLOCKING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    activate_blocking(Some(ip)).await
+}
+
+/// Deactivate blocking: remove our chains from both filter tables.
+///
+/// VERIFIES the removal before reporting success. Clearing the flag on an
+/// unchecked `let _ =` teardown is how a machine ends up fully firewalled while
+/// the app believes it is not blocking: every later lift is gated on that flag,
+/// so nothing ever retries.
 pub async fn deactivate_blocking() -> Result<(), String> {
     tracing::info!("Deactivating Linux iptables kill switch");
 
-    // Remove jumps to our chain
-    let _ = iptables(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
-    let _ = iptables(&["-D", "INPUT", "-j", CHAIN_NAME]);
-    let _ = iptables(&["-D", "FORWARD", "-j", CHAIN_NAME]);
+    remove_all_chains();
 
-    // Flush and delete our chain
-    if chain_exists() {
-        let _ = iptables(&["-F", CHAIN_NAME]);
-        let _ = iptables(&["-X", CHAIN_NAME]);
+    // `iptables -X` refuses to delete a chain that is still referenced, so an
+    // absent chain proves both its rules and every jump to it are gone.
+    let leftover = leftover_chains();
+    if !leftover.is_empty() {
+        // Keep the flag TRUE: the kernel is (or may still be) filtering, and the
+        // caller must be able to retry rather than assume success.
+        IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
+        let msg = format!(
+            "Kill switch teardown incomplete — these chains are still installed: {}",
+            leftover.join(", ")
+        );
+        tracing::error!("{}", msg);
+        return Err(msg);
     }
 
-    // AUDIT-N5: tear down IPv6 chain too.
-    let _ = ip6tables(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
-    let _ = ip6tables(&["-D", "INPUT", "-j", CHAIN_NAME]);
-    let _ = ip6tables(&["-D", "FORWARD", "-j", CHAIN_NAME]);
-    if chain_exists_v6() {
-        let _ = ip6tables(&["-F", CHAIN_NAME]);
-        let _ = ip6tables(&["-X", CHAIN_NAME]);
-    }
-
+    LIVE_GEN.store(-1, Ordering::SeqCst);
     IPTABLES_BLOCKING.store(false, Ordering::SeqCst);
     tracing::info!("Linux iptables kill switch deactivated");
     Ok(())
@@ -283,34 +495,9 @@ pub fn is_blocking() -> bool {
 }
 
 /// Emergency cleanup — called from panic handler.
-/// Uses raw Command to avoid async runtime dependency.
+/// Synchronous, so it needs no async runtime.
 pub fn emergency_cleanup() {
-    let _ = std::process::Command::new("iptables")
-        .args(["-D", "OUTPUT", "-j", CHAIN_NAME])
-        .output();
-    let _ = std::process::Command::new("iptables")
-        .args(["-D", "INPUT", "-j", CHAIN_NAME])
-        .output();
-    let _ = std::process::Command::new("iptables")
-        .args(["-D", "FORWARD", "-j", CHAIN_NAME])
-        .output();
-    let _ = std::process::Command::new("iptables")
-        .args(["-F", CHAIN_NAME])
-        .output();
-    let _ = std::process::Command::new("iptables")
-        .args(["-X", CHAIN_NAME])
-        .output();
-
-    // AUDIT-N5: tear down IPv6 chain in panic handler too.
-    for chain in ["OUTPUT", "INPUT", "FORWARD"] {
-        let _ = std::process::Command::new("ip6tables")
-            .args(["-D", chain, "-j", CHAIN_NAME])
-            .output();
-    }
-    let _ = std::process::Command::new("ip6tables")
-        .args(["-F", CHAIN_NAME])
-        .output();
-    let _ = std::process::Command::new("ip6tables")
-        .args(["-X", CHAIN_NAME])
-        .output();
+    remove_all_chains();
+    LIVE_GEN.store(-1, Ordering::SeqCst);
+    IPTABLES_BLOCKING.store(false, Ordering::SeqCst);
 }

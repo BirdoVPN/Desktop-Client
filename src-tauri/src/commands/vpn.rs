@@ -647,6 +647,13 @@ pub async fn connect_vpn(
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
         }
+        // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+        // scoped to tcp/443, so a reconnect onto a different server needs the
+        // live block re-armed or its handshake is dropped.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+            tracing::warn!("Failed to update iptables VPN server: {}", e);
+        }
     }
 
     // Suppress auto-reconnect for the duration of this USER-initiated connect.
@@ -1010,6 +1017,13 @@ pub async fn quick_connect(
         #[cfg(target_os = "windows")]
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
+        }
+        // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+        // scoped to tcp/443, so a reconnect onto a different server needs the
+        // live block re-armed or its handshake is dropped.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+            tracing::warn!("Failed to update iptables VPN server: {}", e);
         }
     }
 
