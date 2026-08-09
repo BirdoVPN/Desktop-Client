@@ -893,37 +893,55 @@ impl WintunTunnel {
         // always-on mode can permit tunneled traffic by interface. Best-effort —
         // only lockdown mode (off by default) depends on it.
         #[cfg(windows)]
-        if let Some(idx) = if_index {
-            let mut luid = windows::Win32::NetworkManagement::Ndis::NET_LUID_LH::default();
-            // SAFETY: `idx` is the Wintun adapter's interface index; the call
-            // fills `luid` and returns NO_ERROR (0) on success.
-            let rc = unsafe {
-                windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid(
-                    idx, &mut luid,
-                )
-            };
-            if rc.0 == 0 {
-                // SAFETY: on success the union's `Value` field holds the LUID.
-                crate::vpn::wfp::set_tunnel_luid(unsafe { luid.Value });
-                // LOCKDOWN server-switch / reconnect: if the block is already
-                // active (lockdown holds it on continuously), rebuild it NOW with
-                // this NEW interface LUID + the new server IP, so the active block
-                // never permits a stale/freed LUID. On a fresh connect the block
-                // is not active yet — arm() does the first activation.
-                if crate::vpn::wfp::is_lockdown_mode() && crate::vpn::wfp::is_blocking() {
-                    if let Err(e) = crate::vpn::wfp::activate_blocking().await {
-                        tracing::error!(
-                            "Lockdown: failed to re-activate kill switch with new tunnel LUID: {}",
-                            e
-                        );
+        {
+            let mut luid_published = false;
+            if let Some(idx) = if_index {
+                let mut luid = windows::Win32::NetworkManagement::Ndis::NET_LUID_LH::default();
+                // SAFETY: `idx` is the Wintun adapter's interface index; the call
+                // fills `luid` and returns NO_ERROR (0) on success.
+                let rc = unsafe {
+                    windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid(
+                        idx, &mut luid,
+                    )
+                };
+                if rc.0 == 0 {
+                    // SAFETY: on success the union's `Value` field holds the LUID.
+                    crate::vpn::wfp::set_tunnel_luid(unsafe { luid.Value });
+                    luid_published = true;
+                    // LOCKDOWN server-switch / reconnect: if the block is already
+                    // active (lockdown holds it on continuously), rebuild it NOW with
+                    // this NEW interface LUID + the new server IP, so the active block
+                    // never permits a stale/freed LUID. On a fresh connect the block
+                    // is not active yet — arm() does the first activation.
+                    if crate::vpn::wfp::is_lockdown_mode() && crate::vpn::wfp::is_blocking() {
+                        if let Err(e) = crate::vpn::wfp::activate_blocking().await {
+                            tracing::error!(
+                                "Lockdown: failed to re-activate kill switch with new tunnel LUID: {}",
+                                e
+                            );
+                        }
                     }
+                } else {
+                    tracing::warn!(
+                        "Could not resolve tunnel LUID from interface index {} (rc=0x{:08X}); lockdown mode unavailable this session",
+                        idx,
+                        rc.0
+                    );
                 }
-            } else {
+            }
+
+            // If we could not identify the tunnel interface, an always-on block-all
+            // has no way to permit tunneled traffic — it would block the user's own
+            // VPN browsing. activate_blocking no longer refuses in that situation
+            // (refusing deadlocked the reconnect loop, see wfp.rs), so the decision
+            // has to be made here instead: degrade this session to the reactive kill
+            // switch. In-memory only; the saved preference is untouched.
+            if !luid_published && crate::vpn::wfp::is_lockdown_mode() {
                 tracing::warn!(
-                    "Could not resolve tunnel LUID from interface index {} (rc=0x{:08X}); lockdown mode unavailable this session",
-                    idx,
-                    rc.0
+                    "Lockdown (always-on) unavailable this session — falling back to the \
+                     reactive kill switch"
                 );
+                crate::vpn::wfp::set_lockdown_mode(false);
             }
         }
 

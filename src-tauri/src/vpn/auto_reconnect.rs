@@ -583,10 +583,20 @@ impl AutoReconnectService {
                                             tracing::info!("Kill switch activated for reconnect protection");
                                         }
                                         Err(e) => {
+                                            // Abort THIS attempt (reconnecting without the
+                                            // block could leak), but CONSUME the attempt.
+                                            // Without that the loop spun here forever on a
+                                            // persistent activation failure: no reconnect,
+                                            // and the give-up branch — the only thing that
+                                            // releases the block — was never reached.
+                                            let spent = attempt_count.fetch_add(1, Ordering::SeqCst) + 1;
                                             tracing::error!(
                                                 "Kill switch activation failed during reconnect: {}. \
-                                                 Aborting reconnect to prevent traffic leak.",
-                                                e
+                                                 Aborting this attempt to prevent a traffic leak \
+                                                 (attempt {} of {}).",
+                                                e,
+                                                spent,
+                                                cfg.max_attempts
                                             );
                                             is_reconnecting.store(false, Ordering::SeqCst);
                                             continue;
@@ -814,20 +824,44 @@ impl AutoReconnectService {
                                             cfg.max_attempts
                                         );
                                         is_reconnecting.store(false, Ordering::SeqCst);
-                                        // The session is over: forget the IPv6-block intent BEFORE
-                                        // deactivating, or deactivate_blocking() would re-install a
-                                        // standalone IPv6 block for a tunnel that will never come back
-                                        // and silently blackhole IPv6 for the rest of the run.
-                                        // (WFP is Windows-only; no-op elsewhere.)
-                                        #[cfg(target_os = "windows")]
-                                        crate::vpn::wfp::clear_ipv6_block_intent();
                                         // AUDIT-2026-06-19 FIX (lockout regression): deactivate the
                                         // kill switch when we give up, SYMMETRIC with the Error arm
                                         // below (line ~698). Without this, arming the (previously
                                         // dead) kill switch would strand the user behind an active
                                         // block-all with no automatic recovery after a flaky network
                                         // exhausted all reconnect attempts.
-                                        let _ = killswitch::deactivate_killswitch().await;
+                                        //
+                                        // NOT in lockdown ("always-on") mode: there the user asked
+                                        // for traffic to be blocked whenever there is no tunnel, so
+                                        // auto-releasing the block here would fail OPEN on exactly
+                                        // the event the mode exists for. The escape hatches are
+                                        // explicit and user-driven — Disconnect (killswitch::disarm)
+                                        // or turning the kill switch off in Settings
+                                        // (set_killswitch_live) — so this cannot strand anyone.
+                                        if killswitch::is_lockdown_mode() {
+                                            tracing::error!(
+                                                "Gave up reconnecting with the always-on kill switch armed — \
+                                                 traffic stays blocked until you disconnect or turn the kill \
+                                                 switch off"
+                                            );
+                                            let _ = vpn_manager
+                                                .set_state(ConnectionState::Error(
+                                                    "Always-on protection is blocking traffic: the VPN could \
+                                                     not reconnect. Disconnect, or turn off the kill switch \
+                                                     in Settings, to restore normal internet."
+                                                        .to_string(),
+                                                ))
+                                                .await;
+                                        } else {
+                                            // The session is over: forget the IPv6-block intent BEFORE
+                                            // deactivating, or deactivate_blocking() would re-install a
+                                            // standalone IPv6 block for a tunnel that will never come back
+                                            // and silently blackhole IPv6 for the rest of the run.
+                                            // (WFP is Windows-only; no-op elsewhere.)
+                                            #[cfg(target_os = "windows")]
+                                            crate::vpn::wfp::clear_ipv6_block_intent();
+                                            let _ = killswitch::deactivate_killswitch().await;
+                                        }
                                         // PWR-8: after giving up there is nothing left for this loop
                                         // to do — without stopping it, it ticks every
                                         // `check_interval` FOREVER (waking the CPU/timer for no
@@ -892,10 +926,18 @@ impl AutoReconnectService {
                                             tracing::info!("Kill switch activated for error recovery");
                                         }
                                         Err(e) => {
+                                            // Same as the Disconnected arm: abort the attempt
+                                            // but consume it, so a persistent activation
+                                            // failure still advances toward give-up instead
+                                            // of spinning with the budget untouched.
+                                            let spent = attempt_count.fetch_add(1, Ordering::SeqCst) + 1;
                                             tracing::error!(
                                                 "Kill switch activation failed during error recovery: {}. \
-                                                 Aborting to prevent traffic leak.",
-                                                e
+                                                 Aborting this attempt to prevent a traffic leak \
+                                                 (attempt {} of {}).",
+                                                e,
+                                                spent,
+                                                cfg.max_attempts
                                             );
                                             is_reconnecting.store(false, Ordering::SeqCst);
                                             continue;
@@ -914,13 +956,23 @@ impl AutoReconnectService {
                                         cfg.max_attempts
                                     );
                                     is_reconnecting.store(false, Ordering::SeqCst);
-                                    // As in the Disconnected give-up branch: drop the IPv6-block
-                                    // intent before deactivating so no standalone block is rebuilt
-                                    // for a session that is over. (WFP is Windows-only.)
-                                    #[cfg(target_os = "windows")]
-                                    crate::vpn::wfp::clear_ipv6_block_intent();
-                                    // Deactivate kill switch since we're giving up
-                                    let _ = killswitch::deactivate_killswitch().await;
+                                    // As in the Disconnected give-up branch — including the
+                                    // lockdown carve-out: always-on protection must not release
+                                    // itself just because the retry budget ran out.
+                                    if killswitch::is_lockdown_mode() {
+                                        tracing::error!(
+                                            "Gave up recovering with the always-on kill switch armed — \
+                                             traffic stays blocked until you disconnect or turn the kill \
+                                             switch off"
+                                        );
+                                    } else {
+                                        // Drop the IPv6-block intent before deactivating so no
+                                        // standalone block is rebuilt for a session that is over.
+                                        // (WFP is Windows-only.)
+                                        #[cfg(target_os = "windows")]
+                                        crate::vpn::wfp::clear_ipv6_block_intent();
+                                        let _ = killswitch::deactivate_killswitch().await;
+                                    }
                                     // PWR-8: symmetric with the Disconnected arm's give-up branch
                                     // above — stop the loop instead of ticking forever with
                                     // nothing left to do. `auto_reconnect.start()` is called again
@@ -962,16 +1014,30 @@ impl AutoReconnectService {
                                 // tunnel. Either way, stop holding every packet
                                 // hostage: release the block and rejoin the normal
                                 // retry/give-up path, which can actually recover.
-                                tracing::warn!(
-                                    "Offline pause exceeded {:?} — releasing the kill switch and \
-                                     resuming the normal retry path",
-                                    OFFLINE_PAUSE_CAP
-                                );
-                                if let Err(e) = killswitch::deactivate_killswitch().await {
+                                //
+                                // In lockdown ("always-on") mode the block STAYS: a user who
+                                // chose always-on did not ask for protection to lapse after two
+                                // minutes of (possibly misdetected) offline time. Rejoining the
+                                // retry path is still the right move, and the retry path re-arms
+                                // the block on every tick anyway.
+                                if killswitch::is_lockdown_mode() {
                                     tracing::warn!(
-                                        "Kill switch release after the offline-pause cap failed: {}",
-                                        e
+                                        "Offline pause exceeded {:?} — resuming the normal retry path; \
+                                         always-on mode keeps the block engaged",
+                                        OFFLINE_PAUSE_CAP
                                     );
+                                } else {
+                                    tracing::warn!(
+                                        "Offline pause exceeded {:?} — releasing the kill switch and \
+                                         resuming the normal retry path",
+                                        OFFLINE_PAUSE_CAP
+                                    );
+                                    if let Err(e) = killswitch::deactivate_killswitch().await {
+                                        tracing::warn!(
+                                            "Kill switch release after the offline-pause cap failed: {}",
+                                            e
+                                        );
+                                    }
                                 }
                                 offline_pause_since = None;
                                 let _ = vpn_manager.set_state(ConnectionState::Disconnected).await;

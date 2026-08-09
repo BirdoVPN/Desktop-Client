@@ -1103,32 +1103,41 @@ pub async fn activate_blocking() -> Result<(), String> {
         // LOCKDOWN (always-on): permit the tunnel interface so tunneled traffic
         // flows while the block-all on the physical NIC stays in force. This is
         // what makes a continuously-active block-all safe — without it, an
-        // always-on block would block the user's own tunneled browsing. We refuse
-        // to install the block in lockdown if the tunnel LUID is unknown (aborts
-        // the transaction → no filters), rather than silently block everything.
+        // always-on block would block the user's own tunneled browsing.
+        //
+        // A missing LUID no longer refuses the activation. It used to, and that
+        // deadlocked the client after any drop: tunnel teardown clears the LUID
+        // (tunnel.rs), so the reconnect loop's very next activate_blocking()
+        // returned Err with the previous block-all still installed — machine
+        // fully blocked, no reconnect attempted, and the give-up release
+        // unreachable. Installing the block WITHOUT the tunnel permit is strictly
+        // MORE restrictive, never less: the self-permit and relay permit still let
+        // the reconnect run, and tunnel.rs re-activates with the new LUID the
+        // moment the adapter is back, which is what restores tunneled traffic.
         if LOCKDOWN_MODE.load(Ordering::SeqCst) {
             let luid = TUNNEL_LUID.load(Ordering::SeqCst);
             if luid == 0 {
-                return Err(
-                    "Lockdown mode: tunnel interface LUID unknown — refusing to install \
-                     block-all without a tunnel-interface permit (would block tunneled traffic)"
-                        .to_string(),
+                tracing::warn!(
+                    "Lockdown: no tunnel interface LUID (tunnel is down) — installing the \
+                     block-all without a tunnel permit; it is re-installed with the permit \
+                     as soon as the adapter is published"
+                );
+            } else {
+                engine.add_permit_tunnel_interface(
+                    luid,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                    "Birdo: Permit tunnel interface (v4)",
+                )?;
+                engine.add_permit_tunnel_interface(
+                    luid,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                    "Birdo: Permit tunnel interface (v6)",
+                )?;
+                tracing::info!(
+                    "Lockdown: permitted tunnel interface LUID {} (zero-window always-on)",
+                    luid
                 );
             }
-            engine.add_permit_tunnel_interface(
-                luid,
-                FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                "Birdo: Permit tunnel interface (v4)",
-            )?;
-            engine.add_permit_tunnel_interface(
-                luid,
-                FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-                "Birdo: Permit tunnel interface (v6)",
-            )?;
-            tracing::info!(
-                "Lockdown: permitted tunnel interface LUID {} (zero-window always-on)",
-                luid
-            );
         }
 
         // Local network sharing: permit RFC1918 private ranges
