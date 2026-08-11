@@ -90,13 +90,11 @@ pub struct ConnectionStats {
     pub bytes_received: u64,
     pub packets_sent: u64,
     pub packets_received: u64,
+    /// Last MEASURED round-trip latency, ms. `None` until a real probe has run
+    /// this session — consumers must treat `None` as "unmeasured", never as 0.
     pub latency_ms: Option<u32>,
     /// P2-16: Rolling latency samples for jitter calculation (stddev).
     pub latency_samples: VecDeque<u32>,
-    /// P2-16: Packets sent at last quality report (for loss estimation).
-    pub prev_packets_sent: u64,
-    /// P2-16: Packets received at last quality report (for loss estimation).
-    pub prev_packets_received: u64,
     pub connected_at: Option<chrono::DateTime<chrono::Utc>>,
     pub server_id: Option<String>,
     pub key_id: Option<String>,
@@ -123,18 +121,11 @@ impl ConnectionStats {
         variance.sqrt()
     }
 
-    /// P2-16: Estimate packet loss percentage since last report window.
-    pub fn packet_loss_percent(&self) -> f64 {
-        let sent_delta = self.packets_sent.saturating_sub(self.prev_packets_sent);
-        let recv_delta = self
-            .packets_received
-            .saturating_sub(self.prev_packets_received);
-        if sent_delta == 0 {
-            return 0.0;
-        }
-        let lost = sent_delta.saturating_sub(recv_delta);
-        (lost as f64 / sent_delta as f64) * 100.0
-    }
+    // P1-dk-fabricated-quality-telemetry: `packet_loss_percent()` (TX packet
+    // delta vs RX packet delta) and its `prev_packets_*` snapshot machinery were
+    // removed. The two directions are independent counters, so a normal
+    // upload-heavy minute reported a large invented "loss" — the quality report
+    // now derives loss from probe outcomes in auto_reconnect.rs instead.
 
     /// Push a latency sample, keeping at most 20 entries.
     pub fn push_latency_sample(&mut self, ms: u32) {
@@ -142,12 +133,6 @@ impl ConnectionStats {
         if self.latency_samples.len() > 20 {
             self.latency_samples.pop_front();
         }
-    }
-
-    /// Snapshot the current packet counters for the next loss calculation window.
-    pub fn snapshot_packets(&mut self) {
-        self.prev_packets_sent = self.packets_sent;
-        self.prev_packets_received = self.packets_received;
     }
 }
 
@@ -205,8 +190,6 @@ impl VpnManager {
                 packets_received: 0,
                 latency_ms: None,
                 latency_samples: VecDeque::new(),
-                prev_packets_sent: 0,
-                prev_packets_received: 0,
                 connected_at: None,
                 server_id: None,
                 key_id: None,
@@ -288,8 +271,6 @@ impl VpnManager {
                     packets_received: 0,
                     latency_ms: None,
                     latency_samples: VecDeque::new(),
-                    prev_packets_sent: 0,
-                    prev_packets_received: 0,
                     connected_at: None,
                     server_id: None,
                     key_id: None,
@@ -495,6 +476,11 @@ impl VpnManager {
                         stats.server_name = Some(server_name);
                         stats.bytes_sent = 0;
                         stats.bytes_received = 0;
+                        // Latency belongs to a PATH; a new session (possibly a
+                        // different server) must not inherit the old one's
+                        // measurements now that update_stats keeps them.
+                        stats.latency_ms = None;
+                        stats.latency_samples.clear();
                     }
                     Err(_) => tracing::error!("Stats write lock timeout"),
                 }
@@ -621,6 +607,10 @@ impl VpnManager {
                 stats.server_id = None;
                 stats.key_id = None;
                 stats.server_name = None;
+                // Measurements die with the session (update_stats no longer
+                // clears latency on its own, so do it at the boundary).
+                stats.latency_ms = None;
+                stats.latency_samples.clear();
             }
             Err(_) => tracing::error!("Stats write lock timeout during disconnect"),
         }
@@ -663,9 +653,15 @@ impl VpnManager {
                             stats.bytes_received = received;
                             stats.packets_sent = pkts_sent;
                             stats.packets_received = pkts_received;
-                            stats.latency_ms = latency;
-                            // P2-16: Push latency sample for jitter calculation
+                            // P1-dk-fabricated-quality-telemetry: only OVERWRITE
+                            // the latency when the tunnel actually measured one.
+                            // The tunnel probe is idle in production, so blindly
+                            // assigning here reset a real measurement (the
+                            // heartbeat RTT recorded by auto_reconnect.rs) back
+                            // to None on every 2s stats poll.
                             if let Some(lat) = latency {
+                                stats.latency_ms = Some(lat);
+                                // P2-16: Push latency sample for jitter calculation
                                 stats.push_latency_sample(lat);
                             }
                         }

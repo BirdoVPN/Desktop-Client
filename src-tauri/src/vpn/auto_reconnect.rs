@@ -322,6 +322,14 @@ impl AutoReconnectService {
         // P2-15: Quality report counter — send every ~60s (12 ticks × 5s)
         let mut quality_tick_count: u32 = 0;
         const QUALITY_EVERY_N_TICKS: u32 = 12;
+        // P1-dk-fabricated-quality-telemetry: probe outcomes for the CURRENT
+        // quality window. The heartbeat is a real request/response round trip
+        // THROUGH the tunnel, so it doubles as the latency/loss probe: a
+        // completed heartbeat yields a measured RTT, a transport-level failure
+        // (timeout/no route — ApiError::Network) is a lost probe. HTTP-status
+        // failures are NOT loss: those packets flowed both ways.
+        let mut probe_attempts: u32 = 0;
+        let mut probe_losses: u32 = 0;
 
         // AUDIT-2026-06-19 FIX (HIGH): tunnel liveness watchdog state. The manager
         // only leaves Connected on an explicit disconnect or a server-invalidated
@@ -448,12 +456,38 @@ impl AutoReconnectService {
                             if heartbeat_tick_count >= HEARTBEAT_EVERY_N_TICKS {
                                 heartbeat_tick_count = 0;
                                 if let Some(key_id) = vpn_manager.get_key_id().await {
+                                    let hb_started = std::time::Instant::now();
                                     match api.heartbeat(&key_id).await {
                                         Ok(resp) => {
                                             // The heartbeat reached the server THROUGH
                                             // the tunnel → the tunnel is alive. Clears
                                             // the watchdog's control-plane signal.
                                             recent_heartbeat_failed = false;
+                                            // Record the round trip as a MEASURED
+                                            // latency sample. Before this, latency_ms
+                                            // was written only by a test-only tunnel
+                                            // probe, so every quality report shipped a
+                                            // fabricated 0 ms latency / 0 ms jitter.
+                                            probe_attempts = probe_attempts.saturating_add(1);
+                                            let rtt_ms = hb_started
+                                                .elapsed()
+                                                .as_millis()
+                                                .min(u128::from(u32::MAX))
+                                                as u32;
+                                            match timeout(
+                                                Duration::from_secs(5),
+                                                vpn_manager.stats.write(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(mut st) => {
+                                                    st.latency_ms = Some(rtt_ms);
+                                                    st.push_latency_sample(rtt_ms);
+                                                }
+                                                Err(_) => tracing::error!(
+                                                    "Stats write lock timeout recording heartbeat RTT"
+                                                ),
+                                            }
                                             if !resp.valid {
                                                 tracing::warn!("Heartbeat: session invalidated by server — disconnecting");
                                                 let _ = vpn_manager.disconnect().await;
@@ -486,52 +520,63 @@ impl AutoReconnectService {
                                             // tunnel) is one half of the liveness
                                             // watchdog's dead-tunnel signal.
                                             recent_heartbeat_failed = true;
+                                            // Probe accounting: only a TRANSPORT
+                                            // failure is a lost probe; an HTTP error
+                                            // proves the path carried packets.
+                                            probe_attempts = probe_attempts.saturating_add(1);
+                                            if matches!(e, ApiError::Network(_)) {
+                                                probe_losses = probe_losses.saturating_add(1);
+                                            }
                                             tracing::warn!("Heartbeat failed: {}", e);
                                         }
                                     }
                                 }
                             }
 
-                            // P2-15: Periodic quality telemetry reporting
+                            // P2-15: Periodic quality telemetry reporting.
+                            //
+                            // P1-dk-fabricated-quality-telemetry: report ONLY what
+                            // was measured. latency/jitter come from real heartbeat
+                            // RTTs recorded above; loss is the fraction of probes
+                            // that failed at the transport level in this window.
+                            // A window with no completed probe sends NO report —
+                            // the backend must see missing data, never invented
+                            // zeros (same class as the security-console telemetry
+                            // lie: reassurance rendered from nothing).
                             quality_tick_count += 1;
                             if quality_tick_count >= QUALITY_EVERY_N_TICKS {
                                 quality_tick_count = 0;
+                                let window_attempts = probe_attempts;
+                                let window_losses = probe_losses;
+                                probe_attempts = 0;
+                                probe_losses = 0;
                                 let stats = vpn_manager.get_stats().await;
-                                if let Some(ref key_id) = stats.key_id {
-                                    let connected_secs = stats.connected_at
-                                        .map(|t| (chrono::Utc::now() - t).num_seconds().max(0) as u64)
-                                        .unwrap_or(0);
-                                    // P2-16: Use real jitter and packet loss from rolling stats
-                                    let jitter = stats.jitter_ms();
-                                    let loss = stats.packet_loss_percent();
-                                    let report = crate::api::types::QualityReport {
-                                        key_id: key_id.clone(),
-                                        latency_ms: stats.latency_ms.unwrap_or(0) as f64,
-                                        jitter_ms: jitter,
-                                        packet_loss_percent: loss,
-                                        bytes_in: stats.bytes_received,
-                                        bytes_out: stats.bytes_sent,
-                                        handshake_age_seconds: connected_secs,
-                                        connection_state: "connected".to_string(),
-                                        platform: std::env::consts::OS.to_string(),
-                                    };
-                                    // Snapshot packet counters for the next loss window.
-                                    // Match the 5s lock-timeout discipline used across manager.rs
-                                    // so a stuck stats lock can't hang the health-check loop.
-                                    match timeout(
-                                        Duration::from_secs(5),
-                                        vpn_manager.stats.write(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(mut stats_w) => stats_w.snapshot_packets(),
-                                        Err(_) => tracing::error!(
-                                            "Stats write lock timeout in quality report snapshot"
-                                        ),
+                                match (&stats.key_id, stats.latency_ms) {
+                                    (Some(key_id), Some(latency_ms)) if window_attempts > 0 => {
+                                        let connected_secs = stats.connected_at
+                                            .map(|t| (chrono::Utc::now() - t).num_seconds().max(0) as u64)
+                                            .unwrap_or(0);
+                                        let loss = (window_losses as f64
+                                            / window_attempts as f64)
+                                            * 100.0;
+                                        let report = crate::api::types::QualityReport {
+                                            key_id: key_id.clone(),
+                                            latency_ms: latency_ms as f64,
+                                            jitter_ms: stats.jitter_ms(),
+                                            packet_loss_percent: loss,
+                                            bytes_in: stats.bytes_received,
+                                            bytes_out: stats.bytes_sent,
+                                            handshake_age_seconds: connected_secs,
+                                            connection_state: "connected".to_string(),
+                                            platform: std::env::consts::OS.to_string(),
+                                        };
+                                        if let Err(e) = api.report_quality(&report).await {
+                                            tracing::debug!("Quality report failed (non-fatal): {}", e);
+                                        }
                                     }
-                                    if let Err(e) = api.report_quality(&report).await {
-                                        tracing::debug!("Quality report failed (non-fatal): {}", e);
-                                    }
+                                    _ => tracing::debug!(
+                                        "Quality report skipped — no measured probe this window"
+                                    ),
                                 }
                             }
                         }
