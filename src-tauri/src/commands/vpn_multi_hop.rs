@@ -278,7 +278,10 @@ pub async fn connect_multi_hop(
     release_switch_guard(switch_guard).await;
 
     auto_reconnect.clear_user_disconnected();
-    tracing::info!("Multi-hop VPN connected: {} → {}", entryNodeId, exitNodeId);
+    // LOG-001: the chosen entry/exit nodes are connection history — keep them
+    // out of the release log (info reaches birdo.log); debug is dev-only.
+    tracing::info!("Multi-hop VPN connected");
+    tracing::debug!("Multi-hop VPN connected: {} → {}", entryNodeId, exitNodeId);
     auto_reconnect
         .store_last_config(
             entryNodeId,

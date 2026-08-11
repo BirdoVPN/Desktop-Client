@@ -190,11 +190,13 @@ impl XrayManager {
         // can silently downgrade Reality to plain TLS without the user noticing.
         verify_xray_integrity(&xray_binary)?;
 
+        // LOG-001: the server host is the chosen VPN node — redact it (and the
+        // SNI camouflage domain) so birdo.log carries no connection history.
         tracing::info!(
             "Starting Xray Reality tunnel: {} → 127.0.0.1:{} → {}:{}",
-            config.sni,
+            crate::utils::redact::redact_hostname(&config.sni),
             local_port,
-            server_host,
+            crate::utils::redact::redact_hostname(&server_host),
             server_port
         );
 

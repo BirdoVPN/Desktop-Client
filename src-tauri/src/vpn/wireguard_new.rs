@@ -149,7 +149,7 @@ impl WireGuardSession {
                 // L-7 FIX: Use DNS-over-HTTPS to prevent plain DNS leak of VPN server hostname
                 tracing::warn!(
                     "Endpoint '{}' is not a pre-resolved IP:port — resolving via DoH",
-                    endpoint
+                    crate::utils::redact_endpoint(endpoint)
                 );
                 // Extract host and port from the endpoint string
                 let (host, port) = {

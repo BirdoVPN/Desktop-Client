@@ -299,7 +299,10 @@ impl VpnManager {
         server_name: String,
         local_network_sharing: bool,
     ) -> Result<(), String> {
-        tracing::info!("VpnManager::connect called for server: {}", server_name);
+        // LOG-001: the chosen node is connection history — keep the name out
+        // of the release log (info reaches birdo.log); debug is dev-only.
+        tracing::info!("VpnManager::connect called");
+        tracing::debug!("VpnManager::connect called for server: {}", server_name);
 
         // FIX-R5: Clear the user-disconnected flag so auto-reconnect can work again
         self.user_initiated_disconnect
@@ -417,7 +420,9 @@ impl VpnManager {
             .map_err(|e| format!("Failed to set connecting state: {}", e))?;
         tracing::info!("Set state to Connecting");
 
-        tracing::info!("Creating VPN tunnel for: {}", server_name);
+        // LOG-001: node name demoted to debug — see connect() above.
+        tracing::info!("Creating VPN tunnel");
+        tracing::debug!("Creating VPN tunnel for: {}", server_name);
         tracing::debug!(
             "Tunnel config: endpoint={}, client_ip={}",
             config.endpoint,

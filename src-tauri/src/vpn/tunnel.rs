@@ -1451,7 +1451,12 @@ impl WintunTunnel {
             }
         }
 
-        tracing::info!("IPv6 routed through tunnel (dual-stack): {}", ip_str);
+        // LOG-001: the per-session tunnel IPv6 is joinable back to a user by
+        // the backend IPAM — redact it in the release log.
+        tracing::info!(
+            "IPv6 routed through tunnel (dual-stack): {}",
+            crate::utils::redact_ip(ip_str)
+        );
         Ok(())
     }
 

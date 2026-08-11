@@ -125,7 +125,10 @@ pub async fn ping_server(hostname: String, port: Option<u16>) -> Result<Option<u
             .map(|octet| (16..=31).contains(&octet))
             .unwrap_or(false);
         if is_private {
-            tracing::warn!("ping_server blocked: private hostname '{}'", hostname);
+            tracing::warn!(
+                "ping_server blocked: private hostname '{}'",
+                crate::utils::redact::redact_hostname(&hostname)
+            );
             return Err("Invalid hostname for latency testing".to_string());
         }
     }
@@ -144,11 +147,20 @@ pub async fn ping_server(hostname: String, port: Option<u16>) -> Result<Option<u
             Ok(Some(latency))
         }
         Ok(Err(e)) => {
-            tracing::warn!("Failed to connect to {}: {}", addr, e);
+            // LOG-001: `addr` is the chosen VPN node — redact so birdo.log
+            // carries no plaintext connection history.
+            tracing::warn!(
+                "Failed to connect to {}: {}",
+                crate::utils::redact_endpoint(&addr),
+                e
+            );
             Ok(None)
         }
         Err(_) => {
-            tracing::warn!("Timeout connecting to {}", addr);
+            tracing::warn!(
+                "Timeout connecting to {}",
+                crate::utils::redact_endpoint(&addr)
+            );
             Ok(None)
         }
     }

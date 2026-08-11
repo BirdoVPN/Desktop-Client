@@ -772,7 +772,10 @@ pub async fn connect_vpn(
         tracing::warn!("Failed to start auto-reconnect: {}", e);
     }
 
-    tracing::info!("VPN connected successfully to {}", server_id);
+    // LOG-001: the chosen node id is connection history — keep it out of the
+    // release log (info reaches birdo.log); the id is still visible at debug.
+    tracing::info!("VPN connected successfully");
+    tracing::debug!("VPN connected to server id {}", server_id);
     Ok(true)
 }
 
