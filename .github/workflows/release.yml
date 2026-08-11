@@ -71,6 +71,97 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
+      # P5-CICD-15: tag↔version gate. tests.yml's `version-consistency` job has
+      # no tag trigger, so nothing ever compared a pushed tag against the source
+      # versions: tagging v1.4.31 while the source still said 1.4.30 published
+      # BirdoVPN_1.4.30_*-setup.exe under a v1.4.31 release — and the in-app
+      # updater resolves the bundle by asset filename, so clients told "1.4.31
+      # is available" would be served the 1.4.30 installer forever (a permanent,
+      # errorless update loop). This step fails the whole release (every build
+      # job `needs: test`) before a single installer is produced. It also
+      # asserts the FOUR version sources agree — package.json, tauri.conf.json,
+      # Cargo.toml [package] and Cargo.lock's own package entry (the one
+      # historically missed) — and puts the previously unused workflow_dispatch
+      # `version` input to work as the same gate for manual runs.
+      - name: Gate tag / dispatch version against the source versions
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          const conf = JSON.parse(
+            fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'),
+          ).version;
+
+          // Extract the [package] table's `version = "..."` from Cargo.toml,
+          // scoped to that table so a dependency's `version = ...` can't match
+          // (same extraction as tests.yml's version-consistency job).
+          const toml = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          const pkgTable = toml
+            .split(/^\[/m)
+            .find((s) => s.startsWith('package]'));
+          const m = pkgTable && pkgTable.match(/^\s*version\s*=\s*"([^"]+)"/m);
+          const cargo = m ? m[1] : undefined;
+
+          // Cargo.lock's own [[package]] entry: `cargo build` refreshes it in
+          // the working tree, but only a committed bump ships it — a stale
+          // entry means the release ref's lockfile disagrees with the manifest.
+          const lock = fs.readFileSync('src-tauri/Cargo.lock', 'utf8');
+          const lm = lock.match(
+            /\[\[package\]\]\s*name = "birdo-vpn-desktop"\s*version = "([^"]+)"/,
+          );
+          const lockVer = lm ? lm[1] : undefined;
+
+          const versions = {
+            'package.json': pkg,
+            'src-tauri/tauri.conf.json': conf,
+            'src-tauri/Cargo.toml [package]': cargo,
+            'src-tauri/Cargo.lock [[package]] birdo-vpn-desktop': lockVer,
+          };
+          console.log('Detected versions:', JSON.stringify(versions, null, 2));
+
+          const unique = [...new Set(Object.values(versions))];
+          if (unique.length !== 1 || !unique[0]) {
+            console.error(
+              '::error::App version strings disagree across sources of truth: ' +
+                JSON.stringify(versions),
+            );
+            process.exit(1);
+          }
+          const version = unique[0];
+
+          const ref = process.env.REF || '';
+          const refName = process.env.REF_NAME || '';
+          if (ref.startsWith('refs/tags/v')) {
+            if (refName !== 'v' + version) {
+              console.error(
+                `::error::Tag ${refName} does not match the source version ` +
+                  `${version} (expected v${version}). Refusing to publish a ` +
+                  'mislabeled release the updater would loop on forever.',
+              );
+              process.exit(1);
+            }
+            console.log(`OK — tag ${refName} matches source version ${version}`);
+          } else if (process.env.DISPATCH_VERSION) {
+            if (process.env.DISPATCH_VERSION !== version) {
+              console.error(
+                `::error::workflow_dispatch version input '` +
+                  `${process.env.DISPATCH_VERSION}' does not match the source ` +
+                  `version ${version}.`,
+              );
+              process.exit(1);
+            }
+            console.log(`OK — dispatch input matches source version ${version}`);
+          } else {
+            console.log('OK — all version strings match: ' + version);
+          }
+          EOF
+
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
