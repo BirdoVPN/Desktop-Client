@@ -256,57 +256,89 @@ fn get_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// root, and settings.json already lives in the same root-owned directory, so a
 /// sibling 0600 file is exactly as strong as the keychain was pretending to be
 /// here.
+/// P1-dk-hmac-key-source-drift: the key source used to be keystore-first with
+/// a silent (debug-logged) fallback that MINTED a fresh key file whenever the
+/// store was merely unreachable — a locked GNOME Secret Service at login, or
+/// root on macOS. Settings signed with the store's key then failed
+/// verification against the freshly minted file key, and the "tampering" path
+/// reset every preference to defaults (including `multi_hop_enabled`,
+/// `lockdown_mode` and `killswitch_enabled`) permanently. The rework:
+/// - loads verify against EVERY readable key (both sources) and never mint;
+/// - the winning key is mirrored into BOTH sources so they converge and a
+///   later outage of either source can no longer strand the signature;
+/// - fallbacks log at warn/error, not debug.
 fn get_hmac_key(settings_path: &Path) -> Result<Vec<u8>, String> {
-    match Entry::new(SETTINGS_HMAC_SERVICE, SETTINGS_HMAC_KEY_NAME) {
-        Ok(entry) => match entry.get_password() {
-            Ok(key_hex) => {
-                return hex::decode(&key_hex).map_err(|e| format!("Corrupted HMAC key: {}", e));
-            }
-            Err(keyring::Error::NoEntry) => {
-                // First run — generate a random 32-byte key.
-                use rand::Rng;
-                let key: [u8; 32] = rand::thread_rng().gen();
-                if entry.set_password(&hex::encode(key)).is_ok() {
-                    tracing::info!("Generated new settings HMAC key (credential store)");
-                    return Ok(key.to_vec());
-                }
-                // The store accepted no write (root on macOS, typically). Fall
-                // through to the key file rather than minting a fresh key on
-                // every load, which would make verification fail forever.
-                tracing::debug!(
-                    "Credential store would not persist the settings HMAC key; using the key file"
-                );
-            }
-            Err(e) => {
-                tracing::debug!(
-                    "Credential store unavailable for the settings HMAC key ({}); using the key file",
-                    e
-                );
-            }
-        },
+    // Deterministic order: credential store first (existing installs keep the
+    // key — and therefore the signature — they already have), then the sibling
+    // key file (an install that has been signing with the file key stays on
+    // it, even once the store becomes writable again).
+    match read_keystore_key() {
+        Ok(Some(key)) => {
+            sync_hmac_key_sources(settings_path, &key);
+            return Ok(key);
+        }
+        Ok(None) => {} // store reachable, no key stored — check the file
         Err(e) => {
-            tracing::debug!(
-                "Could not open the credential store ({}); using the key file",
+            tracing::warn!(
+                "Credential store unavailable for the settings HMAC key ({}); using the key file",
                 e
             );
         }
     }
-    hmac_key_from_file(settings_path)
-}
-
-/// Read — or create — the 0600 HMAC key file that sits beside settings.json.
-fn hmac_key_from_file(settings_path: &Path) -> Result<Vec<u8>, String> {
-    let key_path = settings_path.with_file_name("settings_hmac.key");
-
-    if let Ok(existing) = fs::read_to_string(&key_path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            return hex::decode(trimmed).map_err(|e| format!("Corrupted HMAC key file: {}", e));
-        }
+    if let Some(key) = read_file_key(settings_path) {
+        sync_hmac_key_sources(settings_path, &key);
+        return Ok(key);
     }
 
+    // Neither source holds a key — first run. Mint one and persist it to BOTH
+    // sources. The file write is the hard requirement (it is the source that
+    // is always reachable); the store mirror is best-effort.
     use rand::Rng;
     let key: [u8; 32] = rand::thread_rng().gen();
+    write_key_file(settings_path, &key)?;
+    sync_hmac_key_sources(settings_path, &key);
+    tracing::info!("Generated new settings HMAC key");
+    Ok(key.to_vec())
+}
+
+/// Read the settings HMAC key from the OS credential store, WITHOUT ever
+/// creating one. `Ok(None)` means the store answered "no such entry";
+/// `Err` means the store could not answer (locked, no session, absent) — which
+/// is indistinguishable from "temporarily locked", so callers must never treat
+/// it as proof that no key exists.
+fn read_keystore_key() -> Result<Option<Vec<u8>>, String> {
+    let entry = Entry::new(SETTINGS_HMAC_SERVICE, SETTINGS_HMAC_KEY_NAME)
+        .map_err(|e| format!("credential store: {}", e))?;
+    match entry.get_password() {
+        Ok(key_hex) => hex::decode(&key_hex)
+            .map(Some)
+            .map_err(|e| format!("corrupted HMAC key in the credential store: {}", e)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("credential store: {}", e)),
+    }
+}
+
+/// Read the sibling 0600 key file, WITHOUT ever creating one. `None` means
+/// absent, empty, unreadable or non-hex.
+fn read_file_key(settings_path: &Path) -> Option<Vec<u8>> {
+    let key_path = settings_path.with_file_name("settings_hmac.key");
+    let existing = fs::read_to_string(&key_path).ok()?;
+    let trimmed = existing.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match hex::decode(trimmed) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            tracing::warn!("Corrupted settings HMAC key file ({}); ignoring it", e);
+            None
+        }
+    }
+}
+
+/// Write the 0600 HMAC key file that sits beside settings.json.
+fn write_key_file(settings_path: &Path, key: &[u8]) -> Result<(), String> {
+    let key_path = settings_path.with_file_name("settings_hmac.key");
     if let Some(parent) = key_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
     }
@@ -319,8 +351,35 @@ fn hmac_key_from_file(settings_path: &Path) -> Result<Vec<u8>, String> {
         // does not widen access beyond what settings.json itself has.
         let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
     }
-    tracing::info!("Generated new settings HMAC key (local key file)");
-    Ok(key.to_vec())
+    Ok(())
+}
+
+/// Mirror the canonical key into both sources (best-effort) so a transient
+/// outage of either one can never strand the settings signature again. This
+/// key only makes local tampering DETECTABLE (see `get_hmac_key`'s history) —
+/// duplicating it into the sibling 0600 file does not widen access beyond
+/// what settings.json itself already has.
+fn sync_hmac_key_sources(settings_path: &Path, key: &[u8]) {
+    let key_hex = hex::encode(key);
+
+    if let Ok(entry) = Entry::new(SETTINGS_HMAC_SERVICE, SETTINGS_HMAC_KEY_NAME) {
+        let already = matches!(entry.get_password(), Ok(existing) if existing == key_hex);
+        if !already && entry.set_password(&key_hex).is_err() {
+            // Expected wherever the store is unwritable (root on macOS); the
+            // key file below is the source that keeps working there.
+            tracing::debug!("Could not mirror the settings HMAC key into the credential store");
+        }
+    }
+
+    let key_path = settings_path.with_file_name("settings_hmac.key");
+    let already = fs::read_to_string(&key_path)
+        .map(|s| s.trim() == key_hex)
+        .unwrap_or(false);
+    if !already {
+        if let Err(e) = write_key_file(settings_path, key) {
+            tracing::warn!("Could not mirror the settings HMAC key into the key file: {}", e);
+        }
+    }
 }
 
 /// Compute HMAC-SHA256 over serialized settings JSON
@@ -377,49 +436,106 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
 
     // Try to parse as signed settings (new format)
     if let Ok(signed) = serde_json::from_str::<SignedSettings>(&content) {
-        // Verify HMAC
-        match get_hmac_key(&path) {
-            Ok(key) => {
-                let settings_json = serde_json::to_string(&signed.settings)
-                    .map_err(|e| format!("Failed to re-serialize settings: {}", e))?;
-                if verify_hmac(&settings_json, &signed.hmac, &key) {
-                    return Ok(normalize_loaded_settings(signed.settings));
-                }
-
-                // Fallback: the file may have been signed by a build whose
-                // AppSettings predates newer fields — the HMAC covers the OLD
-                // shape's serialization, which the primary check (serialized
-                // with the new fields present) can never reproduce. Re-verify
-                // against the legacy shape before declaring tampering, else
-                // every upgrade would silently reset user settings.
-                if let Ok(legacy) = serde_json::to_value(&signed.settings)
-                    .and_then(serde_json::from_value::<LegacyAppSettingsV1>)
-                {
-                    let legacy_json = serde_json::to_string(&legacy)
-                        .map_err(|e| format!("Failed to serialize legacy settings: {}", e))?;
-                    if verify_hmac(&legacy_json, &signed.hmac, &key) {
-                        tracing::info!(
-                            "Settings verified against pre-multi-hop shape — migrating signature"
-                        );
-                        let settings = normalize_loaded_settings(AppSettings::from(legacy));
-                        if let Err(e) = save_settings_inner(app, &settings) {
-                            tracing::warn!(
-                                "Failed to re-sign migrated settings: {} (will retry next load)",
-                                e
-                            );
-                        }
-                        return Ok(settings);
-                    }
-                }
-
-                tracing::warn!("Settings HMAC verification failed — possible tampering. Resetting to defaults.");
-                return Ok(AppSettings::default());
-            }
+        // P1-dk-hmac-key-source-drift: collect every key the two sources hold
+        // right now, WITHOUT minting one — minting during load is what used to
+        // turn a transient credential-store outage into a permanent signature
+        // mismatch. A signature made by EITHER source's key is accepted, and
+        // the winning key is then mirrored into both sources so they converge.
+        let mut keystore_unavailable = false;
+        let mut candidates: Vec<Vec<u8>> = Vec::new();
+        match read_keystore_key() {
+            Ok(Some(key)) => candidates.push(key),
+            Ok(None) => {}
             Err(e) => {
-                tracing::error!("HMAC key unavailable ({}). Resetting to secure defaults to prevent tampered settings from loading.", e);
-                return Ok(AppSettings::default());
+                keystore_unavailable = true;
+                tracing::warn!(
+                    "Credential store unavailable while verifying settings ({}); trying the key file",
+                    e
+                );
             }
         }
+        if let Some(key) = read_file_key(&path) {
+            if !candidates.contains(&key) {
+                candidates.push(key);
+            }
+        }
+
+        if candidates.is_empty() {
+            // No key is readable RIGHT NOW. If the store is merely locked the
+            // real key may still exist, so this is not tampering: serve
+            // defaults for this session, mint nothing, touch nothing — the
+            // next load retries with the store hopefully unlocked.
+            tracing::error!(
+                "Settings HMAC key unavailable ({}); using defaults for this session without resetting settings.json",
+                if keystore_unavailable {
+                    "credential store unreachable, no key file"
+                } else {
+                    "no key in the credential store, no key file"
+                }
+            );
+            return Ok(AppSettings::default());
+        }
+
+        let settings_json = serde_json::to_string(&signed.settings)
+            .map_err(|e| format!("Failed to re-serialize settings: {}", e))?;
+        for key in &candidates {
+            if verify_hmac(&settings_json, &signed.hmac, key) {
+                sync_hmac_key_sources(&path, key);
+                return Ok(normalize_loaded_settings(signed.settings));
+            }
+        }
+
+        // Fallback: the file may have been signed by a build whose
+        // AppSettings predates newer fields — the HMAC covers the OLD
+        // shape's serialization, which the primary check (serialized
+        // with the new fields present) can never reproduce. Re-verify
+        // against the legacy shape before declaring tampering, else
+        // every upgrade would silently reset user settings.
+        if let Ok(legacy) = serde_json::to_value(&signed.settings)
+            .and_then(serde_json::from_value::<LegacyAppSettingsV1>)
+        {
+            let legacy_json = serde_json::to_string(&legacy)
+                .map_err(|e| format!("Failed to serialize legacy settings: {}", e))?;
+            for key in &candidates {
+                if verify_hmac(&legacy_json, &signed.hmac, key) {
+                    tracing::info!(
+                        "Settings verified against pre-multi-hop shape — migrating signature"
+                    );
+                    sync_hmac_key_sources(&path, key);
+                    let settings = normalize_loaded_settings(AppSettings::from(legacy));
+                    if let Err(e) = save_settings_inner(app, &settings) {
+                        tracing::warn!(
+                            "Failed to re-sign migrated settings: {} (will retry next load)",
+                            e
+                        );
+                    }
+                    return Ok(settings);
+                }
+            }
+        }
+
+        if keystore_unavailable {
+            // The signing key may be exactly the one we cannot read right now.
+            // Transient, not tampering: keep the file intact and retry on the
+            // next load.
+            tracing::error!(
+                "Settings signature matches no readable key while the credential store is unreachable — using defaults for this session without resetting"
+            );
+            return Ok(AppSettings::default());
+        }
+
+        // Every key source was readable and none verifies: genuine mismatch.
+        // Quarantine the file (settings.json.tampered) instead of leaving it
+        // in place for the next save to silently overwrite — the user's data
+        // stays recoverable and the reset is visible on disk.
+        tracing::warn!(
+            "Settings HMAC verification failed — possible tampering. Resetting to defaults."
+        );
+        let quarantine = path.with_file_name("settings.json.tampered");
+        if let Err(e) = fs::rename(&path, &quarantine) {
+            tracing::warn!("Could not preserve the unverified settings file: {}", e);
+        }
+        return Ok(AppSettings::default());
     }
 
     // Legacy format (unsigned) — migrate by parsing and re-saving with HMAC
