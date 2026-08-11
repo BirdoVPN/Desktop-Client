@@ -62,8 +62,13 @@ fn all_chain_names() -> Vec<String> {
 const HOOKS: [&str; 3] = ["OUTPUT", "INPUT", "FORWARD"];
 
 /// Run an iptables command, returning Ok on success.
+///
+/// `-w` waits for the xtables lock instead of failing instantly when another
+/// process (firewalld, docker, ...) holds it — a transient insert failure
+/// mid-swap is exactly what used to poison LIVE_GEN.
 fn iptables(args: &[&str]) -> Result<(), String> {
     let output = crate::utils::hidden_cmd("iptables")
+        .arg("-w")
         .args(args)
         .output()
         .map_err(|e| format!("iptables command failed: {}", e))?;
@@ -80,7 +85,11 @@ fn iptables(args: &[&str]) -> Result<(), String> {
 /// returning Ok on `command not found`; presence of ip6tables but failure on
 /// a specific rule is still surfaced as an error.
 fn ip6tables(args: &[&str]) -> Result<(), String> {
-    let output = match crate::utils::hidden_cmd("ip6tables").args(args).output() {
+    let output = match crate::utils::hidden_cmd("ip6tables")
+        .arg("-w")
+        .args(args)
+        .output()
+    {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!("ip6tables not present — skipping IPv6 rule (host is IPv4-only)");
@@ -99,7 +108,7 @@ fn ip6tables(args: &[&str]) -> Result<(), String> {
 /// Check if one of our chains exists in the IPv4 table.
 fn chain_exists(name: &str) -> bool {
     crate::utils::hidden_cmd("iptables")
-        .args(["-L", name, "-n"])
+        .args(["-w", "-L", name, "-n"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -108,7 +117,7 @@ fn chain_exists(name: &str) -> bool {
 /// AUDIT-N5: Check if one of our chains exists in the IPv6 table.
 fn chain_exists_v6(name: &str) -> bool {
     crate::utils::hidden_cmd("ip6tables")
-        .args(["-L", name, "-n"])
+        .args(["-w", "-L", name, "-n"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -117,7 +126,7 @@ fn chain_exists_v6(name: &str) -> bool {
 /// Whether a jump from `hook` to `name` is currently installed (IPv4).
 fn jump_present(hook: &str, name: &str) -> bool {
     crate::utils::hidden_cmd("iptables")
-        .args(["-C", hook, "-j", name])
+        .args(["-w", "-C", hook, "-j", name])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -419,19 +428,42 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
     }
 
     if let Err(e) = hook_chains(next) {
-        // Part of the swap landed. Do NOT roll back into an unprotected state —
-        // every chain involved terminates in DROP, so leaving them hooked fails
-        // closed. Report the truth: `blocking` reflects whether OUTPUT is
-        // actually filtered, not whether we finished.
-        let blocking = jump_present("OUTPUT", &chain_out(next))
-            || (live >= 0 && jump_present("OUTPUT", &chain_out(live)));
-        LIVE_GEN.store(next, Ordering::SeqCst);
-        IPTABLES_BLOCKING.store(blocking, Ordering::SeqCst);
-        tracing::error!(
-            "Kill switch: only part of the rule set could be hooked ({}); blocking={}",
-            e,
-            blocking
-        );
+        // INVARIANT: the generation LIVE_GEN does NOT name is never referenced
+        // from a built-in chain — it is the one the next activation flushes and
+        // rebuilds. While an older generation is live, LIVE_GEN must therefore
+        // keep naming it (fully hooked) rather than a partially-hooked `next`:
+        // otherwise the following re-arm would flush the old, still-hooked
+        // chains, and an empty hooked chain falls through to the default ACCEPT
+        // policy for the whole per-rule rebuild (defect #1 all over again).
+        if live >= 0 {
+            // The old generation is still fully hooked underneath, every chain
+            // DROP-terminated — so unhooking whatever next-gen jumps landed is
+            // fail-closed. Retire the staging generation and keep LIVE_GEN on
+            // the old one.
+            retire_chains(next);
+            IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
+            tracing::error!(
+                "Kill switch: re-arm could not hook the new rule set ({}); \
+                 previous generation left armed",
+                e
+            );
+        } else {
+            // First arm: part of the swap landed and there is no previous
+            // generation to fall back on. Do NOT roll back into an unprotected
+            // state — every chain involved terminates in DROP, so leaving them
+            // hooked fails closed, and the retry path is safe (the next
+            // activation builds the OTHER generation). Report the truth:
+            // `blocking` reflects whether OUTPUT is actually filtered, not
+            // whether we finished.
+            let blocking = jump_present("OUTPUT", &chain_out(next));
+            LIVE_GEN.store(next, Ordering::SeqCst);
+            IPTABLES_BLOCKING.store(blocking, Ordering::SeqCst);
+            tracing::error!(
+                "Kill switch: only part of the rule set could be hooked ({}); blocking={}",
+                e,
+                blocking
+            );
+        }
         return Err(e);
     }
 

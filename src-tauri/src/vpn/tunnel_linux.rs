@@ -34,7 +34,9 @@ const IPV6_BLOCK_CHAIN: &str = "BIRDO_IPV6_LEAK_BLOCK";
 /// Run an ip6tables command, tolerating ip6tables being absent (IPv4-only host).
 /// Mirrors firewall_linux.rs's ip6tables() so behaviour is identical.
 fn ip6t(args: &[&str]) -> Result<(), String> {
-    match cmd("ip6tables").args(args).output() {
+    // `-w`: wait for the xtables lock instead of failing instantly under
+    // contention (firewalld, docker) — same as firewall_linux.rs's helpers.
+    match cmd("ip6tables").arg("-w").args(args).output() {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(format!(
             "ip6tables {} failed: {}",
