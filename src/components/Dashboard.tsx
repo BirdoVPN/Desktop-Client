@@ -144,6 +144,16 @@ const planLevel = (plan: string | null | undefined): number => {
 export function Dashboard() {
   const [showServerSheet, setShowServerSheet] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  /**
+   * Deep-link connect awaiting explicit user confirmation. A birdo:// link is
+   * third-party input — any web page, chat message or document can hand the
+   * user one — so acting on it without an Accept would let an attacker move
+   * the VPN egress to a jurisdiction of their choosing (or force a reconnect
+   * that mints fresh keys) with no signal beyond the server card quietly
+   * changing. The link's target is staged here and only acted on from the
+   * confirmation dialog.
+   */
+  const [deepLinkConfirm, setDeepLinkConfirm] = useState<Server | null>(null);
   const [liveStats, setLiveStats] = useState<RustVpnStats | null>(null);
   // Live security posture from get_vpn_status — surfaced as chips under the
   // status pill so the user can SEE that stealth / post-quantum are actually
@@ -812,6 +822,31 @@ export function Dashboard() {
       return;
     }
 
+    // NEVER act on the link directly. Stage it for an explicit Accept/Cancel
+    // (showing the target country) — matching the multi-hop refusal above in
+    // treating a deep link as untrusted third-party input. Without this, one
+    // click anywhere could silently move a live tunnel to an attacker-chosen
+    // exit node, or repeatedly force reconnects as a tunnel-teardown primitive.
+    setDeepLinkConfirm(target);
+  }, [deepLinkAction, servers, multiHopReady, setErrorMessage]);
+
+  // Accept handler for the staged deep-link connect. Re-validates the session
+  // state at click time — it may have changed while the dialog was open.
+  const handleDeepLinkAccept = useCallback(() => {
+    const target = deepLinkConfirm;
+    setDeepLinkConfirm(null);
+    if (!target) return;
+
+    const st = useAppStore.getState().connectionState;
+    const onTunnel =
+      st === 'connected' || st === 'reconnecting' || st === 'rekeying' || st === 'kill_switch_active';
+
+    if (onTunnel && multiHopReady) {
+      setErrorMessage(
+        'That link would replace your Multi-Hop route with a single hop. Disconnect first if you meant to switch.',
+      );
+      return;
+    }
     if (onTunnel) {
       // Single-hop session: handleSelectServer performs a real switch.
       handleSelectServer(target);
@@ -834,7 +869,7 @@ export function Dashboard() {
         setCurrentServer(null);
       }
     })();
-  }, [deepLinkAction, servers, multiHopReady, handleSelectServer, setCurrentServer, setConnectionState, setErrorMessage, setVpnIp]);
+  }, [deepLinkConfirm, multiHopReady, handleSelectServer, setCurrentServer, setConnectionState, setErrorMessage, setVpnIp]);
 
   const handleLogout = useCallback(async () => {
     const cur = useAppStore.getState().connectionState;
@@ -1140,6 +1175,76 @@ export function Dashboard() {
                   }}
                 >
                   Log Out
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Deep-link connect confirmation — a birdo:// link is third-party
+          input; never move the user's egress without an explicit Accept. */}
+      <AnimatePresence>
+        {deepLinkConfirm && (
+          <motion.div
+            className="absolute inset-0 z-50 flex items-center justify-center bg-black/85"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <motion.div
+              className="mx-6 w-full max-w-sm rounded-2xl p-6 text-center"
+              style={{
+                backgroundColor: surface.s2,
+                border: `1px solid ${hairline.soft}`,
+              }}
+              initial={{ scale: 0.92, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.92, opacity: 0 }}
+            >
+              <Globe size={36} color={status.yellowLight} className="mx-auto mb-3" />
+              <h3 className="mb-2 text-lg font-semibold" style={{ color: white.w100 }}>
+                {isConnected || isKillSwitchActive ? 'Switch server via link?' : 'Connect via link?'}
+              </h3>
+              <p className="mb-5 text-sm" style={{ color: white.w60 }}>
+                A link asks to route your traffic through{' '}
+                <span className="font-medium" style={{ color: white.w100 }}>
+                  {deepLinkConfirm.countryCode
+                    ? `${countryCodeToFlag(deepLinkConfirm.countryCode)} `
+                    : ''}
+                  {[deepLinkConfirm.city, deepLinkConfirm.country]
+                    .filter(Boolean)
+                    .join(', ') || deepLinkConfirm.name}
+                </span>
+                .{' '}
+                {isConnected || isKillSwitchActive
+                  ? 'Your current connection will be replaced. Only accept if you trust where this link came from.'
+                  : 'Only accept if you trust where this link came from.'}
+              </p>
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => setDeepLinkConfirm(null)}
+                  className="flex-1 rounded-xl py-2.5 text-sm font-medium transition-colors hover:bg-white/10"
+                  style={{
+                    backgroundColor: white.w05,
+                    color: white.w100,
+                    border: `1px solid ${hairline.soft}`,
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeepLinkAccept}
+                  className="flex-1 rounded-xl py-2.5 text-sm font-medium transition-colors hover:bg-white/20"
+                  style={{
+                    backgroundColor: white.w10,
+                    color: white.w100,
+                    border: `1px solid ${hairline.soft}`,
+                  }}
+                >
+                  {isConnected || isKillSwitchActive ? 'Switch' : 'Connect'}
                 </button>
               </div>
             </motion.div>
