@@ -27,6 +27,65 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use vpn::{AutoReconnectService, VpnManager};
 
+/// Exit-teardown state machine. pf rulesets and iptables chains SURVIVE
+/// process exit — unlike Windows WFP dynamic sessions, which self-clean — so
+/// quitting without a teardown left macOS/Linux without IPv6 after a normal
+/// session, or with NO network at all if the quit landed while the kill switch
+/// was blocking (e.g. mid-reconnect), with nothing pointing at the VPN client.
+///
+/// STARTED guards the teardown from running twice; DONE is what lets the exit
+/// we re-request after teardown pass through instead of looping back in.
+static EXIT_TEARDOWN_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static EXIT_TEARDOWN_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Best-effort teardown run while an exit request is held open: stop
+/// auto-reconnect, bring the tunnel down (routes/DNS/IPv6 restore) and disarm
+/// the kill switch. Every step is capped so quitting can never hang.
+async fn teardown_for_exit(app: &tauri::AppHandle) {
+    use std::time::Duration;
+
+    // Quit is user intent: neutralize auto-reconnect first so it cannot race
+    // the teardown and bring the tunnel (and kill-switch arming) back up.
+    let auto_reconnect = app.state::<AutoReconnectService>();
+    auto_reconnect.set_user_disconnected();
+    auto_reconnect.stop().await;
+
+    let vpn_manager = app.state::<VpnManager>();
+    vpn_manager.set_user_disconnected(true);
+
+    // Stop the Xray stealth transport if it is running.
+    app.state::<crate::vpn::xray::XrayManager>().stop().await;
+
+    // Free the server-side peer while the tunnel is still up (mirrors
+    // disconnect_vpn). Courtesy call — tightly capped, never stalls the exit.
+    if let Some(key_id) = vpn_manager.get_key_id().await {
+        let api = app.state::<BirdoApi>();
+        match tokio::time::timeout(Duration::from_secs(3), api.disconnect_vpn(&key_id)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => info!("Exit teardown: backend disconnect notify failed: {}", e),
+            Err(_) => info!("Exit teardown: backend disconnect notify timed out"),
+        }
+    }
+
+    // Tunnel teardown: routes, DNS restore, session IPv6 leak block. Inner cap
+    // so a hung stop can never starve the disarm below out of running — the
+    // disarm is the piece whose absence outlives the process.
+    match tokio::time::timeout(Duration::from_secs(6), vpn_manager.disconnect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("Exit teardown: tunnel disconnect failed: {}", e),
+        Err(_) => error!("Exit teardown: tunnel disconnect timed out"),
+    }
+
+    // Disarm the kill switch UNCONDITIONALLY, exactly as disconnect_vpn does
+    // (the 3e6f1e2 escape hatch): quitting IS the user ending the session, and
+    // is_lockdown_mode() is hard false off-Windows, so any gate here would
+    // leave macOS/Linux behind a kernel firewall with no running app to disarm
+    // it. disarm() is a no-op if the switch was never armed.
+    let _ = crate::commands::killswitch::disarm().await;
+}
+
 /// A birdo:// URL captured from the launch argv at cold start, held until the
 /// frontend has mounted its "deep-link" listener and pulls it via
 /// `take_pending_deep_link`. Emitting the event at `setup()` time would be lost
@@ -325,6 +384,9 @@ fn main() {
                 .tooltip("Birdo VPN - Disconnected")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
+                        // app.exit() raises RunEvent::ExitRequested, so this
+                        // funnels through the same teardown (disconnect +
+                        // kill-switch disarm) as every other exit path.
                         info!("User requested quit from tray");
                         app.exit(0);
                     }
@@ -488,10 +550,46 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
-            if let RunEvent::ExitRequested { .. } = event {
-                // PB-3.12: Allow the exit to proceed (do not call api.prevent_exit())
-                info!("Application exit requested, allowing exit");
+        .run(|app_handle, event| {
+            if let RunEvent::ExitRequested { code, api, .. } = &event {
+                // A restart (updater relaunch) cannot be held open —
+                // prevent_exit() is a documented no-op for RESTART_EXIT_CODE —
+                // and must not be turned into a plain exit. Let it through; the
+                // startup reconcile (setup(), F-001/F-032) clears any stale
+                // kernel firewall state in the relaunched instance.
+                if *code == Some(tauri::RESTART_EXIT_CODE) {
+                    info!("Restart requested — skipping exit teardown");
+                    return;
+                }
+                if !EXIT_TEARDOWN_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // First exit request (tray Quit lands here too — app.exit()
+                    // raises ExitRequested): hold the exit open, run the
+                    // teardown, then re-request the exit.
+                    info!("Application exit requested — tearing down VPN + kill switch first");
+                    api.prevent_exit();
+                    let app = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        // Hard cap over the whole teardown: quitting must never
+                        // hang. The inner steps carry their own tighter budgets.
+                        if tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            teardown_for_exit(&app),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            error!("Exit teardown timed out — exiting anyway");
+                        }
+                        EXIT_TEARDOWN_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                        app.exit(0);
+                    });
+                } else if !EXIT_TEARDOWN_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Teardown in flight (e.g. an impatient second tray Quit):
+                    // keep holding the door. Our own re-exit lands after DONE.
+                    api.prevent_exit();
+                } else {
+                    info!("Exit teardown complete — allowing exit");
+                }
             }
         });
 }
