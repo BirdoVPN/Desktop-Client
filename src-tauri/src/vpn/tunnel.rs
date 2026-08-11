@@ -873,6 +873,12 @@ impl WintunTunnel {
             ));
         }
 
+        // P1-dk-allowedips-no-default-coverage: the CIDRs above are only
+        // syntax-checked; also refuse a scope that does not cover the full
+        // address space (defense in depth — build_vpn_config already enforces
+        // this at the choke point every connect path funnels through).
+        crate::vpn::validate_tunnel_scope(&self.config)?;
+
         tracing::debug!("VPN config validation passed");
         Ok(())
     }

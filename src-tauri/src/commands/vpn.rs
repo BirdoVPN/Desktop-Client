@@ -190,6 +190,15 @@ pub fn build_vpn_config(
         persistent_keepalive,
     };
 
+    // P1-dk-allowedips-no-default-coverage: refuse a scope that leaves part of
+    // the address space outside the tunnel — a hostile/compromised backend
+    // must not be able to shrink allowed_ips so traffic egresses in the clear
+    // under a green "Protected". This is the single choke point every connect
+    // path funnels through (connect_vpn, quick_connect, multi-hop and
+    // auto-reconnect all call build_vpn_config); the per-platform tunnels
+    // re-check it in validate_config as defense in depth.
+    crate::vpn::validate_tunnel_scope(&config)?;
+
     Ok((config, server_name))
 }
 
