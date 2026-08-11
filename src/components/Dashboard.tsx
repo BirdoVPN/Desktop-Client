@@ -74,12 +74,23 @@ interface RustVpnStats {
   current_latency_ms: number | null;
 }
 
+/**
+ * Shape of `get_vpn_status`. The Rust `VpnStatus` is `#[serde(rename_all =
+ * "camelCase")]` (commands/vpn.rs), so the wire fields are camelCase; the
+ * snake_case spellings are kept only as a defensive fallback — same pattern as
+ * `RustServer` below. Declaring snake_case ONLY is what made `server_name`
+ * permanently undefined and the post-quick-connect labeller dead code.
+ */
 interface RustVpnStatus {
   state: string;
-  bytes_sent: number;
-  bytes_received: number;
-  connected_at: string | null;
-  server_name: string | null;
+  bytesSent?: number;
+  bytes_sent?: number;
+  bytesReceived?: number;
+  bytes_received?: number;
+  connectedAt?: string | null;
+  connected_at?: string | null;
+  serverName?: string | null;
+  server_name?: string | null;
   stealthActive?: boolean;
   quantumActive?: boolean;
   pqMode?: 'disabled' | 'server_provided' | 'bilateral';
@@ -339,12 +350,20 @@ export function Dashboard() {
   const refreshCurrentServerFromStatus = useCallback(async () => {
     try {
       const st = await invoke<RustVpnStatus>('get_vpn_status');
-      if (!st.server_name) return;
+      // camelCase is the real wire field (serde rename_all); snake_case is a
+      // defensive fallback only.
+      const serverName = st.serverName ?? st.server_name;
+      if (!serverName) return;
       const list = useAppStore.getState().servers;
-      const match = list.find((sv) => sv.name === st.server_name);
+      const match = list.find((sv) => sv.name === serverName);
       useAppStore.getState().setCurrentServer(
-        match ?? ({ name: st.server_name } as (typeof list)[number]),
+        match ?? ({ name: serverName } as (typeof list)[number]),
       );
+      // The explicit connect paths set vpnIp from their target; quick-connect
+      // has only this labeller, so fill it here too when the node is known.
+      if (match) {
+        useAppStore.getState().setVpnIp(match.ipAddress ?? match.hostname ?? null);
+      }
     } catch {
       /* label only — never fail a live connection over it */
     }
