@@ -13,7 +13,8 @@ use crate::vpn::AutoReconnectService;
 
 use super::vpn::{
     apply_vpn_settings, build_vpn_config, derive_quantum_psk, enforce_requested_protection,
-    generate_wireguard_keypair, get_device_name, parse_endpoint_ip, start_stealth_tunnel,
+    engage_switch_guard, generate_wireguard_keypair, get_device_name, parse_endpoint_ip,
+    release_switch_guard, start_stealth_tunnel,
 };
 
 /// Get available multi-hop routes (SOVEREIGN plan only)
@@ -73,6 +74,11 @@ pub async fn connect_multi_hop(
     let device_name = get_device_name();
     let (local_private_key, client_public_key) = generate_wireguard_keypair();
     let vpn_settings = apply_vpn_settings(&app).await;
+
+    // Switching onto a multi-hop route from a live session is a server switch —
+    // same fail-closed guard as connect_vpn across the teardown + handshake
+    // window. Released only after the new tunnel is up.
+    let switch_guard = engage_switch_guard(&vpn_manager).await;
 
     let pq_pk = if vpn_settings.quantum_protection {
         Some(crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
@@ -236,6 +242,15 @@ pub async fn connect_multi_hop(
         if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
             tracing::warn!("Failed to update iptables VPN server: {}", e);
         }
+        // macOS twin: pf bakes the relay permit into the loaded ruleset — while
+        // a block is engaged it must be re-loaded with the NEW relay IP or the
+        // new handshake is dropped (see connect_vpn).
+        #[cfg(target_os = "macos")]
+        if crate::commands::killswitch::pf_blocking_active() {
+            if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+                tracing::warn!("Failed to update pf VPN server permit: {}", e);
+            }
+        }
     } else {
         tracing::warn!(
             "Could not resolve kill switch endpoint IP from '{}'; kill switch may not filter \
@@ -258,6 +273,9 @@ pub async fn connect_multi_hop(
     if let Err(e) = crate::commands::killswitch::arm(&app).await {
         tracing::warn!("Failed to arm kill switch after multi-hop connect: {}", e);
     }
+
+    // New tunnel verified up — release the switch guard (success path only).
+    release_switch_guard(switch_guard).await;
 
     auto_reconnect.clear_user_disconnected();
     tracing::info!("Multi-hop VPN connected: {} → {}", entryNodeId, exitNodeId);

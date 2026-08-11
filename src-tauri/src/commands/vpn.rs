@@ -489,6 +489,54 @@ pub fn get_admin_status() -> bool {
     crate::utils::elevation::is_elevated()
 }
 
+/// Fail-closed guard for a USER-INITIATED connect that lands on an already
+/// ACTIVE session (server switch from the UI, or quick-connect while
+/// connected).
+///
+/// `vpn_manager.connect()` disconnect-firsts, so on macOS/Linux the
+/// multi-second teardown + create + handshake window otherwise ran with NO
+/// IPv4 block at all: every server switch dropped the user's traffic onto the
+/// physical NIC with the real IP exposed while the UI showed a
+/// connecting/connected state (only IPv6 was contained by the session leak
+/// block). Mirrors reapply_vpn_settings, which already engages the block
+/// before its rebuild for exactly this reason. The live tunnel keeps carrying
+/// traffic through the engaged block (tun/utun interface permits), and the
+/// relay permit is swapped to the NEW server before the teardown starts.
+///
+/// No-op when the kill switch is disabled by preference (activate_killswitch
+/// checks) or when no tunnel is up. Returns whether a session was active; the
+/// caller MUST hand that to [`release_switch_guard`] once the new tunnel is
+/// verified up.
+pub(super) async fn engage_switch_guard(vpn_manager: &VpnManager) -> bool {
+    let state = vpn_manager.get_state().await;
+    if !state.is_tunnel_active() {
+        return false;
+    }
+    if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+        tracing::warn!("Kill switch activation before server switch failed: {}", e);
+    }
+    true
+}
+
+/// Release the guard engaged by [`engage_switch_guard`] once the NEW tunnel is
+/// verified up. Called on SUCCESS only — a failed switch must stay failed
+/// CLOSED (reapply_vpn_settings semantics; Disconnect and the Settings
+/// kill-switch toggle remain the user's explicit escape hatches).
+///
+/// Lockdown (always-on) keeps its block: is_lockdown_mode() is hard false on
+/// macOS/Linux — so this can never strand a Unix user — and on Windows the
+/// tunnel layer has already re-baked the active block with the new adapter
+/// LUID; releasing it here would open the reactive detection window lockdown
+/// exists to close.
+pub(super) async fn release_switch_guard(guard_engaged: bool) {
+    if !guard_engaged || crate::commands::killswitch::is_lockdown_mode() {
+        return;
+    }
+    if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
+        tracing::warn!("Kill switch release after server switch failed: {}", e);
+    }
+}
+
 /// Connect to a VPN server
 #[tauri::command]
 pub async fn connect_vpn(
@@ -532,6 +580,11 @@ pub async fn connect_vpn(
 
     // Apply VPN settings early — needed for the API call (stealth/quantum flags)
     let vpn_settings = apply_vpn_settings(&app).await;
+
+    // Server switch on a live session: engage the block-all BEFORE anything
+    // can tear the old tunnel down, so the teardown + handshake window cannot
+    // leak on the physical NIC. Released only after the new tunnel is up.
+    let switch_guard = engage_switch_guard(&vpn_manager).await;
 
     // Connect via backend API — send public key, NOT private key
     tracing::debug!("Calling /vpn/connect for server {}", server_id);
@@ -654,6 +707,16 @@ pub async fn connect_vpn(
         if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
             tracing::warn!("Failed to update iptables VPN server: {}", e);
         }
+        // macOS twin: pf has no update_vpn_server — the relay permit is baked
+        // into the loaded ruleset, so while a block is engaged (the switch
+        // guard above, or a reconnect block) it must be re-loaded with the NEW
+        // relay IP or the new handshake is dropped (block drop all wins).
+        #[cfg(target_os = "macos")]
+        if crate::commands::killswitch::pf_blocking_active() {
+            if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+                tracing::warn!("Failed to update pf VPN server permit: {}", e);
+            }
+        }
     }
 
     // Suppress auto-reconnect for the duration of this USER-initiated connect.
@@ -686,6 +749,9 @@ pub async fn connect_vpn(
     if let Err(e) = crate::commands::killswitch::arm(&app).await {
         tracing::warn!("Failed to arm kill switch after connect: {}", e);
     }
+
+    // New tunnel verified up — release the switch guard (success path only).
+    release_switch_guard(switch_guard).await;
 
     // Wire up auto-reconnect: store reconnect info and start health monitoring
     auto_reconnect.clear_user_disconnected();
@@ -932,6 +998,11 @@ pub async fn quick_connect(
 
     // AUDIT-C1: quick-connect respects the user's quantum-protection setting too.
     let vpn_settings = apply_vpn_settings(&app).await;
+
+    // Quick-connect on a live session is a server switch too — same fail-closed
+    // guard as connect_vpn across the teardown + handshake window.
+    let switch_guard = engage_switch_guard(&vpn_manager).await;
+
     let pq_pk = if vpn_settings.quantum_protection {
         Some(crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
             "Post-quantum engine unavailable. Connection aborted because quantum protection is enabled."
@@ -1025,6 +1096,15 @@ pub async fn quick_connect(
         if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
             tracing::warn!("Failed to update iptables VPN server: {}", e);
         }
+        // macOS twin: pf bakes the relay permit into the loaded ruleset — while
+        // a block is engaged it must be re-loaded with the NEW relay IP or the
+        // new handshake is dropped (see connect_vpn).
+        #[cfg(target_os = "macos")]
+        if crate::commands::killswitch::pf_blocking_active() {
+            if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+                tracing::warn!("Failed to update pf VPN server permit: {}", e);
+            }
+        }
     }
 
     // Connect using VPN manager
@@ -1042,6 +1122,9 @@ pub async fn quick_connect(
     if let Err(e) = crate::commands::killswitch::arm(&app).await {
         tracing::warn!("Failed to arm kill switch after quick-connect: {}", e);
     }
+
+    // New tunnel verified up — release the switch guard (success path only).
+    release_switch_guard(switch_guard).await;
 
     // Wire up auto-reconnect for quick-connect too
     auto_reconnect.clear_user_disconnected();

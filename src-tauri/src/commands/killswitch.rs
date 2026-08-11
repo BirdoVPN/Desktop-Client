@@ -477,6 +477,16 @@ pub async fn disarm() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 static PF_BLOCKING: AtomicBool = AtomicBool::new(false);
 
+/// macOS: is the pf block-all ruleset currently loaded? Twin of
+/// `wfp::is_blocking()` / `firewall_linux::is_blocking()`, needed by the
+/// connect paths' update-the-relay-permit step: pf bakes the permitted server
+/// IP into the loaded ruleset and has no incremental update, so a switch onto
+/// a different relay while a block is engaged must re-load the ruleset.
+#[cfg(target_os = "macos")]
+pub fn pf_blocking_active() -> bool {
+    PF_BLOCKING.load(Ordering::SeqCst)
+}
+
 /// True when WE enabled pf (it was disabled before us). Governs whether
 /// deactivation should `pfctl -d` — we must never disable pf if the user or
 /// another tool had it running.
