@@ -685,9 +685,11 @@ impl AutoReconnectService {
                                         #[cfg(target_os = "linux")]
                                         { let _ = std::process::Command::new("resolvectl").args(["flush-caches"]).output(); }
 
-                                        let device_name = hostname::get()
-                                            .map(|h| h.to_string_lossy().to_string())
-                                            .unwrap_or_else(|_| "Windows PC".to_string());
+                                        // SEC-PII: same generic label as every other auth/connect
+                                        // payload — never the raw hostname (and never a DIFFERENT
+                                        // label, which would relabel the account's device row on
+                                        // every auto-reconnect).
+                                        let device_name = crate::utils::get_device_name();
 
                                         // FIX-1-1: Generate fresh keypair for reconnect too
                                         let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
