@@ -3,8 +3,14 @@
  *
  * A thin top strip: Birdo mark + name on the left, minimize + close-to-tray on
  * the right. Replaces the floating controls. Minimize sends the window to the
- * taskbar; close hides to the system tray (mirrors main.rs CloseRequested — the
- * app keeps running in the tray, "Quit Birdo VPN" there fully exits).
+ * taskbar; close asks for a window close, which main.rs's CloseRequested
+ * handler turns into hide-to-tray (the app keeps running in the tray, "Quit
+ * Birdo VPN" there fully exits). Routing through CloseRequested — instead of
+ * calling win.hide() directly — is what re-arms the biometric app-lock: only
+ * that Rust handler emits `app-hidden`, and a direct hide() bypassed it, so in
+ * the default (frameless) mode the opt-in lock only ever guarded a cold start
+ * and the authenticated UI stayed one tray-click away for anyone at the
+ * machine.
  *
  * Hidden in "Free (draggable)" window mode, where the native OS title bar is
  * restored and owns these controls.
@@ -55,7 +61,10 @@ export function TitleBar() {
           aria-label="Close to tray"
           title="Close to tray"
           onClick={() => {
-            win.hide().catch((e) => console.error('Failed to hide window:', e));
+            // close() raises CloseRequested in Rust, which hides to tray AND
+            // emits `app-hidden` so the biometric lock re-arms. Never hide()
+            // directly here — that skips the re-arm (see header comment).
+            win.close().catch((e) => console.error('Failed to close window to tray:', e));
           }}
           className="flex h-6 w-7 items-center justify-center rounded text-white/45 transition-colors hover:bg-red-500/80 hover:text-white focus:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
         >
