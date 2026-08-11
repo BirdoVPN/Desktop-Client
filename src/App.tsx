@@ -123,20 +123,27 @@ function App() {
   // Keep the system-tray icon + tooltip in sync with the live connection state.
   // The Rust `set_tray_state` command swaps the embedded status icon (green /
   // amber / slate) and the hover tooltip. Every in-progress phase maps to the
-  // amber "connecting" icon.
+  // amber "connecting" icon — EXCEPT kill_switch_active, which used to fall
+  // into that catch-all: the tray (often the only visible surface, the window
+  // being hidden) said "Connecting…" while every packet on the machine was
+  // being dropped. It now gets the slate icon and an explicit tooltip.
   useEffect(() => {
     const trayState =
       connectionState === 'connected'
         ? 'connected'
-        : connectionState === 'disconnected' || connectionState === 'error'
+        : connectionState === 'disconnected'
+            || connectionState === 'error'
+            || connectionState === 'kill_switch_active'
           ? 'disconnected'
           : 'connecting';
     const tooltip =
-      trayState === 'connected'
-        ? `Birdo VPN — Connected${currentServerName ? ` · ${currentServerName}` : ''}`
-        : trayState === 'connecting'
-          ? 'Birdo VPN — Connecting…'
-          : 'Birdo VPN — Disconnected';
+      connectionState === 'kill_switch_active'
+        ? 'Birdo VPN — Kill switch active: traffic blocked'
+        : trayState === 'connected'
+          ? `Birdo VPN — Connected${currentServerName ? ` · ${currentServerName}` : ''}`
+          : trayState === 'connecting'
+            ? 'Birdo VPN — Connecting…'
+            : 'Birdo VPN — Disconnected';
     invoke('set_tray_state', { state: trayState, tooltip }).catch(() => {
       /* tray not ready / non-fatal */
     });

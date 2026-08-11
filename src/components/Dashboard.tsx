@@ -490,19 +490,17 @@ export function Dashboard() {
   // feeds — a reconnect or kill-switch trip must still reach the one surface the
   // user can actually see. On re-show we poll immediately so the UI is never
   // stale by more than a frame.
+  // P1-dk-status-poll-never-restarts-terminal-states: this effect used to be
+  // gated on `isConnected || isConnecting`, so reaching 'error',
+  // 'kill_switch_active' or 'disconnected' tore the interval down — and since
+  // this poll is the ONLY writer of connectionState from Rust, the UI (and the
+  // tray it feeds) froze on the stale reading forever: "Error" while Rust had
+  // silently reconnected, or "Kill Switch" after Rust recovered. The poll now
+  // runs unconditionally for the life of the Dashboard (i.e. while
+  // authenticated), at the same visibility-aware cadence.
   const VISIBLE_POLL_MS = 2_000;
   const HIDDEN_POLL_MS = 15_000;
-  const isActive = isConnected || isConnecting;
   useEffect(() => {
-    if (!isActive) {
-      setLiveStats(null);
-      setLiveSecurity({ stealth: false });
-      if (statsInterval.current) {
-        clearInterval(statsInterval.current);
-        statsInterval.current = null;
-      }
-      return;
-    }
     let cancelled = false;
     const poll = async () => {
       try {
@@ -523,6 +521,10 @@ export function Dashboard() {
         if (st.state === 'connected' || st.state === 'rekeying') {
           setLiveStats(stats);
           setLiveSecurity({ stealth: !!st.stealthActive });
+        } else {
+          // Clearing used to happen in the (now removed) !isActive teardown.
+          setLiveStats(null);
+          setLiveSecurity({ stealth: false });
         }
       } catch { /* silent */ }
     };
@@ -547,7 +549,7 @@ export function Dashboard() {
       document.removeEventListener('visibilitychange', onVisibility);
       if (statsInterval.current) clearInterval(statsInterval.current);
     };
-  }, [isActive, setConnectionState]);
+  }, [setConnectionState]);
 
   // ── Toast auto-dismiss ────────────────────────────────────────────
   useEffect(() => {
