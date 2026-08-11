@@ -31,12 +31,26 @@ import { white, status, hairline, surface, gradient, motion as motionTokens } fr
 
 type Protocol = 'tcp' | 'udp';
 
-/** create_port_forward returns the created rule (camelCase, mirrors Rust). */
+/**
+ * Wire shape of `create_port_forward` — mirrors the Rust
+ * `CreatePortForwardResponse` (`#[serde(rename_all = "camelCase")]`, types.rs):
+ * `{ success, message?, portForward? }`. The rule fields live INSIDE
+ * `portForward`, and a backend refusal arrives as `success: false` with a
+ * `message` — this interface used to declare the rule fields at the top level,
+ * so every add rendered `{id: undefined, ...}` into the store (crashing the
+ * screen on `protocol.toUpperCase()`) and refusals were indistinguishable from
+ * success.
+ */
 interface CreatePortForwardResult {
-  id: string;
-  externalPort: number;
-  internalPort: number;
-  protocol: string;
+  success: boolean;
+  message?: string | null;
+  portForward?: {
+    id: string;
+    externalPort: number;
+    internalPort: number;
+    protocol: string;
+    enabled: boolean;
+  } | null;
 }
 
 export function PortForward() {
@@ -93,10 +107,18 @@ export function PortForward() {
     setAdding(true);
     setError(null);
     try {
-      const created = await invoke<CreatePortForwardResult>('create_port_forward', {
+      const res = await invoke<CreatePortForwardResult>('create_port_forward', {
         port: portValue,
         protocol,
       });
+      // Branch on `success` and read the rule from `portForward` — a refusal
+      // (plan limit, port taken) must surface its message, never render as a
+      // half-empty "successful" row.
+      if (!res.success || !res.portForward) {
+        setError(res.message || 'Failed to create port forwarding rule.');
+        return;
+      }
+      const created = res.portForward;
       setPortForwards([
         ...portForwards,
         {
@@ -104,7 +126,7 @@ export function PortForward() {
           externalPort: created.externalPort,
           internalPort: created.internalPort,
           protocol: created.protocol,
-          enabled: true,
+          enabled: created.enabled ?? true,
         },
       ]);
       setPortText('');
@@ -326,7 +348,7 @@ function DeleteRuleDialog({
             </h2>
           </div>
           <p className="text-[13px]" style={{ color: white.w60 }}>
-            Remove the {rule.protocol.toUpperCase()} forward{' '}
+            Remove the {(rule.protocol || '').toUpperCase()} forward{' '}
             <span className="font-medium" style={{ color: white.w80 }}>
               {rule.externalPort} → {rule.internalPort}
             </span>
@@ -370,7 +392,9 @@ function PortForwardRow({ rule, onRequestDelete, deleting }: PortForwardRowProps
           <span style={{ color: white.w80 }}>{rule.internalPort}</span>
         </div>
         <div className="mt-1">
-          <BirdoBadge text={rule.protocol.toUpperCase()} tone="neutral" />
+          {/* Defensive: a malformed rule must degrade to a blank badge, not
+              throw into the screen's error boundary. */}
+          <BirdoBadge text={(rule.protocol || '').toUpperCase()} tone="neutral" />
         </div>
       </div>
 
