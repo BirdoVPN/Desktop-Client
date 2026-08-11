@@ -49,7 +49,10 @@ const PINNED_SPKI_SHA256: &[&str] = &[
 /// Identical to `openssl x509 -pubkey | openssl pkey -pubin -outform DER |
 /// openssl dgst -sha256 -binary | base64` and OkHttp's `sha256/...` pin.
 /// Returns `None` if the certificate cannot be parsed as X.509.
-fn spki_sha256_b64(cert: &CertificateDer<'_>) -> Option<String> {
+///
+/// pub(crate): the DoH resolver's pinning verifier (vpn/doh.rs) reuses this
+/// exact extraction so its pins stay byte-compatible with the API pins.
+pub(crate) fn spki_sha256_b64(cert: &CertificateDer<'_>) -> Option<String> {
     let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
     let spki_der = parsed.tbs_certificate.subject_pki.raw;
     Some(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(spki_der)))
