@@ -3,7 +3,7 @@
 //! Handles VPN connection, disconnection, and status reporting.
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::api::types::ConnectResponse;
 use crate::api::types::VpnConfig;
@@ -39,6 +39,42 @@ pub struct ConnectionStats {
 /// the connect paths below and `commands::auth` already call it by this name.
 pub(super) fn get_device_name() -> String {
     crate::utils::get_device_name()
+}
+
+// ─── ADAPTIVE TRANSPORT ──────────────────────────────────────────────────────
+//
+// Desktop twin of Android's TransportProbe + VpnManager.onTransportBlocked
+// (birdo-client-mobile). Android reports Connected before any handshake, so it
+// needs a post-connect probe; the desktop `WireGuardSession` performs an
+// EXPLICIT establish-time handshake (3 attempts x 5s recv timeout,
+// wireguard_new.rs) and the whole connect FAILS when the network silently eats
+// it — which on a DPI-filtered network (Iran, Russia, Bangladesh) is exactly
+// what happens: interface never comes up, `connect_vpn` returns the handshake
+// error below. That failure IS the probe verdict, so the fallback lives here:
+// classify the error, re-ask the backend with `fallbackReason` (granted on ANY
+// plan, including anonymous — see backend ConnectDto), and rebuild the same
+// session over Xray Reality.
+
+/// Wire value for "no WireGuard handshake inside the window" — the common DPI
+/// case. MUST match the backend ConnectDto `fallbackReason` @IsIn list.
+pub(crate) const FALLBACK_HANDSHAKE_TIMEOUT: &str = "handshake-timeout";
+/// Wire value for "the transport was actively refused" (ICMP unreachable, RST).
+pub(crate) const FALLBACK_TRANSPORT_BLOCKED: &str = "transport-blocked";
+
+/// Classify a failed connect: `Some(reason)` when the failure is
+/// transport-shaped (the establish-time WireGuard handshake got no answer or
+/// was refused) and an automatic stealth retry is warranted; `None` for every
+/// other failure (auth, config, elevation, server-side rejection…), where a
+/// fallback would only mask the real error. Deliberately narrow: a false
+/// positive costs the user an unnecessary rebuild onto the slower transport.
+pub(crate) fn transport_fallback_reason(error: &str) -> Option<&'static str> {
+    if error.contains(crate::vpn::ERR_HANDSHAKE_NO_RESPONSE) {
+        Some(FALLBACK_HANDSHAKE_TIMEOUT)
+    } else if error.contains(crate::vpn::ERR_HANDSHAKE_RECV) {
+        Some(FALLBACK_TRANSPORT_BLOCKED)
+    } else {
+        None
+    }
 }
 
 fn connect_failure_message(response: &ConnectResponse) -> String {
@@ -489,7 +525,15 @@ pub fn get_admin_status() -> bool {
     crate::utils::elevation::is_elevated()
 }
 
-/// Connect to a VPN server
+/// Connect to a VPN server.
+///
+/// ADAPTIVE TRANSPORT wrapper: try direct WireGuard first; when that attempt
+/// fails in the transport-shaped way (establish-time handshake unanswered or
+/// refused — see `transport_fallback_reason`), automatically retry ONCE with
+/// the backend's any-plan stealth grant and rebuild the session over Xray
+/// Reality. A single retry cannot loop: a stealth attempt that also fails
+/// returns its own error (and its handshake runs against the LOCAL Xray
+/// proxy, whose failure strings don't classify as transport-shaped anyway).
 #[tauri::command]
 pub async fn connect_vpn(
     #[allow(non_snake_case)] serverId: String,
@@ -500,7 +544,126 @@ pub async fn connect_vpn(
     auto_reconnect: State<'_, AutoReconnectService>,
 ) -> Result<bool, String> {
     let server_id = serverId;
-    tracing::debug!(server_id = %server_id, "connect_vpn called");
+    let direct = connect_vpn_attempt(
+        &server_id,
+        &app,
+        &api,
+        &vpn_manager,
+        &credentials,
+        &auto_reconnect,
+        None,
+    )
+    .await;
+
+    let Err(direct_err) = direct else {
+        return direct;
+    };
+
+    let Some(reason) = transport_fallback_reason(&direct_err) else {
+        return Err(direct_err);
+    };
+
+    // Respect an explicit user transport choice: with Stealth Mode forced ON,
+    // the attempt that just failed was ALREADY the stealth transport. Stealth
+    // is the last transport we have, so its failure belongs to the normal
+    // error path — retrying it would be a reconnect loop. (Mirrors Android's
+    // `alreadyStealth` short-circuit in BirdoVpnService.)
+    let user_forced_stealth = get_settings(app.clone())
+        .await
+        .map(|s| s.stealth_mode)
+        .unwrap_or(false);
+    if user_forced_stealth {
+        return Err(direct_err);
+    }
+
+    tracing::warn!(
+        "Adaptive Transport: direct WireGuard failed ({reason}) — rebuilding over the stealth transport"
+    );
+
+    // Kill-switch interplay: cover the transport switch with the SAME block
+    // that covers a reconnect gap / settings reapply. If a session was live
+    // before this connect (server switch, reapply), the kill switch is armed
+    // and this installs the block-all for the whole retry window (API call +
+    // Xray start + tunnel establish), so the app backlog of a user who
+    // believed they were protected cannot burst out in cleartext — on exactly
+    // the networks that are already interfering with our traffic. On a fresh
+    // first connect the kill switch was never armed and this is a no-op
+    // (there was no protected session whose traffic could leak).
+    if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+        tracing::warn!(
+            "Kill switch activation before transport fallback failed: {}",
+            e
+        );
+    }
+
+    // Surface the switch — the user must never silently land on a different
+    // transport. The Dashboard listens for this and shows a notice; the
+    // "Stealth" chip then reports the transport for the rest of the session
+    // via get_vpn_status.stealth_active.
+    let _ = app.emit(
+        "adaptive-transport-fallback",
+        serde_json::json!({ "reason": reason }),
+    );
+
+    let retry = connect_vpn_attempt(
+        &server_id,
+        &app,
+        &api,
+        &vpn_manager,
+        &credentials,
+        &auto_reconnect,
+        Some(reason),
+    )
+    .await;
+
+    match retry {
+        Ok(v) => {
+            // Release the block engaged above, mirroring the auto-reconnect
+            // loop's Connected arm — EXCEPT in lockdown mode, where arm()
+            // (inside the successful attempt) re-activated the always-on
+            // block with the tunnel LUID permitted and it must stay up.
+            if !crate::commands::killswitch::is_lockdown_mode() {
+                if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
+                    tracing::warn!(
+                        "Kill switch release after a successful stealth fallback failed: {}",
+                        e
+                    );
+                }
+            }
+            tracing::info!("Adaptive Transport: session rebuilt over the stealth transport");
+            Ok(v)
+        }
+        Err(stealth_err) => {
+            // BOTH transports failed. If the block engaged above, it stays —
+            // same fail-closed semantics as a failed settings reapply: the
+            // manager already recorded the Error state, Connect remains
+            // available from it, and a user Disconnect disarms the block.
+            Err(format!(
+                "Connection failed on both transports. Direct WireGuard: {direct_err} \
+                 Stealth fallback: {stealth_err}"
+            ))
+        }
+    }
+}
+
+/// One full connect attempt (API call → optional stealth/PQ setup → tunnel).
+///
+/// This is the former `connect_vpn` body, extracted so the Adaptive Transport
+/// wrapper above can run it twice (direct, then stealth-fallback) and so
+/// `quick_connect` shares it instead of maintaining a diverging twin.
+/// `fallback_reason` is forwarded to the backend, which answers it with a
+/// stealth grant on ANY plan (including anonymous).
+#[allow(clippy::too_many_arguments)]
+async fn connect_vpn_attempt(
+    server_id: &str,
+    app: &AppHandle,
+    api: &State<'_, BirdoApi>,
+    vpn_manager: &State<'_, VpnManager>,
+    credentials: &State<'_, CredentialStore>,
+    auto_reconnect: &State<'_, AutoReconnectService>,
+    fallback_reason: Option<&'static str>,
+) -> Result<bool, String> {
+    tracing::debug!(server_id = %server_id, ?fallback_reason, "connect_vpn attempt");
 
     // Pre-flight: refuse to proceed without admin privileges.
     // Wintun adapter creation is an in-process FFI call that requires
@@ -531,7 +694,7 @@ pub async fn connect_vpn(
     let (local_private_key, client_public_key) = generate_wireguard_keypair();
 
     // Apply VPN settings early — needed for the API call (stealth/quantum flags)
-    let vpn_settings = apply_vpn_settings(&app).await;
+    let vpn_settings = apply_vpn_settings(app).await;
 
     // Connect via backend API — send public key, NOT private key
     tracing::debug!("Calling /vpn/connect for server {}", server_id);
@@ -549,7 +712,7 @@ pub async fn connect_vpn(
 
     let response = match api
         .connect_vpn(
-            &server_id,
+            server_id,
             &device_name,
             Some(client_public_key),
             if vpn_settings.stealth_mode {
@@ -557,6 +720,7 @@ pub async fn connect_vpn(
             } else {
                 None
             },
+            fallback_reason,
             if vpn_settings.quantum_protection {
                 Some(true)
             } else {
@@ -588,10 +752,22 @@ pub async fn connect_vpn(
         vpn_settings.quantum_protection,
     )?;
 
+    // ADAPTIVE TRANSPORT: a fallback retry MUST come back with the stealth
+    // transport. Direct WireGuard is proven broken on this network, so
+    // silently rebuilding it would just burn another multi-second handshake
+    // failure and report a misleading error — fail fast with the real story.
+    if fallback_reason.is_some() && !response.stealth_enabled.unwrap_or(false) {
+        return Err(
+            "This network appears to block WireGuard and the server could not provide \
+             the stealth transport. Please try a different server."
+                .to_string(),
+        );
+    }
+
     tracing::info!("Got VPN config from server, extracting fields...");
 
     // Phase 1: Xray Reality Stealth Tunnel
-    let stealth_endpoint_override = start_stealth_tunnel(&app, &response).await?;
+    let stealth_endpoint_override = start_stealth_tunnel(app, &response).await?;
     let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
         response
             .xray_endpoint
@@ -609,7 +785,7 @@ pub async fn connect_vpn(
     // P3-1: Pass custom MTU and port from user settings
     let (mut config, server_name) = build_vpn_config(
         response,
-        &server_id,
+        server_id,
         vpn_settings.custom_dns.clone(),
         Some(local_private_key),
         vpn_settings.custom_mtu,
@@ -676,15 +852,18 @@ pub async fn connect_vpn(
     // installs the WFP block-all during the reconnect gap (it previously
     // short-circuited because the kill switch was never armed). Best-effort: a
     // failure to arm must not tear down a working tunnel.
-    if let Err(e) = crate::commands::killswitch::arm(&app).await {
+    if let Err(e) = crate::commands::killswitch::arm(app).await {
         tracing::warn!("Failed to arm kill switch after connect: {}", e);
     }
 
-    // Wire up auto-reconnect: store reconnect info and start health monitoring
+    // Wire up auto-reconnect: store reconnect info and start health monitoring.
+    // ADAPTIVE TRANSPORT: persist the fallback reason for this session so a
+    // drop rebuilds over the transport that is KNOWN to work here, instead of
+    // failing another direct handshake on every reconnect attempt.
     auto_reconnect.clear_user_disconnected();
     auto_reconnect
         .store_last_config(
-            server_id.clone(),
+            server_id.to_string(),
             server_name,
             vpn_settings.local_network_sharing,
             vpn_settings.custom_mtu,
@@ -692,6 +871,7 @@ pub async fn connect_vpn(
             vpn_settings.custom_dns,
             vpn_settings.stealth_mode,
             vpn_settings.quantum_protection,
+            fallback_reason.map(str::to_string),
             None,
         )
         .await;
@@ -917,138 +1097,22 @@ pub async fn quick_connect(
         best_server.id
     );
 
-    // Get device name for connection
-    let device_name = get_device_name();
-
-    // FIX-1-1: Generate X25519 keypair locally
-    let (local_private_key, client_public_key) = generate_wireguard_keypair();
-
-    // AUDIT-C1: quick-connect respects the user's quantum-protection setting too.
-    let vpn_settings = apply_vpn_settings(&app).await;
-    let pq_pk = if vpn_settings.quantum_protection {
-        Some(crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
-            "Post-quantum engine unavailable. Connection aborted because quantum protection is enabled."
-                .to_string()
-        })?)
-    } else {
-        None
-    };
-
-    // Connect via backend API — send public key only
-    let response = api
-        .connect_vpn(
-            &best_server.id,
-            &device_name,
-            Some(client_public_key),
-            if vpn_settings.stealth_mode {
-                Some(true)
-            } else {
-                None
-            },
-            if vpn_settings.quantum_protection {
-                Some(true)
-            } else {
-                None
-            },
-            pq_pk,
-        )
-        .await
-        .map_err(|e| sanitize_error(&format!("Failed to connect: {}", e)))?;
-
-    if !response.success {
-        let msg = connect_failure_message(&response);
-        return Err(msg);
-    }
-
-    enforce_requested_protection(
-        &response,
-        vpn_settings.stealth_mode,
-        vpn_settings.quantum_protection,
-    )?;
-
-    let stealth_endpoint_override = start_stealth_tunnel(&app, &response).await?;
-    let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
-        response
-            .xray_endpoint
-            .clone()
-            .or_else(|| response.endpoint.clone())
-    } else {
-        None
-    };
-    let quantum_psk = derive_quantum_psk(&response)?;
-
-    // H-2 FIX: Use shared helper instead of duplicated extraction logic
-    // FIX-1-1: Pass locally generated private key
-    // P3-1: Pass custom MTU and port from user settings
-    let (mut config, _server_name) = build_vpn_config(
-        response,
-        &best_server.id,
-        vpn_settings.custom_dns.clone(),
-        Some(local_private_key),
-        vpn_settings.custom_mtu,
-        &vpn_settings.custom_port,
-    )?;
-
-    if let Some(ref stealth_ep) = stealth_endpoint_override {
-        tracing::info!(
-            "Overriding quick-connect WireGuard endpoint to Xray proxy: {}",
-            stealth_ep
-        );
-        config.endpoint = stealth_ep.clone();
-    }
-
-    if let Some(ref psk) = quantum_psk {
-        config.preshared_key = Some(psk.clone());
-    }
-
-    // Set the VPN server IP for kill switch permit rules (quick connect path)
-    let killswitch_endpoint = upstream_endpoint_for_killswitch
-        .as_deref()
-        .unwrap_or(&config.endpoint);
-    if let Some(ip) = parse_endpoint_ip(killswitch_endpoint) {
-        crate::commands::killswitch::set_vpn_server_ip(Some(ip)).await;
-        #[cfg(target_os = "windows")]
-        if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
-            tracing::warn!("Failed to update WFP VPN server: {}", e);
-        }
-    }
-
-    // Connect using VPN manager
-    vpn_manager
-        .connect(
-            config,
-            best_server.name.clone(),
-            vpn_settings.local_network_sharing,
-        )
-        .await
-        .map_err(|e| sanitize_error(&format!("Connection failed: {}", e)))?;
-
-    // AUDIT-2026-06-19 FIX (CRITICAL): arm the kill switch once the tunnel is up
-    // so a drop fails closed (see connect_vpn for the full rationale).
-    if let Err(e) = crate::commands::killswitch::arm(&app).await {
-        tracing::warn!("Failed to arm kill switch after quick-connect: {}", e);
-    }
-
-    // Wire up auto-reconnect for quick-connect too
-    auto_reconnect.clear_user_disconnected();
-    auto_reconnect
-        .store_last_config(
-            best_server.id.clone(),
-            best_server.name.clone(),
-            vpn_settings.local_network_sharing,
-            vpn_settings.custom_mtu,
-            vpn_settings.custom_port,
-            vpn_settings.custom_dns,
-            vpn_settings.stealth_mode,
-            vpn_settings.quantum_protection,
-            None,
-        )
-        .await;
-    if let Err(e) = auto_reconnect.start().await {
-        tracing::warn!("Failed to start auto-reconnect: {}", e);
-    }
-
-    Ok(true)
+    // Delegate to connect_vpn — the same pattern as the multi-hop branch above.
+    // quick_connect used to carry a hand-maintained copy of the whole connect
+    // orchestration (keygen → API → stealth → PQ → kill switch → reconnect
+    // wiring), which is exactly how fixes go missing in one of the twins.
+    // Delegating gives it the ADAPTIVE TRANSPORT fallback for free and leaves
+    // ONE connect path to maintain. (Server name now comes from the connect
+    // response instead of the server list — same backend record.)
+    connect_vpn(
+        best_server.id,
+        app,
+        api,
+        vpn_manager,
+        credentials,
+        auto_reconnect,
+    )
+    .await
 }
 
 /// Live-reapply tunnel-affecting settings to the ACTIVE session (mobile parity).
@@ -1250,3 +1314,51 @@ pub async fn get_usage_stats(
 }
 
 // Multi-hop and port forwarding commands extracted to vpn_multi_hop.rs and vpn_port_forward.rs
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact shape a DPI-filtered connect produces: wireguard_new's marker,
+    /// wrapped by handshake_with_retry, tunnel start, and VpnManager::connect.
+    #[test]
+    fn classifies_wrapped_handshake_timeout_as_fallback() {
+        let err = format!(
+            "Failed to start tunnel: Handshake failed after 3 attempts: {}",
+            crate::vpn::ERR_HANDSHAKE_NO_RESPONSE
+        );
+        assert_eq!(
+            transport_fallback_reason(&err),
+            Some(FALLBACK_HANDSHAKE_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn classifies_refused_transport_as_fallback() {
+        let err = format!(
+            "Failed to start tunnel: Handshake failed after 3 attempts: {}: \
+             An existing connection was forcibly closed by the remote host. (os error 10054)",
+            crate::vpn::ERR_HANDSHAKE_RECV
+        );
+        assert_eq!(
+            transport_fallback_reason(&err),
+            Some(FALLBACK_TRANSPORT_BLOCKED)
+        );
+    }
+
+    /// Every other failure must NOT trigger a fallback — a stealth rebuild
+    /// would mask the real error (auth, config, elevation, server refusal).
+    #[test]
+    fn non_transport_errors_do_not_classify() {
+        for err in [
+            "Not authenticated. Please log in first.",
+            "Missing key_id in response",
+            "Connection timed out after 30s", // could be netsh/AV, not the network
+            "Stealth mode was requested but the server did not enable it. \
+             Connection aborted to prevent a silent downgrade.",
+            "Tunnel lock timeout during teardown — please try again",
+        ] {
+            assert_eq!(transport_fallback_reason(err), None, "{err}");
+        }
+    }
+}

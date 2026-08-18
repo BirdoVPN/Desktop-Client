@@ -39,6 +39,11 @@ pub use manager::VpnManager;
 #[allow(unused_imports)]
 pub use wireguard_new::WireGuardSession;
 
+// ADAPTIVE TRANSPORT: the establish-time handshake failure markers, re-exported
+// so commands::vpn::transport_fallback_reason can classify a failed connect
+// without wireguard_new becoming a public module.
+pub(crate) use wireguard_new::{ERR_HANDSHAKE_NO_RESPONSE, ERR_HANDSHAKE_RECV};
+
 // Re-export DoH resolver (available for future use)
 #[allow(unused_imports)]
 pub use doh::resolve_via_doh;
