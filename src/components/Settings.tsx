@@ -394,21 +394,21 @@ export function Settings() {
             subtitle="birdo.app/privacy"
             leadingIcon={ShieldCheck}
             leadingTint={brand.accentSoft}
-            onClick={() => openExternal(PRIVACY_URL)}
+            onClick={() => openExternal(PRIVACY_URL).catch(() => {})}
           />
           <BirdoNavRow
             title="Terms of Service"
             subtitle="birdo.app/terms"
             leadingIcon={FileText}
             leadingTint={brand.accentSoft}
-            onClick={() => openExternal(TERMS_URL)}
+            onClick={() => openExternal(TERMS_URL).catch(() => {})}
           />
           <BirdoNavRow
             title="Manage on web"
             subtitle="dashboard.birdo.app"
             leadingIcon={ExternalLink}
             leadingTint={brand.accentSoft}
-            onClick={() => openExternal(DASHBOARD_URL)}
+            onClick={() => openExternal(DASHBOARD_URL).catch(() => {})}
           />
         </BirdoCard>
 

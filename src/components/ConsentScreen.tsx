@@ -1,4 +1,5 @@
 import { motion } from 'framer-motion';
+import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { Shield, Eye, BarChart3, ShieldOff } from 'lucide-react';
 import { AppIconMark, BirdoButton, BirdoCard } from './birdo';
 import { brand } from '@/lib/birdo-theme';
@@ -87,11 +88,14 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
           </motion.div>
 
           {/* Privacy policy link */}
-          <motion.a
-            href="https://birdo.app/privacy"
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label="Read the full Privacy Policy (opens in a new tab)"
+          {/* Open in the SYSTEM browser via the scoped shell plugin (like every
+              other external link) — a raw <a target="_blank"> is outside the
+              shell allowlist, and a webview that follows it in-place strands
+              this frameless window on a remote page with no way back. */}
+          <motion.button
+            type="button"
+            onClick={() => openExternal('https://birdo.app/privacy').catch(() => {})}
+            aria-label="Read the full Privacy Policy (opens in your browser)"
             className="mb-6 text-sm underline underline-offset-2 transition hover:opacity-80"
             style={{ color: brand.accentSoft }}
             initial={{ opacity: 0 }}
@@ -99,7 +103,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             transition={{ duration: 0.5, delay: 0.3 }}
           >
             Read the full Privacy Policy
-          </motion.a>
+          </motion.button>
 
           {/* Accept button */}
           <motion.div

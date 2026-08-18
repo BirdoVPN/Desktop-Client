@@ -115,7 +115,7 @@ export function Pricing() {
   // Default to yearly (matches mobile) so the discounted annual price leads.
   const [period, setPeriod] = useState<BillingPeriod>('yearly');
 
-  const openBilling = () => openExternal(`${DASHBOARD_URL}/billing`);
+  const openBilling = () => openExternal(`${DASHBOARD_URL}/billing`).catch(() => {});
 
   return (
     // Transparent so the App-level PixelCanvas backdrop shows through (matches
