@@ -449,16 +449,32 @@ impl VpnManager {
             Ok(Ok(tunnel)) => {
                 tracing::info!("Tunnel started successfully");
 
+                // P1-dk-manager-tunnel-dropped-state-connected: store the tunnel
+                // BEFORE transitioning to Connected. The old order dropped a live
+                // tunnel on a write-lock timeout while leaving state=Connected —
+                // green UI with traffic on the physical NIC. If the store fails,
+                // stop the tunnel and surface Error instead.
+                match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
+                    Ok(mut guard) => *guard = Some(tunnel),
+                    Err(_) => {
+                        tracing::error!(
+                            "Tunnel write lock timeout — stopping fresh tunnel instead of \
+                             reporting Connected without one"
+                        );
+                        let _ = tunnel.stop().await;
+                        let _ = self
+                            .write_state_with_timeout(ConnectionState::Error(
+                                "Internal error storing tunnel state".to_string(),
+                            ))
+                            .await;
+                        return Err("Tunnel state lock timeout during connect".to_string());
+                    }
+                }
+
                 // Update state with timeout protection
                 let _ = self
                     .write_state_with_timeout(ConnectionState::Connected)
                     .await;
-
-                // Update tunnel reference with timeout
-                match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
-                    Ok(mut guard) => *guard = Some(tunnel),
-                    Err(_) => tracing::error!("Tunnel write lock timeout"),
-                }
 
                 match timeout(STATE_LOCK_TIMEOUT, self.current_config.write()).await {
                     Ok(mut guard) => {
