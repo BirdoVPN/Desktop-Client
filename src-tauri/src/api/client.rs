@@ -111,6 +111,15 @@ impl BirdoApi {
 
     /// Return a clone of the hardened reqwest Client for reuse by other commands.
     /// This avoids creating secondary un-hardened clients that bypass TLS pinning.
+    ///
+    /// KNOWN EXCEPTION (P1-dk-updater-unpinned): the tauri-plugin-updater check
+    /// against `https://api.birdo.app/updates/...` (tauri.conf.json `updater`)
+    /// uses the plugin's OWN reqwest client, which is NOT pinned. Installed
+    /// code is still protected by the minisign signature check; the residual
+    /// risk is that a mis-issued certificate holder can suppress "update
+    /// available" (version-pinning) and fingerprint version/target/arch.
+    /// Fixing it means either the plugin's custom-client builder hook or a
+    /// pre-fetched manifest via BirdoApi.
     pub fn http_client(&self) -> Client {
         self.client.clone()
     }
@@ -374,17 +383,11 @@ impl BirdoApi {
     /// P2-15: Report connection quality telemetry to the backend.
     /// Fire-and-forget — callers should not block on failure.
     pub async fn report_quality(&self, report: &QualityReport) -> Result<(), ApiError> {
+        // 204 No Content is the expected reply; handle_response maps an empty
+        // 2xx body to JSON `null`, so no parse-error special-casing is needed.
         let _: serde_json::Value = self
             .post(endpoints::vpn::QUALITY_REPORT, report, true)
-            .await
-            .or_else(|e| {
-                // 204 No Content is expected — treat parse errors as success
-                if matches!(e, ApiError::Parse(_)) {
-                    Ok(serde_json::Value::Null)
-                } else {
-                    Err(e)
-                }
-            })?;
+            .await?;
         Ok(())
     }
 
@@ -574,6 +577,16 @@ impl BirdoApi {
         body: Option<&(dyn erased_serde::Serialize + Sync)>,
         auth: bool,
     ) -> Result<T, ApiError> {
+        // Snapshot the token BEFORE the first attempt so that, after taking the
+        // refresh lock, we can tell whether another task already refreshed while
+        // we waited — and only then re-send the original request. Blindly
+        // re-sending first tripled request volume at the exact moment every
+        // session's 1 h access token expired.
+        let token_before = if auth {
+            self.access_token_value().await
+        } else {
+            None
+        };
         let result = self.do_request::<T>(&method, path, body, auth).await;
 
         // If we got a 401 and we have a refresh token, try refreshing
@@ -583,10 +596,15 @@ impl BirdoApi {
                 // H-1 FIX: Serialize token refresh attempts to prevent concurrent
                 // refreshes from racing and overwriting each other's tokens.
                 let _guard = self.refresh_lock.lock().await;
-                // Re-check: another thread may have already refreshed while we waited
-                let retry_first = self.do_request::<T>(&method, path, body, auth).await;
-                if !matches!(&retry_first, Err(ApiError::Unauthorized)) {
-                    return retry_first;
+                // Re-check: another task may have already refreshed while we
+                // waited on the lock. Only if the token actually CHANGED is a
+                // pre-refresh retry worth a round-trip; otherwise go straight to
+                // the refresh instead of re-sending a request that will 401.
+                if self.access_token_value().await != token_before {
+                    let retry_first = self.do_request::<T>(&method, path, body, auth).await;
+                    if !matches!(&retry_first, Err(ApiError::Unauthorized)) {
+                        return retry_first;
+                    }
                 }
                 tracing::info!("Got 401 — attempting transparent token refresh");
                 match self.refresh_token_internal().await {
@@ -794,11 +812,18 @@ impl BirdoApi {
         // (see super::cert_pin) — no post-response check is required.
         let status = response.status();
 
-        if matches!(status, StatusCode::OK | StatusCode::CREATED) {
-            return response
-                .json()
+        if status.is_success() {
+            // Treat the WHOLE 2xx range as success, not just 200/201: the
+            // quality-report endpoint returns 204 No Content, and any endpoint
+            // adopting 202/204 must not silently start "failing". An empty body
+            // deserializes as JSON `null` (fits `serde_json::Value` and any
+            // `Option<T>`-shaped response).
+            let bytes = response
+                .bytes()
                 .await
-                .map_err(|e| ApiError::Parse(e.to_string()));
+                .map_err(|e| ApiError::Parse(e.to_string()))?;
+            let payload: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
+            return serde_json::from_slice(payload).map_err(|e| ApiError::Parse(e.to_string()));
         }
 
         // Parse the body once for typed protocol errors and backend-provided messages.
