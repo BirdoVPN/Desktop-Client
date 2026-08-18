@@ -513,7 +513,13 @@ impl UtunTunnel {
                         let write_len = 4 + decrypted.len();
                         let fd = utun_fd;
                         let buf = write_buf[..write_len].to_vec();
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let expected = buf.len();
+                        // P1-dk-macos-rx-counters-on-failed-write: only count a
+                        // packet as received when the utun write fully succeeds
+                        // (as the Linux path does) — otherwise a dead utun keeps
+                        // RX rising and the watchdog's data-plane signal never
+                        // fires.
+                        let write_ok = tokio::task::spawn_blocking(move || {
                             let written = unsafe {
                                 libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
                             };
@@ -523,11 +529,15 @@ impl UtunTunnel {
                                     std::io::Error::last_os_error()
                                 );
                             }
+                            written == expected as isize
                         })
-                        .await;
+                        .await
+                        .unwrap_or(false);
 
-                        bytes_received.fetch_add(packet_len, Ordering::Relaxed);
-                        packets_received.fetch_add(1, Ordering::Relaxed);
+                        if write_ok {
+                            bytes_received.fetch_add(packet_len, Ordering::Relaxed);
+                            packets_received.fetch_add(1, Ordering::Relaxed);
+                        }
                     } else {
                         break; // nothing queued — stop draining
                     }
