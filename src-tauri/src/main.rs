@@ -148,11 +148,17 @@ fn main() {
         // MAX_LOG_BYTES, move it aside to birdo.log.1 (clobbering any older
         // one) before we start appending to a fresh file.
         rotate_log_if_large(&p);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&p)
-            .ok()?;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create(true).append(true);
+        // P6-CLI-D-08: the log records which VPN nodes were used and when —
+        // keep it owner-readable only on multi-user Unix hosts. (Windows
+        // relies on the per-user %APPDATA% ACL, same as the settings file.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.mode(0o600);
+        }
+        let file = open_opts.open(&p).ok()?;
         Some(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -161,7 +167,20 @@ fn main() {
                 // down the whole process from inside the logging path — and
                 // possibly before earlier logs are flushed. Degrade gracefully
                 // by dropping that single log line (io::sink) instead.
+                //
+                // PWR-5 addendum: rotate_log_if_large only runs at startup, so a
+                // weeks-long session used to grow birdo.log without bound. Hard
+                // in-session cap: once the file passes 2x MAX_LOG_BYTES, drop
+                // further lines (the next launch rotates it aside). A stat per
+                // log event at info level is negligible.
                 .with_writer(move || -> Box<dyn std::io::Write> {
+                    if file
+                        .metadata()
+                        .map(|m| m.len() > 2 * MAX_LOG_BYTES)
+                        .unwrap_or(false)
+                    {
+                        return Box::new(std::io::sink());
+                    }
                     match file.try_clone() {
                         Ok(f) => Box::new(f),
                         Err(_) => Box::new(std::io::sink()),
@@ -835,10 +854,42 @@ fn write_crash_report(location: &str, message: &str) {
 
     let _ = std::fs::create_dir_all(&crash_dir);
 
+    // P6-CLI-D-05: cap the directory — crash files used to accumulate forever
+    // (a permanent, timestamped on-disk history on a product that claims to
+    // retain nothing). Keep the newest few; the filename's timestamp format
+    // sorts lexicographically, so a plain sort is a time sort.
+    const KEEP_CRASH_REPORTS: usize = 5;
+    if let Ok(entries) = std::fs::read_dir(&crash_dir) {
+        let mut crashes: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("crash_") && n.ends_with(".txt"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        crashes.sort();
+        // The report being written below makes KEEP_CRASH_REPORTS total.
+        if crashes.len() + 1 > KEEP_CRASH_REPORTS {
+            for old in &crashes[..crashes.len() + 1 - KEEP_CRASH_REPORTS] {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+    }
+
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
 
-    if let Ok(mut file) = std::fs::File::create(&crash_file) {
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create(true).truncate(true);
+    // P6-CLI-D-08: owner-readable only on multi-user Unix hosts.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+    if let Ok(mut file) = open_opts.open(&crash_file) {
         let _ = writeln!(file, "Birdo VPN Crash Report");
         let _ = writeln!(file, "=====================");
         let _ = writeln!(file, "Time: {}", chrono::Utc::now().to_rfc3339());
@@ -846,7 +897,11 @@ fn write_crash_report(location: &str, message: &str) {
         let _ = writeln!(file, "Message: {}", message);
         let _ = writeln!(file);
         let _ = writeln!(file, "Backtrace:");
-        let _ = writeln!(file, "{:?}", std::backtrace::Backtrace::capture());
+        // Backtraces can carry PII in path segments (home directory = local
+        // username) and panic payload fragments — run them through the same
+        // redaction as everything else that reaches disk.
+        let backtrace = format!("{:?}", std::backtrace::Backtrace::capture());
+        let _ = writeln!(file, "{}", crate::utils::redact::sanitize_error(&backtrace));
 
         error!("Crash report written to {:?}", crash_file);
     }
