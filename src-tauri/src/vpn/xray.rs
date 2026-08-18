@@ -683,4 +683,48 @@ mod tests {
             "www.example.com"
         );
     }
+
+    /// P6-CLI-D-10: the generated config must produce no per-connection
+    /// destination data client-side — the `log` object is EXACTLY
+    /// `{"loglevel": "warning"}` (an `access` path is Xray's per-connection
+    /// destination log), and every inbound has sniffing explicitly disabled.
+    /// Runs in CI (`cargo test` dies at exe load on dev Windows hosts —
+    /// 0xC0000139); its source-scan twin lives in tests/privacy_pins.rs and
+    /// runs everywhere.
+    #[test]
+    fn xray_config_has_no_access_log_and_sniffing_stays_disabled() {
+        let config = build_xray_config(
+            51821,
+            "1.2.3.4",
+            8443,
+            51820,
+            "test-uuid",
+            "test-pubkey",
+            "abcdef01",
+            "www.example.com",
+            "xtls-rprx-vision",
+        );
+
+        let log = config["log"].as_object().expect("log object present");
+        assert_eq!(
+            log.keys().collect::<Vec<_>>(),
+            vec!["loglevel"],
+            "P6-CLI-D-10 broken: the log object grew a key beyond loglevel — \
+             an `access` path is a per-connection destination log on the \
+             customer's machine"
+        );
+        assert_eq!(log["loglevel"], "warning");
+
+        let inbounds = config["inbounds"].as_array().expect("inbounds array");
+        assert!(!inbounds.is_empty(), "vacuity guard: no inbounds generated");
+        for inbound in inbounds {
+            assert_eq!(
+                inbound["sniffing"]["enabled"],
+                serde_json::Value::Bool(false),
+                "P6-CLI-D-10 broken: inbound {:?} no longer disables sniffing — \
+                 sniffing makes Xray parse and expose destination domains",
+                inbound["tag"]
+            );
+        }
+    }
 }
