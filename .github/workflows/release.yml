@@ -1066,7 +1066,10 @@ jobs:
       # the names users download (the per-platform files this replaces listed
       # local build paths like ./deb/… that never matched a published asset,
       # so `sha256sum -c` could never succeed). Its single Sigstore bundle
-      # transitively covers every artifact:
+      # transitively covers every artifact EXCEPT the updater `.sig` files,
+      # which the find below deliberately excludes — those are verified
+      # independently by the updater against its embedded minisign public key,
+      # not via this checksums file (P5-CICD-25):
       #   cosign verify-blob --bundle SHA256SUMS.txt.sigstore SHA256SUMS.txt
       #   sha256sum -c SHA256SUMS.txt --ignore-missing
       - name: Install Cosign
