@@ -188,20 +188,20 @@ impl Default for AppSettings {
             wireguard_mtu: 0,
             stealth_mode: false,      // premium — off by default
             quantum_protection: true, // post-quantum on by default
-            // Always-on kill switch. ON by default where it is REAL (Windows),
-            // OFF elsewhere — because on macOS and Linux `is_lockdown_mode()`
-            // returns a hard-coded `false` (killswitch.rs), so nothing ever
-            // installs a steady-state block. Defaulting it to `true` there made
-            // the stored settings, and the UI reading them, claim a protection
-            // that did not exist: a user could see "always-on" enabled while the
-            // only containment was split-default routing — exactly the
-            // configuration TunnelVision (CVE-2024-3661) defeats.
+            // LOCKDOWN mode. ON by default where it is REAL (Windows), OFF
+            // elsewhere — on macOS and Linux `is_lockdown_mode()` returns a
+            // hard-coded `false` (killswitch.rs), so this flag does nothing
+            // there and defaulting it `true` would make the stored settings,
+            // and the UI reading them, claim semantics that do not exist.
             //
-            // This is the honesty half of the fix. The protection half (wiring
-            // lockdown through on Unix) is deliberately NOT done here: it must
-            // come after routes reliably capture traffic and after the kill
-            // switch permits our own control plane, or an always-on block locks
-            // users out with no reconnect path.
+            // Note the distinction: macOS/Linux DO now hold a steady-state
+            // block for the whole Connected session whenever the kill switch
+            // is enabled (killswitch::holds_block_while_connected — the
+            // P1-ks-reactive-detection-window fix), so a silent tunnel death
+            // fails closed. What they do NOT have is lockdown's
+            // keep-blocked-after-give-up semantics, which is what this flag
+            // governs: on Unix the give-up/offline-cap branches still release
+            // the block so a dead session cannot strand the machine.
             #[cfg(target_os = "windows")]
             lockdown_mode: true,
             #[cfg(not(target_os = "windows"))]

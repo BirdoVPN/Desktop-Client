@@ -238,9 +238,10 @@ impl UtunTunnel {
 
         // F-001 (P0): block IPv6 egress for the whole Connected session. Installed
         // here — at tunnel start, INDEPENDENT of the kill-switch enabled/lockdown
-        // setting — exactly as Windows does (tunnel.rs LEAK-2). The reactive kill
-        // switch cannot cover this: it is torn down once the tunnel is healthy, and
-        // an IPv6 leak never drops the (IPv4-only) tunnel so it never trips.
+        // setting — exactly as Windows does (tunnel.rs LEAK-2). The kill switch
+        // cannot cover this: it is preference-gated (and released on disarm/
+        // give-up), and an IPv6 leak never drops the (IPv4-only) tunnel so the
+        // reactive path never trips.
         //
         // macOS blocks IPv6 unconditionally — including on dual-stack nodes —
         // and that is deliberate, not an oversight.

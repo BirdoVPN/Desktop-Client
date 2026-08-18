@@ -341,8 +341,12 @@ pub fn is_enabled() -> bool {
 }
 
 /// Whether the kill switch is in lockdown (always-on) mode. Cross-platform
-/// accessor used by the auto-reconnect loop so it keeps the block active
-/// continuously instead of deactivating in steady Connected state.
+/// accessor used by the auto-reconnect loop's GIVE-UP and offline-pause-cap
+/// branches: lockdown is the explicit user opt-in that keeps traffic blocked
+/// even when the session is over. Hard false off-Windows — the Unix
+/// steady-state block (see [`holds_block_while_connected`]) is NOT lockdown
+/// and must never inherit lockdown's keep-blocked-after-give-up semantics,
+/// or a Unix user would be stranded behind the firewall.
 pub fn is_lockdown_mode() -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -351,6 +355,36 @@ pub fn is_lockdown_mode() -> bool {
     #[cfg(not(target_os = "windows"))]
     {
         false
+    }
+}
+
+/// Whether the platform keeps the block-all ENGAGED for the whole Connected
+/// session (P1-ks-reactive-detection-window).
+///
+/// Gates only the "deactivate now that we are healthy" sites (auto-reconnect's
+/// Connected arm, release_switch_guard, the reapply release): where this is
+/// true, a healthy tunnel keeps the block and carries its traffic through the
+/// tunnel-interface permits (pf utun pass rules / iptables `-o birdo0 ACCEPT`
+/// / WFP tunnel-LUID permit), so a SILENT tunnel death leaks nothing while
+/// the liveness watchdog needs up to ~60s to notice and reconnect.
+///
+/// - Windows: lockdown mode only — reactive stays the default there, where
+///   the WFP lockdown opt-in already exists.
+/// - macOS/Linux: always, whenever the kill switch is armed. There is no
+///   lockdown flag off-Windows, and a reactive-only kill switch on those
+///   platforms is exactly the finding's ~60s real-IP leak window.
+///
+/// This must NEVER gate the escape hatches — disconnect_vpn → disarm(),
+/// set_killswitch_live(false), the give-up branches and the offline-pause cap
+/// (those use [`is_lockdown_mode`]) — so it cannot strand anyone.
+pub fn holds_block_while_connected() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        wfp::is_lockdown_mode()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        is_enabled()
     }
 }
 
@@ -367,11 +401,13 @@ pub fn is_lockdown_mode() -> bool {
 /// clear — while the UI promised an always-on kill switch.
 ///
 /// This arms the INTENT and initializes the WFP engine as part of the connect
-/// lifecycle, so the existing reactive protection actually engages. It does NOT
-/// install the block-all filters itself: the auto-reconnect health loop owns the
-/// activate/deactivate transitions (it deactivates while healthy-Connected and
-/// activates during a drop/reconnect gap), so arming here must not fight that
-/// state machine.
+/// lifecycle, so the existing reactive protection actually engages. On Windows
+/// (outside lockdown) it does NOT install the block-all filters itself: the
+/// auto-reconnect health loop owns the activate/deactivate transitions (it
+/// deactivates while healthy-Connected and activates during a drop/reconnect
+/// gap), so arming here must not fight that state machine. On macOS/Linux it
+/// DOES activate the block immediately and the loop keeps it engaged for the
+/// whole session — see [`holds_block_while_connected`].
 ///
 /// Best-effort: a non-elevated host (should not happen — the app manifest
 /// requires administrator) logs and returns `Ok(false)` rather than failing the
@@ -431,8 +467,46 @@ pub async fn arm(app: &AppHandle) -> Result<bool, String> {
         return Ok(true);
     }
 
-    tracing::info!("Kill switch armed for active session (reactive)");
-    Ok(true)
+    // STEADY-STATE BLOCK (macOS/Linux) — P1-ks-reactive-detection-window:
+    // activate the block-all NOW and keep it engaged for the whole Connected
+    // session. The tunnel is already up when arm() runs on the connect path,
+    // and all the firewall backends permit tunneled traffic through an engaged
+    // block (pf utun0-15 pass rules, iptables `-o birdo0 ACCEPT`), which the
+    // switch-guard/reapply paths already rely on mid-session. Reactive-only
+    // protection left every SILENT tunnel death (dead peer, expired NAT
+    // mapping, sleep/resume, Wi-Fi→LTE handover) leaking real-IP traffic —
+    // DNS included — for the up-to-~60s the liveness watchdog needs to trip.
+    // With the block held, a dead tunnel fails CLOSED instantly and the
+    // watchdog/auto-reconnect still own recovery.
+    //
+    // Not a third mechanism: the escape hatches stay exactly the disarm-on-
+    // quit / disconnect_vpn → disarm() / set_killswitch_live(false) /
+    // give-up + offline-pause-cap paths, all of which release the block —
+    // is_lockdown_mode() stays hard false here, so none of lockdown's
+    // keep-blocked-after-give-up semantics apply.
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Err(e) = activate_killswitch().await {
+            // Degrade to reactive rather than failing the connect: the block
+            // still engages on a drop, this session just keeps the detection
+            // window open. KILLSWITCH_ENABLED stays true.
+            tracing::warn!(
+                "Steady-state block activation failed ({}); falling back to reactive kill switch for this session",
+                e
+            );
+            return Ok(false);
+        }
+        tracing::info!(
+            "Kill switch armed with the steady-state block engaged (always-on while connected)"
+        );
+        Ok(true)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        tracing::info!("Kill switch armed for active session (reactive)");
+        Ok(true)
+    }
 }
 
 /// Disarm the kill switch when the user ends the session: clear the intent flag

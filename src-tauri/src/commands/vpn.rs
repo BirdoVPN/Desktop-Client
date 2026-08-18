@@ -532,13 +532,16 @@ pub(super) async fn engage_switch_guard(vpn_manager: &VpnManager) -> bool {
 /// CLOSED (reapply_vpn_settings semantics; Disconnect and the Settings
 /// kill-switch toggle remain the user's explicit escape hatches).
 ///
-/// Lockdown (always-on) keeps its block: is_lockdown_mode() is hard false on
-/// macOS/Linux — so this can never strand a Unix user — and on Windows the
-/// tunnel layer has already re-baked the active block with the new adapter
-/// LUID; releasing it here would open the reactive detection window lockdown
-/// exists to close.
+/// Platforms that hold the block for the whole Connected session keep it: on
+/// Windows lockdown the tunnel layer has already re-baked the active block
+/// with the new adapter LUID, and on macOS/Linux the steady-state block IS the
+/// session's leak protection (connect_vpn/quick_connect re-baked the new relay
+/// permit into it before the switch, and arm() has just re-activated it for
+/// the new tunnel) — releasing it here would re-open the reactive detection
+/// window it exists to close. This cannot strand a Unix user: Disconnect
+/// (disarm) and the Settings toggle (set_killswitch_live) still release.
 pub(super) async fn release_switch_guard(guard_engaged: bool) {
-    if !guard_engaged || crate::commands::killswitch::is_lockdown_mode() {
+    if !guard_engaged || crate::commands::killswitch::holds_block_while_connected() {
         return;
     }
     if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
@@ -1252,12 +1255,23 @@ pub async fn reapply_vpn_settings(
     //
     // Only release on SUCCESS: a rebuild that failed must stay failed CLOSED, and
     // the auto-reconnect loop then owns recovery.
+    //
+    // And only where the platform does NOT hold the block for the whole
+    // session: on macOS/Linux (and Windows lockdown) the connect path's arm()
+    // has just re-activated the steady-state block with the NEW relay permit
+    // baked in — the rebuilt tunnel carries traffic through it, and releasing
+    // it here would re-open the reactive detection window for the rest of the
+    // session. The old frozen-after-reapply failure mode this release fixed
+    // cannot return: connects re-bake the relay permit into a live block
+    // (connect_vpn/quick_connect update_vpn_server / pf re-activate).
     if matches!(result, Ok(true)) {
-        if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
-            tracing::warn!(
-                "Kill switch deactivation after a successful settings reapply failed: {}",
-                e
-            );
+        if !crate::commands::killswitch::holds_block_while_connected() {
+            if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
+                tracing::warn!(
+                    "Kill switch deactivation after a successful settings reapply failed: {}",
+                    e
+                );
+            }
         }
     } else {
         // FAILED REBUILD MUST LEAVE A FAILED STATE.

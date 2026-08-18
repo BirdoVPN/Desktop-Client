@@ -386,10 +386,16 @@ impl AutoReconnectService {
                                 attempt_count.store(0, Ordering::SeqCst);
 
                                 // Deactivate kill switch now that we're connected
-                                // — UNLESS lockdown (always-on) mode is enabled,
-                                // where the block stays active continuously to
-                                // close the reactive detection window.
-                                if !killswitch::is_lockdown_mode() {
+                                // — UNLESS the platform holds the block for the
+                                // whole session (Windows lockdown mode; ALWAYS on
+                                // macOS/Linux, where the steady-state block is
+                                // what closes the reactive detection window — the
+                                // tunnel-interface permits carry the traffic).
+                                // The give-up and offline-pause-cap branches
+                                // below still gate on is_lockdown_mode() and DO
+                                // release the block on Unix, so this cannot
+                                // strand anyone once the session is over.
+                                if !killswitch::holds_block_while_connected() {
                                     let _ = killswitch::deactivate_killswitch().await;
                                 }
 
