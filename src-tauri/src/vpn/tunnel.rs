@@ -854,7 +854,12 @@ impl WintunTunnel {
                     && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
             });
             if endpoint_host.is_empty() || endpoint_host.len() > 253 || !valid_labels {
-                return Err(format!("Invalid endpoint hostname: '{}'", endpoint_host));
+                // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
+                // in manager.rs / auto_reconnect.rs at levels release builds write.
+                return Err(format!(
+                    "Invalid endpoint hostname: '{}'",
+                    crate::utils::redact::redact_hostname(endpoint_host)
+                ));
             }
         }
 

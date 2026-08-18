@@ -494,7 +494,14 @@ impl VpnManager {
                 Ok(())
             }
             Ok(Err(e)) => {
-                tracing::error!("Tunnel creation/start failed: {}", e);
+                // P6-CLI-D-03 (defence in depth): this is a catch-all for error
+                // strings built anywhere in the tunnel stack. Individual sites redact
+                // their own endpoints, but sanitising here means a future format!()
+                // that forgets cannot reintroduce the leak.
+                tracing::error!(
+                    "Tunnel creation/start failed: {}",
+                    crate::utils::redact::sanitize_error(&e)
+                );
                 let err = VpnError::General(e);
                 let _ = self
                     .write_state_with_timeout(ConnectionState::Error(err.to_string()))

@@ -730,7 +730,12 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
             || endpoint_host.starts_with('-')
             || endpoint_host.starts_with('.')
         {
-            return Err(format!("Invalid endpoint hostname: '{}'", endpoint_host));
+            // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
+            // in manager.rs / auto_reconnect.rs at levels release builds write.
+            return Err(format!(
+                "Invalid endpoint hostname: '{}'",
+                crate::utils::redact::redact_hostname(endpoint_host)
+            ));
         }
     }
 

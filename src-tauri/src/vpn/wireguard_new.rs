@@ -152,22 +152,33 @@ impl WireGuardSession {
                     crate::utils::redact_endpoint(endpoint)
                 );
                 // Extract host and port from the endpoint string
+                // P6-CLI-D-03: these Err strings are logged verbatim by the catch-all
+                // handlers (manager.rs, auto_reconnect.rs) at levels release builds
+                // write, so the endpoint must be redacted HERE — the warn! above
+                // already does it, and an unredacted sibling defeats it.
                 let (host, port) = {
                     let parts: Vec<&str> = endpoint.rsplitn(2, ':').collect();
                     if parts.len() != 2 {
-                        return Err(format!("Invalid endpoint format: {}", endpoint));
+                        return Err(format!(
+                            "Invalid endpoint format: {}",
+                            crate::utils::redact_endpoint(endpoint)
+                        ));
                     }
-                    let port: u16 = parts[0]
-                        .parse()
-                        .map_err(|_| format!("Invalid port in endpoint: {}", endpoint))?;
+                    let port: u16 = parts[0].parse().map_err(|_| {
+                        format!(
+                            "Invalid port in endpoint: {}",
+                            crate::utils::redact_endpoint(endpoint)
+                        )
+                    })?;
                     (parts[1].to_string(), port)
                 };
-                let ip = super::doh::resolve_via_doh(&host)
-                    .await
-                    .map_err(|e| format!(
+                let ip = super::doh::resolve_via_doh(&host).await.map_err(|e| {
+                    format!(
                         "DoH resolution failed for '{}': {}. Pre-resolve endpoints to IP:port to avoid this.",
-                        endpoint, e
-                    ))?;
+                        crate::utils::redact_endpoint(endpoint),
+                        e
+                    )
+                })?;
                 SocketAddr::from((ip, port))
             }
         };

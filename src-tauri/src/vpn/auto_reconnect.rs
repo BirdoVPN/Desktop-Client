@@ -837,7 +837,12 @@ impl AutoReconnectService {
                                                                 tracing::info!("Auto-reconnect successful on attempt {}", attempts + 1);
                                                             }
                                                             Err(e) => {
-                                                                tracing::warn!("Auto-reconnect tunnel failed on attempt {}: {}", attempts + 1, e);
+                                                                // P6-CLI-D-03 (defence in depth) — see manager.rs.
+                            tracing::warn!(
+                                "Auto-reconnect tunnel failed on attempt {}: {}",
+                                attempts + 1,
+                                crate::utils::redact::sanitize_error(&e)
+                            );
                                                             }
                                                         }
                                                     }
@@ -938,9 +943,10 @@ impl AutoReconnectService {
                             if cfg.enabled && info_snapshot.is_some() {
                                 let attempts = attempt_count.load(Ordering::SeqCst);
 
+                                // P6-CLI-D-03 (defence in depth) — see manager.rs.
                                 tracing::warn!(
                                     "Connection error detected: {}, attempting recovery (attempt {})",
-                                    error_msg,
+                                    crate::utils::redact::sanitize_error(error_msg),
                                     attempts + 1
                                 );
 

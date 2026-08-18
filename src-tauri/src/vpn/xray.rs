@@ -441,13 +441,20 @@ fn find_available_port(start: u16) -> Option<u16> {
 
 /// Parse "host:port" endpoint string
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16), String> {
+    // P6-CLI-D-03: these Err strings reach release-level catch-all loggers verbatim.
     let parts: Vec<&str> = endpoint.rsplitn(2, ':').collect();
     if parts.len() != 2 {
-        return Err(format!("Invalid endpoint format: {}", endpoint));
+        return Err(format!(
+            "Invalid endpoint format: {}",
+            crate::utils::redact_endpoint(endpoint)
+        ));
     }
-    let port = parts[0]
-        .parse::<u16>()
-        .map_err(|_| format!("Invalid port in endpoint: {}", endpoint))?;
+    let port = parts[0].parse::<u16>().map_err(|_| {
+        format!(
+            "Invalid port in endpoint: {}",
+            crate::utils::redact_endpoint(endpoint)
+        )
+    })?;
     Ok((parts[1].to_string(), port))
 }
 

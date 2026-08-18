@@ -124,12 +124,13 @@ pub async fn connect_multi_hop(
     // observe their own egress country, so the client is the only thing that can
     // tell them. Refuse rather than display a route we cannot confirm.
     let Some(ref mh) = mh_response.multi_hop else {
+        // P6-CLI-D-03: node ids are connection history and ERROR IS written in
+        // release, so the ids go to debug and the event stays loud without them.
         tracing::error!(
-            entry = %entryNodeId,
-            exit = %exitNodeId,
             "Multi-hop connect returned success but NO route block — refusing to present an \
              unconfirmed route as multi-hop"
         );
+        tracing::debug!(entry = %entryNodeId, exit = %exitNodeId, "Unconfirmed multi-hop route");
         return Err(
             "The server did not confirm the Multi-Hop route. Not connecting, because this \
              could leave you on a single-hop tunnel while the app showed two."
@@ -137,12 +138,14 @@ pub async fn connect_multi_hop(
         );
     };
     if mh.entry_node.id != entryNodeId || mh.exit_node.id != exitNodeId {
-        tracing::error!(
+        // P6-CLI-D-03: same treatment — four raw node ids must not reach birdo.log.
+        tracing::error!("Multi-hop route MISMATCH — refusing");
+        tracing::debug!(
             requested_entry = %entryNodeId,
             requested_exit = %exitNodeId,
             got_entry = %mh.entry_node.id,
             got_exit = %mh.exit_node.id,
-            "Multi-hop route MISMATCH — refusing"
+            "Multi-hop route mismatch detail"
         );
         return Err(format!(
             "The server established a different Multi-Hop route ({}) than the one selected. \
