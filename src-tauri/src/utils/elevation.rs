@@ -1,24 +1,17 @@
-#![allow(dead_code)]
-//! Elevation helper for privileged operations (C-1 FIX)
+//! Privilege checks for the desktop client.
 //!
-//! Instead of running the entire Tauri app as administrator, this module
-//! provides a `run_elevated()` function that spawns individual commands
-//! with elevated privileges via PowerShell `Start-Process -Verb RunAs`.
+//! REALITY OF THE PRIVILEGE MODEL (do not trust older comments): the entire
+//! Tauri app — webview, IPC, HTTP client, credential store — runs ELEVATED
+//! (Administrator on Windows via the manifest, root on macOS/Linux). There is
+//! no per-command elevation broker: a renderer/webview compromise is therefore
+//! an Administrator/root compromise. The per-command `run_elevated()` helper
+//! this module once carried was never called by any shipped code path (and its
+//! Windows arm interpolated the program name into a PowerShell string); it was
+//! removed in the 2026-08 dead-code sweep rather than left as a misleading
+//! description of a trust boundary that does not exist.
 //!
-//! This limits the attack surface: the webview, IPC, HTTP client, and
-//! credential store all run unprivileged. Only specific netsh / route
-//! commands that truly require admin are elevated.
-//!
-//! # Usage
-//! ```rust,no_run,ignore
-//! use crate::utils::elevation::{run_elevated, is_elevated};
-//!
-//! if !is_elevated() {
-//!     run_elevated("netsh", &["advfirewall", "firewall", "add", "rule", ...])?;
-//! }
-//! ```
-
-// Command::new replaced by super::hidden_cmd() for CREATE_NO_WINDOW
+//! What remains is what the app actually uses: `is_elevated()` pre-flight
+//! checks, and platform-appropriate copy for the "run elevated" error.
 
 /// Platform-appropriate copy for the "you must run elevated" pre-flight error.
 /// The old Windows-only wording ("right-click → Run as administrator") shipped
@@ -93,181 +86,5 @@ pub fn is_elevated() -> bool {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
             .unwrap_or(false)
-    }
-}
-
-/// Run a command with elevated privileges.
-///
-/// If the process is already elevated, runs the command directly.
-/// Otherwise:
-/// - Windows: Uses PowerShell `Start-Process -Verb RunAs` to request UAC.
-/// - macOS: Uses `osascript` to request admin privileges via authorization prompt.
-///
-/// Returns the combined stdout + stderr output.
-pub fn run_elevated(program: &str, args: &[&str]) -> Result<String, String> {
-    if is_elevated() {
-        // Already elevated — run directly
-        let output = super::hidden_cmd(program)
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run {}: {}", program, e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if !output.status.success() {
-            tracing::debug!("Elevated command stderr: {}", stderr);
-            return Err(format!(
-                "Command {} failed: {}",
-                program,
-                if stderr.is_empty() { &stdout } else { &stderr }
-            ));
-        }
-
-        return Ok(format!("{}{}", stdout, stderr));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Not elevated — use PowerShell to spawn with RunAs
-        let args_str = args
-            .iter()
-            .map(|a| format!("'{}'", a.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let ps_command = format!(
-            "Start-Process -FilePath '{}' -ArgumentList {} -Verb RunAs -Wait -WindowStyle Hidden -PassThru | Select-Object -ExpandProperty ExitCode",
-            program,
-            args_str
-        );
-
-        tracing::debug!("Elevating command: {} {}", program, args.join(" "));
-
-        let output = super::hidden_cmd("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
-            .output()
-            .map_err(|e| format!("Failed to elevate {}: {}", program, e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(format!("Elevated command failed: {}", stderr));
-        }
-
-        Ok(stdout)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // On macOS, use osascript to run commands with admin privileges.
-        // SEC: Use POSIX single-quote wrapping for each argument — immune to
-        // injection via spaces, backticks, $(), semicolons, or double-quotes.
-        // Any literal ' in an argument is safely represented as '\'' .
-        let posix_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        let shell_cmd = std::iter::once(posix_quote(program))
-            .chain(args.iter().map(|a| posix_quote(a)))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Escape for embedding in an AppleScript double-quoted string:
-        // only backslash and double-quote need escaping at this level.
-        let apple_escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
-
-        tracing::debug!("Elevating command on macOS");
-
-        let apple_script = format!(
-            "do shell script \"{}\" with administrator privileges",
-            apple_escaped
-        );
-
-        let output = super::hidden_cmd("osascript")
-            .args(["-e", &apple_script])
-            .output()
-            .map_err(|e| format!("Failed to elevate {}: {}", program, e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(format!("Elevated command failed: {}", stderr));
-        }
-
-        Ok(stdout)
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        // On Linux, use pkexec (PolicyKit) for graphical sudo prompt.
-        // No shell escaping is needed: Command passes each arg as a distinct
-        // argv entry, so there is no shell to interpret metacharacters.
-        tracing::debug!(
-            "Elevating command on Linux via pkexec: {} {}",
-            program,
-            args.join(" ")
-        );
-
-        let output = super::hidden_cmd("pkexec")
-            .arg(program)
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to elevate via pkexec: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(format!("Elevated command failed: {}", stderr));
-        }
-
-        Ok(stdout)
-    }
-}
-
-/// Run a netsh command, elevating if necessary. (Windows only)
-///
-/// This is a convenience wrapper for the most common privilege-requiring operation.
-#[cfg(target_os = "windows")]
-pub fn run_netsh_elevated(args: &[&str]) -> Result<(), String> {
-    if is_elevated() {
-        // Already elevated — run directly
-        let output = super::hidden_cmd("netsh")
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run netsh: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("No rules match") && !stderr.contains("was not found") {
-                tracing::debug!("netsh command note: {}", stderr);
-            }
-        }
-        return Ok(());
-    }
-
-    // Not elevated — try direct first, elevate on access denied
-    let output = super::hidden_cmd("netsh")
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to run netsh: {}", e))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("requires elevation")
-        || stderr.contains("access is denied")
-        || stderr.contains("Access is denied")
-    {
-        tracing::info!("netsh requires elevation, requesting UAC...");
-        run_elevated("netsh", args)?;
-        Ok(())
-    } else if stderr.contains("No rules match") || stderr.contains("was not found") {
-        // Ignore "rule not found" errors when deleting
-        Ok(())
-    } else {
-        Err(format!("netsh failed: {}", stderr))
     }
 }

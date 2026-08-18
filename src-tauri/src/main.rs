@@ -539,8 +539,6 @@ fn main() {
             // Window placement (corner anchor / draggable)
             commands::window::set_window_position,
             // Kill switch
-            commands::killswitch::enable_killswitch,
-            commands::killswitch::disable_killswitch,
             commands::killswitch::get_killswitch_status,
             commands::killswitch::set_killswitch_live,
             // Split Tunneling

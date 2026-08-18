@@ -3,13 +3,6 @@
 pub mod elevation;
 pub mod redact;
 
-// elevation is scaffolding — used when specific operations need UAC elevation.
-// Re-exports here for convenience.
-#[cfg(target_os = "windows")]
-#[allow(unused_imports)]
-pub use elevation::run_netsh_elevated;
-#[allow(unused_imports)]
-pub use elevation::{is_elevated, run_elevated};
 pub use redact::redact_email;
 pub use redact::redact_endpoint;
 pub use redact::redact_ip;

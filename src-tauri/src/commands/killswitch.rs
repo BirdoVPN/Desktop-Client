@@ -37,95 +37,14 @@ pub struct KillSwitchStatus {
     pub blocking_connections: u32,
 }
 
-/// Enable the kill switch (arm it for when VPN disconnects)
-#[tauri::command]
-pub async fn enable_killswitch() -> Result<bool, String> {
-    tracing::info!("Enabling kill switch");
-
-    #[cfg(target_os = "windows")]
-    {
-        // Check for admin privileges
-        if !is_elevated() {
-            tracing::warn!("Kill switch requires administrator privileges");
-            return Err("Administrator privileges required for kill switch".to_string());
-        }
-
-        // Initialize WFP engine
-        if let Err(e) = wfp::initialize().await {
-            tracing::error!("Failed to initialize WFP engine: {}", e);
-            return Err(format!("Failed to initialize firewall: {}", e));
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if !is_elevated() {
-            tracing::warn!("Kill switch requires root privileges on macOS");
-            return Err("Root privileges required for kill switch".to_string());
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if !is_elevated() {
-            tracing::warn!("Kill switch requires root privileges on Linux");
-            return Err("Root privileges required for kill switch".to_string());
-        }
-    }
-
-    KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
-    tracing::info!("Kill switch enabled and ready");
-    Ok(true)
-}
-
-/// Disable the kill switch completely
-/// SECURITY: Rejects the command when VPN is in an active state (Connected,
-/// Connecting, Reconnecting) to prevent a compromised webview from silently
-/// removing leak protection while the tunnel is up.
-#[tauri::command]
-pub async fn disable_killswitch(vpn_manager: State<'_, VpnManager>) -> Result<bool, String> {
-    // F-16 FIX: Enforce VPN state check — reject if tunnel is active
-    let state = vpn_manager.get_state().await;
-    if state.is_tunnel_active() || state.can_disconnect() {
-        tracing::warn!(
-            "Refusing to disable kill switch while VPN is in {:?} state",
-            state
-        );
-        return Err(
-            "Cannot disable kill switch while VPN is connected or connecting. Disconnect first."
-                .to_string(),
-        );
-    }
-
-    tracing::info!("Disabling kill switch");
-
-    #[cfg(target_os = "windows")]
-    {
-        // Remove all WFP filters and cleanup
-        if let Err(e) = wfp::cleanup().await {
-            tracing::warn!("Failed to cleanup WFP filters: {}", e);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Err(e) = pf_deactivate_blocking().await {
-            tracing::warn!("Failed to remove pf rules: {}", e);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = firewall_linux::deactivate_blocking().await {
-            tracing::warn!("Failed to remove iptables rules: {}", e);
-        }
-    }
-
-    KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
-    // SEC-C3 FIX: No longer storing KILLSWITCH_ACTIVE — wfp::is_blocking() is the source of truth
-    tracing::info!("Kill switch disabled");
-    Ok(true)
-}
+// DEAD-CODE SWEEP (P1-dk-dead-privileged-ipc-commands): `enable_killswitch` and
+// `disable_killswitch` were registered IPC commands that no frontend code ever
+// invoked (only the IPC-contract test listed them). They widened the
+// renderer-reachable firewall-mutating surface for no functional reason —
+// `enable_killswitch` even set KILLSWITCH_ENABLED without going through `arm()`,
+// diverging from the persisted preference — so both were removed. The kill
+// switch is driven by `arm()`/`disarm()` on the connect lifecycle and by
+// `set_killswitch_live` from the settings screen.
 
 /// Activate the kill switch (block all non-VPN traffic).
 ///

@@ -101,18 +101,9 @@ describe('IPC Contract: VPN Operations', () => {
 });
 
 describe('IPC Contract: Kill Switch', () => {
-  it('enable_killswitch returns boolean', async () => {
-    mockedInvoke.mockResolvedValueOnce(true);
-    const result = await invoke('enable_killswitch');
-    expect(result).toBe(true);
-  });
-
-  it('disable_killswitch returns boolean', async () => {
-    mockedInvoke.mockResolvedValueOnce(true);
-    const result = await invoke('disable_killswitch');
-    expect(result).toBe(true);
-  });
-
+  // enable_killswitch / disable_killswitch were removed from the IPC surface
+  // (dead commands — never called by the frontend; kill switch is driven by
+  // arm()/disarm() on the connect lifecycle and set_killswitch_live).
   it('get_killswitch_status returns expected shape', async () => {
     const mockStatus = {
       enabled: true,
@@ -315,8 +306,6 @@ const FRONTEND_COMMANDS = [
   'set_tray_state',
   'set_window_position',
   // Kill switch
-  'enable_killswitch',
-  'disable_killswitch',
   'get_killswitch_status',
   'set_killswitch_live',
   // Split tunneling
