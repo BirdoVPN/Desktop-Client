@@ -405,6 +405,18 @@ pub struct WintunTunnel {
     local_network_sharing: bool,
     /// Whether split tunneling routes were added (for cleanup)
     local_network_routes_added: Arc<AtomicBool>,
+    /// P1-dk-win-failed-connect-no-dns-restore: progress flags for the
+    /// emergency unwind. A connect can fail — or be CANCELLED: the manager's
+    /// CONNECT_TIMEOUT drops the start() future mid-await — after
+    /// configure_dns has already set every physical adapter to `static none`
+    /// and the routes are in, but BEFORE `running` ever becomes true. stop()
+    /// and Drop both keyed their early-return on `running`, so nothing
+    /// restored DNS: the machine was left with no resolvers on any real NIC
+    /// (both families) until a later successful connect + clean disconnect.
+    /// These record what start() actually MODIFIED, so Drop unwinds exactly
+    /// that, independent of `running`.
+    dns_modified: Arc<AtomicBool>,
+    routes_installed: Arc<AtomicBool>,
 }
 
 impl WintunTunnel {
@@ -433,6 +445,8 @@ impl WintunTunnel {
             saved_default_gateway: Arc::new(RwLock::new(None)),
             local_network_sharing,
             local_network_routes_added: Arc::new(AtomicBool::new(false)),
+            dns_modified: Arc::new(AtomicBool::new(false)),
+            routes_installed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1063,6 +1077,11 @@ impl WintunTunnel {
         *self.resolved_endpoint_ip.write().await = Some(endpoint_ip.to_string());
         *self.saved_default_gateway.write().await = Some(default_gateway.clone());
 
+        // Mark BEFORE the first route mutation: a cancellation mid-way must
+        // already read as "dirty" so the Drop unwind removes what went in.
+        // Cleared by cleanup_routes_blocking once the routes are removed.
+        self.routes_installed.store(true, Ordering::SeqCst);
+
         // CRITICAL: Add host route for the VPN server BEFORE split routes.
         // Without this, the /1 split routes would capture the WireGuard UDP
         // traffic itself, creating a routing loop (encrypted packets re-enter
@@ -1328,6 +1347,12 @@ impl WintunTunnel {
             non_vpn_adapters.len()
         );
 
+        // Mark BEFORE the first netsh mutation below: if the connect is
+        // cancelled (CONNECT_TIMEOUT) or fails anywhere past this point, the
+        // Drop unwind must know the physical adapters were touched even though
+        // `running` never became true. Cleared by restore_dns once restored.
+        self.dns_modified.store(true, Ordering::SeqCst);
+
         // STEP 1: Disable DNS on all other adapters to prevent SMHNR leak.
         // `validate=no` is critical: without it netsh synchronously validates
         // the change against the network (NLA re-evaluation), which blocks for
@@ -1548,7 +1573,22 @@ impl WintunTunnel {
 
         // H-4 FIX: Restore from snapshots instead of blindly setting DHCP
         let snapshots = self.dns_snapshots.read().await.clone();
+        Self::restore_physical_adapters_dns(&snapshots);
 
+        // The physical adapters carry resolvers again — the emergency unwind
+        // (Drop) has nothing left to do for DNS.
+        self.dns_modified.store(false, Ordering::SeqCst);
+
+        tracing::debug!("DNS restoration complete");
+        Ok(())
+    }
+
+    /// Restore the physical (non-VPN) adapters' resolvers to the exact
+    /// pre-connect `snapshots`, or to DHCP when none were captured.
+    ///
+    /// Synchronous on purpose, and shared by restore_dns() and the Drop
+    /// emergency unwind (which cannot await) so the two can never drift.
+    fn restore_physical_adapters_dns(snapshots: &[AdapterDnsSnapshot]) {
         if snapshots.is_empty() {
             // No snapshots — fall back to DHCP on all adapters (legacy behavior)
             tracing::warn!("No DNS snapshots found, falling back to DHCP restoration");
@@ -1558,7 +1598,7 @@ impl WintunTunnel {
                 Self::restore_adapter_dns(name, "ipv6", &[]);
             }
         } else {
-            for snapshot in &snapshots {
+            for snapshot in snapshots {
                 Self::restore_adapter_dns(&snapshot.adapter_name, "ip", &snapshot.dns_servers);
 
                 // IPv6: restore only resolvers the user actually configured. A
@@ -1582,9 +1622,6 @@ impl WintunTunnel {
                 );
             }
         }
-
-        tracing::debug!("DNS restoration complete");
-        Ok(())
     }
 
     /// Restore one address family's resolvers on an adapter.
@@ -1988,10 +2025,19 @@ impl WintunTunnel {
 
     /// Clean up routes when disconnecting
     async fn cleanup_routes(&self) -> Result<(), String> {
+        // Use the stored resolved IP, not the config hostname
+        let endpoint_ip = self.resolved_endpoint_ip.read().await.clone();
+        self.cleanup_routes_blocking(endpoint_ip.as_deref());
+        Ok(())
+    }
+
+    /// Sync core of route cleanup. Shared by cleanup_routes() and the Drop
+    /// emergency unwind (which cannot await) so the two can never drift.
+    fn cleanup_routes_blocking(&self, endpoint_ip: Option<&str>) {
         tracing::debug!("Cleaning up routes");
 
-        // Remove server endpoint host route (use the stored resolved IP, not the config hostname)
-        if let Some(ref endpoint_ip) = *self.resolved_endpoint_ip.read().await {
+        // Remove server endpoint host route
+        if let Some(endpoint_ip) = endpoint_ip {
             tracing::debug!(
                 "Removing endpoint host route for {}",
                 redact_ip(endpoint_ip)
@@ -2034,7 +2080,8 @@ impl WintunTunnel {
                 .store(false, Ordering::SeqCst);
         }
 
-        Ok(())
+        // Routes are gone — the emergency unwind (Drop) has nothing left to do.
+        self.routes_installed.store(false, Ordering::SeqCst);
     }
 
     /// Check if tunnel is running
@@ -2090,13 +2137,28 @@ impl WintunTunnel {
 /// ordered teardown. This is a safety net only.
 impl Drop for WintunTunnel {
     fn drop(&mut self) {
-        if !self.running.load(Ordering::SeqCst) {
+        // P1-dk-win-failed-connect-no-dns-restore: a tunnel that never reached
+        // `running` can still have mutated global state. The manager's
+        // CONNECT_TIMEOUT cancels start() mid-await and DROPS the half-built
+        // tunnel (no error return ever runs), and start()'s own later error
+        // returns (the dual-stack IPv6 `?`s) exit after DNS and routes are in
+        // — with every physical adapter parked on `static none`. Keying this
+        // unwind on `running` alone left the whole machine without resolvers.
+        // Key it on what was actually MODIFIED instead.
+        let dns_dirty = self.dns_modified.load(Ordering::SeqCst);
+        let routes_dirty = self.routes_installed.load(Ordering::SeqCst)
+            || self.local_network_routes_added.load(Ordering::SeqCst);
+        if !self.running.load(Ordering::SeqCst) && !dns_dirty && !routes_dirty {
             return;
         }
 
         tracing::warn!(
-            "WintunTunnel dropped while still running — performing emergency cleanup \
-             to prevent DNS/route leaks"
+            "WintunTunnel dropped with live state (running={}, dns_modified={}, \
+             routes_installed={}) — performing emergency cleanup to prevent \
+             DNS/route leaks",
+            self.running.load(Ordering::SeqCst),
+            dns_dirty,
+            routes_dirty
         );
         self.running.store(false, Ordering::SeqCst);
 
@@ -2115,25 +2177,43 @@ impl Drop for WintunTunnel {
             ])
             .output();
 
-        // Best-effort: restore the PHYSICAL adapters to DHCP for BOTH families.
+        // Best-effort: restore the PHYSICAL adapters for BOTH families.
         // configure_dns() set every non-VPN adapter to `static none` (IPv4 and
         // IPv6) to suppress SMHNR. The clean teardown (restore_dns) undoes that,
-        // but a crash/panic bypasses it — without this, the machine is left with
-        // no resolvers on its real NICs (both families) until the user reconnects
-        // and cleanly disconnects. DHCP is the safe emergency default; a static
-        // resolver the user set will be re-applied by DHCP/RA. The IPv6 half of
-        // this restore matches configure_dns's IPv6 `static none`.
-        for name in &Self::get_non_vpn_adapters() {
-            Self::restore_adapter_dns(name, "ip", &[]);
-            Self::restore_adapter_dns(name, "ipv6", &[]);
-        }
+        // but a cancelled/failed connect or a panic bypasses it — without this,
+        // the machine is left with no resolvers on its real NICs (both
+        // families) until the user reconnects and cleanly disconnects. Restore
+        // the exact snapshots configure_dns captured (a static resolver the
+        // user set survives); with no snapshot captured this falls back to
+        // DHCP. try_read: Drop cannot await, and by now nothing else
+        // legitimately holds the lock.
+        let snapshots = self
+            .dns_snapshots
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        Self::restore_physical_adapters_dns(&snapshots);
+        self.dns_modified.store(false, Ordering::SeqCst);
 
-        // Best-effort: remove server-specific route
-        if let Some(endpoint_ip) = self.config.endpoint.split(':').next() {
-            if !endpoint_ip.is_empty() {
-                let _ = cmd("route").args(["delete", endpoint_ip]).output();
-            }
-        }
+        // Best-effort: remove the endpoint host route plus the split-default
+        // and LAN-sharing routes — the same cleanup stop() runs, via the same
+        // helper. Prefer the RESOLVED endpoint IP (what the route was actually
+        // installed for); fall back to the config host for a pre-resolution
+        // drop, where the delete simply finds nothing.
+        let endpoint_ip = self
+            .resolved_endpoint_ip
+            .try_read()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| {
+                self.config
+                    .endpoint
+                    .split(':')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            });
+        self.cleanup_routes_blocking(endpoint_ip.as_deref());
 
         // Best-effort: remove IPv6 blocking firewall rules
         let _ = cmd("powershell")
