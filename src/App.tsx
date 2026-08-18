@@ -203,14 +203,19 @@ function App() {
   //
   // Backs off (4s, 8s, 16s) so a retry cannot itself become the thing keeping
   // the rate-limit window saturated, and stops after 3 attempts.
-  const identityRetries = useRef(0);
+  //
+  // The attempt counter is STATE (not a ref) on purpose: bumping it after a
+  // failed attempt re-runs this effect, which is what schedules the next try.
+  // The previous ref-based version never re-ran on failure — the documented
+  // 3-attempt ladder was actually a single attempt, and a profile fetch still
+  // failing 4 s after sign-in left the Profile stuck on "Loading your
+  // account…" until an app restart.
+  const [identityAttempt, setIdentityAttempt] = useState(0);
   const accountEmail = useAppStore((s) => s.account.email);
   useEffect(() => {
-    if (!isAuthenticated || accountEmail || identityRetries.current >= 3) return;
-    const attempt = identityRetries.current;
-    const delayMs = 4000 * 2 ** attempt;
+    if (!isAuthenticated || accountEmail || identityAttempt >= 3) return;
+    const delayMs = 4000 * 2 ** identityAttempt;
     const timer = setTimeout(async () => {
-      identityRetries.current += 1;
       try {
         const st = await invoke<AuthState>('get_auth_state');
         if (st?.email) {
@@ -222,10 +227,14 @@ function App() {
         }
       } catch {
         /* non-fatal — the backoff above bounds how often this runs */
+      } finally {
+        // On success `accountEmail` gates the effect off; on failure this
+        // re-triggers it to schedule the next backed-off attempt.
+        setIdentityAttempt((a) => a + 1);
       }
     }, delayMs);
     return () => clearTimeout(timer);
-  }, [isAuthenticated, accountEmail, setUserEmail, setAccount]);
+  }, [isAuthenticated, accountEmail, identityAttempt, setUserEmail, setAccount]);
 
   // Daily background update check. The per-platform update endpoint is live
   // (api.birdo.app/updates/…), but the only in-app check used to be the manual
