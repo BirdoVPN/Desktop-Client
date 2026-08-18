@@ -193,10 +193,30 @@ pub fn sanitize_error(msg: &str) -> String {
         static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
             Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").expect("email regex")
         });
-        // Matches common hostname patterns (at least two labels with TLD)
+        // Matches common hostname patterns. P1-dk-redaction-incomplete: two
+        // labels are enough ("birdo.app" is as identifying as "api.birdo.app"),
+        // so the repeated-label group is now optional.
         static HOST_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){1,}\.[a-zA-Z]{2,}\b").expect("hostname regex")
+            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){0,}\.[a-zA-Z]{2,}\b").expect("hostname regex")
         });
+        // P1-dk-redaction-incomplete: IPv6 literals. Two shapes — an expanded
+        // run of >= 5 hex groups (>= 5 avoids matching hh:mm:ss timestamps),
+        // and anything containing "::" flanked by hex groups.
+        static IPV6_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(
+                r"(?i)\b(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}\b|(?i)\b(?:[0-9a-f]{1,4}:)+:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?|::[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*",
+            )
+            .expect("IPv6 regex")
+        });
+        // P1-dk-redaction-incomplete / P6-CLI-D-06: JWTs and long unbroken
+        // base64/base64url runs (WireGuard keys are 44 chars of base64; bearer
+        // tokens and API keys are similar). Over-redaction of a long opaque id
+        // is an acceptable trade in a privacy sink.
+        static JWT_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{4,}){1,2}\b").expect("JWT regex")
+        });
+        static TOKEN_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"[A-Za-z0-9+/_-]{32,}={0,2}").expect("token regex"));
         // P2-13: Strip HTML tags
         static HTML_TAG_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"<[^>]{1,200}>").expect("HTML tag regex"));
@@ -214,6 +234,13 @@ pub fn sanitize_error(msg: &str) -> String {
 
         // Strip stack trace lines
         let result = STACK_TRACE_RE.replace_all(&result, "").to_string();
+
+        // Tokens/keys first, before the host/IP passes fragment them.
+        let result = JWT_RE.replace_all(&result, "[redacted-token]").to_string();
+        let result = TOKEN_RE
+            .replace_all(&result, "[redacted-token]")
+            .to_string();
+        let result = IPV6_RE.replace_all(&result, "[redacted-ipv6]").to_string();
 
         let result = IPV4_RE
             .replace_all(&result, |caps: &regex::Captures| {

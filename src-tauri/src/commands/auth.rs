@@ -168,7 +168,7 @@ pub async fn login(
             tracing::warn!("Login failed for {}: {}", redact_email(&request.email), e);
             Ok(LoginResponse {
                 success: false,
-                message: Some(e.to_string()),
+                message: Some(crate::utils::redact::sanitize_error(&e.to_string())),
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
@@ -189,9 +189,22 @@ pub async fn logout(
     let _ = api.logout().await;
 
     // Clear local credentials
-    credentials
-        .clear_tokens()
-        .map_err(|e| format!("Failed to clear credentials: {}", e))?;
+    credentials.clear_tokens().map_err(|e| {
+        format!(
+            "Failed to clear credentials: {}",
+            crate::utils::redact::sanitize_error(&e.to_string())
+        )
+    })?;
+
+    // Logout hygiene (documented contract of the persistent ML-KEM identity):
+    // the keypair is a globally-unique, machine-stable linkage primitive, so it
+    // must not survive an account boundary. Best-effort — a delete failure must
+    // not block the logout itself. Deliberately NOT called on the
+    // rejected-refresh auto-sign-out path (get_auth_state): that is a session
+    // expiry on the same account, not the user leaving it.
+    if let Err(e) = crate::vpn::birdo_pq::reset_persisted_keypair() {
+        tracing::warn!("Failed to reset BirdoPQ keypair on logout: {}", e);
+    }
 
     Ok(true)
 }
@@ -218,12 +231,20 @@ pub async fn delete_account(
 ) -> Result<bool, String> {
     tracing::info!("Account deletion requested (GDPR)");
 
-    api.delete_account(&request.password)
-        .await
-        .map_err(|e| format!("Account deletion failed: {}", e))?;
+    api.delete_account(&request.password).await.map_err(|e| {
+        format!(
+            "Account deletion failed: {}",
+            crate::utils::redact::sanitize_error(&e.to_string())
+        )
+    })?;
 
-    // Clear all local credentials after successful server-side deletion
+    // Clear all local credentials after successful server-side deletion,
+    // including the persistent ML-KEM identity (same hygiene as logout —
+    // doubly so for a GDPR deletion).
     let _ = credentials.clear_tokens();
+    if let Err(e) = crate::vpn::birdo_pq::reset_persisted_keypair() {
+        tracing::warn!("Failed to reset BirdoPQ keypair on account deletion: {}", e);
+    }
 
     tracing::info!("Account permanently deleted");
     Ok(true)
@@ -234,9 +255,12 @@ pub async fn delete_account(
 #[tauri::command]
 pub async fn export_user_data(api: State<'_, BirdoApi>) -> Result<serde_json::Value, String> {
     tracing::info!("GDPR data export requested");
-    api.export_user_data()
-        .await
-        .map_err(|e| format!("Data export failed: {}", e))
+    api.export_user_data().await.map_err(|e| {
+        format!(
+            "Data export failed: {}",
+            crate::utils::redact::sanitize_error(&e.to_string())
+        )
+    })
 }
 
 /// Get current authentication state
@@ -620,7 +644,7 @@ pub async fn register_anonymous(
             tracing::warn!("Anonymous account creation failed: {}", e);
             Ok(LoginResponse {
                 success: false,
-                message: Some(e.to_string()),
+                message: Some(crate::utils::redact::sanitize_error(&e.to_string())),
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
@@ -726,7 +750,7 @@ pub async fn login_anonymous(
             tracing::warn!("Anonymous login failed: {}", e);
             Ok(LoginResponse {
                 success: false,
-                message: Some(e.to_string()),
+                message: Some(crate::utils::redact::sanitize_error(&e.to_string())),
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
