@@ -377,7 +377,10 @@ fn sync_hmac_key_sources(settings_path: &Path, key: &[u8]) {
         .unwrap_or(false);
     if !already {
         if let Err(e) = write_key_file(settings_path, key) {
-            tracing::warn!("Could not mirror the settings HMAC key into the key file: {}", e);
+            tracing::warn!(
+                "Could not mirror the settings HMAC key into the key file: {}",
+                e
+            );
         }
     }
 }

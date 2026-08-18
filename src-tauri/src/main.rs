@@ -23,7 +23,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Listener, LogicalPosition, Manager, RunEvent, WindowEvent,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use vpn::{AutoReconnectService, VpnManager};
 
@@ -115,7 +115,10 @@ fn restore_and_focus(app: &tauri::AppHandle) {
 /// Surface the window and hand a birdo:// URL to the frontend router. Shared by
 /// the runtime deep-link listener and the cold-start path.
 fn deliver_deep_link(app: &tauri::AppHandle, url: &str) {
-    info!("Deep link received: {}", url);
+    // P6-CLI-D-03: a birdo:// URL carries the target server id, i.e. connection
+    // history. Record the arrival at INFO, the payload only at debug.
+    info!("Deep link received");
+    debug!("Deep link received: {}", url);
     restore_and_focus(app);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.emit("deep-link", url);
@@ -481,7 +484,9 @@ fn main() {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 if let Ok(Some(urls)) = app.deep_link().get_current() {
                     if let Some(first) = urls.into_iter().next() {
-                        info!("Launch deep link captured: {}", first);
+                        // P6-CLI-D-03: same treatment as deliver_deep_link.
+                        info!("Launch deep link captured");
+                        debug!("Launch deep link captured: {}", first);
                         if let Ok(mut g) = app.state::<PendingDeepLink>().0.lock() {
                             *g = Some(first.to_string());
                         }

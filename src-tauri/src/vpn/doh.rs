@@ -272,7 +272,9 @@ impl ServerCertVerifier for DohSpkiPinningVerifier {
                 "{PIN_MISMATCH_MARKER}: unparseable certificate in chain for {host}"
             )));
         }
-        tracing::warn!("DoH pinning: no pinned CA SPKI matched {host}'s presented chain — refusing");
+        tracing::warn!(
+            "DoH pinning: no pinned CA SPKI matched {host}'s presented chain — refusing"
+        );
         Err(TlsError::General(format!(
             "{PIN_MISMATCH_MARKER}: no pinned SPKI matched for {host}"
         )))
@@ -660,5 +662,4 @@ mod tests {
             );
         }
     }
-
 }

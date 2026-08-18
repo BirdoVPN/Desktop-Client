@@ -196,7 +196,9 @@ fn ranges_cover(mut ranges: Vec<(u128, u128)>, full_last: u128) -> bool {
 }
 
 fn ip_in_ranges(ip: u128, ranges: &[(u128, u128)]) -> bool {
-    ranges.iter().any(|(start, last)| ip >= *start && ip <= *last)
+    ranges
+        .iter()
+        .any(|(start, last)| ip >= *start && ip <= *last)
 }
 
 #[cfg(test)]
@@ -204,7 +206,11 @@ mod scope_tests {
     use super::validate_tunnel_scope;
     use crate::api::types::VpnConfig;
 
-    fn config(allowed_ips: &[&str], allowed_ips_v6: &[&str], client_ipv6: Option<&str>) -> VpnConfig {
+    fn config(
+        allowed_ips: &[&str],
+        allowed_ips_v6: &[&str],
+        client_ipv6: Option<&str>,
+    ) -> VpnConfig {
         VpnConfig {
             server_id: "test".into(),
             key_id: "k".into(),
@@ -257,22 +263,17 @@ mod scope_tests {
 
     #[test]
     fn rejects_partial_v6_when_routing_v6() {
-        assert!(validate_tunnel_scope(&config(
-            &["0.0.0.0/0"],
-            &["2000::/3"],
-            Some("fd00::2/128")
-        ))
-        .is_err());
+        assert!(
+            validate_tunnel_scope(&config(&["0.0.0.0/0"], &["2000::/3"], Some("fd00::2/128")))
+                .is_err()
+        );
     }
 
     #[test]
     fn accepts_full_dual_stack() {
-        assert!(validate_tunnel_scope(&config(
-            &["0.0.0.0/0"],
-            &["::/0"],
-            Some("fd00::2/128")
-        ))
-        .is_ok());
+        assert!(
+            validate_tunnel_scope(&config(&["0.0.0.0/0"], &["::/0"], Some("fd00::2/128"))).is_ok()
+        );
     }
 
     #[test]

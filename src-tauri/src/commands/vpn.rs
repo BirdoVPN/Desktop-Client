@@ -961,7 +961,9 @@ pub async fn quick_connect(
             settings.multi_hop_exit_node_id.as_deref(),
         ) {
             (Some(entry), Some(exit)) if !entry.is_empty() && !exit.is_empty() => {
-                tracing::info!(%entry, %exit, "Quick connect: multi-hop armed, delegating");
+                // P6-CLI-D-03: node ids are connection history — debug only, like
+                // every other chosen-node line in this file.
+                tracing::debug!(%entry, %exit, "Quick connect: multi-hop armed, delegating");
                 return connect_multi_hop(
                     entry.to_string(),
                     exit.to_string(),
@@ -999,7 +1001,10 @@ pub async fn quick_connect(
         .find(|s| s.is_online)
         .ok_or("No online servers available")?;
 
-    tracing::info!(
+    // P6-CLI-D-03: the chosen node is connection history. INFO records that a quick
+    // connect happened; the node itself only goes to debug.
+    tracing::info!("Quick connecting to the best available server");
+    tracing::debug!(
         "Quick connecting to {} ({})",
         best_server.name,
         best_server.id
