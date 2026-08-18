@@ -235,8 +235,9 @@ impl AutoReconnectService {
         *self.shutdown_tx.write().await = Some(shutdown_tx);
         self.running.store(true, Ordering::SeqCst);
 
-        // Start (idempotently) the connectivity monitor and hand a receiver to the
-        // loop. Cheap 5s in-process TCP probe; it runs for the app's lifetime.
+        // Start (idempotently) the connectivity monitor and hand a receiver to
+        // the loop. Cheap 5s in-process TCP probe; runs only while this service
+        // runs — stop() shuts it down so no probe beacon outlives the session.
         self.network_monitor.start();
         let connectivity_rx = self.network_monitor.subscribe();
 
@@ -278,6 +279,12 @@ impl AutoReconnectService {
         }
         self.running.store(false, Ordering::SeqCst);
         self.is_reconnecting.store(false, Ordering::SeqCst);
+        // P1-ks-connectivity-probe-beacon: stop the connectivity monitor with
+        // the session. Left running it TCP-probed Cloudflare/Quad9/Google every
+        // 5 s for the rest of the app's lifetime — a fixed liveness beacon from
+        // the user's real IP while no VPN session even exists. start() re-arms
+        // it (idempotently) on the next connect.
+        self.network_monitor.stop();
         tracing::info!("Auto-reconnect service stopped");
     }
 
@@ -1185,7 +1192,10 @@ impl AutoReconnectService {
                     .to_string()
             })?;
 
-        crate::commands::vpn::start_stealth_tunnel(&app, response).await
+        // "auto": the reconnect path has no settings handle here, so the WG
+        // port is derived from the server-supplied endpoint (the common case);
+        // only a user-set custom port is not re-applied on reconnect.
+        crate::commands::vpn::start_stealth_tunnel(&app, response, "auto").await
     }
 
     fn multi_hop_response_to_connect_response(

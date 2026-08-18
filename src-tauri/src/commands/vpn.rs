@@ -303,6 +303,7 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
 pub(crate) async fn start_stealth_tunnel(
     app: &AppHandle,
     response: &ConnectResponse,
+    custom_port: &str,
 ) -> Result<Option<String>, String> {
     if !response.stealth_enabled.unwrap_or(false) || response.xray_endpoint.is_none() {
         return Ok(None);
@@ -374,6 +375,25 @@ pub(crate) async fn start_stealth_tunnel(
         return Err(format!("Unsupported Xray flow type '{}' from server", flow));
     }
 
+    // P1-dk-xray-wgport-hardcoded: derive the far-side WireGuard port from the
+    // user's custom-port override, else from the server-supplied WG endpoint,
+    // falling back to 51820 only when neither yields a port. The previous
+    // hardcoded 51820 made any node on a non-default port unreachable through
+    // stealth with no diagnostic, and silently ignored the custom-port setting.
+    let wg_port = if custom_port != "auto" {
+        custom_port.parse::<u16>().ok()
+    } else {
+        None
+    }
+    .or_else(|| {
+        response
+            .endpoint
+            .as_deref()
+            .and_then(|ep| ep.rfind(':').map(|i| &ep[i + 1..]))
+            .and_then(|p| p.parse::<u16>().ok())
+    })
+    .unwrap_or(51820);
+
     let xray_config = crate::vpn::xray::XrayConfig {
         endpoint: response
             .xray_endpoint
@@ -384,7 +404,7 @@ pub(crate) async fn start_stealth_tunnel(
         short_id,
         sni,
         flow,
-        wg_port: 51820,
+        wg_port,
     };
 
     let app_data_dir = app
@@ -449,13 +469,9 @@ pub(crate) fn derive_quantum_psk(response: &ConnectResponse) -> Result<Option<St
     }
 
     // 2) Fall back to the server's classical preshared_key when present.
+    //    (No downgrade warning is possible here: quantum_enabled == true was
+    //    already handled above by aborting the connection fail-closed.)
     if response.preshared_key.is_some() {
-        if response.quantum_enabled.unwrap_or(false) {
-            tracing::warn!(
-                "BirdoPQ: server did not return a PQ ciphertext — falling back to \
-                 server-provided classical PSK (NOT HNDL-safe)"
-            );
-        }
         crate::vpn::birdo_pq::record_server_provided();
         return Ok(response.preshared_key.clone());
     }
@@ -656,7 +672,8 @@ pub async fn connect_vpn(
     tracing::info!("Got VPN config from server, extracting fields...");
 
     // Phase 1: Xray Reality Stealth Tunnel
-    let stealth_endpoint_override = start_stealth_tunnel(&app, &response).await?;
+    let stealth_endpoint_override =
+        start_stealth_tunnel(&app, &response, &vpn_settings.custom_port).await?;
     let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
         response
             .xray_endpoint
@@ -1064,7 +1081,8 @@ pub async fn quick_connect(
         vpn_settings.quantum_protection,
     )?;
 
-    let stealth_endpoint_override = start_stealth_tunnel(&app, &response).await?;
+    let stealth_endpoint_override =
+        start_stealth_tunnel(&app, &response, &vpn_settings.custom_port).await?;
     let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
         response
             .xray_endpoint

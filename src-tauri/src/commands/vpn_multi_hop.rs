@@ -195,7 +195,8 @@ pub async fn connect_multi_hop(
         vpn_settings.quantum_protection,
     )?;
 
-    let stealth_endpoint_override = start_stealth_tunnel(&app, &connect_response).await?;
+    let stealth_endpoint_override =
+        start_stealth_tunnel(&app, &connect_response, &vpn_settings.custom_port).await?;
     let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
         connect_response
             .xray_endpoint
