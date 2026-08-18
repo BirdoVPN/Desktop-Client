@@ -41,7 +41,22 @@ const PINNED_SPKI_SHA256: &[&str] = &[
     "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",
     // ISRG Root X1 (Let's Encrypt) — cross-CA backup so a Google -> Let's Encrypt
     // migration cannot brick installed clients (also pinned on Android).
+    //
+    // NOTE: a standard Let's Encrypt server chain presents the LEAF + one
+    // ISSUING INTERMEDIATE (R10/R11/E5/E6) — NOT ISRG Root X1 itself. Since we
+    // pin against the PRESENTED chain, the root pin alone can never match a
+    // default LE deployment, so the four current issuing intermediates are
+    // pinned below to make this backup real (computed 2026-08-18 from
+    // https://letsencrypt.org/certs/2024/{r10,r11,e5,e6}.pem).
     "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=",
+    // Let's Encrypt R10 (RSA issuing intermediate)
+    "K7rZOrXHknnsEhUH8nLL4MZkejquUuIvOIr6tCa0rbo=",
+    // Let's Encrypt R11 (RSA issuing intermediate)
+    "bdrBhpj38ffhxpubzkINl0rG+UyossdhcBYj+Zx2fcc=",
+    // Let's Encrypt E5 (ECDSA issuing intermediate)
+    "NYbU7PBwV4y9J67c4guWTki8FJ+uudrXL0a4V4aRcrg=",
+    // Let's Encrypt E6 (ECDSA issuing intermediate)
+    "0Bbh/jEZSKymTy3kTOhsmlHKBB32EDu1KojrP3YfV9c=",
 ];
 
 /// base64(SHA-256(DER SubjectPublicKeyInfo)) for a certificate.
@@ -94,13 +109,17 @@ impl ServerCertVerifier for SpkiPinningVerifier {
         }
 
         if !parsed_any {
-            // No certificate in the chain could be parsed. Standard validation
-            // already passed; log loudly but allow, so a parser edge-case cannot
-            // brick the client (pinning is defence-in-depth, not the sole gate).
+            // No certificate in the chain could be parsed by x509-parser. FAIL
+            // CLOSED: WebPKI just parsed and validated this same chain, so a
+            // chain our SPKI extractor cannot read at all is either a crafted
+            // chain or a parser bug — and treating it as "pinned OK" would turn
+            // the pin from a hard gate into advisory exactly when it matters.
             tracing::error!(
-                "cert-pin: could not parse any certificate SPKI in the chain — allowing (WebPKI validation passed)"
+                "cert-pin: could not parse any certificate SPKI in the chain — refusing connection (fail closed)"
             );
-            return Ok(ServerCertVerified::assertion());
+            return Err(TlsError::General(
+                "certificate chain SPKI unparseable — pin check impossible".to_string(),
+            ));
         }
 
         tracing::error!(

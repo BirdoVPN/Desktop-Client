@@ -69,10 +69,25 @@ jobs:
           echo "$CHAIN_SPKIS" | sed 's/^/  /'
 
           # --- Assert at least one live chain SPKI is pinned in cert_pin.rs ---
+          # Parse the EFFECTIVE pin array rather than grepping the whole source
+          # file: a retired pin surviving in a comment (or a commented-out array
+          # entry) must NOT satisfy this check. Extract only string literals on
+          # non-comment lines between the array open and its closing `];`.
+          ACTIVE_PINS=$(sed -n '/PINNED_SPKI_SHA256: &\[&str\] = &\[/,/^\];/p' "$PINS_FILE" \
+            | sed 's://.*$::' \
+            | grep -o '"[A-Za-z0-9+/=]\{40,\}"' \
+            | tr -d '"')
+          if [ -z "$ACTIVE_PINS" ]; then
+            echo "::error file=$PINS_FILE::Could not extract PINNED_SPKI_SHA256 array — watchdog parser needs updating."
+            exit 1
+          fi
+          echo "Effective pins in $PINS_FILE:"
+          echo "$ACTIVE_PINS" | sed 's/^/  /'
+
           MATCHED=""
           while IFS= read -r spki; do
             [ -z "$spki" ] && continue
-            if grep -q "$spki" "$PINS_FILE"; then
+            if echo "$ACTIVE_PINS" | grep -qxF "$spki"; then
               MATCHED="$spki"
               break
             fi
