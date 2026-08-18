@@ -252,9 +252,15 @@ pub async fn connect_multi_hop(
             }
         }
     } else {
+        // P6-CLI-D-03: the endpoint names the entry node. WARN is written in release,
+        // so the diagnostic goes out redacted and the raw value only at debug.
         tracing::warn!(
             "Could not resolve kill switch endpoint IP from '{}'; kill switch may not filter \
              traffic to the VPN server correctly",
+            crate::utils::redact::redact_hostname(killswitch_endpoint)
+        );
+        tracing::debug!(
+            "Unresolvable kill switch endpoint (raw): {}",
             killswitch_endpoint
         );
     }

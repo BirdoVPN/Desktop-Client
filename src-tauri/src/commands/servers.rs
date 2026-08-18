@@ -111,7 +111,7 @@ pub async fn ping_server(hostname: String, port: Option<u16>) -> Result<Option<u
     {
         tracing::warn!(
             "ping_server blocked: invalid or private hostname '{}'",
-            hostname
+            crate::utils::redact::redact_hostname(&hostname)
         );
         return Err("Invalid hostname for latency testing".to_string());
     }

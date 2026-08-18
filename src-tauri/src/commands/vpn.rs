@@ -1214,7 +1214,9 @@ pub async fn reapply_vpn_settings(
         );
     }
 
-    tracing::info!(
+    // P6-CLI-D-03: the node being rebuilt to is connection history.
+    tracing::info!("Reapplying VPN settings — rebuilding the tunnel");
+    tracing::debug!(
         "Reapplying VPN settings — rebuilding tunnel to {}",
         server_id
     );

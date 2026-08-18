@@ -867,7 +867,11 @@ fn self_elevate() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args_str = args.join(" ");
 
-    info!("Self-elevating: {:?} {}", exe_path, args_str);
+    // P6-CLI-D-03: argv carries the birdo:// deep-link URL on a cold start, and that
+    // URL names the target server. This runs BEFORE deliver_deep_link, so redacting
+    // only there left the payload in the log one code path earlier.
+    info!("Self-elevating");
+    debug!("Self-elevating: {:?} {}", exe_path, args_str);
 
     // Convert to wide strings for ShellExecuteW
     let operation: Vec<u16> = std::ffi::OsStr::new("runas")
