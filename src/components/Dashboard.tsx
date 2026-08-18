@@ -293,6 +293,11 @@ export function Dashboard() {
 
   // ── Servers + ping ────────────────────────────────────────────────
   useEffect(() => {
+    // Cancellation guard: the Dashboard unmounts on every tab switch, and
+    // without this the batched fleet-wide ping sweep kept running (and a new
+    // one started per remount), stacking overlapping probe waves for a
+    // component that no longer exists.
+    let cancelled = false;
     invoke<RustServer[]>('get_servers')
       .then(async (raw) => {
         const mapped = raw.map((s) => ({
@@ -331,18 +336,22 @@ export function Dashboard() {
         const PING_BATCH = 5;
         const pingable = mapped.filter((srv) => srv.hostname || srv.ipAddress);
         for (let i = 0; i < pingable.length; i += PING_BATCH) {
+          if (cancelled) return;
           const batch = pingable.slice(i, i + PING_BATCH);
           await Promise.allSettled(
             batch.map((srv) =>
               invoke<number | null>('ping_server', {
                 hostname: srv.hostname || srv.ipAddress,
                 port: srv.port ?? 51820,
-              }).then((p) => { if (p != null) setServerPing(srv.id, p); })
+              }).then((p) => { if (!cancelled && p != null) setServerPing(srv.id, p); })
             )
           );
         }
       })
       .catch(() => { /* silent */ });
+    return () => {
+      cancelled = true;
+    };
   }, [setServers, setServerPing, setCurrentServer]);
 
   /**
