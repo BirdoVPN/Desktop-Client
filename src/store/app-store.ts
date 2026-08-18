@@ -111,6 +111,10 @@ export interface AppSettings {
   // Stealth & Quantum
   stealthMode: boolean;
   quantumProtection: boolean;
+  // LOCKDOWN (always-on kill switch, Windows WFP). No UI toggle yet — carried
+  // in the store so settings saves round-trip it instead of silently resetting
+  // the persisted flag to the Rust serde default on every write.
+  lockdownMode: boolean;
 }
 
 export interface MultiHopRoute {
@@ -266,6 +270,8 @@ const defaultSettings: AppSettings = {
   // users — available on every plan, negligible overhead. Matches the Rust
   // `AppSettings::default()` so a fresh install agrees on both sides.
   quantumProtection: true,
+  // Matches the Rust `default_true` serde default for lockdown_mode.
+  lockdownMode: true,
 };
 
 export const useAppStore = create<AppState>()(

@@ -165,6 +165,12 @@ export interface RustSettings {
   multi_hop_exit_node_id: string | null;
   stealth_mode: boolean;
   quantum_protection: boolean;
+  // LOCKDOWN (always-on kill switch). MUST round-trip: `save_settings` replaces
+  // the whole Rust struct, so any field missing here is silently rewritten to
+  // its serde default on every save — which made `false` unrepresentable and
+  // force-reset lockdown on each settings write. Add any future Rust
+  // AppSettings field here too, for the same reason.
+  lockdown_mode: boolean;
 }
 
 import type { AppSettings } from '../store/app-store';
@@ -197,6 +203,8 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     // Post-quantum is ON by default (matches Rust `AppSettings::default()`); the
     // `?? true` only applies if the field is absent from an older settings file.
     quantumProtection: rs.quantum_protection ?? true,
+    // Matches the Rust serde default (default_true) for older settings files.
+    lockdownMode: rs.lockdown_mode ?? true,
   };
 }
 
@@ -220,5 +228,6 @@ export function settingsToRust(s: AppSettings): RustSettings {
     multi_hop_exit_node_id: s.multiHopExitNodeId,
     stealth_mode: s.stealthMode,
     quantum_protection: s.quantumProtection,
+    lockdown_mode: s.lockdownMode,
   };
 }

@@ -22,6 +22,7 @@ const base: RustSettings = {
   multi_hop_exit_node_id: null,
   stealth_mode: false,
   quantum_protection: true,
+  lockdown_mode: true,
 };
 
 describe('settingsFromRust — v1.3.30/31 default guarantees', () => {
