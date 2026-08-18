@@ -112,19 +112,21 @@ mod kill_switch_tests {
     /// FIX-2-1: Validate WFP filter weight ordering.
     /// STUN blocks (15) > Permit exceptions (10) > Block-all catch-all (1).
     #[test]
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::assertions_on_constants)] // asserting the real constants IS the point
     fn wfp_filter_weights_are_correctly_ordered() {
-        let weight_block_all: u8 = 1;
-        let weight_permit: u8 = 10;
-        let weight_block_stun: u8 = 15;
+        // P1-dk-tautological-buffer-tests (twin): assert on the REAL wfp.rs
+        // constants, not locally declared literals.
+        use crate::vpn::wfp::{WEIGHT_BLOCK_ALL, WEIGHT_BLOCK_STUN, WEIGHT_PERMIT};
 
         // Permits must override block-all
         assert!(
-            weight_permit > weight_block_all,
+            WEIGHT_PERMIT > WEIGHT_BLOCK_ALL,
             "Permit weight must exceed block-all weight"
         );
         // STUN blocks must override permits
         assert!(
-            weight_block_stun > weight_permit,
+            WEIGHT_BLOCK_STUN > WEIGHT_PERMIT,
             "STUN block weight must exceed permit weight"
         );
     }
@@ -230,14 +232,24 @@ mod tunnel_health_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)] // asserting the real constants IS the point
     fn buffer_pool_size_is_within_bounds() {
-        // WireGuard MTU is typically 1420, with overhead the buffer should be >= 1500
-        let buffer_size: usize = 65536; // Common buffer pool allocation
+        // P1-dk-tautological-buffer-tests: assert on the REAL implementation
+        // constants, not a locally declared literal — this is the invariant
+        // buffer_pool.rs documents ("power of two and >= 9000 + overhead").
+        use crate::vpn::buffer_pool::{MAX_PACKET_SIZE, WIREGUARD_OVERHEAD};
         assert!(
-            buffer_size >= 1500,
-            "Buffer too small for WireGuard packets"
+            MAX_PACKET_SIZE >= 9000 + WIREGUARD_OVERHEAD,
+            "MAX_PACKET_SIZE too small for jumbo frame + WireGuard overhead"
         );
-        assert!(buffer_size <= 1 << 20, "Buffer unreasonably large (>1MB)");
+        assert!(
+            MAX_PACKET_SIZE.is_power_of_two(),
+            "MAX_PACKET_SIZE must be a power of two"
+        );
+        assert!(
+            MAX_PACKET_SIZE <= 1 << 20,
+            "Buffer unreasonably large (>1MB)"
+        );
     }
 }
 
