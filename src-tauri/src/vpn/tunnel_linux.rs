@@ -167,6 +167,14 @@ pub struct LinuxTunnel {
     local_network_sharing: bool,
     /// Endpoint IP for route exclusion
     endpoint_ip: Arc<RwLock<Option<String>>>,
+    /// JoinHandle of the spawned packet loop.
+    ///
+    /// P1-dk-tun-fd-close-race: stop() must JOIN this task before closing the
+    /// TUN fd. The loop's spawn_blocking closures capture the raw i32; closing
+    /// while one is still in flight lets the kernel recycle the descriptor
+    /// number, and the stale read()/write() then lands on whatever unrelated
+    /// file or socket this process opens next.
+    packet_loop: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl LinuxTunnel {
@@ -188,6 +196,7 @@ impl LinuxTunnel {
             network_snapshot: Arc::new(RwLock::new(None)),
             local_network_sharing,
             endpoint_ip: Arc::new(RwLock::new(None)),
+            packet_loop: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -348,7 +357,7 @@ impl LinuxTunnel {
         let wg_session = self.wg_session.clone();
         let fd = tun_fd;
 
-        tokio::spawn(async move {
+        let loop_handle = tokio::spawn(async move {
             Self::packet_loop(
                 fd,
                 wg_session,
@@ -361,6 +370,9 @@ impl LinuxTunnel {
             )
             .await;
         });
+        // Keep the handle so stop() can join the loop before closing the fd
+        // (P1-dk-tun-fd-close-race).
+        *self.packet_loop.write().await = Some(loop_handle);
 
         tracing::info!("Linux tunnel started successfully");
         Ok(())
@@ -400,6 +412,31 @@ impl LinuxTunnel {
         // Signal the packet loop to stop
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(()).await;
+        }
+
+        // P1-dk-tun-fd-close-race: JOIN the packet loop before the fd close
+        // below. The loop's spawn_blocking closures capture the raw i32 fd;
+        // without the join, an in-flight libc::read/libc::write can execute
+        // AFTER close(2) returns the number to the kernel's free pool — and the
+        // stale syscall then reads from or writes packet bytes into whatever
+        // unrelated descriptor (log file, TLS socket, keystore handle) this
+        // process opened next. The fd is O_NONBLOCK, so the loop drains within
+        // one iteration of the shutdown signal; the timeout is a safety valve
+        // only. If it ever fires we abort the task and fall through to the
+        // close anyway — a stuck loop must not leave the device alive owning
+        // the half-default routes (that is the frozen-switch blackhole).
+        if let Some(handle) = self.packet_loop.write().await.take() {
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .is_err()
+            {
+                abort.abort();
+                tracing::warn!(
+                    "Packet loop did not exit within 5s of shutdown — aborted it; \
+                     closing the TUN fd regardless"
+                );
+            }
         }
 
         // Restore DNS
@@ -685,6 +722,10 @@ impl Drop for LinuxTunnel {
         let Some(fd) = fd else {
             return; // stop()/unwind already ran — nothing leaked
         };
+        // Drop cannot join the packet loop (no await), so this close carries
+        // the small fd-recycle race stop() eliminates. Accepted: this is the
+        // last-resort path for a DROPPED half-built tunnel, and leaving the
+        // device alive (the alternative) is a guaranteed IPv4 blackhole.
         let _ = unsafe { libc::close(fd) };
         tracing::warn!(
             "LinuxTunnel dropped with the TUN fd still open — closed it to \
