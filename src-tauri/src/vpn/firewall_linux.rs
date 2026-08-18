@@ -75,7 +75,15 @@ fn iptables(args: &[&str]) -> Result<(), String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("iptables {} failed: {}", args.join(" "), stderr));
+        // P6-CLI-D-03: the argument list carries the relay address (`-d <ip>` in
+        // build_chains, `-s <ip>` in the return path), and five release-level
+        // sinks print this Err verbatim. Redact HERE — the sinks cannot know the
+        // string came from a command line.
+        return Err(format!(
+            "iptables {} failed: {}",
+            crate::utils::redact::sanitize_error(&args.join(" ")),
+            crate::utils::redact::sanitize_error(&stderr)
+        ));
     }
     Ok(())
 }
@@ -100,7 +108,12 @@ fn ip6tables(args: &[&str]) -> Result<(), String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ip6tables {} failed: {}", args.join(" "), stderr));
+        // P6-CLI-D-03: same as the IPv4 twin above.
+        return Err(format!(
+            "ip6tables {} failed: {}",
+            crate::utils::redact::sanitize_error(&args.join(" ")),
+            crate::utils::redact::sanitize_error(&stderr)
+        ));
     }
     Ok(())
 }
