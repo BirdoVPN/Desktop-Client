@@ -71,13 +71,26 @@ pub async fn measure_download(
         }
     }
 
-    let bytes = response
-        .bytes()
+    // P1-dk-speedtest-unbounded-body: the Content-Length check above only holds
+    // when the server declares a length. Stream the body and count, so the cap
+    // is enforced regardless of what the server sends (chunked, lying, etc).
+    let mut response = response;
+    let mut bytes_received: u64 = 0;
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("Failed to read download body: {}", e))?;
+        .map_err(|e| format!("Failed to read download body: {}", e))?
+    {
+        bytes_received = bytes_received.saturating_add(chunk.len() as u64);
+        if bytes_received > max_bytes {
+            return Err(format!(
+                "Download body too large: > {} bytes (max {})",
+                bytes_received, max_bytes
+            ));
+        }
+    }
 
     let elapsed = start.elapsed().as_secs_f64();
-    let bytes_received = bytes.len() as u64;
     let mbps = if elapsed > 0.0 {
         (bytes_received as f64 * 8.0) / (elapsed * 1_000_000.0)
     } else {
