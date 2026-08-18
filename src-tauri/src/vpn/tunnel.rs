@@ -2062,8 +2062,14 @@ impl WintunTunnel {
                 let _ = cmd("route")
                     .args(["delete", "128.0.0.0", "mask", "128.0.0.0"])
                     .output();
-            } else if let Ok((network, _)) = self.parse_cidr(allowed_ip) {
-                let _ = cmd("route").args(["delete", &network]).output();
+            } else if let Ok((network, mask)) = self.parse_cidr(allowed_ip) {
+                // P1-dk-win-unqualified-route-delete: an unqualified
+                // `route delete <net>` removes EVERY route for that network,
+                // including a pre-existing corporate/LAN route the client never
+                // installed. Qualify with the mask, mirroring the add path.
+                let _ = cmd("route")
+                    .args(["delete", &network, "mask", &mask])
+                    .output();
             }
         }
 
