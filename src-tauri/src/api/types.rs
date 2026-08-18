@@ -507,7 +507,7 @@ pub struct VpnServer {
     pub accessible: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VpnConfig {
     pub server_id: String,
@@ -530,6 +530,37 @@ pub struct VpnConfig {
     pub allowed_ips_v6: Vec<String>,
     pub mtu: u16,
     pub persistent_keepalive: u16,
+}
+
+/// P1-dk-vpnconfig-debug-serialize-privkey: manual Debug so a careless
+/// `tracing::debug!(?config)` or panic-context capture can never print the
+/// WireGuard private key / PSK. Endpoint and addresses are connection history
+/// (LOG-001) — redact those too.
+impl std::fmt::Debug for VpnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VpnConfig")
+            .field("server_id", &self.server_id)
+            .field("key_id", &self.key_id)
+            .field("private_key", &"[redacted]")
+            .field("public_key", &self.public_key)
+            .field("server_public_key", &self.server_public_key)
+            .field(
+                "preshared_key",
+                &self.preshared_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("endpoint", &"[redacted]")
+            .field("allowed_ips", &self.allowed_ips)
+            .field("dns", &self.dns)
+            .field("client_ip", &"[redacted]")
+            .field(
+                "client_ipv6",
+                &self.client_ipv6.as_ref().map(|_| "[redacted]"),
+            )
+            .field("allowed_ips_v6", &self.allowed_ips_v6)
+            .field("mtu", &self.mtu)
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .finish()
+    }
 }
 
 /// FIX-R3: Zero sensitive key material before deallocation.
