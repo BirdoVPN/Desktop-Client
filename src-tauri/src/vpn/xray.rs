@@ -40,9 +40,10 @@ const DEFAULT_LOCAL_PORT: u16 = 51821;
 /// is the empty-string sentinel that triggers a hard-fail at runtime if the
 /// build pipeline did not populate it (fail-closed — never run an
 /// un-attested binary in production).
-#[cfg(not(debug_assertions))]
-const XRAY_BINARY_SHA256: Option<&str> = option_env!("XRAY_BINARY_SHA256");
-#[cfg(debug_assertions)]
+// One un-gated definition: the debug/release distinction lives in
+// `verify_xray_integrity` (release hard-fails when unset, debug warns), not in
+// how the constant is sourced. The previous cfg-gated pair was byte-identical
+// and only invited a future edit to change one arm and not the other.
 const XRAY_BINARY_SHA256: Option<&str> = option_env!("XRAY_BINARY_SHA256");
 
 /// AUDIT-N4: verify the xray binary on disk against XRAY_BINARY_SHA256
@@ -221,46 +222,64 @@ impl XrayManager {
             )
         })?;
 
-        // Pipe config JSON to stdin and close to signal EOF
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(config_json.as_bytes())
-                .map_err(|e| format!("Failed to write Xray config to stdin: {}", e))?;
-            // stdin dropped here → EOF sent → Xray parses config
-        }
-
-        tracing::info!("Xray process started (PID: {})", child.id());
-
-        // P1-12: Drain stdout and stderr asynchronously to prevent pipe buffer deadlock
-        // and capture crash indicators.
-        if let Some(stdout) = child.stdout.take() {
-            let stdout_async = tokio::process::ChildStdout::from_std(stdout)
-                .map_err(|e| format!("Failed to create async stdout: {}", e))?;
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout_async);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "xray::stdout", "{}", line);
-                }
-            });
-        }
-        if let Some(stderr) = child.stderr.take() {
-            let stderr_async = tokio::process::ChildStderr::from_std(stderr)
-                .map_err(|e| format!("Failed to create async stderr: {}", e))?;
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr_async);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if line.contains("panic") || line.contains("fatal") || line.contains("FATAL") {
-                        tracing::error!(target: "xray::stderr", "CRASH: {}", line);
-                    } else {
-                        tracing::warn!(target: "xray::stderr", "{}", line);
-                    }
-                }
-            });
-        }
-
+        // P1-dk-xray-orphan-on-early-return: take the pipes and store the Child
+        // BEFORE any fallible post-spawn work, so every error path below can
+        // reap the process via stop() instead of orphaning a live xray holding
+        // the loopback port and an open Reality session.
+        let stdin_pipe = child.stdin.take();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let pid = child.id();
         *self.process.lock().await = Some(child);
+
+        let setup_result: Result<(), String> = (|| {
+            // Pipe config JSON to stdin and close to signal EOF
+            if let Some(mut stdin) = stdin_pipe {
+                stdin
+                    .write_all(config_json.as_bytes())
+                    .map_err(|e| format!("Failed to write Xray config to stdin: {}", e))?;
+                // stdin dropped here → EOF sent → Xray parses config
+            }
+
+            tracing::info!("Xray process started (PID: {})", pid);
+
+            // P1-12: Drain stdout and stderr asynchronously to prevent pipe buffer
+            // deadlock and capture crash indicators.
+            if let Some(stdout) = stdout_pipe {
+                let stdout_async = tokio::process::ChildStdout::from_std(stdout)
+                    .map_err(|e| format!("Failed to create async stdout: {}", e))?;
+                tokio::spawn(async move {
+                    let reader = BufReader::new(stdout_async);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        tracing::debug!(target: "xray::stdout", "{}", line);
+                    }
+                });
+            }
+            if let Some(stderr) = stderr_pipe {
+                let stderr_async = tokio::process::ChildStderr::from_std(stderr)
+                    .map_err(|e| format!("Failed to create async stderr: {}", e))?;
+                tokio::spawn(async move {
+                    let reader = BufReader::new(stderr_async);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if line.contains("panic")
+                            || line.contains("fatal")
+                            || line.contains("FATAL")
+                        {
+                            tracing::error!(target: "xray::stderr", "CRASH: {}", line);
+                        } else {
+                            tracing::warn!(target: "xray::stderr", "{}", line);
+                        }
+                    }
+                });
+            }
+            Ok(())
+        })();
+        if let Err(e) = setup_result {
+            self.stop().await;
+            return Err(e);
+        }
 
         // Give Xray time to bind the port
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -410,11 +429,21 @@ impl XrayManager {
 
 impl Drop for XrayManager {
     fn drop(&mut self) {
-        // Synchronous cleanup — kill process if still running
-        if let Ok(mut proc) = self.process.try_lock() {
-            if let Some(mut child) = proc.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+        // Synchronous cleanup — kill process if still running.
+        // P1-dk-xray-drop-trylock-orphan: on lock contention we cannot safely
+        // reach the Child here; at least say so instead of silently leaking.
+        match self.process.try_lock() {
+            Ok(mut proc) => {
+                if let Some(mut child) = proc.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "XrayManager dropped while process lock is held — xray may be left \
+                     running (a concurrent start/stop owns the handle)"
+                );
             }
         }
     }
