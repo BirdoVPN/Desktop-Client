@@ -26,6 +26,23 @@ use super::buffer_pool::WIREGUARD_OVERHEAD;
 const KEEPALIVE_MIN_SECS: u16 = 15;
 const KEEPALIVE_MAX_SECS: u16 = 120;
 
+/// ADAPTIVE TRANSPORT markers — LOAD-BEARING error strings.
+///
+/// The establish-time handshake below is the desktop's transport probe: on a
+/// DPI-filtered network (Iran, Russia) the WireGuard handshake is dropped
+/// outright, so `handshake()` times out and the whole connect fails with one of
+/// these messages. `commands::vpn::transport_fallback_reason` matches on them
+/// (via `contains`, since callers wrap the error) to decide that the failure is
+/// transport-shaped and an automatic Xray Reality retry is warranted. Reword
+/// them only together with that matcher.
+///
+/// No response inside the recv timeout — the network silently ate the
+/// handshake. The common DPI/UDP-filtering signature.
+pub(crate) const ERR_HANDSHAKE_NO_RESPONSE: &str = "Handshake timeout - no response from server";
+/// The receive itself errored (ICMP port unreachable, connection reset) — the
+/// transport was actively refused rather than silently dropped.
+pub(crate) const ERR_HANDSHAKE_RECV: &str = "Failed to receive handshake response";
+
 /// Wrapper for sensitive key bytes that zeroizes on drop
 /// MEM-003: Ensures key material doesn't remain in memory
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -413,8 +430,8 @@ impl WireGuardSession {
                     other => Err(format!("Unexpected handshake result: {:?}", other)),
                 }
             }
-            Ok(Err(e)) => Err(format!("Failed to receive handshake response: {}", e)),
-            Err(_) => Err("Handshake timeout - no response from server".to_string()),
+            Ok(Err(e)) => Err(format!("{}: {}", ERR_HANDSHAKE_RECV, e)),
+            Err(_) => Err(ERR_HANDSHAKE_NO_RESPONSE.to_string()),
         }
     }
 

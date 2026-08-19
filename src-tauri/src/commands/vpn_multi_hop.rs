@@ -264,6 +264,9 @@ pub async fn connect_multi_hop(
             vpn_settings.custom_dns,
             vpn_settings.stealth_mode,
             vpn_settings.quantum_protection,
+            // Adaptive Transport fallback is single-hop only (mirrors Android:
+            // multi-hop requests stealth up front through the same grant).
+            None,
             Some(exitNodeId.clone()),
         )
         .await;

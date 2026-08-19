@@ -39,6 +39,15 @@ pub struct ReconnectInfo {
     pub stealth_mode: bool,
     /// Whether reconnect must request and receive BirdoPQ protection.
     pub quantum_protection: bool,
+    /// ADAPTIVE TRANSPORT: the `fallbackReason` wire value under which this
+    /// session was granted the stealth transport (None = ordinary direct
+    /// session). A reconnect must re-send it: the network is proven to filter
+    /// direct WireGuard, so rebuilding direct would fail its establish-time
+    /// handshake on every attempt — and the grant is fallback-scoped, NOT the
+    /// plan-gated `stealth_mode` preference, which stays false. Session-scoped
+    /// on purpose (never persisted): the next fresh connect re-tests the fast
+    /// path, mirroring Android's expiring stealth preference.
+    pub fallback_reason: Option<String>,
     /// Exit node for multi-hop reconnects. None means a normal single-hop reconnect.
     pub multi_hop_exit_node_id: Option<String>,
 }
@@ -174,6 +183,7 @@ impl AutoReconnectService {
         custom_dns: Option<Vec<String>>,
         stealth_mode: bool,
         quantum_protection: bool,
+        fallback_reason: Option<String>,
         multi_hop_exit_node_id: Option<String>,
     ) {
         let server_name_log = server_name.clone();
@@ -186,6 +196,7 @@ impl AutoReconnectService {
             custom_dns,
             stealth_mode,
             quantum_protection,
+            fallback_reason,
             multi_hop_exit_node_id,
         });
         self.attempt_count.store(0, Ordering::SeqCst);
@@ -1024,6 +1035,9 @@ impl AutoReconnectService {
                 device_name,
                 Some(client_public_key),
                 if info.stealth_mode { Some(true) } else { None },
+                // ADAPTIVE TRANSPORT: keep the fallback-scoped stealth grant
+                // across reconnects — see ReconnectInfo::fallback_reason.
+                info.fallback_reason.as_deref(),
                 if info.quantum_protection {
                     Some(true)
                 } else {

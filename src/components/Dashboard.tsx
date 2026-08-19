@@ -530,6 +530,20 @@ export function Dashboard() {
     toastTimer.current = setTimeout(() => setToast(null), 3200);
   }, []);
 
+  // ── Adaptive Transport fallback notice ────────────────────────────
+  // Rust emits this when direct WireGuard got no handshake (DPI-filtered
+  // network) and the session is being rebuilt over the stealth transport.
+  // The switch must be surfaced, not silent: the toast says what changed,
+  // and once connected the "Stealth" chip reports the transport for the
+  // rest of the session. showToast is a stable useCallback, so listing it
+  // cannot re-register the listener.
+  useEffect(() => {
+    const unlisten = listen('adaptive-transport-fallback', () => {
+      showToast('Network is blocking WireGuard — switching to stealth transport');
+    });
+    return () => { unlisten.then((f) => f()).catch(() => {}); };
+  }, [showToast]);
+
   // ── Settings persistence (full-object save_settings path) ─────────
   // Mirrors the previous MultiHopCard.persist: patch Zustand, then push the
   // FULL settings object to Rust via the unchanged invoke contract.

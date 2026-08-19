@@ -422,6 +422,7 @@ mod types_serialization_tests {
             preferred_region: None,
             client_public_key: None,
             stealth_mode: None,
+            fallback_reason: None,
             quantum_protection: None,
             pq_client_public_key: None,
             desktop_attest_nonce: None,
@@ -434,6 +435,34 @@ mod types_serialization_tests {
         assert_eq!(json["serverNodeId"], "node-1");
         assert!(json.get("deviceName").is_none());
         assert!(json.get("preferredRegion").is_none());
+        // An ordinary connect must not carry the Adaptive Transport signal.
+        assert!(json.get("fallbackReason").is_none());
+    }
+
+    /// ADAPTIVE TRANSPORT: the fallback signal must serialize under the exact
+    /// camelCase key and wire value the backend's ConnectDto enum pins —
+    /// anything else 400s the retry and strands a censored user.
+    #[test]
+    fn connect_request_serializes_fallback_reason_in_camel_case() {
+        let req = ConnectRequest {
+            server_node_id: Some("node-1".to_string()),
+            device_name: None,
+            preferred_region: None,
+            client_public_key: None,
+            stealth_mode: None,
+            fallback_reason: Some(
+                crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT.to_string(),
+            ),
+            quantum_protection: None,
+            pq_client_public_key: None,
+            desktop_attest_nonce: None,
+            desktop_attest_kid: None,
+            desktop_attest_sig: None,
+            desktop_attest_platform: None,
+            desktop_attest_version: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["fallbackReason"], "handshake-timeout");
     }
 
     /// A build without the attestation key must emit the pre-attestation body
@@ -446,6 +475,7 @@ mod types_serialization_tests {
             preferred_region: None,
             client_public_key: Some("pub=".to_string()),
             stealth_mode: Some(false),
+            fallback_reason: None,
             quantum_protection: Some(false),
             pq_client_public_key: None,
             desktop_attest_nonce: None,
@@ -469,6 +499,7 @@ mod types_serialization_tests {
             preferred_region: None,
             client_public_key: None,
             stealth_mode: None,
+            fallback_reason: None,
             quantum_protection: None,
             pq_client_public_key: None,
             desktop_attest_nonce: Some("nonce".to_string()),

@@ -578,6 +578,20 @@ pub struct ConnectRequest {
     /// Request stealth mode (Xray Reality tunnel)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stealth_mode: Option<bool>,
+    /// ADAPTIVE TRANSPORT: set on an automatic retry after direct WireGuard
+    /// failed at establish time (no handshake response — the DPI-filtering
+    /// signature). Unlike `stealth_mode` (a deliberate, plan-gated user
+    /// preference) this is an observed-failure signal the backend honours on
+    /// ANY plan, including anonymous — on a filtered network stealth is the
+    /// only transport that carries packets.
+    ///
+    /// Wire values are pinned by the backend's ConnectDto/zod enum
+    /// (`handshake-timeout` | `transport-blocked` | `dns-blocked`); anything
+    /// else is a 400, which on the fallback retry would leave a censored user
+    /// with no working transport — build it from the
+    /// `commands::vpn::FALLBACK_*` constants, never a literal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
     /// Request post-quantum protection (Rosenpass PSK)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantum_protection: Option<bool>,

@@ -327,12 +327,17 @@ impl BirdoApi {
 
     /// Connect to a VPN server and get WireGuard configuration
     /// FIX-1-1: Accepts optional client_public_key for client-side keygen
+    /// ADAPTIVE TRANSPORT: `fallback_reason` (see ConnectRequest) asks the
+    /// server for the stealth transport on any plan after direct WireGuard
+    /// observably failed. None on an ordinary connect.
+    #[allow(clippy::too_many_arguments)] // mirrors the ConnectRequest wire fields 1:1
     pub async fn connect_vpn(
         &self,
         server_id: &str,
         device_name: &str,
         client_public_key: Option<String>,
         stealth_mode: Option<bool>,
+        fallback_reason: Option<&str>,
         quantum_protection: Option<bool>,
         pq_client_public_key: Option<String>,
     ) -> Result<ConnectResponse, ApiError> {
@@ -344,6 +349,7 @@ impl BirdoApi {
             preferred_region: None,
             client_public_key,
             stealth_mode,
+            fallback_reason: fallback_reason.map(str::to_string),
             quantum_protection,
             pq_client_public_key,
             desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
