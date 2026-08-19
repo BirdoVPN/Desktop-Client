@@ -39,6 +39,7 @@ describe('useAppStore', () => {
         multiHopExitNodeId: null,
         stealthMode: false,
         quantumProtection: false,
+        lockdownMode: true,
       },
       hasAcceptedConsent: false,
       isOnline: true,

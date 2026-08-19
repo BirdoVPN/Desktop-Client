@@ -123,20 +123,27 @@ function App() {
   // Keep the system-tray icon + tooltip in sync with the live connection state.
   // The Rust `set_tray_state` command swaps the embedded status icon (green /
   // amber / slate) and the hover tooltip. Every in-progress phase maps to the
-  // amber "connecting" icon.
+  // amber "connecting" icon — EXCEPT kill_switch_active, which used to fall
+  // into that catch-all: the tray (often the only visible surface, the window
+  // being hidden) said "Connecting…" while every packet on the machine was
+  // being dropped. It now gets the slate icon and an explicit tooltip.
   useEffect(() => {
     const trayState =
       connectionState === 'connected'
         ? 'connected'
-        : connectionState === 'disconnected' || connectionState === 'error'
+        : connectionState === 'disconnected'
+            || connectionState === 'error'
+            || connectionState === 'kill_switch_active'
           ? 'disconnected'
           : 'connecting';
     const tooltip =
-      trayState === 'connected'
-        ? `Birdo VPN — Connected${currentServerName ? ` · ${currentServerName}` : ''}`
-        : trayState === 'connecting'
-          ? 'Birdo VPN — Connecting…'
-          : 'Birdo VPN — Disconnected';
+      connectionState === 'kill_switch_active'
+        ? 'Birdo VPN — Kill switch active: traffic blocked'
+        : trayState === 'connected'
+          ? `Birdo VPN — Connected${currentServerName ? ` · ${currentServerName}` : ''}`
+          : trayState === 'connecting'
+            ? 'Birdo VPN — Connecting…'
+            : 'Birdo VPN — Disconnected';
     invoke('set_tray_state', { state: trayState, tooltip }).catch(() => {
       /* tray not ready / non-fatal */
     });
@@ -196,14 +203,19 @@ function App() {
   //
   // Backs off (4s, 8s, 16s) so a retry cannot itself become the thing keeping
   // the rate-limit window saturated, and stops after 3 attempts.
-  const identityRetries = useRef(0);
+  //
+  // The attempt counter is STATE (not a ref) on purpose: bumping it after a
+  // failed attempt re-runs this effect, which is what schedules the next try.
+  // The previous ref-based version never re-ran on failure — the documented
+  // 3-attempt ladder was actually a single attempt, and a profile fetch still
+  // failing 4 s after sign-in left the Profile stuck on "Loading your
+  // account…" until an app restart.
+  const [identityAttempt, setIdentityAttempt] = useState(0);
   const accountEmail = useAppStore((s) => s.account.email);
   useEffect(() => {
-    if (!isAuthenticated || accountEmail || identityRetries.current >= 3) return;
-    const attempt = identityRetries.current;
-    const delayMs = 4000 * 2 ** attempt;
+    if (!isAuthenticated || accountEmail || identityAttempt >= 3) return;
+    const delayMs = 4000 * 2 ** identityAttempt;
     const timer = setTimeout(async () => {
-      identityRetries.current += 1;
       try {
         const st = await invoke<AuthState>('get_auth_state');
         if (st?.email) {
@@ -215,10 +227,14 @@ function App() {
         }
       } catch {
         /* non-fatal — the backoff above bounds how often this runs */
+      } finally {
+        // On success `accountEmail` gates the effect off; on failure this
+        // re-triggers it to schedule the next backed-off attempt.
+        setIdentityAttempt((a) => a + 1);
       }
     }, delayMs);
     return () => clearTimeout(timer);
-  }, [isAuthenticated, accountEmail, setUserEmail, setAccount]);
+  }, [isAuthenticated, accountEmail, identityAttempt, setUserEmail, setAccount]);
 
   // Daily background update check. The per-platform update endpoint is live
   // (api.birdo.app/updates/…), but the only in-app check used to be the manual

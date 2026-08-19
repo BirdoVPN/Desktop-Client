@@ -130,8 +130,15 @@ fn urldecode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
+            // Decode from the BYTE slice: `&s[i + 1..i + 3]` slices the &str and
+            // panics when a multibyte character follows a '%', which any local
+            // process can trigger by hitting the loopback callback (release builds
+            // are panic = "abort", so that kills the privileged client).
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                if let Some(byte) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    .ok()
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                {
                     out.push(byte);
                     i += 3;
                     continue;
@@ -308,5 +315,27 @@ pub async fn native_oauth_login(
                 challenge_token: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::urldecode;
+
+    /// `urldecode` used to byte-slice the &str (`&s[i + 1..i + 3]`), so a '%'
+    /// immediately followed by a multibyte character panicked the whole process
+    /// — reachable by any local process posting to the loopback callback.
+    #[test]
+    fn urldecode_multibyte_after_percent_does_not_panic() {
+        assert_eq!(urldecode("code=%世界"), "code=%世界");
+        assert_eq!(urldecode("%é"), "%é");
+    }
+
+    #[test]
+    fn urldecode_decodes_normal_escapes() {
+        assert_eq!(urldecode("a%20b+c"), "a b c");
+        assert_eq!(urldecode("%2Fpath%3Fq%3D1"), "/path?q=1");
+        // Trailing partial escapes are passed through, not decoded.
+        assert_eq!(urldecode("done%2"), "done%2");
     }
 }

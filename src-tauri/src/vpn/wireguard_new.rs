@@ -166,25 +166,36 @@ impl WireGuardSession {
                 // L-7 FIX: Use DNS-over-HTTPS to prevent plain DNS leak of VPN server hostname
                 tracing::warn!(
                     "Endpoint '{}' is not a pre-resolved IP:port — resolving via DoH",
-                    endpoint
+                    crate::utils::redact_endpoint(endpoint)
                 );
                 // Extract host and port from the endpoint string
+                // P6-CLI-D-03: these Err strings are logged verbatim by the catch-all
+                // handlers (manager.rs, auto_reconnect.rs) at levels release builds
+                // write, so the endpoint must be redacted HERE — the warn! above
+                // already does it, and an unredacted sibling defeats it.
                 let (host, port) = {
                     let parts: Vec<&str> = endpoint.rsplitn(2, ':').collect();
                     if parts.len() != 2 {
-                        return Err(format!("Invalid endpoint format: {}", endpoint));
+                        return Err(format!(
+                            "Invalid endpoint format: {}",
+                            crate::utils::redact_endpoint(endpoint)
+                        ));
                     }
-                    let port: u16 = parts[0]
-                        .parse()
-                        .map_err(|_| format!("Invalid port in endpoint: {}", endpoint))?;
+                    let port: u16 = parts[0].parse().map_err(|_| {
+                        format!(
+                            "Invalid port in endpoint: {}",
+                            crate::utils::redact_endpoint(endpoint)
+                        )
+                    })?;
                     (parts[1].to_string(), port)
                 };
-                let ip = super::doh::resolve_via_doh(&host)
-                    .await
-                    .map_err(|e| format!(
+                let ip = super::doh::resolve_via_doh(&host).await.map_err(|e| {
+                    format!(
                         "DoH resolution failed for '{}': {}. Pre-resolve endpoints to IP:port to avoid this.",
-                        endpoint, e
-                    ))?;
+                        crate::utils::redact_endpoint(endpoint),
+                        e
+                    )
+                })?;
                 SocketAddr::from((ip, port))
             }
         };
@@ -435,6 +446,30 @@ impl WireGuardSession {
         }
     }
 
+    /// P1-dk-boringtun-queue-never-drained: boringtun queues packets that
+    /// arrive during a handshake/rekey and its contract requires the caller,
+    /// after any `WriteToNetwork` from decapsulate, to loop on
+    /// `decapsulate(None, &[], ..)` sending each result until `Done` —
+    /// otherwise the first packets after every connect/rekey are stranded.
+    async fn drain_queued_packets(&self) {
+        let mut dst = vec![0u8; 9000];
+        loop {
+            let queued = {
+                let mut tunnel = self.tunnel.lock();
+                match tunnel.decapsulate(None, &[], &mut dst) {
+                    TunnResult::WriteToNetwork(data) => Some(data.to_vec()),
+                    _ => None,
+                }
+            };
+            match queued {
+                Some(data) => {
+                    let _ = self.socket.send(&data).await;
+                }
+                None => break,
+            }
+        }
+    }
+
     /// Encrypt and send an IP packet
     /// PERF-001: Uses stack allocation for normal-sized packets (≤ MTU 1420 + overhead)
     /// to eliminate per-packet heap allocations. Falls back to heap for jumbo frames.
@@ -530,6 +565,8 @@ impl WireGuardSession {
                         );
                         // Send keepalive or timer response — don't return to tunnel
                         let _ = self.socket.send(data).await;
+                        // Honour the boringtun drain contract (queued packets).
+                        self.drain_queued_packets().await;
                         Ok(None)
                     }
                     TunnResult::Err(e) => {
@@ -555,7 +592,11 @@ impl WireGuardSession {
 
     /// Update timers and send keepalives as needed
     pub async fn update_timers(&self) -> Result<(), String> {
-        // PERF: Stack-allocate keepalive buffer (WIREGUARD_OVERHEAD = 80 bytes)
+        // Stack buffer for whatever boringtun emits from the timer tick. The
+        // LARGEST such message is a handshake initiation (exactly 148 bytes on
+        // a rekey), not the 32-byte data/keepalive overhead — WIREGUARD_OVERHEAD
+        // is deliberately over-provisioned to 148 and a const assertion in
+        // buffer_pool.rs keeps it that way.
         let mut dst = [0u8; WIREGUARD_OVERHEAD];
 
         let result = {
@@ -572,7 +613,22 @@ impl WireGuardSession {
                 Ok(())
             }
             TunnResult::Done => Ok(()),
-            TunnResult::Err(e) => Err(format!("Timer update failed: {:?}", e)),
+            TunnResult::Err(e) => {
+                // P1-dk-timer-errors-swallowed (sink fix for all three
+                // platform packet loops): ConnectionExpired is fatal — the
+                // peer session is gone. Invalidate is_connected here so
+                // send_packet fails fast and the watchdog's heartbeat sees a
+                // dead tunnel immediately, instead of the dataplane reporting
+                // Connected indefinitely.
+                if matches!(
+                    e,
+                    boringtun::noise::errors::WireGuardError::ConnectionExpired
+                ) {
+                    tracing::warn!("WireGuard session expired — marking dataplane disconnected");
+                    *self.is_connected.write().await = false;
+                }
+                Err(format!("Timer update failed: {:?}", e))
+            }
             _ => Ok(()),
         }
     }

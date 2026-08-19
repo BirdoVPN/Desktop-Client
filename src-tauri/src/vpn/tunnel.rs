@@ -405,6 +405,18 @@ pub struct WintunTunnel {
     local_network_sharing: bool,
     /// Whether split tunneling routes were added (for cleanup)
     local_network_routes_added: Arc<AtomicBool>,
+    /// P1-dk-win-failed-connect-no-dns-restore: progress flags for the
+    /// emergency unwind. A connect can fail — or be CANCELLED: the manager's
+    /// CONNECT_TIMEOUT drops the start() future mid-await — after
+    /// configure_dns has already set every physical adapter to `static none`
+    /// and the routes are in, but BEFORE `running` ever becomes true. stop()
+    /// and Drop both keyed their early-return on `running`, so nothing
+    /// restored DNS: the machine was left with no resolvers on any real NIC
+    /// (both families) until a later successful connect + clean disconnect.
+    /// These record what start() actually MODIFIED, so Drop unwinds exactly
+    /// that, independent of `running`.
+    dns_modified: Arc<AtomicBool>,
+    routes_installed: Arc<AtomicBool>,
 }
 
 impl WintunTunnel {
@@ -433,6 +445,8 @@ impl WintunTunnel {
             saved_default_gateway: Arc::new(RwLock::new(None)),
             local_network_sharing,
             local_network_routes_added: Arc::new(AtomicBool::new(false)),
+            dns_modified: Arc::new(AtomicBool::new(false)),
+            routes_installed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -840,7 +854,12 @@ impl WintunTunnel {
                     && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
             });
             if endpoint_host.is_empty() || endpoint_host.len() > 253 || !valid_labels {
-                return Err(format!("Invalid endpoint hostname: '{}'", endpoint_host));
+                // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
+                // in manager.rs / auto_reconnect.rs at levels release builds write.
+                return Err(format!(
+                    "Invalid endpoint hostname: '{}'",
+                    crate::utils::redact::redact_hostname(endpoint_host)
+                ));
             }
         }
 
@@ -873,6 +892,12 @@ impl WintunTunnel {
             ));
         }
 
+        // P1-dk-allowedips-no-default-coverage: the CIDRs above are only
+        // syntax-checked; also refuse a scope that does not cover the full
+        // address space (defense in depth — build_vpn_config already enforces
+        // this at the choke point every connect path funnels through).
+        crate::vpn::validate_tunnel_scope(&self.config)?;
+
         tracing::debug!("VPN config validation passed");
         Ok(())
     }
@@ -893,37 +918,55 @@ impl WintunTunnel {
         // always-on mode can permit tunneled traffic by interface. Best-effort —
         // only lockdown mode (off by default) depends on it.
         #[cfg(windows)]
-        if let Some(idx) = if_index {
-            let mut luid = windows::Win32::NetworkManagement::Ndis::NET_LUID_LH::default();
-            // SAFETY: `idx` is the Wintun adapter's interface index; the call
-            // fills `luid` and returns NO_ERROR (0) on success.
-            let rc = unsafe {
-                windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid(
-                    idx, &mut luid,
-                )
-            };
-            if rc.0 == 0 {
-                // SAFETY: on success the union's `Value` field holds the LUID.
-                crate::vpn::wfp::set_tunnel_luid(unsafe { luid.Value });
-                // LOCKDOWN server-switch / reconnect: if the block is already
-                // active (lockdown holds it on continuously), rebuild it NOW with
-                // this NEW interface LUID + the new server IP, so the active block
-                // never permits a stale/freed LUID. On a fresh connect the block
-                // is not active yet — arm() does the first activation.
-                if crate::vpn::wfp::is_lockdown_mode() && crate::vpn::wfp::is_blocking() {
-                    if let Err(e) = crate::vpn::wfp::activate_blocking().await {
-                        tracing::error!(
-                            "Lockdown: failed to re-activate kill switch with new tunnel LUID: {}",
-                            e
-                        );
+        {
+            let mut luid_published = false;
+            if let Some(idx) = if_index {
+                let mut luid = windows::Win32::NetworkManagement::Ndis::NET_LUID_LH::default();
+                // SAFETY: `idx` is the Wintun adapter's interface index; the call
+                // fills `luid` and returns NO_ERROR (0) on success.
+                let rc = unsafe {
+                    windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid(
+                        idx, &mut luid,
+                    )
+                };
+                if rc.0 == 0 {
+                    // SAFETY: on success the union's `Value` field holds the LUID.
+                    crate::vpn::wfp::set_tunnel_luid(unsafe { luid.Value });
+                    luid_published = true;
+                    // LOCKDOWN server-switch / reconnect: if the block is already
+                    // active (lockdown holds it on continuously), rebuild it NOW with
+                    // this NEW interface LUID + the new server IP, so the active block
+                    // never permits a stale/freed LUID. On a fresh connect the block
+                    // is not active yet — arm() does the first activation.
+                    if crate::vpn::wfp::is_lockdown_mode() && crate::vpn::wfp::is_blocking() {
+                        if let Err(e) = crate::vpn::wfp::activate_blocking().await {
+                            tracing::error!(
+                                "Lockdown: failed to re-activate kill switch with new tunnel LUID: {}",
+                                e
+                            );
+                        }
                     }
+                } else {
+                    tracing::warn!(
+                        "Could not resolve tunnel LUID from interface index {} (rc=0x{:08X}); lockdown mode unavailable this session",
+                        idx,
+                        rc.0
+                    );
                 }
-            } else {
+            }
+
+            // If we could not identify the tunnel interface, an always-on block-all
+            // has no way to permit tunneled traffic — it would block the user's own
+            // VPN browsing. activate_blocking no longer refuses in that situation
+            // (refusing deadlocked the reconnect loop, see wfp.rs), so the decision
+            // has to be made here instead: degrade this session to the reactive kill
+            // switch. In-memory only; the saved preference is untouched.
+            if !luid_published && crate::vpn::wfp::is_lockdown_mode() {
                 tracing::warn!(
-                    "Could not resolve tunnel LUID from interface index {} (rc=0x{:08X}); lockdown mode unavailable this session",
-                    idx,
-                    rc.0
+                    "Lockdown (always-on) unavailable this session — falling back to the \
+                     reactive kill switch"
                 );
+                crate::vpn::wfp::set_lockdown_mode(false);
             }
         }
 
@@ -1038,6 +1081,11 @@ impl WintunTunnel {
         // Save for cleanup
         *self.resolved_endpoint_ip.write().await = Some(endpoint_ip.to_string());
         *self.saved_default_gateway.write().await = Some(default_gateway.clone());
+
+        // Mark BEFORE the first route mutation: a cancellation mid-way must
+        // already read as "dirty" so the Drop unwind removes what went in.
+        // Cleared by cleanup_routes_blocking once the routes are removed.
+        self.routes_installed.store(true, Ordering::SeqCst);
 
         // CRITICAL: Add host route for the VPN server BEFORE split routes.
         // Without this, the /1 split routes would capture the WireGuard UDP
@@ -1304,6 +1352,12 @@ impl WintunTunnel {
             non_vpn_adapters.len()
         );
 
+        // Mark BEFORE the first netsh mutation below: if the connect is
+        // cancelled (CONNECT_TIMEOUT) or fails anywhere past this point, the
+        // Drop unwind must know the physical adapters were touched even though
+        // `running` never became true. Cleared by restore_dns once restored.
+        self.dns_modified.store(true, Ordering::SeqCst);
+
         // STEP 1: Disable DNS on all other adapters to prevent SMHNR leak.
         // `validate=no` is critical: without it netsh synchronously validates
         // the change against the network (NLA re-evaluation), which blocks for
@@ -1433,7 +1487,12 @@ impl WintunTunnel {
             }
         }
 
-        tracing::info!("IPv6 routed through tunnel (dual-stack): {}", ip_str);
+        // LOG-001: the per-session tunnel IPv6 is joinable back to a user by
+        // the backend IPAM — redact it in the release log.
+        tracing::info!(
+            "IPv6 routed through tunnel (dual-stack): {}",
+            crate::utils::redact_ip(ip_str)
+        );
         Ok(())
     }
 
@@ -1519,7 +1578,22 @@ impl WintunTunnel {
 
         // H-4 FIX: Restore from snapshots instead of blindly setting DHCP
         let snapshots = self.dns_snapshots.read().await.clone();
+        Self::restore_physical_adapters_dns(&snapshots);
 
+        // The physical adapters carry resolvers again — the emergency unwind
+        // (Drop) has nothing left to do for DNS.
+        self.dns_modified.store(false, Ordering::SeqCst);
+
+        tracing::debug!("DNS restoration complete");
+        Ok(())
+    }
+
+    /// Restore the physical (non-VPN) adapters' resolvers to the exact
+    /// pre-connect `snapshots`, or to DHCP when none were captured.
+    ///
+    /// Synchronous on purpose, and shared by restore_dns() and the Drop
+    /// emergency unwind (which cannot await) so the two can never drift.
+    fn restore_physical_adapters_dns(snapshots: &[AdapterDnsSnapshot]) {
         if snapshots.is_empty() {
             // No snapshots — fall back to DHCP on all adapters (legacy behavior)
             tracing::warn!("No DNS snapshots found, falling back to DHCP restoration");
@@ -1529,7 +1603,7 @@ impl WintunTunnel {
                 Self::restore_adapter_dns(name, "ipv6", &[]);
             }
         } else {
-            for snapshot in &snapshots {
+            for snapshot in snapshots {
                 Self::restore_adapter_dns(&snapshot.adapter_name, "ip", &snapshot.dns_servers);
 
                 // IPv6: restore only resolvers the user actually configured. A
@@ -1553,9 +1627,6 @@ impl WintunTunnel {
                 );
             }
         }
-
-        tracing::debug!("DNS restoration complete");
-        Ok(())
     }
 
     /// Restore one address family's resolvers on an adapter.
@@ -1959,10 +2030,19 @@ impl WintunTunnel {
 
     /// Clean up routes when disconnecting
     async fn cleanup_routes(&self) -> Result<(), String> {
+        // Use the stored resolved IP, not the config hostname
+        let endpoint_ip = self.resolved_endpoint_ip.read().await.clone();
+        self.cleanup_routes_blocking(endpoint_ip.as_deref());
+        Ok(())
+    }
+
+    /// Sync core of route cleanup. Shared by cleanup_routes() and the Drop
+    /// emergency unwind (which cannot await) so the two can never drift.
+    fn cleanup_routes_blocking(&self, endpoint_ip: Option<&str>) {
         tracing::debug!("Cleaning up routes");
 
-        // Remove server endpoint host route (use the stored resolved IP, not the config hostname)
-        if let Some(ref endpoint_ip) = *self.resolved_endpoint_ip.read().await {
+        // Remove server endpoint host route
+        if let Some(endpoint_ip) = endpoint_ip {
             tracing::debug!(
                 "Removing endpoint host route for {}",
                 redact_ip(endpoint_ip)
@@ -1982,8 +2062,14 @@ impl WintunTunnel {
                 let _ = cmd("route")
                     .args(["delete", "128.0.0.0", "mask", "128.0.0.0"])
                     .output();
-            } else if let Ok((network, _)) = self.parse_cidr(allowed_ip) {
-                let _ = cmd("route").args(["delete", &network]).output();
+            } else if let Ok((network, mask)) = self.parse_cidr(allowed_ip) {
+                // P1-dk-win-unqualified-route-delete: an unqualified
+                // `route delete <net>` removes EVERY route for that network,
+                // including a pre-existing corporate/LAN route the client never
+                // installed. Qualify with the mask, mirroring the add path.
+                let _ = cmd("route")
+                    .args(["delete", &network, "mask", &mask])
+                    .output();
             }
         }
 
@@ -2005,7 +2091,8 @@ impl WintunTunnel {
                 .store(false, Ordering::SeqCst);
         }
 
-        Ok(())
+        // Routes are gone — the emergency unwind (Drop) has nothing left to do.
+        self.routes_installed.store(false, Ordering::SeqCst);
     }
 
     /// Check if tunnel is running
@@ -2061,13 +2148,28 @@ impl WintunTunnel {
 /// ordered teardown. This is a safety net only.
 impl Drop for WintunTunnel {
     fn drop(&mut self) {
-        if !self.running.load(Ordering::SeqCst) {
+        // P1-dk-win-failed-connect-no-dns-restore: a tunnel that never reached
+        // `running` can still have mutated global state. The manager's
+        // CONNECT_TIMEOUT cancels start() mid-await and DROPS the half-built
+        // tunnel (no error return ever runs), and start()'s own later error
+        // returns (the dual-stack IPv6 `?`s) exit after DNS and routes are in
+        // — with every physical adapter parked on `static none`. Keying this
+        // unwind on `running` alone left the whole machine without resolvers.
+        // Key it on what was actually MODIFIED instead.
+        let dns_dirty = self.dns_modified.load(Ordering::SeqCst);
+        let routes_dirty = self.routes_installed.load(Ordering::SeqCst)
+            || self.local_network_routes_added.load(Ordering::SeqCst);
+        if !self.running.load(Ordering::SeqCst) && !dns_dirty && !routes_dirty {
             return;
         }
 
         tracing::warn!(
-            "WintunTunnel dropped while still running — performing emergency cleanup \
-             to prevent DNS/route leaks"
+            "WintunTunnel dropped with live state (running={}, dns_modified={}, \
+             routes_installed={}) — performing emergency cleanup to prevent \
+             DNS/route leaks",
+            self.running.load(Ordering::SeqCst),
+            dns_dirty,
+            routes_dirty
         );
         self.running.store(false, Ordering::SeqCst);
 
@@ -2086,25 +2188,43 @@ impl Drop for WintunTunnel {
             ])
             .output();
 
-        // Best-effort: restore the PHYSICAL adapters to DHCP for BOTH families.
+        // Best-effort: restore the PHYSICAL adapters for BOTH families.
         // configure_dns() set every non-VPN adapter to `static none` (IPv4 and
         // IPv6) to suppress SMHNR. The clean teardown (restore_dns) undoes that,
-        // but a crash/panic bypasses it — without this, the machine is left with
-        // no resolvers on its real NICs (both families) until the user reconnects
-        // and cleanly disconnects. DHCP is the safe emergency default; a static
-        // resolver the user set will be re-applied by DHCP/RA. The IPv6 half of
-        // this restore matches configure_dns's IPv6 `static none`.
-        for name in &Self::get_non_vpn_adapters() {
-            Self::restore_adapter_dns(name, "ip", &[]);
-            Self::restore_adapter_dns(name, "ipv6", &[]);
-        }
+        // but a cancelled/failed connect or a panic bypasses it — without this,
+        // the machine is left with no resolvers on its real NICs (both
+        // families) until the user reconnects and cleanly disconnects. Restore
+        // the exact snapshots configure_dns captured (a static resolver the
+        // user set survives); with no snapshot captured this falls back to
+        // DHCP. try_read: Drop cannot await, and by now nothing else
+        // legitimately holds the lock.
+        let snapshots = self
+            .dns_snapshots
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        Self::restore_physical_adapters_dns(&snapshots);
+        self.dns_modified.store(false, Ordering::SeqCst);
 
-        // Best-effort: remove server-specific route
-        if let Some(endpoint_ip) = self.config.endpoint.split(':').next() {
-            if !endpoint_ip.is_empty() {
-                let _ = cmd("route").args(["delete", endpoint_ip]).output();
-            }
-        }
+        // Best-effort: remove the endpoint host route plus the split-default
+        // and LAN-sharing routes — the same cleanup stop() runs, via the same
+        // helper. Prefer the RESOLVED endpoint IP (what the route was actually
+        // installed for); fall back to the config host for a pre-resolution
+        // drop, where the delete simply finds nothing.
+        let endpoint_ip = self
+            .resolved_endpoint_ip
+            .try_read()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| {
+                self.config
+                    .endpoint
+                    .split(':')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            });
+        self.cleanup_routes_blocking(endpoint_ip.as_deref());
 
         // Best-effort: remove IPv6 blocking firewall rules
         let _ = cmd("powershell")

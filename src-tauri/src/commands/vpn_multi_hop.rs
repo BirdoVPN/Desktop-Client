@@ -13,7 +13,8 @@ use crate::vpn::AutoReconnectService;
 
 use super::vpn::{
     apply_vpn_settings, build_vpn_config, derive_quantum_psk, enforce_requested_protection,
-    generate_wireguard_keypair, get_device_name, parse_endpoint_ip, start_stealth_tunnel,
+    engage_switch_guard, generate_wireguard_keypair, get_device_name, parse_endpoint_ip,
+    release_switch_guard, start_stealth_tunnel,
 };
 
 /// Get available multi-hop routes (SOVEREIGN plan only)
@@ -74,6 +75,11 @@ pub async fn connect_multi_hop(
     let (local_private_key, client_public_key) = generate_wireguard_keypair();
     let vpn_settings = apply_vpn_settings(&app).await;
 
+    // Switching onto a multi-hop route from a live session is a server switch —
+    // same fail-closed guard as connect_vpn across the teardown + handshake
+    // window. Released only after the new tunnel is up.
+    let switch_guard = engage_switch_guard(&vpn_manager).await;
+
     let pq_pk = if vpn_settings.quantum_protection {
         Some(crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
             "Post-quantum engine unavailable. Connection aborted because quantum protection is enabled."
@@ -118,12 +124,13 @@ pub async fn connect_multi_hop(
     // observe their own egress country, so the client is the only thing that can
     // tell them. Refuse rather than display a route we cannot confirm.
     let Some(ref mh) = mh_response.multi_hop else {
+        // P6-CLI-D-03: node ids are connection history and ERROR IS written in
+        // release, so the ids go to debug and the event stays loud without them.
         tracing::error!(
-            entry = %entryNodeId,
-            exit = %exitNodeId,
             "Multi-hop connect returned success but NO route block — refusing to present an \
              unconfirmed route as multi-hop"
         );
+        tracing::debug!(entry = %entryNodeId, exit = %exitNodeId, "Unconfirmed multi-hop route");
         return Err(
             "The server did not confirm the Multi-Hop route. Not connecting, because this \
              could leave you on a single-hop tunnel while the app showed two."
@@ -131,12 +138,14 @@ pub async fn connect_multi_hop(
         );
     };
     if mh.entry_node.id != entryNodeId || mh.exit_node.id != exitNodeId {
-        tracing::error!(
+        // P6-CLI-D-03: same treatment — four raw node ids must not reach birdo.log.
+        tracing::error!("Multi-hop route MISMATCH — refusing");
+        tracing::debug!(
             requested_entry = %entryNodeId,
             requested_exit = %exitNodeId,
             got_entry = %mh.entry_node.id,
             got_exit = %mh.exit_node.id,
-            "Multi-hop route MISMATCH — refusing"
+            "Multi-hop route mismatch detail"
         );
         return Err(format!(
             "The server established a different Multi-Hop route ({}) than the one selected. \
@@ -186,7 +195,8 @@ pub async fn connect_multi_hop(
         vpn_settings.quantum_protection,
     )?;
 
-    let stealth_endpoint_override = start_stealth_tunnel(&app, &connect_response).await?;
+    let stealth_endpoint_override =
+        start_stealth_tunnel(&app, &connect_response, &vpn_settings.custom_port).await?;
     let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
         connect_response
             .xray_endpoint
@@ -229,10 +239,32 @@ pub async fn connect_multi_hop(
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
         }
+        // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+        // scoped to tcp/443, so a reconnect onto a different server needs the
+        // live block re-armed or its handshake is dropped.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+            tracing::warn!("Failed to update iptables VPN server: {}", e);
+        }
+        // macOS twin: pf bakes the relay permit into the loaded ruleset — while
+        // a block is engaged it must be re-loaded with the NEW relay IP or the
+        // new handshake is dropped (see connect_vpn).
+        #[cfg(target_os = "macos")]
+        if crate::commands::killswitch::pf_blocking_active() {
+            if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+                tracing::warn!("Failed to update pf VPN server permit: {}", e);
+            }
+        }
     } else {
+        // P6-CLI-D-03: the endpoint names the entry node. WARN is written in release,
+        // so the diagnostic goes out redacted and the raw value only at debug.
         tracing::warn!(
             "Could not resolve kill switch endpoint IP from '{}'; kill switch may not filter \
              traffic to the VPN server correctly",
+            crate::utils::redact::redact_hostname(killswitch_endpoint)
+        );
+        tracing::debug!(
+            "Unresolvable kill switch endpoint (raw): {}",
             killswitch_endpoint
         );
     }
@@ -252,8 +284,14 @@ pub async fn connect_multi_hop(
         tracing::warn!("Failed to arm kill switch after multi-hop connect: {}", e);
     }
 
+    // New tunnel verified up — release the switch guard (success path only).
+    release_switch_guard(switch_guard).await;
+
     auto_reconnect.clear_user_disconnected();
-    tracing::info!("Multi-hop VPN connected: {} → {}", entryNodeId, exitNodeId);
+    // LOG-001: the chosen entry/exit nodes are connection history — keep them
+    // out of the release log (info reaches birdo.log); debug is dev-only.
+    tracing::info!("Multi-hop VPN connected");
+    tracing::debug!("Multi-hop VPN connected: {} → {}", entryNodeId, exitNodeId);
     auto_reconnect
         .store_last_config(
             entryNodeId,

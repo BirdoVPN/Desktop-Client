@@ -32,3 +32,13 @@ pub const MAX_PACKET_SIZE: usize = 16384;
 /// the 32-byte data overhead: it is used as a fixed buffer headroom, not as the
 /// exact per-packet data-message overhead.
 pub const WIREGUARD_OVERHEAD: usize = 148;
+
+/// A WireGuard handshake-initiation message is exactly 148 bytes, and
+/// `update_timers` hands boringtun a buffer of WIREGUARD_OVERHEAD to write one
+/// into (wireguard_new.rs). Shrinking this constant below 148 would make every
+/// rekey fail with DestinationBufferTooSmall — "upload works, download dies
+/// after ~2 minutes" — with no visible error in release builds. Guard it.
+const _: () = assert!(
+    WIREGUARD_OVERHEAD >= 148,
+    "WIREGUARD_OVERHEAD must fit a 148-byte handshake initiation (rekey buffer)"
+);

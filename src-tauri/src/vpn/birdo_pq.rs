@@ -161,7 +161,12 @@ fn write_keypair(path: &PathBuf, kp: &StaticKeypair) -> Result<(), String> {
     if kp.public_key.len() != PUBLIC_KEY_BYTES || kp.secret_key.len() != SECRET_KEY_BYTES {
         return Err("invalid keypair sizes".to_string());
     }
-    let mut buf = Vec::with_capacity(FILE_MAGIC.len() + 4 + PUBLIC_KEY_BYTES + SECRET_KEY_BYTES);
+    // Zeroizing so the secret-key copy is scrubbed on EVERY exit path — the
+    // old manual `buf.fill(0)` at the end was skipped whenever the write,
+    // fsync, or rename errored out early.
+    let mut buf = Zeroizing::new(Vec::with_capacity(
+        FILE_MAGIC.len() + 4 + PUBLIC_KEY_BYTES + SECRET_KEY_BYTES,
+    ));
     buf.extend_from_slice(FILE_MAGIC);
     buf.extend_from_slice(&FILE_VERSION.to_le_bytes());
     buf.extend_from_slice(&kp.public_key);
@@ -212,7 +217,12 @@ fn read_keypair(path: &PathBuf) -> Result<Option<StaticKeypair>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("open {path:?}: {e}")),
     };
-    let mut buf = Vec::new();
+    // Zeroizing + pre-sized: the buffer holds the ML-KEM SECRET key, so (a) it
+    // must be scrubbed on EVERY exit path, not only the manual `buf.fill(0)`
+    // ones, and (b) it must never reallocate mid-read — a realloc leaves an
+    // unscrubbed copy of the key bytes in freed heap.
+    const EXPECTED_LEN: usize = FILE_MAGIC.len() + 4 + PUBLIC_KEY_BYTES + SECRET_KEY_BYTES;
+    let mut buf = Zeroizing::new(Vec::with_capacity(EXPECTED_LEN + 64));
     f.read_to_end(&mut buf)
         .map_err(|e| format!("read {path:?}: {e}"))?;
     if buf.len() != FILE_MAGIC.len() + 4 + PUBLIC_KEY_BYTES + SECRET_KEY_BYTES {

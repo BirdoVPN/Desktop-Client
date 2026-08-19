@@ -146,6 +146,26 @@ pub fn redact_endpoint(endpoint: &str) -> String {
     }
 }
 
+/// Cap a sanitized message at 200 characters, cutting on a CHARACTER boundary.
+///
+/// Byte-slicing (`s[..197]`) panics whenever the cut lands inside a multibyte
+/// sequence, and `sanitize_error` is called from the panic hook (main.rs) — a
+/// panic there aborts the process (release profile is `panic = "abort"`), which
+/// takes the tunnel and the kill switch down with it. Any non-ASCII text in an
+/// OS error message was enough to trigger it.
+///
+/// Split out of the `not(debug_assertions)` branch so it is reachable from tests.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn truncate_for_display(result: String) -> String {
+    if result.chars().count() > 200 {
+        let mut truncated: String = result.chars().take(197).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        result
+    }
+}
+
 /// Sanitize an error message by redacting any embedded PII (IP addresses, emails, hostnames).
 ///
 /// P3-FIX-17: Error messages returned to users or logged may accidentally contain
@@ -173,10 +193,30 @@ pub fn sanitize_error(msg: &str) -> String {
         static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
             Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").expect("email regex")
         });
-        // Matches common hostname patterns (at least two labels with TLD)
+        // Matches common hostname patterns. P1-dk-redaction-incomplete: two
+        // labels are enough ("birdo.app" is as identifying as "api.birdo.app"),
+        // so the repeated-label group is now optional.
         static HOST_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){1,}\.[a-zA-Z]{2,}\b").expect("hostname regex")
+            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){0,}\.[a-zA-Z]{2,}\b").expect("hostname regex")
         });
+        // P1-dk-redaction-incomplete: IPv6 literals. Two shapes — an expanded
+        // run of >= 5 hex groups (>= 5 avoids matching hh:mm:ss timestamps),
+        // and anything containing "::" flanked by hex groups.
+        static IPV6_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(
+                r"(?i)\b(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}\b|(?i)\b(?:[0-9a-f]{1,4}:)+:(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?|::[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*",
+            )
+            .expect("IPv6 regex")
+        });
+        // P1-dk-redaction-incomplete / P6-CLI-D-06: JWTs and long unbroken
+        // base64/base64url runs (WireGuard keys are 44 chars of base64; bearer
+        // tokens and API keys are similar). Over-redaction of a long opaque id
+        // is an acceptable trade in a privacy sink.
+        static JWT_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{4,}){1,2}\b").expect("JWT regex")
+        });
+        static TOKEN_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"[A-Za-z0-9+/_-]{32,}={0,2}").expect("token regex"));
         // P2-13: Strip HTML tags
         static HTML_TAG_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"<[^>]{1,200}>").expect("HTML tag regex"));
@@ -194,6 +234,13 @@ pub fn sanitize_error(msg: &str) -> String {
 
         // Strip stack trace lines
         let result = STACK_TRACE_RE.replace_all(&result, "").to_string();
+
+        // Tokens/keys first, before the host/IP passes fragment them.
+        let result = JWT_RE.replace_all(&result, "[redacted-token]").to_string();
+        let result = TOKEN_RE
+            .replace_all(&result, "[redacted-token]")
+            .to_string();
+        let result = IPV6_RE.replace_all(&result, "[redacted-ipv6]").to_string();
 
         let result = IPV4_RE
             .replace_all(&result, |caps: &regex::Captures| {
@@ -215,13 +262,7 @@ pub fn sanitize_error(msg: &str) -> String {
         let result = HOST_RE.replace_all(&result, "[redacted-host]").to_string();
 
         // P2-20: Truncate to 200 chars (aligned with Android InputValidator.sanitizeErrorMessage)
-        if result.len() > 200 {
-            let mut truncated = result[..197].to_string();
-            truncated.push_str("...");
-            truncated
-        } else {
-            result
-        }
+        truncate_for_display(result)
     }
 }
 
@@ -260,6 +301,24 @@ mod tests {
         let result = sanitize_error(msg);
         // In debug builds, returns as-is
         assert_eq!(result, msg);
+    }
+
+    /// The release-build truncation used to byte-slice at 197 and panicked on any
+    /// message whose cut point landed inside a multibyte character. Exercised
+    /// directly because the truncation itself is `not(debug_assertions)`-only.
+    #[test]
+    fn test_truncate_for_display_multibyte_does_not_panic() {
+        // 300 three-byte characters: every byte index in 195..=197 is mid-character.
+        let msg = "世".repeat(300);
+        let result = truncate_for_display(msg);
+        assert_eq!(result.chars().count(), 200);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_for_display_short_message_untouched() {
+        let msg = "Connection timed out — retrying".to_string();
+        assert_eq!(truncate_for_display(msg.clone()), msg);
     }
 
     #[test]

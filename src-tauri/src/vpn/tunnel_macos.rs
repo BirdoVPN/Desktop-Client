@@ -105,6 +105,14 @@ pub struct UtunTunnel {
     local_network_sharing: bool,
     /// Endpoint IP for route exclusion
     endpoint_ip: Arc<RwLock<Option<String>>>,
+    /// JoinHandle of the spawned packet loop.
+    ///
+    /// P1-dk-tun-fd-close-race: stop() must JOIN this task before closing the
+    /// utun fd. The loop's spawn_blocking closures capture the raw i32; closing
+    /// while one is still in flight lets the kernel recycle the descriptor
+    /// number, and the stale read()/write() then lands on whatever unrelated
+    /// file or socket this process opens next.
+    packet_loop: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// LAST-RESORT teardown. `stop()` closes the utun fd at the very END, after
@@ -128,6 +136,11 @@ impl Drop for UtunTunnel {
         // acquire it must never panic or block a teardown.
         if let Ok(mut guard) = self.utun_fd.try_write() {
             if let Some(fd) = guard.take() {
+                // Drop cannot join the packet loop (no await), so this close
+                // carries the small fd-recycle race stop() eliminates.
+                // Accepted: this is the last-resort path for a DROPPED
+                // half-built tunnel, and leaving the device alive (the
+                // alternative) is a guaranteed IPv4 blackhole.
                 let _ = unsafe { libc::close(fd) };
                 tracing::warn!(
                     "UtunTunnel dropped with the utun fd still open — closed it to \
@@ -158,6 +171,7 @@ impl UtunTunnel {
             network_snapshot: Arc::new(RwLock::new(None)),
             local_network_sharing,
             endpoint_ip: Arc::new(RwLock::new(None)),
+            packet_loop: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -238,9 +252,10 @@ impl UtunTunnel {
 
         // F-001 (P0): block IPv6 egress for the whole Connected session. Installed
         // here — at tunnel start, INDEPENDENT of the kill-switch enabled/lockdown
-        // setting — exactly as Windows does (tunnel.rs LEAK-2). The reactive kill
-        // switch cannot cover this: it is torn down once the tunnel is healthy, and
-        // an IPv6 leak never drops the (IPv4-only) tunnel so it never trips.
+        // setting — exactly as Windows does (tunnel.rs LEAK-2). The kill switch
+        // cannot cover this: it is preference-gated (and released on disarm/
+        // give-up), and an IPv6 leak never drops the (IPv4-only) tunnel so the
+        // reactive path never trips.
         //
         // macOS blocks IPv6 unconditionally — including on dual-stack nodes —
         // and that is deliberate, not an oversight.
@@ -294,7 +309,7 @@ impl UtunTunnel {
         let wg_session = self.wg_session.clone();
         let fd = utun_fd;
 
-        tokio::spawn(async move {
+        let loop_handle = tokio::spawn(async move {
             Self::packet_loop(
                 fd,
                 wg_session,
@@ -307,6 +322,9 @@ impl UtunTunnel {
             )
             .await;
         });
+        // Keep the handle so stop() can join the loop before closing the fd
+        // (P1-dk-tun-fd-close-race).
+        *self.packet_loop.write().await = Some(loop_handle);
 
         tracing::info!("macOS tunnel started successfully");
         Ok(())
@@ -321,6 +339,31 @@ impl UtunTunnel {
         // Signal the packet loop to stop
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(()).await;
+        }
+
+        // P1-dk-tun-fd-close-race: JOIN the packet loop before the fd close
+        // below. The loop's spawn_blocking closures capture the raw i32 fd;
+        // without the join, an in-flight libc::read/libc::write can execute
+        // AFTER close(2) returns the number to the kernel's free pool — and the
+        // stale syscall then reads from or writes packet bytes into whatever
+        // unrelated descriptor (log file, TLS socket, keystore handle) this
+        // process opened next. The fd is O_NONBLOCK, so the loop drains within
+        // one iteration of the shutdown signal; the timeout is a safety valve
+        // only. If it ever fires we abort the task and fall through to the
+        // close anyway — a stuck loop must not leave the device alive owning
+        // the half-default routes (that is the frozen-switch blackhole).
+        if let Some(handle) = self.packet_loop.write().await.take() {
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .is_err()
+            {
+                abort.abort();
+                tracing::warn!(
+                    "Packet loop did not exit within 5s of shutdown — aborted it; \
+                     closing the utun fd regardless"
+                );
+            }
         }
 
         // Restore DNS
@@ -512,7 +555,13 @@ impl UtunTunnel {
                         let write_len = 4 + decrypted.len();
                         let fd = utun_fd;
                         let buf = write_buf[..write_len].to_vec();
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let expected = buf.len();
+                        // P1-dk-macos-rx-counters-on-failed-write: only count a
+                        // packet as received when the utun write fully succeeds
+                        // (as the Linux path does) — otherwise a dead utun keeps
+                        // RX rising and the watchdog's data-plane signal never
+                        // fires.
+                        let write_ok = tokio::task::spawn_blocking(move || {
                             let written = unsafe {
                                 libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
                             };
@@ -522,11 +571,15 @@ impl UtunTunnel {
                                     std::io::Error::last_os_error()
                                 );
                             }
+                            written == expected as isize
                         })
-                        .await;
+                        .await
+                        .unwrap_or(false);
 
-                        bytes_received.fetch_add(packet_len, Ordering::Relaxed);
-                        packets_received.fetch_add(1, Ordering::Relaxed);
+                        if write_ok {
+                            bytes_received.fetch_add(packet_len, Ordering::Relaxed);
+                            packets_received.fetch_add(1, Ordering::Relaxed);
+                        }
                     } else {
                         break; // nothing queued — stop draining
                     }
@@ -597,7 +650,12 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
             || endpoint_host.starts_with('-')
             || endpoint_host.starts_with('.')
         {
-            return Err(format!("Invalid endpoint hostname: '{}'", endpoint_host));
+            // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
+            // in manager.rs / auto_reconnect.rs at levels release builds write.
+            return Err(format!(
+                "Invalid endpoint hostname: '{}'",
+                crate::utils::redact::redact_hostname(endpoint_host)
+            ));
         }
     }
 
@@ -622,6 +680,12 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
     if config.mtu < 576 || config.mtu > 9000 {
         return Err(format!("Invalid MTU: {} (expected 576-9000)", config.mtu));
     }
+
+    // P1-dk-allowedips-no-default-coverage: the CIDRs above are only
+    // syntax-checked; also refuse a scope that does not cover the full address
+    // space (defense in depth — build_vpn_config already enforces this at the
+    // choke point every connect path funnels through).
+    crate::vpn::validate_tunnel_scope(config)?;
 
     Ok(())
 }

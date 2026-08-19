@@ -3,13 +3,6 @@
 pub mod elevation;
 pub mod redact;
 
-// elevation is scaffolding — used when specific operations need UAC elevation.
-// Re-exports here for convenience.
-#[cfg(target_os = "windows")]
-#[allow(unused_imports)]
-pub use elevation::run_netsh_elevated;
-#[allow(unused_imports)]
-pub use elevation::{is_elevated, run_elevated};
 pub use redact::redact_email;
 pub use redact::redact_endpoint;
 pub use redact::redact_ip;
@@ -62,22 +55,32 @@ pub fn get_device_id() -> String {
 }
 
 /// Human-readable name for this machine, shown in the account's device list
-/// ("Revoke MACBOOK-PRO"). Lives here next to `get_device_id` because every
-/// auth payload that carries the id also carries this label — they have to be
-/// derived from the same place or a login can relabel the row a registration
-/// just named. `commands::vpn::get_device_name` delegates here.
+/// ("Revoke Windows Desktop (a1b2c3)"). Lives here next to `get_device_id`
+/// because every auth payload that carries the id also carries this label —
+/// they have to be derived from the same place or a login can relabel the row
+/// a registration just named. `commands::vpn::get_device_name` delegates here.
+///
+/// SEC-PII: this used to be the raw machine hostname, which on consumer
+/// Windows/macOS routinely embeds the owner's real name ("Johns-MacBook-Pro"),
+/// converting a pseudonymous (or anonymous-plan) account into a named one on
+/// every connect and auth call. Now a generic platform label — the shape
+/// Android already uses (Build.MANUFACTURER + MODEL, never the hostname) —
+/// plus a short prefix of the SHA-256 device id so a user with several
+/// machines can still tell the rows apart. The backend already receives that
+/// id in full beside this label, so the suffix transmits zero new information.
 pub fn get_device_name() -> String {
-    hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| {
-            if cfg!(target_os = "macos") {
-                "Mac".to_string()
-            } else if cfg!(target_os = "linux") {
-                "Linux".to_string()
-            } else {
-                "Desktop".to_string()
-            }
-        })
+    let platform = if cfg!(target_os = "macos") {
+        "Mac Desktop"
+    } else if cfg!(target_os = "linux") {
+        "Linux Desktop"
+    } else if cfg!(target_os = "windows") {
+        "Windows Desktop"
+    } else {
+        "Desktop"
+    };
+    let id = get_device_id();
+    let suffix: String = id.chars().take(6).collect();
+    format!("{} ({})", platform, suffix)
 }
 
 /// This build's value for the backend `platform` enum

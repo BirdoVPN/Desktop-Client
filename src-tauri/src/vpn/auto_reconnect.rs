@@ -246,8 +246,9 @@ impl AutoReconnectService {
         *self.shutdown_tx.write().await = Some(shutdown_tx);
         self.running.store(true, Ordering::SeqCst);
 
-        // Start (idempotently) the connectivity monitor and hand a receiver to the
-        // loop. Cheap 5s in-process TCP probe; it runs for the app's lifetime.
+        // Start (idempotently) the connectivity monitor and hand a receiver to
+        // the loop. Cheap 5s in-process TCP probe; runs only while this service
+        // runs — stop() shuts it down so no probe beacon outlives the session.
         self.network_monitor.start();
         let connectivity_rx = self.network_monitor.subscribe();
 
@@ -289,6 +290,12 @@ impl AutoReconnectService {
         }
         self.running.store(false, Ordering::SeqCst);
         self.is_reconnecting.store(false, Ordering::SeqCst);
+        // P1-ks-connectivity-probe-beacon: stop the connectivity monitor with
+        // the session. Left running it TCP-probed Cloudflare/Quad9/Google every
+        // 5 s for the rest of the app's lifetime — a fixed liveness beacon from
+        // the user's real IP while no VPN session even exists. start() re-arms
+        // it (idempotently) on the next connect.
+        self.network_monitor.stop();
         tracing::info!("Auto-reconnect service stopped");
     }
 
@@ -333,6 +340,14 @@ impl AutoReconnectService {
         // P2-15: Quality report counter — send every ~60s (12 ticks × 5s)
         let mut quality_tick_count: u32 = 0;
         const QUALITY_EVERY_N_TICKS: u32 = 12;
+        // P1-dk-fabricated-quality-telemetry: probe outcomes for the CURRENT
+        // quality window. The heartbeat is a real request/response round trip
+        // THROUGH the tunnel, so it doubles as the latency/loss probe: a
+        // completed heartbeat yields a measured RTT, a transport-level failure
+        // (timeout/no route — ApiError::Network) is a lost probe. HTTP-status
+        // failures are NOT loss: those packets flowed both ways.
+        let mut probe_attempts: u32 = 0;
+        let mut probe_losses: u32 = 0;
 
         // AUDIT-2026-06-19 FIX (HIGH): tunnel liveness watchdog state. The manager
         // only leaves Connected on an explicit disconnect or a server-invalidated
@@ -389,10 +404,16 @@ impl AutoReconnectService {
                                 attempt_count.store(0, Ordering::SeqCst);
 
                                 // Deactivate kill switch now that we're connected
-                                // — UNLESS lockdown (always-on) mode is enabled,
-                                // where the block stays active continuously to
-                                // close the reactive detection window.
-                                if !killswitch::is_lockdown_mode() {
+                                // — UNLESS the platform holds the block for the
+                                // whole session (Windows lockdown mode; ALWAYS on
+                                // macOS/Linux, where the steady-state block is
+                                // what closes the reactive detection window — the
+                                // tunnel-interface permits carry the traffic).
+                                // The give-up and offline-pause-cap branches
+                                // below still gate on is_lockdown_mode() and DO
+                                // release the block on Unix, so this cannot
+                                // strand anyone once the session is over.
+                                if !killswitch::holds_block_while_connected() {
                                     let _ = killswitch::deactivate_killswitch().await;
                                 }
 
@@ -459,12 +480,38 @@ impl AutoReconnectService {
                             if heartbeat_tick_count >= HEARTBEAT_EVERY_N_TICKS {
                                 heartbeat_tick_count = 0;
                                 if let Some(key_id) = vpn_manager.get_key_id().await {
+                                    let hb_started = std::time::Instant::now();
                                     match api.heartbeat(&key_id).await {
                                         Ok(resp) => {
                                             // The heartbeat reached the server THROUGH
                                             // the tunnel → the tunnel is alive. Clears
                                             // the watchdog's control-plane signal.
                                             recent_heartbeat_failed = false;
+                                            // Record the round trip as a MEASURED
+                                            // latency sample. Before this, latency_ms
+                                            // was written only by a test-only tunnel
+                                            // probe, so every quality report shipped a
+                                            // fabricated 0 ms latency / 0 ms jitter.
+                                            probe_attempts = probe_attempts.saturating_add(1);
+                                            let rtt_ms = hb_started
+                                                .elapsed()
+                                                .as_millis()
+                                                .min(u128::from(u32::MAX))
+                                                as u32;
+                                            match timeout(
+                                                Duration::from_secs(5),
+                                                vpn_manager.stats.write(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(mut st) => {
+                                                    st.latency_ms = Some(rtt_ms);
+                                                    st.push_latency_sample(rtt_ms);
+                                                }
+                                                Err(_) => tracing::error!(
+                                                    "Stats write lock timeout recording heartbeat RTT"
+                                                ),
+                                            }
                                             if !resp.valid {
                                                 tracing::warn!("Heartbeat: session invalidated by server — disconnecting");
                                                 let _ = vpn_manager.disconnect().await;
@@ -497,52 +544,63 @@ impl AutoReconnectService {
                                             // tunnel) is one half of the liveness
                                             // watchdog's dead-tunnel signal.
                                             recent_heartbeat_failed = true;
+                                            // Probe accounting: only a TRANSPORT
+                                            // failure is a lost probe; an HTTP error
+                                            // proves the path carried packets.
+                                            probe_attempts = probe_attempts.saturating_add(1);
+                                            if matches!(e, ApiError::Network(_)) {
+                                                probe_losses = probe_losses.saturating_add(1);
+                                            }
                                             tracing::warn!("Heartbeat failed: {}", e);
                                         }
                                     }
                                 }
                             }
 
-                            // P2-15: Periodic quality telemetry reporting
+                            // P2-15: Periodic quality telemetry reporting.
+                            //
+                            // P1-dk-fabricated-quality-telemetry: report ONLY what
+                            // was measured. latency/jitter come from real heartbeat
+                            // RTTs recorded above; loss is the fraction of probes
+                            // that failed at the transport level in this window.
+                            // A window with no completed probe sends NO report —
+                            // the backend must see missing data, never invented
+                            // zeros (same class as the security-console telemetry
+                            // lie: reassurance rendered from nothing).
                             quality_tick_count += 1;
                             if quality_tick_count >= QUALITY_EVERY_N_TICKS {
                                 quality_tick_count = 0;
+                                let window_attempts = probe_attempts;
+                                let window_losses = probe_losses;
+                                probe_attempts = 0;
+                                probe_losses = 0;
                                 let stats = vpn_manager.get_stats().await;
-                                if let Some(ref key_id) = stats.key_id {
-                                    let connected_secs = stats.connected_at
-                                        .map(|t| (chrono::Utc::now() - t).num_seconds().max(0) as u64)
-                                        .unwrap_or(0);
-                                    // P2-16: Use real jitter and packet loss from rolling stats
-                                    let jitter = stats.jitter_ms();
-                                    let loss = stats.packet_loss_percent();
-                                    let report = crate::api::types::QualityReport {
-                                        key_id: key_id.clone(),
-                                        latency_ms: stats.latency_ms.unwrap_or(0) as f64,
-                                        jitter_ms: jitter,
-                                        packet_loss_percent: loss,
-                                        bytes_in: stats.bytes_received,
-                                        bytes_out: stats.bytes_sent,
-                                        handshake_age_seconds: connected_secs,
-                                        connection_state: "connected".to_string(),
-                                        platform: std::env::consts::OS.to_string(),
-                                    };
-                                    // Snapshot packet counters for the next loss window.
-                                    // Match the 5s lock-timeout discipline used across manager.rs
-                                    // so a stuck stats lock can't hang the health-check loop.
-                                    match timeout(
-                                        Duration::from_secs(5),
-                                        vpn_manager.stats.write(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(mut stats_w) => stats_w.snapshot_packets(),
-                                        Err(_) => tracing::error!(
-                                            "Stats write lock timeout in quality report snapshot"
-                                        ),
+                                match (&stats.key_id, stats.latency_ms) {
+                                    (Some(key_id), Some(latency_ms)) if window_attempts > 0 => {
+                                        let connected_secs = stats.connected_at
+                                            .map(|t| (chrono::Utc::now() - t).num_seconds().max(0) as u64)
+                                            .unwrap_or(0);
+                                        let loss = (window_losses as f64
+                                            / window_attempts as f64)
+                                            * 100.0;
+                                        let report = crate::api::types::QualityReport {
+                                            key_id: key_id.clone(),
+                                            latency_ms: latency_ms as f64,
+                                            jitter_ms: stats.jitter_ms(),
+                                            packet_loss_percent: loss,
+                                            bytes_in: stats.bytes_received,
+                                            bytes_out: stats.bytes_sent,
+                                            handshake_age_seconds: connected_secs,
+                                            connection_state: "connected".to_string(),
+                                            platform: std::env::consts::OS.to_string(),
+                                        };
+                                        if let Err(e) = api.report_quality(&report).await {
+                                            tracing::debug!("Quality report failed (non-fatal): {}", e);
+                                        }
                                     }
-                                    if let Err(e) = api.report_quality(&report).await {
-                                        tracing::debug!("Quality report failed (non-fatal): {}", e);
-                                    }
+                                    _ => tracing::debug!(
+                                        "Quality report skipped — no measured probe this window"
+                                    ),
                                 }
                             }
                         }
@@ -594,10 +652,20 @@ impl AutoReconnectService {
                                             tracing::info!("Kill switch activated for reconnect protection");
                                         }
                                         Err(e) => {
+                                            // Abort THIS attempt (reconnecting without the
+                                            // block could leak), but CONSUME the attempt.
+                                            // Without that the loop spun here forever on a
+                                            // persistent activation failure: no reconnect,
+                                            // and the give-up branch — the only thing that
+                                            // releases the block — was never reached.
+                                            let spent = attempt_count.fetch_add(1, Ordering::SeqCst) + 1;
                                             tracing::error!(
                                                 "Kill switch activation failed during reconnect: {}. \
-                                                 Aborting reconnect to prevent traffic leak.",
-                                                e
+                                                 Aborting this attempt to prevent a traffic leak \
+                                                 (attempt {} of {}).",
+                                                e,
+                                                spent,
+                                                cfg.max_attempts
                                             );
                                             is_reconnecting.store(false, Ordering::SeqCst);
                                             continue;
@@ -641,9 +709,11 @@ impl AutoReconnectService {
                                         #[cfg(target_os = "linux")]
                                         { let _ = std::process::Command::new("resolvectl").args(["flush-caches"]).output(); }
 
-                                        let device_name = hostname::get()
-                                            .map(|h| h.to_string_lossy().to_string())
-                                            .unwrap_or_else(|_| "Windows PC".to_string());
+                                        // SEC-PII: same generic label as every other auth/connect
+                                        // payload — never the raw hostname (and never a DIFFERENT
+                                        // label, which would relabel the account's device row on
+                                        // every auto-reconnect).
+                                        let device_name = crate::utils::get_device_name();
 
                                         // FIX-1-1: Generate fresh keypair for reconnect too
                                         let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
@@ -758,6 +828,13 @@ impl AutoReconnectService {
                                                             if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
                                                                 tracing::warn!("Failed to update WFP VPN server during reconnect: {}", e);
                                                             }
+                                                            // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+                                                            // scoped to tcp/443, so a reconnect onto a different server needs the
+                                                            // live block re-armed or its handshake is dropped.
+                                                            #[cfg(target_os = "linux")]
+                                                            if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+                                                                tracing::warn!("Failed to update iptables VPN server: {}", e);
+                                                            }
                                                         }
 
                                                         // AR-2 FIX: Re-check the user-disconnect flag immediately
@@ -778,7 +855,12 @@ impl AutoReconnectService {
                                                                 tracing::info!("Auto-reconnect successful on attempt {}", attempts + 1);
                                                             }
                                                             Err(e) => {
-                                                                tracing::warn!("Auto-reconnect tunnel failed on attempt {}: {}", attempts + 1, e);
+                                                                // P6-CLI-D-03 (defence in depth) — see manager.rs.
+                            tracing::warn!(
+                                "Auto-reconnect tunnel failed on attempt {}: {}",
+                                attempts + 1,
+                                crate::utils::redact::sanitize_error(&e)
+                            );
                                                             }
                                                         }
                                                     }
@@ -818,20 +900,44 @@ impl AutoReconnectService {
                                             cfg.max_attempts
                                         );
                                         is_reconnecting.store(false, Ordering::SeqCst);
-                                        // The session is over: forget the IPv6-block intent BEFORE
-                                        // deactivating, or deactivate_blocking() would re-install a
-                                        // standalone IPv6 block for a tunnel that will never come back
-                                        // and silently blackhole IPv6 for the rest of the run.
-                                        // (WFP is Windows-only; no-op elsewhere.)
-                                        #[cfg(target_os = "windows")]
-                                        crate::vpn::wfp::clear_ipv6_block_intent();
                                         // AUDIT-2026-06-19 FIX (lockout regression): deactivate the
                                         // kill switch when we give up, SYMMETRIC with the Error arm
                                         // below (line ~698). Without this, arming the (previously
                                         // dead) kill switch would strand the user behind an active
                                         // block-all with no automatic recovery after a flaky network
                                         // exhausted all reconnect attempts.
-                                        let _ = killswitch::deactivate_killswitch().await;
+                                        //
+                                        // NOT in lockdown ("always-on") mode: there the user asked
+                                        // for traffic to be blocked whenever there is no tunnel, so
+                                        // auto-releasing the block here would fail OPEN on exactly
+                                        // the event the mode exists for. The escape hatches are
+                                        // explicit and user-driven — Disconnect (killswitch::disarm)
+                                        // or turning the kill switch off in Settings
+                                        // (set_killswitch_live) — so this cannot strand anyone.
+                                        if killswitch::is_lockdown_mode() {
+                                            tracing::error!(
+                                                "Gave up reconnecting with the always-on kill switch armed — \
+                                                 traffic stays blocked until you disconnect or turn the kill \
+                                                 switch off"
+                                            );
+                                            let _ = vpn_manager
+                                                .set_state(ConnectionState::Error(
+                                                    "Always-on protection is blocking traffic: the VPN could \
+                                                     not reconnect. Disconnect, or turn off the kill switch \
+                                                     in Settings, to restore normal internet."
+                                                        .to_string(),
+                                                ))
+                                                .await;
+                                        } else {
+                                            // The session is over: forget the IPv6-block intent BEFORE
+                                            // deactivating, or deactivate_blocking() would re-install a
+                                            // standalone IPv6 block for a tunnel that will never come back
+                                            // and silently blackhole IPv6 for the rest of the run.
+                                            // (WFP is Windows-only; no-op elsewhere.)
+                                            #[cfg(target_os = "windows")]
+                                            crate::vpn::wfp::clear_ipv6_block_intent();
+                                            let _ = killswitch::deactivate_killswitch().await;
+                                        }
                                         // PWR-8: after giving up there is nothing left for this loop
                                         // to do — without stopping it, it ticks every
                                         // `check_interval` FOREVER (waking the CPU/timer for no
@@ -855,9 +961,10 @@ impl AutoReconnectService {
                             if cfg.enabled && info_snapshot.is_some() {
                                 let attempts = attempt_count.load(Ordering::SeqCst);
 
+                                // P6-CLI-D-03 (defence in depth) — see manager.rs.
                                 tracing::warn!(
                                     "Connection error detected: {}, attempting recovery (attempt {})",
-                                    error_msg,
+                                    crate::utils::redact::sanitize_error(error_msg),
                                     attempts + 1
                                 );
 
@@ -896,10 +1003,18 @@ impl AutoReconnectService {
                                             tracing::info!("Kill switch activated for error recovery");
                                         }
                                         Err(e) => {
+                                            // Same as the Disconnected arm: abort the attempt
+                                            // but consume it, so a persistent activation
+                                            // failure still advances toward give-up instead
+                                            // of spinning with the budget untouched.
+                                            let spent = attempt_count.fetch_add(1, Ordering::SeqCst) + 1;
                                             tracing::error!(
                                                 "Kill switch activation failed during error recovery: {}. \
-                                                 Aborting to prevent traffic leak.",
-                                                e
+                                                 Aborting this attempt to prevent a traffic leak \
+                                                 (attempt {} of {}).",
+                                                e,
+                                                spent,
+                                                cfg.max_attempts
                                             );
                                             is_reconnecting.store(false, Ordering::SeqCst);
                                             continue;
@@ -918,13 +1033,23 @@ impl AutoReconnectService {
                                         cfg.max_attempts
                                     );
                                     is_reconnecting.store(false, Ordering::SeqCst);
-                                    // As in the Disconnected give-up branch: drop the IPv6-block
-                                    // intent before deactivating so no standalone block is rebuilt
-                                    // for a session that is over. (WFP is Windows-only.)
-                                    #[cfg(target_os = "windows")]
-                                    crate::vpn::wfp::clear_ipv6_block_intent();
-                                    // Deactivate kill switch since we're giving up
-                                    let _ = killswitch::deactivate_killswitch().await;
+                                    // As in the Disconnected give-up branch — including the
+                                    // lockdown carve-out: always-on protection must not release
+                                    // itself just because the retry budget ran out.
+                                    if killswitch::is_lockdown_mode() {
+                                        tracing::error!(
+                                            "Gave up recovering with the always-on kill switch armed — \
+                                             traffic stays blocked until you disconnect or turn the kill \
+                                             switch off"
+                                        );
+                                    } else {
+                                        // Drop the IPv6-block intent before deactivating so no
+                                        // standalone block is rebuilt for a session that is over.
+                                        // (WFP is Windows-only.)
+                                        #[cfg(target_os = "windows")]
+                                        crate::vpn::wfp::clear_ipv6_block_intent();
+                                        let _ = killswitch::deactivate_killswitch().await;
+                                    }
                                     // PWR-8: symmetric with the Disconnected arm's give-up branch
                                     // above — stop the loop instead of ticking forever with
                                     // nothing left to do. `auto_reconnect.start()` is called again
@@ -966,16 +1091,30 @@ impl AutoReconnectService {
                                 // tunnel. Either way, stop holding every packet
                                 // hostage: release the block and rejoin the normal
                                 // retry/give-up path, which can actually recover.
-                                tracing::warn!(
-                                    "Offline pause exceeded {:?} — releasing the kill switch and \
-                                     resuming the normal retry path",
-                                    OFFLINE_PAUSE_CAP
-                                );
-                                if let Err(e) = killswitch::deactivate_killswitch().await {
+                                //
+                                // In lockdown ("always-on") mode the block STAYS: a user who
+                                // chose always-on did not ask for protection to lapse after two
+                                // minutes of (possibly misdetected) offline time. Rejoining the
+                                // retry path is still the right move, and the retry path re-arms
+                                // the block on every tick anyway.
+                                if killswitch::is_lockdown_mode() {
                                     tracing::warn!(
-                                        "Kill switch release after the offline-pause cap failed: {}",
-                                        e
+                                        "Offline pause exceeded {:?} — resuming the normal retry path; \
+                                         always-on mode keeps the block engaged",
+                                        OFFLINE_PAUSE_CAP
                                     );
+                                } else {
+                                    tracing::warn!(
+                                        "Offline pause exceeded {:?} — releasing the kill switch and \
+                                         resuming the normal retry path",
+                                        OFFLINE_PAUSE_CAP
+                                    );
+                                    if let Err(e) = killswitch::deactivate_killswitch().await {
+                                        tracing::warn!(
+                                            "Kill switch release after the offline-pause cap failed: {}",
+                                            e
+                                        );
+                                    }
                                 }
                                 offline_pause_since = None;
                                 let _ = vpn_manager.set_state(ConnectionState::Disconnected).await;
@@ -1067,7 +1206,10 @@ impl AutoReconnectService {
                     .to_string()
             })?;
 
-        crate::commands::vpn::start_stealth_tunnel(&app, response).await
+        // "auto": the reconnect path has no settings handle here, so the WG
+        // port is derived from the server-supplied endpoint (the common case);
+        // only a user-set custom port is not re-applied on reconnect.
+        crate::commands::vpn::start_stealth_tunnel(&app, response, "auto").await
     }
 
     fn multi_hop_response_to_connect_response(

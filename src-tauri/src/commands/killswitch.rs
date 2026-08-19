@@ -37,95 +37,14 @@ pub struct KillSwitchStatus {
     pub blocking_connections: u32,
 }
 
-/// Enable the kill switch (arm it for when VPN disconnects)
-#[tauri::command]
-pub async fn enable_killswitch() -> Result<bool, String> {
-    tracing::info!("Enabling kill switch");
-
-    #[cfg(target_os = "windows")]
-    {
-        // Check for admin privileges
-        if !is_elevated() {
-            tracing::warn!("Kill switch requires administrator privileges");
-            return Err("Administrator privileges required for kill switch".to_string());
-        }
-
-        // Initialize WFP engine
-        if let Err(e) = wfp::initialize().await {
-            tracing::error!("Failed to initialize WFP engine: {}", e);
-            return Err(format!("Failed to initialize firewall: {}", e));
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if !is_elevated() {
-            tracing::warn!("Kill switch requires root privileges on macOS");
-            return Err("Root privileges required for kill switch".to_string());
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if !is_elevated() {
-            tracing::warn!("Kill switch requires root privileges on Linux");
-            return Err("Root privileges required for kill switch".to_string());
-        }
-    }
-
-    KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
-    tracing::info!("Kill switch enabled and ready");
-    Ok(true)
-}
-
-/// Disable the kill switch completely
-/// SECURITY: Rejects the command when VPN is in an active state (Connected,
-/// Connecting, Reconnecting) to prevent a compromised webview from silently
-/// removing leak protection while the tunnel is up.
-#[tauri::command]
-pub async fn disable_killswitch(vpn_manager: State<'_, VpnManager>) -> Result<bool, String> {
-    // F-16 FIX: Enforce VPN state check — reject if tunnel is active
-    let state = vpn_manager.get_state().await;
-    if state.is_tunnel_active() || state.can_disconnect() {
-        tracing::warn!(
-            "Refusing to disable kill switch while VPN is in {:?} state",
-            state
-        );
-        return Err(
-            "Cannot disable kill switch while VPN is connected or connecting. Disconnect first."
-                .to_string(),
-        );
-    }
-
-    tracing::info!("Disabling kill switch");
-
-    #[cfg(target_os = "windows")]
-    {
-        // Remove all WFP filters and cleanup
-        if let Err(e) = wfp::cleanup().await {
-            tracing::warn!("Failed to cleanup WFP filters: {}", e);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Err(e) = pf_deactivate_blocking().await {
-            tracing::warn!("Failed to remove pf rules: {}", e);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = firewall_linux::deactivate_blocking().await {
-            tracing::warn!("Failed to remove iptables rules: {}", e);
-        }
-    }
-
-    KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
-    // SEC-C3 FIX: No longer storing KILLSWITCH_ACTIVE — wfp::is_blocking() is the source of truth
-    tracing::info!("Kill switch disabled");
-    Ok(true)
-}
+// DEAD-CODE SWEEP (P1-dk-dead-privileged-ipc-commands): `enable_killswitch` and
+// `disable_killswitch` were registered IPC commands that no frontend code ever
+// invoked (only the IPC-contract test listed them). They widened the
+// renderer-reachable firewall-mutating surface for no functional reason —
+// `enable_killswitch` even set KILLSWITCH_ENABLED without going through `arm()`,
+// diverging from the persisted preference — so both were removed. The kill
+// switch is driven by `arm()`/`disarm()` on the connect lifecycle and by
+// `set_killswitch_live` from the settings screen.
 
 /// Activate the kill switch (block all non-VPN traffic).
 ///
@@ -341,8 +260,12 @@ pub fn is_enabled() -> bool {
 }
 
 /// Whether the kill switch is in lockdown (always-on) mode. Cross-platform
-/// accessor used by the auto-reconnect loop so it keeps the block active
-/// continuously instead of deactivating in steady Connected state.
+/// accessor used by the auto-reconnect loop's GIVE-UP and offline-pause-cap
+/// branches: lockdown is the explicit user opt-in that keeps traffic blocked
+/// even when the session is over. Hard false off-Windows — the Unix
+/// steady-state block (see [`holds_block_while_connected`]) is NOT lockdown
+/// and must never inherit lockdown's keep-blocked-after-give-up semantics,
+/// or a Unix user would be stranded behind the firewall.
 pub fn is_lockdown_mode() -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -351,6 +274,36 @@ pub fn is_lockdown_mode() -> bool {
     #[cfg(not(target_os = "windows"))]
     {
         false
+    }
+}
+
+/// Whether the platform keeps the block-all ENGAGED for the whole Connected
+/// session (P1-ks-reactive-detection-window).
+///
+/// Gates only the "deactivate now that we are healthy" sites (auto-reconnect's
+/// Connected arm, release_switch_guard, the reapply release): where this is
+/// true, a healthy tunnel keeps the block and carries its traffic through the
+/// tunnel-interface permits (pf utun pass rules / iptables `-o birdo0 ACCEPT`
+/// / WFP tunnel-LUID permit), so a SILENT tunnel death leaks nothing while
+/// the liveness watchdog needs up to ~60s to notice and reconnect.
+///
+/// - Windows: lockdown mode only — reactive stays the default there, where
+///   the WFP lockdown opt-in already exists.
+/// - macOS/Linux: always, whenever the kill switch is armed. There is no
+///   lockdown flag off-Windows, and a reactive-only kill switch on those
+///   platforms is exactly the finding's ~60s real-IP leak window.
+///
+/// This must NEVER gate the escape hatches — disconnect_vpn → disarm(),
+/// set_killswitch_live(false), the give-up branches and the offline-pause cap
+/// (those use [`is_lockdown_mode`]) — so it cannot strand anyone.
+pub fn holds_block_while_connected() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        wfp::is_lockdown_mode()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        is_enabled()
     }
 }
 
@@ -367,11 +320,13 @@ pub fn is_lockdown_mode() -> bool {
 /// clear — while the UI promised an always-on kill switch.
 ///
 /// This arms the INTENT and initializes the WFP engine as part of the connect
-/// lifecycle, so the existing reactive protection actually engages. It does NOT
-/// install the block-all filters itself: the auto-reconnect health loop owns the
-/// activate/deactivate transitions (it deactivates while healthy-Connected and
-/// activates during a drop/reconnect gap), so arming here must not fight that
-/// state machine.
+/// lifecycle, so the existing reactive protection actually engages. On Windows
+/// (outside lockdown) it does NOT install the block-all filters itself: the
+/// auto-reconnect health loop owns the activate/deactivate transitions (it
+/// deactivates while healthy-Connected and activates during a drop/reconnect
+/// gap), so arming here must not fight that state machine. On macOS/Linux it
+/// DOES activate the block immediately and the loop keeps it engaged for the
+/// whole session — see [`holds_block_while_connected`].
 ///
 /// Best-effort: a non-elevated host (should not happen — the app manifest
 /// requires administrator) logs and returns `Ok(false)` rather than failing the
@@ -431,8 +386,46 @@ pub async fn arm(app: &AppHandle) -> Result<bool, String> {
         return Ok(true);
     }
 
-    tracing::info!("Kill switch armed for active session (reactive)");
-    Ok(true)
+    // STEADY-STATE BLOCK (macOS/Linux) — P1-ks-reactive-detection-window:
+    // activate the block-all NOW and keep it engaged for the whole Connected
+    // session. The tunnel is already up when arm() runs on the connect path,
+    // and all the firewall backends permit tunneled traffic through an engaged
+    // block (pf utun0-15 pass rules, iptables `-o birdo0 ACCEPT`), which the
+    // switch-guard/reapply paths already rely on mid-session. Reactive-only
+    // protection left every SILENT tunnel death (dead peer, expired NAT
+    // mapping, sleep/resume, Wi-Fi→LTE handover) leaking real-IP traffic —
+    // DNS included — for the up-to-~60s the liveness watchdog needs to trip.
+    // With the block held, a dead tunnel fails CLOSED instantly and the
+    // watchdog/auto-reconnect still own recovery.
+    //
+    // Not a third mechanism: the escape hatches stay exactly the disarm-on-
+    // quit / disconnect_vpn → disarm() / set_killswitch_live(false) /
+    // give-up + offline-pause-cap paths, all of which release the block —
+    // is_lockdown_mode() stays hard false here, so none of lockdown's
+    // keep-blocked-after-give-up semantics apply.
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Err(e) = activate_killswitch().await {
+            // Degrade to reactive rather than failing the connect: the block
+            // still engages on a drop, this session just keeps the detection
+            // window open. KILLSWITCH_ENABLED stays true.
+            tracing::warn!(
+                "Steady-state block activation failed ({}); falling back to reactive kill switch for this session",
+                e
+            );
+            return Ok(false);
+        }
+        tracing::info!(
+            "Kill switch armed with the steady-state block engaged (always-on while connected)"
+        );
+        Ok(true)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        tracing::info!("Kill switch armed for active session (reactive)");
+        Ok(true)
+    }
 }
 
 /// Disarm the kill switch when the user ends the session: clear the intent flag
@@ -476,6 +469,16 @@ pub async fn disarm() -> Result<(), String> {
 /// Tracks whether pf blocking rules are active on macOS
 #[cfg(target_os = "macos")]
 static PF_BLOCKING: AtomicBool = AtomicBool::new(false);
+
+/// macOS: is the pf block-all ruleset currently loaded? Twin of
+/// `wfp::is_blocking()` / `firewall_linux::is_blocking()`, needed by the
+/// connect paths' update-the-relay-permit step: pf bakes the permitted server
+/// IP into the loaded ruleset and has no incremental update, so a switch onto
+/// a different relay while a block is engaged must re-load the ruleset.
+#[cfg(target_os = "macos")]
+pub fn pf_blocking_active() -> bool {
+    PF_BLOCKING.load(Ordering::SeqCst)
+}
 
 /// True when WE enabled pf (it was disabled before us). Governs whether
 /// deactivation should `pfctl -d` — we must never disable pf if the user or

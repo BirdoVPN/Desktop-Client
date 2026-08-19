@@ -90,13 +90,11 @@ pub struct ConnectionStats {
     pub bytes_received: u64,
     pub packets_sent: u64,
     pub packets_received: u64,
+    /// Last MEASURED round-trip latency, ms. `None` until a real probe has run
+    /// this session — consumers must treat `None` as "unmeasured", never as 0.
     pub latency_ms: Option<u32>,
     /// P2-16: Rolling latency samples for jitter calculation (stddev).
     pub latency_samples: VecDeque<u32>,
-    /// P2-16: Packets sent at last quality report (for loss estimation).
-    pub prev_packets_sent: u64,
-    /// P2-16: Packets received at last quality report (for loss estimation).
-    pub prev_packets_received: u64,
     pub connected_at: Option<chrono::DateTime<chrono::Utc>>,
     pub server_id: Option<String>,
     pub key_id: Option<String>,
@@ -123,18 +121,11 @@ impl ConnectionStats {
         variance.sqrt()
     }
 
-    /// P2-16: Estimate packet loss percentage since last report window.
-    pub fn packet_loss_percent(&self) -> f64 {
-        let sent_delta = self.packets_sent.saturating_sub(self.prev_packets_sent);
-        let recv_delta = self
-            .packets_received
-            .saturating_sub(self.prev_packets_received);
-        if sent_delta == 0 {
-            return 0.0;
-        }
-        let lost = sent_delta.saturating_sub(recv_delta);
-        (lost as f64 / sent_delta as f64) * 100.0
-    }
+    // P1-dk-fabricated-quality-telemetry: `packet_loss_percent()` (TX packet
+    // delta vs RX packet delta) and its `prev_packets_*` snapshot machinery were
+    // removed. The two directions are independent counters, so a normal
+    // upload-heavy minute reported a large invented "loss" — the quality report
+    // now derives loss from probe outcomes in auto_reconnect.rs instead.
 
     /// Push a latency sample, keeping at most 20 entries.
     pub fn push_latency_sample(&mut self, ms: u32) {
@@ -142,12 +133,6 @@ impl ConnectionStats {
         if self.latency_samples.len() > 20 {
             self.latency_samples.pop_front();
         }
-    }
-
-    /// Snapshot the current packet counters for the next loss calculation window.
-    pub fn snapshot_packets(&mut self) {
-        self.prev_packets_sent = self.packets_sent;
-        self.prev_packets_received = self.packets_received;
     }
 }
 
@@ -205,8 +190,6 @@ impl VpnManager {
                 packets_received: 0,
                 latency_ms: None,
                 latency_samples: VecDeque::new(),
-                prev_packets_sent: 0,
-                prev_packets_received: 0,
                 connected_at: None,
                 server_id: None,
                 key_id: None,
@@ -288,8 +271,6 @@ impl VpnManager {
                     packets_received: 0,
                     latency_ms: None,
                     latency_samples: VecDeque::new(),
-                    prev_packets_sent: 0,
-                    prev_packets_received: 0,
                     connected_at: None,
                     server_id: None,
                     key_id: None,
@@ -318,7 +299,10 @@ impl VpnManager {
         server_name: String,
         local_network_sharing: bool,
     ) -> Result<(), String> {
-        tracing::info!("VpnManager::connect called for server: {}", server_name);
+        // LOG-001: the chosen node is connection history — keep the name out
+        // of the release log (info reaches birdo.log); debug is dev-only.
+        tracing::info!("VpnManager::connect called");
+        tracing::debug!("VpnManager::connect called for server: {}", server_name);
 
         // FIX-R5: Clear the user-disconnected flag so auto-reconnect can work again
         self.user_initiated_disconnect
@@ -436,7 +420,9 @@ impl VpnManager {
             .map_err(|e| format!("Failed to set connecting state: {}", e))?;
         tracing::info!("Set state to Connecting");
 
-        tracing::info!("Creating VPN tunnel for: {}", server_name);
+        // LOG-001: node name demoted to debug — see connect() above.
+        tracing::info!("Creating VPN tunnel");
+        tracing::debug!("Creating VPN tunnel for: {}", server_name);
         tracing::debug!(
             "Tunnel config: endpoint={}, client_ip={}",
             config.endpoint,
@@ -463,16 +449,32 @@ impl VpnManager {
             Ok(Ok(tunnel)) => {
                 tracing::info!("Tunnel started successfully");
 
+                // P1-dk-manager-tunnel-dropped-state-connected: store the tunnel
+                // BEFORE transitioning to Connected. The old order dropped a live
+                // tunnel on a write-lock timeout while leaving state=Connected —
+                // green UI with traffic on the physical NIC. If the store fails,
+                // stop the tunnel and surface Error instead.
+                match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
+                    Ok(mut guard) => *guard = Some(tunnel),
+                    Err(_) => {
+                        tracing::error!(
+                            "Tunnel write lock timeout — stopping fresh tunnel instead of \
+                             reporting Connected without one"
+                        );
+                        let _ = tunnel.stop().await;
+                        let _ = self
+                            .write_state_with_timeout(ConnectionState::Error(
+                                "Internal error storing tunnel state".to_string(),
+                            ))
+                            .await;
+                        return Err("Tunnel state lock timeout during connect".to_string());
+                    }
+                }
+
                 // Update state with timeout protection
                 let _ = self
                     .write_state_with_timeout(ConnectionState::Connected)
                     .await;
-
-                // Update tunnel reference with timeout
-                match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
-                    Ok(mut guard) => *guard = Some(tunnel),
-                    Err(_) => tracing::error!("Tunnel write lock timeout"),
-                }
 
                 match timeout(STATE_LOCK_TIMEOUT, self.current_config.write()).await {
                     Ok(mut guard) => {
@@ -495,6 +497,11 @@ impl VpnManager {
                         stats.server_name = Some(server_name);
                         stats.bytes_sent = 0;
                         stats.bytes_received = 0;
+                        // Latency belongs to a PATH; a new session (possibly a
+                        // different server) must not inherit the old one's
+                        // measurements now that update_stats keeps them.
+                        stats.latency_ms = None;
+                        stats.latency_samples.clear();
                     }
                     Err(_) => tracing::error!("Stats write lock timeout"),
                 }
@@ -503,7 +510,14 @@ impl VpnManager {
                 Ok(())
             }
             Ok(Err(e)) => {
-                tracing::error!("Tunnel creation/start failed: {}", e);
+                // P6-CLI-D-03 (defence in depth): this is a catch-all for error
+                // strings built anywhere in the tunnel stack. Individual sites redact
+                // their own endpoints, but sanitising here means a future format!()
+                // that forgets cannot reintroduce the leak.
+                tracing::error!(
+                    "Tunnel creation/start failed: {}",
+                    crate::utils::redact::sanitize_error(&e)
+                );
                 let err = VpnError::General(e);
                 let _ = self
                     .write_state_with_timeout(ConnectionState::Error(err.to_string()))
@@ -621,6 +635,10 @@ impl VpnManager {
                 stats.server_id = None;
                 stats.key_id = None;
                 stats.server_name = None;
+                // Measurements die with the session (update_stats no longer
+                // clears latency on its own, so do it at the boundary).
+                stats.latency_ms = None;
+                stats.latency_samples.clear();
             }
             Err(_) => tracing::error!("Stats write lock timeout during disconnect"),
         }
@@ -663,9 +681,15 @@ impl VpnManager {
                             stats.bytes_received = received;
                             stats.packets_sent = pkts_sent;
                             stats.packets_received = pkts_received;
-                            stats.latency_ms = latency;
-                            // P2-16: Push latency sample for jitter calculation
+                            // P1-dk-fabricated-quality-telemetry: only OVERWRITE
+                            // the latency when the tunnel actually measured one.
+                            // The tunnel probe is idle in production, so blindly
+                            // assigning here reset a real measurement (the
+                            // heartbeat RTT recorded by auto_reconnect.rs) back
+                            // to None on every 2s stats poll.
                             if let Some(lat) = latency {
+                                stats.latency_ms = Some(lat);
+                                // P2-16: Push latency sample for jitter calculation
                                 stats.push_latency_sample(lat);
                             }
                         }

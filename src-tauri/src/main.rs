@@ -23,9 +23,68 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Listener, LogicalPosition, Manager, RunEvent, WindowEvent,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use vpn::{AutoReconnectService, VpnManager};
+
+/// Exit-teardown state machine. pf rulesets and iptables chains SURVIVE
+/// process exit — unlike Windows WFP dynamic sessions, which self-clean — so
+/// quitting without a teardown left macOS/Linux without IPv6 after a normal
+/// session, or with NO network at all if the quit landed while the kill switch
+/// was blocking (e.g. mid-reconnect), with nothing pointing at the VPN client.
+///
+/// STARTED guards the teardown from running twice; DONE is what lets the exit
+/// we re-request after teardown pass through instead of looping back in.
+static EXIT_TEARDOWN_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static EXIT_TEARDOWN_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Best-effort teardown run while an exit request is held open: stop
+/// auto-reconnect, bring the tunnel down (routes/DNS/IPv6 restore) and disarm
+/// the kill switch. Every step is capped so quitting can never hang.
+async fn teardown_for_exit(app: &tauri::AppHandle) {
+    use std::time::Duration;
+
+    // Quit is user intent: neutralize auto-reconnect first so it cannot race
+    // the teardown and bring the tunnel (and kill-switch arming) back up.
+    let auto_reconnect = app.state::<AutoReconnectService>();
+    auto_reconnect.set_user_disconnected();
+    auto_reconnect.stop().await;
+
+    let vpn_manager = app.state::<VpnManager>();
+    vpn_manager.set_user_disconnected(true);
+
+    // Stop the Xray stealth transport if it is running.
+    app.state::<crate::vpn::xray::XrayManager>().stop().await;
+
+    // Free the server-side peer while the tunnel is still up (mirrors
+    // disconnect_vpn). Courtesy call — tightly capped, never stalls the exit.
+    if let Some(key_id) = vpn_manager.get_key_id().await {
+        let api = app.state::<BirdoApi>();
+        match tokio::time::timeout(Duration::from_secs(3), api.disconnect_vpn(&key_id)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => info!("Exit teardown: backend disconnect notify failed: {}", e),
+            Err(_) => info!("Exit teardown: backend disconnect notify timed out"),
+        }
+    }
+
+    // Tunnel teardown: routes, DNS restore, session IPv6 leak block. Inner cap
+    // so a hung stop can never starve the disarm below out of running — the
+    // disarm is the piece whose absence outlives the process.
+    match tokio::time::timeout(Duration::from_secs(6), vpn_manager.disconnect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("Exit teardown: tunnel disconnect failed: {}", e),
+        Err(_) => error!("Exit teardown: tunnel disconnect timed out"),
+    }
+
+    // Disarm the kill switch UNCONDITIONALLY, exactly as disconnect_vpn does
+    // (the 3e6f1e2 escape hatch): quitting IS the user ending the session, and
+    // is_lockdown_mode() is hard false off-Windows, so any gate here would
+    // leave macOS/Linux behind a kernel firewall with no running app to disarm
+    // it. disarm() is a no-op if the switch was never armed.
+    let _ = crate::commands::killswitch::disarm().await;
+}
 
 /// A birdo:// URL captured from the launch argv at cold start, held until the
 /// frontend has mounted its "deep-link" listener and pulls it via
@@ -56,7 +115,10 @@ fn restore_and_focus(app: &tauri::AppHandle) {
 /// Surface the window and hand a birdo:// URL to the frontend router. Shared by
 /// the runtime deep-link listener and the cold-start path.
 fn deliver_deep_link(app: &tauri::AppHandle, url: &str) {
-    info!("Deep link received: {}", url);
+    // P6-CLI-D-03: a birdo:// URL carries the target server id, i.e. connection
+    // history. Record the arrival at INFO, the payload only at debug.
+    info!("Deep link received");
+    debug!("Deep link received: {}", url);
     restore_and_focus(app);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.emit("deep-link", url);
@@ -86,11 +148,17 @@ fn main() {
         // MAX_LOG_BYTES, move it aside to birdo.log.1 (clobbering any older
         // one) before we start appending to a fresh file.
         rotate_log_if_large(&p);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&p)
-            .ok()?;
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create(true).append(true);
+        // P6-CLI-D-08: the log records which VPN nodes were used and when —
+        // keep it owner-readable only on multi-user Unix hosts. (Windows
+        // relies on the per-user %APPDATA% ACL, same as the settings file.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.mode(0o600);
+        }
+        let file = open_opts.open(&p).ok()?;
         Some(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -99,7 +167,20 @@ fn main() {
                 // down the whole process from inside the logging path — and
                 // possibly before earlier logs are flushed. Degrade gracefully
                 // by dropping that single log line (io::sink) instead.
+                //
+                // PWR-5 addendum: rotate_log_if_large only runs at startup, so a
+                // weeks-long session used to grow birdo.log without bound. Hard
+                // in-session cap: once the file passes 2x MAX_LOG_BYTES, drop
+                // further lines (the next launch rotates it aside). A stat per
+                // log event at info level is negligible.
                 .with_writer(move || -> Box<dyn std::io::Write> {
+                    if file
+                        .metadata()
+                        .map(|m| m.len() > 2 * MAX_LOG_BYTES)
+                        .unwrap_or(false)
+                    {
+                        return Box::new(std::io::sink());
+                    }
                     match file.try_clone() {
                         Ok(f) => Box::new(f),
                         Err(_) => Box::new(std::io::sink()),
@@ -160,6 +241,21 @@ fn main() {
             },
             // Scrub PII: no usernames, IPs, or email in breadcrumbs
             send_default_pii: false,
+            // SEC-PII: the `contexts` integration fills a None server_name with
+            // the machine hostname (`ContextIntegration::setup` only assigns
+            // when `options.server_name.is_none()`), and consumer hostnames
+            // routinely embed the owner's real name ("Johns-MacBook-Pro").
+            // `send_default_pii: false` does NOT gate that path. A pre-set
+            // value short-circuits it.
+            server_name: Some("redacted".into()),
+            // SEC-PII: sentry's `panic` integration chains AHEAD of our
+            // sanitizing panic hook (it is installed later, at init time, so
+            // it runs first and sees the raw payload). Scrub every
+            // message-carrying field with the same redaction the local log
+            // gets, at the last point before the event leaves the device.
+            before_send: Some(std::sync::Arc::new(|event| {
+                Some(scrub_sentry_event_pii(event))
+            })),
             sample_rate: 1.0,
             ..Default::default()
         },
@@ -325,6 +421,9 @@ fn main() {
                 .tooltip("Birdo VPN - Disconnected")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
+                        // app.exit() raises RunEvent::ExitRequested, so this
+                        // funnels through the same teardown (disconnect +
+                        // kill-switch disarm) as every other exit path.
                         info!("User requested quit from tray");
                         app.exit(0);
                     }
@@ -404,7 +503,9 @@ fn main() {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 if let Ok(Some(urls)) = app.deep_link().get_current() {
                     if let Some(first) = urls.into_iter().next() {
-                        info!("Launch deep link captured: {}", first);
+                        // P6-CLI-D-03: same treatment as deliver_deep_link.
+                        info!("Launch deep link captured");
+                        debug!("Launch deep link captured: {}", first);
                         if let Ok(mut g) = app.state::<PendingDeepLink>().0.lock() {
                             *g = Some(first.to_string());
                         }
@@ -457,8 +558,6 @@ fn main() {
             // Window placement (corner anchor / draggable)
             commands::window::set_window_position,
             // Kill switch
-            commands::killswitch::enable_killswitch,
-            commands::killswitch::disable_killswitch,
             commands::killswitch::get_killswitch_status,
             commands::killswitch::set_killswitch_live,
             // Split Tunneling
@@ -488,10 +587,46 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
-            if let RunEvent::ExitRequested { .. } = event {
-                // PB-3.12: Allow the exit to proceed (do not call api.prevent_exit())
-                info!("Application exit requested, allowing exit");
+        .run(|app_handle, event| {
+            if let RunEvent::ExitRequested { code, api, .. } = &event {
+                // A restart (updater relaunch) cannot be held open —
+                // prevent_exit() is a documented no-op for RESTART_EXIT_CODE —
+                // and must not be turned into a plain exit. Let it through; the
+                // startup reconcile (setup(), F-001/F-032) clears any stale
+                // kernel firewall state in the relaunched instance.
+                if *code == Some(tauri::RESTART_EXIT_CODE) {
+                    info!("Restart requested — skipping exit teardown");
+                    return;
+                }
+                if !EXIT_TEARDOWN_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // First exit request (tray Quit lands here too — app.exit()
+                    // raises ExitRequested): hold the exit open, run the
+                    // teardown, then re-request the exit.
+                    info!("Application exit requested — tearing down VPN + kill switch first");
+                    api.prevent_exit();
+                    let app = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        // Hard cap over the whole teardown: quitting must never
+                        // hang. The inner steps carry their own tighter budgets.
+                        if tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            teardown_for_exit(&app),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            error!("Exit teardown timed out — exiting anyway");
+                        }
+                        EXIT_TEARDOWN_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                        app.exit(0);
+                    });
+                } else if !EXIT_TEARDOWN_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Teardown in flight (e.g. an impatient second tray Quit):
+                    // keep holding the door. Our own re-exit lands after DONE.
+                    api.prevent_exit();
+                } else {
+                    info!("Exit teardown complete — allowing exit");
+                }
             }
         });
 }
@@ -525,6 +660,42 @@ fn rotate_log_if_large(path: &std::path::Path) {
         // installed) — stderr is the best available diagnostic.
         eprintln!("birdo.log rotation failed (continuing to append): {}", e);
     }
+}
+
+/// SEC-PII: apply the same `sanitize_error` redaction the local log gets to
+/// every message-carrying field of an outgoing Sentry event.
+///
+/// The panic integration stores the raw panic payload in `exception[].value`
+/// (see sentry-panic's `event_from_panic_info`), and `event.message` /
+/// `logentry` / breadcrumb messages can carry error chains with embedded IPs,
+/// hostnames, or emails. Runs as `before_send`, so it covers every capture
+/// path regardless of hook ordering. In debug builds `sanitize_error` is a
+/// pass-through, exactly like the local log.
+fn scrub_sentry_event_pii(
+    mut event: sentry::protocol::Event<'static>,
+) -> sentry::protocol::Event<'static> {
+    use crate::utils::redact::sanitize_error;
+
+    if let Some(msg) = event.message.take() {
+        event.message = Some(sanitize_error(&msg));
+    }
+    if let Some(entry) = event.logentry.as_mut() {
+        entry.message = sanitize_error(&entry.message);
+        // Positional params are interpolated raw values — drop rather than
+        // guess at their shape.
+        entry.params.clear();
+    }
+    for exception in event.exception.values.iter_mut() {
+        if let Some(value) = exception.value.take() {
+            exception.value = Some(sanitize_error(&value));
+        }
+    }
+    for breadcrumb in event.breadcrumbs.values.iter_mut() {
+        if let Some(msg) = breadcrumb.message.take() {
+            breadcrumb.message = Some(sanitize_error(&msg));
+        }
+    }
+    event
 }
 
 /// Set up a custom panic hook for crash recovery
@@ -683,10 +854,42 @@ fn write_crash_report(location: &str, message: &str) {
 
     let _ = std::fs::create_dir_all(&crash_dir);
 
+    // P6-CLI-D-05: cap the directory — crash files used to accumulate forever
+    // (a permanent, timestamped on-disk history on a product that claims to
+    // retain nothing). Keep the newest few; the filename's timestamp format
+    // sorts lexicographically, so a plain sort is a time sort.
+    const KEEP_CRASH_REPORTS: usize = 5;
+    if let Ok(entries) = std::fs::read_dir(&crash_dir) {
+        let mut crashes: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("crash_") && n.ends_with(".txt"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        crashes.sort();
+        // The report being written below makes KEEP_CRASH_REPORTS total.
+        if crashes.len() + 1 > KEEP_CRASH_REPORTS {
+            for old in &crashes[..crashes.len() + 1 - KEEP_CRASH_REPORTS] {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+    }
+
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
 
-    if let Ok(mut file) = std::fs::File::create(&crash_file) {
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create(true).truncate(true);
+    // P6-CLI-D-08: owner-readable only on multi-user Unix hosts.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+    if let Ok(mut file) = open_opts.open(&crash_file) {
         let _ = writeln!(file, "Birdo VPN Crash Report");
         let _ = writeln!(file, "=====================");
         let _ = writeln!(file, "Time: {}", chrono::Utc::now().to_rfc3339());
@@ -694,7 +897,11 @@ fn write_crash_report(location: &str, message: &str) {
         let _ = writeln!(file, "Message: {}", message);
         let _ = writeln!(file);
         let _ = writeln!(file, "Backtrace:");
-        let _ = writeln!(file, "{:?}", std::backtrace::Backtrace::capture());
+        // Backtraces can carry PII in path segments (home directory = local
+        // username) and panic payload fragments — run them through the same
+        // redaction as everything else that reaches disk.
+        let backtrace = format!("{:?}", std::backtrace::Backtrace::capture());
+        let _ = writeln!(file, "{}", crate::utils::redact::sanitize_error(&backtrace));
 
         error!("Crash report written to {:?}", crash_file);
     }
@@ -713,7 +920,11 @@ fn self_elevate() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args_str = args.join(" ");
 
-    info!("Self-elevating: {:?} {}", exe_path, args_str);
+    // P6-CLI-D-03: argv carries the birdo:// deep-link URL on a cold start, and that
+    // URL names the target server. This runs BEFORE deliver_deep_link, so redacting
+    // only there left the payload in the log one code path earlier.
+    info!("Self-elevating");
+    debug!("Self-elevating: {:?} {}", exe_path, args_str);
 
     // Convert to wide strings for ShellExecuteW
     let operation: Vec<u16> = std::ffi::OsStr::new("runas")

@@ -46,8 +46,12 @@
 //!     network stack falls back to the physical interface within a single
 //!     OS poll cycle, not a sustained leak.
 //!   * STUN/TURN UDP destinations are blocked at a higher weight than
-//!     general permits, so even *during* a normal session WebRTC cannot
-//!     leak the real public IP.
+//!     general permits — but ONLY while the block-all is active (the
+//!     STUN/TURN filters are installed by `activate_blocking` and removed
+//!     with it). During a normal reactive-mode session, and on non-Windows
+//!     platforms, WebRTC/STUN is NOT filtered; steady-state protection there
+//!     relies on routing all traffic through the tunnel. Do not read this
+//!     module as providing session-long WebRTC leak protection.
 //!
 //! For users who need a true "fail-CLOSED on crash" posture (paranoid /
 //! journalist threat model), a future v2 could ship a separate Windows
@@ -89,9 +93,9 @@ const BIRDO_SUBLAYER_KEY: GUID = GUID::from_u128(0xe5f4c3b2_8f9d_5ea0_c1b6_00002
 // ── Filter weight constants ──────────────────────────────────────────
 // Within our sublayer the first matching filter wins.  Higher weight is
 // evaluated first.
-const WEIGHT_BLOCK_ALL: u8 = 1; // catch-all, checked last
-const WEIGHT_PERMIT: u8 = 10; // permit exceptions
-const WEIGHT_BLOCK_STUN: u8 = 15; // STUN block overrides permits
+pub(crate) const WEIGHT_BLOCK_ALL: u8 = 1; // catch-all, checked last
+pub(crate) const WEIGHT_PERMIT: u8 = 10; // permit exceptions
+pub(crate) const WEIGHT_BLOCK_STUN: u8 = 15; // STUN block overrides permits
 
 // ── Global state ─────────────────────────────────────────────────────
 static IS_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -960,6 +964,17 @@ impl WfpEngine {
     }
 }
 
+// P1-ks-wfp-initialize-toctou-handle-leak: last-owner backstop — if an engine
+// is ever dropped without an explicit close() (error path, overwrite), release
+// the kernel handle so the dynamic session's objects are removed by the OS.
+impl Drop for WfpEngine {
+    fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            tracing::warn!("WfpEngine dropped with close error: {}", e);
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Create a null-terminated UTF-16 string for Win32 wide-char APIs.
@@ -986,17 +1001,28 @@ pub async fn initialize() -> Result<(), String> {
 
     tracing::info!("Initializing kill switch (WFP API — FIX-2-1)");
 
+    // P1-ks-wfp-initialize-toctou-handle-leak: perform the initialized
+    // re-check, the engine open, and the store under ONE ENGINE lock so a
+    // concurrent initialize() cannot overwrite a stored engine (leaking its
+    // kernel handle and orphaning its dynamic session).
+    let mut guard = ENGINE
+        .lock()
+        .map_err(|e| format!("engine lock poisoned: {}", e))?;
+    if guard.is_some() && IS_INITIALIZED.load(Ordering::SeqCst) {
+        tracing::debug!("Kill switch already initialized (raced)");
+        return Ok(());
+    }
+    if let Some(stale) = guard.as_mut() {
+        // A previous session whose cleanup failed — close it before replacing.
+        let _ = stale.close();
+    }
+
     let engine = WfpEngine::open().map_err(|e| {
         tracing::error!("Failed to open WFP engine: {}", e);
         e
     })?;
-
-    {
-        let mut guard = ENGINE
-            .lock()
-            .map_err(|e| format!("engine lock poisoned: {}", e))?;
-        *guard = Some(engine);
-    }
+    *guard = Some(engine);
+    drop(guard);
 
     IS_INITIALIZED.store(true, Ordering::SeqCst);
     tracing::info!("Kill switch initialized (WFP dynamic session)");
@@ -1103,32 +1129,41 @@ pub async fn activate_blocking() -> Result<(), String> {
         // LOCKDOWN (always-on): permit the tunnel interface so tunneled traffic
         // flows while the block-all on the physical NIC stays in force. This is
         // what makes a continuously-active block-all safe — without it, an
-        // always-on block would block the user's own tunneled browsing. We refuse
-        // to install the block in lockdown if the tunnel LUID is unknown (aborts
-        // the transaction → no filters), rather than silently block everything.
+        // always-on block would block the user's own tunneled browsing.
+        //
+        // A missing LUID no longer refuses the activation. It used to, and that
+        // deadlocked the client after any drop: tunnel teardown clears the LUID
+        // (tunnel.rs), so the reconnect loop's very next activate_blocking()
+        // returned Err with the previous block-all still installed — machine
+        // fully blocked, no reconnect attempted, and the give-up release
+        // unreachable. Installing the block WITHOUT the tunnel permit is strictly
+        // MORE restrictive, never less: the self-permit and relay permit still let
+        // the reconnect run, and tunnel.rs re-activates with the new LUID the
+        // moment the adapter is back, which is what restores tunneled traffic.
         if LOCKDOWN_MODE.load(Ordering::SeqCst) {
             let luid = TUNNEL_LUID.load(Ordering::SeqCst);
             if luid == 0 {
-                return Err(
-                    "Lockdown mode: tunnel interface LUID unknown — refusing to install \
-                     block-all without a tunnel-interface permit (would block tunneled traffic)"
-                        .to_string(),
+                tracing::warn!(
+                    "Lockdown: no tunnel interface LUID (tunnel is down) — installing the \
+                     block-all without a tunnel permit; it is re-installed with the permit \
+                     as soon as the adapter is published"
+                );
+            } else {
+                engine.add_permit_tunnel_interface(
+                    luid,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                    "Birdo: Permit tunnel interface (v4)",
+                )?;
+                engine.add_permit_tunnel_interface(
+                    luid,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                    "Birdo: Permit tunnel interface (v6)",
+                )?;
+                tracing::info!(
+                    "Lockdown: permitted tunnel interface LUID {} (zero-window always-on)",
+                    luid
                 );
             }
-            engine.add_permit_tunnel_interface(
-                luid,
-                FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                "Birdo: Permit tunnel interface (v4)",
-            )?;
-            engine.add_permit_tunnel_interface(
-                luid,
-                FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-                "Birdo: Permit tunnel interface (v6)",
-            )?;
-            tracing::info!(
-                "Lockdown: permitted tunnel interface LUID {} (zero-window always-on)",
-                luid
-            );
         }
 
         // Local network sharing: permit RFC1918 private ranges
@@ -1524,12 +1559,18 @@ pub async fn cleanup() -> Result<(), String> {
     let mut guard = ENGINE
         .lock()
         .map_err(|e| format!("engine lock poisoned: {}", e))?;
-    if let Some(engine) = guard.as_mut() {
-        engine.close()?;
-    }
+    // P1-ks-wfp-initialize-toctou-handle-leak: even if close() errors, drop the
+    // engine and clear IS_INITIALIZED — otherwise the module believes it is
+    // initialized with an engine whose handle may be invalid, and every later
+    // activation fails. Drop on WfpEngine retries the close as a backstop.
+    let close_result = match guard.as_mut() {
+        Some(engine) => engine.close(),
+        None => Ok(()),
+    };
     *guard = None;
 
     IS_INITIALIZED.store(false, Ordering::SeqCst);
+    close_result?;
     tracing::info!("Kill switch cleanup complete");
     Ok(())
 }

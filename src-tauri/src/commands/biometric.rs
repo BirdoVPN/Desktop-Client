@@ -24,43 +24,55 @@ pub struct BiometricStatus {
 /// Check if biometric authentication is available on this device.
 #[tauri::command]
 pub async fn check_biometric_available() -> Result<BiometricStatus, String> {
+    // P1-dk-blocking-io-on-async-runtime: the availability probe (subprocess /
+    // WinRT bridge) and the keystore read both block; run them on the blocking
+    // pool as authenticate_biometric already does. On Linux a locked Secret
+    // Service can otherwise park a runtime worker on a D-Bus prompt.
     #[cfg(windows)]
     {
-        let available = is_windows_hello_available();
-        let enabled = keyring::Entry::new("BirdoVPN", "biometric_lock_enabled")
-            .ok()
-            .and_then(|e| e.get_password().ok())
-            .unwrap_or_default()
-            == "true";
+        tokio::task::spawn_blocking(|| {
+            let available = is_windows_hello_available();
+            let enabled = keyring::Entry::new("BirdoVPN", "biometric_lock_enabled")
+                .ok()
+                .and_then(|e| e.get_password().ok())
+                .unwrap_or_default()
+                == "true";
 
-        Ok(BiometricStatus {
-            available,
-            enabled,
-            method: if available {
-                "windows_hello".to_string()
-            } else {
-                "none".to_string()
-            },
+            BiometricStatus {
+                available,
+                enabled,
+                method: if available {
+                    "windows_hello".to_string()
+                } else {
+                    "none".to_string()
+                },
+            }
         })
+        .await
+        .map_err(|e| format!("Biometric check task failed: {e}"))
     }
     #[cfg(target_os = "macos")]
     {
-        let available = is_touch_id_available();
-        let enabled = keyring::Entry::new("BirdoVPN", "biometric_lock_enabled")
-            .ok()
-            .and_then(|e| e.get_password().ok())
-            .unwrap_or_default()
-            == "true";
+        tokio::task::spawn_blocking(|| {
+            let available = is_touch_id_available();
+            let enabled = keyring::Entry::new("BirdoVPN", "biometric_lock_enabled")
+                .ok()
+                .and_then(|e| e.get_password().ok())
+                .unwrap_or_default()
+                == "true";
 
-        Ok(BiometricStatus {
-            available,
-            enabled,
-            method: if available {
-                "touch_id".to_string()
-            } else {
-                "none".to_string()
-            },
+            BiometricStatus {
+                available,
+                enabled,
+                method: if available {
+                    "touch_id".to_string()
+                } else {
+                    "none".to_string()
+                },
+            }
         })
+        .await
+        .map_err(|e| format!("Biometric check task failed: {e}"))
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -75,11 +87,16 @@ pub async fn check_biometric_available() -> Result<BiometricStatus, String> {
 /// Enable or disable biometric lock.
 #[tauri::command]
 pub async fn set_biometric_enabled(enabled: bool) -> Result<(), String> {
-    let entry = keyring::Entry::new("BirdoVPN", "biometric_lock_enabled")
-        .map_err(|e| format!("Failed to create keyring entry: {e}"))?;
-    entry
-        .set_password(if enabled { "true" } else { "false" })
-        .map_err(|e| format!("Failed to store biometric setting: {e}"))?;
+    // P1-dk-blocking-io-on-async-runtime: keystore write is blocking I/O.
+    tokio::task::spawn_blocking(move || {
+        let entry = keyring::Entry::new("BirdoVPN", "biometric_lock_enabled")
+            .map_err(|e| format!("Failed to create keyring entry: {e}"))?;
+        entry
+            .set_password(if enabled { "true" } else { "false" })
+            .map_err(|e| format!("Failed to store biometric setting: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Biometric setting task failed: {e}"))??;
 
     if enabled {
         info!("Biometric lock enabled");

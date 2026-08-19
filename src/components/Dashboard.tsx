@@ -74,12 +74,23 @@ interface RustVpnStats {
   current_latency_ms: number | null;
 }
 
+/**
+ * Shape of `get_vpn_status`. The Rust `VpnStatus` is `#[serde(rename_all =
+ * "camelCase")]` (commands/vpn.rs), so the wire fields are camelCase; the
+ * snake_case spellings are kept only as a defensive fallback — same pattern as
+ * `RustServer` below. Declaring snake_case ONLY is what made `server_name`
+ * permanently undefined and the post-quick-connect labeller dead code.
+ */
 interface RustVpnStatus {
   state: string;
-  bytes_sent: number;
-  bytes_received: number;
-  connected_at: string | null;
-  server_name: string | null;
+  bytesSent?: number;
+  bytes_sent?: number;
+  bytesReceived?: number;
+  bytes_received?: number;
+  connectedAt?: string | null;
+  connected_at?: string | null;
+  serverName?: string | null;
+  server_name?: string | null;
   stealthActive?: boolean;
   quantumActive?: boolean;
   pqMode?: 'disabled' | 'server_provided' | 'bilateral';
@@ -133,6 +144,16 @@ const planLevel = (plan: string | null | undefined): number => {
 export function Dashboard() {
   const [showServerSheet, setShowServerSheet] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  /**
+   * Deep-link connect awaiting explicit user confirmation. A birdo:// link is
+   * third-party input — any web page, chat message or document can hand the
+   * user one — so acting on it without an Accept would let an attacker move
+   * the VPN egress to a jurisdiction of their choosing (or force a reconnect
+   * that mints fresh keys) with no signal beyond the server card quietly
+   * changing. The link's target is staged here and only acted on from the
+   * confirmation dialog.
+   */
+  const [deepLinkConfirm, setDeepLinkConfirm] = useState<Server | null>(null);
   const [liveStats, setLiveStats] = useState<RustVpnStats | null>(null);
   // Live security posture from get_vpn_status — surfaced as chips under the
   // status pill so the user can SEE that stealth / post-quantum are actually
@@ -272,6 +293,11 @@ export function Dashboard() {
 
   // ── Servers + ping ────────────────────────────────────────────────
   useEffect(() => {
+    // Cancellation guard: the Dashboard unmounts on every tab switch, and
+    // without this the batched fleet-wide ping sweep kept running (and a new
+    // one started per remount), stacking overlapping probe waves for a
+    // component that no longer exists.
+    let cancelled = false;
     invoke<RustServer[]>('get_servers')
       .then(async (raw) => {
         const mapped = raw.map((s) => ({
@@ -310,18 +336,22 @@ export function Dashboard() {
         const PING_BATCH = 5;
         const pingable = mapped.filter((srv) => srv.hostname || srv.ipAddress);
         for (let i = 0; i < pingable.length; i += PING_BATCH) {
+          if (cancelled) return;
           const batch = pingable.slice(i, i + PING_BATCH);
           await Promise.allSettled(
             batch.map((srv) =>
               invoke<number | null>('ping_server', {
                 hostname: srv.hostname || srv.ipAddress,
                 port: srv.port ?? 51820,
-              }).then((p) => { if (p != null) setServerPing(srv.id, p); })
+              }).then((p) => { if (!cancelled && p != null) setServerPing(srv.id, p); })
             )
           );
         }
       })
       .catch(() => { /* silent */ });
+    return () => {
+      cancelled = true;
+    };
   }, [setServers, setServerPing, setCurrentServer]);
 
   /**
@@ -339,12 +369,20 @@ export function Dashboard() {
   const refreshCurrentServerFromStatus = useCallback(async () => {
     try {
       const st = await invoke<RustVpnStatus>('get_vpn_status');
-      if (!st.server_name) return;
+      // camelCase is the real wire field (serde rename_all); snake_case is a
+      // defensive fallback only.
+      const serverName = st.serverName ?? st.server_name;
+      if (!serverName) return;
       const list = useAppStore.getState().servers;
-      const match = list.find((sv) => sv.name === st.server_name);
+      const match = list.find((sv) => sv.name === serverName);
       useAppStore.getState().setCurrentServer(
-        match ?? ({ name: st.server_name } as (typeof list)[number]),
+        match ?? ({ name: serverName } as (typeof list)[number]),
       );
+      // The explicit connect paths set vpnIp from their target; quick-connect
+      // has only this labeller, so fill it here too when the node is known.
+      if (match) {
+        useAppStore.getState().setVpnIp(match.ipAddress ?? match.hostname ?? null);
+      }
     } catch {
       /* label only — never fail a live connection over it */
     }
@@ -461,19 +499,17 @@ export function Dashboard() {
   // feeds — a reconnect or kill-switch trip must still reach the one surface the
   // user can actually see. On re-show we poll immediately so the UI is never
   // stale by more than a frame.
+  // P1-dk-status-poll-never-restarts-terminal-states: this effect used to be
+  // gated on `isConnected || isConnecting`, so reaching 'error',
+  // 'kill_switch_active' or 'disconnected' tore the interval down — and since
+  // this poll is the ONLY writer of connectionState from Rust, the UI (and the
+  // tray it feeds) froze on the stale reading forever: "Error" while Rust had
+  // silently reconnected, or "Kill Switch" after Rust recovered. The poll now
+  // runs unconditionally for the life of the Dashboard (i.e. while
+  // authenticated), at the same visibility-aware cadence.
   const VISIBLE_POLL_MS = 2_000;
   const HIDDEN_POLL_MS = 15_000;
-  const isActive = isConnected || isConnecting;
   useEffect(() => {
-    if (!isActive) {
-      setLiveStats(null);
-      setLiveSecurity({ stealth: false });
-      if (statsInterval.current) {
-        clearInterval(statsInterval.current);
-        statsInterval.current = null;
-      }
-      return;
-    }
     let cancelled = false;
     const poll = async () => {
       try {
@@ -494,6 +530,10 @@ export function Dashboard() {
         if (st.state === 'connected' || st.state === 'rekeying') {
           setLiveStats(stats);
           setLiveSecurity({ stealth: !!st.stealthActive });
+        } else {
+          // Clearing used to happen in the (now removed) !isActive teardown.
+          setLiveStats(null);
+          setLiveSecurity({ stealth: false });
         }
       } catch { /* silent */ }
     };
@@ -518,7 +558,7 @@ export function Dashboard() {
       document.removeEventListener('visibilitychange', onVisibility);
       if (statsInterval.current) clearInterval(statsInterval.current);
     };
-  }, [isActive, setConnectionState]);
+  }, [setConnectionState]);
 
   // ── Toast auto-dismiss ────────────────────────────────────────────
   useEffect(() => {
@@ -807,6 +847,31 @@ export function Dashboard() {
       return;
     }
 
+    // NEVER act on the link directly. Stage it for an explicit Accept/Cancel
+    // (showing the target country) — matching the multi-hop refusal above in
+    // treating a deep link as untrusted third-party input. Without this, one
+    // click anywhere could silently move a live tunnel to an attacker-chosen
+    // exit node, or repeatedly force reconnects as a tunnel-teardown primitive.
+    setDeepLinkConfirm(target);
+  }, [deepLinkAction, servers, multiHopReady, setErrorMessage]);
+
+  // Accept handler for the staged deep-link connect. Re-validates the session
+  // state at click time — it may have changed while the dialog was open.
+  const handleDeepLinkAccept = useCallback(() => {
+    const target = deepLinkConfirm;
+    setDeepLinkConfirm(null);
+    if (!target) return;
+
+    const st = useAppStore.getState().connectionState;
+    const onTunnel =
+      st === 'connected' || st === 'reconnecting' || st === 'rekeying' || st === 'kill_switch_active';
+
+    if (onTunnel && multiHopReady) {
+      setErrorMessage(
+        'That link would replace your Multi-Hop route with a single hop. Disconnect first if you meant to switch.',
+      );
+      return;
+    }
     if (onTunnel) {
       // Single-hop session: handleSelectServer performs a real switch.
       handleSelectServer(target);
@@ -829,7 +894,7 @@ export function Dashboard() {
         setCurrentServer(null);
       }
     })();
-  }, [deepLinkAction, servers, multiHopReady, handleSelectServer, setCurrentServer, setConnectionState, setErrorMessage, setVpnIp]);
+  }, [deepLinkConfirm, multiHopReady, handleSelectServer, setCurrentServer, setConnectionState, setErrorMessage, setVpnIp]);
 
   const handleLogout = useCallback(async () => {
     const cur = useAppStore.getState().connectionState;
@@ -1135,6 +1200,76 @@ export function Dashboard() {
                   }}
                 >
                   Log Out
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Deep-link connect confirmation — a birdo:// link is third-party
+          input; never move the user's egress without an explicit Accept. */}
+      <AnimatePresence>
+        {deepLinkConfirm && (
+          <motion.div
+            className="absolute inset-0 z-50 flex items-center justify-center bg-black/85"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <motion.div
+              className="mx-6 w-full max-w-sm rounded-2xl p-6 text-center"
+              style={{
+                backgroundColor: surface.s2,
+                border: `1px solid ${hairline.soft}`,
+              }}
+              initial={{ scale: 0.92, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.92, opacity: 0 }}
+            >
+              <Globe size={36} color={status.yellowLight} className="mx-auto mb-3" />
+              <h3 className="mb-2 text-lg font-semibold" style={{ color: white.w100 }}>
+                {isConnected || isKillSwitchActive ? 'Switch server via link?' : 'Connect via link?'}
+              </h3>
+              <p className="mb-5 text-sm" style={{ color: white.w60 }}>
+                A link asks to route your traffic through{' '}
+                <span className="font-medium" style={{ color: white.w100 }}>
+                  {deepLinkConfirm.countryCode
+                    ? `${countryCodeToFlag(deepLinkConfirm.countryCode)} `
+                    : ''}
+                  {[deepLinkConfirm.city, deepLinkConfirm.country]
+                    .filter(Boolean)
+                    .join(', ') || deepLinkConfirm.name}
+                </span>
+                .{' '}
+                {isConnected || isKillSwitchActive
+                  ? 'Your current connection will be replaced. Only accept if you trust where this link came from.'
+                  : 'Only accept if you trust where this link came from.'}
+              </p>
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => setDeepLinkConfirm(null)}
+                  className="flex-1 rounded-xl py-2.5 text-sm font-medium transition-colors hover:bg-white/10"
+                  style={{
+                    backgroundColor: white.w05,
+                    color: white.w100,
+                    border: `1px solid ${hairline.soft}`,
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeepLinkAccept}
+                  className="flex-1 rounded-xl py-2.5 text-sm font-medium transition-colors hover:bg-white/20"
+                  style={{
+                    backgroundColor: white.w10,
+                    color: white.w100,
+                    border: `1px solid ${hairline.soft}`,
+                  }}
+                >
+                  {isConnected || isKillSwitchActive ? 'Switch' : 'Connect'}
                 </button>
               </div>
             </motion.div>

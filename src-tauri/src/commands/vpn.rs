@@ -226,6 +226,15 @@ pub fn build_vpn_config(
         persistent_keepalive,
     };
 
+    // P1-dk-allowedips-no-default-coverage: refuse a scope that leaves part of
+    // the address space outside the tunnel — a hostile/compromised backend
+    // must not be able to shrink allowed_ips so traffic egresses in the clear
+    // under a green "Protected". This is the single choke point every connect
+    // path funnels through (connect_vpn, quick_connect, multi-hop and
+    // auto-reconnect all call build_vpn_config); the per-platform tunnels
+    // re-check it in validate_config as defense in depth.
+    crate::vpn::validate_tunnel_scope(&config)?;
+
     Ok((config, server_name))
 }
 
@@ -330,6 +339,7 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
 pub(crate) async fn start_stealth_tunnel(
     app: &AppHandle,
     response: &ConnectResponse,
+    custom_port: &str,
 ) -> Result<Option<String>, String> {
     if !response.stealth_enabled.unwrap_or(false) || response.xray_endpoint.is_none() {
         return Ok(None);
@@ -401,6 +411,25 @@ pub(crate) async fn start_stealth_tunnel(
         return Err(format!("Unsupported Xray flow type '{}' from server", flow));
     }
 
+    // P1-dk-xray-wgport-hardcoded: derive the far-side WireGuard port from the
+    // user's custom-port override, else from the server-supplied WG endpoint,
+    // falling back to 51820 only when neither yields a port. The previous
+    // hardcoded 51820 made any node on a non-default port unreachable through
+    // stealth with no diagnostic, and silently ignored the custom-port setting.
+    let wg_port = if custom_port != "auto" {
+        custom_port.parse::<u16>().ok()
+    } else {
+        None
+    }
+    .or_else(|| {
+        response
+            .endpoint
+            .as_deref()
+            .and_then(|ep| ep.rfind(':').map(|i| &ep[i + 1..]))
+            .and_then(|p| p.parse::<u16>().ok())
+    })
+    .unwrap_or(51820);
+
     let xray_config = crate::vpn::xray::XrayConfig {
         endpoint: response
             .xray_endpoint
@@ -411,7 +440,7 @@ pub(crate) async fn start_stealth_tunnel(
         short_id,
         sni,
         flow,
-        wg_port: 51820,
+        wg_port,
     };
 
     let app_data_dir = app
@@ -476,13 +505,9 @@ pub(crate) fn derive_quantum_psk(response: &ConnectResponse) -> Result<Option<St
     }
 
     // 2) Fall back to the server's classical preshared_key when present.
+    //    (No downgrade warning is possible here: quantum_enabled == true was
+    //    already handled above by aborting the connection fail-closed.)
     if response.preshared_key.is_some() {
-        if response.quantum_enabled.unwrap_or(false) {
-            tracing::warn!(
-                "BirdoPQ: server did not return a PQ ciphertext — falling back to \
-                 server-provided classical PSK (NOT HNDL-safe)"
-            );
-        }
         crate::vpn::birdo_pq::record_server_provided();
         return Ok(response.preshared_key.clone());
     }
@@ -523,6 +548,57 @@ pub(crate) fn enforce_requested_protection(
 #[tauri::command]
 pub fn get_admin_status() -> bool {
     crate::utils::elevation::is_elevated()
+}
+
+/// Fail-closed guard for a USER-INITIATED connect that lands on an already
+/// ACTIVE session (server switch from the UI, or quick-connect while
+/// connected).
+///
+/// `vpn_manager.connect()` disconnect-firsts, so on macOS/Linux the
+/// multi-second teardown + create + handshake window otherwise ran with NO
+/// IPv4 block at all: every server switch dropped the user's traffic onto the
+/// physical NIC with the real IP exposed while the UI showed a
+/// connecting/connected state (only IPv6 was contained by the session leak
+/// block). Mirrors reapply_vpn_settings, which already engages the block
+/// before its rebuild for exactly this reason. The live tunnel keeps carrying
+/// traffic through the engaged block (tun/utun interface permits), and the
+/// relay permit is swapped to the NEW server before the teardown starts.
+///
+/// No-op when the kill switch is disabled by preference (activate_killswitch
+/// checks) or when no tunnel is up. Returns whether a session was active; the
+/// caller MUST hand that to [`release_switch_guard`] once the new tunnel is
+/// verified up.
+pub(super) async fn engage_switch_guard(vpn_manager: &VpnManager) -> bool {
+    let state = vpn_manager.get_state().await;
+    if !state.is_tunnel_active() {
+        return false;
+    }
+    if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+        tracing::warn!("Kill switch activation before server switch failed: {}", e);
+    }
+    true
+}
+
+/// Release the guard engaged by [`engage_switch_guard`] once the NEW tunnel is
+/// verified up. Called on SUCCESS only — a failed switch must stay failed
+/// CLOSED (reapply_vpn_settings semantics; Disconnect and the Settings
+/// kill-switch toggle remain the user's explicit escape hatches).
+///
+/// Platforms that hold the block for the whole Connected session keep it: on
+/// Windows lockdown the tunnel layer has already re-baked the active block
+/// with the new adapter LUID, and on macOS/Linux the steady-state block IS the
+/// session's leak protection (connect_vpn/quick_connect re-baked the new relay
+/// permit into it before the switch, and arm() has just re-activated it for
+/// the new tunnel) — releasing it here would re-open the reactive detection
+/// window it exists to close. This cannot strand a Unix user: Disconnect
+/// (disarm) and the Settings toggle (set_killswitch_live) still release.
+pub(super) async fn release_switch_guard(guard_engaged: bool) {
+    if !guard_engaged || crate::commands::killswitch::holds_block_while_connected() {
+        return;
+    }
+    if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
+        tracing::warn!("Kill switch release after server switch failed: {}", e);
+    }
 }
 
 /// Connect to a VPN server.
@@ -619,10 +695,15 @@ pub async fn connect_vpn(
     match retry {
         Ok(v) => {
             // Release the block engaged above, mirroring the auto-reconnect
-            // loop's Connected arm — EXCEPT in lockdown mode, where arm()
-            // (inside the successful attempt) re-activated the always-on
-            // block with the tunnel LUID permitted and it must stay up.
-            if !crate::commands::killswitch::is_lockdown_mode() {
+            // loop's Connected arm — EXCEPT where the platform holds the
+            // block for the whole Connected session (Windows lockdown, and
+            // macOS/Linux whenever the kill switch is armed — see
+            // holds_block_while_connected): there arm() (inside the
+            // successful attempt) re-activated the block with the tunnel
+            // permitted and it must stay up; releasing it would re-open the
+            // reactive detection window. Same gate as release_switch_guard
+            // and the reapply release.
+            if !crate::commands::killswitch::holds_block_while_connected() {
                 if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
                     tracing::warn!(
                         "Kill switch release after a successful stealth fallback failed: {}",
@@ -696,6 +777,11 @@ async fn connect_vpn_attempt(
     // Apply VPN settings early — needed for the API call (stealth/quantum flags)
     let vpn_settings = apply_vpn_settings(app).await;
 
+    // Server switch on a live session: engage the block-all BEFORE anything
+    // can tear the old tunnel down, so the teardown + handshake window cannot
+    // leak on the physical NIC. Released only after the new tunnel is up.
+    let switch_guard = engage_switch_guard(vpn_manager).await;
+
     // Connect via backend API — send public key, NOT private key
     tracing::debug!("Calling /vpn/connect for server {}", server_id);
 
@@ -767,7 +853,8 @@ async fn connect_vpn_attempt(
     tracing::info!("Got VPN config from server, extracting fields...");
 
     // Phase 1: Xray Reality Stealth Tunnel
-    let stealth_endpoint_override = start_stealth_tunnel(app, &response).await?;
+    let stealth_endpoint_override =
+        start_stealth_tunnel(app, &response, &vpn_settings.custom_port).await?;
     let upstream_endpoint_for_killswitch = if stealth_endpoint_override.is_some() {
         response
             .xray_endpoint
@@ -823,6 +910,23 @@ async fn connect_vpn_attempt(
         if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
             tracing::warn!("Failed to update WFP VPN server: {}", e);
         }
+        // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+        // scoped to tcp/443, so a reconnect onto a different server needs the
+        // live block re-armed or its handshake is dropped.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+            tracing::warn!("Failed to update iptables VPN server: {}", e);
+        }
+        // macOS twin: pf has no update_vpn_server — the relay permit is baked
+        // into the loaded ruleset, so while a block is engaged (the switch
+        // guard above, or a reconnect block) it must be re-loaded with the NEW
+        // relay IP or the new handshake is dropped (block drop all wins).
+        #[cfg(target_os = "macos")]
+        if crate::commands::killswitch::pf_blocking_active() {
+            if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+                tracing::warn!("Failed to update pf VPN server permit: {}", e);
+            }
+        }
     }
 
     // Suppress auto-reconnect for the duration of this USER-initiated connect.
@@ -856,6 +960,9 @@ async fn connect_vpn_attempt(
         tracing::warn!("Failed to arm kill switch after connect: {}", e);
     }
 
+    // New tunnel verified up — release the switch guard (success path only).
+    release_switch_guard(switch_guard).await;
+
     // Wire up auto-reconnect: store reconnect info and start health monitoring.
     // ADAPTIVE TRANSPORT: persist the fallback reason for this session so a
     // drop rebuilds over the transport that is KNOWN to work here, instead of
@@ -879,7 +986,10 @@ async fn connect_vpn_attempt(
         tracing::warn!("Failed to start auto-reconnect: {}", e);
     }
 
-    tracing::info!("VPN connected successfully to {}", server_id);
+    // LOG-001: the chosen node id is connection history — keep it out of the
+    // release log (info reaches birdo.log); the id is still visible at debug.
+    tracing::info!("VPN connected successfully");
+    tracing::debug!("VPN connected to server id {}", server_id);
     Ok(true)
 }
 
@@ -1053,7 +1163,9 @@ pub async fn quick_connect(
             settings.multi_hop_exit_node_id.as_deref(),
         ) {
             (Some(entry), Some(exit)) if !entry.is_empty() && !exit.is_empty() => {
-                tracing::info!(%entry, %exit, "Quick connect: multi-hop armed, delegating");
+                // P6-CLI-D-03: node ids are connection history — debug only, like
+                // every other chosen-node line in this file.
+                tracing::debug!(%entry, %exit, "Quick connect: multi-hop armed, delegating");
                 return connect_multi_hop(
                     entry.to_string(),
                     exit.to_string(),
@@ -1091,7 +1203,10 @@ pub async fn quick_connect(
         .find(|s| s.is_online)
         .ok_or("No online servers available")?;
 
-    tracing::info!(
+    // P6-CLI-D-03: the chosen node is connection history. INFO records that a quick
+    // connect happened; the node itself only goes to debug.
+    tracing::info!("Quick connecting to the best available server");
+    tracing::debug!(
         "Quick connecting to {} ({})",
         best_server.name,
         best_server.id
@@ -1161,7 +1276,9 @@ pub async fn reapply_vpn_settings(
         );
     }
 
-    tracing::info!(
+    // P6-CLI-D-03: the node being rebuilt to is connection history.
+    tracing::info!("Reapplying VPN settings — rebuilding the tunnel");
+    tracing::debug!(
         "Reapplying VPN settings — rebuilding tunnel to {}",
         server_id
     );
@@ -1207,12 +1324,23 @@ pub async fn reapply_vpn_settings(
     //
     // Only release on SUCCESS: a rebuild that failed must stay failed CLOSED, and
     // the auto-reconnect loop then owns recovery.
+    //
+    // And only where the platform does NOT hold the block for the whole
+    // session: on macOS/Linux (and Windows lockdown) the connect path's arm()
+    // has just re-activated the steady-state block with the NEW relay permit
+    // baked in — the rebuilt tunnel carries traffic through it, and releasing
+    // it here would re-open the reactive detection window for the rest of the
+    // session. The old frozen-after-reapply failure mode this release fixed
+    // cannot return: connects re-bake the relay permit into a live block
+    // (connect_vpn/quick_connect update_vpn_server / pf re-activate).
     if matches!(result, Ok(true)) {
-        if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
-            tracing::warn!(
-                "Kill switch deactivation after a successful settings reapply failed: {}",
-                e
-            );
+        if !crate::commands::killswitch::holds_block_while_connected() {
+            if let Err(e) = crate::commands::killswitch::deactivate_killswitch().await {
+                tracing::warn!(
+                    "Kill switch deactivation after a successful settings reapply failed: {}",
+                    e
+                );
+            }
         }
     } else {
         // FAILED REBUILD MUST LEAVE A FAILED STATE.

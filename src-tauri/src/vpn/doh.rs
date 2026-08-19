@@ -5,16 +5,31 @@
 //!
 //! SEC-002: This is critical for preventing DNS leaks during VPN connection.
 //!
-//! PROD-HARDENING: Certificate pinning is now enforced for all DoH providers.
-//! Each provider has multiple SPKI SHA-256 pins (primary + backup CA).
-//! If a provider fails pinning, it is skipped and the next provider is tried.
-//! This is safe because we need only 1-of-N providers to succeed.
+//! PROD-HARDENING: certificate pinning is enforced for all DoH providers as
+//! **CA-chain SPKI** pinning inside the TLS handshake — the same model and
+//! machinery as `api/cert_pin.rs` (a custom rustls `ServerCertVerifier`
+//! wrapping the standard WebPKI verifier). The previous implementation hashed
+//! the LEAF certificate DER via reqwest's `TlsInfo` — which exposes only the
+//! leaf — so every ~90-day provider cert rotation silently expired the pins
+//! and the hardening self-disabled. SPKI pins on the stable intermediate/root
+//! survive leaf rotation; each provider carries >= 2 overlapping pins
+//! (intermediate + its root) so even an intermediate re-issue under the same
+//! root keeps working. If a provider fails pinning, it is skipped and the
+//! next provider is tried; this is safe because only 1-of-N must succeed.
+//! Unlike the API pinning, an unparseable chain fails CLOSED here — DoH has
+//! independent fallback providers, the API host does not.
 
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
+};
+use serde::Deserialize;
 
 /// DoH response format (Cloudflare JSON API)
 #[derive(Deserialize)]
@@ -37,17 +52,19 @@ const DNS_TYPE_A: i32 = 1; // IPv4
 const _DNS_TYPE_AAAA: i32 = 28; // IPv6 (reserved for future use)
 
 /// DoH provider configuration with certificate pinning.
-/// Each provider specifies one or more SPKI SHA-256 pin hashes.
-/// The connection succeeds if ANY pin matches the server certificate chain.
+/// Each provider specifies one or more CA-chain SPKI SHA-256 pin hashes.
+/// The connection succeeds if ANY pin matches ANY certificate in the chain
+/// the server presents (leaf + intermediates).
 ///
-/// Pin generation (full DER cert hash — NOT SPKI):
-///   echo | openssl s_client -connect <host>:443 -servername <host> 2>/dev/null \
-///     | openssl x509 -outform der | openssl dgst -sha256 -binary | base64
+/// Pin generation (SPKI hash, identical to api/cert_pin.rs and OkHttp):
+///   echo | openssl s_client -connect <host>:443 -servername <host> -showcerts \
+///     2>/dev/null   # then, for the intermediate (2nd cert) / root:
+///   openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER \
+///     | openssl dgst -sha256 -binary | base64
 ///
-/// For CA/intermediate backup pin, extract the second cert in the chain.
-///
-/// IMPORTANT: These pins MUST be regenerated when providers renew certificates.
-/// The generate-cert-pins.sh script automates this process.
+/// Because the pinned keys are the stable intermediate + root — not the
+/// volatile leaf — routine provider cert renewal does NOT invalidate them; a
+/// release is only needed if a provider changes CA (years, announced).
 struct DoHProvider {
     url: &'static str,
     /// Hostname in `url` — the key for the bootstrap resolver override below.
@@ -66,32 +83,32 @@ struct DoHProvider {
     /// the hostname, so the certificate pin below is unaffected by which address
     /// is dialled. IPv4 only — the client blocks IPv6 while connecting.
     bootstrap: &'static [Ipv4Addr],
-    /// SPKI SHA-256 pin hashes (base64-encoded). At least one must match.
-    /// Only LEAF certificate pins are effective: reqwest's `peer_certificate()`
-    /// exposes only the leaf cert, so intermediate/CA pins can never match and
-    /// must NOT be listed here (they would provide false confidence, not security).
-    /// For rotation safety, add the NEW leaf pin alongside the old leaf pin.
+    /// CA-chain SPKI SHA-256 pin hashes (base64-encoded). At least one must
+    /// match a certificate in the presented chain. Each provider lists >= 2
+    /// OVERLAPPING pins — the current intermediate AND its root — so a leaf
+    /// rotation never matters and even an intermediate re-issue under the
+    /// same root keeps one pin valid.
     /// Set to empty slice to disable pinning for this provider (emergency only).
     pins: &'static [&'static str],
 }
 
-/// DoH providers with certificate pins for MITM protection.
+/// DoH providers with CA-chain SPKI pins for MITM protection.
 ///
 /// SECURITY MODEL:
-/// - reqwest's `peer_certificate()` returns ONLY the leaf cert, not the chain.
-///   Therefore only leaf cert DER hashes actually provide protection here.
-///   The "backup CA" pins listed below are a safety net in case a DoH provider
-///   re-issues with the same intermediate/root — but they will NOT match via
-///   `peer_certificate()` alone. They are retained for documentation purposes
-///   and in case we later switch to a chain-aware TLS backend.
-/// - If ALL pins fail for a provider, that provider is skipped
-/// - Availability guaranteed as long as 1 provider passes pinning
-/// - If all 3 providers are MITM'd simultaneously, resolution fails CLOSED (safe)
+/// - Pinning runs INSIDE the TLS handshake (DohSpkiPinningVerifier below),
+///   after full WebPKI validation, and sees the whole presented chain — the
+///   same model as api/cert_pin.rs and the Android OkHttp pinner.
+/// - If a provider's chain matches no pin (or cannot be parsed), the
+///   handshake is refused and that provider is skipped.
+/// - Availability guaranteed as long as 1 provider passes pinning.
+/// - If all 3 providers fail pinning simultaneously, resolution fails CLOSED.
 ///
-/// PIN ROTATION PROCEDURE:
-/// 1. Before a provider rotates certs, add the new leaf pin alongside the old one
-/// 2. After rotation is confirmed, remove the old pin in a subsequent release
-/// 3. Never remove all pins for a provider without adding new ones first
+/// PIN ROTATION PROCEDURE (needed only for a CA-chain change, not cert renewal):
+/// 1. When a provider announces a CA migration, add the new intermediate+root
+///    pins alongside the old ones.
+/// 2. After the migration is confirmed fleet-wide, remove the old pins in a
+///    subsequent release.
+/// 3. Never remove all pins for a provider without adding new ones first.
 const DOH_PROVIDERS: &[DoHProvider] = &[
     DoHProvider {
         url: "https://cloudflare-dns.com/dns-query",
@@ -105,14 +122,14 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
             Ipv4Addr::new(1, 1, 1, 1),
             Ipv4Addr::new(1, 0, 0, 1),
         ],
-        // Chain: cloudflare-dns.com → SSL.com SSL Intermediate CA ECC R2 → SSL.com Root CA ECC
-        // Pins regenerated 2025-07-16 from live cloudflare-dns.com certificate.
-        // Only the LEAF pin is listed — reqwest's peer_certificate() exposes only the
-        // leaf cert, so an intermediate/CA pin can never match and would be dead weight.
-        // Intermediate hash (SSL.com SSL Intermediate CA ECC R2), kept for reference only
-        // and NOT used as a pin: lItxEa9C9UbVec/1ziveyCE03ZkUhCvdsMUocutgTjk=
+        // Chain: cloudflare-dns.com → SSL.com SSL Intermediate CA ECC R2
+        //        → SSL.com Root Certification Authority ECC
+        // SPKI pins verified against the live chain 2026-08-12.
         pins: &[
-            "47AoJnidZT0iTT7ay+Tod8tyhvxMkiZy9iJnQcpXrWU=", // leaf: cloudflare-dns.com (expires 2026-12-21)
+            // SSL.com SSL Intermediate CA ECC R2 (presented intermediate)
+            "zGgA4OU4DjJdvpRYUqbi5Vh2g9W5Oc/PgKihy9mkLsE=",
+            // SSL.com Root Certification Authority ECC (trust anchor)
+            "oyD01TTXvpfBro3QSZc1vIlcMjrdLTiL/M9mLCPX+Zo=",
         ],
     },
     DoHProvider {
@@ -120,99 +137,198 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         host: "dns.google",
         bootstrap: &[Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
         // Chain: dns.google → WR2 (Google Trust Services) → GTS Root R1
-        // Pins regenerated 2025-07-16 from live dns.google certificate.
-        // Only the LEAF pin is listed (see note above on peer_certificate()).
-        // Intermediate hash (WR2, Google Trust Services), kept for reference only
-        // and NOT used as a pin: 5v4iv0Xk8NO4XFngLA9JVBjh640yEPeI1IzV4ctUfNQ=
+        // SPKI pins verified against the live chain 2026-08-12; the GTS Root R1
+        // value also matches Google's published pin list (pki.goog).
         pins: &[
-            "V9M+lXJXpft4z4ZbRwpSC1i/L+Vw5ORP1nykdPD7i2o=", // leaf: dns.google (expires 2026-09-21)
+            // WR2, Google Trust Services (presented intermediate)
+            "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=",
+            // GTS Root R1 (trust anchor, presented in the live chain)
+            "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",
         ],
     },
     DoHProvider {
         url: "https://dns.quad9.net/dns-query",
         host: "dns.quad9.net",
         bootstrap: &[Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(149, 112, 112, 112)],
-        // Chain: dns.quad9.net → DigiCert Global G3 TLS ECC SHA384 2020 CA1 → DigiCert Global Root G3
-        // Pins regenerated 2025-07-16 from live dns.quad9.net certificate.
-        // Only the LEAF pin is listed (see note above on peer_certificate()).
-        // Intermediate hash (DigiCert Global G3 TLS ECC SHA384 2020 CA1), kept for
-        // reference only and NOT used as a pin: BYfWvSgZWHq5D7WWSApXk72fdQaj6s5z9eqzZgF/4lk=
+        // Chain: dns.quad9.net → DigiCert Global G3 TLS ECC SHA384 2020 CA1
+        //        → DigiCert Global Root G3
+        // SPKI pins verified against the live chain 2026-08-12.
         pins: &[
-            "N9wT18BDxvC/OFDK4xMwUfKiYJQdLDWrC102do1Ila4=", // leaf: dns.quad9.net (expires 2027-01-31)
+            // DigiCert Global G3 TLS ECC SHA384 2020 CA1 (presented intermediate)
+            "qBRjZmOmkSNJL0p70zek7odSIzqs/muR4Jk9xYyCP+E=",
+            // DigiCert Global Root G3 (trust anchor)
+            "uUwZgwDOxcBXrQcntwu+kYFpkiVkOaezL0WYEZ3anJc=",
         ],
     },
 ];
 
-/// Validate a TLS certificate against a set of SHA-256 pin hashes.
-/// Returns true if ANY pin matches the peer certificate.
-///
-/// SEC: This hashes the full DER-encoded leaf certificate. Pins must be
-/// regenerated whenever the certificate is renewed (even with the same key).
-/// This is intentional — for DoH providers that rotate certs regularly,
-/// add the new leaf cert pin alongside the old one during the rotation window.
-/// Only leaf pins are checked here: reqwest exposes only the leaf certificate,
-/// so intermediate/CA pins would never match and are not used.
-///
-/// To generate a pin for a DoH provider:
-///   echo | openssl s_client -connect <host>:443 -servername <host> 2>/dev/null \
-///     | openssl x509 -outform der | openssl dgst -sha256 -binary | base64
-///
-/// For CA/intermediate backup pin:
-///   echo | openssl s_client -connect <host>:443 -servername <host> -showcerts 2>/dev/null \
-///     | sed -n '/-----BEGIN/{:a;/-----END/!{N;ba};p}' | tail -n +2 | head -1 \
-///     | openssl x509 -outform der | openssl dgst -sha256 -binary | base64
-fn validate_certificate_pin(
-    tls_info: Option<&reqwest::tls::TlsInfo>,
-    expected_pins: &[&str],
-) -> bool {
-    // If no pins configured, pinning is disabled for this provider (emergency bypass)
-    if expected_pins.is_empty() {
-        tracing::warn!("Certificate pinning disabled for provider — emergency bypass active");
-        return true;
-    }
+/// Marker embedded in every pin-rejection `TlsError` so `resolve_single_provider`
+/// can classify a reqwest connect failure as a PIN failure (vs plain network
+/// trouble) by walking the error source chain. rustls carries a custom
+/// verifier's rejection only as `Error::General(String)`, so a distinctive
+/// substring is the only channel that survives reqwest's error wrapping.
+const PIN_MISMATCH_MARKER: &str = "DoH-SPKI-pin-rejected";
 
-    let tls = match tls_info {
-        Some(info) => info,
-        None => {
-            tracing::error!("No TLS info available — cannot verify certificate pin");
-            return false;
-        }
-    };
+/// The pin set for a provider hostname, or None if the host is not a known
+/// DoH provider (the DoH client never legitimately handshakes with anything
+/// else — a redirect off-provider must fail closed, not get pinless TLS).
+fn pins_for_host(host: &str) -> Option<&'static [&'static str]> {
+    DOH_PROVIDERS
+        .iter()
+        .find(|p| p.host.eq_ignore_ascii_case(host))
+        .map(|p| p.pins)
+}
 
-    // Get the DER-encoded peer certificate
-    let cert_der = match tls.peer_certificate() {
-        Some(cert) => cert,
-        None => {
-            tracing::error!("No peer certificate in TLS info — pinning failed");
-            return false;
-        }
-    };
-    let cert_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(cert_der);
-        hasher.finalize()
-    };
-    let cert_pin = base64_encode(&cert_hash);
-
-    // Check if any expected pin matches the leaf cert
-    for pin in expected_pins {
-        if *pin == cert_pin {
-            tracing::debug!("Certificate pin matched (leaf): {}…", &pin[..12]);
+/// Did this reqwest error originate from our pinning verifier? The marker is
+/// embedded in the `TlsError` the verifier returns; reqwest/hyper wrap it in
+/// several layers, so walk the source chain looking for it.
+fn is_pin_rejection(e: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = source {
+        if err.to_string().contains(PIN_MISMATCH_MARKER) {
             return true;
         }
+        source = err.source();
     }
-
-    tracing::warn!(
-        "Certificate pinning FAILED — no pin matched. Got: {}",
-        &cert_pin[..16]
-    );
     false
 }
 
-/// Minimal base64 encoder (avoids pulling in the base64 crate just for this)
-fn base64_encode(data: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(data)
+/// CA-chain SPKI pinning for the DoH providers, layered inside the TLS
+/// handshake exactly like `api/cert_pin.rs`: the wrapped WebPKI verifier runs
+/// full standard validation first, then the presented chain must contain a
+/// certificate whose SPKI hash is pinned for the SNI hostname's provider.
+///
+/// Unlike the API verifier, this one fails CLOSED when the chain cannot be
+/// parsed: the API has a single host and availability wins there, while DoH
+/// has two more independent fallback providers, so refusing one unparseable
+/// chain costs nothing and keeps the pinning guarantee honest.
+#[derive(Debug)]
+struct DohSpkiPinningVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for DohSpkiPinningVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        // 1) Full standard validation first — chain to a trusted root, hostname
+        //    match, validity period. A failure here rejects the connection.
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+
+        // 2) Select the pin set by SNI hostname. The client dials providers by
+        //    hostname only (the bootstrap addresses are attached to those same
+        //    hostnames via resolve_to_addrs), so a non-DNS or unknown name can
+        //    only be a redirect off-provider or a misuse — fail CLOSED.
+        let ServerName::DnsName(dns) = server_name else {
+            return Err(TlsError::General(format!(
+                "{PIN_MISMATCH_MARKER}: non-DNS server name"
+            )));
+        };
+        let host = dns.as_ref();
+        let Some(pins) = pins_for_host(host) else {
+            return Err(TlsError::General(format!(
+                "{PIN_MISMATCH_MARKER}: {host} is not a pinned DoH provider"
+            )));
+        };
+
+        // Empty pin set = pinning disabled for this provider (emergency
+        // bypass, same semantics as before). WebPKI validation still applies.
+        if pins.is_empty() {
+            tracing::warn!("DoH pinning disabled for {host} — emergency bypass active");
+            return Ok(ServerCertVerified::assertion());
+        }
+
+        // 3) SPKI pin check across the PRESENTED chain (leaf + intermediates),
+        //    reusing the exact extraction api/cert_pin.rs uses. Any match passes.
+        let mut parse_failures = 0usize;
+        for cert in std::iter::once(end_entity).chain(intermediates.iter()) {
+            match crate::api::cert_pin::spki_sha256_b64(cert) {
+                Some(spki) if pins.contains(&spki.as_str()) => {
+                    tracing::debug!("DoH SPKI pin matched for {host}");
+                    return Ok(ServerCertVerified::assertion());
+                }
+                Some(_) => {}
+                None => parse_failures += 1,
+            }
+        }
+
+        // FAIL CLOSED — on mismatch AND on parse failure (see type-level doc).
+        if parse_failures > 0 {
+            tracing::error!(
+                "DoH pinning: {parse_failures} unparseable certificate(s) in {host}'s chain — refusing"
+            );
+            return Err(TlsError::General(format!(
+                "{PIN_MISMATCH_MARKER}: unparseable certificate in chain for {host}"
+            )));
+        }
+        tracing::warn!(
+            "DoH pinning: no pinned CA SPKI matched {host}'s presented chain — refusing"
+        );
+        Err(TlsError::General(format!(
+            "{PIN_MISMATCH_MARKER}: no pinned SPKI matched for {host}"
+        )))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Build the rustls `ClientConfig` for the DoH client: full standard WebPKI
+/// validation PLUS per-provider CA-chain SPKI pinning. Fed to reqwest via
+/// `ClientBuilder::use_preconfigured_tls`, mirroring `api/cert_pin.rs` —
+/// including the explicit ring provider selection (see that file for why).
+fn doh_rustls_config() -> ClientConfig {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+    let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        .build()
+        .expect("doh-pin: failed to build WebPKI verifier from Mozilla roots");
+
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("doh-pin: ring provider must support default TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(DohSpkiPinningVerifier { inner }))
+        .with_no_client_auth();
+    // Advertise ALPN http/1.1 — exactly what reqwest's own rustls setup sends
+    // for this crate (our reqwest has no `http2` feature). A preconfigured
+    // config otherwise sends NO ALPN at all, which dns.quad9.net answers with
+    // HTTP 505 (verified live 2026-08-12): the provider would silently degrade.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config
 }
 
 /// Resolve a hostname to IPv4 address using DNS-over-HTTPS
@@ -310,9 +426,12 @@ fn doh_client() -> Result<&'static reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .https_only(true) // Enforce HTTPS only
-        .danger_accept_invalid_certs(false) // Reject invalid certs
-        .min_tls_version(reqwest::tls::Version::TLS_1_2) // Minimum TLS 1.2
-        .tls_info(true); // PROD: Enable TLS info for pinning
+        // WebPKI validation + CA-chain SPKI pinning, INSIDE the handshake.
+        // Replaces the old tls_info(true) + leaf-hash-after-the-fact check
+        // (reqwest's TlsInfo exposes only the leaf, so those pins expired on
+        // every provider cert rotation and the hardening self-disabled).
+        // The rustls config also enforces TLS >= 1.2 and rejects invalid certs.
+        .use_preconfigured_tls(doh_rustls_config());
 
     for provider in DOH_PROVIDERS {
         let addrs: Vec<SocketAddr> = provider
@@ -341,7 +460,10 @@ enum DoHError {
     Parse(String),
 }
 
-/// Resolve using a single DoH provider with certificate pin verification
+/// Resolve using a single DoH provider. Certificate pinning happens INSIDE
+/// the TLS handshake (DohSpkiPinningVerifier) — a pin rejection surfaces here
+/// as a connect error carrying PIN_MISMATCH_MARKER in its source chain, and
+/// is classified as PinningFailed so resolve_via_doh can count possible MITM.
 async fn resolve_single_provider(
     client: &reqwest::Client,
     provider: &DoHProvider,
@@ -353,19 +475,16 @@ async fn resolve_single_provider(
         .header("Accept", "application/dns-json")
         .send()
         .await
-        .map_err(|e| DoHError::Network(format!("DoH request failed: {}", e)))?;
-
-    // PROD-HARDENING: Verify certificate pin BEFORE trusting response data.
-    // This is defense-in-depth against compromised CAs intercepting DoH queries.
-    if !provider.pins.is_empty() {
-        let tls = resp.extensions().get::<reqwest::tls::TlsInfo>();
-        if !validate_certificate_pin(tls, provider.pins) {
-            return Err(DoHError::PinningFailed(format!(
-                "Certificate pin validation failed for {}",
-                provider.url
-            )));
-        }
-    }
+        .map_err(|e| {
+            if is_pin_rejection(&e) {
+                DoHError::PinningFailed(format!(
+                    "Certificate pin validation failed for {}: {}",
+                    provider.url, e
+                ))
+            } else {
+                DoHError::Network(format!("DoH request failed: {}", e))
+            }
+        })?;
 
     if !resp.status().is_success() {
         return Err(DoHError::Network(format!(
@@ -457,16 +576,19 @@ mod tests {
     }
 
     #[test]
-    fn test_doh_provider_pins_non_empty() {
-        // Every provider MUST have at least one pin in production
+    fn test_doh_provider_pins_overlapping() {
+        // Every provider MUST carry >= 2 OVERLAPPING pins (intermediate + its
+        // root) in production — a single pin turns any CA-side re-issue into a
+        // silent one-provider outage, which is exactly how the old leaf pins
+        // self-disabled.
         for provider in DOH_PROVIDERS {
             assert!(
-                !provider.pins.is_empty(),
-                "Provider {} has no certificate pins — this is a security risk",
+                provider.pins.len() >= 2,
+                "Provider {} needs >= 2 overlapping SPKI pins (intermediate + root)",
                 provider.url
             );
-            // Each pin must be valid base64 and 44 chars (SHA-256 = 32 bytes = 44 base64 chars with padding)
-            // SEC: Pins must be regenerated using DER cert hash (see generate-cert-pins.sh)
+            // Each pin must be valid base64 and 44 chars (SHA-256 = 32 bytes =
+            // 44 base64 chars with padding).
             for pin in provider.pins {
                 assert!(
                     pin.len() == 44 && pin.ends_with('='),
@@ -476,6 +598,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The verifier dispatches pin sets by SNI hostname; every provider host
+    /// must resolve to its own pins, and anything else must resolve to None
+    /// (which the verifier fails CLOSED).
+    #[test]
+    fn test_pins_for_host_dispatch() {
+        for provider in DOH_PROVIDERS {
+            let pins = pins_for_host(provider.host)
+                .unwrap_or_else(|| panic!("no pin set for provider host {}", provider.host));
+            assert_eq!(pins, provider.pins);
+        }
+        // Case-insensitive (SNI hostnames are case-insensitive per RFC 4343).
+        assert!(pins_for_host("DNS.GOOGLE").is_some());
+        assert!(pins_for_host("evil.example").is_none());
+        assert!(pins_for_host("").is_none());
+    }
+
+    /// The pinned rustls config must build (panics here would make every DoH
+    /// resolution fail at client construction).
+    #[test]
+    fn test_doh_rustls_config_builds() {
+        let _ = doh_rustls_config();
     }
 
     /// LEAK-6: every provider needs bootstrap addresses (the system resolver is
@@ -516,12 +661,5 @@ mod tests {
                 provider.host, provider.url
             );
         }
-    }
-
-    #[test]
-    fn test_base64_encode() {
-        let data = [0u8; 32]; // 32 zero bytes
-        let encoded = base64_encode(&data);
-        assert_eq!(encoded, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
     }
 }

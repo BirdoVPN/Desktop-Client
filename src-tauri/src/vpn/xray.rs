@@ -40,9 +40,10 @@ const DEFAULT_LOCAL_PORT: u16 = 51821;
 /// is the empty-string sentinel that triggers a hard-fail at runtime if the
 /// build pipeline did not populate it (fail-closed — never run an
 /// un-attested binary in production).
-#[cfg(not(debug_assertions))]
-const XRAY_BINARY_SHA256: Option<&str> = option_env!("XRAY_BINARY_SHA256");
-#[cfg(debug_assertions)]
+// One un-gated definition: the debug/release distinction lives in
+// `verify_xray_integrity` (release hard-fails when unset, debug warns), not in
+// how the constant is sourced. The previous cfg-gated pair was byte-identical
+// and only invited a future edit to change one arm and not the other.
 const XRAY_BINARY_SHA256: Option<&str> = option_env!("XRAY_BINARY_SHA256");
 
 /// AUDIT-N4: verify the xray binary on disk against XRAY_BINARY_SHA256
@@ -190,11 +191,13 @@ impl XrayManager {
         // can silently downgrade Reality to plain TLS without the user noticing.
         verify_xray_integrity(&xray_binary)?;
 
+        // LOG-001: the server host is the chosen VPN node — redact it (and the
+        // SNI camouflage domain) so birdo.log carries no connection history.
         tracing::info!(
             "Starting Xray Reality tunnel: {} → 127.0.0.1:{} → {}:{}",
-            config.sni,
+            crate::utils::redact::redact_hostname(&config.sni),
             local_port,
-            server_host,
+            crate::utils::redact::redact_hostname(&server_host),
             server_port
         );
 
@@ -219,46 +222,64 @@ impl XrayManager {
             )
         })?;
 
-        // Pipe config JSON to stdin and close to signal EOF
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(config_json.as_bytes())
-                .map_err(|e| format!("Failed to write Xray config to stdin: {}", e))?;
-            // stdin dropped here → EOF sent → Xray parses config
-        }
-
-        tracing::info!("Xray process started (PID: {})", child.id());
-
-        // P1-12: Drain stdout and stderr asynchronously to prevent pipe buffer deadlock
-        // and capture crash indicators.
-        if let Some(stdout) = child.stdout.take() {
-            let stdout_async = tokio::process::ChildStdout::from_std(stdout)
-                .map_err(|e| format!("Failed to create async stdout: {}", e))?;
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout_async);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "xray::stdout", "{}", line);
-                }
-            });
-        }
-        if let Some(stderr) = child.stderr.take() {
-            let stderr_async = tokio::process::ChildStderr::from_std(stderr)
-                .map_err(|e| format!("Failed to create async stderr: {}", e))?;
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr_async);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if line.contains("panic") || line.contains("fatal") || line.contains("FATAL") {
-                        tracing::error!(target: "xray::stderr", "CRASH: {}", line);
-                    } else {
-                        tracing::warn!(target: "xray::stderr", "{}", line);
-                    }
-                }
-            });
-        }
-
+        // P1-dk-xray-orphan-on-early-return: take the pipes and store the Child
+        // BEFORE any fallible post-spawn work, so every error path below can
+        // reap the process via stop() instead of orphaning a live xray holding
+        // the loopback port and an open Reality session.
+        let stdin_pipe = child.stdin.take();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let pid = child.id();
         *self.process.lock().await = Some(child);
+
+        let setup_result: Result<(), String> = (|| {
+            // Pipe config JSON to stdin and close to signal EOF
+            if let Some(mut stdin) = stdin_pipe {
+                stdin
+                    .write_all(config_json.as_bytes())
+                    .map_err(|e| format!("Failed to write Xray config to stdin: {}", e))?;
+                // stdin dropped here → EOF sent → Xray parses config
+            }
+
+            tracing::info!("Xray process started (PID: {})", pid);
+
+            // P1-12: Drain stdout and stderr asynchronously to prevent pipe buffer
+            // deadlock and capture crash indicators.
+            if let Some(stdout) = stdout_pipe {
+                let stdout_async = tokio::process::ChildStdout::from_std(stdout)
+                    .map_err(|e| format!("Failed to create async stdout: {}", e))?;
+                tokio::spawn(async move {
+                    let reader = BufReader::new(stdout_async);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        tracing::debug!(target: "xray::stdout", "{}", line);
+                    }
+                });
+            }
+            if let Some(stderr) = stderr_pipe {
+                let stderr_async = tokio::process::ChildStderr::from_std(stderr)
+                    .map_err(|e| format!("Failed to create async stderr: {}", e))?;
+                tokio::spawn(async move {
+                    let reader = BufReader::new(stderr_async);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if line.contains("panic")
+                            || line.contains("fatal")
+                            || line.contains("FATAL")
+                        {
+                            tracing::error!(target: "xray::stderr", "CRASH: {}", line);
+                        } else {
+                            tracing::warn!(target: "xray::stderr", "{}", line);
+                        }
+                    }
+                });
+            }
+            Ok(())
+        })();
+        if let Err(e) = setup_result {
+            self.stop().await;
+            return Err(e);
+        }
 
         // Give Xray time to bind the port
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -408,11 +429,21 @@ impl XrayManager {
 
 impl Drop for XrayManager {
     fn drop(&mut self) {
-        // Synchronous cleanup — kill process if still running
-        if let Ok(mut proc) = self.process.try_lock() {
-            if let Some(mut child) = proc.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+        // Synchronous cleanup — kill process if still running.
+        // P1-dk-xray-drop-trylock-orphan: on lock contention we cannot safely
+        // reach the Child here; at least say so instead of silently leaking.
+        match self.process.try_lock() {
+            Ok(mut proc) => {
+                if let Some(mut child) = proc.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "XrayManager dropped while process lock is held — xray may be left \
+                     running (a concurrent start/stop owns the handle)"
+                );
             }
         }
     }
@@ -439,13 +470,20 @@ fn find_available_port(start: u16) -> Option<u16> {
 
 /// Parse "host:port" endpoint string
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16), String> {
+    // P6-CLI-D-03: these Err strings reach release-level catch-all loggers verbatim.
     let parts: Vec<&str> = endpoint.rsplitn(2, ':').collect();
     if parts.len() != 2 {
-        return Err(format!("Invalid endpoint format: {}", endpoint));
+        return Err(format!(
+            "Invalid endpoint format: {}",
+            crate::utils::redact_endpoint(endpoint)
+        ));
     }
-    let port = parts[0]
-        .parse::<u16>()
-        .map_err(|_| format!("Invalid port in endpoint: {}", endpoint))?;
+    let port = parts[0].parse::<u16>().map_err(|_| {
+        format!(
+            "Invalid port in endpoint: {}",
+            crate::utils::redact_endpoint(endpoint)
+        )
+    })?;
     Ok((parts[1].to_string(), port))
 }
 
@@ -644,5 +682,49 @@ mod tests {
             config["outbounds"][0]["streamSettings"]["realitySettings"]["serverName"],
             "www.example.com"
         );
+    }
+
+    /// P6-CLI-D-10: the generated config must produce no per-connection
+    /// destination data client-side — the `log` object is EXACTLY
+    /// `{"loglevel": "warning"}` (an `access` path is Xray's per-connection
+    /// destination log), and every inbound has sniffing explicitly disabled.
+    /// Runs in CI (`cargo test` dies at exe load on dev Windows hosts —
+    /// 0xC0000139); its source-scan twin lives in tests/privacy_pins.rs and
+    /// runs everywhere.
+    #[test]
+    fn xray_config_has_no_access_log_and_sniffing_stays_disabled() {
+        let config = build_xray_config(
+            51821,
+            "1.2.3.4",
+            8443,
+            51820,
+            "test-uuid",
+            "test-pubkey",
+            "abcdef01",
+            "www.example.com",
+            "xtls-rprx-vision",
+        );
+
+        let log = config["log"].as_object().expect("log object present");
+        assert_eq!(
+            log.keys().collect::<Vec<_>>(),
+            vec!["loglevel"],
+            "P6-CLI-D-10 broken: the log object grew a key beyond loglevel — \
+             an `access` path is a per-connection destination log on the \
+             customer's machine"
+        );
+        assert_eq!(log["loglevel"], "warning");
+
+        let inbounds = config["inbounds"].as_array().expect("inbounds array");
+        assert!(!inbounds.is_empty(), "vacuity guard: no inbounds generated");
+        for inbound in inbounds {
+            assert_eq!(
+                inbound["sniffing"]["enabled"],
+                serde_json::Value::Bool(false),
+                "P6-CLI-D-10 broken: inbound {:?} no longer disables sniffing — \
+                 sniffing makes Xray parse and expose destination domains",
+                inbound["tag"]
+            );
+        }
     }
 }
