@@ -450,9 +450,7 @@ mod types_serialization_tests {
             preferred_region: None,
             client_public_key: None,
             stealth_mode: None,
-            fallback_reason: Some(
-                crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT.to_string(),
-            ),
+            fallback_reason: Some(crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT.to_string()),
             quantum_protection: None,
             pq_client_public_key: None,
             desktop_attest_nonce: None,
