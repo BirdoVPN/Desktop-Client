@@ -4,15 +4,33 @@
 //! carrying the version the user must move to:
 //!
 //! ```json
-//! { "error": "...", "requiredVersion": "1.4.36", "downloadUrl": "https://..." }
+//! {
+//!   "statusCode": 426,
+//!   "error": "update_required",
+//!   "message": "This version of Birdo VPN is no longer supported. Please update the app to reconnect.",
+//!   "details": { "minVersion": "1.4.36", "currentVersion": "1.4.9", "updateUrl": "https://birdo.app/clients" }
+//! }
 //! ```
 //!
-//! ASSUMED SHAPE — the server side is being built in parallel. `requiredVersion`
-//! and `downloadUrl` are read as camelCase (with snake_case accepted as an
-//! alias) and BOTH are optional: a 426 with an unparseable or empty body still
-//! blocks, it just cannot name the version. The block is driven by the STATUS
-//! CODE, never by the body, so a shape mismatch degrades the message rather
-//! than defeating the gate.
+//! NOT an assumed shape — this is the body the backend actually serialises,
+//! captured from a real response and pinned as `CANONICAL_426` in
+//! `api::tests`, with the matching assertion on the backend side
+//! (`vpn-version-floor.wire.spec.ts`). It is `details` that carries the
+//! structured fields: birdo-web's GlobalExceptionFilter REBUILDS every error
+//! body and forwards only an explicit `details` opt-in, so top-level extras do
+//! not survive to the wire.
+//!
+//! An earlier revision of this comment declared
+//! `{ "requiredVersion", "downloadUrl" }` as an "ASSUMED SHAPE ... built in
+//! parallel". Nobody ever agreed it, and the backend never sent those names, so
+//! the released client could not read a single field. The tolerated fallbacks
+//! below exist only so an OLD or unexpected body cannot weaken the gate — they
+//! are not the contract.
+//!
+//! Every field is optional and the block is driven by the STATUS CODE, never by
+//! the body: a 426 with an unparseable or empty body still blocks, it just
+//! cannot name the version. The human sentence is read from `message` (never
+//! from `error`, which is a machine token).
 //!
 //! This module is the process-wide latch. `BirdoApi::handle_response` sets it
 //! the first time any request is refused; from then on:
