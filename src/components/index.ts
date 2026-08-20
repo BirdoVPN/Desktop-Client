@@ -2,6 +2,7 @@ export { Login } from './Login';
 export { Dashboard } from './Dashboard';
 export { Settings } from './Settings';
 export { UpdateChecker } from './UpdateChecker';
+export { UpdateRequired } from './UpdateRequired';
 export { ConsentScreen } from './ConsentScreen';
 export { OfflineBanner } from './OfflineBanner';
 export { PixelCanvas } from './PixelCanvas';

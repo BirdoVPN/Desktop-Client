@@ -380,6 +380,55 @@ impl AutoReconnectService {
                     }
 
                     let state = vpn_manager.get_state().await;
+
+                    // Forced version floor: the backend has refused this build
+                    // (HTTP 426). That is a WALL, not a transient failure —
+                    // every reconnect will be refused identically, so a client
+                    // that keeps retrying is a self-inflicted DoS against our
+                    // own control plane and a battery drain for the user. Stop
+                    // the loop; the UI is already showing the blocking
+                    // "update required" screen, and a successful connect after
+                    // the update spawns a fresh loop.
+                    if crate::api::upgrade_gate::is_blocked() {
+                        tracing::error!(
+                            "Auto-reconnect stopping — the backend requires a newer client build"
+                        );
+                        is_reconnecting.store(false, Ordering::SeqCst);
+                        running.store(false, Ordering::SeqCst);
+                        // A live tunnel is left alone: the floor blocks the
+                        // control plane, not the data plane, and tearing down a
+                        // working tunnel to report a version problem would take
+                        // protection away from the user for no benefit.
+                        if !state.is_tunnel_active() {
+                            // Not connected, and nothing left to retry. Releasing
+                            // the loop with the kill switch still armed would
+                            // strand the machine behind a block-all forever, so
+                            // apply the SAME rule as the give-up branch below:
+                            // lockdown ("always-on") keeps blocking because the
+                            // user asked for exactly that, everything else
+                            // releases.
+                            if killswitch::is_lockdown_mode() {
+                                tracing::error!(
+                                    "Update required with the always-on kill switch armed — \
+                                     traffic stays blocked until you disconnect or turn the \
+                                     kill switch off"
+                                );
+                            } else {
+                                #[cfg(target_os = "windows")]
+                                crate::vpn::wfp::clear_ipv6_block_intent();
+                                let _ = killswitch::deactivate_killswitch().await;
+                            }
+                            let _ = vpn_manager
+                                .set_state(ConnectionState::Error(
+                                    "Update required — this version of Birdo VPN is no \
+                                     longer supported. Install the update to reconnect."
+                                        .to_string(),
+                                ))
+                                .await;
+                        }
+                        break;
+                    }
+
                     let cfg = config.read().await.clone();
 
                     // Network awareness (read once per tick). On an Offline->Online

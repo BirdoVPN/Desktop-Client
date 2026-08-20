@@ -48,6 +48,19 @@ pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// The forced-version-floor requirement, if the backend has already refused
+/// this build (HTTP 426 — see `api::upgrade_gate`).
+///
+/// The gate normally reaches the UI via the `update-required` event, but a
+/// client can be refused before the webview has mounted a listener (the very
+/// first `get_auth_state` on launch, for instance), so the frontend also reads
+/// this once at startup. Otherwise the wall would only appear after a second,
+/// pointless refused request.
+#[tauri::command]
+pub fn get_required_update() -> Option<crate::api::upgrade_gate::RequiredUpdate> {
+    crate::api::upgrade_gate::required_update()
+}
+
 /// An available update, as reported to the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

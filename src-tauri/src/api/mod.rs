@@ -9,6 +9,7 @@ pub mod doh_resolver;
 pub mod endpoints;
 pub mod error;
 pub mod types;
+pub mod upgrade_gate;
 
 #[cfg(test)]
 mod tests;

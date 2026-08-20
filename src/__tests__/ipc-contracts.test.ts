@@ -314,6 +314,7 @@ const FRONTEND_COMMANDS = [
   'get_app_version',
   'check_for_updates',
   'install_update',
+  'get_required_update',
   // Extended VPN info
   'get_subscription_status',
   'get_usage_stats',

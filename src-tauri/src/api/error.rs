@@ -1,6 +1,7 @@
 //! API error types
 
 use super::types::ProtocolErrorCode;
+use super::upgrade_gate::RequiredUpdate;
 use std::fmt;
 
 #[derive(Debug)]
@@ -17,6 +18,10 @@ pub enum ApiError {
     NotFound,
     /// Rate limited (429)
     RateLimited,
+    /// 426: this build is below the backend's forced version floor. Carries the
+    /// version to move to so the UI can name it. Distinct from every other
+    /// variant because it is TERMINAL for this process — retrying cannot help.
+    UpgradeRequired(RequiredUpdate),
     /// Server error (5xx)
     ServerError(u16),
     /// Failed to parse response
@@ -38,6 +43,18 @@ impl fmt::Display for ApiError {
             ApiError::Forbidden => write!(f, "Access denied"),
             ApiError::NotFound => write!(f, "Not found"),
             ApiError::RateLimited => write!(f, "Too many requests, please slow down"),
+            ApiError::UpgradeRequired(info) => match (&info.message, &info.required_version) {
+                (Some(msg), _) if !msg.trim().is_empty() => write!(f, "{}", msg),
+                (_, Some(version)) => write!(
+                    f,
+                    "Update required: Birdo VPN {} or later is needed to continue",
+                    version
+                ),
+                _ => write!(
+                    f,
+                    "Update required: this version of Birdo VPN is no longer supported"
+                ),
+            },
             ApiError::ServerError(code) => write!(f, "Server error ({})", code),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),
             ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update Birdo VPN to the latest version. ({})", msg),

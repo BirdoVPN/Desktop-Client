@@ -7,6 +7,7 @@ import { AppShell } from '@/components/AppShell';
 import { OfflineBanner } from '@/components/OfflineBanner';
 import { PixelCanvas } from '@/components/PixelCanvas';
 import { TitleBar } from '@/components/TitleBar';
+import { UpdateRequired, type RequiredUpdate } from '@/components/UpdateRequired';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
@@ -49,6 +50,31 @@ function App() {
     }))
   );
   const [initializing, setInitializing] = useState(true);
+
+  // Forced client-version floor. The backend answers every request from a
+  // too-old build with a structured 426; api::upgrade_gate latches that
+  // process-wide, emits `update-required`, and stops auto-reconnect from
+  // hammering the wall. Once set this is never cleared in-process — the way
+  // out is installing the update, which restarts the app.
+  const [requiredUpdate, setRequiredUpdate] = useState<RequiredUpdate | null>(null);
+  useEffect(() => {
+    const unlisten = listen<RequiredUpdate>('update-required', (event) => {
+      setRequiredUpdate(event.payload ?? {});
+    });
+    // A request can be refused before this listener exists (the launch-time
+    // get_auth_state, for instance), so also read the latch once. No polling:
+    // one refusal is enough and the gate never reopens.
+    invoke<RequiredUpdate | null>('get_required_update')
+      .then((info) => {
+        if (info) setRequiredUpdate(info);
+      })
+      .catch(() => {
+        /* command unavailable — the event path still covers the live case */
+      });
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, []);
 
   // Biometric app-lock. When "Biometric Unlock" is enabled in Settings the
   // entire UI must stay behind an unlock screen until Windows Hello / Touch ID
@@ -365,6 +391,28 @@ function App() {
               Quit
             </button>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Forced version floor — a hard block over the whole app. Rendered as its own
+  // screen rather than as an error on the dashboard because nothing behind it
+  // can work: the backend refuses every request from this build.
+  //
+  // Deliberately BELOW the biometric lock. That lock is the user's own
+  // device-security boundary and its invariant is that nothing renders until
+  // unlock succeeds; a version problem is not a reason to punch through it.
+  // The wall is waiting on the other side, and everything it offers (update,
+  // manual download, quit) is still one click away after unlocking.
+  if (requiredUpdate) {
+    return (
+      <div className="relative flex h-screen flex-col overflow-hidden bg-[#000000]">
+        <PixelCanvas />
+        <TitleBar />
+
+        <div className="relative z-10 flex flex-1 flex-col">
+          <UpdateRequired info={requiredUpdate} />
         </div>
       </div>
     );

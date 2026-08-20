@@ -761,6 +761,12 @@ impl BirdoApi {
     ///
     /// Ordering is the whole point of this function:
     ///
+    ///  0. **426 Upgrade Required wins over everything**, including a typed
+    ///     `error_code`. The forced version floor is decided by the STATUS
+    ///     CODE, and its body carries a payload (`requiredVersion`,
+    ///     `downloadUrl`) that every other variant would throw away — the UI
+    ///     needs that payload to name the version and offer the update. A body
+    ///     we cannot parse still blocks; it just cannot name the version.
     ///  1. A typed `error_code` always wins — it is a deliberate protocol signal.
     ///  2. **401 maps to `ApiError::Unauthorized` before anything else**, because
     ///     that variant is the ONLY thing `request_with_retry` keys on to run the
@@ -779,6 +785,18 @@ impl BirdoApi {
     ///     ("Stealth mode requires an Operative or Sovereign subscription") with
     ///     a bare "Access denied".
     pub(crate) fn classify_error_response(status: StatusCode, error_text: &str) -> ApiError {
+        if status == StatusCode::UPGRADE_REQUIRED {
+            let upgrade =
+                serde_json::from_str::<super::types::UpgradeRequiredBody>(error_text).ok();
+            return ApiError::UpgradeRequired(super::upgrade_gate::RequiredUpdate {
+                required_version: upgrade.as_ref().and_then(|b| b.required_version.clone()),
+                download_url: upgrade.as_ref().and_then(|b| b.download_url.clone()),
+                message: upgrade
+                    .and_then(|b| b.error)
+                    .filter(|m| !m.trim().is_empty()),
+            });
+        }
+
         let body = serde_json::from_str::<super::types::ApiErrorBody>(error_text).ok();
 
         if let Some(code) = body.as_ref().and_then(|b| b.error_code.clone()) {
@@ -844,7 +862,15 @@ impl BirdoApi {
             );
             String::new()
         });
-        Err(Self::classify_error_response(status, &error_text))
+        let error = Self::classify_error_response(status, &error_text);
+        // Latch the forced-version floor process-wide the FIRST time any request
+        // is refused. Done here rather than in `classify_error_response` so that
+        // function stays pure and unit-testable; the latch is what stops
+        // auto-reconnect and raises the blocking UI (see api::upgrade_gate).
+        if let ApiError::UpgradeRequired(info) = &error {
+            super::upgrade_gate::latch(info.clone());
+        }
+        Err(error)
     }
 }
 

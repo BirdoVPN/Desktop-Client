@@ -351,6 +351,11 @@ fn main() {
         .setup(|app| {
             info!("Setting up Birdo VPN application...");
 
+            // Give the forced-version-floor gate a handle so a 426 from ANY
+            // request can raise the blocking "update required" screen. Must be
+            // set before the first API call is made below.
+            crate::api::upgrade_gate::set_app_handle(app.handle().clone());
+
             // F-001/F-032: reconcile leak-protection state a previous run may have
             // left in the kernel. pf rulesets and ip6tables chains survive process
             // exit, so a crash, a SIGKILL or a power loss mid-session would
@@ -566,6 +571,7 @@ fn main() {
             commands::updater::get_app_version,
             commands::updater::check_for_updates,
             commands::updater::install_update,
+            commands::updater::get_required_update,
             // Extended VPN info
             commands::vpn::get_subscription_status,
             commands::vpn::get_usage_stats,

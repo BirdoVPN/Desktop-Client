@@ -100,6 +100,24 @@ pub struct ApiErrorBody {
     pub message: Option<String>,
 }
 
+/// Body of a 426 Upgrade Required — the forced client-version floor.
+///
+/// ASSUMED SHAPE (the backend side ships in parallel):
+/// `{ "error": "...", "requiredVersion": "1.4.36", "downloadUrl": "https://..." }`.
+/// Every field is optional and snake_case is accepted as an alias, because the
+/// STATUS CODE is what blocks the client — a body we cannot read must degrade
+/// the message shown, never the gate itself.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeRequiredBody {
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default, alias = "required_version")]
+    pub required_version: Option<String>,
+    #[serde(default, alias = "download_url")]
+    pub download_url: Option<String>,
+}
+
 /// Heartbeat response from the backend
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
