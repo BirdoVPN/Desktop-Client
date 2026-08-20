@@ -764,10 +764,12 @@ impl BirdoApi {
     ///
     ///  0. **426 Upgrade Required wins over everything**, including a typed
     ///     `error_code`. The forced version floor is decided by the STATUS
-    ///     CODE, and its body carries a payload (`requiredVersion`,
-    ///     `downloadUrl`) that every other variant would throw away — the UI
-    ///     needs that payload to name the version and offer the update. A body
-    ///     we cannot parse still blocks; it just cannot name the version.
+    ///     CODE, and its body carries a payload (`details.minVersion`,
+    ///     `details.updateUrl`) that every other variant would throw away — the
+    ///     UI needs that payload to name the version and, crucially, to enable
+    ///     the "Download manually" button, which is a blocked user's only
+    ///     escape hatch that does not rely on the in-app updater. A body we
+    ///     cannot parse still blocks; it just cannot name the version.
     ///  1. A typed `error_code` always wins — it is a deliberate protocol signal.
     ///  2. **401 maps to `ApiError::Unauthorized` before anything else**, because
     ///     that variant is the ONLY thing `request_with_retry` keys on to run the
@@ -787,14 +789,17 @@ impl BirdoApi {
     ///     a bare "Access denied".
     pub(crate) fn classify_error_response(status: StatusCode, error_text: &str) -> ApiError {
         if status == StatusCode::UPGRADE_REQUIRED {
-            let upgrade =
-                serde_json::from_str::<super::types::UpgradeRequiredBody>(error_text).ok();
+            // A body we cannot parse yields the default (all-None) struct rather
+            // than skipping the branch: the 426 must still block.
+            let upgrade = serde_json::from_str::<super::types::UpgradeRequiredBody>(error_text)
+                .unwrap_or_default();
             return ApiError::UpgradeRequired(super::upgrade_gate::RequiredUpdate {
-                required_version: upgrade.as_ref().and_then(|b| b.required_version.clone()),
-                download_url: upgrade.as_ref().and_then(|b| b.download_url.clone()),
-                message: upgrade
-                    .and_then(|b| b.error)
-                    .filter(|m| !m.trim().is_empty()),
+                required_version: upgrade.resolved_min_version(),
+                download_url: upgrade.resolved_update_url(),
+                // `message` first, `error` only if it is prose. This slot used to
+                // be filled from `error` unconditionally, so a blocked user's
+                // entire explanation was the machine token "update_required".
+                message: upgrade.human_message(),
             });
         }
 
