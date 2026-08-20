@@ -386,16 +386,17 @@ impl BirdoApi {
             .await
     }
 
-    /// P2-15: Report connection quality telemetry to the backend.
-    /// Fire-and-forget — callers should not block on failure.
-    pub async fn report_quality(&self, report: &QualityReport) -> Result<(), ApiError> {
-        // 204 No Content is the expected reply; handle_response maps an empty
-        // 2xx body to JSON `null`, so no parse-error special-casing is needed.
-        let _: serde_json::Value = self
-            .post(endpoints::vpn::QUALITY_REPORT, report, true)
-            .await?;
-        Ok(())
-    }
+    // P6-CLI-X-01: `report_quality` is GONE, along with the 60-second loop that
+    // called it (vpn/auto_reconnect.rs) and the `QualityReport` type. It sent
+    // latency, jitter, loss, byte counts, connection age and platform to the
+    // backend every 60 seconds for the whole of every session, unconditionally,
+    // with no way for the user to say no. Owner decision 2026-08-19: DELETE it
+    // rather than make it opt-in. A VPN measuring its users continuously by
+    // default is the thing they bought the VPN to avoid, and an opt-in switch
+    // still leaves the code, the endpoint and the temptation in place.
+    //
+    // The heartbeat above is unaffected: it is the liveness signal the tunnel
+    // needs to work at all, not telemetry.
 
     // ========================================================================
     // User Endpoints
@@ -761,6 +762,14 @@ impl BirdoApi {
     ///
     /// Ordering is the whole point of this function:
     ///
+    ///  0. **426 Upgrade Required wins over everything**, including a typed
+    ///     `error_code`. The forced version floor is decided by the STATUS
+    ///     CODE, and its body carries a payload (`details.minVersion`,
+    ///     `details.updateUrl`) that every other variant would throw away — the
+    ///     UI needs that payload to name the version and, crucially, to enable
+    ///     the "Download manually" button, which is a blocked user's only
+    ///     escape hatch that does not rely on the in-app updater. A body we
+    ///     cannot parse still blocks; it just cannot name the version.
     ///  1. A typed `error_code` always wins — it is a deliberate protocol signal.
     ///  2. **401 maps to `ApiError::Unauthorized` before anything else**, because
     ///     that variant is the ONLY thing `request_with_retry` keys on to run the
@@ -779,6 +788,21 @@ impl BirdoApi {
     ///     ("Stealth mode requires an Operative or Sovereign subscription") with
     ///     a bare "Access denied".
     pub(crate) fn classify_error_response(status: StatusCode, error_text: &str) -> ApiError {
+        if status == StatusCode::UPGRADE_REQUIRED {
+            // A body we cannot parse yields the default (all-None) struct rather
+            // than skipping the branch: the 426 must still block.
+            let upgrade = serde_json::from_str::<super::types::UpgradeRequiredBody>(error_text)
+                .unwrap_or_default();
+            return ApiError::UpgradeRequired(super::upgrade_gate::RequiredUpdate {
+                required_version: upgrade.resolved_min_version(),
+                download_url: upgrade.resolved_update_url(),
+                // `message` first, `error` only if it is prose. This slot used to
+                // be filled from `error` unconditionally, so a blocked user's
+                // entire explanation was the machine token "update_required".
+                message: upgrade.human_message(),
+            });
+        }
+
         let body = serde_json::from_str::<super::types::ApiErrorBody>(error_text).ok();
 
         if let Some(code) = body.as_ref().and_then(|b| b.error_code.clone()) {
@@ -819,9 +843,9 @@ impl BirdoApi {
         let status = response.status();
 
         if status.is_success() {
-            // Treat the WHOLE 2xx range as success, not just 200/201: the
-            // quality-report endpoint returns 204 No Content, and any endpoint
-            // adopting 202/204 must not silently start "failing". An empty body
+            // Treat the WHOLE 2xx range as success, not just 200/201: any
+            // endpoint that answers (or starts answering) 202/204 must not
+            // silently be read as a failure. An empty body
             // deserializes as JSON `null` (fits `serde_json::Value` and any
             // `Option<T>`-shaped response).
             let bytes = response
@@ -844,7 +868,15 @@ impl BirdoApi {
             );
             String::new()
         });
-        Err(Self::classify_error_response(status, &error_text))
+        let error = Self::classify_error_response(status, &error_text);
+        // Latch the forced-version floor process-wide the FIRST time any request
+        // is refused. Done here rather than in `classify_error_response` so that
+        // function stays pure and unit-testable; the latch is what stops
+        // auto-reconnect and raises the blocking UI (see api::upgrade_gate).
+        if let ApiError::UpgradeRequired(info) = &error {
+            super::upgrade_gate::latch(info.clone());
+        }
+        Err(error)
     }
 }
 

@@ -100,6 +100,138 @@ pub struct ApiErrorBody {
     pub message: Option<String>,
 }
 
+/// The `details` object of a canonical 426 body.
+///
+/// The backend puts its structured payload here and NOWHERE else:
+/// GlobalExceptionFilter copies `details` onto the response verbatim but
+/// deliberately drops any other extra top-level key, so `details` is the only
+/// place these values can actually arrive.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeRequiredDetails {
+    #[serde(default, alias = "min_version")]
+    pub min_version: Option<String>,
+    #[serde(default, alias = "current_version")]
+    pub current_version: Option<String>,
+    #[serde(default, alias = "update_url")]
+    pub update_url: Option<String>,
+}
+
+/// Body of a 426 Upgrade Required — the forced client-version floor.
+///
+/// CANONICAL SHAPE, agreed with the backend and covered on both sides by tests
+/// that assert the SERIALIZED body (birdo-web
+/// `backend/src/vpn/vpn-version-floor.wire.spec.ts`):
+///
+/// ```json
+/// {
+///   "statusCode": 426,
+///   "error": "update_required",
+///   "message": "This version of Birdo VPN is no longer supported. ...",
+///   "details": { "minVersion": "1.4.36", "currentVersion": "1.4.9",
+///                "updateUrl": "https://birdo.app/clients" }
+/// }
+/// ```
+///
+/// This struct previously guessed at `requiredVersion` / `downloadUrl` with a
+/// doc comment admitting the shape was ASSUMED. It was wrong twice over: the
+/// backend never used those names, AND the names it did use were being stripped
+/// by the global exception filter before reaching the wire, so this parser was
+/// matching a body that could not exist. Both sides are now pinned by tests.
+///
+/// The legacy names are kept as tolerated fallbacks (as are top-level
+/// `minVersion` / `updateUrl`) purely so a body we cannot fully read degrades
+/// the MESSAGE only. The STATUS CODE is what blocks; parsing must never be able
+/// to weaken the gate.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeRequiredBody {
+    /// Machine token, e.g. `"update_required"`. For code to branch on — see
+    /// `human_message()` for why this is not shown to a user as-is.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The backend's human-readable sentence. This is what a user should read.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The canonical structured payload.
+    #[serde(default)]
+    pub details: Option<UpgradeRequiredDetails>,
+
+    // ── Tolerated fallbacks. Never the primary source. ──────────────────────
+    /// Top-level `minVersion`, i.e. the pre-`details` backend layout.
+    #[serde(default, alias = "min_version")]
+    pub min_version: Option<String>,
+    /// Top-level `updateUrl`, i.e. the pre-`details` backend layout.
+    #[serde(default, alias = "update_url")]
+    pub update_url: Option<String>,
+    /// Legacy name this client invented before the contract was agreed.
+    #[serde(default, alias = "required_version")]
+    pub required_version: Option<String>,
+    /// Legacy name this client invented before the contract was agreed.
+    #[serde(default, alias = "download_url")]
+    pub download_url: Option<String>,
+}
+
+impl UpgradeRequiredBody {
+    /// The minimum version the backend will accept.
+    ///
+    /// Canonical `details.minVersion` first, then the tolerated fallbacks.
+    pub fn resolved_min_version(&self) -> Option<String> {
+        self.details
+            .as_ref()
+            .and_then(|d| d.min_version.clone())
+            .or_else(|| self.min_version.clone())
+            .or_else(|| self.required_version.clone())
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// Where to get the update — the URL behind the "Download manually" button,
+    /// which is the ONLY escape hatch a blocked user has that does not depend on
+    /// the in-app updater. Losing it strands them, so it reads every layout we
+    /// have ever emitted.
+    pub fn resolved_update_url(&self) -> Option<String> {
+        self.details
+            .as_ref()
+            .and_then(|d| d.update_url.clone())
+            .or_else(|| self.update_url.clone())
+            .or_else(|| self.download_url.clone())
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// Text fit for a human to read, or `None`.
+    ///
+    /// Precedence is `message` then `error`, because the backend puts its
+    /// sentence in `message` and a machine token in `error` — and this client
+    /// used to read `error` into the message slot, so a blocked user was shown
+    /// the literal string "update_required" as their explanation.
+    ///
+    /// `error` is still consulted, but only when it does not look like a machine
+    /// token, so older/other backends that put a real sentence there are not
+    /// lost. A token (`update_required`, `client_too_old`) is all lowercase
+    /// word characters with no whitespace; anything with a space or capital is
+    /// treated as prose. When nothing usable survives we return `None` and the
+    /// caller falls back to its own wording, which is always better than showing
+    /// an identifier.
+    pub fn human_message(&self) -> Option<String> {
+        let usable = |s: &Option<String>| -> Option<String> {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        };
+
+        usable(&self.message).or_else(|| usable(&self.error).filter(|t| !is_machine_token(t)))
+    }
+}
+
+/// True when a string looks like a machine identifier rather than prose:
+/// lowercase letters, digits, `_`, `-`, `.` only, and no whitespace.
+fn is_machine_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+}
+
 /// Heartbeat response from the backend
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,34 +247,8 @@ fn default_true() -> bool {
     true
 }
 
-// ============================================================================
-// Connection Quality Reporting (P2-15)
-// ============================================================================
-
-/// Client-reported quality telemetry, sent every ~60s while connected.
-/// Backend stores ephemerally in Redis and aggregates per-server.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QualityReport {
-    pub key_id: String,
-    pub latency_ms: f64,
-    pub jitter_ms: f64,
-    pub packet_loss_percent: f64,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-    pub handshake_age_seconds: u64,
-    pub connection_state: String,
-    pub platform: String,
-}
-
-/// Zeroize key_id from heap memory when a QualityReport is dropped. These
-/// reports are sent every ~60s while connected, so without this the sensitive
-/// key_id accumulates copies in freed memory at a high rate.
-impl Drop for QualityReport {
-    fn drop(&mut self) {
-        self.key_id.zeroize();
-    }
-}
+// P6-CLI-X-01: `QualityReport` and the 60-second connection telemetry that sent
+// it are GONE. See `api::client` and `vpn::auto_reconnect` for the rationale.
 
 // ============================================================================
 // Authentication Types

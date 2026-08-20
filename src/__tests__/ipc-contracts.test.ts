@@ -310,8 +310,11 @@ const FRONTEND_COMMANDS = [
   'set_killswitch_live',
   // Split tunneling
   'list_installed_apps',
-  // Auto-updater
+  // Auto-updater (pinned Rust client — see src-tauri/src/commands/updater.rs)
   'get_app_version',
+  'check_for_updates',
+  'install_update',
+  'get_required_update',
   // Extended VPN info
   'get_subscription_status',
   'get_usage_stats',

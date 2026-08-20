@@ -337,17 +337,8 @@ impl AutoReconnectService {
         // FIX-2-13: Heartbeat counter — send heartbeat every ~30s (6 ticks × 5s)
         let mut heartbeat_tick_count: u32 = 0;
         const HEARTBEAT_EVERY_N_TICKS: u32 = 6;
-        // P2-15: Quality report counter — send every ~60s (12 ticks × 5s)
-        let mut quality_tick_count: u32 = 0;
-        const QUALITY_EVERY_N_TICKS: u32 = 12;
-        // P1-dk-fabricated-quality-telemetry: probe outcomes for the CURRENT
-        // quality window. The heartbeat is a real request/response round trip
-        // THROUGH the tunnel, so it doubles as the latency/loss probe: a
-        // completed heartbeat yields a measured RTT, a transport-level failure
-        // (timeout/no route — ApiError::Network) is a lost probe. HTTP-status
-        // failures are NOT loss: those packets flowed both ways.
-        let mut probe_attempts: u32 = 0;
-        let mut probe_losses: u32 = 0;
+        // P6-CLI-X-01: the ~60s quality-report tick and its probe accounting
+        // (attempts/losses per window) are GONE with the telemetry they fed.
 
         // AUDIT-2026-06-19 FIX (HIGH): tunnel liveness watchdog state. The manager
         // only leaves Connected on an explicit disconnect or a server-invalidated
@@ -380,6 +371,55 @@ impl AutoReconnectService {
                     }
 
                     let state = vpn_manager.get_state().await;
+
+                    // Forced version floor: the backend has refused this build
+                    // (HTTP 426). That is a WALL, not a transient failure —
+                    // every reconnect will be refused identically, so a client
+                    // that keeps retrying is a self-inflicted DoS against our
+                    // own control plane and a battery drain for the user. Stop
+                    // the loop; the UI is already showing the blocking
+                    // "update required" screen, and a successful connect after
+                    // the update spawns a fresh loop.
+                    if crate::api::upgrade_gate::is_blocked() {
+                        tracing::error!(
+                            "Auto-reconnect stopping — the backend requires a newer client build"
+                        );
+                        is_reconnecting.store(false, Ordering::SeqCst);
+                        running.store(false, Ordering::SeqCst);
+                        // A live tunnel is left alone: the floor blocks the
+                        // control plane, not the data plane, and tearing down a
+                        // working tunnel to report a version problem would take
+                        // protection away from the user for no benefit.
+                        if !state.is_tunnel_active() {
+                            // Not connected, and nothing left to retry. Releasing
+                            // the loop with the kill switch still armed would
+                            // strand the machine behind a block-all forever, so
+                            // apply the SAME rule as the give-up branch below:
+                            // lockdown ("always-on") keeps blocking because the
+                            // user asked for exactly that, everything else
+                            // releases.
+                            if killswitch::is_lockdown_mode() {
+                                tracing::error!(
+                                    "Update required with the always-on kill switch armed — \
+                                     traffic stays blocked until you disconnect or turn the \
+                                     kill switch off"
+                                );
+                            } else {
+                                #[cfg(target_os = "windows")]
+                                crate::vpn::wfp::clear_ipv6_block_intent();
+                                let _ = killswitch::deactivate_killswitch().await;
+                            }
+                            let _ = vpn_manager
+                                .set_state(ConnectionState::Error(
+                                    "Update required — this version of Birdo VPN is no \
+                                     longer supported. Install the update to reconnect."
+                                        .to_string(),
+                                ))
+                                .await;
+                        }
+                        break;
+                    }
+
                     let cfg = config.read().await.clone();
 
                     // Network awareness (read once per tick). On an Offline->Online
@@ -490,9 +530,8 @@ impl AutoReconnectService {
                                             // Record the round trip as a MEASURED
                                             // latency sample. Before this, latency_ms
                                             // was written only by a test-only tunnel
-                                            // probe, so every quality report shipped a
-                                            // fabricated 0 ms latency / 0 ms jitter.
-                                            probe_attempts = probe_attempts.saturating_add(1);
+                                            // probe, so the figure shown in the UI was
+                                            // a fabricated 0 ms.
                                             let rtt_ms = hb_started
                                                 .elapsed()
                                                 .as_millis()
@@ -504,10 +543,7 @@ impl AutoReconnectService {
                                             )
                                             .await
                                             {
-                                                Ok(mut st) => {
-                                                    st.latency_ms = Some(rtt_ms);
-                                                    st.push_latency_sample(rtt_ms);
-                                                }
+                                                Ok(mut st) => st.latency_ms = Some(rtt_ms),
                                                 Err(_) => tracing::error!(
                                                     "Stats write lock timeout recording heartbeat RTT"
                                                 ),
@@ -544,63 +580,9 @@ impl AutoReconnectService {
                                             // tunnel) is one half of the liveness
                                             // watchdog's dead-tunnel signal.
                                             recent_heartbeat_failed = true;
-                                            // Probe accounting: only a TRANSPORT
-                                            // failure is a lost probe; an HTTP error
-                                            // proves the path carried packets.
-                                            probe_attempts = probe_attempts.saturating_add(1);
-                                            if matches!(e, ApiError::Network(_)) {
-                                                probe_losses = probe_losses.saturating_add(1);
-                                            }
                                             tracing::warn!("Heartbeat failed: {}", e);
                                         }
                                     }
-                                }
-                            }
-
-                            // P2-15: Periodic quality telemetry reporting.
-                            //
-                            // P1-dk-fabricated-quality-telemetry: report ONLY what
-                            // was measured. latency/jitter come from real heartbeat
-                            // RTTs recorded above; loss is the fraction of probes
-                            // that failed at the transport level in this window.
-                            // A window with no completed probe sends NO report —
-                            // the backend must see missing data, never invented
-                            // zeros (same class as the security-console telemetry
-                            // lie: reassurance rendered from nothing).
-                            quality_tick_count += 1;
-                            if quality_tick_count >= QUALITY_EVERY_N_TICKS {
-                                quality_tick_count = 0;
-                                let window_attempts = probe_attempts;
-                                let window_losses = probe_losses;
-                                probe_attempts = 0;
-                                probe_losses = 0;
-                                let stats = vpn_manager.get_stats().await;
-                                match (&stats.key_id, stats.latency_ms) {
-                                    (Some(key_id), Some(latency_ms)) if window_attempts > 0 => {
-                                        let connected_secs = stats.connected_at
-                                            .map(|t| (chrono::Utc::now() - t).num_seconds().max(0) as u64)
-                                            .unwrap_or(0);
-                                        let loss = (window_losses as f64
-                                            / window_attempts as f64)
-                                            * 100.0;
-                                        let report = crate::api::types::QualityReport {
-                                            key_id: key_id.clone(),
-                                            latency_ms: latency_ms as f64,
-                                            jitter_ms: stats.jitter_ms(),
-                                            packet_loss_percent: loss,
-                                            bytes_in: stats.bytes_received,
-                                            bytes_out: stats.bytes_sent,
-                                            handshake_age_seconds: connected_secs,
-                                            connection_state: "connected".to_string(),
-                                            platform: std::env::consts::OS.to_string(),
-                                        };
-                                        if let Err(e) = api.report_quality(&report).await {
-                                            tracing::debug!("Quality report failed (non-fatal): {}", e);
-                                        }
-                                    }
-                                    _ => tracing::debug!(
-                                        "Quality report skipped — no measured probe this window"
-                                    ),
                                 }
                             }
                         }

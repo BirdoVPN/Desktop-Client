@@ -793,4 +793,200 @@ mod error_classification_tests {
         let err = BirdoApi::classify_error_response(StatusCode::FORBIDDEN, r#"{"message":"   "}"#);
         assert!(matches!(err, ApiError::Forbidden));
     }
+
+    // ── Forced client-version floor (426) ────────────────────────────────
+
+    /// The CANONICAL 426 body, captured verbatim from the backend.
+    ///
+    /// This is not a hand-written guess. It is the exact bytes emitted by
+    /// birdo-web's /vpn/connect after passing through the real, globally
+    /// registered GlobalExceptionFilter (only `timestamp` is a fixed sample).
+    /// The same shape is asserted on the backend side by
+    /// `backend/src/vpn/vpn-version-floor.wire.spec.ts`, so if either side
+    /// drifts, one of the two test suites fails.
+    ///
+    /// Note what is NOT here: no `requiredVersion`, no `downloadUrl`. This
+    /// client shipped a parser for those invented names against a body that
+    /// never contained them — and, at the time, could not have contained
+    /// anything at all, because the filter was stripping the payload before the
+    /// wire. Hence a real capture rather than a plausible-looking literal.
+    const CANONICAL_426: &str = r#"{"statusCode":426,"message":"This version of Birdo VPN is no longer supported. Please update the app to reconnect.","error":"update_required","timestamp":"2026-08-20T18:51:59.920Z","path":"/vpn/connect","details":{"minVersion":"1.4.36","currentVersion":"1.4.9","updateUrl":"https://birdo.app/clients"}}"#;
+
+    #[test]
+    fn the_canonical_426_body_is_read_in_full() {
+        match BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, CANONICAL_426) {
+            ApiError::UpgradeRequired(info) => {
+                assert_eq!(info.required_version.as_deref(), Some("1.4.36"));
+                // The manual-download escape hatch. UpdateRequired.tsx gates the
+                // "Download manually" button on this being present; without it a
+                // blocked user has only the in-app updater.
+                assert_eq!(
+                    info.download_url.as_deref(),
+                    Some("https://birdo.app/clients")
+                );
+                // The HUMAN sentence, from `message` — never the token in `error`.
+                assert_eq!(
+                    info.message.as_deref(),
+                    Some(
+                        "This version of Birdo VPN is no longer supported. Please update the app to reconnect."
+                    )
+                );
+            }
+            other => panic!("canonical 426 must map to UpgradeRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_machine_token_is_never_shown_to_a_user() {
+        // REGRESSION GUARD. `message` used to be filled from `error`, so the
+        // entire explanation a blocked user received was "update_required".
+        let err = BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, CANONICAL_426);
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("update_required"),
+            "user-facing text leaked the machine token: {shown}"
+        );
+        assert!(shown.contains("no longer supported"), "got: {shown}");
+
+        // And when the backend sends ONLY the token, we must fall back to our
+        // own wording rather than surfacing the identifier.
+        let token_only = r#"{"error":"update_required","details":{"minVersion":"1.4.36"}}"#;
+        let err = BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, token_only);
+        match &err {
+            ApiError::UpgradeRequired(info) => assert_eq!(info.message, None),
+            other => panic!("expected UpgradeRequired, got {other:?}"),
+        }
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("update_required"),
+            "user-facing text leaked the machine token: {shown}"
+        );
+        assert!(shown.contains("1.4.36"), "got: {shown}");
+    }
+
+    #[test]
+    fn all_four_body_shapes_still_block() {
+        // The gate is the STATUS CODE. Parsing may only ever affect the MESSAGE.
+        // The first two shapes must also keep the manual-download URL, because
+        // that button is the escape hatch that does not depend on the in-app
+        // updater (which has never completed a real end-to-end install).
+        let legacy = r#"{"error":"Client too old","requiredVersion":"1.4.36","downloadUrl":"https://birdo.app/download"}"#;
+
+        let cases: [(&str, Option<&str>, Option<&str>); 4] = [
+            (
+                CANONICAL_426,
+                Some("1.4.36"),
+                Some("https://birdo.app/clients"),
+            ),
+            (legacy, Some("1.4.36"), Some("https://birdo.app/download")),
+            ("{}", None, None),
+            ("<html>502 Bad Gateway</html>", None, None),
+        ];
+
+        for (body, want_version, want_url) in cases {
+            match BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, body) {
+                ApiError::UpgradeRequired(info) => {
+                    assert_eq!(
+                        info.required_version.as_deref(),
+                        want_version,
+                        "body {body:?}"
+                    );
+                    assert_eq!(info.download_url.as_deref(), want_url, "body {body:?}");
+                }
+                other => panic!("426 must block for body {body:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn details_outrank_the_tolerated_top_level_fallbacks() {
+        // If a backend ever sends both, `details` is the agreed contract and
+        // must win — otherwise a stale top-level key silently pins the client to
+        // the wrong version.
+        let body = r#"{"minVersion":"1.0.0","updateUrl":"https://old.example",
+                       "requiredVersion":"0.9.0","downloadUrl":"https://older.example",
+                       "details":{"minVersion":"1.4.36","updateUrl":"https://birdo.app/clients"}}"#;
+        match BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, body) {
+            ApiError::UpgradeRequired(info) => {
+                assert_eq!(info.required_version.as_deref(), Some("1.4.36"));
+                assert_eq!(
+                    info.download_url.as_deref(),
+                    Some("https://birdo.app/clients")
+                );
+            }
+            other => panic!("expected UpgradeRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_426_carries_the_required_version_and_download_url() {
+        let body = r#"{"error":"Client too old","requiredVersion":"1.4.36","downloadUrl":"https://birdo.app/download"}"#;
+        match BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, body) {
+            ApiError::UpgradeRequired(info) => {
+                assert_eq!(info.required_version.as_deref(), Some("1.4.36"));
+                assert_eq!(
+                    info.download_url.as_deref(),
+                    Some("https://birdo.app/download")
+                );
+                assert_eq!(info.message.as_deref(), Some("Client too old"));
+            }
+            other => panic!("426 must map to UpgradeRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_426_with_an_unreadable_body_still_blocks() {
+        // The gate is decided by the STATUS CODE. A body shape we cannot parse
+        // must degrade the message shown, never the block itself — otherwise a
+        // backend that changes its error envelope silently disables the floor.
+        for body in ["", "not json at all", "{}"] {
+            match BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, body) {
+                ApiError::UpgradeRequired(info) => {
+                    assert_eq!(info.required_version, None, "body {body:?}");
+                }
+                other => panic!("426 must map to UpgradeRequired for {body:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_426_wins_over_a_typed_error_code_and_a_message() {
+        // Ordering guard: the generic branches would discard the payload the
+        // update screen needs, so the 426 check must run before both.
+        let body = r#"{"errorCode":"SUBSCRIPTION_REQUIRED","message":"Upgrade required","requiredVersion":"2.0.0"}"#;
+        match BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, body) {
+            ApiError::UpgradeRequired(info) => {
+                assert_eq!(info.required_version.as_deref(), Some("2.0.0"))
+            }
+            other => panic!("426 must outrank a typed error_code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_426_accepts_a_snake_case_body_too() {
+        let body = r#"{"required_version":"1.4.36","download_url":"https://birdo.app/download"}"#;
+        match BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, body) {
+            ApiError::UpgradeRequired(info) => {
+                assert_eq!(info.required_version.as_deref(), Some("1.4.36"));
+                assert_eq!(
+                    info.download_url.as_deref(),
+                    Some("https://birdo.app/download")
+                );
+            }
+            other => panic!("426 must parse snake_case too, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_upgrade_required_message_names_the_version() {
+        let err = BirdoApi::classify_error_response(
+            StatusCode::UPGRADE_REQUIRED,
+            r#"{"requiredVersion":"1.4.36"}"#,
+        );
+        let shown = err.to_string();
+        assert!(
+            shown.contains("1.4.36"),
+            "the user-visible message must name the version, got {shown:?}"
+        );
+    }
 }

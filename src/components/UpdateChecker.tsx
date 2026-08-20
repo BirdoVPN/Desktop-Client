@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { check } from '@tauri-apps/plugin-updater';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { Download, Check, Loader2, RefreshCw } from 'lucide-react';
 
@@ -12,10 +13,17 @@ type UpdateStatus =
   | 'up-to-date' 
   | 'error';
 
+/** Mirrors `commands::updater::UpdateInfo` (serde camelCase). */
 interface UpdateInfo {
   version: string;
   currentVersion: string;
-  releaseNotes?: string;
+  notes?: string | null;
+}
+
+/** Payload of the `updater-download-progress` event. */
+interface DownloadProgress {
+  downloaded: number;
+  contentLength?: number | null;
 }
 
 export function UpdateChecker() {
@@ -25,12 +33,18 @@ export function UpdateChecker() {
   const [error, setError] = useState<string | null>(null);
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // The check/download run in Rust over the CERT-PINNED client
+  // (commands/updater.rs). The frontend deliberately no longer talks to
+  // @tauri-apps/plugin-updater directly: that JS path uses the plugin's own
+  // un-pinned reqwest client, and `updater:default` has been removed from the
+  // capability set so it is not reachable from here at all.
+  //
   // Guard against a hung/unreachable update server leaving the UI stuck in
-  // 'checking'/'downloading' forever. Reject after 10s so the catch handler
-  // can surface an error state the user can retry from.
+  // 'checking' forever. Reject after 10s so the catch handler can surface an
+  // error state the user can retry from.
   const checkWithTimeout = useCallback(() => {
     return Promise.race([
-      check(),
+      invoke<UpdateInfo | null>('check_for_updates'),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('Update check timed out.')), 10000)
       ),
@@ -51,11 +65,7 @@ export function UpdateChecker() {
       const update = await checkWithTimeout();
 
       if (update) {
-        setUpdateInfo({
-          version: update.version,
-          currentVersion: update.currentVersion,
-          releaseNotes: update.body || undefined,
-        });
+        setUpdateInfo(update);
         setStatus('available');
       } else {
         setStatus('up-to-date');
@@ -76,40 +86,31 @@ export function UpdateChecker() {
     setStatus('downloading');
     setDownloadProgress(0);
 
+    // Progress arrives as a Rust-side event while `install_update` runs.
+    const unlisten = listen<DownloadProgress>('updater-download-progress', (event) => {
+      const { downloaded, contentLength } = event.payload;
+      if (contentLength && contentLength > 0) {
+        setDownloadProgress(Math.min(100, Math.round((downloaded / contentLength) * 100)));
+      }
+    });
+
     try {
-      const update = await checkWithTimeout();
-      if (!update) {
+      const installed = await invoke<boolean>('install_update');
+      if (!installed) {
         setStatus('up-to-date');
         return;
       }
-
-      // Download the update with progress tracking
-      let downloaded = 0;
-      let contentLength = 0;
-
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case 'Started':
-            contentLength = event.data.contentLength || 0;
-            break;
-          case 'Progress':
-            downloaded += event.data.chunkLength;
-            if (contentLength > 0) {
-              setDownloadProgress(Math.round((downloaded / contentLength) * 100));
-            }
-            break;
-          case 'Finished':
-            setDownloadProgress(100);
-            break;
-        }
-      });
-
+      setDownloadProgress(100);
       setStatus('ready');
     } catch (_err) {
+      // A pin failure surfaces here too: the pinned client refuses the
+      // handshake rather than downloading over an unverified chain.
       setError('Download failed. Please try again.');
       setStatus('error');
+    } finally {
+      unlisten.then((fn) => fn()).catch(() => {});
     }
-  }, [status, checkWithTimeout]);
+  }, [status]);
 
   const restartApp = useCallback(async () => {
     try {
@@ -222,11 +223,11 @@ export function UpdateChecker() {
         )}
 
         {/* Release notes */}
-        {status === 'available' && updateInfo?.releaseNotes && (
+        {status === 'available' && updateInfo?.notes && (
           <div className="mt-3 rounded-lg bg-white/5 p-3">
             <p className="mb-1 text-xs font-medium text-white/60">What's new:</p>
             <p className="text-xs text-white/60 line-clamp-3">
-              {updateInfo.releaseNotes}
+              {updateInfo.notes}
             </p>
           </div>
         )}

@@ -73,9 +73,46 @@ pub(crate) fn spki_sha256_b64(cert: &CertificateDer<'_>) -> Option<String> {
     Some(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(spki_der)))
 }
 
+/// Apex domain whose certificates are covered by [`PINNED_SPKI_SHA256`].
+const BIRDO_APEX: &str = "birdo.app";
+
+/// Which hosts a config enforces the SPKI pin for.
+///
+/// The pins above are the CA chain *Birdo's own* edge is issued from. They say
+/// nothing about anybody else's CA, so enforcing them against a third-party
+/// host does not harden that connection — it makes it permanently impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinScope {
+    /// Pin every host. Correct for a client that only ever dials Birdo, and the
+    /// strictest possible setting: an unexpected host is refused outright.
+    AllHosts,
+    /// Pin `birdo.app` and its subdomains; every other host gets full, ordinary
+    /// WebPKI validation (chain-to-trusted-root, hostname, validity) and no pin.
+    BirdoHostsOnly,
+}
+
+/// Is this connection going to a host our pins actually cover?
+///
+/// Matching is exact-or-dot-suffix so a lookalike registration such as
+/// `notbirdo.app` or `birdo.app.example.com` does NOT count as a Birdo host.
+/// `server_name` is the name WebPKI has just validated the certificate against
+/// (step 1 runs first), so it cannot be steered independently of the cert.
+fn is_birdo_host(server_name: &ServerName<'_>) -> bool {
+    match server_name {
+        ServerName::DnsName(name) => {
+            let host = name.as_ref().to_ascii_lowercase();
+            host == BIRDO_APEX || host.ends_with(&format!(".{BIRDO_APEX}"))
+        }
+        // Birdo is only ever reached by name; an IP literal is never one of our
+        // pinned hosts.
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 struct SpkiPinningVerifier {
     inner: Arc<WebPkiServerVerifier>,
+    scope: PinScope,
 }
 
 impl ServerCertVerifier for SpkiPinningVerifier {
@@ -97,7 +134,14 @@ impl ServerCertVerifier for SpkiPinningVerifier {
             now,
         )?;
 
-        // 2) SPKI pin check across the presented chain (leaf + intermediates).
+        // 2) Is this host in scope for the pin at all? Under `BirdoHostsOnly`
+        //    a third-party host stops here with standard WebPKI validation —
+        //    see `PinScope` for why pinning it would be a brick, not a lock.
+        if self.scope == PinScope::BirdoHostsOnly && !is_birdo_host(server_name) {
+            return Ok(ServerCertVerified::assertion());
+        }
+
+        // 3) SPKI pin check across the presented chain (leaf + intermediates).
         let mut parsed_any = false;
         for cert in std::iter::once(end_entity).chain(intermediates.iter()) {
             if let Some(spki) = spki_sha256_b64(cert) {
@@ -154,8 +198,55 @@ impl ServerCertVerifier for SpkiPinningVerifier {
 }
 
 /// Build a rustls `ClientConfig` that performs full standard validation PLUS
-/// CA-chain SPKI pinning. Fed to reqwest via `ClientBuilder::use_preconfigured_tls`.
+/// CA-chain SPKI pinning on EVERY host. Fed to reqwest via
+/// `ClientBuilder::use_preconfigured_tls`.
+///
+/// This is the strict configuration and the right one for the API client, which
+/// only ever dials `api.birdo.app`.
 pub fn rustls_config() -> ClientConfig {
+    build_config(PinScope::AllHosts)
+}
+
+/// Like [`rustls_config`], but the SPKI pin is enforced only on `birdo.app` and
+/// its subdomains; other hosts get full WebPKI validation and no pin.
+///
+/// Used by the auto-updater, and ONLY by the auto-updater. Its two requests do
+/// not go to the same place:
+///
+///  * the manifest check hits `api.birdo.app` (the endpoint is compiled into
+///    `tauri.conf.json`, so it is not attacker-steerable) — that request is IN
+///    scope and stays fully pinned, which is the request that matters: it is
+///    the one a MITM would suppress to keep a client below the version floor.
+///  * the installer download goes wherever the manifest's `url` points, which
+///    today is a GitHub release asset (the backend builds the manifest from
+///    `browser_download_url`, see birdo-web `updates.controller.ts`).
+///
+/// GitHub does not chain through our CAs, and never promised to. Measured
+/// 2026-08-20: `github.com` presents Sectigo Public Server Authentication CA DV
+/// E36 / Root E46, and `objects.githubusercontent.com` (where the asset URL
+/// redirects) presents Let's Encrypt **YR1** / ISRG **Root YR** — none of which
+/// is in [`PINNED_SPKI_SHA256`] (we pin LE R10/R11/E5/E6 and ISRG Root X1).
+/// Pinning that leg therefore does not secure the download, it makes it
+/// impossible: every install would fail the handshake, on every platform,
+/// forever. With a hard version floor in front of it (`api::upgrade_gate`) that
+/// is not a safe failure — it is a blocked user with an Update button that can
+/// never succeed.
+///
+/// Adding GitHub's CAs to the pin set would be worse: GitHub can rotate CAs
+/// whenever it likes, and every already-installed client would be bricked the
+/// day it happened, with no way to ship them the fix.
+///
+/// The download does not need the pin, because TLS is not what protects it. The
+/// bundle is verified with the minisign public key baked into the binary
+/// (`tauri.conf.json` → `plugins.updater.pubkey`), which is what actually
+/// decides whether the downloaded installer is allowed to run. A MITM on the
+/// download leg can deny the update; it cannot substitute one. Denial is
+/// already covered by pinning the check.
+pub fn rustls_config_pinning_birdo_hosts_only() -> ClientConfig {
+    build_config(PinScope::BirdoHostsOnly)
+}
+
+fn build_config(scope: PinScope) -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -173,7 +264,7 @@ pub fn rustls_config() -> ClientConfig {
         .with_safe_default_protocol_versions()
         .expect("cert-pin: ring provider must support default TLS versions")
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SpkiPinningVerifier { inner }))
+        .with_custom_certificate_verifier(Arc::new(SpkiPinningVerifier { inner, scope }))
         .with_no_client_auth()
 }
 
@@ -211,5 +302,56 @@ mod tests {
     #[test]
     fn config_builds_without_panicking() {
         let _ = rustls_config();
+    }
+
+    #[test]
+    fn scoped_config_builds_without_panicking() {
+        let _ = rustls_config_pinning_birdo_hosts_only();
+    }
+
+    fn name(host: &str) -> ServerName<'static> {
+        ServerName::try_from(host.to_string()).expect("valid server name")
+    }
+
+    #[test]
+    fn birdo_hosts_are_in_pin_scope() {
+        for host in ["birdo.app", "api.birdo.app", "updates.birdo.app"] {
+            assert!(is_birdo_host(&name(host)), "{host} must stay pinned");
+        }
+    }
+
+    #[test]
+    fn third_party_download_hosts_are_out_of_pin_scope() {
+        // The installer download leg. Pinning these against Birdo's CA set
+        // cannot succeed — see `rustls_config_pinning_birdo_hosts_only`.
+        for host in ["github.com", "objects.githubusercontent.com"] {
+            assert!(!is_birdo_host(&name(host)), "{host} must not be pinned");
+        }
+    }
+
+    #[test]
+    fn lookalike_domains_are_not_treated_as_birdo_hosts() {
+        // The suffix match is dot-anchored, so a registerable lookalike must
+        // NOT inherit Birdo's scope. (Being in scope would only ever make a
+        // connection stricter, but the predicate is security-relevant enough
+        // that its boundaries are worth pinning down in a test.)
+        for host in [
+            "notbirdo.app",
+            "birdo.app.example.com",
+            "birdo.apple",
+            "xbirdo.app",
+        ] {
+            assert!(!is_birdo_host(&name(host)), "{host} is not a Birdo host");
+        }
+    }
+
+    #[test]
+    fn host_matching_is_case_insensitive() {
+        assert!(is_birdo_host(&name("API.BIRDO.APP")));
+    }
+
+    #[test]
+    fn ip_literals_are_not_birdo_hosts() {
+        assert!(!is_birdo_host(&name("203.0.113.7")));
     }
 }
