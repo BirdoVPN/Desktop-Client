@@ -223,7 +223,7 @@ export function UpdateChecker() {
         )}
 
         {/* Release notes */}
-            {status === 'available' && updateInfo?.notes && (
+        {status === 'available' && updateInfo?.notes && (
           <div className="mt-3 rounded-lg bg-white/5 p-3">
             <p className="mb-1 text-xs font-medium text-white/60">What's new:</p>
             <p className="text-xs text-white/60 line-clamp-3">
