@@ -12,11 +12,22 @@
 //!
 //! So the check/download now run in Rust through
 //! `UpdaterBuilder::configure_client`, which lets us hand the plugin the SAME
-//! `cert_pin::rustls_config()` every other Birdo client path uses (CA-chain
-//! SPKI pinning layered on top of full WebPKI validation). There is no second
-//! pinning implementation and no unpinned fallback: if the chain cannot be
-//! verified the TLS handshake fails and the check/download returns an error —
-//! FAIL CLOSED, no update rather than an unverified update.
+//! `api::cert_pin` verifier and the SAME pin set every other Birdo client path
+//! uses (CA-chain SPKI pinning layered on top of full WebPKI validation).
+//! There is no second pinning implementation and no unpinned fallback: if the
+//! chain cannot be verified the TLS handshake fails and the check returns an
+//! error — FAIL CLOSED, no update rather than an unverified update.
+//!
+//! The one wrinkle is that the updater's two requests do NOT go to the same
+//! host. The manifest check hits `api.birdo.app`, which our pins cover. The
+//! installer download goes wherever the manifest points, which today is a
+//! GitHub release asset — a host our pins were never going to match, so
+//! enforcing them there would fail EVERY install rather than securing any of
+//! them. We therefore use `cert_pin::rustls_config_pinning_birdo_hosts_only()`:
+//! the check (the leg a MITM would suppress) stays fully pinned, the download
+//! gets full WebPKI validation, and the minisign signature on the bundle stays
+//! the authority on what is allowed to run. That function's doc comment carries
+//! the measured chains and the full reasoning.
 //!
 //! The webview's direct access to the plugin's own (unpinned) IPC commands is
 //! revoked in `capabilities/default.json` — `updater:default` is gone — so the
@@ -58,8 +69,10 @@ struct DownloadProgress {
 ///
 /// `configure_client` is applied to BOTH requests the plugin makes — the
 /// manifest check and the installer download (the closure is carried into the
-/// `Update` the check returns) — so neither can fall back to an unpinned
-/// client. Errors are returned, never swallowed.
+/// `Update` the check returns, `tauri-plugin-updater` 2.9.0) — so neither can
+/// fall back to a client we did not configure. The verifier itself decides
+/// which of the two is pin-checked; see the module docs. Errors are returned,
+/// never swallowed.
 fn pinned_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
     app.updater_builder()
         // Bound the request so a black-holing middlebox cannot park the UI in
@@ -70,7 +83,9 @@ fn pinned_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Stri
                 // Plaintext HTTP would bypass the pin entirely; refuse it even
                 // if a future config ever names an http:// endpoint.
                 .https_only(true)
-                .use_preconfigured_tls(crate::api::cert_pin::rustls_config())
+                .use_preconfigured_tls(
+                    crate::api::cert_pin::rustls_config_pinning_birdo_hosts_only(),
+                )
         })
         .build()
         .map_err(|e| format!("Updater unavailable: {e}"))
@@ -94,11 +109,12 @@ pub async fn check_for_updates(app: AppHandle) -> Result<Option<UpdateInfo>, Str
     }
 }
 
-/// Download and install the available update over the pinned client.
+/// Download and install the available update.
 ///
-/// The minisign signature check the plugin performs on the downloaded bundle is
-/// unchanged and still the authority on what gets executed; pinning closes the
-/// suppression/fingerprinting gap in front of it.
+/// The re-check that runs first goes to `api.birdo.app` and IS pin-checked. The
+/// download that follows is validated by WebPKI plus the plugin's minisign
+/// signature check on the downloaded bundle, which is unchanged and remains the
+/// authority on what gets executed.
 ///
 /// Emits [`DOWNLOAD_PROGRESS_EVENT`] as bytes arrive. Returns `Ok(false)` if the
 /// re-check found nothing to install.
