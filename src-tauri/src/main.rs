@@ -562,8 +562,10 @@ fn main() {
             commands::killswitch::set_killswitch_live,
             // Split Tunneling
             commands::split_tunnel::list_installed_apps,
-            // Auto-updater
+            // Auto-updater (pinned client — see commands/updater.rs)
             commands::updater::get_app_version,
+            commands::updater::check_for_updates,
+            commands::updater::install_update,
             // Extended VPN info
             commands::vpn::get_subscription_status,
             commands::vpn::get_usage_stats,

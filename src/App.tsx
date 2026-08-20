@@ -10,7 +10,6 @@ import { TitleBar } from '@/components/TitleBar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { exit } from '@tauri-apps/plugin-process';
-import { check as checkForUpdate } from '@tauri-apps/plugin-updater';
 import { notifyUpdateAvailable } from '@/utils/notifications';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 
@@ -241,13 +240,17 @@ function App() {
   // button in Settings → Software Updates — users who never opened it would
   // never learn about security fixes. Checks shortly after startup and then
   // every 24h; notifies at most once per app run.
+  //
+  // Goes through the Rust `check_for_updates` command, which runs the updater
+  // over the cert-pinned client (commands/updater.rs). The un-pinned
+  // @tauri-apps/plugin-updater JS path is no longer reachable from the webview.
   useEffect(() => {
     let notified = false;
     const runCheck = async () => {
       if (notified) return;
       try {
         const update = await Promise.race([
-          checkForUpdate(),
+          invoke<{ version: string } | null>('check_for_updates'),
           new Promise<null>((resolve) => setTimeout(() => resolve(null), 15000)),
         ]);
         if (update) {
