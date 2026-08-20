@@ -94,6 +94,7 @@ pub mod vpn {
         format!("/vpn/heartbeat/{}", encode_segment(key_id))
     }
 
-    /// P2-15: Client quality telemetry reporting endpoint
-    pub const QUALITY_REPORT: &str = "/vpn/quality-report";
+    // P6-CLI-X-01: `QUALITY_REPORT` ("/vpn/quality-report") is GONE with the
+    // 60-second connection telemetry that posted to it. The client no longer
+    // knows the path exists.
 }

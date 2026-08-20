@@ -133,34 +133,8 @@ fn default_true() -> bool {
     true
 }
 
-// ============================================================================
-// Connection Quality Reporting (P2-15)
-// ============================================================================
-
-/// Client-reported quality telemetry, sent every ~60s while connected.
-/// Backend stores ephemerally in Redis and aggregates per-server.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QualityReport {
-    pub key_id: String,
-    pub latency_ms: f64,
-    pub jitter_ms: f64,
-    pub packet_loss_percent: f64,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-    pub handshake_age_seconds: u64,
-    pub connection_state: String,
-    pub platform: String,
-}
-
-/// Zeroize key_id from heap memory when a QualityReport is dropped. These
-/// reports are sent every ~60s while connected, so without this the sensitive
-/// key_id accumulates copies in freed memory at a high rate.
-impl Drop for QualityReport {
-    fn drop(&mut self) {
-        self.key_id.zeroize();
-    }
-}
+// P6-CLI-X-01: `QualityReport` and the 60-second connection telemetry that sent
+// it are GONE. See `api::client` and `vpn::auto_reconnect` for the rationale.
 
 // ============================================================================
 // Authentication Types

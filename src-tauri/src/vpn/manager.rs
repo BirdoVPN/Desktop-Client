@@ -7,7 +7,6 @@
 //! - State transitions are validated to prevent illegal states
 //! - Operation lock prevents concurrent connect/disconnect races
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,8 +92,9 @@ pub struct ConnectionStats {
     /// Last MEASURED round-trip latency, ms. `None` until a real probe has run
     /// this session — consumers must treat `None` as "unmeasured", never as 0.
     pub latency_ms: Option<u32>,
-    /// P2-16: Rolling latency samples for jitter calculation (stddev).
-    pub latency_samples: VecDeque<u32>,
+    // P6-CLI-X-01: the `latency_samples` ring buffer is GONE. Its only reader
+    // was `jitter_ms()`, whose only reader was the 60-second quality report, so
+    // once that went it was a 20-entry buffer being maintained for nobody.
     pub connected_at: Option<chrono::DateTime<chrono::Utc>>,
     pub server_id: Option<String>,
     pub key_id: Option<String>,
@@ -102,24 +102,8 @@ pub struct ConnectionStats {
 }
 
 impl ConnectionStats {
-    /// P2-16: Compute jitter as standard deviation of recent latency samples.
-    pub fn jitter_ms(&self) -> f64 {
-        if self.latency_samples.len() < 2 {
-            return 0.0;
-        }
-        let mean = self.latency_samples.iter().map(|&s| s as f64).sum::<f64>()
-            / self.latency_samples.len() as f64;
-        let variance = self
-            .latency_samples
-            .iter()
-            .map(|&s| {
-                let d = s as f64 - mean;
-                d * d
-            })
-            .sum::<f64>()
-            / self.latency_samples.len() as f64;
-        variance.sqrt()
-    }
+    // P6-CLI-X-01: `jitter_ms()` is GONE. Jitter was computed for one consumer
+    // only — the 60-second quality report — and nothing else ever read it.
 
     // P1-dk-fabricated-quality-telemetry: `packet_loss_percent()` (TX packet
     // delta vs RX packet delta) and its `prev_packets_*` snapshot machinery were
@@ -127,13 +111,7 @@ impl ConnectionStats {
     // upload-heavy minute reported a large invented "loss" — the quality report
     // now derives loss from probe outcomes in auto_reconnect.rs instead.
 
-    /// Push a latency sample, keeping at most 20 entries.
-    pub fn push_latency_sample(&mut self, ms: u32) {
-        self.latency_samples.push_back(ms);
-        if self.latency_samples.len() > 20 {
-            self.latency_samples.pop_front();
-        }
-    }
+    // P6-CLI-X-01: `push_latency_sample()` is GONE with `latency_samples`.
 }
 
 pub struct VpnManager {
@@ -189,7 +167,6 @@ impl VpnManager {
                 packets_sent: 0,
                 packets_received: 0,
                 latency_ms: None,
-                latency_samples: VecDeque::new(),
                 connected_at: None,
                 server_id: None,
                 key_id: None,
@@ -270,7 +247,6 @@ impl VpnManager {
                     packets_sent: 0,
                     packets_received: 0,
                     latency_ms: None,
-                    latency_samples: VecDeque::new(),
                     connected_at: None,
                     server_id: None,
                     key_id: None,
@@ -501,7 +477,6 @@ impl VpnManager {
                         // different server) must not inherit the old one's
                         // measurements now that update_stats keeps them.
                         stats.latency_ms = None;
-                        stats.latency_samples.clear();
                     }
                     Err(_) => tracing::error!("Stats write lock timeout"),
                 }
@@ -638,7 +613,6 @@ impl VpnManager {
                 // Measurements die with the session (update_stats no longer
                 // clears latency on its own, so do it at the boundary).
                 stats.latency_ms = None;
-                stats.latency_samples.clear();
             }
             Err(_) => tracing::error!("Stats write lock timeout during disconnect"),
         }
@@ -689,8 +663,6 @@ impl VpnManager {
                             // to None on every 2s stats poll.
                             if let Some(lat) = latency {
                                 stats.latency_ms = Some(lat);
-                                // P2-16: Push latency sample for jitter calculation
-                                stats.push_latency_sample(lat);
                             }
                         }
                         Err(_) => tracing::error!("Stats write lock timeout in update_stats"),

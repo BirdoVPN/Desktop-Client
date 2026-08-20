@@ -386,16 +386,17 @@ impl BirdoApi {
             .await
     }
 
-    /// P2-15: Report connection quality telemetry to the backend.
-    /// Fire-and-forget — callers should not block on failure.
-    pub async fn report_quality(&self, report: &QualityReport) -> Result<(), ApiError> {
-        // 204 No Content is the expected reply; handle_response maps an empty
-        // 2xx body to JSON `null`, so no parse-error special-casing is needed.
-        let _: serde_json::Value = self
-            .post(endpoints::vpn::QUALITY_REPORT, report, true)
-            .await?;
-        Ok(())
-    }
+    // P6-CLI-X-01: `report_quality` is GONE, along with the 60-second loop that
+    // called it (vpn/auto_reconnect.rs) and the `QualityReport` type. It sent
+    // latency, jitter, loss, byte counts, connection age and platform to the
+    // backend every 60 seconds for the whole of every session, unconditionally,
+    // with no way for the user to say no. Owner decision 2026-08-19: DELETE it
+    // rather than make it opt-in. A VPN measuring its users continuously by
+    // default is the thing they bought the VPN to avoid, and an opt-in switch
+    // still leaves the code, the endpoint and the temptation in place.
+    //
+    // The heartbeat above is unaffected: it is the liveness signal the tunnel
+    // needs to work at all, not telemetry.
 
     // ========================================================================
     // User Endpoints
@@ -837,9 +838,9 @@ impl BirdoApi {
         let status = response.status();
 
         if status.is_success() {
-            // Treat the WHOLE 2xx range as success, not just 200/201: the
-            // quality-report endpoint returns 204 No Content, and any endpoint
-            // adopting 202/204 must not silently start "failing". An empty body
+            // Treat the WHOLE 2xx range as success, not just 200/201: any
+            // endpoint that answers (or starts answering) 202/204 must not
+            // silently be read as a failure. An empty body
             // deserializes as JSON `null` (fits `serde_json::Value` and any
             // `Option<T>`-shaped response).
             let bytes = response
