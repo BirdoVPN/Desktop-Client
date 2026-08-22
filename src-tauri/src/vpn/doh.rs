@@ -124,12 +124,17 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         ],
         // Chain: cloudflare-dns.com → SSL.com SSL Intermediate CA ECC R2
         //        → SSL.com Root Certification Authority ECC
-        // SPKI pins verified against the live chain 2026-08-12.
+        // SPKI pins re-measured against the live chain 2026-08-22 (dialled via
+        // 1.1.1.1: the hostname itself is what a hostile resolver hijacks).
         pins: &[
             // SSL.com SSL Intermediate CA ECC R2 (presented intermediate)
             "zGgA4OU4DjJdvpRYUqbi5Vh2g9W5Oc/PgKihy9mkLsE=",
-            // SSL.com Root Certification Authority ECC (trust anchor)
+            // SSL.com Root Certification Authority ECC (trust anchor, not sent)
             "oyD01TTXvpfBro3QSZc1vIlcMjrdLTiL/M9mLCPX+Zo=",
+            // DigiCert High Assurance EV Root CA — Cloudflare's legacy anchor,
+            // kept as migration overlap and to match the Android pin set.
+            // Dormant: Cloudflare serves SSL.com today.
+            "WoiWRyIOVNa9ihaBciRSC7XHjliYS9VwUGOIud4PB18=",
         ],
     },
     DoHProvider {

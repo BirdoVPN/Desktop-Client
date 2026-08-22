@@ -24,12 +24,26 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 
-/// SPKI SHA-256 pins (base64). Kept in sync with the Android client
-/// (`app/.../di/NetworkModule.kt`) and `birdo-shared/cert-pins.json`.
+/// SPKI SHA-256 pins (base64) for `birdo.app` and its subdomains.
+///
+/// SOURCE OF TRUTH: `third_party/cert-pins.json` (vendored from
+/// `birdo-shared/cert-pins.json`). This array must equal the `birdo.app` pin
+/// set declared there, and so must the Android and iOS copies:
+///   - `app/src/main/java/app/birdo/vpn/di/NetworkModule.kt`
+///   - `app/src/main/res/xml/network_security_config.xml`
+///   - `iosApp/iosApp/Services/APIClient.swift`
+///
+/// That equality is ENFORCED, not merely asserted: `scripts/check-cert-pins.sh`
+/// (CI workflow `cert-pins.yml`, on every PR and daily) parses this array and
+/// fails the build if it diverges from the SSOT by so much as one character.
+/// An earlier version of this comment claimed the copies were "kept in sync"
+/// with no mechanism behind the claim, and they had in fact diverged: this file
+/// carried 8 pins while the Android and iOS clients carried 3.
 ///
 /// A connection is accepted if ANY certificate in the presented chain
-/// (intermediate OR root) matches one of these. Verified against the live
-/// `api.birdo.app` chain 2026-06-08: WE1 + GTS Root R4 are present.
+/// (intermediate OR root) matches one of these. Re-measured against the live
+/// `api.birdo.app` chain 2026-08-22: leaf CN=birdo.app -> WE1 -> GTS Root R4,
+/// so the first two pins below are live and the rest are dormant backups.
 const PINNED_SPKI_SHA256: &[&str] = &[
     // Google Trust Services "WE1" intermediate — the cert api.birdo.app chains
     // through today; stable for years. PRIMARY pin (also pinned on Android).
