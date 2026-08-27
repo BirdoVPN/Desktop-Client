@@ -841,6 +841,19 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
     // so there is no name to bind at rule-load time.
     // back up before deactivation lands, traffic already inside the VPN is not
     // dropped by this main ruleset.
+    //
+    // DHCP: both directions are stated explicitly because these rules are
+    // `no state` — pf will not infer the reply from the request, so each
+    // direction has to match on its own.
+    //     request: client :68 -> server :67
+    //     reply:   server :67 -> client :68
+    // The inbound rule used to read `from any port 68`, which is the CLIENT's
+    // port. A DHCP reply arrives FROM :67, so that rule matched nothing and
+    // every reply fell through to `block drop all` while the kill switch was
+    // armed. The lease could then never be renewed, so a long VPN session ended
+    // with the LAN connection dying underneath it — and, because the tunnel
+    // itself kept working until the lease actually lapsed, the cause looked
+    // nothing like the kill switch.
     let rules = format!(
         "# Birdo VPN Kill Switch (main ruleset — pf evaluates this directly)\n\
          set block-policy drop\n\
@@ -863,8 +876,8 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
          pass quick on utun13 all\n\
          pass quick on utun14 all\n\
          pass quick on utun15 all\n\
-         pass out quick proto udp to any port 67 no state\n\
-         pass in quick proto udp from any port 68 no state\n\
+         pass out quick proto udp from any port 68 to any port 67 no state\n\
+         pass in quick proto udp from any port 67 to any port 68 no state\n\
          {lan_permit}\
          {self_permit}\
          {server_rule}"
