@@ -109,34 +109,49 @@ impl WintunTunnel {
 
         let servers: Vec<String> = stdout
             .lines()
+            // Scan EVERY token on EVERY line, exactly as the v6 twin below does.
+            //
+            // The previous filter required the trimmed line to START with a digit,
+            // which silently dropped the PRIMARY resolver on every adapter. netsh
+            // puts the first server on the label line and only the rest on their
+            // own:
+            //
+            //     Statically Configured DNS Servers:    1.1.1.1
+            //                                           8.8.8.8
+            //
+            // The first line starts with 'S', so it never matched; only 8.8.8.8 was
+            // captured. On disconnect we then restored a strict subset of the user's
+            // DNS — losing the resolver they had listed first, permanently, with no
+            // error anywhere. A single-server adapter (the common case) snapshotted
+            // as EMPTY, which is worse: restore had nothing to write back.
+            //
+            // The v6 twin has always used the token scan and is unaffected. This is
+            // the same bug shape the estate keeps hitting: a fix applied to one of
+            // two parallel code paths.
+            //
+            // Still require a parseable IPv4 per token, because these values are fed
+            // back verbatim into `netsh set/add dns static <ip>` on restore, so a
+            // non-IP would silently break restoration. Annotations such as
+            // "1.1.1.1 (Preferred)" are handled naturally: the address token parses,
+            // the annotation token does not.
             .filter_map(|line| {
-                let trimmed = line.trim();
-                if !trimmed.starts_with(|c: char| c.is_ascii_digit()) {
-                    return None;
-                }
-                // netsh may annotate entries (e.g. "1.1.1.1 (Preferred)") or, on
-                // localized Windows, emit non-IP rows that happen to start with a
-                // digit. Take only the first whitespace token and require it to be a
-                // valid IP — these values are fed back verbatim into
-                // `netsh set/add dns static <ip>` on restore, so storing anything
-                // that is not a bare IP would silently break DNS restoration.
-                let candidate = trimmed.split_whitespace().next()?;
-                if candidate.parse::<std::net::IpAddr>().is_ok() {
-                    Some(candidate.to_string())
-                } else {
-                    // A row started with a digit but its first token is not a
-                    // valid IP. Dropping it (by design) means one fewer DNS
-                    // server is restored on disconnect; log it so partial DNS
-                    // restoration is diagnosable.
-                    tracing::warn!(
-                        "snapshot_adapter_dns: adapter '{}' had a digit-prefixed line that is not a valid IP ('{}'); skipping — DNS restoration may be incomplete",
-                        adapter_name,
-                        candidate
-                    );
-                    None
-                }
+                line.split_whitespace().find_map(|token| {
+                    token
+                        .parse::<std::net::Ipv4Addr>()
+                        .ok()
+                        .map(|_| token.to_string())
+                })
             })
             .collect();
+
+        if servers.is_empty() {
+            // Not fatal — an adapter genuinely on DHCP has no static servers — but
+            // it is the signature of the parsing bug above, so make it visible.
+            tracing::debug!(
+                "snapshot_adapter_dns: adapter '{}' yielded no IPv4 DNS servers",
+                adapter_name
+            );
+        }
 
         Some(AdapterDnsSnapshot {
             adapter_name: adapter_name.to_string(),

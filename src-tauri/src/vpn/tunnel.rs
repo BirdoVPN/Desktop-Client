@@ -1170,7 +1170,25 @@ impl WintunTunnel {
             }
         }
 
+        // Track what actually landed. The success line below used to print
+        // routes_to_add.len() — the ATTEMPTED count — so a run that installed
+        // nothing still logged "Routes configured (N entries)".
+        let mut installed = 0usize;
+        let mut failed_default_split: Vec<String> = Vec::new();
+
         for (network, mask) in &routes_to_add {
+            // The split-default pair IS the tunnel. If either half is missing,
+            // traffic for that half leaves over the physical interface in the
+            // clear while the UI reports Connected — so these two are mandatory
+            // and a failure on them aborts the connect. Linux propagates route
+            // failures out of configure_routes() already (tunnel_linux.rs, the
+            // `if let Err(e) = configure_routes(..) { return Err(e) }` call
+            // site); Windows was the odd one out, logging a warning and
+            // continuing. Other allowed_ips stay best-effort: a narrower route
+            // failing is a reachability problem, not a plaintext leak.
+            let is_default_split =
+                mask == "128.0.0.0" && (network == "0.0.0.0" || network == "128.0.0.0");
+
             tracing::debug!("Adding route: {} mask {} IF {}", network, mask, if_index);
 
             // Native first (CreateIpForwardEntry2 on the Wintun interface, on-link
@@ -1184,6 +1202,7 @@ impl WintunTunnel {
             };
             if native_ok {
                 tracing::debug!("Route added natively: {} mask {}", network, mask);
+                installed += 1;
                 continue;
             }
 
@@ -1204,6 +1223,7 @@ impl WintunTunnel {
             {
                 Ok(output) if output.status.success() => {
                     tracing::debug!("Route added successfully: {} mask {}", network, mask);
+                    installed += 1;
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1214,6 +1234,9 @@ impl WintunTunnel {
                         output.status.code(),
                         stderr.trim()
                     );
+                    if is_default_split {
+                        failed_default_split.push(format!("{network} mask {mask}"));
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1222,12 +1245,27 @@ impl WintunTunnel {
                         mask,
                         e
                     );
+                    if is_default_split {
+                        failed_default_split.push(format!("{network} mask {mask}"));
+                    }
                 }
             }
         }
 
+        if !failed_default_split.is_empty() {
+            // Fail the connect rather than come up leaking. start() unwinds and
+            // the teardown path removes the half-built tunnel.
+            return Err(format!(
+                "Refusing to connect: the default-route split could not be installed ({}). \
+                 Without it, traffic for that half of the address space would leave over the \
+                 physical interface in the clear while the app reported Connected.",
+                failed_default_split.join(", ")
+            ));
+        }
+
         tracing::info!(
-            "Routes configured ({} entries + endpoint host route)",
+            "Routes configured ({}/{} entries installed + endpoint host route)",
+            installed,
             routes_to_add.len()
         );
         Ok(())
