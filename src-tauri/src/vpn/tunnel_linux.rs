@@ -1466,8 +1466,36 @@ async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
     // Gating the backup on `systemctl is-active` stored None on exactly those
     // hosts, so disconnect left the file pointing at tunnel resolvers that no
     // longer existed: DNS dead system-wide until something else rewrote it.
-    // None only when the file itself is unreadable.
-    let resolv_conf_backup = std::fs::read_to_string("/etc/resolv.conf").ok();
+    // None when the file is unreadable — OR when the file is OURS.
+    //
+    // Refusing our own file as a baseline is the other half of the bug above.
+    // If a previous session died dirty — SIGKILL, a panic under
+    // panic = "abort", a power cut — /etc/resolv.conf still holds the tunnel's
+    // resolvers behind RESOLV_CONF_MARKER. Capturing that as "the original"
+    // latches it forever: the next disconnect faithfully restores resolvers
+    // that belong to a tunnel which no longer exists, and DNS is dead
+    // system-wide with nothing left on disk to say what the real config was.
+    // Every later connect then re-captures the same poisoned baseline, so the
+    // damage is permanent rather than self-healing.
+    //
+    // `resolv_conf_is_ours()` already exists and is used on the two unwind
+    // paths (lines ~396 and ~739); the capture path never consulted it. Filter
+    // here and log loudly, because a filtered baseline IS the signal that a
+    // previous session did not shut down cleanly.
+    let resolv_conf_backup = std::fs::read_to_string("/etc/resolv.conf")
+        .ok()
+        .filter(|c| {
+            let ours = c.starts_with(RESOLV_CONF_MARKER);
+            if ours {
+                tracing::warn!(
+                    "/etc/resolv.conf still carries the Birdo marker at capture time — a previous \
+                     session exited without restoring DNS. Refusing to record it as the original \
+                     baseline (that would make the tunnel's resolvers permanent). Disconnect will \
+                     leave the file untouched; restore it by hand or reconnect to a clean state."
+                );
+            }
+            !ours
+        });
 
     // Capture current DNS servers
     let dns_servers: Vec<String> = if uses_resolved {
