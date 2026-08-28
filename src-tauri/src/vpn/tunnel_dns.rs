@@ -321,8 +321,14 @@ Configuration for interface "Ethernet 2"
     #[test]
     fn dhcp_sourced_adapter_is_reported_as_dhcp() {
         let (was_dhcp, servers) = parse_dns_config_v4(DHCP_TWO_SERVERS);
-        assert!(servers.is_empty(), "DHCP-leased servers are not ours to restore");
-        assert!(was_dhcp, "must be recognised as DHCP so restore hands it back");
+        assert!(
+            servers.is_empty(),
+            "DHCP-leased servers are not ours to restore"
+        );
+        assert!(
+            was_dhcp,
+            "must be recognised as DHCP so restore hands it back"
+        );
     }
 
     #[test]
@@ -332,8 +338,8 @@ Configuration for interface "Ethernet 2"
         assert!(!was_dhcp);
     }
 
-    #[test]
-    fn dhcp_leased_servers_are_not_captured() {
+    #[test]
+    fn dhcp_leased_servers_are_not_captured() {
         // The regression this guards: capturing these turned a DHCP adapter into
         // a statically pinned one on disconnect.
         assert!(parse_static_dns_v4(DHCP_TWO_SERVERS).is_empty());

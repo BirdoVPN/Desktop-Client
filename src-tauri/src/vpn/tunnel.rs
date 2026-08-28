@@ -1705,12 +1705,7 @@ impl WintunTunnel {
     ///
     /// `validate=no` skips the slow synchronous network re-validation (~12s) that
     /// made disconnect feel stuck while "recovering".
-    fn restore_adapter_dns(
-        adapter_name: &str,
-        family: &str,
-        servers: &[String],
-        was_dhcp: bool,
-    ) {
+    fn restore_adapter_dns(adapter_name: &str, family: &str, servers: &[String], was_dhcp: bool) {
         let name_arg = format!("name={}", adapter_name);
 
         if servers.is_empty() {
