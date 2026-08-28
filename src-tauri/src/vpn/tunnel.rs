@@ -1639,6 +1639,41 @@ impl WintunTunnel {
         Ok(())
     }
 
+    /// Synchronously hand the physical adapters back their resolvers.
+    ///
+    /// For callers that cannot await and cannot be held open — specifically the
+    /// updater relaunch, where `RunEvent::ExitRequested` carries
+    /// `RESTART_EXIT_CODE` and `prevent_exit()` is a documented no-op. Blocking
+    /// that handler briefly is acceptable; leaving the machine with no DNS is
+    /// not.
+    ///
+    /// Returns whether anything was actually restored, so the caller can log the
+    /// difference between "put them back" and "nothing was parked".
+    ///
+    /// `try_read` mirrors the `Drop` unwind: there is no async context here. On
+    /// contention it yields nothing and this does nothing, which is the safe way
+    /// to be wrong — an empty list means "we know of nothing to restore", and
+    /// acting on that by forcing DHCP is the bug removed alongside this.
+    pub(super) fn restore_dns_blocking(&self) -> bool {
+        if !self.dns_modified.load(Ordering::SeqCst) {
+            return false;
+        }
+        let snapshots = self
+            .dns_snapshots
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if snapshots.is_empty() {
+            tracing::warn!(
+                "Restart teardown: DNS is marked modified but no snapshot is readable —                  leaving the adapters alone rather than guessing"
+            );
+            return false;
+        }
+        Self::restore_physical_adapters_dns(&snapshots);
+        self.dns_modified.store(false, Ordering::SeqCst);
+        true
+    }
+
     /// Restore the physical (non-VPN) adapters' resolvers to the exact
     /// pre-connect `snapshots`, or to DHCP when none were captured.
     ///

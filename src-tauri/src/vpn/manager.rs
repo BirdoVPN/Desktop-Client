@@ -157,6 +157,41 @@ impl std::fmt::Display for VpnError {
 impl std::error::Error for VpnError {}
 
 impl VpnManager {
+    /// Restore physical-adapter DNS synchronously, for exit paths that cannot
+    /// await.
+    ///
+    /// WHY THIS EXISTS. `RunEvent::ExitRequested` with `RESTART_EXIT_CODE` (the
+    /// updater relaunch) returns before `teardown_for_exit`, because a restart
+    /// cannot be held open — `prevent_exit()` is a documented no-op for it. The
+    /// comment there reasons that the startup reconcile in `setup()` cleans up
+    /// after the relaunch, and that is true for kernel firewall state: there are
+    /// macOS and Linux arms for exactly that. There is no Windows arm, and
+    /// Windows is where `configure_dns` parks EVERY physical adapter on
+    /// `static none`.
+    ///
+    /// So an in-app update performed while connected leaves the machine with no
+    /// resolvers, and the relaunched instance then cannot resolve the API it
+    /// needs to reconnect. That is not a crash path — it is the normal update
+    /// path.
+    ///
+    /// Synchronous and non-blocking-on-locks by construction: `try_read` both
+    /// here and inside the tunnel, so this can never wedge the exit.
+    #[cfg(target_os = "windows")]
+    pub fn restore_dns_blocking(&self) -> bool {
+        match self.tunnel.try_read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(tunnel) => tunnel.restore_dns_blocking(),
+                None => false,
+            },
+            Err(_) => {
+                tracing::warn!(
+                    "Restart teardown: tunnel lock busy — cannot restore DNS synchronously"
+                );
+                false
+            }
+        }
+    }
+
     /// Create a new VPN manager
     pub fn new() -> Self {
         Self {

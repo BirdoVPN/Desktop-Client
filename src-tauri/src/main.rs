@@ -603,6 +603,24 @@ fn main() {
                 // startup reconcile (setup(), F-001/F-032) clears any stale
                 // kernel firewall state in the relaunched instance.
                 if *code == Some(tauri::RESTART_EXIT_CODE) {
+                    // The full teardown cannot run here, but ONE piece of it
+                    // outlives the process on Windows and must: configure_dns()
+                    // parks every physical adapter on `static none`, and the
+                    // startup reconcile this comment used to rely on has macOS
+                    // and Linux arms only. Without this, updating in-app while
+                    // connected leaves the machine with no resolvers — and the
+                    // relaunched instance then cannot resolve the API it needs
+                    // to reconnect. Synchronous and try_read-based throughout,
+                    // so it cannot wedge an exit that must not be held open.
+                    #[cfg(target_os = "windows")]
+                    {
+                        let restored = app_handle.state::<VpnManager>().restore_dns_blocking();
+                        info!(
+                            "Restart requested — skipping exit teardown (DNS restored: {})",
+                            restored
+                        );
+                    }
+                    #[cfg(not(target_os = "windows"))]
                     info!("Restart requested — skipping exit teardown");
                     return;
                 }
