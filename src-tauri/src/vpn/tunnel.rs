@@ -1717,11 +1717,30 @@ impl WintunTunnel {
                     .filter(|dns| !is_link_local_v6(dns))
                     .cloned()
                     .collect();
+
+                // ...but "Windows re-learns it" only happens if something puts the
+                // adapter BACK on DHCP/RA. An adapter whose only IPv6 resolvers
+                // were link-local filters to an empty list here, and with the
+                // origin flag saying `static`, the empty case deliberately does
+                // nothing (see restore_adapter_dns) — so the adapter is left
+                // parked on `static none` with no IPv6 resolvers at all.
+                //
+                // A regression introduced when this file started trusting the
+                // origin flag: before, an empty list fell through to DHCP and
+                // Windows re-learned the RA. It bites on IPv6-native networks,
+                // where RDNSS is often the ONLY source of IPv6 DNS.
+                //
+                // So hand it back to DHCP/RA when everything it had was
+                // link-local. Deliberately false when the adapter had NO IPv6
+                // resolvers at all — that is the genuinely-static-with-none case
+                // the origin flag exists to leave alone.
+                let v6_had_only_link_local =
+                    !snapshot.dns_servers_v6.is_empty() && v6_static.is_empty();
                 Self::restore_adapter_dns(
                     &snapshot.adapter_name,
                     "ipv6",
                     &v6_static,
-                    snapshot.v6_was_dhcp,
+                    snapshot.v6_was_dhcp || v6_had_only_link_local,
                 );
 
                 tracing::debug!(
