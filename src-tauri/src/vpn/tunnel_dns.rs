@@ -254,16 +254,8 @@ fn v6_token(token: &str) -> Option<String> {
         .map(|_| token.to_string())
 }
 
-pub(super) fn parse_static_dns_v4(stdout: &str) -> Vec<String> {
-    parse_dns_config(stdout, v4_token).1
-}
-
 pub(super) fn parse_dns_config_v4(stdout: &str) -> (bool, Vec<String>) {
     parse_dns_config(stdout, v4_token)
-}
-
-pub(super) fn parse_static_dns_v6(stdout: &str) -> Vec<String> {
-    parse_dns_config(stdout, v6_token).1
 }
 
 pub(super) fn parse_dns_config_v6(stdout: &str) -> (bool, Vec<String>) {
@@ -272,7 +264,7 @@ pub(super) fn parse_dns_config_v6(stdout: &str) -> (bool, Vec<String>) {
 
 #[cfg(test)]
 mod dns_parse_tests {
-    use super::{parse_static_dns_v4, parse_static_dns_v6};
+    use super::{parse_dns_config_v4, parse_dns_config_v6};
 
     // Captured verbatim from `netsh interface ipv4 show dns name="WiFi 3"` on a
     // real Windows 11 machine, 2026-08-27. This is the case the previous parser
@@ -342,7 +334,7 @@ Configuration for interface "Ethernet 2"
     fn dhcp_leased_servers_are_not_captured() {
         // The regression this guards: capturing these turned a DHCP adapter into
         // a statically pinned one on disconnect.
-        assert!(parse_static_dns_v4(DHCP_TWO_SERVERS).is_empty());
+        assert!(parse_dns_config_v4(DHCP_TWO_SERVERS).1.is_empty());
     }
 
     #[test]
@@ -350,21 +342,21 @@ Configuration for interface "Ethernet 2"
         // The first server sits on the LABEL line, which an earlier parser that
         // required the line to start with a digit silently dropped.
         assert_eq!(
-            parse_static_dns_v4(STATIC_TWO_SERVERS),
+            parse_dns_config_v4(STATIC_TWO_SERVERS).1,
             vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
         );
     }
 
     #[test]
     fn static_none_is_empty() {
-        assert!(parse_static_dns_v4(STATIC_NONE).is_empty());
+        assert!(parse_dns_config_v4(STATIC_NONE).1.is_empty());
     }
 
     #[test]
     fn annotations_do_not_break_capture() {
         let s = "    Statically Configured DNS Servers:    1.1.1.1 (Preferred)
 ";
-        assert_eq!(parse_static_dns_v4(s), vec!["1.1.1.1".to_string()]);
+        assert_eq!(parse_dns_config_v4(s).1, vec!["1.1.1.1".to_string()]);
     }
 
     #[test]
@@ -373,7 +365,7 @@ Configuration for interface "Ethernet 2"
                      DNS servers configured through DHCP:  2001:4860:4860::8888
                                                            2001:4860:4860::8844
 ";
-        assert!(parse_static_dns_v6(s).is_empty());
+        assert!(parse_dns_config_v6(s).1.is_empty());
     }
 
     #[test]
@@ -388,7 +380,7 @@ Configuration for interface "Ethernet 2"
     \r
                                                        9.9.9.9
 ";
-        assert!(parse_static_dns_v4(s).is_empty());
+        assert!(parse_dns_config_v4(s).1.is_empty());
     }
 
     #[test]
@@ -401,7 +393,7 @@ Configuration for interface "Ethernet 2"
         let one = "    Statically Configured DNS Servers:    2606:4700:4700::1111
 ";
         assert_eq!(
-            parse_static_dns_v6(one),
+            parse_dns_config_v6(one).1,
             vec!["2606:4700:4700::1111".to_string()]
         );
     }
@@ -414,7 +406,7 @@ Configuration for interface "Ethernet 2"
                                                                2606:4700:4700::1001
 ";
         assert_eq!(
-            parse_static_dns_v6(s),
+            parse_dns_config_v6(s).1,
             vec![
                 "2606:4700:4700::1111".to_string(),
                 "2606:4700:4700::1001".to_string()
