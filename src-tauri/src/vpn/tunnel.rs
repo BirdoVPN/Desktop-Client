@@ -366,6 +366,19 @@ fn is_link_local_v6(addr: &str) -> bool {
 #[derive(Debug, Clone)]
 pub(super) struct AdapterDnsSnapshot {
     pub(super) adapter_name: String,
+    /// Was IPv4 DNS sourced from DHCP before we touched it?
+    ///
+    /// NOT the same as `dns_servers.is_empty()`, and conflating the two rewrites
+    /// other software's network configuration. Measured on a stock Windows 11
+    /// machine with no VPN running: VirtualBox Host-Only, the Hyper-V/WSL
+    /// vSwitch and the OpenVPN TAP adapter were all `Statically Configured DNS
+    /// Servers: None` — static, with no servers — and two of them were Up, so
+    /// `get_non_vpn_adapters()` returns them. Restoring those to DHCP is an
+    /// unrequested, elevated change to VirtualBox and Hyper-V networking, on
+    /// every clean disconnect.
+    pub(super) v4_was_dhcp: bool,
+    /// IPv6 twin of `v4_was_dhcp`.
+    pub(super) v6_was_dhcp: bool,
     /// Original IPv4 DNS servers (empty = was DHCP)
     pub(super) dns_servers: Vec<String>,
     /// Original IPv6 DNS servers (empty = was DHCP/RA). Snapshotted separately
@@ -1633,16 +1646,30 @@ impl WintunTunnel {
     /// emergency unwind (which cannot await) so the two can never drift.
     fn restore_physical_adapters_dns(snapshots: &[AdapterDnsSnapshot]) {
         if snapshots.is_empty() {
-            // No snapshots — fall back to DHCP on all adapters (legacy behavior)
-            tracing::warn!("No DNS snapshots found, falling back to DHCP restoration");
-            let adapters = Self::get_non_vpn_adapters();
-            for name in &adapters {
-                Self::restore_adapter_dns(name, "ip", &[]);
-                Self::restore_adapter_dns(name, "ipv6", &[]);
-            }
+            // Deliberately DO NOTHING. This used to reset every connected
+            // adapter to DHCP, and it is reachable with no attacker and no
+            // crash: `Drop` reads the snapshots with `try_read().unwrap_or_default()`,
+            // which yields `[]` under lock contention, and `configure_dns` stores
+            // `[]` when `snapshot_adapter_dns` fails for every adapter (netsh
+            // failing to spawn under AV). Blanket DHCP would then rewrite
+            // resolvers on adapters this tunnel never touched — including the
+            // static-none virtual adapters described on `v4_was_dhcp`.
+            //
+            // "We recorded nothing" and "nothing was parked" are indistinguishable
+            // here, and the correct action for the second is to do nothing. Doing
+            // nothing for the first leaves the clean-disconnect path to fix it.
+            tracing::warn!(
+                "No DNS snapshots to restore from — taking no action rather than \r
+                 forcing DHCP on adapters that may never have been touched"
+            );
         } else {
             for snapshot in snapshots {
-                Self::restore_adapter_dns(&snapshot.adapter_name, "ip", &snapshot.dns_servers);
+                Self::restore_adapter_dns(
+                    &snapshot.adapter_name,
+                    "ip",
+                    &snapshot.dns_servers,
+                    snapshot.v4_was_dhcp,
+                );
 
                 // IPv6: restore only resolvers the user actually configured. A
                 // fe80:: resolver was learned from a Router Advertisement (RDNSS);
@@ -1655,7 +1682,12 @@ impl WintunTunnel {
                     .filter(|dns| !is_link_local_v6(dns))
                     .cloned()
                     .collect();
-                Self::restore_adapter_dns(&snapshot.adapter_name, "ipv6", &v6_static);
+                Self::restore_adapter_dns(
+                    &snapshot.adapter_name,
+                    "ipv6",
+                    &v6_static,
+                    snapshot.v6_was_dhcp,
+                );
 
                 tracing::debug!(
                     "Restored {} — IPv4: {:?}, IPv6: {:?}",
@@ -1673,10 +1705,27 @@ impl WintunTunnel {
     ///
     /// `validate=no` skips the slow synchronous network re-validation (~12s) that
     /// made disconnect feel stuck while "recovering".
-    fn restore_adapter_dns(adapter_name: &str, family: &str, servers: &[String]) {
+    fn restore_adapter_dns(
+        adapter_name: &str,
+        family: &str,
+        servers: &[String],
+        was_dhcp: bool,
+    ) {
         let name_arg = format!("name={}", adapter_name);
 
         if servers.is_empty() {
+            if !was_dhcp {
+                // The adapter was ALREADY `static` with no servers before we
+                // parked it, so parking was a no-op and un-parking must be one
+                // too. Forcing DHCP here is what silently reconfigured
+                // VirtualBox / Hyper-V / OpenVPN adapters on every disconnect.
+                tracing::debug!(
+                    "{} ({}): was static with no servers before connect — leaving as-is",
+                    adapter_name,
+                    family
+                );
+                return;
+            }
             let _ = cmd("netsh")
                 .args([
                     "interface",
