@@ -51,7 +51,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5, delay: 0.2 }}
           >
-            Before using Birdo VPN, please review how your data is handled.
+            Before using BirdoVPN, please review how your data is handled.
           </motion.p>
 
           {/* Data processing summary card */}
@@ -66,7 +66,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
                 <DataItem
                   icon={Eye}
                   title="No Activity Logs"
-                  description="Birdo VPN operates a strict zero-logs policy on RAM-only volatile infrastructure. No browsing activity, DNS queries, traffic content, connection timestamps, or IP addresses are logged."
+                  description="BirdoVPN operates a strict zero-logs policy on RAM-only volatile infrastructure. No browsing activity, DNS queries, traffic content, connection timestamps, or IP addresses are logged."
                 />
                 <DataItem
                   icon={Shield}
@@ -144,7 +144,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.45 }}
           >
-            You must accept the privacy policy to use Birdo VPN.
+            You must accept the privacy policy to use BirdoVPN.
           </motion.p>
         </motion.div>
       </div>

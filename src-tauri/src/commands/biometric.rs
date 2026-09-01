@@ -121,7 +121,7 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
         // SEC: Use hardcoded verification message to prevent PowerShell injection.
         // The `reason` parameter from the frontend is intentionally ignored —
         // user-supplied strings must never be interpolated into shell scripts.
-        let safe_reason = "Birdo VPN requires your identity";
+        let safe_reason = "BirdoVPN requires your identity";
 
         // Use PowerShell to invoke Windows Hello via UserConsentVerifier
         // This triggers the Windows Hello prompt (fingerprint, face, PIN)
@@ -205,7 +205,7 @@ pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
             if canEvaluate as boolean is false then
                 return "UNAVAILABLE"
             end if
-            set {authResult, theError} to laContext's evaluatePolicy:1 localizedReason:"Birdo VPN requires your identity" |error|:(reference)
+            set {authResult, theError} to laContext's evaluatePolicy:1 localizedReason:"BirdoVPN requires your identity" |error|:(reference)
             if authResult as boolean then
                 return "VERIFIED"
             else

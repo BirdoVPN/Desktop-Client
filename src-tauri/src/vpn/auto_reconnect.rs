@@ -411,7 +411,7 @@ impl AutoReconnectService {
                             }
                             let _ = vpn_manager
                                 .set_state(ConnectionState::Error(
-                                    "Update required — this version of Birdo VPN is no \
+                                    "Update required — this version of BirdoVPN is no \
                                      longer supported. Install the update to reconnect."
                                         .to_string(),
                                 ))

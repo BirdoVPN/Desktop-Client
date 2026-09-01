@@ -47,17 +47,17 @@ impl fmt::Display for ApiError {
                 (Some(msg), _) if !msg.trim().is_empty() => write!(f, "{}", msg),
                 (_, Some(version)) => write!(
                     f,
-                    "Update required: Birdo VPN {} or later is needed to continue",
+                    "Update required: BirdoVPN {} or later is needed to continue",
                     version
                 ),
                 _ => write!(
                     f,
-                    "Update required: this version of Birdo VPN is no longer supported"
+                    "Update required: this version of BirdoVPN is no longer supported"
                 ),
             },
             ApiError::ServerError(code) => write!(f, "Server error ({})", code),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),
-            ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update Birdo VPN to the latest version. ({})", msg),
+            ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update BirdoVPN to the latest version. ({})", msg),
             ApiError::Protocol(code) => write!(f, "{}", code.user_message()),
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }

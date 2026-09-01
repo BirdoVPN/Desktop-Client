@@ -1610,7 +1610,7 @@ function MultiHopServerCard({ label, server, disabled, onClick }: MultiHopServer
             </div>
             {server && (
               <div className="truncate text-xs" style={{ color: white.w60 }}>
-                {(server.city || server.country)} · {server.load}% load
+                {server.city || server.country}
               </div>
             )}
           </div>

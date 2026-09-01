@@ -83,7 +83,7 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
     try {
       await relaunch();
     } catch {
-      setError('Failed to restart. Please close and reopen Birdo VPN.');
+      setError('Failed to restart. Please close and reopen BirdoVPN.');
       setPhase('error');
     }
   }, []);
@@ -107,8 +107,8 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
           {info.message?.trim()
             ? info.message
             : version
-              ? `Birdo VPN ${version} or later is required to connect. This build is no longer supported.`
-              : 'This version of Birdo VPN is no longer supported and can no longer connect.'}
+              ? `BirdoVPN ${version} or later is required to connect. This build is no longer supported.`
+              : 'This version of BirdoVPN is no longer supported and can no longer connect.'}
         </p>
         {version && (
           <p className="text-xs text-white/40">Required version: v{version}</p>
