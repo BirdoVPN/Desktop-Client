@@ -42,7 +42,7 @@ const OAUTH_TIMEOUT: Duration = Duration::from_secs(300);
 // the loopback closes immediately after serving them — nothing else can load.
 const RESPONSE_OK: &str = concat!(
     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-    r##"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Signed in · Birdo VPN</title><style>
+    r##"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Signed in · BirdoVPN</title><style>
 :root{color-scheme:dark}*{margin:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px;color:#e9ebea;background:#060707;background:radial-gradient(1100px 720px at 50% -12%,#0c1c16 0%,#060707 62%)}
 .card{position:relative;width:100%;max-width:390px;text-align:center;padding:46px 34px 34px;border-radius:24px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.08);box-shadow:0 30px 80px -28px rgba(0,0,0,.75);overflow:hidden}
@@ -59,14 +59,14 @@ p{font-size:14.5px;line-height:1.55;color:rgba(233,235,234,.62)}
 @media(prefers-reduced-motion:reduce){.badge{animation:none}.badge path{animation:none;stroke-dashoffset:0}.card::before{opacity:.4}}
 </style></head><body><main class=card>
 <div class=badge><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></div>
-<h1>Signed in to Birdo VPN</h1>
+<h1>Signed in to BirdoVPN</h1>
 <p>You&rsquo;re all set. You can close this tab and head back to the app &mdash; it&rsquo;s already signing you in.</p>
 <div class=foot><b>Birdo</b> VPN &middot; secure by default</div>
 </main></body></html>"##
 );
 const RESPONSE_ERR: &str = concat!(
     "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-    r##"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign-in problem · Birdo VPN</title><style>
+    r##"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Sign-in problem · BirdoVPN</title><style>
 :root{color-scheme:dark}*{margin:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px;color:#e9ebea;background:#060707;background:radial-gradient(1100px 720px at 50% -12%,#241605 0%,#060707 62%)}
 .card{position:relative;width:100%;max-width:390px;text-align:center;padding:46px 34px 34px;border-radius:24px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.08);box-shadow:0 30px 80px -28px rgba(0,0,0,.75);overflow:hidden}
@@ -82,7 +82,7 @@ p{font-size:14.5px;line-height:1.55;color:rgba(233,235,234,.62)}
 </style></head><body><main class=card>
 <div class=badge><svg viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg></div>
 <h1>Sign-in didn&rsquo;t finish</h1>
-<p>Something interrupted the sign-in. Close this tab and try again from the Birdo VPN app.</p>
+<p>Something interrupted the sign-in. Close this tab and try again from the BirdoVPN app.</p>
 <div class=foot><b>Birdo</b> VPN</div>
 </main></body></html>"##
 );

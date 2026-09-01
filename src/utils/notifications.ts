@@ -93,7 +93,7 @@ export function notifyUpdateAvailable(version: string): void {
   if (!permissionReady) return;
   try {
     sendNotification({
-      title: 'Birdo VPN update available',
+      title: 'BirdoVPN update available',
       body: `Version ${version} is ready — open Settings → Software Updates to install.`,
     });
   } catch (err) {

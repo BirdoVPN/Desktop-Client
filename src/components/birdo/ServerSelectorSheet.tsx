@@ -5,7 +5,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, X, Star, Gauge, ArrowRightLeft, Signal, Lock } from 'lucide-react';
+import { Search, X, Star, Gauge, ArrowRightLeft, Lock } from 'lucide-react';
 import type { Server } from '@/store/app-store';
 import { surface, white, hairline, brand, status } from '@/lib/birdo-theme';
 import { countryCodeToFlag } from '@/utils/helpers';
@@ -282,9 +282,6 @@ function ServerRow({
   onSelect,
   onToggleFavorite,
 }: ServerRowProps) {
-  const loadColor =
-    server.load < 50 ? status.greenLight : server.load < 80 ? status.yellowLight : status.red;
-
   const selectable = server.isOnline && server.isAccessible;
   const hasPing =
     server.ping != null && Number.isFinite(server.ping) && server.ping >= 0;
@@ -374,10 +371,6 @@ function ServerRow({
               {server.ping}ms
             </span>
           )}
-          <span className="flex items-center gap-1" style={{ color: loadColor }}>
-            <Signal size={11} />
-            {server.load}%
-          </span>
         </span>
       </button>
 

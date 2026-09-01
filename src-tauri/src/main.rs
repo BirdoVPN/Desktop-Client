@@ -395,7 +395,7 @@ fn main() {
             }
 
             // Create system tray menu
-            let quit = MenuItem::with_id(app, "quit", "Quit Birdo VPN", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit BirdoVPN", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
             let connect = MenuItem::with_id(app, "connect", "Quick Connect", true, None::<&str>)?;
             let disconnect =
@@ -423,7 +423,7 @@ fn main() {
                 .icon(tray_icon)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .tooltip("Birdo VPN - Disconnected")
+                .tooltip("BirdoVPN - Disconnected")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
                         // app.exit() raises RunEvent::ExitRequested, so this
@@ -916,7 +916,7 @@ fn write_crash_report(location: &str, message: &str) {
         open_opts.mode(0o600);
     }
     if let Ok(mut file) = open_opts.open(&crash_file) {
-        let _ = writeln!(file, "Birdo VPN Crash Report");
+        let _ = writeln!(file, "BirdoVPN Crash Report");
         let _ = writeln!(file, "=====================");
         let _ = writeln!(file, "Time: {}", chrono::Utc::now().to_rfc3339());
         let _ = writeln!(file, "Location: {}", location);

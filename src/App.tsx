@@ -86,7 +86,7 @@ function App() {
   const requestBiometricUnlock = async () => {
     try {
       const ok = await invoke<boolean>('authenticate_biometric', {
-        reason: 'Unlock Birdo VPN',
+        reason: 'Unlock BirdoVPN',
       });
       if (ok) setBioLock('open');
     } catch {
@@ -163,12 +163,12 @@ function App() {
           : 'connecting';
     const tooltip =
       connectionState === 'kill_switch_active'
-        ? 'Birdo VPN — Kill switch active: traffic blocked'
+        ? 'BirdoVPN — Kill switch active: traffic blocked'
         : trayState === 'connected'
-          ? `Birdo VPN — Connected${currentServerName ? ` · ${currentServerName}` : ''}`
+          ? `BirdoVPN — Connected${currentServerName ? ` · ${currentServerName}` : ''}`
           : trayState === 'connecting'
-            ? 'Birdo VPN — Connecting…'
-            : 'Birdo VPN — Disconnected';
+            ? 'BirdoVPN — Connecting…'
+            : 'BirdoVPN — Disconnected';
     invoke('set_tray_state', { state: trayState, tooltip }).catch(() => {
       /* tray not ready / non-fatal */
     });
@@ -370,7 +370,7 @@ function App() {
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.3 }}
           >
-            <h1 className="text-lg font-semibold text-white">Birdo VPN is locked</h1>
+            <h1 className="text-lg font-semibold text-white">BirdoVPN is locked</h1>
             <p className="max-w-xs text-sm text-white/60">
               Biometric Unlock is enabled for this app. Authenticate to continue.
             </p>

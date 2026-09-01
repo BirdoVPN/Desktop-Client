@@ -2,35 +2,27 @@
  * VpnSettings — pushed sub-screen, pixel-faithful to mobile's
  * `VpnSettingsScreen.kt`.
  *
- * Sections (mobile order): SECURITY (Kill Switch, Stealth Mode, Quantum
- * Protection), NETWORK (Local Network Sharing), DNS (Custom DNS expandable),
+ * Sections: SECURITY (Stealth Mode), NETWORK (Local Network Sharing),
  * WIREGUARD (Port radio group + MTU), an info note, then FEATURES
- * (Port Forwarding nav row).
+ * (Kill Switch Exceptions nav row, Windows-only).
  *
  * Every toggle reads/writes the Zustand store settings and persists via the
  * SAME full-object `invoke('save_settings', { settings: settingsToRust(...) })`
  * path used by Settings.tsx / MultiHopCard.tsx. Changes apply on next connect.
  *
- * Kill Switch defaults ON but is user-toggleable: the Rust connect path only
- * arms the firewall block when the persisted setting is on (killswitch::arm),
- * so turning it off genuinely lets traffic through if the tunnel drops.
+ * Kill Switch, Quantum Protection, Custom DNS and Port Forwarding have moved UP
+ * to the main Settings page (Security / VPN) — they are not duplicated here.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useShallow } from 'zustand/react/shallow';
-import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Shield,
   EyeOff,
-  Lock,
   Network,
-  Globe,
   Router,
   SlidersHorizontal,
   Info,
-  ArrowLeftRight,
   Split,
-  ChevronRight,
 } from 'lucide-react';
 import {
   BirdoTopBar,
@@ -39,11 +31,10 @@ import {
   BirdoToggleRow,
   BirdoNavRow,
   BirdoTextField,
-  BirdoButton,
 } from '@/components/birdo';
 import { useAppStore } from '@/store/app-store';
-import { settingsToRust, isValidPort, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
-import { white, status, brand, surface, gradient, motion as motionTokens } from '@/lib/birdo-theme';
+import { settingsToRust, isValidPort, isWindowsPlatform } from '@/utils/helpers';
+import { white, status, brand } from '@/lib/birdo-theme';
 
 export function VpnSettings() {
   const { settings, updateSettings, popRoute, pushRoute, account, connectionState } = useAppStore(
@@ -65,13 +56,6 @@ export function VpnSettings() {
     plan === 'SOVEREIGN' ? 2 : plan === 'OPERATIVE' ? 1 : 0;
   const isOperativeOrAbove = planRank(account?.plan) >= 1;
 
-  const [dnsExpanded, setDnsExpanded] = useState(false);
-  const [dnsErrors, setDnsErrors] = useState<{ primary: string | null; secondary: string | null }>({
-    primary: null,
-    secondary: null,
-  });
-  const [dnsPrimaryInput, setDnsPrimaryInput] = useState((settings.customDns ?? [])[0] ?? '');
-  const [dnsSecondaryInput, setDnsSecondaryInput] = useState((settings.customDns ?? [])[1] ?? '');
   const [customPortInput, setCustomPortInput] = useState(
     !['auto', '51820', '53'].includes(settings.wireGuardPort) ? settings.wireGuardPort : '',
   );
@@ -89,9 +73,6 @@ export function VpnSettings() {
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reapplyDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [reapplying, setReapplying] = useState(false);
-  // Disabling the kill switch removes leak protection — gate it behind an
-  // explicit confirmation (mobile parity). Enabling stays immediate.
-  const [showKsConfirm, setShowKsConfirm] = useState(false);
 
   useEffect(() => {
     return () => {
@@ -120,15 +101,7 @@ export function VpnSettings() {
     }, 900);
   }, []);
 
-  // NOTE: we deliberately do NOT reconcile the toggle against
-  // `get_killswitch_status` here. That command reports the RUNTIME armed flag
-  // (true only while a session is actively armed), which is distinct from the
-  // user's persisted preference. Now that the kill switch is user-toggleable,
-  // the persisted setting is the source of truth for this row; syncing it to the
-  // armed flag would silently flip a user's ON preference to OFF whenever they
-  // are disconnected (not armed).
-
-  // Keep DNS-derived custom port/MTU inputs in sync if settings change elsewhere.
+  // Keep the custom port/MTU inputs in sync if settings change elsewhere.
   useEffect(() => {
     if (!['auto', '51820', '53'].includes(settings.wireGuardPort)) {
       setCustomPortInput(settings.wireGuardPort);
@@ -137,16 +110,6 @@ export function VpnSettings() {
       setCustomMtuInput(String(settings.wireGuardMtu));
     }
   }, [settings.wireGuardPort, settings.wireGuardMtu]);
-
-  // Mirror persisted custom DNS into the local inputs if it changes elsewhere
-  // (e.g. another window). Only persisted (already-valid) values flow back in,
-  // so this never clobbers an in-progress invalid edit with a stale value.
-  const persistedDnsPrimary = (settings.customDns ?? [])[0] ?? '';
-  const persistedDnsSecondary = (settings.customDns ?? [])[1] ?? '';
-  useEffect(() => {
-    setDnsPrimaryInput(persistedDnsPrimary);
-    setDnsSecondaryInput(persistedDnsSecondary);
-  }, [persistedDnsPrimary, persistedDnsSecondary]);
 
   // Persist the FULL settings object via the shared settingsToRust path.
   const saveSettingsToBackend = useCallback(async (next: typeof settings) => {
@@ -158,75 +121,17 @@ export function VpnSettings() {
   }, []);
 
   // Patch the store + persist the full object, then live-apply to an active
-  // session. The kill switch is a live flag push (set_killswitch_live); every
-  // other setting on this screen is tunnel-affecting, so it triggers a debounced
-  // fail-closed rebuild (reapply_vpn_settings). No-op when disconnected.
+  // session. Every setting left on this screen is tunnel-affecting, so each one
+  // schedules a debounced fail-closed rebuild (reapply_vpn_settings). No-op when
+  // disconnected — the persisted setting applies at the next connect.
   const persist = useCallback(
     async (patch: Partial<typeof settings>) => {
       const next = { ...useAppStore.getState().settings, ...patch };
       updateSettings(patch);
-      // AWAIT the persist before any live-apply: set_killswitch_live -> arm()
-      // re-reads killswitch_enabled from disk, so arming ON must not race the
-      // write (else it reads the stale value and silently doesn't arm).
       await saveSettingsToBackend(next);
-
-      if (useAppStore.getState().connectionState === 'connected') {
-        if ('killSwitchEnabled' in patch) {
-          invoke('set_killswitch_live', { enabled: !!patch.killSwitchEnabled }).catch(() => {});
-        } else {
-          scheduleReapply();
-        }
-      }
+      scheduleReapply();
     },
     [updateSettings, saveSettingsToBackend, scheduleReapply],
-  );
-
-  // ── DNS helpers (custom DNS expandable: primary / secondary) ──────────────
-  const dnsList = settings.customDns ?? [];
-  const customDnsEnabled = dnsList.length > 0;
-
-  // Re-validate the local inputs and persist only valid entries. An empty field
-  // is allowed (it clears that entry / falls back to the VPN server's DNS).
-  // Invalid entries are surfaced inline and are NEVER persisted, so a malformed
-  // or special-use address can't silently reach the tunnel config and cause a
-  // DNS failure or leak.
-  const setDns = useCallback(
-    (primary: string, secondary: string) => {
-      const p = primary.trim();
-      const s = secondary.trim();
-
-      const pCheck = p.length > 0 ? isValidDnsAddress(p) : { valid: true as const };
-      const sCheck = s.length > 0 ? isValidDnsAddress(s) : { valid: true as const };
-
-      setDnsErrors({
-        primary: pCheck.valid ? null : pCheck.error ?? 'Invalid DNS address',
-        secondary: sCheck.valid ? null : sCheck.error ?? 'Invalid DNS address',
-      });
-
-      // Persist only entries that are present AND valid, preserving order.
-      const next = [
-        p.length > 0 && pCheck.valid ? p : '',
-        s.length > 0 && sCheck.valid ? s : '',
-      ].filter((v) => v.length > 0);
-      persist({ customDns: next.length > 0 ? next : null });
-    },
-    [persist],
-  );
-
-  const onChangeDnsPrimary = useCallback(
-    (raw: string) => {
-      setDnsPrimaryInput(raw);
-      setDns(raw, dnsSecondaryInput);
-    },
-    [setDns, dnsSecondaryInput],
-  );
-
-  const onChangeDnsSecondary = useCallback(
-    (raw: string) => {
-      setDnsSecondaryInput(raw);
-      setDns(dnsPrimaryInput, raw);
-    },
-    [setDns, dnsPrimaryInput],
   );
 
   // ── WireGuard port selection ──────────────────────────────────────────────
@@ -274,26 +179,6 @@ export function VpnSettings() {
         {/* ── SECURITY ──────────────────────────────────────────────── */}
         <BirdoSectionHeader title="Security" />
 
-        <BirdoCard padding="0" className="overflow-visible">
-          {/* Kill switch defaults ON (the safe choice) but is user-toggleable.
-              The Rust connect path only arms the firewall block when this is on
-              (killswitch::arm reads the persisted setting), so turning it off
-              genuinely lets traffic through if the tunnel drops. */}
-          <BirdoToggleRow
-            title="Kill Switch"
-            leadingIcon={Shield}
-            leadingTint={status.green}
-            checked={settings.killSwitchEnabled}
-            onCheckedChange={(v) => {
-              // Enabling is immediate; disabling removes leak protection, so
-              // require an explicit confirmation first (mobile parity).
-              if (v) persist({ killSwitchEnabled: true });
-              else setShowKsConfirm(true);
-            }}
-          />
-        </BirdoCard>
-
-        <div className="h-2" />
         <BirdoCard padding="0">
           <BirdoToggleRow
             title="Stealth Mode · Premium"
@@ -317,17 +202,6 @@ export function VpnSettings() {
           )}
         </BirdoCard>
 
-        <div className="h-2" />
-        <BirdoCard padding="0">
-          <BirdoToggleRow
-            title="Quantum Protection"
-            leadingIcon={Lock}
-            leadingTint={brand.accent}
-            checked={settings.quantumProtection}
-            onCheckedChange={(v) => persist({ quantumProtection: v })}
-          />
-        </BirdoCard>
-
         {/* ── NETWORK ───────────────────────────────────────────────── */}
         <BirdoSectionHeader title="Network" className="mt-4" />
 
@@ -339,86 +213,6 @@ export function VpnSettings() {
             checked={settings.localNetworkSharing}
             onCheckedChange={(v) => persist({ localNetworkSharing: v })}
           />
-        </BirdoCard>
-
-        {/* ── DNS ───────────────────────────────────────────────────── */}
-        <BirdoSectionHeader title="DNS" className="mt-4" />
-
-        <BirdoCard padding="0">
-          <button
-            type="button"
-            onClick={() => setDnsExpanded((v) => !v)}
-            aria-expanded={dnsExpanded}
-            className="flex w-full items-center gap-3.5 rounded-birdo-md px-3.5 py-3 text-left transition-colors hover:bg-white/5"
-          >
-            <div
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
-              style={{ backgroundColor: white.w05 }}
-            >
-              <Globe size={18} color={brand.accent} aria-hidden />
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-[15px] font-medium text-white">Custom DNS Servers</div>
-              <div className="mt-0.5 truncate text-xs" style={{ color: white.w60 }}>
-                {customDnsEnabled
-                  ? `${dnsList.length} server${dnsList.length > 1 ? 's' : ''} configured`
-                  : 'Using VPN default DNS'}
-              </div>
-            </div>
-            <ChevronRight
-              size={20}
-              color={white.w40}
-              aria-hidden
-              className="shrink-0 transition-transform"
-              style={{ transform: dnsExpanded ? 'rotate(90deg)' : 'none' }}
-            />
-          </button>
-
-          <AnimatePresence initial={false}>
-            {dnsExpanded && (
-              <motion.div
-                className="overflow-hidden"
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
-              >
-                <div className="space-y-3 px-3.5 pb-3.5 pt-1">
-                  <div>
-                    <BirdoTextField
-                      label="Primary DNS"
-                      placeholder="e.g. 1.1.1.1"
-                      value={dnsPrimaryInput}
-                      onChange={onChangeDnsPrimary}
-                      error={!!dnsErrors.primary}
-                    />
-                    {dnsErrors.primary && (
-                      <p className="mt-1 pl-1 text-xs" style={{ color: status.red }}>
-                        {dnsErrors.primary}
-                      </p>
-                    )}
-                  </div>
-                  <div>
-                    <BirdoTextField
-                      label="Secondary DNS (optional)"
-                      placeholder="e.g. 1.0.0.1"
-                      value={dnsSecondaryInput}
-                      onChange={onChangeDnsSecondary}
-                      error={!!dnsErrors.secondary}
-                    />
-                    {dnsErrors.secondary && (
-                      <p className="mt-1 pl-1 text-xs" style={{ color: status.red }}>
-                        {dnsErrors.secondary}
-                      </p>
-                    )}
-                  </div>
-                  <p className="text-xs" style={{ color: white.w40 }}>
-                    Popular: 1.1.1.1 (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9).
-                  </p>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </BirdoCard>
 
         {/* ── WIREGUARD ─────────────────────────────────────────────── */}
@@ -587,92 +381,31 @@ export function VpnSettings() {
         </div>
 
         {/* ── FEATURES ──────────────────────────────────────────────── */}
-        <BirdoSectionHeader title="Features" className="mt-4" />
+        {/* WFP enforcement is Windows-only. Offering it on Linux/macOS let
+            users configure exceptions that silently did nothing. Presented
+            as "Kill Switch Exceptions", not "Split Tunneling": WFP permit
+            filters exempt an app from the kill-switch block — they cannot
+            route it outside the VPN (that needs a signed redirect callout
+            driver), so the old name claimed behaviour that didn't exist.
+            Port Forwarding used to sit beside it; it lives on the main
+            Settings page (VPN) now, which leaves this section Windows-only —
+            hence the gate around the header too, so other platforms don't get
+            a heading over an empty card. */}
+        {isWindowsPlatform() && (
+          <>
+            <BirdoSectionHeader title="Features" className="mt-4" />
 
-        <BirdoCard padding="0">
-          {/* WFP enforcement is Windows-only. Offering it on Linux/macOS let
-              users configure exceptions that silently did nothing. Presented
-              as "Kill Switch Exceptions", not "Split Tunneling": WFP permit
-              filters exempt an app from the kill-switch block — they cannot
-              route it outside the VPN (that needs a signed redirect callout
-              driver), so the old name claimed behaviour that didn't exist. */}
-          {isWindowsPlatform() && (
-            <BirdoNavRow
-              title="Kill Switch Exceptions"
-              leadingIcon={Split}
-              leadingTint={white.w60}
-              onClick={() => pushRoute('splitTunnel')}
-            />
-          )}
-          <BirdoNavRow
-            title="Port Forwarding"
-            leadingIcon={ArrowLeftRight}
-            leadingTint={status.blue}
-            onClick={() => pushRoute('portForward')}
-          />
-        </BirdoCard>
-      </div>
-
-      <AnimatePresence>
-        {showKsConfirm && (
-          <motion.div
-            className="absolute inset-0 z-50 flex items-center justify-center p-5"
-            style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
-            onClick={() => setShowKsConfirm(false)}
-          >
-            <motion.div
-              role="dialog"
-              aria-modal="true"
-              aria-label="Disable kill switch"
-              className="w-full max-w-[340px] overflow-hidden rounded-birdo-lg"
-              style={{
-                background: `linear-gradient(${surface.s3}, ${surface.s3}) padding-box, ${gradient.glassStroke} border-box`,
-                border: '1px solid transparent',
-              }}
-              initial={{ scale: 0.94, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.94, opacity: 0 }}
-              transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex flex-col gap-4 p-5">
-                <div className="flex items-center gap-2">
-                  <Shield size={20} color={status.red} aria-hidden />
-                  <h2 className="text-[16px] font-bold" style={{ color: '#FFFFFF' }}>
-                    Disable kill switch?
-                  </h2>
-                </div>
-                <p className="text-[13px]" style={{ color: white.w60 }}>
-                  Without the kill switch, your internet keeps flowing in the clear
-                  if the VPN drops — apps can leak your real IP. Leave it on unless
-                  you have a specific reason to turn it off.
-                </p>
-                <div className="flex gap-2.5">
-                  <BirdoButton
-                    text="Keep it on"
-                    variant="secondary"
-                    fullWidth
-                    onClick={() => setShowKsConfirm(false)}
-                  />
-                  <BirdoButton
-                    text="Turn off"
-                    variant="danger"
-                    fullWidth
-                    onClick={() => {
-                      setShowKsConfirm(false);
-                      persist({ killSwitchEnabled: false });
-                    }}
-                  />
-                </div>
-              </div>
-            </motion.div>
-          </motion.div>
+            <BirdoCard padding="0">
+              <BirdoNavRow
+                title="Kill Switch Exceptions"
+                leadingIcon={Split}
+                leadingTint={white.w60}
+                onClick={() => pushRoute('splitTunnel')}
+              />
+            </BirdoCard>
+          </>
         )}
-      </AnimatePresence>
+      </div>
     </div>
   );
 }

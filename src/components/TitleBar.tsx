@@ -41,7 +41,7 @@ export function TitleBar() {
           className="text-[11px] font-semibold tracking-wide"
           style={{ color: white.w80 }}
         >
-          Birdo VPN
+          BirdoVPN
         </span>
       </div>
       <div className="flex items-center gap-0.5">
