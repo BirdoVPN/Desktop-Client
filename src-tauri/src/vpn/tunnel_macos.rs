@@ -185,7 +185,7 @@ impl UtunTunnel {
         }
 
         // Snapshot current network config for restoration
-        let snapshot = capture_network_snapshot().await?;
+        let snapshot = capture_network_snapshot(&self.config.dns).await?;
         tracing::info!(
             "Captured network snapshot: service={}",
             snapshot.service_name
@@ -284,7 +284,27 @@ impl UtunTunnel {
             return Err(format!("Failed to block IPv6 leaks: {}", e));
         }
 
-        // Configure DNS
+        // Configure DNS.
+        //
+        // Persist what every service currently holds BEFORE repointing them: the
+        // snapshot captured at the top of start() lives in this process, and
+        // `panic = "abort"`, a SIGKILL or a power cut all skip stop() entirely,
+        // leaving every enabled service pointed at tunnel resolvers that no
+        // longer exist. Cleared by restore_dns (see vpn::dns_journal).
+        if let Some(snapshot) = self.network_snapshot.read().await.as_ref() {
+            // `all_dns` is empty exactly when `list_network_services()` failed —
+            // the same condition that sends configure_dns down its single-service
+            // fallback, where it repoints `get_primary_network_service()` alone.
+            // Recording only `all_dns` there would move DNS aside and journal
+            // nothing to put back, so the crash path would be blind on precisely
+            // the path the clean restore already handles (see its `else` arms).
+            let recorded: Vec<(String, Vec<String>)> = if snapshot.all_dns.is_empty() {
+                vec![(snapshot.service_name.clone(), snapshot.dns_servers.clone())]
+            } else {
+                snapshot.all_dns.clone()
+            };
+            crate::vpn::dns_journal::record_macos(&recorded, &self.config.dns);
+        }
         if let Err(e) = configure_dns(&self.config.dns).await {
             crate::commands::killswitch::ipv6_block_deactivate().await;
             close_fd_on_err(utun_fd);
@@ -1132,16 +1152,7 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
     // never appeared to touch.
     if !snapshot.all_dns.is_empty() {
         for (service, servers) in &snapshot.all_dns {
-            if servers.is_empty() {
-                // "empty" is networksetup's way of saying "go back to DHCP".
-                let _ = cmd("networksetup")
-                    .args(["-setdnsservers", service, "empty"])
-                    .output();
-            } else {
-                let mut args = vec!["-setdnsservers".to_string(), service.clone()];
-                args.extend(servers.iter().cloned());
-                let _ = cmd("networksetup").args(&args).output();
-            }
+            set_service_dns(service, servers);
         }
         tracing::info!(
             "Restored DNS on {} network services",
@@ -1162,6 +1173,64 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
     // Flush DNS cache
     let _ = cmd("dscacheutil").args(["-flushcache"]).output();
     let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
+
+    // The services carry their own resolvers again — the on-disk record has
+    // nothing left to describe.
+    crate::vpn::dns_journal::clear();
+}
+
+/// Point one service's resolvers at `servers`, or hand it back to DHCP when the
+/// list is empty.
+///
+/// One implementation, shared by the clean restore and the journal restore. The
+/// "empty means DHCP" idiom is networksetup-specific, and a second hand-written
+/// copy of it is the estate's recurring bug shape.
+fn set_service_dns(service: &str, servers: &[String]) {
+    if servers.is_empty() {
+        // "empty" is networksetup's way of saying "go back to DHCP".
+        let _ = cmd("networksetup")
+            .args(["-setdnsservers", service, "empty"])
+            .output();
+        return;
+    }
+    let mut args = vec!["-setdnsservers".to_string(), service.to_string()];
+    args.extend(servers.iter().cloned());
+    let _ = cmd("networksetup").args(&args).output();
+}
+
+/// Put back the resolvers on services a previous session repointed and never
+/// restored, for the panic hook and the startup reconcile.
+///
+/// A service is reverted only while it still holds EXACTLY the tunnel resolvers
+/// that session installed. That is what separates "we set this" from "the user
+/// has since fixed their DNS by hand", and it is what makes this safe to run
+/// from `setup()` against an arbitrarily old record. It also means a service
+/// that was never reached (an inactive adapter or a Thunderbolt bridge —
+/// configure_dns tolerates partial failure) is left alone rather than reset.
+pub(super) fn restore_services_still_on_tunnel_dns(
+    services: &[(String, Vec<String>)],
+    tunnel_dns: &[String],
+) -> bool {
+    let mut restored = 0usize;
+    for (service, original) in services {
+        if dns_servers_for(service).as_slice() != tunnel_dns {
+            continue;
+        }
+        set_service_dns(service, original);
+        restored += 1;
+    }
+    if restored == 0 {
+        return false;
+    }
+    let _ = cmd("dscacheutil").args(["-flushcache"]).output();
+    let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
+    tracing::warn!(
+        "{} of {} network services were left on tunnel resolvers by a previous session — restored \
+         their pre-connect DNS",
+        restored,
+        services.len()
+    );
+    true
 }
 
 /// Remove VPN-specific routes.
@@ -1230,7 +1299,11 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String], local_network_
 }
 
 /// Capture current network configuration for later restoration.
-async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
+///
+/// `tunnel_dns` is what `configure_dns` is about to install; it is needed here to
+/// recognise — and refuse — a baseline left behind by a previous session that did
+/// not restore DNS.
+async fn capture_network_snapshot(tunnel_dns: &[String]) -> Result<NetworkSnapshot, String> {
     let service = get_primary_network_service()?;
 
     // Get current DNS servers
@@ -1252,10 +1325,33 @@ async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
     // Snapshot every enabled service BEFORE anything is changed, so each can be
     // put back exactly. Captured even for services that already use DHCP — an
     // empty vec is meaningful here and restores as "empty".
+    //
+    // A previous session that exited dirty is reconciled at startup and by the
+    // panic hook (vpn::dns_journal), so by the time a connect reaches here the
+    // services hold the user's own configuration again. If that reconcile could
+    // not run — the record was lost, or the write failed — the live state may
+    // still be a dead tunnel's resolvers, and capturing THAT as "the original"
+    // latches it forever: every later disconnect faithfully restores resolvers
+    // belonging to a tunnel that no longer exists, and every new connect
+    // re-captures the same poisoned baseline, so the damage never self-heals.
+    // Refuse the resolvers we are about to install as a baseline and say so — a
+    // filtered service IS the signal that a previous session did not shut down
+    // cleanly. This mirrors the marker check tunnel_linux.rs's capture already
+    // performs; recording DHCP instead is the same fallback restore_dns uses and
+    // always yields working DNS.
     let all_dns: Vec<(String, Vec<String>)> = list_network_services()
         .into_iter()
         .map(|s| {
-            let servers = dns_servers_for(&s);
+            let mut servers = dns_servers_for(&s);
+            if !servers.is_empty() && servers.as_slice() == tunnel_dns {
+                tracing::warn!(
+                    "'{}' still points at the tunnel resolvers at capture time — a previous \
+                     session exited without restoring DNS. Recording it as DHCP rather than \
+                     making those resolvers permanent.",
+                    s
+                );
+                servers = Vec::new();
+            }
             (s, servers)
         })
         .collect();

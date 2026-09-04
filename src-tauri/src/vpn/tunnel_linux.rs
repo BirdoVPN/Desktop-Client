@@ -1267,6 +1267,22 @@ async fn configure_dns(
         // SYMLINKED resolv.conf is replaced rather than followed — following it
         // would rewrite whatever it points at, including a /run file owned by
         // another daemon.
+        //
+        // Persist the bytes we are about to overwrite FIRST. The in-memory
+        // NetworkSnapshot dies with the process, and `panic = "abort"`, a
+        // SIGKILL or a power cut all skip restore_dns entirely — the file then
+        // keeps pointing at tunnel resolvers that no longer exist. Recorded here
+        // rather than at the caller so the record can never lag the write it
+        // describes; if the rename below fails the file is unchanged, and the
+        // reconcile's marker check then finds a file that is not ours and does
+        // nothing. The marker filter mirrors capture_network_snapshot: a
+        // resolv.conf we wrote is never a valid baseline (see the note there).
+        crate::vpn::dns_journal::record_linux(
+            std::fs::read_to_string("/etc/resolv.conf")
+                .ok()
+                .filter(|c| !c.starts_with(RESOLV_CONF_MARKER)),
+            uses_resolved,
+        );
         let tmp = "/etc/.resolv.conf.birdo";
         match std::fs::write(tmp, &contents).and_then(|_| std::fs::rename(tmp, "/etc/resolv.conf"))
         {
@@ -1367,6 +1383,10 @@ fn restore_dns(snapshot: &NetworkSnapshot) {
     // backup here would be wrong, which the pinned flag makes impossible:
     // configure_dns never pins over the stub.
     if !snapshot.resolv_conf_pinned {
+        // Nothing of ours is in the file — but a pin that FAILED still leaves a
+        // journal entry behind (record_linux runs before the write), so drop it
+        // here too. A record must never outlive the state it describes.
+        crate::vpn::dns_journal::clear();
         return;
     }
     if let Some(ref backup) = snapshot.resolv_conf_backup {
@@ -1388,6 +1408,41 @@ fn restore_dns(snapshot: &NetworkSnapshot) {
         let _ = std::fs::write("/etc/resolv.conf", contents);
         tracing::info!("Restored /etc/resolv.conf from snapshot");
     }
+
+    // The file is back — the on-disk record has nothing left to describe.
+    crate::vpn::dns_journal::clear();
+}
+
+/// Put back an /etc/resolv.conf a previous session pinned and never restored,
+/// for the panic hook and the startup reconcile.
+///
+/// Guarded on the marker, exactly like the two unwind paths above: a file that is
+/// not ours has been rewritten since — by the user, by NetworkManager, by
+/// resolvconf — and is not ours to overwrite. That guard is what makes this safe
+/// to run from `setup()` against an arbitrarily old record.
+///
+/// Restores through `restore_dns` rather than repeating its logic, so the crash
+/// path and the clean path cannot drift.
+pub(super) fn restore_resolv_conf_if_ours(
+    resolv_conf_backup: Option<String>,
+    uses_systemd_resolved: bool,
+) -> bool {
+    if !resolv_conf_is_ours() {
+        return false;
+    }
+    tracing::warn!(
+        "/etc/resolv.conf still carries the Birdo marker — a previous session exited without \
+         restoring DNS. Putting the pre-connect file back."
+    );
+    restore_dns(&NetworkSnapshot {
+        dns_servers: Vec::new(),
+        default_gateway: None,
+        default_interface: None,
+        uses_systemd_resolved,
+        resolv_conf_backup,
+        resolv_conf_pinned: true,
+    });
+    true
 }
 
 /// Remove VPN-specific routes.

@@ -379,6 +379,20 @@ fn main() {
                 crate::vpn::firewall_linux::emergency_cleanup();
             }
 
+            // The same reconcile, for DNS. The kernel-state arms above cannot
+            // cover it: DNS is moved aside with netsh/networksetup/resolv.conf,
+            // and the snapshot that says what to put back died with the process
+            // that made the change. A SIGKILL, an OOM kill or a power cut never
+            // reaches the panic hook at all, so this call is the only thing that
+            // can heal them. Safe unconditionally for the same reason as the
+            // arms above: no tunnel can be up this early, so a journal on disk
+            // means exactly one thing — the previous session did not restore
+            // DNS. Each platform still re-checks that the live state is the one
+            // it left before touching anything.
+            if crate::vpn::dns_journal::reconcile() {
+                tracing::warn!("Restored DNS left moved aside by a previous session");
+            }
+
             // Wire up AutoReconnectService with references to managed state.
             // BirdoApi and VpnManager use Arc<RwLock<..>> internally, so Clone
             // shares the same underlying state — exactly what we need.
@@ -805,7 +819,22 @@ fn cleanup_on_crash() {
         }
         // WFP engine handle will be closed automatically when the process exits,
         // triggering removal of all dynamic-session filters.
-        error!("Emergency cleanup completed (WFP dynamic session auto-cleans filters)");
+
+        // DNS is the half WFP does NOT clean up, and this arm restored none of
+        // it. configure_dns parks EVERY connected physical adapter on `static
+        // none` to suppress the SMHNR leak, and the Wintun adapter — the only
+        // thing still holding resolvers — dies with the process, so a panic left
+        // the machine with no resolvers at all. Permanently: the next connect
+        // snapshots the parked state as the user's own configuration, and every
+        // later disconnect then correctly refuses to touch it. The restart path
+        // already got this treatment (manager.rs restore_dns_blocking); this is
+        // its crash twin, driven off the on-disk journal because the in-memory
+        // snapshot is unreachable from here.
+        let dns_restored = vpn::dns_journal::reconcile();
+        error!(
+            "Emergency cleanup completed (WFP dynamic session auto-cleans filters, DNS restored: {})",
+            dns_restored
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -838,15 +867,26 @@ fn cleanup_on_crash() {
             .args(["-a", "com.birdo.vpn.killswitch", "-F", "all"])
             .output();
 
-        // Restore DNS to DHCP (best effort)
-        let _ = std::process::Command::new("networksetup")
-            .args(["-setdnsservers", "Wi-Fi", "empty"])
-            .output();
+        // Restore DNS on every service configure_dns actually touched.
+        //
+        // This was one hard-coded `networksetup -setdnsservers Wi-Fi empty`,
+        // while configure_dns points EVERY enabled service at the tunnel
+        // resolvers (that multi-service leak is the reason it does so) and the
+        // clean restore already iterates snapshot.all_dns. A Mac on Ethernet, on
+        // a dock, with a second Wi-Fi service, or with Wi-Fi renamed was left
+        // pointing at a resolver that no longer exists — and `empty` silently
+        // discarded any static DNS the user had deliberately set on Wi-Fi. The
+        // journal puts each service back to exactly what it had, and only while
+        // it still holds the resolvers we installed.
+        let dns_restored = vpn::dns_journal::reconcile();
         let _ = std::process::Command::new("dscacheutil")
             .args(["-flushcache"])
             .output();
 
-        error!("Emergency cleanup completed (pf rules flushed, DNS restored)");
+        error!(
+            "Emergency cleanup completed (pf rules flushed, DNS restored: {})",
+            dns_restored
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -860,12 +900,24 @@ fn cleanup_on_crash() {
         // IPv6 until the next successful connect/disconnect cycle.
         vpn::tunnel_linux::remove_ipv6_leak_block();
 
-        // Restore DNS: revert systemd-resolved or restore resolv.conf
+        // Restore DNS. `resolvectl revert` is only half of it, despite the old
+        // comment's "or": configure_dns OVERWRITES /etc/resolv.conf on every
+        // host where the file is not the systemd stub (see
+        // resolv_conf_uses_resolved), which is most of them — Ubuntu images with
+        // a replaced resolv.conf, Debian resolvconf, NetworkManager dns=default,
+        // WSL, containers. Reverting only the link left the file pointing at
+        // tunnel resolvers that die with the process. The journal restores the
+        // exact pre-connect bytes, and only while the file still carries our
+        // marker.
         let _ = std::process::Command::new("resolvectl")
             .args(["revert", "birdo0"])
             .output();
+        let dns_restored = vpn::dns_journal::reconcile();
 
-        error!("Emergency cleanup completed (iptables rules flushed, DNS reverted)");
+        error!(
+            "Emergency cleanup completed (iptables rules flushed, DNS restored: {})",
+            dns_restored
+        );
     }
 }
 

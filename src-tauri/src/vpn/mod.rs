@@ -206,6 +206,239 @@ fn ip_in_ranges(ip: u128, ranges: &[(u128, u128)]) -> bool {
         .any(|(start, last)| ip >= *start && ip <= *last)
 }
 
+// ──────────────────────────────────────────────────────────────
+// Crash-durable DNS restore journal
+// ──────────────────────────────────────────────────────────────
+
+/// What a live tunnel moved aside, persisted so an abnormal exit can be undone.
+///
+/// WHY THIS EXISTS. `Cargo.toml` sets `panic = "abort"`, so `cleanup_on_crash()`
+/// is the last code a panic runs — and a SIGKILL, an OOM kill or a power cut do
+/// not reach even that. Every platform's `configure_dns` moves the host's
+/// resolvers aside: Windows parks EVERY connected physical adapter on `static
+/// none` to suppress the SMHNR leak, macOS repoints EVERY enabled service at the
+/// tunnel resolvers, Linux pins /etc/resolv.conf. The snapshot that undoes all
+/// three lives in the process that died, so a dirty exit leaves the machine with
+/// no working DNS and nothing on it that knows what the configuration used to be.
+///
+/// Windows additionally cannot self-heal, which is the half that makes the damage
+/// permanent: after a crash the next connect snapshots the PARKED state (`static`,
+/// no servers) as if it were the user's own configuration, and
+/// `restore_adapter_dns` deliberately no-ops on exactly that shape — parking it
+/// was a no-op, and forcing DHCP there is what used to reconfigure VirtualBox and
+/// Hyper-V adapters on every disconnect. So every later disconnect correctly
+/// refuses to undo it. Linux already refuses its own marker as a baseline for the
+/// same reason (see `capture_network_snapshot` in tunnel_linux.rs); this record
+/// gives Windows and macOS the same protection.
+///
+/// The file is written BEFORE the first mutation and deleted by the restore
+/// paths, so its presence means exactly one thing: a previous session did not
+/// restore DNS. Restoring is still guarded per platform by "is the live state the
+/// one we left?", so a machine the user has since fixed by hand is never
+/// rewritten.
+pub mod dns_journal {
+    use serde::{Deserialize, Serialize};
+
+    /// Beside the log file, under the same `<data_dir>/BirdoVPN` main.rs's log
+    /// layer creates — deliberately the same launch context as the log, so a
+    /// client started with `sudo` reads back the file that same client wrote.
+    const JOURNAL_FILE: &str = "dns-restore.json";
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct DnsJournal {
+        /// `std::env::consts::OS` of the writer. A record from another platform
+        /// (a synced home directory) describes commands this host cannot run.
+        #[serde(default)]
+        os: String,
+
+        /// Windows: every physical adapter `configure_dns` parked, with the
+        /// resolvers it had. Restored through the same helper the clean
+        /// disconnect uses, so the two cannot drift.
+        #[cfg(target_os = "windows")]
+        #[serde(default)]
+        adapters: Vec<super::tunnel::AdapterDnsSnapshot>,
+
+        /// macOS: every enabled service `configure_dns` repointed, with the
+        /// resolvers it had (empty = networksetup's "empty", i.e. back to DHCP).
+        #[cfg(target_os = "macos")]
+        #[serde(default)]
+        services: Vec<(String, Vec<String>)>,
+
+        /// macOS: the tunnel resolvers we installed. A service is reverted only
+        /// while it still points at these — that is what separates "we set this"
+        /// from "the user has since fixed their DNS by hand".
+        #[cfg(target_os = "macos")]
+        #[serde(default)]
+        tunnel_dns: Vec<String>,
+
+        /// Linux: the pre-connect bytes of /etc/resolv.conf. `None` when the file
+        /// was unreadable, or when it already carried our marker — a file we
+        /// wrote is never a valid baseline.
+        #[cfg(target_os = "linux")]
+        #[serde(default)]
+        resolv_conf_backup: Option<String>,
+
+        /// Linux: was the tun link also configured through resolvectl?
+        #[cfg(target_os = "linux")]
+        #[serde(default)]
+        uses_systemd_resolved: bool,
+    }
+
+    fn path() -> Option<std::path::PathBuf> {
+        let mut dir = dirs::data_dir()?;
+        dir.push("BirdoVPN");
+        std::fs::create_dir_all(&dir).ok()?;
+        dir.push(JOURNAL_FILE);
+        Some(dir)
+    }
+
+    fn write(journal: &DnsJournal) {
+        let Some(path) = path() else {
+            tracing::warn!(
+                "No data directory — DNS could not be made restorable after an abnormal exit"
+            );
+            return;
+        };
+        let json = match serde_json::to_vec_pretty(journal) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!("Could not serialise the DNS journal: {}", e);
+                return;
+            }
+        };
+        // The record names network services and resolvers — which machine was on
+        // which network. Same sensitivity as birdo.log, so the same owner-only
+        // mode on multi-user Unix hosts (Windows relies on the %APPDATA% ACL).
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let result = opts.open(&path).and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(&json)
+        });
+        match result {
+            Ok(()) => tracing::debug!("DNS journal written"),
+            Err(e) => tracing::warn!(
+                "Could not write the DNS journal ({}) — an abnormal exit will leave this host \
+                 without resolvers",
+                e
+            ),
+        }
+    }
+
+    fn read() -> Option<DnsJournal> {
+        let path = path()?;
+        let bytes = std::fs::read(&path).ok()?;
+        match serde_json::from_slice::<DnsJournal>(&bytes) {
+            Ok(journal) if journal.os == std::env::consts::OS => Some(journal),
+            Ok(journal) => {
+                tracing::warn!(
+                    "Ignoring a DNS journal written on {} — this host is {}",
+                    journal.os,
+                    std::env::consts::OS
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Unreadable DNS journal ({}) — discarding it", e);
+                let _ = std::fs::remove_file(&path);
+                None
+            }
+        }
+    }
+
+    /// Drop the record. Called by the restore paths once the resolvers are back,
+    /// so a record can never outlive the state it describes.
+    pub(super) fn clear() {
+        let Some(path) = path() else {
+            return;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::debug!("DNS journal cleared"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                "Could not clear the DNS journal ({}) — the next startup will re-check the live \
+                 state and find nothing to do",
+                e
+            ),
+        }
+    }
+
+    /// Record the adapters `configure_dns` is about to park.
+    #[cfg(target_os = "windows")]
+    pub(super) fn record_windows(adapters: &[super::tunnel::AdapterDnsSnapshot]) {
+        write(&DnsJournal {
+            os: std::env::consts::OS.to_string(),
+            adapters: adapters.to_vec(),
+        });
+    }
+
+    /// Record the services `configure_dns` is about to repoint, and the tunnel
+    /// resolvers it is about to point them at.
+    #[cfg(target_os = "macos")]
+    pub(super) fn record_macos(services: &[(String, Vec<String>)], tunnel_dns: &[String]) {
+        write(&DnsJournal {
+            os: std::env::consts::OS.to_string(),
+            services: services.to_vec(),
+            tunnel_dns: tunnel_dns.to_vec(),
+        });
+    }
+
+    /// Record the /etc/resolv.conf `configure_dns` is about to overwrite.
+    #[cfg(target_os = "linux")]
+    pub(super) fn record_linux(resolv_conf_backup: Option<String>, uses_systemd_resolved: bool) {
+        write(&DnsJournal {
+            os: std::env::consts::OS.to_string(),
+            resolv_conf_backup,
+            uses_systemd_resolved,
+        });
+    }
+
+    /// Put back whatever a previous session left moved aside.
+    ///
+    /// Synchronous, lock-free and async-free by construction, so it is callable
+    /// from the panic hook (`panic = "abort"` — nothing else runs) and from
+    /// `setup()`, where no tunnel can be up yet and a record on disk therefore
+    /// means exactly one thing. The startup call is the ONLY thing that can heal
+    /// a SIGKILL, an OOM kill or a power cut, none of which reach the hook.
+    ///
+    /// Each platform re-checks that the live state is still the state it left
+    /// before touching anything; the record is dropped either way, so a machine
+    /// the user has already fixed by hand is examined once and then left alone.
+    ///
+    /// Returns whether anything was actually restored.
+    pub fn reconcile() -> bool {
+        let Some(journal) = read() else {
+            return false;
+        };
+
+        #[cfg(target_os = "windows")]
+        let restored = super::tunnel::WintunTunnel::restore_parked_adapters(&journal.adapters);
+        #[cfg(target_os = "macos")]
+        let restored = super::tunnel_macos::restore_services_still_on_tunnel_dns(
+            &journal.services,
+            &journal.tunnel_dns,
+        );
+        #[cfg(target_os = "linux")]
+        let restored = super::tunnel_linux::restore_resolv_conf_if_ours(
+            journal.resolv_conf_backup,
+            journal.uses_systemd_resolved,
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        let restored = {
+            let _ = &journal;
+            false
+        };
+
+        clear();
+        restored
+    }
+}
+
 #[cfg(test)]
 mod scope_tests {
     use super::validate_tunnel_scope;
