@@ -363,7 +363,12 @@ fn is_link_local_v6(addr: &str) -> bool {
 
 /// H-4 FIX: Stores original DNS configuration for an adapter, enabling
 /// precise restoration on disconnect instead of blindly setting DHCP.
-#[derive(Debug, Clone)]
+///
+/// Serialisable because the same record is ALSO written to disk (see
+/// `vpn::dns_journal`): the in-memory copy dies with the process, and after a
+/// crash nothing can tell a parked adapter from one the user configured
+/// `static`-with-no-servers themselves.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct AdapterDnsSnapshot {
     pub(super) adapter_name: String,
     /// Was IPv4 DNS sourced from DHCP before we touched it?
@@ -1397,6 +1402,15 @@ impl WintunTunnel {
                 snapshots.push(snap);
             }
         }
+
+        // Persist the snapshot BEFORE the first netsh mutation below, for the
+        // same reason `dns_modified` is set there: everything past this point
+        // can die without ever running a restore. `panic = "abort"` makes the
+        // panic hook the last code that runs, and a SIGKILL or a power cut does
+        // not reach even that — the in-memory copy goes with the process, and a
+        // parked adapter cannot be recognised as ours afterwards (see
+        // vpn::dns_journal). Cleared by restore_physical_adapters_dns.
+        crate::vpn::dns_journal::record_windows(&snapshots);
         *self.dns_snapshots.write().await = snapshots;
         tracing::debug!(
             "Captured DNS snapshots for {} adapters",
@@ -1750,7 +1764,72 @@ impl WintunTunnel {
                     v6_static
                 );
             }
+
+            // The adapters carry resolvers again, so the on-disk record has
+            // nothing left to describe. Cleared HERE, in the one helper every
+            // restore path funnels through (restore_dns, restore_dns_blocking
+            // and the Drop unwind), so no path can forget it. Deliberately NOT
+            // cleared in the empty-snapshot branch above: there we knowingly did
+            // nothing, and the record is then the only thing that still knows
+            // what to put back.
+            crate::vpn::dns_journal::clear();
         }
+    }
+
+    /// Put back the resolvers on adapters a previous session PARKED and never
+    /// un-parked — the crash twin of `restore_dns_blocking`.
+    ///
+    /// Driven off the on-disk journal, because after a crash there is no
+    /// in-memory snapshot left and no later connect can tell the parked state
+    /// from a user's own `static`-with-no-servers configuration:
+    /// `restore_adapter_dns` deliberately leaves that shape alone, which is
+    /// exactly what makes the damage permanent (see vpn::dns_journal).
+    ///
+    /// Every adapter is re-checked against the LIVE state first. `configure_dns`
+    /// leaves a parked adapter `static` with no servers on both families, so an
+    /// adapter that no longer looks like that has been reconfigured since — by
+    /// the user fixing DNS by hand, by another VPN, by a driver reinstall — and
+    /// is not ours to rewrite. That check is what makes this safe to run from
+    /// `setup()` against an arbitrarily old record. netsh failing to answer
+    /// counts as "not ours": doing nothing is the safe way to be wrong.
+    ///
+    /// The un-parking itself goes through the same helper as the clean
+    /// disconnect, so the two can never drift.
+    pub(super) fn restore_parked_adapters(snapshots: &[AdapterDnsSnapshot]) -> bool {
+        let still_parked: Vec<AdapterDnsSnapshot> = snapshots
+            .iter()
+            .filter(
+                |snap| match Self::snapshot_adapter_dns(&snap.adapter_name) {
+                    Some(live) => {
+                        let parked = !live.v4_was_dhcp
+                            && live.dns_servers.is_empty()
+                            && !live.v6_was_dhcp
+                            && live.dns_servers_v6.is_empty();
+                        if !parked {
+                            tracing::info!(
+                                "{} carries resolvers again — leaving it alone",
+                                snap.adapter_name
+                            );
+                        }
+                        parked
+                    }
+                    None => false,
+                },
+            )
+            .cloned()
+            .collect();
+
+        if still_parked.is_empty() {
+            return false;
+        }
+        tracing::warn!(
+            "{} adapter(s) left parked on `static none` by a previous session — restoring their \
+             pre-connect resolvers",
+            still_parked.len()
+        );
+        Self::restore_physical_adapters_dns(&still_parked);
+        let _ = cmd("ipconfig").args(["/flushdns"]).output();
+        true
     }
 
     /// Restore one address family's resolvers on an adapter.
