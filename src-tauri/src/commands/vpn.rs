@@ -1058,6 +1058,23 @@ pub struct VpnStatus {
     pub stealth_active: bool,
     pub quantum_active: bool,
     pub pq_mode: crate::vpn::birdo_pq::PqMode,
+
+    /// Physical adapters whose DNS this session could not verifiably suppress
+    /// or could not verifiably put back, one human-readable line each.
+    ///
+    /// Empty on every platform but Windows, and empty on Windows whenever there
+    /// is nothing wrong. It is populated from the machine-state owner's own
+    /// record of read-backs that did not match, so it describes work that was
+    /// LOOKED AT — which is the entire point. An adapter that keeps its ISP
+    /// resolvers while the tunnel is up leaks DNS with the UI reading Connected,
+    /// and one that could not be restored leaves the machine without resolvers
+    /// after disconnect. Neither is visible anywhere else, and rendering a
+    /// Connected badge over either is rendering reassurance from missing data.
+    ///
+    /// Excludes adapters merely recorded-but-absent (unplugged): those are
+    /// retained in the record so they can be restored on re-attach, but there is
+    /// no fault to report and nothing the user could do about one.
+    pub dns_degraded: Vec<String>,
 }
 
 /// Get current VPN connection status
@@ -1094,6 +1111,10 @@ pub async fn get_vpn_status(
         quantum_active: crate::vpn::birdo_pq::current_mode()
             == crate::vpn::birdo_pq::PqMode::Bilateral,
         pq_mode: crate::vpn::birdo_pq::current_mode(),
+        #[cfg(target_os = "windows")]
+        dns_degraded: crate::vpn::win_machine_state::degradation_report(),
+        #[cfg(not(target_os = "windows"))]
+        dns_degraded: Vec::new(),
     })
 }
 

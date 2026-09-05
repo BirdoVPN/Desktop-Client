@@ -1,165 +1,71 @@
-//! DNS management for WintunTunnel
+//! DNS reads for the Windows tunnel.
 //!
-//! Extracted from tunnel.rs — handles DNS configuration, snapshot/restore,
-//! and non-VPN adapter enumeration.
+//! One job: turn `netsh interface <family> show dns <adapter>` into an origin,
+//! or into an ERROR. Enumeration, parking, un-parking and the durable record all
+//! live in `win_machine_state`, which owns them across tunnel lifetimes.
 
 use std::process::Command;
-
-use super::tunnel::{AdapterDnsSnapshot, WintunTunnel};
 
 /// Hidden command helper
 fn cmd(program: &str) -> Command {
     crate::utils::hidden_cmd(program)
 }
 
-/// SEC-C4 FIX: Encode PowerShell script as Base64 UTF-16LE
-fn base64_encode_utf16le(script: &str) -> String {
-    use base64::Engine;
-    let utf16: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
-    base64::engine::general_purpose::STANDARD.encode(&utf16)
-}
+/// Read one address family's DNS origin for an adapter.
+///
+/// `family` is the netsh read context: `"ipv4"` or `"ipv6"`. Returns
+/// `(was_dhcp, statically_configured_servers)`.
+///
+/// A FAILED READ IS AN ERROR, NOT A CONFIGURATION. This function used to be a
+/// pair of helpers that matched only `Ok(output) => output` and never looked at
+/// `status.success()`. A netsh that runs and fails prints nothing, and
+/// `parse_dns_config_v4("")` yields exactly `(false, [])` — indistinguishable
+/// from a genuinely static-with-no-servers adapter, which is the one shape the
+/// un-park deliberately refuses to act on. So the process manufactured its own
+/// unrecoverable record, with no failure visible anywhere (issue #102). The
+/// caller must now decide what to do about a failure, and its decision is: never
+/// mutate what you could not read.
+///
+/// Empty output is treated as a failure for the same reason: netsh always prints
+/// at least a `Configuration for interface ...` header for an adapter it can
+/// address, so nothing at all means we did not read the adapter.
+pub(super) fn read_dns_family(
+    adapter_name: &str,
+    family: &str,
+) -> Result<(bool, Vec<String>), String> {
+    let output = cmd("netsh")
+        .args(["interface", family, "show", "dns", adapter_name])
+        .output()
+        .map_err(|e| {
+            format!(
+                "netsh interface {} show dns could not run for '{}': {}",
+                family, adapter_name, e
+            )
+        })?;
 
-impl WintunTunnel {
-    /// List connected non-VPN adapter names.
-    ///
-    /// PERF: parse `netsh interface ipv4 show interfaces` instead of PowerShell
-    /// `Get-NetAdapter` — the PowerShell cold-start cost ~9s on AV-heavy
-    /// machines and was the single slowest step of a connect. netsh is ~50ms.
-    /// Columns are: Idx  Met  MTU  State  Name — Name is everything from the 5th
-    /// token on, so multi-word names like "WiFi 2" are preserved.
-    pub(super) fn get_non_vpn_adapters() -> Vec<String> {
-        let parsed: Vec<String> = match cmd("netsh")
-            .args(["interface", "ipv4", "show", "interfaces"])
-            .output()
-        {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout
-                    .lines()
-                    .filter_map(|line| {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        // Data rows start with a numeric Idx and have >= 5 cols.
-                        if parts.len() < 5 || parts[0].parse::<u32>().is_err() {
-                            return None;
-                        }
-                        // State is col 4 ("connected"/"disconnected"); name is the rest.
-                        if !parts[3].eq_ignore_ascii_case("connected") {
-                            return None;
-                        }
-                        let name = parts[4..].join(" ");
-                        if name.eq_ignore_ascii_case(super::tunnel::ADAPTER_NAME)
-                            || name.contains("Loopback")
-                        {
-                            None
-                        } else {
-                            Some(name)
-                        }
-                    })
-                    .collect()
-            }
-            Err(_) => Vec::new(),
-        };
-        if !parsed.is_empty() {
-            return parsed;
-        }
-
-        // Fallback: PowerShell Get-NetAdapter (only if netsh parsing found none).
-        let ps_script = format!(
-            "Get-NetAdapter -Physical | Where-Object {{ $_.Name -ne '{}' -and $_.Status -eq 'Up' }} | Select-Object -ExpandProperty Name",
-            super::tunnel::ADAPTER_NAME
-        );
-        let encoded = base64_encode_utf16le(&ps_script);
-        match cmd("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
-            .output()
-        {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect(),
-            _ => Vec::new(),
-        }
+    if !output.status.success() {
+        return Err(format!(
+            "netsh interface {} show dns '{}' exited {:?}: {}",
+            family,
+            adapter_name,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
 
-    /// Capture current DNS configuration for an adapter before modification.
-    pub(super) fn snapshot_adapter_dns(adapter_name: &str) -> Option<AdapterDnsSnapshot> {
-        let output = match cmd("netsh")
-            .args(["interface", "ipv4", "show", "dns", adapter_name])
-            .output()
-        {
-            Ok(output) => output,
-            Err(e) => {
-                // Returning None here causes the caller to fall back to DHCP for
-                // this adapter on restore, silently dropping any static DNS the
-                // user had configured. Surface the failure so incomplete DNS
-                // restoration is debuggable.
-                tracing::warn!(
-                    "snapshot_adapter_dns: netsh failed for adapter '{}': {} — DNS for this adapter may not be restored",
-                    adapter_name,
-                    e
-                );
-                return None;
-            }
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        let (v4_was_dhcp, servers) = parse_dns_config_v4(&stdout);
-
-        if servers.is_empty() {
-            // Not fatal — an adapter genuinely on DHCP has no static servers — but
-            // it is the signature of the parsing bug above, so make it visible.
-            tracing::debug!(
-                "snapshot_adapter_dns: adapter '{}' yielded no IPv4 DNS servers",
-                adapter_name
-            );
-        }
-
-        let (v6_was_dhcp, dns_servers_v6) = Self::snapshot_adapter_dns_v6(adapter_name);
-
-        Some(AdapterDnsSnapshot {
-            adapter_name: adapter_name.to_string(),
-            dns_servers: servers,
-            dns_servers_v6,
-            v4_was_dhcp,
-            v6_was_dhcp,
-        })
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Err(format!(
+            "netsh interface {} show dns '{}' printed nothing",
+            family, adapter_name
+        ));
     }
 
-    /// Capture an adapter's IPv6 resolvers before we disable them.
-    ///
-    /// Separate from the IPv4 snapshot because netsh's `ipv4`/`ipv6` contexts hold
-    /// separate resolver lists — the IPv6 one (usually a link-local from
-    /// RA/RDNSS) was previously neither disabled nor restored, so SMHNR kept
-    /// querying it on the physical NIC.
-    ///
-    /// Any token on the line may be the address (netsh prints the first server on
-    /// the same line as the label and the rest on continuation lines), so match on
-    /// parseability rather than position. The zone suffix on a link-local
-    /// (`fe80::1%13`) is preserved: it is part of the address netsh accepts back.
-    fn snapshot_adapter_dns_v6(adapter_name: &str) -> (bool, Vec<String>) {
-        let output = match cmd("netsh")
-            .args(["interface", "ipv6", "show", "dns", adapter_name])
-            .output()
-        {
-            Ok(output) => output,
-            Err(e) => {
-                tracing::warn!(
-                    "snapshot_adapter_dns_v6: netsh failed for adapter '{}': {} — IPv6 DNS for this adapter may not be restored",
-                    adapter_name,
-                    e
-                );
-                // Unknown origin. `false` keeps us on the conservative branch:
-                // leave the adapter alone rather than force it to DHCP.
-                return (false, Vec::new());
-            }
-        };
-
-        parse_dns_config_v6(&String::from_utf8_lossy(&output.stdout))
-    }
+    Ok(if family.eq_ignore_ascii_case("ipv6") {
+        parse_dns_config_v6(&stdout)
+    } else {
+        parse_dns_config_v4(&stdout)
+    })
 }
 
 /// Extract the STATICALLY configured resolvers from `netsh interface <family>
@@ -292,8 +198,8 @@ Configuration for interface "Ethernet 2"
 
     // Captured from `netsh interface ipv4 show dns` on a stock Windows 11 box
     // with NO VPN running. VirtualBox Host-Only and the Hyper-V/WSL vSwitch were
-    // both Up and both static-with-no-servers, so get_non_vpn_adapters() returns
-    // them and the old "empty means DHCP" rule reconfigured them on disconnect.
+    // both Up and both static-with-no-servers, so the enumeration returns them
+    // and the old "empty means DHCP" rule reconfigured them on disconnect.
     const STATIC_NONE_VIRTUAL: &str = r#"
 Configuration for interface "Ethernet 2"
     Statically Configured DNS Servers:    None
