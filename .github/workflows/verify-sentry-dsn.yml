@@ -22,6 +22,16 @@ name: Verify SENTRY_DSN
 
 on:
   workflow_dispatch:
+  # Monthly, because the failure this guards against is SILENT and arrives with
+  # no event: a revoked key, a deleted project, a rotated DSN nobody propagated.
+  # Crash reporting is exactly the system you do not find out is broken through
+  # normal use — you find out the day you need it and the data is not there.
+  #
+  # 09:00 UTC on the 1st. Deliberately not near 05:30, when the hub reboots and
+  # its cron cluster runs; an unrelated red job in that window has cost real
+  # diagnostic time before.
+  schedule:
+    - cron: '0 9 1 * *'
 
 permissions:
   contents: read
