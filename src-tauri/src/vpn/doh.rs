@@ -374,7 +374,11 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
     for provider in DOH_PROVIDERS {
         match resolve_single_provider(client, provider, hostname).await {
             Ok(ip) => {
-                tracing::debug!("DoH resolved {} via {}", hostname, provider.url);
+                tracing::debug!(
+                    "DoH resolved {} via {}",
+                    crate::utils::redact::redact_hostname(hostname),
+                    provider.url
+                );
                 return Ok(ip);
             }
             Err(DoHError::PinningFailed(msg)) => {

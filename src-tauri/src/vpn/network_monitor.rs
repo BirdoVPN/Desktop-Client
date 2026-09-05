@@ -122,7 +122,32 @@ impl NetworkMonitor {
 /// the connect originates in THIS process (which the block permits by
 /// ALE_APP_ID), whereas a getaddrinfo lookup would be serviced by the DNS Client
 /// service — a different process — and denied, which would falsely read as
-/// "offline" and deadlock the reconnect pause. No user data crosses the probe.
+/// "offline" and deadlock the reconnect pause.
+///
+/// WHAT THE PROBE DISCLOSES. No user PAYLOAD crosses it, but the metadata is not
+/// nothing and the docstring used to claim otherwise. While the tunnel is down
+/// and the block-all is engaged — the window the kill switch exists for — this
+/// SYN leaves over the physical NIC, so Cloudflare, then Quad9, then Google each
+/// see the user's real address on a 5-second cadence for as long as the pause
+/// lasts. That is deliberate rather than accidental, for two reasons:
+///
+///   * These are not new counterparties. The control-plane resolver already
+///     reaches exactly these three operators over HTTPS for every
+///     `api.birdo.app` resolution (`vpn::doh::DOH_PROVIDERS` —
+///     cloudflare-dns.com, dns.google, dns.quad9.net), so dropping them here
+///     would not stop the client talking to them.
+///   * Every alternative target is worse. The VPN relay is only contractually a
+///     WireGuard UDP listener, so a TCP probe at it can fail permanently on a
+///     node with no :443 service — and a probe that can never succeed turns the
+///     offline→online edge in `auto_reconnect` into a reconnect that never
+///     fires. Our own control plane needs DNS, which the block-all denies to the
+///     DNS Client service, and pointing a fixed 5-second bare-TCP beacon at our
+///     own edge trades one signal for a per-client SYN cadence against our own
+///     DDoS protection.
+///
+/// If this is ever revisited, the fix is to stop probing on a fixed interval at
+/// all (back off hard once Offline is established) rather than to swap the
+/// addresses.
 async fn check_connectivity() -> bool {
     use tokio::net::TcpStream;
     use tokio::time::timeout;
