@@ -928,7 +928,11 @@ impl WintunTunnel {
     /// left unconfigured.
     async fn configure_adapter(&self) -> Result<(), String> {
         let client_ip = &self.config.client_ip;
-        tracing::debug!("Configuring adapter IP: {}", client_ip);
+        // The per-session tunnel address is assigned by us and maps to a single
+        // device row in the backend IPAM, so it identifies the customer. Both
+        // sibling paths already redact it (tunnel_linux.rs, tunnel_macos.rs);
+        // this one had drifted.
+        tracing::debug!("Configuring adapter IP: {}", redact_ip(client_ip));
 
         let if_index = self.get_adapter_index().await.ok();
 

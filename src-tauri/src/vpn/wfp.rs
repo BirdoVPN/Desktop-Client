@@ -1033,7 +1033,12 @@ pub async fn initialize() -> Result<(), String> {
 pub async fn set_vpn_server(ip: Ipv4Addr) {
     let mut server = VPN_SERVER_IP.write().await;
     *server = Some(ip);
-    tracing::debug!("VPN server IP set to: {}", ip);
+    // The exit node a customer chose. Redacted like every other sink for it
+    // (commands/killswitch.rs logs only whether one is set).
+    tracing::debug!(
+        "VPN server IP set to: {}",
+        crate::utils::redact_ip(&ip.to_string())
+    );
 }
 
 /// Activate the kill switch — block all traffic except VPN, localhost,
@@ -1087,7 +1092,10 @@ pub async fn activate_blocking() -> Result<(), String> {
 
         if let Some(ip) = vpn_ip {
             engine.add_permit_vpn_server(ip)?;
-            tracing::debug!("VPN server {} permitted through kill switch", ip);
+            tracing::debug!(
+                "VPN server {} permitted through kill switch",
+                crate::utils::redact_ip(&ip.to_string())
+            );
         }
 
         // CRITICAL (AUDIT-2026-06-19): permit the Birdo client's OWN process.

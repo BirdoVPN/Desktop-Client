@@ -436,8 +436,8 @@ impl VpnManager {
         tracing::debug!("Creating VPN tunnel for: {}", server_name);
         tracing::debug!(
             "Tunnel config: endpoint={}, client_ip={}",
-            config.endpoint,
-            config.client_ip
+            crate::utils::redact_endpoint(&config.endpoint),
+            crate::utils::redact_ip(&config.client_ip)
         );
 
         // CONNECT-FIX: Wrap the entire tunnel creation + start in a timeout.

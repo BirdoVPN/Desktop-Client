@@ -24,7 +24,7 @@ use tauri::{
     Emitter, Listener, LogicalPosition, Manager, RunEvent, WindowEvent,
 };
 use tracing::{debug, error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use vpn::{AutoReconnectService, VpnManager};
 
 /// Exit-teardown state machine. pf rulesets and iptables chains SURVIVE
@@ -185,7 +185,22 @@ fn main() {
                         Ok(f) => Box::new(f),
                         Err(_) => Box::new(std::io::sink()),
                     }
-                }),
+                })
+                // CLAMP THE PERSISTENT LOG. The redaction strategy leans on
+                // "debug never ships": `redact_ip`/`redact_hostname` are
+                // pass-throughs under `debug_assertions`, and several
+                // connection-history lines are DEMOTED to debug rather than
+                // redacted (the node name in manager.rs, the deep-link URL
+                // above). `RUST_LOG` is read from the environment below and
+                // overrides the default filter for the WHOLE subscriber, so
+                // anything able to set an environment variable for this process
+                // — a shortcut, a scheduled task, a support instruction copied
+                // off a forum — turned birdo.log into a durable record of which
+                // exit node was used and when. A per-layer filter fixes that at
+                // the sink rather than at the call site: the console layer still
+                // honours RUST_LOG in full, the append-only FILE never takes
+                // anything below the level this build is allowed to persist.
+                .with_filter(crate::utils::log_policy::file_log_max_level()),
         )
     });
 

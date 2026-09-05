@@ -1,7 +1,13 @@
 //! Utility modules
 
 pub mod elevation;
+pub mod log_policy;
 pub mod redact;
+
+/// Source-level guard that no address-shaped value reaches a logging macro
+/// unredacted. Test-only: it reads the tree rather than running in the app.
+#[cfg(test)]
+mod log_hygiene;
 
 pub use redact::redact_email;
 pub use redact::redact_endpoint;

@@ -256,16 +256,20 @@ pub async fn connect_multi_hop(
             }
         }
     } else {
-        // P6-CLI-D-03: the endpoint names the entry node. WARN is written in release,
-        // so the diagnostic goes out redacted and the raw value only at debug.
+        // P6-CLI-D-03: the endpoint names the entry node, so both lines go
+        // through a redactor. The debug line used to carry the RAW value on the
+        // reasoning that debug never ships; RUST_LOG made that untrue, and
+        // `redact_*` is already a pass-through in debug builds, so a developer
+        // still sees the real endpoint on the console without it ever being
+        // writable to birdo.log in a release build.
         tracing::warn!(
             "Could not resolve kill switch endpoint IP from '{}'; kill switch may not filter \
              traffic to the VPN server correctly",
             crate::utils::redact::redact_hostname(killswitch_endpoint)
         );
         tracing::debug!(
-            "Unresolvable kill switch endpoint (raw): {}",
-            killswitch_endpoint
+            "Unresolvable kill switch endpoint: {}",
+            crate::utils::redact_endpoint(killswitch_endpoint)
         );
     }
 
