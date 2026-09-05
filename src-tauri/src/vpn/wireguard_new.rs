@@ -281,17 +281,31 @@ impl WireGuardSession {
         // connect() to the endpoint IP, which establishes the route before tunnel
         // routes are installed. IP_UNICAST_IF is not needed — connect() already
         // pins the socket to the correct interface.
-        tracing::debug!("WG UDP socket will connect directly to {}", endpoint_addr);
+        // P6-CLI-D-03 sibling: `redact_endpoint` is applied to the endpoint at :169
+        // and :181, and :203 deliberately says nothing identifying at all. These two
+        // sites drifted from that and wrote the exit node raw. `debug!` is below the
+        // release default of `info`, so this is not a leak for an ordinary user -- but
+        // `RUST_LOG` overrides that default, and setting `RUST_LOG=debug` is exactly
+        // what a user does when collecting a support log they then SEND US. A file
+        // recording which exit node a customer chose is the record the privacy policy
+        // says does not exist, so it must not be written at any level.
+        tracing::debug!(
+            "WG UDP socket will connect directly to {}",
+            crate::utils::redact_endpoint(&endpoint_addr.to_string())
+        );
 
         socket
             .connect(&endpoint_addr)
             .await
             .map_err(|e| format!("Failed to connect to endpoint: {}", e))?;
 
+        // `socket.local_addr()` is dropped rather than redacted: after connect() it is
+        // the PHYSICAL NIC the tunnel rides, i.e. the user's real network address. It
+        // told us nothing a redacted form would not, and everything a redacted form
+        // would not have said.
         tracing::debug!(
-            "Created WireGuard session to {} from {:?}",
-            endpoint_addr,
-            socket.local_addr()
+            "Created WireGuard session to {}",
+            crate::utils::redact_endpoint(&endpoint_addr.to_string())
         );
 
         let session = Self {
