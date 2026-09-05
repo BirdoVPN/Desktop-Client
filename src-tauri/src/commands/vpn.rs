@@ -896,7 +896,10 @@ async fn connect_vpn_attempt(
     tracing::debug!(
         "Got VPN config: endpoint={}, client_ip={}",
         crate::utils::redact_endpoint(&config.endpoint),
-        config.client_ip
+        // The endpoint beside it was already redacted; this one drifted. The tunnel
+        // address is assigned by us and maps to a single device in the database, so
+        // it identifies the customer just as well as the endpoint identifies the node.
+        crate::utils::redact_ip(&config.client_ip)
     );
 
     // Set the VPN server IP for kill switch permit rules

@@ -251,7 +251,13 @@ pub fn lan_sharing_enabled() -> bool {
 }
 pub async fn set_vpn_server_ip(ip: Option<Ipv4Addr>) {
     *VPN_SERVER_IP.write().await = ip;
-    tracing::debug!("Kill switch VPN server IP set to: {:?}", ip);
+    // This is the real exit-node address (set from vpn.rs and vpn_multi_hop.rs),
+    // not a local proxy. Log only whether one is set -- the value itself is the
+    // record of which server a customer chose.
+    tracing::debug!(
+        "Kill switch VPN server IP {}",
+        if ip.is_some() { "set" } else { "cleared" }
+    );
 }
 
 /// Check if kill switch is currently enabled
