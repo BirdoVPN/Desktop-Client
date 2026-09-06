@@ -158,6 +158,12 @@ jobs:
           # Linux: resolv_conf_restore_tests. macOS: dns_journal_restore_tests
           # (restore_services_pass, interpret_dns_query, dns_write_verified).
           FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'resolv_conf_restore_tests' }}
+          # The cfg-gated file those tests live in.
+          SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
+          # Every test module in $SRC that some step of THIS job executes -
+          # FILTER plus the root-only ipv6 step further down, whose tests are
+          # #[ignore]d and so cannot run in the loop above.
+          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'ipv6_leak_block_tests resolv_conf_restore_tests' }}
         run: |
           set -euo pipefail
           # Captured, not piped: a name filter that matches NOTHING still exits
@@ -168,6 +174,23 @@ jobs:
             echo "::error::no DNS journal restore tests ran on ${{ matrix.os }} - the filter '$FILTER' matched nothing"
             exit 1
           fi
+
+          # Completeness, checked rather than asserted in a comment.
+          #
+          # $SRC is compiled by NO other job: the Windows job is the only one
+          # that runs `cargo test`, and it cannot even build these cfg-gated
+          # files. So a test module in $SRC that no step here names runs in no
+          # job at all - a comment that costs a compile. That is exactly the
+          # state every macOS test in this repo was in, including the one named
+          # for the regression this workflow step exists to protect, so the rule
+          # gets a checker instead of a promise.
+          declared=$(grep -oE '^mod [a-z0-9_]+_tests' "$SRC" | awk '{print $2}' | sort | tr '\n' ' ')
+          covered=$(printf '%s\n' $COVERED | sort | tr '\n' ' ')
+          if [ "$declared" != "$covered" ]; then
+            echo "::error::$SRC declares test modules [$declared] but this job executes [$covered] - the difference runs in NO CI job. Add it to FILTER/COVERED."
+            exit 1
+          fi
+          echo "OK - every test module in $SRC is executed by this job: $covered"
 
       # ── F-001 verification ────────────────────────────────────────────────
       # The IPv6 leak fix is kernel-firewall code that a Windows dev box cannot
