@@ -87,6 +87,27 @@ Optional:
 
 ---
 
+## 5. Crash reporting — Sentry
+
+| Secret | Description |
+| ------ | ----------- |
+| `SENTRY_DSN` | Sentry ingest DSN for the **desktop** project. Consumed at
+build time by `option_env!` and compiled into the binary. |
+
+Set at **job** level by every build job in `release.yml`,
+`build-windows.yml` and `build-linux.yml`. Unlike every other secret here,
+a **missing** one now FAILS the release build (`src-tauri/build.rs`) rather
+than degrading quietly — an artifact that cannot report a crash is worse
+than a build that stops.
+
+It must be the DSN of the desktop project, not the Android
+(`4510869977497680`) or backend (`4510932258390096`) one: mixed crash
+streams cannot be un-mixed after the fact. Full click path, verification
+and privacy posture in
+[`docs/SENTRY-SETUP.md`](SENTRY-SETUP.md).
+
+---
+
 ## Local rotation procedure
 
 1. Generate the new credential per the section above.

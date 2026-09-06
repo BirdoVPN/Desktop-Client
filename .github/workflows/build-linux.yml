@@ -33,6 +33,16 @@ jobs:
           - runner: ubuntu-22.04
             arch: x86_64-unknown-linux-gnu
             label: amd64
+    # SENTRY_DSN lives at JOB level, not on the build step.
+    #
+    # It was on the step, which is correct for exactly as long as a job has one
+    # build step — and release.yml's build-macos already has two (the signed
+    # build and the unsigned fallback). A job-level env is the only form that
+    # also covers a step somebody adds next year. Missing one build job is the
+    # twin-drift defect this estate keeps re-finding, and a build with no DSN
+    # now FAILS in build.rs rather than shipping an inert reporter.
+    env:
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -114,9 +124,6 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
-          # the shipped binary (owner sets the SENTRY_DSN repo secret).
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
           XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
           # Ed25519 client-attestation key baked in by option_env! — see

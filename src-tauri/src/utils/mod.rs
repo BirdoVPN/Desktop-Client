@@ -1,5 +1,6 @@
 //! Utility modules
 
+pub mod crash_report;
 pub mod elevation;
 pub mod log_policy;
 pub mod redact;
