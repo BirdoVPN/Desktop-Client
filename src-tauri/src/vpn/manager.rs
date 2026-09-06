@@ -174,22 +174,18 @@ impl VpnManager {
     /// needs to reconnect. That is not a crash path — it is the normal update
     /// path.
     ///
-    /// Synchronous and non-blocking-on-locks by construction: `try_read` both
-    /// here and inside the tunnel, so this can never wedge the exit.
+    /// Goes straight to the machine-state owner rather than through
+    /// `self.tunnel`. Reading it through the tunnel is what made this fragile:
+    /// a reconnect empties that Option for the whole create + handshake window,
+    /// so an exit landing in that window found `None` and restored nothing. The
+    /// park record no longer lives in the tunnel, so there is nothing to look
+    /// through.
+    ///
+    /// Synchronous and lock-free of any async lock, so it can never wedge an
+    /// exit that must not be held open.
     #[cfg(target_os = "windows")]
     pub fn restore_dns_blocking(&self) -> bool {
-        match self.tunnel.try_read() {
-            Ok(guard) => match guard.as_ref() {
-                Some(tunnel) => tunnel.restore_dns_blocking(),
-                None => false,
-            },
-            Err(_) => {
-                tracing::warn!(
-                    "Restart teardown: tunnel lock busy — cannot restore DNS synchronously"
-                );
-                false
-            }
-        }
+        crate::vpn::win_machine_state::release_dns_at_exit()
     }
 
     /// Create a new VPN manager
@@ -333,15 +329,64 @@ impl VpnManager {
 
         tracing::debug!("Current VPN state: {:?}", current_state);
 
-        // If already connected, auto-disconnect first (acts as reconnect).
-        // This handles edge cases: stale state, rapid reconnect, UI race.
-        if matches!(
-            current_state,
-            ConnectionState::Connected | ConnectionState::Connecting
-        ) {
+        // I2 NO ORPHANS. The teardown used to be gated on `Connected |
+        // Connecting`, and `can_connect()` admits `Disconnected`, `Error`,
+        // `KillSwitchActive` and `Reconnecting` — so on EVERY auto-reconnect
+        // path (the only `connect()` call site there always runs with state
+        // `Reconnecting{n}`) the gate never fired and the live tunnel in
+        // `self.tunnel` was simply overwritten. Dropping it there ran its
+        // emergency unwind against machine state a NEW tunnel had since taken
+        // over: physical adapters un-parked, split-default routes deleted, IPv6
+        // block lifted, UI showing Connected. That is issue #98.
+        //
+        // `ConnectionState` is a UI-facing claim written independently of the
+        // tunnel, so it cannot be the input to a disposal decision (I3). The
+        // Option is the record of tunnel existence; take it, dispose of it, and
+        // do that from ANY state.
+        //
+        // NOT #105's "refuse to connect while `self.tunnel.is_some()`": combined
+        // with `disconnect()`'s early return — `can_disconnect()` is false in
+        // `Disconnected` / `Disconnecting` / `KillSwitchActive`, so it returns
+        // Ok(()) without taking the tunnel — that would turn the orphan from a
+        // leak into a permanent lockout where Connect refuses, Disconnect no-ops
+        // and only quitting the app recovers. The correct form is: dispose
+        // unconditionally.
+        let displaced = match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
+            Ok(mut guard) => guard.take(),
+            Err(_) => {
+                tracing::error!(
+                    "Tunnel lock timeout before connect — cannot safely create a new tunnel \
+                     while an old one may still be live"
+                );
+                let _ = self
+                    .write_state_with_timeout(ConnectionState::Error("Tunnel lock timeout".into()))
+                    .await;
+                return Err("Tunnel lock timeout during teardown — please try again".into());
+            }
+        };
+
+        // The machine state (parked DNS + installed routes) is deliberately NOT
+        // released between the outgoing tunnel and the incoming one. Moving it to
+        // a generation the manager holds means the old tunnel's stop()/Drop
+        // cannot un-park or delete anything on its way out, and the new tunnel
+        // ADOPTS it — so the physical NICs never carry ISP resolvers during the
+        // multi-second create + handshake window. Every failure arm below hands
+        // this generation back with `release_after_failed_connect`, so a connect
+        // that never produces a tunnel cannot strand the park.
+        #[cfg(target_os = "windows")]
+        let transition_gen = crate::vpn::win_machine_state::begin_transition();
+
+        if displaced.is_some()
+            || matches!(
+                current_state,
+                ConnectionState::Connected | ConnectionState::Connecting
+            )
+        {
             tracing::info!(
-                "Already {:?} — tearing down old tunnel before reconnecting",
-                current_state
+                "Tearing down the existing tunnel before connecting (state {:?}, tunnel present: \
+                 {})",
+                current_state,
+                displaced.is_some()
             );
             let _ = self
                 .write_state_with_timeout(ConnectionState::Disconnecting)
@@ -360,44 +405,28 @@ impl VpnManager {
                 crate::vpn::wfp::hold_ipv6_block(true);
             }
 
-            let teardown = match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
-                Ok(mut guard) => {
-                    if let Some(tunnel) = guard.take() {
-                        match timeout(Duration::from_secs(10), tunnel.stop()).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                tracing::warn!("Old tunnel teardown error (continuing): {}", e);
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    "Old tunnel teardown timed out (continuing): Tunnel stop timed out"
-                                );
-                            }
-                        }
+            // The tunnel is already out of the Option, so the data plane is
+            // disposed here and nothing can reach it again. Its stop() will find
+            // that it no longer owns the machine state and will leave the park
+            // and the routes exactly where they are.
+            if let Some(tunnel) = displaced {
+                match timeout(Duration::from_secs(10), tunnel.stop()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!("Old tunnel teardown error (continuing): {}", e);
                     }
-                    Ok(())
+                    Err(_) => {
+                        tracing::warn!(
+                            "Old tunnel teardown timed out (continuing): Tunnel stop timed out"
+                        );
+                    }
                 }
-                Err(_) => Err(()),
-            };
+            }
 
             // Release the hold in BOTH outcomes: a held block with no tunnel and no
             // connect in flight could never be lifted.
             #[cfg(target_os = "windows")]
             crate::vpn::wfp::hold_ipv6_block(false);
-
-            if teardown.is_err() {
-                tracing::error!(
-                    "Tunnel lock timeout during auto-disconnect — cannot safely create new tunnel"
-                );
-                let _ = self
-                    .write_state_with_timeout(ConnectionState::Error("Tunnel lock timeout".into()))
-                    .await;
-                #[cfg(target_os = "windows")]
-                if let Err(e) = crate::vpn::wfp::unblock_ipv6().await {
-                    tracing::warn!("Failed to lift IPv6 block after a failed teardown: {}", e);
-                }
-                return Err("Tunnel lock timeout during teardown — please try again".into());
-            }
 
             // LEAK-2 (macOS/Linux): the old tunnel's stop() just lifted the F-001
             // IPv6 leak block. Windows holds the block across the teardown above;
@@ -422,13 +451,22 @@ impl VpnManager {
                 to: "Connecting".into(),
             };
             tracing::warn!("{}", err);
+            #[cfg(target_os = "windows")]
+            self.release_machine_state_after_failed_connect(transition_gen)
+                .await;
             return Err(err.to_string());
         }
 
         // Set connecting state with timeout
-        self.write_state_with_timeout(ConnectionState::Connecting)
+        if let Err(e) = self
+            .write_state_with_timeout(ConnectionState::Connecting)
             .await
-            .map_err(|e| format!("Failed to set connecting state: {}", e))?;
+        {
+            #[cfg(target_os = "windows")]
+            self.release_machine_state_after_failed_connect(transition_gen)
+                .await;
+            return Err(format!("Failed to set connecting state: {}", e));
+        }
         tracing::info!("Set state to Connecting");
 
         // LOG-001: node name demoted to debug — see connect() above.
@@ -477,6 +515,9 @@ impl VpnManager {
                             .write_state_with_timeout(ConnectionState::Error(
                                 "Internal error storing tunnel state".to_string(),
                             ))
+                            .await;
+                        #[cfg(target_os = "windows")]
+                        self.release_machine_state_after_failed_connect(transition_gen)
                             .await;
                         return Err("Tunnel state lock timeout during connect".to_string());
                     }
@@ -532,6 +573,12 @@ impl VpnManager {
                 let _ = self
                     .write_state_with_timeout(ConnectionState::Error(err.to_string()))
                     .await;
+                // Un-park BEFORE lifting the IPv6 block, never the reverse: the
+                // reverse leaves an interval with the physical resolvers back and
+                // egress already clear.
+                #[cfg(target_os = "windows")]
+                self.release_machine_state_after_failed_connect(transition_gen)
+                    .await;
                 self.lift_ipv6_block_after_failed_connect().await;
                 Err(err.to_string())
             }
@@ -544,9 +591,33 @@ impl VpnManager {
                 let _ = self
                     .write_state_with_timeout(ConnectionState::Error(err.to_string()))
                     .await;
+                // CONNECT_TIMEOUT cancelled start() mid-await and dropped the
+                // half-built tunnel; if it had already claimed, its Drop released
+                // and this is a no-op. If it never got that far, the generation
+                // held across the teardown still owns the park.
+                #[cfg(target_os = "windows")]
+                self.release_machine_state_after_failed_connect(transition_gen)
+                    .await;
                 self.lift_ipv6_block_after_failed_connect().await;
                 Err(err.to_string())
             }
+        }
+    }
+
+    /// A connect that never produced a live tunnel must not leave the machine's
+    /// resolvers parked or our routes installed either.
+    ///
+    /// A no-op unless `gen` is still the owner — if the new tunnel got as far as
+    /// claiming and was then dropped, its own `Drop` already released, and
+    /// re-releasing from here would be a second owner acting on state it does not
+    /// hold.
+    #[cfg(target_os = "windows")]
+    async fn release_machine_state_after_failed_connect(
+        &self,
+        gen: crate::vpn::win_machine_state::Gen,
+    ) {
+        if crate::vpn::win_machine_state::release_all(gen) {
+            tracing::info!("Un-parked the physical adapters after a failed connect");
         }
     }
 
@@ -589,7 +660,13 @@ impl VpnManager {
             .await
             .map_err(|e| format!("Failed to read state: {}", e))?;
 
-        if !current_state.can_disconnect() {
+        // I2/I3: `can_disconnect()` is false in `Disconnected`, `Disconnecting`
+        // and `KillSwitchActive`, and `ConnectionState` is written by paths that
+        // never touch `self.tunnel` — so returning on the state alone made an
+        // orphaned live tunnel unreachable by any user action. Take the record
+        // into account: if there IS a tunnel, disconnect means something no
+        // matter what the state claims.
+        if !current_state.can_disconnect() && !self.holds_tunnel().await {
             tracing::debug!("Already disconnected or disconnecting");
             return Ok(());
         }
@@ -662,6 +739,36 @@ impl VpnManager {
                 // Return Ok — we're disconnected, just not cleanly.
                 // The caller doesn't need to retry disconnection.
                 Ok(())
+            }
+        }
+    }
+
+    /// Does the manager still HOLD a tunnel object (I2 NO ORPHANS)?
+    ///
+    /// Named for what it actually reads. It answers "is there a tunnel value
+    /// that has not been disposed of", which is the question `disconnect()`
+    /// needs — an orphan is unreachable by any user action if the decision is
+    /// left to `ConnectionState`, whose `is_tunnel_active()` is `matches!(self,
+    /// Connected)` and so is false in exactly the four states where an orphan
+    /// can exist.
+    ///
+    /// It is NOT the I3 machine-state predicate, and must not be used as one.
+    /// I3 asks whether the parked DNS and the installed routes are in force, and
+    /// this `Option` is emptied by `connect()` itself — deliberately, into
+    /// `displaced` — for the whole create + handshake window, during which the
+    /// park is very much still in force under a generation the manager holds.
+    /// The predicate for that is `win_machine_state::is_owner`, which reads the
+    /// ownership token rather than a container, and every DNS, route and
+    /// firewall mutation in this codebase is already gated on it.
+    ///
+    /// A busy lock answers `true`: absence has to be positively established,
+    /// and the `take()` that follows finds out for certain.
+    pub async fn holds_tunnel(&self) -> bool {
+        match timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
+            Ok(guard) => guard.is_some(),
+            Err(_) => {
+                tracing::warn!("Tunnel read lock timeout in holds_tunnel — assuming one exists");
+                true
             }
         }
     }

@@ -94,6 +94,18 @@ interface RustVpnStatus {
   stealthActive?: boolean;
   quantumActive?: boolean;
   pqMode?: 'disabled' | 'server_provided' | 'bilateral';
+  /**
+   * Physical adapters whose DNS this session could not verifiably suppress, or
+   * could not verifiably put back — one human-readable line each. Windows only;
+   * always present, and empty when there is nothing wrong.
+   *
+   * Optional in the type only so a client polling an OLDER backend (the updater
+   * relaunches into a new binary, but the window can outlive one connect) reads
+   * `undefined` rather than throwing. Treat undefined as "unknown", never as
+   * "fine": the render below shows a banner only for a NON-empty array, so
+   * unknown renders nothing and known-bad renders the reason.
+   */
+  dnsDegraded?: string[];
 }
 
 /**
@@ -155,6 +167,16 @@ export function Dashboard() {
    */
   const [deepLinkConfirm, setDeepLinkConfirm] = useState<Server | null>(null);
   const [liveStats, setLiveStats] = useState<RustVpnStats | null>(null);
+  /**
+   * Adapters whose DNS the Rust side could not verifiably park or put back.
+   *
+   * Held across every connection state on purpose. The failure that matters
+   * most is an adapter left un-restored AFTER a disconnect: the machine is
+   * short a resolver and nothing else on this screen would say so. Clearing it
+   * on disconnect the way `liveStats` is cleared would hide exactly the case it
+   * exists for.
+   */
+  const [dnsDegraded, setDnsDegraded] = useState<string[]>([]);
   // Live security posture from get_vpn_status — surfaced as chips under the
   // status pill so the user can SEE that stealth / post-quantum are actually
   // engaged on the tunnel (not just toggled in settings).
@@ -527,6 +549,10 @@ export function Dashboard() {
         if (valid.has(st.state) && st.state !== cur && cur !== 'connecting' && cur !== 'disconnecting') {
           setConnectionState(st.state as ConnectionState);
         }
+        // Unconditional: this is not live-session telemetry, it is a report of
+        // machine state that outlives the session. `?? []` maps an older backend
+        // that does not send the field to "nothing to show", never to a banner.
+        setDnsDegraded(st.dnsDegraded ?? []);
         if (st.state === 'connected' || st.state === 'rekeying') {
           setLiveStats(stats);
           setLiveSecurity({ stealth: !!st.stealthActive });
@@ -1027,6 +1053,32 @@ export function Dashboard() {
                 bg="rgba(245,158,11,0.10)"
                 border="rgba(245,158,11,0.30)"
                 text="Not running as administrator — VPN cannot connect."
+              />
+              <div className="h-2.5" />
+            </>
+          )}
+
+          {/* DNS degradation. The counterpart to the Connected badge: the Rust
+              side parks every physical adapter's DNS to stop Windows racing the
+              ISP's resolvers against the tunnel's, and it reads back every one
+              of those writes. A read-back that did not match means either an
+              adapter still carrying ISP resolvers beside a live tunnel (a DNS
+              leak, while this screen says Connected) or one left without
+              resolvers after a disconnect. Both are invisible everywhere else,
+              so the badge alone would be reassurance drawn from data nobody
+              checked. Rendered on every connection state for that reason. */}
+          {dnsDegraded.length > 0 && (
+            <>
+              <BannerRow
+                icon={AlertTriangle}
+                color="#FBBF24"
+                bg="rgba(245,158,11,0.10)"
+                border="rgba(245,158,11,0.30)"
+                text={
+                  dnsDegraded.length === 1
+                    ? `DNS not fully protected — ${dnsDegraded[0]}`
+                    : `DNS not fully protected on ${dnsDegraded.length} adapters — ${dnsDegraded[0]}`
+                }
               />
               <div className="h-2.5" />
             </>

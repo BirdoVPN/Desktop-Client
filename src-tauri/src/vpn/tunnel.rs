@@ -279,7 +279,7 @@ const TUNNEL_TYPE: &str = "Birdo";
 /// stale adapters across restarts and crashes.
 /// Generated once — do not change after release.
 #[allow(clippy::unusual_byte_groupings)] // grouping mirrors GUID segment layout
-const ADAPTER_GUID: u128 = 0xB1BD0_0000_0001_0000_0000_B1BD0B1Du128;
+pub(super) const ADAPTER_GUID: u128 = 0xB1BD0_0000_0001_0000_0000_B1BD0B1Du128;
 
 /// Get the Win32 last error code and format it as a human-readable string.
 #[cfg(windows)]
@@ -344,23 +344,6 @@ fn base64_encode_utf16le(script: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(&utf16)
 }
 
-/// Whether an IPv6 resolver address is link-local (`fe80::/10`), i.e. learned
-/// from a Router Advertisement rather than configured by the user. Accepts the
-/// zone suffix netsh prints on link-local addresses (`fe80::1%13`).
-///
-/// Hand-rolled rather than `Ipv6Addr::is_unicast_link_local`, which is still
-/// unstable on the toolchain this crate pins.
-fn is_link_local_v6(addr: &str) -> bool {
-    let bare = addr.split('%').next().unwrap_or(addr);
-    match bare.parse::<Ipv6Addr>() {
-        Ok(ip) => {
-            let o = ip.octets();
-            o[0] == 0xfe && (o[1] & 0xc0) == 0x80
-        }
-        Err(_) => false,
-    }
-}
-
 /// H-4 FIX: Stores original DNS configuration for an adapter, enabling
 /// precise restoration on disconnect instead of blindly setting DHCP.
 ///
@@ -368,9 +351,22 @@ fn is_link_local_v6(addr: &str) -> bool {
 /// `vpn::dns_journal`): the in-memory copy dies with the process, and after a
 /// crash nothing can tell a parked adapter from one the user configured
 /// `static`-with-no-servers themselves.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct AdapterDnsSnapshot {
+    /// Friendly name at record time. A LOG LABEL and a netsh argument, never an
+    /// identity: names are user-editable in Network Connections and localised on
+    /// a fresh install, so the restore re-resolves the CURRENT name from the GUID
+    /// below (I7). Kept because a legacy record has nothing else.
     pub(super) adapter_name: String,
+    /// Interface GUID, `{XXXXXXXX-...}` upper-cased — the record key, and the one
+    /// identifier that cannot change while the adapter is parked.
+    ///
+    /// `serde(default)` so a journal written by an older build (which keyed by
+    /// name) still reconciles after an upgrade: the machine it describes is a
+    /// machine with no resolvers, and refusing to read it would strand exactly
+    /// the users this record exists for.
+    #[serde(default)]
+    pub(super) adapter_guid: String,
     /// Was IPv4 DNS sourced from DHCP before we touched it?
     ///
     /// NOT the same as `dns_servers.is_empty()`, and conflating the two rewrites
@@ -378,7 +374,7 @@ pub(super) struct AdapterDnsSnapshot {
     /// machine with no VPN running: VirtualBox Host-Only, the Hyper-V/WSL
     /// vSwitch and the OpenVPN TAP adapter were all `Statically Configured DNS
     /// Servers: None` — static, with no servers — and two of them were Up, so
-    /// `get_non_vpn_adapters()` returns them. Restoring those to DHCP is an
+    /// the machine-state owner enumerates them. Restoring those to DHCP is an
     /// unrequested, elevated change to VirtualBox and Hyper-V networking, on
     /// every clean disconnect.
     pub(super) v4_was_dhcp: bool,
@@ -412,29 +408,26 @@ pub struct WintunTunnel {
     /// release the adapter — otherwise a server switch fails to recreate the
     /// adapter ("Could not start the VPN network adapter").
     packet_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    /// H-4 FIX: Snapshot of original DNS config for all adapters,
-    /// captured before we modify them. Used in restore_dns().
-    dns_snapshots: Arc<RwLock<Vec<AdapterDnsSnapshot>>>,
-    /// Resolved endpoint IP (from WireGuard socket), used for route cleanup
-    resolved_endpoint_ip: Arc<RwLock<Option<String>>>,
-    /// Default gateway saved during route setup, used for cleanup
+    /// Default gateway saved during route setup, used for the LAN-sharing routes
     saved_default_gateway: Arc<RwLock<Option<String>>>,
     /// Whether local network sharing is enabled (route RFC1918 via real gateway)
     local_network_sharing: bool,
-    /// Whether split tunneling routes were added (for cleanup)
-    local_network_routes_added: Arc<AtomicBool>,
-    /// P1-dk-win-failed-connect-no-dns-restore: progress flags for the
-    /// emergency unwind. A connect can fail — or be CANCELLED: the manager's
-    /// CONNECT_TIMEOUT drops the start() future mid-await — after
-    /// configure_dns has already set every physical adapter to `static none`
-    /// and the routes are in, but BEFORE `running` ever becomes true. stop()
-    /// and Drop both keyed their early-return on `running`, so nothing
-    /// restored DNS: the machine was left with no resolvers on any real NIC
-    /// (both families) until a later successful connect + clean disconnect.
-    /// These record what start() actually MODIFIED, so Drop unwinds exactly
-    /// that, independent of `running`.
-    dns_modified: Arc<AtomicBool>,
-    routes_installed: Arc<AtomicBool>,
+    /// This tunnel's ownership token for the machine state (I1).
+    ///
+    /// The parked physical-adapter DNS and the installed routes used to live in
+    /// this struct, which made every question about them a question about tunnel
+    /// lifetime — and tunnel lifetime is what was broken. `Adapter::open`
+    /// deliberately reuses one OS adapter, so two tunnels can legitimately exist
+    /// over it, and `VpnManager::tunnel` was written by paths that did not
+    /// dispose of what they displaced. The orphan's `Drop` then un-parked every
+    /// physical NIC and deleted the live tunnel's routes (issue #98).
+    ///
+    /// So the state lives in `win_machine_state` and this is the only claim on
+    /// it. A tunnel whose token is not the current owner mutates NOTHING —
+    /// which also replaces the old `dns_modified` / `routes_installed` /
+    /// `local_network_routes_added` flags: "did we change anything" is now
+    /// answered by the owner, which cannot disagree with itself.
+    state_gen: crate::vpn::win_machine_state::Gen,
 }
 
 impl WintunTunnel {
@@ -458,13 +451,9 @@ impl WintunTunnel {
             wg_session: Arc::new(RwLock::new(None)),
             shutdown_tx: Arc::new(RwLock::new(None)),
             packet_task: Arc::new(RwLock::new(None)),
-            dns_snapshots: Arc::new(RwLock::new(Vec::new())),
-            resolved_endpoint_ip: Arc::new(RwLock::new(None)),
             saved_default_gateway: Arc::new(RwLock::new(None)),
             local_network_sharing,
-            local_network_routes_added: Arc::new(AtomicBool::new(false)),
-            dns_modified: Arc::new(AtomicBool::new(false)),
-            routes_installed: Arc::new(AtomicBool::new(false)),
+            state_gen: crate::vpn::win_machine_state::next_generation(),
         })
     }
 
@@ -496,6 +485,14 @@ impl WintunTunnel {
         // connect's fresh block (removing a live block = the exact leak this
         // guards against); the manager's synchronous lift is the single, race-free
         // mechanism.
+
+        // I1: claim the machine state BEFORE the first mutation, so everything
+        // installed from here on is attributable to this generation and nothing
+        // else may un-park or delete it. This ADOPTS whatever a previous
+        // generation left in force — on a reconnect the manager holds the park
+        // and the routes across the gap rather than releasing them into it.
+        crate::vpn::win_machine_state::take_ownership(self.state_gen);
+
         self.block_ipv6_leaks().await?;
         self.start_inner().await
     }
@@ -788,6 +785,46 @@ impl WintunTunnel {
 
         // Configure DNS
         self.configure_dns().await?;
+
+        // #99: `configure_dns` runs exactly once per tunnel, so an adapter that
+        // is DOWN at connect — a dock still negotiating after resume, Wi-Fi
+        // re-associating, a phone tether appearing — is never parked, and
+        // Windows SMHNR races its ISP resolvers against the tunnel's for the
+        // rest of the session with the UI showing Connected. Re-derive the park
+        // on a ticker for as long as this generation owns it.
+        //
+        // A plain OS thread rather than a task: every machine-state operation is
+        // synchronous by design (it has to be callable from Drop and from the
+        // panic hook), and the pass is idempotent — adapters already in the
+        // record are skipped, never re-snapshotted, which is #99's own stated
+        // objection to the naive "re-run configure_dns" fix.
+        //
+        // The thread carries NO liveness state of its own — deliberately. It used
+        // to hold an `Arc<AtomicBool>` this struct cleared in `stop()` and in
+        // `Drop`, and that shape lasted exactly one review: the updater relaunch
+        // un-parks through `win_machine_state::release_dns_at_exit`, which never
+        // touches a tunnel, so the flag stayed set and the ticker re-parked every
+        // physical adapter on a process that was about to be replaced. Same
+        // blackhole, second door — a flag cleared at N call sites always has an
+        // N+1th.
+        //
+        // The gate is now I13, and it lives entirely inside the machine state:
+        // `refresh_live_session` parks only while the generation both OWNS the
+        // park and has a live data plane, and the one function that can un-park
+        // closes the data plane in the same critical section, before any netsh
+        // runs. See `win_machine_state::refresh_live_session` for why that gives
+        // the same answer for `stop()`, `Drop`, the relaunch, the exit teardown,
+        // an abort and a SIGKILL alike.
+        {
+            let state_gen = self.state_gen;
+            std::thread::spawn(move || {
+                while {
+                    std::thread::sleep(crate::vpn::win_machine_state::REFRESH_INTERVAL);
+                    crate::vpn::win_machine_state::refresh_live_session(state_gen)
+                } {}
+                tracing::debug!("DNS park refresh ended for generation {}", state_gen);
+            });
+        }
 
         // IPv6: if the node is dual-stacked (backend sent a client_ipv6), ROUTE
         // IPv6 through the tunnel — lift the block installed at the top of start()
@@ -1100,14 +1137,10 @@ impl WintunTunnel {
             redact_ip(endpoint_ip)
         );
 
-        // Save for cleanup
-        *self.resolved_endpoint_ip.write().await = Some(endpoint_ip.to_string());
+        // Saved for the LAN-sharing routes below. The routes themselves are
+        // recorded in the machine-state owner as they are installed — see the
+        // record_route calls, and I10 in win_machine_state.
         *self.saved_default_gateway.write().await = Some(default_gateway.clone());
-
-        // Mark BEFORE the first route mutation: a cancellation mid-way must
-        // already read as "dirty" so the Drop unwind removes what went in.
-        // Cleared by cleanup_routes_blocking once the routes are removed.
-        self.routes_installed.store(true, Ordering::SeqCst);
 
         // CRITICAL: Add host route for the VPN server BEFORE split routes.
         // Without this, the /1 split routes would capture the WireGuard UDP
@@ -1173,6 +1206,31 @@ impl WintunTunnel {
             }
         }
 
+        // I10 (#100): remember EXACTLY what went in — destination prefix,
+        // interface index AND next hop — so the teardown can delete this row and
+        // nothing else. Recorded only after the add actually succeeded (both
+        // arms above return Err otherwise), because a route we did not install is
+        // never ours to delete. With no physical interface index the route is
+        // unattributable and deliberately goes unrecorded: at teardown it is left
+        // in place rather than removed with an unqualified `route delete`, which
+        // is precisely how the old code tore down Cloudflare WARP's and
+        // Tailscale's routing.
+        if let (Some(idx), Ok(ep), Ok(gw)) = (
+            phys_idx,
+            endpoint_ip.parse::<Ipv4Addr>(),
+            default_gateway.parse::<Ipv4Addr>(),
+        ) {
+            crate::vpn::win_machine_state::record_route(
+                self.state_gen,
+                crate::vpn::win_machine_state::OwnedRoute {
+                    dest: std::net::IpAddr::V4(ep),
+                    prefix_len: 32,
+                    next_hop: std::net::IpAddr::V4(gw),
+                    if_index: idx,
+                },
+            );
+        }
+
         // FIX-ROUTE: Split 0.0.0.0/0 into 0.0.0.0/1 + 128.0.0.0/1
         // This is the standard WireGuard technique used by wireguard-windows,
         // Mullvad, ProtonVPN, etc.  Two /1 routes are MORE SPECIFIC than any
@@ -1197,6 +1255,25 @@ impl WintunTunnel {
         // nothing still logged "Routes configured (N entries)".
         let mut installed = 0usize;
         let mut failed_default_split: Vec<String> = Vec::new();
+
+        // I10: the tunnel routes are on-link on the Wintun interface, so the
+        // owning row is (network/prefix, if_index, next hop 0.0.0.0). Both the
+        // native and the route.exe arm funnel through here so the two cannot
+        // record different things.
+        let state_gen = self.state_gen;
+        let record_tunnel_route = |network: &str, mask: &str| {
+            if let (Ok(net), Ok(m)) = (network.parse::<Ipv4Addr>(), mask.parse::<Ipv4Addr>()) {
+                crate::vpn::win_machine_state::record_route(
+                    state_gen,
+                    crate::vpn::win_machine_state::OwnedRoute {
+                        dest: std::net::IpAddr::V4(net),
+                        prefix_len: u32::from(m).count_ones() as u8,
+                        next_hop: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        if_index,
+                    },
+                );
+            }
+        };
 
         for (network, mask) in &routes_to_add {
             // The split-default pair IS the tunnel. If either half is missing,
@@ -1224,6 +1301,7 @@ impl WintunTunnel {
             };
             if native_ok {
                 tracing::debug!("Route added natively: {} mask {}", network, mask);
+                record_tunnel_route(network, mask);
                 installed += 1;
                 continue;
             }
@@ -1245,6 +1323,7 @@ impl WintunTunnel {
             {
                 Ok(output) if output.status.success() => {
                     tracing::debug!("Route added successfully: {} mask {}", network, mask);
+                    record_tunnel_route(network, mask);
                     installed += 1;
                 }
                 Ok(output) => {
@@ -1312,6 +1391,35 @@ impl WintunTunnel {
             redact_ip(&default_gateway)
         );
 
+        // I10 (#100): these go out over the PHYSICAL interface via the real
+        // gateway, so that is the row that must be recorded. Without the index
+        // the teardown used to issue an unqualified `route delete 10.0.0.0 mask
+        // 255.0.0.0`, which removes a corporate 10/8 route the client never
+        // installed. When the index is unknown we record nothing, and the
+        // teardown then leaves these routes in place: a stale RFC1918 route via
+        // the real gateway is what the machine wants anyway once the tunnel is
+        // gone, whereas deleting another product's is unrecoverable.
+        let gateway_if_index = default_route_native().map(|(_, idx)| idx);
+        let state_gen = self.state_gen;
+        let record_lan_route = |network: &str, mask: &str| {
+            if let (Some(idx), Ok(net), Ok(m), Ok(gw)) = (
+                gateway_if_index,
+                network.parse::<Ipv4Addr>(),
+                mask.parse::<Ipv4Addr>(),
+                default_gateway.parse::<Ipv4Addr>(),
+            ) {
+                crate::vpn::win_machine_state::record_route(
+                    state_gen,
+                    crate::vpn::win_machine_state::OwnedRoute {
+                        dest: std::net::IpAddr::V4(net),
+                        prefix_len: u32::from(m).count_ones() as u8,
+                        next_hop: std::net::IpAddr::V4(gw),
+                        if_index: idx,
+                    },
+                );
+            }
+        };
+
         // RFC1918 private address ranges
         let local_routes: [(&str, &str); 3] = [
             ("10.0.0.0", "255.0.0.0"),      // 10.0.0.0/8
@@ -1340,6 +1448,7 @@ impl WintunTunnel {
                         mask,
                         redact_ip(&default_gateway)
                     );
+                    record_lan_route(network, mask);
                     added += 1;
                 }
                 Ok(output) => {
@@ -1362,8 +1471,14 @@ impl WintunTunnel {
             }
         }
 
-        // Also add link-local (169.254.0.0/16) for mDNS/device discovery
-        let _ = cmd("route")
+        // Also add link-local (169.254.0.0/16) for mDNS/device discovery.
+        //
+        // This was `let _ = ...output()` while the teardown deleted 169.254.0.0/16
+        // unconditionally: the twin of the RFC1918 loop above, missing both the
+        // status check and the attribution. Same treatment as its three
+        // neighbours now, so only a route that actually went in is recorded and
+        // only a recorded route is deleted.
+        match cmd("route")
             .args([
                 "add",
                 "169.254.0.0",
@@ -1373,88 +1488,47 @@ impl WintunTunnel {
                 "metric",
                 "1",
             ])
-            .output();
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                record_lan_route("169.254.0.0", "255.255.0.0");
+            }
+            Ok(output) => tracing::debug!(
+                "Link-local route not added: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(e) => tracing::debug!("Link-local route not added: {}", e),
+        }
 
-        self.local_network_routes_added
-            .store(true, Ordering::SeqCst);
         tracing::info!("Local network sharing: {}/3 routes added", added);
         Ok(())
     }
 
-    // H-3 FIX: Get list of non-VPN adapter names using PowerShell Get-NetAdapter.
     // ===================================================================
     // SECTION: DNS — configure_dns, restore_dns
-    // Static helpers (get_non_vpn_adapters, snapshot_adapter_dns) are in tunnel_dns.rs
+    // The park itself (enumeration, snapshot, suppression, the durable record
+    // and who may undo it) lives in win_machine_state; the netsh reads it drives
+    // live in tunnel_dns.rs.
     // ===================================================================
 
     /// Configure DNS servers
     /// SECURITY FIX (Vuln-DNS-1): Disable DNS on all non-VPN adapters to prevent
     /// Windows "Smart Multi-Homed Name Resolution" (SMHNR) from querying ISP DNS
     /// in parallel with the VPN's DNS servers, leaking queries.
+    ///
+    /// Suppressing SMHNR is a change to the MACHINE, not to this tunnel, so
+    /// `win_machine_state` owns it: the enumeration, the durable record, the
+    /// per-adapter ordering (read -> record -> park -> verify) and the ownership
+    /// token that decides who may undo it. Claiming while a park is already in
+    /// force ADOPTS it and re-snapshots nothing — re-reading a parked adapter is
+    /// what recorded `static`-with-no-servers as the user's own configuration and
+    /// made the loss permanent (issues #98, #102, #105 I5b).
     async fn configure_dns(&self) -> Result<(), String> {
         tracing::debug!("Configuring DNS servers");
 
         let adapter_name = format!("name={}", ADAPTER_NAME);
 
-        // H-3 FIX: Use PowerShell Get-NetAdapter for reliable adapter enumeration
-        let non_vpn_adapters = Self::get_non_vpn_adapters();
-
-        // H-4 FIX: Snapshot original DNS config BEFORE modifying anything
-        let mut snapshots = Vec::new();
-        for name in &non_vpn_adapters {
-            if let Some(snap) = Self::snapshot_adapter_dns(name) {
-                snapshots.push(snap);
-            }
-        }
-
-        // Persist the snapshot BEFORE the first netsh mutation below, for the
-        // same reason `dns_modified` is set there: everything past this point
-        // can die without ever running a restore. `panic = "abort"` makes the
-        // panic hook the last code that runs, and a SIGKILL or a power cut does
-        // not reach even that — the in-memory copy goes with the process, and a
-        // parked adapter cannot be recognised as ours afterwards (see
-        // vpn::dns_journal). Cleared by restore_physical_adapters_dns.
-        crate::vpn::dns_journal::record_windows(&snapshots);
-        *self.dns_snapshots.write().await = snapshots;
-        tracing::debug!(
-            "Captured DNS snapshots for {} adapters",
-            non_vpn_adapters.len()
-        );
-
-        // Mark BEFORE the first netsh mutation below: if the connect is
-        // cancelled (CONNECT_TIMEOUT) or fails anywhere past this point, the
-        // Drop unwind must know the physical adapters were touched even though
-        // `running` never became true. Cleared by restore_dns once restored.
-        self.dns_modified.store(true, Ordering::SeqCst);
-
-        // STEP 1: Disable DNS on all other adapters to prevent SMHNR leak.
-        // `validate=no` is critical: without it netsh synchronously validates
-        // the change against the network (NLA re-evaluation), which blocks for
-        // 10-25s per call on some machines — the dominant cause of slow connects.
-        //
-        // The `ipv6` pass is NOT optional: the `ip` context is IPv4-only, so IPv6
-        // resolvers (RA/RDNSS, usually a fe80:: link-local) stayed registered and
-        // SMHNR kept querying them on the physical NIC. On a dual-stack session the
-        // ::/1 + 8000::/1 tunnel routes do not capture link-local scope, so those
-        // queries egress in the clear.
-        for iface_name in &non_vpn_adapters {
-            let name_arg = format!("name={}", iface_name);
-            for family in ["ip", "ipv6"] {
-                let _ = cmd("netsh")
-                    .args([
-                        "interface",
-                        family,
-                        "set",
-                        "dns",
-                        &name_arg,
-                        "static",
-                        "none",
-                        "validate=no",
-                    ])
-                    .output();
-            }
-            tracing::debug!("Disabled IPv4 + IPv6 DNS on adapter: {}", iface_name);
-        }
+        crate::vpn::win_machine_state::claim(self.state_gen);
 
         // STEP 2: Set DNS on the VPN adapter. Native fast path first
         // (SetInterfaceDnsSettings via the adapter GUID — instant, no
@@ -1544,14 +1618,35 @@ impl WintunTunnel {
         let if_index = self.get_adapter_index().await?;
         set_adapter_ipv6_native(if_index, ip, 128)?;
 
+        // I10, IPv6 twin. These are on-link on the Wintun interface and so die
+        // with it, but they are still routes this generation installed, and the
+        // owner is the single place that knows about installed routes. Leaving
+        // the v6 arm out is exactly the twin drift that has bitten this file
+        // twice already.
+        let state_gen = self.state_gen;
+        let record_v6 = |dest: Ipv6Addr, prefix_len: u8| {
+            crate::vpn::win_machine_state::record_route(
+                state_gen,
+                crate::vpn::win_machine_state::OwnedRoute {
+                    dest: std::net::IpAddr::V6(dest),
+                    prefix_len,
+                    next_hop: std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    if_index,
+                },
+            );
+        };
+
         for cidr in &self.config.allowed_ips_v6 {
             if cidr == "::/0" {
                 add_route6_native(Ipv6Addr::UNSPECIFIED, 1, if_index, 5)?; // ::/1
-                add_route6_native(Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0), 1, if_index, 5)?;
-            // 8000::/1
+                record_v6(Ipv6Addr::UNSPECIFIED, 1);
+                let upper = Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0);
+                add_route6_native(upper, 1, if_index, 5)?; // 8000::/1
+                record_v6(upper, 1);
             } else if let Some((net, plen)) = cidr.split_once('/') {
                 if let (Ok(addr), Ok(len)) = (net.parse::<Ipv6Addr>(), plen.parse::<u8>()) {
                     add_route6_native(addr, len, if_index, 5)?;
+                    record_v6(addr, len);
                 }
             }
         }
@@ -1625,11 +1720,20 @@ impl WintunTunnel {
         Ok(())
     }
 
-    /// H-4 FIX: Restore DNS to the EXACT configuration captured before VPN connected.
-    /// Instead of blindly setting DHCP on all adapters (which broke static DNS configs),
-    /// this restores each adapter to its original DNS servers.
+    /// Hand the physical adapters back the resolvers they had before this
+    /// session parked them, and put the VPN adapter's own DNS back on DHCP.
+    ///
+    /// Owner-gated. A tunnel that no longer owns the machine state must not
+    /// un-park anything: on a reconnect the park is held across the gap and the
+    /// INCOMING tunnel owns it, so un-parking here would be issue #98 — the
+    /// physical NICs get their ISP resolvers back while a live tunnel carries
+    /// traffic and the UI reads Connected.
     async fn restore_dns(&self) -> Result<(), String> {
-        tracing::debug!("Restoring DNS from snapshots");
+        if !crate::vpn::win_machine_state::is_owner(self.state_gen) {
+            tracing::debug!("DNS restore skipped — this tunnel no longer owns the machine state");
+            return Ok(());
+        }
+        tracing::debug!("Restoring DNS");
 
         // Restore DNS on VPN adapter (both families — configure_dns disabled both)
         for family in ["ip", "ipv6"] {
@@ -1645,262 +1749,10 @@ impl WintunTunnel {
                 .output();
         }
 
-        // H-4 FIX: Restore from snapshots instead of blindly setting DHCP
-        let snapshots = self.dns_snapshots.read().await.clone();
-        Self::restore_physical_adapters_dns(&snapshots);
-
-        // The physical adapters carry resolvers again — the emergency unwind
-        // (Drop) has nothing left to do for DNS.
-        self.dns_modified.store(false, Ordering::SeqCst);
+        crate::vpn::win_machine_state::release_dns(self.state_gen);
 
         tracing::debug!("DNS restoration complete");
         Ok(())
-    }
-
-    /// Synchronously hand the physical adapters back their resolvers.
-    ///
-    /// For callers that cannot await and cannot be held open — specifically the
-    /// updater relaunch, where `RunEvent::ExitRequested` carries
-    /// `RESTART_EXIT_CODE` and `prevent_exit()` is a documented no-op. Blocking
-    /// that handler briefly is acceptable; leaving the machine with no DNS is
-    /// not.
-    ///
-    /// Returns whether anything was actually restored, so the caller can log the
-    /// difference between "put them back" and "nothing was parked".
-    ///
-    /// `try_read` mirrors the `Drop` unwind: there is no async context here. On
-    /// contention it yields nothing and this does nothing, which is the safe way
-    /// to be wrong — an empty list means "we know of nothing to restore", and
-    /// acting on that by forcing DHCP is the bug removed alongside this.
-    pub(super) fn restore_dns_blocking(&self) -> bool {
-        if !self.dns_modified.load(Ordering::SeqCst) {
-            return false;
-        }
-        let snapshots = self
-            .dns_snapshots
-            .try_read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        if snapshots.is_empty() {
-            tracing::warn!(
-                "Restart teardown: DNS is marked modified but no snapshot is readable —                  leaving the adapters alone rather than guessing"
-            );
-            return false;
-        }
-        Self::restore_physical_adapters_dns(&snapshots);
-        self.dns_modified.store(false, Ordering::SeqCst);
-        true
-    }
-
-    /// Restore the physical (non-VPN) adapters' resolvers to the exact
-    /// pre-connect `snapshots`, or to DHCP when none were captured.
-    ///
-    /// Synchronous on purpose, and shared by restore_dns() and the Drop
-    /// emergency unwind (which cannot await) so the two can never drift.
-    fn restore_physical_adapters_dns(snapshots: &[AdapterDnsSnapshot]) {
-        if snapshots.is_empty() {
-            // Deliberately DO NOTHING. This used to reset every connected
-            // adapter to DHCP, and it is reachable with no attacker and no
-            // crash: `Drop` reads the snapshots with `try_read().unwrap_or_default()`,
-            // which yields `[]` under lock contention, and `configure_dns` stores
-            // `[]` when `snapshot_adapter_dns` fails for every adapter (netsh
-            // failing to spawn under AV). Blanket DHCP would then rewrite
-            // resolvers on adapters this tunnel never touched — including the
-            // static-none virtual adapters described on `v4_was_dhcp`.
-            //
-            // "We recorded nothing" and "nothing was parked" are indistinguishable
-            // here, and the correct action for the second is to do nothing. Doing
-            // nothing for the first leaves the clean-disconnect path to fix it.
-            tracing::warn!(
-                "No DNS snapshots to restore from — taking no action rather than \r
-                 forcing DHCP on adapters that may never have been touched"
-            );
-        } else {
-            for snapshot in snapshots {
-                Self::restore_adapter_dns(
-                    &snapshot.adapter_name,
-                    "ip",
-                    &snapshot.dns_servers,
-                    snapshot.v4_was_dhcp,
-                );
-
-                // IPv6: restore only resolvers the user actually configured. A
-                // fe80:: resolver was learned from a Router Advertisement (RDNSS);
-                // Windows re-learns it the moment the adapter is back on DHCP/RA,
-                // and pinning a zone-scoped address statically would outlive the
-                // router that advertised it.
-                let v6_static: Vec<String> = snapshot
-                    .dns_servers_v6
-                    .iter()
-                    .filter(|dns| !is_link_local_v6(dns))
-                    .cloned()
-                    .collect();
-
-                // ...but "Windows re-learns it" only happens if something puts the
-                // adapter BACK on DHCP/RA. An adapter whose only IPv6 resolvers
-                // were link-local filters to an empty list here, and with the
-                // origin flag saying `static`, the empty case deliberately does
-                // nothing (see restore_adapter_dns) — so the adapter is left
-                // parked on `static none` with no IPv6 resolvers at all.
-                //
-                // A regression introduced when this file started trusting the
-                // origin flag: before, an empty list fell through to DHCP and
-                // Windows re-learned the RA. It bites on IPv6-native networks,
-                // where RDNSS is often the ONLY source of IPv6 DNS.
-                //
-                // So hand it back to DHCP/RA when everything it had was
-                // link-local. Deliberately false when the adapter had NO IPv6
-                // resolvers at all — that is the genuinely-static-with-none case
-                // the origin flag exists to leave alone.
-                let v6_had_only_link_local =
-                    !snapshot.dns_servers_v6.is_empty() && v6_static.is_empty();
-                Self::restore_adapter_dns(
-                    &snapshot.adapter_name,
-                    "ipv6",
-                    &v6_static,
-                    snapshot.v6_was_dhcp || v6_had_only_link_local,
-                );
-
-                tracing::debug!(
-                    "Restored {} — IPv4: {:?}, IPv6: {:?}",
-                    snapshot.adapter_name,
-                    snapshot.dns_servers,
-                    v6_static
-                );
-            }
-
-            // The adapters carry resolvers again, so the on-disk record has
-            // nothing left to describe. Cleared HERE, in the one helper every
-            // restore path funnels through (restore_dns, restore_dns_blocking
-            // and the Drop unwind), so no path can forget it. Deliberately NOT
-            // cleared in the empty-snapshot branch above: there we knowingly did
-            // nothing, and the record is then the only thing that still knows
-            // what to put back.
-            crate::vpn::dns_journal::clear();
-        }
-    }
-
-    /// Put back the resolvers on adapters a previous session PARKED and never
-    /// un-parked — the crash twin of `restore_dns_blocking`.
-    ///
-    /// Driven off the on-disk journal, because after a crash there is no
-    /// in-memory snapshot left and no later connect can tell the parked state
-    /// from a user's own `static`-with-no-servers configuration:
-    /// `restore_adapter_dns` deliberately leaves that shape alone, which is
-    /// exactly what makes the damage permanent (see vpn::dns_journal).
-    ///
-    /// Every adapter is re-checked against the LIVE state first. `configure_dns`
-    /// leaves a parked adapter `static` with no servers on both families, so an
-    /// adapter that no longer looks like that has been reconfigured since — by
-    /// the user fixing DNS by hand, by another VPN, by a driver reinstall — and
-    /// is not ours to rewrite. That check is what makes this safe to run from
-    /// `setup()` against an arbitrarily old record. netsh failing to answer
-    /// counts as "not ours": doing nothing is the safe way to be wrong.
-    ///
-    /// The un-parking itself goes through the same helper as the clean
-    /// disconnect, so the two can never drift.
-    pub(super) fn restore_parked_adapters(snapshots: &[AdapterDnsSnapshot]) -> bool {
-        let still_parked: Vec<AdapterDnsSnapshot> = snapshots
-            .iter()
-            .filter(
-                |snap| match Self::snapshot_adapter_dns(&snap.adapter_name) {
-                    Some(live) => {
-                        let parked = !live.v4_was_dhcp
-                            && live.dns_servers.is_empty()
-                            && !live.v6_was_dhcp
-                            && live.dns_servers_v6.is_empty();
-                        if !parked {
-                            tracing::info!(
-                                "{} carries resolvers again — leaving it alone",
-                                snap.adapter_name
-                            );
-                        }
-                        parked
-                    }
-                    None => false,
-                },
-            )
-            .cloned()
-            .collect();
-
-        if still_parked.is_empty() {
-            return false;
-        }
-        tracing::warn!(
-            "{} adapter(s) left parked on `static none` by a previous session — restoring their \
-             pre-connect resolvers",
-            still_parked.len()
-        );
-        Self::restore_physical_adapters_dns(&still_parked);
-        let _ = cmd("ipconfig").args(["/flushdns"]).output();
-        true
-    }
-
-    /// Restore one address family's resolvers on an adapter.
-    /// `servers` empty = back to DHCP/RA. `family` is the netsh context
-    /// ("ip" for IPv4, "ipv6" for IPv6).
-    ///
-    /// `validate=no` skips the slow synchronous network re-validation (~12s) that
-    /// made disconnect feel stuck while "recovering".
-    fn restore_adapter_dns(adapter_name: &str, family: &str, servers: &[String], was_dhcp: bool) {
-        let name_arg = format!("name={}", adapter_name);
-
-        if servers.is_empty() {
-            if !was_dhcp {
-                // The adapter was ALREADY `static` with no servers before we
-                // parked it, so parking was a no-op and un-parking must be one
-                // too. Forcing DHCP here is what silently reconfigured
-                // VirtualBox / Hyper-V / OpenVPN adapters on every disconnect.
-                tracing::debug!(
-                    "{} ({}): was static with no servers before connect — leaving as-is",
-                    adapter_name,
-                    family
-                );
-                return;
-            }
-            let _ = cmd("netsh")
-                .args([
-                    "interface",
-                    family,
-                    "set",
-                    "dns",
-                    &name_arg,
-                    "dhcp",
-                    "validate=no",
-                ])
-                .output();
-            return;
-        }
-
-        for (i, dns) in servers.iter().enumerate() {
-            if i == 0 {
-                let _ = cmd("netsh")
-                    .args([
-                        "interface",
-                        family,
-                        "set",
-                        "dns",
-                        &name_arg,
-                        "static",
-                        dns,
-                        "validate=no",
-                    ])
-                    .output();
-            } else {
-                let _ = cmd("netsh")
-                    .args([
-                        "interface",
-                        family,
-                        "add",
-                        "dns",
-                        &name_arg,
-                        dns,
-                        &format!("index={}", i + 1),
-                        "validate=no",
-                    ])
-                    .output();
-            }
-        }
     }
 
     /// Get the default gateway from the routing table
@@ -2169,7 +2021,15 @@ impl WintunTunnel {
     /// SECURITY: Order of operations is critical to prevent traffic leaks
     /// Kill switch must remain active until after all cleanup is complete
     pub async fn stop(&self) -> Result<(), String> {
-        if !self.running.load(Ordering::SeqCst) {
+        // I3 LIVENESS, NOT CLAIM. Keying this on `running` alone made a tunnel
+        // that the manager's CONNECT_TIMEOUT cancelled before `running` was ever
+        // set impossible to stop — even for someone holding it — while it still
+        // owned the parked adapters and the installed routes. Ownership is the
+        // predicate: if this generation owns machine state there is work to do,
+        // whatever the flag says.
+        if !self.running.load(Ordering::SeqCst)
+            && !crate::vpn::win_machine_state::is_owner(self.state_gen)
+        {
             return Ok(());
         }
 
@@ -2247,71 +2107,35 @@ impl WintunTunnel {
         Ok(())
     }
 
-    /// Clean up routes when disconnecting
+    /// Clean up routes when disconnecting.
     async fn cleanup_routes(&self) -> Result<(), String> {
-        // Use the stored resolved IP, not the config hostname
-        let endpoint_ip = self.resolved_endpoint_ip.read().await.clone();
-        self.cleanup_routes_blocking(endpoint_ip.as_deref());
+        self.cleanup_routes_blocking();
         Ok(())
     }
 
-    /// Sync core of route cleanup. Shared by cleanup_routes() and the Drop
+    /// Sync core of route cleanup. Shared by `cleanup_routes()` and the `Drop`
     /// emergency unwind (which cannot await) so the two can never drift.
-    fn cleanup_routes_blocking(&self, endpoint_ip: Option<&str>) {
-        tracing::debug!("Cleaning up routes");
-
-        // Remove server endpoint host route
-        if let Some(endpoint_ip) = endpoint_ip {
-            tracing::debug!(
-                "Removing endpoint host route for {}",
-                redact_ip(endpoint_ip)
-            );
-            let _ = cmd("route")
-                .args(["delete", endpoint_ip, "mask", "255.255.255.255"])
-                .output();
-        }
-
-        // Remove VPN routes (including split routes for 0.0.0.0/0)
-        for allowed_ip in &self.config.allowed_ips {
-            if allowed_ip == "0.0.0.0/0" {
-                // FIX-ROUTE: Clean up the two /1 split routes
-                let _ = cmd("route")
-                    .args(["delete", "0.0.0.0", "mask", "128.0.0.0"])
-                    .output();
-                let _ = cmd("route")
-                    .args(["delete", "128.0.0.0", "mask", "128.0.0.0"])
-                    .output();
-            } else if let Ok((network, mask)) = self.parse_cidr(allowed_ip) {
-                // P1-dk-win-unqualified-route-delete: an unqualified
-                // `route delete <net>` removes EVERY route for that network,
-                // including a pre-existing corporate/LAN route the client never
-                // installed. Qualify with the mask, mirroring the add path.
-                let _ = cmd("route")
-                    .args(["delete", &network, "mask", &mask])
-                    .output();
-            }
-        }
-
-        // Clean up local network sharing routes if they were added
-        if self.local_network_routes_added.load(Ordering::SeqCst) {
-            tracing::debug!("Removing local network sharing routes");
-            let local_routes = [
-                ("10.0.0.0", "255.0.0.0"),
-                ("172.16.0.0", "255.240.0.0"),
-                ("192.168.0.0", "255.255.0.0"),
-                ("169.254.0.0", "255.255.0.0"),
-            ];
-            for (network, mask) in &local_routes {
-                let _ = cmd("route")
-                    .args(["delete", network, "mask", mask])
-                    .output();
-            }
-            self.local_network_routes_added
-                .store(false, Ordering::SeqCst);
-        }
-
-        // Routes are gone — the emergency unwind (Drop) has nothing left to do.
-        self.routes_installed.store(false, Ordering::SeqCst);
+    ///
+    /// ISSUE #100. This used to issue text-mode deletes with no interface and no
+    /// gateway:
+    ///
+    /// ```text
+    /// route delete 0.0.0.0   mask 128.0.0.0
+    /// route delete 128.0.0.0 mask 128.0.0.0
+    /// ```
+    ///
+    /// which removes EVERY route for that destination and mask, whoever
+    /// installed it — Cloudflare WARP and Tailscale both install `/1`
+    /// split-defaults, so disconnecting Birdo tore down their routing. The same
+    /// defect sat on the endpoint host route and, when `local_network_sharing`
+    /// was on, on `10.0.0.0/8` / `172.16.0.0/12` / `192.168.0.0/16` /
+    /// `169.254.0.0/16` — a corporate 10/8 route is common, which makes that the
+    /// more damaging one. The issue names only the two `/1` lines; fixing only
+    /// those is exactly the twin drift this estate keeps re-finding, so all four
+    /// sites now go through the machine-state owner, which deletes the exact rows
+    /// it recorded at install time and nothing else (I10).
+    fn cleanup_routes_blocking(&self) {
+        crate::vpn::win_machine_state::release_routes(self.state_gen);
     }
 
     /// Check if tunnel is running
@@ -2367,83 +2191,67 @@ impl WintunTunnel {
 /// ordered teardown. This is a safety net only.
 impl Drop for WintunTunnel {
     fn drop(&mut self) {
-        // P1-dk-win-failed-connect-no-dns-restore: a tunnel that never reached
-        // `running` can still have mutated global state. The manager's
-        // CONNECT_TIMEOUT cancels start() mid-await and DROPS the half-built
-        // tunnel (no error return ever runs), and start()'s own later error
-        // returns (the dual-stack IPv6 `?`s) exit after DNS and routes are in
-        // — with every physical adapter parked on `static none`. Keying this
-        // unwind on `running` alone left the whole machine without resolvers.
-        // Key it on what was actually MODIFIED instead.
-        let dns_dirty = self.dns_modified.load(Ordering::SeqCst);
-        let routes_dirty = self.routes_installed.load(Ordering::SeqCst)
-            || self.local_network_routes_added.load(Ordering::SeqCst);
-        if !self.running.load(Ordering::SeqCst) && !dns_dirty && !routes_dirty {
+        // I1 SINGLE OWNER, and it is the whole of issue #98.
+        //
+        // On a reconnect where the teardown was skipped, the manager replaced
+        // `Some(old)` with `Some(new)` and DROPPED the old tunnel — whose Drop
+        // then un-parked every physical adapter, deleted the `/1` split-default
+        // pair and removed the IPv6 block while the NEW tunnel was live and
+        // carrying traffic, with the UI showing Connected. Every one of those is
+        // machine state, and this tunnel may only touch machine state it owns.
+        //
+        // Ownership also replaces the old `running` / `dns_modified` /
+        // `routes_installed` gate. That gate existed because a connect cancelled
+        // by CONNECT_TIMEOUT never set `running` yet had already parked the
+        // adapters; the owner knows what was installed, so it cannot disagree
+        // with a flag about it.
+        if !crate::vpn::win_machine_state::is_owner(self.state_gen) {
+            if self.running.load(Ordering::SeqCst) {
+                tracing::warn!(
+                    "A tunnel was dropped while still marked running but no longer owning the \
+                     machine state — leaving DNS, routes and firewall state to their current \
+                     owner rather than tearing down a live session"
+                );
+                self.running.store(false, Ordering::SeqCst);
+            }
             return;
         }
 
         tracing::warn!(
-            "WintunTunnel dropped with live state (running={}, dns_modified={}, \
-             routes_installed={}) — performing emergency cleanup to prevent \
-             DNS/route leaks",
-            self.running.load(Ordering::SeqCst),
-            dns_dirty,
-            routes_dirty
+            "WintunTunnel dropped still owning machine state (running={}) — performing \
+             emergency cleanup to prevent DNS/route leaks",
+            self.running.load(Ordering::SeqCst)
         );
         self.running.store(false, Ordering::SeqCst);
 
         // Best-effort: flush DNS cache to clear VPN-specific entries
         let _ = cmd("ipconfig").args(["/flushdns"]).output();
 
-        // Best-effort: reset VPN adapter DNS to DHCP (prevents DNS leak)
-        let _ = cmd("netsh")
-            .args([
-                "interface",
-                "ip",
-                "set",
-                "dns",
-                &format!("name={}", ADAPTER_NAME),
-                "dhcp",
-            ])
-            .output();
+        // Best-effort: reset VPN adapter DNS to DHCP (prevents DNS leak).
+        //
+        // BOTH families. This was the `ip` context only, while `configure_dns`
+        // sets the tunnel resolvers and `restore_dns` clears both — the same
+        // v4/v6 twin that has drifted twice in this file already.
+        for family in ["ip", "ipv6"] {
+            let _ = cmd("netsh")
+                .args([
+                    "interface",
+                    family,
+                    "set",
+                    "dns",
+                    &format!("name={}", ADAPTER_NAME),
+                    "dhcp",
+                ])
+                .output();
+        }
 
-        // Best-effort: restore the PHYSICAL adapters for BOTH families.
-        // configure_dns() set every non-VPN adapter to `static none` (IPv4 and
-        // IPv6) to suppress SMHNR. The clean teardown (restore_dns) undoes that,
-        // but a cancelled/failed connect or a panic bypasses it — without this,
-        // the machine is left with no resolvers on its real NICs (both
-        // families) until the user reconnects and cleanly disconnects. Restore
-        // the exact snapshots configure_dns captured (a static resolver the
-        // user set survives); with no snapshot captured this falls back to
-        // DHCP. try_read: Drop cannot await, and by now nothing else
-        // legitimately holds the lock.
-        let snapshots = self
-            .dns_snapshots
-            .try_read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        Self::restore_physical_adapters_dns(&snapshots);
-        self.dns_modified.store(false, Ordering::SeqCst);
-
-        // Best-effort: remove the endpoint host route plus the split-default
-        // and LAN-sharing routes — the same cleanup stop() runs, via the same
-        // helper. Prefer the RESOLVED endpoint IP (what the route was actually
-        // installed for); fall back to the config host for a pre-resolution
-        // drop, where the delete simply finds nothing.
-        let endpoint_ip = self
-            .resolved_endpoint_ip
-            .try_read()
-            .ok()
-            .and_then(|g| g.clone())
-            .or_else(|| {
-                self.config
-                    .endpoint
-                    .split(':')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            });
-        self.cleanup_routes_blocking(endpoint_ip.as_deref());
+        // Best-effort: un-park the physical adapters (both families) and remove
+        // exactly the routes this generation installed. The same owner-gated,
+        // verified code path the clean teardown uses, so the two cannot drift:
+        // a cancelled or failed connect and a panic both land here having parked
+        // every physical NIC on `static none`, and without this the machine is
+        // left with no resolvers on its real interfaces.
+        crate::vpn::win_machine_state::release_all(self.state_gen);
 
         // Best-effort: remove IPv6 blocking firewall rules
         let _ = cmd("powershell")

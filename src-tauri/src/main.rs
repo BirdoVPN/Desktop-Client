@@ -634,13 +634,24 @@ fn main() {
                 if *code == Some(tauri::RESTART_EXIT_CODE) {
                     // The full teardown cannot run here, but ONE piece of it
                     // outlives the process on Windows and must: configure_dns()
-                    // parks every physical adapter on `static none`, and the
-                    // startup reconcile this comment used to rely on has macOS
-                    // and Linux arms only. Without this, updating in-app while
-                    // connected leaves the machine with no resolvers — and the
-                    // relaunched instance then cannot resolve the API it needs
-                    // to reconnect. Synchronous and try_read-based throughout,
-                    // so it cannot wedge an exit that must not be held open.
+                    // parks every physical adapter on `static none`. Without
+                    // this, updating in-app while connected leaves the machine
+                    // with no resolvers — and the relaunched instance then
+                    // cannot resolve the API it needs to reconnect.
+                    //
+                    // It is NOT try_read-based (an earlier comment here claimed
+                    // it was, and that stopped being true when the record moved
+                    // out of the tunnel): it takes the machine-state
+                    // `std::sync::Mutex` and issues netsh. The bound on holding
+                    // this thread is therefore "one un-park pass", the same work
+                    // a normal disconnect does, and it must not be made
+                    // conditional — an un-park skipped here is permanent, since
+                    // the process that knew about it is being replaced.
+                    //
+                    // It is also what shuts the refresh ticker down on this
+                    // path: `release_dns_at_exit` un-parks, and the un-park
+                    // closes the data plane in the same critical section (I13),
+                    // so no pass can re-park behind it while the relaunch runs.
                     #[cfg(target_os = "windows")]
                     {
                         let restored = app_handle.state::<VpnManager>().restore_dns_blocking();

@@ -22,8 +22,15 @@ pub mod tunnel_linux;
 pub mod tunnel_macos;
 
 #[cfg(target_os = "windows")]
-mod tunnel_dns; // DNS helpers extracted from tunnel.rs (Windows-specific netsh/powershell)
-                // Removed: pub mod wireguard; - deprecated file with placeholder crypto
+mod tunnel_dns; // netsh DNS reads + their captured-output parsers (Windows only)
+
+// Process-global owner of the Windows machine state a session moves aside: the
+// parked physical-adapter DNS and the installed routes. Lives outside the tunnel
+// because it outlives individual tunnels — see the module docs for the
+// invariants (issues #98, #99, #100, #102, #105).
+#[cfg(target_os = "windows")]
+pub mod win_machine_state;
+// Removed: pub mod wireguard; - deprecated file with placeholder crypto
 mod wireguard_new;
 
 // Windows Filtering Platform for kill switch
@@ -292,18 +299,18 @@ pub mod dns_journal {
         Some(dir)
     }
 
-    fn write(journal: &DnsJournal) {
+    fn write(journal: &DnsJournal) -> Result<(), String> {
         let Some(path) = path() else {
             tracing::warn!(
                 "No data directory — DNS could not be made restorable after an abnormal exit"
             );
-            return;
+            return Err("no data directory".to_string());
         };
         let json = match serde_json::to_vec_pretty(journal) {
             Ok(json) => json,
             Err(e) => {
                 tracing::warn!("Could not serialise the DNS journal: {}", e);
-                return;
+                return Err(format!("could not serialise the DNS journal: {}", e));
             }
         };
         // The record names network services and resolvers — which machine was on
@@ -321,12 +328,18 @@ pub mod dns_journal {
             f.write_all(&json)
         });
         match result {
-            Ok(()) => tracing::debug!("DNS journal written"),
-            Err(e) => tracing::warn!(
-                "Could not write the DNS journal ({}) — an abnormal exit will leave this host \
-                 without resolvers",
-                e
-            ),
+            Ok(()) => {
+                tracing::debug!("DNS journal written");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Could not write the DNS journal ({}) — an abnormal exit will leave this host \
+                     without resolvers",
+                    e
+                );
+                Err(e.to_string())
+            }
         }
     }
 
@@ -368,20 +381,27 @@ pub mod dns_journal {
         }
     }
 
-    /// Record the adapters `configure_dns` is about to park.
+    /// Record the adapters the machine-state owner is about to park.
+    ///
+    /// Returns whether the record actually reached the disk. The Windows owner
+    /// writes the record for an adapter BEFORE parking it and refuses to park it
+    /// if this fails: a mutation whose record is not durable is a mutation
+    /// nothing can undo (I4).
     #[cfg(target_os = "windows")]
-    pub(super) fn record_windows(adapters: &[super::tunnel::AdapterDnsSnapshot]) {
+    pub(super) fn record_windows(
+        adapters: &[super::tunnel::AdapterDnsSnapshot],
+    ) -> Result<(), String> {
         write(&DnsJournal {
             os: std::env::consts::OS.to_string(),
             adapters: adapters.to_vec(),
-        });
+        })
     }
 
     /// Record the services `configure_dns` is about to repoint, and the tunnel
     /// resolvers it is about to point them at.
     #[cfg(target_os = "macos")]
     pub(super) fn record_macos(services: &[(String, Vec<String>)], tunnel_dns: &[String]) {
-        write(&DnsJournal {
+        let _ = write(&DnsJournal {
             os: std::env::consts::OS.to_string(),
             services: services.to_vec(),
             tunnel_dns: tunnel_dns.to_vec(),
@@ -391,7 +411,7 @@ pub mod dns_journal {
     /// Record the /etc/resolv.conf `configure_dns` is about to overwrite.
     #[cfg(target_os = "linux")]
     pub(super) fn record_linux(resolv_conf_backup: Option<String>, uses_systemd_resolved: bool) {
-        write(&DnsJournal {
+        let _ = write(&DnsJournal {
             os: std::env::consts::OS.to_string(),
             resolv_conf_backup,
             uses_systemd_resolved,
@@ -416,26 +436,38 @@ pub mod dns_journal {
             return false;
         };
 
+        // Windows owns its own record lifecycle and deliberately does NOT clear
+        // unconditionally. An entry whose restore could not be verified stays on
+        // disk: clearing it would destroy the last thing that knows what to put
+        // back, which is exactly how a failed un-park became permanent (I5).
+        // `reconcile_record` re-persists what remains, or deletes the file when
+        // nothing is left to describe.
         #[cfg(target_os = "windows")]
-        let restored = super::tunnel::WintunTunnel::restore_parked_adapters(&journal.adapters);
-        #[cfg(target_os = "macos")]
-        let restored = super::tunnel_macos::restore_services_still_on_tunnel_dns(
-            &journal.services,
-            &journal.tunnel_dns,
-        );
-        #[cfg(target_os = "linux")]
-        let restored = super::tunnel_linux::restore_resolv_conf_if_ours(
-            journal.resolv_conf_backup,
-            journal.uses_systemd_resolved,
-        );
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        let restored = {
-            let _ = &journal;
-            false
-        };
+        {
+            super::win_machine_state::reconcile_record(&journal.adapters)
+        }
 
-        clear();
-        restored
+        #[cfg(not(target_os = "windows"))]
+        {
+            #[cfg(target_os = "macos")]
+            let restored = super::tunnel_macos::restore_services_still_on_tunnel_dns(
+                &journal.services,
+                &journal.tunnel_dns,
+            );
+            #[cfg(target_os = "linux")]
+            let restored = super::tunnel_linux::restore_resolv_conf_if_ours(
+                journal.resolv_conf_backup,
+                journal.uses_systemd_resolved,
+            );
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let restored = {
+                let _ = &journal;
+                false
+            };
+
+            clear();
+            restored
+        }
     }
 }
 
