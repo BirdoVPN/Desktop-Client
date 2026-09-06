@@ -1059,21 +1059,31 @@ pub struct VpnStatus {
     pub quantum_active: bool,
     pub pq_mode: crate::vpn::birdo_pq::PqMode,
 
-    /// Physical adapters whose DNS this session could not verifiably suppress
+    /// Network interfaces whose DNS this session could not verifiably suppress
     /// or could not verifiably put back, one human-readable line each.
     ///
-    /// Empty on every platform but Windows, and empty on Windows whenever there
-    /// is nothing wrong. It is populated from the machine-state owner's own
-    /// record of read-backs that did not match, so it describes work that was
-    /// LOOKED AT — which is the entire point. An adapter that keeps its ISP
-    /// resolvers while the tunnel is up leaks DNS with the UI reading Connected,
-    /// and one that could not be restored leaves the machine without resolvers
-    /// after disconnect. Neither is visible anywhere else, and rendering a
-    /// Connected badge over either is rendering reassurance from missing data.
+    /// Populated on ALL THREE platforms, and empty whenever there is nothing
+    /// wrong. It is populated from a read-back that did not match, so it
+    /// describes work that was LOOKED AT — which is the entire point. An adapter
+    /// that keeps its ISP resolvers while the tunnel is up leaks DNS with the UI
+    /// reading Connected, and one that could not be restored leaves the machine
+    /// without resolvers after disconnect. Neither is visible anywhere else, and
+    /// rendering a Connected badge over either is rendering reassurance from
+    /// missing data.
     ///
-    /// Excludes adapters merely recorded-but-absent (unplugged): those are
-    /// retained in the record so they can be restored on re-attach, but there is
-    /// no fault to report and nothing the user could do about one.
+    /// This was hard-coded `Vec::new()` off Windows while the macOS and Linux
+    /// restore passes were computing exactly this value and sending it only to
+    /// `tracing::error!` — telling a user whose DNS had just failed to come back
+    /// to go and read a log file they cannot fetch, because they have no DNS.
+    /// Windows reads the machine-state owner's degradation map; macOS and Linux
+    /// read what `dns_journal::settle` published, which is the same choke point
+    /// that decides whether the restore journal may be deleted, so the banner
+    /// and the record can never disagree.
+    ///
+    /// Excludes interfaces merely recorded-but-absent (unplugged, or a network
+    /// service the user deleted): those are retained in the record so they can
+    /// be restored on re-attach, but there is no fault to report and nothing the
+    /// user could do about one.
     pub dns_degraded: Vec<String>,
 }
 
@@ -1114,7 +1124,7 @@ pub async fn get_vpn_status(
         #[cfg(target_os = "windows")]
         dns_degraded: crate::vpn::win_machine_state::degradation_report(),
         #[cfg(not(target_os = "windows"))]
-        dns_degraded: Vec::new(),
+        dns_degraded: crate::vpn::dns_journal::degradation_report(),
     })
 }
 

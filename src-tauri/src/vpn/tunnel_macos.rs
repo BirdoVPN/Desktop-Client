@@ -78,26 +78,82 @@ fn dns_servers_for(service: &str) -> Vec<String> {
 /// `None` means the QUESTION failed (no such service, networksetup missing),
 /// `Some(vec![])` means the service genuinely has no manually-set resolvers.
 ///
-/// That difference is load-bearing exactly once — verifying a restore back to
-/// DHCP in `set_service_dns`. There, an unanswerable query and "the service is
-/// now on DHCP" both look like the empty list, and treating the first as the
-/// second would report a restore that never happened and let the journal be
-/// deleted. Every other caller wants the lenient reading (a service we cannot
-/// interrogate has nothing worth recording), so they keep it.
+/// That difference is load-bearing in the two places that decide the journal's
+/// fate, and nowhere else:
+///
+/// 1. `set_service_dns`, verifying a restore back to DHCP. An unanswerable query
+///    and "the service is now on DHCP" both look like the empty list, and
+///    treating the first as the second reports a restore that never happened.
+/// 2. `restore_services_pass`'s probe (via `ServiceDns::Unreadable`), deciding
+///    whether a service is still on the tunnel's resolvers at all. There, the
+///    lenient reading says "not on the tunnel DNS, so the user already fixed
+///    it", and the record is deleted off that.
+///
+/// The remaining caller is snapshot CAPTURE, which genuinely wants the lenient
+/// reading: a service we cannot interrogate has nothing worth recording.
 fn query_dns_servers(service: &str) -> Option<Vec<String>> {
-    let output = match cmd("networksetup")
+    let raw = match cmd("networksetup")
         .args(["-getdnsservers", service])
         .output()
     {
-        Ok(o) if o.status.success() => o,
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        // The QUESTION failed: no such service, networksetup missing, a locked
+        // SystemConfiguration store.
         _ => return None,
     };
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    interpret_dns_query(Some(raw.as_str()))
+}
+
+/// Interpret a `networksetup -getdnsservers` result, `None` meaning the command
+/// itself could not be run or exited non-zero.
+///
+/// Split out from the process spawn purely so the distinction this file turns on
+/// - an unanswerable question (`None`) versus an answer of "none" (`Some([])`) -
+/// is asserted by a test rather than only by prose. Nothing on macOS can be
+/// exercised by the one CI job that runs `cargo test`, so anything that is not
+/// pulled out into a pure function here is verified by nothing.
+fn interpret_dns_query(raw: Option<&str>) -> Option<Vec<String>> {
+    let text = raw?.trim();
     if text.contains("aren't any") || text.is_empty() {
-        Some(Vec::new())
-    } else {
-        Some(text.lines().map(|l| l.trim().to_string()).collect())
+        return Some(Vec::new());
     }
+    Some(text.lines().map(|l| l.trim().to_string()).collect())
+}
+
+/// Does a read-back PROVE the write landed?
+///
+/// `after` is `None` when `-getdnsservers` could not be answered, and that must
+/// never count as success: through the lenient `dns_servers_for`, an
+/// unanswerable query and "this service is on DHCP now" are the same empty list,
+/// so reading the first as the second certifies a restore-to-DHCP that never
+/// happened and lets the journal be deleted.
+fn dns_write_verified(intended: &[String], after: Option<Vec<String>>) -> bool {
+    after.is_some_and(|after| after.as_slice() == intended)
+}
+
+/// What a restore pass could learn about one recorded network service.
+///
+/// The three outcomes are deliberately distinct. Collapsing `Unreadable` into
+/// "carries something else, leave it alone" is exactly the hole that survived
+/// the first version of this fix: `dns_servers_for` maps a FAILED query to the
+/// empty list, which against a non-empty `tunnel_dns` reads as "the user already
+/// fixed it", so the service was skipped, counted as neither restored nor
+/// unverified, and the journal was deleted while every service was still on dead
+/// tunnel resolvers. Windows has always kept the record in that case
+/// (`win_machine_state::reconcile_record`, "live DNS unreadable during restore -
+/// leaving it alone and KEEPING the record").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceDns {
+    /// Its current resolvers, read successfully.
+    Known(Vec<String>),
+    /// It is no longer in `networksetup -listallnetworkservices`: removed or
+    /// disabled since the record was written. Nothing to do and nothing the user
+    /// could do, but the record is kept in case it comes back.
+    Absent,
+    /// It is still there, but `-getdnsservers` could not be answered. We cannot
+    /// tell whether it is still on the tunnel's resolvers, so we must not act as
+    /// though we know it is not.
+    Unreadable,
 }
 
 /// macOS utun tunnel for WireGuard VPN
@@ -1168,7 +1224,9 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
     let mut outcome = DnsRestoreOutcome::default();
     if !snapshot.all_dns.is_empty() {
         for (service, servers) in &snapshot.all_dns {
-            outcome.record(set_service_dns(service, servers));
+            outcome.note(set_service_dns(service, servers), || {
+                format!("{}: could not put its pre-connect DNS back", service)
+            });
         }
         tracing::info!(
             "Restored DNS on {}/{} network services",
@@ -1180,12 +1238,22 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
         // all-services change (e.g. an upgrade mid-session). Routed through the
         // same helper as the loop above so the "empty means DHCP" idiom and the
         // read-back cannot drift between the two.
-        outcome.record(set_service_dns(&snapshot.service_name, &[]));
+        outcome.note(set_service_dns(&snapshot.service_name, &[]), || {
+            format!(
+                "{}: could not hand its DNS back to DHCP",
+                snapshot.service_name
+            )
+        });
     } else {
-        outcome.record(set_service_dns(
-            &snapshot.service_name,
-            &snapshot.dns_servers,
-        ));
+        outcome.note(
+            set_service_dns(&snapshot.service_name, &snapshot.dns_servers),
+            || {
+                format!(
+                    "{}: could not put its pre-connect DNS back",
+                    snapshot.service_name
+                )
+            },
+        );
     }
 
     // Flush DNS cache
@@ -1232,24 +1300,37 @@ fn set_service_dns(service: &str, servers: &[String]) -> bool {
     } else {
         args.extend(servers.iter().cloned());
     }
-    match cmd("networksetup").args(&args).output() {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => tracing::warn!(
-            "networksetup rejected the DNS change for '{}': {}",
-            service,
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => tracing::warn!("Could not run networksetup for '{}': {}", service, e),
-    }
-    // query_dns_servers, not dns_servers_for: a query that could not be answered
-    // must never read as "the service is on DHCP now", which is what would
-    // certify a restore to DHCP that never happened.
-    if query_dns_servers(service).is_some_and(|after| after.as_slice() == servers) {
-        return true;
+    // Two attempts, matching the Windows restore pass (`for attempt in 1..=2`).
+    // A single networksetup failure against a momentarily locked
+    // SystemConfiguration store is common, a second attempt costs milliseconds,
+    // and giving up after one turns a recoverable blip into a KEPT journal and a
+    // user-visible banner. Neither Unix path retried; both do now.
+    for attempt in 1..=2 {
+        match cmd("networksetup").args(&args).output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => tracing::warn!(
+                "networksetup rejected the DNS change for '{}' (attempt {}): {}",
+                service,
+                attempt,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => tracing::warn!(
+                "Could not run networksetup for '{}' (attempt {}): {}",
+                service,
+                attempt,
+                e
+            ),
+        }
+        // query_dns_servers, not dns_servers_for: a query that could not be
+        // answered must never read as "the service is on DHCP now", which is
+        // what would certify a restore to DHCP that never happened.
+        if dns_write_verified(servers, query_dns_servers(service)) {
+            return true;
+        }
     }
     tracing::error!(
-        "DNS change for '{}' did not take — asked for {:?}, the service still reports something \
-         else. Not counting it as restored.",
+        "DNS change for '{}' did not take after 2 attempts — asked for {:?}, the service still \
+         reports something else (or cannot be read at all). Not counting it as restored.",
         service,
         servers
     );
@@ -1269,7 +1350,26 @@ pub(super) fn restore_services_still_on_tunnel_dns(
     services: &[(String, Vec<String>)],
     tunnel_dns: &[String],
 ) -> DnsRestoreOutcome {
-    let outcome = restore_services_pass(services, tunnel_dns, dns_servers_for, set_service_dns);
+    // Enumerate once. An EMPTY list means the enumeration itself failed
+    // (networksetup missing, a locked store) - calling every recorded service
+    // "Absent" on that basis would silently downgrade a real fault to a dormant
+    // one, so treat it as "cannot rule anything out" and let the per-service
+    // query answer for itself.
+    let present = list_network_services();
+    let outcome = restore_services_pass(
+        services,
+        tunnel_dns,
+        |service| {
+            if !present.is_empty() && !present.iter().any(|s| s.as_str() == service) {
+                return ServiceDns::Absent;
+            }
+            match query_dns_servers(service) {
+                Some(live) => ServiceDns::Known(live),
+                None => ServiceDns::Unreadable,
+            }
+        },
+        set_service_dns,
+    );
     if outcome.restored > 0 {
         let _ = cmd("dscacheutil").args(["-flushcache"]).output();
         let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
@@ -1304,19 +1404,54 @@ pub(super) fn restore_services_still_on_tunnel_dns(
 fn restore_services_pass(
     services: &[(String, Vec<String>)],
     tunnel_dns: &[String],
-    probe: impl Fn(&str) -> Vec<String>,
+    probe: impl Fn(&str) -> ServiceDns,
     apply: impl Fn(&str, &[String]) -> bool,
 ) -> DnsRestoreOutcome {
     let mut outcome = DnsRestoreOutcome::default();
     for (service, original) in services {
-        if probe(service).as_slice() != tunnel_dns {
-            // Not ours to touch, and not a failure either — the user has fixed
-            // this service by hand, or it was never reached at connect time.
-            // It must NOT count as unverified, or the journal would be kept
-            // forever and every start would log an error about it.
-            continue;
+        match probe(service) {
+            ServiceDns::Known(live) if live.as_slice() != tunnel_dns => {
+                // Not ours to touch, and not a failure either - the user has
+                // fixed this service by hand, or it was never reached at connect
+                // time. It must NOT count as unverified, or the journal would be
+                // kept forever and every start would log an error about it.
+                //
+                // Reachable ONLY from a query that was actually answered. The
+                // lenient `dns_servers_for` used to feed this comparison, so an
+                // unanswerable query arrived here as the empty list and took
+                // this branch - see `ServiceDns`.
+                continue;
+            }
+            ServiceDns::Known(_) => outcome.note(apply(service, original), || {
+                format!("{}: could not put its pre-connect DNS back", service)
+            }),
+            ServiceDns::Unreadable => {
+                tracing::error!(
+                    "Current resolvers for '{}' could not be read, so we cannot tell whether it \
+                     is still on a previous session's tunnel DNS. KEEPING the journal.",
+                    service
+                );
+                outcome.note(false, || {
+                    format!(
+                        "{}: current DNS unreadable - it may still be on tunnel resolvers",
+                        service
+                    )
+                });
+            }
+            ServiceDns::Absent => {
+                // Dormant, not a fault: keeps the record (the service may be
+                // re-added and is still unrestored) but raises no banner,
+                // because there is nothing a user could do about it and a
+                // warning that can never be cleared is how a real one gets
+                // ignored. Windows draws the same line.
+                tracing::info!(
+                    "Network service '{}' is no longer present - keeping its record in case it \
+                     comes back",
+                    service
+                );
+                outcome.note_dormant();
+            }
         }
-        outcome.record(apply(service, original));
     }
     outcome
 }
@@ -1542,7 +1677,7 @@ fn prefix_to_mask(prefix: u8) -> String {
 
 #[cfg(test)]
 mod dns_journal_restore_tests {
-    use super::restore_services_pass;
+    use super::{dns_write_verified, interpret_dns_query, restore_services_pass, ServiceDns};
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -1562,6 +1697,14 @@ mod dns_journal_restore_tests {
         vec!["10.8.0.1".to_string()]
     }
 
+    fn on_tunnel(_: &str) -> ServiceDns {
+        ServiceDns::Known(tunnel_dns())
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
     /// THE regression.
     ///
     /// The user double-clicks Birdo.app to heal a crash. There is no
@@ -1577,16 +1720,21 @@ mod dns_journal_restore_tests {
             &services,
             &tunnel_dns(),
             // Read-back: every service is still on the dead tunnel resolver.
-            |_: &str| tunnel_dns(),
+            on_tunnel,
             // The write never landed (networksetup may still have exited 0).
             |_: &str, _: &[String]| false,
         );
         assert_eq!(outcome.restored, 0, "an attempt is not a restore");
         assert_eq!(outcome.unverified, 2);
+        assert_eq!(
+            outcome.problems.len(),
+            2,
+            "both must reach the status banner"
+        );
         assert!(
             !outcome.may_clear_journal(),
             "the journal would be deleted while both services are still on a resolver that no \
-             longer exists — the user's real resolvers would be unrecoverable"
+             longer exists - the user's real resolvers would be unrecoverable"
         );
     }
 
@@ -1604,7 +1752,10 @@ mod dns_journal_restore_tests {
         let outcome = restore_services_pass(
             &services,
             &tunnel_dns(),
-            |name: &str| live.borrow().get(name).cloned().unwrap_or_default(),
+            |name: &str| match live.borrow().get(name) {
+                Some(dns) => ServiceDns::Known(dns.clone()),
+                None => ServiceDns::Absent,
+            },
             |name: &str, want: &[String]| {
                 live.borrow_mut().insert(name.to_string(), want.to_vec());
                 true
@@ -1612,6 +1763,7 @@ mod dns_journal_restore_tests {
         );
         assert_eq!(outcome.restored, 2);
         assert_eq!(outcome.unverified, 0);
+        assert!(outcome.problems.is_empty());
         assert!(outcome.may_clear_journal());
         assert_eq!(live.borrow()["Wi-Fi"], vec!["192.168.1.1".to_string()]);
         assert!(
@@ -1628,7 +1780,7 @@ mod dns_journal_restore_tests {
         let outcome = restore_services_pass(
             &services,
             &tunnel_dns(),
-            |_: &str| tunnel_dns(),
+            on_tunnel,
             |name: &str, _: &[String]| name == "Wi-Fi",
         );
         assert_eq!(outcome.restored, 1);
@@ -1639,14 +1791,14 @@ mod dns_journal_restore_tests {
     /// Self-healing, and the reason "unverified" must not simply mean "not
     /// restored": a service the user already fixed by hand is skipped, so the
     /// pass is fully verified and the stale record is dropped rather than
-    /// kept — and logged about — forever.
+    /// kept - and logged about - forever.
     #[test]
     fn a_service_the_user_already_fixed_is_skipped_and_the_journal_is_released() {
         let services = services(&[("Wi-Fi", &["192.168.1.1"])]);
         let outcome = restore_services_pass(
             &services,
             &tunnel_dns(),
-            |_: &str| vec!["1.1.1.1".to_string()],
+            |_: &str| ServiceDns::Known(strings(&["1.1.1.1"])),
             |_: &str, _: &[String]| {
                 panic!("must not touch a service that is no longer on the tunnel resolvers")
             },
@@ -1654,5 +1806,107 @@ mod dns_journal_restore_tests {
         assert_eq!(outcome.restored, 0);
         assert_eq!(outcome.unverified, 0);
         assert!(outcome.may_clear_journal());
+    }
+
+    /// THE residual hole this pass had after the first fix.
+    ///
+    /// `networksetup -getdnsservers` fails (a locked SystemConfiguration store,
+    /// or the binary is unavailable). Through the LENIENT `dns_servers_for` that
+    /// arrived here as the empty list, which against a non-empty `tunnel_dns`
+    /// reads as "the user already fixed this" - so the service was skipped,
+    /// counted as neither restored nor unverified, and `settle` DELETED the
+    /// journal while the machine was still pointing at tunnel resolvers that no
+    /// longer exist. Exactly the conflation the read-back fix removed from
+    /// `set_service_dns`, left on the one path whose answer decides the record's
+    /// fate.
+    #[test]
+    fn an_unreadable_service_keeps_the_journal_instead_of_reading_as_already_fixed() {
+        let services = services(&[("Wi-Fi", &["192.168.1.1"])]);
+        let outcome = restore_services_pass(
+            &services,
+            &tunnel_dns(),
+            |_: &str| ServiceDns::Unreadable,
+            |_: &str, _: &[String]| {
+                panic!("must not write to a service whose current state we cannot read")
+            },
+        );
+        assert_eq!(outcome.restored, 0);
+        assert_eq!(outcome.unverified, 1);
+        assert!(
+            !outcome.may_clear_journal(),
+            "an unanswerable query is a FAULT that keeps the record, which is what Windows has \
+             always done - not evidence that there is nothing left to restore"
+        );
+        assert_eq!(outcome.problems.len(), 1, "the user must be told");
+    }
+
+    /// ...and the other side of that line: a service that has genuinely gone
+    /// away keeps the record too, but silently. Without this, a user who deletes
+    /// a network service would get a warning banner they can never clear, and
+    /// the fix for a destroyed journal would have manufactured a permanent
+    /// false alarm.
+    #[test]
+    fn an_absent_service_keeps_the_journal_without_raising_a_banner() {
+        let services = services(&[("Thunderbolt Bridge", &["192.168.1.1"])]);
+        let outcome = restore_services_pass(
+            &services,
+            &tunnel_dns(),
+            |_: &str| ServiceDns::Absent,
+            |_: &str, _: &[String]| panic!("must not write to a service that is not there"),
+        );
+        assert_eq!(outcome.unverified, 1);
+        assert!(!outcome.may_clear_journal());
+        assert!(
+            outcome.problems.is_empty(),
+            "nothing the user can act on, so nothing to put in front of them"
+        );
+    }
+
+    // -- interpret_dns_query: the second commit's whole point, finally asserted --
+
+    /// `Some(vec![])` and `None` are NOT the same answer. This is the
+    /// distinction the restore-to-DHCP verification turns on, and until now
+    /// every macOS test stubbed the query out entirely, so nothing asserted it.
+    #[test]
+    fn an_unanswerable_query_is_none_not_an_empty_list() {
+        assert_eq!(interpret_dns_query(None), None);
+        assert_eq!(
+            interpret_dns_query(Some("There aren't any DNS Servers set on Wi-Fi.\n")),
+            Some(Vec::new()),
+            "'no servers set' is an ANSWER, and it means DHCP"
+        );
+        assert_eq!(interpret_dns_query(Some("   \n")), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_listed_answer_is_parsed_line_by_line() {
+        assert_eq!(
+            interpret_dns_query(Some("192.168.1.1\n 8.8.8.8 \n")),
+            Some(strings(&["192.168.1.1", "8.8.8.8"]))
+        );
+    }
+
+    // -- dns_write_verified: the read-back rule set_service_dns applies --
+
+    /// The restore-to-DHCP hole. The intended value is the empty list, and an
+    /// unanswerable query renders as the empty list through `dns_servers_for` -
+    /// so the lenient reading would certify a restore that never happened and
+    /// release the journal.
+    #[test]
+    fn a_dhcp_restore_is_not_verified_by_a_query_that_failed() {
+        assert!(
+            !dns_write_verified(&[], None),
+            "None is 'we do not know', and 'we do not know' may never clear the journal"
+        );
+        assert!(dns_write_verified(&[], Some(Vec::new())));
+    }
+
+    #[test]
+    fn a_read_back_must_match_the_servers_we_asked_for() {
+        let want = strings(&["192.168.1.1"]);
+        assert!(dns_write_verified(&want, Some(want.clone())));
+        assert!(!dns_write_verified(&want, Some(strings(&["10.8.0.1"]))));
+        assert!(!dns_write_verified(&want, Some(Vec::new())));
+        assert!(!dns_write_verified(&want, None));
     }
 }
