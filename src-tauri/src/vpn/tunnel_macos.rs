@@ -71,18 +71,32 @@ fn list_network_services() -> Vec<String> {
 
 /// Current resolvers for one service, normalised to "empty means DHCP".
 fn dns_servers_for(service: &str) -> Vec<String> {
+    query_dns_servers(service).unwrap_or_default()
+}
+
+/// The same query, keeping the one distinction `dns_servers_for` throws away:
+/// `None` means the QUESTION failed (no such service, networksetup missing),
+/// `Some(vec![])` means the service genuinely has no manually-set resolvers.
+///
+/// That difference is load-bearing exactly once — verifying a restore back to
+/// DHCP in `set_service_dns`. There, an unanswerable query and "the service is
+/// now on DHCP" both look like the empty list, and treating the first as the
+/// second would report a restore that never happened and let the journal be
+/// deleted. Every other caller wants the lenient reading (a service we cannot
+/// interrogate has nothing worth recording), so they keep it.
+fn query_dns_servers(service: &str) -> Option<Vec<String>> {
     let output = match cmd("networksetup")
         .args(["-getdnsservers", service])
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        _ => return None,
     };
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if text.contains("aren't any") || text.is_empty() {
-        Vec::new()
+        Some(Vec::new())
     } else {
-        text.lines().map(|l| l.trim().to_string()).collect()
+        Some(text.lines().map(|l| l.trim().to_string()).collect())
     }
 }
 
@@ -1227,7 +1241,10 @@ fn set_service_dns(service: &str, servers: &[String]) -> bool {
         ),
         Err(e) => tracing::warn!("Could not run networksetup for '{}': {}", service, e),
     }
-    if dns_servers_for(service).as_slice() == servers {
+    // query_dns_servers, not dns_servers_for: a query that could not be answered
+    // must never read as "the service is on DHCP now", which is what would
+    // certify a restore to DHCP that never happened.
+    if query_dns_servers(service).is_some_and(|after| after.as_slice() == servers) {
         return true;
     }
     tracing::error!(
