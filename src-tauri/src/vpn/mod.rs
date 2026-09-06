@@ -496,6 +496,239 @@ pub mod dns_journal {
         }
     }
 
+    /// What one platform's restore pass actually achieved.
+    ///
+    /// `unverified` is the load-bearing field. It counts state a previous
+    /// session moved aside that this pass did NOT prove it put back — and while
+    /// it is non-zero, the journal is the only surviving description of the
+    /// user's real resolvers.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(super) struct DnsRestoreOutcome {
+        /// Restores that a read-back PROVED are in effect.
+        pub(super) restored: usize,
+        /// Restores that were attempted and could not be proved. Never
+        /// increment this for something we chose not to touch: a service the
+        /// user has already fixed by hand is not unverified, it is done.
+        pub(super) unverified: usize,
+        /// The subset of `unverified` a human can see and act on, one readable
+        /// line each - the same contract as `win_machine_state`'s degradation
+        /// report, and what `get_vpn_status` renders as the "DNS not fully
+        /// protected" banner.
+        ///
+        /// A strict subset, not a mirror of the count: state that is unverified
+        /// only because the network service is no longer attached keeps the
+        /// record but is NOT reportable, because there is nothing the user could
+        /// do about it and a banner nobody can clear is how a real one gets
+        /// ignored.
+        pub(super) problems: Vec<String>,
+    }
+
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    impl DnsRestoreOutcome {
+        /// Fold in one restore attempt, `verified` being the read-back's answer
+        /// and NOT the exit status of whatever tool performed the write.
+        ///
+        /// `describe` is evaluated only on failure, and is what the user is
+        /// shown. Taking it is deliberate: there is no way to add to
+        /// `unverified` without also saying what broke, so the banner cannot
+        /// drift away from the journal rule the way it did when the whole field
+        /// was hard-coded empty off Windows.
+        pub(super) fn note(&mut self, verified: bool, describe: impl FnOnce() -> String) {
+            if verified {
+                self.restored += 1;
+            } else {
+                self.unverified += 1;
+                self.problems.push(describe());
+            }
+        }
+
+        /// Fold in state we could not verify and the user cannot fix - a network
+        /// service that is no longer attached, an adapter unplugged since the
+        /// record was written.
+        ///
+        /// It KEEPS the record (the service may come back and still needs its
+        /// resolvers put back), but it raises no banner. Mirrors Windows'
+        /// `Degradation::dormant`, which is explicitly distinct from a fault.
+        pub(super) fn note_dormant(&mut self) {
+            self.unverified += 1;
+        }
+
+        /// The rule this type exists to carry: the record may be dropped only
+        /// when nothing is left that it alone knows how to put back.
+        pub(super) fn may_clear_journal(&self) -> bool {
+            self.unverified == 0
+        }
+    }
+
+    /// Decide the on-disk record's fate after a platform restore pass, and
+    /// report whether anything was verifiably put back.
+    ///
+    /// # Why the journal is not cleared unconditionally
+    ///
+    /// It used to be, on macOS and Linux, and that is how a recoverable outage
+    /// became a permanent one. There is no self-elevation off Windows
+    /// (`main.rs` gates `self_elevate` on `cfg(windows)`), so the startup
+    /// reconcile — the ONLY thing that can heal a SIGKILL, an OOM kill or a
+    /// power cut — normally runs as the ordinary login user, who cannot write
+    /// the SystemConfiguration store or `/etc/resolv.conf`. The restore then
+    /// silently did nothing, `restored` counted the ATTEMPT, and deleting
+    /// `dns-restore.json` on the way out destroyed the last thing that knew
+    /// what to put back: the machine was left with no DNS at all, by the very
+    /// act of trying to recover. Windows already encodes this rule in
+    /// `win_machine_state::reconcile_record`, which retains every entry it
+    /// could not verify; this is that rule for the two Unix twins.
+    ///
+    /// Keeping a record we could not act on is cheap and self-healing: each
+    /// pass re-checks the live state first, so a machine the user has since
+    /// fixed by hand is examined once and the record is then dropped.
+    ///
+    /// Takes the clearing action as an argument so the rule itself is unit-
+    /// testable on any host — including the Windows runner, which is the only
+    /// CI job that actually RUNS the Rust test suite.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(super) fn settle(outcome: DnsRestoreOutcome, clear_journal: impl FnOnce()) -> bool {
+        // Publish FIRST, and unconditionally. Every Unix restore pass funnels
+        // through here, so this is the only place where what the user is shown
+        // cannot drift out of step with what the journal was allowed to do. A
+        // fully verified pass publishes an empty list, which is what clears the
+        // banner.
+        publish_degraded(outcome.problems.clone());
+        if outcome.may_clear_journal() {
+            clear_journal();
+        } else {
+            tracing::error!(
+                "{} DNS restore(s) could not be verified — KEEPING the DNS journal so a \
+                 later start (or one with the privileges this one lacked) can retry. \
+                 Deleting it would destroy the only record of the pre-connect resolvers.",
+                outcome.unverified
+            );
+        }
+        outcome.restored > 0
+    }
+
+    /// The last restore pass's user-actionable failures - Unix's counterpart to
+    /// `win_machine_state::degradation_report()`.
+    ///
+    /// # Why this is not just a log line
+    ///
+    /// `VpnStatus::dns_degraded` hard-coded `Vec::new()` on every platform but
+    /// Windows, and its own doc says rendering a Connected badge over an
+    /// unrestored adapter is "rendering reassurance from missing data". The
+    /// macOS and Linux passes now COMPUTE that exact value, and sending it only
+    /// to `tracing::error!` tells a user whose DNS this app has just failed to
+    /// put back to go and read a log file - which they cannot fetch, because
+    /// they have no DNS. Same fault, same banner, on all three platforms.
+    ///
+    /// Deliberately not `cfg`-gated: the store exists everywhere so the Windows
+    /// job - the only CI job that runs `cargo test` - executes its tests.
+    /// Windows simply reads `win_machine_state` instead, which is richer.
+    static DEGRADED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Replace the report wholesale: each pass is a complete statement about the
+    /// machine, so a stale entry from a previous pass must never survive one
+    /// that no longer sees it.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    fn publish_degraded(lines: Vec<String>) {
+        if let Ok(mut current) = DEGRADED.lock() {
+            *current = lines;
+        }
+    }
+
+    /// Read the report. A poisoned lock reports nothing rather than panicking a
+    /// status poll - and `panic = "abort"` means it cannot be poisoned anyway.
+    ///
+    /// Windows reads `win_machine_state::degradation_report()` instead, so this
+    /// one has no non-test caller there. It is still COMPILED and still TESTED
+    /// there, which is the point: the Windows job is the only one that runs
+    /// `cargo test`.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub fn degradation_report() -> Vec<String> {
+        DEGRADED.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Fold a retained record's baseline into a fresh capture (macOS).
+    ///
+    /// # Why this exists
+    ///
+    /// Keeping the journal past an unverified restore turned it into a
+    /// CROSS-SESSION record, and the writers were never told. The sequence that
+    /// bites: a crash leaves every service on tunnel resolvers; the unprivileged
+    /// relaunch cannot write them back, so `settle` correctly KEEPS the record;
+    /// the user connects again, and `configure_dns` captures "what these
+    /// services currently have" - which is the DEAD TUNNEL RESOLVERS of the
+    /// crashed session. Writing that over the retained record replaces the last
+    /// copy of the user's real DNS with the precise value the record exists to
+    /// undo, and every restore afterwards "succeeds" at restoring nothing.
+    ///
+    /// Windows closes this with `win_machine_state::adopt_unrestored`, which
+    /// hands the live process ownership of the record so the next connect does
+    /// not re-snapshot those adapters. This is that rule for the macOS record: a
+    /// capture that reads back the PREVIOUS session's tunnel resolvers is not a
+    /// baseline, so the older one is kept.
+    ///
+    /// Pure and free of `cfg` so the Windows job actually runs its tests.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(super) fn merge_macos_capture(
+        fresh: &[(String, Vec<String>)],
+        old_services: &[(String, Vec<String>)],
+        old_tunnel_dns: &[String],
+    ) -> Vec<(String, Vec<String>)> {
+        if old_tunnel_dns.is_empty() {
+            // Nothing to recognise pollution by.
+            return fresh.to_vec();
+        }
+        let mut merged: Vec<(String, Vec<String>)> = fresh
+            .iter()
+            .map(|(service, captured)| {
+                if captured.as_slice() != old_tunnel_dns {
+                    // Carries something other than the previous session's tunnel
+                    // resolvers, so this capture is a real baseline - and a newer
+                    // one than the record's.
+                    return (service.clone(), captured.clone());
+                }
+                match old_services.iter().find(|(s, _)| s == service) {
+                    Some((_, original)) => (service.clone(), original.clone()),
+                    // Polluted, and nothing older to fall back on. Keep it
+                    // rather than invent one.
+                    None => (service.clone(), captured.clone()),
+                }
+            })
+            .collect();
+        // Services the record knows about that this capture did not see -
+        // `list_network_services()` failed and `configure_dns` fell back to the
+        // primary service alone. Dropping them would silently discard a baseline
+        // that is still unrestored, so carry them across.
+        for (service, original) in old_services {
+            if !merged.iter().any(|(s, _)| s == service) {
+                merged.push((service.clone(), original.clone()));
+            }
+        }
+        merged
+    }
+
+    /// The same rule for the Linux record.
+    ///
+    /// `fresh` is `None` exactly when /etc/resolv.conf was unreadable OR already
+    /// carried our marker - and "already ours" IS the retained-record case, so
+    /// this is not a corner. Writing that `None` over a retained backup drops
+    /// the real bytes and arms `restore_dns`'s fallback, which writes
+    /// `nameserver 1.1.1.1` / `nameserver 8.8.8.8`, then verifies (our marker is
+    /// legitimately gone) and clears the journal: the user's own resolvers
+    /// replaced by two public ones, permanently, by the recovery path.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(super) fn merge_linux_capture(
+        fresh: Option<&str>,
+        retained: Option<&str>,
+    ) -> Option<String> {
+        match fresh {
+            // A real, marker-free read of the live file: newer and better than
+            // whatever the record holds.
+            Some(bytes) => Some(bytes.to_string()),
+            None => retained.map(|bytes| bytes.to_string()),
+        }
+    }
+
     /// Move an unreadable record aside, without clobbering one already kept: the
     /// first one preserved is the one closest to whatever went wrong.
     fn set_aside_unreadable(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -547,9 +780,16 @@ pub mod dns_journal {
     /// resolvers it is about to point them at.
     #[cfg(target_os = "macos")]
     pub(super) fn record_macos(services: &[(String, Vec<String>)], tunnel_dns: &[String]) {
+        // Never blindly overwrite: a record still on disk at connect time is one
+        // a previous restore could not prove, and this capture may be reading
+        // that session's tunnel resolvers back. See `merge_macos_capture`.
+        let services = match read() {
+            Some(old) => merge_macos_capture(services, &old.services, &old.tunnel_dns),
+            None => services.to_vec(),
+        };
         let _ = write(&DnsJournal {
             os: std::env::consts::OS.to_string(),
-            services: services.to_vec(),
+            services,
             tunnel_dns: tunnel_dns.to_vec(),
         });
     }
@@ -557,6 +797,12 @@ pub mod dns_journal {
     /// Record the /etc/resolv.conf `configure_dns` is about to overwrite.
     #[cfg(target_os = "linux")]
     pub(super) fn record_linux(resolv_conf_backup: Option<String>, uses_systemd_resolved: bool) {
+        // Same rule as macOS: the caller's capture is `None` whenever the file
+        // already carried our marker, which is precisely the retained-record
+        // case. See `merge_linux_capture`.
+        let retained = read().and_then(|old| old.resolv_conf_backup);
+        let resolv_conf_backup =
+            merge_linux_capture(resolv_conf_backup.as_deref(), retained.as_deref());
         let _ = write(&DnsJournal {
             os: std::env::consts::OS.to_string(),
             resolv_conf_backup,
@@ -573,8 +819,9 @@ pub mod dns_journal {
     /// a SIGKILL, an OOM kill or a power cut, none of which reach the hook.
     ///
     /// Each platform re-checks that the live state is still the state it left
-    /// before touching anything; the record is dropped either way, so a machine
-    /// the user has already fixed by hand is examined once and then left alone.
+    /// before touching anything, so a machine the user has already fixed by
+    /// hand is examined once and then left alone. The record is dropped only
+    /// for state a read-back PROVED is back — see `settle`.
     ///
     /// Returns whether anything was actually restored.
     pub fn reconcile() -> bool {
@@ -596,23 +843,294 @@ pub mod dns_journal {
         #[cfg(not(target_os = "windows"))]
         {
             #[cfg(target_os = "macos")]
-            let restored = super::tunnel_macos::restore_services_still_on_tunnel_dns(
+            let outcome = super::tunnel_macos::restore_services_still_on_tunnel_dns(
                 &journal.services,
                 &journal.tunnel_dns,
             );
             #[cfg(target_os = "linux")]
-            let restored = super::tunnel_linux::restore_resolv_conf_if_ours(
+            let outcome = super::tunnel_linux::restore_resolv_conf_if_ours(
                 journal.resolv_conf_backup,
                 journal.uses_systemd_resolved,
             );
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let restored = {
+            let outcome = {
                 let _ = &journal;
-                false
+                DnsRestoreOutcome::default()
             };
 
-            clear();
-            restored
+            // NOT an unconditional `clear()`. The restores above prove
+            // themselves with a read-back, and anything they could not prove
+            // keeps its record — deleting that is what turned a crash into a
+            // machine with no resolvers at all. See `settle`.
+            settle(outcome, clear)
+        }
+    }
+
+    /// The journal-lifecycle rule, exercised on every platform.
+    ///
+    /// Deliberately NOT `cfg(target_os)`-gated: the Windows job is the only CI
+    /// job that RUNS `cargo test`, and the rule these tests protect is the one
+    /// the macOS and Linux paths were missing.
+    #[cfg(test)]
+    mod settle_tests {
+        use super::{
+            degradation_report, merge_linux_capture, merge_macos_capture, settle, DnsRestoreOutcome,
+        };
+        use std::cell::Cell;
+        use std::sync::{Mutex, MutexGuard};
+
+        /// `settle` publishes into a process-wide store, so the tests that
+        /// observe it must not interleave. `cargo test` runs them on N threads.
+        static SERIAL: Mutex<()> = Mutex::new(());
+
+        fn serial() -> MutexGuard<'static, ()> {
+            SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn svc(name: &str, servers: &[&str]) -> (String, Vec<String>) {
+            (
+                name.to_string(),
+                servers.iter().map(|s| s.to_string()).collect(),
+            )
+        }
+
+        fn lines(v: &[&str]) -> Vec<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// Run `settle` and report whether it deleted the record.
+        fn run_settle(outcome: DnsRestoreOutcome) -> (bool, bool) {
+            let cleared = Cell::new(false);
+            let restored = settle(outcome, || cleared.set(true));
+            (cleared.get(), restored)
+        }
+
+        fn unverified(n: usize) -> DnsRestoreOutcome {
+            let mut outcome = DnsRestoreOutcome::default();
+            for i in 0..n {
+                outcome.note(false, || format!("service {}: could not restore", i));
+            }
+            outcome
+        }
+
+        /// THE regression. An unprivileged recovery run attempts every restore
+        /// and lands none of them; the record it is holding is the only thing
+        /// that still knows the user's real resolvers, so it must survive.
+        #[test]
+        fn an_unverified_restore_keeps_the_journal() {
+            let _g = serial();
+            let (cleared, restored) = run_settle(unverified(3));
+            assert!(
+                !cleared,
+                "the journal was deleted after a restore that never landed - this is the \
+                 bug: the pre-connect resolvers are now unrecoverable"
+            );
+            assert!(
+                !restored,
+                "nothing was proved restored, so nothing may be reported"
+            );
+        }
+
+        /// A partial pass is still a failed pass for the entries it missed.
+        #[test]
+        fn a_partial_restore_keeps_the_journal() {
+            let _g = serial();
+            let mut outcome = unverified(1);
+            outcome.note(true, || {
+                unreachable!("a verified restore has no problem to describe")
+            });
+            outcome.note(true, || unreachable!());
+            assert_eq!(outcome.restored, 2);
+            let (cleared, restored) = run_settle(outcome);
+            assert!(
+                !cleared,
+                "one unverified entry is enough to keep the record"
+            );
+            assert!(restored);
+        }
+
+        /// Fully proved: the record now describes nothing and must go, or every
+        /// later start would re-run a pointless pass and log an error forever.
+        #[test]
+        fn a_fully_verified_restore_clears_the_journal() {
+            let _g = serial();
+            let mut outcome = DnsRestoreOutcome::default();
+            outcome.note(true, || unreachable!());
+            outcome.note(true, || unreachable!());
+            let (cleared, restored) = run_settle(outcome);
+            assert!(cleared);
+            assert!(restored);
+        }
+
+        /// Nothing to do - the user already fixed their DNS by hand, so the
+        /// live state is no longer the state we left. Self-healing: the record
+        /// is dropped even though nothing was restored.
+        #[test]
+        fn nothing_left_to_restore_clears_the_journal() {
+            let _g = serial();
+            let (cleared, restored) = run_settle(DnsRestoreOutcome::default());
+            assert!(cleared);
+            assert!(!restored);
+        }
+
+        #[test]
+        fn may_clear_journal_tracks_only_the_unverified_count() {
+            let mut outcome = DnsRestoreOutcome::default();
+            assert!(outcome.may_clear_journal());
+            outcome.note(true, || unreachable!());
+            assert!(outcome.may_clear_journal());
+            outcome.note(false, || "eth0: nope".to_string());
+            assert!(!outcome.may_clear_journal());
+            assert_eq!(outcome.restored, 1);
+            assert_eq!(outcome.unverified, 1);
+        }
+
+        /// A service that is no longer attached keeps the record - it may come
+        /// back and it is still unrestored - but it must NOT raise a banner: the
+        /// user cannot plug in an adapter to satisfy a warning they cannot read,
+        /// and a permanent banner is how a real one gets ignored. This is
+        /// Windows' dormant-vs-fault distinction, which the first version of
+        /// this fix collapsed.
+        #[test]
+        fn a_dormant_entry_keeps_the_record_without_raising_a_banner() {
+            let _g = serial();
+            let mut outcome = DnsRestoreOutcome::default();
+            outcome.note_dormant();
+            assert!(
+                !outcome.may_clear_journal(),
+                "a dormant entry is still unrestored state - the record describes it"
+            );
+            assert!(outcome.problems.is_empty());
+            let (cleared, _) = run_settle(outcome);
+            assert!(!cleared);
+            assert!(
+                degradation_report().is_empty(),
+                "a dormant entry must not reach the user-facing banner"
+            );
+        }
+
+        /// The reporting twin. `VpnStatus::dns_degraded` was hard-coded empty
+        /// off Windows while these very counts were being computed and thrown
+        /// into a log file, so a user with no DNS saw a clean Connected screen.
+        #[test]
+        fn settle_publishes_the_problems_for_the_status_banner() {
+            let _g = serial();
+            let mut outcome = DnsRestoreOutcome::default();
+            outcome.note(false, || {
+                "Wi-Fi: could not put its pre-connect DNS back".to_string()
+            });
+            outcome.note(true, || unreachable!());
+            run_settle(outcome);
+            assert_eq!(
+                degradation_report(),
+                lines(&["Wi-Fi: could not put its pre-connect DNS back"])
+            );
+        }
+
+        /// ...and a later clean pass must take it away again, or the banner
+        /// becomes a permanent scar from one bad disconnect.
+        #[test]
+        fn a_clean_pass_clears_the_banner() {
+            let _g = serial();
+            let mut dirty = DnsRestoreOutcome::default();
+            dirty.note(false, || {
+                "Ethernet: could not put its pre-connect DNS back".to_string()
+            });
+            run_settle(dirty);
+            assert!(!degradation_report().is_empty());
+            run_settle(DnsRestoreOutcome::default());
+            assert!(
+                degradation_report().is_empty(),
+                "a fully settled pass is a complete statement: nothing is degraded"
+            );
+        }
+
+        // ── merge_macos_capture ──────────────────────────────────────────────
+
+        /// THE cross-session regression. A crash left Wi-Fi on the tunnel
+        /// resolvers, the unprivileged relaunch could not put them back, so the
+        /// record was (correctly) KEPT - and then the next connect captured
+        /// those same dead tunnel resolvers as the "baseline" and wrote them
+        /// over it. The record would then restore the machine to the exact
+        /// broken state it exists to undo.
+        #[test]
+        fn a_capture_polluted_by_the_previous_tunnel_keeps_the_older_baseline() {
+            let old = vec![svc("Wi-Fi", &["192.168.1.1"])];
+            let old_tunnel = lines(&["10.8.0.1"]);
+            // What configure_dns reads off the live machine right now:
+            let fresh = vec![svc("Wi-Fi", &["10.8.0.1"])];
+            assert_eq!(
+                merge_macos_capture(&fresh, &old, &old_tunnel),
+                vec![svc("Wi-Fi", &["192.168.1.1"])],
+                "the retained baseline must survive a capture that is just the old tunnel DNS"
+            );
+        }
+
+        /// The other half: once a service really does carry its own resolvers
+        /// again, the fresh read is the better baseline and the stale record
+        /// entry must not shadow it forever.
+        #[test]
+        fn a_genuine_capture_wins_over_the_record() {
+            let old = vec![svc("Wi-Fi", &["192.168.1.1"])];
+            let fresh = vec![svc("Wi-Fi", &["9.9.9.9"])];
+            assert_eq!(
+                merge_macos_capture(&fresh, &old, &lines(&["10.8.0.1"])),
+                vec![svc("Wi-Fi", &["9.9.9.9"])]
+            );
+        }
+
+        /// Restoring to DHCP is the empty list, and so is a polluted capture on
+        /// a record whose tunnel_dns was never written. Nothing to recognise
+        /// pollution by, so nothing may be substituted.
+        #[test]
+        fn an_empty_tunnel_dns_disables_the_substitution() {
+            let old = vec![svc("Wi-Fi", &["192.168.1.1"])];
+            let fresh = vec![svc("Wi-Fi", &[])];
+            assert_eq!(merge_macos_capture(&fresh, &old, &[]), fresh);
+        }
+
+        /// A capture taken through the single-service fallback (
+        /// `list_network_services()` failed) must not silently drop the other
+        /// services the record is still holding baselines for.
+        #[test]
+        fn services_the_capture_missed_are_carried_across() {
+            let old = vec![
+                svc("Wi-Fi", &["192.168.1.1"]),
+                svc("Ethernet", &["10.0.0.1"]),
+            ];
+            let fresh = vec![svc("Wi-Fi", &["10.8.0.1"])];
+            let merged = merge_macos_capture(&fresh, &old, &lines(&["10.8.0.1"]));
+            assert_eq!(
+                merged,
+                vec![
+                    svc("Wi-Fi", &["192.168.1.1"]),
+                    svc("Ethernet", &["10.0.0.1"])
+                ]
+            );
+        }
+
+        // ── merge_linux_capture ──────────────────────────────────────────────
+
+        /// `record_linux` filters out a resolv.conf carrying our own marker, so
+        /// a capture taken while a previous session is still unrestored is
+        /// ALWAYS `None`. Writing that over the retained bytes armed
+        /// `restore_dns`'s fallback, which writes 1.1.1.1/8.8.8.8, verifies
+        /// (our marker is legitimately gone) and clears the journal.
+        #[test]
+        fn a_none_capture_never_overwrites_retained_resolv_conf_bytes() {
+            assert_eq!(
+                merge_linux_capture(None, Some("nameserver 192.168.1.1\n")),
+                Some("nameserver 192.168.1.1\n".to_string())
+            );
+        }
+
+        #[test]
+        fn a_real_capture_wins_and_none_over_nothing_stays_none() {
+            assert_eq!(
+                merge_linux_capture(Some("nameserver 9.9.9.9\n"), Some("nameserver 1.1.1.1\n")),
+                Some("nameserver 9.9.9.9\n".to_string())
+            );
+            assert_eq!(merge_linux_capture(None, None), None);
         }
     }
 
