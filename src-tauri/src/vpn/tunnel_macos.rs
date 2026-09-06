@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, RwLock};
 use super::wireguard_new::WireGuardSession;
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
+use crate::vpn::dns_journal::DnsRestoreOutcome;
 
 /// Run a command without visible terminal window
 fn cmd(program: &str) -> Command {
@@ -1150,52 +1151,92 @@ async fn restore_dns(snapshot: &NetworkSnapshot) {
     // leave every other service pinned to tunnel resolvers that stop existing at
     // disconnect — the user's DNS would simply break, on an interface Birdo
     // never appeared to touch.
+    let mut outcome = DnsRestoreOutcome::default();
     if !snapshot.all_dns.is_empty() {
         for (service, servers) in &snapshot.all_dns {
-            set_service_dns(service, servers);
+            outcome.record(set_service_dns(service, servers));
         }
         tracing::info!(
-            "Restored DNS on {} network services",
+            "Restored DNS on {}/{} network services",
+            outcome.restored,
             snapshot.all_dns.len()
         );
     } else if snapshot.dns_servers.is_empty() {
         // Legacy single-service path, kept for a snapshot captured before the
-        // all-services change (e.g. an upgrade mid-session).
-        let _ = cmd("networksetup")
-            .args(["-setdnsservers", &snapshot.service_name, "empty"])
-            .output();
+        // all-services change (e.g. an upgrade mid-session). Routed through the
+        // same helper as the loop above so the "empty means DHCP" idiom and the
+        // read-back cannot drift between the two.
+        outcome.record(set_service_dns(&snapshot.service_name, &[]));
     } else {
-        let mut args = vec!["-setdnsservers".to_string(), snapshot.service_name.clone()];
-        args.extend(snapshot.dns_servers.iter().cloned());
-        let _ = cmd("networksetup").args(&args).output();
+        outcome.record(set_service_dns(
+            &snapshot.service_name,
+            &snapshot.dns_servers,
+        ));
     }
 
     // Flush DNS cache
     let _ = cmd("dscacheutil").args(["-flushcache"]).output();
     let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
 
-    // The services carry their own resolvers again — the on-disk record has
-    // nothing left to describe.
-    crate::vpn::dns_journal::clear();
+    // Drop the on-disk record only for services that provably carry their own
+    // resolvers again. A networksetup write that did not take (no privileges, a
+    // locked SystemConfiguration store) leaves a service pointing at tunnel
+    // resolvers that are about to stop existing, and this file is then the only
+    // surviving description of the real ones — see dns_journal::settle.
+    crate::vpn::dns_journal::settle(outcome, crate::vpn::dns_journal::clear);
 }
 
 /// Point one service's resolvers at `servers`, or hand it back to DHCP when the
-/// list is empty.
+/// list is empty, and report whether the change is PROVABLY in effect.
 ///
 /// One implementation, shared by the clean restore and the journal restore. The
 /// "empty means DHCP" idiom is networksetup-specific, and a second hand-written
 /// copy of it is the estate's recurring bug shape.
-fn set_service_dns(service: &str, servers: &[String]) {
+///
+/// # Why the read-back, and why a caller must not skip it
+///
+/// The exit status is a hint, not an answer, and the caller that matters most
+/// runs UNPRIVILEGED: there is no self-elevation off Windows, so the startup
+/// reconcile — the only thing that can heal a SIGKILL, an OOM kill or a power
+/// cut — normally runs as the login user, who cannot write
+/// /Library/Preferences/SystemConfiguration/preferences.plist (root-owned, and
+/// networksetup carries no setuid bit). This function used to discard
+/// `.output()` entirely and return `()`, so the crash-recovery path counted
+/// every ATTEMPT as a restore, reported success, and then deleted the journal —
+/// destroying the only record of the user's real resolvers while the services
+/// were still pointing at a tunnel resolver that no longer existed.
+///
+/// `-getdnsservers` is read-only and answers correctly for any user, and it is
+/// the same call that captured the snapshot, so the comparison is a round-trip
+/// through one representation (notably "no manually-set servers" reads back as
+/// the empty list on both sides).
+fn set_service_dns(service: &str, servers: &[String]) -> bool {
+    let mut args = vec!["-setdnsservers".to_string(), service.to_string()];
     if servers.is_empty() {
         // "empty" is networksetup's way of saying "go back to DHCP".
-        let _ = cmd("networksetup")
-            .args(["-setdnsservers", service, "empty"])
-            .output();
-        return;
+        args.push("empty".to_string());
+    } else {
+        args.extend(servers.iter().cloned());
     }
-    let mut args = vec!["-setdnsservers".to_string(), service.to_string()];
-    args.extend(servers.iter().cloned());
-    let _ = cmd("networksetup").args(&args).output();
+    match cmd("networksetup").args(&args).output() {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => tracing::warn!(
+            "networksetup rejected the DNS change for '{}': {}",
+            service,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("Could not run networksetup for '{}': {}", service, e),
+    }
+    if dns_servers_for(service).as_slice() == servers {
+        return true;
+    }
+    tracing::error!(
+        "DNS change for '{}' did not take — asked for {:?}, the service still reports something \
+         else. Not counting it as restored.",
+        service,
+        servers
+    );
+    false
 }
 
 /// Put back the resolvers on services a previous session repointed and never
@@ -1210,27 +1251,57 @@ fn set_service_dns(service: &str, servers: &[String]) {
 pub(super) fn restore_services_still_on_tunnel_dns(
     services: &[(String, Vec<String>)],
     tunnel_dns: &[String],
-) -> bool {
-    let mut restored = 0usize;
+) -> DnsRestoreOutcome {
+    let outcome = restore_services_pass(services, tunnel_dns, dns_servers_for, set_service_dns);
+    if outcome.restored > 0 {
+        let _ = cmd("dscacheutil").args(["-flushcache"]).output();
+        let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
+        tracing::warn!(
+            "{} of {} network services were left on tunnel resolvers by a previous session — \
+             restored their pre-connect DNS",
+            outcome.restored,
+            services.len()
+        );
+    }
+    if outcome.unverified > 0 {
+        // Loud, and actionable: this process could not do it, but the record is
+        // being KEPT so a privileged one still can.
+        tracing::error!(
+            "{} of {} network services are STILL on the previous session's tunnel resolvers — \
+             this process could not write their DNS back (running without root? networksetup \
+             needs it). The DNS journal is being KEPT; re-launch Birdo with administrator \
+             privileges to retry.",
+            outcome.unverified,
+            services.len()
+        );
+    }
+    outcome
+}
+
+/// The pass itself, with the two system touches injected so it can be unit
+/// tested without a Mac and without mutating the host's DNS.
+///
+/// `apply` must answer with a VERIFIED result (see `set_service_dns`): the
+/// counts it produces are what decide whether the journal — the only record of
+/// `original` — is deleted.
+fn restore_services_pass(
+    services: &[(String, Vec<String>)],
+    tunnel_dns: &[String],
+    probe: impl Fn(&str) -> Vec<String>,
+    apply: impl Fn(&str, &[String]) -> bool,
+) -> DnsRestoreOutcome {
+    let mut outcome = DnsRestoreOutcome::default();
     for (service, original) in services {
-        if dns_servers_for(service).as_slice() != tunnel_dns {
+        if probe(service).as_slice() != tunnel_dns {
+            // Not ours to touch, and not a failure either — the user has fixed
+            // this service by hand, or it was never reached at connect time.
+            // It must NOT count as unverified, or the journal would be kept
+            // forever and every start would log an error about it.
             continue;
         }
-        set_service_dns(service, original);
-        restored += 1;
+        outcome.record(apply(service, original));
     }
-    if restored == 0 {
-        return false;
-    }
-    let _ = cmd("dscacheutil").args(["-flushcache"]).output();
-    let _ = cmd("killall").args(["-HUP", "mDNSResponder"]).output();
-    tracing::warn!(
-        "{} of {} network services were left on tunnel resolvers by a previous session — restored \
-         their pre-connect DNS",
-        restored,
-        services.len()
-    );
-    true
+    outcome
 }
 
 /// Remove VPN-specific routes.
@@ -1450,4 +1521,121 @@ fn prefix_to_mask(prefix: u8) -> String {
         (mask_bits >> 8) & 0xFF,
         mask_bits & 0xFF,
     )
+}
+
+#[cfg(test)]
+mod dns_journal_restore_tests {
+    use super::restore_services_pass;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    fn services(pairs: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+        pairs
+            .iter()
+            .map(|(name, dns)| {
+                (
+                    (*name).to_string(),
+                    dns.iter().map(|d| (*d).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn tunnel_dns() -> Vec<String> {
+        vec!["10.8.0.1".to_string()]
+    }
+
+    /// THE regression.
+    ///
+    /// The user double-clicks Birdo.app to heal a crash. There is no
+    /// self-elevation off Windows, so this instance is the login user and every
+    /// `networksetup -setdnsservers` fails to reach the root-owned
+    /// SystemConfiguration store. Nothing may be counted as restored: the
+    /// journal holding `original` is deleted off that count, and it is the only
+    /// surviving record of the user's real resolvers.
+    #[test]
+    fn an_unprivileged_pass_restores_nothing_and_keeps_the_journal() {
+        let services = services(&[("Wi-Fi", &["192.168.1.1"]), ("USB 10/100 LAN", &[])]);
+        let outcome = restore_services_pass(
+            &services,
+            &tunnel_dns(),
+            // Read-back: every service is still on the dead tunnel resolver.
+            |_: &str| tunnel_dns(),
+            // The write never landed (networksetup may still have exited 0).
+            |_: &str, _: &[String]| false,
+        );
+        assert_eq!(outcome.restored, 0, "an attempt is not a restore");
+        assert_eq!(outcome.unverified, 2);
+        assert!(
+            !outcome.may_clear_journal(),
+            "the journal would be deleted while both services are still on a resolver that no \
+             longer exists — the user's real resolvers would be unrecoverable"
+        );
+    }
+
+    /// The privileged pass, modelled against real state so the read-back is the
+    /// thing that decides.
+    #[test]
+    fn a_privileged_pass_restores_every_service_and_releases_the_journal() {
+        let services = services(&[("Wi-Fi", &["192.168.1.1"]), ("Ethernet", &[])]);
+        let live: RefCell<HashMap<String, Vec<String>>> = RefCell::new(
+            services
+                .iter()
+                .map(|(name, _)| (name.clone(), tunnel_dns()))
+                .collect(),
+        );
+        let outcome = restore_services_pass(
+            &services,
+            &tunnel_dns(),
+            |name: &str| live.borrow().get(name).cloned().unwrap_or_default(),
+            |name: &str, want: &[String]| {
+                live.borrow_mut().insert(name.to_string(), want.to_vec());
+                true
+            },
+        );
+        assert_eq!(outcome.restored, 2);
+        assert_eq!(outcome.unverified, 0);
+        assert!(outcome.may_clear_journal());
+        assert_eq!(live.borrow()["Wi-Fi"], vec!["192.168.1.1".to_string()]);
+        assert!(
+            live.borrow()["Ethernet"].is_empty(),
+            "empty means back to DHCP"
+        );
+    }
+
+    /// One service reachable, one not: the record must survive for the one that
+    /// was missed.
+    #[test]
+    fn a_partial_pass_keeps_the_journal() {
+        let services = services(&[("Wi-Fi", &["192.168.1.1"]), ("Ethernet", &["10.0.0.1"])]);
+        let outcome = restore_services_pass(
+            &services,
+            &tunnel_dns(),
+            |_: &str| tunnel_dns(),
+            |name: &str, _: &[String]| name == "Wi-Fi",
+        );
+        assert_eq!(outcome.restored, 1);
+        assert_eq!(outcome.unverified, 1);
+        assert!(!outcome.may_clear_journal());
+    }
+
+    /// Self-healing, and the reason "unverified" must not simply mean "not
+    /// restored": a service the user already fixed by hand is skipped, so the
+    /// pass is fully verified and the stale record is dropped rather than
+    /// kept — and logged about — forever.
+    #[test]
+    fn a_service_the_user_already_fixed_is_skipped_and_the_journal_is_released() {
+        let services = services(&[("Wi-Fi", &["192.168.1.1"])]);
+        let outcome = restore_services_pass(
+            &services,
+            &tunnel_dns(),
+            |_: &str| vec!["1.1.1.1".to_string()],
+            |_: &str, _: &[String]| {
+                panic!("must not touch a service that is no longer on the tunnel resolvers")
+            },
+        );
+        assert_eq!(outcome.restored, 0);
+        assert_eq!(outcome.unverified, 0);
+        assert!(outcome.may_clear_journal());
+    }
 }

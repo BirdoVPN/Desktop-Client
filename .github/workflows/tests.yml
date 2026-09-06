@@ -139,6 +139,25 @@ jobs:
         working-directory: src-tauri
         run: cargo check --all-targets
 
+      # The DNS crash-recovery journal is the only record of the user's
+      # pre-connect resolvers, so it must survive a restore that did not land.
+      # Run UNPRIVILEGED on purpose: an unprivileged relaunch (there is no
+      # self-elevation off Windows) is exactly the case that used to delete it.
+      - name: DNS journal restore tests (Linux)
+        if: matrix.os == 'linux'
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Captured, not piped: a name filter that matches NOTHING still exits
+          # 0, which is a green light for a test suite that never ran.
+          out=$(cargo test --lib resolv_conf_restore_tests)
+          echo "$out"
+          if ! echo "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
+            echo "::error::no DNS journal restore tests ran - the filter matched nothing"
+            exit 1
+          fi
+
       # ── F-001 verification ────────────────────────────────────────────────
       # The IPv6 leak fix is kernel-firewall code that a Windows dev box cannot
       # exercise at all, and full leak-testing needs a dual-stack network we do

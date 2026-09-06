@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, RwLock};
 use super::wireguard_new::WireGuardSession;
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
+use crate::vpn::dns_journal::DnsRestoreOutcome;
 
 /// Run a command (no special flags needed on Linux — no console window issue)
 fn cmd(program: &str) -> Command {
@@ -439,9 +440,11 @@ impl LinuxTunnel {
             }
         }
 
-        // Restore DNS
+        // Restore DNS. The teardown continues either way; restore_dns keeps
+        // the journal for anything it could not verify, so the next start
+        // retries.
         if let Some(snapshot) = self.network_snapshot.read().await.as_ref() {
-            restore_dns(snapshot);
+            let _ = restore_dns(snapshot);
         }
 
         // F-001: lift the IPv6 block. Best-effort so it can never fail teardown
@@ -741,7 +744,7 @@ impl Drop for LinuxTunnel {
                 if let Some(snap) = guard.as_ref() {
                     let mut snap = snap.clone();
                     snap.resolv_conf_pinned = true;
-                    restore_dns(&snap);
+                    let _ = restore_dns(&snap);
                 }
             }
         }
@@ -1214,13 +1217,18 @@ async fn configure_routes(
 /// The reliable signal is what /etc/resolv.conf actually points at: the stub
 /// resolver 127.0.0.53, or a file under /run/systemd/resolve/ once symlinks are
 /// followed.
+/// The one path every DNS read, write and verification in this module goes
+/// through. A second hand-written copy of it is how a restore and its
+/// verification drift apart.
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+
 fn resolv_conf_uses_resolved() -> bool {
-    if let Ok(target) = std::fs::canonicalize("/etc/resolv.conf") {
+    if let Ok(target) = std::fs::canonicalize(RESOLV_CONF) {
         if target.starts_with("/run/systemd/resolve/") {
             return true;
         }
     }
-    match std::fs::read_to_string("/etc/resolv.conf") {
+    match std::fs::read_to_string(RESOLV_CONF) {
         Ok(contents) => contents
             .lines()
             .filter(|l| l.trim_start().starts_with("nameserver"))
@@ -1278,14 +1286,13 @@ async fn configure_dns(
         // nothing. The marker filter mirrors capture_network_snapshot: a
         // resolv.conf we wrote is never a valid baseline (see the note there).
         crate::vpn::dns_journal::record_linux(
-            std::fs::read_to_string("/etc/resolv.conf")
+            std::fs::read_to_string(RESOLV_CONF)
                 .ok()
                 .filter(|c| !c.starts_with(RESOLV_CONF_MARKER)),
             uses_resolved,
         );
         let tmp = "/etc/.resolv.conf.birdo";
-        match std::fs::write(tmp, &contents).and_then(|_| std::fs::rename(tmp, "/etc/resolv.conf"))
-        {
+        match std::fs::write(tmp, &contents).and_then(|_| std::fs::rename(tmp, RESOLV_CONF)) {
             Ok(()) => {
                 pinned_file = true;
                 tracing::info!("Pinned /etc/resolv.conf to the tunnel resolvers");
@@ -1350,16 +1357,55 @@ async fn configure_dns(
 /// Used by the unwind paths where the `Ok(pinned)` flag never reached start():
 /// configure_dns failing after the write, or a cancelled start() being dropped.
 fn resolv_conf_is_ours() -> bool {
-    std::fs::read_to_string("/etc/resolv.conf")
+    std::fs::read_to_string(RESOLV_CONF)
         .map(|c| c.starts_with(RESOLV_CONF_MARKER))
         .unwrap_or(false)
+}
+
+/// Write `contents` to `path` and PROVE the result: the restore only counts once
+/// the file no longer carries our marker.
+///
+/// NOT the negation of `resolv_conf_is_ours`, and the difference is the whole
+/// point. Both answer conservatively for their own caller, so both answer "no"
+/// when the file cannot be read: `resolv_conf_is_ours` says "not ours, do not
+/// touch it", this says "not proved, keep the journal".
+///
+/// The `fs::write` result used to be discarded here. A recovery run that cannot
+/// write /etc/resolv.conf — the ordinary case, since there is no self-elevation
+/// off Windows and the startup reconcile runs as the login user; also a
+/// read-only /etc, an immutable file, or a full disk — then reported a restore
+/// it had not performed, and the caller deleted the journal: the pre-connect
+/// resolv.conf bytes, the only copy of them left anywhere, gone while the file
+/// still pointed at tunnel resolvers that no longer exist.
+fn write_resolv_conf_verified(path: &str, contents: &str) -> bool {
+    if let Err(e) = std::fs::write(path, contents) {
+        tracing::error!("Could not write {} ({})", path, e);
+    }
+    match std::fs::read_to_string(path) {
+        Ok(c) if !c.starts_with(RESOLV_CONF_MARKER) => true,
+        Ok(_) => {
+            tracing::error!(
+                "{} still carries the Birdo marker after the restore — the write did not take",
+                path
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                "Could not read {} back after the restore ({}) — treating it as NOT restored",
+                path,
+                e
+            );
+            false
+        }
+    }
 }
 
 /// Restore original DNS configuration.
 ///
 /// Deliberately synchronous (it never awaited anything): it must be callable
 /// from LinuxTunnel's Drop, which cannot await.
-fn restore_dns(snapshot: &NetworkSnapshot) {
+fn restore_dns(snapshot: &NetworkSnapshot) -> bool {
     // Mirror configure_dns: it pins BOTH resolvectl and /etc/resolv.conf on
     // hosts where resolved is running but is not what applications consult, so
     // restore must undo BOTH.
@@ -1387,12 +1433,10 @@ fn restore_dns(snapshot: &NetworkSnapshot) {
         // journal entry behind (record_linux runs before the write), so drop it
         // here too. A record must never outlive the state it describes.
         crate::vpn::dns_journal::clear();
-        return;
+        return true;
     }
-    if let Some(ref backup) = snapshot.resolv_conf_backup {
-        // Restore original /etc/resolv.conf
-        let _ = std::fs::write("/etc/resolv.conf", backup);
-        tracing::info!("Restored /etc/resolv.conf from backup");
+    let (contents, source) = if let Some(ref backup) = snapshot.resolv_conf_backup {
+        (backup.clone(), "backup")
     } else {
         // We overwrote the file but its original bytes were unreadable at
         // snapshot time. Best effort: write back the original DNS servers.
@@ -1405,12 +1449,30 @@ fn restore_dns(snapshot: &NetworkSnapshot) {
                 contents.push_str(&format!("nameserver {}\n", dns));
             }
         }
-        let _ = std::fs::write("/etc/resolv.conf", contents);
-        tracing::info!("Restored /etc/resolv.conf from snapshot");
-    }
+        (contents, "snapshot")
+    };
 
-    // The file is back — the on-disk record has nothing left to describe.
-    crate::vpn::dns_journal::clear();
+    // Verified, not attempted. The journal is deleted off this answer, and it
+    // is the only thing that still knows the pre-connect resolvers.
+    let restored = write_resolv_conf_verified(RESOLV_CONF, &contents);
+    if restored {
+        tracing::info!("Restored {} from {}", RESOLV_CONF, source);
+        // The file is back — the on-disk record has nothing left to describe.
+        crate::vpn::dns_journal::clear();
+    } else {
+        // KEEPING the record deliberately. It carries the pre-connect bytes;
+        // deleting it here is what turned a crash into a machine with no
+        // resolvers at all, permanently. The next start re-checks the marker
+        // and retries, and a run with the privileges this one lacked can
+        // finish the job.
+        tracing::error!(
+            "{} could not be restored (no permission to write it? running without root?) — the \
+             DNS journal is being KEPT so a later start can retry. Re-launch Birdo with root \
+             privileges to fix DNS.",
+            RESOLV_CONF
+        );
+    }
+    restored
 }
 
 /// Put back an /etc/resolv.conf a previous session pinned and never restored,
@@ -1426,23 +1488,31 @@ fn restore_dns(snapshot: &NetworkSnapshot) {
 pub(super) fn restore_resolv_conf_if_ours(
     resolv_conf_backup: Option<String>,
     uses_systemd_resolved: bool,
-) -> bool {
+) -> DnsRestoreOutcome {
     if !resolv_conf_is_ours() {
-        return false;
+        // Nothing of ours left in the file: either the clean path already ran,
+        // or the user has fixed it by hand. Fully settled, so the caller drops
+        // the record.
+        return DnsRestoreOutcome::default();
     }
     tracing::warn!(
-        "/etc/resolv.conf still carries the Birdo marker — a previous session exited without \
-         restoring DNS. Putting the pre-connect file back."
+        "{} still carries the Birdo marker — a previous session exited without restoring DNS. \
+         Putting the pre-connect file back.",
+        RESOLV_CONF
     );
-    restore_dns(&NetworkSnapshot {
+    let mut outcome = DnsRestoreOutcome::default();
+    // record(), not an unconditional success: restore_dns proves the write with
+    // a read-back, and an unproved restore must keep the journal (see
+    // dns_journal::settle). This is the Windows rule, applied to the Linux twin.
+    outcome.record(restore_dns(&NetworkSnapshot {
         dns_servers: Vec::new(),
         default_gateway: None,
         default_interface: None,
         uses_systemd_resolved,
         resolv_conf_backup,
         resolv_conf_pinned: true,
-    });
-    true
+    }));
+    outcome
 }
 
 /// Remove VPN-specific routes.
@@ -1537,20 +1607,18 @@ async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
     // paths (lines ~396 and ~739); the capture path never consulted it. Filter
     // here and log loudly, because a filtered baseline IS the signal that a
     // previous session did not shut down cleanly.
-    let resolv_conf_backup = std::fs::read_to_string("/etc/resolv.conf")
-        .ok()
-        .filter(|c| {
-            let ours = c.starts_with(RESOLV_CONF_MARKER);
-            if ours {
-                tracing::warn!(
-                    "/etc/resolv.conf still carries the Birdo marker at capture time — a previous \
+    let resolv_conf_backup = std::fs::read_to_string(RESOLV_CONF).ok().filter(|c| {
+        let ours = c.starts_with(RESOLV_CONF_MARKER);
+        if ours {
+            tracing::warn!(
+                "/etc/resolv.conf still carries the Birdo marker at capture time — a previous \
                      session exited without restoring DNS. Refusing to record it as the original \
                      baseline (that would make the tunnel's resolvers permanent). Disconnect will \
                      leave the file untouched; restore it by hand or reconnect to a clean state."
-                );
-            }
-            !ours
-        });
+            );
+        }
+        !ours
+    });
 
     // Capture current DNS servers
     let dns_servers: Vec<String> = if uses_resolved {
@@ -1719,5 +1787,77 @@ mod ipv6_leak_block_tests {
             !after.contains(IPV6_BLOCK_CHAIN),
             "teardown left state behind — the host would stay without IPv6:\n{after}"
         );
+    }
+}
+
+/// The DNS crash-recovery journal must outlive a restore that did not land.
+///
+/// Unprivileged by design — an unprivileged relaunch is the exact scenario that
+/// used to delete the only record of the user's resolvers — so these run in CI
+/// alongside the root-only ipv6 tests without needing sudo.
+#[cfg(test)]
+mod resolv_conf_restore_tests {
+    use super::{write_resolv_conf_verified, RESOLV_CONF_MARKER};
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("birdo-resolv-test-{}-{}", std::process::id(), name));
+        p
+    }
+
+    fn pinned_file(name: &str) -> std::path::PathBuf {
+        let path = tmp_path(name);
+        std::fs::write(
+            &path,
+            format!(
+                "{} — will be restored on disconnect\nnameserver 10.8.0.1\n",
+                RESOLV_CONF_MARKER
+            ),
+        )
+        .expect("write fixture");
+        path
+    }
+
+    #[test]
+    fn a_landed_write_is_verified_and_the_marker_is_gone() {
+        let path = pinned_file("landed");
+        let backup = "nameserver 192.168.1.1\n";
+        let verified = write_resolv_conf_verified(path.to_str().unwrap(), backup);
+        assert!(verified, "a write that landed must verify");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), backup);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE regression. The write cannot land (here: the parent directory does
+    /// not exist; in production: a non-root recovery run, a read-only /etc, an
+    /// immutable file). The old code discarded the `fs::write` result, reported
+    /// success, and the caller then deleted the journal — the only copy of the
+    /// pre-connect resolv.conf bytes.
+    #[test]
+    fn a_write_that_cannot_land_is_never_reported_as_restored() {
+        let mut path = tmp_path("no-such-dir");
+        path.push("resolv.conf");
+        assert!(
+            !write_resolv_conf_verified(path.to_str().unwrap(), "nameserver 192.168.1.1\n"),
+            "an unwritable target must NOT verify — the journal is deleted off this answer"
+        );
+    }
+
+    /// A file that still carries our marker is still pointing at tunnel
+    /// resolvers that no longer exist, whatever the write said.
+    #[test]
+    fn a_file_still_carrying_the_marker_is_not_restored() {
+        let path = pinned_file("still-ours");
+        // Hand it content that is still ours: the read-back, not the write, is
+        // what decides.
+        let verified = write_resolv_conf_verified(
+            path.to_str().unwrap(),
+            &format!("{} still pinned\nnameserver 10.8.0.1\n", RESOLV_CONF_MARKER),
+        );
+        assert!(
+            !verified,
+            "the marker is still there, so nothing was restored"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

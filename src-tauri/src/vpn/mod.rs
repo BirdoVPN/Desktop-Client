@@ -364,6 +364,82 @@ pub mod dns_journal {
         }
     }
 
+    /// What one platform's restore pass actually achieved.
+    ///
+    /// `unverified` is the load-bearing field. It counts state a previous
+    /// session moved aside that this pass did NOT prove it put back — and while
+    /// it is non-zero, the journal is the only surviving description of the
+    /// user's real resolvers.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(super) struct DnsRestoreOutcome {
+        /// Restores that a read-back PROVED are in effect.
+        pub(super) restored: usize,
+        /// Restores that were attempted and could not be proved. Never
+        /// increment this for something we chose not to touch: a service the
+        /// user has already fixed by hand is not unverified, it is done.
+        pub(super) unverified: usize,
+    }
+
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    impl DnsRestoreOutcome {
+        /// Fold in one restore attempt, `verified` being the read-back's answer
+        /// and NOT the exit status of whatever tool performed the write.
+        pub(super) fn record(&mut self, verified: bool) {
+            if verified {
+                self.restored += 1;
+            } else {
+                self.unverified += 1;
+            }
+        }
+
+        /// The rule this type exists to carry: the record may be dropped only
+        /// when nothing is left that it alone knows how to put back.
+        pub(super) fn may_clear_journal(&self) -> bool {
+            self.unverified == 0
+        }
+    }
+
+    /// Decide the on-disk record's fate after a platform restore pass, and
+    /// report whether anything was verifiably put back.
+    ///
+    /// # Why the journal is not cleared unconditionally
+    ///
+    /// It used to be, on macOS and Linux, and that is how a recoverable outage
+    /// became a permanent one. There is no self-elevation off Windows
+    /// (`main.rs` gates `self_elevate` on `cfg(windows)`), so the startup
+    /// reconcile — the ONLY thing that can heal a SIGKILL, an OOM kill or a
+    /// power cut — normally runs as the ordinary login user, who cannot write
+    /// the SystemConfiguration store or `/etc/resolv.conf`. The restore then
+    /// silently did nothing, `restored` counted the ATTEMPT, and deleting
+    /// `dns-restore.json` on the way out destroyed the last thing that knew
+    /// what to put back: the machine was left with no DNS at all, by the very
+    /// act of trying to recover. Windows already encodes this rule in
+    /// `win_machine_state::reconcile_record`, which retains every entry it
+    /// could not verify; this is that rule for the two Unix twins.
+    ///
+    /// Keeping a record we could not act on is cheap and self-healing: each
+    /// pass re-checks the live state first, so a machine the user has since
+    /// fixed by hand is examined once and the record is then dropped.
+    ///
+    /// Takes the clearing action as an argument so the rule itself is unit-
+    /// testable on any host — including the Windows runner, which is the only
+    /// CI job that actually RUNS the Rust test suite.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(super) fn settle(outcome: DnsRestoreOutcome, clear_journal: impl FnOnce()) -> bool {
+        if outcome.may_clear_journal() {
+            clear_journal();
+        } else {
+            tracing::error!(
+                "{} DNS restore(s) could not be verified — KEEPING the DNS journal so a \
+                 later start (or one with the privileges this one lacked) can retry. \
+                 Deleting it would destroy the only record of the pre-connect resolvers.",
+                outcome.unverified
+            );
+        }
+        outcome.restored > 0
+    }
+
     /// Drop the record. Called by the restore paths once the resolvers are back,
     /// so a record can never outlive the state it describes.
     pub(super) fn clear() {
@@ -427,8 +503,9 @@ pub mod dns_journal {
     /// a SIGKILL, an OOM kill or a power cut, none of which reach the hook.
     ///
     /// Each platform re-checks that the live state is still the state it left
-    /// before touching anything; the record is dropped either way, so a machine
-    /// the user has already fixed by hand is examined once and then left alone.
+    /// before touching anything, so a machine the user has already fixed by
+    /// hand is examined once and then left alone. The record is dropped only
+    /// for state a read-back PROVED is back — see `settle`.
     ///
     /// Returns whether anything was actually restored.
     pub fn reconcile() -> bool {
@@ -450,23 +527,113 @@ pub mod dns_journal {
         #[cfg(not(target_os = "windows"))]
         {
             #[cfg(target_os = "macos")]
-            let restored = super::tunnel_macos::restore_services_still_on_tunnel_dns(
+            let outcome = super::tunnel_macos::restore_services_still_on_tunnel_dns(
                 &journal.services,
                 &journal.tunnel_dns,
             );
             #[cfg(target_os = "linux")]
-            let restored = super::tunnel_linux::restore_resolv_conf_if_ours(
+            let outcome = super::tunnel_linux::restore_resolv_conf_if_ours(
                 journal.resolv_conf_backup,
                 journal.uses_systemd_resolved,
             );
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let restored = {
+            let outcome = {
                 let _ = &journal;
-                false
+                DnsRestoreOutcome::default()
             };
 
-            clear();
-            restored
+            // NOT an unconditional `clear()`. The restores above prove
+            // themselves with a read-back, and anything they could not prove
+            // keeps its record — deleting that is what turned a crash into a
+            // machine with no resolvers at all. See `settle`.
+            settle(outcome, clear)
+        }
+    }
+
+    /// The journal-lifecycle rule, exercised on every platform.
+    ///
+    /// Deliberately NOT `cfg(target_os)`-gated: the Windows job is the only CI
+    /// job that RUNS `cargo test`, and the rule these tests protect is the one
+    /// the macOS and Linux paths were missing.
+    #[cfg(test)]
+    mod settle_tests {
+        use super::{settle, DnsRestoreOutcome};
+        use std::cell::Cell;
+
+        /// Run `settle` and report whether it deleted the record.
+        fn run_settle(outcome: DnsRestoreOutcome) -> (bool, bool) {
+            let cleared = Cell::new(false);
+            let restored = settle(outcome, || cleared.set(true));
+            (cleared.get(), restored)
+        }
+
+        /// THE regression. An unprivileged recovery run attempts every restore
+        /// and lands none of them; the record it is holding is the only thing
+        /// that still knows the user's real resolvers, so it must survive.
+        #[test]
+        fn an_unverified_restore_keeps_the_journal() {
+            let outcome = DnsRestoreOutcome {
+                restored: 0,
+                unverified: 3,
+            };
+            let (cleared, restored) = run_settle(outcome);
+            assert!(
+                !cleared,
+                "the journal was deleted after a restore that never landed — this is the \
+                 bug: the pre-connect resolvers are now unrecoverable"
+            );
+            assert!(
+                !restored,
+                "nothing was proved restored, so nothing may be reported"
+            );
+        }
+
+        /// A partial pass is still a failed pass for the entries it missed.
+        #[test]
+        fn a_partial_restore_keeps_the_journal() {
+            let (cleared, restored) = run_settle(DnsRestoreOutcome {
+                restored: 2,
+                unverified: 1,
+            });
+            assert!(
+                !cleared,
+                "one unverified entry is enough to keep the record"
+            );
+            assert!(restored);
+        }
+
+        /// Fully proved: the record now describes nothing and must go, or every
+        /// later start would re-run a pointless pass and log an error forever.
+        #[test]
+        fn a_fully_verified_restore_clears_the_journal() {
+            let (cleared, restored) = run_settle(DnsRestoreOutcome {
+                restored: 2,
+                unverified: 0,
+            });
+            assert!(cleared);
+            assert!(restored);
+        }
+
+        /// Nothing to do — the user already fixed their DNS by hand, so the
+        /// live state is no longer the state we left. Self-healing: the record
+        /// is dropped even though nothing was restored.
+        #[test]
+        fn nothing_left_to_restore_clears_the_journal() {
+            let (cleared, restored) = run_settle(DnsRestoreOutcome::default());
+            assert!(cleared);
+            assert!(!restored);
+        }
+
+        #[test]
+        fn may_clear_journal_tracks_only_the_unverified_count() {
+            assert!(DnsRestoreOutcome::default().may_clear_journal());
+            let mut outcome = DnsRestoreOutcome::default();
+            outcome.record(true);
+            assert!(outcome.may_clear_journal());
+            outcome.record(false);
+            assert!(!outcome.may_clear_journal());
+            assert_eq!(outcome.restored, 1);
+            assert_eq!(outcome.unverified, 1);
         }
     }
 }
