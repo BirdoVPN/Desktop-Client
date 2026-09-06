@@ -44,7 +44,8 @@
 //!   at connect (issue #99). The session, and deliberately not the life of the
 //!   park: the park outlives the session whenever an un-park could not be
 //!   verified, and a refresh that outlived its tunnel would re-park every
-//!   physical adapter with nothing connected — see `refresh_live_session`.
+//!   physical adapter with nothing connected — that is I13, and
+//!   `refresh_live_session` is where it is enforced.
 //! * **I7 STABLE IDENTITY** — entries are keyed by interface GUID, which cannot
 //!   change while the adapter is parked. Adapter NAMES are user-editable in
 //!   Network Connections and are localised on a fresh install; a rename would
@@ -56,6 +57,17 @@
 //! * **I12 IDEMPOTENCE** — claim/adopt/refresh over an already-parked,
 //!   already-recorded adapter change neither the machine nor the record. That is
 //!   what makes adoption safe and the periodic refresh possible.
+//! * **I13 NO PARK MAY FOLLOW AN UN-PARK** — the refresh ticker parks only while
+//!   `owner == live_session == Some(its gen)`, and there are exactly TWO
+//!   un-parks in the process, both of which close `live_session` before a single
+//!   netsh runs: `release_dns_locked`, as its first statement under the same
+//!   lock, and `reconcile_record`, which restores off the on-disk record without
+//!   the lock and so closes it by hand through `close_live_session_for_unpark`.
+//!   So the ticker cannot outlive what put the machine back, on any exit path,
+//!   without anyone having to remember a new one; see `refresh_live_session` for
+//!   the path-by-path table.
+//!   A park that follows NO un-park is idempotent (I12) and is healed by the
+//!   record, which `reconcile_record` now adopts into the next process.
 //!
 //! # Deliberately synchronous
 //!
@@ -67,7 +79,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use super::tunnel::{AdapterDnsSnapshot, ADAPTER_GUID, ADAPTER_NAME};
@@ -148,6 +160,22 @@ pub(super) struct OwnedRoute {
 struct MachineState {
     /// The generation permitted to mutate. `None` = nothing is moved aside.
     owner: Option<Gen>,
+    /// The generation whose DATA PLANE is live, i.e. the one and only generation
+    /// whose refresh ticker may park anything (I13).
+    ///
+    /// Ownership cannot answer that question: ownership outlives the session
+    /// whenever an un-park could not be verified. This can, because it is set in
+    /// exactly one place — [`claim_locked`], the operation that establishes a
+    /// park for a live tunnel — and cleared in exactly the places where the data
+    /// plane stops being the thing that owns the park: [`release_dns_locked`]
+    /// (the ONLY un-park), [`begin_transition`], a [`take_ownership`] that
+    /// moves the park to a different generation, and
+    /// [`release_owner_if_clean`] — which is what keeps `live_session ⊆
+    /// {owner}` true on every reachable path rather than on the ones someone
+    /// happened to check. Never `Some(g)` unless `owner == Some(g)`; the test
+    /// `clearing_the_owner_clears_the_live_session_too` IS that sentence, and
+    /// it fails if this list is ever short by one again.
+    live_session: Option<Gen>,
     /// The park record, keyed by adapter GUID (I7). This IS the park: an
     /// adapter is in here iff we have durably recorded it, and we only ever
     /// mutate an adapter that is already in here (I4).
@@ -209,6 +237,7 @@ impl Degradation {
 
 static STATE: Mutex<MachineState> = Mutex::new(MachineState {
     owner: None,
+    live_session: None,
     park: BTreeMap::new(),
     routes: Vec::new(),
     degraded: BTreeMap::new(),
@@ -921,6 +950,17 @@ fn restore_pass(
 fn release_owner_if_clean(st: &mut MachineState) {
     if st.park.is_empty() && st.routes.is_empty() {
         st.owner = None;
+        // I13, and it is what makes `live_session ⊆ {owner}` a checkable
+        // invariant rather than a sentence in a doc comment. Reachable with a
+        // session still open through ONE door: [`release_routes_locked`] on a
+        // generation whose park happens to be empty — a machine whose physical
+        // NICs were all down at connect. That left `owner = None` next to
+        // `live_session = Some(gen)`, which no ticker can act on (both halves
+        // are required) but which contradicts the stated invariant, and an
+        // invariant that is only true by accident is the shape this subsystem
+        // has been rejected for five times. Both callers are teardown, so the
+        // session really is over here.
+        st.live_session = None;
     }
 }
 
@@ -960,6 +1000,11 @@ fn flush_record(park: &BTreeMap<String, AdapterDnsSnapshot>, io: &dyn MachineIo)
 /// the incoming tunnel picks them up.
 pub(super) fn take_ownership(gen: Gen) {
     let mut st = state();
+    take_ownership_locked(&mut st, gen);
+}
+
+/// Core of [`take_ownership`], over an explicit state so the tests can drive it.
+fn take_ownership_locked(st: &mut MachineState, gen: Gen) {
     if st.owner == Some(gen) {
         return;
     }
@@ -976,6 +1021,11 @@ pub(super) fn take_ownership(gen: Gen) {
     if st.park.is_empty() && st.routes.is_empty() {
         st.degraded.clear();
     }
+    // I13: the park has moved to a generation that has not claimed yet, so no
+    // data plane owns it at this instant. Keeps `live_session ⊆ {owner}` an
+    // invariant rather than a coincidence — the displaced generation's ticker
+    // already fails the owner half, and this stops it passing the session half.
+    st.live_session = None;
     st.owner = Some(gen);
 }
 
@@ -1008,8 +1058,13 @@ pub(super) fn claim(gen: Gen) {
 }
 
 /// Core of [`claim`], over an explicit state so the tests can drive it.
+///
+/// This is the ONE place `live_session` is opened (I13). `claim` is called from
+/// `configure_dns`, i.e. by a tunnel that has a data plane, so it is exactly the
+/// moment at which a refresh ticker for `gen` becomes legitimate.
 fn claim_locked(st: &mut MachineState, io: &dyn MachineIo, gen: Gen) {
     st.owner = Some(gen);
+    st.live_session = Some(gen);
     park_pass(st, io);
 }
 
@@ -1018,6 +1073,19 @@ fn claim_locked(st: &mut MachineState, io: &dyn MachineIo, gen: Gen) {
 /// The ownership check lives HERE, not in the caller, so there is no path to the
 /// machine that skips it (I1).
 fn release_dns_locked(st: &mut MachineState, io: &dyn MachineIo, gen: Gen) -> bool {
+    // I13, and it is the FIRST statement on purpose. This is the only function
+    // in the process that can un-park, and closing the session here — under the
+    // same lock, before a single netsh runs — is what makes "no park may follow
+    // an un-park" true on every exit path at once rather than on the N paths
+    // someone remembered to add a flag-clear to. `refresh_live_session` takes
+    // this same lock and re-reads `live_session` INSIDE it, so a pass cannot
+    // interleave; a pass already blocked on the lock finds the door shut.
+    //
+    // Before the owner check, deliberately: a non-owner's session is over too,
+    // and a stale `live_session` is exactly the residue both criticals grew from.
+    if st.live_session == Some(gen) {
+        st.live_session = None;
+    }
     if st.owner != Some(gen) {
         tracing::debug!(
             "Generation {} asked to un-park DNS but does not own it (owner {:?}) — doing nothing",
@@ -1067,9 +1135,10 @@ fn release_routes_locked(st: &mut MachineState, io: &dyn MachineIo, gen: Gen) {
 /// Returns whether the caller should keep ticking. Both halves of that answer
 /// are computed HERE, under the lock, and that is the point of the signature.
 ///
-/// # Why ownership alone cannot gate the ticker
+/// # Why ownership alone cannot gate the ticker, and why a flag on the tunnel
+/// could not either
 ///
-/// The refresh thread used to loop on `is_owner(gen)`, and ownership does not
+/// The refresh thread first looped on `is_owner(gen)`, and ownership does not
 /// end when the session does. `release_owner_if_clean` clears the owner only
 /// once the park AND the routes are empty, and [`restore_pass`] deliberately
 /// RETAINS an entry it could not verifiably restore — an adapter unplugged
@@ -1080,20 +1149,70 @@ fn release_routes_locked(st: &mut MachineState, io: &dyn MachineIo, gen: Gen) {
 /// Disconnected. That is verbatim the failure design R5 was rejected for in
 /// issue #105, reintroduced through the back door.
 ///
-/// So the SESSION is the scope. `session_alive` is owned by the tunnel and
-/// cleared by `stop()` and by `Drop`, i.e. by every path out of a session, and
-/// it is read inside the same lock `release_dns` takes — so the un-park cannot
-/// interleave with a park pass that would undo it. Ownership stays as the second
-/// condition, because a tunnel that has been displaced by a reconnect must not
-/// keep parking on behalf of the generation that succeeded it.
-pub(super) fn refresh_live_session(gen: Gen, session_alive: &AtomicBool) -> bool {
+/// The second attempt scoped it to the session with an `AtomicBool` the tunnel
+/// owned, cleared by `stop()` and by `Drop`. That is N parallel paths wearing a
+/// disguise, and it took one review to find the N+1th: the updater relaunch
+/// (`RunEvent::ExitRequested` with `RESTART_EXIT_CODE`) un-parks through
+/// [`release_dns_at_exit`], which never sees a tunnel at all — so the flag
+/// stayed set, the ticker survived the un-park, and it re-parked every physical
+/// adapter on a process that was about to be replaced. The same blackhole,
+/// through a second door. Adding a third clear would only invite a fourth door.
+///
+/// # I13: the door is the un-park, and there is only one of them
+///
+/// So the gate stopped being a flag that N call sites must remember to clear and
+/// became a property of the state machine. Two conditions, both read from
+/// `MachineState` under the one lock:
+///
+/// * `owner == Some(gen)` — a displaced tunnel must not park on behalf of the
+///   generation that succeeded it.
+/// * `live_session == Some(gen)` — a generation whose DATA PLANE is live.
+///
+/// `live_session` is opened in exactly one place ([`claim_locked`]) and closed
+/// by every un-park (plus the two ownership moves that mean "held with no data
+/// plane"). There are exactly two un-parks: [`release_dns_locked`], which closes
+/// the session as its first statement while holding this lock, and
+/// [`reconcile_record`], which restores off the on-disk record without the lock
+/// and therefore closes the session by hand, first, through
+/// [`close_live_session_for_unpark`]. Because un-parking is what closes the
+/// gate, the answer to "can the ticker run after X?" is the same for every X:
+///
+/// | how the process/session ends                       | why no park follows |
+/// |----------------------------------------------------|---------------------|
+/// | `stop()`                                            | un-parks ⇒ closed   |
+/// | `WintunTunnel::drop` (owner)                        | un-parks ⇒ closed   |
+/// | `WintunTunnel::drop` (displaced)                    | `begin_transition`/`take_ownership` already closed it |
+/// | updater relaunch (`RESTART_EXIT_CODE`)              | `release_dns_at_exit` un-parks ⇒ closed |
+/// | `ExitRequested` teardown (`teardown_for_exit`)      | disconnect un-parks ⇒ closed |
+/// | panic under `panic = "abort"`                       | hook un-parks off the record and closes the session by hand first ([`close_live_session_for_unpark`]) — it cannot use the lock-holding route, so it does not pretend to |
+/// | `std::process::exit`, `TerminateProcess`, SIGKILL, OOM, power loss, Windows shutdown/logoff | NOTHING was un-parked, so a late pass is idempotent (I12) — it re-parks only what is already parked and already recorded. The on-disk record survives, and [`reconcile_record`] adopts it at next start. |
+///
+/// The last row is the whole reason a one-way "shutting down" latch would have
+/// been the wrong shape: a park that follows no un-park is harmless, and a latch
+/// that made it impossible would also have to be un-latched for reconnect —
+/// which is another N-paths problem. The dangerous event is not "the process is
+/// ending", it is "something was put back". Gate on that and there is one door.
+pub(super) fn refresh_live_session(gen: Gen) -> bool {
     let io = SystemIo;
     let mut st = state();
-    if !should_refresh(st.owner, gen, session_alive.load(Ordering::SeqCst)) {
+    refresh_live_session_locked(&mut st, &io, gen)
+}
+
+/// Core of [`refresh_live_session`], over an explicit state so a test can drive
+/// the ticker's EXACT body rather than a predicate that resembles it.
+///
+/// That distinction is the round-2 lesson. The guard lives HERE, inside the one
+/// call the thread is able to make, and not in the thread's loop — so a thread
+/// that ignores its stop signal (a `loop {}` that discards this return, a spawn
+/// nobody remembered to bound, a future door) still cannot mutate the machine.
+/// The return value only ends the thread; the gate is what protects the
+/// adapters, and the two are deliberately not the same thing.
+fn refresh_live_session_locked(st: &mut MachineState, io: &dyn MachineIo, gen: Gen) -> bool {
+    if !should_refresh(st.owner, st.live_session, gen) {
         return false;
     }
     let before = st.park.len();
-    park_pass(&mut st, &io);
+    park_pass(st, io);
     let after = st.park.len();
     if after > before {
         tracing::info!(
@@ -1106,13 +1225,14 @@ pub(super) fn refresh_live_session(gen: Gen, session_alive: &AtomicBool) -> bool
 
 /// May the refresh ticker run another pass?
 ///
-/// Pure, so the rule that a LIVE SESSION — not ownership — bounds the ticker is
-/// testable without the process-global state or a ten-second sleep. Both
-/// conditions are required and neither implies the other: ownership without a
-/// session is the state a partly-failed un-park leaves behind, and that is the
-/// combination that used to keep parking adapters on a machine with no tunnel.
-fn should_refresh(owner: Option<Gen>, gen: Gen, session_alive: bool) -> bool {
-    session_alive && owner == Some(gen)
+/// Pure, so the rule that a LIVE DATA PLANE — not ownership — bounds the ticker
+/// is testable without the process-global state, without a tunnel and without a
+/// ten-second sleep. Both conditions are required and neither implies the other:
+/// ownership without a live session is the state a partly-failed un-park leaves
+/// behind, and that is the combination that kept parking adapters on a machine
+/// with no tunnel.
+fn should_refresh(owner: Option<Gen>, live_session: Option<Gen>, gen: Gen) -> bool {
+    live_session == Some(gen) && owner == Some(gen)
 }
 
 /// Is `gen` the current owner? The liveness predicate every teardown decision
@@ -1131,6 +1251,16 @@ pub(super) fn is_owner(gen: Gen) -> bool {
 pub(super) fn begin_transition() -> Gen {
     let gen = next_generation();
     let mut st = state();
+    begin_transition_locked(&mut st, gen);
+    gen
+}
+
+/// Core of [`begin_transition`], over an explicit state so the tests can drive
+/// it.
+fn begin_transition_locked(st: &mut MachineState, gen: Gen) {
+    // I13: the park is about to be held by a generation with NO data plane.
+    // Nothing may refresh it until a new tunnel claims.
+    st.live_session = None;
     if st.owner.is_some() || !st.park.is_empty() || !st.routes.is_empty() {
         tracing::debug!(
             "Machine state held across a transition by generation {} (was {:?})",
@@ -1139,7 +1269,6 @@ pub(super) fn begin_transition() -> Gen {
         );
         st.owner = Some(gen);
     }
-    gen
 }
 
 /// Un-park the physical adapters. Owner only. Returns whether anything was put
@@ -1206,13 +1335,34 @@ fn push_owned_route(routes: &mut Vec<OwnedRoute>, route: OwnedRoute) -> bool {
 /// Surfaced through `VpnStatus` rather than only logged: an adapter that keeps
 /// its ISP resolvers for a whole session while the UI reads Connected is the
 /// definition of rendering reassurance from missing data.
+///
+/// # Why this does not block
+///
+/// The Dashboard polls `get_vpn_status` on a short interval, and that is an
+/// `async` Tauri command — so this synchronous call runs ON a tokio worker
+/// thread. A park pass holds the machine-state lock across up to six hidden
+/// `netsh` spawns PER ADAPTER at ~0.2-0.4s each, so a plain `lock()` here would
+/// park a worker for seconds at a time, every poll, for as long as the pass runs
+/// — on a connect, on a reconnect and on every refresh tick.
+///
+/// So it never waits. The report is advisory UI text, and the honest answer
+/// while a pass is mutating the very map it summarises is the last complete one,
+/// not a stalled thread. The cache is refreshed here and only here, so there is
+/// no second place to keep in step.
 pub fn degradation_report() -> Vec<String> {
-    state()
+    static LAST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let Ok(st) = STATE.try_lock() else {
+        return LAST.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    };
+    let report: Vec<String> = st
         .degraded
         .values()
         .filter(|d| d.reportable)
         .map(|d| d.message.clone())
-        .collect()
+        .collect();
+    drop(st);
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = report.clone();
+    report
 }
 
 /// Un-park the physical adapters on behalf of whoever currently owns them.
@@ -1236,13 +1386,120 @@ pub fn release_dns_at_exit() -> bool {
     }
 }
 
+/// Load the entries a reconcile could NOT restore into the RUNNING process, so
+/// the record on disk and the record in memory describe the same machine.
+///
+/// # The bug this closes
+///
+/// [`restore_pass`] deliberately retains an entry it could not verifiably
+/// restore, and the module docs call that entry "the last thing that knows what
+/// to put back". [`reconcile_record`] wrote those survivors back to disk and
+/// then dropped them on the floor: `STATE.park` stayed EMPTY. A process that
+/// started after a crash, a SIGKILL or a power cut therefore ran with adapters
+/// parked on `static none` that it could not see, and every consequence of that
+/// is worse than the leak it was recovering from:
+///
+/// * The next connect's [`park_pass`] does not find those adapters in `st.park`,
+///   so I5b does not fire and it RE-READS them — capturing the parked shape as
+///   if it were the user's own configuration. That is #102's terminal state,
+///   reached from the recovery path.
+/// * `park_pass` then persists `st.park`, which does not contain the survivors,
+///   so `io.persist` CLOBBERS them out of the journal. The only description of
+///   those adapters' real resolvers is destroyed by the act of connecting again.
+/// * Nothing retries them: [`release_dns_at_exit`] reads `state().owner`, which
+///   is `None`, so a clean quit does not even look.
+///
+/// # Why it takes an owner
+///
+/// The survivors are machine state that is moved aside RIGHT NOW, and this
+/// module's whole contract is that such state has exactly one owner (I1). Giving
+/// it a fresh generation makes every existing mechanism apply to it unchanged:
+/// `take_ownership` on the next connect ADOPTS it (park non-empty ⇒ the
+/// degradations are kept, which is correct — those adapters really are still
+/// unrestored), `park_pass` skips re-reading it (I5b) and persists it alongside
+/// the new entries, `restore_pass` retries it on the next disconnect, and
+/// `release_dns_at_exit` retries it on quit. Deliberately NO `live_session`:
+/// nothing is connected, so no refresh ticker may exist for this generation
+/// (I13).
+///
+/// Refuses to act when this process has state of its own — at `setup()` there is
+/// none by construction (no tunnel can be up that early), and from the panic
+/// hook a non-empty `st.park` means the DYING process holds the newer truth and
+/// the file must not overwrite it.
+fn adopt_unrestored(st: &mut MachineState, park: BTreeMap<String, AdapterDnsSnapshot>) {
+    if park.is_empty() {
+        return;
+    }
+    if !st.park.is_empty() || st.owner.is_some() {
+        tracing::debug!(
+            "Not adopting {} unrestored record entr(ies) — this process already owns machine \
+             state (owner {:?}, {} parked)",
+            park.len(),
+            st.owner,
+            st.park.len()
+        );
+        return;
+    }
+    let gen = next_generation();
+    tracing::warn!(
+        "Adopting {} adapter(s) a previous session left parked and could not restore — \
+         generation {} now owns them, so the next connect will not re-snapshot them \
+         and the next disconnect or quit will retry the restore",
+        park.len(),
+        gen
+    );
+    st.park = park;
+    st.owner = Some(gen);
+    st.live_session = None;
+}
+
+/// Close the data plane for the one un-park that does not go through
+/// [`release_dns_locked`] (I13).
+///
+/// # Why this is not covered by "the un-park closes the door"
+///
+/// [`reconcile_record`] un-parks off the ON-DISK record and deliberately never
+/// takes the lock, so the act of un-parking there does not clear `live_session`
+/// the way every other door does. From `setup()` that is harmless — nothing is
+/// connected, so no ticker exists. From the PANIC HOOK it is not: the refresh
+/// thread for the live generation is still running, and [`park_pass`] re-issues
+/// the park for any adapter that is BOTH recorded and degraded (that is the
+/// retry list, and an adapter whose park failed at connect is exactly one).
+///
+/// The composition is what bites. The hook reads that adapter, finds it is not
+/// parked-shaped — correct, its park failed — drops it from the record and
+/// flushes, so the file no longer describes it. A ticker pass landing in the
+/// window between that flush and `panic = "abort"` reaping the process then
+/// PARKS it, with nothing on disk left to put it back and no process left to
+/// try: `static none` forever, which is #102's terminal shape manufactured by
+/// the recovery path. The window is small, but "a park followed an un-park" is
+/// the exact shape I13 exists to make unreachable, and the module's own exit
+/// table claimed this row was closed when it was not.
+///
+/// `try_lock`, never `lock`, for the same reason [`reconcile_record`] does not
+/// lock: the panicking thread may already hold it, and a `std::sync::Mutex`
+/// re-entered on one thread deadlocks — hanging the process instead of aborting
+/// it. Failing to take it is SAFE here, not merely tolerable: a lock held by a
+/// thread that is about to `abort` is never released and never poisoned, so the
+/// ticker blocks inside [`state`] until the OS reaps it. Taken or not taken, no
+/// park follows the un-park.
+fn close_live_session_for_unpark() {
+    if let Ok(mut st) = STATE.try_lock() {
+        st.live_session = None;
+    }
+}
+
 /// The crash twin: put back whatever a PREVIOUS process left moved aside,
 /// driven entirely off the on-disk record.
 ///
-/// Deliberately does NOT touch the global state and does NOT take the lock. It
-/// runs from the panic hook, where this thread may already hold it, and from
-/// `setup()`, where no tunnel can be up and a record on disk therefore means
-/// exactly one thing: a previous session did not restore DNS.
+/// Deliberately never BLOCKS on the global lock. It runs from the panic hook,
+/// where this thread may already hold it and a `std::sync::Mutex` re-entered on
+/// one thread deadlocks, and from `setup()`, where no tunnel can be up and a
+/// record on disk therefore means exactly one thing: a previous session did not
+/// restore DNS. The restore itself is driven entirely off the passed-in record,
+/// never off `STATE`; the only two touches of the global are `try_lock` and
+/// skipped when it is held — closing the session up front (I13) and adopting
+/// what could not be restored at the end.
 ///
 /// Owns the record's lifecycle itself — entries it could not verifiably restore
 /// stay on disk. That is why `dns_journal::reconcile` must not clear the file on
@@ -1251,6 +1508,10 @@ pub(super) fn reconcile_record(entries: &[AdapterDnsSnapshot]) -> bool {
     if entries.is_empty() {
         return false;
     }
+    // I13, and this is the ONE un-park that cannot close the gate by performing
+    // it, because it deliberately does not take the lock. So it closes it by
+    // hand, FIRST, before a single netsh runs — see `close_live_session_for_unpark`.
+    close_live_session_for_unpark();
     let io = SystemIo;
     let mut park: BTreeMap<String, AdapterDnsSnapshot> =
         entries.iter().map(|e| (entry_key(e), e.clone())).collect();
@@ -1261,13 +1522,16 @@ pub(super) fn reconcile_record(entries: &[AdapterDnsSnapshot]) -> bool {
     let mut degraded: BTreeMap<String, Degradation> = BTreeMap::new();
     let restored = restore_pass(&mut park, &io, &mut degraded);
     flush_record(&park, &io);
-    if !degraded.is_empty() {
-        // try_lock, never lock: this runs from the panic hook, and the thread
-        // that is dying may already hold it — a std::sync::Mutex re-entered on
-        // the same thread deadlocks, which would hang the process instead of
-        // aborting it. Losing the report is the acceptable outcome; every entry
-        // was already logged at ERROR.
+    // try_lock, never lock: this runs from the panic hook, and the thread that
+    // is dying may already hold it — a std::sync::Mutex re-entered on the same
+    // thread deadlocks, which would hang the process instead of aborting it.
+    // Losing the adoption and the report is the acceptable outcome there; every
+    // entry was already logged at ERROR, and the record is still on disk for the
+    // next start. At `setup()`, where the adoption actually matters, this
+    // process is single-threaded past the panic hook and the lock is free.
+    if !park.is_empty() || !degraded.is_empty() {
         if let Ok(mut st) = STATE.try_lock() {
+            adopt_unrestored(&mut st, park);
             st.degraded.extend(degraded);
         }
     }
@@ -1732,6 +1996,7 @@ mod tests {
     fn fresh() -> MachineState {
         MachineState {
             owner: Some(1),
+            live_session: None,
             park: BTreeMap::new(),
             routes: Vec::new(),
             degraded: BTreeMap::new(),
@@ -2074,6 +2339,120 @@ mod tests {
         );
     }
 
+    // ── v4 / v6 twin parity ──────────────────────────────────────
+    //
+    // These twins have drifted TWICE in this subsystem, so the parity is
+    // asserted rather than promised in a comment. `FakeIo` substitutes for
+    // `SystemIo`, so what these cover is the shared decision logic — the
+    // combinator and the two verification predicates. The netsh argv in
+    // `SystemIo::park_dns` / `restore_dns` / `read_dns` is NOT reachable from a
+    // unit test and is inspection-only.
+
+    /// Neither family may short-circuit the other, and a half-failure must never
+    /// read as success. [`join_family_results`] is the single place the two are
+    /// combined: both arms are evaluated before it is called (no `?`), so it is
+    /// the only thing that can lose one.
+    #[test]
+    fn a_family_that_failed_can_never_be_reported_as_done() {
+        assert!(join_family_results(Ok(()), Ok(())).is_ok());
+
+        let v6_failed = join_family_results(Ok(()), Err("ipv6 exited 1".to_string()))
+            .expect_err("an IPv6 failure with IPv4 fine is NOT a success");
+        assert!(v6_failed.contains("ipv6"), "{}", v6_failed);
+
+        let v4_failed = join_family_results(Err("ipv4 exited 1".to_string()), Ok(()))
+            .expect_err("and the twin holds the other way round");
+        assert!(v4_failed.contains("ipv4"), "{}", v4_failed);
+
+        // Both failed: the message names BOTH, so neither can be hidden by the
+        // other in a log line.
+        let both = join_family_results(
+            Err("ipv4 exited 1".to_string()),
+            Err("ipv6 exited 1".to_string()),
+        )
+        .expect_err("both failed");
+        assert!(both.contains("ipv4") && both.contains("ipv6"), "{}", both);
+    }
+
+    /// "Is it parked?" is a BOTH-families question. An adapter still holding
+    /// IPv6 resolvers is not parked however clean its IPv4 side looks — SMHNR
+    /// queries RA/RDNSS resolvers too, which is the entire reason `park_dns` has
+    /// an `ipv6` arm.
+    #[test]
+    fn an_adapter_still_holding_one_familys_resolvers_is_not_parked() {
+        assert!(is_parked_shape(&snap(
+            "{A}",
+            "Wi-Fi",
+            false,
+            &[],
+            false,
+            &[]
+        )));
+        assert!(
+            !is_parked_shape(&snap(
+                "{A}",
+                "Wi-Fi",
+                false,
+                &[],
+                false,
+                &["2606:4700:4700::1111"]
+            )),
+            "IPv4 clean but IPv6 resolvers still registered must NOT verify as parked"
+        );
+        assert!(
+            !is_parked_shape(&snap("{A}", "Wi-Fi", false, &[], true, &[])),
+            "nor must an adapter whose IPv6 is still sourced from DHCP/RA"
+        );
+        assert!(
+            !is_parked_shape(&snap("{A}", "Wi-Fi", false, &["1.1.1.1"], false, &[])),
+            "the IPv4 twin of the same question"
+        );
+        assert!(
+            !is_parked_shape(&snap("{A}", "Wi-Fi", true, &[], false, &[])),
+            "and the IPv4 origin half of it"
+        );
+    }
+
+    /// [`matches_intent`] is the restore-side twin of the same question: an
+    /// adapter whose IPv4 came back while its IPv6 stayed suppressed is a
+    /// half-restored adapter, and it must not clear the record.
+    #[test]
+    fn a_restore_that_only_took_on_one_family_does_not_verify() {
+        let entry = snap(
+            "{B}",
+            "Ethernet",
+            false,
+            &["1.1.1.1"],
+            false,
+            &["2606:4700:4700::1111"],
+        );
+        let (v4_dhcp, v4) = intent_v4(&entry);
+        let (v6_dhcp, v6) = intent_v6(&entry);
+        let full = AdapterDnsSnapshot {
+            adapter_name: "Ethernet".to_string(),
+            adapter_guid: "{B}".to_string(),
+            v4_was_dhcp: v4_dhcp,
+            v6_was_dhcp: v6_dhcp,
+            dns_servers: v4,
+            dns_servers_v6: v6,
+        };
+        assert!(matches_intent(&entry, &full), "the whole intent, written");
+
+        let mut v6_missing = full.clone();
+        v6_missing.dns_servers_v6.clear();
+        assert!(
+            !matches_intent(&entry, &v6_missing),
+            "IPv4 back, IPv6 still suppressed — a half-restored adapter reading as restored"
+        );
+
+        let mut v4_missing = full;
+        v4_missing.dns_servers.clear();
+        assert!(
+            !matches_intent(&entry, &v4_missing),
+            "and the twin the other way round"
+        );
+    }
+
     // ── I6 / #99 ─────────────────────────────────────────────────
 
     #[test]
@@ -2178,11 +2557,25 @@ mod tests {
         );
     }
 
+    // ── I13: no park may follow an un-park ───────────────────────
+
+    /// May the ticker for `gen` run another pass against this state?
+    fn ticker_alive(st: &MachineState, gen: Gen) -> bool {
+        should_refresh(st.owner, st.live_session, gen)
+    }
+
+    /// A session that ends with a retained entry — the ordinary case — keeps the
+    /// generation OWNING the park, which is why ownership can never be the
+    /// ticker's gate. R1 shipped exactly that and blackholed DNS machine-wide.
     #[test]
     fn a_failed_restore_leaves_ownership_behind_so_ownership_cannot_gate_the_ticker() {
         let io = FakeIo::new(two_adapters());
         let mut st = fresh();
         claim_locked(&mut st, &io, 7);
+        assert!(
+            ticker_alive(&st, 7),
+            "a claimed, live generation refreshes (#99)"
+        );
 
         // One adapter cannot be read back, so its entry is retained.
         io.with(|m| m.read_fails.push("{B}".to_string()));
@@ -2190,20 +2583,445 @@ mod tests {
 
         assert!(
             !st.park.is_empty() && st.owner == Some(7),
-            "a retained entry keeps the generation owning the park after the session ended              — this is the state the old ticker looped forever in"
+            "a retained entry keeps the generation owning the park after the session ended \
+             — this is the state the old ticker looped forever in"
         );
         assert!(
-            !should_refresh(st.owner, 7, false),
-            "so the ticker must stop on the SESSION ending, not on ownership: otherwise it              re-parks every physical adapter every 10s with no tunnel anywhere"
+            !ticker_alive(&st, 7),
+            "the un-park must have shut the ticker down: otherwise it re-parks every physical \
+             adapter every 10s with no tunnel anywhere"
         );
         assert!(
-            should_refresh(st.owner, 7, true),
-            "while the session IS live the owner still refreshes (#99)"
+            !ticker_alive(&st, 8),
+            "and no other generation may inherit a ticker either"
+        );
+    }
+
+    /// THE REPEAT (round 2 -> round 3). `release_dns_at_exit` is the updater
+    /// relaunch's un-park: `RunEvent::ExitRequested` carries `RESTART_EXIT_CODE`,
+    /// `prevent_exit()` is a documented no-op, the normal teardown never runs and
+    /// NO TUNNEL IS INVOLVED — it reads the owner straight out of the state.
+    ///
+    /// The round-2 gate was an `AtomicBool` the tunnel cleared in `stop()` and in
+    /// `Drop`. Neither runs here, so the flag stayed set, the ticker outlived the
+    /// un-park, and it re-parked every physical adapter on `static none` while
+    /// the process was being replaced — R5's rejected failure design, second
+    /// door.
+    ///
+    /// This test drives that door with no tunnel anywhere, which is the point: if
+    /// the gate can only be closed by something a tunnel owns, this cannot pass.
+    #[test]
+    fn the_updater_relaunch_un_park_shuts_the_ticker_down_with_no_tunnel_involved() {
+        let io = FakeIo::new(two_adapters());
+        let mut st = fresh();
+        claim_locked(&mut st, &io, 7);
+
+        // Retain an entry, so ownership survives the un-park exactly as it does
+        // in the field — an adapter unplugged mid-session is the ordinary way.
+        io.with(|m| m.read_fails.push("{B}".to_string()));
+
+        // `release_dns_at_exit()` in miniature: whoever owns it, un-park it.
+        let owner = st.owner.expect("a connected session has an owner");
+        release_dns_locked(&mut st, &io, owner);
+
+        assert_eq!(
+            st.owner,
+            Some(7),
+            "the retained entry keeps ownership alive"
         );
         assert!(
-            !should_refresh(st.owner, 8, true),
-            "a displaced tunnel must not park on behalf of the generation that replaced it"
+            !ticker_alive(&st, 7),
+            "the relaunch door must close the ticker too — this is the assertion the round-2 \
+             AtomicBool could not make, because nothing on that path ever cleared it"
         );
+    }
+
+    /// Every door that un-parks gives the SAME answer, and it is the un-park —
+    /// not the door — that gives it. That is the difference between one gate and
+    /// N call sites: a door nobody has thought of yet still has to un-park to be
+    /// dangerous, and un-parking is what closes the gate.
+    #[test]
+    fn every_un_park_door_closes_the_ticker() {
+        /// How one exit door reaches the un-park.
+        type Door = fn(&mut MachineState, &FakeIo);
+
+        // (label, how that door reaches the un-park)
+        let doors: Vec<(&str, Door)> = vec![
+            // stop() / Drop: the tunnel un-parks with its OWN generation.
+            ("tunnel stop or drop", |st, io| {
+                release_dns_locked(st, io, 7);
+            }),
+            // The updater relaunch and the panic hook's owner path: un-park
+            // whoever owns it, no tunnel in sight.
+            ("release_dns_at_exit", |st, io| {
+                let owner = st.owner.unwrap();
+                release_dns_locked(st, io, owner);
+            }),
+            // The exit teardown, which disconnects first: same call, plus the
+            // routes.
+            ("exit teardown", |st, io| {
+                release_dns_locked(st, io, 7);
+                release_routes_locked(st, io, 7);
+            }),
+        ];
+
+        for (label, door) in doors {
+            let io = FakeIo::new(two_adapters());
+            let mut st = fresh();
+            claim_locked(&mut st, &io, 7);
+            // Retained entry ⇒ ownership outlives the session, the state R1 and
+            // R2 both went wrong in.
+            io.with(|m| m.read_fails.push("{B}".to_string()));
+            assert!(ticker_alive(&st, 7), "{}: precondition", label);
+
+            door(&mut st, &io);
+
+            // Drive the ticker's ACTUAL body, twice — this is the thread that
+            // ignored its stop signal, or that nobody remembered to bound. It
+            // must not touch the machine. The gate is inside the call, not in
+            // the caller's loop, precisely so it does not matter whether the
+            // thread stops.
+            let parked_after_door = io.parked_set();
+            let recorded_after_door = io.recorded_set();
+            io.with(|m| m.reads.clear());
+            assert!(!refresh_live_session_locked(&mut st, &io, 7), "{}", label);
+            assert!(!refresh_live_session_locked(&mut st, &io, 7), "{}", label);
+            assert_eq!(
+                io.parked_set(),
+                parked_after_door,
+                "{}: the ticker re-parked an adapter after the un-park — this IS the blackhole",
+                label
+            );
+            assert_eq!(io.recorded_set(), recorded_after_door, "{}", label);
+            assert!(
+                io.with(|m| m.reads.is_empty()),
+                "{}: and it read nothing",
+                label
+            );
+
+            assert!(
+                !ticker_alive(&st, 7),
+                "{}: a park pass after this door would re-park every physical adapter with \
+                 nothing connected",
+                label
+            );
+        }
+    }
+
+    /// The gate is not a one-way latch: a reconnect in the same process must get
+    /// its ticker back, or #99's mid-session NIC never gets parked again. This is
+    /// the reason "set a shutting-down flag and never clear it" is the wrong
+    /// shape — it would have to be un-set somewhere, and that is N paths again.
+    #[test]
+    fn a_new_session_reopens_the_ticker_for_its_own_generation_only() {
+        let io = FakeIo::new(two_adapters());
+        let mut st = fresh();
+
+        claim_locked(&mut st, &io, 7);
+        io.with(|m| m.read_fails.push("{B}".to_string()));
+        release_dns_locked(&mut st, &io, 7);
+        assert!(!ticker_alive(&st, 7));
+
+        // Reconnect: the manager holds the park across the gap, then the new
+        // tunnel takes ownership and claims.
+        io.with(|m| m.read_fails.clear());
+        begin_transition_locked(&mut st, 8);
+        assert!(
+            !ticker_alive(&st, 7) && !ticker_alive(&st, 8),
+            "a park held across a transition has no data plane — nobody may refresh it"
+        );
+        take_ownership_locked(&mut st, 9);
+        assert!(!ticker_alive(&st, 9), "ownership alone is still not enough");
+        claim_locked(&mut st, &io, 9);
+
+        assert!(ticker_alive(&st, 9), "the new session refreshes");
+        assert!(
+            !ticker_alive(&st, 7) && !ticker_alive(&st, 8),
+            "and only the new session does"
+        );
+    }
+
+    /// A server switch displaces the outgoing tunnel WITHOUT un-parking (that is
+    /// deliberate — the park is held across the gap so the physical NICs never
+    /// carry ISP resolvers during the create + handshake window). The outgoing
+    /// tunnel's Drop takes the non-owner early return, so nothing it owns clears
+    /// anything: the transition itself has to close the ticker.
+    #[test]
+    fn a_displaced_generation_loses_its_ticker_without_any_un_park() {
+        let io = FakeIo::new(two_adapters());
+        let mut st = fresh();
+        claim_locked(&mut st, &io, 7);
+        assert!(ticker_alive(&st, 7));
+
+        begin_transition_locked(&mut st, 8);
+
+        assert!(
+            !st.park.is_empty(),
+            "the park is deliberately held across the transition"
+        );
+        assert!(
+            !ticker_alive(&st, 7),
+            "the displaced generation must not keep parking on behalf of its successor"
+        );
+    }
+
+    /// The one exit shape that CANNOT close the gate — a SIGKILL, an OOM kill, a
+    /// power cut, `TerminateProcess`, a Windows shutdown — un-parks nothing, so
+    /// a last pass before the OS reaps the thread is idempotent (I12): it touches
+    /// no adapter that is not already parked AND already recorded, and it cannot
+    /// re-snapshot one (I5b). That is why the design gates on the un-park rather
+    /// than on "the process is ending", which is not observable on those paths.
+    #[test]
+    fn a_pass_that_follows_no_un_park_is_harmless() {
+        let io = FakeIo::new(two_adapters());
+        let mut st = fresh();
+        claim_locked(&mut st, &io, 7);
+
+        let recorded_before = io.recorded_set();
+        let parked_before = io.parked_set();
+        io.with(|m| m.reads.clear());
+
+        // The ticker gets one more pass in before the process dies.
+        assert!(ticker_alive(&st, 7));
+        park_pass(&mut st, &io);
+
+        assert!(
+            io.with(|m| m.reads.is_empty()),
+            "I5b: a recorded adapter is never re-read, so the parked shape cannot be captured \
+             as the user's own configuration"
+        );
+        assert_eq!(io.parked_set(), parked_before, "no new machine mutation");
+        assert_eq!(io.recorded_set(), recorded_before, "no record churn");
+    }
+
+    /// I13's SECOND door, and the only one that cannot close itself by
+    /// un-parking: [`reconcile_record`] restores off the ON-DISK record and
+    /// deliberately never takes the lock, so it closes the session by hand
+    /// through [`close_live_session_for_unpark`] instead.
+    ///
+    /// Driven against the process-global `STATE` on purpose — that is the state
+    /// the running ticker reads, and a helper that clears a copy would protect
+    /// nothing. This is the ONLY test in this module that touches `STATE`; every
+    /// other one drives an explicit `MachineState`, and nothing else may start
+    /// using the global or the two will race under the test harness's threads.
+    #[test]
+    fn the_panic_hook_helper_closes_the_live_session_on_the_process_global_state() {
+        {
+            let mut st = state();
+            st.owner = Some(4242);
+            st.live_session = Some(4242);
+        }
+
+        close_live_session_for_unpark();
+
+        let st = state();
+        assert!(
+            st.live_session.is_none(),
+            "the panic hook's un-park must shut the ticker down before it issues a single netsh"
+        );
+        assert!(
+            !should_refresh(st.owner, st.live_session, 4242),
+            "and the ticker's own gate must agree"
+        );
+    }
+
+    /// WHY that helper has to exist, composed.
+    ///
+    /// An adapter whose park FAILED is recorded (so its origin is safe) and on
+    /// the retry list, so [`park_pass`] re-issues its park on every tick. The
+    /// panic hook reads it, correctly finds it is not parked-shaped, drops it
+    /// from the record and flushes. A ticker pass landing after that flush parks
+    /// an adapter that nothing on disk describes any more, milliseconds before
+    /// `panic = "abort"` reaps the process — `static none` forever, with no
+    /// process left to fix it. That is #102's terminal shape reached from the
+    /// recovery path, and it is a park that followed an un-park.
+    #[test]
+    fn the_panic_hook_un_park_must_close_the_ticker_before_it_flushes_the_record() {
+        let io = FakeIo::new(two_adapters());
+        let mut st = fresh();
+        io.with(|m| m.park_fails.push("{B}".to_string()));
+        claim_locked(&mut st, &io, 7);
+        assert!(
+            st.park.contains_key("{B}") && st.degraded.contains_key("{B}"),
+            "a failed park is recorded AND on the retry list — that is the setup"
+        );
+        assert!(ticker_alive(&st, 7), "precondition");
+
+        // `reconcile_record` in miniature: close the session (what the helper
+        // does), then restore off the ON-DISK record and flush what survives.
+        st.live_session = None;
+        let mut from_disk: BTreeMap<String, AdapterDnsSnapshot> = io
+            .with(|m| m.persisted.clone())
+            .expect("the record reached the disk")
+            .into_iter()
+            .map(|e| (entry_key(&e), e))
+            .collect();
+        let mut hook_degraded = BTreeMap::new();
+        restore_pass(&mut from_disk, &io, &mut hook_degraded);
+        flush_record(&from_disk, &io);
+        assert!(
+            io.with(|m| m.persisted.is_none()),
+            "the hook emptied the record — nothing on disk describes {{B}} any more"
+        );
+
+        // The park that failed at connect would succeed now. The ticker must
+        // never get the chance to issue it.
+        io.with(|m| m.park_fails.clear());
+        let parked_after_hook = io.parked_set();
+        assert!(!refresh_live_session_locked(&mut st, &io, 7));
+        assert!(!refresh_live_session_locked(&mut st, &io, 7));
+        assert_eq!(
+            io.parked_set(),
+            parked_after_hook,
+            "the ticker parked an adapter after the hook cleared the record — permanent \
+             resolver loss, and nothing left running to undo it"
+        );
+    }
+
+    /// `live_session ⊆ {owner}` is stated as an invariant on the field, so it
+    /// has to be one. It was true by accident: [`release_owner_if_clean`]
+    /// cleared `owner` and left `live_session` behind, and one caller reaches
+    /// it with a session still open — [`release_routes_locked`] on a generation
+    /// whose park is EMPTY, which is what a machine whose physical NICs were all
+    /// down at connect produces. No ticker could act on the residue (both halves
+    /// of [`should_refresh`] are required), but "no ticker can act on it" is a
+    /// second argument the field doc does not make, and the gap between a stated
+    /// rule and the enforced one is what five rejected designs had in common.
+    #[test]
+    fn clearing_the_owner_clears_the_live_session_too() {
+        // Every physical NIC is down, so nothing is eligible and the park is
+        // empty for a perfectly live session.
+        let io = FakeIo::new(Machine::default());
+        let mut st = fresh();
+        claim_locked(&mut st, &io, 7);
+        st.routes.push(OwnedRoute {
+            dest: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            prefix_len: 1,
+            next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            if_index: 12,
+        });
+        assert!(
+            st.park.is_empty() && ticker_alive(&st, 7),
+            "an empty park with a live session is the precondition, not a bug"
+        );
+
+        release_routes_locked(&mut st, &io, 7);
+
+        assert_eq!(st.owner, None, "nothing is moved aside any more");
+        assert_eq!(
+            st.live_session, None,
+            "the session must go with the ownership it is defined as a subset of",
+        );
+        assert!(!ticker_alive(&st, 7), "and no ticker may survive it");
+    }
+
+    // ── The record has to come BACK, not just go out ─────────────
+
+    /// CRITICAL 2. `reconcile_record` RETAINS what it could not verifiably
+    /// restore — the module docs call a retained entry "the last thing that knows
+    /// what to put back" — and then wrote it to disk and dropped it on the floor:
+    /// `STATE.park` stayed empty. Everything downstream then treats a parked
+    /// adapter as unparked.
+    ///
+    /// Without the adoption, the next connect RE-READS that adapter (I5b never
+    /// fires, because the record it checks is empty in memory) and captures
+    /// `static none` as the user's own configuration. That is #102's terminal
+    /// shape, reached from the recovery path.
+    #[test]
+    fn an_unrestored_entry_is_adopted_so_the_next_connect_cannot_re_snapshot_it() {
+        // {B} is still parked from a previous process; its real resolvers survive
+        // only in the record.
+        let mut m = two_adapters();
+        m.adapters[1].1 = parked("{B}", "Ethernet");
+        m.adapters[1].2 = true;
+        let io = FakeIo::new(m);
+
+        let survivor = snap(
+            "{B}",
+            "Ethernet",
+            false,
+            &["1.1.1.1", "8.8.8.8"],
+            false,
+            &[],
+        );
+        let mut recovered = BTreeMap::new();
+        recovered.insert(entry_key(&survivor), survivor.clone());
+
+        let mut st = MachineState {
+            owner: None,
+            live_session: None,
+            park: BTreeMap::new(),
+            routes: Vec::new(),
+            degraded: BTreeMap::new(),
+        };
+        adopt_unrestored(&mut st, recovered);
+
+        assert_eq!(
+            st.park.len(),
+            1,
+            "the survivor must be visible to the running process, not only to the disk"
+        );
+        assert!(
+            st.owner.is_some(),
+            "it is machine state that is moved aside right now, so it needs an owner (I1) — \
+             otherwise release_dns_at_exit reads owner=None and a clean quit never retries it"
+        );
+        assert!(
+            st.live_session.is_none(),
+            "nothing is connected, so no refresh ticker may exist for that generation (I13)"
+        );
+
+        // Now connect. The adopted adapter must not be read, and the record must
+        // still describe its REAL resolvers afterwards.
+        io.with(|m| m.reads.clear());
+        let gen = next_generation();
+        take_ownership_locked(&mut st, gen);
+        claim_locked(&mut st, &io, gen);
+
+        assert!(
+            !io.with(|m| m.reads.contains(&"{B}".to_string())),
+            "I5b: the adopted adapter was re-read, so the parked shape has just been captured \
+             as its origin — permanent resolver loss"
+        );
+        assert_eq!(
+            st.park.get("{B}").map(|e| e.dns_servers.clone()),
+            Some(vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]),
+            "the recovered origin must survive the connect"
+        );
+        assert!(
+            io.recorded_set().contains(&"{B}".to_string()),
+            "and the durable record must still carry it — park_pass persists st.park, so an \
+             un-adopted survivor is CLOBBERED off the disk by the act of connecting again"
+        );
+
+        // And it is restorable, which is the entire point of keeping it.
+        let mut degraded = std::mem::take(&mut st.degraded);
+        restore_pass(&mut st.park, &io, &mut degraded);
+        assert_eq!(
+            io.live("{B}").dns_servers,
+            vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            "the previous process's resolvers must come back"
+        );
+    }
+
+    /// The adoption is refused when this process already holds state of its own.
+    /// At `setup()` that cannot happen (no tunnel can be up that early); from the
+    /// panic hook it can, and there the DYING process's in-memory record is the
+    /// newer one — overwriting it with the file would restore a stale set.
+    #[test]
+    fn adoption_never_overwrites_a_record_this_process_already_holds() {
+        let io = FakeIo::new(two_adapters());
+        let mut st = fresh();
+        claim_locked(&mut st, &io, 7);
+        let mine = st.park.clone();
+
+        let stale = snap("{Z}", "Old NIC", false, &["9.9.9.9"], false, &[]);
+        let mut from_disk = BTreeMap::new();
+        from_disk.insert(entry_key(&stale), stale);
+        adopt_unrestored(&mut st, from_disk);
+
+        assert_eq!(st.park, mine, "the live record wins");
+        assert_eq!(st.owner, Some(7), "and keeps its owner");
     }
 
     #[test]

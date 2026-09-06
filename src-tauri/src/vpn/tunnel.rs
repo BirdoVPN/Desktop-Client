@@ -428,18 +428,6 @@ pub struct WintunTunnel {
     /// `local_network_routes_added` flags: "did we change anything" is now
     /// answered by the owner, which cannot disagree with itself.
     state_gen: crate::vpn::win_machine_state::Gen,
-
-    /// Is THIS tunnel's session still live, for the DNS park refresh thread
-    /// (#99)?
-    ///
-    /// Deliberately not `running`, and deliberately not ownership. Not
-    /// `running`, because it is set only at the very end of `start_inner()` and
-    /// the netsh calls before it can take 10-25s on an AV-heavy machine, so the
-    /// first tick could observe `false` on a perfectly healthy connect and end
-    /// the refresh for the whole session. Not ownership, because ownership
-    /// outlives the session whenever an un-park could not be verified — see
-    /// `win_machine_state::refresh_live_session`.
-    dns_refresh_active: Arc<AtomicBool>,
 }
 
 impl WintunTunnel {
@@ -466,7 +454,6 @@ impl WintunTunnel {
             saved_default_gateway: Arc::new(RwLock::new(None)),
             local_network_sharing,
             state_gen: crate::vpn::win_machine_state::next_generation(),
-            dns_refresh_active: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -812,31 +799,29 @@ impl WintunTunnel {
         // record are skipped, never re-snapshotted, which is #99's own stated
         // objection to the naive "re-run configure_dns" fix.
         //
-        // Scoped to the SESSION, not to ownership. Ownership does not end when
-        // the session does: an un-park that could not be verified — an adapter
-        // unplugged mid-session is the ordinary way to get one — leaves the park
-        // record non-empty, and `release_owner_if_clean` therefore leaves this
-        // generation owning it indefinitely. A ticker gated on ownership then
-        // outlived its own tunnel and went on parking every physical adapter on
-        // `static none` every ten seconds with nothing connected: DNS dead
-        // machine-wide, UI reading Disconnected. `dns_refresh_active` is cleared
-        // by `stop()` and by `Drop`, which are every way out of a session, and
-        // `refresh_live_session` re-reads it under the machine-state lock so it
-        // cannot interleave with the un-park.
+        // The thread carries NO liveness state of its own — deliberately. It used
+        // to hold an `Arc<AtomicBool>` this struct cleared in `stop()` and in
+        // `Drop`, and that shape lasted exactly one review: the updater relaunch
+        // un-parks through `win_machine_state::release_dns_at_exit`, which never
+        // touches a tunnel, so the flag stayed set and the ticker re-parked every
+        // physical adapter on a process that was about to be replaced. Same
+        // blackhole, second door — a flag cleared at N call sites always has an
+        // N+1th.
+        //
+        // The gate is now I13, and it lives entirely inside the machine state:
+        // `refresh_live_session` parks only while the generation both OWNS the
+        // park and has a live data plane, and the one function that can un-park
+        // closes the data plane in the same critical section, before any netsh
+        // runs. See `win_machine_state::refresh_live_session` for why that gives
+        // the same answer for `stop()`, `Drop`, the relaunch, the exit teardown,
+        // an abort and a SIGKILL alike.
         {
             let state_gen = self.state_gen;
-            let session_alive = self.dns_refresh_active.clone();
-            session_alive.store(true, Ordering::SeqCst);
             std::thread::spawn(move || {
-                loop {
+                while {
                     std::thread::sleep(crate::vpn::win_machine_state::REFRESH_INTERVAL);
-                    if !crate::vpn::win_machine_state::refresh_live_session(
-                        state_gen,
-                        &session_alive,
-                    ) {
-                        break;
-                    }
-                }
+                    crate::vpn::win_machine_state::refresh_live_session(state_gen)
+                } {}
                 tracing::debug!("DNS park refresh ended for generation {}", state_gen);
             });
         }
@@ -2050,11 +2035,6 @@ impl WintunTunnel {
 
         tracing::info!("Stopping Wintun tunnel");
 
-        // STEP 0: end the DNS refresh session FIRST, before anything un-parks.
-        // A pass that started after the un-park would re-park every physical
-        // adapter behind a tunnel that is going away.
-        self.dns_refresh_active.store(false, Ordering::SeqCst);
-
         // STEP 1: Signal shutdown to packet loop
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(()).await;
@@ -2211,13 +2191,6 @@ impl WintunTunnel {
 /// ordered teardown. This is a safety net only.
 impl Drop for WintunTunnel {
     fn drop(&mut self) {
-        // Unconditionally, and before the ownership test below: this tunnel is
-        // being destroyed, so its session is over whether or not it still owns
-        // the machine state. A displaced tunnel takes the non-owner return a few
-        // lines down, and without this its refresh thread would be the one left
-        // parking adapters on behalf of a generation that no longer exists.
-        self.dns_refresh_active.store(false, Ordering::SeqCst);
-
         // I1 SINGLE OWNER, and it is the whole of issue #98.
         //
         // On a reconnect where the teardown was skipped, the manager replaced
