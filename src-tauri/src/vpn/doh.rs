@@ -100,6 +100,11 @@ struct DoHProvider {
 ///   same model as api/cert_pin.rs and the Android OkHttp pinner.
 /// - If a provider's chain matches no pin (or cannot be parsed), the
 ///   handshake is refused and that provider is skipped.
+/// - An intermediate and the root that signed it are ONE lineage: a CA move
+///   kills both in the same handshake, so they are not overlap. A provider
+///   may also serve SEVERAL lineages at once, chosen per anycast edge —
+///   dns.google does, see below — and measuring from one machine only ever
+///   shows you one of them.
 /// - Availability guaranteed as long as 1 provider passes pinning.
 /// - If all 3 providers fail pinning simultaneously, resolution fails CLOSED.
 ///
@@ -109,6 +114,9 @@ struct DoHProvider {
 /// 2. After the migration is confirmed fleet-wide, remove the old pins in a
 ///    subsequent release.
 /// 3. Never remove all pins for a provider without adding new ones first.
+/// 4. Never remove a pin merely because your own machine no longer sees it
+///    in the chain: another user's edge may still be serving exactly that
+///    chain, and a bricked pin cannot be fixed remotely.
 const DOH_PROVIDERS: &[DoHProvider] = &[
     DoHProvider {
         url: "https://cloudflare-dns.com/dns-query",
@@ -141,13 +149,51 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         url: "https://dns.google/resolve",
         host: "dns.google",
         bootstrap: &[Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
-        // Chain: dns.google → WR2 (Google Trust Services) → GTS Root R1
-        // SPKI pins verified against the live chain 2026-08-12; the GTS Root R1
-        // value also matches Google's published pin list (pki.goog).
+        // TWO LINEAGES, NOT ONE — and an intermediate plus the root that
+        // signed it does not count as two.
+        //
+        // 8.8.8.8/8.8.4.4 are anycast, so which Google edge answers depends on
+        // the caller's network path, and on 2026-09-06 dns.google was serving
+        // two different Google Trust Services lineages at the same minute over
+        // those same addresses:
+        //
+        //   ECDSA : leaf → WE2 → GTS Root R4   (US cloud edge)
+        //   RSA   : leaf → WR2 → GTS Root R1   (consumer-ISP edge)
+        //
+        // Until this commit only the second one was pinned. WE2 and GTS Root R4
+        // are a DIFFERENT lineage, so neither of the two pins was in that chain
+        // and the handshake was refused outright: every user routed to a
+        // migrated edge lost this provider, with the log saying "possible MITM
+        // attack" about a stale pin set. WR2 + GTS Root R1 looked like two
+        // overlapping pins but was one lineage — when the CA moved, both went
+        // dark in the same handshake.
+        //
+        // That matters precisely on the networks DoH exists for: with 1.1.1.1
+        // hijacked by a captive portal and 9.9.9.9 blocked by a corporate
+        // filter, dns.google is the last provider standing, and under an
+        // engaged kill switch the system-resolver fallback is blocked too.
+        //
+        // INVARIANT: pin every lineage the provider SERVES, not the one chain
+        // your own vantage point returned. A liveness probe runs from a single
+        // vantage point and goes green as soon as ANY one chain matches, so it
+        // cannot tell you this list is half-empty. Do NOT drop the WR2/R1 pair
+        // because your machine only ever sees WE2/R4 (or the reverse) — that is
+        // the edit that caused this outage, and there is no remote kill switch
+        // for a bricked pin. Retire a lineage only once it is unmeasurable from
+        // several independent networks.
+        //
+        // All four values re-measured 2026-09-06 against Google's published CA
+        // certificates at https://i.pki.goog/.
         pins: &[
-            // WR2, Google Trust Services (presented intermediate)
+            // WE2 — Google Trust Services intermediate, new lineage
+            "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=",
+            // GTS Root R4 — anchor of the new lineage, presented in that chain;
+            // the same anchor api/cert_pin.rs already pins for birdo.app
+            "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
+            // WR2 — Google Trust Services intermediate, legacy lineage,
+            // STILL LIVE from un-migrated edges
             "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=",
-            // GTS Root R1 (trust anchor, presented in the live chain)
+            // GTS Root R1 — anchor of the legacy lineage, presented in that chain
             "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",
         ],
     },
@@ -182,6 +228,18 @@ fn pins_for_host(host: &str) -> Option<&'static [&'static str]> {
         .iter()
         .find(|p| p.host.eq_ignore_ascii_case(host))
         .map(|p| p.pins)
+}
+
+/// Does a presented chain — reduced to the SPKI pin hashes of its
+/// certificates — satisfy `pins`? Any single match accepts, which is what
+/// makes overlapping pins work: several CA lineages pinned at once.
+///
+/// Split out of `verify_server_cert` so a pin set can be regression-tested
+/// against real, measured chains without standing up a TLS handshake. Nothing
+/// in the suite could previously see that dns.google's pin set covered its
+/// GTS Root R1 lineage and none of the GTS Root R4 one it had begun serving.
+fn chain_satisfies_pins(chain_spkis: &[String], pins: &[&str]) -> bool {
+    chain_spkis.iter().any(|s| pins.contains(&s.as_str()))
 }
 
 /// Did this reqwest error originate from our pinning verifier? The marker is
@@ -257,15 +315,18 @@ impl ServerCertVerifier for DohSpkiPinningVerifier {
         // 3) SPKI pin check across the PRESENTED chain (leaf + intermediates),
         //    reusing the exact extraction api/cert_pin.rs uses. Any match passes.
         let mut parse_failures = 0usize;
+        let mut chain_spkis: Vec<String> = Vec::new();
         for cert in std::iter::once(end_entity).chain(intermediates.iter()) {
             match crate::api::cert_pin::spki_sha256_b64(cert) {
-                Some(spki) if pins.contains(&spki.as_str()) => {
-                    tracing::debug!("DoH SPKI pin matched for {host}");
-                    return Ok(ServerCertVerified::assertion());
-                }
-                Some(_) => {}
+                Some(spki) => chain_spkis.push(spki),
                 None => parse_failures += 1,
             }
+        }
+        // A match still wins over an unparseable sibling certificate, exactly as
+        // it did when this was a short-circuiting loop.
+        if chain_satisfies_pins(&chain_spkis, pins) {
+            tracing::debug!("DoH SPKI pin matched for {host}");
+            return Ok(ServerCertVerified::assertion());
         }
 
         // FAIL CLOSED — on mismatch AND on parse failure (see type-level doc).
@@ -651,6 +712,92 @@ mod tests {
                     provider.url
                 );
             }
+        }
+    }
+
+    /// REGRESSION — dns.google was pinned to ONE of the two CA lineages it
+    /// serves.
+    ///
+    /// Google Trust Services was serving dns.google out of two lineages on the
+    /// same anycast addresses on 2026-09-06, the edge deciding which one you
+    /// get. The shipped pin set held only WR2 → GTS Root R1 — one lineage, so
+    /// when an edge answered with WE2 → GTS Root R4 BOTH pins were absent, the
+    /// handshake was refused, the provider was skipped, and the leak-proof
+    /// resolver pool quietly shrank from three providers to two — on exactly
+    /// the hostile networks DoH is there for, with the kill switch blocking the
+    /// system-resolver fallback as designed.
+    ///
+    /// Both chains below are REAL, measured on 2026-09-06 with SNI dns.google.
+    #[test]
+    fn test_dns_google_pins_cover_both_gts_lineages() {
+        let pins = pins_for_host("dns.google").expect("dns.google must be a pinned provider");
+
+        // Observed via 8.8.8.8 and 8.8.4.4 from a consumer-ISP path.
+        let rsa_chain = [
+            "qW3FYuXf0SK210sV5lcUYE1NGTmBA398Ee6LXLqneUY=".to_string(), // leaf (rotates)
+            "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=".to_string(), // WR2
+            "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=".to_string(), // GTS Root R1
+        ];
+        // Observed the same day via 8.8.8.8 from a US cloud edge — the daily
+        // cert-pins liveness job, which is where this failure surfaced.
+        let ecdsa_chain = [
+            "wyib/Zb8QzNvhqZ9QF7LzXCMzYApj7PsLe/ZjlfJzuI=".to_string(), // leaf (rotates)
+            "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=".to_string(), // WE2
+            "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=".to_string(), // GTS Root R4
+        ];
+
+        assert!(
+            chain_satisfies_pins(&rsa_chain, pins),
+            "dns.google GTS Root R1 lineage (WR2) is no longer pinned — users on \
+             an un-migrated Google edge lose this DoH provider entirely"
+        );
+        assert!(
+            chain_satisfies_pins(&ecdsa_chain, pins),
+            "dns.google GTS Root R4 lineage (WE2) is not pinned — users on a \
+             migrated Google edge lose this DoH provider entirely"
+        );
+
+        // Name both anchors explicitly: a future tidy-up that drops either
+        // lineage re-creates the outage, and the message has to say so.
+        for (label, anchor) in [
+            (
+                "GTS Root R1 (legacy lineage)",
+                "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",
+            ),
+            (
+                "GTS Root R4 (new lineage)",
+                "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
+            ),
+        ] {
+            assert!(
+                pins.contains(&anchor),
+                "dns.google no longer pins {label}; both lineages were live on the \
+                 same anycast IPs on 2026-09-06, so dropping one bricks the \
+                 provider for whoever is routed to that edge"
+            );
+        }
+
+        // Pins are on the CA chain: a leaf alone must satisfy nothing, or a
+        // ~90-day leaf rotation would brick the client (the old leaf-DER scheme).
+        assert!(!chain_satisfies_pins(&[rsa_chain[0].clone()], pins));
+        assert!(!chain_satisfies_pins(&[ecdsa_chain[0].clone()], pins));
+
+        // Pin sets are per-host, not a shared pool: Quad9's chain must never
+        // authenticate dns.google.
+        let quad9_chain = [
+            "qBRjZmOmkSNJL0p70zek7odSIzqs/muR4Jk9xYyCP+E=".to_string(),
+            "uUwZgwDOxcBXrQcntwu+kYFpkiVkOaezL0WYEZ3anJc=".to_string(),
+        ];
+        assert!(!chain_satisfies_pins(&quad9_chain, pins));
+    }
+
+    /// An empty chain — or one whose every certificate failed to parse — must
+    /// never satisfy a pin set: `verify_server_cert` depends on that to fail
+    /// CLOSED rather than accept a chain it could not read.
+    #[test]
+    fn test_chain_satisfies_pins_is_false_for_an_empty_chain() {
+        for provider in DOH_PROVIDERS {
+            assert!(!chain_satisfies_pins(&[], provider.pins));
         }
     }
 

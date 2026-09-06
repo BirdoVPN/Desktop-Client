@@ -114,22 +114,38 @@
 
     "dns.google": {
       "include_subdomains": false,
-      "note": "DoH resolver, desktop only. Android dropped this provider (P6-CLI-A-06). Live chain: leaf -> WR2 -> GTS Root R1.",
+      "note": "DoH resolver, desktop only. Android dropped this provider (P6-CLI-A-06). TWO LINEAGES LIVE AT ONCE as of 2026-09-06: a US cloud edge served leaf -> WE2 -> GTS Root R4 while a consumer-ISP path served leaf -> WR2 -> GTS Root R1, the same day, over the same anycast IPs (8.8.8.8 / 8.8.4.4). WR2 + GTS Root R1 on their own were ONE lineage - an intermediate and the root that signed it - so when an edge moved to R4 both pins went dark in the same handshake and the provider became unusable for everyone routed there. Both lineages are now pinned, and neither may be removed while any vantage point still serves it.",
       "enforced_by": ["birdo-client-desktop:src-tauri/src/vpn/doh.rs"],
       "pins": [
         {
-          "hash": "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=",
-          "label": "WR2 - Google Trust Services intermediate",
+          "hash": "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=",
+          "label": "WE2 - Google Trust Services intermediate (R4 lineage)",
           "role": "active-intermediate",
           "in_live_chain": true,
-          "_verification": "2026-08-22 measured in the live dns.google chain"
+          "_verification": "2026-09-06 measured in the live dns.google chain from a US cloud edge (this repo's own cert-pins liveness run 34028720220, dialling 8.8.8.8 with SNI dns.google) AND independently against https://i.pki.goog/we2.crt"
+        },
+        {
+          "hash": "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
+          "label": "GTS Root R4 - Google Trust Services LLC, anchor of the R4 lineage",
+          "role": "active-root",
+          "in_live_chain": true,
+          "_verification": "2026-09-06 measured in that same live chain AND independently against https://i.pki.goog/r4.crt. Same value already pinned for birdo.app."
+        },
+        {
+          "hash": "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=",
+          "label": "WR2 - Google Trust Services intermediate (R1 lineage, legacy)",
+          "role": "active-intermediate",
+          "in_live_chain": true,
+          "_verification": "2026-09-06 STILL measured in the live dns.google chain from a consumer-ISP path, via both 8.8.8.8 and 8.8.4.4, AND independently against https://i.pki.goog/wr2.crt. Absent from the US cloud edge above.",
+          "_note": "DO NOT REMOVE while any vantage point still serves it. This pin is the only thing keeping users behind a not-yet-migrated Google edge able to resolve at all, and a bricked pin has no remote kill switch (_rotation_rule). One green liveness run proves nothing here: the checker sees only its own edge."
         },
         {
           "hash": "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",
-          "label": "GTS Root R1 - Google Trust Services LLC",
+          "label": "GTS Root R1 - Google Trust Services LLC, anchor of the R1 lineage",
           "role": "active-root",
           "in_live_chain": true,
-          "_verification": "2026-08-22 measured in the live dns.google chain AND independently against https://i.pki.goog/r1.crt"
+          "_verification": "2026-09-06 still measured in that same consumer-ISP chain AND independently against https://i.pki.goog/r1.crt",
+          "_note": "Retire together with the WR2 pin above, and only under the same condition."
         }
       ]
     },
