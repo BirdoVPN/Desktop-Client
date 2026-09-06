@@ -299,6 +299,127 @@ pub mod dns_journal {
         Some(dir)
     }
 
+    /// Where the new bytes are staged before they replace the record.
+    ///
+    /// Deliberately a sibling: a rename is only atomic within one filesystem, so
+    /// a system temp dir would silently degrade this back into a copy.
+    fn staging_path(path: &std::path::Path) -> std::path::PathBuf {
+        path.with_extension("json.tmp")
+    }
+
+    /// Where an unreadable record is kept instead of being deleted.
+    fn preserved_path(path: &std::path::Path) -> std::path::PathBuf {
+        path.with_extension("json.corrupt")
+    }
+
+    /// Replace `path` with `bytes` so that every crash point leaves either the
+    /// whole old record or the whole new one — never a shorter one.
+    ///
+    /// WHY NOT `create + truncate + write_all`, which is what this used to be:
+    /// the truncate destroys the old record BEFORE the new one exists, and on
+    /// NTFS the metadata (length 0) is journalled while the data is not
+    /// necessarily flushed, so the exposure outlives a successful return. A
+    /// crash, an OOM kill or a power cut in that window leaves a zero-length or
+    /// NUL-padded file — and on Windows that is terminal, not cosmetic: the
+    /// adapters are still parked, nothing on disk says what they were, the next
+    /// connect re-snapshots `static`/no-servers as if it were the user's own
+    /// configuration, and `restore_family` then correctly refuses to undo that
+    /// shape forever after. The host has no resolvers, permanently, reached
+    /// through the durability mechanism that exists to prevent exactly that
+    /// (#102, and I4: "a mutation whose record is not durable is a mutation
+    /// nothing can undo"). `park_pass` persists once per adapter, so an N-NIC
+    /// host used to open N of those windows on every single connect.
+    ///
+    /// Success here is the caller's permission to mutate the machine, so it must
+    /// mean the bytes are on the disk. Do NOT "simplify" the fsync away:
+    /// renaming a file whose contents are still only in the page cache moves an
+    /// empty file into place just as effectively as it moves a full one, which
+    /// would leave this atomic but not durable — and durability is the half I4
+    /// is asking for.
+    fn write_bytes_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        let staging = staging_path(path);
+        if let Err(e) = stage_bytes(&staging, bytes) {
+            // Never touch the destination on the way out: the old record is
+            // still the only thing that knows what to put back.
+            let _ = std::fs::remove_file(&staging);
+            return Err(e);
+        }
+        match replace_with_retry(&staging, path) {
+            Ok(()) => {
+                sync_parent_dir(path);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&staging);
+                Err(e)
+            }
+        }
+    }
+
+    /// Write the bytes into the staging file and get them onto the disk.
+    fn stage_bytes(staging: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        // The record names network services and resolvers — which machine was on
+        // which network. Same sensitivity as birdo.log, so the same owner-only
+        // mode on multi-user Unix hosts (Windows relies on the %APPDATA% ACL).
+        // The staging file holds those same bytes, so it takes the same mode.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(staging)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    }
+
+    /// Move the staged file over the record.
+    ///
+    /// `std::fs::rename` is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows,
+    /// which does replace an existing destination — but it can fail with a
+    /// transient sharing violation while an AV scanner or the search indexer
+    /// holds either file open. That failure is not cosmetic: `park_pass` refuses
+    /// to park an adapter whose record did not persist, so a scanner's
+    /// few-millisecond window would otherwise cost the user DNS-leak suppression
+    /// on that adapter for the whole session. Retry briefly, then report it. The
+    /// bound stays small on purpose — `write` is reachable from teardown paths
+    /// that must not stall.
+    fn replace_with_retry(
+        staging: &std::path::Path,
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        const ATTEMPTS: u32 = 3;
+        let mut attempt = 1;
+        loop {
+            match std::fs::rename(staging, path) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < ATTEMPTS => {
+                    tracing::debug!("DNS journal replace failed ({}) — retrying", e);
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// On Unix the rename itself is only durable once the DIRECTORY entry is
+    /// flushed, so a power cut can otherwise resurrect the pre-rename listing.
+    /// Best-effort: some filesystems refuse an fsync on a directory handle, and
+    /// failing it leaves the write no worse off than it already was.
+    fn sync_parent_dir(_path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            if let Some(dir) = _path.parent() {
+                if let Ok(handle) = std::fs::File::open(dir) {
+                    let _ = handle.sync_all();
+                }
+            }
+        }
+    }
+
     fn write(journal: &DnsJournal) -> Result<(), String> {
         let Some(path) = path() else {
             tracing::warn!(
@@ -313,56 +434,7 @@ pub mod dns_journal {
                 return Err(format!("could not serialise the DNS journal: {}", e));
             }
         };
-        // The record names network services and resolvers — which machine was on
-        // which network. Same sensitivity as birdo.log, so the same owner-only
-        // mode on multi-user Unix hosts (Windows relies on the %APPDATA% ACL).
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-
-        // Temp file, fsync, THEN rename — the same shape `configure_dns` already
-        // uses for /etc/resolv.conf itself, and for the same reason.
-        //
-        // This was a truncate-then-write_all directly over the live record, and
-        // the crash classes this whole feature exists for (a power cut, an OOM
-        // kill) are exactly the ones that can land inside it — the write happens
-        // IMMEDIATELY before the DNS mutation it describes, so that window is
-        // the moment the machine is most likely to end up needing the record.
-        // Interrupted, it left a truncated file that the next start could not
-        // deserialise. `rename` is atomic for any reader, and `sync_all` before
-        // it is what stops the directory entry from being durable while the
-        // bytes it points at are not.
-        let tmp = path.with_file_name(format!("{}.tmp", JOURNAL_FILE));
-        let result = opts
-            .open(&tmp)
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(&json)?;
-                f.sync_all()
-            })
-            .and_then(|()| std::fs::rename(&tmp, &path));
-        if result.is_err() {
-            // Never leave a half-written temp behind for the next write to
-            // inherit.
-            let _ = std::fs::remove_file(&tmp);
-        }
-        // Durability of the rename itself, not just of the bytes: on Unix the
-        // directory entry needs its own fsync. Best effort — a failure here
-        // costs the same as the pre-existing behaviour, so it must not fail the
-        // write.
-        #[cfg(unix)]
-        if result.is_ok() {
-            if let Some(dir) = path.parent() {
-                if let Ok(d) = std::fs::File::open(dir) {
-                    let _ = d.sync_all();
-                }
-            }
-        }
-        match result {
+        match write_bytes_atomically(&path, &json) {
             Ok(()) => {
                 tracing::debug!("DNS journal written");
                 Ok(())
@@ -380,7 +452,11 @@ pub mod dns_journal {
 
     fn read() -> Option<DnsJournal> {
         let path = path()?;
-        let bytes = std::fs::read(&path).ok()?;
+        read_at(&path)
+    }
+
+    fn read_at(path: &std::path::Path) -> Option<DnsJournal> {
+        let bytes = std::fs::read(path).ok()?;
         match serde_json::from_slice::<DnsJournal>(&bytes) {
             Ok(journal) if journal.os == std::env::consts::OS => Some(journal),
             Ok(journal) => {
@@ -392,27 +468,27 @@ pub mod dns_journal {
                 None
             }
             Err(e) => {
-                // NOT `remove_file`. "serde could not parse this" is not proof
-                // that the file describes nothing — a schema change, an older
-                // build's format, or a torn write from before `write()` became
-                // atomic all land here, and this file is the only description of
-                // the user's pre-connect resolvers that exists anywhere. The
-                // recovery path deleting it is the same failure mode as the
-                // restore path deleting it, which is what this whole feature was
-                // built to stop.
-                //
-                // Moved aside under a fixed name instead: the bytes survive for
-                // a support flow, and the next start does not re-warn forever.
-                let aside = path.with_file_name(format!("{}.unreadable", JOURNAL_FILE));
-                match std::fs::rename(&path, &aside) {
-                    Ok(()) => tracing::error!(
-                        "Unreadable DNS journal ({e}) — PRESERVED as {}, not deleted. Its \
-                         bytes are the last description of the pre-connect resolvers.",
-                        aside.display()
+                // NOT deleted. Unreadable is the one state where the bytes are
+                // both useless to this process and the only surviving trace of
+                // what a previous session moved aside — on Windows, of which
+                // adapters are parked on `static`/no-servers and what their
+                // resolvers used to be. Deleting is the only irreversible option
+                // available here, so it is the one thing not done: the file is
+                // set aside under a name nothing else writes, where a support
+                // session can still read the resolvers out of it by hand. (With
+                // an atomic write, reaching this at all means external
+                // corruption, a half-restored backup, or a record from a future
+                // schema — none of which are ours to destroy.)
+                match set_aside_unreadable(path) {
+                    Some(kept) => tracing::error!(
+                        "Unreadable DNS journal ({}) — kept at {} for recovery, not deleted",
+                        e,
+                        kept.display()
                     ),
-                    Err(move_err) => tracing::error!(
-                        "Unreadable DNS journal ({e}), and it could not be moved aside \
-                         ({move_err}) — leaving it in place rather than destroying it"
+                    None => tracing::error!(
+                        "Unreadable DNS journal ({}) — and it could not be set aside; leaving it \
+                         in place",
+                        e
                     ),
                 }
                 None
@@ -651,6 +727,20 @@ pub mod dns_journal {
             Some(bytes) => Some(bytes.to_string()),
             None => retained.map(|bytes| bytes.to_string()),
         }
+    }
+
+    /// Move an unreadable record aside, without clobbering one already kept: the
+    /// first one preserved is the one closest to whatever went wrong.
+    fn set_aside_unreadable(path: &std::path::Path) -> Option<std::path::PathBuf> {
+        let mut kept = preserved_path(path);
+        if kept.exists() {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            kept = path.with_extension(format!("json.corrupt.{}", stamp));
+        }
+        std::fs::rename(path, &kept).ok().map(|()| kept)
     }
 
     /// Drop the record. Called by the restore paths once the resolvers are back,
@@ -1041,6 +1131,138 @@ pub mod dns_journal {
                 Some("nameserver 9.9.9.9\n".to_string())
             );
             assert_eq!(merge_linux_capture(None, None), None);
+        }
+    }
+
+    /// Durability of the record itself — the property every other invariant in
+    /// `win_machine_state` is standing on (I4). These drive the path-taking
+    /// helpers directly rather than `write`/`read`, which resolve their own
+    /// path under the real data directory.
+    #[cfg(test)]
+    mod journal_durability_tests {
+        use super::{
+            preserved_path, read_at, set_aside_unreadable, staging_path, write_bytes_atomically,
+        };
+
+        /// The smallest byte string `read_at` accepts on the host running the
+        /// test: every platform-specific field carries `#[serde(default)]`.
+        fn record_for_this_os() -> Vec<u8> {
+            format!("{{\"os\":\"{}\"}}", std::env::consts::OS).into_bytes()
+        }
+
+        #[test]
+        fn a_record_for_this_os_round_trips() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            write_bytes_atomically(&path, &record_for_this_os()).unwrap();
+            assert!(read_at(&path).is_some());
+        }
+
+        #[test]
+        fn a_written_record_leaves_no_staging_file_behind() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            write_bytes_atomically(&path, b"first").unwrap();
+            write_bytes_atomically(&path, b"second").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"second".to_vec());
+            assert!(
+                !staging_path(&path).exists(),
+                "the staging sibling must not survive a successful write"
+            );
+        }
+
+        /// #102 regression. The old implementation opened the record itself with
+        /// `truncate(true)`, so ANY failure from that point on — a full disk, a
+        /// crash, a power cut — left a zero-length record and no way to un-park
+        /// the adapters it described. Fault-injected here by parking a DIRECTORY
+        /// on the staging path, which makes the staging open fail; the old code
+        /// had no staging file to fail on.
+        #[test]
+        fn a_failed_write_leaves_the_previous_record_intact() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            let previous = record_for_this_os();
+            write_bytes_atomically(&path, &previous).unwrap();
+
+            std::fs::create_dir(staging_path(&path)).unwrap();
+            write_bytes_atomically(&path, b"never lands")
+                .expect_err("staging onto a directory must fail");
+
+            assert_eq!(std::fs::read(&path).unwrap(), previous);
+            assert!(
+                read_at(&path).is_some(),
+                "the surviving record must still be restorable"
+            );
+        }
+
+        #[test]
+        fn a_failed_replace_cleans_up_the_staging_file() {
+            let dir = tempfile::tempdir().unwrap();
+            // A non-empty directory cannot be replaced by a rename on any
+            // supported platform, so the staging step succeeds and the replace
+            // is the step that fails.
+            let path = dir.path().join("dns-restore.json");
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("occupied"), b"x").unwrap();
+
+            write_bytes_atomically(&path, b"cannot land").expect_err("replace must fail");
+            assert!(
+                !staging_path(&path).exists(),
+                "a failed write must not leave resolver bytes lying in a stray file"
+            );
+        }
+
+        /// The record is the last thing that knows what to put back, so an
+        /// unreadable one is set aside, never removed.
+        #[test]
+        fn an_unreadable_record_is_kept_not_deleted() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            let torn = b"{\"os\": \"wind";
+            std::fs::write(&path, torn).unwrap();
+
+            assert!(read_at(&path).is_none());
+            assert!(
+                !path.exists(),
+                "the unreadable record is moved out of the way"
+            );
+            assert_eq!(
+                std::fs::read(preserved_path(&path)).unwrap(),
+                torn.to_vec(),
+                "its bytes must still be recoverable by hand"
+            );
+        }
+
+        #[test]
+        fn a_second_unreadable_record_does_not_clobber_the_first() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::fs::write(&path, b"first casualty").unwrap();
+            set_aside_unreadable(&path).expect("first set-aside");
+
+            std::fs::write(&path, b"second casualty").unwrap();
+            let second = set_aside_unreadable(&path).expect("second set-aside");
+
+            assert_eq!(
+                std::fs::read(preserved_path(&path)).unwrap(),
+                b"first casualty".to_vec()
+            );
+            assert_ne!(second, preserved_path(&path));
+            assert_eq!(std::fs::read(second).unwrap(), b"second casualty".to_vec());
+        }
+
+        /// A record from another platform describes commands this host cannot
+        /// run, but it is still somebody's restore data (a synced home
+        /// directory) — ignored, not touched.
+        #[test]
+        fn a_record_from_another_os_is_left_on_disk() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::fs::write(&path, b"{\"os\":\"plan9\"}").unwrap();
+
+            assert!(read_at(&path).is_none());
+            assert!(path.exists());
+            assert!(!preserved_path(&path).exists());
         }
     }
 }

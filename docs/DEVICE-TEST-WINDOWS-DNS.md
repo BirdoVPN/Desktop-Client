@@ -147,9 +147,10 @@ without them.
 | DNS on every adapter | `netsh interface ipv4 show dns` / `netsh interface ipv6 show dns` |
 | the split-default pair and owned routes | `route print -4`, or `Get-NetRoute -DestinationPrefix 0.0.0.0/1,128.0.0.0/1` |
 | the crash-durable park record | `%APPDATA%\BirdoVPN\dns-restore.json` (`src-tauri/src/vpn/mod.rs:252`, `:294`) |
+| a park record that could not be parsed | `%APPDATA%\BirdoVPN\dns-restore.json.corrupt` — set aside there, never deleted. `dns-restore.json.tmp` is the staging sibling of an atomic write and is normally absent. |
 | the app log | `%APPDATA%\BirdoVPN\logs\birdo.log` (`src-tauri/src/main.rs:143`) |
 
-Both files sit under `dirs::data_dir()` = `%APPDATA%` (Roaming). The app is
+Those files sit under `dirs::data_dir()` = `%APPDATA%` (Roaming). The app is
 elevated via UAC on **your** account, so it writes **your** `%APPDATA%`. If you
 launch it as a *different* administrator, look under that account's profile
 instead.
