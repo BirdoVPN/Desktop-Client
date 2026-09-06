@@ -1059,14 +1059,22 @@ export function Dashboard() {
           )}
 
           {/* DNS degradation. The counterpart to the Connected badge: the Rust
-              side parks every physical adapter's DNS to stop Windows racing the
+              side moves every interface's DNS aside to stop the OS racing the
               ISP's resolvers against the tunnel's, and it reads back every one
               of those writes. A read-back that did not match means either an
               adapter still carrying ISP resolvers beside a live tunnel (a DNS
               leak, while this screen says Connected) or one left without
               resolvers after a disconnect. Both are invisible everywhere else,
               so the badge alone would be reassurance drawn from data nobody
-              checked. Rendered on every connection state for that reason. */}
+              checked. Rendered on every connection state for that reason.
+
+              Fed on all three platforms: Windows from win_machine_state's
+              degradation map, macOS and Linux from what dns_journal::settle
+              published — the same choke point that decides whether the DNS
+              restore journal may be deleted. It was hard-coded empty off
+              Windows, so a macOS or Linux user whose resolvers this app had
+              just failed to put back saw a clean screen and an ERROR line in a
+              log file they could not fetch without DNS. */}
           {dnsDegraded.length > 0 && (
             <>
               <BannerRow
