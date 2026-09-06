@@ -13,12 +13,34 @@ name: Cert Pins
 # which read only cert_pin.rs, never looked at the three DoH hosts, and failed
 # only when NONE of the pins in that one file matched — so a DoH provider that
 # had migrated CA passed clean.
+#
+# WHAT THIS WORKFLOW STILL DOES NOT COVER — read this before trusting a green run:
+#
+#   * Check 1 (vendored copy == birdo-shared/cert-pins.json) NEVER RUNS HERE.
+#     birdo-shared is private and this repo is public, so a runner has no
+#     credential to check it out, and `pull_request` runs from forks must not be
+#     given one. The script now prints `SKIP` and a "PASSED — WITH SKIPS" summary
+#     instead of a clean "ALL CERT-PIN CHECKS PASSED", because a check that did
+#     not run is not a check that passed. Check 1b (the provenance stamp) is what
+#     covers this offline: it catches a hand-edit of the vendored copy, which is
+#     the failure that actually happened. It cannot catch birdo-shared moving
+#     ahead of us — only re-vendoring does that.
+#
+#   * Check 3's liveness is SINGLE-VANTAGE. Every pinned host is anycast, so a
+#     runner sees ONE edge's chain, and the check goes green the moment any one
+#     pin matches. That is precisely how dns.google's set stayed green while it
+#     was half-empty: four dispatches on this workflow all passed on the legacy
+#     WR2 pin. Adding runner regions does not fix it either — you cannot choose
+#     an anycast edge. Check 2b is the structural answer: it fails a pin set that
+#     depends on a single certificate regardless of which edge answers today.
 
 on:
   pull_request:
     paths:
       - 'third_party/cert-pins.json'
+      - 'third_party/cert-pins.provenance.json'
       - 'scripts/check-cert-pins.sh'
+      - 'scripts/stamp-cert-pins-provenance.py'
       - 'src-tauri/src/api/cert_pin.rs'
       - 'src-tauri/src/vpn/doh.rs'
       - 'app/src/main/java/app/birdo/vpn/di/NetworkModule.kt'
@@ -41,6 +63,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # --offline skips only check 3 (live chains). Checks 1b (provenance),
+      # 2 (divergence) and 2b (effective overlap) all run here, on every PR that
+      # touches a pin file. Check 1 reports SKIP — see the note at the top.
       - name: check-cert-pins.sh --offline
         run: bash scripts/check-cert-pins.sh --offline
 

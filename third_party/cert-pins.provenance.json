@@ -1,0 +1,13 @@
+{
+  "_comment": "Provenance stamp for third_party/cert-pins.json. This file exists because the vendored copy was HAND-EDITED once (dns.google trimmed to 4 pins while the SSOT carried 10) and every check still reported green: check 2 of check-cert-pins.sh compares the Rust pin files against the VENDORED copy, so an edit to both agrees with itself, and check 1 - the only one that compares the vendored copy to the real SSOT - is skipped whenever birdo-shared is not checked out alongside, which is always the case on CI. This stamp closes that hole WITHOUT needing the upstream repo present: the recorded digest is of the vendored file's CANONICAL JSON, so any hand-edit to third_party/cert-pins.json fails check 1b offline, on every PR. Re-vendoring is therefore a two-file change on purpose.",
+  "_how_to_update": "cp ../birdo-shared/cert-pins.json third_party/cert-pins.json && python3 scripts/stamp-cert-pins-provenance.py    # then commit BOTH files",
+  "_digest_is_over": "json.dumps(json.load(f), sort_keys=True, separators=(',',':'), ensure_ascii=False).encode('utf-8') - canonical form, NOT the raw bytes. This repo has core.autocrlf=true, so the Windows working tree is CRLF while the blob and every Linux CI checkout are LF; a raw-byte digest would pass on one and fail on the other.",
+  "upstream_repo": "BirdoVPN/birdo-shared",
+  "upstream_path": "cert-pins.json",
+  "upstream_commit": "55158689875bb2d9d2b880d182581400594fb0f5",
+  "upstream_ref": "fix/dns-google-we2-gts-r4-pins (birdo-shared PR #3, NOT yet on main)",
+  "upstream_subject": "fix(cert-pins): make the pin rules checkable, and give the SSOT the CI it claimed to have",
+  "vendored_on": "2026-09-06",
+  "canonical_sha256": "8b33c56b7445e6e1a64d989a5dec0d865d58dcc4aa59c0444488894ac25305f6",
+  "_pending_before_merge": "Vendored from birdo-shared PR #3's branch, which is NOT on main yet. The PIN SETS agree exactly - dns.google 10, cloudflare-dns.com 3, dns.quad9.net 2, birdo.app 8, same hashes in the same order - so neither PR can ship a divergent set. If birdo-shared#3 lands further commits before this merges, re-vendor and re-stamp (cp + scripts/stamp-cert-pins-provenance.py, commit BOTH files) and run scripts/check-cert-pins.sh --require-upstream from W:/vpn/birdo-client-desktop - NOT from a temp worktree, where check 1 skips itself and this whole class of drift goes unseen. That skip is why the 4-vs-10 divergence nearly shipped."
+}

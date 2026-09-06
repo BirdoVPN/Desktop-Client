@@ -6,18 +6,44 @@
 # three different languages. Until now the only thing keeping them equal was a
 # doc comment asserting that they were. This script is the enforcement.
 #
-# It runs THREE independent checks:
+# It runs FIVE independent checks:
 #
-#   1. VENDOR    third_party/cert-pins.json is byte-identical to the SSOT in
-#                birdo-shared/cert-pins.json (skipped when birdo-shared is not
-#                checked out alongside, e.g. on CI runners).
-#   2. DIVERGENCE  every pin file in this repo declares EXACTLY the pin set the
+#   1.  VENDOR   third_party/cert-pins.json equals the SSOT in
+#                birdo-shared/cert-pins.json. SKIPPED when birdo-shared is not
+#                checked out alongside - which is EVERY CI run, because
+#                birdo-shared is private and this repo is public. Pass
+#                --require-upstream to turn that skip into a failure. A skip is
+#                reported in the final summary line: a check that did not run
+#                must never be mistaken for a check that passed.
+#   1b. PROVENANCE  third_party/cert-pins.json still hashes to the digest
+#                recorded in third_party/cert-pins.provenance.json when it was
+#                vendored. This is check 1 for the offline case: it cannot see
+#                what upstream says today, but it makes a HAND-EDIT of the
+#                vendored copy fail on every PR, with no cross-repo credential.
+#                That hand-edit is a real event, not a hypothetical - see below.
+#   2.  DIVERGENCE  every pin file in this repo declares EXACTLY the pin set the
 #                SSOT lists for the host it pins. Extra pin, missing pin, or
 #                typo => failure, naming the file and the offending hash.
-#   3. LIVENESS  for every pinned host, the LIVE certificate chain is fetched
+#   2b. OVERLAP  the SSOT's own _enforcement_rule and _overlap_rule, enforced
+#                instead of merely asserted: every host must keep at least one
+#                pin that is actually PRESENT in the live chain, and at least
+#                TWO, so that a single CA-side re-issue cannot take the host
+#                dark. Hosts that cannot satisfy the second half today are
+#                listed in an explicit debt baseline below, which is a ratchet:
+#                the debt cannot spread to a new host, and a host that outgrows
+#                it fails until it is removed from the list.
+#   3.  LIVENESS  for every pinned host, the LIVE certificate chain is fetched
 #                and must contain at least one pinned SPKI. This is per-host:
 #                a host whose pins have all gone stale fails even if other
 #                hosts are fine.
+#
+# WHY 1b EXISTS. The vendored copy WAS hand-edited: dns.google was trimmed to 4
+# pins while birdo-shared carried 10, and every check reported green. Check 2
+# compares the Rust pin files to the VENDORED copy, so editing both leaves them
+# agreeing with each other; check 1 - the only one that consults the real SSOT -
+# was skipped because the run happened in a directory with no ../birdo-shared.
+# "4 pins match SSOT" proved only that doh.rs matched the file the same commit
+# rewrote. Check 1b removes that circularity from the offline path.
 #
 # Check 3 is the one the old cert-pin-watchdog.yml got wrong. It read only
 # cert_pin.rs, ignored the DoH hosts entirely, and failed only when NONE of the
@@ -27,8 +53,11 @@
 # Exit 0 = all checks pass. Exit 1 = a real divergence or a dead pin set.
 #
 # Usage:
-#   scripts/check-cert-pins.sh              # all checks
-#   scripts/check-cert-pins.sh --offline    # skip check 3 (no network)
+#   scripts/check-cert-pins.sh                    # all checks
+#   scripts/check-cert-pins.sh --offline          # skip check 3 (no network)
+#   scripts/check-cert-pins.sh --require-upstream # check 1 must RUN, not skip
+#                                                 # (use it from a real checkout
+#                                                 #  that has ../birdo-shared)
 
 set -uo pipefail
 
@@ -36,13 +65,47 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SSOT="$REPO_ROOT/third_party/cert-pins.json"
 UPSTREAM="$REPO_ROOT/../birdo-shared/cert-pins.json"
 
+PROVENANCE="$REPO_ROOT/third_party/cert-pins.provenance.json"
+
 OFFLINE=0
-[ "${1:-}" = "--offline" ] && OFFLINE=1
+REQUIRE_UPSTREAM=0
+for arg in "$@"; do
+  case "$arg" in
+    --offline)          OFFLINE=1 ;;
+    --require-upstream) REQUIRE_UPSTREAM=1 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
 
 FAILED=0
+SKIPPED=""
 fail() { echo "FAIL  $*" >&2; FAILED=1; }
 ok()   { echo "ok    $*"; }
 info() { echo "      $*"; }
+# A check that could not run is NOT a check that passed. Record it so the final
+# summary line names it; a green run that quietly covered less than it looks
+# like is how the pin drift survived.
+skip() {
+  echo "SKIP  $*"
+  SKIPPED="${SKIPPED}  - $*
+"
+}
+
+summarise() {
+  if [ -n "$SKIPPED" ]; then
+    echo "CHECKS SKIPPED (did NOT run — not the same as passed):"
+    printf '%s' "$SKIPPED"
+  fi
+  if [ "$FAILED" -eq 0 ]; then
+    if [ -n "$SKIPPED" ]; then
+      echo "CERT-PIN CHECKS PASSED — WITH SKIPS (see above)"
+    else
+      echo "ALL CERT-PIN CHECKS PASSED"
+    fi
+  else
+    echo "CERT-PIN CHECKS FAILED" >&2
+  fi
+}
 
 command -v python3 >/dev/null 2>&1 && PY=python3 || PY=python
 
@@ -55,14 +118,97 @@ echo "=== 1. vendored SSOT vs birdo-shared ==="
 if [ -f "$UPSTREAM" ]; then
   if "$PY" - "$SSOT" "$UPSTREAM" <<'PYEOF'
 import json, sys
-a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
-sys.exit(0 if a == b else 1)
+
+# Report WHAT drifted, not just THAT something did. A pin-set difference is a
+# security divergence - one of the two sides is enforcing a set the other does
+# not - and it is the one that must never merge. A metadata-only difference is a
+# re-vendoring chore. Both fail (the contract is re-vendor wholesale, so that a
+# reviewer only ever has to trust one file), but they are not the same incident
+# and the old single-line "DRIFTED" message could not tell them apart.
+a = json.load(open(sys.argv[1], encoding="utf-8"))
+b = json.load(open(sys.argv[2], encoding="utf-8"))
+if a == b:
+    sys.exit(0)
+
+pin_drift = False
+for host in sorted(set(a.get("hosts", {})) | set(b.get("hosts", {}))):
+    pa = [p["hash"] for p in a.get("hosts", {}).get(host, {}).get("pins", [])]
+    pb = [p["hash"] for p in b.get("hosts", {}).get(host, {}).get("pins", [])]
+    if set(pa) != set(pb):
+        pin_drift = True
+        print("        PIN SET DRIFT  " + host + ": vendored has " + str(len(pa)) +
+              ", upstream has " + str(len(pb)))
+        for h in sorted(set(pb) - set(pa)):
+            print("          missing here : " + h)
+        for h in sorted(set(pa) - set(pb)):
+            print("          extra here   : " + h)
+
+if pin_drift:
+    print("        ^ THIS IS THE MERGE BLOCKER: the two repos would enforce")
+    print("          different pin sets. Converge them before either PR lands.")
+else:
+    print("        pin sets are IDENTICAL on every host; only descriptive")
+    print("        metadata differs. Re-vendor wholesale anyway - the contract is")
+    print("        that this file is a copy, so that one file is the thing to")
+    print("        review:")
+    print("          cp ../birdo-shared/cert-pins.json third_party/cert-pins.json")
+    print("          python3 scripts/stamp-cert-pins-provenance.py")
+sys.exit(1)
 PYEOF
   then ok "third_party/cert-pins.json matches birdo-shared/cert-pins.json"
-  else fail "third_party/cert-pins.json has DRIFTED from birdo-shared/cert-pins.json — re-vendor it"
+  else fail "third_party/cert-pins.json has DRIFTED from birdo-shared/cert-pins.json — see above"
   fi
+elif [ "$REQUIRE_UPSTREAM" -eq 1 ]; then
+  fail "birdo-shared is not checked out at $UPSTREAM and --require-upstream was given"
 else
-  info "skipped — birdo-shared not checked out alongside this repo"
+  skip "check 1 (vendored vs birdo-shared SSOT): birdo-shared not checked out at $UPSTREAM"
+  info "check 1b below covers the offline case; run this from a checkout that HAS"
+  info "../birdo-shared (a real checkout, not a temp worktree) to compare against"
+  info "the real SSOT — that is how the last drift got past this script."
+fi
+
+echo
+echo "=== 1b. vendored SSOT provenance (offline stand-in for check 1) ==="
+if [ ! -f "$PROVENANCE" ]; then
+  fail "missing $PROVENANCE — run scripts/stamp-cert-pins-provenance.py"
+else
+  "$PY" - "$SSOT" "$PROVENANCE" <<'PYEOF'
+import hashlib, json, sys
+
+ssot_path, prov_path = sys.argv[1], sys.argv[2]
+
+def canonical_sha256(path):
+    obj = json.loads(open(path, encoding="utf-8").read())
+    canon = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(canon).hexdigest()
+
+prov = json.loads(open(prov_path, encoding="utf-8").read())
+declared = prov.get("canonical_sha256")
+if not declared:
+    print("FAIL  cert-pins.provenance.json carries no canonical_sha256 — the stamp "
+          "is the check; an empty stamp is not a pass")
+    sys.exit(1)
+
+actual = canonical_sha256(ssot_path)
+if actual != declared:
+    print("FAIL  third_party/cert-pins.json has been EDITED since it was vendored.")
+    print("        declared (provenance): " + declared)
+    print("        actual   (this file) : " + actual)
+    print("      The vendored copy is NOT where pins are edited. Change the pin set in")
+    print("      birdo-shared/cert-pins.json, then re-vendor:")
+    print("        cp ../birdo-shared/cert-pins.json third_party/cert-pins.json")
+    print("        python3 scripts/stamp-cert-pins-provenance.py")
+    print("      Hand-editing it here is what let 'doh.rs [dns.google] 4 pins match")
+    print("      SSOT' print green while the real SSOT carried 10.")
+    sys.exit(1)
+
+print("ok    third_party/cert-pins.json matches its provenance stamp (" +
+      declared[:16] + "...)")
+print("      vendored from " + str(prov.get("upstream_repo")) + "@" +
+      str(prov.get("upstream_commit", ""))[:12] + "  ref: " + str(prov.get("upstream_ref")))
+PYEOF
+  [ $? -ne 0 ] && FAILED=1
 fi
 
 echo
@@ -258,9 +404,117 @@ sys.exit(1 if failed else 0)
 PYEOF
 [ $? -ne 0 ] && FAILED=1
 
+echo
+echo "=== 2b. effective overlap (_enforcement_rule / _overlap_rule) ==="
+"$PY" - "$SSOT" <<'PYEOF'
+import json, sys
+
+# The SSOT states two rules in prose that nothing has ever checked:
+#
+#   _enforcement_rule  "every host MUST keep at least one pin that is present
+#                       in the live chain"  (a pin the server never sends is
+#                       dormant and can never satisfy today's handshake)
+#   _overlap_rule      "every host MUST hold at least one pin from a SECOND
+#                       hierarchy ... pinning `intermediate + its own root`
+#                       buys no migration safety at all"
+#
+# Prose is not a control. doh.rs asserted the same thing in a doc comment AND in
+# a unit test (`pins.len() >= 2`) while dns.google carried exactly one lineage,
+# and both stayed green through the outage: counting PINS answers the wrong
+# question. The question that matters is how many INDEPENDENTLY-FAILING
+# certificates a pin set can actually match on, which is the number of pins the
+# server is observed to present -- `in_live_chain: true`.
+#
+# So this check counts effective pins per host and requires >= 2. Hosts that
+# cannot reach 2 today are named below with the reason. That list is a RATCHET,
+# not an exemption pool:
+#   * a host NOT on the list with < 2 effective pins fails -> the debt cannot
+#     spread silently to a new host, or back to dns.google;
+#   * a host ON the list that has reached 2 also fails -> the entry cannot rot
+#     into a permanent excuse after the underlying problem is fixed.
+#
+# Closing either entry means adding a pin the provider could actually rotate to
+# (a sibling issuing intermediate), which is a change to birdo-shared/cert-pins.json
+# first -- this file is vendored and check 1b refuses local edits.
+SINGLE_EFFECTIVE_PIN_DEBT = {
+    "cloudflare-dns.com":
+        "Serves a SHORTENED chain (leaf + SSL.com SSL Intermediate CA ECC R2, no "
+        "root; measured 2026-09-06 via 1.1.1.1 and 104.16.248.249), so of its 3 "
+        "pins only the intermediate can ever be presented. The SSL.com root and "
+        "the legacy DigiCert High Assurance EV root are both dormant. An SSL.com "
+        "intermediate re-issue takes this provider dark with no warning -- the "
+        "same shape as the dns.google outage. Fix = pin SSL.com's sibling issuing "
+        "intermediates in birdo-shared, not here.",
+    "dns.quad9.net":
+        "Serves a SHORTENED chain (leaf + DigiCert Global G3 TLS ECC SHA384 2020 "
+        "CA1, no root; measured 2026-09-06 via 9.9.9.9), so of its 2 pins only the "
+        "intermediate can ever be presented and the DigiCert Global Root G3 pin is "
+        "dormant. The SSOT's own note already calls this out: 'RISK - VIOLATES "
+        "_overlap_rule ... exactly the shape that took dns.google dark.' Fix = pin "
+        "DigiCert's sibling G3 intermediates in birdo-shared, not here.",
+}
+
+ssot = json.load(open(sys.argv[1], encoding="utf-8"))
+failed = False
+
+for host, entry in sorted(ssot["hosts"].items()):
+    pins = entry["pins"]
+    missing_flag = [p["hash"] for p in pins if "in_live_chain" not in p]
+    if missing_flag:
+        print("FAIL  " + host + ": " + str(len(missing_flag)) + " pin(s) carry no "
+              "in_live_chain field, so this check cannot tell a live pin from a "
+              "dormant one. A control that cannot run must not report green.")
+        failed = True
+        continue
+
+    effective = [p for p in pins if p["in_live_chain"]]
+    n = len(effective)
+    debt = SINGLE_EFFECTIVE_PIN_DEBT.get(host)
+
+    if n == 0:
+        print("FAIL  " + host + ": NO pin is marked in_live_chain -- every pin is "
+              "dormant, so no handshake can ever satisfy this host "
+              "(SSOT _enforcement_rule).")
+        failed = True
+    elif n >= 2 and debt is None:
+        print("ok    " + host + ": " + str(n) + " of " + str(len(pins)) +
+              " pins are presented in a live chain (>= 2, satisfies _overlap_rule)")
+    elif n >= 2 and debt is not None:
+        print("FAIL  " + host + ": now has " + str(n) + " effective pins, but it is "
+              "still listed in SINGLE_EFFECTIVE_PIN_DEBT in this script. Delete the "
+              "entry -- a stale exemption reads as coverage.")
+        failed = True
+    elif debt is not None:
+        print("ok    " + host + ": 1 effective pin of " + str(len(pins)) +
+              " -- KNOWN DEBT, single point of failure, tracked here:")
+        for line in [debt[i:i + 74] for i in range(0, len(debt), 74)]:
+            print("        " + line)
+    else:
+        print("FAIL  " + host + ": only " + str(n) + " of " + str(len(pins)) +
+              " pins is ever presented in the live chain. The others are dormant, "
+              "so ONE CA-side re-issue takes this host dark in the same handshake "
+              "(SSOT _overlap_rule). Pin a sibling issuing intermediate the "
+              "provider could rotate to, or -- if this is knowingly accepted -- add "
+              "it to SINGLE_EFFECTIVE_PIN_DEBT in scripts/check-cert-pins.sh with "
+              "the reason, so it is visible instead of silent.")
+        failed = True
+
+for host in sorted(SINGLE_EFFECTIVE_PIN_DEBT):
+    if host not in ssot["hosts"]:
+        print("FAIL  SINGLE_EFFECTIVE_PIN_DEBT names '" + host + "', which the SSOT "
+              "no longer pins. Remove the entry.")
+        failed = True
+
+sys.exit(1 if failed else 0)
+PYEOF
+[ $? -ne 0 ] && FAILED=1
+
 if [ "$OFFLINE" -eq 1 ]; then
   echo
   echo "=== 3. live chain liveness — SKIPPED (--offline) ==="
+  skip "check 3 (live chain liveness): --offline"
+  echo
+  summarise
   exit $FAILED
 fi
 
@@ -374,5 +628,5 @@ import json,sys;print(json.load(open(sys.argv[1]))['hosts']['birdo.app'].get('le
 done
 
 echo
-if [ "$FAILED" -eq 0 ]; then echo "ALL CERT-PIN CHECKS PASSED"; else echo "CERT-PIN CHECKS FAILED" >&2; fi
+summarise
 exit $FAILED

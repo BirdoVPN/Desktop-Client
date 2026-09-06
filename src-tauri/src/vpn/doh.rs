@@ -12,14 +12,33 @@
 //! the LEAF certificate DER via reqwest's `TlsInfo` — which exposes only the
 //! leaf — so every ~90-day provider cert rotation silently expired the pins
 //! and the hardening self-disabled. SPKI pins on the stable intermediate/root
-//! survive leaf rotation; each provider carries >= 2 overlapping pins
-//! (intermediate + its root) so even an intermediate re-issue under the same
-//! root keeps working. If a provider fails pinning, it is skipped and the
+//! survive leaf rotation. If a provider fails pinning, it is skipped and the
 //! next provider is tried; this is safe because only 1-of-N must succeed.
 //! Unlike the API pinning, an unparseable chain fails CLOSED here — DoH has
 //! independent fallback providers, the API host does not.
+//!
+//! WHAT THE PIN SETS DO **NOT** GUARANTEE. This paragraph used to claim that
+//! "each provider carries >= 2 overlapping pins (intermediate + its root) so
+//! even an intermediate re-issue under the same root keeps working". That was
+//! false, and believing it is what took dns.google dark:
+//!
+//!   * An intermediate and the root that signed it are ONE lineage. When the CA
+//!     serves the host out of a different hierarchy, BOTH pins are absent from
+//!     the same handshake. Two pins, zero overlap.
+//!   * A pin is only worth anything if the server actually SENDS the
+//!     certificate it hashes. `cloudflare-dns.com` and `dns.quad9.net` both
+//!     send a shortened chain — leaf + intermediate, no root (measured
+//!     2026-09-06) — so of their 3 and 2 pins respectively, exactly ONE can
+//!     ever match. Each is one CA-side re-issue away from the dns.google
+//!     failure, and that is stated here because it is true, not fixed.
+//!
+//! The real per-host position is machine-checked, not asserted in prose:
+//! `scripts/check-cert-pins.sh` check 2b counts the pins each host is observed
+//! to present and fails any host below two that is not on its named debt list.
+//! Do not restore a blanket ">= 2 overlapping pins" claim here.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -84,10 +103,27 @@ struct DoHProvider {
     /// is dialled. IPv4 only — the client blocks IPv6 while connecting.
     bootstrap: &'static [Ipv4Addr],
     /// CA-chain SPKI SHA-256 pin hashes (base64-encoded). At least one must
-    /// match a certificate in the presented chain. Each provider lists >= 2
-    /// OVERLAPPING pins — the current intermediate AND its root — so a leaf
-    /// rotation never matters and even an intermediate re-issue under the
-    /// same root keeps one pin valid.
+    /// match a certificate in the PRESENTED chain.
+    ///
+    /// Counting entries in this slice tells you nothing about safety, and the
+    /// doc that used to live here got that wrong: it promised ">= 2 OVERLAPPING
+    /// pins — the current intermediate AND its root", which is one lineage and
+    /// therefore one failure. What matters is how many of these hashes the
+    /// server is actually observed to send, because a certificate the server
+    /// never presents can never satisfy a handshake:
+    ///
+    ///   dns.google           4 of 10 presented (WR2+R1 and WE2+R4 — two
+    ///                        independent hierarchies; the other 6 are the
+    ///                        sibling issuing intermediates Google rotates
+    ///                        leaves across without notice)
+    ///   cloudflare-dns.com   1 of 3 presented  — SINGLE POINT OF FAILURE
+    ///   dns.quad9.net        1 of 2 presented  — SINGLE POINT OF FAILURE
+    ///
+    /// Those counts are enforced by `scripts/check-cert-pins.sh` check 2b
+    /// against `third_party/cert-pins.json`, and by
+    /// `test_effective_pin_count_per_provider` below against real measured
+    /// chains. Changing a pin set changes one of them.
+    ///
     /// Set to empty slice to disable pinning for this provider (emergency only).
     pins: &'static [&'static str],
 }
@@ -134,6 +170,19 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         //        → SSL.com Root Certification Authority ECC
         // SPKI pins re-measured against the live chain 2026-08-22 (dialled via
         // 1.1.1.1: the hostname itself is what a hostile resolver hijacks).
+        //
+        // SINGLE POINT OF FAILURE — ONE of these three pins can ever match.
+        // Cloudflare sends a SHORTENED chain: leaf + intermediate, NO root
+        // (re-measured 2026-09-06 via both 1.1.1.1 and 104.16.248.249). The
+        // SSL.com root and the legacy DigiCert anchor are therefore dormant —
+        // they protect a future migration, but cannot satisfy today's
+        // handshake. An SSL.com re-issue of the intermediate takes this
+        // provider dark with no warning: the exact shape that took dns.google
+        // dark, and the reason `>= 2 pins` was never the right test. Closing it
+        // means pinning SSL.com's sibling issuing intermediates in the SSOT
+        // (birdo-shared) and re-vendoring; it is NOT closed here, and
+        // scripts/check-cert-pins.sh check 2b carries it as named debt so it
+        // cannot quietly become normal.
         pins: &[
             // SSL.com SSL Intermediate CA ECC R2 (presented intermediate)
             "zGgA4OU4DjJdvpRYUqbi5Vh2g9W5Oc/PgKihy9mkLsE=",
@@ -182,19 +231,51 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         // for a bricked pin. Retire a lineage only once it is unmeasurable from
         // several independent networks.
         //
-        // All four values re-measured 2026-09-06 against Google's published CA
-        // certificates at https://i.pki.goog/.
+        // THE SIBLING INTERMEDIATES ARE PINNED ON PURPOSE. Pinning only the
+        // two chains we happened to measure would leave the same hole one
+        // rotation later: Google moves leaves across WR1..WR4 and WE1..WE4
+        // without announcing it, and an edge that sends a SHORTENED chain
+        // (leaf + intermediate, no root — exactly what cloudflare-dns.com and
+        // dns.quad9.net do today, measured 2026-09-06) would then present
+        // nothing this list knows. A dormant pin costs a handshake nothing; a
+        // missing one costs the provider entirely, with no remote kill switch.
+        //
+        // This set is the SSOT's, not a local judgement call: it is
+        // third_party/cert-pins.json, which is vendored verbatim from
+        // birdo-shared and stamped (scripts/check-cert-pins.sh checks 1, 1b
+        // and 2). Do not add, drop or reorder a pin here alone — change
+        // birdo-shared/cert-pins.json, re-vendor, re-stamp.
+        //
+        // All ten values verified 2026-09-06 by fetching Google's published CA
+        // certificates from https://i.pki.goog/<name>.crt and hashing the SPKI
+        // locally; subjects confirmed CN=WR1..WR4, CN=WE1..WE4, CN=GTS Root R1,
+        // CN=GTS Root R4.
         pins: &[
-            // WE2 — Google Trust Services intermediate, new lineage
+            // --- ECDSA hierarchy (GTS Root R4) ---
+            // WE2 — presented from a migrated (US cloud / production hub) edge
             "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=",
-            // GTS Root R4 — anchor of the new lineage, presented in that chain;
+            // GTS Root R4 — anchor of that hierarchy, presented in that chain;
             // the same anchor api/cert_pin.rs already pins for birdo.app
             "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
-            // WR2 — Google Trust Services intermediate, legacy lineage,
-            // STILL LIVE from un-migrated edges
+            // WE1 — sibling issuing intermediate, dormant for dns.google. It is
+            // the LIVE intermediate for api.birdo.app right now, which is the
+            // proof that Google spreads names across siblings silently.
+            "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
+            // WE3 — sibling issuing intermediate, dormant
+            "daBIAnKdRIX3bqM85I6We7wBUh0DPycNFBMvYkXGX2Q=",
+            // WE4 — sibling issuing intermediate, dormant
+            "O5TQDB/wa4SkRjBrQL2Aq9CG317H9MDDgpTVcrpJDa4=",
+            // --- RSA hierarchy (GTS Root R1) ---
+            // WR2 — presented from an un-migrated (consumer-ISP) edge
             "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=",
-            // GTS Root R1 — anchor of the legacy lineage, presented in that chain
+            // GTS Root R1 — anchor of that hierarchy, presented in that chain
             "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",
+            // WR1 — sibling issuing intermediate, dormant
+            "yDu9og255NN5GEf+Bwa9rTrqFQ0EydZ0r1FCh9TdAW4=",
+            // WR3 — sibling issuing intermediate, dormant
+            "OdSlmQD9NWJh4EbcOHBxkhygPwNSwA9Q91eounfbcoE=",
+            // WR4 — sibling issuing intermediate, dormant
+            "hZe1OerqJ1Pnq6F4N0gVjjpHqm037Ndf4aLLVpZZdAE=",
         ],
     },
     DoHProvider {
@@ -204,6 +285,15 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
         // Chain: dns.quad9.net → DigiCert Global G3 TLS ECC SHA384 2020 CA1
         //        → DigiCert Global Root G3
         // SPKI pins verified against the live chain 2026-08-12.
+        //
+        // SINGLE POINT OF FAILURE — ONE of these two pins can ever match. Quad9
+        // also sends a SHORTENED chain: leaf + intermediate, NO root
+        // (re-measured 2026-09-06 via 9.9.9.9), so the DigiCert Global Root G3
+        // pin is dormant and the two pins are one lineage anyway. The SSOT says
+        // so in as many words: "RISK - VIOLATES _overlap_rule ... exactly the
+        // shape that took dns.google dark." Not closed here for the same reason
+        // as cloudflare-dns.com; tracked as named debt by
+        // scripts/check-cert-pins.sh check 2b.
         pins: &[
             // DigiCert Global G3 TLS ECC SHA384 2020 CA1 (presented intermediate)
             "qBRjZmOmkSNJL0p70zek7odSIzqs/muR4Jk9xYyCP+E=",
@@ -213,12 +303,59 @@ const DOH_PROVIDERS: &[DoHProvider] = &[
     },
 ];
 
+/// Substring `api::doh_resolver` matches on to tell "every provider failed
+/// PINNING" apart from "the network was unreachable".
+///
+/// `resolve_via_doh` returns `Result<_, String>`, so the caller has no typed
+/// channel; it was matching on a free-text literal, which is a coupling that
+/// breaks silently the first time somebody rewords the message. Naming the
+/// substring here makes the two ends move together, and the test below pins the
+/// message to it.
+pub(crate) const ALL_PROVIDERS_PINNING_FAILED: &str =
+    "all providers failed certificate verification";
+
 /// Marker embedded in every pin-rejection `TlsError` so `resolve_single_provider`
 /// can classify a reqwest connect failure as a PIN failure (vs plain network
 /// trouble) by walking the error source chain. rustls carries a custom
 /// verifier's rejection only as `Error::General(String)`, so a distinctive
 /// substring is the only channel that survives reqwest's error wrapping.
 const PIN_MISMATCH_MARKER: &str = "DoH-SPKI-pin-rejected";
+
+/// One bit per `DOH_PROVIDERS` entry: has this provider's pin failure already
+/// been reported this process? A pin mismatch repeats on every single
+/// resolution — the API resolver alone re-resolves every 5 minutes — so an
+/// un-deduplicated report would be a flood, and a flood gets muted, which puts
+/// us back where we started. Compile-time guard below keeps this honest if a
+/// 33rd provider is ever added.
+static PIN_FAILURE_REPORTED: AtomicU32 = AtomicU32::new(0);
+
+/// Reported once per process: every provider failed pinning at the same time.
+static ALL_PROVIDERS_PIN_FAILURE_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+const _: () = assert!(
+    DOH_PROVIDERS.len() <= 32,
+    "PIN_FAILURE_REPORTED is a 32-bit mask; widen it before adding a 33rd DoH provider"
+);
+
+/// Send a provider's pin failure to Sentry the FIRST time it happens in this
+/// process, and never again. Returns without doing anything on repeats.
+fn report_pin_failure_once(provider: &DoHProvider) {
+    let Some(idx) = DOH_PROVIDERS.iter().position(|p| p.host == provider.host) else {
+        return;
+    };
+    let bit = 1u32 << idx;
+    if (PIN_FAILURE_REPORTED.fetch_or(bit, Ordering::Relaxed) & bit) != 0 {
+        return;
+    }
+    // provider.url is a compile-time constant. Nothing about the query goes out.
+    crate::utils::crash_report::report_security_event(&format!(
+        "DoH certificate pin mismatch for provider {} — this provider is \
+         unusable for this client until its pins are updated. Most likely a \
+         stale pin set (a CA moved), not an attack.",
+        provider.url
+    ));
+}
 
 /// The pin set for a provider hostname, or None if the host is not a known
 /// DoH provider (the DoH client never legitimately handshakes with anything
@@ -445,6 +582,17 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
             Err(DoHError::PinningFailed(msg)) => {
                 pinning_failures += 1;
                 tracing::error!("DoH provider {} CERT PIN MISMATCH: {}", provider.url, msg);
+                // BREAK THE SILENCE. A pin mismatch used to be `tracing::error!`
+                // and nothing else, and nothing bridges tracing to Sentry in
+                // this app (see utils::crash_report::report_security_event), so
+                // a provider going dark in the field was invisible until
+                // somebody asked a user for a log file. dns.google was dark on
+                // every ECDSA Google edge and the only reason anyone found out
+                // was a scheduled CI job.
+                //
+                // NO PII: the message carries the provider's hardcoded URL and
+                // nothing about what was being resolved.
+                report_pin_failure_once(provider);
                 last_error = msg;
                 // Continue to next provider — do NOT trust this connection
             }
@@ -465,11 +613,21 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
             "ALL DoH providers failed certificate pinning — possible MITM attack. \
              DNS resolution refused for safety."
         );
-        return Err(
-            "DNS resolution blocked: all providers failed certificate verification. \
+        // ...or a stale pin set, which is the far more common cause and the one
+        // this file exists to stop being silent about. Either way it is a total
+        // loss of encrypted resolution for this client and must leave the
+        // device. Reported once per process, no PII.
+        if !ALL_PROVIDERS_PIN_FAILURE_REPORTED.swap(true, Ordering::Relaxed) {
+            crate::utils::crash_report::report_security_event(
+                "DoH: ALL providers failed certificate pinning — either a \
+                 network-level attack or (more often) a stale pin set that has \
+                 taken every provider dark",
+            );
+        }
+        return Err(format!(
+            "DNS resolution blocked: {ALL_PROVIDERS_PINNING_FAILED}. \
              This may indicate a network-level attack."
-                .to_string(),
-        );
+        ));
     }
 
     Err(format!(
@@ -645,16 +803,67 @@ mod tests {
         assert!(!is_private_ip(Ipv4Addr::new(104, 16, 0, 1)));
     }
 
+    /// Chains this repo has ACTUALLY MEASURED, per provider host, newest
+    /// measurement first. Every entry is a real `openssl s_client -showcerts`
+    /// run against the provider's pinned bootstrap address with its own SNI —
+    /// leaf first, then whatever the server sent after it. Where a chain has
+    /// only two entries that is not an omission: the server sends no root.
+    ///
+    /// This table is the input to the two tests below, and it is the thing that
+    /// makes them mechanical rather than decorative. Adding a chain here means
+    /// having measured it.
+    const MEASURED_CHAINS: &[(&str, &str, &[&str])] = &[
+        (
+            "dns.google",
+            "2026-09-06, 8.8.8.8 + 8.8.4.4 from a UK consumer ISP (RSA edge)",
+            &[
+                "qW3FYuXf0SK210sV5lcUYE1NGTmBA398Ee6LXLqneUY=", // leaf (rotates)
+                "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=", // WR2
+                "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=", // GTS Root R1
+            ],
+        ),
+        (
+            "dns.google",
+            "2026-09-06, 8.8.8.8 + 8.8.4.4 from the production hub / Azure \
+             centralus (ECDSA edge) — the chain the daily liveness job hit",
+            &[
+                "wyib/Zb8QzNvhqZ9QF7LzXCMzYApj7PsLe/ZjlfJzuI=", // leaf (rotates)
+                "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=", // WE2
+                "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=", // GTS Root R4
+            ],
+        ),
+        (
+            "cloudflare-dns.com",
+            "2026-09-06, 1.1.1.1 and 104.16.248.249 — TWO certificates, NO root",
+            &[
+                "ltQ6aXy3tqpNZKJdnevMD7oR+IsI5rNWbOssFDrl+Ew=", // leaf (rotates)
+                "zGgA4OU4DjJdvpRYUqbi5Vh2g9W5Oc/PgKihy9mkLsE=", // SSL.com ECC R2
+            ],
+        ),
+        (
+            "dns.quad9.net",
+            "2026-09-06, 9.9.9.9 — TWO certificates, NO root",
+            &[
+                "i2kObfz0qIKCGNWt7MjBUeSrh0Dyjb0/zWINImZES+I=", // leaf (rotates)
+                "qBRjZmOmkSNJL0p70zek7odSIzqs/muR4Jk9xYyCP+E=", // DigiCert G3 ECC
+            ],
+        ),
+    ];
+
     #[test]
-    fn test_doh_provider_pins_overlapping() {
-        // Every provider MUST carry >= 2 OVERLAPPING pins (intermediate + its
-        // root) in production — a single pin turns any CA-side re-issue into a
-        // silent one-provider outage, which is exactly how the old leaf pins
-        // self-disabled.
+    fn test_doh_provider_pin_format() {
+        // Format only. This test used to ALSO assert `pins.len() >= 2` under the
+        // heading "every provider MUST carry >= 2 OVERLAPPING pins (intermediate
+        // + its root)". It was green throughout the dns.google outage, because
+        // counting entries in a slice cannot see that both of them belong to the
+        // same CA lineage — or that the server never sends one of them. The
+        // question it was pretending to answer is answered for real by
+        // `test_effective_pin_count_per_provider` below.
         for provider in DOH_PROVIDERS {
             assert!(
-                provider.pins.len() >= 2,
-                "Provider {} needs >= 2 overlapping SPKI pins (intermediate + root)",
+                !provider.pins.is_empty(),
+                "Provider {} has an EMPTY pin set — that is the emergency bypass, \
+                 not a configuration",
                 provider.url
             );
             // Each pin must be valid base64 and 44 chars (SHA-256 = 32 bytes =
@@ -667,7 +876,201 @@ mod tests {
                     provider.url
                 );
             }
+            // No duplicates: a repeated hash pads the list and makes a pin set
+            // look wider than it is.
+            for (i, pin) in provider.pins.iter().enumerate() {
+                assert!(
+                    !provider.pins[i + 1..].contains(pin),
+                    "Pin {pin} is listed twice for {} — a duplicate inflates the \
+                     apparent size of the set without adding any coverage",
+                    provider.url
+                );
+            }
         }
+    }
+
+    /// THE TEST THAT WOULD HAVE CAUGHT THE OUTAGE.
+    ///
+    /// A pin only protects a handshake if the server actually SENDS the
+    /// certificate it hashes; a pin nothing presents is dormant. So the number
+    /// that matters per provider is not `pins.len()` but "how many of these
+    /// hashes have ever been observed on the wire" — the count of
+    /// independently-failing certificates the set can match on.
+    ///
+    /// Those counts are asserted EXACTLY, against the measured chains above,
+    /// with the known single-point-of-failure providers named rather than
+    /// waived. Any edit to a pin set moves one of these numbers:
+    ///   * trimming dns.google back to "the chain I just measured" drops it from
+    ///     4 to 2 and fails here;
+    ///   * closing the cloudflare/quad9 debt raises theirs to 2 and fails here
+    ///     too, which is the prompt to delete the entry from this list and from
+    ///     SINGLE_EFFECTIVE_PIN_DEBT in scripts/check-cert-pins.sh.
+    ///
+    /// The same invariant is enforced offline over the SSOT by check 2b of
+    /// scripts/check-cert-pins.sh; this is the half that runs in `cargo test`.
+    #[test]
+    fn test_effective_pin_count_per_provider() {
+        // host -> (effective pins, why it is not >= 2 — None means it is fine)
+        const EXPECTED: &[(&str, usize, Option<&str>)] = &[
+            ("dns.google", 4, None),
+            (
+                "cloudflare-dns.com",
+                1,
+                Some(
+                    "Cloudflare sends leaf + SSL.com intermediate and NO root, so \
+                     the SSL.com root pin and the legacy DigiCert anchor are both \
+                     dormant. One SSL.com re-issue takes this provider dark. \
+                     Tracked as named debt in scripts/check-cert-pins.sh.",
+                ),
+            ),
+            (
+                "dns.quad9.net",
+                1,
+                Some(
+                    "Quad9 sends leaf + DigiCert G3 ECC intermediate and NO root, \
+                     and the two pins are one lineage regardless. Tracked as named \
+                     debt in scripts/check-cert-pins.sh.",
+                ),
+            ),
+        ];
+
+        for provider in DOH_PROVIDERS {
+            let (_, expected_effective, debt) = EXPECTED
+                .iter()
+                .find(|(h, _, _)| *h == provider.host)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "provider {} has no entry in EXPECTED — a new DoH provider \
+                         must declare how many of its pins are actually presented, \
+                         or it ships with the dns.google hole",
+                        provider.host
+                    )
+                });
+
+            let measured: Vec<&&[&str]> = MEASURED_CHAINS
+                .iter()
+                .filter(|(h, _, _)| h == &provider.host)
+                .map(|(_, _, chain)| chain)
+                .collect();
+            assert!(
+                !measured.is_empty(),
+                "no measured chain recorded for {} — MEASURED_CHAINS must cover \
+                 every provider or this test silently checks nothing",
+                provider.host
+            );
+
+            let mut effective: Vec<&str> = Vec::new();
+            for chain in &measured {
+                for cert in chain.iter() {
+                    if provider.pins.contains(cert) && !effective.contains(cert) {
+                        effective.push(*cert);
+                    }
+                }
+            }
+
+            assert_eq!(
+                effective.len(),
+                *expected_effective,
+                "{} now has {} pin(s) present in a measured chain, not {}. \
+                 {} Update EXPECTED here, MEASURED_CHAINS, and \
+                 SINGLE_EFFECTIVE_PIN_DEBT in scripts/check-cert-pins.sh together \
+                 — and if the number went DOWN, do not: a pin the provider still \
+                 serves has just been removed and there is no remote kill switch \
+                 for a bricked pin.",
+                provider.host,
+                effective.len(),
+                expected_effective,
+                debt.unwrap_or("")
+            );
+
+            // Whatever the count, every measured chain must still authenticate:
+            // that is the outage itself, restated as an assertion.
+            for (host, provenance, chain) in MEASURED_CHAINS {
+                if *host != provider.host {
+                    continue;
+                }
+                let owned: Vec<String> = chain.iter().map(|c| (*c).to_string()).collect();
+                assert!(
+                    chain_satisfies_pins(&owned, provider.pins),
+                    "{host}: the chain measured {provenance} matches NO pin — every \
+                     user routed to that edge loses this DoH provider outright, \
+                     with the log calling a stale pin set a MITM attack"
+                );
+                // Leaf alone must satisfy nothing: pins are on the CA chain, so a
+                // ~90-day leaf rotation must not brick the client (the old
+                // leaf-DER scheme did exactly that).
+                assert!(
+                    !chain_satisfies_pins(&owned[..1], provider.pins),
+                    "{host}: the LEAF certificate satisfies a pin — leaf pinning \
+                     self-disables on every renewal"
+                );
+            }
+        }
+
+        // Pin sets are per-host, not a shared pool: no provider's measured chain
+        // may authenticate a different provider.
+        for provider in DOH_PROVIDERS {
+            for (host, _, chain) in MEASURED_CHAINS {
+                if *host == provider.host {
+                    continue;
+                }
+                let owned: Vec<String> = chain.iter().map(|c| (*c).to_string()).collect();
+                assert!(
+                    !chain_satisfies_pins(&owned, provider.pins),
+                    "{}'s pin set accepts {host}'s chain — pin sets must not pool",
+                    provider.host
+                );
+            }
+        }
+    }
+
+    /// `api::doh_resolver` classifies a DoH failure by looking for
+    /// `ALL_PROVIDERS_PINNING_FAILED` in the error string, and logs a different,
+    /// louder message when it finds it. That is a string contract across two
+    /// modules with no type to hold it, so assert it here: reword the error and
+    /// this fails, instead of the classification silently going dead.
+    #[test]
+    fn test_all_providers_pinning_failed_marker_is_in_the_error() {
+        let rendered = format!(
+            "DNS resolution blocked: {ALL_PROVIDERS_PINNING_FAILED}. \
+             This may indicate a network-level attack."
+        );
+        assert!(
+            rendered.contains(ALL_PROVIDERS_PINNING_FAILED),
+            "api::doh_resolver would stop recognising the all-providers-failed-\
+             pinning case and log it as an ordinary network failure"
+        );
+    }
+
+    /// The pin set compiled into this binary must be exactly the one the SSOT
+    /// declares. `scripts/check-cert-pins.sh` check 2 already enforces that, but
+    /// only in the Cert Pins workflow and only when it is run; this puts the
+    /// dns.google set in front of `cargo test` too, so a hand-edit that trims a
+    /// lineage back out cannot reach main through a green test suite alone.
+    #[test]
+    fn test_dns_google_pins_match_the_vendored_ssot() {
+        let ssot = include_str!("../../../third_party/cert-pins.json");
+        let pins = pins_for_host("dns.google").expect("dns.google must be pinned");
+        for pin in pins {
+            assert!(
+                ssot.contains(*pin),
+                "dns.google pin {pin} is not in third_party/cert-pins.json — the \
+                 vendored SSOT and doh.rs have diverged"
+            );
+        }
+        // And the reverse: every dns.google hash the SSOT lists must be here.
+        // Counting `"hash":` occurrences would be brittle, so this asserts the
+        // ten known values explicitly; check 2 of check-cert-pins.sh does the
+        // structural comparison.
+        assert_eq!(
+            pins.len(),
+            10,
+            "dns.google should carry 10 pins (both GTS hierarchies plus the \
+             sibling issuing intermediates Google rotates leaves across). Got {}. \
+             If the SSOT genuinely changed, re-vendor and re-stamp — do not edit \
+             one side.",
+            pins.len()
+        );
     }
 
     /// The verifier dispatches pin sets by SNI hostname; every provider host

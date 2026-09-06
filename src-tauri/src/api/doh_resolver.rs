@@ -9,13 +9,24 @@
 //! (`crate::vpn::doh`), matching the Android client's behaviour.
 //!
 //! SECURITY MODEL (defense-in-depth):
-//!   1. DoH (Cloudflare → Google → Quad9, each leaf-cert-pinned, anti-rebinding)
-//!      is tried first. This defeats plain DNS blocking/poisoning because the
-//!      providers are reached over HTTPS via their own pinned certificates.
-//!   2. If EVERY DoH provider is unreachable (e.g. a network that blocks
-//!      1.1.1.1/8.8.8.8/9.9.9.9:443 outright but has a working local resolver),
-//!      we fall back to the system resolver rather than failing closed — so we
-//!      never REGRESS a network that works today.
+//!   1. DoH (Cloudflare → Google → Quad9) is tried first, each provider pinned
+//!      by CA-CHAIN SPKI inside the TLS handshake — NOT leaf-pinned, which this
+//!      comment claimed long after `vpn::doh` moved off leaf-DER hashing
+//!      precisely because leaf pins self-disable on every ~90-day renewal. This
+//!      defeats plain DNS blocking/poisoning because the providers are reached
+//!      over HTTPS via their own pinned certificates.
+//!   2. If EVERY DoH provider fails, we fall back to the system resolver rather
+//!      than failing closed — so we never REGRESS a network that works today.
+//!      READ THIS BEFORE RELYING ON `vpn::doh`'s FAIL-CLOSED GUARANTEE: that
+//!      guarantee is `vpn::doh`'s, and it ends here. Step 3 explains why that is
+//!      an accepted trade rather than an oversight, but it IS a trade — the
+//!      fallback fires even when every provider failed *pinning* specifically
+//!      (`resolve_via_doh`'s "all providers failed certificate verification"),
+//!      which is the case that looks most like an attack. It is also, far more
+//!      often, a stale pin set: that is exactly what happened to dns.google, and
+//!      failing closed there would have bricked the control plane on any network
+//!      where the other two providers were blocked. The all-providers-failed
+//!      case is reported to Sentry from `vpn::doh` so it cannot be silent.
 //!   3. A poisoned IP obtained through the fallback cannot mount a MITM: the
 //!      `BirdoApi` client still enforces CA-chain SPKI certificate pinning
 //!      (see `super::cert_pin`) during the TLS handshake, so a forged
@@ -89,10 +100,28 @@ impl Resolve for DohApiResolver {
                     //    never regress a working-but-restrictive network. A
                     //    poisoned answer here is still defeated by TLS cert
                     //    pinning on the API client (see module docs).
-                    tracing::warn!(
-                        "DoH resolution for {host} failed ({e}); \
-                         falling back to system resolver (TLS pinning still enforced)"
-                    );
+                    //
+                    //    Say which of the two it was. "DoH failed" reads as a
+                    //    network problem; a pin failure is a different incident
+                    //    with a different fix (re-vendor the pin set), and it
+                    //    was previously indistinguishable in the log.
+                    if e.contains(crate::vpn::doh::ALL_PROVIDERS_PINNING_FAILED) {
+                        tracing::error!(
+                            "DoH resolution for {host} failed because EVERY provider \
+                             failed CERTIFICATE PINNING, not because the network was \
+                             unreachable. Falling back to the system resolver anyway: \
+                             api.birdo.app is itself CA-chain SPKI pinned \
+                             (api::cert_pin), so a poisoned address cannot mount a \
+                             MITM — but encrypted resolution is GONE for this client \
+                             and the pin sets need checking \
+                             (scripts/check-cert-pins.sh)."
+                        );
+                    } else {
+                        tracing::warn!(
+                            "DoH resolution for {host} failed ({e}); \
+                             falling back to system resolver (TLS pinning still enforced)"
+                        );
+                    }
                     let addrs = system_resolve(&host).await?;
                     // Cache the fallback result too, but only briefly (FALLBACK_TTL).
                     // On the network this branch exists for (DoH endpoints blocked,
