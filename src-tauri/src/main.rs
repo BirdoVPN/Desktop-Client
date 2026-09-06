@@ -265,13 +265,41 @@ fn main() {
             server_name: Some("redacted".into()),
             // SEC-PII: sentry's `panic` integration chains AHEAD of our
             // sanitizing panic hook (it is installed later, at init time, so
-            // it runs first and sees the raw payload). Scrub every
-            // message-carrying field with the same redaction the local log
-            // gets, at the last point before the event leaves the device.
+            // it runs first and sees the raw payload), so the scrub cannot
+            // live in a hook. `before_send` is the last point before the
+            // event leaves the device, and it is an ALLOWLIST: see
+            // `utils::crash_report` for what may go and why.
             before_send: Some(std::sync::Arc::new(|event| {
-                Some(scrub_sentry_event_pii(event))
+                Some(utils::crash_report::scrub_event(event))
             })),
             sample_rate: 1.0,
+            // NO PERFORMANCE DATA, and it takes both of these.
+            //
+            // `before_send` above does NOT run for transactions: it is
+            // invoked at one place in sentry-core (`client/mod.rs:373`, the
+            // event path) while a transaction goes straight out through
+            // `Transaction::finish_with_timestamp` -> `send_envelope`, and
+            // the Rust SDK has no `before_send_transaction`. So a span
+            // description or a transaction name would be an UNSCRUBBED
+            // channel next to a carefully scrubbed one — exactly what was
+            // found on the Android side.
+            //
+            // The rate alone is not enough either: with no sampler,
+            // `performance.rs:615` lets an inherited `ctx.sampled ==
+            // Some(true)` override it. A sampler outranks both arms, so the
+            // sampler is the half that actually holds.
+            traces_sample_rate: 0.0,
+            traces_sampler: Some(std::sync::Arc::new(
+                utils::crash_report::never_sample_a_transaction,
+            )),
+            // Pinned rather than left to the default, which is `true` in
+            // this version and inert only because the `logs` cargo feature
+            // is off. Feature unification in a future dependency could turn
+            // it on without anyone editing this file.
+            enable_logs: false,
+            // No sessions: they add nothing to a crash report and they are a
+            // second event type with its own path out.
+            auto_session_tracking: false,
             ..Default::default()
         },
     ));
@@ -726,42 +754,6 @@ fn rotate_log_if_large(path: &std::path::Path) {
         // installed) — stderr is the best available diagnostic.
         eprintln!("birdo.log rotation failed (continuing to append): {}", e);
     }
-}
-
-/// SEC-PII: apply the same `sanitize_error` redaction the local log gets to
-/// every message-carrying field of an outgoing Sentry event.
-///
-/// The panic integration stores the raw panic payload in `exception[].value`
-/// (see sentry-panic's `event_from_panic_info`), and `event.message` /
-/// `logentry` / breadcrumb messages can carry error chains with embedded IPs,
-/// hostnames, or emails. Runs as `before_send`, so it covers every capture
-/// path regardless of hook ordering. In debug builds `sanitize_error` is a
-/// pass-through, exactly like the local log.
-fn scrub_sentry_event_pii(
-    mut event: sentry::protocol::Event<'static>,
-) -> sentry::protocol::Event<'static> {
-    use crate::utils::redact::sanitize_error;
-
-    if let Some(msg) = event.message.take() {
-        event.message = Some(sanitize_error(&msg));
-    }
-    if let Some(entry) = event.logentry.as_mut() {
-        entry.message = sanitize_error(&entry.message);
-        // Positional params are interpolated raw values — drop rather than
-        // guess at their shape.
-        entry.params.clear();
-    }
-    for exception in event.exception.values.iter_mut() {
-        if let Some(value) = exception.value.take() {
-            exception.value = Some(sanitize_error(&value));
-        }
-    }
-    for breadcrumb in event.breadcrumbs.values.iter_mut() {
-        if let Some(msg) = breadcrumb.message.take() {
-            breadcrumb.message = Some(sanitize_error(&msg));
-        }
-    }
-    event
 }
 
 /// Set up a custom panic hook for crash recovery

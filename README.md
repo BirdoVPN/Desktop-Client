@@ -36,6 +36,11 @@ auto-update release. See [`docs/CODE_SIGNING.md`](docs/CODE_SIGNING.md),
 [`docs/RELEASE-SECRETS.md`](docs/RELEASE-SECRETS.md). Signing secrets live in the operator
 vault, never in the repo.
 
+Crash reporting is armed at build time from the `SENTRY_DSN` secret, and a release
+build with no usable DSN now fails rather than shipping an inert reporter — see
+[`docs/SENTRY-SETUP.md`](docs/SENTRY-SETUP.md) for the project setup, the
+verification steps and exactly what a crash report may contain.
+
 ## Related
 - `../birdo-shared/` — shared `protocol.json` + `cert-pins.json` contract (cert pins are mirrored here for DER verification).
 - `../birdo-web/` — backend that serves the auth/session/VPN APIs and the Tauri update manifest.

@@ -38,6 +38,16 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 35  # Hard cap. Rust compile ~12m + signing ~3m. If we hit 35m, signing hung.
+    # SENTRY_DSN lives at JOB level, not on the build step.
+    #
+    # It was on the step, which is correct for exactly as long as a job has one
+    # build step — and release.yml's build-macos already has two (the signed
+    # build and the unsigned fallback). A job-level env is the only form that
+    # also covers a step somebody adds next year. Missing one build job is the
+    # twin-drift defect this estate keeps re-finding, and a build with no DSN
+    # now FAILS in build.rs rather than shipping an inert reporter.
+    env:
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     permissions:
@@ -265,9 +275,6 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # CD-2: inject Sentry DSN so option_env!("SENTRY_DSN") is Some(..) in
-          # the shipped binary (owner sets the SENTRY_DSN repo secret).
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # Ed25519 client-attestation key baked in by option_env! — see
           # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
           BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}

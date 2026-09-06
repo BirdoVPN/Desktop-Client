@@ -183,6 +183,30 @@ pub fn sanitize_error(msg: &str) -> String {
 
     #[cfg(not(debug_assertions))]
     {
+        sanitize_always(msg)
+    }
+}
+
+/// The redaction itself, with NO `debug_assertions` escape hatch.
+///
+/// [`sanitize_error`] is deliberately a pass-through in debug builds so a
+/// developer reading their own console sees real addresses. That is the right
+/// trade for a LOCAL log and the wrong one for anything that leaves the
+/// machine, so the crash reporter calls this instead — see
+/// `utils::crash_report`. A developer who sets a DSN on a debug build must
+/// still not be able to post a customer's exit node to Sentry.
+///
+/// One implementation, two thin wrappers: the same shape
+/// `tunnel_dns::parse_dns_config` uses for the v4/v6 twins, and for the same
+/// reason — a second copy of a scrubber is a second thing to keep in step,
+/// and this estate has paid for that shape repeatedly.
+///
+/// Being reachable in debug is also what makes it TESTABLE: `cargo test` runs
+/// with `debug_assertions` on, so every assertion about what
+/// `sanitize_error` removes was previously unwritable and the tests below it
+/// could only assert that the output was non-empty.
+pub fn sanitize_always(msg: &str) -> String {
+    {
         use once_cell::sync::Lazy;
         use regex::Regex;
 
@@ -327,5 +351,42 @@ mod tests {
         let msg = "Failed to connect to 192.168.1.100:51820";
         let result = sanitize_error(msg);
         assert!(!result.is_empty());
+    }
+
+    /// What `sanitize_always` actually removes. Every assertion here was
+    /// unwritable while the implementation lived inside
+    /// `#[cfg(not(debug_assertions))]`: `cargo test` builds with
+    /// `debug_assertions` ON, so the tests above it can only check that the
+    /// output is non-empty. This is the redaction the crash reporter relies
+    /// on, so it is asserted per class rather than in aggregate — a scrubber
+    /// that handles three of four classes must fail, not pass.
+    #[test]
+    fn sanitize_always_removes_every_address_class() {
+        let out = sanitize_always("node de-fra-01.birdo.app 185.199.110.153");
+        assert!(!out.contains("birdo.app"), "hostname: {}", out);
+        assert!(!out.contains("185.199.110.153"), "ipv4: {}", out);
+
+        let v6 = sanitize_always("peer 2606:4700:4700::1111 unreachable");
+        assert!(!v6.contains("2606:4700:4700::1111"), "ipv6: {}", v6);
+
+        let mail = sanitize_always("login failed for user@example.com");
+        assert!(!mail.contains("user@example.com"), "email: {}", mail);
+
+        // WireGuard public keys are 44 chars of base64; the token rule takes
+        // any unbroken run of 32+.
+        let key = sanitize_always("key xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg= rejected");
+        assert!(
+            !key.contains("xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg"),
+            "key: {}",
+            key
+        );
+    }
+
+    /// The point of splitting the two: a message with no address in it comes
+    /// through readable, or a crash report is a wall of markers.
+    #[test]
+    fn sanitize_always_leaves_an_ordinary_message_alone() {
+        let msg = "Wintun adapter creation failed: access denied";
+        assert_eq!(sanitize_always(msg), msg);
     }
 }
