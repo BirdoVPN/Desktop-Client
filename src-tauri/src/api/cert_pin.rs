@@ -4,8 +4,17 @@
 //! Android client (OkHttp `CertificatePinner` in `NetworkModule.kt`). Because we
 //! pin the stable intermediate/root public keys — not the volatile leaf — the
 //! edge cert can rotate every ~90 days WITHOUT a new desktop release. A release
-//! is only needed if the CA chain itself changes (years), and a cross-CA backup
-//! pin guards against a provider migration bricking installed clients.
+//! IS needed the moment the presented chain stops matching these pins, and a
+//! CA can do that without notice: on 2026-09-06 Google Trust Services was
+//! serving `dns.google` from a second hierarchy on some anycast edges and the
+//! DoH pin set in `vpn/doh.rs` went dark there. Do not read "years" into it.
+//!
+//! What the backups below do and do not buy: the live `birdo.app` chain is ONE
+//! lineage (WE1 and the GTS Root R4 that signed it vanish from the same
+//! handshake together), and the Let's Encrypt pins cover exactly one migration
+//! — to Let's Encrypt via R10/R11/E5/E6 — not a second live path. That is the
+//! position `scripts/check-cert-pins.sh` check 2b holds this host to: it fails
+//! unless the SSOT carries an explicit, dated `_overlap_risk` for `birdo.app`.
 //!
 //! Implemented as a custom rustls `ServerCertVerifier` that WRAPS the default
 //! WebPKI verifier: standard validation (chain-to-trusted-root, hostname,
