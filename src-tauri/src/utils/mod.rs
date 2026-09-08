@@ -3,6 +3,7 @@
 pub mod crash_report;
 pub mod elevation;
 pub mod log_policy;
+pub mod log_retention;
 pub mod redact;
 
 /// Source-level guard that no address-shaped value reaches a logging macro

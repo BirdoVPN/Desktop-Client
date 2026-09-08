@@ -141,13 +141,29 @@ fn main() {
         p.push("logs");
         std::fs::create_dir_all(&p).ok()?;
         p.push("birdo.log");
-        // PWR-5: birdo.log is opened in append mode for the life of the
+        // TWO CAPS ON THE SAME FILE, and they run in this order.
+        //
+        // LOG-002 (age). Everything else that protects birdo.log is
+        // forward-only — the level clamp below, and the redact_* call sites,
+        // govern lines written from NOW ON. The file itself is opened in
+        // append mode and had never been pruned, so an install from June was
+        // still carrying every connection it had ever made: exit-node
+        // endpoints, tunnel client IPs, the chosen server names. Upgrading to
+        // a redacting build did nothing to those lines. The sweep cuts the
+        // log (and the rotated birdo.log.1 beside it) back to the retention
+        // window on every launch, so the file can only ever describe recent
+        // activity. See utils::log_retention before widening the window.
+        crate::utils::log_retention::enforce(&p, chrono::Utc::now());
+        //
+        // PWR-5 (size). birdo.log is open in append mode for the life of the
         // process, so a long-running session (this is a VPN client — it can
-        // stay connected for weeks) grows it unbounded. A simple one-generation
-        // rotation caps the damage: once the log has already grown past
-        // MAX_LOG_BYTES, move it aside to birdo.log.1 (clobbering any older
-        // one) before we start appending to a fresh file.
-        rotate_log_if_large(&p);
+        // stay connected for weeks) grows it unbounded. A one-generation
+        // rotation caps that: once the log is past MAX_LOG_BYTES, move it
+        // aside to birdo.log.1 before we start appending to a fresh file.
+        // AFTER the sweep — the sweep may already have brought it back under
+        // the cap, and rotating first would only push expired content into
+        // .1 to be pruned there.
+        crate::utils::log_retention::rotate_if_large(&p);
         let mut open_opts = std::fs::OpenOptions::new();
         open_opts.create(true).append(true);
         // P6-CLI-D-08: the log records which VPN nodes were used and when —
@@ -168,7 +184,7 @@ fn main() {
                 // possibly before earlier logs are flushed. Degrade gracefully
                 // by dropping that single log line (io::sink) instead.
                 //
-                // PWR-5 addendum: rotate_log_if_large only runs at startup, so a
+                // PWR-5 addendum: the rotation above only runs at startup, so a
                 // weeks-long session used to grow birdo.log without bound. Hard
                 // in-session cap: once the file passes 2x MAX_LOG_BYTES, drop
                 // further lines (the next launch rotates it aside). A stat per
@@ -176,7 +192,7 @@ fn main() {
                 .with_writer(move || -> Box<dyn std::io::Write> {
                     if file
                         .metadata()
-                        .map(|m| m.len() > 2 * MAX_LOG_BYTES)
+                        .map(|m| m.len() > 2 * crate::utils::log_retention::MAX_LOG_BYTES)
                         .unwrap_or(false)
                     {
                         return Box::new(std::io::sink());
@@ -723,37 +739,6 @@ fn main() {
                 }
             }
         });
-}
-
-/// PWR-5: cap for `birdo.log` before it gets rotated aside.
-const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
-
-/// If `path` already exists and has grown past [`MAX_LOG_BYTES`], move it to
-/// `<path>.1` (clobbering any previous `.1`) so the caller can open a fresh,
-/// empty file at `path`. Best-effort: any failure here just means we keep
-/// appending to the existing file, which is the pre-existing (unbounded)
-/// behaviour — never worth failing startup over a log file.
-fn rotate_log_if_large(path: &std::path::Path) {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return; // doesn't exist yet (first run) — nothing to rotate
-    };
-    if meta.len() <= MAX_LOG_BYTES {
-        return;
-    }
-    let rotated = path.with_file_name(format!(
-        "{}.1",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("birdo.log")
-    ));
-    // std::fs::rename replaces an existing destination on both Windows
-    // (MoveFileExW with MOVEFILE_REPLACE_EXISTING) and Unix, so this is a
-    // single atomic step — no separate "delete old .1 first" required.
-    if let Err(e) = std::fs::rename(path, &rotated) {
-        // Can't log through tracing yet (this runs before the subscriber is
-        // installed) — stderr is the best available diagnostic.
-        eprintln!("birdo.log rotation failed (continuing to append): {}", e);
-    }
 }
 
 /// Set up a custom panic hook for crash recovery
