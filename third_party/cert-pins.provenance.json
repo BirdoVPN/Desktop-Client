@@ -1,0 +1,16 @@
+{
+  "_comment": "Provenance stamp for third_party/cert-pins.json. This file exists because the vendored copy was HAND-EDITED once (its dns.google entry differed from the SSOT's) and every check still reported green: check 2 of check-cert-pins.sh compares the Rust pin files against the VENDORED copy, so an edit to both agrees with itself, and check 1 - the only one that compares the vendored copy to the real SSOT - is skipped whenever birdo-shared is not checked out alongside, which is always the case on CI. This stamp closes that hole WITHOUT needing the upstream repo present: the recorded digest is of the vendored file's CANONICAL JSON, so any hand-edit to third_party/cert-pins.json fails check 1b offline, on every PR. Re-vendoring is therefore a two-file change on purpose.",
+  "_how_to_update": "cp ../birdo-shared/cert-pins.json third_party/cert-pins.json && python3 scripts/stamp-cert-pins-provenance.py    # then commit BOTH files",
+  "_digest_is_over": "json.dumps(json.load(f), sort_keys=True, separators=(',',':'), ensure_ascii=False).encode('utf-8') - canonical form, NOT the raw bytes. This repo has core.autocrlf=true, so the Windows working tree is CRLF while the blob and every Linux CI checkout are LF; a raw-byte digest would pass on one and fail on the other.",
+  "_merge_order": "upstream_commit_on_main is MEASURED by scripts/stamp-cert-pins-provenance.py (git merge-base --is-ancestor against birdo-shared origin/main) and cannot be written by hand without check 1 catching it on any checkout that has ../birdo-shared. While it is false, check 1b FAILS on every run, including CI: the consumer PR that vendors an unmerged SSOT branch stays red until the SSOT PR merges and this copy is re-vendored and re-stamped from main. That is the merge order, made mechanical.",
+  "upstream_repo": "BirdoVPN/birdo-shared",
+  "upstream_path": "cert-pins.json",
+  "upstream_commit": "9bca49306b40a117332b9bad3738952cdf6fe3c9",
+  "upstream_branch": "main",
+  "upstream_subject": "fix(cert-pins): pin both GTS hierarchies for dns.google â€” its pin set was dark on ECDSA edges (#3)",
+  "upstream_commit_on_main": true,
+  "upstream_main_ref": "origin/main@9bca49306b40",
+  "upstream_main_fetched": true,
+  "vendored_on": "2026-09-09",
+  "canonical_sha256": "84706c3f179639358fde01c317174c7e51134ceebc3a0f2bf28a9869c1be84ba"
+}

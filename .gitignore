@@ -45,3 +45,7 @@ wintun.dll
 # Tauri updater signing keys
 .tauri/
 *.key
+
+# Python bytecode (scripts/stamp-cert-pins-provenance.py)
+__pycache__/
+*.pyc

@@ -4,8 +4,17 @@
 //! Android client (OkHttp `CertificatePinner` in `NetworkModule.kt`). Because we
 //! pin the stable intermediate/root public keys — not the volatile leaf — the
 //! edge cert can rotate every ~90 days WITHOUT a new desktop release. A release
-//! is only needed if the CA chain itself changes (years), and a cross-CA backup
-//! pin guards against a provider migration bricking installed clients.
+//! IS needed the moment the presented chain stops matching these pins, and a
+//! CA can do that without notice: on 2026-09-06 Google Trust Services was
+//! serving `dns.google` from a second hierarchy on some anycast edges and the
+//! DoH pin set in `vpn/doh.rs` went dark there. Do not read "years" into it.
+//!
+//! What the backups below do and do not buy: the live `birdo.app` chain is ONE
+//! lineage (WE1 and the GTS Root R4 that signed it vanish from the same
+//! handshake together), and the Let's Encrypt pins cover exactly one migration
+//! — to Let's Encrypt via R10/R11/E5/E6 — not a second live path. That is the
+//! position `scripts/check-cert-pins.sh` check 2b holds this host to: it fails
+//! unless the SSOT carries an explicit, dated `_overlap_risk` for `birdo.app`.
 //!
 //! Implemented as a custom rustls `ServerCertVerifier` that WRAPS the default
 //! WebPKI verifier: standard validation (chain-to-trusted-root, hostname,
@@ -45,16 +54,29 @@ use sha2::{Digest, Sha256};
 /// `api.birdo.app` chain 2026-08-22: leaf CN=birdo.app -> WE1 -> GTS Root R4,
 /// so the first two pins below are live and the rest are dormant backups.
 const PINNED_SPKI_SHA256: &[&str] = &[
-    // Google Trust Services "WE1" intermediate — the cert api.birdo.app chains
-    // through today; stable for years. PRIMARY pin (also pinned on Android).
+    // Google Trust Services "WE1" intermediate — the cert api.birdo.app chained
+    // through when it was last measured (2026-09-08, both vantages). PRIMARY
+    // pin (also pinned on Android). NOT "stable for years": that is what this
+    // comment used to say, and dns.google's set was described the same way
+    // three days before a GTS hierarchy change took it dark on every ECDSA
+    // edge, with no CA change and no announcement. What is true is narrower —
+    // it is what the CA served the last time anyone looked.
     "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
     // GTS Root R4 — the actual trust anchor in the live chain (2026-06-08).
     "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
     // GlobalSign ECC Root CA - R4 — alternate Google cross-sign anchor (kept for
     // chains that present GlobalSign instead of GTS Root R4; also on Android).
     "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",
-    // ISRG Root X1 (Let's Encrypt) — cross-CA backup so a Google -> Let's Encrypt
-    // migration cannot brick installed clients (also pinned on Android).
+    // ISRG Root X1 (Let's Encrypt) — cross-CA backup for ONE migration: Google
+    // -> Let's Encrypt via the four issuing intermediates pinned below (also
+    // pinned on Android). It does not cover a migration to any other CA, and
+    // Cloudflare's Universal SSL pool includes SSL.com, which is NOT pinned —
+    // so "cannot brick installed clients", which is what this comment used to
+    // say, is false. A renewal that lands outside these pins bricks every
+    // installed client's API access with no remote recovery path. That risk is
+    // recorded, dated and machine-checked as the SSOT's `_overlap_risk`
+    // "birdo-app-single-live-lineage" (check 2b of scripts/check-cert-pins.sh
+    // fails this host if the waiver is dropped, expires, or stops matching).
     //
     // NOTE: a standard Let's Encrypt server chain presents the LEAF + one
     // ISSUING INTERMEDIATE (R10/R11/E5/E6) — NOT ISRG Root X1 itself. Since we
