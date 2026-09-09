@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_check_cert_pins.py - proves checks 2b and 3 of scripts/check-cert-pins.sh
+"""test_check_cert_pins.py - proves checks 2b, 2c and 3 of scripts/check-cert-pins.sh
 still fail the shapes they exist to fail.
 
 A checker nobody has watched fail is a comment with a shell script around it.
@@ -15,6 +15,13 @@ before 2026-09-06 - WR2 + GTS Root R1, both live, ONE lineage. An earlier
 revision of check 2b counted pins marked in_live_chain and printed
 "2 of 2 ... satisfies _overlap_rule" for that file, while every user reaching a
 GTS Root R4 edge could not connect. It must fail, and it must keep failing.
+
+The next is SIBLING_IN_A_TEST_FIXTURE: the six Google sibling intermediates
+were deleted from `DOH_PROVIDERS` on this branch and every check went green
+while all six were still written out, hash by hash, in a `#[cfg(test)]`
+block in the same file. Check 2 strips comments before it compares, so it
+could not see them; check 2c reads raw text, and that fixture is what
+proves it does.
 
 The second most important is CROSS_SIGNED_ROOT: Google serves its roots
 cross-signed (subject "GTS Root R1", issuer "GlobalSign Root CA"; measured
@@ -53,6 +60,7 @@ def load_module(name):
 
 lineages = load_module("cert_pins_lineages")
 live_chain = load_module("cert_pins_live_chain")
+retired = load_module("cert_pins_retired")
 
 with open(SSOT, encoding="utf-8") as fh:
     BASE = json.load(fh)
@@ -366,6 +374,90 @@ LIVE_CASES = [
 ]
 
 
+# ------------------------------------------------- check 2c: retired pins
+#
+# cert_pins_retired.py reads RAW text, comments included, so a fixture here is a
+# {path: text} map rather than a mutated SSOT. The first case is the committed
+# tree itself; the rest paste a retired hash back the ways it would realistically
+# survive - a comment, a test const, a doc - plus the one place a hash retired
+# for one host is still legitimate for another.
+NL = chr(10)
+TREE = retired.collect(ROOT)
+DOH_RS = "src-tauri/src/vpn/doh.rs"
+CERT_PIN_RS = "src-tauri/src/api/cert_pin.rs"
+
+
+def removed_hash(label_prefix, host=None):
+    """A hash out of the SSOT's own _removed[]; still nothing written down here."""
+    found = [r for r in BASE["_removed"]
+             if r.get("was_labelled", "").startswith(label_prefix)
+             and (host is None or r.get("host") == host)]
+    if len(found) != 1:
+        raise AssertionError("expected exactly one _removed record labelled %r "
+                             "(host=%r), found %d" % (label_prefix, host, len(found)))
+    return found[0]["hash"]
+
+
+def tree_with(path, addition):
+    t = dict(TREE)
+    t[path] = t.get(path, "") + addition
+    return t
+
+
+# WR1: retired for dns.google and live nowhere -> rule R1, forbidden repo-wide.
+WR1 = removed_hash("WR1", host="dns.google")
+# WE1: retired for dns.google, still the live birdo.app intermediate -> rule R2,
+# forbidden in the dns.google pin file and required in the birdo.app one.
+WE1_RETIRED = removed_hash("WE1", host="dns.google")
+WE1_LIVE = pin("birdo.app", lineage="gts-r4", role="active-intermediate")["hash"]
+assert WE1_RETIRED == WE1_LIVE, (
+    "this fixture exists because WE1 is retired for dns.google AND live for "
+    "birdo.app; if that stops being true, rewrite it rather than deleting it")
+
+RETIRED_CASES = [
+    # name, files, want_failed, needles, forbidden
+    ("COMMITTED_TREE", TREE, False,
+     ["ok    2c: no retired pin survives outside the SSOT"], ["FAIL"]),
+
+    ("SIBLING_IN_A_COMMENT",
+     tree_with(DOH_RS, NL + '// kept for reference: "' + WR1 + '"' + NL),
+     True, ["FAIL  2c: " + DOH_RS, "carries RETIRED pin",
+            "Never measured serving dns.google"], []),
+
+    # The exact shape that survived on this branch: not a pin declaration, a
+    # test fixture. Check 2 strips comments and reads only the pin array, so it
+    # cannot see this; 2c must.
+    ("SIBLING_IN_A_TEST_FIXTURE",
+     tree_with(DOH_RS, NL + '#[cfg(test)]' + NL +
+               'const SIBLINGS: &[&str] = &["' + WR1 + '"];' + NL),
+     True, ["FAIL  2c: " + DOH_RS, "carries RETIRED pin"], []),
+
+    # R1 is repo-wide, not pin-site-scoped: a hash retired outright has no home
+    # here at all, including a doc that only quotes it.
+    ("SIBLING_IN_A_DOC",
+     tree_with("SECURITY.md", NL + "We used to pin `" + WR1 + "`." + NL),
+     True, ["FAIL  2c: SECURITY.md", "carries RETIRED pin"], []),
+
+    # R2: forbidden in the file the SSOT's enforced_by calls a dns.google pin
+    # site, even though the hash is a live pin somewhere else.
+    ("WE1_BACK_IN_THE_DOH_FILE",
+     tree_with(DOH_RS, NL + '// "' + WE1_RETIRED + '", // WE1' + NL),
+     True, ["FAIL  2c: " + DOH_RS, "retired for dns.google",
+            "enforced_by names this file as a dns.google pin site"], []),
+
+    # ...and untouched in the file that pins birdo.app, where it is live. A rule
+    # that simply grepped every _removed hash would brick the API pin set; this
+    # is the case that says it must not.
+    ("WE1_STAYS_IN_THE_API_FILE", TREE, False,
+     ["ok    2c:"], ["FAIL  2c: " + CERT_PIN_RS]),
+
+    # Degrade honestly: an SSOT with nothing retired must say so, not print a
+    # green line that reads like coverage.
+    ("NO_RETIRED_RECORDS", TREE, False,
+     ["ok    2c: the SSOT records no retired pins"], ["FAIL"]),
+]
+
+
 def run():
     passed = failed = 0
 
@@ -398,6 +490,21 @@ def run():
     for name, host, e, observed, want_failed, needles, forbidden in LIVE_CASES:
         got_failed, lines = live_chain.analyse(e, host, observed)
         text = "\n".join(lines)
+        problems = []
+        if got_failed != want_failed:
+            problems.append("failed=%r, expected %r" % (got_failed, want_failed))
+        problems += ["output lacks %r" % n for n in needles if n not in text]
+        problems += ["output unexpectedly contains %r" % n for n in forbidden if n in text]
+        report(name, problems, text)
+
+    print()
+    print("== check 2c (cert_pins_retired.py) against %d trees ==" % len(RETIRED_CASES))
+    for name, files, want_failed, needles, forbidden in RETIRED_CASES:
+        doc = copy.deepcopy(BASE)
+        if name == "NO_RETIRED_RECORDS":
+            doc["_removed"] = []
+        got_failed, lines = retired.scan(doc, files)
+        text = chr(10).join(lines)
         problems = []
         if got_failed != want_failed:
             problems.append("failed=%r, expected %r" % (got_failed, want_failed))

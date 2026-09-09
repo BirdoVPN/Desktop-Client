@@ -43,6 +43,17 @@
 #                one fails, and a waived host that reaches two also fails, so
 #                the debt can neither spread silently nor rot into a permanent
 #                excuse.
+#   2c. RETIRED   a pin the SSOT has retired must not survive anywhere in this
+#                repo - not in a comment, a doc block or a test fixture. Check 2
+#                strips comments before it compares (so a dead pin in a comment
+#                cannot satisfy it), and that blind spot is real: the six Google
+#                sibling intermediates were removed from DOH_PROVIDERS on this
+#                branch while all six were still written out in a #[cfg(test)]
+#                block in the same file, and every check printed green. 2c reads
+#                raw text. scripts/cert_pins_retired.py, rules R1 (retired
+#                everywhere -> forbidden everywhere) and R2 (retired for a host,
+#                still live for another -> forbidden in the files the SSOT's
+#                enforced_by names as that host's pin sites).
 #   3.  LIVENESS  for every pinned host, the LIVE certificate chain is fetched
 #                and must contain at least one pinned SPKI. This is per-host:
 #                a host whose pins have all gone stale fails even if other
@@ -69,9 +80,10 @@
 # went dark on every GTS Root R4 edge, and it green-lit birdo.app (WE1 + GTS
 # Root R4) the same way. Counting pins answers the wrong question.
 #
-# WHERE THE LOGIC LIVES, AND WHY NOT HERE. Checks 2b and 3 call
-# scripts/cert_pins_lineages.py and scripts/cert_pins_live_chain.py rather than
-# an inline heredoc, so that scripts/test_check_cert_pins.py can run both
+# WHERE THE LOGIC LIVES, AND WHY NOT HERE. Checks 2b, 2c and 3 call
+# scripts/cert_pins_lineages.py, scripts/cert_pins_retired.py and
+# scripts/cert_pins_live_chain.py rather than an inline heredoc, so that
+# scripts/test_check_cert_pins.py can run them
 # against known-bad fixtures (the pre-outage dns.google shape, a stale waiver,
 # a chain that matches only a dormant pin, a shortened chain, Google's
 # cross-signed roots) and assert they FAIL. The Cert Pins workflow runs that
@@ -578,6 +590,14 @@ echo "=== 2b. live lineages per host (_enforcement_rule / _overlap_rule) ==="
 # a comment with a shell script around it. That file's header says why this
 # counts LINEAGES and not pins.
 "$PY" "$REPO_ROOT/scripts/cert_pins_lineages.py" "$SSOT"
+[ $? -ne 0 ] && FAILED=1
+
+echo
+echo "=== 2c. retired pins must not survive anywhere (SSOT _removed) ==="
+# Reads RAW text, comments included - the opposite of check 2, which strips them.
+# The pair is deliberate: check 2 must ignore a commented-out pin so it cannot
+# be used to satisfy the declaration, and 2c must see it so it cannot be kept.
+"$PY" "$REPO_ROOT/scripts/cert_pins_retired.py" "$SSOT" "$REPO_ROOT"
 [ $? -ne 0 ] && FAILED=1
 
 if [ "$OFFLINE" -eq 1 ]; then

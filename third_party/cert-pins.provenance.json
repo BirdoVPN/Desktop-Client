@@ -5,12 +5,12 @@
   "_merge_order": "upstream_commit_on_main is MEASURED by scripts/stamp-cert-pins-provenance.py (git merge-base --is-ancestor against birdo-shared origin/main) and cannot be written by hand without check 1 catching it on any checkout that has ../birdo-shared. While it is false, check 1b FAILS on every run, including CI: the consumer PR that vendors an unmerged SSOT branch stays red until the SSOT PR merges and this copy is re-vendored and re-stamped from main. That is the merge order, made mechanical.",
   "upstream_repo": "BirdoVPN/birdo-shared",
   "upstream_path": "cert-pins.json",
-  "upstream_commit": "44bbd3c8c254e90a231b77ad4a354426b677bc94",
-  "upstream_branch": "fix/dns-google-we2-gts-r4-pins",
-  "upstream_subject": "docs(cert-pins): record the Azure westus2 vantage from this PR's own live job",
-  "upstream_commit_on_main": false,
-  "upstream_main_ref": "origin/main@a1b7ee659cc3",
+  "upstream_commit": "9bca49306b40a117332b9bad3738952cdf6fe3c9",
+  "upstream_branch": "main",
+  "upstream_subject": "fix(cert-pins): pin both GTS hierarchies for dns.google â€” its pin set was dark on ECDSA edges (#3)",
+  "upstream_commit_on_main": true,
+  "upstream_main_ref": "origin/main@9bca49306b40",
   "upstream_main_fetched": true,
-  "vendored_on": "2026-09-08",
-  "canonical_sha256": "5eac90e2b611ffa48e5b0f4ebb969634c418c052dc019782cbb8aca10461f778"
+  "vendored_on": "2026-09-09",
+  "canonical_sha256": "84706c3f179639358fde01c317174c7e51134ceebc3a0f2bf28a9869c1be84ba"
 }

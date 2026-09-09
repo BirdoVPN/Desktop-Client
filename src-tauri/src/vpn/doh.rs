@@ -1086,54 +1086,35 @@ mod tests {
         }
     }
 
-    /// The three dns.google pin sets this repo has shipped or proposed, and
-    /// what counting PINS said about each versus what counting MEASURED
-    /// LINEAGES says. This is the evidence behind pinning exactly the four
-    /// measured hashes and not Google's six other published intermediates.
+    /// The two dns.google pin sets this repo has SHIPPED, and what counting
+    /// PINS said about each versus what counting MEASURED LINEAGES says.
+    ///
+    /// A third set was proposed on this branch and rejected by the owner on
+    /// 2026-09-06: ten pins, adding the six sibling issuing intermediates
+    /// Google publishes but has never been seen serving this host. Its six
+    /// hashes are deliberately NOT written down here. They live in exactly one
+    /// place in this repo — the SSOT's `_removed[]`, each `never_shipped: true`
+    /// with the reason — and `scripts/cert_pins_retired.py` (check 2c of
+    /// scripts/check-cert-pins.sh) fails the build if any of them reappears in
+    /// a file that pins the host they were removed from, comments and test
+    /// fixtures included. Copying a retired hash into a test to prove it is
+    /// retired is how a ten-pin set survives a `git grep`.
+    ///
+    /// What replaces that arm is the invariant the ten-pin set violated, stated
+    /// forwards instead of backwards: every dns.google pin must be one this
+    /// repo has MEASURED on the wire. A speculative sibling fails that the day
+    /// it is added, whether or not anyone remembers to retire it upstream.
     #[test]
     fn test_dns_google_lineage_count_is_what_the_pin_count_hid() {
         const WR2: &str = "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=";
         const R1: &str = "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=";
-        const WE2: &str = "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=";
-        const R4: &str = "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=";
-        // Google's other published issuing intermediates, SPKI-hashed on
-        // 2026-09-06 from https://i.pki.goog/{wr1,wr3,wr4,we1,we3,we4}.crt.
-        const SIBLINGS: &[&str] = &[
-            "yDu9og255NN5GEf+Bwa9rTrqFQ0EydZ0r1FCh9TdAW4=", // WR1
-            "OdSlmQD9NWJh4EbcOHBxkhygPwNSwA9Q91eounfbcoE=", // WR3
-            "hZe1OerqJ1Pnq6F4N0gVjjpHqm037Ndf4aLLVpZZdAE=", // WR4
-            "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=", // WE1
-            "daBIAnKdRIX3bqM85I6We7wBUh0DPycNFBMvYkXGX2Q=", // WE3
-            "O5TQDB/wa4SkRjBrQL2Aq9CG317H9MDDgpTVcrpJDa4=", // WE4
-        ];
 
         // Shipped until 2026-09-06: two pins, ONE lineage. `pins.len() >= 2`
         // was green; every ECDSA edge was dark.
         let pre_outage = [WR2, R1];
         assert_eq!(accepted_lineages("dns.google", &pre_outage), ["gts-r1"]);
 
-        // Proposed in an earlier revision of this change: ten pins, still TWO
-        // lineages. The six siblings appear in no measured chain, so they add
-        // nothing this test can see — and under the SSOT's _rotation_rule each
-        // would have been permanent in every enforcing client.
-        let mut ten: Vec<&str> = vec![WR2, R1, WE2, R4];
-        ten.extend_from_slice(SIBLINGS);
-        assert_eq!(accepted_lineages("dns.google", &ten), ["gts-r1", "gts-r4"]);
-        for (host, _, _, chain) in MEASURED_CHAINS {
-            if *host != "dns.google" {
-                continue;
-            }
-            for sibling in SIBLINGS {
-                assert!(
-                    !chain.contains(sibling),
-                    "{sibling} was observed in a measured dns.google chain — then it \
-                     is no longer speculative and belongs in the SSOT"
-                );
-            }
-        }
-
-        // Shipped now: the four measured pins, TWO lineages — the same coverage
-        // of every measured chain as the ten, with nothing unmeasured in it.
+        // Shipped now: four pins, TWO lineages — and nothing unmeasured in it.
         let shipped = pins_for_host("dns.google").expect("dns.google must be pinned");
         assert_eq!(
             shipped.len(),
@@ -1145,6 +1126,26 @@ mod tests {
             accepted_lineages("dns.google", shipped),
             ["gts-r1", "gts-r4"]
         );
+
+        // MEASURE-BEFORE-PIN, mechanically. Every shipped dns.google pin must
+        // appear in a chain this repo actually received (MEASURED_CHAINS).
+        // dns.google is the one host here with no dormant pin, and it must stay
+        // that way: a dormant pin on this host is the ten-pin shape returning.
+        for pin in shipped {
+            let seen = MEASURED_CHAINS
+                .iter()
+                .any(|(h, _, _, chain)| *h == "dns.google" && chain.contains(pin));
+            assert!(
+                seen,
+                "dns.google pin {pin} appears in no chain this repo has \
+                 measured. Pinning what a CA publishes rather than what it \
+                 serves is what the rejected ten-pin revision did, and under \
+                 the SSOT's _rotation_rule the pin would be permanent in every \
+                 installed client. Measure the chain, add it to MEASURED_CHAINS \
+                 with its vantage, and record the measurement in \
+                 birdo-shared/cert-pins.json — or do not pin it."
+            );
+        }
     }
 
     /// `api::doh_resolver` classifies a DoH failure by looking for

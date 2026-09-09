@@ -67,10 +67,13 @@ This client is built with defence-in-depth:
   `birdo.app` chain is ONE lineage (an intermediate and the root that signed
   it); the Let's Encrypt pins beside it are dormant backups that cover one
   specific migration, not a second live path. `scripts/check-cert-pins.sh`
-  enforces every pin set against the vendored SSOT on each PR and, daily,
-  checks that the live chain of every pinned host still matches — from the
-  single vantage point a CI runner has, which for anycast hosts is evidence
-  about one edge, not the host.
+  checks every pin set against the vendored SSOT on each PR, fails any pin the
+  SSOT has retired that survives anywhere in the tree (comments and test
+  fixtures included), and daily checks that the live chain of every pinned host
+  still matches — from the single vantage point a CI runner has, which for
+  anycast hosts is evidence about one edge, not the host. It reports; it does
+  not block: `main` carries no branch protection and no required status checks
+  (verified 2026-09-09), so a red run has to be read by a person.
 - **Credential storage** — auth tokens live in the OS credential store
   (Windows Credential Manager / macOS Keychain / Secret Service) via the
   `keyring` crate, wrapped in `Zeroizing` so old values are wiped from memory.

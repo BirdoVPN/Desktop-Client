@@ -42,6 +42,13 @@ name: Cert Pins
 #     (an intermediate plus its own root is one) unless the SSOT carries a
 #     dated waiver for it, regardless of which edge answers today.
 #
+#   * NOTHING HERE BLOCKS A MERGE. `main` has no branch protection and no
+#     required status checks (verified 2026-09-09 via the branch-protection and
+#     rulesets APIs: "Branch not protected", and the one ruleset is
+#     `enforcement: disabled`). Every gate in this workflow is advisory until a
+#     person reads the run. The dns.google outage was found by a red run of this
+#     very workflow that nobody acted on.
+#
 #   * Checks 2b and 3 trust the SSOT's own `lineage` / `in_live_chain` labels.
 #     Check 3 holds them against the one chain the runner saw; `cargo test`
 #     (vpn::doh::tests::test_ssot_live_lineage_flags_match_measured_chains)
@@ -57,6 +64,7 @@ on:
       - 'scripts/check-cert-pins.sh'
       - 'scripts/cert_pins_lineages.py'
       - 'scripts/cert_pins_live_chain.py'
+      - 'scripts/cert_pins_retired.py'
       - 'scripts/test_check_cert_pins.py'
       - 'scripts/stamp-cert-pins-provenance.py'
       - 'src-tauri/src/api/cert_pin.rs'
@@ -82,9 +90,10 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # --offline skips only check 3 (live chains). Checks 1b (provenance +
-      # merge order), 2 (divergence) and 2b (live lineages) all run here, on
-      # every PR that touches a pin file. Check 1 reports SKIP — see the note at
-      # the top.
+      # merge order), 2 (divergence), 2b (live lineages) and 2c (retired pins
+      # must not survive anywhere, comments and test fixtures included) all run
+      # here, on every PR that touches a pin file. Check 1 reports SKIP — see
+      # the note at the top.
       - name: check-cert-pins.sh --offline
         run: bash scripts/check-cert-pins.sh --offline
       # The checker against known-bad fixtures: the pre-outage dns.google shape
