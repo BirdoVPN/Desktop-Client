@@ -13,12 +13,60 @@ name: Cert Pins
 # which read only cert_pin.rs, never looked at the three DoH hosts, and failed
 # only when NONE of the pins in that one file matched — so a DoH provider that
 # had migrated CA passed clean.
+#
+# WHAT THIS WORKFLOW STILL DOES NOT COVER — read this before trusting a green run:
+#
+#   * Check 1 (vendored copy == birdo-shared/cert-pins.json) NEVER RUNS HERE.
+#     birdo-shared is private and this repo is public, so a runner has no
+#     credential to check it out, and `pull_request` runs from forks must not be
+#     given one. The script prints `SKIP` and a "PASSED — WITH SKIPS" summary
+#     instead of a clean "ALL CERT-PIN CHECKS PASSED", because a check that did
+#     not run is not a check that passed. Check 1b (the provenance stamp) is what
+#     covers this offline: it catches a hand-edit of the vendored copy, which is
+#     the failure that actually happened, and it enforces MERGE ORDER — the
+#     stamp records whether the vendored commit was on birdo-shared main, and
+#     this job is RED while it was not. A PR that vendors from an unmerged
+#     birdo-shared branch is therefore red until that branch merges and the
+#     copy is re-vendored from main; that is deliberate. What 1b still cannot
+#     see is birdo-shared moving ahead of us AFTER the stamp — only
+#     re-vendoring, or birdo-shared's own `vendor` job, does that.
+#
+#   * Check 3's liveness is SINGLE-VANTAGE. Every pinned host is anycast, so a
+#     runner sees ONE edge's chain, and the check goes green the moment any one
+#     pin matches. That is precisely how dns.google's set stayed green while it
+#     was half-empty: four dispatches on this workflow all passed on the legacy
+#     WR2 pin. Adding runner regions does not fix it either — you cannot choose
+#     an anycast edge. Check 3 now names the declared lineages it did NOT
+#     observe and holds the SSOT's flags against the chain it did see. Check 2b
+#     is the structural answer: it fails a pin set with a single live LINEAGE
+#     (an intermediate plus its own root is one) unless the SSOT carries a
+#     dated waiver for it, regardless of which edge answers today.
+#
+#   * NOTHING HERE BLOCKS A MERGE. `main` has no branch protection and no
+#     required status checks (verified 2026-09-09 via the branch-protection and
+#     rulesets APIs: "Branch not protected", and the one ruleset is
+#     `enforcement: disabled`). Every gate in this workflow is advisory until a
+#     person reads the run. The dns.google outage was found by a red run of this
+#     very workflow that nobody acted on.
+#
+#   * Checks 2b and 3 trust the SSOT's own `lineage` / `in_live_chain` labels.
+#     Check 3 holds them against the one chain the runner saw; `cargo test`
+#     (vpn::doh::tests::test_ssot_live_lineage_flags_match_measured_chains)
+#     holds them against every chain this repo has measured; and the self-test
+#     step below proves the checker still fails the shapes it exists to fail.
+#     None of that can see a mislabelled pin for a lineage nobody has measured.
 
 on:
   pull_request:
     paths:
       - 'third_party/cert-pins.json'
+      - 'third_party/cert-pins.provenance.json'
       - 'scripts/check-cert-pins.sh'
+      - 'scripts/cert_pins_lineages.py'
+      - 'scripts/cert_pins_live_chain.py'
+      - 'scripts/cert_pins_retired.py'
+      - 'scripts/test_check_cert_pins.py'
+      - 'scripts/stamp-cert-pins-provenance.py'
       - 'src-tauri/src/api/cert_pin.rs'
       - 'src-tauri/src/vpn/doh.rs'
       - 'app/src/main/java/app/birdo/vpn/di/NetworkModule.kt'
@@ -41,8 +89,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # --offline skips only check 3 (live chains). Checks 1b (provenance +
+      # merge order), 2 (divergence), 2b (live lineages) and 2c (retired pins
+      # must not survive anywhere, comments and test fixtures included) all run
+      # here, on every PR that touches a pin file. Check 1 reports SKIP — see
+      # the note at the top.
       - name: check-cert-pins.sh --offline
         run: bash scripts/check-cert-pins.sh --offline
+      # The checker against known-bad fixtures: the pre-outage dns.google shape
+      # (WR2 + GTS Root R1 live, one lineage) must FAIL check 2b, a stale or
+      # expired waiver must fail it, and check 3 must fail a chain that matches
+      # only a dormant pin or that arrives shortened - and must NOT fail
+      # Google's cross-signed roots. `if: always()` so it runs even when the
+      # step above is red: a broken checker must not hide behind a merge-order
+      # block.
+      - name: test_check_cert_pins.py (the checker against known-bad fixtures)
+        if: always()
+        run: python3 scripts/test_check_cert_pins.py
 
   liveness:
     name: Live chains still satisfy the pins

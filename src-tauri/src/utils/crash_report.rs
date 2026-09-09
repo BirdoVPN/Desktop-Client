@@ -142,6 +142,27 @@ pub fn never_sample_a_transaction(_ctx: &sentry::TransactionContext) -> f32 {
     0.0
 }
 
+/// Report a SECURITY-RELEVANT, non-panic condition to Sentry.
+///
+/// WHY THIS EXISTS. Crash reporting reached this app through the `panic`
+/// integration only: a condition that does not crash the process — a
+/// certificate-pin mismatch, say — was written with `tracing::error!` and went
+/// no further than the local log. `sentry` is built here WITHOUT the `tracing`
+/// feature and `main.rs` installs no sentry layer in the subscriber, so nothing
+/// bridges the two, and no amount of `tracing::error!` will ever leave the
+/// device. That is how a pin set can be dark in the field for as long as it
+/// takes somebody to ask a user for a log file.
+///
+/// CONTRACT FOR CALLERS — `message` must contain NO user data. It is a literal
+/// or a formatted string built only from compile-time constants and counts.
+/// Never pass a hostname being resolved, a server name, an IP, a path or an
+/// error string from the network stack. `scrub_event` sanitises what it can
+/// recognise, but the guarantee here is the caller's: this is an errors-only,
+/// PII-free channel by owner decision.
+pub fn report_security_event(message: &str) {
+    sentry::capture_message(message, sentry::Level::Error);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
