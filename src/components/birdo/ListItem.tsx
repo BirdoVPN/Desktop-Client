@@ -18,6 +18,15 @@ export interface BirdoListItemProps {
   onClick?: () => void;
   enabled?: boolean;
   className?: string;
+  /**
+   * When the row itself is the control (BirdoToggleRow), it carries the
+   * switch semantics so there is exactly ONE interactive element: a row
+   * `<button>` wrapping a switch `<button>` is invalid HTML, gives keyboard
+   * users two tab stops for one setting, and needed a stopPropagation hack to
+   * avoid toggling twice.
+   */
+  role?: 'switch';
+  ariaChecked?: boolean;
 }
 
 export function BirdoListItem({
@@ -29,11 +38,15 @@ export function BirdoListItem({
   onClick,
   enabled = true,
   className = '',
+  role,
+  ariaChecked,
 }: BirdoListItemProps) {
   const Wrapper = onClick && enabled ? 'button' : 'div';
   return (
     <Wrapper
       type={Wrapper === 'button' ? 'button' : undefined}
+      role={role}
+      aria-checked={role === 'switch' ? ariaChecked : undefined}
       onClick={onClick && enabled ? onClick : undefined}
       className={`flex w-full items-center gap-3.5 overflow-hidden rounded-birdo-md px-3.5 py-3 text-left ${
         onClick && enabled ? 'transition-colors hover:bg-white/5' : ''
@@ -94,14 +107,10 @@ export function BirdoToggleRow({
       leadingIcon={leadingIcon}
       leadingTint={leadingTint}
       enabled={enabled}
+      role="switch"
+      ariaChecked={checked}
       onClick={enabled ? () => onCheckedChange(!checked) : undefined}
-      trailing={
-        <BirdoSwitch
-          checked={checked}
-          onChange={(v) => enabled && onCheckedChange(v)}
-          disabled={!enabled}
-        />
-      }
+      trailing={<BirdoSwitchKnob checked={checked} disabled={!enabled} />}
     />
   );
 }
@@ -158,19 +167,17 @@ export interface BirdoSwitchProps {
   ariaLabel?: string;
 }
 
-export function BirdoSwitch({ checked, onChange, disabled = false, ariaLabel }: BirdoSwitchProps) {
+/**
+ * The switch's appearance alone -- no semantics, no handlers. Used inside
+ * BirdoToggleRow, where the ROW is the switch; the knob just shows its state.
+ */
+export function BirdoSwitchKnob({ checked, disabled = false }: { checked: boolean; disabled?: boolean }) {
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={ariaLabel}
-      disabled={disabled}
-      onClick={(e) => {
-        e.stopPropagation();
-        if (!disabled) onChange(!checked);
-      }}
-      className="relative inline-flex h-[28px] w-[48px] shrink-0 cursor-pointer items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+    <span
+      aria-hidden
+      className={`relative inline-flex h-[28px] w-[48px] shrink-0 items-center rounded-full transition-colors ${
+        disabled ? 'opacity-40' : ''
+      }`}
       style={{
         backgroundColor: checked ? brand.accent : white.w10,
         border: `1px solid ${checked ? 'transparent' : hairline.soft}`,
@@ -183,6 +190,25 @@ export function BirdoSwitch({ checked, onChange, disabled = false, ariaLabel }: 
           backgroundColor: checked ? '#FFFFFF' : white.w60,
         }}
       />
+    </span>
+  );
+}
+
+/** A standalone switch control (its own button). Not for use inside a clickable row. */
+export function BirdoSwitch({ checked, onChange, disabled = false, ariaLabel }: BirdoSwitchProps) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      onClick={() => {
+        if (!disabled) onChange(!checked);
+      }}
+      className="cursor-pointer disabled:cursor-not-allowed"
+    >
+      <BirdoSwitchKnob checked={checked} disabled={disabled} />
     </button>
   );
 }
