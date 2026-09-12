@@ -89,11 +89,11 @@ const mockedInvoke = vi.mocked(invoke);
 // The Settings screen is now a single scrollable list (no tabs); the Speed
 // Test section's "Run" button is rendered directly.
 async function renderToolsTab() {
-  await act(async () => {
-    render(<Settings />);
-    await Promise.resolve();
-    await Promise.resolve();
-  });
+  // RTL's render and userEvent are already act-aware; wrapping them in a
+  // manual act() nests two act scopes and RTL flips the act environment off
+  // inside its own wrapper, which is what produced "The current testing
+  // environment is not configured to support act(...)" on every click.
+  render(<Settings />);
   await waitFor(() => {
     expect(screen.getByText('Run')).toBeInTheDocument();
   });
@@ -136,10 +136,7 @@ describe('Speed Test section', () => {
       Promise.resolve({ downloadMbps: 95.3, uploadMbps: 42.1, latencyMs: 12 });
 
     await renderToolsTab();
-    await act(async () => {
-      await userEvent.click(screen.getByText('Run'));
-      await Promise.resolve();
-    });
+    await userEvent.click(screen.getByText('Run'));
 
     await waitFor(() => {
       expect(mockedInvoke).toHaveBeenCalledWith('run_speed_test_command');
@@ -154,9 +151,7 @@ describe('Speed Test section', () => {
 
     await renderToolsTab();
     const btn = screen.getByText('Run');
-    await act(async () => {
-      await userEvent.click(btn);
-    });
+    await userEvent.click(btn);
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /running/i })).toBeDisabled();
@@ -174,10 +169,7 @@ describe('Speed Test section', () => {
       Promise.resolve({ downloadMbps: 95.3, uploadMbps: 42.1, latencyMs: 12 });
 
     await renderToolsTab();
-    await act(async () => {
-      await userEvent.click(screen.getByText('Run'));
-      await Promise.resolve();
-    });
+    await userEvent.click(screen.getByText('Run'));
 
     await waitFor(() => {
       expect(
@@ -195,10 +187,7 @@ describe('Speed Test section', () => {
       Promise.resolve({ downloadMbps: 50.0, uploadMbps: 25.0, latencyMs: 20 });
 
     await renderToolsTab();
-    await act(async () => {
-      await userEvent.click(screen.getByText('Run'));
-      await Promise.resolve();
-    });
+    await userEvent.click(screen.getByText('Run'));
 
     await waitFor(() => {
       expect(screen.getByText('Run')).not.toBeDisabled();
@@ -209,10 +198,7 @@ describe('Speed Test section', () => {
     speedTestImpl = () => Promise.reject(new Error('Network error'));
 
     await renderToolsTab();
-    await act(async () => {
-      await userEvent.click(screen.getByText('Run'));
-      await Promise.resolve();
-    });
+    await userEvent.click(screen.getByText('Run'));
 
     await waitFor(() => {
       expect(screen.getByText('Run')).not.toBeDisabled();
