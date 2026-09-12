@@ -5,17 +5,14 @@
 # In v2 vulnerabilities are always denied; this lists advisories we've reviewed
 # and consciously accept (with justification + a review-by date).
 ignore = [
-    # RUSTSEC-2025-0009: aes may panic when overflow-checking is enabled. The
-    # shipped client is a release build (overflow-checks off), so this is a
-    # debug-only panic, not a release vulnerability.
-    "RUSTSEC-2025-0009",
-
     # RUSTSEC-2026-0194 / -0195: quick-xml quadratic duplicate-attribute check /
-    # unbounded namespace allocation. Both reachable only via tauri's transitive
-    # chains (tauri-winrt-notification renders OUR notification XML; plist in
-    # tauri-utils/tauri-build parses build-time files) — never attacker-supplied
-    # XML. Fixed by quick-xml >= 0.41, which upstream tauri deps have not adopted
-    # yet. Review-by: 2026-09-01.
+    # unbounded namespace allocation. 2026-09-12: the plist chain (tauri-utils /
+    # tauri-build, build-time files) is FIXED — plist 1.10 pulls quick-xml 0.41.
+    # The one chain left is tauri-plugin-notification -> notify-rust ->
+    # tauri-winrt-notification 0.7 -> quick-xml 0.37, which renders OUR Windows
+    # toast XML from our own strings — never attacker-supplied XML. notify-rust
+    # (4.18.0, latest) still pins tauri-winrt-notification ^0.7, so nothing on
+    # our side can move it. Review-by: 2026-12-01 (re-check notify-rust's pin).
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]
