@@ -2,22 +2,17 @@
 # UNIFIED release workflow — Windows + Linux + macOS build TOGETHER and
 # publish into ONE draft GitHub Release from a SINGLE tag (v*.*.* e.g. v1.4.16).
 #
-# This supersedes the three separate per-platform pipelines:
-#   - build-windows.yml (trigger win-v*)
-#   - build-linux.yml   (trigger linux-v*)
-#   - build-macos.yml   (workflow_dispatch only, PAUSED)
+# This superseded the three separate per-platform pipelines
+# (build-windows.yml, build-linux.yml, build-macos.yml). All three are GONE:
+# build-macos.yml first, build-windows.yml and build-linux.yml on 2026-09-13
+# (OPEN-WORK F16) — they had lost their tag triggers but still carried full
+# build+sign+release steps that nothing exercised, a second release path to
+# keep in step by hand. This file is the only release pipeline; for a manual
+# single-platform build use workflow_dispatch here.
 #
-# ACTION REQUIRED (not done by this commit): those three files still have
-# their OLD tag triggers wired up (win-v*/linux-v*). To avoid double-building
-# and double-releasing if someone pushes an old-style tag, they should be
-# either deleted or have their `push.tags` trigger removed (workflow_dispatch
-# can stay, for manual single-platform debugging). See PR description /
-# accompanying notes for the exact list.
-#
-# Each build job below is a faithful copy of the corresponding job from the
-# file it replaces (same steps, same pinned action SHAs, same env, same
-# signing/attestation behavior). Only the job ids/names and the top-level
-# trigger/env/concurrency and the final release job are new.
+# Each build job below started as a faithful copy of the corresponding job
+# from the file it replaced (same steps, pinned action SHAs, env,
+# signing/attestation behaviour).
 # ============================================================================
 
 name: Release (Windows + Linux + macOS)
@@ -212,7 +207,7 @@ jobs:
         run: cargo test --lib
 
   # ══════════════════════════════════════════════════════════════════════
-  # WINDOWS — faithful copy of build-windows.yml's `build` job.
+  # WINDOWS — began as a faithful copy of the retired build-windows.yml `build` job.
   # Authenticode (Azure OIDC Trusted Signing) + Sigstore + updater .sig.
   # ══════════════════════════════════════════════════════════════════════
   build-windows:
@@ -528,7 +523,7 @@ jobs:
           retention-days: 30
 
   # ══════════════════════════════════════════════════════════════════════
-  # LINUX — faithful copy of build-linux.yml's `build-linux` job.
+  # LINUX — began as a faithful copy of the retired build-linux.yml `build-linux` job.
   # AppImage + .deb + the minisign updater .sig. Checksums + Sigstore are
   # produced once, in the release job, over the final asset names.
   # ══════════════════════════════════════════════════════════════════════

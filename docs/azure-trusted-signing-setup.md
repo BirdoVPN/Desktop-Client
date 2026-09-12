@@ -2,7 +2,7 @@
 
 Azure Trusted Signing (formerly known as Azure Code Signing) provides
 Authenticode signatures for Windows EXE and MSI installers. The CI/CD
-pipeline in `build-windows.yml` uses OIDC federation, so **no client
+pipeline (the Windows job of `release.yml`) uses OIDC federation, so **no client
 secrets are ever stored in GitHub**.
 
 ---

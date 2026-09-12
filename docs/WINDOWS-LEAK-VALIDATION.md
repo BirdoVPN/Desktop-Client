@@ -62,10 +62,16 @@ on-device verification that a failed connect never strands IPv6 blocked and that
 DNS restore stays symmetric.
 
 ### B1. Block IPv6 at the *start* of `tunnel.rs::start()` (finding #10)
-Today `block_ipv6_leaks()` runs **last** in `start()`, so IPv6 stays routable on
-the physical adapter for the whole tunnel-setup window (configure_adapter →
-routes → dns). Under reactive mode (lockdown off) that is a real sub-second IPv6
-leak below the tunnel.
+> **Shipped** (LEAK-2, `tunnel.rs::start()` — IPv6 is blocked before any
+> network setup and stays blocked for the tunnel-setup window; failed connects
+> lift it via `lift_ipv6_block_after_failed_connect()`). The description below
+> is the finding as it was; the checkboxes are the device verification that
+> has still not been run.
+
+Before LEAK-2, `block_ipv6_leaks()` ran **last** in `start()`, so IPv6 stayed
+routable on the physical adapter for the whole tunnel-setup window
+(configure_adapter → routes → dns). Under reactive mode (lockdown off) that was
+a real sub-second IPv6 leak below the tunnel.
 
 - Implement: call `wfp::block_ipv6()` as the **first** network step in `start()`.
   For dual-stack nodes (`config.client_ipv6.is_some()`) call `unblock_ipv6()`
@@ -78,10 +84,14 @@ leak below the tunnel.
 - [ ] Dual-stack node (if/when deployed) still routes IPv6 through the tunnel.
 
 ### B2. Mirror SMHNR DNS suppression on IPv6 (finding #11)
-The DNS-disable loop (`tunnel.rs` ~1263) only runs `netsh interface ip set dns`
-(IPv4) on non-VPN adapters. On a dual-stack adapter the IPv6 resolvers stay
-active, a latent AAAA DNS leak. (Largely masked today because nodes are IPv4-only
-and IPv6 is blocked, but should be symmetric.)
+> **Shipped** (the IPv6 DNS snapshot/restore is symmetric —
+> `win_machine_state.rs` snapshots and restores IPv6 resolvers, including the
+> RA/RDNSS link-local case). The description below is the finding as it was;
+> the checkboxes are the device verification that has still not been run.
+
+Before the fix, the DNS-disable loop only ran `netsh interface ip set dns`
+(IPv4) on non-VPN adapters, so on a dual-stack adapter the IPv6 resolvers
+stayed active — a latent AAAA DNS leak, masked while nodes were IPv4-only.
 
 - Implement: also run `netsh interface ipv6 set dns name=<adapter> static none
   validate=no`; capture IPv6 DNS in `snapshot_adapter_dns` and restore it in

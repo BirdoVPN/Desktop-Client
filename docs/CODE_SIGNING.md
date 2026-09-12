@@ -72,7 +72,8 @@ See [VERIFICATION.md](./VERIFICATION.md) for detailed instructions.
 
 ## CI Configuration
 
-The `build-windows.yml` and `build-macos.yml` workflows handle signing automatically:
+The `release.yml` workflow (the single release pipeline; the per-platform
+`build-*.yml` files were retired) handles signing automatically:
 
 | Trigger | Action |
 |---------|--------|

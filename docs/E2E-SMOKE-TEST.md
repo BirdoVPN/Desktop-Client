@@ -14,11 +14,15 @@ installing the signed `win-v1.3.x` build, **as Administrator**. Tick each box.
 - [ ] Login works (email + password). 2FA challenge appears for a 2FA account and verifies.
 - [ ] Anonymous login creates/loads a device account.
 
-## 1. Kill switch — ALWAYS ON (highest priority)
-- [ ] Settings -> Security: **Kill Switch shows "Always on", toggle is locked off-limits** (cannot be disabled).
+## 1. Kill switch — ON BY DEFAULT (highest priority)
+- [ ] Settings -> Security: **Kill Switch is ON** on a fresh install. It IS
+      user-toggleable — turning it off shows a confirm dialog explaining the leak
+      risk (`Settings.tsx`; `settings.rs`: "user turned it off — must be
+      respected"). Turning it off and confirming must work; a tester who files
+      "the toggle can be disabled" is filing correct behaviour.
 - [ ] Connect to any server. Pull the network / kill the tunnel process abruptly -> **internet is fully blocked** (no leak): `ping 1.1.1.1` fails, browser fails.
 - [ ] Now click **Disconnect** deliberately -> **internet returns** (kill switch releases on intentional disconnect).
-- [ ] Restart the app while disconnected -> kill-switch row still locked on; settings file shows `killswitch_enabled: true` even if hand-edited to false.
+- [ ] Restart the app while disconnected -> the kill-switch state persists exactly as the user left it (on stays on; a deliberate off stays off).
 
 ## 2. Connect / disconnect / stats (single-hop)
 - [ ] Quick-connect connects; status pill shows **Protected**; live up/down/duration stats tick.

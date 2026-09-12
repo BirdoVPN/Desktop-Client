@@ -104,8 +104,8 @@ gh secret list --repo BirdoVPN/Desktop-Client | grep SENTRY_DSN
 | CI `release.yml` → `build-windows` | **Yes** | job-level `env` |
 | CI `release.yml` → `build-linux` (matrix) | **Yes** | job-level `env` |
 | CI `release.yml` → `build-macos` (matrix, signed **and** unsigned-fallback steps) | **Yes** | job-level `env` — this job has **two** `tauri build` steps, which is exactly why the env is at job level |
-| CI `build-windows.yml` → `build` | **Yes** | job-level `env` |
-| CI `build-linux.yml` → `build-linux` | **Yes** | job-level `env` |
+| CI `release.yml` → Windows job | **Yes** | job-level `env` |
+| CI `release.yml` → Linux job | **Yes** | job-level `env` |
 | `release` jobs in all three workflows | N/A | they download and publish artifacts; they never compile |
 
 ## 4. Local development
