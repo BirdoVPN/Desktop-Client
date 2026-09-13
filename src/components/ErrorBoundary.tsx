@@ -43,12 +43,12 @@ export class ErrorBoundary extends Component<Props, State> {
           {this.state.errorMessage && (
             <details className="max-w-md text-center text-xs text-white/60">
               <summary className="cursor-pointer">Details</summary>
-              <p className="mt-2 break-words">{this.state.errorMessage}</p>
+              <p className="mt-2 wrap-break-word">{this.state.errorMessage}</p>
             </details>
           )}
           <button
             onClick={this.handleReset}
-            className="rounded bg-white/10 px-4 py-2 text-sm hover:bg-white/20"
+            className="rounded-sm bg-white/10 px-4 py-2 text-sm hover:bg-white/20"
           >
             Try again
           </button>

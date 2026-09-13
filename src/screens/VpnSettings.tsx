@@ -311,7 +311,7 @@ export function VpnSettings() {
               className="flex w-full items-center gap-3 rounded-birdo-sm px-3 py-2 text-left"
             >
               <span
-                className="flex h-4 w-4 shrink-0 items-center justify-center rounded border-2"
+                className="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border-2"
                 style={{
                   borderColor: mtuAuto ? white.w100 : white.w40,
                   backgroundColor: mtuAuto ? white.w100 : 'transparent',

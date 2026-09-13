@@ -44,7 +44,7 @@ export function AppShell() {
   const showNav = navStack.length === 0;
 
   return (
-    <div className="relative z-10 mx-auto flex h-full w-full min-w-phone max-w-phone flex-col overflow-hidden">
+    <div className="relative z-10 mx-auto flex h-full w-full min-w-phone-min max-w-phone flex-col overflow-hidden">
       {/* Tab root */}
       <div className="relative flex-1 overflow-hidden">
         {tab === 'home' && <Dashboard />}

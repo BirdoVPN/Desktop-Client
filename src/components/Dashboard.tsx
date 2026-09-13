@@ -5,7 +5,7 @@
  *  - Full-bleed WorldGlobe background (auto-rotates when not connected)
  *  - HomeTopBar: multi-hop toggle (left) + brand mark + email + logout (right)
  *  - Floating <StatusPill/> below the top bar
- *  - Bottom translucent rounded-t-[24px] panel: stats (when connected) →
+ *  - Bottom translucent rounded-t-birdo-xl panel: stats (when connected) →
  *    admin banner → error banner → server selector (single, or Entry/Exit pair
  *    when multi-hop is armed) → compact connect button
  *  - Server picker is a modal bottom sheet (not a separate tab)
@@ -1008,7 +1008,7 @@ export function Dashboard() {
         <div className="flex-1" />
         {/* Bottom panel */}
         <div
-          className="pointer-events-auto rounded-t-[24px] px-5 pt-4 pb-4"
+          className="pointer-events-auto rounded-t-birdo-xl px-5 pt-4 pb-4"
           style={{
             // Near-opaque fill instead of backdrop-filter blur — the blur
             // shader smears the repainting globe canvas into vertical streaks

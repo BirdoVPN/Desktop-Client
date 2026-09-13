@@ -47,7 +47,7 @@ export function BottomNav() {
             style={{ color: active ? brand.accent : white.w60 }}
           >
             <Icon size={22} strokeWidth={active ? 2.4 : 2} />
-            <span className="text-[10px] font-medium tracking-[0.05em]">{label}</span>
+            <span className="text-[10px] font-medium tracking-wider">{label}</span>
           </button>
         );
       })}
