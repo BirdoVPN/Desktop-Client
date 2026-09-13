@@ -1,9 +1,115 @@
 /* L-4: Import locally bundled Inter font (no Google Fonts CDN) */
-@import './fonts.css';
+@import './fonts.css' layer(base);
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@theme {
+  --color-primary-50: #ecfdf5;
+  --color-primary-100: #d1fae5;
+  --color-primary-200: #a7f3d0;
+  --color-primary-300: #6ee7b7;
+  --color-primary-400: #34d399;
+  --color-primary-500: #10b981;
+  --color-primary-600: #059669;
+  --color-primary-700: #047857;
+  --color-primary-800: #065f46;
+  --color-primary-900: #064e3b;
+  --color-primary-950: #022c22;
+
+  --font-sans: Inter, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius-birdo-xs: 6px;
+  --radius-birdo-sm: 10px;
+  --radius-birdo-md: 14px;
+  --radius-birdo-lg: 18px;
+  --radius-birdo-card: 16px;
+  --radius-birdo-sub: 12px;
+  --radius-birdo-xl: 24px;
+
+  /* max-w-phone / min-w-phone-min (AppShell): v4 keys both on --container-* */
+  --container-phone: 420px;
+  --container-phone-min: 360px;
+
+  --animate-spin-slow: spin 3s linear infinite;
+  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-birdo-pulse-ring-3x: birdo-pulse-ring 1100ms linear 3 forwards;
+
+  @keyframes birdo-pulse-ring {
+    0% {
+      transform: scale(1);
+      opacity: 0.6;
+    }
+    100% {
+      transform: scale(2);
+      opacity: 0;
+    }
+  }
+}
+
+
+/*
+  Birdo design tokens as utilities (bg-birdo-s0, text-w60, border-birdo-hairline…).
+  `inline` so each utility emits `var(--w60)` itself instead of a theme variable
+  that merely points at it — the runtime tokens below stay the single source
+  of truth and any future per-subtree override keeps working. One --color-*
+  namespace in v4: the v3 split into backgroundColor / textColor / borderColor
+  no longer exists, so every token here is usable with any colour utility.
+*/
+@theme inline {
+  --color-birdo-black: var(--birdo-black);
+  --color-birdo-s0: var(--birdo-s0);
+  --color-birdo-s1: var(--birdo-s1);
+  --color-birdo-s2: var(--birdo-s2);
+  --color-birdo-s3: var(--birdo-s3);
+  --color-birdo-accent-bg: var(--birdo-accent-bg);
+  --color-birdo-green-bg: var(--birdo-green-bg);
+  --color-birdo-red-bg: var(--birdo-red-bg);
+  --color-birdo-primary: var(--birdo-primary);
+  --color-birdo-on-primary: var(--birdo-on-primary);
+  --color-birdo-accent: var(--birdo-accent);
+  --color-birdo-accent-soft: var(--birdo-accent-soft);
+  --color-birdo-green: var(--birdo-green);
+  --color-birdo-hairline: var(--birdo-hairline);
+  --color-birdo-hairline-soft: var(--birdo-hairline-soft);
+  --color-w100: var(--w100);
+  --color-w80: var(--w80);
+  --color-w60: var(--w60);
+  --color-w40: var(--w40);
+  --color-w20: var(--w20);
+  --color-w10: var(--w10);
+  --color-w06: var(--w06);
+  --color-w05: var(--w05);
+  --color-w04: var(--w04);
+  --color-w03: var(--w03);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+/* v4 preflight sets `cursor: default` on buttons (v3 set `pointer`); 55 buttons
+   in this app were relying on the v3 default. Keep the hand cursor. */
+@layer base {
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}
 
 :root {
   --color-primary: 16 185 129;
@@ -58,55 +164,66 @@
   --birdo-hairline-soft: rgba(255, 255, 255, 0.08);
 }
 
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
+/*
+  App-level resets and element defaults live in `@layer base` (Tailwind's own
+  preflight layer). Under v4 every utility is in `@layer utilities`, and an
+  UNLAYERED rule beats a layered one whatever its specificity — so the old
+  unlayered `* { margin: 0; padding: 0 }` silently zeroed every padding and
+  margin utility (caught in the v3→v4 screenshot diff). Class-based component rules
+  further down stay unlayered on purpose: they came after `@tailwind utilities`
+  in v3 and won on order, and unlayered-beats-layered keeps that outcome.
+*/
+@layer base {
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
 
-html, body, #root {
-  height: 100%;
-}
+  html, body, #root {
+    height: 100%;
+  }
 
-body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background: var(--background);
-  color: var(--foreground);
-  overflow: hidden;
-  user-select: none;
-  -webkit-user-select: none;
-}
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--background);
+    color: var(--foreground);
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
 
-/* Custom scrollbar */
-::-webkit-scrollbar {
-  width: 6px;
-}
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
 
-::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 3px;
-}
+  ::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 3px;
+  }
 
-::-webkit-scrollbar-thumb {
-  background: rgba(16, 185, 129, 0.5);
-  border-radius: 3px;
-}
+  ::-webkit-scrollbar-thumb {
+    background: rgba(16, 185, 129, 0.5);
+    border-radius: 3px;
+  }
 
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(16, 185, 129, 0.7);
-}
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(16, 185, 129, 0.7);
+  }
 
-/* Titlebar drag region */
-[data-tauri-drag-region] {
-  -webkit-app-region: drag;
-}
+  /* Titlebar drag region */
+  [data-tauri-drag-region] {
+    -webkit-app-region: drag;
+  }
 
-button {
-  -webkit-app-region: no-drag;
-}
+  button {
+    -webkit-app-region: no-drag;
+  }
 
-input {
-  -webkit-app-region: no-drag;
+  input {
+    -webkit-app-region: no-drag;
+  }
 }
 
 /* Connection status animations */
@@ -420,21 +537,23 @@ input {
   }
 }
 
-/* Focus-visible: keyboard-nav ring for non-text controls (buttons, links).
-   A clean emerald ring — only shows for keyboard users, never on mouse click. */
-:focus-visible {
-  outline: 2px solid rgba(16, 185, 129, 0.7);
-  outline-offset: 2px;
-}
+@layer base {
+  /* Focus-visible: keyboard-nav ring for non-text controls (buttons, links).
+     A clean emerald ring — only shows for keyboard users, never on mouse click. */
+  :focus-visible {
+    outline: 2px solid rgba(16, 185, 129, 0.7);
+    outline-offset: 2px;
+  }
 
-/* Text fields glow softly in brand emerald on focus instead of a hard outline. */
-input:focus-visible,
-textarea:focus-visible {
-  outline: none;
-  border-color: rgba(16, 185, 129, 0.55);
-  box-shadow:
-    0 0 0 3px rgba(16, 185, 129, 0.16),
-    0 0 18px -2px rgba(16, 185, 129, 0.42);
+  /* Text fields glow softly in brand emerald on focus instead of a hard outline. */
+  input:focus-visible,
+  textarea:focus-visible {
+    outline: none;
+    border-color: rgba(16, 185, 129, 0.55);
+    box-shadow:
+      0 0 0 3px rgba(16, 185, 129, 0.16),
+      0 0 18px -2px rgba(16, 185, 129, 0.42);
+  }
 }
 
 /* BirdoTextField wraps its <input> in a styled shell that carries the focus

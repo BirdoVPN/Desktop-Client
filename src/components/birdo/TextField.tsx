@@ -100,7 +100,7 @@ export function BirdoTextField({
           aria-label={ariaLabel ?? label}
           aria-invalid={error ? 'true' : undefined}
           autoComplete={autoComplete}
-          className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[color:var(--placeholder)] disabled:cursor-not-allowed"
+          className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-hidden placeholder:text-(--placeholder) disabled:cursor-not-allowed"
           style={{
             color: focused ? white.w100 : white.w80,
             // expose placeholder color to the pseudo-element (raised to ~0.45 so

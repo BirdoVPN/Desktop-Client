@@ -184,7 +184,7 @@ export function BirdoSwitchKnob({ checked, disabled = false }: { checked: boolea
       }}
     >
       <span
-        className="inline-block h-[22px] w-[22px] transform rounded-full bg-white shadow transition-transform"
+        className="inline-block h-[22px] w-[22px] transform rounded-full bg-white shadow-sm transition-transform"
         style={{
           transform: checked ? 'translateX(22px)' : 'translateX(2px)',
           backgroundColor: checked ? '#FFFFFF' : white.w60,

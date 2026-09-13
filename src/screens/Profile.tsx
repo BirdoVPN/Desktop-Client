@@ -361,7 +361,7 @@ function IdentityCard({ email, plan, isAnon }: IdentityCardProps) {
         {/* User avatar — initial on the plan-tinted gradient (the brand mark is
             the window's title bar; this slot represents the signed-in user). */}
         <div
-          className="flex h-14 w-14 shrink-0 items-center justify-center rounded-[18px] text-[22px] font-bold text-white"
+          className="flex h-14 w-14 shrink-0 items-center justify-center rounded-birdo-lg text-[22px] font-bold text-white"
           style={{
             backgroundImage: planGradient(planLabel),
             boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.18)',

@@ -29,7 +29,7 @@ export function TitleBar() {
 
   return (
     <div
-      className="relative z-[100] flex h-8 shrink-0 select-none items-center justify-between border-b border-white/[0.06] px-2.5"
+      className="relative z-100 flex h-8 shrink-0 select-none items-center justify-between border-b border-white/6 px-2.5"
       // No backdrop-filter: a blur() that samples the continuously-repainting
       // globe canvas behind it smears into vertical "stretched line" streaks on
       // many WebView2 GPUs. A near-opaque solid fill reads the same and is safe.
@@ -52,7 +52,7 @@ export function TitleBar() {
           onClick={() => {
             win.minimize().catch((e) => console.error('Failed to minimize window:', e));
           }}
-          className="flex h-6 w-7 items-center justify-center rounded text-white/45 transition-colors hover:bg-white/10 hover:text-white/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+          className="flex h-6 w-7 items-center justify-center rounded-sm text-white/45 transition-colors hover:bg-white/10 hover:text-white/90 focus:outline-hidden focus-visible:ring-1 focus-visible:ring-white/40"
         >
           <Minus size={13} strokeWidth={2.5} />
         </button>
@@ -66,7 +66,7 @@ export function TitleBar() {
             // directly here — that skips the re-arm (see header comment).
             win.close().catch((e) => console.error('Failed to close window to tray:', e));
           }}
-          className="flex h-6 w-7 items-center justify-center rounded text-white/45 transition-colors hover:bg-red-500/80 hover:text-white focus:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+          className="flex h-6 w-7 items-center justify-center rounded-sm text-white/45 transition-colors hover:bg-red-500/80 hover:text-white focus:outline-hidden focus-visible:ring-1 focus-visible:ring-white/40"
         >
           <X size={13} strokeWidth={2.5} />
         </button>

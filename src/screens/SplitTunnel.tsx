@@ -326,7 +326,7 @@ export function SplitTunnel() {
                     onKeyDown={handleInputKeyDown}
                     placeholder="e.g. chrome.exe"
                     aria-label="App path or name"
-                    className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-w40"
+                    className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-hidden placeholder:text-w40"
                     style={{ color: white.w100 }}
                   />
                 </div>
@@ -522,7 +522,7 @@ export function SplitTunnel() {
                         setPickerOpen(false);
                       }}
                       title={app.path}
-                      className="flex w-full items-center gap-3 rounded-birdo-md px-3.5 py-2.5 text-left transition-colors hover:bg-white/[0.06] disabled:opacity-50"
+                      className="flex w-full items-center gap-3 rounded-birdo-md px-3.5 py-2.5 text-left transition-colors hover:bg-white/6 disabled:opacity-50"
                       style={{ backgroundColor: white.w04, border: `1px solid ${hairline.soft}` }}
                     >
                       <AppIconMark size={32} />

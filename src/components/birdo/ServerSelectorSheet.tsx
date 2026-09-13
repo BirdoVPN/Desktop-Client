@@ -170,7 +170,7 @@ export function ServerSelectorSheet({
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="Search by country or city"
                   aria-label="Search servers"
-                  className="w-full rounded-xl py-3 pl-9 pr-9 text-sm outline-none transition"
+                  className="w-full rounded-xl py-3 pl-9 pr-9 text-sm outline-hidden transition"
                   style={{
                     // Solid well (matches the login fields) — the ~5% white fill
                     // let the background grid bleed through.

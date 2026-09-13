@@ -463,7 +463,7 @@ export function Login() {
                 required
                 maxLength={19}
                 autoFocus
-                className="w-full rounded-birdo-sub px-4 py-3 text-center text-2xl tracking-[0.3em] outline-none"
+                className="w-full rounded-birdo-sub px-4 py-3 text-center text-2xl tracking-[0.3em] outline-hidden"
                 style={{
                   backgroundColor: white.w04,
                   border: `1px solid ${hairline.soft}`,
