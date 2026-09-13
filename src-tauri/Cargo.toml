@@ -74,7 +74,7 @@ socket2 = "0.5"
 
 # Crypto (for WireGuard)
 # Note: Using versions compatible with boringtun
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 blake2 = "0.10"
 sha2 = "0.10"  # DLL integrity verification (already a transitive dep via tauri)
 hmac = "0.12"  # FIX-1-7: Settings file HMAC integrity
