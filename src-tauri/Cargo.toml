@@ -56,7 +56,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], defa
 # custom ClientConfig type matches `use_preconfigured_tls`.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 # Socket configuration (for buffer sizes)
 socket2 = "0.5"
@@ -72,10 +72,10 @@ socket2 = "0.5"
 # left every platform unable to remember a login. Backends are declared per
 # target so each OS links its real keystore and nothing else.
 
-# Crypto (for WireGuard)
-# Note: Using versions compatible with boringtun
-chacha20poly1305 = "0.10"
-blake2 = "0.10"
+# Crypto. WireGuard's ChaCha20-Poly1305 / BLAKE2s live INSIDE boringtun; the
+# app never calls them directly, so they are not declared here (F19, 2026-09-13:
+# the direct `chacha20poly1305`/`blake2` entries were dead and only existed to
+# receive Dependabot majors boringtun could not follow).
 sha2 = "0.10"  # DLL integrity verification (already a transitive dep via tauri)
 hmac = "0.12"  # FIX-1-7: Settings file HMAC integrity
 hex = "0.4"    # FIX-1-7: Hex encoding for HMAC key storage
@@ -152,9 +152,9 @@ keyring = { version = "3.2", features = ["windows-native"] }
 nix = { version = "0.29", features = ["net", "ioctl", "socket", "fs"] }
 # libc for raw utun fd read/write and AF_SYSTEM socket creation
 libc = "0.2"
-# System Configuration framework bindings
-core-foundation = "0.10"
-system-configuration = "0.6"
+# NOTE: no core-foundation / system-configuration — DNS and routes on macOS go
+# through `networksetup`/`scutil` (tunnel_macos.rs); the bindings were declared
+# but never referenced (removed 2026-09-13, F19).
 
 # Real macOS Keychain instead of keyring's mock backend.
 keyring = { version = "3.2", features = ["apple-native"] }
