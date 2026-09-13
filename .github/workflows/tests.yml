@@ -311,3 +311,45 @@ jobs:
           }
           console.log('OK — all version strings match: ' + unique[0]);
           EOF
+
+      # Every Tauri plugin is TWO packages — a Rust crate and its npm twin —
+      # and `tauri build` refuses to run when a pair's major.minor differ
+      # ("Found version mismatched Tauri packages"). Dependabot bumps the two
+      # ecosystems in separate PRs, so a merged cargo group can leave npm
+      # behind; nothing here ran `tauri build`, so the v1.4.41 tag (2026-09-13)
+      # was the first thing to notice: all four platform builds failed on
+      # updater 2.11 vs 2.9 and dialog 2.7 vs 2.6. Same defect as 1194757 a
+      # release earlier. This applies the CLI's own rule on every PR.
+      - name: Assert Tauri crate / npm package pairs share major.minor
+        shell: bash
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const lock = fs.readFileSync('src-tauri/Cargo.lock', 'utf8');
+          const npm = JSON.parse(fs.readFileSync('package-lock.json', 'utf8')).packages;
+
+          const crates = {};
+          for (const m of lock.matchAll(/name = "(tauri(?:-plugin-[a-z0-9-]+)?)"\r?\nversion = "([^"]+)"/g)) {
+            crates[m[1]] = m[2];
+          }
+          const npmName = (crate) =>
+            crate === 'tauri' ? '@tauri-apps/api' : '@tauri-apps/plugin-' + crate.slice('tauri-plugin-'.length);
+          const minor = (v) => v.split('.').slice(0, 2).join('.');
+
+          const rows = [];
+          let bad = 0;
+          for (const [crate, cv] of Object.entries(crates).sort()) {
+            const n = npmName(crate);
+            const entry = npm['node_modules/' + n];
+            if (!entry) { rows.push(`${crate} ${cv}  (no npm twin installed — fine)`); continue; }
+            const ok = minor(cv) === minor(entry.version);
+            if (!ok) bad++;
+            rows.push(`${crate} ${cv}  <->  ${n} ${entry.version}  ${ok ? 'OK' : 'MISMATCH'}`);
+          }
+          console.log(rows.join('\n'));
+          if (bad) {
+            console.error(`::error::${bad} Tauri crate/npm pair(s) differ in major.minor — \`tauri build\` will refuse. Bump the lagging side (both lockfiles) in the same PR.`);
+            process.exit(1);
+          }
+          console.log('OK — every Tauri crate/npm pair shares major.minor');
+          EOF
