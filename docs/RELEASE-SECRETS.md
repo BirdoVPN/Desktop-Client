@@ -109,10 +109,48 @@ and privacy posture in
 
 ---
 
+## 6. Client attestation — Ed25519 signer (a tagged build HARD-FAILS without these)
+
+| Secret | Description |
+| ------ | ----------- |
+| `BIRDO_DESKTOP_ATTEST_SK` | Raw Ed25519 **private** key, base64. Compiled into the binary and used to sign the connect attestation. |
+| `BIRDO_DESKTOP_ATTEST_KID` | Key id for the above, matched against `DESKTOP_ATTESTATION_PUBKEYS` on the backend. |
+
+Both are read at **job** level by every platform job in `release.yml`
+(Windows, macOS ×2, Linux) and each job asserts them explicitly:
+
+```
+if (-not $env:BIRDO_DESKTOP_ATTEST_SK) { throw "… a tagged release cannot ship unattestable" }
+```
+
+So a `refs/tags/v*` build **fails on all three platforms** if either is
+missing — which is the intended behaviour, and exactly why they must be
+documented here. This file omitted them entirely until 2026-09-14
+(OPEN-WORK J10).
+
+The public half goes into the backend's `DESKTOP_ATTESTATION_PUBKEYS` as
+`kid:base64pub`. That list is comma-separated so a new release line's key can
+be added **before** the old one is dropped — rotate in that order, never the
+reverse, or in-flight clients signed with the old key are rejected. Ladder and
+semantics: [`docs/CLIENT-ATTESTATION.md`](CLIENT-ATTESTATION.md) here and
+`birdo-web/docs/CLIENT-ATTESTATION.md` for the server side.
+
+---
+
 ## Local rotation procedure
 
 1. Generate the new credential per the section above.
 2. Open <https://github.com/birdo-vpn/desktop/settings/secrets/actions>.
 3. Update the secret value (the secret name stays the same).
 4. Trigger a `workflow_dispatch` run of the relevant build to verify.
-5. Record the rotation in `birdo-shared/SECURITY-LOG.md`.
+5. Record the rotation in this file's table below. `birdo-shared/SECURITY-LOG.md`
+   — which step 5 named until 2026-09-14 — **does not exist in any repo**, so
+   every rotation recorded "there" went nowhere (OPEN-WORK J10).
+
+### Rotation log
+
+Append one line per rotation. Secret **names** only, never values.
+
+| Date | Secret | Reason | By |
+| ---- | ------ | ------ | -- |
+| 2026-09-14 | — | Log created; no rotation. Prior rotations were recorded in a file that did not exist. | — |
