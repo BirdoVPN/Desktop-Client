@@ -1,8 +1,9 @@
 # Release signing secrets
 
 This document lists every GitHub Actions secret required for the three
-production release pipelines (`build-windows.yml`, `build-macos.yml`,
-`build-linux.yml`) and how to provision each one.
+production release pipeline (`release.yml` — one workflow builds and signs
+Windows, Linux and macOS from a single `v*` tag; the per-platform
+`build-*.yml` files were retired) and how to provision each secret.
 
 > Configure each secret under **Repo -> Settings -> Secrets and variables ->
 > Actions -> New repository secret**.
@@ -95,7 +96,7 @@ Optional:
 build time by `option_env!` and compiled into the binary. |
 
 Set at **job** level by every build job in `release.yml`,
-`build-windows.yml` and `build-linux.yml`. Unlike every other secret here,
+the Windows and Linux jobs of `release.yml`. Unlike every other secret here,
 a **missing** one now FAILS the release build (`src-tauri/build.rs`) rather
 than degrading quietly — an artifact that cannot report a crash is worse
 than a build that stops.

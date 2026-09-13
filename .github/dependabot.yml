@@ -1,0 +1,42 @@
+# OPEN-WORK I11 (2026-09-13): this repo had no Dependabot at all, so its
+# SHA-pinned action refs, npm tree and Cargo tree aged with no mechanism to
+# ever surface an update — advisories arrived only via the audit gates
+# (dependency-audit / cargo-deny), i.e. after the fact. Same shape as
+# birdo-web/.github/dependabot.yml.
+#
+# Every bump still goes through the normal gates (tests.yml, cargo-deny,
+# CodeQL, cert-pins) and the version-consistency check; a Dependabot PR is a
+# proposal, not a merge.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # codeql-action/init and codeql-action/analyze MUST bump as ONE PR:
+      # analyze refuses to consume a config written by a different version,
+      # so split bumps leave neither able to go green.
+      codeql:
+        patterns: ["github/codeql-action*"]
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # vitest and its coverage provider are version-locked to each other.
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
+
+  - package-ecosystem: "cargo"
+    directory: "/src-tauri"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # tauri, tauri-build and the tauri-plugin-* crates move together.
+      tauri:
+        patterns: ["tauri", "tauri-build", "tauri-plugin-*"]

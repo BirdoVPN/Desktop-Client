@@ -16,7 +16,7 @@ DNS — are only observable at runtime.
 
 ```powershell
 cd src-tauri
-# Download wintun.dll + xray.exe first (see .github/workflows/build-windows.yml
+# Download wintun.dll + xray.exe first (see the Windows job in .github/workflows/release.yml
 # steps "Download Wintun" / "Download pinned Xray Reality engine"), then:
 cargo tauri build --bundles nsis
 # Installer: src-tauri/target/release/bundle/nsis/*-setup.exe
@@ -104,16 +104,23 @@ Disconnect button — that's a clean user disconnect):
   offline indefinitely behind an un-removable block. (Both the Disconnected and
   Error give-up paths now deactivate symmetrically.)
 
-## 3e. Lockdown / always-on mode (OPT-IN — verify before enabling by default)
+## 3e. Lockdown / always-on mode (ON BY DEFAULT on Windows — verify it holds)
 
-Lockdown mode (`lockdown_mode` setting, **off by default**) keeps the WFP
-block-all active the *entire* time you're connected and permits tunneled traffic
-by the Wintun interface LUID — eliminating the ~5–30s reactive window. It **must**
-pass this test before being shipped on, because a wrong interface LUID would
-block your own tunneled traffic.
+> **Correction 2026-09-13.** This section used to say lockdown is opt-in and off
+> by default. It is not: `src-tauri/src/commands/settings.rs` defaults
+> `lockdown_mode` to **`true` on Windows** (and `false` elsewhere, where the
+> lift is not implemented), and a unit test asserts that default. The decision
+> to ship it on was taken and shipped **without this section ever being run
+> on hardware** — so the checks below are not a gate before enabling, they are
+> the overdue verification of what every Windows user already runs.
 
-Enable it: set `"lockdown_mode": true` in the persisted settings JSON (or via the
-UI toggle once exposed), then connect.
+Lockdown mode (`lockdown_mode` setting) keeps the WFP block-all active the
+*entire* time you're connected and permits tunneled traffic by the Wintun
+interface LUID — eliminating the ~5–30s reactive window. A wrong interface
+LUID would block your own tunneled traffic, which is exactly why 3e-1 matters.
+
+To test the reactive (non-lockdown) path instead, set `"lockdown_mode": false`
+in the persisted settings JSON, then connect.
 
 - **3e-1. Browsing still works (the critical check):** while connected in lockdown
   mode, browse normally for a few minutes (load several sites, stream something).
@@ -130,7 +137,8 @@ UI toggle once exposed), then connect.
 - **3e-4. Disconnect releases everything:** Disconnect -> real IP returns, no Birdo
   filters remain (`disarm()` -> `wfp::cleanup()`).
 
-If all four pass on real hardware, lockdown is safe to enable by default.
+If all four pass on real hardware, the shipped default is verified; if any
+fails, the fix is a hotfix release, not a settings flip.
 
 ## 4. Reconnect & server switch
 
@@ -147,7 +155,7 @@ If all four pass on real hardware, lockdown is safe to enable by default.
 2. EXPECT: connection succeeds (xray.exe spawns; the app aborts rather than
    downgrading if stealth/PQ was requested but the server didn't grant it).
 3. Confirm `XRAY_BINARY_SHA256` was injected at build time — otherwise stealth
-   fails closed at runtime (see build-windows.yml). A successful stealth connect
+   fails closed at runtime (see the Windows job in release.yml). A successful stealth connect
    from a signed release confirms this.
 
 ## 6. Updater + signing (release artifact only)

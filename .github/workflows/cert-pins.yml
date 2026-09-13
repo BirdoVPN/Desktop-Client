@@ -69,10 +69,6 @@ on:
       - 'scripts/stamp-cert-pins-provenance.py'
       - 'src-tauri/src/api/cert_pin.rs'
       - 'src-tauri/src/vpn/doh.rs'
-      - 'app/src/main/java/app/birdo/vpn/di/NetworkModule.kt'
-      - 'app/src/main/java/app/birdo/vpn/data/network/DohResolver.kt'
-      - 'app/src/main/res/xml/network_security_config.xml'
-      - 'iosApp/iosApp/Services/APIClient.swift'
       - '.github/workflows/cert-pins.yml'
   push:
     branches: [main]
