@@ -24,6 +24,20 @@ on:
         description: 'Release version (e.g., 1.4.16)'
         required: true
         type: string
+      # OPEN-WORK F4: Authenticode used to run ONLY on tag builds, so the
+      # sign-xray-before-hash step and the post-bundle xray gate below could
+      # never be exercised without cutting a real tag. This flag turns the
+      # signed Windows path on for a dispatch run from any branch; dispatch
+      # runs still never publish a release (see the `release` job), and the
+      # attestation-key requirement stays tag-only. Needs the Azure federated
+      # credential to admit the dispatched ref (it is configured for tags;
+      # if OIDC login fails on a branch, that is the credential's subject
+      # filter, not this workflow).
+      authenticode_dry_run:
+        description: 'Windows: run the Authenticode path (sign xray.exe before hashing + verify the bundled hash) on this non-tag build'
+        required: false
+        type: boolean
+        default: false
   push:
     tags:
       - 'v*'
@@ -301,6 +315,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path "src-tauri/resources" | Out-Null
           Copy-Item $xrayExe.FullName "src-tauri/resources/xray.exe" -Force
           $binarySha = (Get-FileHash -Path "src-tauri/resources/xray.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          # PROVISIONAL on signed builds: the "Sign xray.exe BEFORE bundling"
+          # step below re-captures XRAY_BINARY_SHA256 from the signed bytes.
+          # Unsigned (PR/dispatch) builds ship exactly these bytes.
           "XRAY_BINARY_SHA256=$binarySha" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Xray ready: src-tauri/resources/xray.exe ($binarySha)"
 
@@ -325,10 +342,15 @@ jobs:
       - name: Determine if this build should be Authenticode-signed
         id: sign-mode
         shell: pwsh
+        env:
+          AUTHENTICODE_DRY_RUN: ${{ inputs.authenticode_dry_run }}
         run: |
           if ("${{ github.ref }}".StartsWith("refs/tags/")) {
             "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             Write-Host "Tag build — Authenticode signing ENABLED"
+          } elseif ($env:AUTHENTICODE_DRY_RUN -eq 'true') {
+            "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "workflow_dispatch authenticode_dry_run=true — Authenticode signing ENABLED on a non-tag build (no release is published)"
           } else {
             "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             Write-Host "Non-tag build — Authenticode signing DISABLED (Sigstore only)"
@@ -446,6 +468,57 @@ jobs:
           if ($sig.Status -ne 'Valid') { throw "Smoke-test artifact has invalid signature: $($sig.Status)" }
           Write-Host "Smoke-test OK: signed by $($sig.SignerCertificate.Subject)"
 
+      # OPEN-WORK F4 — sign xray.exe BEFORE the build captures its hash.
+      #
+      # Windows stealth was dead on every signed release (v1.4.40 + v1.4.41
+      # measured: the shipped resources\xray.exe hashed fc6382ef…/d481fccc…
+      # while the build log — and the compiled-in XRAY_BINARY_SHA256 — said
+      # 103da275…). Cause: tauri-bundler signs every .exe/.dll RESOURCE in
+      # place during `tauri build` (tauri-bundler 2.11.4
+      # nsis/mod.rs generate_resource_data(): `if can_sign() &&
+      # should_sign(&resource_path) { try_sign(...) }`), i.e. AFTER the
+      # download step above hashed the pristine file, so xray.rs
+      # verify_xray_integrity() refused the binary on every stealth connect.
+      #
+      # Fix: sign xray.exe here with the SAME signtool invocation the
+      # signCommand uses, then re-capture XRAY_BINARY_SHA256 from the signed
+      # bytes. tauri-bundler's should_sign() skips a resource whose
+      # `signtool verify /pa` already succeeds (sign.rs:264-284), so the
+      # bundler leaves these bytes alone and the shipped file hashes to the
+      # value compiled in. That skip is the load-bearing assumption, so the
+      # step runs the identical verify itself and fails if it does not pass —
+      # and the post-bundle gate after the build proves the final installer
+      # regardless.
+      - name: Sign xray.exe BEFORE bundling and re-capture XRAY_BINARY_SHA256 from the signed bytes
+        if: steps.sign-mode.outputs.enabled == 'true'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $xray = (Resolve-Path "src-tauri/resources/xray.exe").Path
+          $before = (Get-FileHash -Path $xray -Algorithm SHA256).Hash.ToLowerInvariant()
+          & $env:SIGNTOOL_PATH sign /v /debug /fd SHA256 `
+            /tr http://timestamp.acs.microsoft.com /td SHA256 `
+            /dlib $env:TRUSTED_SIGNING_DLIB `
+            /dmdf $env:TRUSTED_SIGNING_METADATA `
+            $xray
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign on xray.exe failed with exit $LASTEXITCODE" }
+
+          # Exactly what tauri-bundler's should_sign() runs to decide whether
+          # to re-sign the resource: if this fails, the bundler WOULD re-sign
+          # and the compiled-in hash would be wrong again — fail now.
+          & $env:SIGNTOOL_PATH verify /pa $xray
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify /pa on the signed xray.exe failed (exit $LASTEXITCODE) — tauri-bundler would re-sign it during bundling and the shipped hash would drift" }
+          $sig = Get-AuthenticodeSignature -FilePath $xray
+          if ($sig.Status -ne 'Valid') { throw "xray.exe signature status $($sig.Status) after signing" }
+
+          $after = (Get-FileHash -Path $xray -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($after -eq $before) { throw "xray.exe bytes unchanged by signing ($after) — signing did not happen" }
+          # Last write to GITHUB_ENV wins for every later step, including the
+          # build that bakes the value in via option_env!.
+          "XRAY_BINARY_SHA256=$after" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "xray.exe signed by $($sig.SignerCertificate.Subject)"
+          Write-Host "XRAY_BINARY_SHA256: $before (unsigned) -> $after (signed, compiled in)"
+
       - name: Build Tauri application
         timeout-minutes: 25
         env:
@@ -456,6 +529,24 @@ jobs:
           BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
           BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
         run: npx tauri build
+
+      # OPEN-WORK F4 — the gate that would have caught v1.4.40 and v1.4.41:
+      # extract resources\xray.exe from the NSIS installer we are about to
+      # ship and require its SHA-256 to equal the XRAY_BINARY_SHA256 the app
+      # was just compiled with. Runs on EVERY build (unsigned ones must match
+      # trivially); on signed builds the bundled file must also carry a Valid
+      # Authenticode signature. Script + self-test: scripts/ci/.
+      - name: Gate — bundled resources\xray.exe must hash to the compiled-in XRAY_BINARY_SHA256
+        shell: pwsh
+        env:
+          SIGNED: ${{ steps.sign-mode.outputs.enabled }}
+        run: |
+          $nsis = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          if (-not $nsis) { throw "No NSIS installer found to gate" }
+          $gateArgs = @('-Installer', $nsis.FullName, '-ExpectedSha256', "$env:XRAY_BINARY_SHA256")
+          if ($env:SIGNED -eq 'true') { $gateArgs += '-RequireAuthenticode' }
+          & ./scripts/ci/verify-bundled-xray-hash.ps1 @gateArgs
+          if ($LASTEXITCODE -ne 0) { throw "bundled xray.exe gate failed (exit $LASTEXITCODE)" }
 
       # Sanity-check the artifacts we actually SHIP: both installers must be
       # Authenticode-signed, and so must the app .exe packed INSIDE the NSIS

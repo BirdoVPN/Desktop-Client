@@ -157,6 +157,17 @@ fails, the fix is a hotfix release, not a settings flip.
 3. Confirm `XRAY_BINARY_SHA256` was injected at build time — otherwise stealth
    fails closed at runtime (see the Windows job in release.yml). A successful stealth connect
    from a signed release confirms this.
+4. Confirm the SHIPPED `resources\xray.exe` hashes to the compiled-in value.
+   Every signed release up to v1.4.41 failed here: the build hashed xray.exe
+   and tauri-bundler then Authenticode-signed it in place, so `birdo.log`
+   showed `xray binary integrity check FAILED ... expected 103da275... got
+   <signed hash>` on every stealth connect (OPEN-WORK F4). release.yml now
+   signs xray.exe BEFORE hashing and gates the installer; to re-check a
+   downloaded installer by hand:
+   `pwsh scripts/ci/verify-bundled-xray-hash.ps1 -Installer BirdoVPN_<ver>_x64-setup.exe -ExpectedSha256 <XRAY_BINARY_SHA256 from the build-windows log> -RequireAuthenticode`
+   EXPECT: `OK: bundled resources\xray.exe matches`, and after connecting
+   with Stealth ON, `birdo.log` contains `xray binary integrity verified` and
+   `Starting Xray Reality tunnel`.
 
 ## 6. Updater + signing (release artifact only)
 
