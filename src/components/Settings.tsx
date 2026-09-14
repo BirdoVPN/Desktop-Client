@@ -86,7 +86,7 @@ import {
   gradient,
   motion as motionTokens,
 } from '@/lib/birdo-theme';
-import type { WindowCorner } from '@/store/app-store';
+import type { ConnectionState, WindowCorner } from '@/store/app-store';
 
 const DASHBOARD_URL = 'https://dashboard.birdo.app';
 const PRIVACY_URL = 'https://birdo.app/privacy';
@@ -112,6 +112,24 @@ const CORNER_OPTIONS: { value: WindowCorner; label: string; icon: typeof ArrowUp
   { value: 'bottom-left', label: 'Bot L', icon: ArrowDownLeft },
   { value: 'bottom-right', label: 'Bot R', icon: ArrowDownRight },
 ];
+
+/**
+ * Whether a kill-switch toggle must be pushed to Rust (`set_killswitch_live`)
+ * right now, i.e. whether a session that could be holding the firewall block
+ * exists. OPEN-WORK F3: this used to be `connectionState === 'connected'`,
+ * which is exactly the state in which the toggle matters LEAST — the reactive
+ * block is engaged while Reconnecting / Error / Rekeying, and turning the
+ * kill switch OFF in those states never reached Rust, so the block stayed up
+ * until the tunnel recovered or the user hit Disconnect (fail-safe, but the
+ * user's OFF was silently ignored; on macOS/Linux the stale armed intent then
+ * outlived the next auto-reconnect). Rust already no-ops without a session
+ * (`set_killswitch_live` returns Ok(false) unless the tunnel is active or
+ * can_disconnect()), so the only states worth skipping are the two where no
+ * session exists or one is being torn down by disconnect_vpn -> disarm().
+ */
+export function killSwitchLiveApplies(state: ConnectionState): boolean {
+  return state !== 'disconnected' && state !== 'disconnecting';
+}
 
 export function Settings() {
   const {
@@ -265,12 +283,13 @@ export function Settings() {
       // write (else it reads the stale value and silently doesn't arm).
       await saveSettingsToBackend(next);
 
-      if (useAppStore.getState().connectionState === 'connected') {
-        if ('killSwitchEnabled' in patch) {
+      const connectionState = useAppStore.getState().connectionState;
+      if ('killSwitchEnabled' in patch) {
+        if (killSwitchLiveApplies(connectionState)) {
           invoke('set_killswitch_live', { enabled: !!patch.killSwitchEnabled }).catch(() => {});
-        } else {
-          scheduleReapply();
         }
+      } else if (connectionState === 'connected') {
+        scheduleReapply();
       }
     },
     [updateSettings, saveSettingsToBackend, scheduleReapply],
