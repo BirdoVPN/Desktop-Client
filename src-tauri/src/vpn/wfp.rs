@@ -1965,4 +1965,49 @@ mod tests {
 
         reset_state();
     }
+
+    /// W15 (tunnel.rs `bring_up_dual_stack`): when a dual-stack tunnel's IPv6
+    /// configure FAILS, `unblock_ipv6_dual_stack()` is never called, so the
+    /// pre-emptive block AND its intent must survive — through a reactive
+    /// kill-switch cycle too — until the session ends. The old
+    /// unblock-then-configure order dropped the intent first and then
+    /// re-blocked; this walks the state the new order leaves behind.
+    #[test]
+    fn failed_dual_stack_configure_retains_the_block_intent() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_state();
+        let mut engine = FakeEngine::default();
+
+        // Top of start(): pre-emptive block.
+        engine.block_ipv6();
+        assert!(engine.ipv6_blocked());
+        assert!(IPV6_BLOCK_WANTED.load(Ordering::SeqCst));
+
+        // configure_ipv6() fails -> no unblock_ipv6_dual_stack() call at all.
+        // (Nothing to do here: the absence of the call IS the behaviour.)
+        assert!(engine.ipv6_blocked(), "block must still be in force");
+        assert!(
+            IPV6_BLOCK_WANTED.load(Ordering::SeqCst),
+            "intent must be retained when configure fails"
+        );
+        assert!(IPV6_ONLY_ACTIVE.load(Ordering::SeqCst));
+
+        // The session carries on IPv4-only; a later drop + reactive kill
+        // switch + recovery must keep IPv6 blocked, exactly as for a v4-only
+        // tunnel.
+        engine.activate_blocking();
+        engine.unblock_ipv6(); // old tunnel's stop(); kill switch owns v6
+        engine.deactivate_blocking();
+        assert!(
+            engine.ipv6_blocked(),
+            "after a reactive cycle the standalone block must be rebuilt"
+        );
+
+        // Only the user's disconnect lifts it.
+        engine.cleanup();
+        assert!(!engine.ipv6_blocked());
+        assert!(!IPV6_BLOCK_WANTED.load(Ordering::SeqCst));
+
+        reset_state();
+    }
 }

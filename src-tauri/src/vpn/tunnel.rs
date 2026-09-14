@@ -225,8 +225,7 @@ fn set_dns_native(adapter_guid: u128, servers: &[String]) -> Result<(), String> 
 #[cfg(windows)]
 fn set_adapter_ip_mtu_native(if_index: u32, ip: &str, prefix: u8, mtu: u32) -> Result<(), String> {
     use windows::Win32::NetworkManagement::IpHelper::{
-        CreateUnicastIpAddressEntry, GetIpInterfaceEntry, InitializeUnicastIpAddressEntry,
-        SetIpInterfaceEntry, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
+        CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
     };
     use windows::Win32::Networking::WinSock::AF_INET;
 
@@ -251,24 +250,158 @@ fn set_adapter_ip_mtu_native(if_index: u32, ip: &str, prefix: u8, mtu: u32) -> R
         return Err(format!("CreateUnicastIpAddressEntry failed: 0x{:08X}", e.0));
     }
 
-    // ── MTU (read-modify-write the interface row) ──
+    // ── MTU (read-modify-write the AF_INET interface row) ──
+    set_interface_mtu_native(if_index, AF_INET, mtu)
+}
+
+/// Set NlMtu on ONE address family's interface row (read-modify-write of
+/// MIB_IPINTERFACE_ROW). Windows keeps a separate row — and a separate MTU —
+/// per family, so the IPv4 write above never touched IPv6 (OPEN-WORK W11):
+/// every dual-stack Windows session ran IPv6 at the adapter's 1500 default
+/// inside a 1420-byte WireGuard path, so large v6 flows fragmented the outer
+/// UDP or blackholed on PMTU. `configure_ipv6` now calls this with AF_INET6.
+// Clippy: MIB_* FFI rows must be default-initialised and then populated.
+#[allow(clippy::field_reassign_with_default)]
+#[cfg(windows)]
+fn set_interface_mtu_native(
+    if_index: u32,
+    family: windows::Win32::Networking::WinSock::ADDRESS_FAMILY,
+    mtu: u32,
+) -> Result<(), String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetIpInterfaceEntry, SetIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET;
+
     let mut irow = MIB_IPINTERFACE_ROW::default();
-    irow.Family = AF_INET;
+    irow.Family = family;
     irow.InterfaceIndex = if_index;
     // SAFETY: Family + InterfaceIndex are set; the call fills the remaining fields.
     let g = unsafe { GetIpInterfaceEntry(&mut irow) };
     if g.0 != 0 {
-        return Err(format!("GetIpInterfaceEntry failed: 0x{:08X}", g.0));
+        return Err(format!(
+            "GetIpInterfaceEntry (family {}) failed: 0x{:08X}",
+            family.0, g.0
+        ));
     }
     irow.NlMtu = mtu;
-    // Required for IPv4: SitePrefixLength must be 0 or SetIpInterfaceEntry rejects it.
-    irow.SitePrefixLength = 0;
+    // Required for IPv4: SitePrefixLength must be 0 or SetIpInterfaceEntry
+    // rejects it. For IPv6 the value GetIpInterfaceEntry returned is kept.
+    if family == AF_INET {
+        irow.SitePrefixLength = 0;
+    }
     // SAFETY: `irow` was populated by GetIpInterfaceEntry; we only adjusted NlMtu.
     let s = unsafe { SetIpInterfaceEntry(&mut irow) };
     if s.0 != 0 {
-        return Err(format!("SetIpInterfaceEntry failed: 0x{:08X}", s.0));
+        return Err(format!(
+            "SetIpInterfaceEntry (family {}) failed: 0x{:08X}",
+            family.0, s.0
+        ));
     }
     Ok(())
+}
+
+/// Dual-stack bring-up order (W15): install the tunnel's IPv6 address and
+/// routes, and lift the pre-emptive IPv6 block ONLY if that succeeded. On a
+/// configure failure the block is left exactly as it was (never lifted), the
+/// failure is logged, and the session continues IPv4-only — `Ok(())`. The
+/// unblock's own error propagates: a lifted-but-failed unblock is a WFP
+/// engine fault the connect must not paper over.
+///
+/// Engine-free so the ORDER is unit-testable (the two operations are handed
+/// in as closures); `start()` passes `configure_ipv6` and
+/// `wfp::unblock_ipv6_dual_stack`.
+async fn bring_up_dual_stack<CF, UF>(
+    configure: impl FnOnce() -> CF,
+    unblock: impl FnOnce() -> UF,
+) -> Result<(), String>
+where
+    CF: std::future::Future<Output = Result<(), String>>,
+    UF: std::future::Future<Output = Result<(), String>>,
+{
+    match configure().await {
+        Ok(()) => unblock().await,
+        Err(e) => {
+            tracing::warn!(
+                "IPv6 routing setup failed ({}); the IPv6 block stays in force",
+                e
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod dual_stack_order_tests {
+    use super::bring_up_dual_stack;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn recorder() -> (
+        Rc<RefCell<Vec<&'static str>>>,
+        Rc<RefCell<Vec<&'static str>>>,
+    ) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        (log.clone(), log)
+    }
+
+    /// W15: routes BEFORE the unblock — the reverse order is the leak window.
+    #[tokio::test]
+    async fn routes_are_installed_before_the_block_is_lifted() {
+        let (log, seen) = recorder();
+        let l1 = log.clone();
+        let l2 = log.clone();
+        let r = bring_up_dual_stack(
+            move || async move {
+                l1.borrow_mut().push("configure");
+                Ok(())
+            },
+            move || async move {
+                l2.borrow_mut().push("unblock");
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(r, Ok(()));
+        assert_eq!(*seen.borrow(), vec!["configure", "unblock"]);
+    }
+
+    /// A failed configure must never lift the block: the unblock closure is
+    /// not even invoked, and the session carries on (Ok) IPv4-only.
+    #[tokio::test]
+    async fn a_failed_configure_leaves_the_block_untouched() {
+        let (log, seen) = recorder();
+        let l1 = log.clone();
+        let l2 = log.clone();
+        let r = bring_up_dual_stack(
+            move || async move {
+                l1.borrow_mut().push("configure");
+                Err("SetIpInterfaceEntry (family 23) failed: 0x00000057".to_string())
+            },
+            move || async move {
+                l2.borrow_mut().push("unblock");
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(r, Ok(()), "IPv4-only session continues");
+        assert_eq!(
+            *seen.borrow(),
+            vec!["configure"],
+            "the block must not be lifted"
+        );
+    }
+
+    /// The unblock's own failure is a WFP fault and must surface.
+    #[tokio::test]
+    async fn an_unblock_failure_propagates() {
+        let r = bring_up_dual_stack(
+            || async { Ok(()) },
+            || async { Err("engine lock poisoned".to_string()) },
+        )
+        .await;
+        assert_eq!(r, Err("engine lock poisoned".to_string()));
+    }
 }
 
 /// Wintun adapter configuration
@@ -827,16 +960,20 @@ impl WintunTunnel {
         }
 
         // IPv6: if the node is dual-stacked (backend sent a client_ipv6), ROUTE
-        // IPv6 through the tunnel — lift the block installed at the top of start()
-        // only now, immediately before the tunnel's own IPv6 address and routes go
-        // in. Otherwise the block simply stays in force. If routing setup fails,
-        // re-block (never leak).
+        // IPv6 through the tunnel. W15: the address + ::/1 + 8000::/1 routes go
+        // in FIRST and the block installed at the top of start() is lifted only
+        // once they are in — the same order Linux uses (tunnel_linux.rs:
+        // configure_ipv6 then remove_ipv6_leak_block). The previous
+        // unblock-then-configure left a window with no tunnel route and no
+        // block, in which a real-IPv6 packet could egress the physical NIC on
+        // every connect. If routing setup fails the block simply stays in
+        // force (no re-block needed, nothing was lifted).
         if self.config.client_ipv6.is_some() {
-            crate::vpn::wfp::unblock_ipv6_dual_stack().await?;
-            if let Err(e) = self.configure_ipv6().await {
-                tracing::warn!("IPv6 routing setup failed ({}); blocking IPv6 instead", e);
-                self.block_ipv6_leaks().await?;
-            }
+            bring_up_dual_stack(
+                || self.configure_ipv6(),
+                || crate::vpn::wfp::unblock_ipv6_dual_stack(),
+            )
+            .await?;
         }
 
         // Store remaining state (adapter was already stored above, pre-config).
@@ -1617,6 +1754,16 @@ impl WintunTunnel {
 
         let if_index = self.get_adapter_index().await?;
         set_adapter_ipv6_native(if_index, ip, 128)?;
+        // W11: the IPv6 interface row has its own MTU; without this write it
+        // stays at the adapter default (1500) while the WireGuard path is
+        // `config.mtu` (1420 by default). Fatal like the IPv4 write: on Err the
+        // caller keeps IPv6 blocked (fail-closed, v4 still flows) rather than
+        // route v6 through a path that fragments or blackholes.
+        set_interface_mtu_native(
+            if_index,
+            windows::Win32::Networking::WinSock::AF_INET6,
+            self.config.mtu.into(),
+        )?;
 
         // I10, IPv6 twin. These are on-link on the Wintun interface and so die
         // with it, but they are still routes this generation installed, and the
