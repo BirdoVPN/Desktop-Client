@@ -425,6 +425,7 @@ mod types_serialization_tests {
             fallback_reason: None,
             quantum_protection: None,
             pq_client_public_key: None,
+            pq_client_can_decapsulate: None,
             desktop_attest_nonce: None,
             desktop_attest_kid: None,
             desktop_attest_sig: None,
@@ -453,6 +454,7 @@ mod types_serialization_tests {
             fallback_reason: Some(crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT.to_string()),
             quantum_protection: None,
             pq_client_public_key: None,
+            pq_client_can_decapsulate: None,
             desktop_attest_nonce: None,
             desktop_attest_kid: None,
             desktop_attest_sig: None,
@@ -476,6 +478,7 @@ mod types_serialization_tests {
             fallback_reason: None,
             quantum_protection: Some(false),
             pq_client_public_key: None,
+            pq_client_can_decapsulate: None,
             desktop_attest_nonce: None,
             desktop_attest_kid: None,
             desktop_attest_sig: None,
@@ -500,6 +503,7 @@ mod types_serialization_tests {
             fallback_reason: None,
             quantum_protection: None,
             pq_client_public_key: None,
+            pq_client_can_decapsulate: None,
             desktop_attest_nonce: Some("nonce".to_string()),
             desktop_attest_kid: Some("desk-2026-07".to_string()),
             desktop_attest_sig: Some("sig".to_string()),
@@ -524,6 +528,7 @@ mod types_serialization_tests {
             stealth_mode: None,
             quantum_protection: None,
             pq_client_public_key: None,
+            pq_client_can_decapsulate: None,
             desktop_attest_nonce: None,
             desktop_attest_kid: None,
             desktop_attest_sig: None,
@@ -532,6 +537,102 @@ mod types_serialization_tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(json, r#"{"entryNodeId":"entry","exitNodeId":"exit"}"#);
+    }
+
+    // ------------------------------------------------------------------
+    // OPEN-WORK G5: BirdoPQ HNDL opt-in. These assert the SERIALIZED body,
+    // not the struct — the backend whitelist (connect.dto.ts) and the
+    // multi-hop zod schema (vpn.controller.ts) both pin the exact key
+    // `pqClientCanDecapsulate`; a snake_case or misspelt key is silently
+    // stripped by class-validator and the server falls back to returning the
+    // PSK over TLS, which is the very hole the flag closes.
+    // ------------------------------------------------------------------
+
+    fn pq_connect_request(pq: Option<String>, can: Option<bool>) -> ConnectRequest {
+        ConnectRequest {
+            server_node_id: Some("node-1".to_string()),
+            device_name: None,
+            preferred_region: None,
+            client_public_key: None,
+            stealth_mode: None,
+            fallback_reason: None,
+            quantum_protection: pq.as_ref().map(|_| true),
+            pq_client_public_key: pq,
+            pq_client_can_decapsulate: can,
+            desktop_attest_nonce: None,
+            desktop_attest_kid: None,
+            desktop_attest_sig: None,
+            desktop_attest_platform: None,
+            desktop_attest_version: None,
+        }
+    }
+
+    fn pq_multi_hop_request(pq: Option<String>, can: Option<bool>) -> MultiHopConnectRequest {
+        MultiHopConnectRequest {
+            entry_node_id: "entry".to_string(),
+            exit_node_id: "exit".to_string(),
+            device_name: None,
+            client_public_key: None,
+            stealth_mode: None,
+            quantum_protection: pq.as_ref().map(|_| true),
+            pq_client_public_key: pq,
+            pq_client_can_decapsulate: can,
+            desktop_attest_nonce: None,
+            desktop_attest_kid: None,
+            desktop_attest_sig: None,
+            desktop_attest_platform: None,
+            desktop_attest_version: None,
+        }
+    }
+
+    #[test]
+    fn connect_request_carries_pq_can_decapsulate_when_set() {
+        let req = pq_connect_request(Some("pk".to_string()), Some(true));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["pqClientCanDecapsulate"], true);
+        assert_eq!(json["pqClientPublicKey"], "pk");
+        // Exact key spelling — the only spelling the backend whitelist accepts.
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert!(
+            keys.contains(&&"pqClientCanDecapsulate".to_string()),
+            "{keys:?}"
+        );
+        assert!(!json.to_string().contains("pq_client_can_decapsulate"));
+    }
+
+    /// A non-PQ connect body must stay byte-identical to the 1.4.41 body —
+    /// no `pqClientCanDecapsulate:null` / `false` key for the backend to trip on.
+    #[test]
+    fn connect_request_omits_pq_can_decapsulate_when_none() {
+        let req = pq_connect_request(None, None);
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"serverNodeId":"node-1"}"#);
+    }
+
+    #[test]
+    fn multi_hop_request_carries_pq_can_decapsulate_when_set() {
+        let req = pq_multi_hop_request(Some("pk".to_string()), Some(true));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["pqClientCanDecapsulate"], true);
+        assert_eq!(json["pqClientPublicKey"], "pk");
+        assert!(!json.to_string().contains("pq_client_can_decapsulate"));
+    }
+
+    #[test]
+    fn multi_hop_request_omits_pq_can_decapsulate_when_none() {
+        let req = pq_multi_hop_request(None, None);
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"entryNodeId":"entry","exitNodeId":"exit"}"#);
+    }
+
+    /// The single rule both builders use: the flag follows the key exactly.
+    #[test]
+    fn pq_can_decapsulate_follows_public_key() {
+        use super::super::client::pq_can_decapsulate;
+        assert_eq!(pq_can_decapsulate(&None), None);
+        assert_eq!(pq_can_decapsulate(&Some("x".to_string())), Some(true));
+        // Never Some(false): the backend's compat default IS "absent".
+        assert_ne!(pq_can_decapsulate(&Some(String::new())), Some(false));
     }
 
     #[test]

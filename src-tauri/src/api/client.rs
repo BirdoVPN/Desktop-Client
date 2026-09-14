@@ -29,6 +29,17 @@ const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " 
 // Android client) via a custom rustls verifier, so Cloudflare/Google leaf
 // rotations NO LONGER require a desktop release. See src/api/cert_pin.rs.
 
+/// The `pqClientCanDecapsulate` wire value for a connect body carrying
+/// `pq_client_public_key`. ONE rule for both request builders (single- and
+/// multi-hop) so the twins cannot drift: uploading a key IS the promise that
+/// this build decapsulates, so the flag follows the key exactly — `Some(true)`
+/// with a key, absent without one (a non-PQ body stays byte-identical to
+/// every earlier desktop release). Never `Some(false)`: the backend treats a
+/// missing flag as the compat path already.
+pub(crate) fn pq_can_decapsulate(pq_client_public_key: &Option<String>) -> Option<bool> {
+    pq_client_public_key.as_ref().map(|_| true)
+}
+
 pub struct BirdoApi {
     client: Client,
     /// F-23 FIX: Tokens wrapped in Zeroizing<String> so old values are securely
@@ -351,6 +362,8 @@ impl BirdoApi {
         pq_client_public_key: Option<String>,
     ) -> Result<ConnectResponse, ApiError> {
         let attestation = self.desktop_attestation().await;
+        // Computed before the key is moved into the literal.
+        let pq_client_can_decapsulate = pq_can_decapsulate(&pq_client_public_key);
 
         let payload = ConnectRequest {
             server_node_id: Some(server_id.to_string()),
@@ -361,6 +374,7 @@ impl BirdoApi {
             fallback_reason: fallback_reason.map(str::to_string),
             quantum_protection,
             pq_client_public_key,
+            pq_client_can_decapsulate,
             desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
             desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
             desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
@@ -514,6 +528,8 @@ impl BirdoApi {
         pq_client_public_key: Option<String>,
     ) -> Result<MultiHopConnectResponse, ApiError> {
         let attestation = self.desktop_attestation().await;
+        // Computed before the key is moved into the literal.
+        let pq_client_can_decapsulate = pq_can_decapsulate(&pq_client_public_key);
 
         let payload = MultiHopConnectRequest {
             entry_node_id: entry_node_id.to_string(),
@@ -523,6 +539,7 @@ impl BirdoApi {
             stealth_mode: Some(stealth_mode),
             quantum_protection: Some(quantum_protection),
             pq_client_public_key,
+            pq_client_can_decapsulate,
             desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
             desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
             desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),

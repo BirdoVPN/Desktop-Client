@@ -739,6 +739,20 @@ pub struct ConnectRequest {
     /// Closes B1 (PQ claimed but not implemented on desktop).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pq_client_public_key: Option<String>,
+    /// BirdoPQ HNDL opt-in (OPEN-WORK G5): `Some(true)` whenever
+    /// `pq_client_public_key` is uploaded. It tells the backend this build
+    /// WILL ML-KEM-decapsulate locally (`vpn::birdo_pq::try_decapsulate`), so
+    /// `vpn.service.ts connect()` withholds the derived PSK instead of echoing
+    /// it back over TLS — the harvest-now-decrypt-later hole the whole PQ
+    /// exchange exists to close. Absent, the backend keeps the compat path
+    /// (quantumEnabled=true AND presharedKey returned), which every desktop
+    /// build up to 1.4.41 relied on. `commands::vpn::derive_quantum_psk`
+    /// already fails closed when decapsulation fails in quantum mode, so
+    /// withholding the PSK can never silently downgrade. Mirrors Android
+    /// BirdoRepository (`pqClientPublicKey != null`) and iOS APIClient
+    /// (`pqPk == nil ? nil : true`), which have sent it since android-v1.4.24.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pq_client_can_decapsulate: Option<bool>,
     /// Ed25519 client attestation (`BIRDO-DESKTOP-ATTEST-v1`, see api::attestation).
     /// All five are absent on builds compiled without the signing key, so the
     /// request body is byte-identical to a pre-attestation client.
@@ -861,6 +875,11 @@ pub struct MultiHopConnectRequest {
     pub quantum_protection: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pq_client_public_key: Option<String>,
+    /// BirdoPQ HNDL opt-in — see `ConnectRequest`. Multi-hop is the twin of
+    /// the single-hop request (multi-hop.service.ts forwards the flag into the
+    /// same connect()); it must not drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pq_client_can_decapsulate: Option<bool>,
     /// Ed25519 client attestation — see `ConnectRequest`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desktop_attest_nonce: Option<String>,
