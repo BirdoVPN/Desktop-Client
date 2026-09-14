@@ -1231,11 +1231,7 @@ pub async fn quick_connect(
         .await
         .map_err(|e| format!("Failed to get servers: {}", e))?;
 
-    // Find the best server (first online server)
-    let best_server = servers
-        .into_iter()
-        .find(|s| s.is_online)
-        .ok_or("No online servers available")?;
+    let best_server = pick_quick_connect_server(servers).ok_or("No online servers available")?;
 
     // P6-CLI-D-03: the chosen node is connection history. INFO records that a quick
     // connect happened; the node itself only goes to debug.
@@ -1262,6 +1258,31 @@ pub async fn quick_connect(
         auto_reconnect,
     )
     .await
+}
+
+/// Quick-connect node choice (OPEN-WORK K10): the least-loaded node the user
+/// can actually use.
+///
+/// Until 1.4.42 this was `.find(|s| s.is_online)` on the backend's list, which
+/// `/vpn/servers` sorts by NAME — so every desktop quick-connect landed on
+/// Amsterdam regardless of load, and a free-plan user could be handed a paid
+/// node and eat the backend's refusal because `accessible` was never checked.
+/// Android (VpnManager.quickConnect) already gates on `isOnline && accessible`
+/// and ranks `minByOrNull { load }`; this is the same rule. `load` is the
+/// backend's composite score (max of slot% and fresh CPU% once birdo-web K10-A
+/// ships; slot% before that), so ranking on it needs no client change later.
+///
+/// Ties keep list order (`min_by_key` returns the FIRST minimum), which is the
+/// old alphabetical behaviour on an idle fleet — every node reports load 0
+/// today, so quick-connect stays deterministic rather than flapping.
+/// Kept free of Tauri state so it is unit-testable.
+pub(crate) fn pick_quick_connect_server(
+    servers: Vec<crate::api::types::VpnServer>,
+) -> Option<crate::api::types::VpnServer> {
+    servers
+        .into_iter()
+        .filter(|s| s.is_online && s.accessible)
+        .min_by_key(|s| s.load)
 }
 
 /// Live-reapply tunnel-affecting settings to the ACTIVE session (mobile parity).
@@ -1522,5 +1543,138 @@ mod tests {
         ] {
             assert_eq!(transport_fallback_reason(err), None, "{err}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // OPEN-WORK G5: with `pqClientCanDecapsulate:true` on the wire the backend
+    // withholds `presharedKey`. This proves that a withheld PSK can never
+    // degrade to a classical/no-PSK tunnel: when quantum mode is on and the
+    // ciphertext cannot be decapsulated, derive_quantum_psk must ERR, not
+    // return the (absent) server PSK or Ok(None).
+    // ------------------------------------------------------------------
+
+    /// Synthetic backend response: quantum on, PSK withheld, undecapsulatable
+    /// ciphertext ("AAAA" is 3 bytes, ML-KEM-1024 ciphertexts are 1568).
+    fn withheld_psk_response(quantum_enabled: Option<bool>) -> ConnectResponse {
+        ConnectResponse {
+            success: true,
+            message: None,
+            error_code: None,
+            config: None,
+            key_id: Some("k1".into()),
+            private_key: None,
+            public_key: None,
+            preshared_key: None,
+            assigned_ip: None,
+            client_ipv6: None,
+            server_public_key: None,
+            endpoint: None,
+            dns: None,
+            allowed_ips: None,
+            mtu: None,
+            persistent_keepalive: None,
+            server_node: None,
+            stealth_enabled: None,
+            xray_endpoint: None,
+            xray_uuid: None,
+            xray_public_key: None,
+            xray_short_id: None,
+            xray_sni: None,
+            xray_flow: None,
+            quantum_enabled,
+            rosenpass_public_key: Some("AAAA".into()),
+            rosenpass_endpoint: Some("bm9uY2U=".into()),
+        }
+    }
+
+    #[test]
+    fn derive_quantum_psk_fails_closed_when_psk_withheld() {
+        let resp = withheld_psk_response(Some(true));
+        let r = derive_quantum_psk(&resp);
+        assert!(r.is_err(), "expected fail-closed Err, got {r:?}");
+        assert!(r.unwrap_err().contains("silent downgrade"));
+    }
+
+    /// Control: the same response with quantum OFF is the legacy no-PSK path
+    /// and must NOT abort — proves the test above bites on `quantum_enabled`
+    /// specifically, not on the missing PSK alone.
+    #[test]
+    fn derive_quantum_psk_allows_no_psk_when_quantum_off() {
+        let resp = withheld_psk_response(Some(false));
+        assert_eq!(derive_quantum_psk(&resp), Ok(None));
+    }
+
+    // ------------------------------------------------------------------
+    // OPEN-WORK K10: quick-connect picks the least-loaded ACCESSIBLE node.
+    // ------------------------------------------------------------------
+
+    fn server(id: &str, online: bool, accessible: bool, load: u8) -> crate::api::types::VpnServer {
+        // Built from the wire shape so the test exercises the same serde
+        // defaults quick-connect sees from /vpn/servers.
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": id,
+            "country": "XX",
+            "isOnline": online,
+            "accessible": accessible,
+            "load": load,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn quick_connect_picks_lowest_load() {
+        let picked = pick_quick_connect_server(vec![
+            server("A", true, true, 60),
+            server("B", true, true, 10),
+        ])
+        .unwrap();
+        assert_eq!(picked.id, "B");
+    }
+
+    /// A free user's quick-connect must never target a plan-gated node, even
+    /// when it is the emptiest — the backend would refuse and the user would
+    /// see a failure instead of a connection.
+    #[test]
+    fn quick_connect_skips_inaccessible_even_when_emptier() {
+        let picked = pick_quick_connect_server(vec![
+            server("A", true, false, 5),
+            server("B", true, true, 40),
+        ])
+        .unwrap();
+        assert_eq!(picked.id, "B");
+    }
+
+    #[test]
+    fn quick_connect_skips_offline_even_when_emptier() {
+        let picked = pick_quick_connect_server(vec![
+            server("A", false, true, 0),
+            server("B", true, true, 40),
+        ])
+        .unwrap();
+        assert_eq!(picked.id, "B");
+    }
+
+    #[test]
+    fn quick_connect_none_when_all_offline() {
+        assert!(pick_quick_connect_server(vec![
+            server("A", false, true, 0),
+            server("B", false, true, 0),
+        ])
+        .is_none());
+        assert!(pick_quick_connect_server(vec![]).is_none());
+    }
+
+    /// Equal loads keep list order (the backend sorts by name), so an idle
+    /// fleet behaves exactly as before — deterministic, not flapping.
+    #[test]
+    fn quick_connect_ties_keep_list_order() {
+        let picked = pick_quick_connect_server(vec![
+            server("Zed", true, true, 0),
+            server("Amsterdam", true, true, 0),
+            server("Berlin", true, true, 0),
+        ])
+        .unwrap();
+        assert_eq!(picked.id, "Zed");
     }
 }
