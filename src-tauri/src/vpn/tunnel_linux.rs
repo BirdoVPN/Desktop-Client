@@ -528,6 +528,16 @@ impl LinuxTunnel {
     /// Packet processing loop: read from TUN, encrypt via WireGuard, send to server.
     ///
     /// Linux TUN with IFF_NO_PI provides raw IP packets — no protocol header unlike macOS utun.
+    ///
+    /// OPEN-WORK F6: the TUN read reuses ONE owned buffer across iterations
+    /// (the macOS loop's pattern, tunnel_macos.rs) instead of allocating a
+    /// fresh 64 KiB `Vec` per iteration. The loop spins once per packet in
+    /// either direction and — before idle backoff kicks in — once per
+    /// EAGAIN poll, so the old `vec![0u8; MAX_PACKET_SIZE]` inside the
+    /// per-iteration `spawn_blocking` closure was a 64 KiB alloc + free (and
+    /// on every non-idle iteration a page fault or memset for the pages the
+    /// kernel actually filled) per packet, on the hot path, for the whole
+    /// session. See [`tun_read_owned`].
     async fn packet_loop(
         tun_fd: i32,
         wg_session: Arc<RwLock<Option<WireGuardSession>>>,
@@ -561,6 +571,10 @@ impl LinuxTunnel {
         let mut last_timer_update = std::time::Instant::now();
         const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+        // The one read buffer for the whole session (F6). It is moved into the
+        // blocking read task each iteration and handed back with the byte count.
+        let mut read_buf = vec![0u8; MAX_PACKET_SIZE];
+
         loop {
             let mut did_work = false;
             if !running.load(Ordering::SeqCst) {
@@ -568,49 +582,46 @@ impl LinuxTunnel {
                 break;
             }
 
+            // The buffer normally comes back from the blocking task. If it did
+            // not (the task failed to join — the shutdown arm breaks the loop, so
+            // it never reaches here), restore it so `read` is never issued
+            // against a zero-length slice; that would return 0 forever and read
+            // as a silent EOF.
+            if read_buf.len() != MAX_PACKET_SIZE {
+                read_buf = vec![0u8; MAX_PACKET_SIZE];
+            }
+
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     tracing::info!("Packet loop: shutdown signal received");
                     break;
                 }
-                // Read from TUN (async via spawn_blocking for the fd read)
+                // Read from TUN (async via spawn_blocking for the fd read). The
+                // owned buffer is moved in and returned, never reallocated.
                 result = tokio::task::spawn_blocking({
                     let fd = tun_fd;
-                    // Allocate a fresh zeroed buffer per read. alloc_zeroed for a
-                    // large buffer is typically backed by lazily-faulted zero pages,
-                    // avoiding the eager 64KiB memcpy that `read_buf.clone()` incurred.
-                    // Behaviour is identical: the buffer is overwritten by `read` up to
-                    // `n` bytes and then truncated to `n`, so initial contents never matter.
-                    let mut buf = vec![0u8; MAX_PACKET_SIZE];
-                    move || {
-                        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                        if n > 0 {
-                            buf.truncate(n as usize);
-                            Some(buf)
-                        } else if n < 0 {
-                            let err = std::io::Error::last_os_error();
-                            if err.raw_os_error() != Some(libc::EAGAIN) {
-                                tracing::debug!("TUN read error: {}", err);
-                            }
-                            None
-                        } else {
-                            None
-                        }
-                    }
+                    let buf = std::mem::take(&mut read_buf);
+                    move || tun_read_owned(fd, buf)
                 }) => {
-                    if let Ok(Some(ip_packet)) = result {
-                        did_work = true;
-                        // Linux TUN with IFF_NO_PI: data is already a raw IP packet
-                        let packet_len = ip_packet.len() as u64;
+                    if let Ok((buf, n)) = result {
+                        // Hand the buffer back for the next iteration BEFORE
+                        // looking at the result, so every path reuses it.
+                        read_buf = buf;
+                        if let Some(n) = n {
+                            did_work = true;
+                            // Linux TUN with IFF_NO_PI: data is already a raw IP packet
+                            let ip_packet = &read_buf[..n];
+                            let packet_len = ip_packet.len() as u64;
 
-                        if let Some(session) = wg_session.read().await.as_ref() {
-                            match session.send_packet(&ip_packet).await {
-                                Ok(_) => {
-                                    bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
-                                    packets_sent.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Failed to send WG packet: {}", e);
+                            if let Some(session) = wg_session.read().await.as_ref() {
+                                match session.send_packet(ip_packet).await {
+                                    Ok(_) => {
+                                        bytes_sent.fetch_add(packet_len, Ordering::Relaxed);
+                                        packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("Failed to send WG packet: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -701,6 +712,126 @@ impl LinuxTunnel {
         }
 
         tracing::info!("Packet loop exited");
+    }
+}
+
+/// One blocking TUN read into an OWNED buffer that is handed straight back,
+/// so the packet loop reuses a single allocation for the whole session (F6).
+///
+/// Returns `(buf, Some(n))` when `n > 0` bytes landed in `buf[..n]`, and
+/// `(buf, None)` on EAGAIN (nothing queued on the O_NONBLOCK fd), EOF, or an
+/// error (logged unless it is EAGAIN). `buf` comes back with its length and
+/// allocation untouched in every case — the caller slices `&buf[..n]`
+/// instead of truncating, which is what keeps the next read full-size
+/// without a reallocation.
+fn tun_read_owned(fd: i32, mut buf: Vec<u8>) -> (Vec<u8>, Option<usize>) {
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    let got = if n > 0 {
+        Some(n as usize)
+    } else {
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EAGAIN) {
+                tracing::debug!("TUN read error: {}", err);
+            }
+        }
+        None
+    };
+    (buf, got)
+}
+
+/// F6: the packet loop's read helper must reuse its buffer. Exercised on a
+/// pipe (any fd works for `read(2)`) on the ubuntu leg of tests.yml — no TUN
+/// device or root needed.
+#[cfg(test)]
+mod tun_read_tests {
+    use super::tun_read_owned;
+
+    /// (read_fd, write_fd), read end O_NONBLOCK like the real TUN fd.
+    fn nonblocking_pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        (fds[0], fds[1])
+    }
+
+    fn write_all(fd: i32, bytes: &[u8]) {
+        let n = unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+        assert_eq!(n as usize, bytes.len());
+    }
+
+    /// The regression this helper exists to prevent: the old closure built a
+    /// fresh 64 KiB Vec per iteration and `truncate`d it to the packet. Across
+    /// many reads the SAME allocation must come back, full length, with the
+    /// packet in its prefix.
+    #[test]
+    fn buffer_is_reused_across_reads_without_reallocation_or_truncation() {
+        const CAP: usize = 65536;
+        let (r, w) = nonblocking_pipe();
+        let mut buf = vec![0u8; CAP];
+        let original_ptr = buf.as_ptr();
+
+        for i in 0..1_000u32 {
+            let packet = i.to_le_bytes();
+            write_all(w, &packet);
+            let (returned, n) = tun_read_owned(r, buf);
+            buf = returned;
+            assert_eq!(n, Some(4), "iteration {i}");
+            assert_eq!(&buf[..4], &packet, "iteration {i}");
+            assert_eq!(buf.len(), CAP, "iteration {i}: length must not shrink");
+            assert!(
+                std::ptr::eq(buf.as_ptr(), original_ptr),
+                "iteration {i}: the buffer was reallocated"
+            );
+        }
+
+        unsafe {
+            libc::close(w);
+            libc::close(r);
+        }
+    }
+
+    /// An idle O_NONBLOCK fd (EAGAIN) and a closed writer (EOF) both yield
+    /// None — and still hand the buffer back intact, so the idle-poll path
+    /// (the most frequent one before backoff) allocates nothing either.
+    #[test]
+    fn eagain_and_eof_return_none_but_keep_the_buffer() {
+        let (r, w) = nonblocking_pipe();
+        let buf = vec![0u8; 4096];
+        let ptr = buf.as_ptr();
+
+        let (buf, n) = tun_read_owned(r, buf);
+        assert_eq!(n, None, "nothing written yet: EAGAIN");
+        assert_eq!(buf.len(), 4096);
+        assert!(std::ptr::eq(buf.as_ptr(), ptr));
+
+        unsafe { libc::close(w) };
+        let (buf, n) = tun_read_owned(r, buf);
+        assert_eq!(n, None, "writer closed: EOF");
+        assert_eq!(buf.len(), 4096);
+        assert!(std::ptr::eq(buf.as_ptr(), ptr));
+
+        unsafe { libc::close(r) };
+    }
+
+    /// A packet larger than the buffer is clipped to the buffer (read(2)
+    /// semantics) — n never exceeds len, so `&buf[..n]` cannot panic.
+    #[test]
+    fn read_never_reports_more_than_the_buffer_holds() {
+        let (r, w) = nonblocking_pipe();
+        write_all(w, &[0xAB; 100]);
+        let (buf, n) = tun_read_owned(r, vec![0u8; 64]);
+        assert_eq!(n, Some(64));
+        assert!(buf.iter().all(|&b| b == 0xAB));
+        unsafe {
+            libc::close(w);
+            libc::close(r);
+        }
     }
 }
 
