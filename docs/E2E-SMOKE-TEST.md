@@ -41,11 +41,47 @@ installing the signed `win-v1.3.x` build, **as Administrator**. Tick each box.
 - [ ] Multi-hop arm toggle is gated to Sovereign; entry + exit pickers work; same-server is rejected.
 - [ ] Connects through both hops; egress IP is the **exit** node.
 
-## 6. IPv6 (per-node — test once a node has IPv6 activated)
-- [ ] **Dual-stack node, single-hop:** adapter gets an IPv6 address; `ping -6 2606:4700:4700::1111` succeeds; an IPv6 leak test (e.g. test-ipv6.com) shows the **VPN** IPv6, not your ISP's.
-- [ ] **Dual-stack node, multi-hop:** same as above (this release added multi-hop IPv6 — previously IPv4-only).
-- [ ] **IPv4-only node:** IPv6 is **blocked, not leaked** — `ping -6` fails and test-ipv6.com shows no native IPv6. (Fail-closed: the tunnel blocks v6 when the node has none.)
+## 6. IPv6
+
+> **Re-measured against the live fleet on 2026-09-14 (OPEN-WORK F14).** This
+> section had three rows that would each have wasted a tester's evening. What is
+> below is what the fleet and the backend actually do.
+>
+> * **All ten nodes are dual-stack.** `server_nodes.ipv6Enabled` is true for
+>   every one of them, each with `fd00:b1d0::/64`. There is **no IPv4-only node
+>   to test against**, so the old "IPv4-only node" row named a target that does
+>   not exist — the reason F14 was raised. It is retargeted below rather than
+>   retired: the fail-closed path it was checking is real and is still reachable,
+>   just by a different route.
+> * **The tunnel address is a ULA, not a global address.** Clients get
+>   `fd00:b1d0::<last octet of their v4>`; the node NAT66-masquerades it out of
+>   its own global `2001:19f0:…` (verified on Amsterdam and London: global v6 on
+>   `enp1s0`, `net.ipv6.conf.all.forwarding=1`, one MASQUERADE rule in
+>   `ip6tables -t nat`, and `ping6` to `2606:4700:4700::1111` succeeds from the
+>   node). So an adapter showing `fd00:…` is **correct** — do not report it.
+> * **Multi-hop is IPv4-only, deliberately.** The old row claimed "this release
+>   added multi-hop IPv6", which is backwards. `deriveClientIpv6()` takes
+>   `multiHop` as a REQUIRED argument and returns `null` for it, and
+>   `vpn.service.ts` gates the derivation on `!params.multiHop` as well. The
+>   reason is in the code: the wg-mesh fabric carries IPv4 only (10.99.0.0/24)
+>   and the entry node's policy routing diverts IPv4 alone, so a multi-hop
+>   client holding a v6 address would egress over the **entry** node's v6 — the
+>   wrong country, from the one hop that also knows who the customer is, which
+>   is the exact property multi-hop is sold to prevent. Happy Eyeballs prefers
+>   v6, so most traffic to dual-stack destinations would take that leaking path.
+
+- [ ] **Dual-stack node, single-hop:** the adapter gets an IPv6 address in `fd00:b1d0::/64`; `ping -6 2606:4700:4700::1111` succeeds; an IPv6 leak test (e.g. test-ipv6.com) shows an address in the **node's** `2001:19f0:…` range — not your ISP's, and not the `fd00:` ULA (that one is inside the tunnel and never appears to a website).
+- [ ] **Multi-hop — IPv6 is BLOCKED, not leaked.** This is the fail-closed check the old "IPv4-only node" row was after, on a target that exists. Connect multi-hop and confirm: the adapter has **no** IPv6 tunnel address, `ping -6 2606:4700:4700::1111` **fails**, and test-ipv6.com reports no IPv6 connectivity at all. A **leak here is critical** — if test-ipv6.com shows any address, and especially one in the **entry** node's country, stop and report it.
 - [ ] Kill switch active -> **both** IPv4 and IPv6 are blocked (WFP v4 + v6 filters).
+
+**Already covered by automated tests — do not spend manual time re-checking:**
+the `null`-for-multi-hop rule and the octet/prefix maths
+(`wireguard.service.spec.ts`, 14 assertions over `deriveClientIpv6`); that an
+absent `client_ipv6` is accepted as fail-closed rather than treated as a partial
+scope (`validate_tunnel_scope`, `vpn/mod.rs` tests); and that a dual-stack
+tunnel clears the pre-emptive v6 block while an IPv4-only one leaves it standing
+(`wfp.rs`, LEAK-2). The manual rows above exist to check the **real network**
+behaviour those tests cannot reach.
 
 ## 7. Split tunnel (Operative+)
 - [ ] Add an app (e.g. a browser) to the exclude list; connect -> that app's traffic uses the **physical** interface (real IP) while everything else is tunnelled. Verify for both IPv4 and IPv6.
