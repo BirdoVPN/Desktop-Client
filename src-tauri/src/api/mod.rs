@@ -13,6 +13,9 @@ pub mod upgrade_gate;
 
 #[cfg(test)]
 mod tests;
+// K5: serialized connect bodies validated against contract/vpn-protocol.schema.json.
+#[cfg(test)]
+mod contract_tests;
 
 pub use client::BirdoApi;
 // ApiError is used internally but re-exported for module consumers

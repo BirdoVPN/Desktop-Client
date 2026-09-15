@@ -240,7 +240,10 @@ pub fn build_vpn_config(
 
 /// Generate a X25519 keypair for WireGuard. Returns (local_private_key_b64, client_public_key_b64).
 /// Private key bytes are zeroized immediately after encoding.
-pub(super) fn generate_wireguard_keypair() -> (String, String) {
+/// pub(crate) (was pub(super)) so api/contract_tests.rs can run the REAL
+/// producer through the schema's `clientPublicKey` pattern instead of a
+/// hand-typed 44-char literal that would pass no matter what this emits.
+pub(crate) fn generate_wireguard_keypair() -> (String, String) {
     let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let public = PublicKey::from(&secret);
     let mut private_key_bytes = secret.to_bytes();

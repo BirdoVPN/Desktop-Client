@@ -40,6 +40,84 @@ pub(crate) fn pq_can_decapsulate(pq_client_public_key: &Option<String>) -> Optio
     pq_client_public_key.as_ref().map(|_| true)
 }
 
+/// The exact `/vpn/connect` body, assembled in one place so the contract test
+/// (api/contract_tests.rs) validates the SAME struct `connect_vpn` posts, not
+/// a hand-typed twin that could drift from it. Pure: no I/O, no async — the
+/// attestation is fetched by the caller and passed in.
+///
+/// `device_id` is sourced HERE, not from the caller, for the same reason
+/// `LoginRequest::new` does it: every path that dials — connect, quick-connect,
+/// multi-hop and auto-reconnect's unattended re-dial — must present the identity
+/// the login registered, or the backend cannot reclaim this machine's own slot
+/// (see `ConnectRequest::device_id`). A caller-supplied parameter would be one
+/// more thing a new call site can forget.
+#[allow(clippy::too_many_arguments)] // mirrors the ConnectRequest wire fields 1:1
+pub(crate) fn build_connect_request(
+    server_id: &str,
+    device_name: &str,
+    client_public_key: Option<String>,
+    stealth_mode: Option<bool>,
+    fallback_reason: Option<&str>,
+    quantum_protection: Option<bool>,
+    pq_client_public_key: Option<String>,
+    attestation: Option<super::attestation::DesktopAttestation>,
+) -> ConnectRequest {
+    // Computed before the key is moved into the literal.
+    let pq_client_can_decapsulate = pq_can_decapsulate(&pq_client_public_key);
+    ConnectRequest {
+        server_node_id: Some(server_id.to_string()),
+        device_name: Some(device_name.to_string()),
+        preferred_region: None,
+        device_id: Some(crate::utils::get_device_id()),
+        client_public_key,
+        stealth_mode,
+        fallback_reason: fallback_reason.map(str::to_string),
+        quantum_protection,
+        pq_client_public_key,
+        pq_client_can_decapsulate,
+        desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
+        desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
+        desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
+        desktop_attest_platform: attestation.as_ref().map(|a| a.platform.to_string()),
+        desktop_attest_version: attestation.as_ref().map(|a| a.version.to_string()),
+    }
+}
+
+/// The exact `/vpn/multi-hop/connect` body — twin of [`build_connect_request`],
+/// same reasons. `device_id` is sourced here too: MultiHopService forwards it
+/// into the same eviction, so a double-VPN reconnect without it burns slots
+/// exactly like a single-hop one.
+#[allow(clippy::too_many_arguments)] // mirrors the backend endpoint's parameter surface 1:1
+pub(crate) fn build_multi_hop_request(
+    entry_node_id: &str,
+    exit_node_id: &str,
+    device_name: &str,
+    client_public_key: &str,
+    stealth_mode: bool,
+    quantum_protection: bool,
+    pq_client_public_key: Option<String>,
+    attestation: Option<super::attestation::DesktopAttestation>,
+) -> MultiHopConnectRequest {
+    // Computed before the key is moved into the literal.
+    let pq_client_can_decapsulate = pq_can_decapsulate(&pq_client_public_key);
+    MultiHopConnectRequest {
+        entry_node_id: entry_node_id.to_string(),
+        exit_node_id: exit_node_id.to_string(),
+        device_name: Some(device_name.to_string()),
+        device_id: Some(crate::utils::get_device_id()),
+        client_public_key: Some(client_public_key.to_string()),
+        stealth_mode: Some(stealth_mode),
+        quantum_protection: Some(quantum_protection),
+        pq_client_public_key,
+        pq_client_can_decapsulate,
+        desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
+        desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
+        desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
+        desktop_attest_platform: attestation.as_ref().map(|a| a.platform.to_string()),
+        desktop_attest_version: attestation.as_ref().map(|a| a.version.to_string()),
+    }
+}
+
 pub struct BirdoApi {
     client: Client,
     /// F-23 FIX: Tokens wrapped in Zeroizing<String> so old values are securely
@@ -362,25 +440,16 @@ impl BirdoApi {
         pq_client_public_key: Option<String>,
     ) -> Result<ConnectResponse, ApiError> {
         let attestation = self.desktop_attestation().await;
-        // Computed before the key is moved into the literal.
-        let pq_client_can_decapsulate = pq_can_decapsulate(&pq_client_public_key);
-
-        let payload = ConnectRequest {
-            server_node_id: Some(server_id.to_string()),
-            device_name: Some(device_name.to_string()),
-            preferred_region: None,
+        let payload = build_connect_request(
+            server_id,
+            device_name,
             client_public_key,
             stealth_mode,
-            fallback_reason: fallback_reason.map(str::to_string),
+            fallback_reason,
             quantum_protection,
             pq_client_public_key,
-            pq_client_can_decapsulate,
-            desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
-            desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
-            desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
-            desktop_attest_platform: attestation.as_ref().map(|a| a.platform.to_string()),
-            desktop_attest_version: attestation.as_ref().map(|a| a.version.to_string()),
-        };
+            attestation,
+        );
 
         self.post(endpoints::vpn::CONNECT, &payload, true).await
     }
@@ -528,24 +597,16 @@ impl BirdoApi {
         pq_client_public_key: Option<String>,
     ) -> Result<MultiHopConnectResponse, ApiError> {
         let attestation = self.desktop_attestation().await;
-        // Computed before the key is moved into the literal.
-        let pq_client_can_decapsulate = pq_can_decapsulate(&pq_client_public_key);
-
-        let payload = MultiHopConnectRequest {
-            entry_node_id: entry_node_id.to_string(),
-            exit_node_id: exit_node_id.to_string(),
-            device_name: Some(device_name.to_string()),
-            client_public_key: Some(client_public_key.to_string()),
-            stealth_mode: Some(stealth_mode),
-            quantum_protection: Some(quantum_protection),
+        let payload = build_multi_hop_request(
+            entry_node_id,
+            exit_node_id,
+            device_name,
+            client_public_key,
+            stealth_mode,
+            quantum_protection,
             pq_client_public_key,
-            pq_client_can_decapsulate,
-            desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
-            desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
-            desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
-            desktop_attest_platform: attestation.as_ref().map(|a| a.platform.to_string()),
-            desktop_attest_version: attestation.as_ref().map(|a| a.version.to_string()),
-        };
+            attestation,
+        );
 
         self.post(endpoints::vpn::MULTI_HOP_CONNECT, &payload, true)
             .await
