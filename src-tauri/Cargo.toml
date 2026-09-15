@@ -194,4 +194,15 @@ tempfile = "3.13"
 # default-features = false: the defaults exist only to fetch remote `$ref`s
 # (reqwest + rustls + aws-lc-rs, a C/asm build) and the vendored schema has
 # none -- a test-only dep must not add a native toolchain to every runner.
+#
+# DISCLOSURE (review of #158): this dev-dependency is test-only, but Cargo
+# resolves ONE version of each crate for the whole graph, and two of its
+# transitive pins are exact -- jsonschema-value 0.56.0 wants zmij = "1.0.23"
+# and fraction 0.17.0 wants num-bigint = "0.4.8". Unification therefore moved
+# two crates that ARE in the shipped release binary: serde_json now links
+# zmij 1.0.23 (was 1.0.9) and x509-parser -> der-parser links num-bigint 0.4.8
+# (was 0.4.6) -- the cert-pin X.509 parsing path. Both are semver-compatible
+# patch releases, cargo-deny advisories/licenses/bans pass, and they cannot be
+# pinned back without dropping this dep. Whoever signs the next release should
+# know the production dependency set changed here, not just the test set.
 jsonschema = { version = "=0.56.0", default-features = false }
