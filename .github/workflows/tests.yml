@@ -271,6 +271,27 @@ jobs:
       - name: Unit tests
         run: npm run test:run
 
+  # OPEN-WORK F4: self-test of the release pipeline's post-bundle xray gate.
+  # release.yml build-windows runs scripts/ci/verify-bundled-xray-hash.ps1
+  # against the produced NSIS installer and fails the release unless the
+  # bundled resources\xray.exe hashes to the compiled-in XRAY_BINARY_SHA256
+  # (v1.4.40 and v1.4.41 shipped with a mismatch — Authenticode rewrote the
+  # file after the hash was captured — and nothing noticed). A gate that can
+  # be edited into a no-op is worse than none, so every PR proves each of its
+  # failure paths still fails, using fake installers 7z extracts like NSIS.
+  xray-gate-selftest:
+    name: Bundled-xray hash gate self-test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run the gate against fake installers (pass + must-fail scenarios)
+        shell: pwsh
+        run: ./scripts/ci/verify-bundled-xray-hash.tests.ps1
+
   # Version-consistency gate. The app version is declared in THREE places:
   # package.json, src-tauri/tauri.conf.json, and src-tauri/Cargo.toml
   # ([package] version). The in-app updater matches installed-vs-release by

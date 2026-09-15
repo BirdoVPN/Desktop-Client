@@ -49,12 +49,29 @@ const XRAY_BINARY_SHA256: Option<&str> = option_env!("XRAY_BINARY_SHA256");
 /// AUDIT-N4: verify the xray binary on disk against XRAY_BINARY_SHA256
 /// before exec'ing it. Returns Ok(()) on match, error string on mismatch or
 /// when the constant is unset in a release build.
+///
+/// OPEN-WORK F4: this check refused xray on EVERY signed Windows release
+/// (v1.4.40, v1.4.41 measured): release.yml captured XRAY_BINARY_SHA256
+/// from the freshly downloaded xray.exe and tauri-bundler then Authenticode-
+/// signed the same file in place, so the shipped bytes never matched. The
+/// check itself was right; the pipeline now hashes the SIGNED file and gates
+/// the produced installer on it (scripts/ci/verify-bundled-xray-hash.ps1).
 fn verify_xray_integrity(path: &std::path::Path) -> Result<(), String> {
+    verify_xray_integrity_against(path, XRAY_BINARY_SHA256)
+}
+
+/// The comparison behind `verify_xray_integrity`, with the expected digest as
+/// a parameter so the mismatch and unset arms are unit-testable (the constant
+/// is fixed at compile time; a test cannot vary it).
+fn verify_xray_integrity_against(
+    path: &std::path::Path,
+    expected_sha256: Option<&str>,
+) -> Result<(), String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("Failed to read xray binary for integrity check: {}", e))?;
     let actual = format!("{:x}", Sha256::digest(&bytes));
 
-    match XRAY_BINARY_SHA256 {
+    match expected_sha256 {
         Some(expected) if !expected.is_empty() => {
             if actual.eq_ignore_ascii_case(expected) {
                 tracing::info!(
@@ -655,6 +672,57 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F4: the shipped-file/compiled-hash mismatch is exactly what every
+    /// signed Windows release hit. A one-byte rewrite after hashing (what an
+    /// Authenticode signature does, at larger scale) must yield Err, and the
+    /// message must name both digests so the log is actionable.
+    #[test]
+    fn integrity_mismatch_is_refused_and_names_both_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("xray.exe");
+        std::fs::write(&bin, b"not really xray").unwrap();
+        let good = format!("{:x}", Sha256::digest(b"not really xray"));
+
+        assert_eq!(verify_xray_integrity_against(&bin, Some(&good)), Ok(()));
+        // GITHUB_ENV carries lower-case hex, Get-FileHash emits upper-case:
+        // the comparison must not depend on which one the pipeline exported.
+        assert_eq!(
+            verify_xray_integrity_against(&bin, Some(&good.to_uppercase())),
+            Ok(())
+        );
+
+        std::fs::write(&bin, b"not really xray+sig").unwrap();
+        let err = verify_xray_integrity_against(&bin, Some(&good)).unwrap_err();
+        assert!(err.contains("integrity verification failed"), "{err}");
+        assert!(err.contains(&good), "expected digest missing from {err}");
+        let rewritten = format!("{:x}", Sha256::digest(b"not really xray+sig"));
+        assert!(err.contains(&rewritten), "actual digest missing from {err}");
+    }
+
+    /// An EMPTY compiled-in value is the "pipeline never exported it" case
+    /// and must behave like unset: refused in release, tolerated in debug.
+    #[test]
+    fn integrity_empty_expectation_is_treated_as_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("xray.exe");
+        std::fs::write(&bin, b"x").unwrap();
+        let r = verify_xray_integrity_against(&bin, Some(""));
+        assert_eq!(verify_xray_integrity_against(&bin, None), r);
+        if cfg!(debug_assertions) {
+            assert_eq!(r, Ok(()));
+        } else {
+            assert!(r.unwrap_err().contains("unset in release build"));
+        }
+    }
+
+    #[test]
+    fn integrity_unreadable_path_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            verify_xray_integrity_against(&dir.path().join("missing"), Some("00")).unwrap_err();
+        assert!(err.contains("Failed to read xray binary"), "{err}");
+    }
 
     #[test]
     fn test_parse_endpoint() {
