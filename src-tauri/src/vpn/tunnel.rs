@@ -337,20 +337,18 @@ mod dual_stack_order_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    fn recorder() -> (
-        Rc<RefCell<Vec<&'static str>>>,
-        Rc<RefCell<Vec<&'static str>>>,
-    ) {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        (log.clone(), log)
+    type Log = Rc<RefCell<Vec<&'static str>>>;
+
+    fn recorder() -> Log {
+        Rc::new(RefCell::new(Vec::new()))
     }
 
     /// W15: routes BEFORE the unblock — the reverse order is the leak window.
     #[tokio::test]
     async fn routes_are_installed_before_the_block_is_lifted() {
-        let (log, seen) = recorder();
-        let l1 = log.clone();
-        let l2 = log.clone();
+        let seen = recorder();
+        let l1 = seen.clone();
+        let l2 = seen.clone();
         let r = bring_up_dual_stack(
             move || async move {
                 l1.borrow_mut().push("configure");
@@ -370,9 +368,9 @@ mod dual_stack_order_tests {
     /// not even invoked, and the session carries on (Ok) IPv4-only.
     #[tokio::test]
     async fn a_failed_configure_leaves_the_block_untouched() {
-        let (log, seen) = recorder();
-        let l1 = log.clone();
-        let l2 = log.clone();
+        let seen = recorder();
+        let l1 = seen.clone();
+        let l2 = seen.clone();
         let r = bring_up_dual_stack(
             move || async move {
                 l1.borrow_mut().push("configure");
@@ -971,7 +969,7 @@ impl WintunTunnel {
         if self.config.client_ipv6.is_some() {
             bring_up_dual_stack(
                 || self.configure_ipv6(),
-                || crate::vpn::wfp::unblock_ipv6_dual_stack(),
+                crate::vpn::wfp::unblock_ipv6_dual_stack,
             )
             .await?;
         }
