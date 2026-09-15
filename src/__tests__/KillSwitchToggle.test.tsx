@@ -137,21 +137,22 @@ async function turnKillSwitchOff(state: ConnectionState) {
 const liveCalls = () =>
   mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'set_killswitch_live');
 
+const ALL_STATES: ConnectionState[] = [
+  'disconnected',
+  'connecting',
+  'authenticating',
+  'stealth_connecting',
+  'connected',
+  'disconnecting',
+  'reconnecting',
+  'rekeying',
+  'kill_switch_active',
+  'error',
+];
+
 describe('killSwitchLiveApplies', () => {
-  it('is true for every state that can be holding the block, false only when no session exists', () => {
-    const all: ConnectionState[] = [
-      'disconnected',
-      'connecting',
-      'authenticating',
-      'stealth_connecting',
-      'connected',
-      'disconnecting',
-      'reconnecting',
-      'rekeying',
-      'kill_switch_active',
-      'error',
-    ];
-    const applies = all.filter(killSwitchLiveApplies);
+  it('OFF applies in every state that can be holding the block, and only skips the two with no session', () => {
+    const applies = ALL_STATES.filter((s) => killSwitchLiveApplies(s, false));
     expect(applies).toEqual([
       'connecting',
       'authenticating',
@@ -163,6 +164,19 @@ describe('killSwitchLiveApplies', () => {
       'error',
     ]);
   });
+
+  it('ON additionally skips the pre-tunnel states, where arm() would block before VPN_SERVER_IP / the LUID exist', () => {
+    const applies = ALL_STATES.filter((s) => killSwitchLiveApplies(s, true));
+    expect(applies).toEqual(['connected', 'reconnecting', 'rekeying', 'kill_switch_active', 'error']);
+  });
+
+  it.each<ConnectionState>(['connecting', 'authenticating', 'stealth_connecting'])(
+    'ON during %s is persisted only while OFF still applies (the asymmetry is the point)',
+    (state) => {
+      expect(killSwitchLiveApplies(state, true)).toBe(false);
+      expect(killSwitchLiveApplies(state, false)).toBe(true);
+    },
+  );
 });
 
 describe('Kill switch toggle → set_killswitch_live', () => {
@@ -209,5 +223,28 @@ describe('Kill switch toggle → set_killswitch_live', () => {
     await waitFor(() => {
       expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: true });
     });
+  });
+
+  it.each<ConnectionState>(['connecting', 'authenticating', 'stealth_connecting'])(
+    'ON during %s is persisted only (arm() before the tunnel exists would block-all with no relay permit)',
+    async (state) => {
+      mockStoreState.settings.killSwitchEnabled = false;
+      mockStoreState.connectionState = state;
+      render(<Settings />);
+      await userEvent.click(await screen.findByRole('switch', { name: /kill switch/i }));
+      await waitFor(() => {
+        expect(mockedInvoke).toHaveBeenCalledWith('save_settings', expect.anything());
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(liveCalls()).toHaveLength(0);
+    },
+  );
+
+  it('OFF during connecting still reaches Rust (the narrowing is ON-only)', async () => {
+    await turnKillSwitchOff('connecting');
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: false });
+    });
+    expect(liveCalls()).toHaveLength(1);
   });
 });

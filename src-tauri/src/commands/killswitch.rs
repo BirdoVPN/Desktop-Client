@@ -352,17 +352,27 @@ pub async fn arm(app: &AppHandle) -> Result<bool, String> {
 async fn arm_with_preference(enabled: bool) -> Result<bool, String> {
     if !enabled {
         // F3: the OFF preference must also CLEAR the intent flag, not merely
-        // skip arming. Until #64's frontend twin lands, toggling the kill
-        // switch off while the tunnel was Reconnecting/Error never reached
-        // `set_killswitch_live`, so `KILLSWITCH_ENABLED` stayed true from the
-        // previous arm; the next auto-reconnect then ran this branch with the
-        // persisted preference false, returned early, and left the flag set —
-        // on macOS/Linux `holds_block_while_connected()` (== `is_enabled()`)
-        // therefore stayed true and the "healthy again, lift the block" sites
-        // in auto_reconnect.rs / vpn.rs kept the block-all engaged for the
-        // rest of the session, against a preference that said OFF. Clearing
-        // it here makes the preference the source of truth on every connect,
-        // whichever path armed the previous session.
+        // skip arming. The stale-flag path (auto_reconnect.rs never calls
+        // arm() — its only callers are connect_vpn_attempt in vpn.rs and
+        // vpn_multi_hop.rs):
+        //   1. a session arms (flag true); the tunnel drops and the reactive
+        //      block goes up; auto-reconnect exhausts its budget and the
+        //      give-up branch (auto_reconnect.rs, "Max attempts reached")
+        //      calls deactivate_killswitch() — which lifts the block but never
+        //      touches KILLSWITCH_ENABLED — and the state goes Disconnected;
+        //   2. the user turns the kill switch OFF while Disconnected: that is
+        //      persisted only (set_killswitch_live no-ops without a session),
+        //      so the flag is still true from step 1;
+        //   3. the next USER connect runs arm() -> this branch with the
+        //      persisted preference false; before this fix it returned early
+        //      and left the flag set, so the next drop's activate_killswitch()
+        //      blocked against the preference — and on macOS/Linux
+        //      `holds_block_while_connected()` (== `is_enabled()`) stayed true,
+        //      so the "healthy again, lift the block" sites in
+        //      auto_reconnect.rs / vpn.rs kept the block-all engaged for the
+        //      rest of the session.
+        // Clearing it here makes the preference the source of truth on every
+        // connect, whichever path armed the previous session.
         if KILLSWITCH_ENABLED.swap(false, Ordering::SeqCst) {
             tracing::info!(
                 "Kill switch disabled by user preference — not arming (cleared a stale armed intent from the previous session)"
@@ -971,9 +981,11 @@ async fn pf_deactivate_blocking() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// F3: an OFF preference must clear a stale armed intent, or (Unix)
-    /// `holds_block_while_connected()` keeps the block-all engaged for the
-    /// rest of the session after an auto-reconnect. Only this test touches
+    /// F3: an OFF preference must clear a stale armed intent (left by the
+    /// auto-reconnect give-up branch, which lifts the block but never clears
+    /// the flag), or the next user connect's drop blocks against the
+    /// preference and (Unix) `holds_block_while_connected()` keeps the
+    /// block-all engaged for the rest of the session. Only this test touches
     /// `KILLSWITCH_ENABLED`, so it needs no serialisation against the others.
     #[tokio::test]
     async fn arm_with_preference_off_clears_stale_armed_intent() {
