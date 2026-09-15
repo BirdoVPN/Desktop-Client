@@ -86,7 +86,7 @@ import {
   gradient,
   motion as motionTokens,
 } from '@/lib/birdo-theme';
-import type { WindowCorner } from '@/store/app-store';
+import type { ConnectionState, WindowCorner } from '@/store/app-store';
 
 const DASHBOARD_URL = 'https://dashboard.birdo.app';
 const PRIVACY_URL = 'https://birdo.app/privacy';
@@ -112,6 +112,44 @@ const CORNER_OPTIONS: { value: WindowCorner; label: string; icon: typeof ArrowUp
   { value: 'bottom-left', label: 'Bot L', icon: ArrowDownLeft },
   { value: 'bottom-right', label: 'Bot R', icon: ArrowDownRight },
 ];
+
+/**
+ * Whether a kill-switch toggle must be pushed to Rust (`set_killswitch_live`)
+ * right now, or only persisted for the next connect to read.
+ *
+ * OPEN-WORK F3: this used to be `connectionState === 'connected'` for both
+ * directions, which is exactly the state in which the toggle matters LEAST —
+ * the reactive block is engaged while Reconnecting / Error / Rekeying, and
+ * turning the kill switch OFF in those states never reached Rust, so the block
+ * stayed up until the tunnel recovered or the user hit Disconnect. Fail-safe,
+ * but the user's OFF was silently ignored — and the stale armed intent it left
+ * behind outlived the session: auto_reconnect's give-up branch lifts the block
+ * but never clears `KILLSWITCH_ENABLED`, so the user's OFF (persisted while
+ * Disconnected) met a still-true flag on the next connect, where `arm()` used
+ * to return early without clearing it and the next drop blocked against the
+ * preference (see `arm_with_preference` in killswitch.rs).
+ *
+ * The two directions have different safe sets:
+ * - OFF is safe in every state (clear the intent + lift any block); Rust
+ *   already no-ops without a session (`set_killswitch_live` returns Ok(false)
+ *   unless the tunnel is active or can_disconnect()), so the only states worth
+ *   skipping are the two where no session exists or one is being torn down by
+ *   disconnect_vpn -> disarm().
+ * - ON must ALSO skip the pre-tunnel states ('connecting' | 'authenticating' |
+ *   'stealth_connecting'): can_disconnect() is true there, so Rust would run
+ *   `arm()` before the connect path publishes VPN_SERVER_IP / the tunnel LUID —
+ *   on macOS/Linux that raises a block-all with no (or the PREVIOUS server's)
+ *   relay permit ahead of the API call and handshake, the attempt fails and
+ *   nothing lifts it; on Windows lockdown, arm() without a LUID trips the
+ *   activate_blocking refusal and silently drops lockdown for the session.
+ *   The connect path's own `arm()` (connect_vpn_attempt) arms at the right
+ *   moment and reads the persisted preference, so ON is persisted-only there.
+ */
+export function killSwitchLiveApplies(state: ConnectionState, enabled: boolean): boolean {
+  if (state === 'disconnected' || state === 'disconnecting') return false;
+  if (!enabled) return true;
+  return state !== 'connecting' && state !== 'authenticating' && state !== 'stealth_connecting';
+}
 
 export function Settings() {
   const {
@@ -265,12 +303,14 @@ export function Settings() {
       // write (else it reads the stale value and silently doesn't arm).
       await saveSettingsToBackend(next);
 
-      if (useAppStore.getState().connectionState === 'connected') {
-        if ('killSwitchEnabled' in patch) {
-          invoke('set_killswitch_live', { enabled: !!patch.killSwitchEnabled }).catch(() => {});
-        } else {
-          scheduleReapply();
+      const connectionState = useAppStore.getState().connectionState;
+      if ('killSwitchEnabled' in patch) {
+        const enabled = !!patch.killSwitchEnabled;
+        if (killSwitchLiveApplies(connectionState, enabled)) {
+          invoke('set_killswitch_live', { enabled }).catch(() => {});
         }
+      } else if (connectionState === 'connected') {
+        scheduleReapply();
       }
     },
     [updateSettings, saveSettingsToBackend, scheduleReapply],
