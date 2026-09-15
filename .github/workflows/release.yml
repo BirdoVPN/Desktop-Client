@@ -544,8 +544,17 @@ jobs:
         run: |
           $nsis = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
           if (-not $nsis) { throw "No NSIS installer found to gate" }
-          $gateArgs = @('-Installer', $nsis.FullName, '-ExpectedSha256', "$env:XRAY_BINARY_SHA256")
-          if ($env:SIGNED -eq 'true') { $gateArgs += '-RequireAuthenticode' }
+          # HASHTABLE splat, not an array. The v1.4.42 tag build failed HERE
+          # with "A positional parameter cannot be found that accepts argument
+          # '-RequireAuthenticode'": an in-process `& script @array` passes the
+          # elements positionally, and a bare '-Switch' element is not a
+          # switch. The self-test never saw it because it spawns a child
+          # `pwsh -File`, where argv binding does accept it — the harness and
+          # the workflow were invoking the gate two different ways. The
+          # self-test now also calls the script in-process with exactly this
+          # form. The gate failed CLOSED, which is the right failure.
+          $gateArgs = @{ Installer = $nsis.FullName; ExpectedSha256 = "$env:XRAY_BINARY_SHA256" }
+          if ($env:SIGNED -eq 'true') { $gateArgs.RequireAuthenticode = $true }
           & ./scripts/ci/verify-bundled-xray-hash.ps1 @gateArgs
           if ($LASTEXITCODE -ne 0) { throw "bundled xray.exe gate failed (exit $LASTEXITCODE)" }
 

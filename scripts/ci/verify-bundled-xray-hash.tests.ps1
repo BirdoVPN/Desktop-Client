@@ -75,7 +75,11 @@ $failures = 0
 function Assert-Exit {
     param([string]$Case, [hashtable]$Result, [int]$Expected, [string]$MustMention = '')
     $ok = ($Result.Code -eq $Expected)
-    if ($ok -and $MustMention -and ($Result.Output -notmatch [regex]::Escape($MustMention))) { $ok = $false }
+    # `-not ("..." -match ...)`, NOT `-notmatch` on the raw value: when a child wrote
+    # nothing, $Result.Output is $null and `$null -notmatch 'x'` evaluates to an
+    # EMPTY collection (falsy), so the MustMention check silently skipped and only
+    # the exit code was ever asserted. Found by the #159 review.
+    if ($ok -and $MustMention -and -not ("$($Result.Output)" -match [regex]::Escape($MustMention))) { $ok = $false }
     if ($ok) {
         Write-Host ("PASS  {0} (exit {1})" -f $Case, $Result.Code)
     } else {
@@ -112,6 +116,34 @@ Assert-Exit 'non-hex expected hash fails' (Invoke-Gate @('-Installer', $good, '-
 
 # 6. signed-release mode on an unsigned payload
 Assert-Exit '-RequireAuthenticode on unsigned payload fails' (Invoke-Gate @('-Installer', $good, '-ExpectedSha256', $goodSha, '-RequireAuthenticode')) 1 'Authenticode status'
+
+# IN-PROCESS invocation, the exact form release.yml uses (`& script @hashtable`).
+# Every scenario above spawns a child `pwsh -File`, whose argv binding accepts a
+# bare '-RequireAuthenticode'; an in-process ARRAY splat does not, and the
+# v1.4.42 tag build died on exactly that difference while the child-process
+# harness stayed green. This scenario binds the switch the way the workflow
+# does, so the harness and the workflow can no longer disagree.
+$inproc = @{ Installer = $good; ExpectedSha256 = $goodSha; RequireAuthenticode = $true; ExtractDir = (Join-Path $work 'extract-inproc') }
+# *>&1, not 2>&1: in-process Write-Host goes to the Information stream (6), which
+# 2>&1 never merges — the first cut of this scenario captured an EMPTY string and
+# reported FAIL while the gate had exited 1 correctly (#159 review).
+$inprocOut = & $script @inproc *>&1 | Out-String
+$inprocCode = $LASTEXITCODE
+if ($inprocCode -ne 1 -or $inprocOut -notmatch 'Authenticode status') {
+    Write-Host "FAIL in-process hashtable splat with -RequireAuthenticode: expected exit 1 mentioning 'Authenticode status', got exit $inprocCode"
+    Write-Host $inprocOut
+    $failures++
+} else {
+    Write-Host "PASS in-process hashtable splat binds -RequireAuthenticode (exit 1, refused unsigned payload)"
+}
+$inprocOk = @{ Installer = $good; ExpectedSha256 = $goodSha; ExtractDir = (Join-Path $work 'extract-inproc-ok') }
+$null = & $script @inprocOk *>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FAIL in-process hashtable splat without the switch: expected exit 0, got $LASTEXITCODE"
+    $failures++
+} else {
+    Write-Host "PASS in-process hashtable splat passes a matching unsigned payload"
+}
 
 # 7. missing installer
 Assert-Exit 'missing installer fails' (Invoke-Gate @('-Installer', (Join-Path $work 'does-not-exist-setup.exe'), '-ExpectedSha256', $goodSha)) 1 'installer not found'
