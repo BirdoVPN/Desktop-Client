@@ -151,29 +151,42 @@ jobs:
       # repo, including the one named for the regression this whole change
       # exists to stop, executed in no job at all. A test nothing runs is not
       # coverage, it is a comment that costs a compile.
-      - name: DNS journal restore tests (Linux + macOS)
+      - name: DNS journal restore + TUN read tests (Linux + macOS)
         working-directory: src-tauri
         shell: bash
         env:
-          # Linux: resolv_conf_restore_tests. macOS: dns_journal_restore_tests
-          # (restore_services_pass, interpret_dns_query, dns_write_verified).
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'resolv_conf_restore_tests' }}
+          # Linux: resolv_conf_restore_tests + tun_read_tests (F6: the packet
+          # loop's buffer-reuse helper, run on a pipe fd). macOS:
+          # dns_journal_restore_tests (restore_services_pass,
+          # interpret_dns_query, dns_write_verified). Space-separated: libtest
+          # runs every test matching ANY of the filters after `--`.
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'resolv_conf_restore_tests tun_read_tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
           # FILTER plus the root-only ipv6 step further down, whose tests are
           # #[ignore]d and so cannot run in the loop above.
-          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'ipv6_leak_block_tests resolv_conf_restore_tests' }}
+          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
         run: |
           set -euo pipefail
           # Captured, not piped: a name filter that matches NOTHING still exits
           # 0, which is a green light for a test suite that never ran.
-          out=$(cargo test --lib "$FILTER")
+          # $FILTER is deliberately unquoted: it is one or more libtest name
+          # filters (see env above), and libtest ORs them.
+          out=$(cargo test --lib -- $FILTER)
           echo "$out"
           if ! echo "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
-            echo "::error::no DNS journal restore tests ran on ${{ matrix.os }} - the filter '$FILTER' matched nothing"
+            echo "::error::no tests ran on ${{ matrix.os }} - the filter '$FILTER' matched nothing"
             exit 1
           fi
+          # Each named module must have run at least one test, or a typo in
+          # one filter hides behind the other's passes.
+          for f in $FILTER; do
+            if ! echo "$out" | grep -qE "^test [a-z0-9_:]*${f}::[a-z0-9_]+ \.\.\. ok"; then
+              echo "::error::filter '$f' matched no passing test on ${{ matrix.os }}"
+              exit 1
+            fi
+          done
 
           # Completeness, checked rather than asserted in a comment.
           #
