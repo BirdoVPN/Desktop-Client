@@ -708,6 +708,22 @@ pub struct ConnectRequest {
     pub device_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_region: Option<String>,
+    /// Stable per-installation id — the SAME `utils::get_device_id()` value the
+    /// desktop login body already sends, so the backend's identity pair
+    /// `(userId, deviceId)` names ONE row for the session and for the WireGuard
+    /// key. Up to 1.4.42 desktop was the one client that omitted it on connect
+    /// (K5 contract review): `vpn.service.ts evictForConnect` step (1), the
+    /// same-device replacement that lets an install reclaim ITS OWN slot, only
+    /// runs when the body carries a deviceId. Without it a crash / kill / update
+    /// that skipped `disconnect_vpn` left the previous key active and the next
+    /// connect burned a second slot until cap eviction tore down the OLDEST key
+    /// — which on a multi-device plan can be a different machine's live tunnel.
+    /// The connect-time appVersion touch is keyed on it too, so the fleet view
+    /// never saw a desktop update. Contract: contract/vpn-protocol.schema.json
+    /// `ConnectRequest.deviceId` (`^[A-Za-z0-9._:-]+$`, 1..=128) — the hex
+    /// SHA-256 fits; api/contract_tests.rs pins that against the real producer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     /// FIX-1-1: Client-generated public key. When provided, the server does not
     /// generate a keypair and never sees the private key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -867,6 +883,12 @@ pub struct MultiHopConnectRequest {
     pub exit_node_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
+    /// Stable per-installation id — see `ConnectRequest::device_id`. The
+    /// multi-hop zod schema declares the same field and MultiHopService
+    /// forwards it into the same `connect()` eviction, so the twin must carry
+    /// it too or a double-VPN reconnect keeps burning slots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

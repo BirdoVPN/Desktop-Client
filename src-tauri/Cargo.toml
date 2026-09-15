@@ -187,3 +187,11 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3.13"
+# K5 connect contract: validates the SERIALIZED ConnectRequest /
+# MultiHopConnectRequest bodies against the vendored
+# contract/vpn-protocol.schema.json (src/api/contract_tests.rs). Exact pin so a
+# `cargo update` cannot change which draft-2020-12 semantics the gate applies.
+# default-features = false: the defaults exist only to fetch remote `$ref`s
+# (reqwest + rustls + aws-lc-rs, a C/asm build) and the vendored schema has
+# none -- a test-only dep must not add a native toolchain to every runner.
+jsonschema = { version = "=0.56.0", default-features = false }
