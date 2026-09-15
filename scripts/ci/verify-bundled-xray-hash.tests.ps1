@@ -113,6 +113,31 @@ Assert-Exit 'non-hex expected hash fails' (Invoke-Gate @('-Installer', $good, '-
 # 6. signed-release mode on an unsigned payload
 Assert-Exit '-RequireAuthenticode on unsigned payload fails' (Invoke-Gate @('-Installer', $good, '-ExpectedSha256', $goodSha, '-RequireAuthenticode')) 1 'Authenticode status'
 
+# IN-PROCESS invocation, the exact form release.yml uses (`& script @hashtable`).
+# Every scenario above spawns a child `pwsh -File`, whose argv binding accepts a
+# bare '-RequireAuthenticode'; an in-process ARRAY splat does not, and the
+# v1.4.42 tag build died on exactly that difference while the child-process
+# harness stayed green. This scenario binds the switch the way the workflow
+# does, so the harness and the workflow can no longer disagree.
+$inproc = @{ Installer = $good; ExpectedSha256 = $goodSha; RequireAuthenticode = $true; ExtractDir = (Join-Path $work 'extract-inproc') }
+$inprocOut = & $script @inproc 2>&1 | Out-String
+$inprocCode = $LASTEXITCODE
+if ($inprocCode -ne 1 -or $inprocOut -notmatch 'Authenticode status') {
+    Write-Host "FAIL in-process hashtable splat with -RequireAuthenticode: expected exit 1 mentioning 'Authenticode status', got exit $inprocCode"
+    Write-Host $inprocOut
+    $failures++
+} else {
+    Write-Host "PASS in-process hashtable splat binds -RequireAuthenticode (exit 1, refused unsigned payload)"
+}
+$inprocOk = @{ Installer = $good; ExpectedSha256 = $goodSha; ExtractDir = (Join-Path $work 'extract-inproc-ok') }
+$null = & $script @inprocOk 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FAIL in-process hashtable splat without the switch: expected exit 0, got $LASTEXITCODE"
+    $failures++
+} else {
+    Write-Host "PASS in-process hashtable splat passes a matching unsigned payload"
+}
+
 # 7. missing installer
 Assert-Exit 'missing installer fails' (Invoke-Gate @('-Installer', (Join-Path $work 'does-not-exist-setup.exe'), '-ExpectedSha256', $goodSha)) 1 'installer not found'
 
