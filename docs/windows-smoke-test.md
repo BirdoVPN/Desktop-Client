@@ -159,7 +159,8 @@ fails, the fix is a hotfix release, not a settings flip.
    from a signed release confirms this.
 4. Confirm the SHIPPED `resources\xray.exe` hashes to the compiled-in value.
    Every signed release up to v1.4.41 failed here: the build hashed xray.exe
-   and tauri-bundler then Authenticode-signed it in place, so `birdo.log`
+   and tauri-bundler (2.9.4 — the crate behind the pinned @tauri-apps/cli
+   2.11.4 / tauri-cli-v2.11.4) then Authenticode-signed it in place, so `birdo.log`
    showed `xray binary integrity check FAILED ... expected 103da275... got
    <signed hash>` on every stealth connect (OPEN-WORK F4). release.yml now
    signs xray.exe BEFORE hashing and gates the installer; to re-check a

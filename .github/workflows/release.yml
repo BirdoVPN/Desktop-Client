@@ -474,8 +474,9 @@ jobs:
       # measured: the shipped resources\xray.exe hashed fc6382ef…/d481fccc…
       # while the build log — and the compiled-in XRAY_BINARY_SHA256 — said
       # 103da275…). Cause: tauri-bundler signs every .exe/.dll RESOURCE in
-      # place during `tauri build` (tauri-bundler 2.11.4
-      # nsis/mod.rs generate_resource_data(): `if can_sign() &&
+      # place during `tauri build` (tauri-bundler 2.9.4 — the crate pinned by
+      # tauri-cli-v2.11.4, which is what the locked @tauri-apps/cli 2.11.4 is
+      # built from; nsis/mod.rs generate_resource_data(): `if can_sign() &&
       # should_sign(&resource_path) { try_sign(...) }`), i.e. AFTER the
       # download step above hashed the pristine file, so xray.rs
       # verify_xray_integrity() refused the binary on every stealth connect.

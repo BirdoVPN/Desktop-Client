@@ -7,9 +7,11 @@
 # installer whose resources\xray.exe did NOT match the compiled-in hash. The
 # build captured XRAY_BINARY_SHA256 from the freshly downloaded xray.exe, and
 # tauri-bundler then Authenticode-signed that same file IN PLACE during
-# `tauri build` (tauri-bundler 2.11.4 nsis/mod.rs generate_resource_data():
-# `if can_sign() && should_sign(&resource_path) { try_sign(...) }` for every
-# .exe/.dll resource). Signing appends a PKCS#7 blob, so the shipped bytes
+# `tauri build` (tauri-bundler 2.9.4 - the crate pinned by tauri-cli-v2.11.4,
+# which the locked @tauri-apps/cli 2.11.4 is built from; nsis/mod.rs
+# generate_resource_data(): `if can_sign() && should_sign(&resource_path)
+# { try_sign(...) }` for every .exe/.dll resource). Signing appends a PKCS#7
+# blob, so the shipped bytes
 # hash differently, xray.rs verify_xray_integrity() returns Err on every
 # stealth connect, and Windows stealth has been dead on every signed release
 # since the integrity check landed (v1.3.2). Nothing in the pipeline compared
