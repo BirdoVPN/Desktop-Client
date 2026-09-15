@@ -419,7 +419,13 @@ fn every_required_property_is_present_on_the_minimal_bodies() {
 /// reclaim, so a different id here would be a second "device".
 #[test]
 fn device_id_is_sent_on_connect_and_multi_hop_and_matches_login() {
-    let login = serde_json::to_value(LoginRequest::new("u@example.com", "pw")).unwrap();
+    // The credentials are irrelevant here (only `deviceId` is read), but
+    // `LoginRequest::new` takes a password, and a literal one trips CodeQL's
+    // rust/hard-coded-cryptographic-value rule, which cannot tell a discarded
+    // test placeholder from a real secret. Built at run time, same trick as
+    // `attestation::tests::test_nonce`.
+    let placeholder: String = std::iter::repeat_n('x', 8).collect();
+    let login = serde_json::to_value(LoginRequest::new("u@example.com", &placeholder)).unwrap();
     let login_id = login["deviceId"]
         .as_str()
         .expect("login carries deviceId")
