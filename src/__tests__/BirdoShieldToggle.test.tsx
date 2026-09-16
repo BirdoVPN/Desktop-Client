@@ -339,11 +339,13 @@ describe('BirdoShield toggle → dns_filtering', () => {
   // PR #162 review, nit: a disabled control still has to BE a control.
   // `BirdoListItem` degrades a blocked row from <button role="switch"> to
   // <div role="switch">, and a div carries no `disabled` attribute and is not
-  // focusable — so the blocked row announced as an ordinary switch reading
-  // "off", with the sentence explaining why sitting in a separate, unlinked
-  // node the user had no way to reach. That is the visual lie this PR removes,
-  // re-told to a screen reader. Fixed with `aria-disabled`, a tab stop, and
-  // `aria-describedby` pointing at the row's own reason.
+  // focusable — so the blocked row was announced as an ordinary switch whose
+  // state was simply "off". That is the visual lie this PR removes, re-told to
+  // a screen reader. Fixed with `aria-disabled` and a tab stop.
+  //
+  // The rest of the round-4 justification for this block — that the reason sat
+  // "in a separate, unlinked node" — was false, and is corrected in the
+  // name/description block below rather than quietly dropped.
   describe('the disabled row has a correct accessible representation', () => {
     const reasonOf = (row: HTMLElement) => {
       const id = row.getAttribute('aria-describedby');
@@ -393,6 +395,68 @@ describe('BirdoShield toggle → dns_filtering', () => {
       expect(row.tagName).toBe('DIV');
       expect(row).toHaveAttribute('aria-disabled', 'true');
       expect(row).toHaveAttribute('tabindex', '0');
+    });
+  });
+
+  // PR #162 review, must-fix 2 (round 5). Round 4 added `aria-describedby` on
+  // the stated grounds that the reason was "sitting in a sibling node with
+  // nothing linking it" and that a screen reader announced only "BirdoShield,
+  // switch, off". Both were false, and the fix that followed from them said
+  // the reason TWICE: the subtitle is a DESCENDANT of the element carrying
+  // role="switch", so it was already the tail of the row's accessible NAME,
+  // and pointing `aria-describedby` at it made the same sentence the
+  // DESCRIPTION as well — on every subtitled toggle row, enabled ones
+  // included, since describedBy is set whenever a `role` is present.
+  //
+  // What the pair is really for: the NAME is the setting, the DESCRIPTION is
+  // why it cannot be used, and neither is allowed to be the other. Drop
+  // `aria-label` and the name assertions fail (the exact-string role query
+  // stops matching, because the name grows the reason back onto it); drop
+  // `aria-describedby` and the description assertions fail.
+  describe('the row NAMES the setting and DESCRIBES the reason, saying neither twice', () => {
+    it('the structural premise round 4 got wrong: the subtitle is INSIDE the switch', async () => {
+      mockStoreState.dnsFilteringAvailable = false;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: 'BirdoShield' });
+      expect(row.contains(screen.getByText(UNAVAILABLE_COPY))).toBe(true);
+    });
+
+    it('the blocked row: name is the setting, description is the reason', async () => {
+      mockStoreState.dnsFilteringAvailable = false;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: 'BirdoShield' });
+      expect(row).toHaveAccessibleName('BirdoShield');
+      expect(row).toHaveAccessibleDescription(UNAVAILABLE_COPY);
+    });
+
+    it('an ENABLED row does not announce its subtitle twice either', async () => {
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: 'BirdoShield' });
+      expect(row).toHaveAccessibleName('BirdoShield');
+      expect(row).toHaveAccessibleDescription(
+        "Blocks ads, trackers and malware domains at the VPN's DNS resolver.",
+      );
+    });
+
+    // The `subtitle=""` half pins a claim review made and MEASUREMENT refutes:
+    // that `subtitle && isSemanticControl ? id : undefined` emits a dangling
+    // aria-describedby="". `&&` binds tighter than `?:`, so '' is the falsy
+    // condition and the result is undefined — this case passes under both that
+    // form and the `Boolean(subtitle)` one now in the component. Kept because
+    // the attribute being absent is the property that matters, whichever way
+    // the condition is spelled.
+    it('a row with no subtitle gets no description, and never an empty aria-describedby', () => {
+      const { unmount } = render(
+        <BirdoListItem title="Port" role="switch" ariaChecked={false} />,
+      );
+      const row = screen.getByRole('switch');
+      expect(row).toHaveAccessibleName('Port');
+      expect(row).toHaveAccessibleDescription('');
+      expect(row).not.toHaveAttribute('aria-describedby');
+      unmount();
+
+      render(<BirdoListItem title="Port" subtitle="" role="switch" ariaChecked={false} />);
+      expect(screen.getByRole('switch')).not.toHaveAttribute('aria-describedby');
     });
   });
 

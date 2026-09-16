@@ -20,7 +20,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, waitFor, act } from '@testing-library/react';
 import { invoke } from '@tauri-apps/api/core';
-import { useClientConfig, GATE_REFETCH_MIN_INTERVAL_MS } from '@/hooks/useClientConfig';
+import {
+  useClientConfig,
+  GATE_REFETCH_MIN_INTERVAL_MS,
+  GATE_POLL_INTERVAL_MS,
+} from '@/hooks/useClientConfig';
 import { useAppStore } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
@@ -359,6 +363,106 @@ describe('useClientConfig -> dnsFilteringAvailable', () => {
       fireWindowFocus();
       fireVisibilityChange(false);
       await flush();
+      expect(mockedInvoke).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // — A bound that holds only AT a return is not a bound on what is read ——
+  //
+  // PR #162 review, must-fix 1 (round 5). EVERY trigger in the block above is
+  // a RETURN to the window: mount, visibilitychange→visible, window focus and
+  // the `app-shown` tray event. Not one of them fires while the window simply
+  // stays open — and staying open is what a window does between the user
+  // coming back to it and the user reading the row.
+  //
+  // Measured on the round-4 code: mount the hook, flip the server answer to
+  // `false`, advance the clock three days with no visibilitychange, no focus
+  // and no `app-shown`, and `invoke` had been called exactly once with the
+  // gate still `true`. AppShell mounts once per authenticated session, so that
+  // was a whole session on a three-day-old answer, for a user who came back
+  // once and then left the 380x640 window up. `GATE_POLL_INTERVAL_MS` is what
+  // closes that, and these tests are that measurement kept.
+  //
+  // Only `setInterval`/`clearInterval` are faked here: `Date.now` is already
+  // spied above (the throttle reads it) and `setTimeout` has to stay real for
+  // `@testing-library`'s own async plumbing, so the poll clock and the
+  // throttle clock are stepped together by `idle()`.
+  describe('re-reads the gate while the window just stays open', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Mount with the window visible, first fetch settled, gate available. */
+    async function mountedVisible() {
+      mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: true });
+      const view = renderHook(() => useClientConfig());
+      await flush();
+      expect(mockedInvoke).toHaveBeenCalledTimes(1);
+      return view;
+    }
+
+    /** Time passing with the window open and NOTHING else happening. */
+    async function idle(ms: number) {
+      advance(ms);
+      await act(async () => {
+        vi.advanceTimersByTime(ms);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
+
+    it('picks up a gate switched off with no return to the window at all', async () => {
+      await mountedVisible();
+      mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: false });
+
+      await idle(GATE_REFETCH_MIN_INTERVAL_MS + GATE_POLL_INTERVAL_MS);
+
+      expect(mockedInvoke).toHaveBeenCalledTimes(2);
+      expect(gate()).toBe(false);
+    });
+
+    it('three days of a visible, untouched window do not keep serving the mount-time answer', async () => {
+      // Verbatim the round-4 measurement, which ended here with one invoke and
+      // a gate still reading `true`.
+      await mountedVisible();
+      expect(gate()).toBe(true);
+      mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: false });
+
+      await idle(3 * 24 * 60 * 60 * 1000);
+
+      expect(gate()).toBe(false);
+    });
+
+    it('does not poll while hidden — nobody is reading, and the return triggers cover it', async () => {
+      await mountedVisible();
+      setHidden(true);
+
+      await idle(GATE_REFETCH_MIN_INTERVAL_MS + GATE_POLL_INTERVAL_MS * 10);
+
+      expect(mockedInvoke).toHaveBeenCalledTimes(1);
+    });
+
+    it('the tick obeys the same throttle — it asks, the throttle answers', async () => {
+      await mountedVisible();
+
+      await idle(GATE_POLL_INTERVAL_MS);
+      await idle(GATE_POLL_INTERVAL_MS);
+      expect(mockedInvoke).toHaveBeenCalledTimes(1);
+
+      await idle(GATE_REFETCH_MIN_INTERVAL_MS);
+      expect(mockedInvoke).toHaveBeenCalledTimes(2);
+    });
+
+    it('stops polling on unmount — the interval is cleared, not leaked', async () => {
+      const { unmount } = await mountedVisible();
+      unmount();
+
+      await idle(GATE_REFETCH_MIN_INTERVAL_MS + GATE_POLL_INTERVAL_MS * 5);
+
       expect(mockedInvoke).toHaveBeenCalledTimes(1);
     });
   });

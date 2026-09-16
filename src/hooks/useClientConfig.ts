@@ -44,6 +44,22 @@ export interface ClientConfig {
 export const GATE_REFETCH_MIN_INTERVAL_MS = 5 * 60_000;
 
 /**
+ * How often the gate is re-checked while the window is VISIBLE, in ms.
+ *
+ * Deliberately shorter than the throttle above, and doing a different job:
+ * this is the tick that asks "may I fetch yet?", and
+ * `GATE_REFETCH_MIN_INTERVAL_MS` is what answers. Together they bound a
+ * visible window's value at throttle + tick, with no user action required —
+ * see the staleness section on `useClientConfig` for why a bound that only
+ * holds at the instant the user RETURNS to the window is not a bound on what
+ * the user reads.
+ *
+ * The tick does nothing while `document.hidden`: a hidden window has no
+ * reader, and the return triggers are what cover coming back to it.
+ */
+export const GATE_POLL_INTERVAL_MS = 60_000;
+
+/**
  * Sync the fleet gate into the store, and keep it synced.
  *
  * CALL IT FROM `AppShell`, NOT FROM A TAB ROOT (PR #162 review, must-fix 1).
@@ -77,7 +93,9 @@ export const GATE_REFETCH_MIN_INTERVAL_MS = 5 * 60_000;
  * kept its mount-time answer for as long as the user left it there. Days, with
  * the row reading ON and switchable after the gate went off.
  *
- * So the gate is re-read whenever the user comes back to the window:
+ * So the gate is re-read on two independent kinds of trigger.
+ *
+ * (a) RETURNS to the window, which cover the app having been away:
  *
  *  - `visibilitychange`, on the way to visible — the shape Dashboard's status
  *    poll already uses;
@@ -88,23 +106,48 @@ export const GATE_REFETCH_MIN_INTERVAL_MS = 5 * 60_000;
  *    the one that covers a real close-to-tray, where a hidden webview may see
  *    no visibility or focus event at all.
  *
- * …each throttled to one fetch per `GATE_REFETCH_MIN_INTERVAL_MS`.
+ * (b) A POLL while the window is visible (`GATE_POLL_INTERVAL_MS`).
  *
- * THE REAL BOUND is therefore: the value on screen was fetched at most
- * `GATE_REFETCH_MIN_INTERVAL_MS` before this return to the window, plus
- * however stale the answer already was when it arrived. birdo-web's
- * `app/api/client-config/route.ts` sets `Cache-Control: public, max-age=300,
- * stale-while-revalidate=3600` and `CDN-Cache-Control: public, s-maxage=3600,
- * stale-while-revalidate=86400`, so a shared cache in front of the route may
- * hand back an answer up to an hour old, and older still on the request that
- * arrives while it revalidates. reqwest keeps no cache of its own, so nothing
- * on this side adds to that except the throttle.
+ * (b) exists because EVERY trigger in (a) is a return, and nothing in that
+ * list fires while the window simply stays open. Measured on the round-4 code
+ * — mount the hook, flip the server answer to `false`, advance the clock three
+ * days with no `visibilitychange`, no `focus` and no `app-shown` — `invoke`
+ * was called exactly once and the gate was still `true`. `AppShell` mounts
+ * once per authenticated session, so that was a whole session: a user who came
+ * back, left the 380x640 window up and walked into Settings → VPN two hours
+ * later read a two-hour-old gate. A bound that holds only AT the instant of a
+ * return is not a bound on the value the user reads, because reading the row
+ * is not a return.
+ *
+ * Each trigger, tick included, is throttled to one fetch per
+ * `GATE_REFETCH_MIN_INTERVAL_MS`.
+ *
+ * THE REAL BOUND is therefore:
+ *
+ *  - window visible: the value on screen was fetched at most
+ *    `GATE_REFETCH_MIN_INTERVAL_MS + GATE_POLL_INTERVAL_MS` ago, with no user
+ *    action required to make that true;
+ *  - coming back from hidden: at most `GATE_REFETCH_MIN_INTERVAL_MS` before
+ *    that return;
+ *
+ * …plus, in both cases, however stale the answer already was when it arrived.
+ * birdo-web's `app/api/client-config/route.ts` sets `Cache-Control: public,
+ * max-age=300, stale-while-revalidate=3600` and `CDN-Cache-Control: public,
+ * s-maxage=3600, stale-while-revalidate=86400` on its normal path, so a shared
+ * cache in front of the route may hand back an answer up to an hour old, and
+ * older still on the request that arrives while it revalidates. (On its
+ * cert-pins-read-failure path the same route sends `no-store, max-age=0,
+ * must-revalidate` / `s-maxage=10`, which is tighter — the hour is the bound
+ * either way.) reqwest keeps no cache of its own, so nothing on this side adds
+ * to that except the throttle.
  *
  * What is still NOT bounded: the fetch is asynchronous, so the first paint
- * after a return shows the previous value for one round trip. A stale-ON row
- * for one request is the residue; a stale-ON row for a whole tray-resident
- * session is what this removes. `src/__tests__/useClientConfig.test.tsx` fails
- * if any of the three triggers or the throttle is dropped.
+ * after a return — and the paint in the tick that discovers a change — shows
+ * the previous value for one round trip. A stale-ON row for one request is the
+ * residue; a stale-ON row for a whole tray-resident session, or for a whole
+ * session with the window left open, is what this removes.
+ * `src/__tests__/useClientConfig.test.tsx` fails if any of the three return
+ * triggers, the visible poll, or the throttle is dropped.
  *
  * Which direction each error costs, unchanged:
  *
@@ -164,6 +207,14 @@ export function useClientConfig(): void {
 
     document.addEventListener('visibilitychange', onVisibility);
     window.addEventListener('focus', onFocus);
+    // The visible poll. Every listener above is a RETURN to the window; this
+    // is the only trigger that fires while the window just stays open, which
+    // is what a user does between opening the app and reading the row. Skipped
+    // while hidden — nobody is reading it then, and the listeners above are
+    // what cover coming back.
+    const poll = window.setInterval(() => {
+      if (!document.hidden) fetchGate(false);
+    }, GATE_POLL_INTERVAL_MS);
     // `listen` resolves to its own unlisten fn. The catch covers a teardown
     // that beats the subscription, and any host without the event plugin
     // (a bare jsdom render, say).
@@ -173,6 +224,7 @@ export function useClientConfig(): void {
       cancelled = true;
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('focus', onFocus);
+      window.clearInterval(poll);
       unlistenShown.then((off) => off()).catch(() => {});
     };
   }, [setDnsFilteringAvailable]);

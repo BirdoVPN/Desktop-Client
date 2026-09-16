@@ -69,18 +69,48 @@ export function BirdoListItem({
   // stays focusable precisely so its state and description can be read. It has
   // no click handler, so reaching it does nothing.
   //
-  // `aria-describedby` points the switch at its own subtitle, which is where
-  // the reason lives -- otherwise the row announces "BirdoShield, switch, off,
-  // dimmed" and the sentence explaining why is a separate, unassociated node.
+  // WHAT THE NAME/DESCRIPTION HALF IS FOR -- round-5 correction, because the
+  // reason given for it in round 4 was measurably false. That revision said
+  // the explanation sat "in a sibling node with nothing linking it" and that a
+  // screen reader announced only "BirdoShield, switch, off". Neither was true:
+  // the subtitle is a DESCENDANT of the element carrying role="switch", so it
+  // was already part of the row's ACCESSIBLE NAME. Measured against the real
+  // row with `aria-describedby` removed, the name computed to "BirdoShield Not
+  // available on your account's server fleet yet. Your preference is kept and
+  // applies as soon as it is." -- the reason WAS being announced, welded onto
+  // the name, and adding `aria-describedby` ALONE made that same sentence the
+  // description too, so every subtitled row (enabled ones included) said it
+  // twice.
+  //
+  // The fix is the pair, not either half. `aria-label={title}` pins the NAME
+  // to the setting ("BirdoShield"), and `aria-describedby` makes the subtitle
+  // the DESCRIPTION -- so the row announces "BirdoShield, switch, off, dimmed"
+  // and then, separately, why. Drop the label and the description duplicates
+  // the name; drop the description and the reason is only ever heard welded to
+  // the name, in the same breath as the state. The label is safe for WCAG
+  // 2.5.3 (label in name) because `title` IS the row's visible label.
+  //
+  // `src/__tests__/BirdoShieldToggle.test.tsx` computes both strings and fails
+  // if either collapses back into the other.
   const subtitleId = useId();
   const isSemanticControl = role !== undefined;
-  const describedBy = subtitle && isSemanticControl ? subtitleId : undefined;
+  // `Boolean(subtitle)` is spelling, not a bug fix, and the difference is
+  // worth stating because review reported the opposite. The nit was that
+  // `subtitle && isSemanticControl ? subtitleId : undefined` "yields '' for an
+  // empty-string subtitle, so React would emit aria-describedby=\"\"". It does
+  // not: `&&` binds tighter than `?:`, so '' is the falsy CONDITION and the
+  // ternary already returns undefined. MEASURED both ways -- the attribute is
+  // absent for `subtitle=""` under either form, which the test below pins so
+  // the claim stops being re-litigated. This form just spares the next reader
+  // deriving the precedence.
+  const describedBy = isSemanticControl && Boolean(subtitle) ? subtitleId : undefined;
   return (
     <Wrapper
       type={Wrapper === 'button' ? 'button' : undefined}
       role={role}
       aria-checked={role === 'switch' ? ariaChecked : undefined}
       aria-disabled={isSemanticControl && !enabled ? true : undefined}
+      aria-label={isSemanticControl ? title : undefined}
       aria-describedby={describedBy}
       tabIndex={Wrapper === 'div' && isSemanticControl ? 0 : undefined}
       onClick={onClick && enabled ? onClick : undefined}

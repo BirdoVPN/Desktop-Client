@@ -29,13 +29,25 @@ const API_BASE_URL: &str = "https://api.birdo.app";
 /// route.ts` in birdo-web), not by the NestJS backend behind `api.birdo.app`,
 /// so it needs its own base.
 ///
-/// What actually covers it: `cert_pin`'s `BIRDO_APEX` scope is `birdo.app`
-/// and its subdomains, so this host meets the same CA-chain SPKI pin as every
-/// `api.birdo.app` request — no new trust surface. The tauri CSP is NOT part
-/// of that answer, contrary to what this comment used to say: `connect-src`
-/// constrains the WEBVIEW's own fetches, and this request is made by reqwest
-/// in the Rust process, which no CSP sees. (`https://birdo.app` is in the
-/// CSP regardless, for the webview's sake.)
+/// What actually covers it — and the mechanism this comment named in round 4
+/// was the wrong one, in the weaker direction. It said `cert_pin`'s
+/// `BIRDO_APEX` scope is "`birdo.app` and its subdomains", implying the host
+/// is pinned because it matches an apex rule. It is not: `BirdoApi::new()`
+/// builds this client with `cert_pin::rustls_config()`, which is
+/// `PinScope::AllHosts`, where `is_birdo_host()`/`BIRDO_APEX` is never
+/// consulted and EVERY host the client dials is pinned to the CA-chain SPKI
+/// set. (`BIRDO_APEX` is the auto-updater's narrower scope, not this one.) So
+/// `birdo.app` is covered not by a rule that happens to include it but
+/// because there is no unpinned host on this client at all, and the pin it
+/// must meet is satisfied: reviewer-verified 2026-09-16, birdo.app chains
+/// through the same intermediate and root as api.birdo.app, both of whose
+/// SPKI hashes are in `PINNED_SPKI_SHA256`. No new trust surface.
+///
+/// The tauri CSP is NOT part of that answer either, contrary to what this
+/// comment said before round 4: `connect-src` constrains the WEBVIEW's own
+/// fetches, and this request is made by reqwest in the Rust process, which no
+/// CSP sees. (`https://birdo.app` is in the CSP regardless, for the webview's
+/// sake.)
 const WEB_BASE_URL: &str = "https://birdo.app";
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Windows)");
 
