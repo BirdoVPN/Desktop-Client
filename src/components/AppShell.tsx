@@ -15,6 +15,7 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
 import { useAppStore, type RouteId } from '@/store/app-store';
+import { useClientConfig } from '@/hooks/useClientConfig';
 import { motion as motionTokens } from '@/lib/birdo-theme';
 import { BottomNav } from '@/components/BottomNav';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
@@ -38,6 +39,25 @@ export function AppShell() {
   const { tab, navStack } = useAppStore(
     useShallow((s) => ({ tab: s.tab, navStack: s.navStack }))
   );
+
+  // ── BirdoShield fleet gate ────────────────────────────────────────
+  // `GET /api/client-config` → `dnsFilteringAvailable`, fetched HERE and
+  // not on a tab root, because the shell is the only component that is
+  // mounted for every authenticated session no matter which tab or pushed
+  // sub-screen is showing. `birdo://settings` (App.tsx) sets `tab` to
+  // 'settings' before this shell first renders, so a cold launch can land
+  // straight on Settings → VPN Settings with Dashboard never mounted; while
+  // the fetch lived there the gate stayed at its `true` default for the
+  // whole session and BirdoShield read ON and switchable with
+  // `DNS_FILTERING_ENABLED` off — exactly the reassurance-from-missing-data
+  // this screen exists to remove. Pinned by
+  // `src/__tests__/AppShellClientConfig.test.tsx`.
+  //
+  // It is also the right lifetime: the shell mounts once per sign-in, so
+  // the gate is fetched once instead of once per tab switch (Dashboard
+  // unmounts on every one). The rule itself — unknown means AVAILABLE —
+  // lives in `src/hooks/useClientConfig.ts`.
+  useClientConfig();
 
   const topRoute = navStack[navStack.length - 1];
   // Bottom nav is hidden whenever a sub-screen is pushed (matches mobile).

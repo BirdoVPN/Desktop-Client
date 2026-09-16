@@ -32,17 +32,26 @@ export interface ClientConfig {
 /**
  * Sync the fleet gate into the store. Fire-and-forget, once per mount.
  *
- * Lives on the Dashboard because that is already the screen that pulls the
- * server-side state the settings screens render (`get_subscription_status`),
- * and VpnSettings is a pushed sub-screen only reachable through it.
+ * CALL IT FROM `AppShell`, NOT FROM A TAB ROOT (PR #162 review, must-fix 1).
+ * An earlier revision called this from `Dashboard` and justified it with
+ * "VpnSettings is a pushed sub-screen only reachable through it". That was
+ * FALSE: `Settings.tsx` is the only component that pushes the `vpnSettings`
+ * route, and `AppShell` renders Settings and Dashboard mutually exclusively,
+ * so Dashboard is not on the path to this screen at all. A `birdo://settings`
+ * cold launch sets `tab` to 'settings' before the shell first renders, which
+ * left the gate at its `true` default for the entire session and showed
+ * BirdoShield ON and switchable with `DNS_FILTERING_ENABLED` off. `AppShell`
+ * is the component that is mounted for every authenticated session whatever
+ * the tab, which is the property this fetch actually needs.
  *
- * Unauthenticated, so it runs regardless of sign-in state. It is a plain 200
+ * Unauthenticated, so it does not wait on sign-in state. It is a plain 200
  * every time: the client sends no `If-None-Match` and reqwest keeps no HTTP
- * cache, so a remount (the Dashboard unmounts on every tab switch) is a full
- * refetch of the whole payload. That is tolerable because the route is public
- * and small, and because its rate limit (60 req/min) failing closed is
- * harmless here — a 429 lands in the catch below and leaves the gate at its
- * "available" default.
+ * cache, so every mount is a full refetch of the whole payload. From the shell
+ * that is one request per sign-in rather than one per tab switch (Dashboard
+ * unmounts on every one), so no in-flight dedupe or AbortController is needed
+ * here. It is tolerable regardless because the route is public and small, and
+ * because its rate limit (60 req/min) failing closed is harmless — a 429 lands
+ * in the catch below and leaves the gate at its "available" default.
  *
  * STALENESS, and which direction it errs in: the route is served with
  * `s-maxage=3600, stale-while-revalidate=86400`, so this value can trail the

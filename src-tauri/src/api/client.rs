@@ -541,10 +541,13 @@ impl BirdoApi {
     /// constant). It reuses `self.client`, so it keeps the pinned TLS config,
     /// the DoH resolver and the timeouts — the one thing a second client must
     /// never quietly drop. Unauthenticated by design: the payload is public and
-    /// identical for every user, and requiring a token would make the answer
-    /// unavailable on exactly the screens that show it before sign-in.
+    /// identical for every user, so a token would buy nothing and would couple a
+    /// fleet-wide rollout flag to session state — a signed-out or
+    /// token-refreshing client would read "unknown" for no reason. Today's only
+    /// caller (`AppShell`) does run signed in; this is about what the endpoint
+    /// needs, not about where it happens to be called from.
     ///
-    /// No 401 retry is needed for the same reason.
+    /// No 401 retry is needed for the same reason: there is no token to refresh.
     ///
     /// Handled as `Origin::Web`: this is the first response from anywhere but
     /// `api.birdo.app` to reach `handle_response`, and a 426 from a public web

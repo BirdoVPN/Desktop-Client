@@ -19,7 +19,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore, ConnectionState } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
-import { useClientConfig } from '@/hooks/useClientConfig';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   ArrowDown,
@@ -313,13 +312,6 @@ export function Dashboard() {
       })
       .catch(() => { /* silent */ });
   }, [setAccount]);
-
-  // ── BirdoShield fleet gate ────────────────────────────────────────
-  // `GET /api/client-config` → `dnsFilteringAvailable`, beside the
-  // subscription fetch above. The unknown-means-AVAILABLE rule and its two
-  // guards live in the hook so they can be tested on their own — see
-  // `src/hooks/useClientConfig.ts`.
-  useClientConfig();
 
   // ── Servers + ping ────────────────────────────────────────────────
   useEffect(() => {

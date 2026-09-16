@@ -103,7 +103,13 @@ pub fn set_app_handle(app: AppHandle) {
 ///
 /// Idempotent: only the FIRST 426 emits the event, so a burst of refused
 /// requests cannot spam the frontend.
-pub fn latch(info: RequiredUpdate) {
+///
+/// DELIBERATELY PRIVATE (PR #162 review nit): `latch_from` is the only way in
+/// from outside this module, so "only the control plane may arm the version
+/// floor" holds by construction rather than by every caller remembering to
+/// check the origin. The in-module tests below still call it directly to set up
+/// state that is not reachable through the origin check.
+fn latch(info: RequiredUpdate) {
     // A poisoned lock must not turn a hard security gate into a no-op, so
     // recover the guard instead of unwrapping (nothing here can panic while
     // holding it, but the gate must survive a panic elsewhere regardless).

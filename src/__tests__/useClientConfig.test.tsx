@@ -72,9 +72,22 @@ describe('useClientConfig -> dnsFilteringAvailable', () => {
 
   // ── Unknown must never read as "off" ────────────────────────────────────
   //
-  // Each of the four cases below fails if the guard is relaxed to
-  // `setDnsFilteringAvailable(!!cfg?.dnsFilteringAvailable)` or the `typeof`
-  // check is dropped -- the mutation the reviewer landed unnoticed.
+  // WHAT THESE ACTUALLY KILL, measured rather than assumed (PR #162 review,
+  // must-fix 3 -- the PR body used to credit the setter edit on its own):
+  //
+  //  - `typeof … === 'boolean'` -> `true`, setter untouched: 3 fail (absent,
+  //    JSON null, non-boolean). The whole-payload-null case still passes,
+  //    because `cfg.dnsFilteringAvailable` on `null` throws inside the `.then`
+  //    and the silent `.catch` swallows it, leaving the default standing.
+  //  - both relaxed at once (guard dropped AND the setter coerced to
+  //    `!!cfg?.dnsFilteringAvailable`): 3 fail (absent, JSON null, whole
+  //    payload null). The non-boolean case survives that one, since
+  //    `!!'false'` is `true` -- the right answer for the wrong reason.
+  //  - the setter coerced to `!!cfg?.dnsFilteringAvailable` ON ITS OWN, inside
+  //    the surviving `typeof` guard: nothing fails, and nothing can. Inside
+  //    that guard the value is already a boolean, so `!!` is the identity
+  //    function and the edit is a no-op no test could distinguish. The guard,
+  //    not the setter, is what carries the rule.
   describe('an unknown answer leaves the gate AVAILABLE', () => {
     it('the field is absent (a web deploy that predates birdo-web#465)', async () => {
       mockedInvoke.mockResolvedValue({ version: 1, certPins: {} });
@@ -88,7 +101,14 @@ describe('useClientConfig -> dnsFilteringAvailable', () => {
       expect(gate()).toBe(true);
     });
 
-    it('the whole payload is null (2xx with an empty body)', async () => {
+    // NOT a shape today's Rust path can produce: `handle_response_from` maps an
+    // empty 2xx body to `b"null"`, and `serde_json::from_slice::<
+    // ClientConfigResponse>(b"null")` errors, so an empty body arrives as a
+    // REJECTION (covered by the failed-fetch block below), not as a `null`
+    // resolve. This pins the frontend contract anyway: the hook's own type says
+    // `ClientConfig | null`, and `cfg?.` is what makes that type honest. Drop the
+    // optional chain and this is the test that catches the TypeError.
+    it('the whole payload is null (the hook types the resolve as nullable)', async () => {
       mockedInvoke.mockResolvedValue(null);
       await runHook();
       expect(gate()).toBe(true);
