@@ -21,12 +21,33 @@
 //!   `rax1`, `xar`, `bcax`) — the same four mnemonics PQClean's `keccak2x`
 //!   assembly contributed to the Android 1.4.25 SIGILL. What changed is that
 //!   `keccak` compiles that backend on every aarch64 target
-//!   (`keccak-0.2.2/src/backends.rs:7`) and selects it behind a runtime
+//!   (`keccak-0.2.2/src/backends.rs:7`) and selects it behind a
 //!   `cpufeatures` check (`lib.rs:18,82`), where PQClean's AArch64 gate was a
-//!   literal `if true`. Of the four targets this client releases
+//!   literal `if true`.
+//!
+//!   That check is only a *runtime* one where `sha3` is absent from the
+//!   target's default feature set — which is the Android case
+//!   (`aarch64-linux-android`, `getauxval(AT_HWCAP)`), and that is the
+//!   estate-wide point. It is NOT what happens on `aarch64-apple-darwin`, the
+//!   only aarch64 target this client itself ships: `rustc --print cfg` for
+//!   that target already emits `target_feature="sha3"`, so `cpufeatures`'
+//!   `__unless_target_features!` (`cpufeatures-0.3.0/src/aarch64.rs:11-21`)
+//!   compiles down to a literal `true` and no detection runs. Correct there
+//!   — every Apple Silicon part has FEAT_SHA3 — but it is a compile-time
+//!   gate, not a runtime one. Of the four targets this client releases
 //!   (x86_64 Windows/Linux/macOS, aarch64-apple-darwin) only the last reaches
-//!   that code at all, and Apple Silicon has FEAT_SHA3 — but the claim is
-//!   estate-wide, and the Android JNI is where it bites.
+//!   that code at all.
+//!
+//!   Nor is `sha3` the only assembly the swap introduces. `ml-kem` itself
+//!   contains no C and no assembly; its graph does. Besides `keccak`, the
+//!   unconditional chain `ml-kem -> module-lattice[ctutils] -> ctutils ->
+//!   cmov 0.5.4` compiles inline `asm!` on both architectures this client
+//!   ships: `csel` on aarch64 (`cmov-0.5.4/src/backends/aarch64.rs:8,27`) and
+//!   `cmovnz`/`cmovz` on x86 (`backends/x86.rs:16,33`). Both are baseline
+//!   ISA, present on every CPU either target can run on, so this is a
+//!   constant-time ASSET rather than a SIGILL risk — but it is assembly,
+//!   and it is the reason "no C or assembly" above is said of the crate and
+//!   must never be said of the graph.
 //! * It did not change one byte of the wire format or the on-disk encoding.
 //!   Verified against the production server's own KAT fixture and against a
 //!   PQClean-produced stored key — see `fixtures/README.md` and the tests at
@@ -242,14 +263,20 @@ pub fn generate_keypair() -> StaticKeypair {
 /// [`load_or_generate_at`]), never retry it.
 #[allow(deprecated)]
 fn load_decapsulation_key(sk: &[u8]) -> Result<DecapsulationKey<MlKem1024>, String> {
-    let arr = Array::<u8, U3168>::try_from(sk).map_err(|_| {
+    // `Array` has no Drop of its own, so this stack copy of the decapsulation
+    // key is scrubbed by hand. It is taken on every load AND every
+    // `derive_psk`, i.e. on every connect — everything around it is
+    // `Zeroizing`, and this one was not.
+    let mut arr = Array::<u8, U3168>::try_from(sk).map_err(|_| {
         format!(
             "malformed client secret key: expected {SECRET_KEY_BYTES} bytes, got {}",
             sk.len()
         )
     })?;
-    <DecapsulationKey<MlKem1024> as ExpandedKeyEncoding>::from_expanded_bytes(&arr)
-        .map_err(|_| "client secret key failed FIPS 203 validation (H(ek) mismatch)".to_string())
+    let dk = <DecapsulationKey<MlKem1024> as ExpandedKeyEncoding>::from_expanded_bytes(&arr)
+        .map_err(|_| "client secret key failed FIPS 203 validation (H(ek) mismatch)".to_string());
+    arr.as_mut_slice().zeroize();
+    dk
 }
 
 /// Decapsulate the server-supplied ciphertext into a 32-byte PSK.
@@ -373,8 +400,17 @@ fn read_keypair(path: &PathBuf) -> Result<Option<StaticKeypair>, KeypairReadErro
     // must be scrubbed on EVERY exit path, not only the manual `buf.fill(0)`
     // ones, and (b) it must never reallocate mid-read — a realloc leaves an
     // unscrubbed copy of the key bytes in freed heap.
+    //
+    // (b) takes the `take()` as well as the reservation: a bare
+    // `read_to_end` grows the buffer to whatever is on disk, so a corrupt or
+    // appended file bigger than the reservation would realloc and leave
+    // exactly the copy this comment warns about. Capped at one byte MORE than
+    // a valid file: enough for the size check below to reject a too-long
+    // file, never enough to reach the reservation.
     let mut buf = Zeroizing::new(Vec::with_capacity(KEYPAIR_FILE_BYTES + 64));
-    f.read_to_end(&mut buf)
+    (&mut f)
+        .take(KEYPAIR_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
         .map_err(|e| KeypairReadError::Io(format!("read {path:?}: {e}")))?;
     if buf.len() != KEYPAIR_FILE_BYTES {
         let n = buf.len();
@@ -796,6 +832,91 @@ mod tests {
             .expect("the re-keyed file must be readable")
             .expect("the re-keyed file must exist");
         assert_eq!(reread.secret_key.as_slice(), fresh.secret_key.as_slice());
+    }
+
+    /// The stored public key is handed to the server as-is — it is never
+    /// re-derived at connect time — so a file whose pk half disagrees with
+    /// the key embedded in the dk makes the server encapsulate to a key this
+    /// client cannot decapsulate for. ML-KEM rejects implicitly, so the only
+    /// symptom is a WireGuard handshake that silently never completes: exactly
+    /// the failure mode this module exists to make impossible.
+    ///
+    /// Review of #163: of sixteen mutations run against this module, replacing
+    /// the `dk.encapsulation_key() != pk` condition in `read_keypair` with
+    /// `if false {` was the ONLY one that left every test green. It cannot be
+    /// caught by any dk-only assertion — the secret key here is perfectly
+    /// valid and passes FIPS 203 §7.3 on its own.
+    #[test]
+    fn read_keypair_rejects_public_key_that_disagrees_with_secret_key() {
+        let _g = fs_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEYPAIR_FILENAME);
+
+        let kp = generate_keypair();
+        let mut wrong_pk = kp.public_key.clone();
+        wrong_pk[0] ^= 0x01; // one byte off; magic, version and both sizes stay perfect
+        write_keypair(
+            &path,
+            &StaticKeypair {
+                public_key: wrong_pk.clone(),
+                secret_key: Zeroizing::new(kp.secret_key.to_vec()),
+            },
+        )
+        .unwrap();
+
+        // The dk half is untouched and still validates, so nothing about the
+        // secret key can reveal this — only comparing the two halves can.
+        load_decapsulation_key(kp.secret_key.as_slice())
+            .expect("the secret-key half is valid; only the stored pk is wrong");
+
+        match read_keypair(&path) {
+            Err(KeypairReadError::Unusable(m)) => assert!(
+                m.contains("stored public key"),
+                "wrong Unusable reason: {m}"
+            ),
+            Err(e) => panic!("expected Unusable, got {e:?}"),
+            Ok(_) => panic!("a pk that disagrees with the dk must not be accepted"),
+        }
+
+        // Unusable means re-key, not fail-forever: the replacement file must
+        // be readable and its halves must agree.
+        let fresh = load_or_generate_at(&path).expect("must re-key rather than fail");
+        assert_ne!(fresh.public_key, wrong_pk);
+        let reread = read_keypair(&path)
+            .expect("the re-keyed file must be readable")
+            .expect("the re-keyed file must exist");
+        assert_eq!(reread.public_key, fresh.public_key);
+        assert_eq!(reread.secret_key.as_slice(), fresh.secret_key.as_slice());
+    }
+
+    /// A file LONGER than a valid keypair must be rejected without the read
+    /// buffer ever growing past its reservation — a realloc mid-read leaves
+    /// an unscrubbed copy of the secret key in freed heap, which is precisely
+    /// what the pre-sized buffer exists to prevent. `read_to_end` alone would
+    /// have grown to the file's real size.
+    #[test]
+    fn read_keypair_rejects_oversized_file_without_reading_it_all() {
+        let _g = fs_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEYPAIR_FILENAME);
+
+        let kp = generate_keypair();
+        write_keypair(&path, &kp).unwrap();
+        // Append a megabyte of junk to an otherwise valid file.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&vec![0xAAu8; 1 << 20]).unwrap();
+        drop(f);
+
+        match read_keypair(&path) {
+            // The reported size is the CAP (4745), not the file's real size:
+            // proof the read stopped inside the reservation.
+            Err(KeypairReadError::Unusable(m)) => assert!(
+                m.contains(&format!("size {}", KEYPAIR_FILE_BYTES + 1)),
+                "expected the bounded-read size in the message, got: {m}"
+            ),
+            Err(e) => panic!("expected Unusable, got {e:?}"),
+            Ok(_) => panic!("an oversized keypair file must not be accepted"),
+        }
     }
 
     /// Nobody may later "fix" implicit rejection into a `Result`: a wrong key

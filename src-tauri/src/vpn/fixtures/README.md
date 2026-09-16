@@ -3,6 +3,8 @@
 Two committed vectors guard the ML-KEM-1024 (FIPS 203) path in
 `src-tauri/src/vpn/birdo_pq.rs`. Both are consumed by `#[cfg(test)]` tests in
 that file, which CI runs (`.github/workflows/tests.yml` -> `cargo test --lib`).
+The crate and feature set those tests run against are themselves gated by
+`scripts/ci/check-pq-features.sh` in the same workflow.
 
 ## `birdo-pq-ml-kem-1024.kat.json` — the interop guard
 
@@ -46,6 +48,20 @@ embedded `H(ek)` field (offset 3110, in `dk[3104..3136]`) to exercise the
 FIPS 203 §7.3 validation that `ml-kem` performs and `pqcrypto-mlkem`'s
 length-only `from_bytes` did not — and to prove the caller re-keys instead of
 failing forever.
+
+### These secret keys are PUBLISHED
+
+`birdo-pq-pqclean-stored-key.json` contains a **real 3168-byte ML-KEM-1024
+decapsulation key**, and `birdo-pq-ml-kem-1024.kat.json` a real one plus the
+64-byte keygen seed that produced it. Desktop-Client is a **public** repo, so
+both are world-readable and always will be, including in every past commit.
+
+That is fine, and intended: they are throwaway vectors that exist only to be
+compared against. It is only a problem if someone later mistakes one for a
+spare identity. So, explicitly: **never install either key as a client
+identity, never reuse them anywhere outside these tests, and never copy the
+shape of this directory for a key that protects anything.** A PSK derived from
+a published decapsulation key protects nothing.
 
 ### Regenerating
 

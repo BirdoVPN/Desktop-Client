@@ -135,6 +135,28 @@ jobs:
           mkdir -p dist
           echo '<!doctype html><title>stub</title>' > dist/index.html
 
+      # PQ dependency + feature gate. Runs on Linux only (once per PR is
+      # enough; the answer is host-independent) and BEFORE `cargo check`,
+      # which would regenerate a stale Cargo.lock out from under the
+      # banned-crate grep.
+      #
+      # WHY: `zeroize` is what makes ml-kem's DecapsulationKey ZeroizeOnDrop
+      # (ml-kem-0.3.2/src/decapsulation_key.rs:142,156 gate `impl Drop` and
+      # `impl ZeroizeOnDrop` on that feature), and nothing asserted it. Review
+      # of #163 changed the dependency to `features = ["alloc"]` and all 15
+      # crypto tests still passed — no test can observe a Drop that did not
+      # happen — so a Dependabot bump or a refactor could disarm every
+      # decapsulation-key wipe with a green build. Mobile-Client has
+      # scripts/check_pq_features.sh for exactly this; Desktop-Client had no
+      # equivalent. The script also holds the exact `=0.3.2` pin, keeps the
+      # pqcrypto/PQClean C trio out (RUSTSEC-2026-0161/-0162/-0163), and
+      # enforces by hand the invariant the `hazmat` feature was wrongly
+      # believed to enforce: `encapsulate_deterministic` stays inside the
+      # #[cfg(test)] module.
+      - name: PQ dependency + feature gate
+        if: matrix.os == 'linux'
+        run: ./scripts/ci/check-pq-features.sh
+
       - name: cargo check (all targets)
         working-directory: src-tauri
         run: cargo check --all-targets

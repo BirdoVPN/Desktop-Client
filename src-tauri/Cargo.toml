@@ -104,16 +104,50 @@ zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # still use it. Neither does extended-ISA code leave; see the "Implementation"
 # section of src/vpn/birdo_pq.rs for what did and did not change there.
 #
-# EXACT PIN, deliberately: this is the KEM, not a dependency. `ml-kem` shipped
-# FIPS 203 input validation and a Zeroize fix inside 0.3.x patch releases, so
-# every version move here is a crypto change that needs the KAT re-run and a
-# re-read of the changelog, not a Dependabot rubber stamp.
+# EXACT PIN, deliberately: this is the KEM, not a dependency. Every version
+# move here is a crypto change that needs the KAT re-run and a changelog read,
+# not a Dependabot rubber stamp.
+#
+# CORRECTED (review of #163): an earlier draft of this comment justified the
+# pin with "ml-kem shipped FIPS 203 input validation and a Zeroize fix inside
+# 0.3.x patch releases". Upstream does not say that, and a wrong citation in a
+# crypto manifest is worse than none. The 0.3 line has exactly TWO published
+# releases — 0.3.0 (2026-04-28) and 0.3.2 (2026-05-10); crates.io lists no
+# other non-prerelease 0.3.x, and ml-kem/CHANGELOG.md records 0.3.1 as
+# "Skipped as it was tagged without a version bump". That changelog gives
+# 0.3.2 exactly one line: "Added - Optional on-by-default heap offload support
+# ([#310])". The input-validation work the sentence was reaching for
+# ("Validate encryption/encapsulation keys ([#179])", "Validate expanded
+# decapsulation key hash ([#207])") landed in 0.3.0, the MINOR release, and
+# the Zeroize entry is older still.
+#
+# The pin stays, on the real reason: 0.3.2 is a single patch release that
+# already changed where key material is allocated, nobody here reviews this
+# crate's patches, and the only thing standing between a bad one and a silent
+# interop break is the KAT in src/vpn/fixtures/ — which only runs if someone
+# is looking. `scripts/ci/check-pq-features.sh` gates the pin and the feature
+# set on every PR.
 #
 # default-features = false + ["alloc", "zeroize"]: the crate's default is
-# ["alloc"] ALONE — `zeroize` is opt-in, and without it DecapsulationKey is not
-# ZeroizeOnDrop. The `hazmat` feature is dev-only (below): tests need
-# `encapsulate_deterministic` to reproduce fixed vectors; production only ever
-# key-generates and decapsulates.
+# ["alloc"] ALONE — `zeroize` is opt-in, and without it DecapsulationKey is
+# not ZeroizeOnDrop (ml-kem-0.3.2/src/decapsulation_key.rs:142,156 gate both
+# `impl Drop` and `impl ZeroizeOnDrop` on `#[cfg(feature = "zeroize")]`).
+# Because a missing `zeroize` disarms every dk wipe without failing a single
+# test, that feature set is asserted in CI by
+# `scripts/ci/check-pq-features.sh`, not just written down here.
+#
+# There is deliberately NO `hazmat` entry, here or in [dev-dependencies].
+# `hazmat` gates NOTHING but rustdoc: in ml-kem 0.3.2 the feature is defined
+# as `hazmat = []` and its only use is
+# `#[cfg_attr(not(feature = "hazmat"), doc(hidden))]` on
+# `EncapsulationKey::encapsulate_deterministic`
+# (ml-kem-0.3.2/src/encapsulation_key.rs:43-45) — a plain `pub fn` that is
+# compiled into every profile regardless. Requesting it in [dev-dependencies]
+# bought nothing and, worse, read as a build-time guarantee that deterministic
+# encapsulation cannot reach a release binary. It is not one. Keeping
+# `encapsulate_deterministic` out of production is a CODE-REVIEW invariant:
+# the only caller is the `#[cfg(test)]` KAT helper in src/vpn/birdo_pq.rs,
+# and it must stay that way.
 ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "zeroize"] }
 hkdf = "0.12"
 
@@ -213,14 +247,6 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3.13"
-# `hazmat` gates `EncapsulationKey::encapsulate_deterministic`, which the tests
-# use to reproduce the server's exact ciphertext from the KAT fixture's fixed
-# randomness. In [dev-dependencies] on purpose: Cargo resolves dev-dependency
-# features only for this package's test/bench targets, so `hazmat` is on for
-# `cargo test` and off for `cargo build --release`. The client never
-# encapsulates in production (the server does, with @noble/post-quantum), and a
-# deterministic encapsulation in a shipping build would be a real vulnerability.
-ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "zeroize", "hazmat"] }
 # K5 connect contract: validates the SERIALIZED ConnectRequest /
 # MultiHopConnectRequest bodies against the vendored
 # contract/vpn-protocol.schema.json (src/api/contract_tests.rs). Exact pin so a

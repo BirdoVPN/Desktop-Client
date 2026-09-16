@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings in the working tree as well as in the
+# blob: CRLF makes bash fail with the unreadable `$'': command not found`,
+# and scripts/ci/check-pq-features.sh runs on a CI runner whose checkout
+# settings this repo does not control.
+*.sh text eol=lf
