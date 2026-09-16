@@ -237,8 +237,14 @@ impl ServerCertVerifier for SpkiPinningVerifier {
 /// CA-chain SPKI pinning on EVERY host. Fed to reqwest via
 /// `ClientBuilder::use_preconfigured_tls`.
 ///
-/// This is the strict configuration and the right one for the API client, which
-/// only ever dials `api.birdo.app`.
+/// This is the strict configuration and the right one for the API client.
+///
+/// It used to say the API client "only ever dials `api.birdo.app`". PR #162 is
+/// what made that false: `BirdoApi::get_client_config` dials the `birdo.app`
+/// apex for `/api/client-config`. Nothing here needs to change — `AllHosts`
+/// pins whatever the client dials, and both hosts chain through pinned CAs —
+/// but left standing, that sentence read as a promise about the caller that a
+/// future reader could rely on and a future caller could quietly break.
 pub fn rustls_config() -> ClientConfig {
     build_config(PinScope::AllHosts)
 }

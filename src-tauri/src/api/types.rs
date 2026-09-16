@@ -545,6 +545,35 @@ pub struct UserProfile {
     pub is_sso: bool,
 }
 
+/// `GET /api/client-config` — only the fields this client acts on.
+///
+/// Deliberately NOT a full mirror of the payload: the endpoint also serves
+/// cert pins, per-plan feature entitlements and consent copy, none of which the
+/// desktop client reads today (pins are vendored into `third_party/` and
+/// enforced at build time). Adding fields here would create a second source of
+/// truth for each of them.
+///
+/// Every field is `Option` and defaulted: a payload from an OLDER web deploy —
+/// one that predates the field — must deserialize, not error. `None` means
+/// "the server did not say", which the UI treats as AVAILABLE. See
+/// `dns_filtering_available`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientConfigResponse {
+    /// BirdoShield (D18) fleet gate: is `DNS_FILTERING_ENABLED` on for the
+    /// fleet this account dials? The per-device opt-in is the `dnsFiltering`
+    /// connect flag; this says whether that flag can do anything at all.
+    ///
+    /// `None` (field absent, older web deploy) is NOT `false`. The UI's default
+    /// is AVAILABLE, so a client that cannot learn the answer keeps offering a
+    /// feature that works, instead of hiding a working one behind a fetch
+    /// failure. The dishonest state this whole field exists to prevent — a
+    /// toggle that reads ON while the server hands out Cloudflare — only
+    /// happens on an explicit `false`.
+    #[serde(default)]
+    pub dns_filtering_available: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionStatus {

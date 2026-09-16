@@ -19,6 +19,15 @@ mod endpoint_tests {
         assert!(endpoints::auth::ME.starts_with("/auth/"));
     }
 
+    /// The client-config path is a WEB-app route, so unlike every other
+    /// constant in this file it is joined to `WEB_BASE_URL`, not the NestJS
+    /// `API_BASE_URL`. Pinning the literal here is the cheap guard against
+    /// someone "tidying" it into the backend base, where it 404s.
+    #[test]
+    fn client_config_endpoint_is_the_web_api_route() {
+        assert_eq!(endpoints::config::CLIENT_CONFIG, "/api/client-config");
+    }
+
     #[test]
     fn vpn_connection_path_includes_key_id() {
         let path = endpoints::vpn::connection("key-abc-123");
@@ -679,6 +688,50 @@ mod types_serialization_tests {
         assert_eq!(status.plan, "OPERATIVE");
         assert_eq!(status.devices_used, 2);
         assert_eq!(status.bandwidth_limit, Some(10737418240));
+    }
+
+    /// `GET /api/client-config` → `dnsFilteringAvailable` (the BirdoShield
+    /// fleet gate). Three shapes, and the difference between them is the whole
+    /// point of the field being `Option<bool>`:
+    ///
+    ///   true  -> gate on, the toggle can do something
+    ///   false -> gate off, the toggle must read OFF and be disabled
+    ///   absent -> UNKNOWN (older web deploy), which is NOT false
+    ///
+    /// If the absent case ever deserialized as `Some(false)` — or failed to
+    /// deserialize, which the UI treats the same way as a network error — every
+    /// client talking to a pre-#465 web deploy would hide a feature that works.
+    #[test]
+    fn client_config_dns_filtering_available_distinguishes_false_from_absent() {
+        let on: ClientConfigResponse =
+            serde_json::from_str(r#"{"dnsFilteringAvailable":true}"#).unwrap();
+        assert_eq!(on.dns_filtering_available, Some(true));
+
+        let off: ClientConfigResponse =
+            serde_json::from_str(r#"{"dnsFilteringAvailable":false}"#).unwrap();
+        assert_eq!(off.dns_filtering_available, Some(false));
+
+        // Pre-#465 web deploy: the key does not exist at all.
+        let absent: ClientConfigResponse = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert_eq!(absent.dns_filtering_available, None);
+    }
+
+    /// The real payload carries cert pins, per-plan feature maps and consent
+    /// copy this client does not model. Unknown fields must be IGNORED, not
+    /// rejected: a strict struct here would turn every future web-side addition
+    /// into a silent "gate unknown" for every shipped desktop build.
+    #[test]
+    fn client_config_ignores_the_fields_it_does_not_model() {
+        let json = r#"{
+            "version": 1,
+            "certPins": { "hosts": { "birdo.app": {} } },
+            "dnsFilteringAvailable": false,
+            "features": { "RECON": { "dnsFiltering": true } },
+            "consent": { "vpnDisclaimer": "..." },
+            "minimumVersions": { "windows": "1.0.0" }
+        }"#;
+        let cfg: ClientConfigResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.dns_filtering_available, Some(false));
     }
 
     /// The in-app anonymous-registration body must serialize with the exact

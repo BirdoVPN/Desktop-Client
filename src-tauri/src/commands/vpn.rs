@@ -1505,6 +1505,25 @@ pub async fn get_subscription_status(
         .map_err(|e| sanitize_error(&format!("Failed to get subscription: {}", e)))
 }
 
+/// Fetch the public client configuration (`GET /api/client-config`).
+///
+/// Unauthenticated on purpose — the payload is the same for every user, so
+/// unlike `get_subscription_status` this command does not restore tokens or
+/// refuse when signed out.
+///
+/// Errors are returned as `Err` rather than swallowed into a default here: the
+/// CALLER owns the fallback, and the frontend's fallback is "available". If
+/// this returned a synthesized `dnsFilteringAvailable: false` on a network
+/// blip, every offline client would hide a feature that works.
+#[tauri::command]
+pub async fn get_client_config(
+    api: State<'_, BirdoApi>,
+) -> Result<crate::api::types::ClientConfigResponse, String> {
+    api.get_client_config()
+        .await
+        .map_err(|e| sanitize_error(&format!("Failed to get client config: {}", e)))
+}
+
 /// Get per-user monthly bandwidth usage + cap for the data-usage meter.
 /// Distinct from `get_vpn_stats` (local live-tunnel throughput counters).
 #[tauri::command]

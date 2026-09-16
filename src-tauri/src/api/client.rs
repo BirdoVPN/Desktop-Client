@@ -22,6 +22,33 @@ use erased_serde;
 /// As of subdomain-based routing, the backend is reachable via api.birdo.app
 /// (Caddy reverse-proxies api.birdo.app -> backend:4000 directly, no /api prefix).
 const API_BASE_URL: &str = "https://api.birdo.app";
+
+/// The Next.js WEB origin.
+///
+/// `/api/client-config` is served by the web app (`app/api/client-config/
+/// route.ts` in birdo-web), not by the NestJS backend behind `api.birdo.app`,
+/// so it needs its own base.
+///
+/// What actually covers it — and the mechanism this comment named in round 4
+/// was the wrong one, in the weaker direction. It said `cert_pin`'s
+/// `BIRDO_APEX` scope is "`birdo.app` and its subdomains", implying the host
+/// is pinned because it matches an apex rule. It is not: `BirdoApi::new()`
+/// builds this client with `cert_pin::rustls_config()`, which is
+/// `PinScope::AllHosts`, where `is_birdo_host()`/`BIRDO_APEX` is never
+/// consulted and EVERY host the client dials is pinned to the CA-chain SPKI
+/// set. (`BIRDO_APEX` is the auto-updater's narrower scope, not this one.) So
+/// `birdo.app` is covered not by a rule that happens to include it but
+/// because there is no unpinned host on this client at all, and the pin it
+/// must meet is satisfied: reviewer-verified 2026-09-16, birdo.app chains
+/// through the same intermediate and root as api.birdo.app, both of whose
+/// SPKI hashes are in `PINNED_SPKI_SHA256`. No new trust surface.
+///
+/// The tauri CSP is NOT part of that answer either, contrary to what this
+/// comment said before round 4: `connect-src` constrains the WEBVIEW's own
+/// fetches, and this request is made by reqwest in the Rust process, which no
+/// CSP sees. (`https://birdo.app` is in the CSP regardless, for the webview's
+/// sake.)
+const WEB_BASE_URL: &str = "https://birdo.app";
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Windows)");
 
 // SEC-C1: TLS certificate pinning lives in `super::cert_pin`. It pins the
@@ -524,6 +551,37 @@ impl BirdoApi {
         self.get(endpoints::users::SUBSCRIPTION, true).await
     }
 
+    /// Fetch `GET /api/client-config` from the WEB origin.
+    ///
+    /// Does not go through `request_with_retry`/`do_request`: those prefix
+    /// `API_BASE_URL`, and this endpoint lives on `WEB_BASE_URL` (see the
+    /// constant). It reuses `self.client`, so it keeps the pinned TLS config,
+    /// the DoH resolver and the timeouts — the one thing a second client must
+    /// never quietly drop. Unauthenticated by design: the payload is public and
+    /// identical for every user, so a token would buy nothing and would couple a
+    /// fleet-wide rollout flag to session state — a signed-out or
+    /// token-refreshing client would read "unknown" for no reason. Today's only
+    /// caller (`AppShell`) does run signed in; this is about what the endpoint
+    /// needs, not about where it happens to be called from.
+    ///
+    /// No 401 retry is needed for the same reason: there is no token to refresh.
+    ///
+    /// Handled as `Origin::Web`: this is the first response from anywhere but
+    /// `api.birdo.app` to reach `handle_response`, and a 426 from a public web
+    /// route (or from the CDN in front of it) must not arm the process-wide
+    /// version-floor block. See `upgrade_gate::Origin`.
+    pub async fn get_client_config(&self) -> Result<ClientConfigResponse, ApiError> {
+        let url = format!("{}{}", WEB_BASE_URL, endpoints::config::CLIENT_CONFIG);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        self.handle_response_from(response, super::upgrade_gate::Origin::Web)
+            .await
+    }
+
     /// Get per-user monthly bandwidth usage + cap for the data-usage meter.
     /// Distinct from `get_vpn_stats` (local live-tunnel throughput).
     pub async fn get_usage_stats(&self) -> Result<super::types::UsageStats, ApiError> {
@@ -952,9 +1010,26 @@ impl BirdoApi {
         }
     }
 
+    /// Control-plane responses (everything through `do_request`).
     async fn handle_response<T: DeserializeOwned>(
         &self,
         response: reqwest::Response,
+    ) -> Result<T, ApiError> {
+        self.handle_response_from(response, super::upgrade_gate::Origin::ControlPlane)
+            .await
+    }
+
+    /// `handle_response`, told which origin produced the response.
+    ///
+    /// The origin only matters for HTTP 426: latching the forced-version floor
+    /// is a one-way, process-wide block, and it is a contract of the NestJS
+    /// control plane. `get_client_config` reuses this handler against the WEB
+    /// origin, so the origin has to travel with the response -- see
+    /// `upgrade_gate::Origin`.
+    async fn handle_response_from<T: DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+        origin: super::upgrade_gate::Origin,
     ) -> Result<T, ApiError> {
         // SEC-C1: certificate pinning now happens during the TLS handshake
         // (see super::cert_pin) — no post-response check is required.
@@ -992,7 +1067,7 @@ impl BirdoApi {
         // function stays pure and unit-testable; the latch is what stops
         // auto-reconnect and raises the blocking UI (see api::upgrade_gate).
         if let ApiError::UpgradeRequired(info) = &error {
-            super::upgrade_gate::latch(info.clone());
+            super::upgrade_gate::latch_from(origin, info.clone());
         }
         Err(error)
     }

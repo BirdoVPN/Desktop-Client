@@ -32,6 +32,21 @@ pub mod users {
     pub const SUBSCRIPTION: &str = "/auth/me";
 }
 
+/// Client configuration endpoint.
+///
+/// NOT on `api.birdo.app`. This one is served by the Next.js WEB app
+/// (`app/api/client-config/route.ts` in birdo-web), so it is requested against
+/// `WEB_BASE_URL` in client.rs rather than the NestJS `API_BASE_URL`. Public
+/// (no auth) and rate-limited (birdo-web's shared `api` bucket, 60 req/min).
+/// The route is CDN-cacheable server-side, but this client sends no
+/// `If-None-Match` and reqwest keeps no HTTP cache, so every fetch is a full
+/// 200 -- cheap, but not a 304.
+pub mod config {
+    /// Cert pins, per-plan feature entitlements, consent copy, and the
+    /// BirdoShield fleet gate (`dnsFilteringAvailable`).
+    pub const CLIENT_CONFIG: &str = "/api/client-config";
+}
+
 /// Voucher endpoints
 pub mod vouchers {
     /// Authenticated user redeems a 30/90-day time-extension code.

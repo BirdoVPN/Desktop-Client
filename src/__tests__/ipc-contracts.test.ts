@@ -318,6 +318,7 @@ const FRONTEND_COMMANDS = [
   // Extended VPN info
   'get_subscription_status',
   'get_usage_stats',
+  'get_client_config',
   // Multi-hop (Double VPN)
   'get_multi_hop_routes',
   'connect_multi_hop',

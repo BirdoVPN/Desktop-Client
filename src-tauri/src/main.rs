@@ -648,6 +648,7 @@ fn main() {
             // Extended VPN info
             commands::vpn::get_subscription_status,
             commands::vpn::get_usage_stats,
+            commands::vpn::get_client_config,
             // Multi-Hop (Double VPN)
             commands::vpn_multi_hop::get_multi_hop_routes,
             commands::vpn_multi_hop::connect_multi_hop,

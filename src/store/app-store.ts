@@ -171,6 +171,32 @@ interface AppState {
   settings: AppSettings;
   settingsHydrated: boolean;
 
+  /**
+   * BirdoShield (D18) FLEET GATE, from `GET /api/client-config`
+   * (`dnsFilteringAvailable` = the backend's `DNS_FILTERING_ENABLED`).
+   *
+   * Distinct from the per-device `settings.dnsFiltering` preference: this says
+   * whether turning that preference on can do anything. With the gate off the
+   * backend ignores the connect flag and hands out the normal resolver, so a
+   * toggle that read ON would be reassurance from missing data.
+   *
+   * DEFAULTS TO TRUE, and is deliberately NOT persisted (see `partialize`) and
+   * NOT cleared on logout — it is a property of the fleet, not of the account.
+   * True is the safe default because the failure mode it guards is asymmetric:
+   * a wrongly-`false` value HIDES a feature that works (and loses the user
+   * filtering they paid attention to), while a wrongly-`true` one costs a
+   * greyed-out row appearing a moment late. Only an explicit `false` from the
+   * server disables the row; an unreachable server, a 500, an older web deploy
+   * that predates the field, or a cold start before the fetch all leave it on.
+   *
+   * Typed `boolean | undefined`, not `boolean`, so the type carries the
+   * tri-state the rule is written against: consumers must test `=== false`,
+   * and a `!available` that treats unknown as off is then a type-visible
+   * change of meaning rather than an invisible one.
+   */
+  dnsFilteringAvailable: boolean | undefined;
+  setDnsFilteringAvailable: (available: boolean) => void;
+
   // Multi-Hop & Port Forwarding
   multiHopRoutes: MultiHopRoute[];
   portForwards: PortForward[];
@@ -326,6 +352,10 @@ export const useAppStore = create<AppState>()(
 
       settings: { ...defaultSettings },
       settingsHydrated: false,
+
+      // See the AppState doc comment: true until the server says otherwise.
+      dnsFilteringAvailable: true,
+      setDnsFilteringAvailable: (dnsFilteringAvailable) => set({ dnsFilteringAvailable }),
 
       multiHopRoutes: [],
       portForwards: [],
