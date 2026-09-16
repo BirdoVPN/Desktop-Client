@@ -545,6 +545,11 @@ impl BirdoApi {
     /// unavailable on exactly the screens that show it before sign-in.
     ///
     /// No 401 retry is needed for the same reason.
+    ///
+    /// Handled as `Origin::Web`: this is the first response from anywhere but
+    /// `api.birdo.app` to reach `handle_response`, and a 426 from a public web
+    /// route (or from the CDN in front of it) must not arm the process-wide
+    /// version-floor block. See `upgrade_gate::Origin`.
     pub async fn get_client_config(&self) -> Result<ClientConfigResponse, ApiError> {
         let url = format!("{}{}", WEB_BASE_URL, endpoints::config::CLIENT_CONFIG);
         let response = self
@@ -553,7 +558,8 @@ impl BirdoApi {
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
-        self.handle_response(response).await
+        self.handle_response_from(response, super::upgrade_gate::Origin::Web)
+            .await
     }
 
     /// Get per-user monthly bandwidth usage + cap for the data-usage meter.
@@ -984,9 +990,26 @@ impl BirdoApi {
         }
     }
 
+    /// Control-plane responses (everything through `do_request`).
     async fn handle_response<T: DeserializeOwned>(
         &self,
         response: reqwest::Response,
+    ) -> Result<T, ApiError> {
+        self.handle_response_from(response, super::upgrade_gate::Origin::ControlPlane)
+            .await
+    }
+
+    /// `handle_response`, told which origin produced the response.
+    ///
+    /// The origin only matters for HTTP 426: latching the forced-version floor
+    /// is a one-way, process-wide block, and it is a contract of the NestJS
+    /// control plane. `get_client_config` reuses this handler against the WEB
+    /// origin, so the origin has to travel with the response -- see
+    /// `upgrade_gate::Origin`.
+    async fn handle_response_from<T: DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+        origin: super::upgrade_gate::Origin,
     ) -> Result<T, ApiError> {
         // SEC-C1: certificate pinning now happens during the TLS handshake
         // (see super::cert_pin) — no post-response check is required.
@@ -1024,7 +1047,7 @@ impl BirdoApi {
         // function stays pure and unit-testable; the latch is what stops
         // auto-reconnect and raises the blocking UI (see api::upgrade_gate).
         if let ApiError::UpgradeRequired(info) = &error {
-            super::upgrade_gate::latch(info.clone());
+            super::upgrade_gate::latch_from(origin, info.clone());
         }
         Err(error)
     }

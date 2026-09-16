@@ -188,8 +188,13 @@ interface AppState {
    * greyed-out row appearing a moment late. Only an explicit `false` from the
    * server disables the row; an unreachable server, a 500, an older web deploy
    * that predates the field, or a cold start before the fetch all leave it on.
+   *
+   * Typed `boolean | undefined`, not `boolean`, so the type carries the
+   * tri-state the rule is written against: consumers must test `=== false`,
+   * and a `!available` that treats unknown as off is then a type-visible
+   * change of meaning rather than an invisible one.
    */
-  dnsFilteringAvailable: boolean;
+  dnsFilteringAvailable: boolean | undefined;
   setDnsFilteringAvailable: (available: boolean) => void;
 
   // Multi-Hop & Port Forwarding

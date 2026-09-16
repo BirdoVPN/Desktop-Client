@@ -27,6 +27,19 @@ export interface BirdoListItemProps {
    */
   role?: 'switch';
   ariaChecked?: boolean;
+  /**
+   * Let the subtitle WRAP instead of truncating to one ellipsised line.
+   *
+   * The default is `truncate`, which is right for a subtitle that is a value
+   * or a hint ("Automatic", "2 apps"), and wrong for one that is the only
+   * explanation of why a row is disabled: the window is a fixed, non-resizable
+   * 380x640 (`src-tauri/tauri.conf.json`), which leaves the subtitle column
+   * roughly 208px, so at `text-xs` (12px) about 34 characters survive and the
+   * rest is an ellipsis the user can never reveal — there is no resize, no
+   * tooltip and no horizontal scroll. A blocked row whose reason is cut off is
+   * the same missing-information failure as a row that lies about its state.
+   */
+  subtitleWrap?: boolean;
 }
 
 export function BirdoListItem({
@@ -40,6 +53,7 @@ export function BirdoListItem({
   className = '',
   role,
   ariaChecked,
+  subtitleWrap = false,
 }: BirdoListItemProps) {
   const Wrapper = onClick && enabled ? 'button' : 'div';
   return (
@@ -69,7 +83,12 @@ export function BirdoListItem({
           {title}
         </div>
         {subtitle && (
-          <div className="mt-0.5 truncate text-xs" style={{ color: white.w60 }}>
+          <div
+            className={`mt-0.5 text-xs ${
+              subtitleWrap ? 'whitespace-normal break-words leading-snug' : 'truncate'
+            }`}
+            style={{ color: white.w60 }}
+          >
             {subtitle}
           </div>
         )}
@@ -89,6 +108,8 @@ export interface BirdoToggleRowProps {
   leadingIcon?: LucideIcon;
   leadingTint?: string;
   enabled?: boolean;
+  /** See `BirdoListItemProps.subtitleWrap`. */
+  subtitleWrap?: boolean;
 }
 
 export function BirdoToggleRow({
@@ -99,6 +120,7 @@ export function BirdoToggleRow({
   leadingIcon,
   leadingTint,
   enabled = true,
+  subtitleWrap = false,
 }: BirdoToggleRowProps) {
   return (
     <BirdoListItem
@@ -107,6 +129,7 @@ export function BirdoToggleRow({
       leadingIcon={leadingIcon}
       leadingTint={leadingTint}
       enabled={enabled}
+      subtitleWrap={subtitleWrap}
       role="switch"
       ariaChecked={checked}
       onClick={enabled ? () => onCheckedChange(!checked) : undefined}
@@ -125,6 +148,8 @@ export interface BirdoNavRowProps {
   leadingTint?: string;
   valueText?: string;
   enabled?: boolean;
+  /** See `BirdoListItemProps.subtitleWrap`. */
+  subtitleWrap?: boolean;
 }
 
 export function BirdoNavRow({
@@ -135,6 +160,7 @@ export function BirdoNavRow({
   leadingTint,
   valueText,
   enabled = true,
+  subtitleWrap = false,
 }: BirdoNavRowProps) {
   return (
     <BirdoListItem
@@ -143,6 +169,7 @@ export function BirdoNavRow({
       leadingIcon={leadingIcon}
       leadingTint={leadingTint}
       enabled={enabled}
+      subtitleWrap={subtitleWrap}
       onClick={onClick}
       trailing={
         <div className="flex items-center gap-1.5">

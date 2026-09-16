@@ -67,6 +67,30 @@ pub struct RequiredUpdate {
     pub message: Option<String>,
 }
 
+/// Which origin a refused response came from.
+///
+/// The forced-version floor is a contract of the NestJS CONTROL PLANE
+/// (`api.birdo.app`): it is the only thing that knows this build's version, the
+/// only thing that enforces a minimum, and the only thing that emits the
+/// structured 426 documented above. Until PR #162 it was also the only origin
+/// whose responses reached `handle_response` at all, so "any 426 latches" and
+/// "any control-plane 426 latches" were the same sentence.
+///
+/// `get_client_config` broke that by pointing the same response handler at the
+/// WEB origin (`birdo.app`), which is a Next.js route behind a CDN. Nothing
+/// there emits 426 today -- but the latch is a ONE-WAY, process-wide wall that
+/// stops auto-reconnect and raises the blocking update screen, so an edge or
+/// proxy response on an unrelated public route must not be able to arm it on a
+/// build the backend is perfectly happy with. This enum keeps the old
+/// invariant explicit now that two origins share the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// `api.birdo.app` -- the NestJS backend that owns the version floor.
+    ControlPlane,
+    /// `birdo.app` -- the Next.js web app (public `/api/client-config`).
+    Web,
+}
+
 static GATE: RwLock<Option<RequiredUpdate>> = RwLock::new(None);
 static APP: OnceLock<AppHandle> = OnceLock::new();
 
@@ -97,6 +121,23 @@ pub fn latch(info: RequiredUpdate) {
     if let Some(app) = APP.get() {
         let _ = app.emit(UPDATE_REQUIRED_EVENT, info);
     }
+}
+
+/// Latch a 426, but only when it came from the control plane.
+///
+/// Returns whether it latched, so the policy is assertable without reaching
+/// into the gate's internals. See `Origin` for why a web-origin 426 is
+/// ignored rather than honoured.
+pub fn latch_from(origin: Origin, info: RequiredUpdate) -> bool {
+    if origin != Origin::ControlPlane {
+        tracing::warn!(
+            "Ignoring HTTP 426 from {:?}: the client version floor is a control-plane contract, and another origin must not arm the process-wide block",
+            origin
+        );
+        return false;
+    }
+    latch(info);
+    true
 }
 
 /// The latched requirement, if the floor has been hit.
@@ -147,6 +188,46 @@ mod tests {
         reset_for_test();
         latch(info("1.4.36"));
         assert!(is_blocked());
+        assert_eq!(
+            required_update().and_then(|i| i.required_version),
+            Some("1.4.36".to_string())
+        );
+        reset_for_test();
+    }
+
+    /// PR #162 review: `get_client_config` routes WEB-origin responses through
+    /// the same `handle_response`, so for the first time a non-control-plane
+    /// 426 can reach the latch. It must not arm it -- the latch is one-way for
+    /// the life of the process and stops auto-reconnect outright.
+    #[test]
+    fn web_origin_426_does_not_latch() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        assert!(!latch_from(Origin::Web, info("9.9.9")));
+        assert!(!is_blocked());
+        assert_eq!(required_update(), None);
+    }
+
+    #[test]
+    fn control_plane_426_still_latches() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        assert!(latch_from(Origin::ControlPlane, info("1.4.36")));
+        assert!(is_blocked());
+        assert_eq!(
+            required_update().and_then(|i| i.required_version),
+            Some("1.4.36".to_string())
+        );
+        reset_for_test();
+    }
+
+    /// A web-origin 426 must not even poison a LATER control-plane one.
+    #[test]
+    fn web_origin_426_leaves_a_later_control_plane_426_free_to_latch() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        assert!(!latch_from(Origin::Web, info("9.9.9")));
+        assert!(latch_from(Origin::ControlPlane, info("1.4.36")));
         assert_eq!(
             required_update().and_then(|i| i.required_version),
             Some("1.4.36".to_string())

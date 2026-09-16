@@ -258,6 +258,12 @@ export function VpnSettings() {
                   ? 'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.'
                   : "Blocks ads, trackers and malware domains at the VPN's DNS resolver."
             }
+            // All three subtitles here are explanations, not values, and every
+            // one of them is longer than the ~34 characters a single 12px line
+            // fits in the fixed 380px window — the two blocked reasons most of
+            // all. Truncated, the user would read "Not available on your
+            // account's ser…" and never see that their preference is kept.
+            subtitleWrap
             leadingIcon={ShieldCheck}
             leadingTint={shieldBlocked ? white.w40 : status.green}
             checked={settings.dnsFiltering && !shieldBlocked}

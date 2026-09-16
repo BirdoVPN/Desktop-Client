@@ -15,6 +15,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { VpnSettings } from '@/screens/VpnSettings';
+import { BirdoListItem } from '@/components/birdo/ListItem';
 import type { ConnectionState } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
@@ -267,6 +268,70 @@ describe('BirdoShield toggle → dns_filtering', () => {
         screen.getByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
       ).toBeInTheDocument();
       expect(screen.queryByText(UNAVAILABLE_COPY)).not.toBeInTheDocument();
+    });
+  });
+
+  // PR #162 review, must-fix 1: `expect(screen.getByText(COPY))` reads DOM
+  // text, and jsdom applies no CSS, so it passes on copy the user can never
+  // read. The subtitle was `mt-0.5 truncate text-xs` -- ONE ellipsised line --
+  // in a window that is `"width": 380, "height": 640, "resizable": false`
+  // (src-tauri/tauri.conf.json). Subtracting the screen padding (32), the row
+  // padding (28), the 36px leading icon, the 48px switch and their 14px gaps
+  // leaves the subtitle column about 208px; at `text-xs` (12px, ~6px average
+  // glyph) roughly 34 characters survive. The fleet-gate reason is 104
+  // characters, so the second half -- "Your preference is kept and applies as
+  // soon as it is.", the entire reassurance -- never rendered, with no resize,
+  // no tooltip and no horizontal scroll to recover it.
+  //
+  // There is no layout engine here to measure, so the assertion is structural:
+  // a subtitle longer than one line must not be in a truncating container.
+  describe('the blocked reason must be readable, not just present in the DOM', () => {
+    /** Characters that fit on one 12px line in the 380px window (see above). */
+    const ONE_LINE_BUDGET = 34;
+
+    /** The row's subtitle element (the title is `text-[15px]`). */
+    const subtitleOf = (row: HTMLElement) => {
+      const el = row.querySelector('.text-xs');
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    };
+
+    const states: Array<[string, () => void]> = [
+      ['default', () => {}],
+      ['fleet gate off', () => { mockStoreState.dnsFilteringAvailable = false; }],
+      ['custom DNS', () => { mockStoreState.settings.customDns = ['1.1.1.1']; }],
+    ];
+
+    it.each(states)('%s: the whole subtitle is rendered untruncated', async (_name, setup) => {
+      setup();
+      render(<VpnSettings />);
+      const subtitle = subtitleOf(await screen.findByRole('switch', { name: /birdoshield/i }));
+      // Every one of the three copies is longer than a line -- if one ever is
+      // not, the budget below stops being the thing under test.
+      expect(subtitle.textContent!.length).toBeGreaterThan(ONE_LINE_BUDGET);
+      expect(subtitle.className).not.toMatch(/\btruncate\b/);
+      expect(subtitle.className).toMatch(/\bwhitespace-normal\b/);
+    });
+
+    it('spells out the fleet-gate reason past the truncation point', async () => {
+      mockStoreState.dnsFilteringAvailable = false;
+      render(<VpnSettings />);
+      const subtitle = subtitleOf(await screen.findByRole('switch', { name: /birdoshield/i }));
+      expect(subtitle).toHaveTextContent(UNAVAILABLE_COPY);
+      // The half that used to fall off the end. Asserted separately so the
+      // failure names the thing that was lost, not just "text mismatch".
+      expect(UNAVAILABLE_COPY.slice(ONE_LINE_BUDGET)).toContain('Your preference is kept');
+      expect(subtitle).toHaveTextContent('Your preference is kept and applies as soon as it is.');
+    });
+
+    it('rows whose subtitle is a short value keep the default truncation', () => {
+      // The opt-out is per row, not a blanket change to BirdoListItem: only a
+      // subtitle that is an EXPLANATION pays the extra height.
+      render(
+        <BirdoListItem title="Port" subtitle="Automatic" />,
+      );
+      const subtitle = screen.getByText('Automatic');
+      expect(subtitle.className).toMatch(/\btruncate\b/);
     });
   });
 

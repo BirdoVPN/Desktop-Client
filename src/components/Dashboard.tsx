@@ -19,6 +19,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore, ConnectionState } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
+import { useClientConfig } from '@/hooks/useClientConfig';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   ArrowDown,
@@ -215,7 +216,6 @@ export function Dashboard() {
     setIsAdmin,
     setVpnIp,
     vpnIp,
-    setDnsFilteringAvailable,
   } = useAppStore(
     useShallow((s) => ({
       connectionState: s.connectionState,
@@ -242,7 +242,6 @@ export function Dashboard() {
       setErrorMessage: s.setErrorMessage,
       setIsAdmin: s.setIsAdmin,
       setVpnIp: s.setVpnIp,
-      setDnsFilteringAvailable: s.setDnsFilteringAvailable,
     }))
   );
 
@@ -316,29 +315,11 @@ export function Dashboard() {
   }, [setAccount]);
 
   // ── BirdoShield fleet gate ────────────────────────────────────────
-  // `GET /api/client-config` → `dnsFilteringAvailable`. Fetched here, beside
-  // the subscription fetch, because this is already the screen that pulls the
-  // server-side state the settings screens render; VpnSettings is a pushed
-  // sub-screen that can only be reached through it.
-  //
-  // Unauthenticated and public, so it runs regardless of sign-in state, and
-  // cheap to repeat: the route is ETag'd and CDN-cached, so a remount costs a
-  // 304 at most.
-  //
-  // The catch deliberately does NOTHING rather than setting `false`. The store
-  // default is `true`, and a network failure must never hide a feature that
-  // works — see the store's `dnsFilteringAvailable` doc comment.
-  useEffect(() => {
-    invoke<{ dnsFilteringAvailable?: boolean | null }>('get_client_config')
-      .then((cfg) => {
-        // Only an explicit boolean is a signal. An older web deploy omits the
-        // field entirely (undefined/null) — that is "unknown", not "off".
-        if (typeof cfg?.dnsFilteringAvailable === 'boolean') {
-          setDnsFilteringAvailable(cfg.dnsFilteringAvailable);
-        }
-      })
-      .catch(() => { /* silent — the default (available) stands */ });
-  }, [setDnsFilteringAvailable]);
+  // `GET /api/client-config` → `dnsFilteringAvailable`, beside the
+  // subscription fetch above. The unknown-means-AVAILABLE rule and its two
+  // guards live in the hook so they can be tested on their own — see
+  // `src/hooks/useClientConfig.ts`.
+  useClientConfig();
 
   // ── Servers + ping ────────────────────────────────────────────────
   useEffect(() => {
