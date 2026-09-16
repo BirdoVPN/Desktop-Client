@@ -425,7 +425,6 @@ impl XrayManager {
     }
 
     /// Check if Xray process is currently running
-    #[allow(dead_code)] // Surfaced via diagnostics command pending UI wiring
     pub async fn is_running(&self) -> bool {
         let mut proc = self.process.lock().await;
         if let Some(ref mut child) = *proc {

@@ -257,7 +257,6 @@ impl CredentialStore {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
 
     /// A credential written through one `Entry` handle must be readable through
