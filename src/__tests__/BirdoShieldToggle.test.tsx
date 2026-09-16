@@ -24,6 +24,9 @@ vi.mock('@tauri-apps/api/core');
 // `settings` the screen re-reads via getState() carries the new value.
 const mockStoreState = {
   connectionState: 'disconnected' as ConnectionState,
+  // The fleet gate from GET /api/client-config. `true` is the store default —
+  // see the availability describe block at the bottom of this file.
+  dnsFilteringAvailable: true as boolean | undefined,
   settings: {
     killSwitchEnabled: true,
     autoConnect: false,
@@ -88,8 +91,13 @@ beforeEach(() => {
   mockStoreState.settings.customDns = null;
   mockStoreState.connectionState = 'disconnected';
   mockStoreState.account.plan = 'RECON';
+  mockStoreState.dnsFilteringAvailable = true;
 });
 
+
+/** The exact fleet-gate reason copy the screen renders. */
+const UNAVAILABLE_COPY =
+  "Not available on your account's server fleet yet. Your preference is kept and applies as soon as it is.";
 
 const savedSettings = () =>
   mockedInvoke.mock.calls
@@ -190,6 +198,75 @@ describe('BirdoShield toggle → dns_filtering', () => {
       const row = await screen.findByRole('switch', { name: /birdoshield/i });
       expect(row.tagName).toBe('BUTTON');
       expect(row).toHaveAttribute('aria-checked', 'true');
+    });
+  });
+
+  // PR #160/#403 review follow-up: `dnsFilteringAvailable` on
+  // GET /api/client-config is the backend's DNS_FILTERING_ENABLED fleet gate.
+  // With it off the backend ignores the connect flag and hands out the normal
+  // resolver, so a row the user can switch ON is a lie about what the server
+  // will do.
+  describe('with the fleet gate off (dnsFilteringAvailable: false)', () => {
+    it('reads OFF, is disabled and gives the reason — even when dnsFiltering is persisted ON', async () => {
+      mockStoreState.dnsFilteringAvailable = false;
+      mockStoreState.settings.dnsFiltering = true;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row).toHaveAttribute('aria-checked', 'false');
+      // Disabled rows degrade to a static <div> (same as Stealth on RECON).
+      expect(row.tagName).toBe('DIV');
+      expect(screen.getByText(UNAVAILABLE_COPY)).toBeInTheDocument();
+      expect(
+        screen.queryByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
+      ).not.toBeInTheDocument();
+
+      // Clicking the disabled row must not persist anything — and, crucially,
+      // must not CLEAR the stored preference either: it has to come back on
+      // its own when the gate does.
+      await userEvent.click(row);
+      expect(mockStoreState.updateSettings).not.toHaveBeenCalled();
+      expect(savedSettings()).toHaveLength(0);
+      expect(mockStoreState.settings.dnsFiltering).toBe(true);
+    });
+
+    it('names the fleet gate, not Custom DNS, when both block the row', async () => {
+      mockStoreState.dnsFilteringAvailable = false;
+      mockStoreState.settings.customDns = ['1.1.1.1'];
+      render(<VpnSettings />);
+      expect(screen.getByText(UNAVAILABLE_COPY)).toBeInTheDocument();
+      expect(
+        screen.queryByText(
+          'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.',
+        ),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  describe('with the fleet gate on or unknown', () => {
+    it('true leaves the row enabled and switchable', async () => {
+      mockStoreState.dnsFilteringAvailable = true;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row.tagName).toBe('BUTTON');
+      await userEvent.click(row);
+      expect(mockStoreState.updateSettings).toHaveBeenCalledWith({ dnsFiltering: true });
+    });
+
+    // The default that matters: a failed/absent fetch leaves the store value
+    // untouched, and `undefined` must NOT read as "off". Hiding a feature that
+    // works because the client could not reach the web app is the failure this
+    // whole flag exists to avoid.
+    it('an unknown value (failed fetch, older web deploy) leaves the row enabled', async () => {
+      mockStoreState.dnsFilteringAvailable = undefined;
+      mockStoreState.settings.dnsFiltering = true;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row.tagName).toBe('BUTTON');
+      expect(row).toHaveAttribute('aria-checked', 'true');
+      expect(
+        screen.getByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(UNAVAILABLE_COPY)).not.toBeInTheDocument();
     });
   });
 

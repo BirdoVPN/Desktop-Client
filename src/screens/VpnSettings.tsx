@@ -38,7 +38,15 @@ import { settingsToRust, isValidPort, isWindowsPlatform } from '@/utils/helpers'
 import { white, status, brand } from '@/lib/birdo-theme';
 
 export function VpnSettings() {
-  const { settings, updateSettings, popRoute, pushRoute, account, connectionState } = useAppStore(
+  const {
+    settings,
+    updateSettings,
+    popRoute,
+    pushRoute,
+    account,
+    connectionState,
+    dnsFilteringAvailable,
+  } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       updateSettings: s.updateSettings,
@@ -46,6 +54,7 @@ export function VpnSettings() {
       pushRoute: s.pushRoute,
       account: s.account,
       connectionState: s.connectionState,
+      dnsFilteringAvailable: s.dnsFilteringAvailable,
     })),
   );
   const connected = connectionState === 'connected';
@@ -67,6 +76,27 @@ export function VpnSettings() {
   // rule so the connect body never requests a resolver the tunnel won't use.
   // Same precedence Mobile's WireGuardConfigBuilder.resolveDnsServers has.
   const customDnsActive = (settings.customDns ?? []).length > 0;
+
+  // BirdoShield fleet gate (PR #160/#403 review follow-up): the backend only
+  // hands out the filtering resolver while `DNS_FILTERING_ENABLED` is on for
+  // the fleet, and advertises that as `dnsFilteringAvailable` on
+  // `GET /api/client-config`. With the gate off the connect flag is ignored and
+  // the user silently gets Cloudflare — so a row that read ON would be exactly
+  // the reassurance-from-missing-data this screen already refuses to render for
+  // Custom DNS.
+  //
+  // `=== false` (not `!available`) is the whole point: undefined/unknown means
+  // AVAILABLE. The store defaults to true and never downgrades on a failed
+  // fetch, so an offline client keeps a working feature; only an explicit
+  // server "no" greys the row out. See the store's doc comment.
+  const fleetGateOff = dnsFilteringAvailable === false;
+
+  // Either blocker hides the toggle's effect, so both must read OFF and
+  // disabled. The persisted `settings.dnsFiltering` is NOT cleared by either:
+  // clearing Custom DNS, or the fleet gate coming back, restores the user's
+  // own choice without them having to remember it. The fleet gate is named
+  // first in the subtitle because it is the one the user cannot act on.
+  const shieldBlocked = fleetGateOff || customDnsActive;
 
   const [customPortInput, setCustomPortInput] = useState(
     !['auto', '51820', '53'].includes(settings.wireGuardPort) ? settings.wireGuardPort : '',
@@ -222,15 +252,17 @@ export function VpnSettings() {
           <BirdoToggleRow
             title="BirdoShield"
             subtitle={
-              customDnsActive
-                ? 'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.'
-                : "Blocks ads, trackers and malware domains at the VPN's DNS resolver."
+              fleetGateOff
+                ? "Not available on your account's server fleet yet. Your preference is kept and applies as soon as it is."
+                : customDnsActive
+                  ? 'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.'
+                  : "Blocks ads, trackers and malware domains at the VPN's DNS resolver."
             }
             leadingIcon={ShieldCheck}
-            leadingTint={customDnsActive ? white.w40 : status.green}
-            checked={settings.dnsFiltering && !customDnsActive}
+            leadingTint={shieldBlocked ? white.w40 : status.green}
+            checked={settings.dnsFiltering && !shieldBlocked}
             onCheckedChange={(v) => persist({ dnsFiltering: v })}
-            enabled={!customDnsActive}
+            enabled={!shieldBlocked}
           />
         </BirdoCard>
 

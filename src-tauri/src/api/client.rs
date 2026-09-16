@@ -22,6 +22,16 @@ use erased_serde;
 /// As of subdomain-based routing, the backend is reachable via api.birdo.app
 /// (Caddy reverse-proxies api.birdo.app -> backend:4000 directly, no /api prefix).
 const API_BASE_URL: &str = "https://api.birdo.app";
+
+/// The Next.js WEB origin.
+///
+/// `/api/client-config` is served by the web app, not by the NestJS backend
+/// behind `api.birdo.app` (Caddy maps that subdomain straight to `backend:4000`
+/// with no `/api` prefix), so it needs its own base. Covered by the CSP
+/// (`connect-src ... https://birdo.app`) and by the cert pin set, which lists
+/// `birdo.app` alongside the DoH resolvers — the pinning is CA-chain SPKI, so
+/// this host is protected by the same verifier as every other request.
+const WEB_BASE_URL: &str = "https://birdo.app";
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Windows)");
 
 // SEC-C1: TLS certificate pinning lives in `super::cert_pin`. It pins the
@@ -522,6 +532,28 @@ impl BirdoApi {
     /// Get subscription status
     pub async fn get_subscription(&self) -> Result<SubscriptionStatus, ApiError> {
         self.get(endpoints::users::SUBSCRIPTION, true).await
+    }
+
+    /// Fetch `GET /api/client-config` from the WEB origin.
+    ///
+    /// Does not go through `request_with_retry`/`do_request`: those prefix
+    /// `API_BASE_URL`, and this endpoint lives on `WEB_BASE_URL` (see the
+    /// constant). It reuses `self.client`, so it keeps the pinned TLS config,
+    /// the DoH resolver and the timeouts — the one thing a second client must
+    /// never quietly drop. Unauthenticated by design: the payload is public and
+    /// identical for every user, and requiring a token would make the answer
+    /// unavailable on exactly the screens that show it before sign-in.
+    ///
+    /// No 401 retry is needed for the same reason.
+    pub async fn get_client_config(&self) -> Result<ClientConfigResponse, ApiError> {
+        let url = format!("{}{}", WEB_BASE_URL, endpoints::config::CLIENT_CONFIG);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        self.handle_response(response).await
     }
 
     /// Get per-user monthly bandwidth usage + cap for the data-usage meter.

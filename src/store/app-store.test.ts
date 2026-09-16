@@ -300,6 +300,23 @@ describe('useAppStore', () => {
       expect(fresh.useAppStore.getState().settings.stealthMode).toBe(false)
     })
 
+    // The fleet gate is separate from the per-device preference: it is not
+    // persisted and must start AVAILABLE, so a cold start (or a client that
+    // never reaches the web app) offers a feature that works instead of
+    // hiding it.
+    it('should default dnsFilteringAvailable to true and keep it out of persisted storage', async () => {
+      localStorage.clear()
+      vi.resetModules()
+      const fresh = await import('./app-store')
+      expect(fresh.useAppStore.getState().dnsFilteringAvailable).toBe(true)
+
+      fresh.useAppStore.getState().setDnsFilteringAvailable(false)
+      expect(fresh.useAppStore.getState().dnsFilteringAvailable).toBe(false)
+      expect(localStorage.getItem('birdo-vpn-storage') ?? '').not.toContain(
+        'dnsFilteringAvailable',
+      )
+    })
+
     it('should turn BirdoShield on via updateSettings', () => {
       useAppStore.getState().updateSettings({ dnsFiltering: true })
       expect(useAppStore.getState().settings.dnsFiltering).toBe(true)
