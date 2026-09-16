@@ -39,7 +39,7 @@ const SCHEMA_SRC: &str = include_str!("../../contract/vpn-protocol.schema.json")
 /// `sha256sum` of birdo-web `backend/contract/vpn-protocol.schema.json` at the
 /// commit vendored (LF bytes, as git stores them). The test normalises `\r\n`
 /// so an autocrlf checkout hashes the same as CI.
-const SCHEMA_SHA256: &str = "418b2402fc0ac7a28645a2e8cad324b804c2ae653b9b2b73058df0165743fc7d";
+const SCHEMA_SHA256: &str = "9b8690c097876541c0cdcd4037e335ed36cfe26b301e1a9d1c26cdee96c71384";
 
 const CONNECT: &str = "ConnectRequest";
 const MULTI_HOP: &str = "MultiHopConnectRequest";
@@ -213,6 +213,7 @@ fn full_connect_request() -> ConnectRequest {
         Some(crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT),
         Some(true),
         Some(real_pq_public_key()),
+        true,
         Some(attestation_fixture()),
     );
     req.preferred_region = Some("eu-west".to_string());
@@ -228,6 +229,7 @@ fn full_multi_hop_request() -> MultiHopConnectRequest {
         true,
         true,
         Some(real_pq_public_key()),
+        true,
         Some(attestation_fixture()),
     )
 }
@@ -304,6 +306,7 @@ fn minimal_dial_bodies_validate() {
         None,
         None,
         None,
+        false,
         None,
     );
     let b = Value::Object(body(&req));
@@ -325,6 +328,7 @@ fn minimal_dial_bodies_validate() {
         false,
         false,
         None,
+        false,
         None,
     );
     let b = Value::Object(body(&req));
@@ -385,7 +389,7 @@ fn multi_hop_body_keys_are_the_contract_minus_the_known_unsent() {
 #[test]
 fn every_required_property_is_present_on_the_minimal_bodies() {
     let connect = body(&build_connect_request(
-        "n", "d", None, None, None, None, None, None,
+        "n", "d", None, None, None, None, None, false, None,
     ));
     for key in def_required(CONNECT) {
         assert!(
@@ -394,7 +398,7 @@ fn every_required_property_is_present_on_the_minimal_bodies() {
         );
     }
     let multi = body(&build_multi_hop_request(
-        "entry", "exit", "d", "k", false, false, None, None,
+        "entry", "exit", "d", "k", false, false, None, false, None,
     ));
     let required = def_required(MULTI_HOP);
     // The contract does require these two; if it ever stops, this test is no
@@ -436,13 +440,13 @@ fn device_id_is_sent_on_connect_and_multi_hop_and_matches_login() {
         (
             "connect",
             body(&build_connect_request(
-                "n", "d", None, None, None, None, None, None,
+                "n", "d", None, None, None, None, None, false, None,
             )),
         ),
         (
             "multi-hop",
             body(&build_multi_hop_request(
-                "entry", "exit", "d", "k", false, false, None, None,
+                "entry", "exit", "d", "k", false, false, None, false, None,
             )),
         ),
     ] {
@@ -610,7 +614,8 @@ fn fallback_reason_constants_are_the_contract_enum() {
             allowed.contains(reason),
             "{reason} not in contract enum {allowed:?}"
         );
-        let req = build_connect_request("n", "d", None, None, Some(reason), None, None, None);
+        let req =
+            build_connect_request("n", "d", None, None, Some(reason), None, None, false, None);
         assert_valid(CONNECT, &Value::Object(body(&req)));
     }
     let kinds = error_kinds(CONNECT, &json!({ "fallbackReason": "handshake_timeout" }));
@@ -660,4 +665,69 @@ fn real_pq_public_key_fits_the_contract_window() {
             .any(|k| matches!(k, ValidationErrorKind::MinLength { .. })),
         "{kinds:?}"
     );
+}
+
+// ── BirdoShield (OPEN-WORK D18): per-device dnsFiltering ────────────────────
+
+/// The vendored contract (birdo-web #465) declares `dnsFiltering` as a
+/// boolean on BOTH request definitions — the backend keys the filtering
+/// resolver on this per-device flag, so a schema without it means the
+/// backend that generated it would 400 the whole body.
+#[test]
+fn dns_filtering_is_a_boolean_property_on_both_contracts() {
+    for name in [CONNECT, MULTI_HOP] {
+        assert!(
+            def_properties(name).contains("dnsFiltering"),
+            "$defs/{name} lacks dnsFiltering — re-vendor from birdo-web #465 or later"
+        );
+        assert_eq!(
+            def(name)["properties"]["dnsFiltering"]["type"],
+            "boolean",
+            "$defs/{name}.dnsFiltering"
+        );
+    }
+}
+
+/// With BirdoShield ON, both dial paths serialize `dnsFiltering: true`, the
+/// body validates, and the key is the camelCase spelling the backend
+/// whitelists (a `dns_filtering` slip would be a 400 for every shielded user).
+#[test]
+fn dns_filtering_true_is_sent_on_both_dial_paths_when_enabled() {
+    let connect = body(&build_connect_request(
+        "n", "d", None, None, None, None, None, true, None,
+    ));
+    assert_eq!(connect.get("dnsFiltering"), Some(&json!(true)));
+    assert!(!connect.contains_key("dns_filtering"));
+    assert_valid(CONNECT, &Value::Object(connect));
+
+    let multi = body(&build_multi_hop_request(
+        "entry", "exit", "d", "k", false, false, None, true, None,
+    ));
+    assert_eq!(multi.get("dnsFiltering"), Some(&json!(true)));
+    assert!(!multi.contains_key("dns_filtering"));
+    assert_valid(MULTI_HOP, &Value::Object(multi));
+}
+
+/// With BirdoShield OFF (the default) the key is ABSENT on both paths — never
+/// `false`. The server treats a missing flag as off, and an install that never
+/// touched the toggle keeps posting the exact 1.4.42 body.
+#[test]
+fn dns_filtering_is_absent_on_both_dial_paths_when_off() {
+    let connect = body(&build_connect_request(
+        "n", "d", None, None, None, None, None, false, None,
+    ));
+    assert!(
+        !connect.contains_key("dnsFiltering"),
+        "OFF must be absent, not false: {connect:?}"
+    );
+    let multi = body(&build_multi_hop_request(
+        "entry", "exit", "d", "k", false, false, None, false, None,
+    ));
+    assert!(
+        !multi.contains_key("dnsFiltering"),
+        "OFF must be absent, not false: {multi:?}"
+    );
+    // The single mapping rule both builders share.
+    assert_eq!(super::client::dns_filtering_flag(true), Some(true));
+    assert_eq!(super::client::dns_filtering_flag(false), None);
 }

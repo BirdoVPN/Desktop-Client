@@ -165,6 +165,10 @@ export interface RustSettings {
   multi_hop_exit_node_id: string | null;
   stealth_mode: boolean;
   quantum_protection: boolean;
+  // BirdoShield (D18). Optional on the READ side only: the Rust struct omits
+  // the key while it is false (`skip_serializing_if`) so a pre-D18 settings
+  // file keeps its HMAC; settingsToRust always writes it.
+  dns_filtering?: boolean;
   // LOCKDOWN (always-on kill switch). MUST round-trip: `save_settings` replaces
   // the whole Rust struct, so any field missing here is silently rewritten to
   // its serde default on every save — which made `false` unrepresentable and
@@ -200,6 +204,8 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     multiHopEntryNodeId: rs.multi_hop_entry_node_id ?? null,
     multiHopExitNodeId: rs.multi_hop_exit_node_id ?? null,
     stealthMode: rs.stealth_mode ?? false,
+    // BirdoShield is opt-in; the key is absent (not false) while off.
+    dnsFiltering: rs.dns_filtering ?? false,
     // Post-quantum is ON by default (matches Rust `AppSettings::default()`); the
     // `?? true` only applies if the field is absent from an older settings file.
     quantumProtection: rs.quantum_protection ?? true,
@@ -228,6 +234,7 @@ export function settingsToRust(s: AppSettings): RustSettings {
     multi_hop_exit_node_id: s.multiHopExitNodeId,
     stealth_mode: s.stealthMode,
     quantum_protection: s.quantumProtection,
+    dns_filtering: s.dnsFiltering,
     lockdown_mode: s.lockdownMode,
   };
 }

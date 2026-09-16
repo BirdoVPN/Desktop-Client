@@ -111,6 +111,10 @@ export interface AppSettings {
   // Stealth & Quantum
   stealthMode: boolean;
   quantumProtection: boolean;
+  // BirdoShield (OPEN-WORK D18): per-device DNS filtering (ads, trackers,
+  // malware domains) at the VPN resolver. Sent as the `dnsFiltering` connect
+  // flag by the Rust dial paths; OFF by default, available on every plan.
+  dnsFiltering: boolean;
   // LOCKDOWN (always-on kill switch, Windows WFP). No UI toggle yet — carried
   // in the store so settings saves round-trip it instead of silently resetting
   // the persisted flag to the Rust serde default on every write.
@@ -266,6 +270,8 @@ const defaultSettings: AppSettings = {
   multiHopEntryNodeId: null,
   multiHopExitNodeId: null,
   stealthMode: false,
+  // BirdoShield is opt-in — matches the Rust `AppSettings::default()`.
+  dnsFiltering: false,
   // Post-quantum protection (BirdoPQ / ML-KEM-1024) is ON by default for all
   // users — available on every plan, negligible overhead. Matches the Rust
   // `AppSettings::default()` so a fresh install agrees on both sides.

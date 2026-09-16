@@ -266,6 +266,9 @@ pub struct VpnSettings {
     pub stealth_mode: bool,
     /// Enable Rosenpass post-quantum protection
     pub quantum_protection: bool,
+    /// BirdoShield: request the fleet's filtering DNS resolver for this
+    /// device (per-device `dnsFiltering` connect flag, OPEN-WORK D18).
+    pub dns_filtering: bool,
 }
 
 /// Read VPN-related settings and configure WFP split tunneling / local network sharing.
@@ -307,6 +310,7 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         .as_ref()
         .map(|s| s.quantum_protection)
         .unwrap_or(false);
+    let dns_filtering = settings.as_ref().map(|s| s.dns_filtering).unwrap_or(false);
     // Lockdown (always-on kill switch) — OFF by default; needs device verification
     // before being enabled (see wfp::LOCKDOWN_MODE).
     let lockdown_mode = settings.as_ref().map(|s| s.lockdown_mode).unwrap_or(false);
@@ -334,6 +338,7 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         custom_port,
         stealth_mode,
         quantum_protection,
+        dns_filtering,
     }
 }
 
@@ -816,6 +821,7 @@ async fn connect_vpn_attempt(
                 None
             },
             pq_pk,
+            vpn_settings.dns_filtering,
         )
         .await
     {
@@ -984,6 +990,7 @@ async fn connect_vpn_attempt(
             vpn_settings.custom_dns,
             vpn_settings.stealth_mode,
             vpn_settings.quantum_protection,
+            vpn_settings.dns_filtering,
             fallback_reason.map(str::to_string),
             None,
         )

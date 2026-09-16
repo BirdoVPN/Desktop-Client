@@ -39,6 +39,12 @@ pub struct ReconnectInfo {
     pub stealth_mode: bool,
     /// Whether reconnect must request and receive BirdoPQ protection.
     pub quantum_protection: bool,
+    /// BirdoShield (D18): the per-device `dnsFiltering` flag this session was
+    /// dialled with. A reconnect MUST re-send it — the backend keys the
+    /// filtering resolver on the connect body, so a re-dial without it would
+    /// hand back an unfiltered config and silently un-shield the session the
+    /// user believed was protected.
+    pub dns_filtering: bool,
     /// ADAPTIVE TRANSPORT: the `fallbackReason` wire value under which this
     /// session was granted the stealth transport (None = ordinary direct
     /// session). A reconnect must re-send it: the network is proven to filter
@@ -183,6 +189,7 @@ impl AutoReconnectService {
         custom_dns: Option<Vec<String>>,
         stealth_mode: bool,
         quantum_protection: bool,
+        dns_filtering: bool,
         fallback_reason: Option<String>,
         multi_hop_exit_node_id: Option<String>,
     ) {
@@ -196,6 +203,7 @@ impl AutoReconnectService {
             custom_dns,
             stealth_mode,
             quantum_protection,
+            dns_filtering,
             fallback_reason,
             multi_hop_exit_node_id,
         });
@@ -1147,6 +1155,7 @@ impl AutoReconnectService {
                     info.stealth_mode,
                     info.quantum_protection,
                     pq_client_public_key,
+                    info.dns_filtering,
                 )
                 .await?;
             Ok(Self::multi_hop_response_to_connect_response(response))
@@ -1165,6 +1174,7 @@ impl AutoReconnectService {
                     None
                 },
                 pq_client_public_key,
+                info.dns_filtering,
             )
             .await
         }

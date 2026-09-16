@@ -607,6 +607,7 @@ mod auto_reconnect_service_tests {
                 Some(vec!["1.1.1.1".into()]),
                 true,
                 true,
+                true,
                 None,
                 Some("exit-1".into()),
             )

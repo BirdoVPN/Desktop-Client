@@ -2,7 +2,7 @@
  * VpnSettings — pushed sub-screen, pixel-faithful to mobile's
  * `VpnSettingsScreen.kt`.
  *
- * Sections: SECURITY (Stealth Mode), NETWORK (Local Network Sharing),
+ * Sections: SECURITY (Stealth Mode, BirdoShield), NETWORK (Local Network Sharing),
  * WIREGUARD (Port radio group + MTU), an info note, then FEATURES
  * (Kill Switch Exceptions nav row, Windows-only).
  *
@@ -18,6 +18,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useShallow } from 'zustand/react/shallow';
 import {
   EyeOff,
+  ShieldCheck,
   Network,
   Router,
   SlidersHorizontal,
@@ -200,6 +201,19 @@ export function VpnSettings() {
               View plans →
             </button>
           )}
+          {/* BirdoShield (OPEN-WORK D18): per-device DNS filtering, sent to the
+              server as the `dnsFiltering` connect flag by BOTH Rust dial paths.
+              No plan gate — available on every plan. Same semantics as Stealth
+              above: `persist` saves it and, on an active session, schedules the
+              debounced fail-closed rebuild that re-dials with the new flag. */}
+          <BirdoToggleRow
+            title="BirdoShield"
+            subtitle="Blocks ads, trackers and malware domains at the VPN's DNS resolver. Applies on your next connection."
+            leadingIcon={ShieldCheck}
+            leadingTint={status.green}
+            checked={settings.dnsFiltering}
+            onCheckedChange={(v) => persist({ dnsFiltering: v })}
+          />
         </BirdoCard>
 
         {/* ── NETWORK ───────────────────────────────────────────────── */}

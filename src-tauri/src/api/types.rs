@@ -769,6 +769,20 @@ pub struct ConnectRequest {
     /// (`pqPk == nil ? nil : true`), which have sent it since android-v1.4.24.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pq_client_can_decapsulate: Option<bool>,
+    /// BirdoShield (OPEN-WORK D18): per-device DNS-filtering opt-in. The
+    /// backend keys the fleet's filtering resolver on THIS flag for THIS
+    /// connection (birdo-web #465 dropped the account-wide dashboard path),
+    /// so the client owns the choice and must present it on every dial —
+    /// user connect, quick-connect, the multi-hop twin AND auto-reconnect's
+    /// unattended re-dial, or a drop would silently un-shield the session.
+    /// `Some(true)` when the setting is on, ABSENT when off (never
+    /// `Some(false)`): the server treats a missing flag as off, and a body
+    /// from a user who never touched the toggle stays byte-identical to
+    /// 1.4.42's. Contract: contract/vpn-protocol.schema.json
+    /// `ConnectRequest.dnsFiltering` (boolean); the one rule that maps the
+    /// preference to the wire is `client::dns_filtering_flag`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_filtering: Option<bool>,
     /// Ed25519 client attestation (`BIRDO-DESKTOP-ATTEST-v1`, see api::attestation).
     /// All five are absent on builds compiled without the signing key, so the
     /// request body is byte-identical to a pre-attestation client.
@@ -902,6 +916,12 @@ pub struct MultiHopConnectRequest {
     /// same connect()); it must not drift.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pq_client_can_decapsulate: Option<bool>,
+    /// BirdoShield per-device opt-in — see `ConnectRequest::dns_filtering`.
+    /// The multi-hop zod schema declares the same property and
+    /// MultiHopService forwards it into the same connect(); the twin must
+    /// carry it or a double-VPN session is never shielded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_filtering: Option<bool>,
     /// Ed25519 client attestation — see `ConnectRequest`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desktop_attest_nonce: Option<String>,
