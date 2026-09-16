@@ -1704,7 +1704,6 @@ fn route_delete_argv(route: &OwnedRoute) -> Option<Vec<String>> {
 /// destination prefix, the interface index AND the next hop must all agree, so
 /// another product's identically-shaped route on a different interface is
 /// untouched.
-#[allow(clippy::field_reassign_with_default)] // MIB_* FFI rows: initialise, then populate
 fn delete_route_native(route: &OwnedRoute) -> Result<(), String> {
     use windows::Win32::NetworkManagement::IpHelper::{
         DeleteIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,

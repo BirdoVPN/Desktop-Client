@@ -219,9 +219,6 @@ fn set_dns_native(adapter_guid: u128, servers: &[String]) -> Result<(), String> 
 /// Set an interface's IPv4 address + MTU natively via the IP Helper API
 /// (addressed by interface index, so no cross-crate LUID type concerns).
 /// Returns Err on failure so the caller can fall back to netsh.
-// Clippy: MIB_* FFI rows must be default-initialised and then populated
-// (InitializeUnicastIpAddressEntry fills the row between the two steps).
-#[allow(clippy::field_reassign_with_default)]
 #[cfg(windows)]
 fn set_adapter_ip_mtu_native(if_index: u32, ip: &str, prefix: u8, mtu: u32) -> Result<(), String> {
     use windows::Win32::NetworkManagement::IpHelper::{
@@ -461,18 +458,6 @@ fn verify_dll_integrity(bytes: &[u8], display_path: &std::path::Path) -> Result<
         display_path
     );
     Ok(())
-}
-
-/// SEC-C4 FIX: Encode a PowerShell script as Base64 UTF-16LE for use with -EncodedCommand.
-/// This prevents command injection via interpolated strings (adapter names, etc.)
-/// because -EncodedCommand does not interpret shell metacharacters.
-fn base64_encode_utf16le(script: &str) -> String {
-    use base64::Engine;
-    let utf16: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
-    base64::engine::general_purpose::STANDARD.encode(&utf16)
 }
 
 /// H-4 FIX: Stores original DNS configuration for an adapter, enabling
