@@ -271,6 +271,25 @@ pub struct VpnSettings {
     pub dns_filtering: bool,
 }
 
+/// The BirdoShield flag a connect body may carry, given the stored preference
+/// AND the user's Custom DNS servers (PR #160 review, must-fix 1).
+///
+/// `build_vpn_config` writes Custom DNS into the tunnel AHEAD of the resolver
+/// the server hands back, so with Custom DNS set the filtering resolver is
+/// never used: posting `dnsFiltering:true` then makes the backend allocate a
+/// resolver this device will not route through, while the session runs
+/// unfiltered. ONE rule, applied here (the wire) and mirrored by the
+/// `customDnsActive` gate in `VpnSettings.tsx` (the row), so the toggle can
+/// never claim protection the tunnel does not have. The precedence itself —
+/// Custom DNS wins — is the same one Mobile's
+/// `WireGuardConfigBuilder.resolveDnsServers` applies; the owner decides the
+/// rule once and both clients follow it. `build_vpn_config`'s own
+/// `!d.is_empty()` check is the twin of the emptiness test here.
+pub(crate) fn effective_dns_filtering(dns_filtering: bool, custom_dns: Option<&[String]>) -> bool {
+    let custom_dns_active = custom_dns.is_some_and(|d| !d.is_empty());
+    dns_filtering && !custom_dns_active
+}
+
 /// Read VPN-related settings and configure WFP split tunneling / local network sharing.
 pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     // Settings failing to load means security-relevant flags (stealth_mode,
@@ -310,7 +329,10 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         .as_ref()
         .map(|s| s.quantum_protection)
         .unwrap_or(false);
-    let dns_filtering = settings.as_ref().map(|s| s.dns_filtering).unwrap_or(false);
+    let dns_filtering = effective_dns_filtering(
+        settings.as_ref().map(|s| s.dns_filtering).unwrap_or(false),
+        custom_dns.as_deref(),
+    );
     // Lockdown (always-on kill switch) — OFF by default; needs device verification
     // before being enabled (see wfp::LOCKDOWN_MODE).
     let lockdown_mode = settings.as_ref().map(|s| s.lockdown_mode).unwrap_or(false);
@@ -1511,6 +1533,70 @@ pub async fn get_usage_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // PR #160 review, must-fix 1: BirdoShield vs Custom DNS. `build_vpn_config`
+    // writes Custom DNS into the tunnel ahead of the server's resolver, so the
+    // connect body must not request a filtering resolver the tunnel will not
+    // use — and the UI gate in VpnSettings.tsx applies the same rule.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dns_filtering_is_dropped_when_custom_dns_is_set() {
+        let custom = vec!["9.9.9.9".to_string(), "149.112.112.112".to_string()];
+        assert!(!effective_dns_filtering(true, Some(&custom)));
+        // A single custom resolver is enough — same threshold as the tunnel builder.
+        let one = vec!["1.1.1.1".to_string()];
+        assert!(!effective_dns_filtering(true, Some(&one)));
+    }
+
+    #[test]
+    fn dns_filtering_survives_no_or_empty_custom_dns() {
+        assert!(effective_dns_filtering(true, None));
+        // An empty list is what `build_vpn_config` treats as "no custom DNS"
+        // (`filter(|d| !d.is_empty())`), so it must not gate the flag either.
+        let empty: Vec<String> = Vec::new();
+        assert!(effective_dns_filtering(true, Some(&empty)));
+    }
+
+    #[test]
+    fn dns_filtering_off_stays_off_regardless_of_custom_dns() {
+        let custom = vec!["9.9.9.9".to_string()];
+        assert!(!effective_dns_filtering(false, None));
+        assert!(!effective_dns_filtering(false, Some(&custom)));
+    }
+
+    /// The tunnel-builder side of the same rule, asserted directly: with Custom
+    /// DNS set, the resolver the server returned (the filtering one under
+    /// BirdoShield) is NOT what lands in the tunnel. This is the precedence
+    /// `effective_dns_filtering` exists to keep the connect body honest about.
+    #[test]
+    fn build_vpn_config_prefers_custom_dns_over_server_resolver() {
+        // Built from the wire shape (camelCase) so the test goes through the
+        // same serde defaults a real /vpn/connect response does.
+        let response: ConnectResponse = serde_json::from_value(serde_json::json!({
+            "success": true,
+            "keyId": "key-1",
+            "publicKey": "pub",
+            "assignedIp": "10.0.0.2/32",
+            "serverPublicKey": "spk",
+            "endpoint": "203.0.113.1:51820",
+            "dns": ["10.64.0.1"],            // the filtering resolver
+            "allowedIps": ["0.0.0.0/0"],
+        }))
+        .unwrap();
+        let (local_private_key, _) = generate_wireguard_keypair();
+        let (config, _) = build_vpn_config(
+            response,
+            "server-1",
+            Some(vec!["9.9.9.9".into()]),
+            Some(local_private_key),
+            0,
+            "auto",
+        )
+        .expect("config builds");
+        assert_eq!(config.dns, vec!["9.9.9.9".to_string()]);
+    }
 
     /// The exact shape a DPI-filtered connect produces: wireguard_new's marker,
     /// wrapped by handshake_with_retry, tunnel start, and VpnManager::connect.

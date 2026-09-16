@@ -397,7 +397,9 @@ impl BirdoApi {
     /// layer so quick-connect and auto-reconnect's unattended re-dial are signed
     /// too; an unsigned re-dial would be refused under `enforce` exactly when the
     /// user is not watching.
-    async fn desktop_attestation(&self) -> Option<super::attestation::DesktopAttestation> {
+    pub(crate) async fn desktop_attestation(
+        &self,
+    ) -> Option<super::attestation::DesktopAttestation> {
         if !super::attestation::is_configured() {
             return None;
         }
@@ -466,7 +468,19 @@ impl BirdoApi {
             attestation,
         );
 
-        self.post(endpoints::vpn::CONNECT, &payload, true).await
+        self.post_connect_request(&payload).await
+    }
+
+    /// POST a pre-built `/vpn/connect` body. Split out of `connect_vpn` so
+    /// auto-reconnect can assemble its body through a PURE, unit-tested
+    /// mapping (`vpn::auto_reconnect::reconnect_connect_request`) and post the
+    /// very struct the test inspected — instead of a positional argument list
+    /// nothing asserts on (PR #160 review, nit 3).
+    pub(crate) async fn post_connect_request(
+        &self,
+        payload: &ConnectRequest,
+    ) -> Result<ConnectResponse, ApiError> {
+        self.post(endpoints::vpn::CONNECT, payload, true).await
     }
 
     /// Disconnect from VPN (revoke key)
@@ -625,7 +639,16 @@ impl BirdoApi {
             attestation,
         );
 
-        self.post(endpoints::vpn::MULTI_HOP_CONNECT, &payload, true)
+        self.post_multi_hop_request(&payload).await
+    }
+
+    /// POST a pre-built `/vpn/multi-hop/connect` body — twin of
+    /// [`Self::post_connect_request`], same reason.
+    pub(crate) async fn post_multi_hop_request(
+        &self,
+        payload: &MultiHopConnectRequest,
+    ) -> Result<MultiHopConnectResponse, ApiError> {
+        self.post(endpoints::vpn::MULTI_HOP_CONNECT, payload, true)
             .await
     }
 

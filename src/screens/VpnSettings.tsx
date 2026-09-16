@@ -57,6 +57,17 @@ export function VpnSettings() {
     plan === 'SOVEREIGN' ? 2 : plan === 'OPERATIVE' ? 1 : 0;
   const isOperativeOrAbove = planRank(account?.plan) >= 1;
 
+  // BirdoShield vs Custom DNS (PR #160 review, must-fix 1): the Rust tunnel
+  // builder (`build_vpn_config`) applies the user's Custom DNS servers BEFORE
+  // the server-supplied resolver, so with Custom DNS set the filtering
+  // resolver the backend hands back is never written into the tunnel — zero
+  // filtering. Showing the row ON in that state is reassurance from missing
+  // data. Mirror the Stealth plan gate: the row reads OFF, is disabled, and
+  // says why. The Rust side (`effective_dns_filtering`) applies the SAME
+  // rule so the connect body never requests a resolver the tunnel won't use.
+  // Same precedence Mobile's WireGuardConfigBuilder.resolveDnsServers has.
+  const customDnsActive = (settings.customDns ?? []).length > 0;
+
   const [customPortInput, setCustomPortInput] = useState(
     !['auto', '51820', '53'].includes(settings.wireGuardPort) ? settings.wireGuardPort : '',
   );
@@ -205,14 +216,21 @@ export function VpnSettings() {
               server as the `dnsFiltering` connect flag by BOTH Rust dial paths.
               No plan gate — available on every plan. Same semantics as Stealth
               above: `persist` saves it and, on an active session, schedules the
-              debounced fail-closed rebuild that re-dials with the new flag. */}
+              debounced fail-closed rebuild that re-dials with the new flag.
+              Gated by Custom DNS instead (see `customDnsActive`): the stored
+              preference is kept, so clearing Custom DNS restores it. */}
           <BirdoToggleRow
             title="BirdoShield"
-            subtitle="Blocks ads, trackers and malware domains at the VPN's DNS resolver. Applies on your next connection."
+            subtitle={
+              customDnsActive
+                ? 'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.'
+                : "Blocks ads, trackers and malware domains at the VPN's DNS resolver."
+            }
             leadingIcon={ShieldCheck}
-            leadingTint={status.green}
-            checked={settings.dnsFiltering}
+            leadingTint={customDnsActive ? white.w40 : status.green}
+            checked={settings.dnsFiltering && !customDnsActive}
             onCheckedChange={(v) => persist({ dnsFiltering: v })}
+            enabled={!customDnsActive}
           />
         </BirdoCard>
 

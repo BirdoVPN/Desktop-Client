@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { useAppStore } from './app-store'
 
 describe('useAppStore', () => {
@@ -282,6 +282,27 @@ describe('useAppStore', () => {
     it('should update MTU', () => {
       useAppStore.getState().updateSettings({ wireGuardMtu: 1420 })
       expect(useAppStore.getState().settings.wireGuardMtu).toBe(1420)
+    })
+
+    // BirdoShield (D18) is opt-in. The `beforeEach` above seeds the settings
+    // from a fixture, so asserting on THIS store instance would only test the
+    // fixture (PR #160 review, nit 2): import a fresh module instance and read
+    // the store's own `defaultSettings` before anything touches it.
+    it('should have BirdoShield (dnsFiltering) OFF in the store default, not just the fixture', async () => {
+      // `settings` is in the persist partialize: drop what earlier tests wrote
+      // to localStorage so the fresh instance cannot rehydrate from it.
+      localStorage.removeItem('birdo-vpn-storage')
+      vi.resetModules()
+      const fresh = await import('./app-store')
+      expect(fresh.useAppStore.getState().settings.dnsFiltering).toBe(false)
+      // And the Rust `AppSettings::default()` twin: quantum ON, stealth OFF.
+      expect(fresh.useAppStore.getState().settings.quantumProtection).toBe(true)
+      expect(fresh.useAppStore.getState().settings.stealthMode).toBe(false)
+    })
+
+    it('should turn BirdoShield on via updateSettings', () => {
+      useAppStore.getState().updateSettings({ dnsFiltering: true })
+      expect(useAppStore.getState().settings.dnsFiltering).toBe(true)
     })
   })
 

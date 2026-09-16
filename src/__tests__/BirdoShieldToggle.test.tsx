@@ -35,7 +35,7 @@ const mockStoreState = {
     preferredServerId: null,
     splitTunnelingEnabled: false,
     splitTunnelApps: [] as string[],
-    customDns: null,
+    customDns: null as string[] | null,
     protocol: 'wireguard' as const,
     localNetworkSharing: false,
     wireGuardPort: 'auto',
@@ -85,6 +85,7 @@ beforeEach(() => {
   mockStoreState.updateSettings.mockClear();
   mockStoreState.settings.dnsFiltering = false;
   mockStoreState.settings.stealthMode = false;
+  mockStoreState.settings.customDns = null;
   mockStoreState.connectionState = 'disconnected';
   mockStoreState.account.plan = 'RECON';
 });
@@ -106,10 +107,10 @@ describe('BirdoShield toggle → dns_filtering', () => {
     // BirdoListItem renders an interactive <button> only when enabled; a
     // gated row degrades to a static <div>.
     expect(row.tagName).toBe('BUTTON');
+    // No "applies on your next connection" tail: the screen's info note
+    // already states the live-reapply behaviour and the two contradicted.
     expect(
-      screen.getByText(
-        "Blocks ads, trackers and malware domains at the VPN's DNS resolver. Applies on your next connection.",
-      ),
+      screen.getByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
     ).toBeInTheDocument();
     // Stealth, by contrast, IS plan-gated on RECON — the two rows differ on purpose.
     expect(screen.getByRole('switch', { name: /stealth mode/i }).tagName).toBe('DIV');
@@ -145,6 +146,51 @@ describe('BirdoShield toggle → dns_filtering', () => {
       expect(savedSettings()).toHaveLength(1);
     });
     expect(savedSettings()[0].dns_filtering).toBe(false);
+  });
+
+  // PR #160 review, must-fix 1: `build_vpn_config` writes the user's Custom
+  // DNS servers into the tunnel ahead of the server's resolver, so with Custom
+  // DNS set the filtering resolver is never used. The row must not read ON
+  // (reassurance from missing data) and must say why it is unavailable.
+  describe('with Custom DNS configured', () => {
+    it('reads OFF, is disabled and explains the override — even when dnsFiltering is persisted ON', async () => {
+      mockStoreState.settings.customDns = ['9.9.9.9', '149.112.112.112'];
+      mockStoreState.settings.dnsFiltering = true;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row).toHaveAttribute('aria-checked', 'false');
+      // Disabled rows degrade to a static <div> (same as Stealth on RECON).
+      expect(row.tagName).toBe('DIV');
+      expect(
+        screen.getByText(
+          'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.',
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
+      ).not.toBeInTheDocument();
+
+      // Clicking the disabled row must not persist anything.
+      await userEvent.click(row);
+      expect(mockStoreState.updateSettings).not.toHaveBeenCalled();
+      expect(savedSettings()).toHaveLength(0);
+    });
+
+    it('a single custom server is enough to gate the row', async () => {
+      mockStoreState.settings.customDns = ['1.1.1.1'];
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row.tagName).toBe('DIV');
+    });
+
+    it('an empty custom DNS list does NOT gate the row (matches the Rust `!d.is_empty()` rule)', async () => {
+      mockStoreState.settings.customDns = [];
+      mockStoreState.settings.dnsFiltering = true;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row.tagName).toBe('BUTTON');
+      expect(row).toHaveAttribute('aria-checked', 'true');
+    });
   });
 
   it('while connected, schedules the same debounced fail-closed rebuild Stealth uses', async () => {
