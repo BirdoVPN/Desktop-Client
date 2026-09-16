@@ -8,11 +8,13 @@
 //!
 //! ## Implementation
 //!
-//! RustCrypto `ml-kem` 0.3.2 — a pure-Rust ML-KEM with no C or assembly of
-//! its own. It replaced `pqcrypto-mlkem` (PQClean's portable CLEAN C) in
-//! 2026-09: PQClean upstream is archived read-only and the three `pqcrypto-*`
-//! crates carry unmaintained advisories (RUSTSEC-2026-0161/-0162/-0163), whose
-//! own remediation text says to migrate to `ml-kem`.
+//! RustCrypto `ml-kem` 0.3.2 — a pure-Rust ML-KEM with no C or assembly of its
+//! own, though its dependency GRAPH has both: that qualifier belongs in the
+//! same sentence, because the half before it is the half that gets quoted. It
+//! replaced `pqcrypto-mlkem` (PQClean's portable CLEAN C) in 2026-09: PQClean
+//! upstream is archived read-only and the three `pqcrypto-*` crates carry
+//! unmaintained advisories (RUSTSEC-2026-0161/-0162/-0163), whose own
+//! remediation text says to migrate to `ml-kem`.
 //!
 //! Two things that swap did NOT do, and that nothing here should claim:
 //!
@@ -136,6 +138,16 @@ const FILE_MAGIC: &[u8; 4] = b"BPQ1";
 const FILE_VERSION: u32 = 1;
 const KEYPAIR_FILENAME: &str = "birdo_pq_v1.bin";
 const KEYPAIR_FILE_BYTES: usize = FILE_MAGIC.len() + 4 + PUBLIC_KEY_BYTES + SECRET_KEY_BYTES;
+/// One-shot reservation for the keypair read. The buffer holds the ML-KEM
+/// SECRET key, so it must never reallocate mid-read: a realloc leaves an
+/// unscrubbed copy of those bytes in freed heap.
+const READ_RESERVE_BYTES: usize = KEYPAIR_FILE_BYTES + 64;
+/// Hard bound on that read — one byte more than a valid file, which is enough
+/// for the size check to reject a too-long file and nothing more.
+const READ_CAP_BYTES: usize = KEYPAIR_FILE_BYTES + 1;
+/// The no-realloc property above, proved at compile time instead of asserted
+/// in prose. A test can only observe the cap; this observes the headroom.
+const _: () = assert!(READ_CAP_BYTES < READ_RESERVE_BYTES);
 // PFA-M5: legacy DEFAULT_NONCE_BYTES constant removed — `try_decapsulate`
 // now refuses to derive a PSK against a missing/empty per-connect nonce.
 
@@ -163,8 +175,14 @@ pub struct StaticKeypair {
 ///
 /// The distinction is load-bearing: an I/O failure must NOT throw the user's
 /// long-lived identity key away, but a file whose contents this build cannot
-/// use is unrecoverable and must be replaced, or the client falls back to the
-/// classical PSK on every connect for the rest of the install's life.
+/// use is unrecoverable and must be replaced, or the install stops connecting
+/// at all. `commands::vpn::derive_quantum_psk` fails CLOSED — when the server
+/// sets `quantum_enabled` and `try_decapsulate` yields `None` it returns
+/// `Err("… Connection aborted to prevent a silent downgrade.")`, and all three
+/// callers (`commands::vpn`, `commands::vpn_multi_hop`, `vpn::auto_reconnect`)
+/// propagate it. So the cost of keeping an unusable file is an aborted
+/// connect, not a quiet demotion: worse than a downgrade, and just as
+/// permanent, because nothing else ever rewrites the file.
 #[derive(Debug)]
 enum KeypairReadError {
     /// The file could not be read at all. Transient — keep the file.
@@ -404,12 +422,12 @@ fn read_keypair(path: &PathBuf) -> Result<Option<StaticKeypair>, KeypairReadErro
     // (b) takes the `take()` as well as the reservation: a bare
     // `read_to_end` grows the buffer to whatever is on disk, so a corrupt or
     // appended file bigger than the reservation would realloc and leave
-    // exactly the copy this comment warns about. Capped at one byte MORE than
-    // a valid file: enough for the size check below to reject a too-long
-    // file, never enough to reach the reservation.
-    let mut buf = Zeroizing::new(Vec::with_capacity(KEYPAIR_FILE_BYTES + 64));
+    // exactly the copy this comment warns about. `READ_CAP_BYTES <
+    // READ_RESERVE_BYTES` is a `const` assert, so "the read can never exhaust
+    // the reservation" is checked by the compiler rather than trusted here.
+    let mut buf = Zeroizing::new(Vec::with_capacity(READ_RESERVE_BYTES));
     (&mut f)
-        .take(KEYPAIR_FILE_BYTES as u64 + 1)
+        .take(READ_CAP_BYTES as u64)
         .read_to_end(&mut buf)
         .map_err(|e| KeypairReadError::Io(format!("read {path:?}: {e}")))?;
     if buf.len() != KEYPAIR_FILE_BYTES {
@@ -464,11 +482,15 @@ fn read_keypair(path: &PathBuf) -> Result<Option<StaticKeypair>, KeypairReadErro
 
 /// Read the persisted keypair from `path`, or generate + persist a fresh one.
 ///
-/// A file this build cannot use is REPLACED, not reported: leaving it in place
-/// would mean falling back to the server-provided classical PSK on every
-/// connect for the rest of the install's life, with no path back. A file that
-/// merely failed to read (I/O) is left alone — discarding a long-lived
-/// identity key on a transient error is the worse trade.
+/// A file this build cannot use is REPLACED, not reported. Reporting it would
+/// abort every connect the server enables BirdoPQ on, permanently: nothing
+/// else rewrites the file, and `commands::vpn::derive_quantum_psk` fails
+/// closed on a decapsulation that never happens. Re-keying is free on the
+/// server side — birdo-web `backend/src/vpn/birdo-pq.service.ts`
+/// `encapsulate()` reads `clientPublicKeyB64` off the request and persists no
+/// per-device PQ key — so the fresh key is simply used from the next connect.
+/// A file that merely failed to read (I/O) is left alone: discarding a
+/// long-lived identity key on a transient error is the worse trade.
 fn load_or_generate_at(path: &PathBuf) -> Result<StaticKeypair, String> {
     match read_keypair(path) {
         Ok(Some(kp)) => return Ok(kp),
@@ -496,8 +518,10 @@ fn load_or_generate_at(path: &PathBuf) -> Result<StaticKeypair, String> {
 }
 
 /// Returns a reference to the cached keypair, generating + persisting one
-/// on first call. Errors are logged + returned; callers should treat error
-/// as "PQ unavailable, fall back to server-provided PSK".
+/// on first call. Errors are logged + returned and reach the caller as
+/// "PQ unavailable" — which means the server's classical PSK only while the
+/// server left `quantum_enabled` off. With it on, `derive_quantum_psk` turns
+/// the same condition into an aborted connect (fail-closed, by design).
 fn load_or_generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), String> {
     let cell = cache();
     {
@@ -547,8 +571,12 @@ pub fn get_client_public_key_b64() -> Option<String> {
 
 /// Try to derive a bilateral PQ PSK from the server response. Returns
 /// `None` when the server did not include a ciphertext (legacy path) or
-/// when our local keypair is missing — caller should then fall back to the
-/// server-provided classical PSK and call `record_server_provided`.
+/// when our local keypair is missing.
+///
+/// What the caller does with `None` depends entirely on `quantum_enabled`:
+/// with it OFF this is the legacy path and `derive_quantum_psk` takes the
+/// server-provided PSK (`record_server_provided`); with it ON the same `None`
+/// aborts the connection. `None` is therefore never a silent downgrade.
 ///
 /// On success, latches `current_mode() == Bilateral` so the UI can display
 /// the genuine HNDL-safe state.
@@ -580,8 +608,9 @@ pub fn try_decapsulate(response: &ConnectResponse) -> Option<String> {
     // a fresh shared secret per encapsulation so the previous fallback to a
     // hard-coded constant did NOT cause cryptographic nonce reuse, but it
     // removed per-connect domain separation and let a misconfigured server
-    // silently weaken the protocol. Fail closed (returns None ⇒ caller falls
-    // back to server-provided classical PSK, mode latched to ServerProvided).
+    // silently weaken the protocol. Fail closed: we only reach this line with
+    // `quantum_enabled` set, so the `None` below makes `derive_quantum_psk`
+    // abort the connect — it is not a demotion to the server-provided PSK.
     let nonce: Vec<u8> = match response.rosenpass_endpoint.as_deref() {
         None | Some("") => {
             tracing::error!(
@@ -636,18 +665,12 @@ mod tests {
     use super::*;
     use ml_kem::array::sizes::U32;
     use ml_kem::{EncapsulationKey, Key, TryKeyInit, B32};
-    use std::sync::Mutex as StdMutex;
 
-    // Serialise file-touching tests so they don't race on the shared
-    // config_local_dir keypair file when the suite runs threaded.
-    static FS_LOCK: StdMutex<()> = StdMutex::new(());
-
-    /// Take that lock ignoring poisoning. One test panicking while holding it
-    /// must not turn every other file-touching test into a phantom failure —
-    /// the real signal gets lost in the cascade.
-    fn fs_lock() -> std::sync::MutexGuard<'static, ()> {
-        FS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // No suite-wide file lock: every file-touching test below owns a
+    // `tempfile::tempdir()`, so none of them can reach the shared
+    // `config_local_dir` keypair the lock was introduced to serialise. A lock
+    // whose stated reason no longer holds is worse than no lock — the next
+    // reader assumes some shared file still needs protecting.
 
     /// The production server's own known-answer fixture, byte-identical to
     /// birdo-web `backend/src/vpn/__fixtures__/birdo-pq-ml-kem-1024.kat.json`.
@@ -772,7 +795,6 @@ mod tests {
     /// so the byte count is asserted explicitly, in memory and on disk.
     #[test]
     fn stored_key_length_is_3168() {
-        let _g = fs_lock();
         let kp = generate_keypair();
         assert_eq!(kp.secret_key.len(), SECRET_KEY_BYTES);
         assert_eq!(kp.public_key.len(), PUBLIC_KEY_BYTES);
@@ -796,11 +818,13 @@ mod tests {
 
     /// ml-kem enforces FIPS 203 §7.3 where `pqcrypto-mlkem`'s `from_bytes` was
     /// a length check only, so a new hard-error path exists on an install base
-    /// that never had one. It must lead to a re-key, not to a client that
-    /// falls back to the classical PSK on every connect forever.
+    /// that never had one. It must lead to a re-key: surfacing the error
+    /// instead would abort every BirdoPQ-enabled connect for the life of the
+    /// install, because `derive_quantum_psk` fails closed — see
+    /// `undecapsulatable_pq_aborts_even_when_a_server_psk_is_offered` in
+    /// `commands::vpn`.
     #[test]
     fn corrupt_dk_returns_invalid_key_and_rekeys() {
-        let _g = fs_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEYPAIR_FILENAME);
 
@@ -848,7 +872,6 @@ mod tests {
     /// valid and passes FIPS 203 §7.3 on its own.
     #[test]
     fn read_keypair_rejects_public_key_that_disagrees_with_secret_key() {
-        let _g = fs_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEYPAIR_FILENAME);
 
@@ -896,7 +919,6 @@ mod tests {
     /// have grown to the file's real size.
     #[test]
     fn read_keypair_rejects_oversized_file_without_reading_it_all() {
-        let _g = fs_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEYPAIR_FILENAME);
 
@@ -917,6 +939,27 @@ mod tests {
             Err(e) => panic!("expected Unusable, got {e:?}"),
             Ok(_) => panic!("an oversized keypair file must not be accepted"),
         }
+
+        // The size above proves the CAP. The property `read_keypair`'s comment
+        // actually sells is that the capped read never reallocates the
+        // Zeroizing buffer (a realloc would leave an unscrubbed copy of the
+        // secret key in freed heap). Replay the same reservation and the same
+        // bound against the same oversized file and watch the allocation stay
+        // put; the `const` assert `READ_CAP_BYTES < READ_RESERVE_BYTES` is the
+        // other half of the proof.
+        let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(READ_RESERVE_BYTES));
+        let (ptr_before, cap_before) = (buf.as_ptr(), buf.capacity());
+        let mut f2 = fs::File::open(&path).unwrap();
+        (&mut f2)
+            .take(READ_CAP_BYTES as u64)
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert_eq!(buf.len(), READ_CAP_BYTES, "the bound must stop the read");
+        assert_eq!(buf.capacity(), cap_before, "the bounded read reallocated");
+        assert!(
+            std::ptr::eq(buf.as_ptr(), ptr_before),
+            "the bounded read moved the secret-key buffer"
+        );
     }
 
     /// Nobody may later "fix" implicit rejection into a `Result`: a wrong key
@@ -1010,7 +1053,6 @@ mod tests {
 
     #[test]
     fn keypair_file_roundtrip() {
-        let _g = fs_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEYPAIR_FILENAME);
         let kp = generate_keypair();
@@ -1024,7 +1066,6 @@ mod tests {
 
     #[test]
     fn read_keypair_rejects_bad_magic() {
-        let _g = fs_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEYPAIR_FILENAME);
         let mut f = fs::File::create(&path).unwrap();
@@ -1035,7 +1076,6 @@ mod tests {
 
     #[test]
     fn read_keypair_rejects_short_file() {
-        let _g = fs_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEYPAIR_FILENAME);
         let mut f = fs::File::create(&path).unwrap();

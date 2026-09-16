@@ -86,23 +86,31 @@ rand = "0.8"
 ring = "0.17"
 base64 = "0.22"
 zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
-# AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). Same crate as the Android
-# JNI (native/rosenpass-jni) and the iOS C-ABI shim, so every client speaks the
-# byte-for-byte encoding the backend's @noble/post-quantum encapsulates with.
-# The KAT in src/vpn/fixtures/ is the enforcement, not this comment.
+# AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). The KAT fixture in
+# src/vpn/fixtures/, not crate identity, is what keeps the four clients
+# interoperable while Mobile-Client is still on pqcrypto-mlkem. Checked against
+# BirdoVPN/Mobile-Client origin/main on 2026-09-16: native/rosenpass-jni,
+# native/birdo-pq-ios and native/birdo-pq-server all still declare
+# `pqcrypto-mlkem = { version = "0.1", ... }`, so "same crate everywhere" is
+# NOT true today and must not be written here as if it were. What every client
+# does share is the byte-for-byte encoding the backend's @noble/post-quantum
+# encapsulates with, and the KAT is what proves it. The gate at
+# scripts/ci/check-pq-features.sh fails if this comment claims parity again.
 #
 # 2026-09: migrated off `pqcrypto-mlkem` (PQClean's portable CLEAN C). PQClean
 # upstream is archived read-only, and pqcrypto-mlkem / -traits / -internals all
 # carry unmaintained advisories (RUSTSEC-2026-0161/-0162/-0163) whose own
 # remediation text says to move to `ml-kem`.
 #
-# Measured effect on THIS crate's graph (Cargo.lock diff + `cargo tree`): the
-# pqcrypto trio leaves, and with it the last C the PQ path compiled; 16 lock
-# entries arrive, of which 5 (pkcs8, spki, der, const-oid, base64ct) are
-# optional ml-kem deps that our feature set never builds - `cargo tree -i` finds
-# no path to any of them. `cc` does NOT leave the build: aws-lc-sys and ring
-# still use it. Neither does extended-ISA code leave; see the "Implementation"
-# section of src/vpn/birdo_pq.rs for what did and did not change there.
+# Measured effect on THIS crate's graph (Cargo.lock diff + `cargo tree`): 3
+# entries leave (the pqcrypto trio, and with them the last C the PQ path
+# compiled), 16 new crates arrive, and typenum is bumped 1.19.0 -> 1.20.1 in
+# place, for a net 761 -> 774 [[package]] entries. Of the 16, five (pkcs8,
+# spki, der, const-oid, base64ct) are optional ml-kem deps that our feature set
+# never builds - `cargo tree -i` prints "nothing to print" for each. `cc` does
+# NOT leave the build: aws-lc-sys and ring still use it. Neither does
+# extended-ISA code leave; see the "Implementation" section of
+# src/vpn/birdo_pq.rs for what did and did not change there.
 #
 # EXACT PIN, deliberately: this is the KEM, not a dependency. Every version
 # move here is a crypto change that needs the KAT re-run and a changelog read,

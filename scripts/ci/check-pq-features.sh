@@ -109,13 +109,64 @@ fi
 # that file, so any use before it is production code.
 mod_line=$(grep -n '^mod tests {' src/vpn/birdo_pq.rs | cut -d: -f1 || true)
 if [ -z "${mod_line:-}" ]; then
-  mod_line=$(grep -n 'mod tests {' src/vpn/birdo_pq.rs | cut -d: -f1)
+  mod_line=$(grep -n 'mod tests {' src/vpn/birdo_pq.rs | cut -d: -f1 || true)
 fi
-first_use=$(grep -n 'encapsulate_deterministic' src/vpn/birdo_pq.rs | cut -d: -f1 | head -1)
-if [ -n "${first_use:-}" ] && [ "$first_use" -lt "$mod_line" ]; then
+# `|| true` on both: under `set -euo pipefail` a renamed symbol or a moved
+# `mod tests` makes grep exit 1, pipefail propagates it, and the script dies
+# with a BARE exit 1 - no ::error:: line, no "PQ gate FAILED", nothing in the
+# CI log to act on. Fail-closed either way, but a gate that cannot say why it
+# failed is a gate nobody fixes. The guards below own the diagnosis.
+first_use=$(grep -n 'encapsulate_deterministic' src/vpn/birdo_pq.rs | cut -d: -f1 | head -1 || true)
+if [ -z "${mod_line:-}" ]; then
+  err "could not find the '#[cfg(test)] mod tests' boundary in src/vpn/birdo_pq.rs, so the confinement check below could not run. If the module was renamed, update this script deliberately."
+elif [ -z "${first_use:-}" ]; then
+  err "encapsulate_deterministic is not referenced anywhere in src/vpn/birdo_pq.rs. Either the KAT helper that reproduces the backend's own ciphertext is gone - which is how a byte-for-byte check quietly stops being one - or the symbol was renamed. Update this gate deliberately instead of letting it pass on an absent name."
+elif [ "$first_use" -lt "$mod_line" ]; then
   err "encapsulate_deterministic is used at src/vpn/birdo_pq.rs:${first_use}, before the #[cfg(test)] mod tests at line ${mod_line} - i.e. in code that is compiled into the release binary."
 else
   ok "encapsulate_deterministic is confined to the #[cfg(test)] module"
+fi
+
+# ── 5. No comment may promise a downgrade path the code refuses ──────────────
+# `commands::vpn::derive_quantum_psk` fails CLOSED: with `quantum_enabled` set
+# and `try_decapsulate` returning None it returns Err("... Connection aborted to
+# prevent a silent downgrade.") and all three callers propagate it. Round 2 of
+# PR #163 justified DISCARDING the user's long-lived ML-KEM identity key at
+# three comment sites with the opposite claim - a permanent quiet demotion to
+# the server's classical PSK - which cannot happen in either direction (with
+# quantum off, try_decapsulate returns at its first line and never opens the
+# key file). The re-key is right; the reason was not, and a wrong reason next
+# to a destructive action is how the action gets "fixed" away later.
+if ! grep -qF 'Post-quantum key exchange failed after the server enabled BirdoPQ. Connection aborted to prevent a silent downgrade.' src/commands/vpn.rs; then
+  err "src/commands/vpn.rs no longer fails closed on a failed post-quantum decapsulation. If that is deliberate it is a protocol change, and every comment in src/vpn/birdo_pq.rs explaining the re-key path has to be rewritten with it - then this check removed on purpose."
+else
+  ok "derive_quantum_psk still aborts the connect when BirdoPQ decapsulation fails"
+fi
+# File-level, not line-level: these claims are written in wrapped doc comments,
+# so a line-anchored grep walks straight past them.
+downgrade_claims=""
+while IFS= read -r f; do
+  if tr '\n' ' ' < "$f" | tr -s ' ' \
+    | grep -qiE 'fall(s|ing)? back to (the )?(server.provided )?classical|classical[ -]PSK (fallback|on every connect|for the rest)'; then
+    downgrade_claims="${downgrade_claims} ${f}"
+  fi
+done < <(find src -name '*.rs')
+if [ -n "$downgrade_claims" ]; then
+  err "a comment claims an unusable or undecapsulatable BirdoPQ key demotes the client to the classical PSK:${downgrade_claims}. It does not - derive_quantum_psk returns Err and the connect is ABORTED (grep 'classical' in those files). Describe the real consequence."
+else
+  ok "no comment promises a classical-PSK downgrade that derive_quantum_psk forbids"
+fi
+
+# ── 6. The manifest may not assert cross-client crate parity ─────────────────
+# Verified against BirdoVPN/Mobile-Client origin/main on 2026-09-16:
+# native/rosenpass-jni, native/birdo-pq-ios and native/birdo-pq-server are all
+# still on `pqcrypto-mlkem = { version = "0.1", ... }`. Until they move, a
+# "same crate as the Android JNI" sentence in this manifest is not aspirational,
+# it is false - in the first file a contributor reads before touching the KEM.
+if parity=$(grep -niE 'same (crate|KEM crate) as the (android|ios|mobile)' Cargo.toml); then
+  err "Cargo.toml's AUDIT-C1 comment asserts the desktop and mobile clients link the same KEM crate: ${parity}. Check BirdoVPN/Mobile-Client native/*/Cargo.toml before restoring that sentence; while they differ, the KAT fixture is the interoperability guarantee, not crate identity."
+else
+  ok "Cargo.toml does not assert cross-client crate identity"
 fi
 
 if [ "$fail" -ne 0 ]; then
