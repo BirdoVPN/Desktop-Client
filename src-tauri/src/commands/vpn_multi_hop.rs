@@ -99,6 +99,7 @@ pub async fn connect_multi_hop(
             vpn_settings.stealth_mode,
             vpn_settings.quantum_protection,
             pq_pk,
+            vpn_settings.dns_filtering,
         )
         .await
         .map_err(|e| sanitize_error(&format!("Multi-hop connect failed: {}", e)))?;
@@ -306,6 +307,7 @@ pub async fn connect_multi_hop(
             vpn_settings.custom_dns,
             vpn_settings.stealth_mode,
             vpn_settings.quantum_protection,
+            vpn_settings.dns_filtering,
             // Adaptive Transport fallback is single-hop only (mirrors Android:
             // multi-hop requests stealth up front through the same grant).
             None,

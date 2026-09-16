@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { settingsFromRust, friendlyVpnError, type RustSettings } from './helpers';
+import { settingsFromRust, settingsToRust, friendlyVpnError, type RustSettings } from './helpers';
 
 // A complete RustSettings payload; individual tests override single fields
 // (and cast to RustSettings when deliberately omitting one to exercise the
@@ -55,6 +55,33 @@ describe('settingsFromRust — v1.3.30/31 default guarantees', () => {
     expect(out.wireGuardMtu).toBe(1380);
     expect(out.stealthMode).toBe(true);
     expect(out.multiHopEnabled).toBe(true);
+  });
+});
+
+describe('BirdoShield (D18) dns_filtering ↔ dnsFiltering', () => {
+  it('defaults OFF when the key is absent — the Rust struct omits it while false, and pre-D18 files never had it', () => {
+    // `base` deliberately has no dns_filtering: that IS the wire shape for OFF.
+    expect('dns_filtering' in base).toBe(false);
+    expect(settingsFromRust(base).dnsFiltering).toBe(false);
+  });
+
+  it('maps an explicit dns_filtering: true to dnsFiltering: true', () => {
+    expect(settingsFromRust({ ...base, dns_filtering: true }).dnsFiltering).toBe(true);
+  });
+
+  it('settingsToRust always writes dns_filtering, so a save cannot silently drop the choice', () => {
+    const on = settingsFromRust({ ...base, dns_filtering: true });
+    expect(settingsToRust(on).dns_filtering).toBe(true);
+    const off = settingsFromRust(base);
+    expect(settingsToRust(off).dns_filtering).toBe(false);
+  });
+
+  it('round-trips through both directions without touching neighbouring flags', () => {
+    const rs = settingsToRust(settingsFromRust({ ...base, dns_filtering: true, stealth_mode: true }));
+    expect(rs.dns_filtering).toBe(true);
+    expect(rs.stealth_mode).toBe(true);
+    expect(rs.quantum_protection).toBe(true);
+    expect(rs.lockdown_mode).toBe(true);
   });
 });
 

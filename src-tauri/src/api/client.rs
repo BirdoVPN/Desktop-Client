@@ -40,6 +40,15 @@ pub(crate) fn pq_can_decapsulate(pq_client_public_key: &Option<String>) -> Optio
     pq_client_public_key.as_ref().map(|_| true)
 }
 
+/// The `dnsFiltering` wire value for the BirdoShield preference (OPEN-WORK
+/// D18). ONE rule for both request builders so the twins cannot drift:
+/// `Some(true)` when the user turned BirdoShield on, ABSENT when off. Never
+/// `Some(false)` — the backend treats a missing flag as off already, and an
+/// untouched install keeps posting the exact body 1.4.42 did.
+pub(crate) fn dns_filtering_flag(dns_filtering: bool) -> Option<bool> {
+    dns_filtering.then_some(true)
+}
+
 /// The exact `/vpn/connect` body, assembled in one place so the contract test
 /// (api/contract_tests.rs) validates the SAME struct `connect_vpn` posts, not
 /// a hand-typed twin that could drift from it. Pure: no I/O, no async — the
@@ -60,6 +69,7 @@ pub(crate) fn build_connect_request(
     fallback_reason: Option<&str>,
     quantum_protection: Option<bool>,
     pq_client_public_key: Option<String>,
+    dns_filtering: bool,
     attestation: Option<super::attestation::DesktopAttestation>,
 ) -> ConnectRequest {
     // Computed before the key is moved into the literal.
@@ -75,6 +85,7 @@ pub(crate) fn build_connect_request(
         quantum_protection,
         pq_client_public_key,
         pq_client_can_decapsulate,
+        dns_filtering: dns_filtering_flag(dns_filtering),
         desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
         desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
         desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
@@ -96,6 +107,7 @@ pub(crate) fn build_multi_hop_request(
     stealth_mode: bool,
     quantum_protection: bool,
     pq_client_public_key: Option<String>,
+    dns_filtering: bool,
     attestation: Option<super::attestation::DesktopAttestation>,
 ) -> MultiHopConnectRequest {
     // Computed before the key is moved into the literal.
@@ -110,6 +122,7 @@ pub(crate) fn build_multi_hop_request(
         quantum_protection: Some(quantum_protection),
         pq_client_public_key,
         pq_client_can_decapsulate,
+        dns_filtering: dns_filtering_flag(dns_filtering),
         desktop_attest_nonce: attestation.as_ref().map(|a| a.nonce.clone()),
         desktop_attest_kid: attestation.as_ref().map(|a| a.kid.clone()),
         desktop_attest_sig: attestation.as_ref().map(|a| a.signature.clone()),
@@ -384,7 +397,9 @@ impl BirdoApi {
     /// layer so quick-connect and auto-reconnect's unattended re-dial are signed
     /// too; an unsigned re-dial would be refused under `enforce` exactly when the
     /// user is not watching.
-    async fn desktop_attestation(&self) -> Option<super::attestation::DesktopAttestation> {
+    pub(crate) async fn desktop_attestation(
+        &self,
+    ) -> Option<super::attestation::DesktopAttestation> {
         if !super::attestation::is_configured() {
             return None;
         }
@@ -438,6 +453,7 @@ impl BirdoApi {
         fallback_reason: Option<&str>,
         quantum_protection: Option<bool>,
         pq_client_public_key: Option<String>,
+        dns_filtering: bool,
     ) -> Result<ConnectResponse, ApiError> {
         let attestation = self.desktop_attestation().await;
         let payload = build_connect_request(
@@ -448,10 +464,23 @@ impl BirdoApi {
             fallback_reason,
             quantum_protection,
             pq_client_public_key,
+            dns_filtering,
             attestation,
         );
 
-        self.post(endpoints::vpn::CONNECT, &payload, true).await
+        self.post_connect_request(&payload).await
+    }
+
+    /// POST a pre-built `/vpn/connect` body. Split out of `connect_vpn` so
+    /// auto-reconnect can assemble its body through a PURE, unit-tested
+    /// mapping (`vpn::auto_reconnect::reconnect_connect_request`) and post the
+    /// very struct the test inspected — instead of a positional argument list
+    /// nothing asserts on (PR #160 review, nit 3).
+    pub(crate) async fn post_connect_request(
+        &self,
+        payload: &ConnectRequest,
+    ) -> Result<ConnectResponse, ApiError> {
+        self.post(endpoints::vpn::CONNECT, payload, true).await
     }
 
     /// Disconnect from VPN (revoke key)
@@ -595,6 +624,7 @@ impl BirdoApi {
         stealth_mode: bool,
         quantum_protection: bool,
         pq_client_public_key: Option<String>,
+        dns_filtering: bool,
     ) -> Result<MultiHopConnectResponse, ApiError> {
         let attestation = self.desktop_attestation().await;
         let payload = build_multi_hop_request(
@@ -605,10 +635,20 @@ impl BirdoApi {
             stealth_mode,
             quantum_protection,
             pq_client_public_key,
+            dns_filtering,
             attestation,
         );
 
-        self.post(endpoints::vpn::MULTI_HOP_CONNECT, &payload, true)
+        self.post_multi_hop_request(&payload).await
+    }
+
+    /// POST a pre-built `/vpn/multi-hop/connect` body — twin of
+    /// [`Self::post_connect_request`], same reason.
+    pub(crate) async fn post_multi_hop_request(
+        &self,
+        payload: &MultiHopConnectRequest,
+    ) -> Result<MultiHopConnectResponse, ApiError> {
+        self.post(endpoints::vpn::MULTI_HOP_CONNECT, payload, true)
             .await
     }
 

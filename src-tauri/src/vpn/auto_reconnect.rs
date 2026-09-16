@@ -19,7 +19,11 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use super::manager::{ConnectionState, VpnManager};
-use crate::api::types::{ConnectResponse, MultiHopConnectResponse};
+use crate::api::attestation::DesktopAttestation;
+use crate::api::client::{build_connect_request, build_multi_hop_request};
+use crate::api::types::{
+    ConnectRequest, ConnectResponse, MultiHopConnectRequest, MultiHopConnectResponse,
+};
 use crate::api::{ApiError, BirdoApi};
 
 /// H-5 FIX: Instead of storing the full VpnConfig (which has zeroized keys),
@@ -39,6 +43,12 @@ pub struct ReconnectInfo {
     pub stealth_mode: bool,
     /// Whether reconnect must request and receive BirdoPQ protection.
     pub quantum_protection: bool,
+    /// BirdoShield (D18): the per-device `dnsFiltering` flag this session was
+    /// dialled with. A reconnect MUST re-send it — the backend keys the
+    /// filtering resolver on the connect body, so a re-dial without it would
+    /// hand back an unfiltered config and silently un-shield the session the
+    /// user believed was protected.
+    pub dns_filtering: bool,
     /// ADAPTIVE TRANSPORT: the `fallbackReason` wire value under which this
     /// session was granted the stealth transport (None = ordinary direct
     /// session). A reconnect must re-send it: the network is proven to filter
@@ -50,6 +60,64 @@ pub struct ReconnectInfo {
     pub fallback_reason: Option<String>,
     /// Exit node for multi-hop reconnects. None means a normal single-hop reconnect.
     pub multi_hop_exit_node_id: Option<String>,
+}
+
+/// The exact `/vpn/connect` body a single-hop auto-reconnect posts for
+/// `info`. Pure (no I/O): the attestation is fetched by the caller. Every
+/// session property `ReconnectInfo` carries for the WIRE is mapped here —
+/// `stealth_mode` / `quantum_protection` as `Some(true)`-or-absent, the
+/// fallback-scoped stealth grant, and the D18 BirdoShield flag — through the
+/// same `build_connect_request` the user-initiated connect uses, so the
+/// re-dial cannot silently drop a property the session was granted.
+pub(crate) fn reconnect_connect_request(
+    info: &ReconnectInfo,
+    device_name: &str,
+    client_public_key: String,
+    pq_client_public_key: Option<String>,
+    attestation: Option<DesktopAttestation>,
+) -> ConnectRequest {
+    build_connect_request(
+        &info.server_id,
+        device_name,
+        Some(client_public_key),
+        if info.stealth_mode { Some(true) } else { None },
+        // ADAPTIVE TRANSPORT: keep the fallback-scoped stealth grant across
+        // reconnects — see ReconnectInfo::fallback_reason.
+        info.fallback_reason.as_deref(),
+        if info.quantum_protection {
+            Some(true)
+        } else {
+            None
+        },
+        pq_client_public_key,
+        info.dns_filtering,
+        attestation,
+    )
+}
+
+/// The exact `/vpn/multi-hop/connect` body a double-VPN auto-reconnect posts
+/// — twin of [`reconnect_connect_request`]. `info.server_id` is the ENTRY
+/// node; `exit_node_id` is `info.multi_hop_exit_node_id`, passed explicitly
+/// so the caller's `Some` check and this builder cannot disagree.
+pub(crate) fn reconnect_multi_hop_request(
+    info: &ReconnectInfo,
+    exit_node_id: &str,
+    device_name: &str,
+    client_public_key: &str,
+    pq_client_public_key: Option<String>,
+    attestation: Option<DesktopAttestation>,
+) -> MultiHopConnectRequest {
+    build_multi_hop_request(
+        &info.server_id,
+        exit_node_id,
+        device_name,
+        client_public_key,
+        info.stealth_mode,
+        info.quantum_protection,
+        pq_client_public_key,
+        info.dns_filtering,
+        attestation,
+    )
 }
 
 /// Configuration for auto-reconnect behavior
@@ -183,6 +251,7 @@ impl AutoReconnectService {
         custom_dns: Option<Vec<String>>,
         stealth_mode: bool,
         quantum_protection: bool,
+        dns_filtering: bool,
         fallback_reason: Option<String>,
         multi_hop_exit_node_id: Option<String>,
     ) {
@@ -196,6 +265,7 @@ impl AutoReconnectService {
             custom_dns,
             stealth_mode,
             quantum_protection,
+            dns_filtering,
             fallback_reason,
             multi_hop_exit_node_id,
         });
@@ -1130,6 +1200,12 @@ impl AutoReconnectService {
         (delay as u64).min(max_delay)
     }
 
+    /// The unattended re-dial. The body is assembled by the two PURE
+    /// builders below (unit-tested in vpn/tests.rs against a `ReconnectInfo`)
+    /// and posted as-is, so what the tests assert on — stealth, quantum,
+    /// fallback reason and the D18 `dnsFiltering` flag all forwarded from
+    /// `info` — is the very struct that reaches the wire, not a positional
+    /// argument list nothing checks (PR #160 review, nit 3).
     async fn request_fresh_response(
         api: &BirdoApi,
         info: &ReconnectInfo,
@@ -1137,36 +1213,27 @@ impl AutoReconnectService {
         client_public_key: String,
         pq_client_public_key: Option<String>,
     ) -> Result<ConnectResponse, ApiError> {
+        let attestation = api.desktop_attestation().await;
         if let Some(exit_node_id) = info.multi_hop_exit_node_id.as_deref() {
-            let response = api
-                .connect_multi_hop(
-                    &info.server_id,
-                    exit_node_id,
-                    device_name,
-                    &client_public_key,
-                    info.stealth_mode,
-                    info.quantum_protection,
-                    pq_client_public_key,
-                )
-                .await?;
+            let payload = reconnect_multi_hop_request(
+                info,
+                exit_node_id,
+                device_name,
+                &client_public_key,
+                pq_client_public_key,
+                attestation,
+            );
+            let response = api.post_multi_hop_request(&payload).await?;
             Ok(Self::multi_hop_response_to_connect_response(response))
         } else {
-            api.connect_vpn(
-                &info.server_id,
+            let payload = reconnect_connect_request(
+                info,
                 device_name,
-                Some(client_public_key),
-                if info.stealth_mode { Some(true) } else { None },
-                // ADAPTIVE TRANSPORT: keep the fallback-scoped stealth grant
-                // across reconnects — see ReconnectInfo::fallback_reason.
-                info.fallback_reason.as_deref(),
-                if info.quantum_protection {
-                    Some(true)
-                } else {
-                    None
-                },
+                client_public_key,
                 pq_client_public_key,
-            )
-            .await
+                attestation,
+            );
+            api.post_connect_request(&payload).await
         }
     }
 

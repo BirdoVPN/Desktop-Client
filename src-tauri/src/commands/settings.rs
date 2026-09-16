@@ -74,6 +74,24 @@ pub struct AppSettings {
     /// (available on every plan, negligible overhead).
     #[serde(default = "default_true")]
     pub quantum_protection: bool,
+    /// BirdoShield (OPEN-WORK D18): ask the server to resolve this device's
+    /// DNS through the fleet's filtering resolver (ads, trackers, malware
+    /// domains). OFF by default, available on every plan, sent as the
+    /// per-device `dnsFiltering` connect flag on both dial paths — absent
+    /// when off, so a body from a user who never touched it is byte-identical
+    /// to 1.4.42's. Applies on the next connect (same semantics as stealth).
+    ///
+    /// `skip_serializing_if = is_false` is what keeps every existing install's
+    /// HMAC valid across this upgrade: `load_settings_sync` verifies the
+    /// signature over a RE-serialization of the parsed struct, so a field
+    /// that always serializes would turn every 1.4.42-signed settings.json
+    /// (multi-hop fields present, no `dns_filtering`) into a "tampering"
+    /// quarantine + reset — the `LegacyAppSettingsV1` fallback cannot save it
+    /// either, since that shape predates multi-hop. Omitting the key while it
+    /// holds its default reproduces the old bytes exactly; only a file that
+    /// was signed WITH the field (by this build, value true) carries it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dns_filtering: bool,
     /// LOCKDOWN: always-on kill switch (Mullvad-style). When true the WFP
     /// block-all stays active the entire time the tunnel is up, permitting
     /// tunneled traffic by interface so there is ZERO leak window — including
@@ -162,6 +180,7 @@ impl From<LegacyAppSettingsV1> for AppSettings {
             wireguard_mtu: l.wireguard_mtu,
             stealth_mode: l.stealth_mode,
             quantum_protection: l.quantum_protection,
+            dns_filtering: false,
             lockdown_mode: l.lockdown_mode,
             multi_hop_enabled: false,
             multi_hop_entry_node_id: None,
@@ -188,6 +207,7 @@ impl Default for AppSettings {
             wireguard_mtu: 0,
             stealth_mode: false,      // premium — off by default
             quantum_protection: true, // post-quantum on by default
+            dns_filtering: false,     // BirdoShield — opt-in (D18)
             // LOCKDOWN mode. ON by default where it is REAL (Windows), OFF
             // elsewhere — on macOS and Linux `is_lockdown_mode()` returns a
             // hard-coded `false` (killswitch.rs), so this flag does nothing
@@ -219,6 +239,12 @@ fn default_wireguard_port() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+/// `skip_serializing_if` predicate for default-false preferences whose key
+/// must stay OUT of the signed JSON while unset (see `dns_filtering`).
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -848,5 +874,117 @@ mod tests {
             "PQ is a real preference — normalize must not flip it"
         );
         assert!(loaded.stealth_mode, "other prefs pass through untouched");
+    }
+
+    /// D18 BirdoShield: OFF for a fresh install and OFF when the stored file
+    /// predates the field — an upgrade must never silently opt a device into
+    /// DNS filtering it did not ask for.
+    #[test]
+    fn dns_filtering_defaults_off_and_absent_field_loads_off() {
+        assert!(
+            !AppSettings::default().dns_filtering,
+            "BirdoShield is opt-in"
+        );
+        // The exact 1.4.42 on-disk shape (multi-hop fields present, no
+        // dns_filtering) — the frontend payload without the new key.
+        let json = r#"{
+            "autostart": false,
+            "start_minimized": false,
+            "killswitch_enabled": true,
+            "notifications_enabled": true,
+            "auto_connect": false,
+            "preferred_server_id": null,
+            "split_tunneling_enabled": false,
+            "split_tunnel_apps": [],
+            "custom_dns": null,
+            "protocol": "wireguard",
+            "local_network_sharing": false,
+            "wireguard_port": "auto",
+            "wireguard_mtu": 0,
+            "stealth_mode": false,
+            "quantum_protection": true,
+            "lockdown_mode": true,
+            "multi_hop_enabled": false,
+            "multi_hop_entry_node_id": null,
+            "multi_hop_exit_node_id": null
+        }"#;
+        let s: AppSettings =
+            serde_json::from_str(json).expect("pre-D18 settings must still deserialize");
+        assert!(!s.dns_filtering, "absent dns_filtering must load as OFF");
+    }
+
+    /// D18 BirdoShield round-trip: `true` survives serialize → deserialize
+    /// (so the HMAC covers the user's choice), and `false` is omitted from the
+    /// JSON entirely rather than written as `false`.
+    #[test]
+    fn dns_filtering_round_trips_and_is_omitted_when_off() {
+        let on = AppSettings {
+            dns_filtering: true,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(
+            json.contains("\"dns_filtering\":true"),
+            "enabled flag must be persisted: {json}"
+        );
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(back.dns_filtering, "true must round-trip");
+
+        let off_json = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(
+            !off_json.contains("dns_filtering"),
+            "an OFF flag must not appear in the signed JSON: {off_json}"
+        );
+        let back: AppSettings = serde_json::from_str(&off_json).unwrap();
+        assert!(!back.dns_filtering);
+    }
+
+    /// REGRESSION GUARD for the upgrade path: a settings.json signed by 1.4.42
+    /// (the current shape WITHOUT `dns_filtering`) must still pass the PRIMARY
+    /// HMAC check under this build. That file carries the multi-hop fields, so
+    /// the `LegacyAppSettingsV1` fallback cannot rescue it — if the new field
+    /// were re-serialized as `"dns_filtering":false` the signature would never
+    /// match again and every upgrading install would be quarantined + reset.
+    #[test]
+    fn settings_signed_before_dns_filtering_still_verify_on_the_primary_check() {
+        let key: &[u8] = b"unit-test-hmac-key-32-bytes-pad!";
+        // What 1.4.42 serialized and signed: every field it knew, in struct
+        // order, compact — the exact bytes `save_settings_inner` fed the MAC
+        // (a `json!` literal would sort the keys and prove nothing).
+        let v142_json = concat!(
+            r#"{"autostart":true,"start_minimized":false,"killswitch_enabled":true,"#,
+            r#""notifications_enabled":true,"auto_connect":false,"preferred_server_id":"node-7","#,
+            r#""split_tunneling_enabled":true,"split_tunnel_apps":["C:\\games\\x.exe"],"#,
+            r#""custom_dns":null,"protocol":"wireguard","local_network_sharing":false,"#,
+            r#""wireguard_port":"auto","wireguard_mtu":0,"stealth_mode":false,"#,
+            r#""quantum_protection":true,"lockdown_mode":true,"multi_hop_enabled":true,"#,
+            r#""multi_hop_entry_node_id":"entry-1","multi_hop_exit_node_id":"exit-2"}"#
+        )
+        .to_string();
+        let hmac = compute_hmac(&v142_json, key).unwrap();
+
+        // The V1 fallback is NOT what saves this file (it drops multi-hop).
+        let current: AppSettings = serde_json::from_str(&v142_json).unwrap();
+        let v1: LegacyAppSettingsV1 = serde_json::to_value(&current)
+            .and_then(serde_json::from_value)
+            .unwrap();
+        assert!(
+            !verify_hmac(&serde_json::to_string(&v1).unwrap(), &hmac, key),
+            "a multi-hop-era file is outside the V1 fallback's reach — the primary check must carry it"
+        );
+
+        // The primary check: re-serialization of the parsed struct must be
+        // byte-identical to what 1.4.42 signed.
+        let reserialized = serde_json::to_string(&current).unwrap();
+        assert_eq!(
+            reserialized, v142_json,
+            "adding dns_filtering changed the signed bytes"
+        );
+        assert!(
+            verify_hmac(&reserialized, &hmac, key),
+            "a 1.4.42-signed settings file must verify unchanged on the primary check"
+        );
+        assert!(!current.dns_filtering);
+        assert!(current.multi_hop_enabled, "user values pass through");
     }
 }

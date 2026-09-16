@@ -607,6 +607,7 @@ mod auto_reconnect_service_tests {
                 Some(vec!["1.1.1.1".into()]),
                 true,
                 true,
+                true,
                 None,
                 Some("exit-1".into()),
             )
@@ -645,5 +646,98 @@ mod auto_reconnect_service_tests {
         let dbg = format!("{:?}", status);
         assert!(dbg.contains("is_reconnecting"));
         assert!(dbg.contains("3"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR #160 review, nit 3: the unattended re-dial must forward every wire
+// property the session was granted — in particular the D18 `dnsFiltering`
+// flag on BOTH paths. `request_fresh_response` now posts exactly what these
+// two pure builders return, so asserting on them pins the mapping.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod reconnect_request_mapping_tests {
+    use super::super::auto_reconnect::{
+        reconnect_connect_request, reconnect_multi_hop_request, ReconnectInfo,
+    };
+
+    fn info(dns_filtering: bool, exit: Option<&str>) -> ReconnectInfo {
+        ReconnectInfo {
+            server_id: "entry-1".into(),
+            server_name: "US East".into(),
+            local_network_sharing: false,
+            custom_mtu: 0,
+            custom_port: "auto".into(),
+            custom_dns: None,
+            stealth_mode: false,
+            quantum_protection: false,
+            dns_filtering,
+            fallback_reason: None,
+            multi_hop_exit_node_id: exit.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn single_hop_redial_forwards_dns_filtering_as_some_true() {
+        let req = reconnect_connect_request(&info(true, None), "dev", "cpk".into(), None, None);
+        assert_eq!(req.dns_filtering, Some(true));
+        assert_eq!(req.server_node_id.as_deref(), Some("entry-1"));
+        assert_eq!(req.client_public_key.as_deref(), Some("cpk"));
+    }
+
+    #[test]
+    fn single_hop_redial_omits_dns_filtering_when_session_was_unshielded() {
+        // Absent, never Some(false): the same rule `client::dns_filtering_flag`
+        // applies to a user-initiated connect, so the re-dial body matches.
+        let req = reconnect_connect_request(&info(false, None), "dev", "cpk".into(), None, None);
+        assert_eq!(req.dns_filtering, None);
+    }
+
+    #[test]
+    fn multi_hop_redial_forwards_dns_filtering_as_some_true() {
+        let req = reconnect_multi_hop_request(
+            &info(true, Some("exit-1")),
+            "exit-1",
+            "dev",
+            "cpk",
+            None,
+            None,
+        );
+        assert_eq!(req.dns_filtering, Some(true));
+        assert_eq!(req.entry_node_id, "entry-1");
+        assert_eq!(req.exit_node_id, "exit-1");
+    }
+
+    #[test]
+    fn multi_hop_redial_omits_dns_filtering_when_session_was_unshielded() {
+        let req = reconnect_multi_hop_request(
+            &info(false, Some("exit-1")),
+            "exit-1",
+            "dev",
+            "cpk",
+            None,
+            None,
+        );
+        assert_eq!(req.dns_filtering, None);
+    }
+
+    /// The pre-D18 properties the re-dial already forwarded, pinned in the
+    /// same place so a future field cannot be dropped from one path only.
+    #[test]
+    fn redial_forwards_stealth_quantum_and_fallback_grant() {
+        let mut i = info(false, None);
+        i.stealth_mode = true;
+        i.quantum_protection = true;
+        i.fallback_reason = Some("handshake_timeout".into());
+        let req = reconnect_connect_request(&i, "dev", "cpk".into(), Some("pq".into()), None);
+        assert_eq!(req.stealth_mode, Some(true));
+        assert_eq!(req.quantum_protection, Some(true));
+        assert_eq!(req.fallback_reason.as_deref(), Some("handshake_timeout"));
+        assert_eq!(req.pq_client_public_key.as_deref(), Some("pq"));
+
+        let mh = reconnect_multi_hop_request(&i, "exit-1", "dev", "cpk", Some("pq".into()), None);
+        assert_eq!(mh.stealth_mode, Some(true));
+        assert_eq!(mh.quantum_protection, Some(true));
+        assert_eq!(mh.pq_client_public_key.as_deref(), Some("pq"));
     }
 }
