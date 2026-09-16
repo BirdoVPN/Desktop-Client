@@ -86,10 +86,35 @@ rand = "0.8"
 ring = "0.17"
 base64 = "0.22"
 zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
-# AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). Same crate as the Android JNI
-# (native/rosenpass-jni) so client+server agree on wire format byte-for-byte.
-pqcrypto-mlkem = { version = "0.1", default-features = false, features = ["std"] }
-pqcrypto-traits = "0.3"
+# AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). Same crate as the Android
+# JNI (native/rosenpass-jni) and the iOS C-ABI shim, so every client speaks the
+# byte-for-byte encoding the backend's @noble/post-quantum encapsulates with.
+# The KAT in src/vpn/fixtures/ is the enforcement, not this comment.
+#
+# 2026-09: migrated off `pqcrypto-mlkem` (PQClean's portable CLEAN C). PQClean
+# upstream is archived read-only, and pqcrypto-mlkem / -traits / -internals all
+# carry unmaintained advisories (RUSTSEC-2026-0161/-0162/-0163) whose own
+# remediation text says to move to `ml-kem`.
+#
+# Measured effect on THIS crate's graph (Cargo.lock diff + `cargo tree`): the
+# pqcrypto trio leaves, and with it the last C the PQ path compiled; 16 lock
+# entries arrive, of which 5 (pkcs8, spki, der, const-oid, base64ct) are
+# optional ml-kem deps that our feature set never builds - `cargo tree -i` finds
+# no path to any of them. `cc` does NOT leave the build: aws-lc-sys and ring
+# still use it. Neither does extended-ISA code leave; see the "Implementation"
+# section of src/vpn/birdo_pq.rs for what did and did not change there.
+#
+# EXACT PIN, deliberately: this is the KEM, not a dependency. `ml-kem` shipped
+# FIPS 203 input validation and a Zeroize fix inside 0.3.x patch releases, so
+# every version move here is a crypto change that needs the KAT re-run and a
+# re-read of the changelog, not a Dependabot rubber stamp.
+#
+# default-features = false + ["alloc", "zeroize"]: the crate's default is
+# ["alloc"] ALONE — `zeroize` is opt-in, and without it DecapsulationKey is not
+# ZeroizeOnDrop. The `hazmat` feature is dev-only (below): tests need
+# `encapsulate_deterministic` to reproduce fixed vectors; production only ever
+# key-generates and decapsulates.
+ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "zeroize"] }
 hkdf = "0.12"
 
 # Fast mutex for async-safe crypto operations (replaces std::sync::Mutex)
@@ -107,8 +132,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # System directories for crash reports
 dirs = "6.0"
 
-# Logging
-log = "0.4"
+# Logging. (`log` was a direct dependency with no `log::` call anywhere in
+# src/ — the app logs through `tracing`. Dropped 2026-09; it stays in the graph
+# transitively, so nothing about the built binary changes.)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4.2"
@@ -187,6 +213,14 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3.13"
+# `hazmat` gates `EncapsulationKey::encapsulate_deterministic`, which the tests
+# use to reproduce the server's exact ciphertext from the KAT fixture's fixed
+# randomness. In [dev-dependencies] on purpose: Cargo resolves dev-dependency
+# features only for this package's test/bench targets, so `hazmat` is on for
+# `cargo test` and off for `cargo build --release`. The client never
+# encapsulates in production (the server does, with @noble/post-quantum), and a
+# deterministic encapsulation in a shipping build would be a real vulnerability.
+ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "zeroize", "hazmat"] }
 # K5 connect contract: validates the SERIALIZED ConnectRequest /
 # MultiHopConnectRequest bodies against the vendored
 # contract/vpn-protocol.schema.json (src/api/contract_tests.rs). Exact pin so a
