@@ -954,7 +954,7 @@ mod tests {
         let v142_json = concat!(
             r#"{"autostart":true,"start_minimized":false,"killswitch_enabled":true,"#,
             r#""notifications_enabled":true,"auto_connect":false,"preferred_server_id":"node-7","#,
-            r#""split_tunneling_enabled":true,"split_tunnel_apps":["C:\games\x.exe"],"#,
+            r#""split_tunneling_enabled":true,"split_tunnel_apps":["C:\\games\\x.exe"],"#,
             r#""custom_dns":null,"protocol":"wireguard","local_network_sharing":false,"#,
             r#""wireguard_port":"auto","wireguard_mtu":0,"stealth_mode":false,"#,
             r#""quantum_protection":true,"lockdown_mode":true,"multi_hop_enabled":true,"#,

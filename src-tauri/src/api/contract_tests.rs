@@ -701,7 +701,15 @@ fn dns_filtering_true_is_sent_on_both_dial_paths_when_enabled() {
     assert_valid(CONNECT, &Value::Object(connect));
 
     let multi = body(&build_multi_hop_request(
-        "entry", "exit", "d", "k", false, false, None, true, None,
+        "entry",
+        "exit",
+        "d",
+        &real_wireguard_public_key(),
+        false,
+        false,
+        None,
+        true,
+        None,
     ));
     assert_eq!(multi.get("dnsFiltering"), Some(&json!(true)));
     assert!(!multi.contains_key("dns_filtering"));
