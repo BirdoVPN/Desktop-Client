@@ -1719,6 +1719,45 @@ mod tests {
         assert_eq!(derive_quantum_psk(&resp), Ok(None));
     }
 
+    /// The consequence of a BirdoPQ decapsulation that cannot happen — an
+    /// unusable persisted `birdo_pq_v1.bin`, a malformed ciphertext, a missing
+    /// nonce — is an ABORTED connect, never a demotion to the server's
+    /// classical PSK. Three comments in `vpn::birdo_pq` once justified
+    /// discarding the user's long-lived ML-KEM identity key with the opposite
+    /// claim: a permanent, silent demotion for the life of the install. It
+    /// cannot occur, and this is the assertion that would have said so. (The
+    /// exact phrase is not repeated here — scripts/ci/check-pq-features.sh
+    /// bans it from `src/` outright.) Here the server DOES offer a classical
+    /// `preshared_key`, so `Ok(Some(_))` is sitting there for the taking and
+    /// is still refused.
+    #[test]
+    fn undecapsulatable_pq_aborts_even_when_a_server_psk_is_offered() {
+        let mut resp = withheld_psk_response(Some(true));
+        resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
+        let r = derive_quantum_psk(&resp);
+        assert!(
+            r.is_err(),
+            "a failed PQ decapsulation must abort, not take the offered classical PSK; got {r:?}"
+        );
+        assert!(r.unwrap_err().contains("silent downgrade"));
+    }
+
+    /// The other direction of the same correction: with `quantum_enabled` off,
+    /// `try_decapsulate` returns at its first line and the PQ key file is never
+    /// opened, so the state of that file cannot affect the classical path at
+    /// all — there is no install-lifetime fallback for an unusable key to
+    /// cause. The server PSK is taken. (The `PqMode` latch is process-global
+    /// and other tests move it, so asserting on it here would race.)
+    #[test]
+    fn quantum_off_takes_the_server_psk_regardless_of_the_pq_key_file() {
+        let mut resp = withheld_psk_response(Some(false));
+        resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
+        assert_eq!(
+            derive_quantum_psk(&resp),
+            Ok(Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".to_string()))
+        );
+    }
+
     // ------------------------------------------------------------------
     // OPEN-WORK K10: quick-connect picks the least-loaded ACCESSIBLE node.
     // ------------------------------------------------------------------

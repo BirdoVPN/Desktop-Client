@@ -86,10 +86,77 @@ rand = "0.8"
 ring = "0.17"
 base64 = "0.22"
 zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
-# AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). Same crate as the Android JNI
-# (native/rosenpass-jni) so client+server agree on wire format byte-for-byte.
-pqcrypto-mlkem = { version = "0.1", default-features = false, features = ["std"] }
-pqcrypto-traits = "0.3"
+# AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). The KAT fixture in
+# src/vpn/fixtures/, not crate identity, is what keeps the four clients
+# interoperable while Mobile-Client is still on pqcrypto-mlkem. Checked against
+# BirdoVPN/Mobile-Client origin/main on 2026-09-16: native/rosenpass-jni,
+# native/birdo-pq-ios and native/birdo-pq-server all still declare
+# `pqcrypto-mlkem = { version = "0.1", ... }`, so "same crate everywhere" is
+# NOT true today and must not be written here as if it were. What every client
+# does share is the byte-for-byte encoding the backend's @noble/post-quantum
+# encapsulates with, and the KAT is what proves it. The gate at
+# scripts/ci/check-pq-features.sh fails if this comment claims parity again.
+#
+# 2026-09: migrated off `pqcrypto-mlkem` (PQClean's portable CLEAN C). PQClean
+# upstream is archived read-only, and pqcrypto-mlkem / -traits / -internals all
+# carry unmaintained advisories (RUSTSEC-2026-0161/-0162/-0163) whose own
+# remediation text says to move to `ml-kem`.
+#
+# Measured effect on THIS crate's graph (Cargo.lock diff + `cargo tree`): 3
+# entries leave (the pqcrypto trio, and with them the last C the PQ path
+# compiled), 16 new crates arrive, and typenum is bumped 1.19.0 -> 1.20.1 in
+# place, for a net 761 -> 774 [[package]] entries. Of the 16, five (pkcs8,
+# spki, der, const-oid, base64ct) are optional ml-kem deps that our feature set
+# never builds - `cargo tree -i` prints "nothing to print" for each. `cc` does
+# NOT leave the build: aws-lc-sys and ring still use it. Neither does
+# extended-ISA code leave; see the "Implementation" section of
+# src/vpn/birdo_pq.rs for what did and did not change there.
+#
+# EXACT PIN, deliberately: this is the KEM, not a dependency. Every version
+# move here is a crypto change that needs the KAT re-run and a changelog read,
+# not a Dependabot rubber stamp.
+#
+# CORRECTED (review of #163): an earlier draft of this comment justified the
+# pin with "ml-kem shipped FIPS 203 input validation and a Zeroize fix inside
+# 0.3.x patch releases". Upstream does not say that, and a wrong citation in a
+# crypto manifest is worse than none. The 0.3 line has exactly TWO published
+# releases — 0.3.0 (2026-04-28) and 0.3.2 (2026-05-10); crates.io lists no
+# other non-prerelease 0.3.x, and ml-kem/CHANGELOG.md records 0.3.1 as
+# "Skipped as it was tagged without a version bump". That changelog gives
+# 0.3.2 exactly one line: "Added - Optional on-by-default heap offload support
+# ([#310])". The input-validation work the sentence was reaching for
+# ("Validate encryption/encapsulation keys ([#179])", "Validate expanded
+# decapsulation key hash ([#207])") landed in 0.3.0, the MINOR release, and
+# the Zeroize entry is older still.
+#
+# The pin stays, on the real reason: 0.3.2 is a single patch release that
+# already changed where key material is allocated, nobody here reviews this
+# crate's patches, and the only thing standing between a bad one and a silent
+# interop break is the KAT in src/vpn/fixtures/ — which only runs if someone
+# is looking. `scripts/ci/check-pq-features.sh` gates the pin and the feature
+# set on every PR.
+#
+# default-features = false + ["alloc", "zeroize"]: the crate's default is
+# ["alloc"] ALONE — `zeroize` is opt-in, and without it DecapsulationKey is
+# not ZeroizeOnDrop (ml-kem-0.3.2/src/decapsulation_key.rs:142,156 gate both
+# `impl Drop` and `impl ZeroizeOnDrop` on `#[cfg(feature = "zeroize")]`).
+# Because a missing `zeroize` disarms every dk wipe without failing a single
+# test, that feature set is asserted in CI by
+# `scripts/ci/check-pq-features.sh`, not just written down here.
+#
+# There is deliberately NO `hazmat` entry, here or in [dev-dependencies].
+# `hazmat` gates NOTHING but rustdoc: in ml-kem 0.3.2 the feature is defined
+# as `hazmat = []` and its only use is
+# `#[cfg_attr(not(feature = "hazmat"), doc(hidden))]` on
+# `EncapsulationKey::encapsulate_deterministic`
+# (ml-kem-0.3.2/src/encapsulation_key.rs:43-45) — a plain `pub fn` that is
+# compiled into every profile regardless. Requesting it in [dev-dependencies]
+# bought nothing and, worse, read as a build-time guarantee that deterministic
+# encapsulation cannot reach a release binary. It is not one. Keeping
+# `encapsulate_deterministic` out of production is a CODE-REVIEW invariant:
+# the only caller is the `#[cfg(test)]` KAT helper in src/vpn/birdo_pq.rs,
+# and it must stay that way.
+ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "zeroize"] }
 hkdf = "0.12"
 
 # Fast mutex for async-safe crypto operations (replaces std::sync::Mutex)
@@ -107,8 +174,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # System directories for crash reports
 dirs = "6.0"
 
-# Logging
-log = "0.4"
+# Logging. (`log` was a direct dependency with no `log::` call anywhere in
+# src/ — the app logs through `tracing`. Dropped 2026-09; it stays in the graph
+# transitively, so nothing about the built binary changes.)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4.2"
