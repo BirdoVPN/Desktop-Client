@@ -14,8 +14,27 @@
  *
  * These tests assert the property that actually matters -- the gate is fetched
  * for every entry point into the authenticated frame -- rather than "Dashboard
- * calls the hook", which is the assertion that let the bug through. Moving the
- * call back onto any tab root fails the 'settings' and 'profile' cases.
+ * calls the hook", which is the assertion that let the bug through.
+ *
+ * WHAT THE MUTATION ACTUALLY DOES, measured (PR #162 review, must-fix 2 -- an
+ * earlier revision of this header and of the PR body claimed "fails 5 of the 7
+ * cases ... only the two that start on Home survive", and both the number and
+ * the mechanism were wrong). Moving `useClientConfig()` off AppShell and back
+ * onto `Dashboard` fails ALL SEVEN cases, including the two that open on Home.
+ * The reason is the mock 20 lines below: this suite replaces
+ * `@/components/Dashboard` with a stub, so a hook placed inside the REAL
+ * Dashboard never runs here at all and `get_client_config` is invoked zero
+ * times on every tab. Re-measured on this branch: 7 failed / 7.
+ *
+ * So be precise about what that buys. These cases prove that AppShell itself
+ * issues the fetch, and that it does so for every tab, for a cold-start deep
+ * link, underneath a pushed sub-screen, and once per shell mount rather than
+ * once per tab switch. They do NOT prove anything about the real Dashboard,
+ * and the all-seven failure above is a property of this file's stubbing as
+ * much as of the placement -- it says "the call is not on the shell", not
+ * "the call is unreachable in the app". The argument that the shell is the
+ * right home is the structural one in the paragraph above, which these tests
+ * pin for the shell's side of it.
  *
  * The tab roots and push screens are stubbed: this file is about the shell's own
  * responsibility, and the real Dashboard drags in the globe, the 2s status poll
@@ -30,6 +49,12 @@ import { AppShell } from '@/components/AppShell';
 import { useAppStore, type TabId } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
+// The gate hook subscribes to the `app-shown` tray-restore event; jsdom has no
+// Tauri IPC to carry it. The shell's own responsibility is the FETCH, so the
+// refetch triggers are pinned in `useClientConfig.test.tsx` instead.
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async () => () => {}),
+}));
 
 // Tab roots and push screens are stand-ins. Each renders a testid so the tests
 // can also state the structural fact the bug rested on: Dashboard is NOT

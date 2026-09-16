@@ -14,6 +14,7 @@
  */
 import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '@/store/app-store';
 
 /**
@@ -30,7 +31,20 @@ export interface ClientConfig {
 }
 
 /**
- * Sync the fleet gate into the store. Fire-and-forget, once per mount.
+ * Floor between two gate fetches, in milliseconds.
+ *
+ * The refetches below are driven by user actions (focusing the window,
+ * restoring from the tray), and a user can produce those as fast as they can
+ * alt-tab. This is what stops that becoming a request per focus change; it is
+ * also the in-flight guard, because the timestamp is taken BEFORE the invoke
+ * rather than after it resolves. Five minutes stays far inside the endpoint's
+ * 60 req/min bucket, and it is the only term this client itself adds to the
+ * staleness bound documented on `useClientConfig`.
+ */
+export const GATE_REFETCH_MIN_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * Sync the fleet gate into the store, and keep it synced.
  *
  * CALL IT FROM `AppShell`, NOT FROM A TAB ROOT (PR #162 review, must-fix 1).
  * An earlier revision called this from `Dashboard` and justified it with
@@ -44,49 +58,122 @@ export interface ClientConfig {
  * is the component that is mounted for every authenticated session whatever
  * the tab, which is the property this fetch actually needs.
  *
- * Unauthenticated, so it does not wait on sign-in state. It is a plain 200
- * every time: the client sends no `If-None-Match` and reqwest keeps no HTTP
- * cache, so every mount is a full refetch of the whole payload. From the shell
- * that is one request per sign-in rather than one per tab switch (Dashboard
- * unmounts on every one), so no in-flight dedupe or AbortController is needed
- * here. It is tolerable regardless because the route is public and small, and
- * because its rate limit (60 req/min) failing closed is harmless — a 429 lands
+ * Unauthenticated, so it does not wait on sign-in state. Every fetch is a plain
+ * 200: the client sends no `If-None-Match` and reqwest keeps no HTTP cache, so
+ * each one pulls the whole public payload. That is cheap (small, public route)
+ * and it fails harmlessly — a 429 from the endpoint's 60 req/min bucket lands
  * in the catch below and leaves the gate at its "available" default.
  *
- * STALENESS, and which direction it errs in: the route is served with
- * `s-maxage=3600, stale-while-revalidate=86400`, so this value can trail the
- * real fleet gate by up to an hour, longer while SWR is revalidating.
+ * ── STALENESS: what actually bounds it ─────────────────────────────────────
+ *
+ * An earlier revision claimed a gate switched OFF left the row usable "for up
+ * to the same hour", citing the route's `s-maxage=3600`. That was false in the
+ * dishonest direction, and why is worth keeping: a cache header bounds how old
+ * a RESPONSE may be when it is fetched. It says nothing about how long ago
+ * this client last fetched one. On mount alone that gap is unbounded in
+ * practice — `AppShell` mounts once per authenticated session, and BirdoVPN is
+ * a close-to-tray app (`src-tauri/src/main.rs` turns the window's close button
+ * into `hide()` and keeps the process alive), so a client parked in the tray
+ * kept its mount-time answer for as long as the user left it there. Days, with
+ * the row reading ON and switchable after the gate went off.
+ *
+ * So the gate is re-read whenever the user comes back to the window:
+ *
+ *  - `visibilitychange`, on the way to visible — the shape Dashboard's status
+ *    poll already uses;
+ *  - window `focus` — alt-tab back, which need not change `document.hidden`;
+ *  - the `app-shown` Tauri event — emitted by `restore_and_focus` in
+ *    `src-tauri/src/main.rs` for a tray click, the tray "Show Window" item, a
+ *    deep link, a single-instance relaunch and the post-SSO return. This is
+ *    the one that covers a real close-to-tray, where a hidden webview may see
+ *    no visibility or focus event at all.
+ *
+ * …each throttled to one fetch per `GATE_REFETCH_MIN_INTERVAL_MS`.
+ *
+ * THE REAL BOUND is therefore: the value on screen was fetched at most
+ * `GATE_REFETCH_MIN_INTERVAL_MS` before this return to the window, plus
+ * however stale the answer already was when it arrived. birdo-web's
+ * `app/api/client-config/route.ts` sets `Cache-Control: public, max-age=300,
+ * stale-while-revalidate=3600` and `CDN-Cache-Control: public, s-maxage=3600,
+ * stale-while-revalidate=86400`, so a shared cache in front of the route may
+ * hand back an answer up to an hour old, and older still on the request that
+ * arrives while it revalidates. reqwest keeps no cache of its own, so nothing
+ * on this side adds to that except the throttle.
+ *
+ * What is still NOT bounded: the fetch is asynchronous, so the first paint
+ * after a return shows the previous value for one round trip. A stale-ON row
+ * for one request is the residue; a stale-ON row for a whole tray-resident
+ * session is what this removes. `src/__tests__/useClientConfig.test.tsx` fails
+ * if any of the three triggers or the throttle is dropped.
+ *
+ * Which direction each error costs, unchanged:
  *
  *  - trailing a gate that has just been switched ON: the row reads OFF and
  *    disabled while the tunnel really is filtering. `settingsToRust` sends
  *    `dns_filtering: settings.dnsFiltering` regardless of the gate, so the
  *    user's stored preference is still honoured server-side — the screen
  *    understates what is happening, which is the safe direction.
- *  - trailing a gate that has just been switched OFF: the row stays usable
- *    for up to the same hour. That is the dishonest direction, and it is
- *    bounded because the gate is a deliberate fleet rollout switch, not an
- *    incident toggle — it moves on a deploy, not on a page load.
+ *  - trailing a gate that has just been switched OFF: the row stays usable,
+ *    which is the direction that lies, and the one the refetch above bounds.
  */
 export function useClientConfig(): void {
   const setDnsFilteringAvailable = useAppStore((s) => s.setDnsFilteringAvailable);
 
   useEffect(() => {
-    invoke<ClientConfig | null>('get_client_config')
-      .then((cfg) => {
-        // GUARD 1: only an explicit boolean is a signal. A web deploy that
-        // predates the field sends nothing (undefined) or `null` — that is
-        // "unknown", NOT "off". `!!cfg?.dnsFilteringAvailable` here would turn
-        // every such deploy into a fleet-wide false and hide a working feature.
-        if (typeof cfg?.dnsFilteringAvailable === 'boolean') {
-          setDnsFilteringAvailable(cfg.dnsFilteringAvailable);
-        }
-      })
-      // GUARD 2: the catch deliberately does NOTHING. The store default is
-      // `true`; an offline client, a 500, a 429 or a cold start must leave the
-      // row usable. Setting `false` here is precisely the bug this PR exists to
-      // prevent, one layer down.
-      .catch(() => {
-        /* silent — the store default (available) stands */
-      });
+    let cancelled = false;
+    let lastFetchAt = 0;
+
+    const fetchGate = (force: boolean) => {
+      const now = Date.now();
+      // Taken BEFORE the invoke, so an in-flight request throttles the next
+      // trigger too and no separate dedupe flag is needed. A failed fetch
+      // throttles as well: the store default already stands, and retrying a
+      // broken network on every alt-tab buys nothing.
+      if (!force && now - lastFetchAt < GATE_REFETCH_MIN_INTERVAL_MS) return;
+      lastFetchAt = now;
+
+      invoke<ClientConfig | null>('get_client_config')
+        .then((cfg) => {
+          if (cancelled) return;
+          // GUARD 1: only an explicit boolean is a signal. A web deploy that
+          // predates the field sends nothing (undefined) or `null` — that is
+          // "unknown", NOT "off". `!!cfg?.dnsFilteringAvailable` here would
+          // turn every such deploy into a fleet-wide false and hide a working
+          // feature.
+          if (typeof cfg?.dnsFilteringAvailable === 'boolean') {
+            setDnsFilteringAvailable(cfg.dnsFilteringAvailable);
+          }
+        })
+        // GUARD 2: the catch deliberately does NOTHING. The store default is
+        // `true`; an offline client, a 500, a 429 or a cold start must leave
+        // the row usable. Setting `false` here is precisely the bug this PR
+        // exists to prevent, one layer down.
+        .catch(() => {
+          /* silent — the store default (available) stands */
+        });
+    };
+
+    // Mount: forced past the throttle, since `lastFetchAt` starts at 0 anyway
+    // and the intent ("always fetch once") should not read as an accident.
+    fetchGate(true);
+
+    const onVisibility = () => {
+      if (!document.hidden) fetchGate(false);
+    };
+    const onFocus = () => fetchGate(false);
+
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', onFocus);
+    // `listen` resolves to its own unlisten fn. The catch covers a teardown
+    // that beats the subscription, and any host without the event plugin
+    // (a bare jsdom render, say).
+    const unlistenShown = listen('app-shown', () => fetchGate(false));
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', onFocus);
+      unlistenShown.then((off) => off()).catch(() => {});
+    };
   }, [setDnsFilteringAvailable]);
 }

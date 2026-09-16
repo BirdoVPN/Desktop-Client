@@ -54,9 +54,13 @@ export function AppShell() {
   // `src/__tests__/AppShellClientConfig.test.tsx`.
   //
   // It is also the right lifetime: the shell mounts once per sign-in, so
-  // the gate is fetched once instead of once per tab switch (Dashboard
-  // unmounts on every one). The rule itself — unknown means AVAILABLE —
-  // lives in `src/hooks/useClientConfig.ts`.
+  // the gate is fetched once on mount instead of once per tab switch
+  // (Dashboard unmounts on every one). Mounting is NOT what bounds staleness,
+  // though — this app closes to the tray and can sit there for days — so the
+  // hook also re-reads the gate on every return to the window (visibility,
+  // focus, and the `app-shown` tray-restore event), throttled. Both that bound
+  // and the rule itself — unknown means AVAILABLE — live in
+  // `src/hooks/useClientConfig.ts`.
   useClientConfig();
 
   const topRoute = navStack[navStack.length - 1];

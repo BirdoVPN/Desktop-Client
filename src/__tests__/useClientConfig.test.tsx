@@ -17,13 +17,31 @@
  *
  * Run: npx vitest run src/__tests__/useClientConfig.test.tsx
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, waitFor, act } from '@testing-library/react';
 import { invoke } from '@tauri-apps/api/core';
-import { useClientConfig } from '@/hooks/useClientConfig';
+import { useClientConfig, GATE_REFETCH_MIN_INTERVAL_MS } from '@/hooks/useClientConfig';
 import { useAppStore } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
+
+// The hook subscribes to the `app-shown` Tauri event (tray restore). The mock
+// hands the registered handler back so a test can fire a restore, and records
+// whether the hook unsubscribed.
+// `vi.hoisted` because the factory runs while the module graph is imported,
+// before any plain `const` in this file has been initialised.
+const tray = vi.hoisted(() => ({
+  shownHandlers: [] as Array<() => void>,
+  unlistenCalls: 0,
+}));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async (event: string, handler: () => void) => {
+    if (event === 'app-shown') tray.shownHandlers.push(handler);
+    return () => {
+      tray.unlistenCalls += 1;
+    };
+  }),
+}));
 
 const mockedInvoke = vi.mocked(invoke);
 
@@ -43,11 +61,67 @@ async function runHook() {
   });
 }
 
+// The hook throttles on Date.now(), so the clock is driven explicitly rather
+// than slept through.
+let clock = 1_700_000_000_000;
+let dateNowSpy: ReturnType<typeof vi.spyOn> | undefined;
+const advance = (ms: number) => {
+  clock += ms;
+};
+
 beforeEach(() => {
   mockedInvoke.mockReset();
+  tray.shownHandlers.length = 0;
+  tray.unlistenCalls = 0;
+  clock = 1_700_000_000_000;
+  dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  setHidden(false);
   // The shipped default. Every "unknown" case below asserts this survives.
   useAppStore.setState({ dnsFilteringAvailable: true });
 });
+
+afterEach(() => {
+  dateNowSpy?.mockRestore();
+  setHidden(false);
+});
+
+/** jsdom leaves `document.hidden` a fixed `false`; make it settable. */
+function setHidden(hidden: boolean) {
+  Object.defineProperty(document, 'hidden', {
+    configurable: true,
+    get: () => hidden,
+  });
+}
+
+/** Fire the DOM event the browser fires when the window is shown or hidden. */
+function fireVisibilityChange(hidden: boolean) {
+  setHidden(hidden);
+  act(() => {
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+}
+
+/** Alt-tab back to the window. */
+function fireWindowFocus() {
+  act(() => {
+    window.dispatchEvent(new Event('focus'));
+  });
+}
+
+/** What `restore_and_focus` in src-tauri/src/main.rs emits on a tray restore. */
+function fireTrayRestore() {
+  act(() => {
+    tray.shownHandlers.forEach((h) => h());
+  });
+}
+
+/** Let the .then/.catch of any fetch just started settle. */
+async function flush() {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
 
 describe('useClientConfig -> dnsFilteringAvailable', () => {
   it('asks the Rust side for the client config exactly once per mount', async () => {
@@ -167,5 +241,125 @@ describe('useClientConfig -> dnsFilteringAvailable', () => {
     expect(gate()).toBe(false);
     const persisted = window.localStorage.getItem('birdo-vpn-storage') ?? '';
     expect(persisted).not.toContain('dnsFilteringAvailable');
+  });
+
+  // — The gate has to stay fresh, not merely be fetched once ———————-
+  //
+  // PR #162 review, must-fix 1. The hook used to be a single mount effect, and
+  // the PR justified that with the route's `s-maxage=3600`: "a gate switched
+  // OFF leaves the row usable for up to the same hour". That bounded the age
+  // of a RESPONSE at fetch time, not the age of this client's value. AppShell
+  // mounts once per authenticated session, and BirdoVPN closes to the tray
+  // (`src-tauri/src/main.rs` turns the close button into `hide()`), so a
+  // client left in the tray kept its mount-time answer for DAYS — reading ON
+  // and switchable long after `DNS_FILTERING_ENABLED` went off. These tests
+  // fail if any trigger, or the throttle that keeps them cheap, is removed.
+  describe('re-reads the gate when the user comes back to the window', () => {
+    const outsideThrottle = () => advance(GATE_REFETCH_MIN_INTERVAL_MS + 1);
+
+    async function mountedHook() {
+      mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: true });
+      const view = renderHook(() => useClientConfig());
+      await waitFor(() => expect(mockedInvoke).toHaveBeenCalledTimes(1));
+      await flush();
+      return view;
+    }
+
+    it('on visibilitychange back to visible', async () => {
+      await mountedHook();
+      outsideThrottle();
+      fireVisibilityChange(false);
+      await waitFor(() => expect(mockedInvoke).toHaveBeenCalledTimes(2));
+    });
+
+    it('on window focus — alt-tab back need not change document.hidden', async () => {
+      await mountedHook();
+      outsideThrottle();
+      fireWindowFocus();
+      await waitFor(() => expect(mockedInvoke).toHaveBeenCalledTimes(2));
+    });
+
+    it('on a tray restore (the `app-shown` event main.rs emits)', async () => {
+      await mountedHook();
+      expect(tray.shownHandlers).toHaveLength(1);
+      outsideThrottle();
+      fireTrayRestore();
+      await waitFor(() => expect(mockedInvoke).toHaveBeenCalledTimes(2));
+    });
+
+    it('NOT on the way to hidden — a window being minimised is not a return', async () => {
+      await mountedHook();
+      outsideThrottle();
+      fireVisibilityChange(true);
+      await flush();
+      expect(mockedInvoke).toHaveBeenCalledTimes(1);
+    });
+
+    it('picks up a gate that was switched off while the app sat in the tray', async () => {
+      // The whole point, end to end: mount while the fleet gate is on, sit in
+      // the tray while it is switched off, come back.
+      await mountedHook();
+      expect(gate()).toBe(true);
+
+      mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: false });
+      advance(3 * 24 * 60 * 60 * 1000); // three days in the tray
+      fireTrayRestore();
+
+      await waitFor(() => expect(gate()).toBe(false));
+    });
+
+    it('throttles: returns inside the minimum interval do not refetch', async () => {
+      await mountedHook();
+
+      // Inside the window: three different triggers, no second request.
+      advance(GATE_REFETCH_MIN_INTERVAL_MS - 1);
+      fireWindowFocus();
+      fireVisibilityChange(false);
+      fireTrayRestore();
+      await flush();
+      expect(mockedInvoke).toHaveBeenCalledTimes(1);
+
+      // Past it: exactly one more, and the next trigger is throttled again.
+      outsideThrottle();
+      fireWindowFocus();
+      await waitFor(() => expect(mockedInvoke).toHaveBeenCalledTimes(2));
+      fireWindowFocus();
+      await flush();
+      expect(mockedInvoke).toHaveBeenCalledTimes(2);
+    });
+
+    it('throttles on the request being STARTED, so an in-flight fetch is not doubled', async () => {
+      // `lastFetchAt` is stamped before the invoke, not after it resolves: a
+      // slow request must not let a second trigger through behind it.
+      let resolveFirst: (v: unknown) => void = () => {};
+      mockedInvoke.mockImplementationOnce(
+        () => new Promise((res) => { resolveFirst = res; }),
+      );
+      renderHook(() => useClientConfig());
+      await waitFor(() => expect(mockedInvoke).toHaveBeenCalledTimes(1));
+
+      advance(GATE_REFETCH_MIN_INTERVAL_MS - 1);
+      fireWindowFocus();
+      await flush();
+      expect(mockedInvoke).toHaveBeenCalledTimes(1);
+
+      act(() => resolveFirst({ dnsFilteringAvailable: false }));
+      await flush();
+      expect(gate()).toBe(false);
+    });
+
+    it('stops listening on unmount — no fetch after the shell is gone', async () => {
+      const { unmount } = await mountedHook();
+      unmount();
+      // `listen` resolves a promise, so the unsubscribe lands a microtask late.
+      await flush();
+
+      expect(tray.unlistenCalls).toBe(1);
+      outsideThrottle();
+      fireWindowFocus();
+      fireVisibilityChange(false);
+      await flush();
+      expect(mockedInvoke).toHaveBeenCalledTimes(1);
+    });
   });
 });

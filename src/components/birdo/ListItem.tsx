@@ -4,7 +4,7 @@
  *
  * Mirrors mobile's `BirdoListItem.kt` (BirdoListItem, BirdoToggleRow, BirdoNavRow).
  */
-import type { ReactNode } from 'react';
+import { useId, type ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { ChevronRight } from 'lucide-react';
 import { white, brand, hairline } from '@/lib/birdo-theme';
@@ -56,11 +56,33 @@ export function BirdoListItem({
   subtitleWrap = false,
 }: BirdoListItemProps) {
   const Wrapper = onClick && enabled ? 'button' : 'div';
+  // A disabled control still has to be a control (PR #162 review, nits).
+  // A blocked toggle row degrades to a <div role="switch">, and a plain div
+  // carries no disabled semantics and is not focusable, so the row announced
+  // as an ordinary switch reading "off" -- a screen-reader user was told the
+  // setting was simply off, not that it was unavailable, which is the same
+  // reassurance-from-missing-data failure as a row that lies visually.
+  //
+  // `aria-disabled` (not the `disabled` attribute, which a div cannot carry)
+  // states it, and `tabIndex={0}` keeps the row in the tab order so the reason
+  // can actually be reached: per the ARIA practices an aria-disabled control
+  // stays focusable precisely so its state and description can be read. It has
+  // no click handler, so reaching it does nothing.
+  //
+  // `aria-describedby` points the switch at its own subtitle, which is where
+  // the reason lives -- otherwise the row announces "BirdoShield, switch, off,
+  // dimmed" and the sentence explaining why is a separate, unassociated node.
+  const subtitleId = useId();
+  const isSemanticControl = role !== undefined;
+  const describedBy = subtitle && isSemanticControl ? subtitleId : undefined;
   return (
     <Wrapper
       type={Wrapper === 'button' ? 'button' : undefined}
       role={role}
       aria-checked={role === 'switch' ? ariaChecked : undefined}
+      aria-disabled={isSemanticControl && !enabled ? true : undefined}
+      aria-describedby={describedBy}
+      tabIndex={Wrapper === 'div' && isSemanticControl ? 0 : undefined}
       onClick={onClick && enabled ? onClick : undefined}
       className={`flex w-full items-center gap-3.5 overflow-hidden rounded-birdo-md px-3.5 py-3 text-left ${
         onClick && enabled ? 'transition-colors hover:bg-white/5' : ''
@@ -84,6 +106,7 @@ export function BirdoListItem({
         </div>
         {subtitle && (
           <div
+            id={describedBy}
             className={`mt-0.5 text-xs ${
               subtitleWrap ? 'whitespace-normal break-words leading-snug' : 'truncate'
             }`}

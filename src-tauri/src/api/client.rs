@@ -25,12 +25,17 @@ const API_BASE_URL: &str = "https://api.birdo.app";
 
 /// The Next.js WEB origin.
 ///
-/// `/api/client-config` is served by the web app, not by the NestJS backend
-/// behind `api.birdo.app` (Caddy maps that subdomain straight to `backend:4000`
-/// with no `/api` prefix), so it needs its own base. Covered by the CSP
-/// (`connect-src ... https://birdo.app`) and by the cert pin set, which lists
-/// `birdo.app` alongside the DoH resolvers — the pinning is CA-chain SPKI, so
-/// this host is protected by the same verifier as every other request.
+/// `/api/client-config` is served by the web app (`app/api/client-config/
+/// route.ts` in birdo-web), not by the NestJS backend behind `api.birdo.app`,
+/// so it needs its own base.
+///
+/// What actually covers it: `cert_pin`'s `BIRDO_APEX` scope is `birdo.app`
+/// and its subdomains, so this host meets the same CA-chain SPKI pin as every
+/// `api.birdo.app` request — no new trust surface. The tauri CSP is NOT part
+/// of that answer, contrary to what this comment used to say: `connect-src`
+/// constrains the WEBVIEW's own fetches, and this request is made by reqwest
+/// in the Rust process, which no CSP sees. (`https://birdo.app` is in the
+/// CSP regardless, for the webview's sake.)
 const WEB_BASE_URL: &str = "https://birdo.app";
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Windows)");
 

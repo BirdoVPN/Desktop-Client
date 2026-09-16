@@ -335,6 +335,67 @@ describe('BirdoShield toggle → dns_filtering', () => {
     });
   });
 
+
+  // PR #162 review, nit: a disabled control still has to BE a control.
+  // `BirdoListItem` degrades a blocked row from <button role="switch"> to
+  // <div role="switch">, and a div carries no `disabled` attribute and is not
+  // focusable — so the blocked row announced as an ordinary switch reading
+  // "off", with the sentence explaining why sitting in a separate, unlinked
+  // node the user had no way to reach. That is the visual lie this PR removes,
+  // re-told to a screen reader. Fixed with `aria-disabled`, a tab stop, and
+  // `aria-describedby` pointing at the row's own reason.
+  describe('the disabled row has a correct accessible representation', () => {
+    const reasonOf = (row: HTMLElement) => {
+      const id = row.getAttribute('aria-describedby');
+      expect(id).toBeTruthy();
+      return document.getElementById(id!);
+    };
+
+    it('the fleet-gate row is announced as disabled, is reachable, and points at its reason', async () => {
+      mockStoreState.dnsFilteringAvailable = false;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+
+      // Not a <button>, so `disabled` cannot carry it — ARIA has to.
+      expect(row.tagName).toBe('DIV');
+      expect(row).toHaveAttribute('aria-disabled', 'true');
+      // Focusable on purpose: an aria-disabled control stays in the tab order
+      // so its state and description can be read. It has no click handler, so
+      // reaching it does nothing (asserted above in the gate-off block).
+      expect(row).toHaveAttribute('tabindex', '0');
+      expect(reasonOf(row)).toHaveTextContent(UNAVAILABLE_COPY);
+    });
+
+    it('the Custom DNS row does the same', async () => {
+      mockStoreState.settings.customDns = ['1.1.1.1'];
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row).toHaveAttribute('aria-disabled', 'true');
+      expect(row).toHaveAttribute('tabindex', '0');
+      expect(reasonOf(row)).toHaveTextContent('Custom DNS overrides BirdoShield.');
+    });
+
+    it('an enabled row is NOT announced as disabled and keeps the button tab stop', async () => {
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row.tagName).toBe('BUTTON');
+      expect(row).not.toHaveAttribute('aria-disabled');
+      // A <button> is focusable already; adding tabindex would be noise.
+      expect(row).not.toHaveAttribute('tabindex');
+      expect(reasonOf(row)).toHaveTextContent(
+        "Blocks ads, trackers and malware domains at the VPN's DNS resolver.",
+      );
+    });
+
+    it('the plan-gated Stealth row gets the same treatment (not a BirdoShield special case)', async () => {
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /stealth mode/i });
+      expect(row.tagName).toBe('DIV');
+      expect(row).toHaveAttribute('aria-disabled', 'true');
+      expect(row).toHaveAttribute('tabindex', '0');
+    });
+  });
+
   it('while connected, schedules the same debounced fail-closed rebuild Stealth uses', async () => {
     mockStoreState.connectionState = 'connected';
     render(<VpnSettings />);
