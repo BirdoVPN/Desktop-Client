@@ -126,6 +126,7 @@ export function UpdateChecker() {
   // immediately beats a manual-only "Check" button. App.tsx additionally runs
   // a daily background check with a native notification.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-open; the synchronous setStatus('checking') inside is the loading indicator
     checkForUpdates();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

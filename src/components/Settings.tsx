@@ -331,6 +331,7 @@ export function Settings() {
   const persistedDnsPrimary = (settings.customDns ?? [])[0] ?? '';
   const persistedDnsSecondary = (settings.customDns ?? [])[1] ?? '';
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- mirrors persisted settings into the local inputs when they change elsewhere; the render-time prev-compare rewrite adds two state variables for no behaviour change
     setDnsPrimaryInput(persistedDnsPrimary);
     setDnsSecondaryInput(persistedDnsSecondary);
   }, [persistedDnsPrimary, persistedDnsSecondary]);

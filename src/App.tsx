@@ -114,7 +114,12 @@ function App() {
   // anyone at the machine. Mirrors mobile's onStop re-arm + onResume re-prompt.
   // (Keyed off hide-to-tray, not plain blur, so alt-tabbing never re-locks.)
   const bioLockRef = useRef(bioLock);
-  bioLockRef.current = bioLock;
+  // In an effect, not during render (react-hooks/refs). The only reader is
+  // the async 'app-hidden' listener below, which always runs after commit,
+  // so the one-tick delay versus a render-time write is unobservable.
+  useEffect(() => {
+    bioLockRef.current = bioLock;
+  }, [bioLock]);
   useEffect(() => {
     const unlistenHidden = listen('app-hidden', async () => {
       try {

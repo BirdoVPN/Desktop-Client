@@ -98,6 +98,7 @@ export function PortForward() {
   }, [setPortForwards]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- load-on-mount; loadRules sets the loading flag synchronously (a no-op on first render, where it is already true)
     void loadRules();
   }, [loadRules]);
 

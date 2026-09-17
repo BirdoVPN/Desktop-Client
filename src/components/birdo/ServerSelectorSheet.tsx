@@ -51,6 +51,7 @@ export function ServerSelectorSheet({
   // has to click into the box before typing, in the app's most-used flow.
   useEffect(() => {
     if (!open) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resets search state on open; the sheet stays mounted, so a key-remount is not available
     setQuery('');
     setFilter('all');
     const id = requestAnimationFrame(() => searchRef.current?.focus());
