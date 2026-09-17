@@ -81,8 +81,11 @@ socket2 = "0.5"
 # receive Dependabot majors boringtun could not follow).
 # digest 0.11 generation (sha2/hmac/hkdf move together — they share `digest`,
 # and a split leaves two incompatible `Output` types in one call chain).
-# sha2 0.10 is still in the graph, but only as tauri-codegen's BUILD-TIME
-# dependency; the shipped binary carries one sha2 (this one).
+# sha2 0.10 stays in the graph: on Windows/macOS only as tauri-codegen's
+# BUILD-TIME dependency (one sha2 in the shipped binary); on Linux the keyring
+# D-Bus backend (dbus-secret-service, `crypto-rust`) also links sha2 0.10 +
+# hkdf 0.12 at runtime. Corrected after review — the first draft said
+# "build-time only", which was true for two of three targets.
 sha2 = "0.11"  # DLL integrity verification
 hmac = "0.13"  # FIX-1-7: Settings file HMAC integrity (boringtun still carries hmac 0.12 internally)
 hex = "0.4"    # FIX-1-7: Hex encoding for HMAC key storage
