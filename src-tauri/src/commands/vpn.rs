@@ -19,7 +19,7 @@ use crate::vpn::AutoReconnectService;
 // FIX-1-1: Client-side WireGuard key generation
 use base64::Engine as _;
 use boringtun::x25519::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Serialize)]
 pub struct ConnectionStats {
@@ -519,7 +519,9 @@ pub(crate) async fn start_stealth_tunnel(
 ///
 /// The selected mode is latched in `vpn::birdo_pq` so the UI can render the
 /// real protection level instead of a no-op toggle indicator.
-pub(crate) fn derive_quantum_psk(response: &ConnectResponse) -> Result<Option<String>, String> {
+pub(crate) fn derive_quantum_psk(
+    response: &ConnectResponse,
+) -> Result<Option<Zeroizing<String>>, String> {
     // 1) True bilateral PQ — only succeeds when server returned a ciphertext
     //    AND we have a local keypair AND decapsulation produced a PSK.
     if let Some(psk) = crate::vpn::birdo_pq::try_decapsulate(response) {
@@ -539,7 +541,14 @@ pub(crate) fn derive_quantum_psk(response: &ConnectResponse) -> Result<Option<St
     //    already handled above by aborting the connection fail-closed.)
     if response.preshared_key.is_some() {
         crate::vpn::birdo_pq::record_server_provided();
-        return Ok(response.preshared_key.clone());
+        // Three copies exist on this path, and the caller must wipe all three:
+        // the response's own (moved into `VpnConfig` by `build_vpn_config`),
+        // this `Zeroizing` clone, and the copy the caller assigns over the
+        // config's field — which DISPLACES the first. See the connect sites:
+        // a bare `config.preshared_key = Some(..)` frees the displaced String
+        // un-wiped, because `VpnConfig::drop` only wipes what is in the field
+        // at drop time.
+        return Ok(response.preshared_key.clone().map(Zeroizing::new));
     }
 
     // 3) No PSK at all.
@@ -919,9 +928,21 @@ async fn connect_vpn_attempt(
         config.endpoint = stealth_ep.clone();
     }
 
-    // Phase 3b: Apply quantum PSK override
-    if let Some(ref psk) = quantum_psk {
-        config.preshared_key = Some(psk.clone());
+    // Phase 3b: Apply quantum PSK override. `quantum_psk` is `Zeroizing`, so
+    // the original is wiped when it goes out of scope at the end of this
+    // function; the copy handed to the config is wiped by `VpnConfig::drop`
+    // / `scrub_key_material`. Before this, the original was a plain `String`
+    // and outlived the connect un-wiped.
+    //
+    // `replace`, not `=`: on the classical-fallback path the field already
+    // holds the server's PSK (moved in by `build_vpn_config`), and a plain
+    // assignment would free that displaced String through `String::drop`
+    // with no zeroing — `VpnConfig::drop` only ever sees the value that is
+    // in the field when the struct itself drops. Found by review of #175.
+    if let Some(psk) = quantum_psk.as_deref() {
+        if let Some(mut displaced) = config.preshared_key.replace(psk.to_owned()) {
+            displaced.zeroize();
+        }
     }
 
     tracing::debug!(
@@ -1754,7 +1775,9 @@ mod tests {
         resp.preshared_key = Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".into());
         assert_eq!(
             derive_quantum_psk(&resp),
-            Ok(Some("c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".to_string()))
+            Ok(Some(Zeroizing::new(
+                "c2VydmVyLXN1cHBsaWVkLWNsYXNzaWNhbC1wc2s=".to_string()
+            )))
         );
     }
 

@@ -320,6 +320,18 @@ fn main() {
         },
     ));
 
+    // Name the ML-KEM implementation this binary links, so a native fault in
+    // the BirdoPQ path can be attributed from the crash report alone — the
+    // 1.4.25 Android SIGILL took as long as it did to pin on PQClean's assembly
+    // because no report could say which implementation had faulted. Set once:
+    // it is a compile-time constant, not a per-event probe. The scrubber only
+    // lets this key out when the value is exactly `PQ_IMPL_NAME`
+    // (`utils::crash_report::ALLOWED_TAGS`), so the tag is the same string in
+    // both places by construction rather than by discipline.
+    sentry::configure_scope(|scope| {
+        scope.set_tag("birdo.pq.impl", vpn::birdo_pq::PQ_IMPL_NAME);
+    });
+
     // ── Self-elevation ──────────────────────────────────────────────────
     // Wintun adapter creation is an in-process FFI call that requires
     // administrator privileges. If we're not elevated, relaunch with
