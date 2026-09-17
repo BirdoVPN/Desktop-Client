@@ -25,9 +25,9 @@ tauri = { version = "2.11.5", features = ["tray-icon"] }
 # Decode the embedded tray PNGs into raw RGBA ourselves (Image::new_owned).
 # NOT tauri's "image-png" feature — that pulls the moxcms/pxfm colour chain
 # (edition2024 Cargo feature / Rust 1.85+). That WOULD build now under our 1.96
-# pin, but png 0.17 stays a leaner, known-good decode path we keep to avoid
-# dragging that graph in. png 0.17 builds cleanly on 1.96.
-png = "0.17"
+# pin, but png 0.18 stays a leaner, known-good decode path we keep to avoid
+# dragging that graph in. png 0.18 (rust-version 1.73) builds cleanly on 1.96.
+png = "0.18"
 tauri-plugin-shell = "2.0"
 tauri-plugin-notification = "2.0"
 tauri-plugin-autostart = "2.0"
@@ -183,7 +183,7 @@ hostname = "0.4.2"
 once_cell = "1.19"
 regex = "1"
 which = "8.0"  # Find xray.exe binary in PATH
-sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 tauri-plugin-process = "2.2"
 
 # Windows-specific dependencies

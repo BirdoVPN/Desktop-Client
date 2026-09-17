@@ -293,6 +293,18 @@ jobs:
       - name: Unit tests
         run: npm run test:run
 
+      # The production bundle. Until 2026-09-17 nothing on a PR ran `vite build`
+      # — this job stopped at lint/type-check/vitest, and the bundle was only
+      # ever produced by release.yml's `npx tauri build`. So a vite config that
+      # breaks ONLY at bundle time surfaced as a red RELEASE, not a red PR. The
+      # concrete case: Dependabot's vite 8 bump (#164) kept `minify: 'esbuild'`
+      # while vite 8 dropped esbuild, and vitest never exercises the minifier
+      # (the plugin is gated on isBuild), so that PR would have gone green and
+      # the next tag would have failed inside `vite build`. ~10s here saves a
+      # burned release.
+      - name: Production bundle builds
+        run: npm run build
+
   # OPEN-WORK F4: self-test of the release pipeline's post-bundle xray gate.
   # release.yml build-windows runs scripts/ci/verify-bundled-xray-hash.ps1
   # against the produced NSIS installer and fails the release unless the
