@@ -146,6 +146,7 @@ export function VpnSettings() {
   // Keep the custom port/MTU inputs in sync if settings change elsewhere.
   useEffect(() => {
     if (!['auto', '51820', '53'].includes(settings.wireGuardPort)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- mirrors the persisted port/MTU into the local inputs when they change elsewhere
       setCustomPortInput(settings.wireGuardPort);
     }
     if (settings.wireGuardMtu > 0) {

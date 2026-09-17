@@ -878,6 +878,7 @@ export function Dashboard() {
     // treating a deep link as untrusted third-party input. Without this, one
     // click anywhere could silently move a live tunnel to an attacker-chosen
     // exit node, or repeatedly force reconnects as a tunnel-teardown primitive.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- stages an external deep-link event for explicit user confirmation; the effect is the consumer of a store-staged Tauri event and also clears it
     setDeepLinkConfirm(target);
   }, [deepLinkAction, servers, multiHopReady, setErrorMessage]);
 

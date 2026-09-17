@@ -42,6 +42,28 @@ interface LoginResponse {
   user?: { email?: string; account_id?: string; is_anonymous?: boolean };
 }
 
+// Module scope, not inside Login(). react-hooks/static-components (7.x)
+// flagged this, and it is a genuine bug rather than style: a component TYPE
+// created inside the render body is a new type on every render, so React
+// unmounts and remounts the banner each time Login re-renders — replaying its
+// framer-motion enter animation and losing any focus inside it. It closes over
+// nothing local: `motion` and `status` are module imports.
+const ErrorBanner = ({ message }: { message: string }) => (
+  <motion.div
+    role="alert"
+    className="rounded-birdo-sub px-4 py-3 text-sm"
+    style={{
+      backgroundColor: status.redBg,
+      border: `1px solid rgba(248,113,113,0.20)`,
+      color: status.red,
+    }}
+    initial={{ opacity: 0, scale: 0.95 }}
+    animate={{ opacity: 1, scale: 1 }}
+  >
+    {message}
+  </motion.div>
+);
+
 export function Login() {
   const [activeTab, setActiveTab] = useState<AuthTab>('email');
   const [email, setEmail] = useState('');
@@ -301,22 +323,6 @@ export function Login() {
     { id: 'anonymous', label: 'Anonymous' },
     { id: 'sso', label: 'SSO' },
   ];
-
-  const ErrorBanner = ({ message }: { message: string }) => (
-    <motion.div
-      role="alert"
-      className="rounded-birdo-sub px-4 py-3 text-sm"
-      style={{
-        backgroundColor: status.redBg,
-        border: `1px solid rgba(248,113,113,0.20)`,
-        color: status.red,
-      }}
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-    >
-      {message}
-    </motion.div>
-  );
 
   return (
     // Transparent root so the App-level PixelCanvas shows through behind the
