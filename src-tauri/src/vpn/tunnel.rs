@@ -70,7 +70,9 @@ fn default_route_native() -> Option<(Ipv4Addr, u32)> {
             if ip.is_unspecified() {
                 continue;
             }
-            if best.map_or(true, |(m, _, _)| row.Metric < m) {
+            // is_none_or (1.82) — surfaced by clippy::unnecessary_map_or the moment
+            // rust-version rose past 1.82; the lint is MSRV-gated.
+            if best.is_none_or(|(m, _, _)| row.Metric < m) {
                 best = Some((row.Metric, ip, row.InterfaceIndex));
             }
         }
@@ -437,8 +439,10 @@ const WINTUN_DLL_SHA256: &str = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f68
 /// Verify the SHA256 hash of a DLL from bytes already read under exclusive lock.
 /// Returns Ok(()) if the hash matches, or an error message if it doesn't.
 fn verify_dll_integrity(bytes: &[u8], display_path: &std::path::Path) -> Result<(), String> {
-    let hash = Sha256::digest(bytes);
-    let hex_hash = format!("{:x}", hash);
+    // hex::encode, not `format!("{:x}")`: digest 0.11's Output is a
+    // hybrid_array::Array, which has no LowerHex impl (generic-array's did).
+    // Same lowercase hex, and WINTUN_DLL_SHA256 is written in that form.
+    let hex_hash = hex::encode(Sha256::digest(bytes));
 
     if hex_hash != WINTUN_DLL_SHA256 {
         tracing::error!(
@@ -458,6 +462,33 @@ fn verify_dll_integrity(bytes: &[u8], display_path: &std::path::Path) -> Result<
         display_path
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod dll_integrity_tests {
+    use super::{verify_dll_integrity, WINTUN_DLL_SHA256};
+
+    /// FIPS 180-4 "abc" vector. `verify_dll_integrity` compares its own hex
+    /// rendering against a constant written by hand, so the rendering — not
+    /// just the hash — is the contract: 64 lowercase hex chars of SHA-256.
+    /// Pinned here because the digest 0.11 move changed how those chars are
+    /// produced (`hex::encode` instead of `{:x}`) and a drift to uppercase or
+    /// to a different width would refuse the genuine wintun.dll on every
+    /// launch while every round-trip test stayed green.
+    #[test]
+    fn mismatch_reports_lowercase_sha256_hex_of_the_bytes() {
+        let err = verify_dll_integrity(b"abc", std::path::Path::new("wintun.dll"))
+            .expect_err("\"abc\" is not wintun.dll");
+        assert!(
+            err.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            "{err}"
+        );
+        assert!(err.contains(WINTUN_DLL_SHA256), "{err}");
+        assert_eq!(WINTUN_DLL_SHA256.len(), 64);
+        assert!(WINTUN_DLL_SHA256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    }
 }
 
 /// H-4 FIX: Stores original DNS configuration for an adapter, enabling

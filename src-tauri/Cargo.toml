@@ -6,7 +6,10 @@ authors = ["Birdo VPN"]
 license = "Proprietary"
 publish = false # Tauri app — never published to crates.io (also lets cargo-deny skip it)
 edition = "2021"
-rust-version = "1.77"
+# 1.85: the floor of the RustCrypto 0.11-generation crates (digest/sha2/hmac/
+# hkdf, hybrid-array) and of ml-kem 0.3 — which #163 already pulled in, so the
+# old "1.77" had been fiction since then. rust-toolchain.toml pins 1.96.
+rust-version = "1.85"
 
 [lib]
 name = "birdo_vpn_desktop_lib"
@@ -76,8 +79,15 @@ socket2 = "0.5"
 # app never calls them directly, so they are not declared here (F19, 2026-09-13:
 # the direct `chacha20poly1305`/`blake2` entries were dead and only existed to
 # receive Dependabot majors boringtun could not follow).
-sha2 = "0.10"  # DLL integrity verification (already a transitive dep via tauri)
-hmac = "0.12"  # FIX-1-7: Settings file HMAC integrity
+# digest 0.11 generation (sha2/hmac/hkdf move together — they share `digest`,
+# and a split leaves two incompatible `Output` types in one call chain).
+# sha2 0.10 stays in the graph: on Windows/macOS only as tauri-codegen's
+# BUILD-TIME dependency (one sha2 in the shipped binary); on Linux the keyring
+# D-Bus backend (dbus-secret-service, `crypto-rust`) also links sha2 0.10 +
+# hkdf 0.12 at runtime. Corrected after review — the first draft said
+# "build-time only", which was true for two of three targets.
+sha2 = "0.11"  # DLL integrity verification
+hmac = "0.13"  # FIX-1-7: Settings file HMAC integrity (boringtun still carries hmac 0.12 internally)
 hex = "0.4"    # FIX-1-7: Hex encoding for HMAC key storage
 rand = "0.8"
 # Ed25519 client attestation (src/api/attestation.rs). Already in the graph —
@@ -157,7 +167,7 @@ zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # the only caller is the `#[cfg(test)]` KAT helper in src/vpn/birdo_pq.rs,
 # and it must stay that way.
 ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "zeroize"] }
-hkdf = "0.12"
+hkdf = "0.13"
 
 # Fast mutex for async-safe crypto operations (replaces std::sync::Mutex)
 parking_lot = "0.12"

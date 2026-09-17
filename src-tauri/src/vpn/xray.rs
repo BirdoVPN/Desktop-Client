@@ -69,7 +69,10 @@ fn verify_xray_integrity_against(
 ) -> Result<(), String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("Failed to read xray binary for integrity check: {}", e))?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
+    // hex::encode, not `format!("{:x}")`: digest 0.11's Output is a
+    // hybrid_array::Array, which has no LowerHex impl. Lowercase hex, as
+    // before; the eq_ignore_ascii_case below covers what the pipeline exports.
+    let actual = hex::encode(Sha256::digest(&bytes));
 
     match expected_sha256 {
         Some(expected) if !expected.is_empty() => {
@@ -681,7 +684,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("xray.exe");
         std::fs::write(&bin, b"not really xray").unwrap();
-        let good = format!("{:x}", Sha256::digest(b"not really xray"));
+        let good = hex::encode(Sha256::digest(b"not really xray"));
 
         assert_eq!(verify_xray_integrity_against(&bin, Some(&good)), Ok(()));
         // GITHUB_ENV carries lower-case hex, Get-FileHash emits upper-case:
@@ -695,8 +698,27 @@ mod tests {
         let err = verify_xray_integrity_against(&bin, Some(&good)).unwrap_err();
         assert!(err.contains("integrity verification failed"), "{err}");
         assert!(err.contains(&good), "expected digest missing from {err}");
-        let rewritten = format!("{:x}", Sha256::digest(b"not really xray+sig"));
+        let rewritten = hex::encode(Sha256::digest(b"not really xray+sig"));
         assert!(err.contains(&rewritten), "actual digest missing from {err}");
+    }
+
+    /// FIPS 180-4 "abc" vector, compared against what the release pipeline
+    /// exports (`Get-FileHash` / `sha256sum` -> GITHUB_ENV -> compiled in).
+    /// The test above is round-trip only; this one pins that the string we
+    /// build from the on-disk bytes is the same lowercase SHA-256 hex any
+    /// external tool produces — the digest 0.11 move changed how that string
+    /// is rendered, and a rendering drift would refuse every shipped xray.
+    #[test]
+    fn integrity_accepts_the_published_sha256_of_known_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("xray.exe");
+        std::fs::write(&bin, b"abc").unwrap();
+        let published = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(verify_xray_integrity_against(&bin, Some(published)), Ok(()));
+        assert_eq!(
+            verify_xray_integrity_against(&bin, Some(&published.to_uppercase())),
+            Ok(())
+        );
     }
 
     /// An EMPTY compiled-in value is the "pipeline never exported it" case

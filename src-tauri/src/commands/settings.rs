@@ -4,7 +4,9 @@
 //! FIX-1-7: Settings files are HMAC-protected to detect tampering.
 //! A random HMAC key is stored in Windows Credential Manager.
 
-use hmac::{Hmac, Mac};
+// digest 0.11 moved `new_from_slice` off the `Mac` trait and onto `KeyInit`,
+// so the constructor needs its own import now.
+use hmac::{Hmac, KeyInit, Mac};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -727,6 +729,26 @@ fn set_autostart_windows(app: &AppHandle, enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 4231 test case 2. The existing tests are round-trip only
+    /// (compute, then verify with the same code), so they would pass just as
+    /// happily if the MAC silently became something other than HMAC-SHA256.
+    /// A published vector pins the bytes: every settings.json signed by an
+    /// older build (hmac 0.12) must still verify under hmac 0.13, and the
+    /// only way to prove that without a fixture from the old build is to
+    /// prove both agree with the RFC.
+    #[test]
+    fn hmac_sha256_matches_rfc4231_test_case_2() {
+        let key = b"Jefe";
+        let data = "what do ya want for nothing?";
+        let expected = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        assert_eq!(compute_hmac(data, key).unwrap(), expected);
+        assert!(verify_hmac(data, expected, key));
+        // and the hex casing on disk must not matter to verification
+        assert!(verify_hmac(data, &expected.to_uppercase(), key));
+        // one flipped bit in the stored tag is a tamper
+        assert!(!verify_hmac(data, &expected.replace("5bdc", "5bdd"), key));
+    }
 
     /// A settings file signed by a pre-multi-hop build must still verify via
     /// the legacy-shape fallback — otherwise every upgrade silently resets
