@@ -27,7 +27,7 @@ tauri = { version = "2.11.5", features = ["tray-icon"] }
 # (edition2024 Cargo feature / Rust 1.85+). That WOULD build now under our 1.96
 # pin, but png 0.17 stays a leaner, known-good decode path we keep to avoid
 # dragging that graph in. png 0.17 builds cleanly on 1.96.
-png = "0.17"
+png = "0.18"
 tauri-plugin-shell = "2.0"
 tauri-plugin-notification = "2.0"
 tauri-plugin-autostart = "2.0"
