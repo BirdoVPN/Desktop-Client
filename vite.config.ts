@@ -9,7 +9,10 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      // import.meta.dirname, not __dirname: vite 8 warns that __dirname is
+      // unsupported by the native config loader it plans to make default.
+      // Node >= 20.11 (CI and release use 22).
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
   // Prevent vite from obscuring rust errors
@@ -28,8 +31,16 @@ export default defineConfig({
   build: {
     // Tauri supports es2021
     target: process.env.TAURI_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
-    // Don't minify for debug builds
-    minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
+    // Don't minify for debug builds.
+    //
+    // 'oxc', not 'esbuild': vite 8 no longer depends on esbuild at all (it is an
+    // optional peer now). With minify: 'esbuild' the shipped dist still
+    // registers vite:esbuild-transpile, whose renderChunk does import("esbuild")
+    // and throws "Failed to load `transformWithEsbuild` ... requires esbuild to
+    // be installed separately". No CI job runs `vite build` — only release.yml's
+    // `npx tauri build` does — so that would have surfaced as a red RELEASE,
+    // not a red PR. Oxc is vite 8's own default minifier.
+    minify: !process.env.TAURI_DEBUG ? 'oxc' : false,
     // Produce sourcemaps for debug builds
     sourcemap: !!process.env.TAURI_DEBUG,
     rollupOptions: {
