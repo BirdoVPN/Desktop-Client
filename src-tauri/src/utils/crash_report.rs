@@ -30,7 +30,6 @@
 //! | `breadcrumbs[].{ty,category,level,timestamp}` | our own literals |
 //! | `breadcrumbs[].message` | scrubbed |
 //! | `contexts` | filtered to `os` / `device` / `runtime` / `rust` — OS version, CPU arch, rustc version. `sentry-contexts` builds `device` from model/family/arch only, and its `server_name()` (the hostname) goes to `options.server_name`, which we pin |
-//!
 //! | `tags` | **one** key, `birdo.pq.impl`, and only when its value is the exact `PQ_IMPL_NAME` constant this binary was compiled with — see [`ALLOWED_TAGS`]. Any other key, and that key with any other value, is dropped |
 //!
 //! Everything else is dropped: `user`, `request`, every other `tag`, `extra`,

@@ -541,8 +541,13 @@ pub(crate) fn derive_quantum_psk(
     //    already handled above by aborting the connection fail-closed.)
     if response.preshared_key.is_some() {
         crate::vpn::birdo_pq::record_server_provided();
-        // The response's own copy is consumed by `build_vpn_config` and lands
-        // in `VpnConfig`, which wipes it; this clone is wiped by `Zeroizing`.
+        // Three copies exist on this path, and the caller must wipe all three:
+        // the response's own (moved into `VpnConfig` by `build_vpn_config`),
+        // this `Zeroizing` clone, and the copy the caller assigns over the
+        // config's field — which DISPLACES the first. See the connect sites:
+        // a bare `config.preshared_key = Some(..)` frees the displaced String
+        // un-wiped, because `VpnConfig::drop` only wipes what is in the field
+        // at drop time.
         return Ok(response.preshared_key.clone().map(Zeroizing::new));
     }
 
@@ -928,8 +933,16 @@ async fn connect_vpn_attempt(
     // function; the copy handed to the config is wiped by `VpnConfig::drop`
     // / `scrub_key_material`. Before this, the original was a plain `String`
     // and outlived the connect un-wiped.
-    if let Some(ref psk) = quantum_psk {
-        config.preshared_key = Some(String::clone(psk));
+    //
+    // `replace`, not `=`: on the classical-fallback path the field already
+    // holds the server's PSK (moved in by `build_vpn_config`), and a plain
+    // assignment would free that displaced String through `String::drop`
+    // with no zeroing — `VpnConfig::drop` only ever sees the value that is
+    // in the field when the struct itself drops. Found by review of #175.
+    if let Some(psk) = quantum_psk.as_deref() {
+        if let Some(mut displaced) = config.preshared_key.replace(psk.to_owned()) {
+            displaced.zeroize();
+        }
     }
 
     tracing::debug!(
