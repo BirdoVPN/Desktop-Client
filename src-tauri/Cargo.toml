@@ -183,7 +183,7 @@ hostname = "0.4.2"
 once_cell = "1.19"
 regex = "1"
 which = "8.0"  # Find xray.exe binary in PATH
-sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 tauri-plugin-process = "2.2"
 
 # Windows-specific dependencies
