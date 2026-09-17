@@ -30,8 +30,9 @@
 //! | `breadcrumbs[].{ty,category,level,timestamp}` | our own literals |
 //! | `breadcrumbs[].message` | scrubbed |
 //! | `contexts` | filtered to `os` / `device` / `runtime` / `rust` — OS version, CPU arch, rustc version. `sentry-contexts` builds `device` from model/family/arch only, and its `server_name()` (the hostname) goes to `options.server_name`, which we pin |
+//! | `tags` | **one** key, `birdo.pq.impl`, and only when its value is the exact `PQ_IMPL_NAME` constant this binary was compiled with — see [`ALLOWED_TAGS`]. Any other key, and that key with any other value, is dropped |
 //!
-//! Everything else is dropped: `user`, `request`, `tags`, `extra`,
+//! Everything else is dropped: `user`, `request`, every other `tag`, `extra`,
 //! `transaction`, `culprit`, `modules`, `dist`, `template`, `threads`, the
 //! top-level `stacktrace`, `debug_meta`, and **every breadcrumb `data` map**.
 //!
@@ -56,6 +57,21 @@ use super::redact::sanitize_always;
 /// exists so that an integration added later cannot widen the payload silently.
 const ALLOWED_CONTEXTS: &[&str] = &["os", "device", "runtime", "rust"];
 
+/// Tag keys that may leave the device, each paired with the ONLY values it may
+/// carry. A tag survives only when both the key and the value match — an
+/// allowed key carrying any other string is dropped — so widening this list
+/// admits a fixed set of literals, never a channel.
+///
+/// `birdo.pq.impl` names the ML-KEM implementation linked into this build
+/// (`vpn::birdo_pq::PQ_IMPL_NAME`, a compile-time constant), mirroring the
+/// same tag on Android. It exists because the 1.4.25 Android SIGILL took as
+/// long as it did to pin on PQClean's assembly precisely because no crash
+/// report could say which implementation had faulted. The value is a
+/// build-time fact about the binary, not a probe of the device and not
+/// user content.
+const ALLOWED_TAGS: &[(&str, &[&str])] =
+    &[("birdo.pq.impl", &[crate::vpn::birdo_pq::PQ_IMPL_NAME])];
+
 /// Rebuild an outgoing event from the allowlist above.
 ///
 /// Runs as `before_send`, i.e. at the last point before the event leaves the
@@ -67,6 +83,17 @@ pub fn scrub_event(event: Event<'static>) -> Event<'static> {
     for key in ALLOWED_CONTEXTS {
         if let Some(ctx) = event.contexts.get(*key) {
             contexts.insert((*key).to_string(), ctx.clone());
+        }
+    }
+
+    // Key AND value must be on the list. `event.tags` is user-shaped input as
+    // far as this file is concerned: any call site can `set_tag` anything.
+    let mut tags: Map<String, String> = Map::new();
+    for (key, allowed_values) in ALLOWED_TAGS {
+        if let Some(value) = event.tags.get(*key) {
+            if allowed_values.contains(&value.as_str()) {
+                tags.insert((*key).to_string(), value.clone());
+            }
         }
     }
 
@@ -115,6 +142,8 @@ pub fn scrub_event(event: Event<'static>) -> Event<'static> {
         exception,
         breadcrumbs,
         contexts,
+        // Only what `ALLOWED_TAGS` admitted above, by key and by value.
+        tags,
         // EVERYTHING ELSE IS DROPPED. Do not replace this with a field list:
         // the point is that a field this file has never heard of defaults to
         // empty instead of egressing.
@@ -284,7 +313,7 @@ mod tests {
 
         assert!(out.user.is_none(), "user must never leave the device");
         assert!(out.request.is_none(), "request URLs name the exit node");
-        assert!(out.tags.is_empty(), "tags");
+        assert!(out.tags.is_empty(), "an unlisted tag key is dropped");
         assert!(out.extra.is_empty(), "extra");
         assert!(out.transaction.is_none(), "transaction");
         assert!(out.culprit.is_none(), "culprit");
@@ -366,5 +395,42 @@ mod tests {
              performance.rs:615 lets ctx.sampled override traces_sample_rate, and only \
              a traces_sampler outranks it"
         );
+    }
+
+    /// The tag allowlist is a list of (key, value) literals, not of keys.
+    /// Three cases, and only the first may survive.
+    #[test]
+    fn a_tag_survives_only_with_both_an_allowed_key_and_an_allowed_value() {
+        use crate::vpn::birdo_pq::PQ_IMPL_NAME;
+
+        // 1. allowed key + the exact allowed value: kept.
+        let mut event = Event::new();
+        event
+            .tags
+            .insert("birdo.pq.impl".into(), PQ_IMPL_NAME.into());
+        let out = scrub_event(event);
+        assert_eq!(
+            out.tags.get("birdo.pq.impl").map(String::as_str),
+            Some(PQ_IMPL_NAME),
+            "the implementation name is the one tag a crash may carry"
+        );
+        assert_eq!(out.tags.len(), 1);
+
+        // 2. allowed key, any other value: dropped. This is the case that
+        //    stops the key becoming a channel — a call site cannot smuggle a
+        //    string out by choosing the right key.
+        let mut event = Event::new();
+        event.tags.insert("birdo.pq.impl".into(), DIRTY.into());
+        let out = scrub_event(event);
+        assert!(
+            out.tags.is_empty(),
+            "an allowed key with an unlisted value must be dropped, not passed through"
+        );
+
+        // 3. any other key carrying the allowed value: dropped.
+        let mut event = Event::new();
+        event.tags.insert("pq_impl".into(), PQ_IMPL_NAME.into());
+        let out = scrub_event(event);
+        assert!(out.tags.is_empty(), "the value alone does not admit a tag");
     }
 }

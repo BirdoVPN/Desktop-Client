@@ -10,6 +10,7 @@ use crate::storage::CredentialStore;
 use crate::utils::redact::sanitize_error;
 use crate::vpn::manager::VpnManager;
 use crate::vpn::AutoReconnectService;
+use zeroize::Zeroize;
 
 use super::vpn::{
     apply_vpn_settings, build_vpn_config, derive_quantum_psk, enforce_requested_protection,
@@ -226,8 +227,13 @@ pub async fn connect_multi_hop(
         config.endpoint = stealth_ep.clone();
     }
 
-    if let Some(ref psk) = quantum_psk {
-        config.preshared_key = Some(psk.clone());
+    // `quantum_psk` is `Zeroizing`; the config wipes its own copy on drop.
+    // `replace` + zeroize rather than `=`: the field may already hold the
+    // server's classical PSK, and a plain assignment frees it un-wiped.
+    if let Some(psk) = quantum_psk.as_deref() {
+        if let Some(mut displaced) = config.preshared_key.replace(psk.to_owned()) {
+            displaced.zeroize();
+        }
     }
 
     // Set VPN server IP for kill switch

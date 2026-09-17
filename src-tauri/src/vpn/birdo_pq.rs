@@ -580,7 +580,12 @@ pub fn get_client_public_key_b64() -> Option<String> {
 ///
 /// On success, latches `current_mode() == Bilateral` so the UI can display
 /// the genuine HNDL-safe state.
-pub fn try_decapsulate(response: &ConnectResponse) -> Option<String> {
+///
+/// The PSK comes back `Zeroizing`: it is the WireGuard preshared key, base64
+/// for the config file, and it used to be a plain `String` that was dropped
+/// un-wiped at the end of `commands::vpn::connect` after being cloned into the
+/// `VpnConfig` (which does wipe its copy). Now both copies are wiped.
+pub fn try_decapsulate(response: &ConnectResponse) -> Option<Zeroizing<String>> {
     if !response.quantum_enabled.unwrap_or(false) {
         return None;
     }
@@ -646,7 +651,9 @@ pub fn try_decapsulate(response: &ConnectResponse) -> Option<String> {
     tracing::info!(
         "BirdoPQ v1 BILATERAL — quantum-resistant PSK derived (32 B, mode=bilateral, impl={PQ_IMPL_NAME})"
     );
-    Some(base64::engine::general_purpose::STANDARD.encode(psk.as_slice()))
+    Some(Zeroizing::new(
+        base64::engine::general_purpose::STANDARD.encode(psk.as_slice()),
+    ))
 }
 
 /// Latch mode for telemetry when we end up using the server's classical PSK
