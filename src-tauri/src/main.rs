@@ -263,61 +263,63 @@ fn main() {
     // live for the entire process so panics / crashes are flushed before exit.
     let _sentry_guard = sentry::init((
         option_env!("SENTRY_DSN").unwrap_or(""),
-        sentry::ClientOptions {
-            release: Some(std::borrow::Cow::Borrowed(env!("CARGO_PKG_VERSION"))),
-            environment: if cfg!(debug_assertions) {
-                Some("development".into())
+        // sentry 0.49 made `ClientOptions` #[non_exhaustive], so the struct
+        // literal this used to be is no longer legal; every option below is the
+        // same one, set through the builder. Nothing was dropped silently —
+        // each removed line is accounted for in a comment.
+        sentry::ClientOptions::new()
+            .release(env!("CARGO_PKG_VERSION"))
+            .environment(if cfg!(debug_assertions) {
+                "development"
             } else {
-                Some("production".into())
-            },
+                "production"
+            })
             // Scrub PII: no usernames, IPs, or email in breadcrumbs
-            send_default_pii: false,
+            .send_default_pii(false)
             // SEC-PII: the `contexts` integration fills a None server_name with
             // the machine hostname (`ContextIntegration::setup` only assigns
             // when `options.server_name.is_none()`), and consumer hostnames
             // routinely embed the owner's real name ("Johns-MacBook-Pro").
             // `send_default_pii: false` does NOT gate that path. A pre-set
             // value short-circuits it.
-            server_name: Some("redacted".into()),
+            .server_name("redacted")
             // SEC-PII: sentry's `panic` integration chains AHEAD of our
             // sanitizing panic hook (it is installed later, at init time, so
             // it runs first and sees the raw payload), so the scrub cannot
             // live in a hook. `before_send` is the last point before the
             // event leaves the device, and it is an ALLOWLIST: see
             // `utils::crash_report` for what may go and why.
-            before_send: Some(std::sync::Arc::new(|event| {
-                Some(utils::crash_report::scrub_event(event))
-            })),
-            sample_rate: 1.0,
-            // NO PERFORMANCE DATA, and it takes both of these.
+            .before_send(|event| Some(utils::crash_report::scrub_event(event)))
+            // 0.49: `sample_rate` became `EventSamplingStrategy::FixedRate`;
+            // 1.0 is also the default, kept explicit so the intent is visible.
+            .sample_rate(1.0)
+            // NO PERFORMANCE DATA.
             //
             // `before_send` above does NOT run for transactions: it is
-            // invoked at one place in sentry-core (`client/mod.rs:373`, the
-            // event path) while a transaction goes straight out through
+            // invoked at one place in sentry-core (the event path) while a
+            // transaction goes straight out through
             // `Transaction::finish_with_timestamp` -> `send_envelope`, and
             // the Rust SDK has no `before_send_transaction`. So a span
             // description or a transaction name would be an UNSCRUBBED
             // channel next to a carefully scrubbed one — exactly what was
             // found on the Android side.
             //
-            // The rate alone is not enough either: with no sampler,
-            // `performance.rs:615` lets an inherited `ctx.sampled ==
-            // Some(true)` override it. A sampler outranks both arms, so the
-            // sampler is the half that actually holds.
-            traces_sample_rate: 0.0,
-            traces_sampler: Some(std::sync::Arc::new(
-                utils::crash_report::never_sample_a_transaction,
-            )),
-            // Pinned rather than left to the default, which is `true` in
-            // this version and inert only because the `logs` cargo feature
-            // is off. Feature unification in a future dependency could turn
-            // it on without anyone editing this file.
-            enable_logs: false,
-            // No sessions: they add nothing to a crash report and they are a
-            // second event type with its own path out.
-            auto_session_tracking: false,
-            ..Default::default()
-        },
+            // 0.49 folded `traces_sample_rate` and `traces_sampler` into one
+            // `traces_sampling_strategy`. A `Function` still outranks an
+            // inherited `ctx.sampled == Some(true)` (performance/mod.rs), so
+            // the sampler is the half that actually holds, as before.
+            //
+            // Two fields the 0.48 literal set are deliberately NOT set here:
+            //   `enable_logs(false)`  — #[deprecated] in 0.49 (a hard error
+            //     under `clippy -D warnings`) and it now only gates automatic
+            //     capture by the `tracing`/`log` integrations, neither of
+            //     which is compiled (Cargo.toml: default-features = false,
+            //     no `logs`/`tracing` feature).
+            //   `auto_session_tracking(false)` — the setter is
+            //     #[cfg(feature = "release-health")], which is off, so the
+            //     session flusher does not exist in this binary at all; the
+            //     field's default is `false`.
+            .traces_sampler(utils::crash_report::never_sample_a_transaction),
     ));
 
     // Name the ML-KEM implementation this binary links, so a native fault in
