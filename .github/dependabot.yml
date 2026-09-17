@@ -30,6 +30,12 @@ updates:
       # vitest and its coverage provider are version-locked to each other.
       vitest:
         patterns: ["vitest", "@vitest/*"]
+      # parser and eslint-plugin are versioned together; a split bump leaves two
+      # AST generations in the tree. #171 moved the parser alone to 8.70.0 and
+      # left the plugin at 8.51.0 because the npm open-pull-requests-limit was
+      # full — a group cannot be starved that way.
+      typescript-eslint:
+        patterns: ["@typescript-eslint/*"]
 
   - package-ecosystem: "cargo"
     directory: "/src-tauri"
@@ -40,3 +46,20 @@ updates:
       # tauri, tauri-build and the tauri-plugin-* crates move together.
       tauri:
         patterns: ["tauri", "tauri-build", "tauri-plugin-*"]
+      # sha2 / hmac / hkdf are ONE RustCrypto `digest` generation: sha2 0.10 +
+      # hmac 0.12 + hkdf 0.12 sit on digest 0.10; sha2 0.11 + hmac 0.13 +
+      # hkdf 0.13 sit on digest 0.11. A lone bump cannot compile — #173 (hmac
+      # 0.13 alone) failed every Rust job with
+      #   error[E0277]: the trait bound `CoreWrapper<...Sha256VarCore...>:
+      #     CoreProxy` is not satisfied   --> src/commands/settings.rs
+      #   note: there are multiple different versions of crate `digest`
+      # Grouped so the next proposal is the whole generation at once. That
+      # move is deliberately NOT taken as a sweep item: it sits under both the
+      # BirdoPQ PSK derivation (hkdf_to_psk) and the settings-file HMAC, the
+      # existing HMAC tests are round-trip only with no fixed vector, and it
+      # also needs KeyInit at settings.rs, four LowerHex formatting sites
+      # (digest 0.11's Output is a hybrid_array::Array), and rust-version 1.85.
+      # It gets its own PR with a fixed-vector test. No advisory affects the
+      # 0.10/0.12 generation, so nothing forces it.
+      rustcrypto-digest:
+        patterns: ["sha2", "hmac", "hkdf"]
