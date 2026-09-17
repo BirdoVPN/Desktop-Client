@@ -867,8 +867,9 @@ impl AutoReconnectService {
                                                         if let Some(ref stealth_endpoint) = stealth_endpoint_override {
                                                             config.endpoint = stealth_endpoint.clone();
                                                         }
+                                                        // `quantum_psk` is `Zeroizing`; the config wipes its own copy on drop.
                                                         if let Some(ref psk) = quantum_psk {
-                                                            config.preshared_key = Some(psk.clone());
+                                                            config.preshared_key = Some(String::clone(psk));
                                                         }
 
                                                         let killswitch_endpoint = upstream_endpoint_for_killswitch

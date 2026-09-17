@@ -226,8 +226,9 @@ pub async fn connect_multi_hop(
         config.endpoint = stealth_ep.clone();
     }
 
+    // `quantum_psk` is `Zeroizing`; the config wipes its own copy on drop.
     if let Some(ref psk) = quantum_psk {
-        config.preshared_key = Some(psk.clone());
+        config.preshared_key = Some(String::clone(psk));
     }
 
     // Set VPN server IP for kill switch
