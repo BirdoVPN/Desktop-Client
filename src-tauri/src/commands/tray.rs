@@ -26,13 +26,21 @@ pub struct TrayMenuItems {
 
 /// Decode an embedded PNG (RGBA, as emitted by `tauri icon`) into a Tauri
 /// `Image`. Uses the `png` crate directly so we avoid tauri's `image-png`
-/// feature (the moxcms/pxfm colour chain); png 0.17 stays the leaner, known-good
+/// feature (the moxcms/pxfm colour chain); png 0.18 stays the leaner, known-good
 /// decode path on the pinned 1.96 toolchain. Returns an owned image so it can
 /// outlive the byte slice.
 pub fn load_tray_image(bytes: &[u8]) -> Result<Image<'static>, String> {
-    let decoder = png::Decoder::new(bytes);
+    // png 0.18: `Decoder<R>` requires `R: BufRead + Seek`; a `Cursor` over the
+    // embedded bytes satisfies both.
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    // png 0.18: `output_buffer_size()` is an `Option` (None on overflow).
+    let mut buf = vec![
+        0u8;
+        reader
+            .output_buffer_size()
+            .ok_or("tray PNG size overflows")?
+    ];
     let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     let (w, h) = (info.width, info.height);
     let rgba = match info.color_type {
