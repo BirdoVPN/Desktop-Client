@@ -211,6 +211,13 @@ impl XrayManager {
         // can silently downgrade Reality to plain TLS without the user noticing.
         verify_xray_integrity(&xray_binary)?;
 
+        // Kill switch: xray is the process that carries the tunnel in stealth
+        // mode, and the own-process permit does not cover it (see
+        // wfp::STEALTH_HELPER_EXE). Registered AFTER the integrity check so
+        // only a verified binary can ever be permitted.
+        #[cfg(target_os = "windows")]
+        crate::vpn::wfp::set_stealth_helper_exe(xray_binary.to_str().map(String::from)).await;
+
         // LOG-001: the server host is the chosen VPN node — redact it (and the
         // SNI camouflage domain) so birdo.log carries no connection history.
         tracing::info!(
@@ -337,6 +344,9 @@ impl XrayManager {
             let _ = tx.send(true);
         }
 
+        #[cfg(target_os = "windows")]
+        crate::vpn::wfp::set_stealth_helper_exe(None).await;
+
         let mut proc = self.process.lock().await;
         if let Some(mut child) = proc.take() {
             tracing::info!("Stopping Xray Reality tunnel (PID: {})", child.id());
@@ -402,10 +412,13 @@ impl XrayManager {
                     break;
                 }
 
-                // Check 2: Can we connect to the local port?
-                let port_open = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                    .await
-                    .is_ok();
+                // Check 2: is the dokodemo-door inbound still bound? It is a UDP
+                // listener, so a TCP connect (what this used to do) is refused
+                // by design and reported "port not responding" every 15 s for
+                // the whole session — 25 consecutive false failures on the
+                // 2026-09-17 device run. Probe by trying to bind the same UDP
+                // address: AddrInUse means xray holds it.
+                let port_open = udp_port_held(port);
 
                 if port_open {
                     if consecutive_failures > 0 {
@@ -565,6 +578,24 @@ fn build_xray_config(
     })
 }
 
+/// True when something already holds 127.0.0.1:{port}/udp — the Xray
+/// dokodemo-door inbound, in the only place this is called. A bind that
+/// SUCCEEDS proves nobody is listening (the probe socket is dropped at once);
+/// any other error is treated as "held" so a transient OS error cannot
+/// masquerade as a dead proxy. Rust's UdpSocket::bind sets no SO_REUSEADDR,
+/// so on Windows and Linux the collision surfaces as AddrInUse.
+fn udp_port_held(port: u16) -> bool {
+    match UdpSocket::bind(("127.0.0.1", port)) {
+        Ok(_probe) => false,
+        Err(e) => {
+            e.kind() == std::io::ErrorKind::AddrInUse || {
+                tracing::debug!("udp_port_held({}): non-AddrInUse bind error {}", port, e);
+                true
+            }
+        }
+    }
+}
+
 /// Find the xray binary — check bundled resources first, then PATH.
 ///
 /// AUDIT-N4: the previous lookup order included `app_data_dir/xray/<bin>`
@@ -719,6 +750,26 @@ mod tests {
             verify_xray_integrity_against(&bin, Some(&published.to_uppercase())),
             Ok(())
         );
+    }
+
+    /// The health monitor's port probe must answer for a UDP listener — the
+    /// old TCP connect could not, and reported the live proxy dead forever.
+    #[test]
+    fn udp_port_held_sees_a_udp_listener_and_its_absence() {
+        let held = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(udp_port_held(port), "a bound UDP socket must read as held");
+        // and the probe itself must not have stolen or kept the port
+        assert!(udp_port_held(port), "second probe still sees it held");
+        drop(held);
+        assert!(
+            !udp_port_held(port),
+            "after the listener is gone the port is free"
+        );
+        // a TCP listener on the same port is NOT the proxy: UDP stays free
+        let tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert!(!udp_port_held(port));
+        drop(tcp);
     }
 
     /// An EMPTY compiled-in value is the "pipeline never exported it" case

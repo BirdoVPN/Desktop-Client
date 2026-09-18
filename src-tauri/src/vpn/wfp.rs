@@ -121,6 +121,18 @@ static IPV6_BLOCK_HELD: AtomicBool = AtomicBool::new(false);
 static VPN_SERVER_IP: once_cell::sync::Lazy<Arc<RwLock<Option<Ipv4Addr>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
+/// STEALTH: the xray.exe the client spawned for a Reality tunnel. In stealth
+/// mode the WireGuard endpoint is 127.0.0.1:<local_port> and it is THIS
+/// process — not ours — that carries the tunnel to the relay over TCP 8443.
+/// The own-process permit below does not cover it, so a lockdown block that
+/// is already installed (always-on, or held after a failed connect) silently
+/// dropped its SYNs: on 2026-09-17 every stealth connect timed out at the
+/// handshake while node captures showed zero packets from the PC on :8443,
+/// and a hand-sent packet to the same xray reached the node instantly once
+/// no block was active. Set by XrayManager::start, cleared by stop.
+static STEALTH_HELPER_EXE: once_cell::sync::Lazy<Arc<RwLock<Option<String>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
+
 /// Split tunnel app executable paths that should bypass the kill switch.
 static SPLIT_TUNNEL_APPS: once_cell::sync::Lazy<Arc<RwLock<Vec<String>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(Vec::new())));
@@ -1030,6 +1042,24 @@ pub async fn initialize() -> Result<(), String> {
 }
 
 /// Set the VPN server IP that should be permitted through the kill switch.
+/// STEALTH: record (or clear) the path of the xray helper so the next
+/// `activate_blocking()` permits it. Does not re-activate on its own: in
+/// lockdown the tunnel layer re-bakes the block once the new adapter
+/// publishes its LUID (before the handshake), and xray is started before the
+/// tunnel exists, so the permit is always in the set the handshake runs
+/// under; in reactive mode no block is active during a user-initiated
+/// connect and the reconnect path re-activates via update_vpn_server.
+pub async fn set_stealth_helper_exe(path: Option<String>) {
+    let mut helper = STEALTH_HELPER_EXE.write().await;
+    if *helper != path {
+        tracing::debug!(
+            "Kill switch: stealth helper permit {}",
+            if path.is_some() { "set" } else { "cleared" }
+        );
+    }
+    *helper = path;
+}
+
 pub async fn set_vpn_server(ip: Ipv4Addr) {
     let mut server = VPN_SERVER_IP.write().await;
     *server = Some(ip);
@@ -1049,6 +1079,7 @@ pub async fn activate_blocking() -> Result<(), String> {
     }
 
     let vpn_ip = *VPN_SERVER_IP.read().await;
+    let stealth_helper = STEALTH_HELPER_EXE.read().await.clone();
 
     let mut guard = ENGINE
         .lock()
@@ -1132,6 +1163,18 @@ pub async fn activate_blocking() -> Result<(), String> {
                     "Kill switch: could NOT determine own exe path — reconnect may be blocked while the kill switch is active"
                 );
             }
+        }
+
+        // STEALTH: the Reality helper is a separate process (see
+        // STEALTH_HELPER_EXE). Permit it exactly like our own exe; the
+        // integrity check in vpn::xray already proved the binary before it was
+        // spawned, so the permit cannot widen to an untrusted executable.
+        if let Some(helper) = stealth_helper.as_deref() {
+            let v4 = engine.add_permit_app(helper)?;
+            if v4 != 0 {
+                let _ = engine.add_permit_app_v6(helper)?;
+            }
+            tracing::info!("Kill switch: permitted the stealth (xray) helper process");
         }
 
         // LOCKDOWN (always-on): permit the tunnel interface so tunneled traffic
