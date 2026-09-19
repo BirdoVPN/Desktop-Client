@@ -57,7 +57,7 @@ pub use doh::resolve_via_doh;
 
 // Public API for auto-reconnect (may be used by external consumers)
 #[allow(unused_imports)]
-pub use auto_reconnect::{AutoReconnectConfig, AutoReconnectService, AutoReconnectStatus};
+pub use auto_reconnect::{AutoReconnectConfig, AutoReconnectService};
 
 // Unit tests for auto-reconnect, kill switch, tunnel health
 #[cfg(test)]

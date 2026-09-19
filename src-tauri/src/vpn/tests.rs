@@ -560,7 +560,7 @@ mod buffer_pool_tests {
 
 #[cfg(test)]
 mod auto_reconnect_service_tests {
-    use super::super::auto_reconnect::{AutoReconnectService, AutoReconnectStatus};
+    use super::super::auto_reconnect::AutoReconnectService;
     use super::super::manager::VpnManager;
     use crate::api::client::BirdoApi;
     use std::sync::Arc;
@@ -569,15 +569,6 @@ mod auto_reconnect_service_tests {
         let mgr = Arc::new(VpnManager::new());
         let api = Arc::new(BirdoApi::new());
         AutoReconnectService::new(mgr, api)
-    }
-
-    #[tokio::test]
-    async fn initial_status_is_idle() {
-        let service = create_service();
-        let status = service.get_status();
-        assert!(!status.is_reconnecting);
-        assert_eq!(status.attempt_count, 0);
-        assert!(!status.is_running);
     }
 
     #[tokio::test]
@@ -614,38 +605,6 @@ mod auto_reconnect_service_tests {
             .await;
         // Store should succeed without panic
         service.clear_last_config().await;
-    }
-
-    #[tokio::test]
-    async fn set_config_updates_config() {
-        use super::super::auto_reconnect::AutoReconnectConfig;
-        let service = create_service();
-        let custom = AutoReconnectConfig {
-            enabled: false,
-            initial_delay_ms: 500,
-            max_delay_ms: 30000,
-            max_attempts: 3,
-            backoff_multiplier: 2.0,
-            health_check_interval_ms: 10000,
-        };
-        service.set_config(custom).await;
-        // set_enabled should not panic
-        service.set_enabled(true).await;
-        assert!(service.is_enabled().await);
-        service.set_enabled(false).await;
-        assert!(!service.is_enabled().await);
-    }
-
-    #[test]
-    fn status_debug_format() {
-        let status = AutoReconnectStatus {
-            is_reconnecting: true,
-            attempt_count: 3,
-            is_running: true,
-        };
-        let dbg = format!("{:?}", status);
-        assert!(dbg.contains("is_reconnecting"));
-        assert!(dbg.contains("3"));
     }
 }
 

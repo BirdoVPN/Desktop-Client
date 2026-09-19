@@ -542,7 +542,6 @@ fn load_or_generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), String> {
 }
 
 /// Permanently delete the persisted keypair. Use on user logout.
-#[allow(dead_code)]
 pub fn reset_persisted_keypair() -> Result<(), String> {
     *cache().lock() = None;
     set_mode(PqMode::Disabled);

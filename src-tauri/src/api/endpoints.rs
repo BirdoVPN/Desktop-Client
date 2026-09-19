@@ -19,8 +19,6 @@ pub mod auth {
     pub const ME: &str = "/auth/me";
     /// FIX C-2: 2FA verification endpoint
     pub const TWO_FACTOR_VERIFY: &str = "/auth/2fa/verify";
-    /// Password reset request (opens flow — server sends email)
-    pub const _PASSWORD_RESET_REQUEST: &str = "/auth/password/request-reset";
     /// GDPR account deletion (requires password confirmation)
     pub const GDPR_DELETE: &str = "/v1/gdpr/delete";
     /// GDPR data export (Right to Data Portability)

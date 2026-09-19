@@ -207,34 +207,12 @@ impl AutoReconnectService {
         }
     }
 
-    /// Update auto-reconnect configuration
-    #[allow(dead_code)] // Reserved: runtime config replacement (settings UI not yet wired)
-    pub async fn set_config(&self, config: AutoReconnectConfig) {
-        *self.config.write().await = config;
-    }
-
     /// Attach the Tauri app handle after setup so reconnects can start Xray.
     pub fn set_app_handle(&self, app: AppHandle) {
         match self.app_handle.write() {
             Ok(mut guard) => *guard = Some(app),
             Err(_) => tracing::warn!("Auto-reconnect app handle lock poisoned"),
         }
-    }
-
-    /// Enable or disable auto-reconnect
-    #[allow(dead_code)] // Reserved: toggle auto-reconnect at runtime (settings UI not yet wired)
-    pub async fn set_enabled(&self, enabled: bool) {
-        self.config.write().await.enabled = enabled;
-        tracing::info!(
-            "Auto-reconnect {}",
-            if enabled { "enabled" } else { "disabled" }
-        );
-    }
-
-    /// Check if auto-reconnect is enabled
-    #[allow(dead_code)] // Reserved: query auto-reconnect state (settings UI not yet wired)
-    pub async fn is_enabled(&self) -> bool {
-        self.config.read().await.enabled
     }
 
     /// H-5 FIX: Store only the reconnect metadata (server_id + name).
@@ -1299,24 +1277,6 @@ impl AutoReconnectService {
             rosenpass_endpoint: response.rosenpass_endpoint,
         }
     }
-
-    /// Get current reconnect status
-    #[allow(dead_code)] // Reserved: status surface for a diagnostics command (not yet wired)
-    pub fn get_status(&self) -> AutoReconnectStatus {
-        AutoReconnectStatus {
-            is_reconnecting: self.is_reconnecting.load(Ordering::SeqCst),
-            attempt_count: self.attempt_count.load(Ordering::SeqCst),
-            is_running: self.running.load(Ordering::SeqCst),
-        }
-    }
-}
-
-#[allow(dead_code)] // Reserved: returned by get_status (diagnostics surface, not yet wired)
-#[derive(Debug, Clone)]
-pub struct AutoReconnectStatus {
-    pub is_reconnecting: bool,
-    pub attempt_count: u32,
-    pub is_running: bool,
 }
 
 impl Clone for AutoReconnectService {
