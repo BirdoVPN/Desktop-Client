@@ -49,7 +49,7 @@ export default [
       'react-hooks': reactHooks,
     },
     settings: {
-      react: { version: '18.3' },
+      react: { version: 'detect' },
     },
     rules: {
       ...tsPlugin.configs.recommended.rules,
