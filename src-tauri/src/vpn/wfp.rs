@@ -1553,18 +1553,8 @@ pub fn is_blocking() -> bool {
     IS_BLOCKING.load(Ordering::SeqCst)
 }
 
-/// Check if the kill switch is initialized.
-///
-/// DT-6: the `get_wfp_status` IPC command that read this was removed (never
-/// invoked from the UI). Kept as a public status accessor alongside
-/// `is_blocking`; allow dead_code until a caller is re-added.
-#[allow(dead_code)]
-pub fn is_initialized() -> bool {
-    IS_INITIALIZED.load(Ordering::SeqCst)
-}
-
 /// Enable/disable lockdown (always-on) mode. Takes effect on the next
-/// `activate_blocking()`. Driven by the `lockdown_mode` user setting (OFF by
+/// `activate_blocking()`. Driven by the `lockdown_mode` user setting (ON by
 /// default). See LOCKDOWN_MODE for the full semantics.
 pub fn set_lockdown_mode(enabled: bool) {
     LOCKDOWN_MODE.store(enabled, Ordering::SeqCst);
@@ -1624,19 +1614,6 @@ pub async fn cleanup() -> Result<(), String> {
     close_result?;
     tracing::info!("Kill switch cleanup complete");
     Ok(())
-}
-
-/// Get kill switch status for display.
-///
-/// DT-6: previously surfaced via the removed `get_wfp_status` IPC command.
-/// Kept as a public status accessor; allow dead_code until a caller is re-added.
-#[allow(dead_code)]
-pub fn get_status() -> KillSwitchStatus {
-    KillSwitchStatus {
-        initialized: IS_INITIALIZED.load(Ordering::SeqCst),
-        active: IS_BLOCKING.load(Ordering::SeqCst),
-        method: "WFP (fwpuclnt.dll)".to_string(),
-    }
 }
 
 /// Set whether local network sharing (RFC1918) should be permitted.
@@ -1734,14 +1711,6 @@ fn resolve_app_path(name: &str) -> Option<String> {
     // sending an invalid path to WFP (which would fail FwpmGetAppIdFromFileName0)
     tracing::debug!("Could not resolve '{}', skipping", name);
     None
-}
-
-/// Status information for the kill switch.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct KillSwitchStatus {
-    pub initialized: bool,
-    pub active: bool,
-    pub method: String,
 }
 
 #[cfg(test)]

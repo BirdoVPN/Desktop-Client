@@ -483,12 +483,6 @@ pub struct AnonymousLoginResult {
     pub challenge_token: Option<String>,
 }
 
-/// Password reset request
-#[derive(Debug, Serialize)]
-pub struct PasswordResetRequest {
-    pub email: String,
-}
-
 #[derive(Debug, Serialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,

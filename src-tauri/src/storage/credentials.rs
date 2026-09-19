@@ -4,7 +4,6 @@
 //! (Windows Credential Manager / macOS Keychain / Linux Secret Service).
 
 use keyring::Entry;
-use serde::{de::DeserializeOwned, Serialize};
 use zeroize::Zeroize;
 
 // Build-time guard: refuse to compile against keyring's `mock` backend.
@@ -156,19 +155,6 @@ impl CredentialStore {
         }
     }
 
-    /// Clear all stored credentials
-    #[allow(dead_code)] // Reserved: bulk wipe (logout uses clear_tokens; not yet wired)
-    pub fn clear_all() -> Result<(), String> {
-        let keys = [CredentialKey::AccessToken, CredentialKey::RefreshToken];
-
-        for key in keys {
-            Self::delete(key)?;
-        }
-
-        tracing::info!("Cleared all stored credentials");
-        Ok(())
-    }
-
     // ========================================================================
     // Instance methods for Tauri State compatibility
     // ========================================================================
@@ -231,27 +217,6 @@ impl CredentialStore {
         Self::delete(CredentialKey::AccessToken)?;
         Self::delete(CredentialKey::RefreshToken)?;
         Ok(())
-    }
-
-    /// Store a serializable value as JSON
-    #[allow(dead_code)] // Reserved: generic JSON credential storage (not yet wired)
-    pub fn store_json<T: Serialize>(key: CredentialKey, value: &T) -> Result<(), String> {
-        let json = serde_json::to_string(value)
-            .map_err(|e| format!("Failed to serialize value: {}", e))?;
-        Self::store(key, &json)
-    }
-
-    /// Retrieve and deserialize a JSON value
-    #[allow(dead_code)] // Reserved: generic JSON credential retrieval (not yet wired)
-    pub fn retrieve_json<T: DeserializeOwned>(key: CredentialKey) -> Result<Option<T>, String> {
-        match Self::retrieve(key)? {
-            Some(json) => {
-                let value = serde_json::from_str(&json)
-                    .map_err(|e| format!("Failed to deserialize value: {}", e))?;
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }
     }
 }
 

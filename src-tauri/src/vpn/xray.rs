@@ -147,7 +147,6 @@ pub struct XrayConfig {
 /// Manages the lifecycle of an Xray Reality stealth tunnel process
 pub struct XrayManager {
     process: Arc<Mutex<Option<Child>>>,
-    local_port: Arc<Mutex<u16>>,
     health_cancel: Arc<Mutex<Option<watch::Sender<bool>>>>,
 }
 
@@ -161,7 +160,6 @@ impl XrayManager {
     pub fn new() -> Self {
         Self {
             process: Arc::new(Mutex::new(None)),
-            local_port: Arc::new(Mutex::new(DEFAULT_LOCAL_PORT)),
             health_cancel: Arc::new(Mutex::new(None)),
         }
     }
@@ -178,7 +176,6 @@ impl XrayManager {
         // Find an available local port
         let local_port = find_available_port(DEFAULT_LOCAL_PORT)
             .ok_or("No available local ports for Xray tunnel")?;
-        *self.local_port.lock().await = local_port;
 
         // Parse server endpoint
         let (server_host, server_port) = parse_endpoint(&config.endpoint)?;
@@ -354,12 +351,6 @@ impl XrayManager {
             let _ = child.kill();
             let _ = child.wait(); // Reap the zombie
         }
-    }
-
-    /// Get the local port Xray is listening on
-    #[allow(dead_code)] // Exposed for future port-forwarding inspection commands
-    pub async fn get_local_port(&self) -> u16 {
-        *self.local_port.lock().await
     }
 
     /// Start a background task that periodically checks Xray process health

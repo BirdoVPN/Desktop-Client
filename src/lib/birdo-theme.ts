@@ -50,13 +50,6 @@ export const brand = {
  */
 export const accentA = (alpha: number): string => `rgba(16,185,129,${alpha})`;
 
-/** Shared focus treatment — border + ring + bloom, one definition. */
-export const focus = {
-  border: accentA(0.55),
-  ring: accentA(0.16),
-  bloom: accentA(0.45),
-} as const;
-
 // ── Status colors ─────────────────────────────────────────────────────────
 export const status = {
   green: '#22C55E',
@@ -72,12 +65,6 @@ export const status = {
   blueBg: 'rgba(59,130,246,0.10)',
   emerald: '#10B981', // update UI accent
   emeraldBg: 'rgba(16,185,129,0.10)',
-} as const;
-
-// ── Primary button (solid white / black text) ─────────────────────────────
-export const primary = {
-  bg: '#FFFFFF', // BirdoPrimary
-  fg: '#000000', // BirdoOnPrimary
 } as const;
 
 // ── White-scale alphas ───────────────────────────────────────────────────
@@ -154,24 +141,4 @@ export const motion = {
   accel: [0.3, 0.0, 0.8, 0.15] as [number, number, number, number],
   decel: [0.05, 0.7, 0.1, 1.0] as [number, number, number, number],
   spring: [0.34, 1.56, 0.64, 1.0] as [number, number, number, number], // overshoot
-} as const;
-
-// ── Radii ────────────────────────────────────────────────────────────────
-// NOTE: existing sm/md/lg/xl kept at their current values (consumed by current
-// primitives). Mobile's Compose scale (6/10/14/18/24) is added as explicit
-// keys so components can target the exact mobile radius without re-valuing.
-export const radius = {
-  sm: 8,
-  md: 12,
-  lg: 16,
-  xl: 20,
-  pill: 9999,
-  // Mobile Compose scale (Shapes.kt)
-  xs6: 6,
-  sm10: 10,
-  md14: 14, // button / server card
-  lg18: 18,
-  xl24: 24, // bottom panel top / sheet
-  card16: 16, // BirdoCard default
-  sub12: 12, // sub-card / stat / text field / flag badge
 } as const;
