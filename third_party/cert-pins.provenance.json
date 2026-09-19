@@ -5,12 +5,12 @@
   "_merge_order": "upstream_commit_on_main is MEASURED by scripts/stamp-cert-pins-provenance.py (git merge-base --is-ancestor against birdo-shared origin/main) and cannot be written by hand without check 1 catching it on any checkout that has ../birdo-shared. While it is false, check 1b FAILS on every run, including CI: the consumer PR that vendors an unmerged SSOT branch stays red until the SSOT PR merges and this copy is re-vendored and re-stamped from main. That is the merge order, made mechanical.",
   "upstream_repo": "BirdoVPN/birdo-shared",
   "upstream_path": "cert-pins.json",
-  "upstream_commit": "9bca49306b40a117332b9bad3738952cdf6fe3c9",
-  "upstream_branch": "main",
-  "upstream_subject": "fix(cert-pins): pin both GTS hierarchies for dns.google â€” its pin set was dark on ECDSA edges (#3)",
+  "upstream_commit": "53a8ff680fed0484a31834a86b371514f4c58676",
+  "upstream_branch": "HEAD",
+  "upstream_subject": "cert-pins: drop the production hub's IP, correct the stale \"CI is red today\", retire the deleted fifth copy (#8)",
   "upstream_commit_on_main": true,
-  "upstream_main_ref": "origin/main@9bca49306b40",
+  "upstream_main_ref": "origin/main@53a8ff680fed",
   "upstream_main_fetched": true,
-  "vendored_on": "2026-09-09",
-  "canonical_sha256": "84706c3f179639358fde01c317174c7e51134ceebc3a0f2bf28a9869c1be84ba"
+  "vendored_on": "2026-09-19",
+  "canonical_sha256": "359abddcb9278a79ef94ea21217c2b8be6093d78f91ea6f924180789244a56a1"
 }
