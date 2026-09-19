@@ -82,14 +82,6 @@ export function isValidPort(port: string): boolean {
 }
 
 /**
- * Validate a WireGuard MTU value.
- */
-export function isValidMtu(mtu: string): boolean {
-  const n = Number(mtu);
-  return Number.isInteger(n) && n >= 1280 && n <= 1500;
-}
-
-/**
  * Extract a user-facing message from an unknown error value.
  */
 export function extractErrorMessage(error: unknown): string {
