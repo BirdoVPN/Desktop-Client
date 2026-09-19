@@ -3,7 +3,7 @@
 Cross-platform desktop VPN client for [Birdo.app](https://birdo.app), built with
 [Tauri](https://tauri.app) — a TypeScript/React frontend wrapped in a Rust core.
 
-- **Product:** `BirdoVPN`  •  **Bundle ID:** `uk.birdo.vpn.desktop`  •  **Targets:** Windows (NSIS/MSI), macOS (DMG/app), Linux (deb/AppImage)
+- **Product:** `BirdoVPN`  •  **Bundle ID:** `uk.birdo.vpn.desktop`  •  **Targets:** Windows (NSIS), macOS (DMG/app), Linux (deb/AppImage)
 - **Version** is the single source of truth in `src-tauri/tauri.conf.json` **and** `package.json` — they **must match** (CI enforces this; a mismatch fails the release build).
 
 ## Layout
@@ -30,9 +30,9 @@ npm run tauri:build    # produces installers under src-tauri/target/release/bund
 ```
 
 ## Release
-Pushing a `win-v*` tag triggers a signed Windows build that is published as the **Latest**
-auto-update release. See [`docs/CODE_SIGNING.md`](docs/CODE_SIGNING.md),
-[`docs/windows-code-signing.md`](docs/windows-code-signing.md) and
+Pushing a `v*` tag triggers the unified Windows/macOS/Linux release build that is
+published as the **Latest** auto-update release. See [`docs/CODE_SIGNING.md`](docs/CODE_SIGNING.md),
+[`docs/azure-trusted-signing-setup.md`](docs/azure-trusted-signing-setup.md) and
 [`docs/RELEASE-SECRETS.md`](docs/RELEASE-SECRETS.md). Signing secrets live in the operator
 vault, never in the repo.
 
@@ -42,5 +42,5 @@ build with no usable DSN now fails rather than shipping an inert reporter — se
 verification steps and exactly what a crash report may contain.
 
 ## Related
-- `../birdo-shared/` — shared `protocol.json` + `cert-pins.json` contract (cert pins are mirrored here for DER verification).
+- `../birdo-shared/` — shared `protocol.json` + `cert-pins.json` contract (CA-chain SPKI pins are mirrored here in `third_party/cert-pins.json`).
 - `../birdo-web/` — backend that serves the auth/session/VPN APIs and the Tauri update manifest.

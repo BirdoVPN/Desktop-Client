@@ -6,7 +6,7 @@ machine, because they depend on admin elevation, the WFP firewall, the wintun
 driver, the bundled Xray engine, and live VPN nodes — none of which exist in CI.
 
 Run this on a clean Windows 10/11 box (ideally not the dev machine) after
-installing the signed `win-v1.3.x` build, **as Administrator**. Tick each box.
+installing the signed `v1.4.x` build, **as Administrator**. Tick each box.
 
 ## 0. Install & launch
 - [ ] Installer runs; SmartScreen shows the signed publisher (not "Unknown").
@@ -116,6 +116,6 @@ behaviour those tests cannot reach.
 ---
 
 ### Sign-off
-Build version tested: `win-v1.3.____`  ·  Tester: __________  ·  Date: __________
+Build version tested: `v1.4.____`  ·  Tester: __________  ·  Date: __________
 
-If every box is ticked, publish the draft: `gh release edit win-v1.3.x --draft=false`.
+If every box is ticked, publish the draft: `gh release edit v1.4.x --draft=false`.

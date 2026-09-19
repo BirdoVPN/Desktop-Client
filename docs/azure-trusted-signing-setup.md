@@ -1,7 +1,7 @@
 # Azure Trusted Signing — Setup Guide
 
 Azure Trusted Signing (formerly known as Azure Code Signing) provides
-Authenticode signatures for Windows EXE and MSI installers. The CI/CD
+Authenticode signatures for the Windows NSIS installer. The CI/CD
 pipeline (the Windows job of `release.yml`) uses OIDC federation, so **no client
 secrets are ever stored in GitHub**.
 
@@ -11,13 +11,13 @@ secrets are ever stored in GitHub**.
 
 ```
 Git tag push  →  GitHub Actions (build job)
-  → Tauri builds NSIS .exe + MSI
+  → Tauri builds the NSIS .exe
   → Sigstore: cosign sign-blob (provenance layer)
   → artifacts uploaded
 
   →  GitHub Actions (sign job)
        → azure/login with OIDC JWT (no secrets)
-       → azure/trusted-signing-action signs EXE + MSI
+       → azure/trusted-signing-action signs the EXE
        → signed artifacts uploaded
 
   →  GitHub Actions (release job)
@@ -175,17 +175,17 @@ az codesigning account show \
 
 ## Step 7 — Trigger a Signed Release
 
-Push a tag matching `win-v*`:
+Push a tag matching `v*`:
 
 ```bash
-git tag win-v1.0.0
-git push origin win-v1.0.0
+git tag v1.4.44
+git push origin v1.4.44
 ```
 
 The pipeline will:
-1. Build the Tauri NSIS + MSI installers on `windows-latest`
+1. Build the Tauri NSIS installer on `windows-latest`
 2. Apply Sigstore provenance bundles (free, keyless, tag-tied)
-3. Azure-sign both EXE **and** MSI with Authenticode (SHA-256 + RFC 3161 timestamp)
+3. Azure-sign the EXE with Authenticode (SHA-256 + RFC 3161 timestamp)
 4. Create a draft GitHub Release with all artefacts
 
 ---
