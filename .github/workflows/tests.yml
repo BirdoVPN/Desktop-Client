@@ -85,6 +85,21 @@ jobs:
           RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
         run: cargo test --lib
 
+      # The privacy pins (P6-CLI-D-09/10/11) live in tests/privacy_pins.rs, an
+      # INTEGRATION target. `cargo test --lib` does not run integration targets
+      # and `cargo check --all-targets` only compiles them — so from the day
+      # they were written until 2026-09-19 these four assertions had never once
+      # executed, in any job, on any branch. They are the tests that prove the
+      # crash reporter and panic hook sanitise before writing, that the xray
+      # config carries no access log and no sniffing, and that the attestation
+      # module has no fingerprint source: exactly the claims the trust pages
+      # make. A gate that never runs is a comment.
+      - name: Run Rust privacy-pin tests (integration target)
+        working-directory: src-tauri
+        env:
+          RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
+        run: cargo test --test privacy_pins
+
   # Cross-platform compile guard. The rust-tests job above only compiles the
   # Windows cfg branches, so Linux/macOS-only code (`#[cfg(target_os = ...)]`
   # blocks, and shared code that calls Windows-only modules like vpn::wfp) was
