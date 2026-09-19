@@ -401,7 +401,6 @@ dependencies = [
  "keyring",
  "libc",
  "ml-kem",
- "nix 0.29.0",
  "once_cell",
  "parking_lot",
  "png 0.18.1",
