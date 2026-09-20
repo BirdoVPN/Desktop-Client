@@ -135,6 +135,39 @@ fn add_endpoint_host_route(
         .output()
     {
         Ok(output) if output.status.success() => {
+            // ROUTE.EXE EXITS 0 WHEN IT FAILS. Measured on an elevated Windows
+            // runner, 2026-09-20:
+            //
+            //   exit=Some(0)
+            //   stdout=""
+            //   stderr="The route addition failed: The parameter is incorrect."
+            //
+            // So the exit status alone reports SUCCESS for a route that was
+            // never installed. The caller then goes on to install the /1 split
+            // routes over an unpinned endpoint, WireGuard's own outer UDP
+            // re-enters the tunnel, and the client reaches Connected carrying
+            // zero traffic — the exact silent failure this function's fatal
+            // path exists to prevent. The fatal `return Err` below was
+            // unreachable for this case.
+            //
+            // The discriminator is the PRESENCE of stderr output, not its
+            // wording: a successful `route add` prints "OK!" to stdout and
+            // nothing to stderr, while every failure writes to stderr. Matching
+            // on the word "failed" would work on an English system and quietly
+            // stop working on a localised one, which is how this class of bug
+            // comes back.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                tracing::error!(
+                    "CRITICAL: Endpoint host route reported exit 0 but FAILED for {}: {}",
+                    redact_ip(endpoint_ip),
+                    stderr.trim()
+                );
+                return Err(format!(
+                    "Failed to add endpoint host route — VPN would create a routing loop: {}",
+                    stderr.trim()
+                ));
+            }
             tracing::info!(
                 "Endpoint host route added: {} via {} (metric 1)",
                 redact_ip(endpoint_ip),
@@ -2567,6 +2600,48 @@ mod endpoint_route_tests {
     /// `phys_idx: None` must not be treated as "native succeeded". This is the
     /// shape of the bug the fatal check exists to prevent: a None index short
     /// -circuiting to Ok would report a pinned endpoint with nothing installed.
+    /// A failed `route add` must be DETECTABLE, whichever way this Windows
+    /// reports it. Pinned because the two tests above passed on an unelevated
+    /// dev box and failed on CI, and the reason was environmental:
+    ///
+    ///   unelevated (Windows 11 dev box): exit=1, stdout="The requested
+    ///       operation requires elevation.", stderr empty
+    ///   ELEVATED (CI runner):            exit=0, stdout empty,
+    ///       stderr="The route addition failed: The parameter is incorrect."
+    ///
+    /// The elevated case is the one that ships, and it is the one the old code
+    /// missed: exit 0 was read as success for a route that was never installed.
+    /// `add_endpoint_host_route` now keys on **either** signal, so this asserts
+    /// exactly that — not the wording, which is localised, and not the
+    /// mechanism, which differs by privilege level.
+    #[test]
+    fn a_route_add_failure_is_always_detectable() {
+        let out = cmd("route")
+            .args([
+                "add",
+                "999.999.999.999",
+                "mask",
+                "255.255.255.255",
+                "192.0.2.1",
+                "metric",
+                "1",
+            ])
+            .output()
+            .expect("route.exe should be present on Windows");
+
+        let nonzero_exit = !out.status.success();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr_nonempty = !stderr.trim().is_empty();
+
+        assert!(
+            nonzero_exit || stderr_nonempty,
+            "route.exe failed in a way neither the exit status nor stderr exposes,              so add_endpoint_host_route would report success for a route that does              not exist. exit={:?} stdout={:?} stderr={:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            stderr.trim()
+        );
+    }
+
     #[test]
     fn no_physical_interface_index_does_not_imply_success() {
         // TEST-NET-1 (RFC 5737) via an unroutable gateway. Whatever the runner's
