@@ -203,28 +203,69 @@ written and large v6 packets will black-hole rather than fragment.
 
 ---
 
-## Step 8 — the kill switch, after disconnect
+## Step 8 — the IPv6 block, and what it is actually for
 
-Disconnect the client, then immediately:
+> **Corrected 2026-09-20, and it was inverted.** This step used to say that
+> after disconnect `curl -6` must FAIL, and that a working `curl -6` meant
+> "IPv6 leaks the moment the tunnel drops". **That is the opposite of what the
+> client does**, and an operator following it would have reported a leak that
+> does not exist — the same mistake step 5 carried.
 
-```bash
-curl -6 -s --max-time 8 https://ifconfig.co ; echo "exit=$?"
-sudo ip6tables -S > /tmp/f001-ip6tables-after.txt
-diff /tmp/f001-ip6tables-before.txt /tmp/f001-ip6tables-after.txt
+**The block is lifted on disconnect, deliberately.** `tunnel_linux.rs`, inside
+`stop()`:
+
+```rust
+// F-001: lift the IPv6 block. Best-effort so it can never fail teardown
+// (a stuck block would leave the host without IPv6 after disconnect).
+remove_ipv6_leak_block();
 ```
 
-**Pass:** the curl fails or times out — IPv6 is blocked — and the rules differ from
-the baseline in the expected direction.
+A kill switch that survived disconnect would strand the machine with no IPv6
+until the next successful connect-and-disconnect cycle. That is a support
+ticket, not protection.
 
-**Fail:** the curl returns ISP_V6. IPv6 leaks the moment the tunnel drops, which is
-the worst of the three failures because nothing on screen indicates it.
+### What the block is really for
+
+It protects the **connect window**, not the disconnected state. The order, from
+`tunnel.rs`:
+
+1. `install_ipv6_leak_block()` at the top of `start()` — IPv6 is dead
+2. `configure_ipv6()` installs the address and the `::/1` + `8000::/1` routes
+3. **only then** is the block lifted
+
+The comment records why that order and not the obvious one: *"The previous
+unblock-then-configure left a window with no tunnel route and no block, in which
+a real-IPv6 packet could egress the physical NIC on every connect."*
+
+So the leak this step exists to catch happens in the first milliseconds of a
+connect, not after a disconnect.
+
+### What to check
+
+```bash
+# while connected to a node WITHOUT IPv6 (no client_ipv6):
+sudo ip6tables -S | grep -c BIRDO_IPV6_LEAK_BLOCK   # expect > 0 - block in force
+curl -6 -s --max-time 8 https://ifconfig.co ; echo "exit=$?"   # expect FAILURE
+
+# now disconnect, then:
+sudo ip6tables -S | grep -c BIRDO_IPV6_LEAK_BLOCK   # expect 0 - chain gone
+curl -6 -s --max-time 8 https://ifconfig.co && echo   # expect YOUR OWN v6 back
+```
+
+**Pass:** blocked while connected to a v6-less node; chain removed and IPv6
+working again after disconnect.
+
+**Fail, and these are different bugs:**
+
+- IPv6 works *while connected to a node with no `client_ipv6`* — that is the
+  real leak, and it is the one this step exists for.
+- The chain survives disconnect — the host is stranded without IPv6, which is
+  the failure the `stop()` comment is guarding against.
 
 **Note for an IPv4-only host:** `ip6tables` may be absent, and the code tolerates
 that deliberately, returning Ok and skipping the rule
-(`firewall_linux.rs:91–103`). On a genuine IPv6 line it will be present. If it is
-absent here, you are on the wrong line — go back to step 1.
-
----
+(`firewall_linux.rs:91–103`). On a genuine IPv6 line it will be present. If it
+is absent here, you are on the wrong line — go back to step 1.
 
 ## Step 9 — restore
 
