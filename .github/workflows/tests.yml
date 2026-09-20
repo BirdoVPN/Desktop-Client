@@ -203,7 +203,7 @@ jobs:
           # Every test module in $SRC that some step of THIS job executes -
           # FILTER plus the root-only ipv6 step further down, whose tests are
           # #[ignore]d and so cannot run in the loop above.
-          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
+          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'configure_ipv6_tests ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
         run: |
           set -euo pipefail
           # Captured, not piped: a name filter that matches NOTHING still exits
@@ -280,6 +280,37 @@ jobs:
         if: matrix.os == 'linux'
         working-directory: src-tauri
         run: sudo -E "$(command -v cargo)" test --lib ipv6_leak_block_tests -- --ignored --nocapture
+
+      # configure_ipv6() itself, which until this step had NEVER EXECUTED — not
+      # in CI, not on a dev box, not anywhere. The bench document opens by saying
+      # so. Every Linux and Windows single-hop connect calls it for real since
+      # route failures became fatal, so without this the first execution would
+      # have been a customer's.
+      #
+      # A dummy interface reaches everything except egress: that the function
+      # runs, that it installs ::/1 + 8000::/1 rather than a ::/0, that the
+      # host's own default survives, that the kernel agrees the tunnel won, and
+      # that a collision on one half is REFUSED rather than swallowed. Proving
+      # IPv6 traffic actually leaves through the tunnel still needs the bench on
+      # a dual-stack line; this is the part that does not.
+      - name: configure_ipv6 route-shape tests (Linux, root)
+        if: matrix.os == 'linux'
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          # --test-threads=1 is load-bearing, not tidiness. Both tests touch
+          # GLOBAL routing state - ::/1 is ::/1 whichever device claims it - so
+          # run in parallel they contend over the same prefix and fail for a
+          # reason that has nothing to do with the code under test.
+          out=$(sudo -E "$(command -v cargo)" test --lib configure_ipv6_tests -- --ignored --nocapture --test-threads=1)
+          echo "$out"
+          # Two tests, both required. An --ignored filter that matches nothing
+          # still exits 0, which is the exact failure this repo has been bitten
+          # by before: a green job proving only that a filter typo compiled.
+          if ! echo "$out" | grep -qE 'test result: ok\. 2 passed'; then
+            echo "::error::configure_ipv6_tests did not run both tests"
+            exit 1
+          fi
 
   frontend-tests:
     name: Frontend unit tests
