@@ -375,12 +375,49 @@ no matter what the client did.)
 teardown defect — the next connect may then hit P2's conflicting-route path for
 real.
 
-### What this session does NOT cover
+### The parity matrix — and it is not five platforms
 
-**macOS, Windows, Android and iOS remain unaudited.** macOS in particular needs a
-real Mac: its route behaviour differs and the same fatal checks apply there. Do
-not record F-008 as closed on the strength of the Linux third of it — record
-exactly which platforms were covered.
+F-008 is written as a five-platform audit. Reading what each platform actually
+does, **the contract it describes exists on three of them.** That is not a
+shortcut; it is what the code says, and it changes what has to be booked.
+
+**Linux, macOS and Windows shell out to the host routing table**, and the
+route-add failure is fatal by design:
+
+| Platform | The fatal check, in the code | What a regression looks like |
+|---|---|---|
+| Linux | `tunnel_linux.rs:1275` — endpoint host route; `configure_ipv6` refuses a collision on `::/1` or `8000::/1` | Connected, zero traffic (encapsulation loop), or v6 unrouted with the block lifted |
+| macOS | `tunnel_macos.rs:995-1010` — *"Failed to pin the endpoint route"*, with an already-present route tolerated | Same loop. Route behaviour differs from Linux, which is why a real Mac is required |
+| Windows | `tunnel.rs:1311-1324` — *"Failed to add endpoint host route — VPN would create a routing loop"* | Same loop, and Windows is the platform with a recorded history of being left with no DNS after a crash |
+
+**Android and iOS never run a route command at all**, so P1 and P2 cannot be
+performed there and asking for them would produce a meaningless session:
+
+| Platform | What replaces it | Where |
+|---|---|---|
+| Android | `VpnService.Builder.addRoute()` — the OS installs routes; the endpoint is excluded by `protect(socket)`, not by a host route | `BirdoVpnService.kt:854-855, 1427-1457` |
+| iOS | `NEPacketTunnelProvider` + `NEIPv4Settings.includedRoutes`; the OS excludes the endpoint automatically | vendored `PacketTunnelSettingsGenerator.swift:117-125` |
+
+So the Android equivalent is **not** "does route-add fail loudly" but **"is
+`protect()` applied to the live socket before connect, and never to a recycled
+descriptor"** — the hazard the code itself flags at `BirdoVpnService.kt:260-275`,
+where the fields are `@Volatile` for visibility but the lifecycle transitions are
+still not atomic. iOS carries the lowest parity risk of the five: the route
+generation is upstream WireGuardKit, unmodified.
+
+### What to book, therefore
+
+| Platform | Session | Status |
+|---|---|---|
+| Linux | This bench (P1–P3 below) | Route shape already proven in CI on every push |
+| **macOS** | **Needs a real Mac** — same three checks, `route -n get` instead of `ip route get` | Unaudited |
+| **Windows** | Same three checks with `route print` / `netsh`, on a machine that is not the daily driver | Unaudited |
+| Android | Folded into the device session that runs the globe benchmark — connect, confirm traffic flows, disconnect, confirm no leak | Unaudited |
+| iOS | Lowest risk; covered by the same device window if one is available | Unaudited |
+
+Do not record F-008 as closed on the strength of the Linux third. Record exactly
+which platforms were covered, and note that Android/iOS were checked against the
+`protect()`/`includedRoutes` contract rather than the route-add one.
 
 ---
 
