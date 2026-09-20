@@ -64,10 +64,25 @@ line.** Do not continue.
 ## Step 2 — install and capture the pre-connect baseline
 
 ```bash
-sudo dpkg -i birdo-vpn_1.4.42_amd64.deb || sudo apt-get -f install -y
+# The release asset is named BirdoVPN_<version>_Linux_amd64.deb — NOT
+# birdo-vpn_*.deb, which is what this step used to say and which does not
+# exist. Desktop-Client is public, so no token is needed.
+VER=1.4.44
+curl -fsSLO "https://github.com/BirdoVPN/Desktop-Client/releases/download/v${VER}/BirdoVPN_${VER}_Linux_amd64.deb"
+sudo dpkg -i "BirdoVPN_${VER}_Linux_amd64.deb" || sudo apt-get -f install -y
+
+# Ask the package what it calls itself rather than guessing. Step 9 removes
+# exactly this name, and a wrong guess there leaves the client installed while
+# the bench reports a clean restore.
+PKG=$(dpkg-deb -f "BirdoVPN_${VER}_Linux_amd64.deb" Package); echo "package: $PKG"
+
 ip -6 route show            > /tmp/f001-routes-before.txt
 sudo ip6tables -S           > /tmp/f001-ip6tables-before.txt
+ip route show               > /tmp/f001-routes4-before.txt
 ```
+
+The third capture is for **P3** at the end — it compares IPv4 routes, and
+without it that parity step has nothing to diff against.
 
 Keep both files. They are half the evidence.
 
@@ -77,10 +92,27 @@ Keep both files. They are half the evidence.
 
 Use a single-hop connection. Multi-hop is a different path and is out of scope here.
 
-**The node must have `ipv6Enabled = true`.** If you are unsure, pick one from the
-IPv6 activation list; a node without it will hand out no `client_ipv6`, and
-`configure_ipv6()` returns `Ok(())` immediately without doing anything
-(`tunnel_linux.rs:1085`). The bench would then pass while testing nothing.
+**The node must have `ipv6Enabled = true` in the database.** This is the single
+prerequisite most likely to waste the session, because a node without it hands
+out no `client_ipv6`, `configure_ipv6()` returns `Ok(())` immediately without
+doing anything (`tunnel_linux.rs:1085`), and **the bench passes while testing
+nothing**.
+
+Confirm before travelling:
+
+```sql
+SELECT name, "ipv6Enabled" FROM "ServerNode" WHERE "ipv6Enabled" = true;
+```
+
+**The relays themselves are not the risk.** All ten were swept read-only on
+2026-09-20 and every one has two global IPv6 addresses, a default v6 route,
+`ip6tables`, and **working v6 egress** — the last proven by an actual
+`curl -6` to the internet, not merely by the presence of an address. That
+distinction matters here: a Vultr instance created *without* `enable_ipv6`
+still shows an address and an RA default route while routing nothing, and
+turning the flag on afterwards does not fix it. The current fleet was rebuilt
+dual-stack, so it is clear of that trap. What is *not* proven from outside the
+database is which `ServerNode` rows carry the flag.
 
 ---
 
@@ -197,13 +229,16 @@ absent here, you are on the wrong line — go back to step 1.
 ## Step 9 — restore
 
 ```bash
-sudo dpkg -r birdo-vpn
+sudo dpkg -r "$PKG"          # the name captured in step 2
 ip -6 route show
 sudo ip6tables -S
 ```
 
-Confirm routes and rules match `/tmp/f001-*-before.txt`. If they do not, the
-uninstall left state behind, which is itself a finding worth recording.
+**Pass:** routes and rules match `/tmp/f001-*-before.txt`.
+
+**Fail:** any difference. The uninstall left state behind, which is itself a
+finding worth recording — and on a machine you are about to stop using, it is
+the finding most easily lost.
 
 ---
 
@@ -328,8 +363,13 @@ tolerated, and only that. Pinning to `lo` is not identical, so it must fail.
 
 ```bash
 ip route show > /tmp/f008-routes-after.txt
-diff /tmp/f001-routes-before.txt /tmp/f008-routes-after.txt
+diff /tmp/f001-routes4-before.txt /tmp/f008-routes-after.txt
 ```
+
+(`f001-routes4-before.txt` is the IPv4 capture added to step 2. The earlier
+version of this step diffed against the **IPv6** baseline, which would have
+reported every IPv4 route in the table as a difference and made P3 look failed
+no matter what the client did.)
 
 **Pass:** no difference. **Fail:** any leftover host route or tunnel route is a
 teardown defect — the next connect may then hit P2's conflicting-route path for
