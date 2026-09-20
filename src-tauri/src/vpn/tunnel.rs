@@ -2516,26 +2516,52 @@ mod endpoint_route_tests {
     ///
     /// Needs no privileges: `route add` fails on the address before it ever
     /// reaches the routing table.
+    /// Reports exactly what `route.exe` did, so a failure here is diagnosable
+    /// from the CI log rather than guessable.
+    ///
+    /// The first version of these tests passed on an unelevated dev box for the
+    /// WRONG REASON: without elevation `route.exe` fails with "requires
+    /// elevation", a non-zero exit, so the function returned Err by accident.
+    /// The CI runner is elevated, gets further, and exposed the real behaviour.
+    fn route_exe_says(dest: &str, gw: &str) -> String {
+        match cmd("route")
+            .args(["add", dest, "mask", "255.255.255.255", gw, "metric", "1"])
+            .output()
+        {
+            Ok(o) => format!(
+                "exit={:?} stdout={:?} stderr={:?}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout).trim(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => format!("spawn failed: {e}"),
+        }
+    }
+
     #[test]
     fn a_malformed_endpoint_is_fatal_not_swallowed() {
-        let err = add_endpoint_host_route("999.999.999.999", "192.0.2.1", None)
-            .expect_err("a malformed endpoint must not be accepted");
-        assert!(
-            err.contains("routing loop") || err.contains("Failed to execute route add"),
-            "refused, but not with the endpoint-route error: {err}"
-        );
+        let diag = route_exe_says("999.999.999.999", "192.0.2.1");
+        match add_endpoint_host_route("999.999.999.999", "192.0.2.1", None) {
+            Ok(()) => panic!("a malformed endpoint was ACCEPTED. route.exe: {diag}"),
+            Err(err) => assert!(
+                err.contains("routing loop") || err.contains("Failed to execute route add"),
+                "refused, but not with the endpoint-route error: {err} | route.exe: {diag}"
+            ),
+        }
     }
 
     /// Same contract from the other side: a malformed GATEWAY also defeats the
     /// native path, so the fallback runs and must fail loudly too.
     #[test]
     fn a_malformed_gateway_is_fatal_not_swallowed() {
-        let err = add_endpoint_host_route("192.0.2.10", "not-a-gateway", None)
-            .expect_err("a malformed gateway must not be accepted");
-        assert!(
-            err.contains("routing loop") || err.contains("Failed to execute route add"),
-            "refused, but not with the endpoint-route error: {err}"
-        );
+        let diag = route_exe_says("192.0.2.10", "not-a-gateway");
+        match add_endpoint_host_route("192.0.2.10", "not-a-gateway", None) {
+            Ok(()) => panic!("a malformed gateway was ACCEPTED. route.exe: {diag}"),
+            Err(err) => assert!(
+                err.contains("routing loop") || err.contains("Failed to execute route add"),
+                "refused, but not with the endpoint-route error: {err} | route.exe: {diag}"
+            ),
+        }
     }
 
     /// `phys_idx: None` must not be treated as "native succeeded". This is the
