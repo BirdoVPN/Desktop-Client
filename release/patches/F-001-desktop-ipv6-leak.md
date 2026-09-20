@@ -100,23 +100,40 @@ it errored. Capture the client log — the error text is `ip -6 addr add failed:
 
 ## Step 5 — prove the v6 route is the tunnel's, and not a pre-existing one
 
-This is the step with the known trap, and it is worth doing carefully.
+> **Corrected 2026-09-20. The earlier version of this step was wrong**, and
+> wrong in the direction that produces a false failure: it told you to look for
+> a **default** v6 route on the tunnel and to treat the host's surviving `::/0`
+> as the bug. Correct code never installs a `::/0`, so an operator following
+> that instruction would have reported a working client as broken. The step
+> below describes what `configure_ipv6()` actually does.
 
 ```bash
-ip -6 route show | grep -E '^default|^::/0'
+ip -6 route show | grep -E '^(::/1|8000::/1)'
+ip -6 route get 2606:4700:4700::1111
 ```
 
-**Pass:** the default v6 route points at the tunnel interface.
+**Pass:** `::/1` **and** `8000::/1` are both present on the tunnel device, and
+`route get` names the tunnel device.
 
-**Fail, and the specific hazard:** if the host already had a `::/0` default, then
-`ip -6 route add ::/0 dev <tun>` returns **"File exists"**. The code comments at
-`tunnel_linux.rs:1121` record exactly this: treating that as success would leave
-**no tunnel route installed** while the caller goes on to lift the IPv6 block —
-"strictly worse than never having routed v6 at all". So if you see the old ISP
-route still there while the client reports connected, that is the bug, not a
-cosmetic mismatch.
+**The host's own `::/0` is still there, and that is correct.** The client
+deliberately routes the two halves instead of a default
+(`tunnel_linux.rs:1078-1080`, and the long comment from line 1129). Two
+more-specific prefixes win on longest-prefix match without deleting anything, so
+teardown has nothing to restore — the same trick the IPv4 path uses. The
+comments there spell out why the obvious approach was rejected: on a normal
+SLAAC host the kernel already holds a `::/0`, so `ip -6 route add ::/0 dev <tun>`
+returns **"File exists"**, and swallowing that would report success with **no
+tunnel route installed** while the caller went on to lift the IPv6 leak block —
+"strictly worse than never having routed v6 at all".
 
----
+**Fail:** either half missing, or `route get` naming the physical interface.
+
+**Note what a failure here means.** The function makes both of these checks
+itself before returning — a missing half is a hard error, and the `route get`
+probe exists precisely because a route can install and still lose on metric. So
+a client that reports **Connected** while this step fails is not a routing
+mismatch; it means the fatal check did not fire, which is a deeper bug than the
+leak this bench is looking for.
 
 ## Step 6 — the leak test itself
 
@@ -189,6 +206,52 @@ Confirm routes and rules match `/tmp/f001-*-before.txt`. If they do not, the
 uninstall left state behind, which is itself a finding worth recording.
 
 ---
+
+## What CI now covers, so you do not re-test it by hand
+
+Since `configure_ipv6_tests` landed in `src-tauri/src/vpn/tunnel_linux.rs`, the
+following run as root on ubuntu-latest on **every push**, and the coverage gate
+in `tests.yml` fails the build if either stops being executed:
+
+| Proved in CI | Still needs this bench |
+|---|---|
+| `configure_ipv6()` executes without error — **its first execution anywhere** | That IPv6 traffic actually **leaves** through the tunnel (step 6) |
+| It installs `::/1` + `8000::/1`, never a `::/0` | MTU behaviour on a real path (step 7) |
+| The host's pre-existing v6 default survives untouched | The kill switch after disconnect (step 8) |
+| The kernel agrees the tunnel won, via `ip -6 route get` | |
+| A collision on one half is **refused**, not swallowed | |
+
+That is goal 1 of the three this document opens with. Goals 2 and 3 are about
+traffic and firewall state on a real dual-stack line, and no amount of CI
+substitutes for them.
+
+## Why this cannot be run on a production relay
+
+The obvious thought — the fleet is Linux, so use a relay — does not survive
+contact with what the steps do, and the reason is worth writing down so it is not
+re-proposed.
+
+**Step 1 was run on the fleet on 2026-09-20, read-only, and all ten relays
+pass:** two global IPv6 addresses each, a default v6 route, working v6 egress,
+`ip6tables` present. So a relay is a perfectly valid *environment* for this
+bench. That is not the problem.
+
+The problem is everything after step 1. Steps 2–9 install a VPN client, and
+`configure_ipv6()` installs `::/1` + `8000::/1` — which between them cover the
+entire IPv6 address space. On a relay that means **every customer's IPv6 egress
+is pulled into the test tunnel**. Step 8 then verifies that the kill switch
+*blocks* IPv6 after disconnect, which deliberately leaves the box in a
+v6-blocking state, and step 9 removes a package. P2 goes further and provokes a
+route conflict on purpose to prove the client refuses to connect.
+
+So: step 1 on a relay, yes, and it is done. Steps 2 onwards need a Linux machine
+on a dual-stack line that is **not carrying customer traffic**. A laptop on a UK
+mobile hotspot is the cheapest thing that qualifies.
+
+A network namespace would isolate routing and firewall state well enough to make
+a relay safe, but the client is a Tauri desktop application with no headless
+binary — there is no `[[bin]]` target to run under `ip netns exec`. Building one
+purely for this would be a larger job than borrowing a laptop for an hour.
 
 ## Evidence to capture
 
@@ -285,7 +348,7 @@ exactly which platforms were covered.
 
 | Step | Result | Date | Notes |
 |---|---|---|---|
-| 1 host has IPv6 | | | ISP_V6 = |
+| 1 host has IPv6 | n/a for the fleet | 2026-09-20 | **Fleet sweep: 10/10 relays pass** (2 global addrs, default route, v6 egress, ip6tables). Still to be captured on the bench machine: ISP_V6 = |
 | 2 baseline captured | | | |
 | 3 connected to v6 node | | | node = |
 | 4 configure_ipv6 ran | | | |
@@ -298,7 +361,11 @@ exactly which platforms were covered.
 | P2 route-add failure is loud | | | |
 | P3 clean teardown | | | |
 
-**Overall: not yet run.**
+**Overall: not yet run on a client machine.** Step 1's prerequisite is proven
+across the fleet, and goal 1 — that `configure_ipv6()` executes and installs the
+route shape it claims — is now proven in CI on every push. What remains is the
+part that needs a real dual-stack client: the leak test itself, MTU, and the kill
+switch after disconnect.
 
 Once every row passes, this closes F-001, records the first-ever execution of
 `configure_ipv6()`, and clears F-010 on the same bench. Re-issue the public-launch

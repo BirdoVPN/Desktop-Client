@@ -2124,3 +2124,199 @@ mod resolv_conf_restore_tests {
         ));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F-001 goal 1: configure_ipv6() has never been executed, anywhere.
+//
+// The bench document (release/patches/F-001-desktop-ipv6-leak.md) opens by
+// saying this function "has never been executed on a machine with working IPv6,
+// anywhere" — and it still had not been, because the only way to reach it was a
+// dual-stack device nobody had. Every Linux and Windows single-hop connect calls
+// it for real since route failures became fatal, so the first execution would
+// otherwise have been a customer's.
+//
+// A dummy interface is enough for the parts that do not need egress. These tests
+// do not prove IPv6 traffic LEAVES through the tunnel — that still needs the
+// bench on a dual-stack line — but they do prove the function runs, installs the
+// route shape it claims, leaves the host default alone, and refuses in the one
+// case the comments say it must refuse.
+//
+// WHY A DUMMY INTERFACE AND NOT A NETNS: the test process would have to be
+// inside the namespace, which `cargo test` cannot arrange for itself. A uniquely
+// named dummy is self-limiting instead — deleting the link removes every route
+// through it, so cleanup cannot leave anything behind even if an assert panics.
+//
+// Ignored by default so a normal `cargo test` never touches host routing. CI
+// runs it as root on ubuntu-latest alongside the leak-block test.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod configure_ipv6_tests {
+    use super::*;
+
+    const DEV: &str = "birdof001";
+    const V6: &str = "fd00:f001::2";
+
+    fn ip(args: &[&str]) -> (bool, String) {
+        let out = cmd("ip").args(args).output();
+        match out {
+            Ok(o) => (
+                o.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (false, e.to_string()),
+        }
+    }
+
+    fn routes() -> String {
+        ip(&["-6", "route", "show"]).1
+    }
+
+    /// Removes the dummy link on drop, which takes every route through it with
+    /// it. Runs even when an assertion panics, so a failed test cannot leave the
+    /// runner holding half of the IPv6 address space on a dead interface.
+    struct Dummy;
+    impl Drop for Dummy {
+        fn drop(&mut self) {
+            let _ = ip(&["link", "del", DEV]);
+        }
+    }
+
+    fn make_dummy() -> Dummy {
+        let _ = ip(&["link", "del", DEV]); // in case a previous run died
+        let (ok, err) = ip(&["link", "add", DEV, "type", "dummy"]);
+        assert!(ok, "could not create a dummy interface (are we root?): {err}");
+        let guard = Dummy;
+        assert!(ip(&["link", "set", DEV, "up"]).0, "could not bring {DEV} up");
+
+        // Test scaffolding, not a change to production behaviour: on a dummy
+        // device a fresh IPv6 address sits TENTATIVE while duplicate-address
+        // detection runs, and a tentative address is not a usable route source,
+        // so `ip -6 route get` would fail for a reason that has nothing to do
+        // with the code under test. A real TUN device does not hit this.
+        let _ = std::process::Command::new("sysctl")
+            .arg("-w")
+            .arg(format!("net.ipv6.conf.{DEV}.accept_dad=0"))
+            .output();
+        let _ = std::process::Command::new("sysctl")
+            .arg("-w")
+            .arg(format!("net.ipv6.conf.{DEV}.disable_ipv6=0"))
+            .output();
+        guard
+    }
+
+    fn config() -> VpnConfig {
+        VpnConfig {
+            server_id: "f001".into(),
+            key_id: "f001".into(),
+            private_key: String::new(),
+            public_key: String::new(),
+            server_public_key: String::new(),
+            preshared_key: None,
+            endpoint: "192.0.2.1:51820".into(),
+            allowed_ips: vec!["0.0.0.0/0".into()],
+            dns: vec![],
+            client_ip: "10.0.0.2".into(),
+            client_ipv6: Some(format!("{V6}/128")),
+            // The backend always sends ::/0 (vpn.service.ts). Using the real
+            // value is the point: the split into halves must happen for what the
+            // backend actually sends, not only for an empty list.
+            allowed_ips_v6: vec!["::/0".into()],
+            mtu: 1420,
+            persistent_keepalive: 25,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    async fn installs_two_halves_and_leaves_the_host_default_alone() {
+        let _guard = make_dummy();
+
+        // Whatever ::/0 the host holds must survive. The whole reason the code
+        // splits the default is so teardown has nothing to restore.
+        let host_default_before: Vec<String> = routes()
+            .lines()
+            .filter(|l| l.starts_with("default") || l.starts_with("::/0"))
+            .map(|s| s.to_string())
+            .collect();
+
+        configure_ipv6(DEV, &config())
+            .await
+            .expect("configure_ipv6 failed — this is its first execution anywhere");
+
+        let after = routes();
+
+        // 1. The /128 landed on the tunnel.
+        let addrs = ip(&["-6", "addr", "show", "dev", DEV]).1;
+        assert!(
+            addrs.contains(V6),
+            "the client IPv6 was not assigned to {DEV}:\n{addrs}"
+        );
+
+        // 2. Two halves, not a ::/0. A test asserting on ::/0 here would fail
+        //    against correct code — which is exactly what the bench document
+        //    told an operator to look for before this test existed.
+        for half in ["::/1", "8000::/1"] {
+            assert!(
+                after
+                    .lines()
+                    .any(|l| l.starts_with(half) && l.contains(DEV)),
+                "{half} was not routed via {DEV}:\n{after}"
+            );
+        }
+        assert!(
+            !after.lines().any(|l| l.starts_with("::/0") && l.contains(DEV)),
+            "a ::/0 default was installed on the tunnel; the split is the design:\n{after}"
+        );
+
+        // 3. The host's own default is untouched.
+        let host_default_after: Vec<String> = after
+            .lines()
+            .filter(|l| l.starts_with("default") || l.starts_with("::/0"))
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            host_default_before, host_default_after,
+            "the host IPv6 default changed; teardown would have to restore it"
+        );
+
+        // 4. The kernel agrees. This is the assertion the function itself makes
+        //    before the caller lifts the leak block, and the one that catches a
+        //    route that installed but lost on metric.
+        let probe = ip(&["-6", "route", "get", "2606:4700:4700::1111"]).1;
+        assert!(
+            probe.contains(DEV),
+            "kernel would not route via {DEV}:\n{probe}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    async fn refuses_when_something_else_already_owns_a_half() {
+        let _guard = make_dummy();
+
+        // Park ::/1 somewhere else first. The comments in configure_ipv6 say a
+        // collision here must NOT be swallowed, because reporting success with
+        // no tunnel route makes the caller lift the leak block over an unrouted
+        // tunnel — "strictly worse than never having routed v6 at all". That
+        // branch had never run.
+        let (parked, err) = ip(&["-6", "route", "add", "::/1", "dev", "lo"]);
+        assert!(parked, "could not park ::/1 on lo for the test: {err}");
+
+        let result = configure_ipv6(DEV, &config()).await;
+
+        let _ = ip(&["-6", "route", "del", "::/1", "dev", "lo"]);
+
+        let err = result.expect_err(
+            "configure_ipv6 returned Ok while ::/1 belonged to another device — \
+             the caller would now lift the IPv6 leak block over an unrouted tunnel",
+        );
+        assert!(
+            err.contains("route add") || err.contains("File exists"),
+            "refused, but not for the collision: {err}"
+        );
+    }
+}
