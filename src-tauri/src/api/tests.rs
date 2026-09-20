@@ -1118,15 +1118,23 @@ mod error_classification_tests {
     }
 
     #[test]
-    fn a_426_wins_over_a_typed_error_code_and_a_message() {
-        // Ordering guard: the generic branches would discard the payload the
-        // update screen needs, so the 426 check must run before both.
+    fn a_426_wins_over_a_message_and_ignores_an_unknown_error_code() {
+        // Ordering guard: the generic message branch would discard the payload
+        // the update screen needs, so the 426 check must run before it.
+        //
+        // The body still carries `errorCode` on purpose. It used to select a
+        // third branch, via ProtocolErrorCode, which was retired on 2026-09-20
+        // because the server never sent that key (see api/types.rs). Keeping it
+        // here now asserts the OTHER half of that decision: an unknown field
+        // must be ignored rather than fail the parse, so a server that one day
+        // starts sending `errorCode` degrades to the message, and never to a
+        // dropped 426.
         let body = r#"{"errorCode":"SUBSCRIPTION_REQUIRED","message":"Upgrade required","requiredVersion":"2.0.0"}"#;
         match BirdoApi::classify_error_response(StatusCode::UPGRADE_REQUIRED, body) {
             ApiError::UpgradeRequired(info) => {
                 assert_eq!(info.required_version.as_deref(), Some("2.0.0"))
             }
-            other => panic!("426 must outrank a typed error_code, got {other:?}"),
+            other => panic!("426 must outrank the message branch, got {other:?}"),
         }
     }
 

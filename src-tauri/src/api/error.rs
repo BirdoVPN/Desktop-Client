@@ -1,6 +1,5 @@
 //! API error types
 
-use super::types::ProtocolErrorCode;
 use super::upgrade_gate::RequiredUpdate;
 use std::fmt;
 
@@ -28,8 +27,6 @@ pub enum ApiError {
     Parse(String),
     /// SEC-C1: TLS certificate pinning verification failed (possible MITM)
     CertificatePinningFailed(String),
-    /// Protocol error with typed error code from backend
-    Protocol(ProtocolErrorCode),
     /// Unknown error
     Unknown(String),
 }
@@ -58,7 +55,6 @@ impl fmt::Display for ApiError {
             ApiError::ServerError(code) => write!(f, "Server error ({})", code),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),
             ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update BirdoVPN to the latest version. ({})", msg),
-            ApiError::Protocol(code) => write!(f, "{}", code.user_message()),
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }
     }
