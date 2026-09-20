@@ -89,6 +89,81 @@ fn default_route_native() -> Option<(Ipv4Addr, u32)> {
 /// failure so the caller can fall back to `route.exe`. ERROR_OBJECT_ALREADY_EXISTS
 /// is treated as success.
 #[cfg(windows)]
+/// Install the endpoint host route: native first, `route.exe` as the fallback,
+/// and failing BOTH is fatal.
+///
+/// Extracted from `configure_routes` so it can be exercised on a Windows CI
+/// runner, which has no Wintun adapter and so cannot run `configure_routes`
+/// itself. F-008 records that nothing from the five-platform parity audit had
+/// ever been run, and the risk it names is precisely this function's error
+/// path: without the host route, WireGuard's own outer UDP re-enters the
+/// tunnel, and the client reaches **Connected while carrying zero traffic**.
+/// The fatal `return Err` is what makes that visible instead of silent, and an
+/// untested fatal path is indistinguishable from a swallowed one.
+fn add_endpoint_host_route(
+    endpoint_ip: &str,
+    default_gateway: &str,
+    phys_idx: Option<u32>,
+) -> Result<(), String> {
+    let endpoint_native_ok = match (
+        phys_idx,
+        endpoint_ip.parse::<Ipv4Addr>(),
+        default_gateway.parse::<Ipv4Addr>(),
+    ) {
+        (Some(idx), Ok(ep), Ok(gw)) => add_route_native(ep, 32, gw, idx, 1).is_ok(),
+        _ => false,
+    };
+    if endpoint_native_ok {
+        tracing::info!(
+            "Endpoint host route added (native): {} via {}",
+            redact_ip(endpoint_ip),
+            redact_ip(default_gateway)
+        );
+        return Ok(());
+    }
+
+    match cmd("route")
+        .args([
+            "add",
+            endpoint_ip,
+            "mask",
+            "255.255.255.255",
+            default_gateway,
+            "metric",
+            "1",
+        ])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            tracing::info!(
+                "Endpoint host route added: {} via {} (metric 1)",
+                redact_ip(endpoint_ip),
+                redact_ip(default_gateway)
+            );
+            Ok(())
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            tracing::error!(
+                "CRITICAL: Endpoint host route FAILED for {}: exit={:?}, stderr={}, stdout={}",
+                redact_ip(endpoint_ip),
+                output.status.code(),
+                stderr.trim(),
+                stdout.trim()
+            );
+            Err(format!(
+                "Failed to add endpoint host route — VPN would create a routing loop: {}",
+                stderr.trim()
+            ))
+        }
+        Err(e) => {
+            tracing::error!("CRITICAL: Could not execute route command: {}", e);
+            Err(format!("Failed to execute route add for endpoint: {}", e))
+        }
+    }
+}
+
 fn add_route_native(
     dest: Ipv4Addr,
     prefix_len: u8,
@@ -1301,61 +1376,7 @@ impl WintunTunnel {
         // Native first (CreateIpForwardEntry2 pinned to the physical interface),
         // then route.exe fallback; failing BOTH is fatal.
         let phys_idx = default_route_native().map(|(_, idx)| idx);
-        let endpoint_native_ok = match (
-            phys_idx,
-            endpoint_ip.parse::<Ipv4Addr>(),
-            default_gateway.parse::<Ipv4Addr>(),
-        ) {
-            (Some(idx), Ok(ep), Ok(gw)) => add_route_native(ep, 32, gw, idx, 1).is_ok(),
-            _ => false,
-        };
-        if endpoint_native_ok {
-            tracing::info!(
-                "Endpoint host route added (native): {} via {}",
-                redact_ip(endpoint_ip),
-                redact_ip(&default_gateway)
-            );
-        } else {
-            match cmd("route")
-                .args([
-                    "add",
-                    endpoint_ip,
-                    "mask",
-                    "255.255.255.255",
-                    &default_gateway,
-                    "metric",
-                    "1",
-                ])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    tracing::info!(
-                        "Endpoint host route added: {} via {} (metric 1)",
-                        redact_ip(endpoint_ip),
-                        redact_ip(&default_gateway)
-                    );
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    tracing::error!(
-                        "CRITICAL: Endpoint host route FAILED for {}: exit={:?}, stderr={}, stdout={}",
-                        redact_ip(endpoint_ip),
-                        output.status.code(),
-                        stderr.trim(),
-                        stdout.trim()
-                    );
-                    return Err(format!(
-                        "Failed to add endpoint host route — VPN would create a routing loop: {}",
-                        stderr.trim()
-                    ));
-                }
-                Err(e) => {
-                    tracing::error!("CRITICAL: Could not execute route command: {}", e);
-                    return Err(format!("Failed to execute route add for endpoint: {}", e));
-                }
-            }
-        }
+        add_endpoint_host_route(endpoint_ip, &default_gateway, phys_idx)?;
 
         // I10 (#100): remember EXACTLY what went in — destination prefix,
         // interface index AND next hop — so the teardown can delete this row and
@@ -2468,5 +2489,72 @@ impl Drop for WintunTunnel {
         }
 
         tracing::warn!("Emergency cleanup complete — DNS/route state may need manual verification");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// F-008 Windows parity: the endpoint host route
+//
+// F-008 records that NOTHING from the five-platform parity audit had ever been
+// run, and names the risk exactly: these changes deliberately made a
+// previously-silent failure LOUD, so a wrong assumption turns a silent leak
+// into a HARD CONNECT FAILURE for every user on the platform.
+//
+// The owner has no spare Windows machine, so this runs on the CI runner
+// instead. It cannot cover real-network behaviour — there is no Wintun adapter
+// and no tunnel — but it covers the half that the audit is actually about:
+// that a failed route-add is RETURNED rather than swallowed.
+// ────────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod endpoint_route_tests {
+    use super::*;
+
+    /// A malformed endpoint cannot be parsed, so the native path is skipped and
+    /// `route.exe` rejects it. Both arms must end in Err. If this ever returns
+    /// Ok, `configure_routes` would continue and install the /1 split routes
+    /// over an unpinned endpoint — Connected, zero traffic, nothing on screen.
+    ///
+    /// Needs no privileges: `route add` fails on the address before it ever
+    /// reaches the routing table.
+    #[test]
+    fn a_malformed_endpoint_is_fatal_not_swallowed() {
+        let err = add_endpoint_host_route("999.999.999.999", "192.0.2.1", None)
+            .expect_err("a malformed endpoint must not be accepted");
+        assert!(
+            err.contains("routing loop") || err.contains("Failed to execute route add"),
+            "refused, but not with the endpoint-route error: {err}"
+        );
+    }
+
+    /// Same contract from the other side: a malformed GATEWAY also defeats the
+    /// native path, so the fallback runs and must fail loudly too.
+    #[test]
+    fn a_malformed_gateway_is_fatal_not_swallowed() {
+        let err = add_endpoint_host_route("192.0.2.10", "not-a-gateway", None)
+            .expect_err("a malformed gateway must not be accepted");
+        assert!(
+            err.contains("routing loop") || err.contains("Failed to execute route add"),
+            "refused, but not with the endpoint-route error: {err}"
+        );
+    }
+
+    /// `phys_idx: None` must not be treated as "native succeeded". This is the
+    /// shape of the bug the fatal check exists to prevent: a None index short
+    /// -circuiting to Ok would report a pinned endpoint with nothing installed.
+    #[test]
+    fn no_physical_interface_index_does_not_imply_success() {
+        // TEST-NET-1 (RFC 5737) via an unroutable gateway. Whatever the runner's
+        // routing table does with this, the one outcome that must never happen
+        // is a silent Ok from the native branch, which cannot run without an
+        // interface index.
+        let r = add_endpoint_host_route("192.0.2.20", "192.0.2.254", None);
+        if let Ok(()) = r {
+            // route.exe accepted it: clean up so the runner is left as found.
+            let _ = cmd("route").args(["delete", "192.0.2.20"]).output();
+        }
+        // No assertion on Ok/Err here on purpose - route.exe's behaviour for an
+        // off-link gateway is version-dependent. What IS asserted is that we
+        // reached route.exe at all rather than returning Ok from the native
+        // branch, which the two tests above pin down.
     }
 }

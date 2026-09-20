@@ -977,6 +977,40 @@ fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Pin the VPN endpoint to the real gateway, so WireGuard's own outer UDP does
+/// not get captured by the tunnel's own routes.
+///
+/// Extracted from `configure_routes` so it can be exercised on a macOS CI
+/// runner, which has no utun device and therefore cannot run `configure_routes`
+/// itself. F-008 records that nothing from the five-platform parity audit had
+/// ever been run, and macOS is the platform it singles out as deserving real
+/// hardware — its route behaviour differs from Linux. This does not replace
+/// that; it covers the half the audit is really about, which is that a failed
+/// route-add is RETURNED rather than swallowed.
+fn pin_endpoint_route(endpoint_ip: &str, default_gw: &str) -> Result<(), String> {
+    let output = cmd("route")
+        .args(["-n", "add", "-host", endpoint_ip, default_gw])
+        .output()
+        .map_err(|e| format!("Failed to add endpoint route: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // MUST be fatal (except an existing identical route). Once the default
+        // is genuinely captured, a missing endpoint route sends WireGuard's own
+        // outer UDP back into the tunnel — an encapsulation loop that reaches
+        // Connected and carries zero traffic. Warning here would convert a
+        // visible failure into an invisible one.
+        if !stderr.contains("File exists") {
+            return Err(format!(
+                "Failed to pin the endpoint route: {}",
+                stderr.trim()
+            ));
+        }
+        tracing::debug!("Endpoint route already present");
+    }
+    Ok(())
+}
+
 async fn configure_routes(
     utun_name: &str,
     endpoint_ip: &str,
@@ -987,28 +1021,7 @@ async fn configure_routes(
     let default_gw = get_default_gateway()?;
     tracing::info!("Default gateway: {}", redact_ip(&default_gw));
 
-    // Add a specific route for the VPN endpoint via the real gateway
-    // so WireGuard UDP packets don't get caught in the VPN tunnel
-    let output = cmd("route")
-        .args(["-n", "add", "-host", endpoint_ip, default_gw.as_str()])
-        .output()
-        .map_err(|e| format!("Failed to add endpoint route: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // MUST be fatal (except an existing identical route). Once the default
-        // below is genuinely captured, a missing endpoint route sends WireGuard's
-        // own outer UDP back into the tunnel — an encapsulation loop that reaches
-        // Connected and carries zero traffic. Warning here would convert a visible
-        // failure into an invisible one.
-        if !stderr.contains("File exists") {
-            return Err(format!(
-                "Failed to pin the endpoint route: {}",
-                stderr.trim()
-            ));
-        }
-        tracing::debug!("Endpoint route already present");
-    }
+    pin_endpoint_route(endpoint_ip, &default_gw)?;
 
     let allowed_ips = expand_default_v4(allowed_ips);
 
@@ -1908,5 +1921,74 @@ mod dns_journal_restore_tests {
         assert!(!dns_write_verified(&want, Some(strings(&["10.8.0.1"]))));
         assert!(!dns_write_verified(&want, Some(Vec::new())));
         assert!(!dns_write_verified(&want, None));
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// F-008 macOS parity: the endpoint route
+//
+// The owner has no Mac, so this runs on the CI runner. It cannot cover what a
+// real Mac would — no utun, no tunnel, no network path — and F-008's note that
+// macOS route behaviour deserves real hardware still stands. What it does cover
+// is the contract the audit is named for: the failure is RETURNED, not
+// swallowed, and the ONE tolerated case is an already-present route.
+// ────────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod endpoint_route_tests {
+    use super::*;
+
+    /// `route` rejects a malformed destination, and that rejection must reach
+    /// the caller. If this returned Ok, `configure_routes` would go on to
+    /// install the split default over an unpinned endpoint — Connected, zero
+    /// traffic, nothing on screen to say why.
+    ///
+    /// Needs no privileges: the address is refused before the routing table is
+    /// touched.
+    #[test]
+    fn a_malformed_endpoint_is_fatal_not_swallowed() {
+        let err = pin_endpoint_route("999.999.999.999", "192.0.2.1")
+            .expect_err("a malformed endpoint must not be accepted");
+        assert!(
+            err.contains("Failed to pin the endpoint route")
+                || err.contains("Failed to add endpoint route"),
+            "refused, but not with the endpoint-route error: {err}"
+        );
+    }
+
+    /// Same from the gateway side.
+    #[test]
+    fn a_malformed_gateway_is_fatal_not_swallowed() {
+        let err = pin_endpoint_route("192.0.2.10", "not-a-gateway")
+            .expect_err("a malformed gateway must not be accepted");
+        assert!(
+            err.contains("Failed to pin the endpoint route")
+                || err.contains("Failed to add endpoint route"),
+            "refused, but not with the endpoint-route error: {err}"
+        );
+    }
+
+    /// The ONE tolerated failure, proven rather than asserted in a comment: a
+    /// route that is already present returns Ok, because reconnecting over a
+    /// surviving route is normal and must not be fatal.
+    ///
+    /// Root-only — it really installs a route to TEST-NET-1 and removes it.
+    #[test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    fn an_already_present_route_is_tolerated() {
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(e) => panic!("no default gateway on this runner: {e}"),
+        };
+        const DEST: &str = "192.0.2.123"; // RFC 5737 TEST-NET-1
+
+        let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
+
+        pin_endpoint_route(DEST, &gw).expect("first add should succeed");
+        // Second call hits "File exists" — the tolerated case.
+        let second = pin_endpoint_route(DEST, &gw);
+
+        let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
+
+        second.expect("an already-present endpoint route must be tolerated, not fatal");
     }
 }

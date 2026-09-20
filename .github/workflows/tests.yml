@@ -197,13 +197,13 @@ jobs:
           # dns_journal_restore_tests (restore_services_pass,
           # interpret_dns_query, dns_write_verified). Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'resolv_conf_restore_tests tun_read_tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests' || 'resolv_conf_restore_tests tun_read_tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
           # FILTER plus the root-only ipv6 step further down, whose tests are
           # #[ignore]d and so cannot run in the loop above.
-          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests' || 'configure_ipv6_tests ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
+          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests' || 'configure_ipv6_tests ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
         run: |
           set -euo pipefail
           # Captured, not piped: a name filter that matches NOTHING still exits
@@ -293,6 +293,21 @@ jobs:
       # that a collision on one half is REFUSED rather than swallowed. Proving
       # IPv6 traffic actually leaves through the tunnel still needs the bench on
       # a dual-stack line; this is the part that does not.
+      # F-008 macOS: the ONE tolerated route failure, proven rather than
+      # asserted in a comment. The owner has no Mac, so this runner is the only
+      # place it can run. It installs a route to TEST-NET-1 and removes it.
+      - name: Endpoint-route tolerated-duplicate test (macOS, root)
+        if: matrix.os == 'macos'
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          out=$(sudo -E "$(command -v cargo)" test --lib endpoint_route_tests -- --ignored --nocapture --test-threads=1)
+          echo "$out"
+          if ! echo "$out" | grep -qE 'test result: ok\. 1 passed'; then
+            echo "::error::the macOS endpoint-route root test did not run"
+            exit 1
+          fi
+
       - name: configure_ipv6 route-shape tests (Linux, root)
         if: matrix.os == 'linux'
         working-directory: src-tauri
