@@ -938,15 +938,17 @@ impl BirdoApi {
     ///
     /// Ordering is the whole point of this function:
     ///
-    ///  0. **426 Upgrade Required wins over everything**, including a typed
-    ///     `error_code`. The forced version floor is decided by the STATUS
+    ///  0. **426 Upgrade Required wins over everything.** The forced version
+    ///     floor is decided by the STATUS
     ///     CODE, and its body carries a payload (`details.minVersion`,
     ///     `details.updateUrl`) that every other variant would throw away — the
     ///     UI needs that payload to name the version and, crucially, to enable
     ///     the "Download manually" button, which is a blocked user's only
     ///     escape hatch that does not rely on the in-app updater. A body we
     ///     cannot parse still blocks; it just cannot name the version.
-    ///  1. A typed `error_code` always wins — it is a deliberate protocol signal.
+    ///  1. (Retired 2026-09-20.) A typed `error_code` used to win here, via
+    ///     ProtocolErrorCode. The server never sent the key, so the branch
+    ///     never ran; see api/types.rs for the full reasoning.
     ///  2. **401 maps to `ApiError::Unauthorized` before anything else**, because
     ///     that variant is the ONLY thing `request_with_retry` keys on to run the
     ///     transparent token refresh. The backend registers GlobalExceptionFilter
@@ -980,10 +982,6 @@ impl BirdoApi {
         }
 
         let body = serde_json::from_str::<super::types::ApiErrorBody>(error_text).ok();
-
-        if let Some(code) = body.as_ref().and_then(|b| b.error_code.clone()) {
-            return ApiError::Protocol(code);
-        }
 
         if status == StatusCode::UNAUTHORIZED {
             return ApiError::Unauthorized;

@@ -10,92 +10,39 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 // ============================================================================
-// Protocol Error Codes (from birdo-shared/protocol.json)
+// RETIRED: ProtocolErrorCode (owner decision, 2026-09-20)
 // ============================================================================
-
-/// Standardized error codes for cross-platform consistency.
-/// Generated from the ErrorCode enum in protocol.json.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProtocolErrorCode {
-    AuthRequired,
-    AuthExpired,
-    SubscriptionRequired,
-    SubscriptionExpired,
-    DeviceLimitReached,
-    RateLimited,
-    ServerOffline,
-    ServerFull,
-    NoServersAvailable,
-    TunnelCreationFailed,
-    TunnelStartFailed,
-    DnsConfigurationFailed,
-    RouteConfigurationFailed,
-    KillSwitchFailed,
-    Ipv6BlockFailed,
-    StealthTunnelFailed,
-    QuantumHandshakeFailed,
-    AdminRequired,
-    NetworkUnreachable,
-    HandshakeTimeout,
-    DllIntegrityFailed,
-    JniIntegrityFailed,
-    SettingsTampered,
-    BiometricFailed,
-    Unknown,
-}
-
-impl ProtocolErrorCode {
-    /// Human-readable message for UI display
-    pub fn user_message(&self) -> &'static str {
-        match self {
-            Self::AuthRequired => "Please sign in to continue",
-            Self::AuthExpired => "Your session has expired — please sign in again",
-            Self::SubscriptionRequired => "A subscription is required for this feature",
-            Self::SubscriptionExpired => "Your subscription has expired",
-            Self::DeviceLimitReached => "Device limit reached — remove a device to connect",
-            Self::RateLimited => "Too many requests — please wait a moment",
-            Self::ServerOffline => "This server is currently offline",
-            Self::ServerFull => "This server is at capacity — try another",
-            Self::NoServersAvailable => "No servers available — check back shortly",
-            Self::TunnelCreationFailed => "Failed to create VPN tunnel",
-            Self::TunnelStartFailed => "Failed to start VPN tunnel",
-            Self::DnsConfigurationFailed => "Failed to configure DNS",
-            Self::RouteConfigurationFailed => "Failed to configure routing",
-            Self::KillSwitchFailed => "Kill switch activation failed",
-            Self::Ipv6BlockFailed => "IPv6 leak protection failed",
-            Self::StealthTunnelFailed => "Stealth tunnel failed — try without stealth mode",
-            Self::QuantumHandshakeFailed => {
-                "Post-quantum handshake failed — try without quantum protection"
-            }
-            Self::AdminRequired => "Administrator privileges are required",
-            Self::NetworkUnreachable => "Network is unreachable — check your connection",
-            Self::HandshakeTimeout => "Connection timed out — try a closer server",
-            Self::DllIntegrityFailed => {
-                "Security check failed — application files may be corrupted"
-            }
-            Self::JniIntegrityFailed => {
-                "Security check failed — application files may be corrupted"
-            }
-            Self::SettingsTampered => "Settings integrity check failed",
-            Self::BiometricFailed => "Biometric authentication failed",
-            Self::Unknown => "An unexpected error occurred",
-        }
-    }
-}
-
-impl std::fmt::Display for ProtocolErrorCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.user_message())
-    }
-}
+//
+// A 25-value enum mirroring `definitions.ErrorCode` in birdo-shared's
+// protocol.json, with a `user_message()` arm for every value. It was wired
+// into two real user-facing paths and still never ran once, because the
+// server has never populated the field that feeds it:
+//
+//   * ApiErrorBody.error_code  -> ApiError::Protocol(code) in client.rs,
+//     rendered by error.rs's Display arm.
+//   * ConnectResponse.error_code -> the middle fallback in
+//     commands/vpn.rs::connect_failure_message.
+//
+// Both deserialise the camelCase key `errorCode`. That key appears NOWHERE
+// in birdo-web — the only `errorCode` in that repo is Turnstile's unrelated
+// `errorCodes` array — so both fields were always None and both branches
+// were unreachable. protocol.json's own `_status.authoritative` is false,
+// and birdo-shared's README posed the choice explicitly: populate it on the
+// wire, or delete the enum and both client mirrors. The owner chose delete.
+//
+// Removing it is behaviour-preserving precisely BECAUSE it never ran. The
+// connect message now falls `message` -> "Connection failed", which is what
+// every real response already produced.
+//
+// To bring it back, implement it server-side FIRST and pin it with a
+// wire-level test, the way `update_required` is pinned in
+// backend/src/vpn/contract/protocol-schema.ts. A contract the code does not
+// honour is worse than no contract: it reads as a promise.
 
 /// Parsed error body from API responses
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiErrorBody {
-    #[serde(default)]
-    pub error_code: Option<ProtocolErrorCode>,
     #[serde(default)]
     pub message: Option<String>,
 }
@@ -834,8 +781,6 @@ pub struct ConnectResponse {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
-    #[serde(default)]
-    pub error_code: Option<ProtocolErrorCode>,
     #[serde(default)]
     pub config: Option<String>,
     #[serde(default)]

@@ -78,15 +78,13 @@ pub(crate) fn transport_fallback_reason(error: &str) -> Option<&'static str> {
 }
 
 fn connect_failure_message(response: &ConnectResponse) -> String {
+    // The `error_code` arm that used to sit between these two was removed
+    // with ProtocolErrorCode (see api/types.rs): the server never sent the
+    // `errorCode` key, so it was always None and this was always
+    // `message` -> "Connection failed" in practice.
     response
         .message
         .clone()
-        .or_else(|| {
-            response
-                .error_code
-                .as_ref()
-                .map(|code| code.user_message().to_string())
-        })
         .unwrap_or_else(|| "Connection failed".to_string())
 }
 
@@ -1695,7 +1693,6 @@ mod tests {
         ConnectResponse {
             success: true,
             message: None,
-            error_code: None,
             config: None,
             key_id: Some("k1".into()),
             private_key: None,
