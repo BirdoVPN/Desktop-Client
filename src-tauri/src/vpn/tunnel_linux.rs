@@ -2153,7 +2153,13 @@ mod resolv_conf_restore_tests {
 mod configure_ipv6_tests {
     use super::*;
 
-    const DEV: &str = "birdof001";
+    // One device per test. libtest runs tests in parallel by default, so a
+    // single shared name made the second test fail on "RTNETLINK answers: File
+    // exists" — a collision between the tests, not a finding about the code.
+    // Distinct names are half the fix; the CI step passes --test-threads=1 for
+    // the other half, because these tests also touch GLOBAL routing state
+    // (`::/1` is `::/1` no matter which device claims it) and a rename cannot
+    // isolate that.
     const V6: &str = "fd00:f001::2";
 
     fn ip(args: &[&str]) -> (bool, String) {
@@ -2178,19 +2184,25 @@ mod configure_ipv6_tests {
     /// Removes the dummy link on drop, which takes every route through it with
     /// it. Runs even when an assertion panics, so a failed test cannot leave the
     /// runner holding half of the IPv6 address space on a dead interface.
-    struct Dummy;
+    struct Dummy(&'static str);
     impl Drop for Dummy {
         fn drop(&mut self) {
-            let _ = ip(&["link", "del", DEV]);
+            let _ = ip(&["link", "del", self.0]);
         }
     }
 
-    fn make_dummy() -> Dummy {
-        let _ = ip(&["link", "del", DEV]); // in case a previous run died
-        let (ok, err) = ip(&["link", "add", DEV, "type", "dummy"]);
-        assert!(ok, "could not create a dummy interface (are we root?): {err}");
-        let guard = Dummy;
-        assert!(ip(&["link", "set", DEV, "up"]).0, "could not bring {DEV} up");
+    fn make_dummy(dev: &'static str) -> Dummy {
+        let _ = ip(&["link", "del", dev]); // in case a previous run died
+        let (ok, err) = ip(&["link", "add", dev, "type", "dummy"]);
+        assert!(
+            ok,
+            "could not create a dummy interface (are we root?): {err}"
+        );
+        let guard = Dummy(dev);
+        assert!(
+            ip(&["link", "set", dev, "up"]).0,
+            "could not bring {dev} up"
+        );
 
         // Test scaffolding, not a change to production behaviour: on a dummy
         // device a fresh IPv6 address sits TENTATIVE while duplicate-address
@@ -2199,11 +2211,11 @@ mod configure_ipv6_tests {
         // with the code under test. A real TUN device does not hit this.
         let _ = std::process::Command::new("sysctl")
             .arg("-w")
-            .arg(format!("net.ipv6.conf.{DEV}.accept_dad=0"))
+            .arg(format!("net.ipv6.conf.{dev}.accept_dad=0"))
             .output();
         let _ = std::process::Command::new("sysctl")
             .arg("-w")
-            .arg(format!("net.ipv6.conf.{DEV}.disable_ipv6=0"))
+            .arg(format!("net.ipv6.conf.{dev}.disable_ipv6=0"))
             .output();
         guard
     }
@@ -2233,7 +2245,8 @@ mod configure_ipv6_tests {
     #[tokio::test]
     #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
     async fn installs_two_halves_and_leaves_the_host_default_alone() {
-        let _guard = make_dummy();
+        const DEV: &str = "birdof001a";
+        let _guard = make_dummy(DEV);
 
         // Whatever ::/0 the host holds must survive. The whole reason the code
         // splits the default is so teardown has nothing to restore.
@@ -2268,7 +2281,9 @@ mod configure_ipv6_tests {
             );
         }
         assert!(
-            !after.lines().any(|l| l.starts_with("::/0") && l.contains(DEV)),
+            !after
+                .lines()
+                .any(|l| l.starts_with("::/0") && l.contains(DEV)),
             "a ::/0 default was installed on the tunnel; the split is the design:\n{after}"
         );
 
@@ -2296,7 +2311,8 @@ mod configure_ipv6_tests {
     #[tokio::test]
     #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
     async fn refuses_when_something_else_already_owns_a_half() {
-        let _guard = make_dummy();
+        const DEV: &str = "birdof001b";
+        let _guard = make_dummy(DEV);
 
         // Park ::/1 somewhere else first. The comments in configure_ipv6 say a
         // collision here must NOT be swallowed, because reporting success with

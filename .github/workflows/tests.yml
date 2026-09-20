@@ -298,7 +298,11 @@ jobs:
         working-directory: src-tauri
         run: |
           set -euo pipefail
-          out=$(sudo -E "$(command -v cargo)" test --lib configure_ipv6_tests -- --ignored --nocapture)
+          # --test-threads=1 is load-bearing, not tidiness. Both tests touch
+          # GLOBAL routing state - ::/1 is ::/1 whichever device claims it - so
+          # run in parallel they contend over the same prefix and fail for a
+          # reason that has nothing to do with the code under test.
+          out=$(sudo -E "$(command -v cargo)" test --lib configure_ipv6_tests -- --ignored --nocapture --test-threads=1)
           echo "$out"
           # Two tests, both required. An --ignored filter that matches nothing
           # still exits 0, which is the exact failure this repo has been bitten
