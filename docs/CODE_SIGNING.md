@@ -119,3 +119,52 @@ Each release includes:
 - [Rekor Transparency Log](https://docs.sigstore.dev/logging/overview/)
 - [Tauri v2 Code Signing — Windows](https://v2.tauri.app/distribute/sign/windows/)
 - [Tauri v2 Code Signing — macOS](https://v2.tauri.app/distribute/sign/macos/)
+
+---
+
+# Decisions of record and standing warnings
+
+Moved out of the open-work register on 2026-09-20. None of these is a task.
+They are here so they are not rediscovered as bugs and turned back into tickets.
+
+## Windows "split tunnelling" does not exist, and the name is the honest part
+
+True split tunnelling on Windows needs a **signed WFP redirect callout driver**.
+We do not have one. WFP can only *exempt* an app from the block — an exempt app
+is not routed outside the tunnel, it is simply not blocked.
+
+So the feature was relabelled to **"Kill Switch Exceptions"** on 2026-07-29. That
+was an honesty decision, not a rename for its own sake: calling it split
+tunnelling would promise routing behaviour the platform cannot deliver without a
+driver.
+
+## 🔴 Never rotate `plugins.updater.pubkey` without bumping every installed client
+
+In `tauri.conf.json`. Rotating it **orphans every existing installation** — they
+reject the new signature and silently stop updating. There is no error a user
+would notice; their client simply never updates again.
+
+If it ever has to change, every installed client must be bumped first, which in
+practice means the rotation ships *after* a release everyone has already taken.
+
+## Deliberately deferred, and the UI says so
+
+Desktop **bilateral PQ** and **macOS/Linux split tunnelling** are deferred.
+One-way PQ is active and Windows split tunnelling works. Both stay marked
+"coming soon" in the UI — that label is the commitment, and removing it is a
+product decision rather than a tidy-up.
+
+## The IPv6 leak-test procedure
+
+Preserved from the IPv6 activation runbook, and it is the same shape as the
+F-001 bench in `release/patches/`:
+
+- `test-ipv6.com` and `ipleak.net` must show the **node's** v6 address
+- use a **non-activated node as the control** — without one you cannot tell "the
+  tunnel carries v6" from "this line has no v6 today"
+- instant rollback, no release needed:
+  `UPDATE "ServerNode" SET "ipv6Enabled" = false WHERE name = '<node>';`
+
+⚠ The runbook's protected-infrastructure list is stale: it calls `89.167.6.86`
+"crypto server, leave alone", and that box has since been **wiped and
+reimaged**.
