@@ -5,12 +5,12 @@
   "_merge_order": "upstream_commit_on_main is MEASURED by scripts/stamp-cert-pins-provenance.py (git merge-base --is-ancestor against birdo-shared origin/main) and cannot be written by hand without check 1 catching it on any checkout that has ../birdo-shared. While it is false, check 1b FAILS on every run, including CI: the consumer PR that vendors an unmerged SSOT branch stays red until the SSOT PR merges and this copy is re-vendored and re-stamped from main. That is the merge order, made mechanical.",
   "upstream_repo": "BirdoVPN/birdo-shared",
   "upstream_path": "cert-pins.json",
-  "upstream_commit": "53a8ff680fed0484a31834a86b371514f4c58676",
+  "upstream_commit": "72a85f369d6cf5dcd16c98303a155aad6a9e9d01",
   "upstream_branch": "HEAD",
-  "upstream_subject": "cert-pins: drop the production hub's IP, correct the stale \"CI is red today\", retire the deleted fifth copy (#8)",
+  "upstream_subject": "contract: retire ErrorCode â€” the 25-value enum nobody emitted (#11)",
   "upstream_commit_on_main": true,
-  "upstream_main_ref": "origin/main@53a8ff680fed",
+  "upstream_main_ref": "origin/main@72a85f369d6c",
   "upstream_main_fetched": true,
-  "vendored_on": "2026-09-19",
-  "canonical_sha256": "359abddcb9278a79ef94ea21217c2b8be6093d78f91ea6f924180789244a56a1"
+  "vendored_on": "2026-09-20",
+  "canonical_sha256": "eb52c3e36c4c2ef102b522064cecfbbcbed6a5d31504494594f7af93de814863"
 }
