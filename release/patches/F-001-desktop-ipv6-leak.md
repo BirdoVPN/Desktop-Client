@@ -213,6 +213,74 @@ a rollback with no record is how this comes back as a surprise.
 
 ---
 
+## Also in this session — F-008 parity checks (Linux half)
+
+F-008 records that **nothing** from the five-platform parity audit has ever been
+run, and that the changes it covers deliberately made previously-silent failures
+**loud**: route-add failures and the endpoint host-route are now fatal. The risk
+is the mirror of a leak — a wrong assumption turns a silent leak into a **hard
+connect failure for every user on that platform**.
+
+The five platforms are Windows, macOS, Linux, Android and iOS. **Linux is the
+only one this session can cover**, and it is the one that shares an environment
+with the IPv6 bench, so do it here rather than booking a second session.
+
+### P1 — the endpoint host-route is pinned
+
+While connected:
+
+```bash
+ip route get $(ip route show | grep -oP 'via \K[0-9.]+' | head -1)
+ip route show | grep -E "<node-ip>"
+```
+
+**Pass:** a host route to the node's IP exists, pointing at the physical
+interface, not the tunnel.
+
+**Why it is fatal in the code, and what its absence looks like:** without it,
+WireGuard's own outer UDP goes back into the tunnel — an encapsulation loop that
+**reaches Connected and carries zero traffic**
+(`src-tauri/src/vpn/tunnel_linux.rs:1275`). The client would look connected and
+nothing would work, which is precisely the failure the fatal check exists to make
+visible.
+
+### P2 — a route-add failure is loud, not silent
+
+Provoke it. With the client disconnected, install a conflicting host route to the
+node by hand, then connect:
+
+```bash
+sudo ip route add <node-ip>/32 dev lo
+# connect the client — expect it to FAIL, visibly
+sudo ip route del <node-ip>/32 dev lo
+```
+
+**Pass:** the client refuses to connect and says why. **Fail:** it reports
+Connected. That is the silent-failure regression this audit exists to catch.
+
+Note the deliberate exception in the code: an **existing identical** route is
+tolerated, and only that. Pinning to `lo` is not identical, so it must fail.
+
+### P3 — disconnect leaves no routes behind
+
+```bash
+ip route show > /tmp/f008-routes-after.txt
+diff /tmp/f001-routes-before.txt /tmp/f008-routes-after.txt
+```
+
+**Pass:** no difference. **Fail:** any leftover host route or tunnel route is a
+teardown defect — the next connect may then hit P2's conflicting-route path for
+real.
+
+### What this session does NOT cover
+
+**macOS, Windows, Android and iOS remain unaudited.** macOS in particular needs a
+real Mac: its route behaviour differs and the same fatal checks apply there. Do
+not record F-008 as closed on the strength of the Linux third of it — record
+exactly which platforms were covered.
+
+---
+
 ## Results
 
 | Step | Result | Date | Notes |
@@ -226,6 +294,9 @@ a rollback with no record is how this comes back as a surprise.
 | 7 MTU | | | |
 | 8 kill switch after disconnect | | | |
 | 9 clean restore | | | |
+| P1 endpoint host-route pinned | | | |
+| P2 route-add failure is loud | | | |
+| P3 clean teardown | | | |
 
 **Overall: not yet run.**
 
