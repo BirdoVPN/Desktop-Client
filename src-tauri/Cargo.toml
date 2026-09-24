@@ -182,7 +182,7 @@ boringtun = "0.7.1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # System directories for crash reports
-dirs = "6.0"
+dirs = "7.0"
 
 # Logging. (`log` was a direct dependency with no `log::` call anywhere in
 # src/ — the app logs through `tracing`. Dropped 2026-09; it stays in the graph
