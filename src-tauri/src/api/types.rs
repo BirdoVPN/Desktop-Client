@@ -75,6 +75,19 @@ pub struct DeleteAccountResponse {
     pub store_subscriptions_still_billing: Option<serde_json::Value>,
 }
 
+/// Body of `GET /api/v1/gdpr/delete/preflight` (second-pass #9): backend
+/// `{ success, storeSubscriptionsStillBilling: [{store, productId, expiresAt}],
+/// webSubscriptionWillBeCancelled }`. Every field optional; the list is read
+/// by [`store_subscription_labels`], exactly like the deletion response's.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionPreflightResponse {
+    #[serde(default)]
+    pub store_subscriptions_still_billing: Option<serde_json::Value>,
+    #[serde(default)]
+    pub web_subscription_will_be_cancelled: Option<bool>,
+}
+
 /// Turn `storeSubscriptionsStillBilling` into user-facing store names,
 /// whatever reasonable shape the backend settles on: an array of store
 /// strings (`"APP_STORE"`, `"GOOGLE_PLAY"`), an array of objects carrying a

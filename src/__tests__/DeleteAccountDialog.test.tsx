@@ -14,7 +14,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
-import { Profile, STORE_BILLING_WARNING } from '@/screens/Profile';
+import {
+  Profile,
+  PREFLIGHT_WEB_CANCELLED,
+  STORE_BILLING_WARNING,
+  preflightStoreWarning,
+} from '@/screens/Profile';
 import type { ConnectionState } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
@@ -82,6 +87,7 @@ vi.mock('zustand/react/shallow', () => ({ useShallow: (fn: unknown) => fn }));
 
 const mockedInvoke = vi.mocked(invoke);
 let deleteResult: () => Promise<unknown>;
+let preflightResult: () => Promise<unknown>;
 
 beforeEach(() => {
   mockedInvoke.mockReset();
@@ -90,8 +96,11 @@ beforeEach(() => {
   setConnectionState.mockReset();
   mockStoreState.connectionState = 'connected';
   deleteResult = () => Promise.resolve({ storeSubscriptionsStillBilling: [] });
+  // Default: the preflight has nothing to say (an older backend answers 404).
+  preflightResult = () => Promise.reject('Not Found');
   mockedInvoke.mockImplementation((cmd: string) => {
     if (cmd === 'delete_account') return deleteResult();
+    if (cmd === 'deletion_preflight') return preflightResult();
     return Promise.resolve(undefined);
   });
 });
@@ -164,6 +173,30 @@ describe('Delete account dialog', () => {
     await screen.findByText('Google Play');
     await userEvent.keyboard('{Escape}');
     await waitFor(() => expect(logout).toHaveBeenCalled());
+  });
+
+  it('names the stores the preflight reports, before anything is sent', async () => {
+    preflightResult = () =>
+      Promise.resolve({
+        storeSubscriptionsStillBilling: ['Google Play'],
+        webSubscriptionWillBeCancelled: true,
+      });
+    render(<Profile />);
+    await userEvent.click(screen.getByRole('button', { name: /delete account/i }));
+    expect(await screen.findByText(preflightStoreWarning(['Google Play']))).toBeInTheDocument();
+    expect(screen.getByText(PREFLIGHT_WEB_CANCELLED)).toBeInTheDocument();
+    expect(screen.queryByText(STORE_BILLING_WARNING)).not.toBeInTheDocument();
+    expect(calls()).toContain('deletion_preflight');
+    expect(calls()).not.toContain('delete_account');
+  });
+
+  it('a failed preflight keeps the static warning and never blocks the deletion', async () => {
+    preflightResult = () => Promise.reject('Service temporarily unavailable');
+    await openAndConfirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(mockedInvoke).toHaveBeenCalledWith('delete_account', {
+      request: { password: 'hunter2' },
+    });
   });
 
   it('tolerates a backend that returns nothing', async () => {

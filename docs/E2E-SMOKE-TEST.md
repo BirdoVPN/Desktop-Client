@@ -108,10 +108,11 @@ behaviour those tests cannot reach.
 - [ ] Subscription screen shows plan/devices/bandwidth; "manage/upgrade" opens the web.
 - [ ] GDPR **Export my data** downloads a JSON file (`GET /api/v1/gdpr/export`).
 - [ ] **Delete account** requires the password (or typing DELETE for password-less
-      accounts), shows the App Store / Google Play billing warning before confirming,
-      disconnects the VPN first, and signs out only once the server confirms
-      (`DELETE /api/v1/gdpr/delete`). A wrong password shows the server's message and
-      leaves you signed in. Use a throwaway test account.
+      accounts), shows the App Store / Google Play billing warning before confirming
+      (naming the stores when the preflight `GET /api/v1/gdpr/delete/preflight`
+      reports any), and only once the server confirms (`DELETE /api/v1/gdpr/delete`)
+      disconnects the VPN and signs out. A wrong password shows the server's message and
+      leaves you signed in AND connected. Use a throwaway test account.
 - [ ] **Consent screen** (fresh install): the Terms and Privacy links open in the browser,
       the 18+ line is shown, and the crash-report toggle starts OFF.
 - [ ] Auto-connect on launch (if enabled), tray connect/disconnect, autostart, start-minimized all behave.

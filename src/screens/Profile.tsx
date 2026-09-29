@@ -8,7 +8,8 @@
  *
  * IPC:
  *   get_subscription_status (snake_case fields), disconnect_vpn, logout,
- *   redeem_voucher, export_user_data, delete_account (-> DeleteAccountResult).
+ *   redeem_voucher, export_user_data, deletion_preflight (-> DeletionPreflight),
+ *   delete_account (-> DeleteAccountResult).
  */
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -573,6 +574,25 @@ export const STORE_BILLING_WARNING =
   'Cancel it first in your Apple or Google account settings, or it will keep billing. ' +
   'A web subscription bought on birdo.app is cancelled automatically.';
 
+/** Shape returned by the Rust `deletion_preflight` command (second-pass #9). */
+export interface DeletionPreflight {
+  /** Store names whose subscriptions will keep billing; empty if none. */
+  storeSubscriptionsStillBilling: string[];
+  /** A web (Polar) subscription is billing and the deletion will cancel it. */
+  webSubscriptionWillBeCancelled: boolean;
+}
+
+/** Shown in place of STORE_BILLING_WARNING when the preflight names stores. */
+export function preflightStoreWarning(stores: string[]): string {
+  return (
+    `This account has a subscription that deleting it will not cancel: ${stores.join(', ')}. ` +
+    'Cancel it first in your Apple or Google account settings, or it will keep billing.'
+  );
+}
+
+export const PREFLIGHT_WEB_CANCELLED =
+  'Your web subscription bought on birdo.app will be cancelled automatically.';
+
 function DeleteAccountDialog({
   hasPassword,
   onDismiss,
@@ -590,9 +610,28 @@ function DeleteAccountDialog({
   // subscriptions that are still billing: the account is gone, but the user
   // has to read this before the app signs out.
   const [stillBilling, setStillBilling] = useState<string[] | null>(null);
+  // Second-pass #9: what the server says a deletion would leave billing,
+  // asked for when the dialog opens. Null while loading or after a failure:
+  // the static warning is shown then, and nothing waits on it.
+  const [preflight, setPreflight] = useState<DeletionPreflight | null>(null);
   // Once the account is gone, every way out of the dialog must finish the
   // sign-out; merely closing it would leave the UI on a deleted account.
   const dismiss = stillBilling ? onDeleted : onDismiss;
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<DeletionPreflight | null>('deletion_preflight')
+      .then((result) => {
+        if (!cancelled && result) setPreflight(result);
+      })
+      .catch(() => {
+        /* best effort: the static warning stays */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const namedStores = preflight?.storeSubscriptionsStillBilling ?? [];
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -683,12 +722,23 @@ function DeleteAccountDialog({
                   ? ' Enter your password to confirm.'
                   : ' Type DELETE below to confirm.'}
               </p>
+              {/* Second-pass #9: the stores the preflight names, before the
+                  confirm button; the static warning when it has not answered,
+                  failed, or named none (true in every case). */}
               <p
                 className="rounded-birdo-sm px-3 py-2 text-[12px]"
-                style={{ backgroundColor: white.w05, color: white.w80 }}
+                style={{
+                  backgroundColor: white.w05,
+                  color: namedStores.length > 0 ? statusTokens.red : white.w80,
+                }}
               >
-                {STORE_BILLING_WARNING}
+                {namedStores.length > 0 ? preflightStoreWarning(namedStores) : STORE_BILLING_WARNING}
               </p>
+              {namedStores.length > 0 && preflight?.webSubscriptionWillBeCancelled && (
+                <p className="text-[12px]" style={{ color: white.w80 }}>
+                  {PREFLIGHT_WEB_CANCELLED}
+                </p>
+              )}
               {!hasPassword ? (
                 <BirdoTextField
                   value={confirmText}

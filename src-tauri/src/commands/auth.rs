@@ -316,6 +316,46 @@ pub async fn delete_account(
     })
 }
 
+/// What the deletion dialog shows BEFORE the user confirms (second-pass #9).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionPreflightResult {
+    /// Store names ("Apple App Store", "Google Play") whose subscriptions will
+    /// keep billing after the deletion. Empty when there are none.
+    pub store_subscriptions_still_billing: Vec<String>,
+    /// A web (Polar) subscription is billing and the deletion will cancel it.
+    pub web_subscription_will_be_cancelled: bool,
+}
+
+/// `GET /api/v1/gdpr/delete/preflight`: read-only, nothing local changes.
+/// The dialog treats an error as "unknown" and keeps its static warning, so
+/// a failed preflight never blocks a deletion.
+#[tauri::command]
+pub async fn deletion_preflight(
+    api: State<'_, BirdoApi>,
+) -> Result<DeletionPreflightResult, String> {
+    let response = api
+        .deletion_preflight()
+        .await
+        .map_err(|e| crate::utils::redact::sanitize_error(&e.to_string()))?;
+    Ok(deletion_preflight_result(&response))
+}
+
+fn deletion_preflight_result(
+    response: &crate::api::types::DeletionPreflightResponse,
+) -> DeletionPreflightResult {
+    DeletionPreflightResult {
+        store_subscriptions_still_billing: response
+            .store_subscriptions_still_billing
+            .as_ref()
+            .map(crate::api::types::store_subscription_labels)
+            .unwrap_or_default(),
+        web_subscription_will_be_cancelled: response
+            .web_subscription_will_be_cancelled
+            .unwrap_or(false),
+    }
+}
+
 /// GDPR: Export all user data (Right to Data Portability, Art. 20).
 /// Returns a JSON blob the frontend can save to disk.
 #[tauri::command]
@@ -868,5 +908,22 @@ mod account_boundary_tests {
             .expect("local state cleared");
         assert!(confirmed < disconnect, "disconnect runs before the server confirmed");
         assert!(disconnect < cleared, "local state is cleared before the disconnect");
+    }
+
+    /// Second-pass #9: the preflight the dialog shows before confirming.
+    #[test]
+    fn preflight_names_the_stores_and_defaults_to_nothing() {
+        let named = super::deletion_preflight_result(&crate::api::types::DeletionPreflightResponse {
+            store_subscriptions_still_billing: Some(serde_json::json!([
+                { "store": "GOOGLE_PLAY", "productId": "birdo_operative", "expiresAt": null }
+            ])),
+            web_subscription_will_be_cancelled: Some(true),
+        });
+        assert_eq!(named.store_subscriptions_still_billing, vec!["Google Play"]);
+        assert!(named.web_subscription_will_be_cancelled);
+
+        let nothing = super::deletion_preflight_result(&Default::default());
+        assert!(nothing.store_subscriptions_still_billing.is_empty());
+        assert!(!nothing.web_subscription_will_be_cancelled);
     }
 }

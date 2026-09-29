@@ -30,6 +30,10 @@ pub mod auth {
     pub const GDPR_DELETE: &str = "/api/v1/gdpr/delete";
     /// GDPR data export (Art. 15 / 20), `GET`. Same controller, same prefix.
     pub const GDPR_EXPORT: &str = "/api/v1/gdpr/export";
+    /// What a deletion will and will not stop, `GET` (second-pass #9;
+    /// `@Get('delete/preflight')` on the same controller). Read by the
+    /// deletion dialog before the user confirms.
+    pub const GDPR_DELETE_PREFLIGHT: &str = "/api/v1/gdpr/delete/preflight";
 }
 
 /// User endpoints — FIX C-3: route through /auth/me instead of phantom /users/subscription

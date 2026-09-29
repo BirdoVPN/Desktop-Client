@@ -552,6 +552,12 @@ impl BirdoApi {
         self.get(endpoints::auth::GDPR_EXPORT, true).await
     }
 
+    /// What deleting the account would leave billing (second-pass #9).
+    /// Read-only; the ordinary GET path with the usual refresh-and-retry.
+    pub async fn deletion_preflight(&self) -> Result<DeletionPreflightResponse, ApiError> {
+        self.get(endpoints::auth::GDPR_DELETE_PREFLIGHT, true).await
+    }
+
     // ========================================================================
     // VPN Endpoints
     // ========================================================================

@@ -71,6 +71,35 @@ mod endpoint_tests {
     fn gdpr_paths_carry_the_api_prefix_the_backend_serves() {
         assert_eq!(endpoints::auth::GDPR_DELETE, "/api/v1/gdpr/delete");
         assert_eq!(endpoints::auth::GDPR_EXPORT, "/api/v1/gdpr/export");
+        // Second-pass #9: `@Get('delete/preflight')` on the same controller.
+        assert_eq!(
+            endpoints::auth::GDPR_DELETE_PREFLIGHT,
+            "/api/v1/gdpr/delete/preflight"
+        );
+    }
+
+    /// Second-pass #9: the preflight body the backend sends
+    /// (gdpr.controller.ts `deletePreflight`), and a sparse one.
+    #[test]
+    fn deletion_preflight_decodes_the_backend_shape() {
+        use super::super::types::{store_subscription_labels, DeletionPreflightResponse};
+        let body = r#"{"success":true,
+            "storeSubscriptionsStillBilling":[
+              {"store":"GOOGLE_PLAY","productId":"birdo_operative","expiresAt":"2026-11-01T00:00:00.000Z"},
+              {"store":"APPLE_APP_STORE","productId":"app.birdo.vpn.sovereign.yearly","expiresAt":null}
+            ],
+            "webSubscriptionWillBeCancelled":true}"#;
+        let parsed: DeletionPreflightResponse = serde_json::from_str(body).expect("decodes");
+        assert_eq!(
+            store_subscription_labels(parsed.store_subscriptions_still_billing.as_ref().unwrap()),
+            vec!["Google Play", "Apple App Store"]
+        );
+        assert_eq!(parsed.web_subscription_will_be_cancelled, Some(true));
+
+        let sparse: DeletionPreflightResponse =
+            serde_json::from_str(r#"{"success":true}"#).expect("decodes");
+        assert!(sparse.store_subscriptions_still_billing.is_none());
+        assert!(sparse.web_subscription_will_be_cancelled.is_none());
     }
 }
 

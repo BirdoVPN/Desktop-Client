@@ -186,6 +186,22 @@ describe('IPC Contract: Account Deletion', () => {
     });
   });
 
+  it('deletion_preflight takes no arguments and resolves camelCase store names', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      storeSubscriptionsStillBilling: ['Apple App Store'],
+      webSubscriptionWillBeCancelled: false,
+    });
+
+    const result = await invoke<{
+      storeSubscriptionsStillBilling: string[];
+      webSubscriptionWillBeCancelled: boolean;
+    }>('deletion_preflight');
+
+    expect(mockedInvoke).toHaveBeenCalledWith('deletion_preflight');
+    expect(result.storeSubscriptionsStillBilling).toEqual(['Apple App Store']);
+    expect(result.webSubscriptionWillBeCancelled).toBe(false);
+  });
+
   it('delete_account rejects on 401', async () => {
     mockedInvoke.mockRejectedValueOnce(new Error('Invalid password'));
 
@@ -296,6 +312,7 @@ const FRONTEND_COMMANDS = [
   'get_auth_state',
   'verify_2fa',
   'delete_account',
+  'deletion_preflight',
   'export_user_data',
   // VPN operations
   'connect_vpn',

@@ -575,6 +575,7 @@ fn main() {
             commands::auth::get_auth_state,
             commands::auth::verify_2fa, // FIX C-2: 2FA TOTP verification
             commands::auth::delete_account, // GDPR account deletion
+            commands::auth::deletion_preflight, // what a deletion leaves billing
             commands::auth::export_user_data, // GDPR data export
             // VPN operations
             commands::vpn::connect_vpn,
