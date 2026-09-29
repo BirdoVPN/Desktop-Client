@@ -12,8 +12,18 @@
 //!
 //! Android and iOS already use a random ID. Desktop now does the same:
 //! `desktop_<uuid-v4>`, generated on first use and persisted beside the ML-KEM
-//! key (`<config_local_dir>/BirdoVPN/device_id`), and ROTATED on sign-out and on
-//! account deletion so the next account on the machine is a new device.
+//! key (`<config_local_dir>/BirdoVPN/device_id`), and ROTATED after a confirmed
+//! account deletion, so the erased account's device identity dies with it.
+//!
+//! # Not on sign-out (second-pass #14)
+//!
+//! It is deliberately NOT rotated on sign-out, the same policy as iOS
+//! (`APIClient.resetDeviceIdentity`) and Android (`BirdoRepository`, deletion
+//! only). Rotating under a live account leaves the old device row behind,
+//! re-triggers 2FA on every sign-in, and resets the per-device
+//! anonymous-register cap (`rl:anon-register:dev:*`). On sign-out the ML-KEM
+//! keypair is reset instead (`commands::auth::logout`), so the post-quantum key
+//! does not link the next account on the machine to this one.
 //!
 //! # What the backend does with a new ID
 //!
@@ -173,8 +183,8 @@ pub fn get() -> String {
     STORE.get()
 }
 
-/// Rotate the identifier: called on sign-out and after a confirmed account
-/// deletion. Never fails; problems are logged.
+/// Rotate the identifier: called after a confirmed account deletion only,
+/// never on sign-out (see the module docs). Never fails; problems are logged.
 pub fn rotate() {
     STORE.rotate();
     tracing::info!("Device identifier rotated");

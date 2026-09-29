@@ -36,7 +36,7 @@ pub fn hidden_cmd(program: &str) -> std::process::Command {
 }
 
 /// This install's device identifier: a random `desktop_<uuid-v4>`, persisted
-/// per install and rotated on sign-out and account deletion. See
+/// per install and rotated on account deletion (not on sign-out). See
 /// `utils::device_id` for why it is no longer derived from the machine.
 ///
 /// This is the ONE device identity the desktop client presents — SSO handoff,

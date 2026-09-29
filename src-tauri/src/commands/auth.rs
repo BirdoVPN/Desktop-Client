@@ -206,10 +206,13 @@ pub async fn logout(
         tracing::warn!("Failed to reset BirdoPQ keypair on logout: {}", e);
     }
 
-    // Same boundary, same reason, for the device identifier (C-8): the next
-    // account to sign in on this machine must not present the ID the previous
-    // one registered, or the two accounts are linkable server-side.
-    crate::utils::device_id::rotate();
+    // The device identifier is deliberately NOT rotated here (second-pass
+    // #14), matching iOS and Android: it rotates on account DELETION only.
+    // Rotating under a live account leaves the old device row behind (the
+    // device list and GET /devices/limit/status count it), re-triggers 2FA on
+    // every sign-in, and resets the per-device anonymous-register cap. The
+    // ML-KEM reset above is what stops the post-quantum key linking the next
+    // account on this machine to this one.
 
     Ok(true)
 }
@@ -799,5 +802,32 @@ pub async fn login_anonymous(
                 challenge_token: None,
             })
         }
+    }
+}
+
+/// Source pins for the account-boundary ordering in `logout` and
+/// `delete_account`. Tauri commands take `State`, which a unit test cannot
+/// build, so these read this file the way `ipv6_binding_tests` reads
+/// `src/vpn`.
+#[cfg(test)]
+mod account_boundary_tests {
+    const SOURCE: &str = include_str!("auth.rs");
+
+    /// The body of `pub async fn <name>(`, up to its closing brace at column 0.
+    fn body(name: &str) -> &'static str {
+        let start = SOURCE
+            .find(&format!("pub async fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} not found"));
+        let rest = &SOURCE[start..];
+        let end = rest.find("\n}").expect("closing brace at column 0");
+        &rest[..end]
+    }
+
+    #[test]
+    fn sign_out_does_not_rotate_the_device_id() {
+        // Second-pass #14: same policy as iOS and Android (deletion only).
+        let needle = ["device_id", "::rotate()"].concat();
+        assert!(!body("logout").contains(&needle));
+        assert!(body("delete_account").contains(&needle));
     }
 }
