@@ -43,6 +43,13 @@ interface Tier {
   /** Displayed prices, or null for the free tier. */
   monthly: string | null;
   yearly: string | null;
+  /**
+   * Yearly saving vs 12 monthly payments, per plan and rounded DOWN (the web
+   * floors it too): Operative £38 vs £47.88 = 20.6%, Sovereign £99 vs £119.88
+   * = 17.4%. A single "save 20%" for both overstated Sovereign (audit A-24 /
+   * A-34); the toggle says "up to 20%".
+   */
+  yearlySavingPct: number | null;
   features: string[];
 }
 
@@ -55,13 +62,16 @@ const TIERS: Tier[] = [
     iconTint: white.w60,
     monthly: null,
     yearly: null,
+    yearlySavingPct: null,
+    // No "Split tunneling": the desktop app has none (vpn/mod.rs — Windows
+    // only has Kill Switch Exceptions, which keep traffic IN the tunnel), so
+    // listing it here sold a feature that does not exist (audit A-24 / D-4).
     features: [
       '1 device',
       'Limited server locations',
       '10 GB / month data cap',
       'WireGuard + post-quantum (BirdoPQ)',
       'Kill switch',
-      'Split tunneling',
     ],
   },
   {
@@ -72,6 +82,7 @@ const TIERS: Tier[] = [
     iconTint: brand.accent,
     monthly: '£3.99',
     yearly: '£38',
+    yearlySavingPct: 20,
     features: [
       'Everything in Recon',
       'Unlimited bandwidth',
@@ -89,6 +100,7 @@ const TIERS: Tier[] = [
     iconTint: brand.accentLight,
     monthly: '£9.99',
     yearly: '£99',
+    yearlySavingPct: 17,
     features: [
       'Everything in Operative',
       'Multi-Hop (double VPN)',
@@ -156,7 +168,7 @@ export function Pricing() {
                     className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold"
                     style={{ backgroundColor: accentA(0.14), color: brand.accentSoft }}
                   >
-                    Save ~2 months
+                    Save up to 20%
                   </span>
                 )}
               </button>
@@ -177,8 +189,13 @@ export function Pricing() {
           ))}
         </div>
 
+        {/* VAT wording per REMEDIATION-DECISIONS §3: checkout is Polar's
+            (merchant of record), whose tax behaviour decides the total. */}
         <p className="mt-5 px-1 text-xs" style={{ color: white.w40 }}>
-          Prices in GBP. Upgrading opens dashboard.birdo.app in your browser to
+          Prices in GBP. Prices include VAT for customers in the UK, EU and most
+          other countries. In the United States, Canada and India, sales tax is
+          added at checkout. Polar, our reseller, shows the final total before
+          you pay. Upgrading opens dashboard.birdo.app in your browser to
           complete checkout — payments are never taken inside the app.
         </p>
       </div>
@@ -254,9 +271,9 @@ function TierCard({ tier, period, currentPlan, onUpgrade }: TierCardProps) {
           </span>
         )}
       </div>
-      {!isFree && period === 'yearly' && (
+      {!isFree && period === 'yearly' && tier.yearlySavingPct !== null && (
         <div className="mt-1 text-[12px]" style={{ color: brand.accentSoft }}>
-          Save ~2 months vs paying monthly
+          Save {tier.yearlySavingPct}% vs paying monthly
         </div>
       )}
 
