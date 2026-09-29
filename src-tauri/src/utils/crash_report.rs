@@ -128,6 +128,25 @@ pub fn is_opted_in() -> bool {
     OPTED_IN.load(Ordering::SeqCst)
 }
 
+/// How long an exit waits for queued reports to go out.
+pub const EXIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Send whatever is still queued before the process exits (second-pass #17).
+///
+/// The old top-of-`main()` `sentry::init` returned a guard that flushed on
+/// drop; building the client lazily on opt-in lost that, so a
+/// [`report_security_event`] raised just before quitting could be dropped
+/// with the transport thread. Called from the exit paths in `main.rs`.
+/// A no-op when no client was ever built (never opted in): it does not touch
+/// the SDK at all then. Blocks for at most [`EXIT_FLUSH_TIMEOUT`].
+pub fn flush_on_exit() {
+    if let Some(client) = CLIENT.get() {
+        if !client.flush(Some(EXIT_FLUSH_TIMEOUT)) {
+            tracing::warn!("Crash reports still queued at exit were not all sent");
+        }
+    }
+}
+
 /// `before_send`: drop everything while the user is opted out, otherwise
 /// rebuild the event from the allowlist ([`scrub_event`]).
 pub fn gate_and_scrub(event: Event<'static>) -> Option<Event<'static>> {
@@ -561,6 +580,16 @@ mod tests {
     fn the_process_starts_opted_out() {
         assert!(!is_opted_in());
         assert!(gate_and_scrub(Event::new()).is_none());
+    }
+
+    /// Second-pass #17: the exit flush never builds a client, and so never
+    /// touches the SDK, for a user who did not opt in.
+    #[test]
+    fn exit_flush_is_a_no_op_without_opt_in() {
+        let started = std::time::Instant::now();
+        flush_on_exit();
+        assert!(CLIENT.get().is_none(), "flushing must not build a client");
+        assert!(started.elapsed() < EXIT_FLUSH_TIMEOUT, "and must not wait");
     }
 
     /// The options the client is built with carry the gate itself, not just

@@ -669,6 +669,9 @@ fn main() {
                     }
                     #[cfg(not(target_os = "windows"))]
                     info!("Restart requested — skipping exit teardown");
+                    // Second-pass #17: queued crash/error reports go out
+                    // before the process is replaced (no-op unless opted in).
+                    crate::utils::crash_report::flush_on_exit();
                     return;
                 }
                 if !EXIT_TEARDOWN_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -691,6 +694,10 @@ fn main() {
                             error!("Exit teardown timed out — exiting anyway");
                         }
                         EXIT_TEARDOWN_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // Second-pass #17: the lazily built Sentry client has
+                        // no drop guard, so flush what is queued (at most
+                        // EXIT_FLUSH_TIMEOUT; a no-op unless opted in).
+                        crate::utils::crash_report::flush_on_exit();
                         app.exit(0);
                     });
                 } else if !EXIT_TEARDOWN_DONE.load(std::sync::atomic::Ordering::SeqCst) {
