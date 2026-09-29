@@ -65,6 +65,20 @@ binding).
 - [ ] On an adapter with IPv6 enabled, connect/disconnect: IPv6 still works
       afterwards (the WFP block is removed with the session).
 
+**Manual check for machines that ran 1.3.19 or earlier (second-pass #17).**
+Those builds disabled the `ms_tcpip6` binding themselves and could leave it
+off; the removed heal was also what repaired such a machine, and no code path
+does now. The risk is low after many releases, but on a report of "no IPv6
+since an old Birdo install", check it by hand:
+
+- [ ] In an elevated PowerShell, `Get-NetAdapterBinding -ComponentID ms_tcpip6`
+      lists each adapter's IPv6 binding. An adapter the user never changed that
+      shows `Enabled False` is the old leftover.
+- [ ] Re-enable it for that adapter only, with the user's agreement:
+      `Enable-NetAdapterBinding -Name "<adapter>" -ComponentID ms_tcpip6`.
+      Never re-enable every adapter: that is exactly the blanket change D-24
+      removed, and it overrides a user who turned IPv6 off on purpose.
+
 ### A2. arm() degrades to reactive instead of disabling all protection (#9)
 If lockdown activation fails at `arm()` (e.g. tunnel LUID not yet published),
 the kill switch now falls back to **reactive** for the session instead of
