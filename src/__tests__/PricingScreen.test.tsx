@@ -56,4 +56,17 @@ describe('Pricing', () => {
     expect(text).toContain('Prices include VAT for customers in the UK, EU and most other countries');
     expect(text).not.toMatch(/\d+\s+(server\s+)?locations/i);
   });
+
+  it('uses the mobile wording and sells no server tier that does not exist', () => {
+    // Second-pass #16.
+    const { container } = render(<Pricing />);
+    const text = container.textContent ?? '';
+    expect(text).toContain('Core server locations');
+    expect(text).toContain('All server locations');
+    expect(text).toContain('Stealth mode');
+    expect(text).toContain('Multi-hop routing');
+    expect(text).not.toMatch(/high-speed|priority servers|premium servers|maximum privacy/i);
+    // Custom DNS is not plan-gated on desktop, so no card may sell it as a tier.
+    expect(text).not.toMatch(/custom dns/i);
+  });
 });

@@ -66,11 +66,13 @@ const TIERS: Tier[] = [
     // No "Split tunneling": the desktop app has none (vpn/mod.rs — Windows
     // only has Kill Switch Exceptions, which keep traffic IN the tunnel), so
     // listing it here sold a feature that does not exist (audit A-24 / D-4).
+    // Wording follows the mobile paywalls (second-pass #16).
     features: [
-      '1 device',
-      'Limited server locations',
-      '10 GB / month data cap',
-      'WireGuard + post-quantum (BirdoPQ)',
+      '1 device connection',
+      'Core server locations',
+      '10 GB monthly bandwidth',
+      'WireGuard® encryption',
+      'Post-quantum key exchange',
       'Kill switch',
     ],
   },
@@ -83,30 +85,39 @@ const TIERS: Tier[] = [
     monthly: '£3.99',
     yearly: '£38',
     yearlySavingPct: 20,
+    // Second-pass #16: no "High-speed servers" line. A node's isHighSpeed is an
+    // owner-set display flag (the server list's filter), and no plan gates on
+    // it: access is decided by the node's minPlan alone, which "All server
+    // locations" already describes. The Recon plan can use a fast node too.
     features: [
       'Everything in Recon',
+      '5 device connections',
+      'All server locations',
       'Unlimited bandwidth',
-      'All standard servers',
-      'High-speed servers',
-      'Stealth (Xray Reality) DPI-evasion',
-      'Up to 5 devices',
+      'Stealth mode',
     ],
   },
   {
     id: 'SOVEREIGN',
     name: 'Sovereign',
-    tagline: 'Maximum privacy & control',
+    tagline: 'Full control',
     icon: Crown,
     iconTint: brand.accentLight,
     monthly: '£9.99',
     yearly: '£99',
     yearlySavingPct: 17,
+    // Second-pass #16: no "Priority servers" line (nothing is prioritised: the
+    // backend's isPremium is just minPlan !== 'RECON', and whether any node
+    // is Sovereign-only is a per-node owner setting, not a plan feature), and
+    // no "Custom DNS" either: mobile sells it as Sovereign-only, but the
+    // desktop does not gate it by plan (Settings), so listing it here would
+    // misstate what the free and Operative plans get on desktop. Whether it
+    // should be gated everywhere is an owner decision.
     features: [
       'Everything in Operative',
-      'Multi-Hop (double VPN)',
+      '10 device connections',
+      'Multi-hop routing',
       'Port forwarding',
-      'Priority servers',
-      'Up to 10 devices',
     ],
   },
 ];
@@ -137,7 +148,7 @@ export function Pricing() {
 
       <div className="flex-1 overflow-y-auto px-4 pb-8 pt-3">
         <p className="px-1 text-[13px]" style={{ color: white.w60 }}>
-          Upgrade for unlimited bandwidth, premium servers and advanced privacy
+          Upgrade for unlimited bandwidth, every server location and more devices
           features. Billing is managed securely on the web.
         </p>
 
