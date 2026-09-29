@@ -64,6 +64,9 @@ describe('ConsentScreen copy', () => {
     expect(screen.getByText(CONSENT_COPY.accountHolds)).toBeInTheDocument();
     expect(screen.getByText(CONSENT_COPY.crashReports)).toBeInTheDocument();
     expect(CONSENT_COPY.noActivityLogs).toContain('keeps a live record of your session');
+    // Second-pass #7: the app sends error events as well as crashes.
+    expect(CONSENT_COPY.crashReports).toContain('crash and error reports');
+    expect(CONSENT_COPY.crashReports).not.toMatch(/crash details|\bonly\b/i);
     // Second-pass #2: the nightly dump leaves it out; the 7-day PITR copy can hold it.
     expect(CONSENT_COPY.noActivityLogs).toContain('is left out of our nightly backups');
   });

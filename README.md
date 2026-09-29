@@ -45,7 +45,10 @@ artefact is PGP-signed.
 
 Crash reporting is **opt-in**: nothing is sent to Sentry unless the user turns it
 on (consent screen or Settings › Privacy); it is off by default, including for
-installs upgraded from builds that reported unconditionally. The DSN is still
+installs upgraded from builds that reported unconditionally. When on, it sends
+crash and error reports: crashes, and errors when an app feature such as
+connecting fails (today the secure-DNS certificate-pin failures), with the app and
+OS version and device model. The DSN is still
 compiled in at build time from the `SENTRY_DSN` secret, and a release build with no
 usable DSN fails rather than shipping an opt-in that cannot work — see
 [`docs/SENTRY-SETUP.md`](docs/SENTRY-SETUP.md) for the project setup, the

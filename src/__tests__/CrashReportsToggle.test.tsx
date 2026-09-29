@@ -115,7 +115,10 @@ describe('Crash reports toggle', () => {
     const row = await screen.findByRole('switch', { name: /crash reports/i });
     expect(row).toHaveAttribute('aria-checked', 'false');
     expect(screen.getByText(/Off by default/)).toBeInTheDocument();
-    expect(screen.getByText(/No account details or browsing data/)).toBeInTheDocument();
+    // Second-pass #7: error reports are disclosed too, and nothing says "only".
+    expect(screen.getByText(/crash and error reports/)).toBeInTheDocument();
+    expect(screen.getByText(/No account details, IP address or browsing data/)).toBeInTheDocument();
+    expect(screen.queryByText(/crash details/i)).not.toBeInTheDocument();
     // Applied live on the Rust side, so there is no restart note.
     expect(screen.queryByText(/restart/i)).not.toBeInTheDocument();
   });

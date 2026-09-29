@@ -259,6 +259,16 @@ purged). So the configuration states every relevant switch **explicitly**,
 including the ones whose SDK default is already safe — a default is someone
 else's decision and it can change in a version bump.
 
+### Crash AND error reports
+
+Besides panics, `report_security_event` sends a non-fatal `Error`-level event
+when a feature fails: today the DoH certificate-pin failures (`vpn/doh.rs`),
+which stop the app resolving our hostnames. That is not a crash, so every
+disclosure (consent screen, Settings, README) says "crash and error reports"
+(second-pass #7, option A), never "crash details" or "only". A new
+`report_security_event` caller must fit that description or the disclosure
+must change with it.
+
 ### An allowlist, not a denylist
 
 `before_send` does not strip fields from the incoming event. It **builds a new

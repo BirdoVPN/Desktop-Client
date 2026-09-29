@@ -32,10 +32,16 @@ export const CONSENT_COPY = {
   accountHolds:
     'Your email (or anonymous account number), plan, the devices you add, and your ' +
     'usage totals. Full list: birdo.app/privacy.',
+  // Second-pass #7 (option A, disclose): besides crashes, the app sends a
+  // non-fatal error event when a feature fails (report_security_event: the
+  // secure-DNS certificate-pin failures that stop it reaching our servers).
+  // So "crash and error reports", never "crash details" or "only". Desktop
+  // reports no kill-switch failures, so unlike Android it does not name one.
   crashReports:
-    'Off by default. If you turn this on, the app sends crash details (stack trace, app ' +
-    'and OS version, device model) to Sentry so we can fix bugs. No account details or ' +
-    'browsing data. Change it any time in Settings.',
+    'Off by default. If you turn this on, the app sends crash and error reports to Sentry ' +
+    'so we can fix bugs: crashes, and errors when an app feature such as connecting ' +
+    'fails, with the app and OS version and device model. No account details, IP ' +
+    'address or browsing data. Change it any time in Settings.',
   noAds: "No advertising or analytics SDKs. We don't sell your data or share it with advertisers.",
 } as const;
 

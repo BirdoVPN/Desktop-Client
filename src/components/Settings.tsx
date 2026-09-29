@@ -583,7 +583,7 @@ export function Settings() {
           <BirdoCard padding="0.25rem">
             <BirdoToggleRow
               title="Crash reports"
-              subtitle="Off by default. When on, the app sends crash details (stack trace, app and OS version, device model) to Sentry. No account details or browsing data."
+              subtitle="Off by default. When on, the app sends crash and error reports to Sentry: crashes, and errors when an app feature such as connecting fails, with the app and OS version and device model. No account details, IP address or browsing data."
               subtitleWrap
               leadingIcon={Bug}
               leadingTint={white.w60}
