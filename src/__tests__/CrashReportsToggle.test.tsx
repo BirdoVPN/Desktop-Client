@@ -150,15 +150,37 @@ describe('Crash reports toggle', () => {
 });
 
 describe('Kill switch copy and the always-on toggle', () => {
+  const BASE =
+    'If the tunnel drops unexpectedly, the app blocks traffic until it reconnects. Protection applies while the app is running.';
+  const GIVE_UP = ' If reconnecting keeps failing, the app stops blocking.';
+
   it('scopes the promise to while the app is running (no "never leaks")', async () => {
+    setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36');
     const { container } = render(<Settings />);
     await screen.findByRole('switch', { name: /^kill switch/i });
-    expect(
-      screen.getByText(
-        'If the tunnel drops unexpectedly, the app blocks traffic until it reconnects. Protection applies while the app is running.',
-      ),
-    ).toBeInTheDocument();
-    expect(container.textContent ?? '').not.toMatch(/never leak|nothing leaves/i);
+    // Second-pass #5: off Windows, auto_reconnect gives up after 10 attempts
+    // and releases the block, so the row says so (and not "tells you").
+    expect(screen.getByText(BASE + GIVE_UP)).toBeInTheDocument();
+    expect(container.textContent ?? '').not.toMatch(/never leak|nothing leaves|tells you/i);
+  });
+
+  it('on Windows the give-up caveat follows the always-on setting', async () => {
+    setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    mockStoreState.settings.lockdownMode = true;
+    const { unmount } = render(<Settings />);
+    await screen.findByRole('switch', { name: /^kill switch/i });
+    // Lockdown keeps blocking after the retries run out: no caveat.
+    expect(screen.getByText(BASE)).toBeInTheDocument();
+    unmount();
+
+    mockStoreState.settings.lockdownMode = false;
+    try {
+      render(<Settings />);
+      await screen.findByRole('switch', { name: /^kill switch/i });
+      expect(screen.getByText(BASE + GIVE_UP)).toBeInTheDocument();
+    } finally {
+      mockStoreState.settings.lockdownMode = true;
+    }
   });
 
   it('offers the always-on toggle on Windows, persisted without a live reapply', async () => {

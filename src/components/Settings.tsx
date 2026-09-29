@@ -541,10 +541,19 @@ export function Settings() {
                 genuinely lets traffic through if the tunnel drops. */}
             {/* Copy per the 2026-09-29 audit (D-7): no "never leaks" absolute.
                 The WFP / pf / iptables block lives in this process, so it
-                protects only while the app is running. */}
+                protects only while the app is running. Second-pass #5: after
+                10 failed reconnects auto_reconnect.rs releases the block
+                unless Windows lockdown ("always-on") is on, so say so there.
+                Not "and tells you": the give-up raises no notification. */}
             <BirdoToggleRow
               title="Kill Switch"
-              subtitle="If the tunnel drops unexpectedly, the app blocks traffic until it reconnects. Protection applies while the app is running."
+              subtitle={
+                'If the tunnel drops unexpectedly, the app blocks traffic until it reconnects. ' +
+                'Protection applies while the app is running.' +
+                (!isWindowsPlatform() || !settings.lockdownMode
+                  ? ' If reconnecting keeps failing, the app stops blocking.'
+                  : '')
+              }
               subtitleWrap
               leadingIcon={Shield}
               leadingTint={statusTokens.green}

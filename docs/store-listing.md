@@ -52,7 +52,9 @@ Servers in several regions, each showing its current load.
 **Kill Switch**
 If the tunnel drops unexpectedly, the app blocks traffic until it reconnects.
 Protection applies while the app is running. On Windows the block uses the
-Windows Filtering Platform and, by default, stays on for the whole session.
+Windows Filtering Platform and, by default, stays on for the whole session. With
+that "always-on" setting turned off, if reconnecting keeps failing, the app stops
+blocking.
 
 **Kill Switch Exceptions (Windows)**
 Let chosen apps keep working while the kill switch is blocking traffic. This is
