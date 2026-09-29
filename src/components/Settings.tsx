@@ -12,9 +12,9 @@
  * Sections: APPEARANCE (window position), CONNECTION (auto-connect), DISPLAY
  * (notifications + show-IP / show-server-location sub-toggles), SECURITY
  * (biometric unlock — hidden when unavailable — quantum protection, kill
- * switch), PRIVACY (opt-in crash reports), STARTUP (launch at login, start
- * minimized), VPN (VPN Settings push row, custom DNS, port forwarding), ABOUT
- * (version + updates + support links).
+ * switch, always-on kill switch on Windows), PRIVACY (opt-in crash reports),
+ * STARTUP (launch at login, start minimized), VPN (VPN Settings push row,
+ * custom DNS, port forwarding), ABOUT (version + updates + support links).
  *
  * Every settings write goes through the SAME full-object path used elsewhere:
  *   invoke('save_settings', { settings: settingsToRust(next) })
@@ -69,6 +69,7 @@ import {
   settingsToRust,
   settingsFromRust,
   isValidDnsAddress,
+  isWindowsPlatform,
   type RustSettings,
 } from '@/utils/helpers';
 import {
@@ -538,8 +539,13 @@ export function Settings() {
                 The Rust connect path only arms the firewall block when this is on
                 (killswitch::arm reads the persisted setting), so turning it off
                 genuinely lets traffic through if the tunnel drops. */}
+            {/* Copy per the 2026-09-29 audit (D-7): no "never leaks" absolute.
+                The WFP / pf / iptables block lives in this process, so it
+                protects only while the app is running. */}
             <BirdoToggleRow
               title="Kill Switch"
+              subtitle="If the tunnel drops unexpectedly, the app blocks traffic until it reconnects. Protection applies while the app is running."
+              subtitleWrap
               leadingIcon={Shield}
               leadingTint={statusTokens.green}
               checked={settings.killSwitchEnabled}
@@ -550,6 +556,23 @@ export function Settings() {
                 else setShowKsConfirm(true);
               }}
             />
+            {/* LOCKDOWN (D-21). ON by default on Windows since desktop #34 but,
+                until now, invisible and unchangeable. Windows-only (the flag is
+                hard false elsewhere) and only meaningful with the kill switch
+                on. Deliberately persisted WITHOUT a live reapply: it takes
+                effect from the next connection, so a toggle can never rebuild
+                a live session's firewall state mid-flight. */}
+            {isWindowsPlatform() && settings.killSwitchEnabled && (
+              <BirdoToggleRow
+                title="Always-on kill switch"
+                subtitle="Keeps traffic outside the tunnel blocked for the whole session, including while reconnecting. Applies from your next connection."
+                subtitleWrap
+                leadingIcon={Lock}
+                leadingTint={statusTokens.green}
+                checked={settings.lockdownMode}
+                onCheckedChange={(v) => persist({ lockdownMode: v })}
+              />
+            )}
           </BirdoCard>
 
           {/* ── PRIVACY ────────────────────────────────────────────────── */}

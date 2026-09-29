@@ -44,6 +44,27 @@ option-121 decloak window).
       during the gap; reconnect restores cleanly.
 - [ ] Disconnect fully restores connectivity (no stranded block-all filters).
 
+### A1b. The lockdown default is now visible and switchable (audit D-21, 2026-09-29)
+Settings › Security › **Always-on kill switch** (Windows only, shown while the
+kill switch is on) exposes `lockdown_mode`. The **default is unchanged (ON)**;
+the toggle is persisted only and takes effect from the next connection (no live
+reapply). Code comments that said "OFF by default" were corrected.
+
+- [ ] Fresh install: the row reads ON.
+- [ ] Switch it OFF, reconnect: reactive mode — traffic flows, a pulled network
+      still fails closed during the reconnect gap, and disconnect lifts every filter.
+- [ ] Switch it back ON, reconnect: the A1 checks above hold again.
+
+### A1c. Disconnect no longer re-enables IPv6 on every adapter (audit D-24, 2026-09-29)
+The "legacy heal" that re-enabled the `ms_tcpip6` binding on EVERY adapter at
+each disconnect is gone (the client blocks IPv6 with WFP and never disables a
+binding).
+
+- [ ] Untick IPv6 on one physical adapter by hand, connect, disconnect, quit:
+      IPv6 is still unticked on that adapter.
+- [ ] On an adapter with IPv6 enabled, connect/disconnect: IPv6 still works
+      afterwards (the WFP block is removed with the session).
+
 ### A2. arm() degrades to reactive instead of disabling all protection (#9)
 If lockdown activation fails at `arm()` (e.g. tunnel LUID not yet published),
 the kill switch now falls back to **reactive** for the session instead of

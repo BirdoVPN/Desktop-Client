@@ -1,13 +1,15 @@
 /**
- * Settings › Privacy › Crash reports (audit C-3 / D-12).
+ * Settings › Privacy › Crash reports (audit C-3 / D-12) and the kill-switch
+ * rows' copy and lockdown toggle (D-7 / D-21).
  *
  * Crash reporting is opt-in: the row reads the persisted choice and writes it
  * through the dedicated `set_crash_reports_enabled` command, which applies it
- * live on the Rust side (no restart).
+ * live on the Rust side (no restart). The lockdown ("always-on") toggle is
+ * Windows-only and persisted without a live reapply.
  *
  * Run: npx vitest run src/__tests__/CrashReportsToggle.test.tsx
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
@@ -82,6 +84,11 @@ vi.mock('@/store/app-store', () => {
 vi.mock('zustand/react/shallow', () => ({ useShallow: (fn: unknown) => fn }));
 
 const mockedInvoke = vi.mocked(invoke);
+const realUserAgent = navigator.userAgent;
+
+function setUserAgent(ua: string) {
+  Object.defineProperty(window.navigator, 'userAgent', { value: ua, configurable: true });
+}
 
 beforeEach(() => {
   mockedInvoke.mockReset();
@@ -99,6 +106,8 @@ beforeEach(() => {
     }
   });
 });
+
+afterEach(() => setUserAgent(realUserAgent));
 
 describe('Crash reports toggle', () => {
   it('reads OFF by default and says what would be sent', async () => {
@@ -134,5 +143,43 @@ describe('Crash reports toggle', () => {
     await waitFor(() => {
       expect(updateSettings).toHaveBeenLastCalledWith({ crashReportsEnabled: false });
     });
+  });
+});
+
+describe('Kill switch copy and the always-on toggle', () => {
+  it('scopes the promise to while the app is running (no "never leaks")', async () => {
+    const { container } = render(<Settings />);
+    await screen.findByRole('switch', { name: /^kill switch/i });
+    expect(
+      screen.getByText(
+        'If the tunnel drops unexpectedly, the app blocks traffic until it reconnects. Protection applies while the app is running.',
+      ),
+    ).toBeInTheDocument();
+    expect(container.textContent ?? '').not.toMatch(/never leak|nothing leaves/i);
+  });
+
+  it('offers the always-on toggle on Windows, persisted without a live reapply', async () => {
+    setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    render(<Settings />);
+    const row = await screen.findByRole('switch', { name: /always-on kill switch/i });
+    expect(row).toHaveAttribute('aria-checked', 'true');
+    await userEvent.click(row);
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith(
+        'save_settings',
+        expect.objectContaining({
+          settings: expect.objectContaining({ lockdown_mode: false }),
+        }),
+      );
+    });
+    expect(mockedInvoke).not.toHaveBeenCalledWith('reapply_vpn_settings');
+    expect(mockedInvoke).not.toHaveBeenCalledWith('set_killswitch_live', expect.anything());
+  });
+
+  it('hides the always-on toggle off Windows', async () => {
+    setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36');
+    render(<Settings />);
+    await screen.findByRole('switch', { name: /^kill switch/i });
+    expect(screen.queryByRole('switch', { name: /always-on kill switch/i })).not.toBeInTheDocument();
   });
 });
