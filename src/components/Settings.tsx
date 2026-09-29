@@ -12,8 +12,9 @@
  * Sections: APPEARANCE (window position), CONNECTION (auto-connect), DISPLAY
  * (notifications + show-IP / show-server-location sub-toggles), SECURITY
  * (biometric unlock — hidden when unavailable — quantum protection, kill
- * switch), STARTUP (launch at login, start minimized), VPN (VPN Settings push
- * row, custom DNS, port forwarding), ABOUT (version + updates + support links).
+ * switch), PRIVACY (opt-in crash reports), STARTUP (launch at login, start
+ * minimized), VPN (VPN Settings push row, custom DNS, port forwarding), ABOUT
+ * (version + updates + support links).
  *
  * Every settings write goes through the SAME full-object path used elsewhere:
  *   invoke('save_settings', { settings: settingsToRust(next) })
@@ -61,6 +62,7 @@ import {
   ArrowDownLeft,
   ArrowDownRight,
   Move,
+  Bug,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import {
@@ -397,6 +399,20 @@ export function Settings() {
     [persist],
   );
 
+  // ── Crash reports (opt-in; dedicated command, applied live) ────────────────
+  const handleCrashReports = useCallback(
+    async (value: boolean) => {
+      updateSettings({ crashReportsEnabled: value });
+      try {
+        await invoke('set_crash_reports_enabled', { enabled: value });
+      } catch {
+        // Not persisted: show the state Rust actually has.
+        updateSettings({ crashReportsEnabled: !value });
+      }
+    },
+    [updateSettings],
+  );
+
   // ── Biometric Unlock (special: keyring-backed + optional confirm) ───────────
   const handleBiometric = useCallback(
     async (value: boolean) => {
@@ -533,6 +549,23 @@ export function Settings() {
                 if (v) persistTunnel({ killSwitchEnabled: true });
                 else setShowKsConfirm(true);
               }}
+            />
+          </BirdoCard>
+
+          {/* ── PRIVACY ────────────────────────────────────────────────── */}
+          {/* Crash reports are OPT-IN (audit C-3). The dedicated command
+              persists the one field and applies it live in both directions,
+              so no restart is needed and no "restart" note is shown. */}
+          <BirdoSectionHeader title="Privacy" className="mt-2" />
+          <BirdoCard padding="0.25rem">
+            <BirdoToggleRow
+              title="Crash reports"
+              subtitle="Off by default. When on, the app sends crash details (stack trace, app and OS version, device model) to Sentry. No account details or browsing data."
+              subtitleWrap
+              leadingIcon={Bug}
+              leadingTint={white.w60}
+              checked={settings.crashReportsEnabled}
+              onCheckedChange={handleCrashReports}
             />
           </BirdoCard>
 

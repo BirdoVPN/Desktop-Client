@@ -177,8 +177,10 @@ fails, the fix is a hotfix release, not a settings flip.
    (Authenticode is applied by the **tag** build via Tauri `signCommand`; a local
    `cargo tauri build` is unsigned — that's expected.)
 2. Confirm crash reporting: set the `SENTRY_DSN` repo secret, cut a tagged
-   build, force a panic, and verify the event lands in Sentry. Without the
-   secret, Sentry is a no-op (option_env! is None).
+   build, **turn on Settings › Privacy › Crash reports** (it is opt-in and OFF by
+   default), force a panic, and verify the event lands in Sentry. With the
+   toggle OFF, confirm nothing arrives. Without the secret, Sentry is a no-op
+   (option_env! is None).
 
 ---
 

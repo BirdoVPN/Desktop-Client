@@ -41,6 +41,7 @@ describe('useAppStore', () => {
         quantumProtection: false,
         dnsFiltering: false,
         lockdownMode: true,
+        crashReportsEnabled: false,
       },
       hasAcceptedConsent: false,
       isOnline: true,

@@ -119,6 +119,10 @@ export interface AppSettings {
   // in the store so settings saves round-trip it instead of silently resetting
   // the persisted flag to the Rust serde default on every write.
   lockdownMode: boolean;
+  // Crash reports to Sentry. OPT-IN, OFF by default (audit 2026-09-29, C-3).
+  // Written through the dedicated `set_crash_reports_enabled` command (consent
+  // screen, Settings › Privacy) and round-tripped by every full save.
+  crashReportsEnabled: boolean;
 }
 
 export interface MultiHopRoute {
@@ -304,6 +308,8 @@ const defaultSettings: AppSettings = {
   quantumProtection: true,
   // Matches the Rust `default_true` serde default for lockdown_mode.
   lockdownMode: true,
+  // Crash reporting is opt-in — matches the Rust `AppSettings::default()`.
+  crashReportsEnabled: false,
 };
 
 export const useAppStore = create<AppState>()(

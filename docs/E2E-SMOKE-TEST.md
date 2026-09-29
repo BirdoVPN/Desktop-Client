@@ -112,6 +112,8 @@ behaviour those tests cannot reach.
       disconnects the VPN first, and signs out only once the server confirms
       (`DELETE /api/v1/gdpr/delete`). A wrong password shows the server's message and
       leaves you signed in. Use a throwaway test account.
+- [ ] **Consent screen** (fresh install): the Terms and Privacy links open in the browser,
+      the 18+ line is shown, and the crash-report toggle starts OFF.
 - [ ] Auto-connect on launch (if enabled), tray connect/disconnect, autostart, start-minimized all behave.
 
 ## 13. Updater

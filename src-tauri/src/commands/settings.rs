@@ -94,6 +94,18 @@ pub struct AppSettings {
     /// was signed WITH the field (by this build, value true) carries it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub dns_filtering: bool,
+    /// Send crash reports to Sentry. OPT-IN: false for a new install AND for
+    /// every install upgrading from a build that reported unconditionally
+    /// (audit 2026-09-29, C-3 / D-12). Driven by the consent-screen toggle and
+    /// Settings › Privacy; applied by `utils::crash_report::set_opted_in` at
+    /// startup and on every save.
+    ///
+    /// `skip_serializing_if = is_false` for the same HMAC reason as
+    /// `dns_filtering`: an existing settings.json (no such key) must
+    /// re-serialize byte-identically, or every upgrade would be quarantined as
+    /// tampering and reset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub crash_reports_enabled: bool,
     /// LOCKDOWN: always-on kill switch (Mullvad-style). When true the WFP
     /// block-all stays active the entire time the tunnel is up, permitting
     /// tunneled traffic by interface so there is ZERO leak window — including
@@ -183,6 +195,7 @@ impl From<LegacyAppSettingsV1> for AppSettings {
             stealth_mode: l.stealth_mode,
             quantum_protection: l.quantum_protection,
             dns_filtering: false,
+            crash_reports_enabled: false,
             lockdown_mode: l.lockdown_mode,
             multi_hop_enabled: false,
             multi_hop_entry_node_id: None,
@@ -207,9 +220,10 @@ impl Default for AppSettings {
             local_network_sharing: false,
             wireguard_port: default_wireguard_port(),
             wireguard_mtu: 0,
-            stealth_mode: false,      // premium — off by default
-            quantum_protection: true, // post-quantum on by default
-            dns_filtering: false,     // BirdoShield — opt-in (D18)
+            stealth_mode: false,          // premium — off by default
+            quantum_protection: true,     // post-quantum on by default
+            dns_filtering: false,         // BirdoShield — opt-in (D18)
+            crash_reports_enabled: false, // crash reports — opt-in (C-3)
             // LOCKDOWN mode. ON by default where it is REAL (Windows), OFF
             // elsewhere — on macOS and Linux `is_lockdown_mode()` returns a
             // hard-coded `false` (killswitch.rs), so this flag does nothing
@@ -631,8 +645,28 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
 #[tauri::command]
 pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool, String> {
     save_settings_inner(&app, &settings)?;
+    // Keep the live crash-reporting gate equal to what is on disk, whichever
+    // screen saved.
+    crate::utils::crash_report::set_opted_in(settings.crash_reports_enabled);
     tracing::info!("Settings saved successfully");
     Ok(true)
+}
+
+/// Turn crash reporting on or off (consent screen and Settings › Privacy).
+///
+/// A dedicated command rather than a full-object `save_settings`, because the
+/// consent screen runs before anything has hydrated the frontend store from
+/// Rust: saving the store's view there could overwrite a settings.json the
+/// store has never read. This reads the file, changes the one field and
+/// writes it back. Takes effect immediately in both directions (see
+/// `utils::crash_report`), so no restart is needed.
+#[tauri::command]
+pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let mut settings = load_settings_sync(&app)?;
+    settings.crash_reports_enabled = enabled;
+    save_settings_inner(&app, &settings)?;
+    crate::utils::crash_report::set_opted_in(enabled);
+    Ok(enabled)
 }
 
 /// Enable or disable autostart
@@ -959,6 +993,46 @@ mod tests {
         );
         let back: AppSettings = serde_json::from_str(&off_json).unwrap();
         assert!(!back.dns_filtering);
+    }
+
+    /// Crash reports are OPT-IN: off for a fresh install, off when an upgraded
+    /// install's file predates the key (1.4.44 reported unconditionally — that
+    /// must not carry over as consent), and `true` round-trips.
+    #[test]
+    fn crash_reports_default_off_absent_loads_off_and_true_round_trips() {
+        assert!(!AppSettings::default().crash_reports_enabled);
+
+        let v144: AppSettings = serde_json::from_str(
+            r#"{"autostart":false,"start_minimized":false,"killswitch_enabled":true,
+               "notifications_enabled":true,"auto_connect":false,"preferred_server_id":null,
+               "split_tunneling_enabled":false,"split_tunnel_apps":[],"custom_dns":null,
+               "protocol":"wireguard","local_network_sharing":false,"wireguard_port":"auto",
+               "wireguard_mtu":0,"stealth_mode":false,"quantum_protection":true,
+               "lockdown_mode":true,"multi_hop_enabled":false,
+               "multi_hop_entry_node_id":null,"multi_hop_exit_node_id":null}"#,
+        )
+        .unwrap();
+        assert!(
+            !v144.crash_reports_enabled,
+            "an upgrade must not opt anyone in"
+        );
+
+        let off_json = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(
+            !off_json.contains("crash_reports_enabled"),
+            "OFF must stay out of the signed JSON so older files keep verifying: {off_json}"
+        );
+        let on = AppSettings {
+            crash_reports_enabled: true,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(json.contains("\"crash_reports_enabled\":true"), "{json}");
+        assert!(
+            serde_json::from_str::<AppSettings>(&json)
+                .unwrap()
+                .crash_reports_enabled
+        );
     }
 
     /// REGRESSION GUARD for the upgrade path: a settings.json signed by 1.4.42

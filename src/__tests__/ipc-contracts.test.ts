@@ -312,6 +312,7 @@ const FRONTEND_COMMANDS = [
   'get_settings',
   'save_settings',
   'set_autostart',
+  'set_crash_reports_enabled',
   // System tray / window
   'set_tray_state',
   'set_window_position',

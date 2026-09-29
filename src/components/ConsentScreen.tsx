@@ -1,20 +1,60 @@
+import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { Shield, Eye, BarChart3, ShieldOff } from 'lucide-react';
-import { AppIconMark, BirdoButton, BirdoCard } from './birdo';
+import { AppIconMark, BirdoButton, BirdoCard, BirdoToggleRow } from './birdo';
 import { brand } from '@/lib/birdo-theme';
 
+export const TERMS_URL = 'https://birdo.app/terms';
+export const PRIVACY_URL = 'https://birdo.app/privacy';
+
+/**
+ * The pre-use disclosure text. Owned by the audit remediation of 29 Sep 2026
+ * (REMEDIATION-DECISIONS.md §1.5, shared with Android and iOS): it must say no
+ * more than the privacy model actually supports.
+ *
+ * The previous text claimed "RAM-only volatile infrastructure" (the nodes are
+ * ordinary cloud servers with disks), that no connection timestamps or IP
+ * addresses were logged (a live session record exists while you are
+ * connected), and that crash reports carried "no personal data" while they
+ * were sent unconditionally. Do not reintroduce any of those.
+ */
+export const CONSENT_COPY = {
+  noActivityLogs:
+    "Our VPN servers don't record the sites you visit, your DNS queries or your traffic. " +
+    "While you're connected, our account system keeps a live record of your session " +
+    '(server, device, connect time). It is deleted when you disconnect and is never ' +
+    'included in backups. We also count your data use per billing period.',
+  accountHolds:
+    'Your email (or anonymous account number), plan, the devices you add, and your ' +
+    'usage totals. Full list: birdo.app/privacy.',
+  crashReports:
+    'Off by default. If you turn this on, the app sends crash details (stack trace, app ' +
+    'and OS version, device model) to Sentry so we can fix bugs. No account details or ' +
+    'browsing data. Change it any time in Settings.',
+  noAds: "No advertising or analytics SDKs. We don't sell your data or share it with advertisers.",
+} as const;
+
 interface ConsentScreenProps {
-  onAccept: () => void;
+  /** Called with the user's crash-report choice (default OFF). */
+  onAccept: (crashReportsEnabled: boolean) => void;
   onDecline: () => void;
 }
 
 /**
- * GDPR-compliant consent screen shown on first launch.
- * User must accept the privacy policy before proceeding.
- * Mirrors the Android ConsentScreen.kt implementation.
+ * Consent screen shown on first launch, before sign-in or any connection.
+ *
+ * "I Agree & Continue" accepts BOTH the Terms of Service and the Privacy
+ * Policy and confirms the user is 18 or over (the Terms' age). Every desktop
+ * sign-up path (email, anonymous, SSO) sits behind this screen, so this is
+ * where the Terms are accepted on desktop (audit B-13).
+ *
+ * Crash reporting is a separate, optional choice made here with a toggle that
+ * starts OFF; nothing is sent to Sentry unless it is switched on (C-3).
  */
 export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
+  const [crashReports, setCrashReports] = useState(false);
+
   return (
     <div className="flex h-full flex-col">
       {/* Brand now lives in the window TitleBar. */}
@@ -66,44 +106,85 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
                 <DataItem
                   icon={Eye}
                   title="No Activity Logs"
-                  description="BirdoVPN operates a strict zero-logs policy on RAM-only volatile infrastructure. No browsing activity, DNS queries, traffic content, connection timestamps, or IP addresses are logged."
+                  description={CONSENT_COPY.noActivityLogs}
                 />
                 <DataItem
                   icon={Shield}
-                  title="Account Data Only"
-                  description="Only your email, subscription status, and aggregate bandwidth are stored in a separate account database — never on VPN servers."
+                  title="What Your Account Holds"
+                  description={CONSENT_COPY.accountHolds}
                 />
                 <DataItem
                   icon={BarChart3}
-                  title="Crash Reports"
-                  description="Anonymous crash reports help fix bugs faster. No personal data is included."
+                  title="Crash Reports (optional)"
+                  description={CONSENT_COPY.crashReports}
                 />
                 <DataItem
                   icon={ShieldOff}
-                  title="No Data Sales"
-                  description="Your data is never sold, shared with advertisers, or used for profiling."
+                  title="No Ads or Analytics"
+                  description={CONSENT_COPY.noAds}
                 />
               </div>
             </BirdoCard>
           </motion.div>
 
-          {/* Privacy policy link */}
-          {/* Open in the SYSTEM browser via the scoped shell plugin (like every
-              other external link) — a raw <a target="_blank"> is outside the
-              shell allowlist, and a webview that follows it in-place strands
-              this frameless window on a remote page with no way back. */}
-          <motion.button
-            type="button"
-            onClick={() => openExternal('https://birdo.app/privacy').catch(() => {})}
-            aria-label="Read the full Privacy Policy (opens in your browser)"
-            className="mb-6 text-sm underline underline-offset-2 transition hover:opacity-80"
-            style={{ color: brand.accentSoft }}
+          {/* The crash-report choice: a real control, starting OFF. */}
+          <motion.div
+            className="mb-5 w-full"
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, delay: 0.28 }}
+          >
+            <BirdoCard padding="0.25rem" cornerRadius={20}>
+              <BirdoToggleRow
+                title="Send crash reports"
+                subtitle="Optional. Off unless you turn it on."
+                leadingIcon={BarChart3}
+                checked={crashReports}
+                onCheckedChange={setCrashReports}
+              />
+            </BirdoCard>
+          </motion.div>
+
+          {/* Terms + Privacy links. Opened in the SYSTEM browser via the scoped
+              shell plugin (like every other external link): a raw
+              <a target="_blank"> is outside the shell allowlist, and a webview
+              that follows it in-place strands this frameless window on a
+              remote page with no way back. */}
+          <motion.div
+            className="mb-4 flex items-center justify-center gap-4"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.3 }}
           >
-            Read the full Privacy Policy
-          </motion.button>
+            <button
+              type="button"
+              onClick={() => openExternal(TERMS_URL).catch(() => {})}
+              aria-label="Read the Terms of Service (opens in your browser)"
+              className="text-sm underline underline-offset-2 transition hover:opacity-80"
+              style={{ color: brand.accentSoft }}
+            >
+              Terms of Service
+            </button>
+            <button
+              type="button"
+              onClick={() => openExternal(PRIVACY_URL).catch(() => {})}
+              aria-label="Read the Privacy Policy (opens in your browser)"
+              className="text-sm underline underline-offset-2 transition hover:opacity-80"
+              style={{ color: brand.accentSoft }}
+            >
+              Privacy Policy
+            </button>
+          </motion.div>
+
+          <motion.p
+            className="mb-5 text-center text-xs leading-relaxed text-w60"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.5, delay: 0.32 }}
+          >
+            You must be 18 or over to use BirdoVPN. By selecting &ldquo;I Agree &amp;
+            Continue&rdquo; you accept the Terms of Service and the Privacy Policy.
+          </motion.p>
 
           {/* Accept button */}
           <motion.div
@@ -117,7 +198,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
               variant="brand"
               size="large"
               fullWidth
-              onClick={onAccept}
+              onClick={() => onAccept(crashReports)}
             />
           </motion.div>
 
@@ -144,7 +225,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.45 }}
           >
-            You must accept the privacy policy to use BirdoVPN.
+            You must accept the Terms of Service and the Privacy Policy to use BirdoVPN.
           </motion.p>
         </motion.div>
       </div>
