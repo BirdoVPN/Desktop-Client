@@ -1,6 +1,7 @@
 //! Utility modules
 
 pub mod crash_report;
+pub mod device_id;
 pub mod elevation;
 pub mod log_policy;
 pub mod log_retention;
@@ -34,32 +35,18 @@ pub fn hidden_cmd(program: &str) -> std::process::Command {
     cmd
 }
 
-/// Generate a stable, anonymous device identifier.
-/// Uses SHA-256 of the hostname + OS family + username for a non-reversible but consistent ID.
+/// This install's device identifier: a random `desktop_<uuid-v4>`, persisted
+/// per install and rotated on sign-out and account deletion. See
+/// `utils::device_id` for why it is no longer derived from the machine.
 ///
 /// This is the ONE device identity the desktop client presents — SSO handoff,
-/// anonymous register/login and email+password login all send this exact value,
-/// so every sign-in on a machine lands on the same `(userId, deviceId)` row in
-/// the account's device list. Deliberately derived from install-invariant facts
-/// only (no app version, no random seed, nothing written to disk): it must
-/// survive an app update, a reinstall and a restart, otherwise the backend
-/// creates a fresh device row each time and per-device revocation can no longer
-/// target the machine the user means.
+/// anonymous register/login, email+password login and every connect body send
+/// this exact value, so every sign-in on this install lands on the same
+/// `(userId, deviceId)` row in the account's device list. It survives an app
+/// update and a restart (the file is read back), so the backend can reclaim
+/// this install's own slot at connect time.
 pub fn get_device_id() -> String {
-    use sha2::{Digest, Sha256};
-
-    let hostname = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    let mut hasher = Sha256::new();
-    hasher.update(hostname.as_bytes());
-    hasher.update(b"|");
-    hasher.update(std::env::consts::OS.as_bytes());
-    hasher.update(b"|");
-    hasher.update(std::env::var("USERNAME").unwrap_or_default().as_bytes());
-
-    hex::encode(hasher.finalize())
+    device_id::get()
 }
 
 /// Human-readable name for this machine, shown in the account's device list
@@ -73,9 +60,9 @@ pub fn get_device_id() -> String {
 /// converting a pseudonymous (or anonymous-plan) account into a named one on
 /// every connect and auth call. Now a generic platform label — the shape
 /// Android already uses (Build.MANUFACTURER + MODEL, never the hostname) —
-/// plus a short prefix of the SHA-256 device id so a user with several
-/// machines can still tell the rows apart. The backend already receives that
-/// id in full beside this label, so the suffix transmits zero new information.
+/// plus a short prefix of the device id so a user with several machines can
+/// still tell the rows apart. The backend already receives that id in full
+/// beside this label, so the suffix transmits zero new information.
 pub fn get_device_name() -> String {
     let platform = if cfg!(target_os = "macos") {
         "Mac Desktop"
@@ -87,8 +74,23 @@ pub fn get_device_name() -> String {
         "Desktop"
     };
     let id = get_device_id();
-    let suffix: String = id.chars().take(6).collect();
+    // Skip the constant `desktop_` prefix, or every install would read
+    // "(deskto)" and the suffix would stop telling machines apart.
+    let random_part = id.strip_prefix("desktop_").unwrap_or(&id);
+    let suffix: String = random_part.chars().take(6).collect();
     format!("{} ({})", platform, suffix)
+}
+
+#[cfg(test)]
+mod device_name_tests {
+    #[test]
+    fn the_suffix_comes_from_the_random_part_of_the_id() {
+        let name = super::get_device_name();
+        assert!(!name.contains("deskto"), "{name}");
+        let id = super::get_device_id();
+        let expected: String = id.trim_start_matches("desktop_").chars().take(6).collect();
+        assert!(name.ends_with(&format!("({expected})")), "{name} vs {id}");
+    }
 }
 
 /// This build's value for the backend `platform` enum

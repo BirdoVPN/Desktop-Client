@@ -206,6 +206,11 @@ pub async fn logout(
         tracing::warn!("Failed to reset BirdoPQ keypair on logout: {}", e);
     }
 
+    // Same boundary, same reason, for the device identifier (C-8): the next
+    // account to sign in on this machine must not present the ID the previous
+    // one registered, or the two accounts are linkable server-side.
+    crate::utils::device_id::rotate();
+
     Ok(true)
 }
 
@@ -269,11 +274,12 @@ pub async fn delete_account(
 
     // Clear all local credentials after successful server-side deletion,
     // including the persistent ML-KEM identity (same hygiene as logout —
-    // doubly so for a GDPR deletion).
+    // doubly so for a GDPR deletion) and the device identifier (C-8).
     let _ = credentials.clear_tokens();
     if let Err(e) = crate::vpn::birdo_pq::reset_persisted_keypair() {
         tracing::warn!("Failed to reset BirdoPQ keypair on account deletion: {}", e);
     }
+    crate::utils::device_id::rotate();
 
     let store_subscriptions_still_billing = response
         .store_subscriptions_still_billing
