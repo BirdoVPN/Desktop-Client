@@ -223,20 +223,49 @@ impl Drop for DeleteAccountRequest {
     }
 }
 
+/// What the UI needs after a successful deletion.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAccountResult {
+    /// App Store / Google Play subscriptions the server reported as still
+    /// billing (store names). Empty when there are none, and on a backend that
+    /// does not report them yet — the dialog warns about store billing before
+    /// the user confirms either way.
+    pub store_subscriptions_still_billing: Vec<String>,
+}
+
+/// The message a refused deletion shows. The backend's own words when it gave
+/// any (the password check's "Incorrect password"), not the variant's generic
+/// "Unknown error: …" framing.
+fn delete_failure_message(error: &ApiError) -> String {
+    let reason = match error {
+        ApiError::Unknown(message) => message.clone(),
+        ApiError::Unauthorized | ApiError::NotAuthenticated => {
+            "Your session has expired. Sign in again, then retry.".to_string()
+        }
+        other => other.to_string(),
+    };
+    format!(
+        "Account deletion failed: {}",
+        crate::utils::redact::sanitize_error(&reason)
+    )
+}
+
 #[tauri::command]
 pub async fn delete_account(
     request: DeleteAccountRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<bool, String> {
+) -> Result<DeleteAccountResult, String> {
     tracing::info!("Account deletion requested (GDPR)");
 
-    api.delete_account(&request.password).await.map_err(|e| {
-        format!(
-            "Account deletion failed: {}",
-            crate::utils::redact::sanitize_error(&e.to_string())
-        )
-    })?;
+    // Nothing local is touched unless the server confirms the deletion: a
+    // refused request (wrong password, expired session, offline) must leave
+    // the user signed in to the account that still exists.
+    let response = api
+        .delete_account(&request.password)
+        .await
+        .map_err(|e| delete_failure_message(&e))?;
 
     // Clear all local credentials after successful server-side deletion,
     // including the persistent ML-KEM identity (same hygiene as logout —
@@ -246,8 +275,16 @@ pub async fn delete_account(
         tracing::warn!("Failed to reset BirdoPQ keypair on account deletion: {}", e);
     }
 
+    let store_subscriptions_still_billing = response
+        .store_subscriptions_still_billing
+        .as_ref()
+        .map(crate::api::types::store_subscription_labels)
+        .unwrap_or_default();
+
     tracing::info!("Account permanently deleted");
-    Ok(true)
+    Ok(DeleteAccountResult {
+        store_subscriptions_still_billing,
+    })
 }
 
 /// GDPR: Export all user data (Right to Data Portability, Art. 20).

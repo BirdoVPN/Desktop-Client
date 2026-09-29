@@ -166,6 +166,16 @@ describe('IPC Contract: Settings', () => {
 });
 
 describe('IPC Contract: Account Deletion', () => {
+  it('delete_account resolves with the store subscriptions still billing (camelCase)', async () => {
+    mockedInvoke.mockResolvedValueOnce({ storeSubscriptionsStillBilling: ['Google Play'] });
+
+    const result = await invoke<{ storeSubscriptionsStillBilling: string[] }>('delete_account', {
+      request: { password: 'mypassword123' },
+    });
+
+    expect(result.storeSubscriptionsStillBilling).toEqual(['Google Play']);
+  });
+
   it('delete_account sends password payload', async () => {
     mockedInvoke.mockResolvedValueOnce(undefined);
 

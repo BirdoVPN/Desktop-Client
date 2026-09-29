@@ -62,6 +62,163 @@ mod endpoint_tests {
         assert!(path.starts_with("/vpn/connections/"));
         assert!(path.contains("key-with-dashes-and_underscores"));
     }
+
+    /// C-2 / P0-6 (audit 2026-09-29). The backend serves the GDPR routes from
+    /// `@Controller('api/v1/gdpr')` and api.birdo.app rewrites nothing, so the
+    /// `/api` prefix is part of the path. The client sent `/v1/gdpr/*` for
+    /// months and every desktop deletion and export 404'd.
+    #[test]
+    fn gdpr_paths_carry_the_api_prefix_the_backend_serves() {
+        assert_eq!(endpoints::auth::GDPR_DELETE, "/api/v1/gdpr/delete");
+        assert_eq!(endpoints::auth::GDPR_EXPORT, "/api/v1/gdpr/export");
+    }
+}
+
+/// The deletion request itself — method, URL, headers and body — built by the
+/// same function the app sends through, not a hand-typed twin.
+#[cfg(test)]
+mod gdpr_request_tests {
+    use super::super::client::{BirdoApi, GdprDeleteOutcome, DESKTOP_CLIENT_HEADER};
+    use super::super::error::ApiError;
+    use super::super::types::{store_subscription_labels, DeleteAccountBody};
+    use reqwest::StatusCode;
+    use serde_json::json;
+
+    #[test]
+    fn gdpr_delete_is_a_delete_to_the_api_prefixed_route() {
+        let api = BirdoApi::new();
+        let request = api
+            .gdpr_delete_request("tok", &DeleteAccountBody { password: "pw" })
+            .build()
+            .expect("request builds");
+
+        assert_eq!(
+            request.method(),
+            reqwest::Method::DELETE,
+            "the backend route is @Delete('delete'); POST 404s"
+        );
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.birdo.app/api/v1/gdpr/delete"
+        );
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer tok",
+            "Bearer auth is also what lets the backend's CsrfGuard pass"
+        );
+        assert_eq!(
+            request.headers().get("x-desktop-client").unwrap(),
+            DESKTOP_CLIENT_HEADER
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({ "password": "pw" }),
+            "the body deleteAccountSchema validates: an optional password, at most 256 chars"
+        );
+    }
+
+    #[test]
+    fn gdpr_export_is_the_api_prefixed_route() {
+        assert_eq!(
+            BirdoApi::gdpr_export_url(),
+            "https://api.birdo.app/api/v1/gdpr/export"
+        );
+    }
+
+    /// 2xx is a deletion whatever the body says; a missing or unparsable body
+    /// must not become an error the user would "retry" against an erased
+    /// account.
+    #[test]
+    fn a_2xx_is_a_deletion_even_with_an_unexpected_body() {
+        let real = r#"{"success":true,"message":"Your data has been deleted.","deletedItems":7,"anonymizedItems":2}"#;
+        for body in [real, "", "not json"] {
+            assert!(matches!(
+                BirdoApi::classify_gdpr_delete_response(StatusCode::OK, body),
+                GdprDeleteOutcome::Deleted(_)
+            ));
+        }
+    }
+
+    /// The password check's 401 is the ANSWER and must reach the user
+    /// verbatim; passport's bare "Unauthorized" is an expired token and must
+    /// trigger a refresh instead.
+    #[test]
+    fn the_two_401s_are_told_apart() {
+        let wrong_password =
+            r#"{"statusCode":401,"message":"Incorrect password","error":"Unauthorized"}"#;
+        match BirdoApi::classify_gdpr_delete_response(StatusCode::UNAUTHORIZED, wrong_password) {
+            GdprDeleteOutcome::Refused(ApiError::Unknown(m)) => assert_eq!(m, "Incorrect password"),
+            other => panic!("wrong password must be shown, got {other:?}"),
+        }
+
+        let expired = r#"{"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}"#;
+        for body in [expired, ""] {
+            assert!(matches!(
+                BirdoApi::classify_gdpr_delete_response(StatusCode::UNAUTHORIZED, body),
+                GdprDeleteOutcome::SessionExpired
+            ));
+        }
+    }
+
+    #[test]
+    fn other_refusals_keep_the_backend_message() {
+        let body = r#"{"statusCode":429,"message":"Slow down"}"#;
+        match BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, body) {
+            GdprDeleteOutcome::Refused(ApiError::Unknown(m)) => assert_eq!(m, "Slow down"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, ""),
+            GdprDeleteOutcome::Refused(ApiError::NotFound)
+        ));
+    }
+
+    /// A-8 / C-9: the store subscriptions deletion cannot cancel. The backend
+    /// field is new and its shape is not settled, so every plausible shape must
+    /// produce a warning, and its absence must produce none.
+    #[test]
+    fn store_subscription_labels_tolerate_every_plausible_shape() {
+        let body =
+            r#"{"success":true,"storeSubscriptionsStillBilling":["APP_STORE","GOOGLE_PLAY"]}"#;
+        match BirdoApi::classify_gdpr_delete_response(StatusCode::OK, body) {
+            GdprDeleteOutcome::Deleted(r) => assert_eq!(
+                store_subscription_labels(r.store_subscriptions_still_billing.as_ref().unwrap()),
+                vec!["Apple App Store", "Google Play"]
+            ),
+            other => panic!("{other:?}"),
+        }
+
+        assert_eq!(
+            store_subscription_labels(&json!([
+                { "store": "APPLE", "productId": "x" },
+                { "provider": "google_play" },
+                { "store": "APPLE" }
+            ])),
+            vec!["Apple App Store", "Google Play"],
+            "objects are named by their store field and de-duplicated"
+        );
+        assert_eq!(
+            store_subscription_labels(&json!([{ "productId": "x" }])),
+            vec!["App Store or Google Play subscription"],
+            "an unnamed subscription still warns"
+        );
+        assert_eq!(
+            store_subscription_labels(&json!(true)),
+            vec!["App Store or Google Play subscription"]
+        );
+        for none in [json!([]), json!(null), json!(false), json!(0)] {
+            assert!(store_subscription_labels(&none).is_empty(), "{none}");
+        }
+
+        // Today's backend does not send the field at all.
+        let today = r#"{"success":true,"message":"Your data has been deleted."}"#;
+        match BirdoApi::classify_gdpr_delete_response(StatusCode::OK, today) {
+            GdprDeleteOutcome::Deleted(r) => assert!(r.store_subscriptions_still_billing.is_none()),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

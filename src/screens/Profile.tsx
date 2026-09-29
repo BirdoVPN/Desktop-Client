@@ -2,14 +2,13 @@
  * Profile — top-level tab root.
  *
  * Identity card (avatar + name/email + plan), a subscription summary, and the
- * few account actions kept IN-APP: redeem voucher + sign out. Everything else —
- * managing the subscription, deleting the account, exporting data, and the
- * legal links — lives on the web (dashboard.birdo.app), so it's intentionally
- * NOT duplicated here.
+ * account actions kept IN-APP: redeem voucher, export data, delete account and
+ * sign out. Managing a subscription and the legal links live on the web
+ * (dashboard.birdo.app).
  *
- * IPC (unchanged contracts):
+ * IPC:
  *   get_subscription_status (snake_case fields), disconnect_vpn, logout,
- *   redeem_voucher.
+ *   redeem_voucher, export_user_data, delete_account (-> DeleteAccountResult).
  */
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -549,7 +548,28 @@ function UsageMeter() {
 // sign in through Google/GitHub — type "DELETE" instead. Grouping SSO with
 // email here used to trap SSO users: the dialog demanded a password they had
 // never set, so Delete stayed disabled and they could not exercise erasure at
-// all. Backend: delete_account.
+// all. Backend: delete_account -> DELETE /api/v1/gdpr/delete.
+//
+// Audit 2026-09-29:
+//  - A-8 / C-9: deleting the account cancels a WEB (Polar) subscription but
+//    cannot cancel an App Store or Google Play one, which keeps billing. The
+//    dialog says so BEFORE the user confirms, and lists any store subscription
+//    the server reports as still billing afterwards.
+//  - C-2: the VPN is disconnected first (Android parity), so no tunnel is left
+//    up (kill switch armed) against keys the deletion is about to remove.
+//  - Local state is only cleared once the server confirms (Rust side); a
+//    refusal shows the server's own message ("Incorrect password").
+
+/** Shape returned by the Rust `delete_account` command. */
+export interface DeleteAccountResult {
+  /** Store names ("Apple App Store", "Google Play"); empty if none/unknown. */
+  storeSubscriptionsStillBilling: string[];
+}
+
+export const STORE_BILLING_WARNING =
+  'Deleting your account does not cancel an App Store or Google Play subscription. ' +
+  'Cancel it first in your Apple or Google account settings, or it will keep billing. ' +
+  'A web subscription bought on birdo.app is cancelled automatically.';
 
 function DeleteAccountDialog({
   hasPassword,
@@ -564,14 +584,21 @@ function DeleteAccountDialog({
   const [confirmText, setConfirmText] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Set once the server confirmed the deletion AND reported store
+  // subscriptions that are still billing: the account is gone, but the user
+  // has to read this before the app signs out.
+  const [stillBilling, setStillBilling] = useState<string[] | null>(null);
+  // Once the account is gone, every way out of the dialog must finish the
+  // sign-out; merely closing it would leave the UI on a deleted account.
+  const dismiss = stillBilling ? onDeleted : onDismiss;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !deleting) onDismiss();
+      if (e.key === 'Escape' && !deleting) dismiss();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [deleting, onDismiss]);
+  }, [deleting, dismiss]);
 
   const canSubmit =
     !deleting && (hasPassword ? password.length > 0 : confirmText.trim().toUpperCase() === 'DELETE');
@@ -580,12 +607,34 @@ function DeleteAccountDialog({
     if (!canSubmit) return;
     setDeleting(true);
     setError(null);
+    // Disconnect first (Android parity). Best effort: a failed disconnect must
+    // not block an erasure request, and the server tears the account's keys
+    // down either way.
+    if (useAppStore.getState().connectionState !== 'disconnected') {
+      try {
+        await invoke('disconnect_vpn');
+        const ns = useAppStore.getState();
+        ns.setConnectionState('disconnected');
+        ns.setCurrentServer(null);
+        ns.setVpnIp(null);
+      } catch {
+        /* best effort */
+      }
+    }
     try {
       // Password-less accounts (anonymous and SSO) send the typed confirmation
       // token: the server skips the password check for them entirely, and the
       // Tauri command's request type is non-optional, so a non-empty value
       // keeps the contract satisfied without inventing a fake secret.
-      await invoke('delete_account', { request: { password: hasPassword ? password : confirmText.trim() } });
+      const result = await invoke<DeleteAccountResult | null>('delete_account', {
+        request: { password: hasPassword ? password : confirmText.trim() },
+      });
+      const billing = result?.storeSubscriptionsStillBilling ?? [];
+      if (billing.length > 0) {
+        setStillBilling(billing);
+        setDeleting(false);
+        return;
+      }
       onDeleted();
     } catch (e: unknown) {
       const message =
@@ -603,7 +652,7 @@ function DeleteAccountDialog({
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
-      onClick={() => !deleting && onDismiss()}
+      onClick={() => !deleting && dismiss()}
     >
       <motion.div
         role="dialog"
@@ -627,67 +676,106 @@ function DeleteAccountDialog({
               Delete account
             </h2>
           </div>
-          <p className="text-[13px]" style={{ color: white.w60 }}>
-            This permanently erases your account and all associated data. This
-            cannot be undone.
-            {hasPassword
-              ? ' Enter your password to confirm.'
-              : ' Type DELETE below to confirm.'}
-          </p>
-          {!hasPassword ? (
-            <BirdoTextField
-              value={confirmText}
-              onChange={(v) => {
-                setConfirmText(v);
-                if (error) setError(null);
-              }}
-              label="Type DELETE to confirm"
-              type="text"
-              placeholder="DELETE"
-              error={error != null}
-              disabled={deleting}
-              autoComplete="off"
-            />
+          {stillBilling ? (
+            <StillBillingNotice stores={stillBilling} onDone={onDeleted} />
           ) : (
-            <BirdoTextField
-              value={password}
-              onChange={(v) => {
-                setPassword(v);
-                if (error) setError(null);
-              }}
-              label="Password"
-              type="password"
-              placeholder="••••••••"
-              error={error != null}
-              disabled={deleting}
-              autoComplete="current-password"
-            />
+            <>
+              <p className="text-[13px]" style={{ color: white.w60 }}>
+                This deletes your account. It is anonymised immediately and fully
+                deleted within 30 days; payment records are kept, anonymised, for 7
+                years for tax. This cannot be undone.
+                {hasPassword
+                  ? ' Enter your password to confirm.'
+                  : ' Type DELETE below to confirm.'}
+              </p>
+              <p
+                className="rounded-birdo-sm px-3 py-2 text-[12px]"
+                style={{ backgroundColor: white.w05, color: white.w80 }}
+              >
+                {STORE_BILLING_WARNING}
+              </p>
+              {!hasPassword ? (
+                <BirdoTextField
+                  value={confirmText}
+                  onChange={(v) => {
+                    setConfirmText(v);
+                    if (error) setError(null);
+                  }}
+                  label="Type DELETE to confirm"
+                  type="text"
+                  placeholder="DELETE"
+                  error={error != null}
+                  disabled={deleting}
+                  autoComplete="off"
+                />
+              ) : (
+                <BirdoTextField
+                  value={password}
+                  onChange={(v) => {
+                    setPassword(v);
+                    if (error) setError(null);
+                  }}
+                  label="Password"
+                  type="password"
+                  placeholder="••••••••"
+                  error={error != null}
+                  disabled={deleting}
+                  autoComplete="current-password"
+                />
+              )}
+              {error && (
+                <p className="text-[12px]" style={{ color: statusTokens.red }}>
+                  {error}
+                </p>
+              )}
+              <div className="flex gap-2.5">
+                <BirdoButton
+                  text="Cancel"
+                  variant="secondary"
+                  fullWidth
+                  disabled={deleting}
+                  onClick={onDismiss}
+                />
+                <BirdoButton
+                  text={deleting ? 'Deleting…' : 'Delete forever'}
+                  variant="danger"
+                  fullWidth
+                  isLoading={deleting}
+                  disabled={!canSubmit}
+                  onClick={handleConfirm}
+                />
+              </div>
+            </>
           )}
-          {error && (
-            <p className="text-[12px]" style={{ color: statusTokens.red }}>
-              {error}
-            </p>
-          )}
-          <div className="flex gap-2.5">
-            <BirdoButton
-              text="Cancel"
-              variant="secondary"
-              fullWidth
-              disabled={deleting}
-              onClick={onDismiss}
-            />
-            <BirdoButton
-              text={deleting ? 'Deleting…' : 'Delete forever'}
-              variant="danger"
-              fullWidth
-              isLoading={deleting}
-              disabled={!canSubmit}
-              onClick={handleConfirm}
-            />
-          </div>
         </div>
       </motion.div>
     </motion.div>
+  );
+}
+
+/**
+ * Shown after a CONFIRMED deletion when the server reports store
+ * subscriptions it could not cancel. The account is already gone; this is the
+ * user's last chance to learn that Apple or Google will keep charging.
+ */
+function StillBillingNotice({ stores, onDone }: { stores: string[]; onDone: () => void }) {
+  return (
+    <>
+      <p className="text-[13px]" style={{ color: white.w80 }}>
+        Your account has been deleted. These subscriptions are still active and
+        will keep billing until you cancel them in the store:
+      </p>
+      <ul className="list-disc pl-5 text-[13px]" style={{ color: white.w80 }}>
+        {stores.map((store) => (
+          <li key={store}>{store}</li>
+        ))}
+      </ul>
+      <p className="text-[12px]" style={{ color: white.w60 }}>
+        Cancel them in your Apple or Google account settings. Birdo cannot cancel
+        a store subscription for you.
+      </p>
+      <BirdoButton text="OK" variant="primary" fullWidth onClick={onDone} />
+    </>
   );
 }
 

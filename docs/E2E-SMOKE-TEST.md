@@ -106,8 +106,12 @@ behaviour those tests cannot reach.
 
 ## 12. Account / lifecycle
 - [ ] Subscription screen shows plan/devices/bandwidth; "manage/upgrade" opens the web.
-- [ ] GDPR **Export my data** downloads a JSON file.
-- [ ] **Delete account** requires password + typing DELETE, then signs out.
+- [ ] GDPR **Export my data** downloads a JSON file (`GET /api/v1/gdpr/export`).
+- [ ] **Delete account** requires the password (or typing DELETE for password-less
+      accounts), shows the App Store / Google Play billing warning before confirming,
+      disconnects the VPN first, and signs out only once the server confirms
+      (`DELETE /api/v1/gdpr/delete`). A wrong password shows the server's message and
+      leaves you signed in. Use a throwaway test account.
 - [ ] Auto-connect on launch (if enabled), tray connect/disconnect, autostart, start-minimized all behave.
 
 ## 13. Updater

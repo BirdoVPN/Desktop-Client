@@ -47,6 +47,91 @@ pub struct ApiErrorBody {
     pub message: Option<String>,
 }
 
+/// Body of `DELETE /api/v1/gdpr/delete`. Password-less accounts (SSO and
+/// anonymous) send whatever the UI collected; the backend only checks it when
+/// the account has a password hash (`deleteAccountSchema`, max 256 chars).
+#[derive(Debug, Serialize)]
+pub struct DeleteAccountBody<'a> {
+    pub password: &'a str,
+}
+
+/// Success body of `DELETE /api/v1/gdpr/delete`.
+///
+/// Every field is optional: a deletion the server confirmed with a 2xx is a
+/// deletion, whatever the body looks like, so a parse failure must never turn
+/// it back into an error the user would retry against an erased account.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAccountResponse {
+    #[serde(default)]
+    pub message: Option<String>,
+    /// App Store / Google Play subscriptions the deletion could NOT cancel
+    /// (Birdo cannot cancel a store subscription; only Polar web subscriptions
+    /// are cancelled server-side). The backend is adding this field as part of
+    /// the same remediation and its exact shape is not fixed yet, so it is kept
+    /// as raw JSON and read by [`store_subscription_labels`]; absent on today's
+    /// backend.
+    #[serde(default)]
+    pub store_subscriptions_still_billing: Option<serde_json::Value>,
+}
+
+/// Turn `storeSubscriptionsStillBilling` into user-facing store names,
+/// whatever reasonable shape the backend settles on: an array of store
+/// strings (`"APP_STORE"`, `"GOOGLE_PLAY"`), an array of objects carrying a
+/// `store` / `provider` / `platform` / `source` string, or a bare `true`.
+/// Anything it cannot name still produces a generic entry, so a subscription
+/// that is billing can never be silently dropped from the warning.
+pub fn store_subscription_labels(value: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+    const GENERIC: &str = "App Store or Google Play subscription";
+
+    fn name(raw: &str) -> &'static str {
+        let s = raw.to_ascii_lowercase();
+        if s.contains("apple")
+            || s.contains("app_store")
+            || s.contains("appstore")
+            || s.contains("app store")
+            || s == "ios"
+            || s == "macos"
+        {
+            "Apple App Store"
+        } else if s.contains("google") || s.contains("play") || s == "android" {
+            "Google Play"
+        } else {
+            GENERIC
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |label: &str| {
+        if !out.iter().any(|l| l == label) {
+            out.push(label.to_string());
+        }
+    };
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(s) => push(name(s)),
+                    Value::Object(map) => {
+                        let store = ["store", "provider", "platform", "source"]
+                            .iter()
+                            .find_map(|k| map.get(*k).and_then(Value::as_str));
+                        push(store.map(name).unwrap_or(GENERIC));
+                    }
+                    Value::Null | Value::Bool(false) => {}
+                    _ => push(GENERIC),
+                }
+            }
+        }
+        Value::Bool(true) => push(GENERIC),
+        Value::Number(n) if n.as_f64().unwrap_or(0.0) > 0.0 => push(GENERIC),
+        Value::String(s) if !s.trim().is_empty() => push(name(s)),
+        _ => {}
+    }
+    out
+}
+
 /// The `details` object of a canonical 426 body.
 ///
 /// The backend puts its structured payload here and NOWHERE else:
