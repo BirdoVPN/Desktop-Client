@@ -77,10 +77,10 @@
       }
     },
     "publisher": "Birdo VPN",
-    "copyright": "© 2026 Birdo VPN. All rights reserved.",
+    "copyright": "© 2026 Birdo Networks Ltd. All rights reserved.",
     "category": "Utility",
     "shortDescription": "Privacy-First VPN Client",
-    "longDescription": "Birdo VPN - A lightweight, secure VPN client using WireGuard protocol. Fast, private, and anonymous."
+    "longDescription": "Birdo VPN - a lightweight VPN client using the WireGuard protocol."
   },
   "plugins": {
     "shell": {
