@@ -64,7 +64,8 @@ describe('ConsentScreen copy', () => {
     expect(screen.getByText(CONSENT_COPY.accountHolds)).toBeInTheDocument();
     expect(screen.getByText(CONSENT_COPY.crashReports)).toBeInTheDocument();
     expect(CONSENT_COPY.noActivityLogs).toContain('keeps a live record of your session');
-    expect(CONSENT_COPY.noActivityLogs).toContain('never included in backups');
+    // Second-pass #2: the nightly dump leaves it out; the 7-day PITR copy can hold it.
+    expect(CONSENT_COPY.noActivityLogs).toContain('is left out of our nightly backups');
   });
 
   it('never repeats a withdrawn claim', () => {
@@ -79,6 +80,9 @@ describe('ConsentScreen copy', () => {
       /non-reversible/i,
       /IP addresses are logged/i,
       /connection timestamps/i,
+      /never included in backups/i,
+      /never in backups/i,
+      /not in any backup/i,
     ]) {
       expect(text).not.toMatch(banned);
     }

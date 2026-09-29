@@ -34,7 +34,9 @@ our VPN servers, so the sites you visit see the server's address instead of your
 Our VPN servers don't record the sites you visit, your DNS queries or your
 traffic. While you're connected, our account system keeps a live record of your
 session (server, device, connect time). It is deleted when you disconnect and is
-never included in backups. We also count your data use per billing period.
+left out of our nightly backups. Our daily encrypted copy of the database files
+(kept 7 days, used for point-in-time recovery) can contain it as it stood at that
+moment. We also count your data use per billing period.
 
 **What Your Account Holds**
 Your email (or anonymous account number), plan, the devices you add, and your

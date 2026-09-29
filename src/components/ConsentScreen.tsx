@@ -18,13 +18,17 @@ export const PRIVACY_URL = 'https://birdo.app/privacy';
  * addresses were logged (a live session record exists while you are
  * connected), and that crash reports carried "no personal data" while they
  * were sent unconditionally. Do not reintroduce any of those.
+ *
+ * Nor "never included in backups" (second-pass #2): the nightly dump leaves
+ * the live record out, but the daily point-in-time-recovery base backup
+ * (kept 7 days) copies every data file, so it can hold it (§1.2a).
  */
 export const CONSENT_COPY = {
   noActivityLogs:
     "Our VPN servers don't record the sites you visit, your DNS queries or your traffic. " +
     "While you're connected, our account system keeps a live record of your session " +
-    '(server, device, connect time). It is deleted when you disconnect and is never ' +
-    'included in backups. We also count your data use per billing period.',
+    '(server, device, connect time). It is deleted when you disconnect and is left out ' +
+    'of our nightly backups. We also count your data use per billing period.',
   accountHolds:
     'Your email (or anonymous account number), plan, the devices you add, and your ' +
     'usage totals. Full list: birdo.app/privacy.',
