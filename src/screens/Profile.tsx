@@ -555,8 +555,10 @@ function UsageMeter() {
 //    cannot cancel an App Store or Google Play one, which keeps billing. The
 //    dialog says so BEFORE the user confirms, and lists any store subscription
 //    the server reports as still billing afterwards.
-//  - C-2: the VPN is disconnected first (Android parity), so no tunnel is left
-//    up (kill switch armed) against keys the deletion is about to remove.
+//  - Second-pass #15: the VPN is disconnected only AFTER the server confirms
+//    the deletion (the Rust `delete_account` does it between the 2xx and
+//    clearing local state). Disconnecting first left a user who typed a wrong
+//    password, or was offline, disconnected from an account that still exists.
 //  - Local state is only cleared once the server confirms (Rust side); a
 //    refusal shows the server's own message ("Incorrect password").
 
@@ -607,20 +609,6 @@ function DeleteAccountDialog({
     if (!canSubmit) return;
     setDeleting(true);
     setError(null);
-    // Disconnect first (Android parity). Best effort: a failed disconnect must
-    // not block an erasure request, and the server tears the account's keys
-    // down either way.
-    if (useAppStore.getState().connectionState !== 'disconnected') {
-      try {
-        await invoke('disconnect_vpn');
-        const ns = useAppStore.getState();
-        ns.setConnectionState('disconnected');
-        ns.setCurrentServer(null);
-        ns.setVpnIp(null);
-      } catch {
-        /* best effort */
-      }
-    }
     try {
       // Password-less accounts (anonymous and SSO) send the typed confirmation
       // token: the server skips the password check for them entirely, and the
@@ -629,6 +617,13 @@ function DeleteAccountDialog({
       const result = await invoke<DeleteAccountResult | null>('delete_account', {
         request: { password: hasPassword ? password : confirmText.trim() },
       });
+      // Confirmed: the Rust side has already taken the tunnel down (between
+      // the 2xx and clearing local state). Mirror that in the store now rather
+      // than waiting for the next status poll.
+      const ns = useAppStore.getState();
+      ns.setConnectionState('disconnected');
+      ns.setCurrentServer(null);
+      ns.setVpnIp(null);
       const billing = result?.storeSubscriptionsStillBilling ?? [];
       if (billing.length > 0) {
         setStillBilling(billing);

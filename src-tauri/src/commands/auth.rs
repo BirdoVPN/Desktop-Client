@@ -8,7 +8,7 @@ use crate::api::BirdoApi;
 use crate::storage::CredentialStore;
 use crate::utils::redact_email;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 use zeroize::Zeroize;
 
 // FIX-2-5: Client-side rate limiting for login IPC command
@@ -262,6 +262,7 @@ fn delete_failure_message(error: &ApiError) -> String {
 #[tauri::command]
 pub async fn delete_account(
     request: DeleteAccountRequest,
+    app: tauri::AppHandle,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<DeleteAccountResult, String> {
@@ -269,11 +270,30 @@ pub async fn delete_account(
 
     // Nothing local is touched unless the server confirms the deletion: a
     // refused request (wrong password, expired session, offline) must leave
-    // the user signed in to the account that still exists.
+    // the user signed in to the account that still exists — and connected.
     let response = api
         .delete_account(&request.password)
         .await
         .map_err(|e| delete_failure_message(&e))?;
+
+    // The server has confirmed (2xx). Only NOW take the tunnel down, before
+    // the local state is cleared (second-pass #15). This used to happen in
+    // the dialog before the request, so a wrong password or an offline delete
+    // left the user disconnected from an account that still existed. The
+    // account's keys are gone server-side, so the tunnel could not carry
+    // traffic anyway; the full user-initiated path also stops auto-reconnect
+    // and disarms the kill switch, so nothing is left blocking. Best effort:
+    // a failed teardown never turns a completed erasure into an error.
+    if let Err(e) = crate::commands::vpn::disconnect_vpn(
+        app.clone(),
+        app.state(),
+        app.state(),
+        app.state(),
+    )
+    .await
+    {
+        tracing::warn!("Disconnect after account deletion failed: {}", e);
+    }
 
     // Clear all local credentials after successful server-side deletion,
     // including the persistent ML-KEM identity (same hygiene as logout —
@@ -829,5 +849,24 @@ mod account_boundary_tests {
         let needle = ["device_id", "::rotate()"].concat();
         assert!(!body("logout").contains(&needle));
         assert!(body("delete_account").contains(&needle));
+    }
+
+    #[test]
+    fn deletion_disconnects_only_after_the_server_confirmed() {
+        // Second-pass #15: a refused deletion (wrong password, offline) must
+        // leave the tunnel up; a confirmed one takes it down before the local
+        // state is cleared.
+        let del = body("delete_account");
+        let confirmed = del
+            .find(".delete_account(&request.password)")
+            .expect("the server call");
+        let disconnect = del
+            .find("commands::vpn::disconnect_vpn(")
+            .expect("the disconnect after the 2xx");
+        let cleared = del
+            .find("credentials.clear_tokens()")
+            .expect("local state cleared");
+        assert!(confirmed < disconnect, "disconnect runs before the server confirmed");
+        assert!(disconnect < cleared, "local state is cleared before the disconnect");
     }
 }

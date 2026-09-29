@@ -2,7 +2,8 @@
  * In-app account deletion (audit 2026-09-29: C-2 / P0-6, A-8 / C-9).
  *
  * - The store-billing warning is shown BEFORE the user confirms.
- * - The VPN is disconnected before the deletion request (Android parity).
+ * - The dialog never disconnects the VPN itself: the Rust command does, only
+ *   after the server confirmed (second-pass #15). A refusal leaves it up.
  * - A server refusal shows the server's message and signs nobody out.
  * - Store subscriptions the server reports as still billing are listed after
  *   a confirmed deletion, and every way out of that notice signs out.
@@ -115,12 +116,12 @@ describe('Delete account dialog', () => {
     expect(calls()).not.toContain('delete_account');
   });
 
-  it('disconnects the VPN before asking the server to delete', async () => {
+  it('shows the tunnel as down only after the server confirmed the deletion', async () => {
     await openAndConfirm();
     await waitFor(() => expect(calls()).toContain('logout'));
-    const order = calls();
-    expect(order.indexOf('disconnect_vpn')).toBeGreaterThanOrEqual(0);
-    expect(order.indexOf('disconnect_vpn')).toBeLessThan(order.indexOf('delete_account'));
+    // Second-pass #15: the Rust delete_account disconnects between the 2xx and
+    // clearing local state; the dialog must not disconnect before asking.
+    expect(calls()).not.toContain('disconnect_vpn');
     expect(mockedInvoke).toHaveBeenCalledWith('delete_account', {
       request: { password: 'hunter2' },
     });
@@ -128,11 +129,12 @@ describe('Delete account dialog', () => {
     expect(logout).toHaveBeenCalled();
   });
 
-  it('skips the disconnect when not connected', async () => {
-    mockStoreState.connectionState = 'disconnected';
+  it('a refused deletion leaves the VPN connected', async () => {
+    deleteResult = () => Promise.reject('Account deletion failed: Incorrect password');
     await openAndConfirm();
-    await waitFor(() => expect(calls()).toContain('delete_account'));
+    await screen.findByText('Account deletion failed: Incorrect password');
     expect(calls()).not.toContain('disconnect_vpn');
+    expect(setConnectionState).not.toHaveBeenCalled();
   });
 
   it('shows the server refusal and signs nobody out', async () => {
