@@ -50,11 +50,33 @@ const API_BASE_URL: &str = "https://api.birdo.app";
 /// sake.)
 const WEB_BASE_URL: &str = "https://birdo.app";
 
+/// Per-OS User-Agent. This was `… (Windows)` on every OS, so macOS and Linux
+/// installs were reported as Windows (audit 2026-09-29, D-18). The backend's
+/// parser (`client-version.util.ts` UA_RE) reads only `Birdo-Desktop/<semver>`
+/// and ignores the suffix, so the change is invisible to version enforcement.
+#[cfg(target_os = "windows")]
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Windows)");
+#[cfg(target_os = "macos")]
+const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (macOS)");
+#[cfg(target_os = "linux")]
+const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Linux)");
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Desktop)");
 
-/// Value of the `X-Desktop-Client` marker header, sent on every POST and on
-/// the GDPR deletion.
+/// Value of the `X-Desktop-Client` marker header. The backend tests only for
+/// the header's PRESENCE (CSRF bypass, desktop-only auth routes, attestation
+/// scheme) and substring-matches "android"/"ios"/"desktop" when inferring a
+/// device type — none of which these values trip — so only the Windows value
+/// is byte-identical to earlier releases, and that is the one shipped build
+/// that matters. Same D-18 fix as `USER_AGENT`.
+#[cfg(target_os = "windows")]
 pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-windows";
+#[cfg(target_os = "macos")]
+pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-macos";
+#[cfg(target_os = "linux")]
+pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-linux";
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-desktop";
 
 /// What one `DELETE /api/v1/gdpr/delete` response means
 /// (see `BirdoApi::classify_gdpr_delete_response`).
