@@ -69,7 +69,7 @@ openssl pkey -in desk.pem -pubout -outform DER | tail -c 32 | base64
 4. Retire the old public key only once the old clients are below the floor you
    are willing to refuse (an `enforce` policy would otherwise lock them out).
 
-Because the client is open source, the key is only as secret as the CI secret
+Because the client source is public (source-available), the key is only as secret as the CI secret
 store — it distinguishes "built by our release pipeline" from "rebuilt by anyone
 else", which is exactly the same guarantee bound as the Play channel, and it does
 not gate entitlements (plan/device limits are enforced server-side regardless).

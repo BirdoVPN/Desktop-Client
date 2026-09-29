@@ -44,6 +44,13 @@ GitHub OIDC token is exchanged for an Azure access token at runtime.
 
 ## 3. macOS — Apple Developer ID + Notarization
 
+> **Status (2026-09-29): none of these secrets exists.** There is no Apple
+> Developer account, `APPLE_CERTIFICATE` is not configured, and `release.yml`
+> therefore always builds the macOS Tauri app **unsigned and un-notarised**.
+> This section only documents what the workflow would do if the secrets were
+> added. Nothing may describe the shipped macOS build as Developer-ID signed or
+> notarised (audit D-22 / B-5).
+
 Generate the `.p12` from Xcode -> Settings -> Accounts -> Manage Certificates
 -> "Developer ID Application" -> right-click -> Export. Then base64-encode:
 
