@@ -93,7 +93,15 @@ export function Login() {
   // user has moved on.
   const [ssoWaiting, setSsoWaiting] = useState<SsoProvider | null>(null);
   const ssoAttemptRef = useRef(0);
-  const createButtonRef = useRef<HTMLButtonElement>(null);
+  // Set by "Sign up"; the Create button takes focus when it mounts, which is
+  // after the previous tab's exit animation — not on the next frame.
+  const focusCreateRef = useRef(false);
+  const createButtonRef = (el: HTMLButtonElement | null) => {
+    if (el && focusCreateRef.current) {
+      focusCreateRef.current = false;
+      el.focus();
+    }
+  };
   const tabsId = useId();
 
   const { setAuthenticated, setUserEmail, sessionEndedReason, setSessionEndedReason } = useAppStore(
@@ -329,8 +337,8 @@ export function Login() {
   // "Sign up" goes to the Anonymous tab and its Create button (iOS), instead of
   // opening the web SIGN-IN page as "Register at birdo.app" did (W2-027).
   const goToSignUp = () => {
+    focusCreateRef.current = true;
     selectTab('anonymous');
-    requestAnimationFrame(() => createButtonRef.current?.focus());
   };
 
   const tabs: { id: AuthTab; label: string }[] = [

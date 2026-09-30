@@ -30,11 +30,14 @@ let serversInFlight: Promise<void> | null = null;
 let subscriptionInFlight: Promise<void> | null = null;
 let usageInFlight: Promise<void> | null = null;
 
-/** Forget the timestamps (sign-out: the next account starts cold). */
+/** Forget the timestamps and in-flight requests (sign-out: the next account starts cold). */
 export function resetSessionData(): void {
   serversAt = 0;
   pingsAt = 0;
   subscriptionAt = 0;
+  serversInFlight = null;
+  subscriptionInFlight = null;
+  usageInFlight = null;
 }
 
 export async function loadSettings(): Promise<void> {

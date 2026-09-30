@@ -110,7 +110,10 @@ export function PixelCanvas({
           if (animate) {
             const dx = mouseX - (p.x + pixelSize / 2);
             const dy = mouseY - (p.y + pixelSize / 2);
-            if (Math.sqrt(dx * dx + dy * dy) < 60) {
+            // Only a MOVING pointer lights cells: one resting over the window
+            // would otherwise hold its trail at full strength and the loop
+            // would never park.
+            if (twinkle && Math.sqrt(dx * dx + dy * dy) < 60) {
               p.hoverDecay = Math.min(1.0, p.hoverDecay + 0.08);
             } else {
               p.hoverDecay = Math.max(0, p.hoverDecay - 0.004);
