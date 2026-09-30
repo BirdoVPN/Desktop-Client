@@ -8,6 +8,12 @@
  * plan (no gate), and scheduling the live rebuild when a session is up. These
  * tests drive the real VpnSettings screen and assert exactly that.
  *
+ * Updated for the client overhaul (2026-09-30): Custom DNS gained an on/off
+ * switch that KEEPS the addresses while off (P1-parity-042), so the gate is
+ * "switched on AND has addresses"; and the plan-locked Stealth row is now the
+ * iOS locked-row pattern — a lock that routes to the plans — rather than a
+ * disabled switch plus a separate link (P1-parity-032).
+ *
  * Run: npx vitest run src/__tests__/BirdoShieldToggle.test.tsx
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -40,6 +46,7 @@ const mockStoreState = {
     splitTunnelingEnabled: false,
     splitTunnelApps: [] as string[],
     customDns: null as string[] | null,
+    customDnsEnabled: false,
     protocol: 'wireguard' as const,
     localNetworkSharing: false,
     wireGuardPort: 'auto',
@@ -57,6 +64,9 @@ const mockStoreState = {
   }),
   popRoute: vi.fn(),
   pushRoute: vi.fn(),
+  setReapplying: vi.fn(),
+  showNotice: vi.fn(),
+  reapplying: false,
   account: {
     email: 'test@birdo.app',
     plan: 'RECON',
@@ -90,6 +100,8 @@ beforeEach(() => {
   mockStoreState.settings.dnsFiltering = false;
   mockStoreState.settings.stealthMode = false;
   mockStoreState.settings.customDns = null;
+  mockStoreState.settings.customDnsEnabled = false;
+  mockStoreState.pushRoute.mockClear();
   mockStoreState.connectionState = 'disconnected';
   mockStoreState.account.plan = 'RECON';
   mockStoreState.dnsFilteringAvailable = true;
@@ -121,8 +133,11 @@ describe('BirdoShield toggle → dns_filtering', () => {
     expect(
       screen.getByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
     ).toBeInTheDocument();
-    // Stealth, by contrast, IS plan-gated on RECON — the two rows differ on purpose.
-    expect(screen.getByRole('switch', { name: /stealth mode/i }).tagName).toBe('DIV');
+    // Stealth, by contrast, IS plan-gated on RECON — the two rows differ on
+    // purpose. The locked row is no switch at all: it routes to the plans.
+    expect(screen.queryByRole('switch', { name: /stealth mode/i })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /stealth mode/i }));
+    expect(mockStoreState.pushRoute).toHaveBeenCalledWith('pricing');
   });
 
   it('ON persists dnsFiltering through the store patch and the full-object save_settings (dns_filtering: true)', async () => {
@@ -164,6 +179,7 @@ describe('BirdoShield toggle → dns_filtering', () => {
   describe('with Custom DNS configured', () => {
     it('reads OFF, is disabled and explains the override — even when dnsFiltering is persisted ON', async () => {
       mockStoreState.settings.customDns = ['9.9.9.9', '149.112.112.112'];
+      mockStoreState.settings.customDnsEnabled = true;
       mockStoreState.settings.dnsFiltering = true;
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: /birdoshield/i });
@@ -172,7 +188,7 @@ describe('BirdoShield toggle → dns_filtering', () => {
       expect(row.tagName).toBe('DIV');
       expect(
         screen.getByText(
-          'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.',
+          'Custom DNS overrides BirdoShield. Turn off Custom DNS Servers under Settings › VPN to use the filtering resolver.',
         ),
       ).toBeInTheDocument();
       expect(
@@ -187,6 +203,7 @@ describe('BirdoShield toggle → dns_filtering', () => {
 
     it('a single custom server is enough to gate the row', async () => {
       mockStoreState.settings.customDns = ['1.1.1.1'];
+      mockStoreState.settings.customDnsEnabled = true;
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: /birdoshield/i });
       expect(row.tagName).toBe('DIV');
@@ -194,6 +211,19 @@ describe('BirdoShield toggle → dns_filtering', () => {
 
     it('an empty custom DNS list does NOT gate the row (matches the Rust `!d.is_empty()` rule)', async () => {
       mockStoreState.settings.customDns = [];
+      mockStoreState.settings.customDnsEnabled = true;
+      mockStoreState.settings.dnsFiltering = true;
+      render(<VpnSettings />);
+      const row = await screen.findByRole('switch', { name: /birdoshield/i });
+      expect(row.tagName).toBe('BUTTON');
+      expect(row).toHaveAttribute('aria-checked', 'true');
+    });
+
+    // P1-parity-042: switching Custom DNS off keeps the addresses but sends
+    // none (settingsToRust writes null), so nothing overrides the resolver.
+    it('addresses kept while Custom DNS is switched OFF do NOT gate the row', async () => {
+      mockStoreState.settings.customDns = ['1.1.1.1'];
+      mockStoreState.settings.customDnsEnabled = false;
       mockStoreState.settings.dnsFiltering = true;
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: /birdoshield/i });
@@ -233,11 +263,12 @@ describe('BirdoShield toggle → dns_filtering', () => {
     it('names the fleet gate, not Custom DNS, when both block the row', async () => {
       mockStoreState.dnsFilteringAvailable = false;
       mockStoreState.settings.customDns = ['1.1.1.1'];
+      mockStoreState.settings.customDnsEnabled = true;
       render(<VpnSettings />);
       expect(screen.getByText(UNAVAILABLE_COPY)).toBeInTheDocument();
       expect(
         screen.queryByText(
-          'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.',
+          'Custom DNS overrides BirdoShield. Turn off Custom DNS Servers under Settings › VPN to use the filtering resolver.',
         ),
       ).not.toBeInTheDocument();
     });
@@ -299,7 +330,10 @@ describe('BirdoShield toggle → dns_filtering', () => {
     const states: Array<[string, () => void]> = [
       ['default', () => {}],
       ['fleet gate off', () => { mockStoreState.dnsFilteringAvailable = false; }],
-      ['custom DNS', () => { mockStoreState.settings.customDns = ['1.1.1.1']; }],
+      ['custom DNS', () => {
+        mockStoreState.settings.customDns = ['1.1.1.1'];
+        mockStoreState.settings.customDnsEnabled = true;
+      }],
     ];
 
     it.each(states)('%s: the whole subtitle is rendered untruncated', async (_name, setup) => {
@@ -370,6 +404,7 @@ describe('BirdoShield toggle → dns_filtering', () => {
 
     it('the Custom DNS row does the same', async () => {
       mockStoreState.settings.customDns = ['1.1.1.1'];
+      mockStoreState.settings.customDnsEnabled = true;
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: /birdoshield/i });
       expect(row).toHaveAttribute('aria-disabled', 'true');
@@ -389,12 +424,22 @@ describe('BirdoShield toggle → dns_filtering', () => {
       );
     });
 
-    it('the plan-gated Stealth row gets the same treatment (not a BirdoShield special case)', async () => {
+    // The plan-gated Stealth row is no longer a disabled switch: it is a
+    // reachable button that says it is locked and where to unlock it.
+    it('the plan-gated Stealth row is a reachable, labelled control, not a dead switch', async () => {
+      render(<VpnSettings />);
+      const row = await screen.findByRole('button', { name: /stealth mode/i });
+      expect(row).not.toHaveAttribute('aria-disabled');
+      expect(row).toHaveTextContent('Operative');
+    });
+
+    it('while the plan is unknown, Stealth waits instead of showing a lock (W2-011)', async () => {
+      (mockStoreState.account as { plan: string | null }).plan = null;
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: /stealth mode/i });
-      expect(row.tagName).toBe('DIV');
       expect(row).toHaveAttribute('aria-disabled', 'true');
-      expect(row).toHaveAttribute('tabindex', '0');
+      expect(screen.getByText('Checking your plan…')).toBeInTheDocument();
+      expect(screen.queryByText('Operative')).not.toBeInTheDocument();
     });
   });
 

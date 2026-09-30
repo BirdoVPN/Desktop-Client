@@ -230,7 +230,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
 
           {/* Required notice */}
           <motion.p
-            className="mt-4 text-center text-xs text-w40"
+            className="mt-4 text-center text-xs text-w60"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.45 }}

@@ -4,8 +4,8 @@
  *
  * Border: soft hairline → emerald on focus → red on error.
  */
-import { useState } from 'react';
-import type { ReactNode } from 'react';
+import { useId, useState } from 'react';
+import type { KeyboardEvent, ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { Eye, EyeOff } from 'lucide-react';
 import { status, white } from '@/lib/birdo-theme';
@@ -23,6 +23,14 @@ export interface BirdoTextFieldProps {
   className?: string;
   ariaLabel?: string;
   autoComplete?: string;
+  /** Inline error message, linked to the input with aria-describedby. */
+  errorText?: string | null;
+  /** Hint under the field (also linked), shown while there is no error. */
+  hint?: string;
+  onBlur?: () => void;
+  onKeyDown?: (e: KeyboardEvent<HTMLInputElement>) => void;
+  inputMode?: 'text' | 'numeric' | 'decimal';
+  inputRef?: React.Ref<HTMLInputElement>;
 }
 
 export function BirdoTextField({
@@ -38,9 +46,19 @@ export function BirdoTextField({
   className = '',
   ariaLabel,
   autoComplete,
+  errorText,
+  hint,
+  onBlur,
+  onKeyDown,
+  inputMode,
+  inputRef,
 }: BirdoTextFieldProps) {
   const [focused, setFocused] = useState(false);
   const [revealed, setRevealed] = useState(false);
+  const inputId = useId();
+  const noteId = useId();
+  const hasError = error || !!errorText;
+  const note = errorText || hint;
 
   const isPassword = type === 'password';
   const inputType = isPassword ? (revealed ? 'text' : 'password') : type;
@@ -48,7 +66,7 @@ export function BirdoTextField({
   // Focus = a soft, layered brand-emerald glow (a brighter emerald edge + a tight
   // ring + an outer bloom). Error = red. Otherwise a calm hairline. The glow
   // makes the active field unmistakable without a hard outline.
-  const borderColor = error
+  const borderColor = hasError
     ? status.red
     : focused
     ? 'rgba(16,185,129,0.55)'
@@ -56,7 +74,7 @@ export function BirdoTextField({
     ? 'rgba(255,255,255,0.05)'
     : 'rgba(255,255,255,0.10)';
 
-  const boxShadow = error
+  const boxShadow = hasError
     ? '0 0 0 3px rgba(248,113,113,0.16), inset 0 1px 0 rgba(255,255,255,0.04)'
     : focused
     ? '0 0 0 3px rgba(16,185,129,0.16), 0 0 22px -2px rgba(16,185,129,0.45), inset 0 1px 0 rgba(255,255,255,0.06)'
@@ -66,6 +84,7 @@ export function BirdoTextField({
     <div className={className}>
       {label && (
         <label
+          htmlFor={inputId}
           className="mb-1.5 block pl-1 text-xs font-medium tracking-tight"
           style={{ color: white.w60 }}
         >
@@ -90,15 +109,23 @@ export function BirdoTextField({
           <LeadingIcon size={18} color={white.w40} aria-hidden className="shrink-0" />
         )}
         <input
+          id={inputId}
+          ref={inputRef}
           type={inputType}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
+          onBlur={() => {
+            setFocused(false);
+            onBlur?.();
+          }}
+          onKeyDown={onKeyDown}
+          inputMode={inputMode}
           placeholder={placeholder}
           disabled={disabled}
-          aria-label={ariaLabel ?? label}
-          aria-invalid={error ? 'true' : undefined}
+          aria-label={ariaLabel}
+          aria-invalid={hasError ? 'true' : undefined}
+          aria-describedby={note ? noteId : undefined}
           autoComplete={autoComplete}
           className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-hidden placeholder:text-(--placeholder) disabled:cursor-not-allowed"
           style={{
@@ -125,6 +152,15 @@ export function BirdoTextField({
         )}
         {!isPassword && trailing && <div className="shrink-0">{trailing}</div>}
       </div>
+      {note && (
+        <p
+          id={noteId}
+          className="mt-1 pl-1 text-xs"
+          style={{ color: errorText ? status.red : white.w60 }}
+        >
+          {note}
+        </p>
+      )}
     </div>
   );
 }

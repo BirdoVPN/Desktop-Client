@@ -129,11 +129,11 @@ export function WorldGlobe({
   );
 
   const atmo = isConnected
-    ? 'rgba(68, 209, 126, 0.22)' // green when connected
+    ? status.greenShadow // mint when connected (status.green at 0.30)
     : 'rgba(73, 131, 199, 0.20)'; // blue idle
   // Idle dots are blue (NOT the emerald accent) so green stays exclusive to the
-  // connected state — see the file header.
-  const dotColor = isConnected ? '#44D17E' : status.blue;
+  // connected state — see the file header. Connected is the shared mint.
+  const dotColor = isConnected ? status.green : status.blue;
 
   // Unique server locations → offsets within ONE map tile (0..50% of the
   // 400%-wide scroller). Rendered twice (tile 0 and +50%) so a marker stays on

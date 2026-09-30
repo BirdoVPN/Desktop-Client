@@ -4,7 +4,9 @@
  * - The store-billing warning is shown BEFORE the user confirms.
  * - The dialog never disconnects the VPN itself: the Rust command does, only
  *   after the server confirmed (second-pass #15). A refusal leaves it up.
- * - A server refusal shows the server's message and signs nobody out.
+ * - A server refusal is SHOWN (by its error code: a wrong password reads
+ *   "Incorrect password. Please try again.", never Rust's raw text — W2-012)
+ *   and signs nobody out.
  * - Store subscriptions the server reports as still billing are listed after
  *   a confirmed deletion, and every way out of that notice signs out.
  *
@@ -110,8 +112,16 @@ async function openAndConfirm() {
   await userEvent.click(screen.getByRole('button', { name: /delete account/i }));
   expect(screen.getByText(STORE_BILLING_WARNING)).toBeInTheDocument();
   await userEvent.type(screen.getByPlaceholderText('••••••••'), 'hunter2');
-  await userEvent.click(screen.getByRole('button', { name: /delete forever/i }));
+  await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
 }
+
+/** The v2 rejection for a wrong password (contract WINDOWS-IPC-V2 §2). */
+const WRONG_PASSWORD = {
+  code: 'invalid_credentials',
+  message: 'Incorrect password',
+  retryable: true,
+  retry_after_secs: null,
+};
 
 const calls = () => mockedInvoke.mock.calls.map(([cmd]) => cmd);
 
@@ -139,20 +149,28 @@ describe('Delete account dialog', () => {
   });
 
   it('a refused deletion leaves the VPN connected', async () => {
-    deleteResult = () => Promise.reject('Account deletion failed: Incorrect password');
+    deleteResult = () => Promise.reject(WRONG_PASSWORD);
     await openAndConfirm();
-    await screen.findByText('Account deletion failed: Incorrect password');
+    await screen.findByText('Incorrect password. Please try again.');
     expect(calls()).not.toContain('disconnect_vpn');
     expect(setConnectionState).not.toHaveBeenCalled();
   });
 
   it('shows the server refusal and signs nobody out', async () => {
-    deleteResult = () => Promise.reject('Account deletion failed: Incorrect password');
+    deleteResult = () => Promise.reject(WRONG_PASSWORD);
+    await openAndConfirm();
+    expect(await screen.findByText('Incorrect password. Please try again.')).toBeInTheDocument();
+    expect(calls()).not.toContain('logout');
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it('never shows a legacy raw error string; an unclassified refusal gets a sentence about deleting', async () => {
+    deleteResult = () => Promise.reject('Account deletion failed: HTTP 502 from api');
     await openAndConfirm();
     expect(
-      await screen.findByText('Account deletion failed: Incorrect password'),
+      await screen.findByText("Couldn't delete your account. Please try again."),
     ).toBeInTheDocument();
-    expect(calls()).not.toContain('logout');
+    expect(screen.queryByText(/HTTP 502/)).not.toBeInTheDocument();
     expect(logout).not.toHaveBeenCalled();
   });
 

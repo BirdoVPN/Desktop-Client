@@ -113,7 +113,6 @@
 
 :root {
   --color-primary: 16 185 129;
-  --color-secondary: 99 102 241;
   --background: #050505;
   --foreground: #f2f2f2;
   --card: rgba(26, 26, 26, 0.95);
@@ -123,8 +122,8 @@
   --border: rgba(255, 255, 255, 0.08);
   --ring: rgba(255, 255, 255, 0.2);
 
-  /* ── Birdo design tokens (desktop is emerald since web #201; mobile is still violet) ─────────────
-     Consumed by tailwind.config.js utilities + components. Dark is default. */
+  /* ── Birdo design tokens — the same emerald palette as iOS BirdoTheme.swift
+     and Android Color.kt (see src/lib/birdo-theme.ts). Dark is default. */
   --birdo-black: #000000;
   --birdo-s0: #050507;
   --birdo-s1: #0b0b10;
@@ -139,9 +138,9 @@
   --birdo-accent-soft: #6ee7b7;
   --birdo-accent-bg: rgba(16, 185, 129, 0.1);
 
-  --birdo-green: #22c55e;
-  --birdo-green-light: #4ade80;
-  --birdo-green-bg: rgba(34, 197, 94, 0.1);
+  --birdo-green: #34d399;
+  --birdo-green-light: #6ee7b7;
+  --birdo-green-bg: rgba(52, 211, 153, 0.1);
   --birdo-yellow-light: #facc15;
   --birdo-red: #f87171;
   --birdo-red-bg: rgba(248, 113, 113, 0.1);
@@ -224,97 +223,6 @@
   input {
     -webkit-app-region: no-drag;
   }
-}
-
-/* Connection status animations */
-@keyframes pulse-ring {
-  0% {
-    transform: scale(0.8);
-    opacity: 1;
-  }
-  100% {
-    transform: scale(2);
-    opacity: 0;
-  }
-}
-
-.pulse-ring {
-  animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
-}
-
-/* Glass effect - enhanced glassmorphism */
-.glass {
-  background: rgba(255, 255, 255, 0.03);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.glass-strong {
-  background: rgba(255, 255, 255, 0.06);
-  backdrop-filter: blur(32px) saturate(200%);
-  -webkit-backdrop-filter: blur(32px) saturate(200%);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-}
-
-.glass-card {
-  background: rgba(20, 20, 25, 0.7);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-}
-
-.glass-input {
-  background: rgba(255, 255, 255, 0.04);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  transition: all 0.2s ease;
-}
-
-.glass-input:focus {
-  background: rgba(255, 255, 255, 0.07);
-  border-color: rgba(16, 185, 129, 0.55);
-  box-shadow:
-    0 0 0 3px rgba(16, 185, 129, 0.16),
-    0 0 22px -2px rgba(16, 185, 129, 0.42);
-}
-
-/* Button hover effect */
-.btn-hover {
-  transition: all 0.2s ease;
-}
-
-.btn-hover:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 8px 24px rgba(16, 185, 129, 0.25);
-}
-
-/* Primary button style */
-.btn-primary {
-  background: white;
-  color: black;
-  font-weight: 500;
-  transition: all 0.2s ease;
-}
-
-.btn-primary:hover {
-  background: rgba(255, 255, 255, 0.9);
-  transform: translateY(-1px);
-}
-
-/* Secondary button style */
-.btn-secondary {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  color: white;
-  backdrop-filter: blur(8px);
-  transition: all 0.2s ease;
-}
-
-.btn-secondary:hover {
-  background: rgba(255, 255, 255, 0.1);
 }
 
 /* ── CSS/SVG world globe ──────────────────────────────────────────────────
@@ -437,7 +345,7 @@
 }
 .birdo-globe__arc path {
   fill: none;
-  stroke: var(--birdo-globe-dot, #44d17e);
+  stroke: var(--birdo-globe-dot, #34d399);
   stroke-width: 1.6;
   stroke-linecap: round;
   /* constant visual width despite the non-uniform viewBox stretch */
@@ -458,67 +366,6 @@
   .birdo-globe__map { animation: none; }
 }
 
-/* Status dot animation */
-@keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
-.status-blink {
-  animation: blink 1s ease-in-out infinite;
-}
-
-/* Ping animation for status indicator */
-@keyframes ping {
-  75%, 100% {
-    transform: scale(2);
-    opacity: 0;
-  }
-}
-
-.animate-ping {
-  animation: ping 1s cubic-bezier(0, 0, 0.2, 1) infinite;
-}
-
-/* Server list item animation */
-.server-item {
-  transition: all 0.15s ease;
-}
-
-.server-item:hover {
-  background: rgba(255, 255, 255, 0.05);
-  transform: translateX(4px);
-}
-
-/* Gradient text */
-.text-gradient {
-  background: linear-gradient(to bottom, white, rgba(255, 255, 255, 0.4));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-/* Background blur glow effects */
-.glow-primary {
-  position: absolute;
-  width: 500px;
-  height: 500px;
-  background: rgba(16, 185, 129, 0.08);
-  border-radius: 50%;
-  filter: blur(120px);
-  pointer-events: none;
-}
-
-.glow-blue {
-  position: absolute;
-  width: 600px;
-  height: 600px;
-  background: rgba(59, 130, 246, 0.05);
-  border-radius: 50%;
-  filter: blur(120px);
-  pointer-events: none;
-}
-
 /* Accessibility: respect user's reduced-motion preference */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -528,12 +375,6 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
-  }
-
-  .pulse-ring,
-  .status-blink,
-  .animate-ping {
-    animation: none !important;
   }
 }
 
@@ -573,4 +414,78 @@
 input::-ms-reveal,
 input::-ms-clear {
   display: none;
+}
+
+/*
+  Windows high contrast (forced colours), W2-019. The browser replaces every
+  background colour with a system colour, which erased the only cue for a
+  switch's state (its track fill), the selected server (a tint) and the
+  Connect button's state (its gradient). Each gets a cue that survives:
+  borders, outlines and system colours with `forced-color-adjust: none` where
+  the fill itself IS the meaning.
+*/
+@media (forced-colors: active) {
+  .birdo-switch {
+    forced-color-adjust: none;
+    border: 1px solid CanvasText !important;
+    background-color: Canvas !important;
+  }
+  .birdo-switch[data-checked] {
+    background-color: Highlight !important;
+    border-color: Highlight !important;
+  }
+  .birdo-switch-knob {
+    forced-color-adjust: none;
+    background-color: CanvasText !important;
+    border: 1px solid Canvas;
+  }
+  .birdo-switch[data-checked] .birdo-switch-knob {
+    background-color: HighlightText !important;
+  }
+
+  .birdo-server-row[data-selected] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+  .birdo-radio[aria-checked='true'],
+  .birdo-toggle[aria-pressed='true'],
+  .birdo-tab[aria-selected='true'] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+  .birdo-radio-dot {
+    border-color: CanvasText !important;
+  }
+  .birdo-radio[aria-checked='true'] .birdo-radio-dot > span {
+    forced-color-adjust: none;
+    background-color: Highlight !important;
+  }
+
+  .birdo-cta {
+    border: 2px solid ButtonText !important;
+  }
+  .birdo-cta[data-look='connected'] {
+    border-color: Highlight !important;
+  }
+  .birdo-cta:disabled {
+    border-color: GrayText !important;
+    color: GrayText;
+  }
+
+  .birdo-badge,
+  .birdo-banner,
+  .birdo-notice,
+  .birdo-dialog {
+    border: 1px solid CanvasText !important;
+  }
+  .birdo-meter {
+    border: 1px solid CanvasText;
+  }
+  .birdo-meter > div {
+    forced-color-adjust: none;
+    background-color: Highlight !important;
+  }
+  :focus-visible {
+    outline: 2px solid Highlight;
+  }
 }

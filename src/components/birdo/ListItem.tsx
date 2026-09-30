@@ -6,7 +6,7 @@
  */
 import { useId, type ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, Lock } from 'lucide-react';
 import { white, brand, hairline } from '@/lib/birdo-theme';
 
 export interface BirdoListItemProps {
@@ -163,6 +163,13 @@ export interface BirdoToggleRowProps {
   enabled?: boolean;
   /** See `BirdoListItemProps.subtitleWrap`. */
   subtitleWrap?: boolean;
+  /**
+   * The plan does not include this setting (P1-parity-032, iOS locked rows):
+   * the row shows a lock instead of a switch and the whole row routes to the
+   * upgrade — one affordance, instead of a disabled switch plus a separate
+   * "View plans →" link.
+   */
+  locked?: { onClick: () => void; label?: string };
 }
 
 export function BirdoToggleRow({
@@ -174,7 +181,26 @@ export function BirdoToggleRow({
   leadingTint,
   enabled = true,
   subtitleWrap = false,
+  locked,
 }: BirdoToggleRowProps) {
+  if (locked) {
+    return (
+      <BirdoListItem
+        title={title}
+        subtitle={subtitle}
+        leadingIcon={leadingIcon}
+        leadingTint={white.w40}
+        subtitleWrap={subtitleWrap}
+        onClick={locked.onClick}
+        trailing={
+          <span className="flex items-center gap-1 text-xs" style={{ color: white.w60 }}>
+            <Lock size={14} aria-hidden />
+            {locked.label ?? 'View plans'}
+          </span>
+        }
+      />
+    );
+  }
   return (
     <BirdoListItem
       title={title}
@@ -255,7 +281,8 @@ export function BirdoSwitchKnob({ checked, disabled = false }: { checked: boolea
   return (
     <span
       aria-hidden
-      className={`relative inline-flex h-[28px] w-[48px] shrink-0 items-center rounded-full transition-colors ${
+      data-checked={checked || undefined}
+      className={`birdo-switch relative inline-flex h-[28px] w-[48px] shrink-0 items-center rounded-full transition-colors ${
         disabled ? 'opacity-40' : ''
       }`}
       style={{
@@ -264,7 +291,7 @@ export function BirdoSwitchKnob({ checked, disabled = false }: { checked: boolea
       }}
     >
       <span
-        className="inline-block h-[22px] w-[22px] transform rounded-full bg-white shadow-sm transition-transform"
+        className="birdo-switch-knob inline-block h-[22px] w-[22px] transform rounded-full bg-white shadow-sm transition-transform"
         style={{
           transform: checked ? 'translateX(22px)' : 'translateX(2px)',
           backgroundColor: checked ? '#FFFFFF' : white.w60,

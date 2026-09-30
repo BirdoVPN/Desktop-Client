@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import { settingsFromRust, settingsToRust, friendlyVpnError, type RustSettings } from './helpers';
+import {
+  settingsFromRust,
+  settingsToRust,
+  formatBytes,
+  formatUptime,
+  formatDate,
+  anonAccountNumber,
+  formatAccountNumber,
+  isValidMtu,
+  type RustSettings,
+} from './helpers';
 
 // A complete RustSettings payload; individual tests override single fields
 // (and cast to RustSettings when deliberately omitting one to exercise the
@@ -99,35 +109,71 @@ describe('crash reports (C-3) crash_reports_enabled ↔ crashReportsEnabled', ()
   });
 });
 
-describe('friendlyVpnError — surfaces the real reason', () => {
-  it('maps known patterns to friendly copy', () => {
-    expect(friendlyVpnError('Device limit reached (1 devices for RECON plan)')).toMatch(
-      /Subscription limit|device/i,
-    );
-    expect(friendlyVpnError('handshake did not complete')).toMatch(/timed out|busy/i);
+// friendlyVpnError (substring-matching free text) is gone: errors are mapped by
+// their v2 code in lib/errors.ts (W2-012), tested in lib/errors.test.ts.
+
+describe('Custom DNS on/off (P1-parity-042): Rust has no flag, so off = null on the wire', () => {
+  it('a non-empty list from Rust reads as ON', () => {
+    const s = settingsFromRust({ ...base, custom_dns: ['1.1.1.1'] });
+    expect(s.customDnsEnabled).toBe(true);
+    expect(s.customDns).toEqual(['1.1.1.1']);
   });
 
-  it("surfaces the server's clean message instead of the generic fallback", () => {
-    // This is exactly the message the live outage produced — it must reach the user.
-    expect(friendlyVpnError('Failed to configure VPN server. Please try again.')).toBe(
-      'Failed to configure VPN server. Please try again.',
-    );
-    expect(
-      friendlyVpnError('All VPN servers are currently offline. Please try again shortly.'),
-    ).toBe('All VPN servers are currently offline. Please try again shortly.');
+  it('switched OFF sends null but the addresses stay in the store', () => {
+    const s = { ...settingsFromRust({ ...base, custom_dns: ['1.1.1.1', '8.8.8.8'] }), customDnsEnabled: false };
+    expect(settingsToRust(s).custom_dns).toBeNull();
+    expect(s.customDns).toEqual(['1.1.1.1', '8.8.8.8']);
   });
 
-  it('adds trailing punctuation to a clean fragment', () => {
-    expect(friendlyVpnError('Server is rebooting')).toBe('Server is rebooting.');
+  it('switched ON with no addresses sends null, never an empty list', () => {
+    const s = { ...settingsFromRust(base), customDnsEnabled: true, customDns: [] };
+    expect(settingsToRust(s).custom_dns).toBeNull();
+  });
+});
+
+describe('formatting (iOS / Android FormatUtils parity, W2-031)', () => {
+  it('uptime is MM:SS under an hour and H:MM:SS above', () => {
+    expect(formatUptime(0)).toBe('00:00');
+    expect(formatUptime(65)).toBe('01:05');
+    expect(formatUptime(3599)).toBe('59:59');
+    expect(formatUptime(3600)).toBe('1:00:00');
+    expect(formatUptime(3 * 3600 + 7 * 60 + 9)).toBe('3:07:09');
   });
 
-  it('falls back to generic for empty or obviously-technical errors', () => {
-    expect(friendlyVpnError('')).toBe('Connection failed. Please try again.');
-    expect(
-      friendlyVpnError("thread 'main' panicked at src/x.rs:1:1: boom"),
-    ).toBe('Connection failed. Please try again.');
-    expect(friendlyVpnError('connect: os error 10061')).toBe(
-      'Connection failed. Please try again.',
-    );
+  it('bytes: KB and MB with one decimal, GB with two', () => {
+    expect(formatBytes(0)).toBe('0 B');
+    expect(formatBytes(512)).toBe('512 B');
+    expect(formatBytes(1536)).toBe('1.5 KB');
+    expect(formatBytes(5 * 1024 * 1024)).toBe('5.0 MB');
+    expect(formatBytes(1.5 * 1024 ** 3)).toBe('1.50 GB');
+  });
+
+  it('dates read "MMM d, yyyy", and a bare calendar date is not shifted a day by the timezone', () => {
+    expect(formatDate('2026-07-31')).toBe('Jul 31, 2026');
+    expect(formatDate('')).toBeNull();
+    expect(formatDate('not a date')).toBeNull();
+    expect(formatDate('2026-01-05T12:00:00Z')).toMatch(/^Jan [45], 2026$/);
+  });
+
+  it('MTU accepts 1280–1500 only', () => {
+    expect(isValidMtu('1280')).toBe(true);
+    expect(isValidMtu('1500')).toBe(true);
+    expect(isValidMtu('1279')).toBe(false);
+    expect(isValidMtu('14')).toBe(false);
+  });
+});
+
+describe('anonymous identity (P1-parity-007)', () => {
+  const synthetic = 'anon_123456789012345678901234@anonymous.local';
+
+  it('recognises the synthetic address and extracts the account number', () => {
+    expect(anonAccountNumber(synthetic)).toBe('123456789012345678901234');
+    expect(anonAccountNumber('someone@example.com')).toBeNull();
+    expect(anonAccountNumber(null)).toBeNull();
+  });
+
+  it('formats the account number in six space-separated groups of four', () => {
+    expect(formatAccountNumber('123456789012345678901234')).toBe('1234 5678 9012 3456 7890 1234');
+    expect(formatAccountNumber('1234|5678')).toBe('1234 5678');
   });
 });
