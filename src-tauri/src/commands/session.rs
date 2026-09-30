@@ -419,6 +419,36 @@ async fn attempt(
     Ok(())
 }
 
+/// How a failed user connect ends (W1-010). Pure, so every branch is tested.
+#[derive(Debug, PartialEq, Eq)]
+enum FailureOutcome {
+    /// Superseded by a disconnect or a newer connect: it owns the state.
+    Cancelled,
+    /// iOS #354: a switch that failed BEFORE the old tunnel was touched keeps
+    /// the old session, and the error is shown beside it.
+    KeepOldSession,
+    /// End in `error`. `hold_block`: a protected session was live, and its
+    /// traffic has nowhere safe to go, so the block (if armed) stays up.
+    Error { hold_block: bool },
+}
+
+fn failure_outcome(
+    superseded: bool,
+    was_live: bool,
+    old_transport_touched: bool,
+    old_tunnel_held: bool,
+) -> FailureOutcome {
+    if superseded {
+        FailureOutcome::Cancelled
+    } else if was_live && !old_transport_touched && old_tunnel_held {
+        FailureOutcome::KeepOldSession
+    } else {
+        FailureOutcome::Error {
+            hold_block: was_live,
+        }
+    }
+}
+
 /// Land a failed user connect in a state the contract can explain (W1-010):
 /// never an unexplained block, never a silent revert to another server.
 async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) -> IpcError {
@@ -427,36 +457,38 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
     // now must not have its `disconnected` overwritten by this `error`, nor a
     // reverted session restarted behind it.
     let _commit = vm.lock_commit().await;
-    if error.code == IpcErrorCode::Cancelled || !vm.is_current(ctx.epoch) {
-        // Whoever cancelled (a disconnect, a newer connect) owns the state.
-        return IpcError::cancelled();
-    }
+    let outcome = failure_outcome(
+        error.code == IpcErrorCode::Cancelled || !vm.is_current(ctx.epoch),
+        ctx.was_live,
+        ctx.old_transport_touched,
+        vm.holds_tunnel().await,
+    );
+    let hold_block = match outcome {
+        FailureOutcome::Cancelled => return IpcError::cancelled(),
+        FailureOutcome::KeepOldSession => {
+            tracing::error!("Switch failed; keeping the current session: {}", error);
+            // Its reconnect info is still the old one (the new target is only
+            // stored on success), so the loop goes back to guarding it.
+            let _ = vm.set_state(ConnectionState::Connected).await;
+            release_rebuild_block(ctx.block_engaged).await;
+            let ar = app.state::<AutoReconnectService>();
+            if ar.current_info().await.is_some() {
+                if let Err(e) = ar.start().await {
+                    tracing::warn!(
+                        "Failed to restart auto-reconnect after a failed switch: {}",
+                        e
+                    );
+                }
+            }
+            return error;
+        }
+        FailureOutcome::Error { hold_block } => hold_block,
+    };
     tracing::error!("Connect failed: {}", error);
 
-    // iOS #354: a switch that failed BEFORE the old tunnel was touched keeps
-    // the old session and shows the error beside it. Its reconnect info is
-    // still the old one (the new target is only stored on success), so the
-    // loop goes back to guarding it.
-    if ctx.was_live && !ctx.old_transport_touched && vm.holds_tunnel().await {
-        let _ = vm.set_state(ConnectionState::Connected).await;
-        release_rebuild_block(ctx.block_engaged).await;
-        let ar = app.state::<AutoReconnectService>();
-        if ar.current_info().await.is_some() {
-            if let Err(e) = ar.start().await {
-                tracing::warn!(
-                    "Failed to restart auto-reconnect after a failed switch: {}",
-                    e
-                );
-            }
-        }
-        return error;
-    }
-
-    // The protected session is gone (or never existed). If one was live its
-    // traffic has nowhere safe to go: keep it blocked (a no-op when the kill
-    // switch is not armed). The UI shows `kill_switch_blocking` with a
-    // working Disconnect, which is the documented way out.
-    if ctx.was_live {
+    // The UI shows `kill_switch_blocking` with a working Disconnect, which is
+    // the documented way out. (A no-op when the kill switch is not armed.)
+    if hold_block {
         if let Err(e) = killswitch::activate_killswitch().await {
             tracing::warn!("Kill switch activation after a failed switch failed: {}", e);
         }
@@ -723,10 +755,12 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
     ar.stop().await;
     ar.clear_last_config().await;
 
-    app.state::<XrayManager>().stop().await;
-
     // PERF-DISCONNECT: free the server-side peer (and device slot) while the
-    // tunnel is still up. A courtesy call: tightly capped, never fatal.
+    // tunnel is still up. A courtesy call: tightly capped, never fatal. The
+    // stealth transport stays up until after it: this call rides the tunnel,
+    // and stopping xray first (as the old disconnect did) sent it into a dead
+    // tunnel — a 3 s stall on every stealth disconnect, and the peer was
+    // never released.
     if !matches!(
         reason,
         EndReason::SessionExpired | EndReason::AccountDeleted
@@ -754,6 +788,7 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
     if let Err(e) = result {
         tracing::error!("Tunnel disconnect failed: {}", e);
     }
+    app.state::<XrayManager>().stop().await;
 
     // The 3e6f1e2 escape hatch, unconditionally: ending the session is the
     // user releasing the block, and is_lockdown_mode() is hard false
@@ -828,8 +863,9 @@ mod lifecycle_tests {
                 "vm.lock_commit()",
                 "ar.stop()",
                 "ar.clear_last_config()",
-                "XrayManager>().stop()",
+                "api.disconnect_vpn(&key_id)",
                 "vm.disconnect()",
+                "XrayManager>().stop()",
                 "killswitch::disarm()",
                 "ConnectionState::Disconnected",
             ],
@@ -865,6 +901,36 @@ mod lifecycle_tests {
                 "ar.store_last_config(",
                 "ar.start()",
             ],
+        );
+    }
+
+    /// W1-010: every way a user connect can fail ends somewhere explainable.
+    #[test]
+    fn a_failed_connect_ends_in_an_explainable_state() {
+        use super::{failure_outcome, FailureOutcome};
+        // A disconnect or newer connect superseded it: hands off.
+        assert_eq!(
+            failure_outcome(true, true, false, true),
+            FailureOutcome::Cancelled
+        );
+        // A switch that failed before touching the old tunnel keeps it.
+        assert_eq!(
+            failure_outcome(false, true, false, true),
+            FailureOutcome::KeepOldSession
+        );
+        // The old tunnel is gone, or its stealth transport was restarted: the
+        // protected session is over — error, block held.
+        for (touched, held) in [(false, false), (true, true), (true, false)] {
+            assert_eq!(
+                failure_outcome(false, true, touched, held),
+                FailureOutcome::Error { hold_block: true },
+                "touched={touched} held={held}"
+            );
+        }
+        // A fresh connect that failed: error, nothing to hold.
+        assert_eq!(
+            failure_outcome(false, false, false, false),
+            FailureOutcome::Error { hold_block: false }
         );
     }
 

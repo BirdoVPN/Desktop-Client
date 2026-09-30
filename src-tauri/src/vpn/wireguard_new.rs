@@ -44,6 +44,42 @@ pub(crate) const ERR_HANDSHAKE_NO_RESPONSE: &str = "Handshake timeout - no respo
 /// transport was actively refused rather than silently dropped.
 pub(crate) const ERR_HANDSHAKE_RECV: &str = "Failed to receive handshake response";
 
+/// What one `encapsulate` means for the send path (W1-002).
+#[derive(Debug)]
+enum Outbound<'a> {
+    /// Put this datagram on the wire (data, or a handshake initiation).
+    Send(&'a [u8]),
+    /// boringtun queued the packet: there is no session and a handshake is
+    /// already in flight. The normal re-handshake path, not an error.
+    Queued,
+    Failed(String),
+}
+
+fn outbound(result: TunnResult<'_>) -> Outbound<'_> {
+    match result {
+        TunnResult::WriteToNetwork(data) => Outbound::Send(data),
+        TunnResult::Done => Outbound::Queued,
+        TunnResult::Err(e) => Outbound::Failed(format!("Encryption failed: {:?}", e)),
+        _ => Outbound::Failed("Unexpected encapsulate result".to_string()),
+    }
+}
+
+/// The instant the last handshake COMPLETED, carried through a boringtun
+/// session expiry (W1-002). `observed_age` is `time_since_last_handshake()`,
+/// which goes to `None` when the session is cleared; the previous completion
+/// is kept then, so the age keeps growing through an outage instead of
+/// vanishing.
+fn carry_last_handshake(
+    previous: Option<Instant>,
+    observed_age: Option<Duration>,
+    now: Instant,
+) -> Option<Instant> {
+    match observed_age.and_then(|age| now.checked_sub(age)) {
+        Some(completed) if previous.is_none_or(|prev| completed > prev) => Some(completed),
+        _ => previous,
+    }
+}
+
 /// Wrapper for sensitive key bytes that zeroizes on drop
 /// MEM-003: Ensures key material doesn't remain in memory
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -521,18 +557,14 @@ impl WireGuardSession {
                 tunnel.encapsulate(packet, &mut dst)
             };
 
-            match result {
-                TunnResult::WriteToNetwork(data) => {
-                    let sent = self
-                        .socket
-                        .send(data)
-                        .await
-                        .map_err(|e| format!("Failed to send: {}", e))?;
-                    Ok(sent)
-                }
-                TunnResult::Err(e) => Err(format!("Encryption failed: {:?}", e)),
-                TunnResult::Done => Ok(0),
-                _ => Err("Unexpected encapsulate result".to_string()),
+            match outbound(result) {
+                Outbound::Send(data) => self
+                    .socket
+                    .send(data)
+                    .await
+                    .map_err(|e| format!("Failed to send: {}", e)),
+                Outbound::Queued => Ok(0),
+                Outbound::Failed(e) => Err(e),
             }
         } else {
             // Slow path — heap allocation for jumbo/oversized packets
@@ -543,18 +575,14 @@ impl WireGuardSession {
                 tunnel.encapsulate(packet, &mut dst)
             };
 
-            match result {
-                TunnResult::WriteToNetwork(data) => {
-                    let sent = self
-                        .socket
-                        .send(data)
-                        .await
-                        .map_err(|e| format!("Failed to send: {}", e))?;
-                    Ok(sent)
-                }
-                TunnResult::Err(e) => Err(format!("Encryption failed: {:?}", e)),
-                TunnResult::Done => Ok(0),
-                _ => Err("Unexpected encapsulate result".to_string()),
+            match outbound(result) {
+                Outbound::Send(data) => self
+                    .socket
+                    .send(data)
+                    .await
+                    .map_err(|e| format!("Failed to send: {}", e)),
+                Outbound::Queued => Ok(0),
+                Outbound::Failed(e) => Err(e),
             }
         }
     }
@@ -681,11 +709,11 @@ impl WireGuardSession {
     pub fn handshake_age(&self) -> Duration {
         let observed = self.tunnel.lock().time_since_last_handshake();
         let mut last = self.last_handshake.lock();
-        if let Some(completed) = observed.and_then(|age| Instant::now().checked_sub(age)) {
-            if last.is_none_or(|prev| completed > prev) {
-                *last = Some(completed);
-                self.expiry_reported.store(false, Ordering::SeqCst);
-            }
+        let carried = carry_last_handshake(*last, observed, Instant::now());
+        if carried != *last {
+            // A new handshake completed: the next expiry is news again.
+            self.expiry_reported.store(false, Ordering::SeqCst);
+            *last = carried;
         }
         last.unwrap_or(self.created_at).elapsed()
     }
@@ -806,5 +834,56 @@ impl Drop for WireGuardSession {
         // which will trigger boringtun's internal zeroization when refcount hits 0
 
         tracing::trace!("WireGuardSession drop complete");
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    fn fresh_tunn() -> Tunn {
+        let ours = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let theirs = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng));
+        Tunn::new(ours, theirs, None, None, 0, None)
+    }
+
+    /// W1-002: with no session (never established, or cleared by an expiry)
+    /// an outbound packet still reaches `encapsulate`, which starts a new
+    /// handshake; a second packet while it is in flight is QUEUED, not an
+    /// error. The old gate refused both with "Not connected", so the handshake
+    /// that would have recovered the session was never sent.
+    #[test]
+    fn a_session_without_keys_starts_a_handshake_and_queues() {
+        let mut tunn = fresh_tunn();
+        let mut dst = [0u8; 1600];
+        match outbound(tunn.encapsulate(b"payload", &mut dst)) {
+            Outbound::Send(initiation) => assert_eq!(initiation.len(), 148),
+            other => panic!("expected a handshake initiation, got {other:?}"),
+        }
+        assert!(matches!(
+            outbound(tunn.encapsulate(b"payload", &mut dst)),
+            Outbound::Queued
+        ));
+    }
+
+    #[test]
+    fn the_last_handshake_survives_a_session_expiry() {
+        let now = Instant::now();
+        let s = Duration::from_secs;
+        // A handshake 10 s ago.
+        let last = carry_last_handshake(None, Some(s(10)), now);
+        assert_eq!(last, now.checked_sub(s(10)));
+        // The session expires: boringtun reports no handshake at all. The
+        // completion is kept, so the age keeps growing past the limit.
+        let later = now + s(200);
+        let carried = carry_last_handshake(last, None, later);
+        assert_eq!(carried, last);
+        assert!(later.duration_since(carried.unwrap()) > s(180));
+        // A fresh handshake replaces it; an older reading never does.
+        assert_eq!(
+            carry_last_handshake(carried, Some(s(1)), later),
+            later.checked_sub(s(1))
+        );
+        assert_eq!(carry_last_handshake(carried, Some(s(500)), later), carried);
     }
 }

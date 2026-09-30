@@ -898,13 +898,21 @@ mod tests {
             !udp_port_held(port),
             "after the listener is gone the port is free"
         );
-        // a TCP listener is NOT the proxy: UDP on its port stays free. The port
-        // comes from the TCP side: a port the OS picked for UDP can sit inside
-        // a TCP exclusion range (Hyper-V reserves blocks at the start of the
-        // dynamic range), which made the TCP bind — not the probe — fail.
-        let tcp = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let tcp_port = tcp.local_addr().unwrap().port();
-        assert!(!udp_port_held(tcp_port));
+        // a TCP listener on the same port is NOT the proxy: UDP stays free.
+        // The port must be usable by BOTH protocols, which one bind cannot
+        // promise: Hyper-V reserves separate TCP and UDP blocks inside the
+        // dynamic range, and landing in one failed the setup — not the probe
+        // under test. So look for a port both accept.
+        let (tcp, port) = (0..50)
+            .find_map(|_| {
+                let udp = UdpSocket::bind(("127.0.0.1", 0)).ok()?;
+                let port = udp.local_addr().ok()?.port();
+                drop(udp);
+                let tcp = TcpListener::bind(("127.0.0.1", port)).ok()?;
+                Some((tcp, port))
+            })
+            .expect("a loopback port free for both TCP and UDP");
+        assert!(!udp_port_held(port));
         drop(tcp);
     }
 
