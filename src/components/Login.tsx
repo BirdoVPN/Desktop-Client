@@ -1,53 +1,51 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useId, useEffect, type FormEvent, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore, type AccountInfo } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
-import { ShieldCheck, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
+import { ShieldCheck, KeyRound, Copy, Check, ShieldAlert, Info } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { BirdoButton, BirdoTextField, AppIconMark } from './birdo';
-import { gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
-
-/** Map raw backend error strings to user-friendly messages */
-function friendlyError(raw: unknown): string {
-  const msg = typeof raw === 'string' ? raw : String(raw);
-  const lower = msg.toLowerCase();
-
-  if (lower.includes('invalid credentials') || lower.includes('unauthorized') || lower.includes('401'))
-    return 'Incorrect email or password. Please try again.';
-  if (lower.includes('network') || lower.includes('dns') || lower.includes('connect'))
-    return 'Unable to reach the server. Check your internet connection.';
-  if (lower.includes('timeout'))
-    return 'The server took too long to respond. Please try again.';
-  if (lower.includes('rate limit') || lower.includes('429'))
-    return 'Too many login attempts. Please wait a moment and try again.';
-  if (lower.includes('subscription') || lower.includes('expired'))
-    return 'Your subscription has expired. Please renew at birdo.app.';
-  if (lower.includes('server') || lower.includes('500'))
-    return 'A server error occurred. Please try again later.';
-  if (lower.includes('invalid') && lower.includes('verification'))
-    return 'Invalid verification code. Please try again.';
-
-  return msg.length > 120 ? `${msg.slice(0, 120)}…` : msg;
-}
+import { brand, gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
+import { errorCopy, SESSION_EXPIRED_COPY, type ErrorContext } from '@/lib/errors';
+import { toIpcError } from '@/lib/ipc';
+import { formatAccountNumber } from '@/utils/helpers';
 
 type AuthTab = 'email' | 'anonymous' | 'sso';
+type SsoProvider = 'google' | 'github' | 'apple';
+
+const SSO_NAME: Record<SsoProvider, string> = { google: 'Google', github: 'GitHub', apple: 'Apple' };
 
 interface LoginResponse {
   success: boolean;
   message?: string;
   error?: string;
+  /** v2 may carry a code on a `success: false` answer; mapped like a rejection. */
+  code?: string;
   requires_two_factor?: boolean;
   challenge_token?: string;
   user?: { email?: string; account_id?: string; is_anonymous?: boolean };
 }
 
-// Module scope, not inside Login(). react-hooks/static-components (7.x)
-// flagged this, and it is a genuine bug rather than style: a component TYPE
-// created inside the render body is a new type on every render, so React
-// unmounts and remounts the banner each time Login re-renders — replaying its
-// framer-motion enter animation and losing any focus inside it. It closes over
-// nothing local: `motion` and `status` are module imports.
+/** A syntactically plausible email: something@something.tld. */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Copy for a failed sign-in (W2-012). A rejection maps by its code; an Ok
+ * `{ success: false }` answer maps by its code when it has one, and otherwise
+ * to a neutral sentence — never the raw `message`, which is Rust's `ApiError`
+ * text ("Authentication failed", "Network error: …", "Server error (502)").
+ */
+function signInError(e: unknown, context: ErrorContext = 'sign_in'): string {
+  return errorCopy(toIpcError(e), context).message;
+}
+function refusedCopy(result: LoginResponse, context: ErrorContext, fallback: string): string {
+  return result.code ? signInError({ code: result.code, message: '' }, context) : fallback;
+}
+
+// Module scope, not inside Login(): a component TYPE created inside the render
+// body is a new type on every render, so React would remount it (replaying its
+// enter animation and losing focus) on each re-render.
 const ErrorBanner = ({ message }: { message: string }) => (
   <motion.div
     role="alert"
@@ -69,43 +67,68 @@ export function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
+  // Separate flags per action (W2-045): the create link used to read
+  // "Creating…" during an ordinary sign-in because both shared one flag.
+  const [signingIn, setSigningIn] = useState(false);
+  const [creating, setCreating] = useState(false);
 
   // 2FA challenge state
   const [twoFactorRequired, setTwoFactorRequired] = useState(false);
   const [challengeToken, setChallengeToken] = useState<string | null>(null);
   const [totpCode, setTotpCode] = useState('');
 
-  // Anonymous login state
+  // Anonymous sign-in state
   const [anonId, setAnonId] = useState('');
   const [anonPassword, setAnonPassword] = useState('');
 
-  // Newly-created anonymous account: show its 24-digit recovery ID once so the
-  // user can save it before we sign them in (the account is already created +
-  // its tokens stored by the backend command).
+  // A newly created anonymous account: its account number is shown once so
+  // the user can save it before we sign them in (the account already exists
+  // and its tokens are stored by the backend command).
   const [createdId, setCreatedId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState(false);
 
-  // SSO in-progress state: which provider we're waiting on the browser for.
+  // SSO in progress: which provider we're waiting on the browser for.
   // `ssoAttemptRef` lets Cancel invalidate the in-flight attempt so a late
-  // resolve (or the ~5-min loopback timeout) can't clobber the UI after the user
-  // has moved on — previously an SSO click left the buttons disabled with no way
-  // out until it timed out.
-  const [ssoWaiting, setSsoWaiting] = useState<'google' | 'github' | null>(null);
+  // resolve (or the ~5-min loopback timeout) can't clobber the UI after the
+  // user has moved on.
+  const [ssoWaiting, setSsoWaiting] = useState<SsoProvider | null>(null);
   const ssoAttemptRef = useRef(0);
+  // Set by "Sign up"; the Create button takes focus when it mounts, which is
+  // after the previous tab's exit animation — not on the next frame.
+  const focusCreateRef = useRef(false);
+  const createButtonRef = (el: HTMLButtonElement | null) => {
+    if (el && focusCreateRef.current) {
+      focusCreateRef.current = false;
+      el.focus();
+    }
+  };
+  const tabsId = useId();
+  // The 2FA step replaces the form the user just submitted: put them in the
+  // code field (what `autoFocus` did, without re-grabbing focus on re-render).
+  const totpRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (twoFactorRequired) totpRef.current?.focus();
+  }, [twoFactorRequired]);
 
-  const { setAuthenticated, setUserEmail } = useAppStore(
+  const { setAuthenticated, setUserEmail, sessionEndedReason, setSessionEndedReason } = useAppStore(
     useShallow((s) => ({
       setAuthenticated: s.setAuthenticated,
       setUserEmail: s.setUserEmail,
-    }))
+      sessionEndedReason: s.sessionEndedReason,
+      setSessionEndedReason: s.setSessionEndedReason,
+    })),
   );
+
+  const signedIn = () => {
+    setSessionEndedReason(null);
+    setAuthenticated(true);
+  };
 
   // After a login that doesn't carry the email in its response (native SSO
   // exchange, 2FA, anonymous create), fetch the canonical profile so the app
-  // shows the REAL identity immediately instead of falling back to "Anonymous"
-  // until the next launch. get_auth_state -> get_profile returns email +
-  // account_id + plan from the freshly-stored tokens.
+  // shows the REAL identity immediately. Only what was received is written
+  // back: `setAccount` MERGES, and explicit nulls would overwrite a known-good
+  // identity on a transient profile-fetch failure.
   const hydrateIdentity = async () => {
     try {
       const st = await invoke<{
@@ -115,12 +138,6 @@ export function Login() {
         plan: string | null;
       }>('get_auth_state');
       if (st?.email) setUserEmail(st.email);
-      // Only write back what we actually received. `setAccount` MERGES, so
-      // spreading explicit nulls here would overwrite a known-good identity with
-      // null whenever hydration came back empty (a transient profile-fetch
-      // failure, say) — turning a recoverable blip into a wrong identity that
-      // sticks until the next successful fetch. Absent means "unchanged", not
-      // "cleared".
       const patch: Partial<AccountInfo> = {};
       if (st?.email) patch.email = st.email;
       if (st?.account_id) patch.accountId = st.account_id;
@@ -132,181 +149,181 @@ export function Login() {
     }
   };
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const emailValid = EMAIL_RE.test(email.trim());
+  const canSubmitEmail = emailValid && password.length > 0 && !signingIn;
+
+  const handleLogin = async (e: FormEvent) => {
     e.preventDefault();
+    // Validated before any request (W2-045): an empty submit used to reach the
+    // backend and count against the sign-in rate limit.
+    if (!canSubmitEmail) return;
     setError(null);
-    setIsLoading(true);
-
+    setSigningIn(true);
     try {
-      const result = await invoke<LoginResponse>('login', { request: { email, password } });
-
+      const result = await invoke<LoginResponse>('login', { request: { email: email.trim(), password } });
       if (result.requires_two_factor && result.challenge_token) {
         setTwoFactorRequired(true);
         setChallengeToken(result.challenge_token);
       } else if (result.success) {
-        setUserEmail(result.user?.email || email);
+        setUserEmail(result.user?.email || email.trim());
         setPassword('');
-        setAuthenticated(true);
+        signedIn();
       } else {
-        setError(result.message || result.error || 'Login failed');
+        setError(refusedCopy(result, 'sign_in', "Couldn't sign in. Check your email and password and try again."));
       }
     } catch (err) {
-      setError(friendlyError(err));
+      setError(signInError(err));
     } finally {
-      setIsLoading(false);
+      setSigningIn(false);
     }
   };
 
-  const handleAnonymousLogin = async () => {
+  const handleAnonymousLogin = async (e: FormEvent) => {
+    e.preventDefault();
     setError(null);
-
-    // Validate on submit so the button stays visually active (matching the Email
-    // tab) instead of sitting disabled/greyed until the ID is complete.
     if (anonId.replace(/\D/g, '').length < 24) {
-      setError('Enter your full 24-digit anonymous ID.');
+      setError('Enter your full 24-digit account number.');
       return;
     }
-
-    setIsLoading(true);
-
+    setSigningIn(true);
     try {
-      // Send the typed 24-digit ID (+ optional password set on the website).
-      // The backend logs in to that EXISTING account — it never creates one.
+      // The backend signs in to that EXISTING account — it never creates one.
       const result = await invoke<LoginResponse>('login_anonymous', {
         request: {
           anonymousId: anonId.replace(/\D/g, ''),
           password: anonPassword || null,
         },
       });
-
       if (result.requires_two_factor && result.challenge_token) {
         setTwoFactorRequired(true);
         setChallengeToken(result.challenge_token);
       } else if (result.success) {
         await hydrateIdentity();
         setAnonPassword('');
-        setAuthenticated(true);
+        signedIn();
       } else {
-        setError(result.message || result.error || 'Login failed. Check your anonymous ID.');
+        setError(
+          refusedCopy(
+            result,
+            'anonymous_sign_in',
+            "Couldn't sign in. Check your account number and try again.",
+          ),
+        );
       }
     } catch (err) {
-      setError(friendlyError(err));
+      setError(signInError(err, 'anonymous_sign_in'));
     } finally {
-      setIsLoading(false);
+      setSigningIn(false);
     }
   };
 
-  // Create a brand-new anonymous account in-app (no email/SSO). The backend mints
-  // the 24-digit ID and stores tokens, so we only need to show the ID to save and
-  // then flip authenticated.
+  // Create a brand-new anonymous account in-app. The backend mints the
+  // 24-digit number and stores tokens; we show the number to save first.
   const handleCreateAnonymous = async () => {
     setError(null);
-    setIsLoading(true);
+    setCreating(true);
     try {
       const result = await invoke<LoginResponse>('register_anonymous');
       if (result.success && result.user?.account_id) {
         setCreatedId(result.user.account_id);
       } else {
-        setError(result.message || result.error || 'Could not create an account. Please try again.');
+        setError(refusedCopy(result, 'general', "Couldn't create an account. Please try again."));
       }
     } catch (err) {
-      setError(friendlyError(err));
+      setError(signInError(err, 'general'));
     } finally {
-      setIsLoading(false);
+      setCreating(false);
     }
   };
 
   const copyCreatedId = async () => {
     if (!createdId) return;
     try {
-      await navigator.clipboard.writeText(createdId);
+      // Digits only: that is what the sign-in field and the backend take.
+      await navigator.clipboard.writeText(createdId.replace(/\D/g, ''));
       setCopiedId(true);
       setTimeout(() => setCopiedId(false), 2000);
     } catch {
-      /* clipboard unavailable — the ID is still on screen to copy manually */
+      /* clipboard unavailable — the number is still on screen */
     }
   };
 
   const handleForgotPassword = async () => {
     try {
       await open('https://auth.birdo.app/reset-password');
-    } catch (err) {
-      setError(`Failed to open browser: ${friendlyError(err)}`);
+    } catch {
+      setError("Couldn't open your browser. Visit auth.birdo.app to reset your password.");
     }
   };
 
   // Native SSO: the Rust command opens the system browser to the Birdo broker,
-  // catches the loopback redirect, and exchanges the code for tokens — so an
-  // SSO user never needs a password. Same response shape as password login, so
-  // the 2FA branch is handled identically.
-  const handleSsoLogin = async (provider: 'google' | 'github') => {
+  // catches the loopback redirect, and exchanges the code for tokens. Apple
+  // uses the same broker Android uses (P1-parity-008): an account created with
+  // Sign in with Apple on a phone has no password to type here.
+  const handleSsoLogin = async (provider: SsoProvider) => {
     setError(null);
-    setIsLoading(true);
+    setSigningIn(true);
     setSsoWaiting(provider);
     const attempt = ++ssoAttemptRef.current;
     try {
       const result = await invoke<LoginResponse>('native_oauth_login', { provider });
-      // Ignore a result the user already cancelled (they may have switched to
-      // email login, or hit Cancel while the browser flow stalled).
+      // Ignore a result the user already cancelled.
       if (attempt !== ssoAttemptRef.current) return;
-
       if (result.requires_two_factor && result.challenge_token) {
         setTwoFactorRequired(true);
         setChallengeToken(result.challenge_token);
       } else if (result.success) {
-        // The SSO exchange doesn't return the email — fetch the profile so the
-        // app shows the real account, not "Anonymous".
         await hydrateIdentity();
-        setAuthenticated(true);
+        signedIn();
       } else {
-        setError(result.message || result.error || 'Sign-in was cancelled or failed.');
+        setError(refusedCopy(result, 'sign_in', 'Sign-in was cancelled or did not finish. Please try again.'));
       }
     } catch (err) {
       if (attempt !== ssoAttemptRef.current) return;
-      setError(friendlyError(err));
+      setError(signInError(err));
     } finally {
       if (attempt === ssoAttemptRef.current) {
-        setIsLoading(false);
+        setSigningIn(false);
         setSsoWaiting(null);
       }
     }
   };
 
   // Abandon an in-flight SSO attempt and return to the buttons. The backend
-  // loopback keeps waiting harmlessly until it times out; we just stop blocking
-  // the UI on it (the attempt guard makes its eventual result a no-op).
+  // loopback keeps waiting harmlessly until it times out; the attempt guard
+  // makes its eventual result a no-op.
   const cancelSso = () => {
     ssoAttemptRef.current += 1;
     setSsoWaiting(null);
-    setIsLoading(false);
+    setSigningIn(false);
     setError(null);
   };
 
-  const handleVerify2FA = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setIsLoading(true);
+  const totpValid = /^\d{6}$/.test(totpCode) || /^[0-9A-Fa-f]{4}(?:-?[0-9A-Fa-f]{4})+$/.test(totpCode);
 
+  const handleVerify2FA = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!totpValid) return;
+    setError(null);
+    setSigningIn(true);
     try {
       const result = await invoke<LoginResponse>('verify_2fa', {
-        request: {
-          challenge_token: challengeToken,
-          code: totpCode,
-        },
+        request: { challenge_token: challengeToken, code: totpCode },
       });
-
       if (result.success) {
         await hydrateIdentity();
         setPassword('');
         setChallengeToken(null);
-        setAuthenticated(true);
+        signedIn();
       } else {
-        setError(result.message || result.error || 'Verification failed');
+        setError(
+          refusedCopy(result, 'sign_in', 'That verification code is invalid or has expired. Please try again.'),
+        );
       }
     } catch (err) {
-      setError(friendlyError(err));
+      setError(signInError(err));
     } finally {
-      setIsLoading(false);
+      setSigningIn(false);
     }
   };
 
@@ -318,436 +335,442 @@ export function Login() {
     setError(null);
   };
 
+  const selectTab = (tab: AuthTab) => {
+    setActiveTab(tab);
+    setError(null);
+  };
+
+  // "Sign up" goes to the Anonymous tab and its Create button (iOS), instead of
+  // opening the web SIGN-IN page as "Register at birdo.app" did (W2-027).
+  const goToSignUp = () => {
+    focusCreateRef.current = true;
+    selectTab('anonymous');
+  };
+
   const tabs: { id: AuthTab; label: string }[] = [
     { id: 'email', label: 'Email' },
     { id: 'anonymous', label: 'Anonymous' },
     { id: 'sso', label: 'SSO' },
   ];
+  const onTabKeyDown = (e: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+    e.preventDefault();
+    const next = (index + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    selectTab(tabs[next].id);
+    const buttons = e.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    buttons?.[next]?.focus();
+  };
+
+  const sessionBanner =
+    sessionEndedReason === 'expired'
+      ? SESSION_EXPIRED_COPY
+      : sessionEndedReason === 'revoked'
+        ? 'You were signed out because this session was ended. Sign in again.'
+        : null;
 
   return (
-    // Transparent root so the App-level PixelCanvas shows through behind the
-    // login content (opaque bg-birdo-s0 here was hiding the animated backdrop).
+    // Transparent root so the App-level PixelCanvas shows through.
     <div className="flex h-full flex-col">
-      {/* Brand now lives in the window TitleBar — no duplicate header here. */}
-      {/* ── Centered phone column ──
-          Scrollable: on the fixed 380x640 non-resizable window the auth content
-          (tabs + form + SSO buttons + register link) can exceed the height. The
-          outer scrolls; `min-h-full` keeps it centered when it fits and lets it
-          grow (so the SSO buttons at the bottom are always reachable) when it
-          doesn't. Without this the SSO section was clipped below the fold. */}
+      {/* Scrollable: the window can be shorter than the content (a small or
+          high-DPI display, W2-020). `min-h-full` keeps it centred when it fits. */}
       <div className="flex-1 overflow-y-auto">
         <div className="flex min-h-full flex-col items-center justify-center px-8 py-6">
-        <motion.div
-          className="w-full max-w-sm"
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: motionTokens.slow520 }}
-        >
-          {/* Brand mark */}
           <motion.div
-            className="mb-3 flex justify-center"
-            initial={{ opacity: 0, y: 16 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: motionTokens.emphasis, delay: 0.06 }}
-          >
-            <AppIconMark mark size={72} />
-          </motion.div>
-
-          {/* Gradient headline */}
-          <motion.h2
-            className="mb-2 text-center text-3xl font-bold"
-            style={{
-              backgroundImage: gradient.headlineText,
-              WebkitBackgroundClip: 'text',
-              backgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}
+            className="w-full max-w-sm"
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: motionTokens.emphasis, delay: 0.15 }}
+            transition={{ duration: motionTokens.slow }}
           >
-            {createdId ? 'Account created' : twoFactorRequired ? 'Two-Factor Auth' : 'Welcome Back'}
-          </motion.h2>
+            <div className="mb-3 flex justify-center">
+              <AppIconMark mark size={72} />
+            </div>
 
-          <motion.p
-            className="mb-5 text-center text-sm text-w40"
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: motionTokens.emphasis, delay: 0.2 }}
-          >
-            {createdId
-              ? 'Save your recovery ID'
-              : twoFactorRequired
-                ? 'Enter your authenticator code'
-                : 'Sign in to your Birdo account'}
-          </motion.p>
-
-          {createdId ? (
-            /* ── New anonymous account: show the recovery ID once ── */
-            <motion.div
-              className="flex flex-col gap-4"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: motionTokens.standard }}
+            <h1
+              className="mb-2 text-center text-3xl font-bold"
+              style={{
+                backgroundImage: gradient.headlineText,
+                WebkitBackgroundClip: 'text',
+                backgroundClip: 'text',
+                WebkitTextFillColor: 'transparent',
+              }}
             >
-              <div className="flex flex-col items-center gap-2 text-center">
+              {createdId ? 'Account created' : 'Welcome Back'}
+            </h1>
+
+            <p className="mb-5 text-center text-sm" style={{ color: white.w60 }}>
+              {createdId
+                ? 'Save your account number'
+                : twoFactorRequired
+                  ? 'Enter your authenticator code'
+                  : 'Sign in to your Birdo account'}
+            </p>
+
+            {sessionBanner && !createdId && (
+              <div
+                role="status"
+                className="mb-4 flex items-start gap-2 rounded-birdo-sub px-4 py-3 text-sm"
+                style={{ backgroundColor: white.w05, border: `1px solid ${hairline.strong}`, color: white.w80 }}
+              >
+                <Info size={16} aria-hidden className="mt-0.5 shrink-0" color={white.w60} />
+                <span>{sessionBanner}</span>
+              </div>
+            )}
+
+            {createdId ? (
+              /* ── New anonymous account: show the number once ── */
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col items-center gap-2 text-center">
+                  <div
+                    className="flex h-12 w-12 items-center justify-center rounded-full"
+                    style={{ backgroundColor: white.w05 }}
+                  >
+                    <KeyRound size={24} color={brand.accentLight} aria-hidden />
+                  </div>
+                  <p className="text-sm" style={{ color: white.w60 }}>
+                    Your anonymous account is ready. This account number is the{' '}
+                    <span className="font-semibold" style={{ color: white.w100 }}>
+                      only
+                    </span>{' '}
+                    way back in.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={copyCreatedId}
+                  className="flex w-full items-center gap-3 rounded-birdo-sub px-4 py-3 text-left transition-colors hover:bg-white/5"
+                  style={{ backgroundColor: white.w04, border: `1px solid ${hairline.soft}` }}
+                  aria-label={`Copy account number ${formatAccountNumber(createdId)}`}
+                >
+                  <span className="min-w-0 flex-1 break-all font-mono text-sm tracking-wide" style={{ color: white.w100 }}>
+                    {formatAccountNumber(createdId)}
+                  </span>
+                  {copiedId ? (
+                    <Check size={18} color={brand.accentLight} aria-hidden />
+                  ) : (
+                    <Copy size={18} color={white.w60} aria-hidden />
+                  )}
+                </button>
+
+                <p className="flex items-start gap-1.5 text-xs" style={{ color: white.w60 }}>
+                  <ShieldAlert size={14} color={status.yellow} aria-hidden className="mt-0.5 shrink-0" />
+                  <span>Save it somewhere safe — we can&apos;t reset it if you lose it.</span>
+                </p>
+
+                <BirdoButton
+                  type="button"
+                  text="I've saved it — continue"
+                  onClick={async () => {
+                    await hydrateIdentity();
+                    signedIn();
+                  }}
+                  variant="brand"
+                  size="large"
+                  fullWidth
+                />
+              </div>
+            ) : twoFactorRequired ? (
+              /* ── 2FA verification ── */
+              <form onSubmit={handleVerify2FA} className="flex flex-col items-center space-y-4">
                 <div
                   className="flex h-12 w-12 items-center justify-center rounded-full"
                   style={{ backgroundColor: white.w05 }}
                 >
-                  <KeyRound size={24} color={status.green} />
+                  <ShieldCheck size={24} color={white.w60} aria-hidden />
                 </div>
-                <p className="text-sm text-w60">
-                  Your anonymous account is ready. This ID is the{' '}
-                  <span className="font-semibold text-w100">only</span> way back in.
+
+                <label htmlFor="totp" className="block text-xs font-medium" style={{ color: white.w60 }}>
+                  Verification Code
+                </label>
+                <input
+                  ref={totpRef}
+                  id="totp"
+                  type="text"
+                  inputMode="text"
+                  autoComplete="one-time-code"
+                  value={totpCode}
+                  // A 6-digit TOTP OR a hex backup code (16 hex, 19 chars with
+                  // dashes). Keep digits, hex letters and dashes; cap at 19.
+                  onChange={(e) => setTotpCode(e.target.value.replace(/[^0-9A-Fa-f-]/g, '').slice(0, 19))}
+                  placeholder="000000 or backup code"
+                  required
+                  maxLength={19}
+                  aria-describedby="totp-hint"
+                  className="w-full rounded-birdo-sub px-4 py-3 text-center text-2xl tracking-[0.3em] outline-hidden"
+                  style={{
+                    backgroundColor: white.w04,
+                    border: `1px solid ${hairline.soft}`,
+                    color: white.w100,
+                  }}
+                />
+                <p id="totp-hint" className="text-center text-xs" style={{ color: white.w60 }}>
+                  Enter the 6-digit code from your authenticator, or a backup code
                 </p>
-              </div>
 
-              <button
-                type="button"
-                onClick={copyCreatedId}
-                className="flex w-full items-center gap-3 rounded-birdo-sub px-4 py-3 text-left transition-colors hover:bg-white/5"
-                style={{ backgroundColor: white.w04, border: `1px solid ${hairline.soft}` }}
-                aria-label="Copy account ID"
-              >
-                <span className="min-w-0 flex-1 break-all font-mono text-sm tracking-wide text-w100">
-                  {createdId}
-                </span>
-                {copiedId ? (
-                  <Check size={18} color={status.green} aria-hidden />
-                ) : (
-                  <Copy size={18} color={white.w60} aria-hidden />
-                )}
-              </button>
+                {error && <ErrorBanner message={error} />}
 
-              <p className="flex items-start gap-1.5 text-xs text-w40">
-                <ShieldAlert size={14} color={status.yellow} aria-hidden className="mt-0.5 shrink-0" />
-                <span>Save it somewhere safe — we can&apos;t reset it if you lose it.</span>
-              </p>
+                <BirdoButton
+                  type="submit"
+                  text={signingIn ? 'Verifying…' : 'Verify'}
+                  onClick={() => {}}
+                  variant="brand"
+                  size="large"
+                  fullWidth
+                  isLoading={signingIn}
+                  disabled={!totpValid}
+                />
 
-              <BirdoButton
-                type="button"
-                text="I've saved it — continue"
-                onClick={async () => {
-                  await hydrateIdentity();
-                  setAuthenticated(true);
-                }}
-                variant="brand"
-                size="large"
-                fullWidth
-              />
-            </motion.div>
-          ) : twoFactorRequired ? (
-            /* ── 2FA Verification Form ── */
-            <motion.form
-              onSubmit={handleVerify2FA}
-              className="flex flex-col items-center space-y-4"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: motionTokens.standard }}
-            >
-              <div
-                className="flex h-12 w-12 items-center justify-center rounded-full"
-                style={{ backgroundColor: white.w05 }}
-              >
-                <ShieldCheck size={24} color={white.w60} />
-              </div>
-
-              <label htmlFor="totp" className="block text-xs font-medium text-w60">
-                Verification Code
-              </label>
-              <input
-                id="totp"
-                type="text"
-                inputMode="text"
-                autoComplete="one-time-code"
-                value={totpCode}
-                // Accept a 6-digit TOTP OR a hex backup code (16 hex, 19 chars
-                // with dashes). Keep digits, hex letters and dashes; cap at 19.
-                onChange={(e) => setTotpCode(e.target.value.replace(/[^0-9A-Fa-f-]/g, '').slice(0, 19))}
-                placeholder="000000 or backup code"
-                required
-                maxLength={19}
-                autoFocus
-                className="w-full rounded-birdo-sub px-4 py-3 text-center text-2xl tracking-[0.3em] outline-hidden"
-                style={{
-                  backgroundColor: white.w04,
-                  border: `1px solid ${hairline.soft}`,
-                  color: white.w100,
-                }}
-              />
-              <p className="text-center text-xs text-w40">
-                Enter the 6-digit code from your authenticator, or a backup code
-              </p>
-
-              {error && <ErrorBanner message={error} />}
-
-              {/* Enable once a 6-digit TOTP or a hex backup code (>=2 groups of 4) is entered. */}
-              <BirdoButton
-                type="submit"
-                text={isLoading ? 'Verifying…' : 'Verify'}
-                onClick={() => {}}
-                variant="brand"
-                size="large"
-                fullWidth
-                isLoading={isLoading}
-                disabled={!(/^\d{6}$/.test(totpCode) || /^[0-9A-Fa-f]{4}(?:-?[0-9A-Fa-f]{4})+$/.test(totpCode))}
-              />
-
-              <button
-                type="button"
-                onClick={handleBack}
-                className="text-sm text-w60 underline transition hover:text-w80"
-              >
-                Back to login
-              </button>
-            </motion.form>
-          ) : (
-            <>
-              {/* ── Auth method tabs ── */}
-              <motion.div
-                className="mb-5 flex gap-1 rounded-birdo-sub bg-w06 p-1"
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: motionTokens.emphasis, delay: 0.22 }}
-              >
-                {tabs.map((tab) => {
-                  const active = activeTab === tab.id;
-                  return (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      onClick={() => {
-                        setActiveTab(tab.id);
-                        setError(null);
-                      }}
-                      className="flex flex-1 items-center justify-center rounded-birdo-sm py-2 text-xs font-medium transition-all"
-                      style={{
-                        backgroundColor: active ? white.w10 : 'transparent',
-                        color: active ? white.w100 : white.w60,
-                        boxShadow: active
-                          ? 'inset 0 1px 0 rgba(255,255,255,0.12), 0 2px 8px -2px rgba(0,0,0,0.45)'
-                          : 'none',
-                      }}
-                    >
-                      {tab.label}
-                    </button>
-                  );
-                })}
-              </motion.div>
-
-              <AnimatePresence mode="wait">
-                {activeTab === 'email' && (
-                  <motion.form
-                    key="email-form"
-                    onSubmit={handleLogin}
-                    className="flex min-h-[256px] flex-col gap-3"
-                    initial={{ opacity: 0, x: -10 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    exit={{ opacity: 0, x: 10 }}
-                    transition={{ duration: motionTokens.fast }}
-                  >
-                    <BirdoTextField
-                      label="Email"
-                      type="email"
-                      value={email}
-                      onChange={setEmail}
-                      placeholder="you@example.com"
-                      autoComplete="email"
-                    />
-
-                    <div>
-                      <div className="mb-1.5 flex items-center justify-between pl-1">
-                        <span className="text-xs font-medium text-w60">Password</span>
-                        <button
-                          type="button"
-                          onClick={handleForgotPassword}
-                          className="text-xs text-w60 transition hover:text-w100"
-                        >
-                          Forgot password?
-                        </button>
-                      </div>
-                      <BirdoTextField
-                        type="password"
-                        value={password}
-                        onChange={setPassword}
-                        placeholder="••••••••"
-                        autoComplete="current-password"
-                        ariaLabel="Password"
-                      />
-                    </div>
-
-                    {error && <ErrorBanner message={error} />}
-
-                    <BirdoButton
-                      type="submit"
-                      text={isLoading ? 'Signing in…' : 'Sign in'}
-                      onClick={() => {}}
-                      variant="brand"
-                      size="large"
-                      fullWidth
-                      isLoading={isLoading}
-                      className="mt-auto"
-                    />
-                  </motion.form>
-                )}
-
-                {activeTab === 'anonymous' && (
-                  <motion.form
-                    key="anon-form"
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      handleAnonymousLogin();
-                    }}
-                    className="flex min-h-[256px] flex-col gap-3"
-                    initial={{ opacity: 0, x: -10 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    exit={{ opacity: 0, x: 10 }}
-                    transition={{ duration: motionTokens.fast }}
-                  >
-                    <div>
-                      <BirdoTextField
-                        label="Anonymous ID"
-                        value={anonId}
-                        onChange={(next) =>
-                          setAnonId(
-                            next
-                              .replace(/\D/g, '')
-                              .slice(0, 24)
-                              .replace(/(\d{4})(?=\d)/g, '$1|'),
-                          )
-                        }
-                        placeholder="0000|0000|0000|0000|0000|0000"
-                        className="font-mono"
-                        ariaLabel="Anonymous ID"
-                      />
-                      <p className="mt-1 pl-1 text-xs text-w40">
-                        Enter the 24-digit ID from your anonymous account
-                      </p>
-                    </div>
-
-                    <BirdoTextField
-                      label="Password (only if you set one)"
-                      type="password"
-                      value={anonPassword}
-                      onChange={setAnonPassword}
-                      placeholder="••••••••"
-                      autoComplete="current-password"
-                      ariaLabel="Anonymous account password"
-                    />
-
-                    {error && <ErrorBanner message={error} />}
-
-                    <BirdoButton
-                      type="submit"
-                      text={isLoading ? 'Signing in…' : 'Sign in'}
-                      onClick={() => {}}
-                      variant="brand"
-                      size="large"
-                      fullWidth
-                      isLoading={isLoading}
-                      className="mt-auto"
-                    />
-
-                    {/* Create a brand-new anonymous account in-app — a compact
-                        text link (not a full button) so the Anonymous tab is the
-                        same height as the others and never needs to scroll. */}
-                    <button
-                      type="button"
-                      onClick={handleCreateAnonymous}
-                      disabled={isLoading}
-                      className="text-center text-xs text-w60 transition hover:text-w100 disabled:opacity-50"
-                    >
-                      {isLoading ? 'Creating…' : 'New here? Create an anonymous account'}
-                    </button>
-                  </motion.form>
-                )}
-
-                {activeTab === 'sso' && (
-                  <motion.div
-                    key="sso-form"
-                    className="flex min-h-[256px] flex-col justify-center gap-3"
-                    initial={{ opacity: 0, x: -10 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    exit={{ opacity: 0, x: 10 }}
-                    transition={{ duration: motionTokens.fast }}
-                  >
-                    {ssoWaiting ? (
-                      <div className="flex flex-col items-center gap-4 text-center">
-                        <div className="h-9 w-9 animate-spin rounded-full border-2 border-white/10 border-t-white" />
-                        <p className="text-sm text-w60">
-                          Finish signing in with {ssoWaiting === 'google' ? 'Google' : 'GitHub'} in
-                          your browser, then return here.
-                        </p>
-                        <p className="text-xs text-w40">
-                          Tip: if the browser is signed into a different account, pick the right one
-                          there.
-                        </p>
-                        <button
-                          type="button"
-                          onClick={cancelSso}
-                          className="text-xs text-w60 underline transition hover:text-w100"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    ) : (
-                      <>
-                        <p className="text-center text-sm text-w40">
-                          Continue with your Google or GitHub account — no password needed.
-                        </p>
-                        {error && <ErrorBanner message={error} />}
-                        <BirdoButton
-                          type="button"
-                          text="Continue with Google"
-                          onClick={() => handleSsoLogin('google')}
-                          variant="brand"
-                          size="large"
-                          fullWidth
-                          disabled={isLoading}
-                          ariaLabel="Continue with Google"
-                        />
-                        <BirdoButton
-                          type="button"
-                          text="Continue with GitHub"
-                          onClick={() => handleSsoLogin('github')}
-                          variant="brand"
-                          size="large"
-                          fullWidth
-                          disabled={isLoading}
-                          ariaLabel="Continue with GitHub"
-                        />
-                      </>
-                    )}
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
-              {/* Register prompt — hidden on the Anonymous tab (the Create button
-                  is right there, so a "register" link is redundant/misleading),
-                  matching mobile. SSO auto-creates an account, so it's kept there. */}
-              {activeTab !== 'anonymous' && (
-                <motion.p
-                  className="mt-5 text-center text-sm text-w60"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  transition={{ duration: motionTokens.emphasis, delay: 0.3 }}
+                <button
+                  type="button"
+                  onClick={handleBack}
+                  className="text-sm underline transition hover:text-w80"
+                  style={{ color: white.w60 }}
                 >
-                  Don&apos;t have an account?{' '}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      open('https://auth.birdo.app/login').catch(() => {});
-                    }}
-                    className="font-medium text-w100 underline-offset-2 transition hover:text-w80 hover:underline"
-                  >
-                    Register at birdo.app
-                  </button>
-                </motion.p>
-              )}
-            </>
-          )}
-        </motion.div>
+                  Back to sign in
+                </button>
+              </form>
+            ) : (
+              <>
+                {/* ── Auth method tabs (a real tablist, W2-035) ── */}
+                <div
+                  role="tablist"
+                  aria-label="Sign-in method"
+                  className="mb-5 flex gap-1 rounded-birdo-sub bg-w06 p-1"
+                >
+                  {tabs.map((tab, i) => {
+                    const active = activeTab === tab.id;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        role="tab"
+                        id={`${tabsId}-${tab.id}`}
+                        aria-selected={active}
+                        aria-controls={`${tabsId}-panel`}
+                        tabIndex={active ? 0 : -1}
+                        onClick={() => selectTab(tab.id)}
+                        onKeyDown={(e) => onTabKeyDown(e, i)}
+                        className="birdo-tab flex flex-1 items-center justify-center rounded-birdo-sm py-2 text-xs font-medium transition-all"
+                        style={{
+                          backgroundColor: active ? white.w10 : 'transparent',
+                          color: active ? white.w100 : white.w60,
+                          boxShadow: active
+                            ? 'inset 0 1px 0 rgba(255,255,255,0.12), 0 2px 8px -2px rgba(0,0,0,0.45)'
+                            : 'none',
+                        }}
+                      >
+                        {tab.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div role="tabpanel" id={`${tabsId}-panel`} aria-labelledby={`${tabsId}-${activeTab}`}>
+                  <AnimatePresence mode="wait">
+                    {activeTab === 'email' && (
+                      <motion.form
+                        key="email-form"
+                        onSubmit={handleLogin}
+                        noValidate
+                        className="flex flex-col gap-3"
+                        initial={{ opacity: 0, x: -10 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: 10 }}
+                        transition={{ duration: motionTokens.fast }}
+                      >
+                        <BirdoTextField
+                          label="Email"
+                          type="email"
+                          value={email}
+                          onChange={setEmail}
+                          placeholder="you@example.com"
+                          autoComplete="email"
+                        />
+
+                        <div>
+                          <div className="mb-1.5 flex items-center justify-between pl-1">
+                            <span className="text-xs font-medium" style={{ color: white.w60 }}>
+                              Password
+                            </span>
+                            <button
+                              type="button"
+                              onClick={handleForgotPassword}
+                              className="text-xs transition hover:text-w100"
+                              style={{ color: white.w60 }}
+                            >
+                              Forgot password?
+                            </button>
+                          </div>
+                          <BirdoTextField
+                            type="password"
+                            value={password}
+                            onChange={setPassword}
+                            placeholder="••••••••"
+                            autoComplete="current-password"
+                            ariaLabel="Password"
+                          />
+                        </div>
+
+                        {error && <ErrorBanner message={error} />}
+
+                        <BirdoButton
+                          type="submit"
+                          text={signingIn ? 'Signing in…' : 'Sign in'}
+                          onClick={() => {}}
+                          variant="brand"
+                          size="large"
+                          fullWidth
+                          isLoading={signingIn}
+                          disabled={!emailValid || password.length === 0}
+                          className="mt-1"
+                        />
+                      </motion.form>
+                    )}
+
+                    {activeTab === 'anonymous' && (
+                      <motion.div
+                        key="anon-form"
+                        className="flex flex-col gap-3"
+                        initial={{ opacity: 0, x: -10 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: 10 }}
+                        transition={{ duration: motionTokens.fast }}
+                      >
+                        {/* Creating an account comes FIRST and is the primary
+                            action (iOS LoginView, W2-027): it used to be a small
+                            text link under the sign-in button. */}
+                        <button
+                          ref={createButtonRef}
+                          type="button"
+                          onClick={handleCreateAnonymous}
+                          disabled={creating || signingIn}
+                          className="flex h-14 w-full items-center justify-center rounded-birdo-md text-base font-semibold text-white transition-opacity disabled:opacity-60"
+                          style={{ backgroundImage: gradient.primary }}
+                        >
+                          {creating && (
+                            <span
+                              className="mr-2.5 h-[18px] w-[18px] animate-spin rounded-full border-2 border-current border-t-transparent"
+                              aria-hidden
+                            />
+                          )}
+                          {creating ? 'Creating…' : 'Create a new anonymous account'}
+                        </button>
+                        <p className="text-center text-xs" style={{ color: white.w60 }}>
+                          No email needed. You get an account number to sign in with.
+                        </p>
+
+                        <div className="my-1 flex items-center gap-3" aria-hidden>
+                          <span className="h-px flex-1" style={{ backgroundColor: hairline.soft }} />
+                          <span className="text-xs" style={{ color: white.w60 }}>
+                            or use an existing account number
+                          </span>
+                          <span className="h-px flex-1" style={{ backgroundColor: hairline.soft }} />
+                        </div>
+
+                        <form onSubmit={handleAnonymousLogin} className="flex flex-col gap-3">
+                          <BirdoTextField
+                            label="Account number"
+                            value={anonId}
+                            onChange={(next) => setAnonId(formatAccountNumber(next.replace(/\D/g, '').slice(0, 24)))}
+                            placeholder="XXXX XXXX XXXX XXXX XXXX XXXX"
+                            className="font-mono"
+                            inputMode="numeric"
+                            hint="The 24 digits you saved when you created the account."
+                          />
+
+                          <BirdoTextField
+                            label="Password (only if you set one)"
+                            type="password"
+                            value={anonPassword}
+                            onChange={setAnonPassword}
+                            placeholder="••••••••"
+                            autoComplete="current-password"
+                          />
+
+                          {error && <ErrorBanner message={error} />}
+
+                          <BirdoButton
+                            type="submit"
+                            text={signingIn ? 'Signing in…' : 'Sign in'}
+                            onClick={() => {}}
+                            variant="secondary"
+                            size="large"
+                            fullWidth
+                            isLoading={signingIn}
+                            disabled={creating}
+                          />
+                        </form>
+                      </motion.div>
+                    )}
+
+                    {activeTab === 'sso' && (
+                      <motion.div
+                        key="sso-form"
+                        className="flex flex-col justify-center gap-3"
+                        initial={{ opacity: 0, x: -10 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: 10 }}
+                        transition={{ duration: motionTokens.fast }}
+                      >
+                        {ssoWaiting ? (
+                          <div className="flex flex-col items-center gap-4 text-center" aria-live="polite">
+                            <div className="h-9 w-9 animate-spin rounded-full border-2 border-white/10 border-t-white" />
+                            <p className="text-sm" style={{ color: white.w60 }}>
+                              Finish signing in with {SSO_NAME[ssoWaiting]} in your browser, then return here.
+                            </p>
+                            <p className="text-xs" style={{ color: white.w60 }}>
+                              Tip: if the browser is signed into a different account, pick the right one there.
+                            </p>
+                            <button
+                              type="button"
+                              onClick={cancelSso}
+                              className="text-xs underline transition hover:text-w100"
+                              style={{ color: white.w60 }}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            <p className="text-center text-sm" style={{ color: white.w60 }}>
+                              Continue with your Google, GitHub or Apple account — no password needed.
+                            </p>
+                            {error && <ErrorBanner message={error} />}
+                            {(['google', 'github', 'apple'] as const).map((p) => (
+                              <BirdoButton
+                                key={p}
+                                type="button"
+                                text={`Continue with ${SSO_NAME[p]}`}
+                                onClick={() => handleSsoLogin(p)}
+                                variant="brand"
+                                size="large"
+                                fullWidth
+                                disabled={signingIn}
+                              />
+                            ))}
+                          </>
+                        )}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+
+                {activeTab !== 'anonymous' && (
+                  <p className="mt-5 text-center text-sm" style={{ color: white.w60 }}>
+                    Don&apos;t have an account?{' '}
+                    <button
+                      type="button"
+                      onClick={goToSignUp}
+                      className="font-medium underline-offset-2 transition hover:underline"
+                      style={{ color: white.w100 }}
+                    >
+                      Sign up
+                    </button>
+                  </p>
+                )}
+              </>
+            )}
+          </motion.div>
         </div>
       </div>
     </div>

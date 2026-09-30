@@ -2,6 +2,13 @@ import { Component, Fragment, type ReactNode } from 'react';
 
 interface Props {
   children: ReactNode;
+  /**
+   * Rendered above the fallback. The ROOT boundary passes the title bar: the
+   * window is frameless, so a fallback that replaced everything left a window
+   * with no minimise or close control (W2-044). Inner boundaries sit below the
+   * title bar and need none.
+   */
+  chrome?: ReactNode;
 }
 
 interface State {
@@ -38,20 +45,24 @@ export class ErrorBoundary extends Component<Props, State> {
   render() {
     if (this.state.hasError) {
       return (
-        <div className="flex h-screen flex-col items-center justify-center gap-4 bg-black text-white">
-          <p className="text-lg font-semibold">Something went wrong</p>
-          {this.state.errorMessage && (
-            <details className="max-w-md text-center text-xs text-white/60">
-              <summary className="cursor-pointer">Details</summary>
-              <p className="mt-2 wrap-break-word">{this.state.errorMessage}</p>
-            </details>
-          )}
-          <button
-            onClick={this.handleReset}
-            className="rounded-sm bg-white/10 px-4 py-2 text-sm hover:bg-white/20"
-          >
-            Try again
-          </button>
+        <div className="flex h-full flex-col bg-black text-white">
+          {this.props.chrome}
+          <div className="flex flex-1 flex-col items-center justify-center gap-4">
+            <p className="text-lg font-semibold">Something went wrong</p>
+            {this.state.errorMessage && (
+              <details className="max-w-md text-center text-xs text-white/60">
+                <summary className="cursor-pointer">Details</summary>
+                <p className="mt-2 wrap-break-word">{this.state.errorMessage}</p>
+              </details>
+            )}
+            <button
+              type="button"
+              onClick={this.handleReset}
+              className="rounded-sm bg-white/10 px-4 py-2 text-sm hover:bg-white/20"
+            >
+              Try again
+            </button>
+          </div>
         </div>
       );
     }

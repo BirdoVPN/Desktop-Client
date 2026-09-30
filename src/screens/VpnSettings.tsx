@@ -1,30 +1,21 @@
 /**
- * VpnSettings — pushed sub-screen, pixel-faithful to mobile's
- * `VpnSettingsScreen.kt`.
+ * VpnSettings — pushed sub-screen, mirroring mobile's `VpnSettingsScreen.kt` /
+ * iOS VpnSettingsView.
  *
- * Sections: SECURITY (Stealth Mode, BirdoShield), NETWORK (Local Network Sharing),
- * WIREGUARD (Port radio group + MTU), an info note, then FEATURES
- * (Kill Switch Exceptions nav row, Windows-only).
+ * Sections: SECURITY (Stealth Mode, BirdoShield), NETWORK (Local Network
+ * Sharing), WIREGUARD (Port radio group + MTU), an info note, then FEATURES
+ * (Kill Switch Exceptions, Windows-only).
  *
- * Every toggle reads/writes the Zustand store settings and persists via the
- * SAME full-object `invoke('save_settings', { settings: settingsToRust(...) })`
- * path used by Settings.tsx / MultiHopCard.tsx. Changes apply on next connect.
- *
- * Kill Switch, Quantum Protection, Custom DNS and Port Forwarding have moved UP
- * to the main Settings page (Security / VPN) — they are not duplicated here.
+ * Every setting here shapes the tunnel, so each save goes through
+ * `persistSettings(…, { reapply: true })`: saved, rolled back and reported if
+ * the save fails, and applied to a live session by one debounced fail-closed
+ * rebuild. The port and MTU fields are drafts saved when the field is left
+ * (W2-007): "5" is a valid port on the way to "51820", and saving per
+ * keystroke rebuilt the tunnel on port 5.
  */
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import {
-  EyeOff,
-  ShieldCheck,
-  Network,
-  Router,
-  SlidersHorizontal,
-  Info,
-  Split,
-} from 'lucide-react';
+import { EyeOff, ShieldCheck, Network, Router, SlidersHorizontal, Info, Split } from 'lucide-react';
 import {
   BirdoTopBar,
   BirdoCard,
@@ -32,189 +23,102 @@ import {
   BirdoToggleRow,
   BirdoNavRow,
   BirdoTextField,
+  BirdoRadioGroup,
 } from '@/components/birdo';
 import { useAppStore } from '@/store/app-store';
-import { settingsToRust, isValidPort, isWindowsPlatform } from '@/utils/helpers';
+import { isValidMtu, isValidPort, isWindowsPlatform } from '@/utils/helpers';
 import { white, status, brand } from '@/lib/birdo-theme';
+import { planRank } from '@/lib/plan';
+import { persistSettings } from '@/session/settings-persist';
+import { loadSubscription } from '@/session/session-data';
+
+type PortChoice = 'auto' | '51820' | '53' | 'custom';
+const PRESET_PORTS = ['auto', '51820', '53'];
 
 export function VpnSettings() {
-  const {
-    settings,
-    updateSettings,
-    popRoute,
-    pushRoute,
-    account,
-    connectionState,
-    dnsFilteringAvailable,
-  } = useAppStore(
+  const { settings, popRoute, pushRoute, plan, connectionState, dnsFilteringAvailable, reapplying } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
-      updateSettings: s.updateSettings,
       popRoute: s.popRoute,
       pushRoute: s.pushRoute,
-      account: s.account,
+      plan: s.account.plan,
       connectionState: s.connectionState,
       dnsFilteringAvailable: s.dnsFilteringAvailable,
+      reapplying: s.reapplying,
     })),
   );
   const connected = connectionState === 'connected';
+  const save = (patch: Parameters<typeof persistSettings>[0]) => void persistSettings(patch, { reapply: true });
 
-  // Stealth mode is OPERATIVE+. Gated by PLAN only (an anonymous RECON user is
-  // treated identically to an email/SSO RECON user). Enforced server-side too
-  // (birdo-web): a non-entitled connect with stealth is refused.
-  const planRank = (plan: string | null | undefined): number =>
-    plan === 'SOVEREIGN' ? 2 : plan === 'OPERATIVE' ? 1 : 0;
-  const isOperativeOrAbove = planRank(account?.plan) >= 1;
+  // Stealth Mode is OPERATIVE+ (enforced server-side too). `null` = the plan is
+  // not known yet: the row waits instead of showing a paying user a lock.
+  const rank = planRank(plan);
 
   // BirdoShield vs Custom DNS (PR #160 review, must-fix 1): the Rust tunnel
-  // builder (`build_vpn_config`) applies the user's Custom DNS servers BEFORE
-  // the server-supplied resolver, so with Custom DNS set the filtering
-  // resolver the backend hands back is never written into the tunnel — zero
-  // filtering. Showing the row ON in that state is reassurance from missing
-  // data. Mirror the Stealth plan gate: the row reads OFF, is disabled, and
-  // says why. The Rust side (`effective_dns_filtering`) applies the SAME
-  // rule so the connect body never requests a resolver the tunnel won't use.
-  // Same precedence Mobile's WireGuardConfigBuilder.resolveDnsServers has.
-  const customDnsActive = (settings.customDns ?? []).length > 0;
+  // builder applies the user's Custom DNS servers BEFORE the server-supplied
+  // resolver, so with Custom DNS in force the filtering resolver is never
+  // written into the tunnel — zero filtering. The row reads OFF, is disabled
+  // and says why; Rust's `effective_dns_filtering` applies the same rule.
+  // Custom DNS is "in force" only while its switch is on AND it has addresses
+  // (the addresses are kept while it is off, P1-parity-042).
+  const customDnsActive = settings.customDnsEnabled && (settings.customDns ?? []).length > 0;
 
-  // BirdoShield fleet gate (PR #160/#403 review follow-up): the backend only
-  // hands out the filtering resolver while `DNS_FILTERING_ENABLED` is on for
-  // the fleet, and advertises that as `dnsFilteringAvailable` on
-  // `GET /api/client-config`. With the gate off the connect flag is ignored and
-  // the user silently gets Cloudflare — so a row that read ON would be exactly
-  // the reassurance-from-missing-data this screen already refuses to render for
-  // Custom DNS.
-  //
-  // `=== false` (not `!available`) is the whole point: undefined/unknown means
-  // AVAILABLE. The store defaults to true and never downgrades on a failed
-  // fetch, so an offline client keeps a working feature; only an explicit
-  // server "no" greys the row out. See the store's doc comment.
+  // BirdoShield fleet gate: `=== false` (not `!available`) is the whole point —
+  // undefined/unknown means AVAILABLE; only an explicit server "no" greys it out.
   const fleetGateOff = dnsFilteringAvailable === false;
 
-  // Either blocker hides the toggle's effect, so both must read OFF and
-  // disabled. The persisted `settings.dnsFiltering` is NOT cleared by either:
-  // clearing Custom DNS, or the fleet gate coming back, restores the user's
-  // own choice without them having to remember it. The fleet gate is named
-  // first in the subtitle because it is the one the user cannot act on.
+  // Either blocker hides the toggle's effect, so both read OFF and disabled.
+  // The saved `settings.dnsFiltering` is NOT cleared by either: clearing
+  // Custom DNS, or the fleet gate coming back, restores the user's choice.
   const shieldBlocked = fleetGateOff || customDnsActive;
 
-  const [customPortInput, setCustomPortInput] = useState(
-    !['auto', '51820', '53'].includes(settings.wireGuardPort) ? settings.wireGuardPort : '',
-  );
-  // Whether the "Custom" port radio is selected. Tracked as UI state (not derived
-  // purely from the persisted port) so choosing Custom can REVEAL the input field
-  // before a valid port exists — otherwise clicking Custom with an empty input
-  // persisted "auto", which snapped the selection straight back to Automatic and
-  // the input never appeared (Custom was impossible to select).
-  const [customPortMode, setCustomPortMode] = useState(
-    !['auto', '51820', '53'].includes(settings.wireGuardPort),
-  );
-  const [customMtuInput, setCustomMtuInput] = useState(
-    settings.wireGuardMtu > 0 ? String(settings.wireGuardMtu) : '',
-  );
-  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reapplyDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [reapplying, setReapplying] = useState(false);
+  // ── WireGuard port (a draft for the custom value) ─────────────────────────
+  const persistedIsCustom = !PRESET_PORTS.includes(settings.wireGuardPort);
+  // "Custom" is UI state as well as a saved value, so choosing it can reveal
+  // the field before a valid port exists.
+  const [customPortMode, setCustomPortMode] = useState(persistedIsCustom);
+  const [portDraft, setPortDraft] = useState(persistedIsCustom ? settings.wireGuardPort : '');
+  const [portError, setPortError] = useState<string | null>(null);
+  const portChoice: PortChoice = customPortMode || persistedIsCustom ? 'custom' : (settings.wireGuardPort as PortChoice);
 
-  useEffect(() => {
-    return () => {
-      if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-      if (reapplyDebounceRef.current) clearTimeout(reapplyDebounceRef.current);
-    };
-  }, []);
-
-  // Live-apply tunnel-affecting changes to an ACTIVE session (mobile parity):
-  // a debounced fail-closed tunnel rebuild. The kill switch is pushed live as a
-  // flag (no rebuild). Both no-op when disconnected — the persisted setting then
-  // applies at the next connect. Reads live connection state to avoid a stale
-  // closure. See the Rust `reapply_vpn_settings` / `set_killswitch_live`.
-  const scheduleReapply = useCallback(() => {
-    if (useAppStore.getState().connectionState !== 'connected') return;
-    if (reapplyDebounceRef.current) clearTimeout(reapplyDebounceRef.current);
-    reapplyDebounceRef.current = setTimeout(async () => {
-      setReapplying(true);
-      try {
-        await invoke('reapply_vpn_settings');
-      } catch {
-        /* Rust backend logs the error */
-      } finally {
-        setReapplying(false);
-      }
-    }, 900);
-  }, []);
-
-  // Keep the custom port/MTU inputs in sync if settings change elsewhere.
-  useEffect(() => {
-    if (!['auto', '51820', '53'].includes(settings.wireGuardPort)) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- mirrors the persisted port/MTU into the local inputs when they change elsewhere
-      setCustomPortInput(settings.wireGuardPort);
-    }
-    if (settings.wireGuardMtu > 0) {
-      setCustomMtuInput(String(settings.wireGuardMtu));
-    }
-  }, [settings.wireGuardPort, settings.wireGuardMtu]);
-
-  // Persist the FULL settings object via the shared settingsToRust path.
-  const saveSettingsToBackend = useCallback(async (next: typeof settings) => {
-    try {
-      await invoke('save_settings', { settings: settingsToRust(next) });
-    } catch {
-      /* Rust backend logs the error */
-    }
-  }, []);
-
-  // Patch the store + persist the full object, then live-apply to an active
-  // session. Every setting left on this screen is tunnel-affecting, so each one
-  // schedules a debounced fail-closed rebuild (reapply_vpn_settings). No-op when
-  // disconnected — the persisted setting applies at the next connect.
-  const persist = useCallback(
-    async (patch: Partial<typeof settings>) => {
-      const next = { ...useAppStore.getState().settings, ...patch };
-      updateSettings(patch);
-      await saveSettingsToBackend(next);
-      scheduleReapply();
-    },
-    [updateSettings, saveSettingsToBackend, scheduleReapply],
-  );
-
-  // ── WireGuard port selection ──────────────────────────────────────────────
-  const portOptions = ['auto', '51820', '53', 'custom'] as const;
-  const persistedIsCustom = !['auto', '51820', '53'].includes(settings.wireGuardPort);
-  const selectedPort =
-    customPortMode || persistedIsCustom ? 'custom' : settings.wireGuardPort;
-
-  const onSelectPort = (option: (typeof portOptions)[number]) => {
-    if (option === 'custom') {
-      // Enter custom mode and reveal the input. Only persist if a valid port is
-      // already typed; otherwise wait for the input's onChange (persisting "auto"
-      // here would revert the selection and hide the field).
+  const choosePort = (choice: PortChoice) => {
+    setPortError(null);
+    if (choice === 'custom') {
       setCustomPortMode(true);
-      if (isValidPort(customPortInput)) {
-        persist({ wireGuardPort: customPortInput });
-      }
-    } else {
-      setCustomPortMode(false);
-      persist({ wireGuardPort: option });
+      if (isValidPort(portDraft) && portDraft !== settings.wireGuardPort) save({ wireGuardPort: portDraft });
+      return;
     }
+    setCustomPortMode(false);
+    if (choice !== settings.wireGuardPort) save({ wireGuardPort: choice });
+  };
+  const commitPort = () => {
+    const v = portDraft.trim();
+    if (!v) return;
+    if (!isValidPort(v)) {
+      setPortError('Enter a port from 1 to 65535.');
+      return;
+    }
+    setPortError(null);
+    if (v !== settings.wireGuardPort) save({ wireGuardPort: v });
   };
 
-  const portLabel = (option: (typeof portOptions)[number]) => {
-    switch (option) {
-      case 'auto':
-        return 'Automatic';
-      case 'custom':
-        return 'Custom';
-      default:
-        return option;
-    }
-  };
-
-  // ── MTU ───────────────────────────────────────────────────────────────────
+  // ── MTU (a draft while custom) ─────────────────────────────────────────────
   const mtuAuto = settings.wireGuardMtu === 0;
+  const [mtuDraft, setMtuDraft] = useState(settings.wireGuardMtu > 0 ? String(settings.wireGuardMtu) : '');
+  const [mtuError, setMtuError] = useState<string | null>(null);
+  const commitMtu = () => {
+    const v = mtuDraft.trim();
+    if (!v) return;
+    if (!isValidMtu(v)) {
+      setMtuError('Enter a value from 1280 to 1500.');
+      return;
+    }
+    setMtuError(null);
+    if (Number(v) !== settings.wireGuardMtu) save({ wireGuardMtu: Number(v) });
+  };
 
   return (
-    // Transparent so the App-level PixelCanvas backdrop shows through (matches
-    // the Settings / Profile tab roots).
+    // Transparent so the App-level PixelCanvas backdrop shows through.
     <div className="flex h-full flex-col">
       <BirdoTopBar title="VPN Settings" onBack={popRoute} />
 
@@ -223,52 +127,60 @@ export function VpnSettings() {
         <BirdoSectionHeader title="Security" />
 
         <BirdoCard padding="0">
+          {/* Title without "· Premium" (P1-parity-032): a paying user saw an
+              upsell word on a setting they own. When locked, the whole row
+              routes to the plans — one affordance, not a dead switch plus a
+              separate link. */}
           <BirdoToggleRow
-            title="Stealth Mode · Premium"
+            title="Stealth Mode"
+            subtitle={
+              rank === null
+                ? 'Checking your plan…'
+                : 'Wraps WireGuard in an encrypted transport for networks that block VPNs. Slower.'
+            }
+            subtitleWrap
             leadingIcon={EyeOff}
             leadingTint={status.blue}
-            // `&& isOperativeOrAbove` so a persisted-on state can't resurface
-            // after a downgrade; disabled for RECON (also enforced server-side).
-            checked={settings.stealthMode && isOperativeOrAbove}
-            onCheckedChange={(v) => persist({ stealthMode: v })}
-            enabled={isOperativeOrAbove}
+            // `&& rank >= 1` so a saved ON cannot resurface after a downgrade.
+            checked={settings.stealthMode && (rank ?? 0) >= 1}
+            onCheckedChange={(v) => save({ stealthMode: v })}
+            enabled={rank !== null}
+            locked={
+              rank === 0
+                ? { onClick: () => pushRoute('pricing'), label: 'Operative' }
+                : undefined
+            }
           />
-          {!isOperativeOrAbove && (
+          {rank === null && (
             <button
               type="button"
-              onClick={() => pushRoute('pricing')}
-              className="px-3.5 pb-3 pt-0 text-xs font-semibold transition-opacity hover:opacity-80"
-              style={{ color: brand.accent }}
+              onClick={() => void loadSubscription(true)}
+              className="px-3.5 pb-3 text-xs font-semibold"
+              style={{ color: brand.accentSoft }}
             >
-              View plans →
+              Retry
             </button>
           )}
-          {/* BirdoShield (OPEN-WORK D18): per-device DNS filtering, sent to the
-              server as the `dnsFiltering` connect flag by BOTH Rust dial paths.
-              No plan gate — available on every plan. Same semantics as Stealth
-              above: `persist` saves it and, on an active session, schedules the
-              debounced fail-closed rebuild that re-dials with the new flag.
-              Gated by Custom DNS instead (see `customDnsActive`): the stored
-              preference is kept, so clearing Custom DNS restores it. */}
+          {/* BirdoShield (D18): per-device DNS filtering, sent as the
+              `dnsFiltering` connect flag by BOTH Rust dial paths. No plan
+              gate. Gated by the fleet and by Custom DNS instead. */}
           <BirdoToggleRow
             title="BirdoShield"
             subtitle={
               fleetGateOff
                 ? "Not available on your account's server fleet yet. Your preference is kept and applies as soon as it is."
                 : customDnsActive
-                  ? 'Custom DNS overrides BirdoShield. Clear your custom DNS servers under Settings › VPN to use the filtering resolver.'
+                  ? 'Custom DNS overrides BirdoShield. Turn off Custom DNS Servers under Settings › VPN to use the filtering resolver.'
                   : "Blocks ads, trackers and malware domains at the VPN's DNS resolver."
             }
-            // All three subtitles here are explanations, not values, and every
-            // one of them is longer than the ~34 characters a single 12px line
-            // fits in the fixed 380px window — the two blocked reasons most of
-            // all. Truncated, the user would read "Not available on your
-            // account's ser…" and never see that their preference is kept.
+            // Every subtitle here is an explanation, longer than the ~34
+            // characters one 12px line fits in the 380px window; truncated,
+            // the user would never see that their preference is kept.
             subtitleWrap
             leadingIcon={ShieldCheck}
-            leadingTint={shieldBlocked ? white.w40 : status.green}
+            leadingTint={shieldBlocked ? white.w40 : brand.accent}
             checked={settings.dnsFiltering && !shieldBlocked}
-            onCheckedChange={(v) => persist({ dnsFiltering: v })}
+            onCheckedChange={(v) => save({ dnsFiltering: v })}
             enabled={!shieldBlocked}
           />
         </BirdoCard>
@@ -279,159 +191,102 @@ export function VpnSettings() {
         <BirdoCard padding="0">
           <BirdoToggleRow
             title="Local Network Sharing"
+            subtitle="Allow access to devices on your local network (printers, NAS, etc.) while connected to VPN."
+            subtitleWrap
             leadingIcon={Network}
             leadingTint={status.blue}
             checked={settings.localNetworkSharing}
-            onCheckedChange={(v) => persist({ localNetworkSharing: v })}
+            onCheckedChange={(v) => save({ localNetworkSharing: v })}
           />
         </BirdoCard>
 
         {/* ── WIREGUARD ─────────────────────────────────────────────── */}
         <BirdoSectionHeader title="WireGuard" className="mt-4" />
 
-        {/* Port radio group */}
         <BirdoCard>
-          <div className="flex items-center gap-3.5">
-            <Router size={20} color={status.green} aria-hidden />
+          <div className="mb-3 flex items-center gap-3.5">
+            <Router size={20} color={brand.accent} aria-hidden />
             <span className="text-[15px] font-medium text-white">WireGuard Port</span>
           </div>
-          <div className="mt-3 space-y-1">
-            {portOptions.map((option) => {
-              const checked = selectedPort === option;
-              return (
-                <button
-                  key={option}
-                  type="button"
-                  role="radio"
-                  aria-checked={checked}
-                  onClick={() => onSelectPort(option)}
-                  className={`flex w-full items-center gap-3 rounded-birdo-sm px-3 py-2 text-left transition-colors ${
-                    checked ? 'bg-white/10' : 'hover:bg-white/5'
-                  }`}
-                >
-                  <span
-                    className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2"
-                    style={{ borderColor: checked ? white.w100 : white.w40 }}
-                  >
-                    {checked && (
-                      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: white.w100 }} />
-                    )}
-                  </span>
-                  <span className="text-sm" style={{ color: white.w80 }}>
-                    {portLabel(option)}
-                  </span>
-                </button>
-              );
-            })}
-
-            {selectedPort === 'custom' && (
-              <div className="pt-1">
-                <BirdoTextField
-                  placeholder="1-65535"
-                  value={customPortInput}
-                  onChange={(raw) => {
-                    const filtered = raw.replace(/\D/g, '').slice(0, 5);
-                    setCustomPortInput(filtered);
-                    if (isValidPort(filtered)) {
-                      updateSettings({ wireGuardPort: filtered });
-                      if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-                      saveDebounceRef.current = setTimeout(() => {
-                        saveSettingsToBackend({
-                          ...useAppStore.getState().settings,
-                          wireGuardPort: filtered,
-                        });
-                        scheduleReapply();
-                      }, 500);
-                    }
-                  }}
-                />
-              </div>
-            )}
-          </div>
-          <p className="mt-2 text-xs" style={{ color: white.w40 }}>
+          <BirdoRadioGroup<PortChoice>
+            label="WireGuard Port"
+            options={[
+              { value: 'auto', label: 'Automatic' },
+              { value: '51820', label: '51820' },
+              { value: '53', label: '53' },
+              { value: 'custom', label: 'Custom' },
+            ]}
+            value={portChoice}
+            onChange={choosePort}
+          />
+          {portChoice === 'custom' && (
+            <BirdoTextField
+              className="pt-2"
+              ariaLabel="Custom WireGuard port"
+              placeholder="1-65535"
+              inputMode="numeric"
+              value={portDraft}
+              onChange={(raw) => {
+                setPortDraft(raw.replace(/\D/g, '').slice(0, 5));
+                if (portError) setPortError(null);
+              }}
+              onBlur={commitPort}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commitPort();
+              }}
+              errorText={portError}
+              hint="Saved when you leave the field."
+            />
+          )}
+          <p className="mt-2 text-xs" style={{ color: white.w60 }}>
             Use port 53 to bypass restrictive firewalls. Default is 51820.
           </p>
         </BirdoCard>
 
-        {/* MTU */}
         <div className="h-2" />
         <BirdoCard>
           <div className="flex items-center gap-3.5">
             <SlidersHorizontal size={20} color={status.yellow} aria-hidden />
             <div>
-              <div className="text-[15px] font-medium text-white">MTU</div>
-              <div className="text-xs" style={{ color: white.w40 }}>
-                Maximum transmission unit
+              <div className="text-[15px] font-medium text-white">WireGuard MTU</div>
+              <div className="text-xs" style={{ color: white.w60 }}>
+                Packet size — lower values improve reliability on unstable networks
               </div>
             </div>
           </div>
           <div className="mt-3 space-y-1">
-            <button
-              type="button"
-              role="checkbox"
-              aria-checked={mtuAuto}
-              onClick={() => {
-                if (mtuAuto) {
-                  setCustomMtuInput('1420');
-                  persist({ wireGuardMtu: 1420 });
+            <BirdoToggleRow
+              title="Automatic (server default)"
+              checked={mtuAuto}
+              onCheckedChange={(auto) => {
+                setMtuError(null);
+                if (auto) {
+                  setMtuDraft('');
+                  save({ wireGuardMtu: 0 });
                 } else {
-                  setCustomMtuInput('');
-                  persist({ wireGuardMtu: 0 });
+                  setMtuDraft('1420');
+                  save({ wireGuardMtu: 1420 });
                 }
               }}
-              className="flex w-full items-center gap-3 rounded-birdo-sm px-3 py-2 text-left"
-            >
-              <span
-                className="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border-2"
-                style={{
-                  borderColor: mtuAuto ? white.w100 : white.w40,
-                  backgroundColor: mtuAuto ? white.w100 : 'transparent',
-                }}
-              >
-                {mtuAuto && (
-                  <svg viewBox="0 0 12 12" className="h-3 w-3" style={{ color: '#000000' }}>
-                    <path
-                      d="M10 3L4.5 8.5L2 6"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      fill="none"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                )}
-              </span>
-              <span className="text-sm" style={{ color: white.w80 }}>
-                Automatic (use server default)
-              </span>
-            </button>
-
+            />
             {!mtuAuto && (
-              <div className="pt-1">
-                <BirdoTextField
-                  placeholder="1280-1500"
-                  value={customMtuInput}
-                  onChange={(raw) => {
-                    const filtered = raw.replace(/\D/g, '').slice(0, 4);
-                    setCustomMtuInput(filtered);
-                    const n = Number(filtered);
-                    if (n >= 1280 && n <= 1500) {
-                      updateSettings({ wireGuardMtu: n });
-                      if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
-                      saveDebounceRef.current = setTimeout(() => {
-                        saveSettingsToBackend({
-                          ...useAppStore.getState().settings,
-                          wireGuardMtu: n,
-                        });
-                        scheduleReapply();
-                      }, 500);
-                    }
-                  }}
-                />
-                <p className="mt-1.5 text-xs" style={{ color: white.w40 }}>
-                  Valid range: 1280 - 1500. Recommended: 1420.
-                </p>
-              </div>
+              <BirdoTextField
+                className="px-1 pt-1"
+                ariaLabel="WireGuard MTU"
+                placeholder="1280-1500"
+                inputMode="numeric"
+                value={mtuDraft}
+                onChange={(raw) => {
+                  setMtuDraft(raw.replace(/\D/g, '').slice(0, 4));
+                  if (mtuError) setMtuError(null);
+                }}
+                onBlur={commitMtu}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitMtu();
+                }}
+                errorText={mtuError}
+                hint="Valid range: 1280–1500. Recommended: 1420."
+              />
             )}
           </div>
         </BirdoCard>
@@ -440,11 +295,12 @@ export function VpnSettings() {
         <div
           className="mt-3 flex items-center gap-2.5 rounded-birdo-sm px-3 py-2.5"
           style={{ backgroundColor: white.w10 }}
+          aria-live="polite"
         >
-          <Info size={16} color={white.w40} aria-hidden className="shrink-0" />
+          <Info size={16} color={white.w60} aria-hidden className="shrink-0" />
           <p className="text-xs" style={{ color: white.w60 }}>
             {reapplying
-              ? 'Applying changes to your live connection…'
+              ? 'Applying settings — reconnecting…'
               : connected
                 ? 'Changes apply to your current connection automatically (brief reconnect).'
                 : 'Changes take effect on the next connection.'}
@@ -452,23 +308,18 @@ export function VpnSettings() {
         </div>
 
         {/* ── FEATURES ──────────────────────────────────────────────── */}
-        {/* WFP enforcement is Windows-only. Offering it on Linux/macOS let
-            users configure exceptions that silently did nothing. Presented
-            as "Kill Switch Exceptions", not "Split Tunneling": WFP permit
-            filters exempt an app from the kill-switch block — they cannot
-            route it outside the VPN (that needs a signed redirect callout
-            driver), so the old name claimed behaviour that didn't exist.
-            Port Forwarding used to sit beside it; it lives on the main
-            Settings page (VPN) now, which leaves this section Windows-only —
-            hence the gate around the header too, so other platforms don't get
-            a heading over an empty card. */}
+        {/* WFP enforcement is Windows-only. Presented as "Kill Switch
+            Exceptions", not "Split Tunneling": WFP permit filters exempt an
+            app from the kill-switch block — they cannot route it outside the
+            VPN (that needs a signed redirect callout driver). */}
         {isWindowsPlatform() && (
           <>
             <BirdoSectionHeader title="Features" className="mt-4" />
-
             <BirdoCard padding="0">
               <BirdoNavRow
                 title="Kill Switch Exceptions"
+                subtitle="Apps that stay online while the kill switch blocks traffic"
+                subtitleWrap
                 leadingIcon={Split}
                 leadingTint={white.w60}
                 onClick={() => pushRoute('splitTunnel')}

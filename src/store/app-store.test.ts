@@ -1,5 +1,14 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { useAppStore } from './app-store'
+import { selectDisplayState, selectTunnelActive } from './selectors'
+import { parseVpnStatus, type VpnStatus } from '@/lib/ipc'
+
+/** A v2 status payload (snake_case), parsed exactly as the controller parses one. */
+function status(fields: Record<string, unknown>): VpnStatus {
+  const st = parseVpnStatus({ state: 'disconnected', kill_switch_blocking: false, error: null, ...fields })
+  if (!st) throw new Error('fixture did not parse')
+  return st
+}
 
 describe('useAppStore', () => {
   beforeEach(() => {
@@ -9,13 +18,14 @@ describe('useAppStore', () => {
       isLoading: false,
       userEmail: null,
       connectionState: 'disconnected',
+      pendingAction: null,
+      killSwitchBlocking: false,
+      vpnError: null,
+      commandError: null,
+      giveUp: null,
+      statusSeq: -1,
+      dnsDegraded: [],
       currentServer: null,
-      stats: {
-        bytesSent: 0,
-        bytesReceived: 0,
-        connectedAt: null,
-        serverName: null,
-      },
       servers: [],
       favoriteServers: [],
       settings: {
@@ -30,6 +40,7 @@ describe('useAppStore', () => {
         splitTunnelingEnabled: false,
         splitTunnelApps: [],
         customDns: null,
+        customDnsEnabled: false,
         protocol: 'wireguard',
         localNetworkSharing: false,
         wireGuardPort: 'auto',
@@ -76,12 +87,11 @@ describe('useAppStore', () => {
         userEmail: 'test@birdo.app',
         connectionState: 'connected',
         currentServer: makeMockServer('us-1'),
-        stats: {
-          bytesSent: 1024,
-          bytesReceived: 2048,
-          connectedAt: '2026-01-01T00:00:00Z',
-          serverName: 'US Server',
-        },
+        lastServerId: 'us-1',
+        servers: [makeMockServer('us-1')],
+        liveStats: { bytesIn: 2048, bytesOut: 1024, uptimeSeconds: 60, latencyMs: 20 },
+        killSwitchBlocking: true,
+        pendingAction: 'disconnecting',
       })
 
       useAppStore.getState().logout()
@@ -91,9 +101,12 @@ describe('useAppStore', () => {
       expect(state.userEmail).toBeNull()
       expect(state.connectionState).toBe('disconnected')
       expect(state.currentServer).toBeNull()
-      expect(state.stats.bytesSent).toBe(0)
-      expect(state.stats.bytesReceived).toBe(0)
-      expect(state.stats.connectedAt).toBeNull()
+      // The next account must not inherit this one's servers, choice or counters.
+      expect(state.lastServerId).toBeNull()
+      expect(state.servers).toEqual([])
+      expect(state.liveStats).toBeNull()
+      expect(state.killSwitchBlocking).toBe(false)
+      expect(state.pendingAction).toBeNull()
     })
   })
 
@@ -325,31 +338,96 @@ describe('useAppStore', () => {
   })
 
   // ==========================================
-  // Stats
+  // Rust status (contract v2 §1): seq ordering and error ownership
   // ==========================================
 
-  describe('connection stats', () => {
-    it('should start with zeroed stats', () => {
-      const stats = useAppStore.getState().stats
-      expect(stats.bytesSent).toBe(0)
-      expect(stats.bytesReceived).toBe(0)
-      expect(stats.connectedAt).toBeNull()
-      expect(stats.serverName).toBeNull()
+  describe('applyVpnStatus', () => {
+    it('applies a newer status and records its seq', () => {
+      expect(useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 3 }))).toBe(true)
+      expect(useAppStore.getState().connectionState).toBe('connected')
+      expect(useAppStore.getState().statusSeq).toBe(3)
     })
 
-    it('should update stats', () => {
-      useAppStore.getState().setStats({
-        bytesSent: 1024,
-        bytesReceived: 2048,
-        connectedAt: '2026-01-01T00:00:00Z',
-        serverName: 'US West',
-      })
+    it('drops a status older than the one applied — the stale-poll flip-back (W2-009)', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'disconnected', seq: 5 }))
+      // A resync that read `connected` before the user's Disconnect, arriving late.
+      expect(useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 4 }))).toBe(false)
+      expect(useAppStore.getState().connectionState).toBe('disconnected')
+    })
 
-      const stats = useAppStore.getState().stats
-      expect(stats.bytesSent).toBe(1024)
-      expect(stats.bytesReceived).toBe(2048)
-      expect(stats.connectedAt).toBe('2026-01-01T00:00:00Z')
-      expect(stats.serverName).toBe('US West')
+    it('applies an EQUAL seq (a resync of the same state) without moving backwards', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 7, dns_degraded: [] }))
+      expect(
+        useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 7, dns_degraded: ['Wi-Fi'] })),
+      ).toBe(true)
+      expect(useAppStore.getState().dnsDegraded).toEqual(['Wi-Fi'])
+    })
+
+    it('an identical reading writes nothing, so subscribers do not re-render (W2-037)', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 1, dns_degraded: [] }))
+      const listener = vi.fn()
+      const unsubscribe = useAppStore.subscribe(listener)
+      useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 1, dns_degraded: [] }))
+      unsubscribe()
+      expect(listener).not.toHaveBeenCalled()
+    })
+
+    it('a pre-v2 status without `seq` or `error` is applied and leaves a command error alone', () => {
+      useAppStore.setState({ commandError: { code: 'device_limit', message: '', retryable: false, retry_after_secs: null } })
+      const legacy = parseVpnStatus({ state: 'disconnected' })!
+      expect(legacy.seq).toBeNull()
+      expect(legacy.error).toBeUndefined()
+      expect(useAppStore.getState().applyVpnStatus(legacy)).toBe(true)
+      expect(useAppStore.getState().commandError?.code).toBe('device_limit')
+    })
+
+    it('records a reconnect give-up (reconnecting → error) with its kind and attempts (P1-parity-020)', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'reconnecting', seq: 1, reconnect_attempt: 9, reconnect_max: 10 }))
+      useAppStore.getState().applyVpnStatus(
+        status({
+          state: 'error',
+          seq: 2,
+          reconnect_attempt: 10,
+          reconnect_max: 10,
+          error: { code: 'server_unreachable', message: 'x', retryable: true, retry_after_secs: null },
+        }),
+      )
+      expect(useAppStore.getState().giveUp).toEqual({ kind: 'never_established', attempts: 10 })
+      useAppStore.getState().applyVpnStatus(status({ state: 'connecting', seq: 3 }))
+      expect(useAppStore.getState().giveUp).toBeNull()
+    })
+  })
+
+  describe('display state (the pending command over the Rust state)', () => {
+    it('shows the pending command until Rust gets there', () => {
+      expect(selectDisplayState({ connectionState: 'disconnected', pendingAction: 'connecting' })).toBe('connecting')
+      expect(selectDisplayState({ connectionState: 'connected', pendingAction: 'connecting' })).toBe('connected')
+      expect(selectDisplayState({ connectionState: 'connected', pendingAction: 'disconnecting' })).toBe('disconnecting')
+      expect(selectDisplayState({ connectionState: 'disconnected', pendingAction: 'disconnecting' })).toBe('disconnected')
+      expect(selectDisplayState({ connectionState: 'connected', pendingAction: 'switching' })).toBe('switching')
+      expect(selectDisplayState({ connectionState: 'reconnecting', pendingAction: null })).toBe('reconnecting')
+    })
+
+    it('counts a held kill-switch block as an active tunnel, even when disconnected', () => {
+      expect(selectTunnelActive({ connectionState: 'disconnected', pendingAction: null, killSwitchBlocking: false })).toBe(false)
+      expect(selectTunnelActive({ connectionState: 'disconnected', pendingAction: null, killSwitchBlocking: true })).toBe(true)
+      expect(selectTunnelActive({ connectionState: 'error', pendingAction: null, killSwitchBlocking: false })).toBe(true)
+    })
+  })
+
+  describe('persisted settings migration', () => {
+    it('merges an older saved settings object over the defaults and carries a Custom DNS list over as ON', async () => {
+      localStorage.setItem(
+        'birdo-vpn-storage',
+        JSON.stringify({ state: { settings: { customDns: ['1.1.1.1'], killSwitchEnabled: false } }, version: 0 }),
+      )
+      await useAppStore.persist.rehydrate()
+      const s = useAppStore.getState().settings
+      expect(s.customDnsEnabled).toBe(true)
+      expect(s.killSwitchEnabled).toBe(false)
+      // A field the old object never had comes from the defaults, not undefined.
+      expect(s.lockdownMode).toBe(true)
+      localStorage.removeItem('birdo-vpn-storage')
     })
   })
 })

@@ -1,6 +1,11 @@
 /**
  * PortForward — mobile-parity Port Forwarding screen.
  *
+ * A failed LOAD is its own state with a Retry, never "No port forwarding
+ * rules yet" (W2-030): the empty state used to render under the error banner,
+ * telling users they had no rules when the list had merely failed to load.
+ * Errors from add / delete are mapped by code, not shown raw (W2-012).
+ *
  * Pixel-faithful port of mobile's `PortForwardScreen.kt`:
  *   • BirdoTopBar "Port Forwarding" + back (popRoute).
  *   • "NEW RULE" BirdoSubCard — port field (1024-65535) + TCP/UDP segmented
@@ -13,10 +18,8 @@
  * zustand `portForwards` slice (camelCase Server/PortForward shape).
  */
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { useShallow } from 'zustand/react/shallow';
-import { motion, AnimatePresence } from 'framer-motion';
-import { Plus, Trash2, ArrowRightLeft, Network } from 'lucide-react';
+import { Plus, Trash2, ArrowRightLeft, Network, AlertCircle } from 'lucide-react';
 import {
   BirdoTopBar,
   BirdoSubCard,
@@ -25,9 +28,19 @@ import {
   BirdoButton,
   BirdoBadge,
   BirdoEmptyState,
+  BirdoDialog,
 } from '@/components/birdo';
 import { useAppStore, type PortForward as PortForwardRule } from '@/store/app-store';
-import { white, status, hairline, surface, gradient, motion as motionTokens } from '@/lib/birdo-theme';
+import { white, status, hairline, brand } from '@/lib/birdo-theme';
+import { errorCopy } from '@/lib/errors';
+import { toIpcError } from '@/lib/ipc';
+import { command } from '@/session/command';
+
+/** Copy for an add / delete failure; unclassified refusals get `fallback`. */
+function portForwardError(e: unknown, fallback: string): string {
+  const err = toIpcError(e);
+  return err.code === 'unknown' ? fallback : errorCopy(err).message;
+}
 
 type Protocol = 'tcp' | 'udp';
 
@@ -68,6 +81,7 @@ export function PortForward() {
   const [adding, setAdding] = useState(false);
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState(false);
   // Deleting a rule tears down a live DNAT mapping — confirm before it happens
   // (mobile parity; a mis-click otherwise silently removes a rule).
   const [pendingDelete, setPendingDelete] = useState<PortForwardRule | null>(null);
@@ -86,12 +100,12 @@ export function PortForward() {
   // ── Load active rules on mount ──────────────────────────────────────────
   const loadRules = useCallback(async () => {
     setLoading(true);
-    setError(null);
+    setLoadError(false);
     try {
-      const rules = await invoke<PortForwardRule[]>('get_port_forwards');
-      setPortForwards(rules);
-    } catch (e) {
-      setError(typeof e === 'string' ? e : 'Failed to load port forwarding rules.');
+      const rules = await command<PortForwardRule[]>('get_port_forwards');
+      setPortForwards(Array.isArray(rules) ? rules : []);
+    } catch {
+      setLoadError(true);
     } finally {
       setLoading(false);
     }
@@ -108,7 +122,7 @@ export function PortForward() {
     setAdding(true);
     setError(null);
     try {
-      const res = await invoke<CreatePortForwardResult>('create_port_forward', {
+      const res = await command<CreatePortForwardResult>('create_port_forward', {
         port: portValue,
         protocol,
       });
@@ -116,7 +130,9 @@ export function PortForward() {
       // (plan limit, port taken) must surface its message, never render as a
       // half-empty "successful" row.
       if (!res.success || !res.portForward) {
-        setError(res.message || 'Failed to create port forwarding rule.');
+        setError(
+          "Couldn't add that rule. Check your plan includes Port Forwarding and the port is free, then try again.",
+        );
         return;
       }
       const created = res.portForward;
@@ -132,7 +148,7 @@ export function PortForward() {
       ]);
       setPortText('');
     } catch (e) {
-      setError(typeof e === 'string' ? e : 'Failed to create port forwarding rule.');
+      setError(portForwardError(e, "Couldn't add that rule. Please try again."));
     } finally {
       setAdding(false);
     }
@@ -146,10 +162,10 @@ export function PortForward() {
       setError(null);
       setDeletingIds((prev) => new Set(prev).add(id));
       try {
-        await invoke('delete_port_forward', { id });
+        await command('delete_port_forward', { id });
         setPortForwards(portForwards.filter((pf) => pf.id !== id));
       } catch (e) {
-        setError(typeof e === 'string' ? e : 'Failed to delete port forwarding rule.');
+        setError(portForwardError(e, "Couldn't delete that rule. Please try again."));
       } finally {
         setDeletingIds((prev) => {
           const next = new Set(prev);
@@ -182,21 +198,16 @@ export function PortForward() {
         )}
 
         {/* ── New rule ─────────────────────────────────────────────────── */}
-        <BirdoSectionHeader title="New Rule" className="mt-3" />
+        <BirdoSectionHeader title="New rule" className="mt-3" />
         <BirdoSubCard padding="1rem">
           <BirdoTextField
             value={portText}
             onChange={(v) => setPortText(v.replace(/\D/g, '').slice(0, 5))}
-            label="Internal Port"
+            label="Internal port"
             placeholder="e.g. 8080"
-            error={showPortError}
-            ariaLabel="Internal port"
+            inputMode="numeric"
+            errorText={showPortError ? 'Port must be 1024–65535' : null}
           />
-          {showPortError && (
-            <p className="mt-1.5 pl-1 text-xs" style={{ color: status.red }}>
-              Port must be 1024-65535
-            </p>
-          )}
 
           {/* Protocol segmented toggle (TCP / UDP) */}
           <div className="mt-3 flex items-center gap-3">
@@ -221,11 +232,11 @@ export function PortForward() {
                     type="button"
                     onClick={() => setProtocol(proto)}
                     aria-pressed={selected}
-                    className="px-4 py-1 text-xs font-semibold uppercase tracking-wide transition-colors"
+                    className="birdo-toggle px-4 py-1 text-xs font-semibold uppercase tracking-wide transition-colors"
                     style={{
                       borderRadius: 8,
                       backgroundColor: selected ? white.w10 : 'transparent',
-                      color: selected ? '#FFFFFF' : white.w40,
+                      color: selected ? '#FFFFFF' : white.w60,
                     }}
                   >
                     {proto}
@@ -236,7 +247,7 @@ export function PortForward() {
           </div>
 
           <BirdoButton
-            text="Add Rule"
+            text="Add rule"
             onClick={handleAdd}
             icon={Plus}
             fullWidth
@@ -247,9 +258,20 @@ export function PortForward() {
         </BirdoSubCard>
 
         {/* ── Active rules ─────────────────────────────────────────────── */}
-        <BirdoSectionHeader title="Active Rules" className="mt-4" />
+        <BirdoSectionHeader title="Active rules" className="mt-4" />
 
-        {loading ? (
+        {loadError ? (
+          <BirdoSubCard padding="0">
+            <BirdoEmptyState
+              icon={AlertCircle}
+              title="Couldn't load your rules"
+              description="Your rules are unchanged. Check your connection and try again."
+              action={
+                <BirdoButton text="Retry" variant="secondary" size="medium" onClick={() => void loadRules()} />
+              }
+            />
+          </BirdoSubCard>
+        ) : loading ? (
           <div className="flex w-full items-center justify-center py-6">
             <span
               className="h-6 w-6 animate-spin rounded-full border-2"
@@ -261,7 +283,7 @@ export function PortForward() {
           <BirdoSubCard padding="0">
             <BirdoEmptyState
               icon={Network}
-              title="No rules yet"
+              title="No port forwarding rules yet"
               description="Add one above to get started."
             />
           </BirdoSubCard>
@@ -281,87 +303,38 @@ export function PortForward() {
         <div className="h-8" />
       </div>
 
-      <AnimatePresence>
+      <BirdoDialog
+        open={pendingDelete !== null}
+        onClose={() => setPendingDelete(null)}
+        title="Delete rule?"
+        icon={Trash2}
+        iconColor={status.red}
+      >
         {pendingDelete && (
-          <DeleteRuleDialog
-            rule={pendingDelete}
-            onCancel={() => setPendingDelete(null)}
-            onConfirm={() => {
+          <p className="text-[13px]" style={{ color: white.w60 }}>
+            Remove the {(pendingDelete.protocol || '').toUpperCase()} forward{' '}
+            <span className="font-medium" style={{ color: white.w80 }}>
+              {pendingDelete.externalPort} → {pendingDelete.internalPort}
+            </span>
+            ? This tears down the live mapping immediately.
+          </p>
+        )}
+        <div className="flex gap-2.5">
+          <BirdoButton text="Cancel" variant="secondary" fullWidth onClick={() => setPendingDelete(null)} />
+          <BirdoButton
+            text="Delete"
+            variant="danger"
+            fullWidth
+            onClick={() => {
+              if (!pendingDelete) return;
               const id = pendingDelete.id;
               setPendingDelete(null);
               void handleDelete(id);
             }}
           />
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
-
-// ── Delete confirmation dialog ──────────────────────────────────────────────
-function DeleteRuleDialog({
-  rule,
-  onCancel,
-  onConfirm,
-}: {
-  rule: PortForwardRule;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onCancel]);
-
-  return (
-    <motion.div
-      className="absolute inset-0 z-50 flex items-center justify-center p-5"
-      style={{ backgroundColor: 'rgba(0,0,0,0.6)' }}
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
-      onClick={onCancel}
-    >
-      <motion.div
-        role="dialog"
-        aria-modal="true"
-        aria-label="Delete port forwarding rule"
-        className="w-full max-w-[340px] overflow-hidden rounded-birdo-lg"
-        style={{
-          background: `linear-gradient(${surface.s3}, ${surface.s3}) padding-box, ${gradient.glassStroke} border-box`,
-          border: '1px solid transparent',
-        }}
-        initial={{ scale: 0.94, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        exit={{ scale: 0.94, opacity: 0 }}
-        transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex flex-col gap-4 p-5">
-          <div className="flex items-center gap-2">
-            <Trash2 size={20} color={status.red} aria-hidden />
-            <h2 className="text-[16px] font-bold" style={{ color: '#FFFFFF' }}>
-              Delete rule?
-            </h2>
-          </div>
-          <p className="text-[13px]" style={{ color: white.w60 }}>
-            Remove the {(rule.protocol || '').toUpperCase()} forward{' '}
-            <span className="font-medium" style={{ color: white.w80 }}>
-              {rule.externalPort} → {rule.internalPort}
-            </span>
-            ? This tears down the live mapping immediately.
-          </p>
-          <div className="flex gap-2.5">
-            <BirdoButton text="Cancel" variant="secondary" fullWidth onClick={onCancel} />
-            <BirdoButton text="Delete" variant="danger" fullWidth onClick={onConfirm} />
-          </div>
         </div>
-      </motion.div>
-    </motion.div>
+      </BirdoDialog>
+    </div>
   );
 }
 
@@ -382,12 +355,12 @@ function PortForwardRow({ rule, onRequestDelete, deleting }: PortForwardRowProps
         border: `1px solid ${hairline.soft}`,
       }}
     >
-      <ArrowRightLeft size={22} color={status.green} aria-hidden className="shrink-0" />
+      <ArrowRightLeft size={22} color={brand.accent} aria-hidden className="shrink-0" />
 
       <div className="min-w-0 flex-1">
         <div className="flex items-center text-[15px] font-medium">
           <span style={{ color: white.w80 }}>{rule.externalPort}</span>
-          <span className="px-1.5" style={{ color: white.w40 }}>
+          <span className="px-1.5" style={{ color: white.w60 }} aria-label="to">
             →
           </span>
           <span style={{ color: white.w80 }}>{rule.internalPort}</span>

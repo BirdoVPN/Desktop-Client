@@ -4,8 +4,9 @@
  */
 import type { LucideIcon } from 'lucide-react';
 import { RefreshCw, AlertCircle, WifiOff } from 'lucide-react';
-import { brand, status, white, hairline } from '@/lib/birdo-theme';
+import { accentA, brand, status, white, hairline } from '@/lib/birdo-theme';
 import type { ConnectionState } from '@/store/app-store';
+import { statusPill, type PillIcon } from '@/lib/vpn-display';
 
 export type BadgeTone = 'neutral' | 'success' | 'warning' | 'danger' | 'info' | 'brand';
 
@@ -17,11 +18,11 @@ interface ToneStyle {
 
 const TONE: Record<BadgeTone, ToneStyle> = {
   neutral: { bg: white.w05, fg: white.w80, border: hairline.soft },
-  success: { bg: status.greenBg, fg: status.greenLight, border: 'rgba(34,197,94,0.30)' },
+  success: { bg: status.greenBg, fg: status.greenLight, border: status.greenShadow },
   warning: { bg: status.yellowBg, fg: status.yellowLight, border: 'rgba(234,179,8,0.30)' },
-  danger:  { bg: status.redBg,    fg: status.red,         border: 'rgba(248,113,113,0.30)' },
+  danger:  { bg: status.redBg,    fg: status.red,         border: status.redBorder },
   info:    { bg: status.blueBg,   fg: status.blue,        border: 'rgba(59,130,246,0.30)' },
-  brand:   { bg: 'rgba(16,185,129,0.10)', fg: brand.accentSoft, border: 'rgba(16,185,129,0.30)' },
+  brand:   { bg: brand.accentBg, fg: brand.accentSoft, border: accentA(0.3) },
 };
 
 export interface BirdoBadgeProps {
@@ -42,7 +43,7 @@ export function BirdoBadge({
   const t = TONE[tone];
   return (
     <div
-      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 ${className}`}
+      className={`birdo-badge inline-flex items-center gap-2 rounded-full border px-3 py-1.5 ${className}`}
       style={{
         backgroundColor: t.bg,
         borderColor: t.border,
@@ -99,41 +100,30 @@ export function PulsingDot({ color, size = 8 }: PulsingDotProps) {
 
 export interface StatusPillProps {
   state: ConnectionState;
+  /** The live session is a Multi-Hop route: "Protected · Multi-Hop" (P1-parity-017). */
+  multiHop?: boolean;
   className?: string;
 }
 
-interface StatusConfig {
-  tone: BadgeTone;
-  text: string;
-  icon?: LucideIcon;
-  pulse?: boolean;
-}
-
-const STATUS_CONFIG: Record<ConnectionState, StatusConfig> = {
-  connected:          { tone: 'success', text: 'Protected',     pulse: true },
-  connecting:         { tone: 'warning', text: 'Connecting',    icon: RefreshCw },
-  authenticating:     { tone: 'warning', text: 'Authenticating', icon: RefreshCw },
-  stealth_connecting: { tone: 'warning', text: 'Connecting',    icon: RefreshCw },
-  reconnecting:       { tone: 'warning', text: 'Reconnecting',  icon: RefreshCw },
-  rekeying:           { tone: 'warning', text: 'Rekeying',      icon: RefreshCw },
-  disconnecting:      { tone: 'warning', text: 'Disconnecting', icon: RefreshCw },
-  kill_switch_active: { tone: 'danger',  text: 'Kill Switch',   icon: AlertCircle },
-  error:              { tone: 'danger',  text: 'Error',         icon: AlertCircle },
-  disconnected:       { tone: 'neutral', text: 'Disconnected',  icon: WifiOff },
+const PILL_ICON: Record<Exclude<PillIcon, null>, LucideIcon> = {
+  'wifi-off': WifiOff,
+  sync: RefreshCw,
+  alert: AlertCircle,
 };
 
 /**
- * VPN connection-state pill. Maps the polled `get_vpn_status` state to a tone,
- * label and icon (Connected pulses, busy states sync, faults alert).
+ * VPN connection-state pill. Wording and tone come from `statusPill` (the
+ * canonical table); announcing changes is LiveAnnouncer's job, so the pill is
+ * deliberately not a live region itself (one change, one announcement).
  */
-export function StatusPill({ state, className = '' }: StatusPillProps) {
-  const cfg = STATUS_CONFIG[state];
+export function StatusPill({ state, multiHop = false, className = '' }: StatusPillProps) {
+  const cfg = statusPill(state, multiHop);
   return (
     <div data-testid="vpn-status" className={className}>
       <BirdoBadge
         text={cfg.text}
         tone={cfg.tone}
-        icon={cfg.icon}
+        icon={cfg.icon ? PILL_ICON[cfg.icon] : undefined}
         pulseDot={cfg.pulse}
       />
     </div>

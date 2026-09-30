@@ -12,8 +12,6 @@ export interface BirdoCardProps {
   surfaceColor?: string;
   /** When true, render gradient hairline border (default). */
   glassBorder?: boolean;
-  /** Optional brand glow rendered behind content. */
-  glow?: 'idle' | 'connected' | 'error' | null;
   padding?: string;
   style?: CSSProperties;
 }
@@ -24,16 +22,9 @@ export function BirdoCard({
   cornerRadius = 16,
   surfaceColor = surface.s1,
   glassBorder = true,
-  glow = null,
   padding = '1rem',
   style,
 }: BirdoCardProps) {
-  const glowBg =
-    glow === 'idle'      ? gradient.idle
-    : glow === 'connected' ? gradient.connected
-    : glow === 'error'   ? gradient.error
-    : null;
-
   return (
     <div
       className={`relative overflow-hidden ${className}`}
@@ -48,13 +39,6 @@ export function BirdoCard({
         ...style,
       }}
     >
-      {glowBg && (
-        <div
-          className="pointer-events-none absolute inset-0"
-          style={{ background: glowBg }}
-          aria-hidden
-        />
-      )}
       <div className="relative" style={{ padding }}>
         {children}
       </div>

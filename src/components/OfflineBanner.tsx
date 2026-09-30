@@ -3,33 +3,39 @@ import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { WifiOff } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { motion as motionTokens } from '@/lib/birdo-theme';
 
 /**
- * Monitors network connectivity and shows a banner when offline.
- * Mirrors Android's NetworkMonitor.kt + BirdoNavGraph offline banner.
+ * "No internet connection", shown above every screen while the OS reports no
+ * network (`navigator.onLine`; the OS fires online/offline on interface
+ * changes).
  *
- * Uses the browser's `navigator.onLine` as a lightweight heuristic.
- * This is sufficient for desktop since the OS triggers online/offline
- * events when the network interface changes.
+ * Hidden while a tunnel is up or coming up (P1-parity-029, the iOS/Android
+ * rule): the tunnel's own adapter changes what the webview reports, and a red
+ * "No internet connection" over "Protected" contradicts a working connection.
+ * The connection states say what is happening then.
  */
 export function OfflineBanner() {
-  const { isOnline, setOnline } = useAppStore(
+  const { isOnline, setOnline, tunnelUp } = useAppStore(
     useShallow((s) => ({
       isOnline: s.isOnline,
       setOnline: s.setOnline,
-    }))
+      tunnelUp:
+        s.connectionState === 'connected' ||
+        s.connectionState === 'connecting' ||
+        s.connectionState === 'reconnecting' ||
+        s.connectionState === 'switching' ||
+        s.pendingAction === 'connecting' ||
+        s.pendingAction === 'switching',
+    })),
   );
 
   useEffect(() => {
-    // Set initial state
     setOnline(navigator.onLine);
-
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
-
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
@@ -37,21 +43,25 @@ export function OfflineBanner() {
   }, [setOnline]);
 
   return (
-    <AnimatePresence>
-      {!isOnline && (
-        <motion.div
-          role="status"
-          aria-live="polite"
-          className="flex items-center justify-center gap-2 bg-red-500/90 px-3 py-1.5 text-xs font-medium text-white"
-          initial={{ opacity: 0, height: 0 }}
-          animate={{ opacity: 1, height: 'auto' }}
-          exit={{ opacity: 0, height: 0 }}
-          transition={{ duration: 0.2 }}
-        >
-          <WifiOff size={14} aria-hidden />
-          <span>No internet connection</span>
-        </motion.div>
-      )}
-    </AnimatePresence>
+    <div role="status" aria-live="polite" className="shrink-0">
+      <AnimatePresence>
+        {!isOnline && !tunnelUp && (
+          <motion.div
+            className="flex items-center justify-center gap-2 px-3 py-1.5 text-xs font-semibold"
+            // The theme red (status.red) at 0.95 — it was Tailwind's red-500,
+            // a different red from every other alert in the app. Dark text:
+            // white on this light red would fail contrast.
+            style={{ backgroundColor: 'rgba(248,113,113,0.95)', color: '#1A0505' }}
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: motionTokens.fast }}
+          >
+            <WifiOff size={14} aria-hidden />
+            <span>No internet connection</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   );
 }
