@@ -58,11 +58,9 @@ import { UpdateChecker } from './UpdateChecker';
 import { brand, status as statusTokens, white } from '@/lib/birdo-theme';
 import { persistSettings, setKillSwitch } from '@/session/settings-persist';
 import { loadAppVersion, useUpdater } from '@/session/updater';
+import { DASHBOARD_URL, PRIVACY_URL, TERMS_URL } from '@/lib/links';
 import type { WindowCorner } from '@/store/app-store';
 
-const DASHBOARD_URL = 'https://dashboard.birdo.app';
-const PRIVACY_URL = 'https://birdo.app/privacy';
-const TERMS_URL = 'https://birdo.app/terms';
 
 /** Shape returned by the Rust `check_biometric_available` command. */
 interface BiometricStatus {

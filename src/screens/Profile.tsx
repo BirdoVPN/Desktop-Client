@@ -16,6 +16,7 @@ import { useAppStore } from '@/store/app-store';
 import { BirdoCard, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
 import { brand, status as statusTokens } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
+import { BILLING_URL } from '@/lib/links';
 import { anonAccountNumber } from '@/utils/helpers';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
@@ -116,7 +117,7 @@ export function Profile() {
                 rank === null || isFreeTier
                   ? () => pushRoute('pricing')
                   : () => {
-                      void open('https://dashboard.birdo.app/billing').catch(() => {});
+                      void open(BILLING_URL).catch(() => {});
                     }
               }
             />

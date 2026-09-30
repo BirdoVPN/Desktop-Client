@@ -80,6 +80,13 @@ describe('contrast (W2-018)', () => {
   });
 });
 
+describe('motion (W2-034)', () => {
+  it('animation durations come from the motion tokens, not literals', () => {
+    expect(offenders(/duration:\s*0?\.\d/)).toEqual([]);
+    expect(offenders(/stiffness:|damping:/)).toEqual([]);
+  });
+});
+
 describe('vocabulary (P1-parity-034, canonical tables)', () => {
   const RETIRED = [
     'Log Out',

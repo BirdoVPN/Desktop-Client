@@ -25,12 +25,9 @@ import { BirdoTopBar, BirdoCard, BirdoButton, BirdoBadge } from '@/components/bi
 import { useAppStore } from '@/store/app-store';
 import { brand, white, hairline, surface, accentA } from '@/lib/birdo-theme';
 import { PLAN_RANK, normalizePlan, type PlanId } from '@/lib/plan';
+import { BILLING_URL } from '@/lib/links';
 
-// Billing lives on the web (the same host Settings.tsx opens for "Manage on
-// web"). `DASHBOARD_URL` is a module-local const in Settings.tsx (not exported),
-// so — per the task's guidance — we replicate the same constant and the same
-// `open`-from-plugin-shell helper here rather than hardcode a bare URL inline.
-const DASHBOARD_URL = 'https://dashboard.birdo.app';
+// Billing lives on the web (the same host Settings opens for "Manage on web").
 
 type BillingPeriod = 'monthly' | 'yearly';
 
@@ -132,7 +129,7 @@ export function Pricing() {
   // Default to yearly (matches mobile) so the discounted annual price leads.
   const [period, setPeriod] = useState<BillingPeriod>('yearly');
 
-  const openBilling = () => openExternal(`${DASHBOARD_URL}/billing`).catch(() => {});
+  const openBilling = () => openExternal(BILLING_URL).catch(() => {});
 
   return (
     // Transparent so the App-level PixelCanvas backdrop shows through (matches

@@ -3,7 +3,7 @@ import { motion } from 'framer-motion';
 import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { Shield, Eye, BarChart3, ShieldOff } from 'lucide-react';
 import { AppIconMark, BirdoButton, BirdoCard, BirdoToggleRow } from './birdo';
-import { brand } from '@/lib/birdo-theme';
+import { brand, motion as motionTokens } from '@/lib/birdo-theme';
 
 export const TERMS_URL = 'https://birdo.app/terms';
 export const PRIVACY_URL = 'https://birdo.app/privacy';
@@ -73,14 +73,14 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
           className="flex flex-col items-center"
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
+          transition={{ duration: motionTokens.slow }}
         >
           {/* Brand mark */}
           <motion.div
             className="mt-8 mb-4"
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.5, delay: 0.1 }}
+            transition={{ duration: motionTokens.slow, delay: 0.1 }}
           >
             <AppIconMark mark size={76} />
           </motion.div>
@@ -90,7 +90,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="mb-2 text-center text-2xl font-bold text-w100"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, delay: 0.15 }}
+            transition={{ duration: motionTokens.slow, delay: 0.15 }}
           >
             Your Privacy Matters
           </motion.h1>
@@ -99,7 +99,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="mb-6 text-center text-sm leading-relaxed text-w60"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, delay: 0.2 }}
+            transition={{ duration: motionTokens.slow, delay: 0.2 }}
           >
             Before using BirdoVPN, please review how your data is handled.
           </motion.p>
@@ -109,7 +109,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="mb-5 w-full"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, delay: 0.25 }}
+            transition={{ duration: motionTokens.slow, delay: 0.25 }}
           >
             <BirdoCard padding="1.25rem" cornerRadius={20}>
               <div className="space-y-5">
@@ -142,7 +142,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="mb-5 w-full"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, delay: 0.28 }}
+            transition={{ duration: motionTokens.slow, delay: 0.28 }}
           >
             <BirdoCard padding="0.25rem" cornerRadius={20}>
               <BirdoToggleRow
@@ -164,7 +164,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="mb-4 flex items-center justify-center gap-4"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            transition={{ duration: 0.5, delay: 0.3 }}
+            transition={{ duration: motionTokens.slow, delay: 0.3 }}
           >
             <button
               type="button"
@@ -190,7 +190,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="mb-5 text-center text-xs leading-relaxed text-w60"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            transition={{ duration: 0.5, delay: 0.32 }}
+            transition={{ duration: motionTokens.slow, delay: 0.32 }}
           >
             You must be 18 or over to use BirdoVPN. By selecting &ldquo;I Agree &amp;
             Continue&rdquo; you accept the Terms of Service and the Privacy Policy.
@@ -201,7 +201,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="w-full"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, delay: 0.35 }}
+            transition={{ duration: motionTokens.slow, delay: 0.35 }}
           >
             <BirdoButton
               text="I Agree & Continue"
@@ -217,7 +217,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="mt-3 w-full"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, delay: 0.4 }}
+            transition={{ duration: motionTokens.slow, delay: 0.4 }}
           >
             <BirdoButton
               text="Decline"
@@ -233,7 +233,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             className="mt-4 text-center text-xs text-w60"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            transition={{ duration: 0.5, delay: 0.45 }}
+            transition={{ duration: motionTokens.slow, delay: 0.45 }}
           >
             You must accept the Terms of Service and the Privacy Policy to use BirdoVPN.
           </motion.p>
