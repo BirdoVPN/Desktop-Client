@@ -143,9 +143,9 @@ export function Dashboard() {
   };
 
   const upsellLocked = (server: Server) => {
-    const planName = server.minPlan ? titleCasePlan(server.minPlan) : 'a higher';
+    const which = server.minPlan ? `the ${titleCasePlan(server.minPlan)} plan` : 'a higher plan';
     notice({
-      text: `This server requires the ${planName} plan. Upgrade to unlock.`,
+      text: `This server requires ${which}. Upgrade to unlock.`,
       tone: 'info',
       actionLabel: 'View plans',
       onAction: () => useAppStore.getState().pushRoute('pricing'),
