@@ -81,18 +81,6 @@ pub fn get_device_name() -> String {
     format!("{} ({})", platform, suffix)
 }
 
-#[cfg(test)]
-mod device_name_tests {
-    #[test]
-    fn the_suffix_comes_from_the_random_part_of_the_id() {
-        let name = super::get_device_name();
-        assert!(!name.contains("deskto"), "{name}");
-        let id = super::get_device_id();
-        let expected: String = id.trim_start_matches("desktop_").chars().take(6).collect();
-        assert!(name.ends_with(&format!("({expected})")), "{name} vs {id}");
-    }
-}
-
 /// This build's value for the backend `platform` enum
 /// (WINDOWS | MACOS | LINUX | IOS | ANDROID | UNKNOWN).
 ///
@@ -106,5 +94,17 @@ pub fn device_platform() -> &'static str {
         "macos" => "MACOS",
         "linux" => "LINUX",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod device_name_tests {
+    #[test]
+    fn the_suffix_comes_from_the_random_part_of_the_id() {
+        let name = super::get_device_name();
+        assert!(!name.contains("deskto"), "{name}");
+        let id = super::get_device_id();
+        let expected: String = id.trim_start_matches("desktop_").chars().take(6).collect();
+        assert!(name.ends_with(&format!("({expected})")), "{name} vs {id}");
     }
 }
