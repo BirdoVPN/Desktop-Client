@@ -140,8 +140,9 @@ pub enum ConnectPhase {
     Handshaking,
 }
 
-/// The confirmed Multi-Hop route of the live session (contract §1 `multi_hop`).
+/// The confirmed Multi-Hop route of the live session (contract §1 `multiHop`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MultiHopStatus {
     pub entry_id: String,
     pub entry_name: String,
@@ -1453,6 +1454,28 @@ mod tests {
         assert_eq!(mgr.published().seq, seq);
         assert_eq!(mgr.get_state().await, ConnectionState::Disconnected);
         assert!(!mgr.holds_tunnel().await);
+    }
+
+    /// The UI recognises an auto-reconnect give-up as a `reconnecting` →
+    /// `error` transition and words it from `error.code`. Ending a recovery
+    /// in `Error` must therefore be ONE visible change, never passing through
+    /// `disconnecting` / `disconnected`, and the code must be on it.
+    #[tokio::test]
+    async fn a_give_up_is_one_transition_from_reconnecting_to_error() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        mgr.set_reconnecting(10, Some(IpcError::unknown("last try")), Some(10))
+            .await;
+        let before = mgr.published().seq;
+
+        let verdict = IpcError::new(IpcErrorCode::ServerUnreachable, "gave up");
+        mgr.disconnect_to(ConnectionState::Error(verdict.clone()))
+            .await
+            .unwrap();
+
+        let after = mgr.published();
+        assert_eq!(after.seq, before + 1, "an intermediate state was published");
+        assert_eq!(after.state, ConnectionState::Error(verdict));
+        assert_eq!(after.reconnect_max, None);
     }
 
     #[tokio::test]

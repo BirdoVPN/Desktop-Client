@@ -18,4 +18,3 @@ pub mod vouchers;
 pub mod vpn;
 pub mod vpn_multi_hop;
 pub mod vpn_port_forward;
-pub mod window;

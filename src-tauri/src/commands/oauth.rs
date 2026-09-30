@@ -17,7 +17,7 @@
 
 use crate::api::types::LoginResult;
 use crate::api::BirdoApi;
-use crate::commands::ipc_error::IpcError;
+use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::storage::CredentialStore;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -354,6 +354,7 @@ pub async fn native_oauth_login(
                 }),
                 requires_two_factor: false,
                 challenge_token: None,
+                code: None,
             })
         }
         Ok(LoginResult::TwoFactorChallenge {
@@ -364,6 +365,7 @@ pub async fn native_oauth_login(
             user: None,
             requires_two_factor: true,
             challenge_token: Some(challenge_token),
+            code: Some(IpcErrorCode::TwoFactorRequired),
         }),
         Err(e) => {
             tracing::warn!("Native SSO exchange failed: {e}");
@@ -373,6 +375,7 @@ pub async fn native_oauth_login(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(super::auth::sign_in_failure_code(&e)),
             })
         }
     }

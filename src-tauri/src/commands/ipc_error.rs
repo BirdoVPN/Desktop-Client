@@ -19,10 +19,9 @@ use crate::api::ApiError;
 /// Stable, snake_case error codes. Extend only by ADDING codes: the UI keys
 /// its copy on them, and an unknown code falls back to `unknown` there.
 ///
-/// The contract's `two_factor_required` and `two_factor_invalid` are not here
-/// because nothing in Rust produces them: the sign-in commands answer a 2FA
-/// challenge or a wrong code with an `Ok(LoginResponse)` carrying
-/// `requires_two_factor` / `success:false`, which is the flow the UI drives.
+/// The sign-in commands answer a refusal with `Ok(LoginResponse)` and put the
+/// code in its `code` field (`invalid_credentials`, `two_factor_required`,
+/// `two_factor_invalid`, …); every other command returns it as the `Err`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcErrorCode {
@@ -36,6 +35,8 @@ pub enum IpcErrorCode {
     UpgradeRequired,
     RateLimited,
     InvalidCredentials,
+    TwoFactorRequired,
+    TwoFactorInvalid,
     CertPinFailed,
     StealthFailed,
     PqFailed,
@@ -295,6 +296,8 @@ mod tests {
             (IpcErrorCode::UpgradeRequired, "upgrade_required"),
             (IpcErrorCode::RateLimited, "rate_limited"),
             (IpcErrorCode::InvalidCredentials, "invalid_credentials"),
+            (IpcErrorCode::TwoFactorRequired, "two_factor_required"),
+            (IpcErrorCode::TwoFactorInvalid, "two_factor_invalid"),
             (IpcErrorCode::CertPinFailed, "cert_pin_failed"),
             (IpcErrorCode::StealthFailed, "stealth_failed"),
             (IpcErrorCode::PqFailed, "pq_failed"),

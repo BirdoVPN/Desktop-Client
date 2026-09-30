@@ -65,6 +65,34 @@ pub struct LoginResponse {
     /// The frontend must prompt for TOTP code and call verify_2fa.
     pub requires_two_factor: bool,
     pub challenge_token: Option<String>,
+    /// Why a sign-in did not complete, as an IPC contract code (§2): a
+    /// refusal is answered `Ok` with `success:false`, so the code rides here
+    /// for the UI to map to canonical copy. `None` on success.
+    pub code: Option<IpcErrorCode>,
+}
+
+/// The code for a refused sign-in. A 401 from a sign-in endpoint means the
+/// credentials were wrong — the generic mapping reads every 401 as an expired
+/// session, which is only true for an authenticated call.
+pub(crate) fn sign_in_failure_code(error: &ApiError) -> IpcErrorCode {
+    match error {
+        ApiError::Unauthorized | ApiError::Rejected { status: 401, .. } => {
+            IpcErrorCode::InvalidCredentials
+        }
+        other => IpcError::from_api(other).code,
+    }
+}
+
+/// The code for a refused 2FA verification: a 400/401 there is the code (or
+/// its challenge) being wrong or expired.
+fn two_factor_failure_code(error: &ApiError) -> IpcErrorCode {
+    match error {
+        ApiError::Unauthorized
+        | ApiError::Rejected {
+            status: 400 | 401, ..
+        } => IpcErrorCode::TwoFactorInvalid,
+        other => IpcError::from_api(other).code,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -154,6 +182,7 @@ pub async fn login(
                     user: Some(user_info),
                     requires_two_factor: false,
                     challenge_token: None,
+                    code: None,
                 })
             }
             LoginResult::TwoFactorChallenge {
@@ -167,6 +196,7 @@ pub async fn login(
                     user: None,
                     requires_two_factor: true,
                     challenge_token: Some(challenge_token),
+                    code: Some(IpcErrorCode::TwoFactorRequired),
                 })
             }
         },
@@ -178,6 +208,7 @@ pub async fn login(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(sign_in_failure_code(&e)),
             })
         }
     }
@@ -620,6 +651,7 @@ pub async fn verify_2fa(
                             user: None,
                             requires_two_factor: true,
                             challenge_token: Some(request.challenge_token),
+                            code: Some(IpcErrorCode::ServerError),
                         });
                     }
                 };
@@ -638,6 +670,7 @@ pub async fn verify_2fa(
                     user: None, // Profile will be fetched via get_auth_state
                     requires_two_factor: false,
                     challenge_token: None,
+                    code: None,
                 })
             } else {
                 Ok(LoginResponse {
@@ -646,6 +679,7 @@ pub async fn verify_2fa(
                     user: None,
                     requires_two_factor: true,
                     challenge_token: Some(request.challenge_token),
+                    code: Some(IpcErrorCode::TwoFactorInvalid),
                 })
             }
         }
@@ -657,6 +691,7 @@ pub async fn verify_2fa(
                 user: None,
                 requires_two_factor: true,
                 challenge_token: Some(request.challenge_token),
+                code: Some(two_factor_failure_code(&e)),
             })
         }
     }
@@ -711,6 +746,7 @@ pub async fn register_anonymous(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(IpcErrorCode::RateLimited),
             });
         }
         attempts.push(now);
@@ -744,6 +780,7 @@ pub async fn register_anonymous(
                 }),
                 requires_two_factor: false,
                 challenge_token: None,
+                code: None,
             })
         }
         Ok(_) => Ok(LoginResponse {
@@ -752,6 +789,7 @@ pub async fn register_anonymous(
             user: None,
             requires_two_factor: false,
             challenge_token: None,
+            code: Some(IpcErrorCode::ServerError),
         }),
         Err(e) => {
             tracing::warn!("Anonymous account creation failed: {}", e);
@@ -761,6 +799,7 @@ pub async fn register_anonymous(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(IpcError::from_api(&e).code),
             })
         }
     }
@@ -786,6 +825,7 @@ pub async fn login_anonymous(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(IpcErrorCode::RateLimited),
             });
         }
         attempts.push(now);
@@ -803,6 +843,7 @@ pub async fn login_anonymous(
             user: None,
             requires_two_factor: false,
             challenge_token: None,
+            code: Some(IpcErrorCode::InvalidCredentials),
         });
     }
 
@@ -823,6 +864,7 @@ pub async fn login_anonymous(
                     user: None,
                     requires_two_factor: true,
                     challenge_token: result.challenge_token,
+                    code: Some(IpcErrorCode::TwoFactorRequired),
                 });
             }
             if result.ok {
@@ -848,6 +890,7 @@ pub async fn login_anonymous(
                     user: Some(user_info),
                     requires_two_factor: false,
                     challenge_token: None,
+                    code: None,
                 })
             } else {
                 Ok(LoginResponse {
@@ -856,6 +899,7 @@ pub async fn login_anonymous(
                     user: None,
                     requires_two_factor: false,
                     challenge_token: None,
+                    code: Some(IpcErrorCode::InvalidCredentials),
                 })
             }
         }
@@ -867,6 +911,7 @@ pub async fn login_anonymous(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(sign_in_failure_code(&e)),
             })
         }
     }
@@ -952,6 +997,44 @@ mod account_boundary_tests {
         assert_eq!(
             super::delete_failure_message(&super::ApiError::Unauthorized).code,
             super::IpcErrorCode::SessionExpired
+        );
+    }
+
+    /// Sign-in refusals carry a contract code: a 401 from a sign-in endpoint
+    /// is wrong credentials (never "session expired"), and a 2FA refusal is
+    /// `two_factor_invalid`.
+    #[test]
+    fn sign_in_refusals_carry_their_codes() {
+        use super::{sign_in_failure_code, two_factor_failure_code, ApiError, IpcErrorCode};
+        assert_eq!(
+            sign_in_failure_code(&ApiError::Unauthorized),
+            IpcErrorCode::InvalidCredentials
+        );
+        assert_eq!(
+            sign_in_failure_code(&ApiError::Rejected {
+                status: 401,
+                message: "Invalid credentials".into()
+            }),
+            IpcErrorCode::InvalidCredentials
+        );
+        assert_eq!(
+            sign_in_failure_code(&ApiError::RateLimited),
+            IpcErrorCode::RateLimited
+        );
+        assert_eq!(
+            sign_in_failure_code(&ApiError::Network("x".into())),
+            IpcErrorCode::NetworkOffline
+        );
+        assert_eq!(
+            two_factor_failure_code(&ApiError::Rejected {
+                status: 400,
+                message: "Invalid code".into()
+            }),
+            IpcErrorCode::TwoFactorInvalid
+        );
+        assert_eq!(
+            two_factor_failure_code(&ApiError::ServerError(502)),
+            IpcErrorCode::ServerError
         );
     }
 

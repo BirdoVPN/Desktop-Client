@@ -603,10 +603,6 @@ fn main() {
             commands::settings::save_settings,
             commands::settings::set_autostart,
             commands::settings::set_crash_reports_enabled,
-            // System tray
-            commands::tray::set_tray_state,
-            // Window placement (corner anchor / draggable)
-            commands::window::set_window_position,
             // Kill switch
             commands::killswitch::get_killswitch_status,
             commands::killswitch::set_killswitch_live,

@@ -631,26 +631,20 @@ pub async fn disconnect_vpn(app: AppHandle) -> Result<bool, IpcError> {
 
 /// `get_vpn_status` and the `vpn-status-changed` payload (contract §1).
 ///
-/// WIRE CASING, deliberately mixed: the fields that existed before v2 keep the
-/// camelCase they have always had on the wire (the contract says they are
-/// unchanged, and the UI already reads them that way), and the fields v2 adds
-/// use the snake_case names the contract table spells out.
+/// camelCase on the wire, the v2 fields included (`killSwitchBlocking`,
+/// `reconnectAttempt`, `reconnectMax`, `serverId`, `multiHop`, `seq`,
+/// `phase`, `error`), as the pre-v2 fields always were. The `error` payload
+/// itself keeps the contract's `IpcError` shape.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VpnStatus {
     pub state: &'static str,
-    #[serde(rename = "phase")]
     pub phase: Option<ConnectPhase>,
-    #[serde(rename = "reconnect_attempt")]
     pub reconnect_attempt: Option<u32>,
-    #[serde(rename = "reconnect_max")]
     pub reconnect_max: Option<u32>,
-    #[serde(rename = "kill_switch_blocking")]
     pub kill_switch_blocking: bool,
     pub error: Option<IpcError>,
-    #[serde(rename = "server_id")]
     pub server_id: Option<String>,
-    #[serde(rename = "multi_hop")]
     pub multi_hop: Option<MultiHopStatus>,
     pub seq: u64,
 
@@ -1125,8 +1119,9 @@ mod tests {
         );
     }
 
-    /// Contract §1: the exact key set of `VpnStatus` — the pre-v2 fields keep
-    /// their camelCase, the v2 fields use the contract's snake_case names.
+    /// Contract §1: the exact key set of `VpnStatus`, camelCase throughout
+    /// (the casing correction of 2026-09-30); the IpcError inside keeps its
+    /// contract shape.
     #[test]
     fn vpn_status_serializes_the_contract_shape() {
         let status = VpnStatus {
@@ -1169,29 +1164,30 @@ mod tests {
                 "connectedAt",
                 "dnsDegraded",
                 "error",
-                "kill_switch_blocking",
-                "multi_hop",
+                "killSwitchBlocking",
+                "multiHop",
                 "phase",
                 "pqMode",
                 "quantumActive",
-                "reconnect_attempt",
-                "reconnect_max",
+                "reconnectAttempt",
+                "reconnectMax",
                 "seq",
+                "serverId",
                 "serverName",
-                "server_id",
                 "state",
                 "stealthActive"
             ]
         );
         assert_eq!(json["phase"], "handshaking");
         assert_eq!(json["error"]["code"], "server_unreachable");
+        assert!(json["error"].get("retry_after_secs").is_some());
         assert_eq!(
-            json["multi_hop"],
+            json["multiHop"],
             serde_json::json!({
-                "entry_id": "entry-1",
-                "entry_name": "Frankfurt",
-                "exit_id": "exit-1",
-                "exit_name": "Reykjavik"
+                "entryId": "entry-1",
+                "entryName": "Frankfurt",
+                "exitId": "exit-1",
+                "exitName": "Reykjavik"
             })
         );
     }

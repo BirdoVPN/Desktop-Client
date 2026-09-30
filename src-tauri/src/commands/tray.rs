@@ -139,13 +139,6 @@ pub fn apply_tray_status(app: &AppHandle, status: &crate::commands::vpn::VpnStat
     }
 }
 
-/// Retired: the tray follows the Rust state choke point now (W1-023). Kept
-/// registered, and deliberately inert, only so the current UI's call resolves
-/// instead of rejecting; it takes no arguments so whatever the UI still sends
-/// is ignored. The UI lane drops the call, and this command with it.
-#[tauri::command]
-pub fn set_tray_state() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
