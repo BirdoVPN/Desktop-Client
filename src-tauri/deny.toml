@@ -42,8 +42,9 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
-# Skip our own first-party crate (license = "Proprietary", publish = false) — it
-# isn't a third-party dependency whose license we need to vet.
+# Skip our own first-party crate (license = "CC-BY-NC-4.0", publish = false) — it
+# isn't a third-party dependency whose license we need to vet. It must stay
+# skipped: CC-BY-NC-4.0 is deliberately not in the allow-list above.
 private = { ignore = true }
 
 # `ring` ships a custom LICENSE that doesn't resolve to a single SPDX id

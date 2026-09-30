@@ -1083,12 +1083,6 @@ jobs:
           name: birdo-vpn-macos-x64
           path: release-files/macos-x64/
 
-      # Every platform emits a `SHA256SUMS.txt` (+ .sigstore/.asc) and macOS emits
-      # a generic `BirdoVPN.app.tar.gz` — identical basenames. A GitHub release
-      # cannot hold two assets with the same name (softprops uploads by basename),
-      # so the second upload 404s on the asset-metadata update and fails the job.
-      # Scope those colliding names per-platform; installer names already carry
-      # the version+arch and are unique.
       # Name every asset for the platform it runs on, and disambiguate the
       # basenames that would otherwise collide.
       #
@@ -1097,10 +1091,13 @@ jobs:
       #    `_x64-setup.exe` vs `_amd64.AppImage` vs `_x64.dmg` were only
       #    distinguishable if you already knew which bundler produced which
       #    extension. Insert an OS token: `BirdoVPN_<ver>_<OS>_<arch>.<ext>`.
-      #  * Every platform emits `SHA256SUMS.txt` and macOS emits a generic
-      #    `BirdoVPN.app.tar.gz` — identical basenames. A GitHub release cannot
-      #    hold two assets with the same name (softprops uploads by basename),
-      #    so the second upload 404s on the metadata update and fails the job.
+      #  * Both macOS builds emit a generic `BirdoVPN.app.tar.gz` (+ its .sig) —
+      #    identical basenames. A GitHub release cannot hold two assets with the
+      #    same name (softprops uploads by basename), so the second upload 404s
+      #    on the metadata update and fails the job. (Per-platform
+      #    SHA256SUMS.txt, .sigstore and GPG .asc files used to collide the same
+      #    way. None is built any more: the one SHA256SUMS.txt and its Sigstore
+      #    bundle are made further down, after this rename.)
       #
       # !! DO NOT rename in a way that breaks the updater !!
       # `backend/src/updates/updates.controller.ts` resolves the bundle to serve
@@ -1109,10 +1106,11 @@ jobs:
       #   2. an arch token anywhere in the name — x86_64|x64|amd64 / aarch64|arm64
       #   3. the detached signature by EXACT `<installer-name>.sig`
       # So the OS token may only be INSERTED (never replacing the arch token or
-      # the extension), and companions (.sig/.sigstore/.asc) must be renamed in
-      # lockstep with their installer — which the shared `BirdoVPN_<ver>_` prefix
-      # rule below does automatically, since a companion is just the installer
-      # name plus a suffix. `updates.controller.spec.ts` asserts the patterns
+      # the extension), and the .sig companion (the updater signature, the only
+      # per-installer companion shipped) must be renamed in lockstep with its
+      # installer — which the shared `BirdoVPN_<ver>_` prefix rule below does
+      # automatically, since a companion is just the installer name plus a
+      # suffix. `updates.controller.spec.ts` asserts the patterns
       # still match these exact names; run it if you touch this.
       - name: Name assets per platform (and disambiguate collisions)
         shell: bash
@@ -1123,7 +1121,7 @@ jobs:
             [ -d "$root" ] || return 0
             # Insert the OS token after the version: BirdoVPN_1.2.3_x64-setup.exe
             # -> BirdoVPN_1.2.3_Windows_x64-setup.exe. Applies to installers AND
-            # their .sig/.sigstore/.asc companions, keeping the pairing intact.
+            # their .sig companions, keeping the pairing intact.
             find "$root" -type f -name 'BirdoVPN_*' | while read -r f; do
               b="$(basename "$f")"
               n="$(printf '%s' "$b" | sed -E "s/^BirdoVPN_([0-9][^_]*)_/BirdoVPN_\1_${os}_/")"
