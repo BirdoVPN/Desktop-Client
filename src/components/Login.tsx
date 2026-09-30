@@ -1,4 +1,4 @@
-import { useState, useRef, useId, type FormEvent, type KeyboardEvent } from 'react';
+import { useState, useRef, useId, useEffect, type FormEvent, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore, type AccountInfo } from '@/store/app-store';
@@ -103,6 +103,12 @@ export function Login() {
     }
   };
   const tabsId = useId();
+  // The 2FA step replaces the form the user just submitted: put them in the
+  // code field (what `autoFocus` did, without re-grabbing focus on re-render).
+  const totpRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (twoFactorRequired) totpRef.current?.focus();
+  }, [twoFactorRequired]);
 
   const { setAuthenticated, setUserEmail, sessionEndedReason, setSessionEndedReason } = useAppStore(
     useShallow((s) => ({
@@ -477,6 +483,7 @@ export function Login() {
                   Verification Code
                 </label>
                 <input
+                  ref={totpRef}
                   id="totp"
                   type="text"
                   inputMode="text"
@@ -488,7 +495,6 @@ export function Login() {
                   placeholder="000000 or backup code"
                   required
                   maxLength={19}
-                  autoFocus
                   aria-describedby="totp-hint"
                   className="w-full rounded-birdo-sub px-4 py-3 text-center text-2xl tracking-[0.3em] outline-hidden"
                   style={{

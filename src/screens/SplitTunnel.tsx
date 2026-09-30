@@ -283,7 +283,11 @@ export function SplitTunnel() {
           <>
             {/* ── Add by path/name, installed-app picker, or file browse ── */}
             <div className="mt-3">
-              <label className="mb-1.5 block pl-1 text-xs font-medium" style={{ color: white.w60 }}>
+              <label
+                htmlFor="kill-switch-exception-input"
+                className="mb-1.5 block pl-1 text-xs font-medium"
+                style={{ color: white.w60 }}
+              >
                 Add by path or name
               </label>
               <div className="flex gap-2">
@@ -298,12 +302,12 @@ export function SplitTunnel() {
                 >
                   <Plus size={18} color={white.w60} aria-hidden className="shrink-0" />
                   <input
+                    id="kill-switch-exception-input"
                     type="text"
                     value={appInput}
                     onChange={(e) => setAppInput(e.target.value)}
                     onKeyDown={handleInputKeyDown}
                     placeholder="e.g. chrome.exe"
-                    aria-label="App path or name"
                     className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-hidden placeholder:text-w60"
                     style={{ color: white.w100 }}
                   />
