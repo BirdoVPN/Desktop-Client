@@ -22,7 +22,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
 import { errorCopy } from '@/lib/errors';
 import { useAppStore, type Server } from '@/store/app-store';
-import { selectDisplayState, selectTunnelActive } from '@/store/selectors';
+import { selectTunnelActive } from '@/store/selectors';
 import { endSession } from '@/session/session';
 import {
   loadAdminStatus,
@@ -31,7 +31,7 @@ import {
   loadSubscription,
   resetSessionData,
 } from '@/session/session-data';
-import { connectPreferred, disconnectVpn, findLiveServer } from '@/session/vpn-actions';
+import { connectPreferred, findLiveServer } from '@/session/vpn-actions';
 import { persistSettings } from '@/session/settings-persist';
 import {
   connectionNotification,
@@ -144,28 +144,24 @@ function useStatsPoll(): void {
 }
 
 /**
- * Tray actions (W2-001, W2-003). Disconnect acts in EVERY state that has a
- * tunnel, a dial or a block — it used to act only in `connected`, so during a
- * five-minute reconnect loop the tray's enabled Disconnect did nothing.
+ * Tray Quick Connect and Disconnect run in Rust (W1-023, W2-003): they must work
+ * with the window hidden, behind the biometric cover or with the webview
+ * suspended, so the UI no longer acts on the `tray-*` events — acting as well
+ * dialled twice. Rust cannot read this store, though, so mirror the user's
+ * server into the Rust setting quick-connect does read (`preferred_server_id`):
+ * the tray then dials the server the Connect button would, not merely the
+ * least-loaded one. Waits for hydration because `persistSettings` writes the
+ * whole settings object, and writing it before Rust's copy has loaded would
+ * replace the user's settings with defaults.
  */
-function useTrayActions(): void {
+function usePreferredServerMirror(): void {
+  const lastServerId = useAppStore((s) => s.lastServerId);
+  const hydrated = useAppStore((s) => s.settingsHydrated);
   useEffect(() => {
-    const offConnect = unlistenLater(
-      listen('tray-quick-connect', () => {
-        const d = selectDisplayState(useAppStore.getState());
-        if (d === 'disconnected' || d === 'error') void connectPreferred();
-      }),
-    );
-    const offDisconnect = unlistenLater(
-      listen('tray-disconnect', () => {
-        if (selectTunnelActive(useAppStore.getState())) void disconnectVpn();
-      }),
-    );
-    return () => {
-      offConnect();
-      offDisconnect();
-    };
-  }, []);
+    if (!hydrated || !lastServerId) return;
+    if (useAppStore.getState().settings.preferredServerId === lastServerId) return;
+    void persistSettings({ preferredServerId: lastServerId }, { quiet: true });
+  }, [hydrated, lastServerId]);
 }
 
 /** Contract §3.3: Rust already tore down and cleared tokens; route to Login. */
@@ -400,7 +396,7 @@ function useStealthFallbackNotice(): void {
 export function VpnSessionController(): null {
   useStatusSync();
   useStatsPoll();
-  useTrayActions();
+  usePreferredServerMirror();
   useSessionExpiry();
   useSessionData();
   useAutoConnectOnce();

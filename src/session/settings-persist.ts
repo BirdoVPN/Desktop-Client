@@ -68,7 +68,7 @@ export function cancelScheduledReapply(): void {
  */
 export async function persistSettings(
   patch: Partial<AppSettings>,
-  opts: { reapply?: boolean } = {},
+  opts: { reapply?: boolean; quiet?: boolean } = {},
 ): Promise<boolean> {
   const store = useAppStore.getState();
   const before = store.settings;
@@ -85,10 +85,14 @@ export async function persistSettings(
       }
     }
     useAppStore.getState().updateSettings(revert);
-    useAppStore.getState().showNotice({
-      text: "Couldn't save that setting. It has been put back — please try again.",
-      tone: 'danger',
-    });
+    // A background mirror the user never touched must not raise a notice
+    // about "that setting"; it rolls back the same way and retries next time.
+    if (!opts.quiet) {
+      useAppStore.getState().showNotice({
+        text: "Couldn't save that setting. It has been put back — please try again.",
+        tone: 'danger',
+      });
+    }
     return false;
   }
   if (opts.reapply) scheduleReapply();

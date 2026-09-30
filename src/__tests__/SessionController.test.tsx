@@ -179,28 +179,56 @@ describe('session expiry (W2-006, contract §3.3)', () => {
   });
 });
 
-describe('tray actions (W2-001, W2-003)', () => {
-  it('tray Disconnect acts during a reconnect loop — it used to do nothing outside "connected"', async () => {
-    render(<VpnSessionController />);
-    emit('vpn-status-changed', { state: 'reconnecting', seq: 9, kill_switch_blocking: true, error: null });
-    emit('tray-disconnect');
-    await waitFor(() => expect(callsTo('disconnect_vpn')).toHaveLength(1));
-  });
-
-  it('tray Disconnect releases an always-on block with no tunnel', async () => {
-    render(<VpnSessionController />);
-    emit('vpn-status-changed', { state: 'disconnected', seq: 9, kill_switch_blocking: true, error: null });
-    emit('tray-disconnect');
-    await waitFor(() => expect(callsTo('disconnect_vpn')).toHaveLength(1));
-  });
-
-  it('tray Quick Connect from an error dials the server the user last used', async () => {
+describe('tray actions run in Rust (W1-023, W2-003)', () => {
+  // Rust performs tray Quick Connect / Disconnect itself so they work with the
+  // window hidden; the events are notifications only. Acting on them here as
+  // well dialled twice (a wasted key and /vpn/connect per click).
+  it('does not act on tray events, in any state', async () => {
     useAppStore.setState({ lastServerId: 'c' });
     render(<VpnSessionController />);
     await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
-    emit('vpn-status-changed', { state: 'error', seq: 9, error: { code: 'server_unreachable', message: '' } });
+    emit('vpn-status-changed', { state: 'reconnecting', seq: 9, kill_switch_blocking: true, error: null });
+    emit('tray-disconnect');
+    emit('vpn-status-changed', { state: 'error', seq: 10, error: { code: 'server_unreachable', message: '' } });
     emit('tray-quick-connect');
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'c' }]]));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(callsTo('disconnect_vpn')).toHaveLength(0);
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it("mirrors the user's server into preferred_server_id so the tray dials it", async () => {
+    useAppStore.setState({ lastServerId: 'c' });
+    render(<VpnSessionController />);
+    await waitFor(() =>
+      expect(callsTo('save_settings').some(([, a]) =>
+        (a as { settings: { preferred_server_id: string | null } }).settings.preferred_server_id === 'c')).toBe(true),
+    );
+  });
+
+  it("never writes settings before Rust's copy has loaded (it would replace them with defaults)", async () => {
+    let releaseSettings: (v: unknown) => void = () => {};
+    const settingsLoaded = new Promise((r) => { releaseSettings = r; });
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd, args) => {
+      if (cmd === 'get_settings') { await settingsLoaded; return rustSettings; }
+      return base(cmd, args);
+    });
+    useAppStore.setState({ lastServerId: 'c' });
+    render(<VpnSessionController />);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(callsTo('save_settings')).toHaveLength(0);
+    releaseSettings(undefined);
+    await waitFor(() => expect(callsTo('save_settings').length).toBeGreaterThan(0));
+  });
+
+  it('does not rewrite settings when Rust already has the same server', async () => {
+    rustSettings = { ...rustSettings, preferred_server_id: 'c' };
+    useAppStore.setState({ lastServerId: 'c' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().settingsHydrated).toBe(true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(callsTo('save_settings')).toHaveLength(0);
   });
 });
 
@@ -253,7 +281,7 @@ describe('session data is loaded once, not per tab visit (W2-023)', () => {
 });
 
 describe('App: the controller runs under the biometric cover (W2-001, W2-026)', () => {
-  it('tray Disconnect works while the app is locked', async () => {
+  it('keeps tracking the tunnel while the app is locked', async () => {
     vi.doMock('@tauri-apps/api/window', () => ({
       getCurrentWindow: () => ({
         isVisible: async () => false,
@@ -289,7 +317,9 @@ describe('App: the controller runs under the biometric cover (W2-001, W2-026)', 
     expect(callsTo('authenticate_biometric')).toHaveLength(0);
 
     await waitFor(() => expect(useAppStore.getState().connectionState).toBe('connected'));
-    emit('tray-disconnect');
-    await waitFor(() => expect(callsTo('disconnect_vpn')).toHaveLength(1));
+    // A drop published by Rust (e.g. after a tray Disconnect, which Rust performs
+    // itself) still reaches the store under the cover.
+    emit('vpn-status-changed', { state: 'disconnected', seq: 999, kill_switch_blocking: false, error: null });
+    await waitFor(() => expect(useAppStore.getState().connectionState).toBe('disconnected'));
   });
 });

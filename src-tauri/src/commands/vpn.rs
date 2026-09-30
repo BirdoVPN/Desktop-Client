@@ -832,7 +832,8 @@ async fn quick_connect_target(
     }
 
     let servers = api.get_servers().await.map_err(IpcError::from)?;
-    let best_server = pick_quick_connect_server(servers).ok_or_else(|| {
+    let best_server = pick_quick_connect_server(servers, settings.preferred_server_id.as_deref())
+        .ok_or_else(|| {
         IpcError::new(
             IpcErrorCode::ServerUnavailable,
             "No online servers available",
@@ -841,7 +842,7 @@ async fn quick_connect_target(
 
     // P6-CLI-D-03: the chosen node is connection history. INFO records that a quick
     // connect happened; the node itself only goes to debug.
-    tracing::info!("Quick connecting to the best available server");
+    tracing::info!("Quick connecting to the preferred or best available server");
     tracing::debug!(
         "Quick connecting to {} ({})",
         best_server.name,
@@ -867,14 +868,26 @@ async fn quick_connect_target(
 /// Ties keep list order (`min_by_key` returns the FIRST minimum), which is the
 /// old alphabetical behaviour on an idle fleet — every node reports load 0
 /// today, so quick-connect stays deterministic rather than flapping.
+///
+/// `preferred` is the server the user last chose (`preferred_server_id`, which
+/// the UI mirrors from its own selection). The tray's Quick Connect must dial
+/// what the Connect button would, so a preferred node the user can use wins
+/// over a less-loaded one; an offline, plan-gated or vanished one falls back to
+/// the rule above rather than failing.
+///
 /// Kept free of Tauri state so it is unit-testable.
 pub(crate) fn pick_quick_connect_server(
     servers: Vec<crate::api::types::VpnServer>,
+    preferred: Option<&str>,
 ) -> Option<crate::api::types::VpnServer> {
-    servers
+    let usable: Vec<_> = servers
         .into_iter()
         .filter(|s| s.is_online && s.accessible)
-        .min_by_key(|s| s.load)
+        .collect();
+    if let Some(chosen) = preferred.and_then(|id| usable.iter().find(|s| s.id == id)) {
+        return Some(chosen.clone());
+    }
+    usable.into_iter().min_by_key(|s| s.load)
 }
 
 /// Live-reapply tunnel-affecting settings to the ACTIVE session (mobile parity).
@@ -1330,10 +1343,10 @@ mod tests {
 
     #[test]
     fn quick_connect_picks_lowest_load() {
-        let picked = pick_quick_connect_server(vec![
-            server("A", true, true, 60),
-            server("B", true, true, 10),
-        ])
+        let picked = pick_quick_connect_server(
+            vec![server("A", true, true, 60), server("B", true, true, 10)],
+            None,
+        )
         .unwrap();
         assert_eq!(picked.id, "B");
     }
@@ -1343,43 +1356,77 @@ mod tests {
     /// see a failure instead of a connection.
     #[test]
     fn quick_connect_skips_inaccessible_even_when_emptier() {
-        let picked = pick_quick_connect_server(vec![
-            server("A", true, false, 5),
-            server("B", true, true, 40),
-        ])
+        let picked = pick_quick_connect_server(
+            vec![server("A", true, false, 5), server("B", true, true, 40)],
+            None,
+        )
         .unwrap();
         assert_eq!(picked.id, "B");
     }
 
     #[test]
     fn quick_connect_skips_offline_even_when_emptier() {
-        let picked = pick_quick_connect_server(vec![
-            server("A", false, true, 0),
-            server("B", true, true, 40),
-        ])
+        let picked = pick_quick_connect_server(
+            vec![server("A", false, true, 0), server("B", true, true, 40)],
+            None,
+        )
         .unwrap();
         assert_eq!(picked.id, "B");
     }
 
     #[test]
     fn quick_connect_none_when_all_offline() {
-        assert!(pick_quick_connect_server(vec![
-            server("A", false, true, 0),
-            server("B", false, true, 0),
-        ])
+        assert!(pick_quick_connect_server(
+            vec![server("A", false, true, 0), server("B", false, true, 0),],
+            None
+        )
         .is_none());
-        assert!(pick_quick_connect_server(vec![]).is_none());
+        assert!(pick_quick_connect_server(vec![], None).is_none());
+    }
+
+    /// The tray dials the user's own server when they can use it, even when a
+    /// node is emptier — the same server the Connect button would dial.
+    #[test]
+    fn quick_connect_prefers_the_users_server_when_usable() {
+        let picked = pick_quick_connect_server(
+            vec![server("A", true, true, 5), server("B", true, true, 90)],
+            Some("B"),
+        )
+        .unwrap();
+        assert_eq!(picked.id, "B");
+    }
+
+    /// A preferred node that went offline, lost plan access or vanished falls
+    /// back to the least-loaded usable one instead of failing the connect.
+    #[test]
+    fn quick_connect_falls_back_when_the_preferred_server_is_unusable() {
+        for preferred in ["OFF", "LOCKED", "GONE"] {
+            let picked = pick_quick_connect_server(
+                vec![
+                    server("OFF", false, true, 0),
+                    server("LOCKED", true, false, 0),
+                    server("A", true, true, 50),
+                    server("B", true, true, 10),
+                ],
+                Some(preferred),
+            )
+            .unwrap();
+            assert_eq!(picked.id, "B", "preferred {preferred}");
+        }
     }
 
     /// Equal loads keep list order (the backend sorts by name), so an idle
     /// fleet behaves exactly as before — deterministic, not flapping.
     #[test]
     fn quick_connect_ties_keep_list_order() {
-        let picked = pick_quick_connect_server(vec![
-            server("Zed", true, true, 0),
-            server("Amsterdam", true, true, 0),
-            server("Berlin", true, true, 0),
-        ])
+        let picked = pick_quick_connect_server(
+            vec![
+                server("Zed", true, true, 0),
+                server("Amsterdam", true, true, 0),
+                server("Berlin", true, true, 0),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(picked.id, "Zed");
     }
