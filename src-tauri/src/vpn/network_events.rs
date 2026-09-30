@@ -42,7 +42,9 @@ use tokio::sync::watch;
 
 use super::reconnect_policy::Connectivity;
 
-/// The physical default route a session is built over.
+/// The physical default route a session is built over. (Never built on macOS,
+/// which has no route signal yet.)
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysicalRoute {
     pub gateway: Ipv4Addr,

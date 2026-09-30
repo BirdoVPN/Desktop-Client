@@ -898,9 +898,13 @@ mod tests {
             !udp_port_held(port),
             "after the listener is gone the port is free"
         );
-        // a TCP listener on the same port is NOT the proxy: UDP stays free
-        let tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        assert!(!udp_port_held(port));
+        // a TCP listener is NOT the proxy: UDP on its port stays free. The port
+        // comes from the TCP side: a port the OS picked for UDP can sit inside
+        // a TCP exclusion range (Hyper-V reserves blocks at the start of the
+        // dynamic range), which made the TCP bind — not the probe — fail.
+        let tcp = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let tcp_port = tcp.local_addr().unwrap().port();
+        assert!(!udp_port_held(tcp_port));
         drop(tcp);
     }
 

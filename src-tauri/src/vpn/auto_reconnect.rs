@@ -190,10 +190,15 @@ impl AutoReconnectConfig {
 /// `valid:false` answer is how a revocation arrives.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long `stop()` waits for the loop to finish its current step. A dial in
-/// flight has already been cancelled through the manager's epoch by then, so
-/// this is only a backstop.
-const STOP_GRACE: Duration = Duration::from_secs(3);
+/// How long `stop()` waits for the loop to finish its current step before
+/// aborting it. Normally milliseconds: every caller cancels the manager's
+/// epoch first, and a cancelled dial returns at its next await. But the
+/// tunnel build's machine-state passes are synchronous netsh (documented at
+/// 10-25 s on AV-heavy machines), and aborting the task in the middle of a
+/// build would drop it without the release that hands the DNS park back. So
+/// the grace outlasts a whole build (CONNECT_TIMEOUT) and abort stays a last
+/// resort for a loop that is truly wedged.
+const STOP_GRACE: Duration = Duration::from_secs(35);
 
 struct LoopTask {
     shutdown: watch::Sender<bool>,

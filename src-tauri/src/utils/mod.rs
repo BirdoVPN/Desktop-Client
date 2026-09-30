@@ -41,6 +41,7 @@ pub fn hidden_cmd(program: &str) -> std::process::Command {
 /// long as the child runs, and no `tokio::time::timeout` around it can fire.
 /// Pair this with [`run_bounded`], which kills the child on timeout.
 pub fn hidden_async_cmd(program: &str) -> tokio::process::Command {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut cmd = tokio::process::Command::new(program);
     #[cfg(target_os = "windows")]
     {
