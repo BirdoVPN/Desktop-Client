@@ -284,13 +284,9 @@ pub async fn delete_account(
     // traffic anyway; the full user-initiated path also stops auto-reconnect
     // and disarms the kill switch, so nothing is left blocking. Best effort:
     // a failed teardown never turns a completed erasure into an error.
-    if let Err(e) = crate::commands::vpn::disconnect_vpn(
-        app.clone(),
-        app.state(),
-        app.state(),
-        app.state(),
-    )
-    .await
+    if let Err(e) =
+        crate::commands::vpn::disconnect_vpn(app.clone(), app.state(), app.state(), app.state())
+            .await
     {
         tracing::warn!("Disconnect after account deletion failed: {}", e);
     }
@@ -906,19 +902,26 @@ mod account_boundary_tests {
         let cleared = del
             .find("credentials.clear_tokens()")
             .expect("local state cleared");
-        assert!(confirmed < disconnect, "disconnect runs before the server confirmed");
-        assert!(disconnect < cleared, "local state is cleared before the disconnect");
+        assert!(
+            confirmed < disconnect,
+            "disconnect runs before the server confirmed"
+        );
+        assert!(
+            disconnect < cleared,
+            "local state is cleared before the disconnect"
+        );
     }
 
     /// Second-pass #9: the preflight the dialog shows before confirming.
     #[test]
     fn preflight_names_the_stores_and_defaults_to_nothing() {
-        let named = super::deletion_preflight_result(&crate::api::types::DeletionPreflightResponse {
-            store_subscriptions_still_billing: Some(serde_json::json!([
-                { "store": "GOOGLE_PLAY", "productId": "birdo_operative", "expiresAt": null }
-            ])),
-            web_subscription_will_be_cancelled: Some(true),
-        });
+        let named =
+            super::deletion_preflight_result(&crate::api::types::DeletionPreflightResponse {
+                store_subscriptions_still_billing: Some(serde_json::json!([
+                    { "store": "GOOGLE_PLAY", "productId": "birdo_operative", "expiresAt": null }
+                ])),
+                web_subscription_will_be_cancelled: Some(true),
+            });
         assert_eq!(named.store_subscriptions_still_billing, vec!["Google Play"]);
         assert!(named.web_subscription_will_be_cancelled);
 
