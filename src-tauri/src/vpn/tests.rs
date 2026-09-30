@@ -258,6 +258,18 @@ mod tunnel_health_tests {
 #[cfg(test)]
 mod connection_state_tests {
     use super::super::manager::ConnectionState;
+    use crate::commands::ipc_error::IpcError;
+
+    fn reconnecting(attempt: u32) -> ConnectionState {
+        ConnectionState::Reconnecting {
+            attempt,
+            last_error: None,
+        }
+    }
+
+    fn error(message: &str) -> ConnectionState {
+        ConnectionState::Error(IpcError::unknown(message))
+    }
 
     #[test]
     fn disconnected_is_not_tunnel_active() {
@@ -281,12 +293,12 @@ mod connection_state_tests {
 
     #[test]
     fn reconnecting_is_not_tunnel_active() {
-        assert!(!ConnectionState::Reconnecting { attempt: 1 }.is_tunnel_active());
+        assert!(!reconnecting(1).is_tunnel_active());
     }
 
     #[test]
     fn error_is_not_tunnel_active() {
-        assert!(!ConnectionState::Error("test".into()).is_tunnel_active());
+        assert!(!error("test").is_tunnel_active());
     }
 
     // ── can_connect tests ────────────────────────────────
@@ -298,12 +310,18 @@ mod connection_state_tests {
 
     #[test]
     fn can_connect_from_error() {
-        assert!(ConnectionState::Error("fail".into()).can_connect());
+        assert!(error("fail").can_connect());
     }
 
     #[test]
     fn can_connect_from_reconnecting() {
-        assert!(ConnectionState::Reconnecting { attempt: 3 }.can_connect());
+        assert!(reconnecting(3).can_connect());
+    }
+
+    /// A live rebuild whose old tunnel is already gone connects from here.
+    #[test]
+    fn can_connect_from_switching() {
+        assert!(ConnectionState::Switching.can_connect());
     }
 
     #[test]
@@ -335,12 +353,19 @@ mod connection_state_tests {
 
     #[test]
     fn can_disconnect_from_reconnecting() {
-        assert!(ConnectionState::Reconnecting { attempt: 1 }.can_disconnect());
+        assert!(reconnecting(1).can_disconnect());
     }
 
     #[test]
     fn can_disconnect_from_error() {
-        assert!(ConnectionState::Error("err".into()).can_disconnect());
+        assert!(error("err").can_disconnect());
+    }
+
+    /// Contract §3.1: Disconnect is valid in every state but the two that are
+    /// already there.
+    #[test]
+    fn can_disconnect_from_switching() {
+        assert!(ConnectionState::Switching.can_disconnect());
     }
 
     #[test]
@@ -364,26 +389,14 @@ mod connection_state_tests {
 
     #[test]
     fn error_equality_by_message() {
-        assert_eq!(
-            ConnectionState::Error("x".into()),
-            ConnectionState::Error("x".into()),
-        );
-        assert_ne!(
-            ConnectionState::Error("a".into()),
-            ConnectionState::Error("b".into()),
-        );
+        assert_eq!(error("x"), error("x"));
+        assert_ne!(error("a"), error("b"));
     }
 
     #[test]
     fn reconnecting_equality_by_attempt() {
-        assert_eq!(
-            ConnectionState::Reconnecting { attempt: 2 },
-            ConnectionState::Reconnecting { attempt: 2 },
-        );
-        assert_ne!(
-            ConnectionState::Reconnecting { attempt: 1 },
-            ConnectionState::Reconnecting { attempt: 2 },
-        );
+        assert_eq!(reconnecting(2), reconnecting(2));
+        assert_ne!(reconnecting(1), reconnecting(2));
     }
 
     #[test]
@@ -391,9 +404,38 @@ mod connection_state_tests {
         let dbg = format!("{:?}", ConnectionState::Connecting);
         assert!(dbg.contains("Connecting"));
 
-        let dbg_err = format!("{:?}", ConnectionState::Error("timeout".into()));
+        let dbg_err = format!("{:?}", error("timeout"));
         assert!(dbg_err.contains("Error"));
         assert!(dbg_err.contains("timeout"));
+    }
+
+    /// Contract §1: the seven `state` strings, and nothing else.
+    #[test]
+    fn wire_names_match_the_contract() {
+        let names: Vec<&str> = [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Connected,
+            ConnectionState::Disconnecting,
+            reconnecting(1),
+            ConnectionState::Switching,
+            error("x"),
+        ]
+        .iter()
+        .map(ConnectionState::wire_name)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "disconnected",
+                "connecting",
+                "connected",
+                "disconnecting",
+                "reconnecting",
+                "switching",
+                "error"
+            ]
+        );
     }
 }
 
@@ -431,14 +473,8 @@ mod vpn_error_tests {
     }
 
     #[test]
-    fn general_error_display() {
-        let err = VpnError::General("Something went wrong".into());
-        assert_eq!(format!("{}", err), "Something went wrong");
-    }
-
-    #[test]
     fn vpn_error_is_error_trait() {
-        let err = VpnError::General("test".into());
+        let err = VpnError::OperationInProgress;
         let _: &dyn std::error::Error = &err;
     }
 }
@@ -492,11 +528,11 @@ mod vpn_manager_tests {
     }
 
     #[tokio::test]
-    async fn set_user_disconnected_flag() {
+    async fn a_new_attempt_supersedes_the_previous_epoch() {
         let mgr = VpnManager::new();
-        // set_user_disconnected should not panic
-        mgr.set_user_disconnected(true);
-        mgr.set_user_disconnected(false);
+        let first = mgr.begin_attempt();
+        mgr.cancel_in_flight();
+        assert!(!mgr.is_current(first));
     }
 
     #[tokio::test]
@@ -560,7 +596,7 @@ mod buffer_pool_tests {
 
 #[cfg(test)]
 mod auto_reconnect_service_tests {
-    use super::super::auto_reconnect::AutoReconnectService;
+    use super::super::auto_reconnect::{AutoReconnectService, ReconnectInfo};
     use super::super::manager::VpnManager;
     use crate::api::client::BirdoApi;
     use std::sync::Arc;
@@ -569,14 +605,6 @@ mod auto_reconnect_service_tests {
         let mgr = Arc::new(VpnManager::new());
         let api = Arc::new(BirdoApi::new());
         AutoReconnectService::new(mgr, api)
-    }
-
-    #[tokio::test]
-    async fn user_disconnect_flag_roundtrip() {
-        let service = create_service();
-        service.set_user_disconnected();
-        // Should not cause auto-reconnect to fire
-        service.clear_user_disconnected();
     }
 
     #[tokio::test]
@@ -589,22 +617,26 @@ mod auto_reconnect_service_tests {
     async fn store_last_config_roundtrip() {
         let service = create_service();
         service
-            .store_last_config(
-                "server-1".into(),
-                "US East".into(),
-                false,
-                1420,
-                String::new(),
-                Some(vec!["1.1.1.1".into()]),
-                true,
-                true,
-                true,
-                None,
-                Some("exit-1".into()),
-            )
+            .store_last_config(ReconnectInfo {
+                server_id: "server-1".into(),
+                server_name: "US East".into(),
+                local_network_sharing: false,
+                custom_mtu: 1420,
+                custom_port: String::new(),
+                custom_dns: Some(vec!["1.1.1.1".into()]),
+                stealth_mode: true,
+                quantum_protection: true,
+                dns_filtering: true,
+                fallback_reason: None,
+                multi_hop: None,
+            })
             .await;
-        // Store should succeed without panic
+        assert_eq!(
+            service.current_info().await.map(|i| i.server_id),
+            Some("server-1".to_string())
+        );
         service.clear_last_config().await;
+        assert!(service.current_info().await.is_none());
     }
 }
 
@@ -619,6 +651,7 @@ mod reconnect_request_mapping_tests {
     use super::super::auto_reconnect::{
         reconnect_connect_request, reconnect_multi_hop_request, ReconnectInfo,
     };
+    use super::super::manager::MultiHopStatus;
 
     fn info(dns_filtering: bool, exit: Option<&str>) -> ReconnectInfo {
         ReconnectInfo {
@@ -632,7 +665,12 @@ mod reconnect_request_mapping_tests {
             quantum_protection: false,
             dns_filtering,
             fallback_reason: None,
-            multi_hop_exit_node_id: exit.map(str::to_string),
+            multi_hop: exit.map(|exit| MultiHopStatus {
+                entry_id: "entry-1".into(),
+                entry_name: "Frankfurt".into(),
+                exit_id: exit.to_string(),
+                exit_name: "Reykjavik".into(),
+            }),
         }
     }
 

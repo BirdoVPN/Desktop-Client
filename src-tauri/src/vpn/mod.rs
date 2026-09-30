@@ -9,7 +9,8 @@ pub mod birdo_pq; // AUDIT-C1: BirdoPQ v1 ML-KEM-1024 PSK derivation (mirror of 
 pub mod buffer_pool; // FIX-2-4: Reduced to packet size constants only
 pub mod doh; // DNS-over-HTTPS resolver for SEC-002
 pub mod manager;
-pub mod network_monitor; // P2-15: System network connectivity monitor
+pub mod network_events; // OS route/resume signals for reconnect — zero packets (W1-011)
+pub mod reconnect_policy; // Pure auto-reconnect decisions + circuit breaker (W1-029)
 pub mod speed_test; // On-device speed test (P3-26)
 pub mod xray; // Xray Reality stealth tunnel (matching Android XrayManager)
 
@@ -36,6 +37,10 @@ mod wireguard_new;
 // Windows Filtering Platform for kill switch
 #[cfg(target_os = "windows")]
 pub mod wfp;
+
+// One-time heal of the netsh firewall rules builds <= 1.3.19 left (W1-036)
+#[cfg(target_os = "windows")]
+pub mod legacy_firewall;
 
 // Linux iptables firewall for kill switch
 #[cfg(target_os = "linux")]

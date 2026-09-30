@@ -1098,7 +1098,6 @@ mod tests {
             message: None,
             config: None,
             key_id: None,
-            private_key: None,
             public_key: None,
             preshared_key: None,
             assigned_ip: None,

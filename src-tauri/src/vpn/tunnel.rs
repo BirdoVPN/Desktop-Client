@@ -36,7 +36,7 @@ fn default_gateway_native() -> Option<String> {
 /// via `GetIpForwardTable2`. The interface index is needed to pin the endpoint
 /// host route to the physical NIC natively. `None` on any failure.
 #[cfg(windows)]
-fn default_route_native() -> Option<(Ipv4Addr, u32)> {
+pub(crate) fn default_route_native() -> Option<(Ipv4Addr, u32)> {
     use windows::Win32::NetworkManagement::IpHelper::{
         FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
     };
@@ -513,6 +513,11 @@ mod dual_stack_order_tests {
 pub(super) const ADAPTER_NAME: &str = "Birdo VPN";
 const TUNNEL_TYPE: &str = "Birdo";
 
+/// Upper bound for a subprocess the tunnel runs from async code (W1-017). The
+/// module documents netsh taking 10-25 s per call on AV-heavy machines; past
+/// this the child is killed instead of holding the connect or the disconnect.
+const SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Fixed GUID for the Birdo VPN adapter, so we can reliably reopen/delete
 /// stale adapters across restarts and crashes.
 /// Generated once — do not change after release.
@@ -894,23 +899,31 @@ impl WintunTunnel {
 
                         // Retry strategy: clean up any stale state and try again
 
+                        // W1-017: every wait and subprocess below used to block
+                        // the runtime worker (std::thread::sleep, a synchronous
+                        // netsh and PowerShell), so CONNECT_TIMEOUT could not
+                        // fire through them. They are async, bounded and killed
+                        // if the connect is cancelled now.
+                        //
                         // 1. Try opening stale adapter and dropping it
                         if let Ok(stale) = Adapter::open(&wintun, ADAPTER_NAME) {
                             tracing::info!("Found stale adapter, dropping it for cleanup");
                             drop(stale);
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
 
                         // 2. Try disabling the network interface via netsh
-                        let netsh_result = cmd("netsh")
-                            .args([
+                        let netsh_result = crate::utils::run_bounded(
+                            crate::utils::hidden_async_cmd("netsh").args([
                                 "interface",
                                 "set",
                                 "interface",
                                 ADAPTER_NAME,
                                 "admin=disable",
-                            ])
-                            .output();
+                            ]),
+                            SUBPROCESS_TIMEOUT,
+                        )
+                        .await;
                         match &netsh_result {
                             Ok(out) if out.status.success() => {
                                 tracing::info!("Disabled stale network interface via netsh");
@@ -925,19 +938,21 @@ impl WintunTunnel {
                         }
 
                         // 3. Also try removing via devcon-like PowerShell if it's a stuck device
-                        let ps_remove = cmd("powershell")
-                            .args([
+                        let ps_remove = crate::utils::run_bounded(
+                            crate::utils::hidden_async_cmd("powershell").args([
                                 "-NoProfile", "-NonInteractive", "-Command",
                                 "Get-PnpDevice -FriendlyName 'Wintun*' -ErrorAction SilentlyContinue | Remove-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue"
-                            ])
-                            .output();
+                            ]),
+                            SUBPROCESS_TIMEOUT,
+                        )
+                        .await;
                         if let Ok(out) = &ps_remove {
                             if out.status.success() {
                                 tracing::info!("Removed stale Wintun PnP device");
                             }
                         }
 
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
                         // Retry with fixed GUID
                         tracing::info!("Retrying adapter creation...");
@@ -1305,9 +1320,9 @@ impl WintunTunnel {
         };
 
         if !native_ok {
-            // Fallback: netsh set address + MTU.
-            let output = cmd("netsh")
-                .args([
+            // Fallback: netsh set address + MTU (bounded and cancellable, W1-017).
+            let output = crate::utils::run_bounded(
+                crate::utils::hidden_async_cmd("netsh").args([
                     "interface",
                     "ip",
                     "set",
@@ -1316,9 +1331,11 @@ impl WintunTunnel {
                     "static",
                     client_ip,
                     "255.255.255.0",
-                ])
-                .output()
-                .map_err(|e| format!("Failed to run netsh: {}", e))?;
+                ]),
+                SUBPROCESS_TIMEOUT,
+            )
+            .await
+            .map_err(|e| format!("Failed to run netsh: {}", e))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.contains("already") && !stderr.is_empty() {
@@ -1327,8 +1344,8 @@ impl WintunTunnel {
             }
 
             let mtu_value = format!("mtu={}", self.config.mtu);
-            let mtu_output = cmd("netsh")
-                .args([
+            let mtu_output = crate::utils::run_bounded(
+                crate::utils::hidden_async_cmd("netsh").args([
                     "interface",
                     "ipv4",
                     "set",
@@ -1336,8 +1353,10 @@ impl WintunTunnel {
                     ADAPTER_NAME,
                     &mtu_value,
                     "store=active",
-                ])
-                .output();
+                ]),
+                SUBPROCESS_TIMEOUT,
+            )
+            .await;
             if let Ok(output) = mtu_output {
                 if !output.status.success() {
                     tracing::warn!(
@@ -1377,16 +1396,18 @@ impl WintunTunnel {
         // combined route metric (route_metric + interface_metric) beats the
         // physical adapter.  Without this, even metric-5 routes can lose to the
         // system default because the interface metric alone is higher.
-        let _ = cmd("netsh")
-            .args([
+        let _ = crate::utils::run_bounded(
+            crate::utils::hidden_async_cmd("netsh").args([
                 "interface",
                 "ip",
                 "set",
                 "interface",
                 ADAPTER_NAME,
                 "metric=5",
-            ])
-            .output();
+            ]),
+            SUBPROCESS_TIMEOUT,
+        )
+        .await;
 
         // Get default gateway BEFORE adding any routes (so we parse the real one)
         let default_gateway = self.get_default_gateway().await?;
@@ -1408,8 +1429,14 @@ impl WintunTunnel {
         //
         // Native first (CreateIpForwardEntry2 pinned to the physical interface),
         // then route.exe fallback; failing BOTH is fatal.
+        //
+        // A route that goes in must also be RECORDED (I10), so this runs to
+        // completion — `block_in_place` rather than a cancellable subprocess —
+        // but off the worker the rest of the runtime needs (W1-017).
         let phys_idx = default_route_native().map(|(_, idx)| idx);
-        add_endpoint_host_route(endpoint_ip, &default_gateway, phys_idx)?;
+        tokio::task::block_in_place(|| {
+            add_endpoint_host_route(endpoint_ip, &default_gateway, phys_idx)
+        })?;
 
         // I10 (#100): remember EXACTLY what went in — destination prefix,
         // interface index AND next hop — so the teardown can delete this row and
@@ -1512,20 +1539,22 @@ impl WintunTunnel {
             }
 
             // Use interface index for Wintun adapter - gateway 0.0.0.0 with IF parameter
-            match cmd("route")
-                .args([
-                    "add",
-                    network,
-                    "mask",
-                    mask,
-                    "0.0.0.0", // Gateway - use 0.0.0.0 for point-to-point interfaces
-                    "metric",
-                    "5",
-                    "IF",
-                    &if_index.to_string(),
-                ])
-                .output()
-            {
+            // (block_in_place: an added route must be recorded, see above).
+            match tokio::task::block_in_place(|| {
+                cmd("route")
+                    .args([
+                        "add",
+                        network,
+                        "mask",
+                        mask,
+                        "0.0.0.0", // Gateway - use 0.0.0.0 for point-to-point interfaces
+                        "metric",
+                        "5",
+                        "IF",
+                        &if_index.to_string(),
+                    ])
+                    .output()
+            }) {
                 Ok(output) if output.status.success() => {
                     tracing::debug!("Route added successfully: {} mask {}", network, mask);
                     record_tunnel_route(network, mask);
@@ -1634,18 +1663,20 @@ impl WintunTunnel {
 
         let mut added = 0u32;
         for (network, mask) in &local_routes {
-            match cmd("route")
-                .args([
-                    "add",
-                    network,
-                    "mask",
-                    mask,
-                    &default_gateway,
-                    "metric",
-                    "1", // Low metric to ensure these win over VPN routes for local traffic
-                ])
-                .output()
-            {
+            // block_in_place: an added route must be recorded (I10, W1-017).
+            match tokio::task::block_in_place(|| {
+                cmd("route")
+                    .args([
+                        "add",
+                        network,
+                        "mask",
+                        mask,
+                        &default_gateway,
+                        "metric",
+                        "1", // Low metric to ensure these win over VPN routes for local traffic
+                    ])
+                    .output()
+            }) {
                 Ok(output) if output.status.success() => {
                     tracing::debug!(
                         "Local network route added: {} mask {} via {}",
@@ -1683,18 +1714,19 @@ impl WintunTunnel {
         // status check and the attribution. Same treatment as its three
         // neighbours now, so only a route that actually went in is recorded and
         // only a recorded route is deleted.
-        match cmd("route")
-            .args([
-                "add",
-                "169.254.0.0",
-                "mask",
-                "255.255.0.0",
-                &default_gateway,
-                "metric",
-                "1",
-            ])
-            .output()
-        {
+        match tokio::task::block_in_place(|| {
+            cmd("route")
+                .args([
+                    "add",
+                    "169.254.0.0",
+                    "mask",
+                    "255.255.0.0",
+                    &default_gateway,
+                    "metric",
+                    "1",
+                ])
+                .output()
+        }) {
             Ok(output) if output.status.success() => {
                 record_lan_route("169.254.0.0", "255.255.0.0");
             }
@@ -1733,7 +1765,10 @@ impl WintunTunnel {
 
         let adapter_name = format!("name={}", ADAPTER_NAME);
 
-        crate::vpn::win_machine_state::claim(self.state_gen);
+        // The park is a synchronous netsh pass by design (it must be callable
+        // from Drop and the panic hook) and must not be abandoned halfway, so
+        // it runs to completion — off the runtime worker (W1-017).
+        tokio::task::block_in_place(|| crate::vpn::win_machine_state::claim(self.state_gen));
 
         // STEP 2: Set DNS on the VPN adapter. Native fast path first
         // (SetInterfaceDnsSettings via the adapter GUID — instant, no
@@ -1779,9 +1814,7 @@ impl WintunTunnel {
                         "validate=no",
                     ]
                 };
-                let output = cmd("netsh")
-                    .args(&args)
-                    .output()
+                let output = tokio::task::block_in_place(|| cmd("netsh").args(&args).output())
                     .map_err(|e| format!("Failed to set DNS: {}", e))?;
                 if !output.status.success() {
                     tracing::warn!(
@@ -1895,45 +1928,16 @@ impl WintunTunnel {
     }
 
     /// Remove the IPv6 block when disconnecting (native WFP — instant).
+    ///
+    /// W1-036: the heal of the netsh firewall rules versions <= 1.3.19 left
+    /// behind no longer runs here (six netsh processes on EVERY disconnect, for
+    /// machines healed long ago); it runs once per install at start-up, see
+    /// `legacy_firewall`. D-24: nothing here touches adapter bindings either —
+    /// IPv6 is blocked with a WFP filter, so there is no binding of ours to
+    /// restore; `ipv6_binding_tests` keeps it that way.
     async fn unblock_ipv6(&self) -> Result<(), String> {
         tracing::debug!("Removing IPv6 block (native WFP)");
-        crate::vpn::wfp::unblock_ipv6().await?;
-
-        // Best-effort legacy heal, fully non-blocking so disconnect stays
-        // instant: versions <= 1.3.19 may have left stale netsh firewall rules.
-        // Those rules carry our own names, so deleting them can only ever
-        // remove something we created. No-ops once a machine is healed.
-        //
-        // D-24 (audit 2026-09-29): this heal ALSO piped every ms_tcpip6 binding
-        // into PowerShell's binding-enable cmdlet on every disconnect,
-        // re-enabling IPv6 on EVERY adapter, including
-        // ones the user had switched IPv6 off on themselves. This build never
-        // touches adapter bindings (IPv6 is blocked with a WFP filter, see
-        // block_ipv6_leaks), so there is no binding of ours to restore, and the
-        // only bindings that line could still change were the user's. It is
-        // gone; `ipv6_binding_tests` keeps it gone.
-        tokio::task::spawn_blocking(|| {
-            for rule in [
-                "Birdo VPN Block IPv6 Out",
-                "Birdo VPN Block IPv6 Out UDP",
-                "Birdo VPN Block IPv6 In",
-                "Birdo VPN Block IPv6 In UDP",
-                "Birdo VPN Block ICMPv6",
-                "Birdo VPN Block 6in4",
-            ] {
-                let _ = cmd("netsh")
-                    .args([
-                        "advfirewall",
-                        "firewall",
-                        "delete",
-                        "rule",
-                        &format!("name={}", rule),
-                    ])
-                    .output();
-            }
-        });
-
-        Ok(())
+        crate::vpn::wfp::unblock_ipv6().await
     }
 
     /// Hand the physical adapters back the resolvers they had before this
@@ -1951,21 +1955,25 @@ impl WintunTunnel {
         }
         tracing::debug!("Restoring DNS");
 
-        // Restore DNS on VPN adapter (both families — configure_dns disabled both)
-        for family in ["ip", "ipv6"] {
-            let _ = cmd("netsh")
-                .args([
-                    "interface",
-                    family,
-                    "set",
-                    "dns",
-                    &format!("name={}", ADAPTER_NAME),
-                    "dhcp",
-                ])
-                .output();
-        }
+        // An un-park abandoned halfway is a stranded park, so this runs to
+        // completion — off the runtime worker (W1-017).
+        tokio::task::block_in_place(|| {
+            // Restore DNS on VPN adapter (both families — configure_dns disabled both)
+            for family in ["ip", "ipv6"] {
+                let _ = cmd("netsh")
+                    .args([
+                        "interface",
+                        family,
+                        "set",
+                        "dns",
+                        &format!("name={}", ADAPTER_NAME),
+                        "dhcp",
+                    ])
+                    .output();
+            }
 
-        crate::vpn::win_machine_state::release_dns(self.state_gen);
+            crate::vpn::win_machine_state::release_dns(self.state_gen);
+        });
 
         tracing::debug!("DNS restoration complete");
         Ok(())
@@ -1981,10 +1989,12 @@ impl WintunTunnel {
             return Ok(gw);
         }
 
-        let output = cmd("route")
-            .args(["print", "0.0.0.0"])
-            .output()
-            .map_err(|e| format!("Failed to get routes: {}", e))?;
+        let output = crate::utils::run_bounded(
+            crate::utils::hidden_async_cmd("route").args(["print", "0.0.0.0"]),
+            SUBPROCESS_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("Failed to get routes: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -2271,8 +2281,12 @@ impl WintunTunnel {
 
         // STEP 3: Network cleanup — run all three in parallel since they
         // are independent and each spawns external processes.
-        // Also flush DNS inline (ipconfig /flushdns is ~10ms).
-        let _ = cmd("ipconfig").args(["/flushdns"]).output();
+        // Also flush DNS (bounded: it must never hold a disconnect).
+        let _ = crate::utils::run_bounded(
+            crate::utils::hidden_async_cmd("ipconfig").args(["/flushdns"]),
+            SUBPROCESS_TIMEOUT,
+        )
+        .await;
         let (dns_r, ipv6_r, route_r) = tokio::join!(
             self.restore_dns(),
             self.unblock_ipv6(),
@@ -2323,9 +2337,10 @@ impl WintunTunnel {
         Ok(())
     }
 
-    /// Clean up routes when disconnecting.
+    /// Clean up routes when disconnecting — to completion, off the runtime
+    /// worker (W1-017).
     async fn cleanup_routes(&self) -> Result<(), String> {
-        self.cleanup_routes_blocking();
+        tokio::task::block_in_place(|| self.cleanup_routes_blocking());
         Ok(())
     }
 
@@ -2375,6 +2390,24 @@ impl WintunTunnel {
             wg.get_latency_ms().await
         } else {
             None
+        }
+    }
+
+    /// Time since the last completed WireGuard handshake (W1-002). `None` once
+    /// the WireGuard session is gone (the tunnel is being stopped).
+    pub async fn handshake_age(&self) -> Option<Duration> {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .map(|wg| wg.handshake_age())
+    }
+
+    /// Start a handshake now unless one is in flight (see
+    /// `WireGuardSession::force_handshake`).
+    pub async fn force_handshake(&self) {
+        if let Some(wg) = self.wg_session.read().await.as_ref() {
+            wg.force_handshake().await;
         }
     }
 
@@ -2469,48 +2502,13 @@ impl Drop for WintunTunnel {
         // left with no resolvers on its real interfaces.
         crate::vpn::win_machine_state::release_all(self.state_gen);
 
-        // Best-effort: remove IPv6 blocking firewall rules
-        let _ = cmd("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-Command",
-                "Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 Out' -ErrorAction SilentlyContinue; \
-                 Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 Out UDP' -ErrorAction SilentlyContinue; \
-                 Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 In' -ErrorAction SilentlyContinue; \
-                 Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 In UDP' -ErrorAction SilentlyContinue",
-            ])
-            .output();
-        let _ = cmd("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=Birdo VPN Block ICMPv6",
-            ])
-            .output();
-        let _ = cmd("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=Birdo VPN Block 6in4",
-            ])
-            .output();
-        // Also try legacy rule names
-        let _ = cmd("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=Birdo Block IPv6",
-            ])
-            .output();
-        // No adapter-binding "re-enable" here (D-24): this build never disables
-        // an ms_tcpip6 binding, so the only bindings a blanket re-enable could
-        // change are ones the USER turned off. The WFP IPv6 block lives in the
-        // dynamic session and is removed with it.
+        // Nothing to remove for IPv6: the WFP IPv6 block lives in the dynamic
+        // session and goes with it. (W1-036: the PowerShell + netsh deletion of
+        // the <= 1.3.19 firewall rules ran here on every unwind, seconds of
+        // AV-scanned process spawns on the crash path; it runs once per install
+        // now, see `legacy_firewall`.) No adapter-binding "re-enable" either
+        // (D-24): this build never disables an ms_tcpip6 binding, so the only
+        // bindings a blanket re-enable could change are ones the USER turned off.
 
         tracing::warn!("Emergency cleanup complete — DNS/route state may need manual verification");
     }

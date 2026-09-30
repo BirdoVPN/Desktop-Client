@@ -178,7 +178,10 @@ mod gdpr_request_tests {
         let wrong_password =
             r#"{"statusCode":401,"message":"Incorrect password","error":"Unauthorized"}"#;
         match BirdoApi::classify_gdpr_delete_response(StatusCode::UNAUTHORIZED, wrong_password) {
-            GdprDeleteOutcome::Refused(ApiError::Unknown(m)) => assert_eq!(m, "Incorrect password"),
+            GdprDeleteOutcome::Refused(ApiError::Rejected { status, message }) => {
+                assert_eq!(status, 401);
+                assert_eq!(message, "Incorrect password");
+            }
             other => panic!("wrong password must be shown, got {other:?}"),
         }
 
@@ -195,7 +198,10 @@ mod gdpr_request_tests {
     fn other_refusals_keep_the_backend_message() {
         let body = r#"{"statusCode":429,"message":"Slow down"}"#;
         match BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, body) {
-            GdprDeleteOutcome::Refused(ApiError::Unknown(m)) => assert_eq!(m, "Slow down"),
+            GdprDeleteOutcome::Refused(ApiError::Rejected { status, message }) => {
+                assert_eq!(status, 429);
+                assert_eq!(message, "Slow down");
+            }
             other => panic!("{other:?}"),
         }
         assert!(matches!(
@@ -857,7 +863,6 @@ mod types_serialization_tests {
         assert!(resp.success);
         assert!(resp.config.is_none());
         assert!(resp.key_id.is_none());
-        assert!(resp.private_key.is_none());
         assert!(resp.dns.is_none());
         assert!(resp.server_node.is_none());
     }
@@ -1117,7 +1122,10 @@ mod error_classification_tests {
         let body = r#"{"statusCode":403,"message":"Stealth mode requires an Operative or Sovereign subscription"}"#;
         let err = BirdoApi::classify_error_response(StatusCode::FORBIDDEN, body);
         match err {
-            ApiError::Unknown(msg) => assert!(msg.contains("Stealth mode requires")),
+            ApiError::Rejected { status, message } => {
+                assert_eq!(status, 403);
+                assert!(message.contains("Stealth mode requires"));
+            }
             other => panic!("403 should surface the backend's explanation, got {other:?}"),
         }
     }

@@ -883,8 +883,10 @@ pub struct ConnectResponse {
     pub config: Option<String>,
     #[serde(default)]
     pub key_id: Option<String>,
-    #[serde(default)]
-    pub private_key: Option<String>,
+    // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
+    // locally on every path (FIX-1-1); a server-generated one would mean the
+    // backend knows the client's secret. serde ignores the field if an old
+    // backend still sends it, so it can never be read, copied or kept.
     #[serde(default)]
     pub public_key: Option<String>,
     #[serde(default)]
@@ -1011,8 +1013,10 @@ pub struct MultiHopConnectResponse {
     pub config: Option<String>,
     #[serde(default)]
     pub key_id: Option<String>,
-    #[serde(default)]
-    pub private_key: Option<String>,
+    // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
+    // locally on every path (FIX-1-1); a server-generated one would mean the
+    // backend knows the client's secret. serde ignores the field if an old
+    // backend still sends it, so it can never be read, copied or kept.
     #[serde(default)]
     pub public_key: Option<String>,
     #[serde(default)]
@@ -1057,6 +1061,43 @@ pub struct MultiHopConnectResponse {
     pub rosenpass_public_key: Option<String>,
     #[serde(default, rename = "rosenpassEndpoint")]
     pub rosenpass_endpoint: Option<String>,
+}
+
+impl From<MultiHopConnectResponse> for ConnectResponse {
+    /// A Multi-Hop answer carries the same tunnel fields as a single-hop one,
+    /// so one `build_vpn_config` serves both. The route block is checked by
+    /// the caller BEFORE converting (`session::verified_multi_hop_response`).
+    fn from(response: MultiHopConnectResponse) -> Self {
+        ConnectResponse {
+            success: response.success,
+            message: response.message,
+            config: response.config,
+            key_id: response.key_id,
+            public_key: response.public_key,
+            preshared_key: response.preshared_key,
+            assigned_ip: response.assigned_ip,
+            // Dual-stack parity with single-hop: the exit node's assigned IPv6
+            // makes build_vpn_config route IPv6 exactly as single-hop does.
+            client_ipv6: response.client_ipv6,
+            server_public_key: response.server_public_key,
+            endpoint: response.endpoint,
+            dns: response.dns,
+            allowed_ips: response.allowed_ips,
+            mtu: response.mtu,
+            persistent_keepalive: response.persistent_keepalive,
+            server_node: None,
+            stealth_enabled: response.stealth_enabled,
+            xray_endpoint: response.xray_endpoint,
+            xray_uuid: response.xray_uuid,
+            xray_public_key: response.xray_public_key,
+            xray_short_id: response.xray_short_id,
+            xray_sni: response.xray_sni,
+            xray_flow: response.xray_flow,
+            quantum_enabled: response.quantum_enabled,
+            rosenpass_public_key: response.rosenpass_public_key,
+            rosenpass_endpoint: response.rosenpass_endpoint,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -14,6 +14,7 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use parking_lot::Mutex as FastMutex;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -74,11 +75,25 @@ pub struct WireGuardSession {
     tunnel: Arc<FastMutex<Tunn>>,
     socket: Arc<UdpSocket>,
     endpoint: SocketAddr,
-    is_connected: Arc<RwLock<bool>>,
+    /// Set by `close()`. The ONLY thing that stops outbound packets.
+    ///
+    /// W1-002: this used to be an `is_connected` flag that `update_timers`
+    /// latched false on `ConnectionExpired`, and `send_packet` refused to run
+    /// while it was false. boringtun re-handshakes when handed an outbound
+    /// packet, so the gate is what made every outage longer than ~90 s
+    /// permanent: the packet that would have restarted the handshake never
+    /// reached `encapsulate`.
+    closed: AtomicBool,
+    /// Only one warning per expiry, not one per 250 ms timer tick.
+    expiry_reported: AtomicBool,
     /// Track session creation for debugging/metrics
     created_at: Instant,
-    /// Track last successful handshake
-    last_handshake: Arc<RwLock<Option<Instant>>>,
+    /// When the last handshake COMPLETED, as last observed. boringtun forgets
+    /// it when it expires a session (`time_since_last_handshake()` goes to
+    /// `None`), so it is carried here to keep the age growing through an
+    /// outage — the same semantics as wg-go's `last_handshake_time_sec`, which
+    /// is what the iOS and Android liveness rules read.
+    last_handshake: FastMutex<Option<Instant>>,
     /// Track last measured latency in milliseconds
     last_latency_ms: Arc<RwLock<Option<u32>>>,
 }
@@ -312,9 +327,10 @@ impl WireGuardSession {
             tunnel: Arc::new(FastMutex::new(tunnel)),
             socket: Arc::new(socket),
             endpoint: endpoint_addr,
-            is_connected: Arc::new(RwLock::new(false)),
+            closed: AtomicBool::new(false),
+            expiry_reported: AtomicBool::new(false),
             created_at: Instant::now(),
-            last_handshake: Arc::new(RwLock::new(None)),
+            last_handshake: FastMutex::new(None),
             last_latency_ms: Arc::new(RwLock::new(None)),
         };
 
@@ -357,7 +373,7 @@ impl WireGuardSession {
             match self.handshake().await {
                 Ok(_) => {
                     // Record successful handshake time
-                    *self.last_handshake.write().await = Some(Instant::now());
+                    *self.last_handshake.lock() = Some(Instant::now());
                     return Ok(());
                 }
                 Err(e) if attempt < Self::MAX_HANDSHAKE_RETRIES => {
@@ -437,7 +453,6 @@ impl WireGuardSession {
                 match result {
                     TunnResult::Done => {
                         tracing::info!("WireGuard handshake complete");
-                        *self.is_connected.write().await = true;
                         Ok(())
                     }
                     TunnResult::WriteToNetwork(response_data) => {
@@ -448,7 +463,6 @@ impl WireGuardSession {
                             .map_err(|e| format!("Failed to send response: {}", e))?;
 
                         tracing::info!("WireGuard handshake complete (with response)");
-                        *self.is_connected.write().await = true;
                         Ok(())
                     }
                     TunnResult::Err(e) => Err(format!("Handshake failed: {:?}", e)),
@@ -487,9 +501,13 @@ impl WireGuardSession {
     /// Encrypt and send an IP packet
     /// PERF-001: Uses stack allocation for normal-sized packets (≤ MTU 1420 + overhead)
     /// to eliminate per-packet heap allocations. Falls back to heap for jumbo frames.
+    ///
+    /// `Ok(0)` means boringtun QUEUED the packet: there is no session right now
+    /// and a handshake is already in flight. That is the normal re-handshake
+    /// path after an outage (W1-002), not an error.
     pub async fn send_packet(&self, packet: &[u8]) -> Result<usize, String> {
-        if !*self.is_connected.read().await {
-            return Err("Not connected".to_string());
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("Session closed".to_string());
         }
 
         let total_size = packet.len() + WIREGUARD_OVERHEAD;
@@ -513,6 +531,7 @@ impl WireGuardSession {
                     Ok(sent)
                 }
                 TunnResult::Err(e) => Err(format!("Encryption failed: {:?}", e)),
+                TunnResult::Done => Ok(0),
                 _ => Err("Unexpected encapsulate result".to_string()),
             }
         } else {
@@ -534,6 +553,7 @@ impl WireGuardSession {
                     Ok(sent)
                 }
                 TunnResult::Err(e) => Err(format!("Encryption failed: {:?}", e)),
+                TunnResult::Done => Ok(0),
                 _ => Err("Unexpected encapsulate result".to_string()),
             }
         }
@@ -628,18 +648,21 @@ impl WireGuardSession {
             }
             TunnResult::Done => Ok(()),
             TunnResult::Err(e) => {
-                // P1-dk-timer-errors-swallowed (sink fix for all three
-                // platform packet loops): ConnectionExpired is fatal — the
-                // peer session is gone. Invalidate is_connected here so
-                // send_packet fails fast and the watchdog's heartbeat sees a
-                // dead tunnel immediately, instead of the dataplane reporting
-                // Connected indefinitely.
+                // ConnectionExpired means boringtun gave up on the CURRENT
+                // handshake attempt (REKEY_ATTEMPT_TIME without an answer, or
+                // no new keys for REJECT_AFTER_TIME*3). It is not terminal:
+                // the next outbound packet starts a fresh handshake, and an
+                // idle session is re-handshaked by the auto-reconnect loop's
+                // nudge (`force_handshake`). Whether the session is DEAD is
+                // decided from `handshake_age()` (W1-002), not from this.
                 if matches!(
                     e,
                     boringtun::noise::errors::WireGuardError::ConnectionExpired
-                ) {
-                    tracing::warn!("WireGuard session expired — marking dataplane disconnected");
-                    *self.is_connected.write().await = false;
+                ) && !self.expiry_reported.swap(true, Ordering::SeqCst)
+                {
+                    tracing::warn!(
+                        "WireGuard session expired — waiting for traffic or a nudge to re-handshake"
+                    );
                 }
                 Err(format!("Timer update failed: {:?}", e))
             }
@@ -652,14 +675,52 @@ impl WireGuardSession {
         self.endpoint.ip()
     }
 
-    /// Check if the session is connected
-    pub async fn is_connected(&self) -> bool {
-        *self.is_connected.read().await
+    /// Time since the last COMPLETED handshake (W1-002). Survives boringtun
+    /// expiring the session — see the `last_handshake` field. Before the first
+    /// handshake it is the session's age, which the liveness grace covers.
+    pub fn handshake_age(&self) -> Duration {
+        let observed = self.tunnel.lock().time_since_last_handshake();
+        let mut last = self.last_handshake.lock();
+        if let Some(completed) = observed.and_then(|age| Instant::now().checked_sub(age)) {
+            if last.is_none_or(|prev| completed > prev) {
+                *last = Some(completed);
+                self.expiry_reported.store(false, Ordering::SeqCst);
+            }
+        }
+        last.unwrap_or(self.created_at).elapsed()
     }
 
-    /// Get the last measured latency in milliseconds
+    /// Start a handshake now unless one is already in flight.
+    ///
+    /// For an IDLE session: with persistent keepalive off nothing would ever
+    /// rekey it, so its handshake age would grow past the liveness limit on a
+    /// perfectly healthy peer. Also what re-handshakes an expired session that
+    /// has no traffic queued, and what proves the path after a resume.
+    pub async fn force_handshake(&self) {
+        // WIREGUARD_OVERHEAD is sized for exactly this message (148 bytes).
+        let mut dst = [0u8; WIREGUARD_OVERHEAD];
+        let initiation = {
+            let mut tunnel = self.tunnel.lock();
+            match tunnel.format_handshake_initiation(&mut dst, false) {
+                TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
+                _ => None,
+            }
+        };
+        if let Some(packet) = initiation {
+            if let Err(e) = self.socket.send(&packet).await {
+                tracing::debug!("Forced handshake could not be sent: {}", e);
+            }
+        }
+    }
+
+    /// Round-trip time of the last handshake, in ms: a real measurement of the
+    /// path to the relay. Falls back to an explicit probe's result.
     pub async fn get_latency_ms(&self) -> Option<u32> {
-        *self.last_latency_ms.read().await
+        let handshake_rtt = self.tunnel.lock().stats().4;
+        match handshake_rtt {
+            Some(rtt) => Some(rtt),
+            None => *self.last_latency_ms.read().await,
+        }
     }
 
     /// Measure latency by sending a WireGuard keepalive and timing the response
@@ -706,7 +767,7 @@ impl WireGuardSession {
     /// Close the WireGuard session
     pub async fn close(&self) {
         tracing::debug!("Closing WireGuard session");
-        *self.is_connected.write().await = false;
+        self.closed.store(true, Ordering::SeqCst);
         // Socket will be dropped when session is dropped
     }
 }

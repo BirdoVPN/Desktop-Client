@@ -39,6 +39,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 
+use crate::commands::session::{end_session, EndReason};
+
 /// Event carrying installer download progress to the frontend.
 pub const DOWNLOAD_PROGRESS_EVENT: &str = "updater-download-progress";
 
@@ -87,7 +89,23 @@ struct DownloadProgress {
 /// which of the two is pin-checked; see the module docs. Errors are returned,
 /// never swallowed.
 fn pinned_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    let exit_app = app.clone();
     app.updater_builder()
+        // W1-004 backstop. On Windows `install()` runs this hook and then
+        // `std::process::exit(0)`, so no exit teardown can follow it.
+        // `install_update` ends the session BEFORE installing; this only
+        // un-parks DNS a teardown that timed out may have left behind. Setting
+        // the hook replaces the plugin's own, so its cleanup is kept here.
+        .on_before_exit(move || {
+            #[cfg(target_os = "windows")]
+            {
+                use tauri::Manager;
+                let _ = exit_app
+                    .state::<crate::vpn::VpnManager>()
+                    .restore_dns_blocking();
+            }
+            exit_app.cleanup_before_exit();
+        })
         // Bound the request so a black-holing middlebox cannot park the UI in
         // "checking" forever; the frontend also races its own timeout.
         .timeout(Duration::from_secs(30))
@@ -129,6 +147,14 @@ pub async fn check_for_updates(app: AppHandle) -> Result<Option<UpdateInfo>, Str
 /// signature check on the downloaded bundle, which is unchanged and remains the
 /// authority on what gets executed.
 ///
+/// W1-004: download, END THE SESSION, then install. On Windows the plugin's
+/// install launches the installer and calls `std::process::exit(0)`: no
+/// `RunEvent::ExitRequested`, so no exit teardown ever ran. Every in-app update
+/// while connected left the adapters parked on `static none` for the whole
+/// install, the server peer held, and xray running with its file locked
+/// against the installer. The download is verified before anything is torn
+/// down, so a failed download leaves the session alone.
+///
 /// Emits [`DOWNLOAD_PROGRESS_EVENT`] as bytes arrive. Returns `Ok(false)` if the
 /// re-check found nothing to install.
 #[tauri::command]
@@ -145,8 +171,8 @@ pub async fn install_update(app: AppHandle) -> Result<bool, String> {
 
     let progress_app = app.clone();
     let mut downloaded: u64 = 0;
-    update
-        .download_and_install(
+    let bundle = update
+        .download(
             move |chunk_len, content_length| {
                 downloaded = downloaded.saturating_add(chunk_len as u64);
                 let _ = progress_app.emit(
@@ -157,13 +183,40 @@ pub async fn install_update(app: AppHandle) -> Result<bool, String> {
                     },
                 );
             },
-            || tracing::info!("Update download finished — installing"),
+            || tracing::info!("Update downloaded and verified — ending the session to install"),
         )
         .await
         .map_err(|e| {
-            tracing::warn!("Update install failed: {e}");
+            tracing::warn!("Update download failed: {e}");
             format!("Update failed: {e}")
         })?;
 
+    end_session(&app, EndReason::Update).await;
+
+    update.install(bundle).map_err(|e| {
+        tracing::warn!("Update install failed: {e}");
+        format!("Update failed: {e}")
+    })?;
+
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    /// W1-004: the session ends between the verified download and the install
+    /// (which exits the process on Windows); never a combined
+    /// download-and-install that skips it.
+    #[test]
+    fn the_session_ends_between_download_and_install() {
+        let source = include_str!("updater.rs");
+        let body = &source[source.find("pub async fn install_update(").unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let download = body.find(".download(").expect("download");
+        let teardown = body
+            .find("end_session(&app, EndReason::Update)")
+            .expect("teardown");
+        let install = body.find("update.install(bundle)").expect("install");
+        assert!(download < teardown && teardown < install);
+        assert!(!body.contains(&["download", "_and_install"].concat()));
+    }
 }

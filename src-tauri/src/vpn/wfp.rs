@@ -179,42 +179,6 @@ static TUNNEL_LUID: AtomicU64 = AtomicU64::new(0);
 static ENGINE: once_cell::sync::Lazy<std::sync::Mutex<Option<WfpEngine>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 
-// ── Backward-compat exports for crash cleanup (main.rs) ─────────────
-// FIX-2-1: With dynamic sessions the OS cleans up automatically, so the
-// netsh-based crash cleanup in main.rs is now a harmless no-op.  We keep
-// these constants so the existing `cleanup_on_crash()` still compiles.
-const RULE_BLOCK_ALL: &str = "BirdoVPN_BlockAll";
-const RULE_PERMIT_VPN: &str = "BirdoVPN_PermitVPN";
-const RULE_PERMIT_LOCALHOST: &str = "BirdoVPN_PermitLocalhost";
-const RULE_PERMIT_DHCP: &str = "BirdoVPN_PermitDHCP";
-const RULE_BLOCK_IPV6: &str = "BirdoVPN_BlockIPv6";
-const RULE_BLOCK_STUN: &str = "BirdoVPN_BlockSTUN";
-const RULE_BLOCK_TURN: &str = "BirdoVPN_BlockTURN";
-
-/// L-1: Public rule name constants for use in crash cleanup (main.rs)
-/// so hardcoded strings don't drift out of sync with the actual values.
-/// NOTE: With the WFP migration these are only needed for the legacy
-/// netsh cleanup fallback, which is now a harmless no-op.
-pub struct RuleNames {
-    pub block_all: &'static str,
-    pub permit_vpn: &'static str,
-    pub permit_localhost: &'static str,
-    pub permit_dhcp: &'static str,
-    pub block_ipv6: &'static str,
-    pub block_stun: &'static str,
-    pub block_turn: &'static str,
-}
-
-pub static RULE_NAMES: RuleNames = RuleNames {
-    block_all: RULE_BLOCK_ALL,
-    permit_vpn: RULE_PERMIT_VPN,
-    permit_localhost: RULE_PERMIT_LOCALHOST,
-    permit_dhcp: RULE_PERMIT_DHCP,
-    block_ipv6: RULE_BLOCK_IPV6,
-    block_stun: RULE_BLOCK_STUN,
-    block_turn: RULE_BLOCK_TURN,
-};
-
 // ── WFP engine wrapper ──────────────────────────────────────────────
 
 /// Holds an open WFP engine handle and tracks the filter IDs that we
@@ -1636,10 +1600,59 @@ pub fn set_local_network_sharing(enabled: bool) {
 /// Set the list of split-tunnel app executable paths.
 /// Uses `where.exe` to resolve short names like "chrome.exe" to full paths.
 /// Takes effect on the next `activate_blocking()` call.
+///
+/// W1-044: this runs on every connect and settings reapply, and resolving a
+/// short name spawns `where.exe` and walks Program Files two levels deep. That
+/// work now runs on the blocking pool — it used to run inside this async fn and
+/// pin a runtime worker for seconds — and its result is reused while the
+/// requested list is unchanged and every resolved path still exists.
 pub async fn set_split_tunnel_apps(app_names: Vec<String>) {
-    let mut resolved_paths = Vec::new();
+    let resolved_paths =
+        match tokio::task::spawn_blocking(move || resolve_split_tunnel_apps(&app_names)).await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!(
+                    "Kill-switch exception resolution failed ({}) — none applied",
+                    e
+                );
+                Vec::new()
+            }
+        };
 
-    for name in &app_names {
+    let mut apps = SPLIT_TUNNEL_APPS.write().await;
+    *apps = resolved_paths;
+}
+
+/// The last resolution: (requested names, resolved paths).
+static RESOLVED_SPLIT_TUNNEL: std::sync::Mutex<Option<(Vec<String>, Vec<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// A cached resolution stands only while the request is unchanged, every name
+/// resolved, and every path still exists — so an app that moved to a new
+/// versioned folder, or was installed since, is resolved again.
+fn can_reuse_resolution(
+    requested: &[String],
+    resolved: &[String],
+    now: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> bool {
+    requested == now && resolved.len() == requested.len() && resolved.iter().all(|p| exists(p))
+}
+
+fn resolve_split_tunnel_apps(app_names: &[String]) -> Vec<String> {
+    let mut cache = RESOLVED_SPLIT_TUNNEL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((requested, resolved)) = cache.as_ref() {
+        if can_reuse_resolution(requested, resolved, app_names, |p| {
+            std::path::Path::new(p).exists()
+        }) {
+            return resolved.clone();
+        }
+    }
+
+    let mut resolved_paths = Vec::new();
+    for name in app_names {
         if let Some(path) = resolve_app_path(name) {
             resolved_paths.push(path);
         } else {
@@ -1652,9 +1665,8 @@ pub async fn set_split_tunnel_apps(app_names: Vec<String>) {
         app_names.len(),
         resolved_paths.len()
     );
-
-    let mut apps = SPLIT_TUNNEL_APPS.write().await;
-    *apps = resolved_paths;
+    *cache = Some((app_names.to_vec(), resolved_paths.clone()));
+    resolved_paths
 }
 
 /// Resolve an app name or path to a full executable path.
@@ -1721,6 +1733,40 @@ fn resolve_app_path(name: &str) -> Option<String> {
     // sending an invalid path to WFP (which would fail FwpmGetAppIdFromFileName0)
     tracing::debug!("Could not resolve '{}', skipping", name);
     None
+}
+
+#[cfg(test)]
+mod split_tunnel_resolution_tests {
+    use super::can_reuse_resolution;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_unchanged_request_reuses_the_resolution() {
+        let req = v(&["chrome.exe"]);
+        let res = v(&[r"C:\Apps\chrome.exe"]);
+        assert!(can_reuse_resolution(&req, &res, &req, |_| true));
+    }
+
+    #[test]
+    fn anything_that_could_have_changed_resolves_again() {
+        let req = v(&["chrome.exe", "slack.exe"]);
+        let res = v(&[r"C:\Apps\chrome.exe", r"C:\Apps\slack.exe"]);
+        // A different list.
+        assert!(!can_reuse_resolution(
+            &req,
+            &res,
+            &v(&["chrome.exe"]),
+            |_| true
+        ));
+        // A path that moved (an app updated into a versioned folder).
+        assert!(!can_reuse_resolution(&req, &res, &req, |p| !p.contains("slack")));
+        // A name that did not resolve last time may resolve now.
+        let partial = v(&[r"C:\Apps\chrome.exe"]);
+        assert!(!can_reuse_resolution(&req, &partial, &req, |_| true));
+    }
 }
 
 #[cfg(test)]

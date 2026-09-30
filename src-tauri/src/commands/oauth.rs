@@ -1,11 +1,11 @@
-//! Native SSO (Google / GitHub) login via the brokered PKCE flow.
+//! Native SSO (Google / GitHub / Apple) login via the brokered PKCE flow.
 //!
-//! The desktop app is a public PKCE client of BIRDO, not of Google/GitHub
+//! The desktop app is a public PKCE client of BIRDO, not of the provider
 //! directly. Flow:
 //!   1. generate a PKCE verifier/challenge + anti-CSRF state
-//!   2. bind a ONE-SHOT loopback listener on 127.0.0.1:<random port>
+//!   2. bind a loopback listener on 127.0.0.1:<random port>
 //!   3. open the system browser at the web broker `/native/oauth/start`
-//!   4. the browser completes Google/GitHub and redirects to our loopback
+//!   4. the browser completes the provider and redirects to our loopback
 //!      `/callback?code=<handoff>&state=...`
 //!   5. exchange the handoff code (+ our verifier) at the backend
 //!      `/auth/native/exchange` for real tokens — same result shape as password
@@ -17,6 +17,7 @@
 
 use crate::api::types::LoginResult;
 use crate::api::BirdoApi;
+use crate::commands::ipc_error::IpcError;
 use crate::storage::CredentialStore;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -26,7 +27,7 @@ use std::time::Duration;
 use tauri::{Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use super::auth::{LoginResponse, UserInfo};
 
@@ -36,6 +37,16 @@ const OAUTH_WEB_BASE: &str = "https://birdo.app";
 
 /// How long to wait for the user to finish in the browser before giving up.
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Per-connection budget to send the request line and receive the page. A
+/// local process that connects and sends nothing must not stall the sign-in
+/// (W1-042); the real browser redirect needs milliseconds.
+const CALLBACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The providers the web broker serves. Apple is included for parity with
+/// Android, which uses the same broker for accounts created with Sign in with
+/// Apple on iPhone (P1-parity-008); iOS signs in with Apple natively.
+const SSO_PROVIDERS: [&str; 3] = ["google", "github", "apple"];
 
 // Branded loopback pages shown in the system browser after the SSO round-trip.
 // Fully self-contained (inline CSS + inline SVG, no external resources) because
@@ -170,11 +181,32 @@ fn open_in_browser(app: &tauri::AppHandle, url: String) -> Result<(), String> {
         .map_err(|e| format!("Could not open the browser: {e}"))
 }
 
-/// Parse `code` and `state` out of the loopback request's first line:
-/// `GET /callback?code=...&state=... HTTP/1.1`.
-fn parse_callback(request_line: &str) -> Option<(String, String)> {
-    let path = request_line.split_whitespace().nth(1)?;
-    let query = path.split_once('?')?.1;
+/// What one loopback request means for the sign-in in progress.
+#[derive(Debug, PartialEq, Eq)]
+enum CallbackVerdict {
+    /// Not the callback of THIS sign-in: a favicon, a stray request, or
+    /// another local process. Answered with 204 and otherwise ignored.
+    Ignore,
+    /// Our callback, but the provider sent the user back without a code.
+    Failed,
+    /// The handoff code.
+    Code(String),
+}
+
+/// Classify the request line `GET /callback?code=...&state=... HTTP/1.1`.
+///
+/// W1-042: the FIRST request to `/callback` used to end the flow whatever it
+/// carried, so any local process could abort a sign-in with one request. Only
+/// a request carrying the state WE generated can end it now — which is also
+/// the anti-CSRF check, done before anything is believed.
+fn classify_callback(request_line: &str, expected_state: &str) -> CallbackVerdict {
+    let Some(path) = request_line.split_whitespace().nth(1) else {
+        return CallbackVerdict::Ignore;
+    };
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    if route != "/callback" {
+        return CallbackVerdict::Ignore;
+    }
     let mut code = None;
     let mut state = None;
     for pair in query.split('&') {
@@ -186,29 +218,64 @@ fn parse_callback(request_line: &str) -> Option<(String, String)> {
             }
         }
     }
-    Some((code?, state?))
+    if state.as_deref() != Some(expected_state) {
+        return CallbackVerdict::Ignore;
+    }
+    match code {
+        Some(code) if !code.is_empty() => CallbackVerdict::Code(code),
+        _ => CallbackVerdict::Failed,
+    }
 }
 
-/// Start native SSO for `provider` ("google" | "github"). Blocks (async) until
-/// the browser flow completes, times out, or fails.
+/// Serve one loopback connection. `Some` when it ended the sign-in.
+async fn serve_callback(
+    mut stream: TcpStream,
+    expected_state: &str,
+    io_timeout: Duration,
+) -> Option<Result<String, String>> {
+    let mut buf = vec![0u8; 8192];
+    let n = match tokio::time::timeout(io_timeout, stream.read(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        _ => return None,
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let first_line = request.lines().next().unwrap_or("");
+    let (page, outcome) = match classify_callback(first_line, expected_state) {
+        CallbackVerdict::Ignore => (RESPONSE_IGNORE, None),
+        CallbackVerdict::Failed => (
+            RESPONSE_ERR,
+            Some(Err("Sign-in response was missing the code.".to_string())),
+        ),
+        CallbackVerdict::Code(code) => (RESPONSE_OK, Some(Ok(code))),
+    };
+    let _ = tokio::time::timeout(io_timeout, async {
+        let _ = stream.write_all(page.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    outcome
+}
+
+/// Start native SSO for `provider` (one of [`SSO_PROVIDERS`]). Blocks (async)
+/// until the browser flow completes, times out, or fails.
 #[tauri::command]
 pub async fn native_oauth_login(
     provider: String,
     app: tauri::AppHandle,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<LoginResponse, String> {
-    if provider != "google" && provider != "github" {
-        return Err("Unsupported sign-in provider".into());
+) -> Result<LoginResponse, IpcError> {
+    if !SSO_PROVIDERS.contains(&provider.as_str()) {
+        return Err(IpcError::unknown("Unsupported sign-in provider"));
     }
 
-    // 1. One-shot loopback listener on a random free port.
+    // 1. Loopback listener on a random free port, for this sign-in only.
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
-        .map_err(|e| format!("Could not start local sign-in listener: {e}"))?;
+        .map_err(|e| IpcError::unknown(format!("Could not start local sign-in listener: {e}")))?;
     let port = listener
         .local_addr()
-        .map_err(|e| format!("Could not read local port: {e}"))?
+        .map_err(|e| IpcError::unknown(format!("Could not read local port: {e}")))?
         .port();
 
     // 2. PKCE + anti-CSRF state.
@@ -221,42 +288,35 @@ pub async fn native_oauth_login(
         "{OAUTH_WEB_BASE}/native/oauth/start?provider={provider}&code_challenge={challenge}&redirect_uri={}&state={state}",
         urlencode(&redirect_uri),
     );
-    open_in_browser(&app, start_url)?;
+    open_in_browser(&app, start_url).map_err(IpcError::unknown)?;
 
-    // 4. Wait for the loopback redirect carrying the handoff code.
-    let (code, returned_state) = tokio::time::timeout(OAUTH_TIMEOUT, async {
+    // 4. Wait for the loopback redirect carrying the handoff code. Every
+    //    connection is served on its own task with its own I/O budget, so a
+    //    connection that sends nothing (or a flood of them) cannot hold up
+    //    the real redirect (W1-042); only a request with our state ends it.
+    let (outcomes, mut outcome) = tokio::sync::mpsc::channel::<Result<String, String>>(1);
+    let code = tokio::time::timeout(OAUTH_TIMEOUT, async {
         loop {
-            let (mut stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
-            let mut buf = vec![0u8; 8192];
-            let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let first_line = request.lines().next().unwrap_or("");
-            // Ignore stray requests (e.g. favicon) — only /callback matters.
-            if !first_line.contains("/callback") {
-                let _ = stream.write_all(RESPONSE_IGNORE.as_bytes()).await;
-                continue;
-            }
-            match parse_callback(first_line) {
-                Some(pair) => {
-                    let _ = stream.write_all(RESPONSE_OK.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                    return Ok::<(String, String), String>(pair);
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.map_err(|e| e.to_string())?;
+                    let outcomes = outcomes.clone();
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        if let Some(result) =
+                            serve_callback(stream, &state, CALLBACK_IO_TIMEOUT).await
+                        {
+                            let _ = outcomes.send(result).await;
+                        }
+                    });
                 }
-                None => {
-                    let _ = stream.write_all(RESPONSE_ERR.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                    return Err("Sign-in response was missing the code.".into());
-                }
+                Some(result) = outcome.recv() => return result,
             }
         }
     })
     .await
-    .map_err(|_| "Sign-in timed out. Please try again.".to_string())??;
-
-    // 5. Anti-CSRF: the state we sent must come back unchanged.
-    if returned_state != state {
-        return Err("Sign-in could not be verified (state mismatch).".into());
-    }
+    .map_err(|_| IpcError::unknown("Sign-in timed out. Please try again."))?
+    .map_err(IpcError::unknown)?;
 
     // The browser now holds focus; bring our window back to the foreground so the
     // user lands in the app after signing in rather than behind the browser.
@@ -320,7 +380,90 @@ pub async fn native_oauth_login(
 
 #[cfg(test)]
 mod tests {
-    use super::urldecode;
+    use super::{classify_callback, urldecode, CallbackVerdict, SSO_PROVIDERS};
+
+    const STATE: &str = "s3cr3t-state";
+
+    #[test]
+    fn only_our_state_can_end_the_sign_in() {
+        assert_eq!(
+            classify_callback("GET /callback?code=abc&state=s3cr3t-state HTTP/1.1", STATE),
+            CallbackVerdict::Code("abc".into())
+        );
+        // A forged or stale callback is ignored, not fatal (W1-042).
+        for line in [
+            "GET /callback?code=evil&state=other HTTP/1.1",
+            "GET /callback?code=evil HTTP/1.1",
+            "GET /callback HTTP/1.1",
+            "GET /favicon.ico HTTP/1.1",
+            "GET /callbackx?code=a&state=s3cr3t-state HTTP/1.1",
+            "garbage",
+            "",
+        ] {
+            assert_eq!(
+                classify_callback(line, STATE),
+                CallbackVerdict::Ignore,
+                "{line}"
+            );
+        }
+        // Our state without a code: the provider ended the flow.
+        assert_eq!(
+            classify_callback(
+                "GET /callback?state=s3cr3t-state&error=denied HTTP/1.1",
+                STATE
+            ),
+            CallbackVerdict::Failed
+        );
+    }
+
+    /// P1-parity-008: Apple accounts sign in on Windows through the broker.
+    #[test]
+    fn apple_is_a_broker_provider() {
+        assert!(SSO_PROVIDERS.contains(&"apple"));
+        assert!(SSO_PROVIDERS.contains(&"google"));
+        assert!(SSO_PROVIDERS.contains(&"github"));
+    }
+
+    /// A connection that never sends a byte is dropped after its budget
+    /// instead of holding the sign-in (W1-042). Loopback only.
+    #[tokio::test]
+    async fn a_silent_connection_is_dropped_after_its_budget() {
+        let budget = std::time::Duration::from_millis(200);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let served = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::serve_callback(stream, STATE, budget),
+        )
+        .await
+        .expect("serve_callback must give up on a silent connection");
+        assert_eq!(served, None);
+    }
+
+    /// The real redirect still completes while a silent connection is open.
+    #[tokio::test]
+    async fn the_real_callback_is_served() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut browser = tokio::net::TcpStream::connect(addr).await.unwrap();
+        browser
+            .write_all(b"GET /callback?code=handoff&state=s3cr3t-state HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let served = super::serve_callback(stream, STATE, std::time::Duration::from_secs(5)).await;
+        assert_eq!(served, Some(Ok("handoff".to_string())));
+        let mut page = String::new();
+        let _ = browser.read_to_string(&mut page).await;
+        assert!(page.starts_with("HTTP/1.1 200 OK"));
+    }
 
     /// `urldecode` used to byte-slice the &str (`&s[i + 1..i + 3]`), so a '%'
     /// immediately followed by a multibyte character panicked the whole process
