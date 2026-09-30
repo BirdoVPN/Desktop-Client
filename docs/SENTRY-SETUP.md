@@ -11,6 +11,34 @@
 >
 > After this change a **release** build refuses to compile without a usable DSN.
 
+> **2026-09-29 — crash reporting is OPT-IN (audit C-3 / D-12 / P1-6).** Until
+> 1.4.44 `main()` initialised Sentry on every launch, before the consent screen,
+> with no way to turn it off. Now:
+>
+> - Nothing is initialised unless the persisted setting `crash_reports_enabled`
+>   is true. It defaults to **false** for new installs **and** for every
+>   upgraded install (the key is absent from older settings files).
+> - The user turns it on with the toggle on the consent screen (starts OFF) or
+>   in Settings › Privacy › Crash reports, via the `set_crash_reports_enabled`
+>   command. Both directions take effect immediately; no restart.
+> - With it off, no Sentry client exists (no panic hook, no transport), and
+>   `report_security_event` returns before touching the SDK. After a runtime
+>   opt-out the client stays bound, but `before_send` (`gate_and_scrub`) drops
+>   every event.
+> - No release-health sessions: the SDK's `release-health` feature is not
+>   compiled, and a unit test pins `auto_session_tracking == false`.
+> - The allowlist scrubber below is unchanged and still runs on every event
+>   that is sent.
+>
+> The code is `src-tauri/src/utils/crash_report.rs` (`set_opted_in`,
+> `client_options`, `gate_and_scrub`); `main.rs` `setup()` applies the stored
+> choice. The DSN requirement in `build.rs` is unchanged: it guarantees the
+> opt-in can work, not that anything is sent.
+>
+> The project's Sentry **region** has not been verified from the repo (the
+> privacy text names "Sentry (Functional Software, Inc.)"); checking it in the
+> Sentry UI is an owner action.
+
 ---
 
 ## 0. What is wired, and what is yours
@@ -20,7 +48,7 @@
 | DSN read at build time (`option_env!`) | `src-tauri/src/main.rs` | wired |
 | Release build **fails** without a usable DSN | `src-tauri/build.rs` | wired |
 | CI passes the secret at **job** level to all 5 build jobs | `.github/workflows/{release,build-windows,build-linux}.yml` | wired |
-| Runtime init + client options | `src-tauri/src/main.rs` | wired |
+| Runtime init + client options (opt-in, off by default) | `src-tauri/src/utils/crash_report.rs`, applied from `main.rs` `setup()` | wired |
 | Allowlist scrubber (`before_send`) | `src-tauri/src/utils/crash_report.rs` | wired |
 | Tracing off twice over (`traces_sample_rate` + `traces_sampler`) | same | wired |
 | The DSN value itself | Sentry.io | **YOURS — steps 1-3** |
@@ -165,8 +193,11 @@ Expected: at least `1`.
 
 The app has no on-demand crash trigger. The honest test is a deliberate panic:
 
-1. Temporarily add `panic!("sentry smoke test");` to the top of `fn main()`.
-2. Build a **release** artifact with a DSN and run it.
+1. Temporarily add `panic!("sentry smoke test");` somewhere that runs AFTER
+   `setup()` has applied the opt-in (a panic at the top of `fn main()` now
+   happens before Sentry exists and is — correctly — never reported).
+2. Build a **release** artifact with a DSN, run it, and turn on Settings ›
+   Privacy › Crash reports (or the consent-screen toggle) first.
 3. Sentry → **Issues**. The event appears within ~30 s, tagged
    `release: 1.4.39`, `environment: production`.
 4. **Remove the panic. Do not commit it.**
@@ -227,6 +258,16 @@ incident of that class (ufw logging customer destinations; 63,400 records
 purged). So the configuration states every relevant switch **explicitly**,
 including the ones whose SDK default is already safe — a default is someone
 else's decision and it can change in a version bump.
+
+### Crash AND error reports
+
+Besides panics, `report_security_event` sends a non-fatal `Error`-level event
+when a feature fails: today the DoH certificate-pin failures (`vpn/doh.rs`),
+which stop the app resolving our hostnames. That is not a crash, so every
+disclosure (consent screen, Settings, README) says "crash and error reports"
+(second-pass #7, option A), never "crash details" or "only". A new
+`report_security_event` caller must fit that description or the disclosure
+must change with it.
 
 ### An allowlist, not a denylist
 
@@ -317,8 +358,9 @@ this one.
 
 ### Known gap, accepted
 
-`sentry::init` is called before `setup_panic_hook`, so sentry's own panic
-integration runs **ahead** of the local hook and sees the raw payload. That is
+The Sentry client (when the user has opted in) is built after
+`setup_panic_hook`, so sentry's own panic integration runs **ahead** of the
+local hook and sees the raw payload. That is
 fine — nothing is transmitted until `before_send`, which is the last point
 before the event leaves the device — but it does mean the raw message reaches
 sentry's in-process buffers. Nothing writes it to disk.

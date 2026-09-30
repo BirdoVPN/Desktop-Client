@@ -331,8 +331,10 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         settings.as_ref().map(|s| s.dns_filtering).unwrap_or(false),
         custom_dns.as_deref(),
     );
-    // Lockdown (always-on kill switch) — OFF by default; needs device verification
-    // before being enabled (see wfp::LOCKDOWN_MODE).
+    // Lockdown (always-on kill switch). The SETTING defaults ON on Windows
+    // (AppSettings::default, desktop #34) and is user-switchable in Settings;
+    // only an unreadable settings file falls back to reactive (false) here.
+    // See wfp::LOCKDOWN_MODE (D-21).
     let lockdown_mode = settings.as_ref().map(|s| s.lockdown_mode).unwrap_or(false);
 
     // Mirror Local Network Sharing to the kill switch on every platform, so an

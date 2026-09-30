@@ -49,7 +49,47 @@ const API_BASE_URL: &str = "https://api.birdo.app";
 /// CSP sees. (`https://birdo.app` is in the CSP regardless, for the webview's
 /// sake.)
 const WEB_BASE_URL: &str = "https://birdo.app";
+
+/// Per-OS User-Agent. This was `… (Windows)` on every OS, so macOS and Linux
+/// installs were reported as Windows (audit 2026-09-29, D-18). The backend's
+/// parser (`client-version.util.ts` UA_RE) reads only `Birdo-Desktop/<semver>`
+/// and ignores the suffix, so the change is invisible to version enforcement.
+#[cfg(target_os = "windows")]
 const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Windows)");
+#[cfg(target_os = "macos")]
+const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (macOS)");
+#[cfg(target_os = "linux")]
+const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Linux)");
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+const USER_AGENT: &str = concat!("Birdo-Desktop/", env!("CARGO_PKG_VERSION"), " (Desktop)");
+
+/// Value of the `X-Desktop-Client` marker header. The backend tests only for
+/// the header's PRESENCE (CSRF bypass, desktop-only auth routes, attestation
+/// scheme) and substring-matches "android"/"ios"/"desktop" when inferring a
+/// device type — none of which these values trip — so only the Windows value
+/// is byte-identical to earlier releases, and that is the one shipped build
+/// that matters. Same D-18 fix as `USER_AGENT`.
+#[cfg(target_os = "windows")]
+pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-windows";
+#[cfg(target_os = "macos")]
+pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-macos";
+#[cfg(target_os = "linux")]
+pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-linux";
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+pub(crate) const DESKTOP_CLIENT_HEADER: &str = "birdo-desktop";
+
+/// What one `DELETE /api/v1/gdpr/delete` response means
+/// (see `BirdoApi::classify_gdpr_delete_response`).
+#[derive(Debug)]
+pub(crate) enum GdprDeleteOutcome {
+    /// 2xx — the account is gone.
+    Deleted(DeleteAccountResponse),
+    /// 401 from the JWT guard — refresh the access token and retry once.
+    SessionExpired,
+    /// Anything else, carrying the error to show (the password check's 401
+    /// message included).
+    Refused(ApiError),
+}
 
 // SEC-C1: TLS certificate pinning lives in `super::cert_pin`. It pins the
 // **CA-chain SPKI** (the stable intermediate/root public keys, matching the
@@ -378,25 +418,144 @@ impl BirdoApi {
         Ok(())
     }
 
-    /// GDPR: Permanently delete account and all associated data
-    pub async fn delete_account(&self, password: &str) -> Result<(), ApiError> {
-        #[derive(Serialize)]
-        struct DeleteBody<'a> {
-            password: &'a str,
+    /// GDPR Art. 17: permanently delete the account.
+    ///
+    /// `DELETE /api/v1/gdpr/delete` with `{ "password": … }` — the route and
+    /// method the backend actually serves (see `endpoints::auth::GDPR_DELETE`).
+    ///
+    /// Not routed through `request_with_retry`, because that helper cannot tell
+    /// the two 401s this route produces apart. JwtAuthGuard answers an expired
+    /// access token with a bare "Unauthorized"; the handler's own password check
+    /// answers "Incorrect password" / "Password confirmation is required…". The
+    /// first must refresh the token and retry once, exactly as every other call
+    /// does; the second is the answer, and the user has to see it rather than a
+    /// generic "Authentication failed" after a pointless token rotation.
+    ///
+    /// Tokens are cleared ONLY on a 2xx: a refused deletion leaves the user
+    /// signed in to an account that still exists.
+    pub async fn delete_account(&self, password: &str) -> Result<DeleteAccountResponse, ApiError> {
+        let body = DeleteAccountBody { password };
+        let token_before = self.access_token_value().await;
+        let outcome = match self.send_gdpr_delete(&body).await? {
+            GdprDeleteOutcome::SessionExpired => {
+                {
+                    // Same serialisation as request_with_retry: only refresh if
+                    // nobody else already did while we waited for the lock.
+                    let _guard = self.refresh_lock.lock().await;
+                    if self.access_token_value().await == token_before {
+                        self.refresh_token_internal()
+                            .await
+                            .map_err(|_| ApiError::Unauthorized)?;
+                    }
+                }
+                self.send_gdpr_delete(&body).await?
+            }
+            other => other,
+        };
+        match outcome {
+            GdprDeleteOutcome::Deleted(response) => {
+                self.clear_tokens().await;
+                Ok(response)
+            }
+            GdprDeleteOutcome::Refused(error) => Err(error),
+            GdprDeleteOutcome::SessionExpired => Err(ApiError::Unauthorized),
         }
-        self.post::<_, serde_json::Value>(
-            endpoints::auth::GDPR_DELETE,
-            &DeleteBody { password },
-            true,
-        )
-        .await?;
-        self.clear_tokens().await;
-        Ok(())
+    }
+
+    /// The exact deletion request, built without sending it so a unit test can
+    /// pin method, URL, headers and body (`api/tests.rs`,
+    /// `gdpr_delete_is_a_delete_to_the_api_prefixed_route`).
+    pub(crate) fn gdpr_delete_request(
+        &self,
+        access_token: &str,
+        body: &DeleteAccountBody<'_>,
+    ) -> reqwest::RequestBuilder {
+        self.client
+            .request(
+                reqwest::Method::DELETE,
+                format!("{}{}", API_BASE_URL, endpoints::auth::GDPR_DELETE),
+            )
+            .header("X-Desktop-Client", DESKTOP_CLIENT_HEADER)
+            .bearer_auth(access_token)
+            .json(body)
+    }
+
+    /// The exact export request (`GET /api/v1/gdpr/export`), for the same test.
+    #[cfg(test)]
+    pub(crate) fn gdpr_export_url() -> String {
+        format!("{}{}", API_BASE_URL, endpoints::auth::GDPR_EXPORT)
+    }
+
+    async fn send_gdpr_delete(
+        &self,
+        body: &DeleteAccountBody<'_>,
+    ) -> Result<GdprDeleteOutcome, ApiError> {
+        let token = self
+            .access_token
+            .read()
+            .await
+            .clone()
+            .ok_or(ApiError::NotAuthenticated)?;
+        let response = self
+            .gdpr_delete_request(token.as_str(), body)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        let outcome = Self::classify_gdpr_delete_response(status, &text);
+        // Same one-way latch every control-plane response gets (handle_response_from).
+        if let GdprDeleteOutcome::Refused(ApiError::UpgradeRequired(info)) = &outcome {
+            super::upgrade_gate::latch_from(
+                super::upgrade_gate::Origin::ControlPlane,
+                info.clone(),
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Decide what one deletion response means, from status and body alone.
+    ///
+    /// - 2xx: deleted. The body is parsed leniently; an unreadable one is still
+    ///   a deletion (see [`DeleteAccountResponse`]).
+    /// - 401 whose message is passport's bare "Unauthorized" (or no message):
+    ///   the access token expired — refresh and retry.
+    /// - 401 with any other message: the password check refused; that message
+    ///   is the answer.
+    /// - anything else: the normal mapping, which keeps the backend's message.
+    pub(crate) fn classify_gdpr_delete_response(
+        status: StatusCode,
+        body: &str,
+    ) -> GdprDeleteOutcome {
+        if status.is_success() {
+            let parsed = serde_json::from_str::<DeleteAccountResponse>(body).unwrap_or_default();
+            return GdprDeleteOutcome::Deleted(parsed);
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            let message = serde_json::from_str::<ApiErrorBody>(body)
+                .ok()
+                .and_then(|b| b.message)
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty());
+            return match message {
+                Some(m) if !m.eq_ignore_ascii_case("unauthorized") => {
+                    GdprDeleteOutcome::Refused(ApiError::Unknown(m))
+                }
+                _ => GdprDeleteOutcome::SessionExpired,
+            };
+        }
+        GdprDeleteOutcome::Refused(Self::classify_error_response(status, body))
     }
 
     /// GDPR: Export all user data (Right to Data Portability, Art. 20)
     pub async fn export_user_data(&self) -> Result<serde_json::Value, ApiError> {
         self.get(endpoints::auth::GDPR_EXPORT, true).await
+    }
+
+    /// What deleting the account would leave billing (second-pass #9).
+    /// Read-only; the ordinary GET path with the usual refresh-and-retry.
+    pub async fn deletion_preflight(&self) -> Result<DeletionPreflightResponse, ApiError> {
+        self.get(endpoints::auth::GDPR_DELETE_PREFLIGHT, true).await
     }
 
     // ========================================================================
@@ -820,7 +979,7 @@ impl BirdoApi {
         let mut request = self.client.request(method.clone(), &url);
 
         if method == reqwest::Method::POST {
-            request = request.header("X-Desktop-Client", "birdo-windows");
+            request = request.header("X-Desktop-Client", DESKTOP_CLIENT_HEADER);
         }
 
         if let Some(b) = body {

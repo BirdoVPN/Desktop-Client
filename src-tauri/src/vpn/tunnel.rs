@@ -1900,10 +1900,18 @@ impl WintunTunnel {
         crate::vpn::wfp::unblock_ipv6().await?;
 
         // Best-effort legacy heal, fully non-blocking so disconnect stays
-        // instant: versions <= 1.3.19 may have left stale netsh firewall rules
-        // and/or a disabled ms_tcpip6 adapter binding (the old PowerShell
-        // fallback). Clean both in the background. No-ops once a machine is
-        // healed; never delays the user.
+        // instant: versions <= 1.3.19 may have left stale netsh firewall rules.
+        // Those rules carry our own names, so deleting them can only ever
+        // remove something we created. No-ops once a machine is healed.
+        //
+        // D-24 (audit 2026-09-29): this heal ALSO piped every ms_tcpip6 binding
+        // into PowerShell's binding-enable cmdlet on every disconnect,
+        // re-enabling IPv6 on EVERY adapter, including
+        // ones the user had switched IPv6 off on themselves. This build never
+        // touches adapter bindings (IPv6 is blocked with a WFP filter, see
+        // block_ipv6_leaks), so there is no binding of ours to restore, and the
+        // only bindings that line could still change were the user's. It is
+        // gone; `ipv6_binding_tests` keeps it gone.
         tokio::task::spawn_blocking(|| {
             for rule in [
                 "Birdo VPN Block IPv6 Out",
@@ -1923,13 +1931,6 @@ impl WintunTunnel {
                     ])
                     .output();
             }
-            let _ = cmd("powershell")
-                .args([
-                    "-NoProfile", "-NonInteractive", "-Command",
-                    "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | \
-                     Enable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue",
-                ])
-                .output();
         });
 
         Ok(())
@@ -2506,22 +2507,39 @@ impl Drop for WintunTunnel {
                 "name=Birdo Block IPv6",
             ])
             .output();
-        // Re-enable IPv6 adapter bindings
-        match cmd("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-Command",
-                "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Enable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue",
-            ])
-            .output()
-        {
-            Ok(o) if !o.status.success() => {
-                tracing::warn!("IPv6 re-enable failed: {}", String::from_utf8_lossy(&o.stderr));
-            }
-            Err(e) => tracing::warn!("IPv6 re-enable failed: {}", e),
-            _ => {}
-        }
+        // No adapter-binding "re-enable" here (D-24): this build never disables
+        // an ms_tcpip6 binding, so the only bindings a blanket re-enable could
+        // change are ones the USER turned off. The WFP IPv6 block lives in the
+        // dynamic session and is removed with it.
 
         tracing::warn!("Emergency cleanup complete — DNS/route state may need manual verification");
+    }
+}
+
+/// D-24 (audit 2026-09-29): disconnect used to re-enable IPv6 on EVERY adapter
+/// via PowerShell's binding-enable cmdlet for ms_tcpip6, silently undoing a
+/// user's own IPv6 disablement. The client never disables a binding any more
+/// (WFP filters do the blocking), so it has nothing to restore. This pins that
+/// no source file under `src/vpn` brings the blanket re-enable back.
+#[cfg(test)]
+mod ipv6_binding_tests {
+    #[test]
+    fn no_blanket_ipv6_binding_re_enable() {
+        // Built at run time so this file does not match its own needle.
+        let needle = ["Enable", "-NetAdapterBinding"].concat();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vpn");
+        for entry in std::fs::read_dir(&dir).expect("read src/vpn") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            assert!(
+                !text.contains(&needle),
+                "{} re-enables adapter IPv6 bindings it never disabled (D-24)",
+                path.display()
+            );
+        }
     }
 }
 

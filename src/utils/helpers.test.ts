@@ -85,6 +85,20 @@ describe('BirdoShield (D18) dns_filtering ↔ dnsFiltering', () => {
   });
 });
 
+describe('crash reports (C-3) crash_reports_enabled ↔ crashReportsEnabled', () => {
+  it('defaults OFF when the key is absent — Rust omits it while false, and no pre-opt-in file has it', () => {
+    expect('crash_reports_enabled' in base).toBe(false);
+    expect(settingsFromRust(base).crashReportsEnabled).toBe(false);
+  });
+
+  it('maps an explicit true, and settingsToRust always writes the key so a full save cannot drop the choice', () => {
+    const on = settingsFromRust({ ...base, crash_reports_enabled: true });
+    expect(on.crashReportsEnabled).toBe(true);
+    expect(settingsToRust(on).crash_reports_enabled).toBe(true);
+    expect(settingsToRust(settingsFromRust(base)).crash_reports_enabled).toBe(false);
+  });
+});
+
 describe('friendlyVpnError — surfaces the real reason', () => {
   it('maps known patterns to friendly copy', () => {
     expect(friendlyVpnError('Device limit reached (1 devices for RECON plan)')).toMatch(

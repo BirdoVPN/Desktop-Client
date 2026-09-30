@@ -19,10 +19,21 @@ pub mod auth {
     pub const ME: &str = "/auth/me";
     /// FIX C-2: 2FA verification endpoint
     pub const TWO_FACTOR_VERIFY: &str = "/auth/2fa/verify";
-    /// GDPR account deletion (requires password confirmation)
-    pub const GDPR_DELETE: &str = "/v1/gdpr/delete";
-    /// GDPR data export (Right to Data Portability)
-    pub const GDPR_EXPORT: &str = "/v1/gdpr/export";
+    /// GDPR account deletion, sent as `DELETE` with `{ "password": … }`.
+    ///
+    /// The NestJS controller is `@Controller('api/v1/gdpr')` and api.birdo.app
+    /// proxies paths unchanged, so the `/api` prefix is PART of the route here,
+    /// unlike every other constant in this file. This used to be
+    /// `POST /v1/gdpr/delete`: a path and a method the backend never served, so
+    /// in-app deletion on desktop failed for every user (audit 2026-09-29,
+    /// C-2 / P0-6). iOS has always sent the right request.
+    pub const GDPR_DELETE: &str = "/api/v1/gdpr/delete";
+    /// GDPR data export (Art. 15 / 20), `GET`. Same controller, same prefix.
+    pub const GDPR_EXPORT: &str = "/api/v1/gdpr/export";
+    /// What a deletion will and will not stop, `GET` (second-pass #9;
+    /// `@Get('delete/preflight')` on the same controller). Read by the
+    /// deletion dialog before the user confirms.
+    pub const GDPR_DELETE_PREFLIGHT: &str = "/api/v1/gdpr/delete/preflight";
 }
 
 /// User endpoints — FIX C-3: route through /auth/me instead of phantom /users/subscription

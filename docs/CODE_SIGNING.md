@@ -1,12 +1,26 @@
 # Code Signing with Sigstore
 
+> **What is actually signed today (checked 2026-09-29 against `release.yml`):**
+> - **Windows:** tag builds are Authenticode-signed through Azure Trusted Signing
+>   (see `azure-trusted-signing-setup.md`), plus a Sigstore bundle.
+> - **macOS (Tauri DMG/app):** **unsigned and un-notarised.** There is no Apple
+>   Developer account, so the job always takes the unsigned path. Gatekeeper
+>   will warn. Signing and notarising it, or no longer shipping it, is an open
+>   owner decision (audit D-22).
+> - **Linux:** checksums + Sigstore only.
+> - **PGP:** no release artefact is PGP-signed.
+>
+> Parts of this document below predate the Azure signing work and describe a
+> Sigstore-only setup; where they disagree with the list above, the list wins.
+
 ## Overview
 
 Birdo VPN uses [Sigstore](https://www.sigstore.dev/) for keyless code signing.
-Since all clients are open-source, Sigstore provides **free, transparent, verifiable
+Because the client source is public (source-available, CC BY-NC 4.0 — not an
+OSI open-source licence), Sigstore provides **free, transparent, verifiable
 signatures** tied to our GitHub Actions CI — no paid certificates required.
 
-Every release artifact (`.exe`, `.msi`, `.dmg`) is signed with `cosign sign-blob` using
+Every release artifact (`.exe`, `.dmg`, Linux packages) is signed with `cosign sign-blob` using
 GitHub's OIDC identity token. This produces a `.sigstore` bundle containing:
 
 - A **Fulcio certificate** proving the artifact was built by GitHub Actions from this repo
@@ -33,13 +47,14 @@ Sigstore does **not** replace Windows Authenticode. Windows users will still see
 1. **SmartScreen:** "Windows protected your PC" -> click "More info" -> "Run anyway"
 2. **UAC prompt:** "Unknown publisher" (yellow shield)
 
-This is normal for open-source software. The Sigstore signature lets users
+This is normal for software without an established signing reputation. The Sigstore signature lets users
 **cryptographically verify** the download came from our CI — something SmartScreen
 can't tell them.
 
 ### macOS Gatekeeper
 
-macOS users will see a Gatekeeper warning for unsigned apps. To bypass:
+The macOS build is unsigned and un-notarised, so macOS users will see a
+Gatekeeper warning. To bypass:
 1. Right-click -> Open -> "Open" (first launch only)
 2. Or: System Settings -> Privacy & Security -> "Open Anyway"
 
@@ -104,9 +119,7 @@ Each release includes:
 |------|---------|
 | `BirdoVPN-Setup-X.Y.Z.exe` | NSIS installer (Windows) |
 | `BirdoVPN-Setup-X.Y.Z.exe.sigstore` | Sigstore signature bundle |
-| `BirdoVPN-X.Y.Z.msi` | MSI installer (Windows) |
-| `BirdoVPN-X.Y.Z.msi.sigstore` | Sigstore signature bundle |
-| `BirdoVPN-X.Y.Z.dmg` | DMG installer (macOS) |
+| `BirdoVPN-X.Y.Z.dmg` | DMG installer (macOS, unsigned and un-notarised) |
 | `BirdoVPN-X.Y.Z.dmg.sigstore` | Sigstore signature bundle |
 | `SHA256SUMS.txt` | Checksums for all artifacts |
 | `SHA256SUMS.txt.sigstore` | Signed checksums |

@@ -275,7 +275,11 @@ function App() {
   // Goes through the Rust `check_for_updates` command, which runs the updater
   // over the cert-pinned client (commands/updater.rs). The un-pinned
   // @tauri-apps/plugin-updater JS path is no longer reachable from the webview.
+  //
+  // Not before consent (audit D-12): the check is a request to api.birdo.app,
+  // and nothing on the consent screen needs it.
   useEffect(() => {
+    if (!hasAcceptedConsent) return;
     let notified = false;
     const runCheck = async () => {
       if (notified) return;
@@ -298,7 +302,7 @@ function App() {
       clearTimeout(initial);
       clearInterval(daily);
     };
-  }, []);
+  }, [hasAcceptedConsent]);
 
   // Parse and route a birdo:// deep link. Shared by the runtime event listener
   // and the cold-start path (a URL the app was launched with).
@@ -424,8 +428,18 @@ function App() {
   }
 
   // ── Consent handlers ──────────────────────────────────────────
-  const handleAcceptConsent = () => {
+  // The crash-report choice made on the consent screen goes straight to Rust
+  // through the dedicated command (it reads settings.json, flips the one
+  // field and applies the opt-in live), never through a full save of a store
+  // that has not been hydrated from Rust yet. Default OFF; a failed write
+  // leaves it OFF, which is the safe direction.
+  const handleAcceptConsent = (crashReportsEnabled: boolean) => {
     setConsent(true);
+    useAppStore.getState().updateSettings({ crashReportsEnabled });
+    invoke('set_crash_reports_enabled', { enabled: crashReportsEnabled }).catch((err) => {
+      console.error('Failed to save the crash-report choice', err);
+      useAppStore.getState().updateSettings({ crashReportsEnabled: false });
+    });
   };
 
   const handleDeclineConsent = async () => {

@@ -44,6 +44,41 @@ option-121 decloak window).
       during the gap; reconnect restores cleanly.
 - [ ] Disconnect fully restores connectivity (no stranded block-all filters).
 
+### A1b. The lockdown default is now visible and switchable (audit D-21, 2026-09-29)
+Settings › Security › **Always-on kill switch** (Windows only, shown while the
+kill switch is on) exposes `lockdown_mode`. The **default is unchanged (ON)**;
+the toggle is persisted only and takes effect from the next connection (no live
+reapply). Code comments that said "OFF by default" were corrected.
+
+- [ ] Fresh install: the row reads ON.
+- [ ] Switch it OFF, reconnect: reactive mode — traffic flows, a pulled network
+      still fails closed during the reconnect gap, and disconnect lifts every filter.
+- [ ] Switch it back ON, reconnect: the A1 checks above hold again.
+
+### A1c. Disconnect no longer re-enables IPv6 on every adapter (audit D-24, 2026-09-29)
+The "legacy heal" that re-enabled the `ms_tcpip6` binding on EVERY adapter at
+each disconnect is gone (the client blocks IPv6 with WFP and never disables a
+binding).
+
+- [ ] Untick IPv6 on one physical adapter by hand, connect, disconnect, quit:
+      IPv6 is still unticked on that adapter.
+- [ ] On an adapter with IPv6 enabled, connect/disconnect: IPv6 still works
+      afterwards (the WFP block is removed with the session).
+
+**Manual check for machines that ran 1.3.19 or earlier (second-pass #17).**
+Those builds disabled the `ms_tcpip6` binding themselves and could leave it
+off; the removed heal was also what repaired such a machine, and no code path
+does now. The risk is low after many releases, but on a report of "no IPv6
+since an old Birdo install", check it by hand:
+
+- [ ] In an elevated PowerShell, `Get-NetAdapterBinding -ComponentID ms_tcpip6`
+      lists each adapter's IPv6 binding. An adapter the user never changed that
+      shows `Enabled False` is the old leftover.
+- [ ] Re-enable it for that adapter only, with the user's agreement:
+      `Enable-NetAdapterBinding -Name "<adapter>" -ComponentID ms_tcpip6`.
+      Never re-enable every adapter: that is exactly the blanket change D-24
+      removed, and it overrides a user who turned IPv6 off on purpose.
+
 ### A2. arm() degrades to reactive instead of disabling all protection (#9)
 If lockdown activation fails at `arm()` (e.g. tunnel LUID not yet published),
 the kill switch now falls back to **reactive** for the session instead of

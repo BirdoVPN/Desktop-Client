@@ -267,8 +267,9 @@ pub fn is_enabled() -> bool {
 
 /// Whether the kill switch is in lockdown (always-on) mode. Cross-platform
 /// accessor used by the auto-reconnect loop's GIVE-UP and offline-pause-cap
-/// branches: lockdown is the explicit user opt-in that keeps traffic blocked
-/// even when the session is over. Hard false off-Windows — the Unix
+/// branches: lockdown (ON by default on Windows, switchable in Settings) is
+/// the mode that keeps traffic blocked even when the session is over — for as
+/// long as the app keeps running. Hard false off-Windows — the Unix
 /// steady-state block (see [`holds_block_while_connected`]) is NOT lockdown
 /// and must never inherit lockdown's keep-blocked-after-give-up semantics,
 /// or a Unix user would be stranded behind the firewall.
@@ -293,8 +294,9 @@ pub fn is_lockdown_mode() -> bool {
 /// / WFP tunnel-LUID permit), so a SILENT tunnel death leaks nothing while
 /// the liveness watchdog needs up to ~60s to notice and reconnect.
 ///
-/// - Windows: lockdown mode only — reactive stays the default there, where
-///   the WFP lockdown opt-in already exists.
+/// - Windows: lockdown mode only. Lockdown is the Windows DEFAULT (the
+///   `lockdown_mode` setting defaults ON, desktop #34); a user who switches
+///   "Always-on kill switch" off in Settings gets the reactive mode (D-21).
 /// - macOS/Linux: always, whenever the kill switch is armed. There is no
 ///   lockdown flag off-Windows, and a reactive-only kill switch on those
 ///   platforms is exactly the finding's ~60s real-IP leak window.

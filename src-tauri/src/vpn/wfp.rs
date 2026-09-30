@@ -140,22 +140,32 @@ static SPLIT_TUNNEL_APPS: once_cell::sync::Lazy<Arc<RwLock<Vec<String>>>> =
 /// Whether local network sharing (RFC1918) is permitted through the kill switch.
 static LOCAL_NETWORK_SHARING: AtomicBool = AtomicBool::new(false);
 
-/// LOCKDOWN ("always-on") MODE — gated behind a user setting, OFF by default.
+/// LOCKDOWN ("always-on") MODE — driven by the persisted `lockdown_mode`
+/// setting, which DEFAULTS ON on Windows (`AppSettings::default()`, desktop
+/// #34, the TunnelVision fix) and is user-switchable in Settings › Security ›
+/// "Always-on kill switch". This static is only the pre-connect value: it
+/// starts false and `commands::vpn::apply_vpn_settings` sets it from the
+/// setting on every connect and settings reapply. (This comment used to say
+/// "OFF by default"; that stopped being true with #34 — audit 2026-09-29,
+/// D-21.)
 ///
-/// When false (default): the kill switch is REACTIVE — the block-all is only
+/// When false: the kill switch is REACTIVE — the block-all is only
 /// installed during a reconnect gap, and steady-state Connected traffic is
 /// contained by routing. Small (~5-30s) detection window on a drop, but the
 /// block is never active during normal browsing, so it cannot mis-block.
 ///
-/// When true: Mullvad-style ALWAYS-ON. The block-all stays installed the whole
-/// time the tunnel is up, and an INTERFACE-scoped permit on the tunnel adapter
-/// LUID (see TUNNEL_LUID / add_permit_tunnel_interface) lets tunneled traffic
-/// through while everything on the physical NIC stays blocked — so there is NO
-/// leak window, including across reconnects. This is the correct zero-window
-/// design, but it MUST be device-verified before being enabled by default: an
-/// always-on block that mis-resolves the tunnel LUID would block the user's own
-/// tunneled traffic. The dynamic WFP session still guarantees crash-safety
-/// (filters auto-removed if the process dies).
+/// When true (the Windows default): Mullvad-style ALWAYS-ON. The block-all
+/// stays installed the whole time the tunnel is up, and an INTERFACE-scoped
+/// permit on the tunnel adapter LUID (see TUNNEL_LUID /
+/// add_permit_tunnel_interface) lets tunneled traffic through while
+/// everything on the physical NIC stays blocked — so there is NO leak window,
+/// including across reconnects, while the app is running. The default shipped
+/// ON before the on-device run of `docs/WINDOWS-LEAK-VALIDATION.md` §A1 was
+/// recorded: an always-on block that mis-resolves the tunnel LUID would block
+/// the user's own tunneled traffic, which is why activate_blocking refuses to
+/// install a block-all without a LUID. The dynamic WFP session still
+/// guarantees crash-safety (filters auto-removed if the process dies) — which
+/// is also why none of this protects anything once the app has exited.
 static LOCKDOWN_MODE: AtomicBool = AtomicBool::new(false);
 
 /// The WireGuard tunnel adapter's interface LUID, published by the tunnel layer

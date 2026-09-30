@@ -166,6 +166,16 @@ describe('IPC Contract: Settings', () => {
 });
 
 describe('IPC Contract: Account Deletion', () => {
+  it('delete_account resolves with the store subscriptions still billing (camelCase)', async () => {
+    mockedInvoke.mockResolvedValueOnce({ storeSubscriptionsStillBilling: ['Google Play'] });
+
+    const result = await invoke<{ storeSubscriptionsStillBilling: string[] }>('delete_account', {
+      request: { password: 'mypassword123' },
+    });
+
+    expect(result.storeSubscriptionsStillBilling).toEqual(['Google Play']);
+  });
+
   it('delete_account sends password payload', async () => {
     mockedInvoke.mockResolvedValueOnce(undefined);
 
@@ -174,6 +184,22 @@ describe('IPC Contract: Account Deletion', () => {
     expect(mockedInvoke).toHaveBeenCalledWith('delete_account', {
       request: { password: 'mypassword123' },
     });
+  });
+
+  it('deletion_preflight takes no arguments and resolves camelCase store names', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      storeSubscriptionsStillBilling: ['Apple App Store'],
+      webSubscriptionWillBeCancelled: false,
+    });
+
+    const result = await invoke<{
+      storeSubscriptionsStillBilling: string[];
+      webSubscriptionWillBeCancelled: boolean;
+    }>('deletion_preflight');
+
+    expect(mockedInvoke).toHaveBeenCalledWith('deletion_preflight');
+    expect(result.storeSubscriptionsStillBilling).toEqual(['Apple App Store']);
+    expect(result.webSubscriptionWillBeCancelled).toBe(false);
   });
 
   it('delete_account rejects on 401', async () => {
@@ -286,6 +312,7 @@ const FRONTEND_COMMANDS = [
   'get_auth_state',
   'verify_2fa',
   'delete_account',
+  'deletion_preflight',
   'export_user_data',
   // VPN operations
   'connect_vpn',
@@ -302,6 +329,7 @@ const FRONTEND_COMMANDS = [
   'get_settings',
   'save_settings',
   'set_autostart',
+  'set_crash_reports_enabled',
   // System tray / window
   'set_tray_state',
   'set_window_position',

@@ -8,7 +8,7 @@ use crate::api::BirdoApi;
 use crate::storage::CredentialStore;
 use crate::utils::redact_email;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 use zeroize::Zeroize;
 
 // FIX-2-5: Client-side rate limiting for login IPC command
@@ -206,6 +206,14 @@ pub async fn logout(
         tracing::warn!("Failed to reset BirdoPQ keypair on logout: {}", e);
     }
 
+    // The device identifier is deliberately NOT rotated here (second-pass
+    // #14), matching iOS and Android: it rotates on account DELETION only.
+    // Rotating under a live account leaves the old device row behind (the
+    // device list and GET /devices/limit/status count it), re-triggers 2FA on
+    // every sign-in, and resets the per-device anonymous-register cap. The
+    // ML-KEM reset above is what stops the post-quantum key linking the next
+    // account on this machine to this one.
+
     Ok(true)
 }
 
@@ -223,31 +231,125 @@ impl Drop for DeleteAccountRequest {
     }
 }
 
+/// What the UI needs after a successful deletion.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteAccountResult {
+    /// App Store / Google Play subscriptions the server reported as still
+    /// billing (store names). Empty when there are none, and on a backend that
+    /// does not report them yet — the dialog warns about store billing before
+    /// the user confirms either way.
+    pub store_subscriptions_still_billing: Vec<String>,
+}
+
+/// The message a refused deletion shows. The backend's own words when it gave
+/// any (the password check's "Incorrect password"), not the variant's generic
+/// "Unknown error: …" framing.
+fn delete_failure_message(error: &ApiError) -> String {
+    let reason = match error {
+        ApiError::Unknown(message) => message.clone(),
+        ApiError::Unauthorized | ApiError::NotAuthenticated => {
+            "Your session has expired. Sign in again, then retry.".to_string()
+        }
+        other => other.to_string(),
+    };
+    format!(
+        "Account deletion failed: {}",
+        crate::utils::redact::sanitize_error(&reason)
+    )
+}
+
 #[tauri::command]
 pub async fn delete_account(
     request: DeleteAccountRequest,
+    app: tauri::AppHandle,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<bool, String> {
+) -> Result<DeleteAccountResult, String> {
     tracing::info!("Account deletion requested (GDPR)");
 
-    api.delete_account(&request.password).await.map_err(|e| {
-        format!(
-            "Account deletion failed: {}",
-            crate::utils::redact::sanitize_error(&e.to_string())
-        )
-    })?;
+    // Nothing local is touched unless the server confirms the deletion: a
+    // refused request (wrong password, expired session, offline) must leave
+    // the user signed in to the account that still exists — and connected.
+    let response = api
+        .delete_account(&request.password)
+        .await
+        .map_err(|e| delete_failure_message(&e))?;
+
+    // The server has confirmed (2xx). Only NOW take the tunnel down, before
+    // the local state is cleared (second-pass #15). This used to happen in
+    // the dialog before the request, so a wrong password or an offline delete
+    // left the user disconnected from an account that still existed. The
+    // account's keys are gone server-side, so the tunnel could not carry
+    // traffic anyway; the full user-initiated path also stops auto-reconnect
+    // and disarms the kill switch, so nothing is left blocking. Best effort:
+    // a failed teardown never turns a completed erasure into an error.
+    if let Err(e) =
+        crate::commands::vpn::disconnect_vpn(app.clone(), app.state(), app.state(), app.state())
+            .await
+    {
+        tracing::warn!("Disconnect after account deletion failed: {}", e);
+    }
 
     // Clear all local credentials after successful server-side deletion,
     // including the persistent ML-KEM identity (same hygiene as logout —
-    // doubly so for a GDPR deletion).
+    // doubly so for a GDPR deletion) and the device identifier (C-8).
     let _ = credentials.clear_tokens();
     if let Err(e) = crate::vpn::birdo_pq::reset_persisted_keypair() {
         tracing::warn!("Failed to reset BirdoPQ keypair on account deletion: {}", e);
     }
+    crate::utils::device_id::rotate();
+
+    let store_subscriptions_still_billing = response
+        .store_subscriptions_still_billing
+        .as_ref()
+        .map(crate::api::types::store_subscription_labels)
+        .unwrap_or_default();
 
     tracing::info!("Account permanently deleted");
-    Ok(true)
+    Ok(DeleteAccountResult {
+        store_subscriptions_still_billing,
+    })
+}
+
+/// What the deletion dialog shows BEFORE the user confirms (second-pass #9).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionPreflightResult {
+    /// Store names ("Apple App Store", "Google Play") whose subscriptions will
+    /// keep billing after the deletion. Empty when there are none.
+    pub store_subscriptions_still_billing: Vec<String>,
+    /// A web (Polar) subscription is billing and the deletion will cancel it.
+    pub web_subscription_will_be_cancelled: bool,
+}
+
+/// `GET /api/v1/gdpr/delete/preflight`: read-only, nothing local changes.
+/// The dialog treats an error as "unknown" and keeps its static warning, so
+/// a failed preflight never blocks a deletion.
+#[tauri::command]
+pub async fn deletion_preflight(
+    api: State<'_, BirdoApi>,
+) -> Result<DeletionPreflightResult, String> {
+    let response = api
+        .deletion_preflight()
+        .await
+        .map_err(|e| crate::utils::redact::sanitize_error(&e.to_string()))?;
+    Ok(deletion_preflight_result(&response))
+}
+
+fn deletion_preflight_result(
+    response: &crate::api::types::DeletionPreflightResponse,
+) -> DeletionPreflightResult {
+    DeletionPreflightResult {
+        store_subscriptions_still_billing: response
+            .store_subscriptions_still_billing
+            .as_ref()
+            .map(crate::api::types::store_subscription_labels)
+            .unwrap_or_default(),
+        web_subscription_will_be_cancelled: response
+            .web_subscription_will_be_cancelled
+            .unwrap_or(false),
+    }
 }
 
 /// GDPR: Export all user data (Right to Data Portability, Art. 20).
@@ -756,5 +858,75 @@ pub async fn login_anonymous(
                 challenge_token: None,
             })
         }
+    }
+}
+
+/// Source pins for the account-boundary ordering in `logout` and
+/// `delete_account`. Tauri commands take `State`, which a unit test cannot
+/// build, so these read this file the way `ipv6_binding_tests` reads
+/// `src/vpn`.
+#[cfg(test)]
+mod account_boundary_tests {
+    const SOURCE: &str = include_str!("auth.rs");
+
+    /// The body of `pub async fn <name>(`, up to its closing brace at column 0.
+    fn body(name: &str) -> &'static str {
+        let start = SOURCE
+            .find(&format!("pub async fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} not found"));
+        let rest = &SOURCE[start..];
+        let end = rest.find("\n}").expect("closing brace at column 0");
+        &rest[..end]
+    }
+
+    #[test]
+    fn sign_out_does_not_rotate_the_device_id() {
+        // Second-pass #14: same policy as iOS and Android (deletion only).
+        let needle = ["device_id", "::rotate()"].concat();
+        assert!(!body("logout").contains(&needle));
+        assert!(body("delete_account").contains(&needle));
+    }
+
+    #[test]
+    fn deletion_disconnects_only_after_the_server_confirmed() {
+        // Second-pass #15: a refused deletion (wrong password, offline) must
+        // leave the tunnel up; a confirmed one takes it down before the local
+        // state is cleared.
+        let del = body("delete_account");
+        let confirmed = del
+            .find(".delete_account(&request.password)")
+            .expect("the server call");
+        let disconnect = del
+            .find("commands::vpn::disconnect_vpn(")
+            .expect("the disconnect after the 2xx");
+        let cleared = del
+            .find("credentials.clear_tokens()")
+            .expect("local state cleared");
+        assert!(
+            confirmed < disconnect,
+            "disconnect runs before the server confirmed"
+        );
+        assert!(
+            disconnect < cleared,
+            "local state is cleared before the disconnect"
+        );
+    }
+
+    /// Second-pass #9: the preflight the dialog shows before confirming.
+    #[test]
+    fn preflight_names_the_stores_and_defaults_to_nothing() {
+        let named =
+            super::deletion_preflight_result(&crate::api::types::DeletionPreflightResponse {
+                store_subscriptions_still_billing: Some(serde_json::json!([
+                    { "store": "GOOGLE_PLAY", "productId": "birdo_operative", "expiresAt": null }
+                ])),
+                web_subscription_will_be_cancelled: Some(true),
+            });
+        assert_eq!(named.store_subscriptions_still_billing, vec!["Google Play"]);
+        assert!(named.web_subscription_will_be_cancelled);
+
+        let nothing = super::deletion_preflight_result(&Default::default());
+        assert!(nothing.store_subscriptions_still_billing.is_empty());
+        assert!(!nothing.web_subscription_will_be_cancelled);
     }
 }

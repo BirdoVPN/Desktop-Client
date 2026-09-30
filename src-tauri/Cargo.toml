@@ -1,9 +1,9 @@
 [package]
 name = "birdo-vpn-desktop"
-version = "1.4.44"
+version = "1.4.45"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
-license = "Proprietary"
+license = "CC-BY-NC-4.0" # SPDX id of ../LICENSE (source-available, not open source)
 publish = false # Tauri app — never published to crates.io (also lets cargo-deny skip it)
 edition = "2021"
 # 1.85: the floor of the RustCrypto 0.11-generation crates (digest/sha2/hmac/

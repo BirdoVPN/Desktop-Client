@@ -115,10 +115,16 @@ export interface AppSettings {
   // malware domains) at the VPN resolver. Sent as the `dnsFiltering` connect
   // flag by the Rust dial paths; OFF by default, available on every plan.
   dnsFiltering: boolean;
-  // LOCKDOWN (always-on kill switch, Windows WFP). No UI toggle yet — carried
-  // in the store so settings saves round-trip it instead of silently resetting
-  // the persisted flag to the Rust serde default on every write.
+  // LOCKDOWN (always-on kill switch, Windows WFP). ON by default on Windows
+  // (Rust `AppSettings::default()`, desktop #34); switchable in Settings ›
+  // Security › "Always-on kill switch" (Windows only, applies from the next
+  // connection). Carried in the store so settings saves round-trip it instead
+  // of silently resetting the persisted flag to the Rust serde default.
   lockdownMode: boolean;
+  // Crash reports to Sentry. OPT-IN, OFF by default (audit 2026-09-29, C-3).
+  // Written through the dedicated `set_crash_reports_enabled` command (consent
+  // screen, Settings › Privacy) and round-tripped by every full save.
+  crashReportsEnabled: boolean;
 }
 
 export interface MultiHopRoute {
@@ -304,6 +310,8 @@ const defaultSettings: AppSettings = {
   quantumProtection: true,
   // Matches the Rust `default_true` serde default for lockdown_mode.
   lockdownMode: true,
+  // Crash reporting is opt-in — matches the Rust `AppSettings::default()`.
+  crashReportsEnabled: false,
 };
 
 export const useAppStore = create<AppState>()(

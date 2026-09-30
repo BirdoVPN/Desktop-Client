@@ -167,6 +167,9 @@ export interface RustSettings {
   // force-reset lockdown on each settings write. Add any future Rust
   // AppSettings field here too, for the same reason.
   lockdown_mode: boolean;
+  // Crash reports (opt-in, C-3). Optional on the READ side for the same reason
+  // as dns_filtering: Rust omits the key while it is false.
+  crash_reports_enabled?: boolean;
 }
 
 import type { AppSettings } from '../store/app-store';
@@ -203,6 +206,8 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     quantumProtection: rs.quantum_protection ?? true,
     // Matches the Rust serde default (default_true) for older settings files.
     lockdownMode: rs.lockdown_mode ?? true,
+    // Opt-in; absent (not false) while off, and absent on every pre-opt-in file.
+    crashReportsEnabled: rs.crash_reports_enabled ?? false,
   };
 }
 
@@ -228,5 +233,7 @@ export function settingsToRust(s: AppSettings): RustSettings {
     quantum_protection: s.quantumProtection,
     dns_filtering: s.dnsFiltering,
     lockdown_mode: s.lockdownMode,
+    // Always written, so a full save can never silently drop the user's choice.
+    crash_reports_enabled: s.crashReportsEnabled,
   };
 }

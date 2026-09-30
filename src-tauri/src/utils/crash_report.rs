@@ -47,10 +47,166 @@
 //! the mistake the Android client shipped (`tracesSampleRate = 1.0` beside a
 //! `beforeSend`-only scrubber), so here performance data is off twice over —
 //! see [`never_sample_a_transaction`].
+//!
+//! # Crash reporting is OPT-IN (audit 2026-09-29, C-3 / D-12 / P1-6)
+//!
+//! Until 1.4.44 `main()` called `sentry::init` on every launch, before the
+//! consent screen, with no way to switch it off. Now:
+//!
+//! - Nothing is initialised at startup unless the persisted setting
+//!   `crash_reports_enabled` is true (`main.rs` `setup()` →
+//!   [`set_opted_in`]). The setting defaults to FALSE for new installs and for
+//!   every upgraded one, whatever 1.4.44 did.
+//! - With it off, no Sentry client exists: sentry's panic hook is never
+//!   installed, [`report_security_event`] returns before touching the SDK, and
+//!   nothing can reach the network.
+//! - Turning it on (consent screen or Settings) takes effect immediately —
+//!   [`set_opted_in`] builds the client and binds it to the process hub — so
+//!   the UI needs no "restart" note.
+//! - Turning it off takes effect immediately too: the client stays bound (the
+//!   panic integration cannot be uninstalled), but [`gate_and_scrub`], the
+//!   `before_send` hook, drops every event while the flag is off. Sentry's
+//!   client reports (dropped-event counters) are only ever attached to an
+//!   outgoing envelope, so a dropped event sends nothing either.
+//! - No release-health sessions: the SDK's `release-health` feature is not
+//!   compiled (Cargo.toml), so no session envelope exists in this binary.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use sentry::protocol::{Context, Event, Map};
 
 use super::redact::sanitize_always;
+
+/// The user's crash-reporting choice, mirrored from settings. OFF until
+/// [`set_opted_in`] says otherwise.
+static OPTED_IN: AtomicBool = AtomicBool::new(false);
+
+/// The one Sentry client this process ever builds (the panic integration
+/// installs its hook once per process, so it is built at most once).
+static CLIENT: OnceLock<Arc<sentry::Client>> = OnceLock::new();
+
+/// Apply the user's choice. `true` builds and binds the client on first use;
+/// `false` makes [`gate_and_scrub`] drop everything from now on.
+pub fn set_opted_in(enabled: bool) {
+    OPTED_IN.store(enabled, Ordering::SeqCst);
+    if enabled {
+        CLIENT.get_or_init(|| {
+            let client = Arc::new(sentry::Client::from(sentry::apply_defaults(
+                client_options(),
+            )));
+            // Bind to the PROCESS hub explicitly. `sentry::init` binds to the
+            // CURRENT thread's hub, which is only the process hub when called
+            // on the thread that first touched sentry — true for the old
+            // top-of-main() call, not for a Settings toggle arriving on a
+            // command thread. Nothing touches sentry before this point (see the
+            // module docs), so every thread hub created later inherits it.
+            let hub = sentry::Hub::main();
+            hub.bind_client(Some(client.clone()));
+            // Name the ML-KEM implementation this binary links, so a native
+            // fault in the BirdoPQ path can be attributed from the report
+            // alone (the 1.4.25 Android SIGILL). The scrubber only lets this
+            // key out with exactly this value (`ALLOWED_TAGS`).
+            hub.configure_scope(|scope| {
+                scope.set_tag("birdo.pq.impl", crate::vpn::birdo_pq::PQ_IMPL_NAME);
+            });
+            client
+        });
+    }
+    tracing::info!(
+        "Crash reporting {}",
+        if enabled {
+            "enabled by the user"
+        } else {
+            "off"
+        }
+    );
+}
+
+/// Whether the user has opted in to crash reports.
+pub fn is_opted_in() -> bool {
+    OPTED_IN.load(Ordering::SeqCst)
+}
+
+/// How long an exit waits for queued reports to go out.
+pub const EXIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Send whatever is still queued before the process exits (second-pass #17).
+///
+/// The old top-of-`main()` `sentry::init` returned a guard that flushed on
+/// drop; building the client lazily on opt-in lost that, so a
+/// [`report_security_event`] raised just before quitting could be dropped
+/// with the transport thread. Called from the exit paths in `main.rs`.
+/// A no-op when no client was ever built (never opted in): it does not touch
+/// the SDK at all then. Blocks for at most [`EXIT_FLUSH_TIMEOUT`].
+pub fn flush_on_exit() {
+    if let Some(client) = CLIENT.get() {
+        if !client.flush(Some(EXIT_FLUSH_TIMEOUT)) {
+            tracing::warn!("Crash reports still queued at exit were not all sent");
+        }
+    }
+}
+
+/// `before_send`: drop everything while the user is opted out, otherwise
+/// rebuild the event from the allowlist ([`scrub_event`]).
+pub fn gate_and_scrub(event: Event<'static>) -> Option<Event<'static>> {
+    gate(is_opted_in(), event)
+}
+
+/// The pure half of [`gate_and_scrub`], so both branches are testable without
+/// flipping the process-wide flag under other tests.
+fn gate(opted_in: bool, event: Event<'static>) -> Option<Event<'static>> {
+    if !opted_in {
+        return None;
+    }
+    Some(scrub_event(event))
+}
+
+/// Every client option, stated explicitly (see `docs/SENTRY-SETUP.md` §7).
+fn client_options() -> sentry::ClientOptions {
+    (
+        // The DSN is public — it only identifies the project. Empty in debug
+        // builds, which makes the client a no-op; `build.rs` refuses a release
+        // build without one.
+        option_env!("SENTRY_DSN").unwrap_or(""),
+        // sentry 0.49 made `ClientOptions` #[non_exhaustive], so every option
+        // is set through the builder.
+        sentry::ClientOptions::new()
+            .release(env!("CARGO_PKG_VERSION"))
+            .environment(if cfg!(debug_assertions) {
+                "development"
+            } else {
+                "production"
+            })
+            // Scrub PII: no usernames, IPs, or email in breadcrumbs
+            .send_default_pii(false)
+            // SEC-PII: the `contexts` integration fills a None server_name with
+            // the machine hostname (`ContextIntegration::setup` only assigns
+            // when `options.server_name.is_none()`), and consumer hostnames
+            // routinely embed the owner's real name ("Johns-MacBook-Pro").
+            // `send_default_pii: false` does NOT gate that path. A pre-set
+            // value short-circuits it.
+            .server_name("redacted")
+            // The opt-in gate, then the ALLOWLIST. `before_send` is the last
+            // point before an event leaves the device, and it covers every
+            // capture path — sentry's own panic integration chains AHEAD of
+            // `setup_panic_hook` and sees the raw payload, so neither the gate
+            // nor the scrub can live in a hook.
+            .before_send(gate_and_scrub)
+            // 0.49: `sample_rate` became `EventSamplingStrategy::FixedRate`;
+            // 1.0 is also the default, kept explicit so the intent is visible.
+            .sample_rate(1.0)
+            // NO PERFORMANCE DATA — `before_send` does not run for
+            // transactions (see the module docs), so they are never sampled.
+            // `auto_session_tracking` needs no setting: its setter only exists
+            // under the `release-health` feature, which is not compiled, so
+            // the session flusher is absent from this binary altogether.
+            // `enable_logs` is #[deprecated] in 0.49 and only gates the
+            // `tracing`/`log` integrations, neither of which is compiled.
+            .traces_sampler(never_sample_a_transaction),
+    )
+        .into()
+}
 
 /// Context keys that may leave the device. Everything `sentry-contexts` puts on
 /// an event is in here, so this is a fence rather than a filter today — it
@@ -188,7 +344,13 @@ pub fn never_sample_a_transaction(_ctx: &sentry::TransactionContext) -> f32 {
 /// error string from the network stack. `scrub_event` sanitises what it can
 /// recognise, but the guarantee here is the caller's: this is an errors-only,
 /// PII-free channel by owner decision.
+///
+/// Like every other report it is sent ONLY if the user opted in to crash
+/// reports; otherwise it returns before touching the SDK at all.
 pub fn report_security_event(message: &str) {
+    if !is_opted_in() {
+        return;
+    }
     sentry::capture_message(message, sentry::Level::Error);
 }
 
@@ -394,6 +556,64 @@ mod tests {
             "an upstream sentry-trace header must not be able to turn tracing on: \
              performance.rs:615 lets ctx.sampled override traces_sample_rate, and only \
              a traces_sampler outranks it"
+        );
+    }
+
+    /// Opt-in gate: while the user has not turned crash reports on, NOTHING
+    /// leaves — not even a scrubbed event.
+    #[test]
+    fn nothing_is_sent_unless_the_user_opted_in() {
+        let mut event = Event::new();
+        event.message = Some("panic".into());
+        assert!(gate(false, event.clone()).is_none(), "opted out must drop");
+        let out = gate(true, event).expect("opted in must send");
+        assert_eq!(
+            out.server_name.as_deref(),
+            Some("redacted"),
+            "and still scrub"
+        );
+    }
+
+    /// The process starts opted OUT, whatever an older build did: nothing in
+    /// the test binary ever opts in, so the global must read false here.
+    #[test]
+    fn the_process_starts_opted_out() {
+        assert!(!is_opted_in());
+        assert!(gate_and_scrub(Event::new()).is_none());
+    }
+
+    /// Second-pass #17: the exit flush never builds a client, and so never
+    /// touches the SDK, for a user who did not opt in.
+    #[test]
+    fn exit_flush_is_a_no_op_without_opt_in() {
+        let started = std::time::Instant::now();
+        flush_on_exit();
+        assert!(CLIENT.get().is_none(), "flushing must not build a client");
+        assert!(started.elapsed() < EXIT_FLUSH_TIMEOUT, "and must not wait");
+    }
+
+    /// The options the client is built with carry the gate itself, not just
+    /// the scrubber, and no traces.
+    #[test]
+    fn client_options_wire_the_gate_and_disable_tracing() {
+        let opts = client_options();
+        assert!(!opts.send_default_pii);
+        assert_eq!(opts.server_name.as_deref(), Some("redacted"));
+        let before_send = opts.before_send.as_ref().expect("before_send is set");
+        assert!(
+            before_send(Event::new()).is_none(),
+            "before_send must drop while opted out"
+        );
+        assert!(
+            matches!(
+                opts.traces_sampling_strategy,
+                sentry::TracesSamplingStrategy::Function(_)
+            ),
+            "the never-sample function must outrank any inherited decision"
+        );
+        assert!(
+            !opts.auto_session_tracking,
+            "no release-health sessions: nothing may be sent on app start"
         );
     }
 

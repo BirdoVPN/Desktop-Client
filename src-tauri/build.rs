@@ -22,12 +22,16 @@ fn main() {
 
     // ── Crash reporting must not ship inert ─────────────────────────
     //
-    // `main.rs` reads the DSN with `option_env!`, so an absent one compiles
-    // to `""` and `sentry::init` becomes a silent no-op: the build is green,
-    // the artifact is signed and shipped, and the crash reporter does not
-    // exist. That is how the Android client spent months with a blank DSN
-    // (Mobile-Client #357), and a `cargo:warning` in a twelve-minute build
-    // is not a control — it is a line of scrollback.
+    // `utils/crash_report.rs` reads the DSN with `option_env!`, so an absent
+    // one compiles to `""` and the Sentry client becomes a silent no-op: the
+    // build is green, the artifact is signed and shipped, and the crash
+    // reporter does not exist. That is how the Android client spent months
+    // with a blank DSN (Mobile-Client #357), and a `cargo:warning` in a
+    // twelve-minute build is not a control — it is a line of scrollback.
+    //
+    // A DSN in the binary does NOT mean reports are sent: crash reporting is
+    // opt-in at runtime and OFF until the user turns it on (audit 2026-09-29,
+    // C-3). The gate here only guarantees the opt-in can work.
     //
     // THE REBUILD TRIGGER IS LOAD-BEARING. Cargo caches a build script by
     // its declared inputs; without this line the check below would be
@@ -71,7 +75,10 @@ fn main() {
                  (sntrys_...) would compile and then silently fail to ingest."
             );
         } else {
-            println!("cargo:warning=Sentry: release build has a DSN — crash reporting is ARMED.");
+            println!(
+                "cargo:warning=Sentry: release build has a DSN — crash reporting is ARMED \
+                 (opt-in: nothing is sent until the user turns it on)."
+            );
         }
     }
 
