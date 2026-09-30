@@ -81,9 +81,12 @@ describe('contrast (W2-018)', () => {
 });
 
 describe('motion (W2-034)', () => {
+  // framer-motion props in TS/TSX only: the CSS reduced-motion reset
+  // (`animation-duration: 0.01ms`) is a literal on purpose.
   it('animation durations come from the motion tokens, not literals', () => {
-    expect(offenders(/duration:\s*0?\.\d/)).toEqual([]);
-    expect(offenders(/stiffness:|damping:/)).toEqual([]);
+    const tsx = (re: RegExp) => offenders(re).filter((hit) => !hit.includes('.css:'));
+    expect(tsx(/duration:\s*0?\.\d/)).toEqual([]);
+    expect(tsx(/stiffness:|damping:/)).toEqual([]);
   });
 });
 
