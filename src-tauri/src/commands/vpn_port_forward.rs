@@ -5,28 +5,19 @@
 use tauri::State;
 
 use crate::api::BirdoApi;
+use crate::commands::ipc_error::IpcError;
+use crate::commands::session::ensure_signed_in;
 use crate::storage::CredentialStore;
-use crate::utils::redact::sanitize_error;
 
 /// Get active port forwards for the current user
 #[tauri::command]
 pub async fn get_port_forwards(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<Vec<crate::api::types::PortForward>, String> {
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-                .await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
+) -> Result<Vec<crate::api::types::PortForward>, IpcError> {
+    ensure_signed_in(&api, &credentials).await?;
 
-    api.get_port_forwards()
-        .await
-        .map_err(|e| sanitize_error(&format!("Failed to get port forwards: {}", e)))
+    api.get_port_forwards().await.map_err(IpcError::from)
 }
 
 /// Create a new port forward
@@ -36,33 +27,29 @@ pub async fn create_port_forward(
     protocol: String,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<crate::api::types::CreatePortForwardResponse, String> {
+) -> Result<crate::api::types::CreatePortForwardResponse, IpcError> {
     // SEC FIX: Rust-side allowlist validation — TypeScript types are not a security boundary.
     // A compromised renderer can bypass TypeScript and send arbitrary strings via IPC.
     if protocol != "tcp" && protocol != "udp" {
-        return Err("Invalid protocol: must be 'tcp' or 'udp'".to_string());
+        return Err(IpcError::unknown(
+            "Invalid protocol: must be 'tcp' or 'udp'",
+        ));
     }
 
     // Reject port 0 (OS-assigned) and privileged ports (1-1023) — these are not
     // suitable for user-initiated port forwarding.
     if port < 1024 {
-        return Err("Invalid port: must be in range 1024-65535".to_string());
+        return Err(IpcError::unknown(
+            "Invalid port: must be in range 1024-65535",
+        ));
     }
 
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-                .await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
+    ensure_signed_in(&api, &credentials).await?;
 
     let response = api
         .create_port_forward(port, &protocol, None)
         .await
-        .map_err(|e| sanitize_error(&format!("Failed to create port forward: {}", e)))?;
+        .map_err(IpcError::from)?;
 
     // Surface any backend-provided context (e.g. "Port already in use") for debugging.
     if let Some(message) = response.message.as_deref() {
@@ -80,7 +67,7 @@ pub async fn delete_port_forward(
     id: String,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<bool, String> {
+) -> Result<bool, IpcError> {
     // SEC FIX: Validate id is a CUID/UUID to prevent URL path traversal.
     // The id flows into format!("{}/{}", PORT_FORWARDS_ENDPOINT, id), so
     // a malicious renderer could inject traversal sequences like "../../other".
@@ -90,22 +77,12 @@ pub async fn delete_port_forward(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err("Invalid port forward ID".to_string());
+        return Err(IpcError::unknown("Invalid port forward ID"));
     }
 
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-                .await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
+    ensure_signed_in(&api, &credentials).await?;
 
-    api.delete_port_forward(&id)
-        .await
-        .map_err(|e| sanitize_error(&format!("Failed to delete port forward: {}", e)))?;
+    api.delete_port_forward(&id).await.map_err(IpcError::from)?;
 
     Ok(true)
 }

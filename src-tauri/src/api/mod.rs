@@ -8,6 +8,7 @@ pub mod client;
 pub mod doh_resolver;
 pub mod endpoints;
 pub mod error;
+pub mod session_gate;
 pub mod types;
 pub mod upgrade_gate;
 

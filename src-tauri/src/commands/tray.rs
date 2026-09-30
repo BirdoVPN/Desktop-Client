@@ -1,13 +1,14 @@
-//! System-tray state command.
+//! System-tray state, driven from Rust.
 //!
-//! The tray icon + tooltip reflect the live VPN connection state. The frontend
-//! drives this by calling `set_tray_state` whenever the connection state (or the
-//! current server) changes — there's no native polling loop, so the single
-//! source of truth stays the app store.
+//! W1-023: the icon, tooltip and menu used to be set by the webview through
+//! `set_tray_state`, from a poll that ran only while the Home tab was mounted
+//! — 15 s apart when hidden, and not at all behind the biometric lock. A VPN
+//! lives in the tray, so the tray showed "Connected" long after a drop. They
+//! now follow the `vpn-status-changed` choke point (`VpnManager`'s published
+//! status), which needs no window at all. Copy is the canonical vocabulary
+//! (audit/P1-parity.md).
 //!
-//! `state` is one of: "connected" (green), "connecting" (amber — covers every
-//! in-progress phase), anything else → "disconnected" (slate). The icons are
-//! embedded at build time so they ship inside the exe.
+//! The icons are embedded at build time so they ship inside the exe.
 
 use tauri::image::Image;
 use tauri::menu::MenuItem;
@@ -15,7 +16,7 @@ use tauri::{AppHandle, Manager, Wry};
 
 /// Handles to the tray context-menu items whose `enabled` state must track the
 /// live VPN connection state. Stored in Tauri-managed state at setup time so
-/// `set_tray_state` can flip them.
+/// `apply_tray_status` can flip them.
 ///
 /// Without this, the tray "Disconnect" item was created `enabled: false` and
 /// never re-enabled — so it was permanently greyed out even while connected.
@@ -62,38 +63,194 @@ pub fn load_tray_image(bytes: &[u8]) -> Result<Image<'static>, String> {
     Ok(Image::new_owned(rgba, w, h))
 }
 
-#[tauri::command]
-pub fn set_tray_state(app: AppHandle, state: String, tooltip: String) -> Result<(), String> {
-    // Tray may not exist yet during very early startup — treat as a no-op.
+/// Which embedded icon the tray shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayIcon {
+    Connected,
+    Connecting,
+    Disconnected,
+}
+
+/// What the tray shows for a status. Pure, so the mapping is unit-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayPresentation {
+    pub icon: TrayIcon,
+    pub tooltip: String,
+    pub connect_enabled: bool,
+    pub disconnect_enabled: bool,
+}
+
+pub fn tray_presentation(status: &crate::commands::vpn::VpnStatus) -> TrayPresentation {
+    let (icon, label) = match status.state {
+        "connected" if status.multi_hop.is_some() => (TrayIcon::Connected, "Protected · Multi-Hop"),
+        "connected" => (TrayIcon::Connected, "Protected"),
+        "connecting" => (TrayIcon::Connecting, "Connecting…"),
+        "reconnecting" => (TrayIcon::Connecting, "Reconnecting…"),
+        "switching" => (TrayIcon::Connecting, "Switching server…"),
+        "disconnecting" => (TrayIcon::Connecting, "Disconnecting…"),
+        "error" => (TrayIcon::Disconnected, "Connection error"),
+        _ => (TrayIcon::Disconnected, "Not connected"),
+    };
+    let tooltip = if status.kill_switch_blocking {
+        // The tray is often the only visible surface: say that the machine is
+        // offline on purpose, and why, rather than a state name.
+        "BirdoVPN — Kill Switch — all traffic blocked".to_string()
+    } else {
+        match (status.state, status.server_name.as_deref()) {
+            ("connected", Some(location)) => format!("BirdoVPN — {label}\nvia {location}"),
+            _ => format!("BirdoVPN — {label}"),
+        }
+    };
+    let idle = matches!(status.state, "disconnected" | "error");
+    TrayPresentation {
+        icon,
+        tooltip,
+        connect_enabled: idle,
+        // Disconnect works in every state but "already there" (contract §3.1),
+        // and is always offered while the block holds the machine offline.
+        disconnect_enabled: !matches!(status.state, "disconnected" | "disconnecting")
+            || status.kill_switch_blocking,
+    }
+}
+
+/// Apply `status` to the tray. A no-op before the tray exists.
+pub fn apply_tray_status(app: &AppHandle, status: &crate::commands::vpn::VpnStatus) {
     let Some(tray) = app.tray_by_id("main") else {
-        tracing::debug!(
-            state = %state,
-            "set_tray_state: tray 'main' not initialized yet — discarding update"
-        );
-        return Ok(());
+        return;
     };
-
-    let bytes: &[u8] = match state.as_str() {
-        "connected" => include_bytes!("../../icons/tray-connected.png"),
-        "connecting" => include_bytes!("../../icons/tray-connecting.png"),
-        _ => include_bytes!("../../icons/tray-disconnected.png"),
+    let presentation = tray_presentation(status);
+    let bytes: &[u8] = match presentation.icon {
+        TrayIcon::Connected => include_bytes!("../../icons/tray-connected.png"),
+        TrayIcon::Connecting => include_bytes!("../../icons/tray-connecting.png"),
+        TrayIcon::Disconnected => include_bytes!("../../icons/tray-disconnected.png"),
     };
-
-    let icon = load_tray_image(bytes)?;
-    tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
-    tray.set_tooltip(Some(tooltip.as_str()))
-        .map_err(|e| e.to_string())?;
-
-    // Keep the tray context-menu items in sync with the connection state.
-    // "Disconnect" is only actionable while there's an active tunnel
-    // ("connected" or the in-progress "connecting" phase); "Quick Connect"
-    // is only actionable while idle. If the menu-item handles aren't managed
-    // yet (very early startup), this is a harmless no-op.
+    match load_tray_image(bytes) {
+        Ok(icon) => {
+            let _ = tray.set_icon(Some(icon));
+        }
+        Err(e) => tracing::warn!("Tray icon could not be decoded: {}", e),
+    }
+    let _ = tray.set_tooltip(Some(presentation.tooltip.as_str()));
     if let Some(items) = app.try_state::<TrayMenuItems>() {
-        let active = matches!(state.as_str(), "connected" | "connecting");
-        let _ = items.disconnect.set_enabled(active);
-        let _ = items.connect.set_enabled(!active);
+        let _ = items.connect.set_enabled(presentation.connect_enabled);
+        let _ = items
+            .disconnect
+            .set_enabled(presentation.disconnect_enabled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::vpn::VpnStatus;
+
+    fn status(state: &'static str) -> VpnStatus {
+        VpnStatus {
+            state,
+            phase: None,
+            reconnect_attempt: None,
+            reconnect_max: None,
+            kill_switch_blocking: false,
+            error: None,
+            server_id: None,
+            multi_hop: None,
+            seq: 1,
+            bytes_sent: 0,
+            bytes_received: 0,
+            connected_at: None,
+            server_name: None,
+            stealth_active: false,
+            quantum_active: false,
+            pq_mode: crate::vpn::birdo_pq::PqMode::Disabled,
+            dns_degraded: vec![],
+        }
     }
 
-    Ok(())
+    #[test]
+    fn canonical_copy_per_state() {
+        let mut connected = status("connected");
+        connected.server_name = Some("Amsterdam".into());
+        let p = tray_presentation(&connected);
+        assert_eq!(p.icon, TrayIcon::Connected);
+        assert_eq!(p.tooltip, "BirdoVPN — Protected\nvia Amsterdam");
+        assert!(!p.connect_enabled && p.disconnect_enabled);
+
+        for (state, text, icon) in [
+            ("connecting", "BirdoVPN — Connecting…", TrayIcon::Connecting),
+            (
+                "reconnecting",
+                "BirdoVPN — Reconnecting…",
+                TrayIcon::Connecting,
+            ),
+            (
+                "switching",
+                "BirdoVPN — Switching server…",
+                TrayIcon::Connecting,
+            ),
+            (
+                "disconnected",
+                "BirdoVPN — Not connected",
+                TrayIcon::Disconnected,
+            ),
+            (
+                "error",
+                "BirdoVPN — Connection error",
+                TrayIcon::Disconnected,
+            ),
+        ] {
+            let p = tray_presentation(&status(state));
+            assert_eq!(p.tooltip, text, "{state}");
+            assert_eq!(p.icon, icon, "{state}");
+        }
+    }
+
+    /// W2-003: tray Disconnect must work while connecting and reconnecting,
+    /// and Quick Connect from an error.
+    #[test]
+    fn disconnect_is_offered_in_every_active_state() {
+        for state in [
+            "connecting",
+            "reconnecting",
+            "switching",
+            "connected",
+            "error",
+        ] {
+            assert!(
+                tray_presentation(&status(state)).disconnect_enabled,
+                "{state}"
+            );
+        }
+        for state in ["disconnected", "disconnecting"] {
+            assert!(
+                !tray_presentation(&status(state)).disconnect_enabled,
+                "{state}"
+            );
+        }
+        assert!(tray_presentation(&status("error")).connect_enabled);
+        assert!(!tray_presentation(&status("reconnecting")).connect_enabled);
+    }
+
+    #[test]
+    fn blocking_says_so_and_keeps_disconnect_available() {
+        let mut blocked = status("error");
+        blocked.kill_switch_blocking = true;
+        let p = tray_presentation(&blocked);
+        assert_eq!(p.tooltip, "BirdoVPN — Kill Switch — all traffic blocked");
+        assert!(p.disconnect_enabled);
+    }
+
+    #[test]
+    fn multi_hop_reads_as_such() {
+        let mut mh = status("connected");
+        mh.multi_hop = Some(crate::vpn::manager::MultiHopStatus {
+            entry_id: "a".into(),
+            entry_name: "Frankfurt".into(),
+            exit_id: "b".into(),
+            exit_name: "Reykjavik".into(),
+        });
+        assert_eq!(
+            tray_presentation(&mh).tooltip,
+            "BirdoVPN — Protected · Multi-Hop"
+        );
+    }
 }

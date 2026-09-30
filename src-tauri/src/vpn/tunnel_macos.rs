@@ -511,6 +511,24 @@ impl UtunTunnel {
         }
     }
 
+    /// Time since the last completed WireGuard handshake (W1-002). `None` once
+    /// the WireGuard session is gone (the tunnel is being stopped).
+    pub async fn handshake_age(&self) -> Option<std::time::Duration> {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .map(|session| session.handshake_age())
+    }
+
+    /// Start a handshake now unless one is in flight (see
+    /// `WireGuardSession::force_handshake`).
+    pub async fn force_handshake(&self) {
+        if let Some(session) = self.wg_session.read().await.as_ref() {
+            session.force_handshake().await;
+        }
+    }
+
     /// Measure latency to the VPN endpoint.
     pub async fn measure_latency(&self) -> Option<u32> {
         if let Some(session) = self.wg_session.read().await.as_ref() {

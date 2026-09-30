@@ -6,11 +6,29 @@
 //! - Uses timeout-based lock acquisition to prevent deadlocks
 //! - State transitions are validated to prevent illegal states
 //! - Operation lock prevents concurrent connect/disconnect races
+//!
+//! # The state choke point (IPC contract v2, §1)
+//! Every write of [`ConnectionState`] goes through `write_state_with`, which
+//! PUBLISHES the new status: it recomputes the derived fields
+//! (`kill_switch_blocking`, the phase), bumps `seq` when anything the UI can
+//! see changed, and wakes the `vpn-status-changed` emitter (`main.rs`), which
+//! also drives the tray. The UI therefore learns about a drop, a reconnect or a
+//! give-up without polling and without any window being open (W1-023).
+//!
+//! # Cancellation (W1-021)
+//! A connect attempt carries the EPOCH it started under. `begin_attempt` (a
+//! newer user connect) and `cancel_in_flight` (disconnect, logout, exit, session
+//! expiry) bump it, and an attempt whose epoch is no longer current stops at its
+//! next await — including mid-tunnel-build, where it unwinds exactly like the
+//! CONNECT_TIMEOUT path already does.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex as TokioMutex, RwLock};
+
+use serde::Serialize;
+use tokio::sync::{watch, Mutex as TokioMutex, MutexGuard, RwLock};
 use tokio::time::timeout;
 
 // Platform-specific tunnel implementation
@@ -22,6 +40,7 @@ use super::tunnel_linux::LinuxTunnel as PlatformTunnel;
 use super::tunnel_macos::UtunTunnel as PlatformTunnel;
 
 use crate::api::types::VpnConfig;
+use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 
 /// SM-002: Timeout for state lock acquisition to prevent deadlocks
 const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,24 +52,25 @@ const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// If tunnel creation + start exceeds this, we force-fail to prevent hanging.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The connection state. Every variant is set by some path (W1-034 removed the
+/// three that nothing ever wrote: Authenticating, StealthConnecting and
+/// KillSwitchActive — their detail now lives in [`ConnectPhase`] and in
+/// `kill_switch_blocking`).
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Variants reserved for upcoming auth/stealth/killswitch state transitions
 pub enum ConnectionState {
     Disconnected,
     Connecting,
-    /// P1-6: API auth in progress (after calling /vpn/connect, before config applied)
-    Authenticating,
-    /// P1-6: Xray Reality stealth tunnel being established
-    StealthConnecting,
     Connected,
     Disconnecting,
-    /// SM-002: Reconnecting state with attempt tracking
+    /// Auto-reconnect is recovering a session that dropped. `last_error` is the
+    /// most recent failed attempt, shown beside the attempt counter.
     Reconnecting {
         attempt: u32,
+        last_error: Option<IpcError>,
     },
-    /// P1-6: Kill switch active after disconnect (blocking all non-VPN traffic)
-    KillSwitchActive,
-    Error(String),
+    /// A live server switch or settings reapply is rebuilding the tunnel.
+    Switching,
+    Error(IpcError),
 }
 
 impl ConnectionState {
@@ -62,13 +82,14 @@ impl ConnectionState {
     /// Check if a new connection can be initiated
     /// STATE-FIX: Also allow connecting from Reconnecting state, which is set
     /// by auto-reconnect before calling connect(). Without this, reconnect fails silently.
+    /// `Switching` is the pre-state of a live rebuild whose old tunnel is gone.
     pub fn can_connect(&self) -> bool {
         matches!(
             self,
             ConnectionState::Disconnected
                 | ConnectionState::Error(_)
-                | ConnectionState::KillSwitchActive
                 | ConnectionState::Reconnecting { .. }
+                | ConnectionState::Switching
         )
     }
 
@@ -76,10 +97,171 @@ impl ConnectionState {
     pub fn can_disconnect(&self) -> bool {
         !matches!(
             self,
-            ConnectionState::Disconnected
-                | ConnectionState::Disconnecting
-                | ConnectionState::KillSwitchActive
+            ConnectionState::Disconnected | ConnectionState::Disconnecting
         )
+    }
+
+    /// A tunnel is being built for this state; `phase` is only meaningful here.
+    pub fn is_in_progress(&self) -> bool {
+        matches!(
+            self,
+            ConnectionState::Connecting
+                | ConnectionState::Reconnecting { .. }
+                | ConnectionState::Switching
+        )
+    }
+
+    /// The `state` string of the IPC contract.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            ConnectionState::Disconnected => "disconnected",
+            ConnectionState::Connecting => "connecting",
+            ConnectionState::Connected => "connected",
+            ConnectionState::Disconnecting => "disconnecting",
+            ConnectionState::Reconnecting { .. } => "reconnecting",
+            ConnectionState::Switching => "switching",
+            ConnectionState::Error(_) => "error",
+        }
+    }
+}
+
+/// Optional detail while connecting / reconnecting / switching (contract §1).
+///
+/// The contract's `configuring` is never emitted: route and DNS setup happen
+/// inside the tunnel build, after the handshake, with no point at which the
+/// manager could report them separately. `phase` is optional detail, so the
+/// build reads as `handshaking` until it finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectPhase {
+    Authenticating,
+    NegotiatingPq,
+    StartingStealth,
+    Handshaking,
+}
+
+/// The confirmed Multi-Hop route of the live session (contract §1 `multiHop`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiHopStatus {
+    pub entry_id: String,
+    pub entry_name: String,
+    pub exit_id: String,
+    pub exit_name: String,
+}
+
+/// What a session is on, published together with the Connected state so a
+/// status can never show one server's state with another's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLabel {
+    pub server_name: String,
+    /// The server the tunnel is on — for Multi-Hop, the EXIT.
+    pub server_id: String,
+    pub multi_hop: Option<MultiHopStatus>,
+}
+
+/// The state part of `VpnStatus`, as last published. Read as ONE snapshot so
+/// a status can never pair a new state with an old `seq` (or the reverse),
+/// which is what let a stale poll flip the UI back (W2-009).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishedStatus {
+    pub seq: u64,
+    pub state: ConnectionState,
+    pub phase: Option<ConnectPhase>,
+    pub reconnect_max: Option<u32>,
+    pub kill_switch_blocking: bool,
+    pub server_id: Option<String>,
+    pub multi_hop: Option<MultiHopStatus>,
+}
+
+/// The kill-switch facts `kill_switch_blocking` is derived from. A function
+/// pointer rather than direct calls so unit tests are not at the mercy of the
+/// process-global WFP flags other tests toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockProbe {
+    /// The platform block-all is engaged (WFP / pf / iptables).
+    pub blocking: bool,
+    /// The block stays up for a healthy session and the tunnel interface is
+    /// permitted through it (Windows lockdown; macOS/Linux whenever armed).
+    pub holds_block_while_connected: bool,
+}
+
+fn platform_block_probe() -> BlockProbe {
+    BlockProbe {
+        blocking: crate::commands::killswitch::platform_is_blocking(),
+        holds_block_while_connected: crate::commands::killswitch::holds_block_while_connected(),
+    }
+}
+
+/// `kill_switch_blocking` (contract §1): the block-all is engaged AND traffic
+/// cannot flow through a tunnel. A healthy Connected session never qualifies
+/// (lockdown carries its traffic through the tunnel-interface permit), and
+/// neither does a switch whose OLD tunnel is still up under a block that
+/// permits it. Everything else with the block engaged — reconnecting, a
+/// failed switch, the lockdown give-up, always-on with no tunnel — does.
+pub fn kill_switch_blocking(
+    probe: BlockProbe,
+    state: &ConnectionState,
+    tunnel_present: bool,
+) -> bool {
+    if !probe.blocking {
+        return false;
+    }
+    let tunnel_carries_traffic = match state {
+        ConnectionState::Connected => true,
+        ConnectionState::Switching => tunnel_present && probe.holds_block_while_connected,
+        _ => false,
+    };
+    !tunnel_carries_traffic
+}
+
+struct StatusBus {
+    published: std::sync::Mutex<PublishedStatus>,
+    tx: watch::Sender<u64>,
+    probe: fn() -> BlockProbe,
+    /// Mirrors `VpnManager::tunnel.is_some()` for the synchronous derivation
+    /// of `kill_switch_blocking` (the Option itself sits behind an async lock).
+    tunnel_present: AtomicBool,
+}
+
+impl StatusBus {
+    fn new(probe: fn() -> BlockProbe) -> Self {
+        let (tx, _rx) = watch::channel(0);
+        Self {
+            published: std::sync::Mutex::new(PublishedStatus {
+                seq: 0,
+                state: ConnectionState::Disconnected,
+                phase: None,
+                reconnect_max: None,
+                kill_switch_blocking: false,
+                server_id: None,
+                multi_hop: None,
+            }),
+            tx,
+            probe,
+            tunnel_present: AtomicBool::new(false),
+        }
+    }
+
+    /// Apply `f`, re-derive, and bump `seq` iff anything visible changed.
+    fn publish(&self, f: impl FnOnce(&mut PublishedStatus)) {
+        let probe = (self.probe)();
+        let tunnel_present = self.tunnel_present.load(AtomicOrdering::SeqCst);
+        let mut p = self.published.lock().unwrap_or_else(|e| e.into_inner());
+        let before = p.clone();
+        f(&mut p);
+        if !p.state.is_in_progress() {
+            p.phase = None;
+        }
+        if !matches!(p.state, ConnectionState::Reconnecting { .. }) {
+            p.reconnect_max = None;
+        }
+        p.kill_switch_blocking = kill_switch_blocking(probe, &p.state, tunnel_present);
+        p.seq = before.seq;
+        if *p != before {
+            p.seq = before.seq.wrapping_add(1);
+            self.tx.send_replace(p.seq);
+        }
     }
 }
 
@@ -102,6 +284,20 @@ pub struct ConnectionStats {
 }
 
 impl ConnectionStats {
+    fn empty() -> Self {
+        Self {
+            bytes_sent: 0,
+            bytes_received: 0,
+            packets_sent: 0,
+            packets_received: 0,
+            latency_ms: None,
+            connected_at: None,
+            server_id: None,
+            key_id: None,
+            server_name: None,
+        }
+    }
+
     // P6-CLI-X-01: `jitter_ms()` is GONE. Jitter was computed for one consumer
     // only — the 60-second quality report — and nothing else ever read it.
 
@@ -114,6 +310,7 @@ impl ConnectionStats {
     // P6-CLI-X-01: `push_latency_sample()` is GONE with `latency_samples`.
 }
 
+#[derive(Clone)]
 pub struct VpnManager {
     state: Arc<RwLock<ConnectionState>>,
     pub(crate) stats: Arc<RwLock<ConnectionStats>>,
@@ -122,10 +319,14 @@ pub struct VpnManager {
     /// SM-002: Operation lock to prevent concurrent connect/disconnect
     /// Only one connect or disconnect operation can run at a time
     operation_lock: Arc<TokioMutex<()>>,
-    /// FIX-R5: When true, user explicitly disconnected — auto-reconnect must not fire.
-    /// This prevents the race where user clicks "Disconnect" but auto-reconnect
-    /// immediately brings the VPN back up.
-    user_initiated_disconnect: Arc<AtomicBool>,
+    status: Arc<StatusBus>,
+    /// W1-021: the cancellation epoch. See the module docs.
+    epoch: Arc<watch::Sender<u64>>,
+    /// Serialises a connect's COMMIT (arm the kill switch, start
+    /// auto-reconnect) against `end_session`, so a disconnect that lands while
+    /// a tunnel is coming up can never be followed by an `arm()` that
+    /// re-installs a block nobody will remove.
+    commit_lock: Arc<TokioMutex<()>>,
 }
 
 /// SM-002: Error type for VPN operations
@@ -137,8 +338,6 @@ pub enum VpnError {
     InvalidStateTransition { from: String, to: String },
     /// Operation already in progress
     OperationInProgress,
-    /// General error
-    General(String),
 }
 
 impl std::fmt::Display for VpnError {
@@ -149,7 +348,6 @@ impl std::fmt::Display for VpnError {
                 write!(f, "Invalid state transition from {} to {}", from, to)
             }
             VpnError::OperationInProgress => write!(f, "Another operation is already in progress"),
-            VpnError::General(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -160,19 +358,20 @@ impl VpnManager {
     /// Restore physical-adapter DNS synchronously, for exit paths that cannot
     /// await.
     ///
-    /// WHY THIS EXISTS. `RunEvent::ExitRequested` with `RESTART_EXIT_CODE` (the
-    /// updater relaunch) returns before `teardown_for_exit`, because a restart
-    /// cannot be held open — `prevent_exit()` is a documented no-op for it. The
-    /// comment there reasons that the startup reconcile in `setup()` cleans up
-    /// after the relaunch, and that is true for kernel firewall state: there are
-    /// macOS and Linux arms for exactly that. There is no Windows arm, and
-    /// Windows is where `configure_dns` parks EVERY physical adapter on
-    /// `static none`.
+    /// WHY THIS EXISTS. Two exits cannot run the async teardown:
+    ///   * `RunEvent::ExitRequested` with `RESTART_EXIT_CODE` (a
+    ///     `plugin-process` relaunch) returns before `teardown_for_exit`,
+    ///     because a restart cannot be held open — `prevent_exit()` is a
+    ///     documented no-op for it;
+    ///   * the Windows updater's `on_before_exit` hook, which runs immediately
+    ///     before the plugin calls `std::process::exit(0)` (W1-004).
     ///
-    /// So an in-app update performed while connected leaves the machine with no
-    /// resolvers, and the relaunched instance then cannot resolve the API it
-    /// needs to reconnect. That is not a crash path — it is the normal update
-    /// path.
+    /// `install_update` now performs the full `end_session` teardown BEFORE it
+    /// installs, so on the normal update path this finds nothing parked; it is
+    /// the backstop for a teardown that timed out. Windows is where
+    /// `configure_dns` parks EVERY physical adapter on `static none`, so an
+    /// un-park skipped here leaves the machine without resolvers until the
+    /// next launch reconciles the journal.
     ///
     /// Goes straight to the machine-state owner rather than through
     /// `self.tunnel`. Reading it through the tunnel is what made this fragile:
@@ -190,32 +389,127 @@ impl VpnManager {
 
     /// Create a new VPN manager
     pub fn new() -> Self {
+        Self::with_block_probe(platform_block_probe)
+    }
+
+    /// A manager whose `kill_switch_blocking` derivation reads `probe`
+    /// instead of the process-global firewall flags. Production uses
+    /// [`VpnManager::new`]; tests pin the probe to stay deterministic.
+    pub fn with_block_probe(probe: fn() -> BlockProbe) -> Self {
+        let (epoch, _rx) = watch::channel(0u64);
         Self {
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
-            stats: Arc::new(RwLock::new(ConnectionStats {
-                bytes_sent: 0,
-                bytes_received: 0,
-                packets_sent: 0,
-                packets_received: 0,
-                latency_ms: None,
-                connected_at: None,
-                server_id: None,
-                key_id: None,
-                server_name: None,
-            })),
+            stats: Arc::new(RwLock::new(ConnectionStats::empty())),
             tunnel: Arc::new(RwLock::new(None)),
             current_config: Arc::new(RwLock::new(None)),
             operation_lock: Arc::new(TokioMutex::new(())),
-            user_initiated_disconnect: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(StatusBus::new(probe)),
+            epoch: Arc::new(epoch),
+            commit_lock: Arc::new(TokioMutex::new(())),
         }
     }
 
-    /// FIX-R5: Mark that the user explicitly disconnected.
-    /// Auto-reconnect checks this flag and does NOT reconnect if true.
-    pub fn set_user_disconnected(&self, value: bool) {
-        self.user_initiated_disconnect
-            .store(value, AtomicOrdering::SeqCst);
+    // ── Status publication ──────────────────────────────────────────────
+
+    /// The last published status. See [`PublishedStatus`].
+    pub fn published(&self) -> PublishedStatus {
+        self.status
+            .published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
+
+    /// Wakes on every `seq` bump. The emitter in `main.rs` is the consumer.
+    pub fn subscribe_status(&self) -> watch::Receiver<u64> {
+        self.status.tx.subscribe()
+    }
+
+    /// Re-derive the published status after something OUTSIDE the state
+    /// changed — the kill switch engaging or releasing (contract §1: emit when
+    /// `kill_switch_blocking` changes without a state change). Wired to
+    /// `killswitch::set_blocking_observer` at startup.
+    pub fn refresh_status(&self) {
+        self.status.publish(|_| {});
+    }
+
+    /// Record the connect phase; ignored unless a tunnel is being built.
+    pub fn set_phase(&self, phase: ConnectPhase) {
+        self.status.publish(|p| p.phase = Some(phase));
+    }
+
+    fn set_tunnel_present(&self, present: bool) {
+        self.status
+            .tunnel_present
+            .store(present, AtomicOrdering::SeqCst);
+    }
+
+    // ── Cancellation epoch ──────────────────────────────────────────────
+
+    fn bump_epoch(&self) -> u64 {
+        let mut next = 0;
+        self.epoch.send_modify(|e| {
+            *e = e.wrapping_add(1);
+            next = *e;
+        });
+        next
+    }
+
+    /// Start a new USER-initiated connect: supersedes (cancels) any attempt or
+    /// auto-reconnect dial still in flight, and returns this attempt's epoch.
+    pub fn begin_attempt(&self) -> u64 {
+        self.bump_epoch()
+    }
+
+    /// Cancel whatever connect or re-dial is in flight (disconnect, logout,
+    /// exit, session expiry). The cancelled attempt resolves with `cancelled`.
+    pub fn cancel_in_flight(&self) {
+        self.bump_epoch();
+    }
+
+    /// The epoch an auto-reconnect dial runs under (it does not supersede).
+    pub fn current_epoch(&self) -> u64 {
+        *self.epoch.borrow()
+    }
+
+    pub fn is_current(&self, epoch: u64) -> bool {
+        self.current_epoch() == epoch
+    }
+
+    /// Resolves once `epoch` is no longer current.
+    pub async fn cancelled(&self, epoch: u64) {
+        let mut rx = self.epoch.subscribe();
+        loop {
+            if *rx.borrow_and_update() != epoch {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                // The sender lives as long as this manager; unreachable, but
+                // never report a cancellation that did not happen.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Run `fut` unless `epoch` is superseded first, in which case the attempt
+    /// resolves with `cancelled` and `fut` is dropped at its current await.
+    pub async fn run_cancellable<F: Future>(
+        &self,
+        epoch: u64,
+        fut: F,
+    ) -> Result<F::Output, IpcError> {
+        tokio::select! {
+            out = fut => Ok(out),
+            _ = self.cancelled(epoch) => Err(IpcError::cancelled()),
+        }
+    }
+
+    /// See the `commit_lock` field.
+    pub async fn lock_commit(&self) -> MutexGuard<'_, ()> {
+        self.commit_lock.lock().await
+    }
+
+    // ── State ───────────────────────────────────────────────────────────
 
     /// SM-002: Acquire state read lock with timeout to prevent deadlock
     async fn read_state_with_timeout(&self) -> Result<ConnectionState, VpnError> {
@@ -228,20 +522,25 @@ impl VpnManager {
         }
     }
 
-    /// SM-002: Acquire state write lock with timeout to prevent deadlock
-    async fn write_state_with_timeout(
+    /// SM-002: Acquire state write lock with timeout to prevent deadlock.
+    /// THE choke point: every state write publishes (see the module docs).
+    async fn write_state_with(
         &self,
         new_state: ConnectionState,
+        extra: impl FnOnce(&mut PublishedStatus),
     ) -> Result<ConnectionState, VpnError> {
         match timeout(STATE_LOCK_TIMEOUT, self.state.write()).await {
             Ok(mut guard) => {
-                let old_state = guard.clone();
-                *guard = new_state.clone();
+                let old_state = std::mem::replace(&mut *guard, new_state.clone());
                 tracing::debug!(
-                    old_state = ?old_state,
-                    new_state = ?new_state,
+                    old_state = old_state.wire_name(),
+                    new_state = new_state.wire_name(),
                     "State transition"
                 );
+                self.status.publish(|p| {
+                    p.state = new_state;
+                    extra(p);
+                });
                 Ok(old_state)
             }
             Err(_) => {
@@ -251,11 +550,18 @@ impl VpnManager {
         }
     }
 
+    async fn write_state_with_timeout(
+        &self,
+        new_state: ConnectionState,
+    ) -> Result<ConnectionState, VpnError> {
+        self.write_state_with(new_state, |_| {}).await
+    }
+
     /// Get current connection state
     pub async fn get_state(&self) -> ConnectionState {
-        self.read_state_with_timeout()
-            .await
-            .unwrap_or(ConnectionState::Error("Lock timeout".into()))
+        self.read_state_with_timeout().await.unwrap_or_else(|_| {
+            ConnectionState::Error(IpcError::unknown("Internal error reading the VPN state."))
+        })
     }
 
     /// Set connection state (used by auto-reconnect to set Reconnecting state)
@@ -266,23 +572,31 @@ impl VpnManager {
         Ok(())
     }
 
+    /// Enter (or advance) `Reconnecting`, publishing the retry budget with it.
+    pub async fn set_reconnecting(
+        &self,
+        attempt: u32,
+        last_error: Option<IpcError>,
+        reconnect_max: Option<u32>,
+    ) {
+        let _ = self
+            .write_state_with(
+                ConnectionState::Reconnecting {
+                    attempt,
+                    last_error,
+                },
+                |p| p.reconnect_max = reconnect_max,
+            )
+            .await;
+    }
+
     /// Get current connection stats
     pub async fn get_stats(&self) -> ConnectionStats {
         match timeout(STATE_LOCK_TIMEOUT, self.stats.read()).await {
             Ok(guard) => guard.clone(),
             Err(_) => {
                 tracing::error!("Stats read lock timeout");
-                ConnectionStats {
-                    bytes_sent: 0,
-                    bytes_received: 0,
-                    packets_sent: 0,
-                    packets_received: 0,
-                    latency_ms: None,
-                    connected_at: None,
-                    server_id: None,
-                    key_id: None,
-                    server_name: None,
-                }
+                ConnectionStats::empty()
             }
         }
     }
@@ -298,36 +612,62 @@ impl VpnManager {
         }
     }
 
-    /// Connect to a VPN server
+    /// Connect to a VPN server under `epoch` (see [`VpnManager::begin_attempt`]).
+    ///
+    /// On failure the state is left IN PROGRESS (`Connecting`, `Switching` or
+    /// `Reconnecting`) and the caller writes the outcome: a user connect ends
+    /// in `Error` (or reverts a switch whose old tunnel survived), an
+    /// auto-reconnect dial stays `Reconnecting` with the failure as its
+    /// `last_error`. Writing `Error` here made every failed re-dial flash an
+    /// error at the UI and the tray between attempts. A cancelled attempt
+    /// writes nothing: whoever cancelled it owns the state.
+    ///
     /// SM-002: Uses operation lock to prevent concurrent connect/disconnect
     pub async fn connect(
         &self,
         config: VpnConfig,
-        server_name: String,
+        label: SessionLabel,
         local_network_sharing: bool,
-    ) -> Result<(), String> {
+        epoch: u64,
+    ) -> Result<(), IpcError> {
         // LOG-001: the chosen node is connection history — keep the name out
         // of the release log (info reaches birdo.log); debug is dev-only.
         tracing::info!("VpnManager::connect called");
-        tracing::debug!("VpnManager::connect called for server: {}", server_name);
+        tracing::debug!(
+            "VpnManager::connect called for server: {}",
+            label.server_name
+        );
 
-        // FIX-R5: Clear the user-disconnected flag so auto-reconnect can work again
-        self.user_initiated_disconnect
-            .store(false, AtomicOrdering::SeqCst);
-
-        // SM-002: Acquire operation lock first to prevent concurrent operations
-        let _operation_guard = self
-            .acquire_operation_lock()
-            .await
-            .map_err(|e| format!("Failed to acquire operation lock: {}", e))?;
+        // SM-002: Acquire operation lock first to prevent concurrent operations.
+        // A disconnect must not queue behind a connect it is cancelling, so the
+        // wait itself is cancellable.
+        let _operation_guard = tokio::select! {
+            guard = self.acquire_operation_lock() => guard.map_err(|e| {
+                IpcError::unknown(format!("Failed to acquire operation lock: {}", e))
+            })?,
+            _ = self.cancelled(epoch) => return Err(IpcError::cancelled()),
+        };
+        if !self.is_current(epoch) {
+            return Err(IpcError::cancelled());
+        }
 
         // Check current state with timeout
         let current_state = self
             .read_state_with_timeout()
             .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
+            .map_err(|e| IpcError::unknown(format!("Failed to read state: {}", e)))?;
 
-        tracing::debug!("Current VPN state: {:?}", current_state);
+        tracing::debug!("Current VPN state: {}", current_state.wire_name());
+
+        // What the UI sees while the tunnel is (re)built. A switch and a
+        // re-dial keep their own label for the whole window; before this, the
+        // teardown wrote Disconnecting and then Connecting, so a server switch
+        // read as a disconnect followed by a fresh connect.
+        let in_progress = match &current_state {
+            ConnectionState::Switching => ConnectionState::Switching,
+            ConnectionState::Reconnecting { .. } => current_state.clone(),
+            _ => ConnectionState::Connecting,
+        };
 
         // I2 NO ORPHANS. The teardown used to be gated on `Connected |
         // Connecting`, and `can_connect()` admits `Disconnected`, `Error`,
@@ -346,11 +686,10 @@ impl VpnManager {
         //
         // NOT #105's "refuse to connect while `self.tunnel.is_some()`": combined
         // with `disconnect()`'s early return — `can_disconnect()` is false in
-        // `Disconnected` / `Disconnecting` / `KillSwitchActive`, so it returns
-        // Ok(()) without taking the tunnel — that would turn the orphan from a
-        // leak into a permanent lockout where Connect refuses, Disconnect no-ops
-        // and only quitting the app recovers. The correct form is: dispose
-        // unconditionally.
+        // `Disconnected` / `Disconnecting`, so it returns Ok(()) without taking
+        // the tunnel — that would turn the orphan from a leak into a permanent
+        // lockout where Connect refuses, Disconnect no-ops and only quitting
+        // the app recovers. The correct form is: dispose unconditionally.
         let displaced = match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
             Ok(mut guard) => guard.take(),
             Err(_) => {
@@ -358,12 +697,14 @@ impl VpnManager {
                     "Tunnel lock timeout before connect — cannot safely create a new tunnel \
                      while an old one may still be live"
                 );
-                let _ = self
-                    .write_state_with_timeout(ConnectionState::Error("Tunnel lock timeout".into()))
-                    .await;
-                return Err("Tunnel lock timeout during teardown — please try again".into());
+                return Err(IpcError::unknown(
+                    "Tunnel lock timeout during teardown — please try again",
+                ));
             }
         };
+        if displaced.is_some() {
+            self.set_tunnel_present(false);
+        }
 
         // The machine state (parked DNS + installed routes) is deliberately NOT
         // released between the outgoing tunnel and the incoming one. Moving it to
@@ -383,14 +724,12 @@ impl VpnManager {
             )
         {
             tracing::info!(
-                "Tearing down the existing tunnel before connecting (state {:?}, tunnel present: \
+                "Tearing down the existing tunnel before connecting (state {}, tunnel present: \
                  {})",
-                current_state,
+                current_state.wire_name(),
                 displaced.is_some()
             );
-            let _ = self
-                .write_state_with_timeout(ConnectionState::Disconnecting)
-                .await;
+            let _ = self.write_state_with_timeout(in_progress.clone()).await;
 
             // LEAK-2: this is a server switch — a new tunnel is already committed.
             // Hold the IPv6 block across the teardown, otherwise the old tunnel's
@@ -447,31 +786,30 @@ impl VpnManager {
             }
         } else if !current_state.can_connect() {
             let err = VpnError::InvalidStateTransition {
-                from: format!("{:?}", current_state),
-                to: "Connecting".into(),
+                from: current_state.wire_name().to_string(),
+                to: "connecting".into(),
             };
             tracing::warn!("{}", err);
             #[cfg(target_os = "windows")]
             self.release_machine_state_after_failed_connect(transition_gen)
                 .await;
-            return Err(err.to_string());
+            return Err(IpcError::unknown(err.to_string()));
         }
 
-        // Set connecting state with timeout
-        if let Err(e) = self
-            .write_state_with_timeout(ConnectionState::Connecting)
-            .await
-        {
+        // Set the in-progress state with timeout
+        if let Err(e) = self.write_state_with_timeout(in_progress).await {
             #[cfg(target_os = "windows")]
             self.release_machine_state_after_failed_connect(transition_gen)
                 .await;
-            return Err(format!("Failed to set connecting state: {}", e));
+            return Err(IpcError::unknown(format!(
+                "Failed to set connecting state: {}",
+                e
+            )));
         }
-        tracing::info!("Set state to Connecting");
 
         // LOG-001: node name demoted to debug — see connect() above.
         tracing::info!("Creating VPN tunnel");
-        tracing::debug!("Creating VPN tunnel for: {}", server_name);
+        tracing::debug!("Creating VPN tunnel for: {}", label.server_name);
         tracing::debug!(
             "Tunnel config: endpoint={}, client_ip={}",
             crate::utils::redact_endpoint(&config.endpoint),
@@ -482,7 +820,11 @@ impl VpnManager {
         // If tunnel creation or start hangs (e.g. netsh deadlocks on Windows
         // UAC prompt, or antivirus blocks wintun.dll), we fail fast instead of
         // leaving the state stuck at Connecting forever.
-        let tunnel_result = timeout(CONNECT_TIMEOUT, async {
+        //
+        // W1-021: and race it against cancellation. A disconnect during the
+        // build drops the half-built tunnel at its current await — the SAME
+        // unwind the timeout performs, so it needs no new cleanup path.
+        let build = timeout(CONNECT_TIMEOUT, async {
             let tunnel = PlatformTunnel::create(&config, local_network_sharing)
                 .await
                 .map_err(|e| format!("Failed to create tunnel: {}", e))?;
@@ -491,18 +833,38 @@ impl VpnManager {
                 .await
                 .map_err(|e| format!("Failed to start tunnel: {}", e))?;
             Ok::<PlatformTunnel, String>(tunnel)
-        })
-        .await;
+        });
+        let tunnel_result = tokio::select! {
+            result = build => Some(result),
+            _ = self.cancelled(epoch) => None,
+        };
 
         match tunnel_result {
-            Ok(Ok(tunnel)) => {
+            Some(Ok(Ok(tunnel))) => {
+                if !self.is_current(epoch) {
+                    // Superseded in the instant the build finished: this tunnel
+                    // belongs to nobody. Dispose of it here, under the operation
+                    // lock, rather than hand an orphan to the next connect.
+                    tracing::info!("Connect cancelled as the tunnel came up — tearing it down");
+                    if let Err(e) = timeout(Duration::from_secs(10), tunnel.stop())
+                        .await
+                        .unwrap_or_else(|_| Err("Tunnel stop timed out".to_string()))
+                    {
+                        tracing::warn!("Cancelled tunnel teardown: {}", e);
+                    }
+                    #[cfg(target_os = "windows")]
+                    self.release_machine_state_after_failed_connect(transition_gen)
+                        .await;
+                    self.lift_ipv6_block_after_failed_connect().await;
+                    return Err(IpcError::cancelled());
+                }
                 tracing::info!("Tunnel started successfully");
 
                 // P1-dk-manager-tunnel-dropped-state-connected: store the tunnel
                 // BEFORE transitioning to Connected. The old order dropped a live
                 // tunnel on a write-lock timeout while leaving state=Connected —
                 // green UI with traffic on the physical NIC. If the store fails,
-                // stop the tunnel and surface Error instead.
+                // stop the tunnel and surface the failure instead.
                 match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
                     Ok(mut guard) => *guard = Some(tunnel),
                     Err(_) => {
@@ -511,22 +873,13 @@ impl VpnManager {
                              reporting Connected without one"
                         );
                         let _ = tunnel.stop().await;
-                        let _ = self
-                            .write_state_with_timeout(ConnectionState::Error(
-                                "Internal error storing tunnel state".to_string(),
-                            ))
-                            .await;
                         #[cfg(target_os = "windows")]
                         self.release_machine_state_after_failed_connect(transition_gen)
                             .await;
-                        return Err("Tunnel state lock timeout during connect".to_string());
+                        return Err(IpcError::unknown("Internal error storing tunnel state"));
                     }
                 }
-
-                // Update state with timeout protection
-                let _ = self
-                    .write_state_with_timeout(ConnectionState::Connected)
-                    .await;
+                self.set_tunnel_present(true);
 
                 match timeout(STATE_LOCK_TIMEOUT, self.current_config.write()).await {
                     Ok(mut guard) => {
@@ -540,13 +893,14 @@ impl VpnManager {
                     Err(_) => tracing::error!("Config write lock timeout"),
                 }
 
-                // Update stats with timeout
+                // Stats BEFORE the Connected publication: the status the emitter
+                // builds for it reads the server name from here.
                 match timeout(STATE_LOCK_TIMEOUT, self.stats.write()).await {
                     Ok(mut stats) => {
                         stats.connected_at = Some(chrono::Utc::now());
                         stats.server_id = Some(config.server_id.clone());
                         stats.key_id = Some(config.key_id.clone());
-                        stats.server_name = Some(server_name);
+                        stats.server_name = Some(label.server_name.clone());
                         stats.bytes_sent = 0;
                         stats.bytes_received = 0;
                         // Latency belongs to a PATH; a new session (possibly a
@@ -557,10 +911,17 @@ impl VpnManager {
                     Err(_) => tracing::error!("Stats write lock timeout"),
                 }
 
+                let _ = self
+                    .write_state_with(ConnectionState::Connected, |p| {
+                        p.server_id = Some(label.server_id);
+                        p.multi_hop = label.multi_hop;
+                    })
+                    .await;
+
                 tracing::info!("VPN connected successfully");
                 Ok(())
             }
-            Ok(Err(e)) => {
+            Some(Ok(Err(e))) => {
                 // P6-CLI-D-03 (defence in depth): this is a catch-all for error
                 // strings built anywhere in the tunnel stack. Individual sites redact
                 // their own endpoints, but sanitising here means a future format!()
@@ -569,10 +930,6 @@ impl VpnManager {
                     "Tunnel creation/start failed: {}",
                     crate::utils::redact::sanitize_error(&e)
                 );
-                let err = VpnError::General(e);
-                let _ = self
-                    .write_state_with_timeout(ConnectionState::Error(err.to_string()))
-                    .await;
                 // Un-park BEFORE lifting the IPv6 block, never the reverse: the
                 // reverse leaves an interval with the physical resolvers back and
                 // egress already clear.
@@ -580,26 +937,36 @@ impl VpnManager {
                 self.release_machine_state_after_failed_connect(transition_gen)
                     .await;
                 self.lift_ipv6_block_after_failed_connect().await;
-                Err(err.to_string())
+                Err(IpcError::from_tunnel_failure(&e))
             }
-            Err(_) => {
-                let err = VpnError::General(format!(
-                    "Connection timed out after {}s",
-                    CONNECT_TIMEOUT.as_secs()
-                ));
-                tracing::error!("{}", err);
-                let _ = self
-                    .write_state_with_timeout(ConnectionState::Error(err.to_string()))
-                    .await;
-                // CONNECT_TIMEOUT cancelled start() mid-await and dropped the
-                // half-built tunnel; if it had already claimed, its Drop released
-                // and this is a no-op. If it never got that far, the generation
-                // held across the teardown still owns the park.
+            // Timed out, or cancelled: both dropped start() mid-await along with
+            // the half-built tunnel; if it had already claimed, its Drop released
+            // and this is a no-op. If it never got that far, the generation held
+            // across the teardown still owns the park.
+            outcome => {
+                let cancelled = outcome.is_none();
+                if cancelled {
+                    tracing::info!("Connect cancelled during the tunnel build");
+                } else {
+                    tracing::error!("Connection timed out after {}s", CONNECT_TIMEOUT.as_secs());
+                }
                 #[cfg(target_os = "windows")]
                 self.release_machine_state_after_failed_connect(transition_gen)
                     .await;
                 self.lift_ipv6_block_after_failed_connect().await;
-                Err(err.to_string())
+                if cancelled {
+                    Err(IpcError::cancelled())
+                } else {
+                    // Not transport-shaped: the handshake has its own, shorter
+                    // budget, so a 30 s stall is setup (netsh, AV, the driver).
+                    Err(IpcError::new(
+                        IpcErrorCode::AdapterFailed,
+                        format!(
+                            "Setting up the VPN adapter timed out after {}s.",
+                            CONNECT_TIMEOUT.as_secs()
+                        ),
+                    ))
+                }
             }
         }
     }
@@ -610,13 +977,15 @@ impl VpnManager {
     /// A no-op unless `gen` is still the owner — if the new tunnel got as far as
     /// claiming and was then dropped, its own `Drop` already released, and
     /// re-releasing from here would be a second owner acting on state it does not
-    /// hold.
+    /// hold. `block_in_place` because the un-park is a synchronous netsh pass
+    /// (W1-017): it must not pin a runtime worker, and it must not become
+    /// cancellable either — an un-park abandoned halfway is a stranded park.
     #[cfg(target_os = "windows")]
     async fn release_machine_state_after_failed_connect(
         &self,
         gen: crate::vpn::win_machine_state::Gen,
     ) {
-        if crate::vpn::win_machine_state::release_all(gen) {
+        if tokio::task::block_in_place(|| crate::vpn::win_machine_state::release_all(gen)) {
             tracing::info!("Un-parked the physical adapters after a failed connect");
         }
     }
@@ -644,10 +1013,20 @@ impl VpnManager {
     }
 
     /// Disconnect from VPN
+    pub async fn disconnect(&self) -> Result<(), String> {
+        self.disconnect_to(ConnectionState::Disconnected).await
+    }
+
+    /// Tear the tunnel down and end in `final_state`.
+    ///
+    /// Auto-reconnect tears a dead tunnel down to `Reconnecting`, and a give-up
+    /// to `Error`, so the UI never sees a `disconnected` flicker in the middle
+    /// of a recovery.
+    ///
     /// SM-002: Uses operation lock to prevent concurrent connect/disconnect
     /// STATE-FIX: Wraps tunnel stop in a 15s timeout with forced cleanup.
     /// A stuck Disconnecting state is worse than a dirty Disconnected state.
-    pub async fn disconnect(&self) -> Result<(), String> {
+    pub async fn disconnect_to(&self, final_state: ConnectionState) -> Result<(), String> {
         // SM-002: Acquire operation lock first
         let _operation_guard = self
             .acquire_operation_lock()
@@ -660,8 +1039,8 @@ impl VpnManager {
             .await
             .map_err(|e| format!("Failed to read state: {}", e))?;
 
-        // I2/I3: `can_disconnect()` is false in `Disconnected`, `Disconnecting`
-        // and `KillSwitchActive`, and `ConnectionState` is written by paths that
+        // I2/I3: `can_disconnect()` is false in `Disconnected` and
+        // `Disconnecting`, and `ConnectionState` is written by paths that
         // never touch `self.tunnel` — so returning on the state alone made an
         // orphaned live tunnel unreachable by any user action. Take the record
         // into account: if there IS a tunnel, disconnect means something no
@@ -671,9 +1050,12 @@ impl VpnManager {
             return Ok(());
         }
 
-        let _ = self
-            .write_state_with_timeout(ConnectionState::Disconnecting)
-            .await;
+        let interim = if final_state == ConnectionState::Disconnected {
+            ConnectionState::Disconnecting
+        } else {
+            final_state.clone()
+        };
+        let _ = self.write_state_with_timeout(interim).await;
 
         tracing::info!("Disconnecting from VPN");
 
@@ -683,6 +1065,7 @@ impl VpnManager {
         let stop_result = match timeout(STATE_LOCK_TIMEOUT, self.tunnel.write()).await {
             Ok(mut guard) => {
                 if let Some(tunnel) = guard.take() {
+                    self.set_tunnel_present(false);
                     match timeout(Duration::from_secs(15), tunnel.stop()).await {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(e)) => {
@@ -704,12 +1087,6 @@ impl VpnManager {
             }
         };
 
-        // STATE-FIX: ALWAYS transition to Disconnected, even on error.
-        // A stuck Disconnecting state blocks all future operations.
-        let _ = self
-            .write_state_with_timeout(ConnectionState::Disconnected)
-            .await;
-
         match timeout(STATE_LOCK_TIMEOUT, self.current_config.write()).await {
             Ok(mut guard) => *guard = None,
             Err(_) => tracing::error!("Config write lock timeout during disconnect"),
@@ -728,6 +1105,15 @@ impl VpnManager {
             }
             Err(_) => tracing::error!("Stats write lock timeout during disconnect"),
         }
+
+        // STATE-FIX: ALWAYS reach the final state, even on error.
+        // A stuck Disconnecting state blocks all future operations.
+        let _ = self
+            .write_state_with(final_state, |p| {
+                p.server_id = None;
+                p.multi_hop = None;
+            })
+            .await;
 
         match stop_result {
             Ok(()) => {
@@ -749,8 +1135,8 @@ impl VpnManager {
     /// that has not been disposed of", which is the question `disconnect()`
     /// needs — an orphan is unreachable by any user action if the decision is
     /// left to `ConnectionState`, whose `is_tunnel_active()` is `matches!(self,
-    /// Connected)` and so is false in exactly the four states where an orphan
-    /// can exist.
+    /// Connected)` and so is false in exactly the states where an orphan can
+    /// exist.
     ///
     /// It is NOT the I3 machine-state predicate, and must not be used as one.
     /// I3 asks whether the parked DNS and the installed routes are in force, and
@@ -769,6 +1155,24 @@ impl VpnManager {
             Err(_) => {
                 tracing::warn!("Tunnel read lock timeout in holds_tunnel — assuming one exists");
                 true
+            }
+        }
+    }
+
+    /// Time since the live tunnel's last completed WireGuard handshake
+    /// (W1-002). `None` when there is no tunnel with a WireGuard session.
+    pub async fn handshake_age(&self) -> Option<Duration> {
+        let guard = timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await.ok()?;
+        guard.as_ref()?.handshake_age().await
+    }
+
+    /// Ask the live tunnel for a fresh handshake now (a no-op while one is
+    /// already in flight). Used after resume and when an idle session's
+    /// handshake is getting old, so liveness is proven rather than assumed.
+    pub async fn force_handshake(&self) {
+        if let Ok(guard) = timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
+            if let Some(tunnel) = guard.as_ref() {
+                tunnel.force_handshake().await;
             }
         }
     }
@@ -798,11 +1202,9 @@ impl VpnManager {
                             stats.packets_sent = pkts_sent;
                             stats.packets_received = pkts_received;
                             // P1-dk-fabricated-quality-telemetry: only OVERWRITE
-                            // the latency when the tunnel actually measured one.
-                            // The tunnel probe is idle in production, so blindly
-                            // assigning here reset a real measurement (the
-                            // heartbeat RTT recorded by auto_reconnect.rs) back
-                            // to None on every 2s stats poll.
+                            // the latency when the tunnel actually measured one
+                            // (the handshake RTT, W1-002), so a session that has
+                            // not rekeyed yet keeps "unmeasured" rather than 0.
                             if let Some(lat) = latency {
                                 stats.latency_ms = Some(lat);
                             }
@@ -845,15 +1247,256 @@ impl Default for VpnManager {
     }
 }
 
-impl Clone for VpnManager {
-    fn clone(&self) -> Self {
-        Self {
-            state: Arc::clone(&self.state),
-            stats: Arc::clone(&self.stats),
-            tunnel: Arc::clone(&self.tunnel),
-            current_config: Arc::clone(&self.current_config),
-            operation_lock: Arc::clone(&self.operation_lock),
-            user_initiated_disconnect: Arc::clone(&self.user_initiated_disconnect),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn not_blocking() -> BlockProbe {
+        BlockProbe {
+            blocking: false,
+            holds_block_while_connected: false,
         }
+    }
+
+    fn reactive_blocking() -> BlockProbe {
+        BlockProbe {
+            blocking: true,
+            holds_block_while_connected: false,
+        }
+    }
+
+    fn label() -> SessionLabel {
+        SessionLabel {
+            server_name: "Amsterdam".into(),
+            server_id: "ams-1".into(),
+            multi_hop: None,
+        }
+    }
+
+    #[test]
+    fn blocking_needs_the_block_and_no_tunnel_carrying_traffic() {
+        let lockdown = BlockProbe {
+            blocking: true,
+            holds_block_while_connected: true,
+        };
+        // A healthy lockdown session carries its traffic through the permit.
+        assert!(!kill_switch_blocking(
+            lockdown,
+            &ConnectionState::Connected,
+            true
+        ));
+        // A switch whose old tunnel is still up under lockdown: still carrying.
+        assert!(!kill_switch_blocking(
+            lockdown,
+            &ConnectionState::Switching,
+            true
+        ));
+        // Reactive switch after the teardown: nothing carries traffic.
+        assert!(kill_switch_blocking(
+            reactive_blocking(),
+            &ConnectionState::Switching,
+            false
+        ));
+        for state in [
+            ConnectionState::Reconnecting {
+                attempt: 1,
+                last_error: None,
+            },
+            ConnectionState::Error(IpcError::unknown("x")),
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+        ] {
+            assert!(kill_switch_blocking(lockdown, &state, false), "{state:?}");
+            assert!(
+                !kill_switch_blocking(not_blocking(), &state, false),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_visible_change_bumps_seq_once_and_nothing_else_does() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        let mut rx = mgr.subscribe_status();
+        assert_eq!(mgr.published().seq, 0);
+
+        mgr.set_state(ConnectionState::Connecting).await.unwrap();
+        assert_eq!(mgr.published().seq, 1);
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+
+        // Same state again: nothing visible changed, no event.
+        mgr.set_state(ConnectionState::Connecting).await.unwrap();
+        assert_eq!(mgr.published().seq, 1);
+        assert!(!rx.has_changed().unwrap());
+
+        // A phase change while connecting is visible.
+        mgr.set_phase(ConnectPhase::Authenticating);
+        assert_eq!(mgr.published().seq, 2);
+        assert_eq!(mgr.published().phase, Some(ConnectPhase::Authenticating));
+
+        // Stats-only refreshes never emit.
+        mgr.update_stats().await;
+        mgr.refresh_status();
+        assert_eq!(mgr.published().seq, 2);
+    }
+
+    #[tokio::test]
+    async fn the_phase_and_budget_do_not_outlive_their_state() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        mgr.set_reconnecting(2, None, Some(10)).await;
+        mgr.set_phase(ConnectPhase::Handshaking);
+        let p = mgr.published();
+        assert_eq!(p.reconnect_max, Some(10));
+        assert_eq!(p.phase, Some(ConnectPhase::Handshaking));
+
+        mgr.set_state(ConnectionState::Error(IpcError::unknown("x")))
+            .await
+            .unwrap();
+        let p = mgr.published();
+        assert_eq!(p.reconnect_max, None);
+        assert_eq!(p.phase, None);
+        // A phase set outside a build is ignored.
+        mgr.set_phase(ConnectPhase::Authenticating);
+        assert_eq!(mgr.published().phase, None);
+    }
+
+    #[tokio::test]
+    async fn the_error_travels_with_the_state() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        let err = IpcError::new(IpcErrorCode::Revoked, "Connection has been revoked.");
+        mgr.set_state(ConnectionState::Error(err.clone()))
+            .await
+            .unwrap();
+        assert_eq!(mgr.published().state, ConnectionState::Error(err));
+    }
+
+    #[tokio::test]
+    async fn blocking_changes_publish_without_a_state_change() {
+        use std::sync::atomic::AtomicBool;
+        static BLOCKING: AtomicBool = AtomicBool::new(false);
+        fn probe() -> BlockProbe {
+            BlockProbe {
+                blocking: BLOCKING.load(AtomicOrdering::SeqCst),
+                holds_block_while_connected: false,
+            }
+        }
+        let mgr = VpnManager::with_block_probe(probe);
+        mgr.set_state(ConnectionState::Error(IpcError::unknown("x")))
+            .await
+            .unwrap();
+        let seq = mgr.published().seq;
+        assert!(!mgr.published().kill_switch_blocking);
+
+        BLOCKING.store(true, AtomicOrdering::SeqCst);
+        mgr.refresh_status();
+        assert!(mgr.published().kill_switch_blocking);
+        assert_eq!(mgr.published().seq, seq + 1);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_epoch_is_cancelled() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        let first = mgr.begin_attempt();
+        assert!(mgr.is_current(first));
+        let second = mgr.begin_attempt();
+        assert!(!mgr.is_current(first));
+        assert!(mgr.is_current(second));
+        // Resolves immediately for a stale epoch.
+        tokio::time::timeout(Duration::from_secs(1), mgr.cancelled(first))
+            .await
+            .expect("a superseded epoch must read as cancelled");
+
+        // And a pending operation is dropped the moment its epoch is cancelled.
+        let mgr2 = mgr.clone();
+        let pending = tokio::spawn(async move {
+            mgr2.run_cancellable(second, std::future::pending::<()>())
+                .await
+        });
+        tokio::task::yield_now().await;
+        mgr.cancel_in_flight();
+        let out = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.unwrap_err().code, IpcErrorCode::Cancelled);
+    }
+
+    /// W1-021: a connect whose epoch was superseded before it could start
+    /// touches nothing — no tunnel, no machine state, no state write.
+    #[tokio::test]
+    async fn a_cancelled_connect_touches_nothing() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        let stale = mgr.begin_attempt();
+        mgr.cancel_in_flight();
+        let seq = mgr.published().seq;
+        let config = VpnConfig {
+            server_id: "ams-1".into(),
+            key_id: "k".into(),
+            private_key: "p".into(),
+            public_key: "q".into(),
+            server_public_key: "s".into(),
+            preshared_key: None,
+            endpoint: "203.0.113.1:51820".into(),
+            allowed_ips: vec!["0.0.0.0/0".into()],
+            dns: vec!["10.0.0.1".into()],
+            client_ip: "10.0.0.2".into(),
+            client_ipv6: None,
+            allowed_ips_v6: vec![],
+            mtu: 1420,
+            persistent_keepalive: 25,
+        };
+        let err = mgr
+            .connect(config, label(), false, stale)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, IpcErrorCode::Cancelled);
+        assert_eq!(mgr.published().seq, seq);
+        assert_eq!(mgr.get_state().await, ConnectionState::Disconnected);
+        assert!(!mgr.holds_tunnel().await);
+    }
+
+    /// The UI recognises an auto-reconnect give-up as a `reconnecting` →
+    /// `error` transition and words it from `error.code`. Ending a recovery
+    /// in `Error` must therefore be ONE visible change, never passing through
+    /// `disconnecting` / `disconnected`, and the code must be on it.
+    #[tokio::test]
+    async fn a_give_up_is_one_transition_from_reconnecting_to_error() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        mgr.set_reconnecting(10, Some(IpcError::unknown("last try")), Some(10))
+            .await;
+        let before = mgr.published().seq;
+
+        let verdict = IpcError::new(IpcErrorCode::ServerUnreachable, "gave up");
+        mgr.disconnect_to(ConnectionState::Error(verdict.clone()))
+            .await
+            .unwrap();
+
+        let after = mgr.published();
+        assert_eq!(after.seq, before + 1, "an intermediate state was published");
+        assert_eq!(after.state, ConnectionState::Error(verdict));
+        assert_eq!(after.reconnect_max, None);
+    }
+
+    #[tokio::test]
+    async fn disconnecting_clears_the_session_label() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        let _ = mgr
+            .write_state_with(ConnectionState::Connected, |p| {
+                p.server_id = Some("exit-1".into());
+                p.multi_hop = Some(MultiHopStatus {
+                    entry_id: "entry-1".into(),
+                    entry_name: "Frankfurt".into(),
+                    exit_id: "exit-1".into(),
+                    exit_name: "Reykjavik".into(),
+                });
+            })
+            .await;
+        assert_eq!(mgr.published().server_id.as_deref(), Some("exit-1"));
+        mgr.disconnect().await.unwrap();
+        let p = mgr.published();
+        assert_eq!(p.state, ConnectionState::Disconnected);
+        assert_eq!(p.server_id, None);
+        assert_eq!(p.multi_hop, None);
     }
 }

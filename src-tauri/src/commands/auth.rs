@@ -5,10 +5,12 @@
 use crate::api::error::ApiError;
 use crate::api::types::LoginResult;
 use crate::api::BirdoApi;
+use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+use crate::commands::session::{end_session, EndReason};
 use crate::storage::CredentialStore;
 use crate::utils::redact_email;
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{AppHandle, State};
 use zeroize::Zeroize;
 
 // FIX-2-5: Client-side rate limiting for login IPC command
@@ -63,6 +65,34 @@ pub struct LoginResponse {
     /// The frontend must prompt for TOTP code and call verify_2fa.
     pub requires_two_factor: bool,
     pub challenge_token: Option<String>,
+    /// Why a sign-in did not complete, as an IPC contract code (§2): a
+    /// refusal is answered `Ok` with `success:false`, so the code rides here
+    /// for the UI to map to canonical copy. `None` on success.
+    pub code: Option<IpcErrorCode>,
+}
+
+/// The code for a refused sign-in. A 401 from a sign-in endpoint means the
+/// credentials were wrong — the generic mapping reads every 401 as an expired
+/// session, which is only true for an authenticated call.
+pub(crate) fn sign_in_failure_code(error: &ApiError) -> IpcErrorCode {
+    match error {
+        ApiError::Unauthorized | ApiError::Rejected { status: 401, .. } => {
+            IpcErrorCode::InvalidCredentials
+        }
+        other => IpcError::from_api(other).code,
+    }
+}
+
+/// The code for a refused 2FA verification: a 400/401 there is the code (or
+/// its challenge) being wrong or expired.
+fn two_factor_failure_code(error: &ApiError) -> IpcErrorCode {
+    match error {
+        ApiError::Unauthorized
+        | ApiError::Rejected {
+            status: 400 | 401, ..
+        } => IpcErrorCode::TwoFactorInvalid,
+        other => IpcError::from_api(other).code,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -79,7 +109,7 @@ pub async fn login(
     request: LoginRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<LoginResponse, String> {
+) -> Result<LoginResponse, IpcError> {
     // FIX-2-5: Rate limit login attempts (max 5 per 60s window)
     {
         let mut guard = LOGIN_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -106,10 +136,14 @@ pub async fn login(
                 attempts.len(),
                 LOGIN_WINDOW_SECS
             );
-            return Err(format!(
-                "Too many login attempts. Please wait {} seconds.",
-                wait.as_secs()
-            ));
+            return Err(IpcError::new(
+                IpcErrorCode::RateLimited,
+                format!(
+                    "Too many login attempts. Please wait {} seconds.",
+                    wait.as_secs()
+                ),
+            )
+            .with_retry_after(wait.as_secs()));
         }
         attempts.push(now);
     }
@@ -148,6 +182,7 @@ pub async fn login(
                     user: Some(user_info),
                     requires_two_factor: false,
                     challenge_token: None,
+                    code: None,
                 })
             }
             LoginResult::TwoFactorChallenge {
@@ -161,6 +196,7 @@ pub async fn login(
                     user: None,
                     requires_two_factor: true,
                     challenge_token: Some(challenge_token),
+                    code: Some(IpcErrorCode::TwoFactorRequired),
                 })
             }
         },
@@ -172,6 +208,7 @@ pub async fn login(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(sign_in_failure_code(&e)),
             })
         }
     }
@@ -180,20 +217,29 @@ pub async fn login(
 /// Logout and clear stored credentials
 #[tauri::command]
 pub async fn logout(
+    app: AppHandle,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<bool, String> {
+) -> Result<bool, IpcError> {
     tracing::info!("Logging out");
+
+    // W1-009 / contract §3.2: end the VPN session in Rust BEFORE the
+    // credentials go. The UI only disconnected first in some states, so a
+    // lockdown block after a give-up, or a connect still in flight, survived
+    // sign-out: the machine stayed firewalled at the login screen, or a tunnel
+    // came up for a signed-out user and auto-reconnect kept re-dialling with
+    // the previous account's session.
+    end_session(&app, EndReason::SignOut).await;
 
     // Try to logout on server (best effort)
     let _ = api.logout().await;
 
     // Clear local credentials
     credentials.clear_tokens().map_err(|e| {
-        format!(
+        IpcError::unknown(format!(
             "Failed to clear credentials: {}",
             crate::utils::redact::sanitize_error(&e.to_string())
-        )
+        ))
     })?;
 
     // Logout hygiene (documented contract of the persistent ML-KEM identity):
@@ -242,30 +288,31 @@ pub struct DeleteAccountResult {
     pub store_subscriptions_still_billing: Vec<String>,
 }
 
-/// The message a refused deletion shows. The backend's own words when it gave
-/// any (the password check's "Incorrect password"), not the variant's generic
-/// "Unknown error: …" framing.
-fn delete_failure_message(error: &ApiError) -> String {
-    let reason = match error {
-        ApiError::Unknown(message) => message.clone(),
-        ApiError::Unauthorized | ApiError::NotAuthenticated => {
-            "Your session has expired. Sign in again, then retry.".to_string()
+/// The error a refused deletion shows. The backend's own words when it gave
+/// any (the password check's "Incorrect password", which classifies as
+/// `invalid_credentials`), not the variant's generic "Unknown error: …"
+/// framing.
+fn delete_failure_message(error: &ApiError) -> IpcError {
+    let (code, reason) = match error {
+        ApiError::Rejected { message, .. } | ApiError::Unknown(message) => {
+            (IpcError::from_api(error).code, message.clone())
         }
-        other => other.to_string(),
+        ApiError::Unauthorized | ApiError::NotAuthenticated => (
+            IpcErrorCode::SessionExpired,
+            "Your session has expired. Sign in again, then retry.".to_string(),
+        ),
+        other => (IpcError::from_api(other).code, other.to_string()),
     };
-    format!(
-        "Account deletion failed: {}",
-        crate::utils::redact::sanitize_error(&reason)
-    )
+    IpcError::new(code, format!("Account deletion failed: {}", reason))
 }
 
 #[tauri::command]
 pub async fn delete_account(
     request: DeleteAccountRequest,
-    app: tauri::AppHandle,
+    app: AppHandle,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<DeleteAccountResult, String> {
+) -> Result<DeleteAccountResult, IpcError> {
     tracing::info!("Account deletion requested (GDPR)");
 
     // Nothing local is touched unless the server confirms the deletion: a
@@ -281,15 +328,11 @@ pub async fn delete_account(
     // the dialog before the request, so a wrong password or an offline delete
     // left the user disconnected from an account that still existed. The
     // account's keys are gone server-side, so the tunnel could not carry
-    // traffic anyway; the full user-initiated path also stops auto-reconnect
-    // and disarms the kill switch, so nothing is left blocking. Best effort:
-    // a failed teardown never turns a completed erasure into an error.
-    if let Err(e) =
-        crate::commands::vpn::disconnect_vpn(app.clone(), app.state(), app.state(), app.state())
-            .await
-    {
-        tracing::warn!("Disconnect after account deletion failed: {}", e);
-    }
+    // traffic anyway; ending the session also stops auto-reconnect and
+    // disarms the kill switch, so nothing is left blocking. It skips the
+    // backend disconnect call: the account is gone, and a 401 from it would
+    // read as an expired session.
+    end_session(&app, EndReason::AccountDeleted).await;
 
     // Clear all local credentials after successful server-side deletion,
     // including the persistent ML-KEM identity (same hygiene as logout —
@@ -329,11 +372,8 @@ pub struct DeletionPreflightResult {
 #[tauri::command]
 pub async fn deletion_preflight(
     api: State<'_, BirdoApi>,
-) -> Result<DeletionPreflightResult, String> {
-    let response = api
-        .deletion_preflight()
-        .await
-        .map_err(|e| crate::utils::redact::sanitize_error(&e.to_string()))?;
+) -> Result<DeletionPreflightResult, IpcError> {
+    let response = api.deletion_preflight().await.map_err(IpcError::from)?;
     Ok(deletion_preflight_result(&response))
 }
 
@@ -355,14 +395,9 @@ fn deletion_preflight_result(
 /// GDPR: Export all user data (Right to Data Portability, Art. 20).
 /// Returns a JSON blob the frontend can save to disk.
 #[tauri::command]
-pub async fn export_user_data(api: State<'_, BirdoApi>) -> Result<serde_json::Value, String> {
+pub async fn export_user_data(api: State<'_, BirdoApi>) -> Result<serde_json::Value, IpcError> {
     tracing::info!("GDPR data export requested");
-    api.export_user_data().await.map_err(|e| {
-        format!(
-            "Data export failed: {}",
-            crate::utils::redact::sanitize_error(&e.to_string())
-        )
-    })
+    api.export_user_data().await.map_err(IpcError::from)
 }
 
 /// Get current authentication state
@@ -370,11 +405,14 @@ pub async fn export_user_data(api: State<'_, BirdoApi>) -> Result<serde_json::Va
 pub async fn get_auth_state(
     credentials: State<'_, CredentialStore>,
     api: State<'_, BirdoApi>,
-) -> Result<AuthState, String> {
+) -> Result<AuthState, IpcError> {
     match credentials.get_tokens() {
         Ok(tokens) => {
-            // Set tokens in API client
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+            // W1-028: only when memory holds no session. A session in memory
+            // may carry a ROTATED refresh token the keystore does not have
+            // yet; putting the keystore's consumed one back is what the server
+            // reads as token theft.
+            api.restore_tokens_if_absent(tokens.access_token.clone(), tokens.refresh_token.clone())
                 .await;
 
             // Try to get user profile to validate token
@@ -554,7 +592,7 @@ pub async fn verify_2fa(
     request: TwoFactorRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<LoginResponse, String> {
+) -> Result<LoginResponse, IpcError> {
     // SEC-2FA: Rate limit TOTP verification attempts (max 5 per 120s window)
     {
         let mut guard = TOTP_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -578,10 +616,14 @@ pub async fn verify_2fa(
                 attempts.len(),
                 TOTP_WINDOW_SECS
             );
-            return Err(format!(
-                "Too many 2FA attempts. Please wait {} seconds.",
-                wait.as_secs()
-            ));
+            return Err(IpcError::new(
+                IpcErrorCode::RateLimited,
+                format!(
+                    "Too many 2FA attempts. Please wait {} seconds.",
+                    wait.as_secs()
+                ),
+            )
+            .with_retry_after(wait.as_secs()));
         }
         attempts.push(now);
     }
@@ -609,6 +651,7 @@ pub async fn verify_2fa(
                             user: None,
                             requires_two_factor: true,
                             challenge_token: Some(request.challenge_token),
+                            code: Some(IpcErrorCode::ServerError),
                         });
                     }
                 };
@@ -627,6 +670,7 @@ pub async fn verify_2fa(
                     user: None, // Profile will be fetched via get_auth_state
                     requires_two_factor: false,
                     challenge_token: None,
+                    code: None,
                 })
             } else {
                 Ok(LoginResponse {
@@ -635,6 +679,7 @@ pub async fn verify_2fa(
                     user: None,
                     requires_two_factor: true,
                     challenge_token: Some(request.challenge_token),
+                    code: Some(IpcErrorCode::TwoFactorInvalid),
                 })
             }
         }
@@ -646,6 +691,7 @@ pub async fn verify_2fa(
                 user: None,
                 requires_two_factor: true,
                 challenge_token: Some(request.challenge_token),
+                code: Some(two_factor_failure_code(&e)),
             })
         }
     }
@@ -685,7 +731,7 @@ impl Drop for AnonymousLoginCommandRequest {
 pub async fn register_anonymous(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<LoginResponse, String> {
+) -> Result<LoginResponse, IpcError> {
     // Same client-side rate limit as login (compromised-webview guard). The
     // backend also enforces a strict per-IP creation cap.
     {
@@ -700,6 +746,7 @@ pub async fn register_anonymous(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(IpcErrorCode::RateLimited),
             });
         }
         attempts.push(now);
@@ -733,6 +780,7 @@ pub async fn register_anonymous(
                 }),
                 requires_two_factor: false,
                 challenge_token: None,
+                code: None,
             })
         }
         Ok(_) => Ok(LoginResponse {
@@ -741,6 +789,7 @@ pub async fn register_anonymous(
             user: None,
             requires_two_factor: false,
             challenge_token: None,
+            code: Some(IpcErrorCode::ServerError),
         }),
         Err(e) => {
             tracing::warn!("Anonymous account creation failed: {}", e);
@@ -750,6 +799,7 @@ pub async fn register_anonymous(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(IpcError::from_api(&e).code),
             })
         }
     }
@@ -761,7 +811,7 @@ pub async fn login_anonymous(
     request: AnonymousLoginCommandRequest,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<LoginResponse, String> {
+) -> Result<LoginResponse, IpcError> {
     // Same client-side rate limit as email login (compromised-webview guard).
     {
         let mut guard = LOGIN_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -775,6 +825,7 @@ pub async fn login_anonymous(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(IpcErrorCode::RateLimited),
             });
         }
         attempts.push(now);
@@ -792,6 +843,7 @@ pub async fn login_anonymous(
             user: None,
             requires_two_factor: false,
             challenge_token: None,
+            code: Some(IpcErrorCode::InvalidCredentials),
         });
     }
 
@@ -812,6 +864,7 @@ pub async fn login_anonymous(
                     user: None,
                     requires_two_factor: true,
                     challenge_token: result.challenge_token,
+                    code: Some(IpcErrorCode::TwoFactorRequired),
                 });
             }
             if result.ok {
@@ -837,6 +890,7 @@ pub async fn login_anonymous(
                     user: Some(user_info),
                     requires_two_factor: false,
                     challenge_token: None,
+                    code: None,
                 })
             } else {
                 Ok(LoginResponse {
@@ -845,6 +899,7 @@ pub async fn login_anonymous(
                     user: None,
                     requires_two_factor: false,
                     challenge_token: None,
+                    code: Some(IpcErrorCode::InvalidCredentials),
                 })
             }
         }
@@ -856,6 +911,7 @@ pub async fn login_anonymous(
                 user: None,
                 requires_two_factor: false,
                 challenge_token: None,
+                code: Some(sign_in_failure_code(&e)),
             })
         }
     }
@@ -887,17 +943,18 @@ mod account_boundary_tests {
         assert!(body("delete_account").contains(&needle));
     }
 
+    /// Second-pass #15: a refused deletion (wrong password, offline) must
+    /// leave the tunnel up; a confirmed one takes it down before the local
+    /// state is cleared. (W1-009 moved the teardown to `end_session`, the one
+    /// Rust teardown every sign-out path shares.)
     #[test]
     fn deletion_disconnects_only_after_the_server_confirmed() {
-        // Second-pass #15: a refused deletion (wrong password, offline) must
-        // leave the tunnel up; a confirmed one takes it down before the local
-        // state is cleared.
         let del = body("delete_account");
         let confirmed = del
             .find(".delete_account(&request.password)")
             .expect("the server call");
         let disconnect = del
-            .find("commands::vpn::disconnect_vpn(")
+            .find("end_session(&app, EndReason::AccountDeleted)")
             .expect("the disconnect after the 2xx");
         let cleared = del
             .find("credentials.clear_tokens()")
@@ -909,6 +966,75 @@ mod account_boundary_tests {
         assert!(
             disconnect < cleared,
             "local state is cleared before the disconnect"
+        );
+    }
+
+    /// W1-009 / contract §3.2: logout ends the VPN session in Rust BEFORE the
+    /// credentials are cleared.
+    #[test]
+    fn logout_ends_the_session_before_clearing_credentials() {
+        let out = body("logout");
+        let ended = out
+            .find("end_session(&app, EndReason::SignOut)")
+            .expect("logout ends the session");
+        let cleared = out
+            .find("credentials.clear_tokens()")
+            .expect("credentials cleared");
+        assert!(
+            ended < cleared,
+            "credentials cleared before the session ended"
+        );
+    }
+
+    #[test]
+    fn a_wrong_password_on_deletion_is_invalid_credentials() {
+        let wrong = super::delete_failure_message(&super::ApiError::Rejected {
+            status: 401,
+            message: "Incorrect password".into(),
+        });
+        assert_eq!(wrong.code, super::IpcErrorCode::InvalidCredentials);
+        assert!(wrong.message.contains("Incorrect password"));
+        assert_eq!(
+            super::delete_failure_message(&super::ApiError::Unauthorized).code,
+            super::IpcErrorCode::SessionExpired
+        );
+    }
+
+    /// Sign-in refusals carry a contract code: a 401 from a sign-in endpoint
+    /// is wrong credentials (never "session expired"), and a 2FA refusal is
+    /// `two_factor_invalid`.
+    #[test]
+    fn sign_in_refusals_carry_their_codes() {
+        use super::{sign_in_failure_code, two_factor_failure_code, ApiError, IpcErrorCode};
+        assert_eq!(
+            sign_in_failure_code(&ApiError::Unauthorized),
+            IpcErrorCode::InvalidCredentials
+        );
+        assert_eq!(
+            sign_in_failure_code(&ApiError::Rejected {
+                status: 401,
+                message: "Invalid credentials".into()
+            }),
+            IpcErrorCode::InvalidCredentials
+        );
+        assert_eq!(
+            sign_in_failure_code(&ApiError::RateLimited),
+            IpcErrorCode::RateLimited
+        );
+        assert_eq!(
+            sign_in_failure_code(&ApiError::Network("x".into())),
+            IpcErrorCode::NetworkOffline
+        );
+        assert_eq!(
+            two_factor_failure_code(&ApiError::Rejected {
+                status: 400,
+                message: "Invalid code".into()
+            }),
+            IpcErrorCode::TwoFactorInvalid
+        );
+        assert_eq!(
+            two_factor_failure_code(&ApiError::ServerError(502)),
+            IpcErrorCode::ServerError
         );
     }
 

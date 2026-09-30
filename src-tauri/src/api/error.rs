@@ -27,6 +27,12 @@ pub enum ApiError {
     Parse(String),
     /// SEC-C1: TLS certificate pinning verification failed (possible MITM)
     CertificatePinningFailed(String),
+    /// Any other non-2xx answer that carried the backend's own sentence. The
+    /// status travels with it so `commands::ipc_error` can pick an error code
+    /// by status instead of by wording, and the sentence stays the specific,
+    /// actionable one ("Stealth mode requires an Operative or Sovereign
+    /// subscription") rather than a generic "Access denied".
+    Rejected { status: u16, message: String },
     /// Unknown error
     Unknown(String),
 }
@@ -55,6 +61,7 @@ impl fmt::Display for ApiError {
             ApiError::ServerError(code) => write!(f, "Server error ({})", code),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),
             ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update BirdoVPN to the latest version. ({})", msg),
+            ApiError::Rejected { message, .. } => write!(f, "{}", message),
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }
     }

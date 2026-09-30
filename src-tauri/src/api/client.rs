@@ -257,6 +257,25 @@ impl BirdoApi {
         *self.refresh_token.write().await = Some(Zeroizing::new(refresh));
     }
 
+    /// Fill the in-memory session from the keystore — ONLY if there is none.
+    ///
+    /// W1-028: `get_auth_state` (and every command's token restore) used to
+    /// overwrite memory unconditionally and without the refresh lock. The
+    /// refresh writes the ROTATED pair to memory first and to the keystore
+    /// after, so a keystore read landing between the two put the consumed
+    /// refresh token back in memory; the server treats reusing it as theft and
+    /// revokes the session. Memory is authoritative once set, and the check
+    /// runs under the same lock the refresh holds for its whole write.
+    /// Returns whether the tokens were taken.
+    pub async fn restore_tokens_if_absent(&self, access: String, refresh: String) -> bool {
+        let _guard = self.refresh_lock.lock().await;
+        if self.access_token.read().await.is_some() {
+            return false;
+        }
+        self.set_tokens(access, refresh).await;
+        true
+    }
+
     /// Clear authentication tokens
     pub async fn clear_tokens(&self) {
         *self.access_token.write().await = None;
@@ -395,8 +414,10 @@ impl BirdoApi {
             refresh_token: (*refresh).clone(),
         };
 
-        let response: RefreshResponse =
-            self.post(endpoints::auth::REFRESH, &payload, false).await?;
+        let response: RefreshResponse = self
+            .post(endpoints::auth::REFRESH, &payload, false)
+            .await
+            .inspect_err(super::session_gate::report_refresh_failure)?;
 
         // Update access token
         *self.access_token.write().await = Some(Zeroizing::new(response.access_token.clone()));
@@ -539,7 +560,10 @@ impl BirdoApi {
                 .filter(|m| !m.is_empty());
             return match message {
                 Some(m) if !m.eq_ignore_ascii_case("unauthorized") => {
-                    GdprDeleteOutcome::Refused(ApiError::Unknown(m))
+                    GdprDeleteOutcome::Refused(ApiError::Rejected {
+                        status: StatusCode::UNAUTHORIZED.as_u16(),
+                        message: m,
+                    })
                 }
                 _ => GdprDeleteOutcome::SessionExpired,
             };
@@ -1016,7 +1040,9 @@ impl BirdoApi {
             refresh_token: (*refresh).clone(),
         };
 
-        // Use do_request directly to avoid infinite retry loop
+        // Use do_request directly to avoid infinite retry loop. A 401 here is
+        // the server rejecting the refresh token: contract §3.3 ends the
+        // session everywhere (see `session_gate`).
         let response: RefreshResponse = self
             .do_request(
                 &reqwest::Method::POST,
@@ -1024,7 +1050,8 @@ impl BirdoApi {
                 Some(&payload),
                 false,
             )
-            .await?;
+            .await
+            .inspect_err(super::session_gate::report_refresh_failure)?;
 
         *self.access_token.write().await = Some(Zeroizing::new(response.access_token.clone()));
         // FIX C-1: Also update refresh token if rotated
@@ -1119,7 +1146,9 @@ impl BirdoApi {
     ///     access token expired, Connect / server list / heartbeat all failed
     ///     with "Unknown error: Unauthorized" while a valid 30-day refresh token
     ///     sat unused in the OS keystore, and only a full restart recovered.
-    ///  3. Any other status keeps the backend's message. Deliberate: those
+    ///  3. Any other status keeps the backend's message, WITH its status
+    ///     (`ApiError::Rejected`), so the IPC layer can classify by status and
+    ///     still show the specific sentence. Deliberate: those
     ///     `ApiError` variants carry no payload, so mapping 403 to
     ///     `ApiError::Forbidden` would replace a specific, actionable explanation
     ///     ("Stealth mode requires an Operative or Sovereign subscription") with
@@ -1149,7 +1178,10 @@ impl BirdoApi {
         if let Some(message) = body.as_ref().and_then(|b| b.message.as_deref()) {
             let message = message.trim();
             if !message.is_empty() {
-                return ApiError::Unknown(message.to_string());
+                return ApiError::Rejected {
+                    status: status.as_u16(),
+                    message: message.to_string(),
+                };
             }
         }
 
@@ -1244,5 +1276,70 @@ impl Clone for BirdoApi {
             refresh_token: Arc::clone(&self.refresh_token),
             refresh_lock: Arc::clone(&self.refresh_lock),
         }
+    }
+}
+
+#[cfg(test)]
+mod token_restore_tests {
+    use super::BirdoApi;
+
+    async fn refresh_in_memory(api: &BirdoApi) -> Option<String> {
+        api.refresh_token
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.as_str().to_string())
+    }
+
+    /// W1-028: a session already in memory is authoritative — it may hold a
+    /// rotated refresh token the keystore does not have yet.
+    #[tokio::test]
+    async fn restore_never_overwrites_a_session_in_memory() {
+        let api = BirdoApi::new();
+        api.set_tokens("rotated-access".into(), "rotated-refresh".into())
+            .await;
+        assert!(
+            !api.restore_tokens_if_absent("stale-access".into(), "consumed-refresh".into())
+                .await
+        );
+        assert_eq!(
+            refresh_in_memory(&api).await.as_deref(),
+            Some("rotated-refresh")
+        );
+    }
+
+    /// W1-028's interleaving: a restore that starts while a refresh holds the
+    /// lock waits for it, then finds the rotated pair and leaves it alone.
+    #[tokio::test]
+    async fn restore_waits_for_an_in_flight_refresh() {
+        let api = BirdoApi::new();
+        let refreshing = api.refresh_lock.lock().await;
+        let restorer = api.clone();
+        let restore = tokio::spawn(async move {
+            restorer
+                .restore_tokens_if_absent("stale-access".into(), "consumed-refresh".into())
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!restore.is_finished(), "restore ran inside a refresh");
+        // The refresh writes the rotated pair to memory, then releases.
+        api.set_tokens("rotated-access".into(), "rotated-refresh".into())
+            .await;
+        drop(refreshing);
+        assert!(!restore.await.unwrap());
+        assert_eq!(
+            refresh_in_memory(&api).await.as_deref(),
+            Some("rotated-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_fills_an_empty_session() {
+        let api = BirdoApi::new();
+        assert!(
+            api.restore_tokens_if_absent("access".into(), "refresh".into())
+                .await
+        );
+        assert!(api.is_authenticated().await);
     }
 }

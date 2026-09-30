@@ -35,6 +35,36 @@ pub fn hidden_cmd(program: &str) -> std::process::Command {
     cmd
 }
 
+/// `hidden_cmd`'s async twin, for subprocesses run from async code (W1-017).
+///
+/// A `std::process::Command` awaited nowhere blocks a runtime worker for as
+/// long as the child runs, and no `tokio::time::timeout` around it can fire.
+/// Pair this with [`run_bounded`], which kills the child on timeout.
+pub fn hidden_async_cmd(program: &str) -> tokio::process::Command {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Run `cmd` to completion within `limit`. The child is killed if the limit
+/// passes or the caller is cancelled (`kill_on_drop`), so nothing it does can
+/// outlive the step that started it.
+pub async fn run_bounded(
+    cmd: &mut tokio::process::Command,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    cmd.kill_on_drop(true).stdin(std::process::Stdio::null());
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(_) => Err(format!("timed out after {limit:?}")),
+    }
+}
+
 /// This install's device identifier: a random `desktop_<uuid-v4>`, persisted
 /// per install and rotated on account deletion (not on sign-out). See
 /// `utils::device_id` for why it is no longer derived from the machine.
@@ -94,6 +124,36 @@ pub fn device_platform() -> &'static str {
         "macos" => "MACOS",
         "linux" => "LINUX",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod bounded_process_tests {
+    /// W1-017's test plan: a hung subprocess is cut off at the limit instead
+    /// of pinning the caller for as long as it runs.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_hung_subprocess_is_cut_off_at_the_limit() {
+        let started = std::time::Instant::now();
+        let result = super::run_bounded(
+            super::hidden_async_cmd("cmd.exe").args(["/c", "ping -n 30 127.0.0.1 >nul"]),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_quick_subprocess_returns_its_output() {
+        let out = super::run_bounded(
+            super::hidden_async_cmd("cmd.exe").args(["/c", "echo birdo"]),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("cmd.exe runs");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("birdo"));
     }
 }
 

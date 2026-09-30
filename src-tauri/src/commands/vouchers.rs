@@ -9,6 +9,8 @@ use tauri::State;
 use crate::api::error::ApiError;
 use crate::api::types::RedeemVoucherResponse;
 use crate::api::BirdoApi;
+use crate::commands::ipc_error::IpcError;
+use crate::commands::session::ensure_signed_in;
 use crate::storage::CredentialStore;
 
 /// Maps a redeem failure to a user-facing message.
@@ -45,31 +47,25 @@ pub async fn redeem_voucher(
     code: String,
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<RedeemVoucherResponse, String> {
+) -> Result<RedeemVoucherResponse, IpcError> {
     // Trim + basic shape check before hitting the network (defense-in-depth;
     // the backend is the real validator). A renderer can bypass TS, so re-check.
     let code = code.trim().to_uppercase();
     if code.is_empty() {
-        return Err("Enter a voucher code.".to_string());
+        return Err(IpcError::unknown("Enter a voucher code."));
     }
     if code.len() > 64 {
-        return Err("That code doesn't look right. Check the format and try again.".to_string());
+        return Err(IpcError::unknown(
+            "That code doesn't look right. Check the format and try again.",
+        ));
     }
 
     // Rehydrate tokens the same way every other authenticated command does.
-    if !api.is_authenticated().await {
-        if let Ok(tokens) = credentials.get_tokens() {
-            api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
-                .await;
-        }
-    }
-    if !api.is_authenticated().await {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
+    ensure_signed_in(&api, &credentials).await?;
 
     api.redeem_voucher(&code)
         .await
-        .map_err(|e| friendly_redeem_error(&e))
+        .map_err(|e| IpcError::new(IpcError::from_api(&e).code, friendly_redeem_error(&e)))
 }
 
 #[cfg(test)]

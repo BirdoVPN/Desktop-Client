@@ -144,10 +144,18 @@ pub struct XrayConfig {
     pub wg_port: u16,
 }
 
+/// How often the health monitor checks that xray is still alive. An exit is
+/// reported to the reconnect engine at the next check (W1-005), so this bounds
+/// how long a stealth session can sit dead under a "Protected" UI.
+const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Manages the lifecycle of an Xray Reality stealth tunnel process
 pub struct XrayManager {
     process: Arc<Mutex<Option<Child>>>,
     health_cancel: Arc<Mutex<Option<watch::Sender<bool>>>>,
+    /// Bumped each time xray exits WITHOUT being asked to (a crash, End task).
+    /// An intentional `stop()` cancels the monitor first, so it never counts.
+    exits: watch::Sender<u64>,
 }
 
 impl Default for XrayManager {
@@ -161,7 +169,15 @@ impl XrayManager {
         Self {
             process: Arc::new(Mutex::new(None)),
             health_cancel: Arc::new(Mutex::new(None)),
+            exits: watch::channel(0).0,
         }
+    }
+
+    /// Wakes when xray dies under a session. The reconnect engine treats that
+    /// as a dead data plane and re-dials at once, instead of waiting for the
+    /// handshake to go stale (W1-005).
+    pub fn subscribe_exits(&self) -> watch::Receiver<u64> {
+        self.exits.subscribe()
     }
 
     /// Start the Xray Reality tunnel. Returns the local port to use as WireGuard endpoint.
@@ -245,6 +261,18 @@ impl XrayManager {
                 e, xray_binary
             )
         })?;
+
+        // W1-005: tie xray's lifetime to ours. stop() and Drop only run on a
+        // clean exit; a crash, End task or the updater's process::exit(0)
+        // skipped both and left xray running with a live Reality session and
+        // the file locked against the installer. The job's only handle closes
+        // when this process does, whatever the reason, and the OS then kills
+        // everything in it. A failure is logged, not fatal: an orphaned xray
+        // talks only to the relay, so it is a leftover, not a leak.
+        #[cfg(target_os = "windows")]
+        if let Err(e) = kill_on_close_job::adopt(&child) {
+            tracing::warn!("Could not tie xray to the app's lifetime: {}", e);
+        }
 
         // P1-dk-xray-orphan-on-early-return: take the pipes and store the Child
         // BEFORE any fallible post-spawn work, so every error path below can
@@ -364,12 +392,13 @@ impl XrayManager {
         *self.health_cancel.lock().await = Some(cancel_tx);
 
         let process = Arc::clone(&self.process);
+        let exits = self.exits.clone();
 
         tokio::spawn(async move {
             let mut consecutive_failures: u32 = 0;
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = tokio::time::sleep(HEALTH_CHECK_INTERVAL) => {}
                     _ = cancel_rx.changed() => break,
                 }
 
@@ -399,7 +428,11 @@ impl XrayManager {
                 };
 
                 if !proc_alive {
-                    tracing::error!("Xray health monitor: process not running, stopping monitor");
+                    // W1-005: this used to stop the monitor and say nothing, so
+                    // WireGuard kept sending into a dead loopback port with the
+                    // UI reading Connected until the watchdog noticed.
+                    tracing::error!("Xray exited under the session — reporting a dead transport");
+                    exits.send_modify(|n| *n = n.wrapping_add(1));
                     break;
                 }
 
@@ -468,6 +501,79 @@ impl Drop for XrayManager {
                      running (a concurrent start/stop owns the handle)"
                 );
             }
+        }
+    }
+}
+
+/// A Job Object with KILL_ON_JOB_CLOSE that xray is placed in (W1-005).
+///
+/// Its one handle is held in a static and never closed, so it lives exactly as
+/// long as this process; when the process ends — for any reason — the OS
+/// closes the handle and terminates every process in the job.
+#[cfg(target_os = "windows")]
+mod kill_on_close_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub(super) struct Job(HANDLE);
+
+    // SAFETY: a job handle is a kernel object handle, usable from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        pub(super) fn new() -> Result<Self, String> {
+            // SAFETY: no security attributes, no name; the handle is owned by
+            // the returned Job.
+            let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+                .map_err(|e| format!("CreateJobObjectW: {e}"))?;
+            let job = Job(handle);
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `info` is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION and
+            // the length passed is its exact size.
+            unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            }
+            .map_err(|e| format!("SetInformationJobObject: {e}"))?;
+            Ok(job)
+        }
+
+        pub(super) fn assign(&self, child: &std::process::Child) -> Result<(), String> {
+            // SAFETY: both handles are valid for the call: the job is owned by
+            // `self`, the process handle by `child`.
+            unsafe { AssignProcessToJobObject(self.0, HANDLE(child.as_raw_handle())) }
+                .map_err(|e| format!("AssignProcessToJobObject: {e}"))
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle is owned by this Job and closed exactly once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    static PROCESS_JOB: OnceLock<Result<Job, String>> = OnceLock::new();
+
+    /// Put `child` in the process-lifetime job.
+    pub(super) fn adopt(child: &std::process::Child) -> Result<(), String> {
+        match PROCESS_JOB.get_or_init(Job::new) {
+            Ok(job) => job.assign(child),
+            Err(e) => Err(e.clone()),
         }
     }
 }
@@ -724,6 +830,41 @@ mod tests {
         assert!(err.contains(&rewritten), "actual digest missing from {err}");
     }
 
+    /// W1-005: closing the job kills what is in it. This is the property that
+    /// takes xray down with the app on a crash, End task or an update's
+    /// process::exit — the static job's handle is closed by the OS then. The
+    /// child only pings loopback; nothing leaves the machine.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn closing_the_job_kills_its_processes() {
+        let job = kill_on_close_job::Job::new().expect("job object");
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a long-running child");
+        job.assign(&child).expect("assign to job");
+        assert!(child.try_wait().unwrap().is_none(), "child is running");
+
+        drop(job);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let exited = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        if !exited {
+            let _ = child.kill();
+        }
+        assert!(exited, "closing the job must terminate its processes");
+    }
+
     /// FIPS 180-4 "abc" vector, compared against what the release pipeline
     /// exports (`Get-FileHash` / `sha256sum` -> GITHUB_ENV -> compiled in).
     /// The test above is round-trip only; this one pins that the string we
@@ -757,8 +898,20 @@ mod tests {
             !udp_port_held(port),
             "after the listener is gone the port is free"
         );
-        // a TCP listener on the same port is NOT the proxy: UDP stays free
-        let tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        // a TCP listener on the same port is NOT the proxy: UDP stays free.
+        // The port must be usable by BOTH protocols, which one bind cannot
+        // promise: Hyper-V reserves separate TCP and UDP blocks inside the
+        // dynamic range, and landing in one failed the setup — not the probe
+        // under test. So look for a port both accept.
+        let (tcp, port) = (0..50)
+            .find_map(|_| {
+                let udp = UdpSocket::bind(("127.0.0.1", 0)).ok()?;
+                let port = udp.local_addr().ok()?.port();
+                drop(udp);
+                let tcp = TcpListener::bind(("127.0.0.1", port)).ok()?;
+                Some((tcp, port))
+            })
+            .expect("a loopback port free for both TCP and UDP");
         assert!(!udp_port_held(port));
         drop(tcp);
     }
