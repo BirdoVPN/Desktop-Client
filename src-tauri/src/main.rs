@@ -17,6 +17,7 @@ mod utils;
 mod vpn;
 
 use api::BirdoApi;
+use commands::tray::restore_and_focus;
 use storage::CredentialStore;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -66,18 +67,6 @@ struct PendingDeepLink(std::sync::Mutex<Option<String>>);
 #[tauri::command]
 fn take_pending_deep_link(pending: tauri::State<'_, PendingDeepLink>) -> Option<String> {
     pending.0.lock().ok().and_then(|mut g| g.take())
-}
-
-/// Bring the main window back to the foreground (tray click, "Show", quick
-/// actions, deep link, single-instance relaunch, post-SSO). Emits "app-shown"
-/// so the biometric app-lock can re-challenge after a close-to-tray.
-fn restore_and_focus(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = window.emit("app-shown", ());
-    }
 }
 
 /// Surface the window and hand a birdo:// URL to the frontend router. Shared by

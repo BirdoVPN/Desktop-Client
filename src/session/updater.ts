@@ -42,6 +42,12 @@ interface UpdaterState {
   info: UpdateInfo | null;
   progress: number;
   error: string | null;
+  /**
+   * The install failed after Rust ended the VPN session for it, and the
+   * session can be put back with one click (REVIEW-WIN-002). Under always-on
+   * Rust reconnects by itself and this stays false.
+   */
+  reconnectOffered: boolean;
   appVersion: string | null;
 }
 
@@ -50,8 +56,31 @@ export const useUpdater = create<UpdaterState>(() => ({
   info: null,
   progress: 0,
   error: null,
+  reconnectOffered: false,
   appVersion: null,
 }));
+
+export const UPDATE_DOWNLOAD_FAILED_COPY = 'The update could not be downloaded or verified. Please try again.';
+export const UPDATE_INSTALL_FAILED_COPY =
+  'The update was downloaded but could not be installed. Please try again.';
+const UPDATE_INSTALL_FAILED_RECONNECTING_COPY =
+  'The update was downloaded but could not be installed. BirdoVPN is reconnecting.';
+
+/**
+ * `install_update`'s error (commands/updater.rs `UpdateFailure`): which stage
+ * failed, and what Rust did about the session the install ended.
+ */
+function failureCopy(e: unknown): { error: string; reconnectOffered: boolean } {
+  const f = typeof e === 'object' && e !== null ? (e as Record<string, unknown>) : {};
+  if (f.code !== 'install_failed') {
+    // A pin failure lands here too: the pinned client refuses the handshake
+    // rather than downloading over an unverified chain.
+    return { error: UPDATE_DOWNLOAD_FAILED_COPY, reconnectOffered: false };
+  }
+  return f.reconnect === 'automatic'
+    ? { error: UPDATE_INSTALL_FAILED_RECONNECTING_COPY, reconnectOffered: false }
+    : { error: UPDATE_INSTALL_FAILED_COPY, reconnectOffered: f.reconnect === 'offered' };
+}
 
 const CHECK_TIMEOUT_MS = 10_000;
 let checkedThisRun = false;
@@ -59,7 +88,14 @@ let checkedThisRun = false;
 /** For tests. */
 export function resetUpdater(): void {
   checkedThisRun = false;
-  useUpdater.setState({ phase: 'idle', info: null, progress: 0, error: null, appVersion: null });
+  useUpdater.setState({
+    phase: 'idle',
+    info: null,
+    progress: 0,
+    error: null,
+    reconnectOffered: false,
+    appVersion: null,
+  });
 }
 
 /** On Windows the installer exits the app, so there is no separate restart step. */
@@ -83,7 +119,7 @@ export async function checkForUpdates(force = false): Promise<UpdateInfo | null>
   if (s.phase === 'installing' || s.phase === 'checking') return s.info;
   if (!force && checkedThisRun) return s.info;
   checkedThisRun = true;
-  useUpdater.setState({ phase: 'checking', error: null });
+  useUpdater.setState({ phase: 'checking', error: null, reconnectOffered: false });
   try {
     const info = await Promise.race([
       invoke<UpdateInfo | null>('check_for_updates'),
@@ -103,7 +139,7 @@ export async function checkForUpdates(force = false): Promise<UpdateInfo | null>
 
 export async function installUpdate(): Promise<void> {
   if (useUpdater.getState().phase === 'installing') return;
-  useUpdater.setState({ phase: 'installing', progress: 0, error: null });
+  useUpdater.setState({ phase: 'installing', progress: 0, error: null, reconnectOffered: false });
   const unlisten = listen<{ downloaded: number; contentLength?: number | null }>(
     'updater-download-progress',
     (event) => {
@@ -118,13 +154,8 @@ export async function installUpdate(): Promise<void> {
     useUpdater.setState(
       installed ? { phase: 'ready', progress: 100 } : { phase: 'up-to-date', progress: 0 },
     );
-  } catch {
-    // A pin failure lands here too: the pinned client refuses the handshake
-    // rather than downloading over an unverified chain.
-    useUpdater.setState({
-      phase: 'error',
-      error: 'The update could not be downloaded or verified. Please try again.',
-    });
+  } catch (e) {
+    useUpdater.setState({ phase: 'error', ...failureCopy(e) });
   } finally {
     unlisten.then((off) => off()).catch(() => {});
   }

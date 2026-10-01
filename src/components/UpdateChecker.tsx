@@ -14,9 +14,10 @@ import { brand, status, surface, white } from '@/lib/birdo-theme';
 import { useAppStore } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 import { checkForUpdates, installExitsApp, installUpdate, useUpdater } from '@/session/updater';
+import { connectPreferred } from '@/session/vpn-actions';
 
 export function UpdateChecker() {
-  const { phase, info, progress, error } = useUpdater();
+  const { phase, info, progress, error, reconnectOffered } = useUpdater();
   const [confirmInstall, setConfirmInstall] = useState(false);
   const [restartError, setRestartError] = useState<string | null>(null);
   const exitsApp = installExitsApp();
@@ -72,6 +73,17 @@ export function UpdateChecker() {
             {subtitle}
           </div>
         </div>
+        {/* The install ended the VPN session and then failed (REVIEW-WIN-002):
+            putting the user back on their server comes before a retry. */}
+        {phase === 'error' && reconnectOffered && (
+          <UpdateAction
+            label="Reconnect"
+            onClick={() => {
+              useUpdater.setState({ reconnectOffered: false });
+              void connectPreferred();
+            }}
+          />
+        )}
         {(phase === 'idle' || phase === 'up-to-date' || phase === 'error') && (
           <UpdateAction label={phase === 'error' ? 'Retry' : 'Check'} onClick={() => void checkForUpdates(true)} />
         )}

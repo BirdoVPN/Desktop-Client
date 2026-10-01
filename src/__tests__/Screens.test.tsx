@@ -26,7 +26,13 @@ import { OfflineBanner } from '@/components/OfflineBanner';
 import { UpdateRequired } from '@/components/UpdateRequired';
 import { UpdateChecker } from '@/components/UpdateChecker';
 import { defaultSettings, useAppStore } from '@/store/app-store';
-import { resetUpdater, useUpdater } from '@/session/updater';
+import {
+  installUpdate,
+  resetUpdater,
+  UPDATE_DOWNLOAD_FAILED_COPY,
+  UPDATE_INSTALL_FAILED_COPY,
+  useUpdater,
+} from '@/session/updater';
 import { resetSessionData } from '@/session/session-data';
 
 vi.mock('@tauri-apps/api/core');
@@ -237,6 +243,45 @@ describe('Update wall (W2-025) and updater (W2-024)', () => {
     await userEvent.click(await screen.findByRole('button', { name: /Download|Install and restart/ }));
     expect(screen.getByText('Installing will disconnect the VPN and restart BirdoVPN.')).toBeInTheDocument();
     expect(callsTo('install_update')).toHaveLength(0);
+  });
+
+  // REVIEW-WIN-002: an install that fails after Rust ended the session for it.
+  const installFails = (reconnect: string) =>
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'install_update') {
+        throw { code: 'install_failed', message: 'Update failed: os error 225', reconnect };
+      }
+      return cmd === 'check_for_updates' ? { version: '9.9.9', currentVersion: '1.0.0' } : undefined;
+    });
+
+  it('a failed install says the INSTALL failed and offers to reconnect', async () => {
+    installFails('offered');
+    render(<UpdateChecker />);
+    await userEvent.click(await screen.findByRole('button', { name: /Download|Install and restart/ }));
+    expect(await screen.findByText(UPDATE_INSTALL_FAILED_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(UPDATE_DOWNLOAD_FAILED_COPY)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
+    // Rust has no list yet in this test, so the reconnect goes through its own
+    // best-server pick.
+    await waitFor(() => expect(callsTo('quick_connect')).toHaveLength(1));
+    expect(screen.queryByRole('button', { name: 'Reconnect' })).not.toBeInTheDocument();
+  });
+
+  it('under always-on Rust reconnects by itself, so nothing is offered', async () => {
+    installFails('automatic');
+    await installUpdate();
+    expect(useUpdater.getState().error).toMatch(/could not be installed\. BirdoVPN is reconnecting/);
+    expect(useUpdater.getState().reconnectOffered).toBe(false);
+  });
+
+  it('a download or verification failure keeps its own wording', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'install_update') throw { code: 'download_failed', message: 'x', reconnect: 'none' };
+      return undefined;
+    });
+    await installUpdate();
+    expect(useUpdater.getState().error).toBe(UPDATE_DOWNLOAD_FAILED_COPY);
+    expect(useUpdater.getState().reconnectOffered).toBe(false);
   });
 });
 

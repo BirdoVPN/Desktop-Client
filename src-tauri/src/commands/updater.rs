@@ -36,10 +36,12 @@
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::commands::session::{end_session, EndReason};
+use crate::commands::session::{connect_session, end_session, ConnectTarget, EndReason};
+use crate::commands::tray::{restore_and_focus, set_tray_visible};
+use crate::vpn::AutoReconnectService;
 
 /// Event carrying installer download progress to the frontend.
 pub const DOWNLOAD_PROGRESS_EVENT: &str = "updater-download-progress";
@@ -94,17 +96,26 @@ fn pinned_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Stri
         // W1-004 backstop. On Windows `install()` runs this hook and then
         // `std::process::exit(0)`, so no exit teardown can follow it.
         // `install_update` ends the session BEFORE installing; this only
-        // retries DNS an older build left parked, if a teardown timed out. Setting
-        // the hook replaces the plugin's own, so its cleanup is kept here.
+        // retries DNS an older build left parked, if a teardown timed out.
+        //
+        // REVIEW-WIN-002: the hook runs BEFORE `ShellExecuteW` launches the
+        // installer (tauri-plugin-updater 2.11.0, updater.rs `install_inner`:
+        // extract → hook → ShellExecuteW → Err if it failed, else exit(0)), so
+        // it must do nothing a failed launch cannot undo. Setting the hook
+        // replaces the plugin's own, which was `cleanup_before_exit()`: it
+        // DROPS every tray icon and hides every window (tauri 2.11.5 app.rs),
+        // and when an antivirus quarantined the installer the process lived
+        // on invisible, with the VPN already off. The tray is hidden instead
+        // (no ghost icon after a real exit) and `install_update` shows it
+        // again on failure; the window stays as it is until the exit.
         .on_before_exit(move || {
             #[cfg(target_os = "windows")]
             {
-                use tauri::Manager;
                 let _ = exit_app
                     .state::<crate::vpn::VpnManager>()
                     .restore_dns_blocking();
             }
-            exit_app.cleanup_before_exit();
+            set_tray_visible(&exit_app, false);
         })
         // Bound the request so a black-holing middlebox cannot park the UI in
         // "checking" forever; the frontend also races its own timeout.
@@ -140,6 +151,81 @@ pub async fn check_for_updates(app: AppHandle) -> Result<Option<UpdateInfo>, Str
     }
 }
 
+/// What a failed install does about the VPN session it ended
+/// (REVIEW-WIN-002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reconnect {
+    /// There was no session to put back.
+    None,
+    /// The UI offers Reconnect.
+    Offered,
+    /// Always-on: Rust is already reconnecting.
+    Automatic,
+}
+
+/// `install_update`'s error: which stage failed, so the UI can say the right
+/// thing — "could not be downloaded or verified" is false for an installer
+/// that was verified and then failed to start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateFailure {
+    /// `check_failed`, `download_failed` or `install_failed`.
+    pub code: &'static str,
+    pub message: String,
+    pub reconnect: Reconnect,
+}
+
+impl UpdateFailure {
+    fn before_install(code: &'static str, message: String) -> Self {
+        Self {
+            code,
+            message,
+            reconnect: Reconnect::None,
+        }
+    }
+}
+
+/// After a failed install: put the session back automatically only where the
+/// user asked never to be unprotected (always-on), offer it otherwise.
+fn reconnect_after_failed_install(had_session: bool, always_on: bool) -> Reconnect {
+    match (had_session, always_on) {
+        (false, _) => Reconnect::None,
+        (true, true) => Reconnect::Automatic,
+        (true, false) => Reconnect::Offered,
+    }
+}
+
+/// The install failed after the session was ended for it. Bring the app back
+/// into view and decide about the session (REVIEW-WIN-002).
+async fn recover_from_failed_install(
+    app: &AppHandle,
+    resume: Option<ConnectTarget>,
+    error: String,
+) -> UpdateFailure {
+    set_tray_visible(app, true);
+    restore_and_focus(app);
+    let always_on = crate::commands::settings::get_settings(app.clone())
+        .await
+        .map(|s| s.killswitch_enabled && s.lockdown_mode)
+        .unwrap_or(false);
+    let reconnect = reconnect_after_failed_install(resume.is_some(), always_on);
+    if let (Reconnect::Automatic, Some(target)) = (reconnect, resume) {
+        tracing::info!("Update install failed under always-on — reconnecting");
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = connect_session(&app, target).await {
+                tracing::warn!("Reconnect after a failed update install failed: {}", e);
+            }
+        });
+    }
+    UpdateFailure {
+        code: "install_failed",
+        message: format!("Update failed: {error}"),
+        reconnect,
+    }
+}
+
 /// Download and install the available update.
 ///
 /// The re-check that runs first goes to `api.birdo.app` and IS pin-checked. The
@@ -155,17 +241,26 @@ pub async fn check_for_updates(app: AppHandle) -> Result<Option<UpdateInfo>, Str
 /// against the installer. The download is verified before anything is torn
 /// down, so a failed download leaves the session alone.
 ///
+/// REVIEW-WIN-002: an install that fails after that (an antivirus holding the
+/// installer, say) brings the tray and the window back, says it was the
+/// install that failed, and offers to reconnect — or, under always-on,
+/// reconnects. The process only exits once the installer is running.
+///
 /// Emits [`DOWNLOAD_PROGRESS_EVENT`] as bytes arrive. Returns `Ok(false)` if the
 /// re-check found nothing to install.
 #[tauri::command]
-pub async fn install_update(app: AppHandle) -> Result<bool, String> {
-    let updater = pinned_updater(&app)?;
+pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
+    let updater =
+        pinned_updater(&app).map_err(|e| UpdateFailure::before_install("check_failed", e))?;
     let update = match updater.check().await {
         Ok(Some(update)) => update,
         Ok(None) => return Ok(false),
         Err(e) => {
             tracing::warn!("Update re-check before install failed: {e}");
-            return Err(format!("Update check failed: {e}"));
+            return Err(UpdateFailure::before_install(
+                "check_failed",
+                format!("Update check failed: {e}"),
+            ));
         }
     };
 
@@ -188,15 +283,22 @@ pub async fn install_update(app: AppHandle) -> Result<bool, String> {
         .await
         .map_err(|e| {
             tracing::warn!("Update download failed: {e}");
-            format!("Update failed: {e}")
+            UpdateFailure::before_install("download_failed", format!("Update failed: {e}"))
         })?;
 
+    // The session the install is about to end, so a failed install can put
+    // it back. Present exactly while a session is being kept or recovered.
+    let resume = app
+        .state::<AutoReconnectService>()
+        .current_info()
+        .await
+        .map(|info| ConnectTarget::of(&info));
     end_session(&app, EndReason::Update).await;
 
-    update.install(bundle).map_err(|e| {
+    if let Err(e) = update.install(bundle) {
         tracing::warn!("Update install failed: {e}");
-        format!("Update failed: {e}")
-    })?;
+        return Err(recover_from_failed_install(&app, resume, e.to_string()).await);
+    }
 
     Ok(true)
 }
@@ -218,6 +320,78 @@ mod tests {
         let install = body.find("update.install(bundle)").expect("install");
         assert!(download < teardown && teardown < install);
         assert!(!body.contains(&["download", "_and_install"].concat()));
+    }
+
+    /// REVIEW-WIN-002: the exit hook runs before the installer is launched, so
+    /// it must not do what a failed launch cannot undo: Tauri's
+    /// `cleanup_before_exit` drops the tray and hides the window.
+    #[test]
+    fn the_exit_hook_only_does_what_a_failed_install_can_undo() {
+        let source = include_str!("updater.rs");
+        let hook = &source[source.find(".on_before_exit(move || {").unwrap()..];
+        let hook = &hook[..hook.find("        })").unwrap()];
+        assert!(
+            !hook.contains(&["cleanup", "_before_exit()"].concat()),
+            "the hook drops the tray again"
+        );
+        assert!(!hook.contains(".hide()"), "the hook hides the window");
+        assert!(hook.contains("set_tray_visible(&exit_app, false)"));
+        assert!(hook.contains("restore_dns_blocking()"));
+    }
+
+    /// REVIEW-WIN-002: a failed install brings the app back into view before
+    /// it reports, and is reported as an INSTALL failure.
+    #[test]
+    fn a_failed_install_restores_the_app_and_says_so() {
+        let source = include_str!("updater.rs");
+        let body = &source[source
+            .find("async fn recover_from_failed_install(")
+            .unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let shown = body.find("set_tray_visible(app, true)").expect("tray back");
+        let focused = body.find("restore_and_focus(app)").expect("window back");
+        let code = body.find("\"install_failed\"").expect("install_failed");
+        assert!(shown < code && focused < code);
+
+        let install = &source[source.find("pub async fn install_update(").unwrap()..];
+        assert!(install.contains("recover_from_failed_install(&app, resume"));
+    }
+
+    /// REVIEW-WIN-002: what a failed install does about the session it ended.
+    #[test]
+    fn a_failed_install_puts_the_session_back_as_the_user_asked() {
+        use super::{reconnect_after_failed_install, Reconnect};
+        assert_eq!(
+            reconnect_after_failed_install(false, false),
+            Reconnect::None
+        );
+        assert_eq!(reconnect_after_failed_install(false, true), Reconnect::None);
+        assert_eq!(
+            reconnect_after_failed_install(true, false),
+            Reconnect::Offered
+        );
+        assert_eq!(
+            reconnect_after_failed_install(true, true),
+            Reconnect::Automatic
+        );
+    }
+
+    /// The wire shape the UI parses (`session/updater.ts`).
+    #[test]
+    fn an_update_failure_serializes_its_stage_and_reconnect() {
+        let failure = super::UpdateFailure {
+            code: "install_failed",
+            message: "Update failed: x".into(),
+            reconnect: super::Reconnect::Offered,
+        };
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            serde_json::json!({
+                "code": "install_failed",
+                "message": "Update failed: x",
+                "reconnect": "offered"
+            })
+        );
     }
 
     /// W1-038: the updater plugin (v2) reads only endpoints, pubkey, windows

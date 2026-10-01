@@ -12,7 +12,30 @@
 
 use tauri::image::Image;
 use tauri::menu::MenuItem;
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Emitter, Manager, Wry};
+
+/// Bring the main window back to the foreground (tray click, "Show", quick
+/// actions, deep link, single-instance relaunch, post-SSO, a failed update
+/// install). Emits "app-shown" so the biometric app-lock can re-challenge
+/// after a close-to-tray.
+pub fn restore_and_focus(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("app-shown", ());
+    }
+}
+
+/// Show or hide the tray icon. Unlike dropping it (what Tauri's
+/// `cleanup_before_exit` does), hiding can be undone — which is the whole
+/// point for the updater, whose install can fail after the hook ran
+/// (REVIEW-WIN-002).
+pub fn set_tray_visible(app: &AppHandle, visible: bool) {
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_visible(visible);
+    }
+}
 
 /// Handles to the tray context-menu items whose `enabled` state must track the
 /// live VPN connection state. Stored in Tauri-managed state at setup time so
