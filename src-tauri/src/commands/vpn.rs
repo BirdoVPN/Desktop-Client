@@ -864,9 +864,14 @@ async fn quick_connect_target(
 /// backend's composite score (max of slot% and fresh CPU% once birdo-web K10-A
 /// ships; slot% before that), so ranking on it needs no client change later.
 ///
-/// Ties keep list order (`min_by_key` returns the FIRST minimum), which is the
-/// old alphabetical behaviour on an idle fleet — every node reports load 0
-/// today, so quick-connect stays deterministic rather than flapping.
+/// Ties on load go by name, then id (REVIEW-WIN-008), each compared by UTF-16
+/// code unit — exactly JavaScript's `<` on strings — so the UI's
+/// `pickBestServer` (`src/lib/ipc.ts`) lands on the same node: the Connect
+/// button, auto-connect and the tray all agree. Ties used to keep LIST order
+/// here while the UI used `localeCompare`, which agreed only while the
+/// backend's sort happened to match the user's locale. Every node reports
+/// load 0 on an idle fleet, so the tie-break is what decides most picks.
+/// Both sides run `fixtures/best_server.json`.
 ///
 /// `preferred` is the server the user last chose (`preferred_server_id`, which
 /// the UI mirrors from its own selection). The tray's Quick Connect must dial
@@ -886,7 +891,12 @@ pub(crate) fn pick_quick_connect_server(
     if let Some(chosen) = preferred.and_then(|id| usable.iter().find(|s| s.id == id)) {
         return Some(chosen.clone());
     }
-    usable.into_iter().min_by_key(|s| s.load)
+    usable.into_iter().min_by(|a, b| {
+        a.load
+            .cmp(&b.load)
+            .then_with(|| a.name.encode_utf16().cmp(b.name.encode_utf16()))
+            .then_with(|| a.id.encode_utf16().cmp(b.id.encode_utf16()))
+    })
 }
 
 /// Live-reapply tunnel-affecting settings to the ACTIVE session (mobile parity).
@@ -1413,19 +1423,29 @@ mod tests {
         }
     }
 
-    /// Equal loads keep list order (the backend sorts by name), so an idle
-    /// fleet behaves exactly as before — deterministic, not flapping.
+    /// REVIEW-WIN-008: the one best-server rule, run against the fixture the
+    /// UI's `pickBestServer` test runs too (src/lib/ipc.test.ts). Equal loads
+    /// now go by name, not list order: an idle fleet still picks
+    /// deterministically, and the same node as the Connect button.
     #[test]
-    fn quick_connect_ties_keep_list_order() {
-        let picked = pick_quick_connect_server(
-            vec![
-                server("Zed", true, true, 0),
-                server("Amsterdam", true, true, 0),
-                server("Berlin", true, true, 0),
-            ],
-            None,
-        )
-        .unwrap();
-        assert_eq!(picked.id, "Zed");
+    fn quick_connect_follows_the_shared_best_server_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/best_server.json")).unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(cases.len() >= 5, "vacuity guard");
+        for case in cases {
+            let mut servers: Vec<crate::api::types::VpnServer> =
+                serde_json::from_value(case["servers"].clone()).unwrap();
+            for _order in ["as listed", "reversed"] {
+                let picked = pick_quick_connect_server(servers.clone(), None).map(|s| s.id);
+                assert_eq!(
+                    picked.as_deref(),
+                    case["expect"].as_str(),
+                    "{} ({_order})",
+                    case["name"]
+                );
+                servers.reverse();
+            }
+        }
     }
 }

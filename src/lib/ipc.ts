@@ -305,21 +305,27 @@ export function parseServers(raw: unknown): Server[] {
 }
 
 /**
- * The Rust / iOS "best server": online and accessible, lowest load, then name
- * (vpn.rs `quick_connect`, iOS `QuickSelect.bestServer`). One definition, so
- * the Connect button, auto-connect and the tray land on the same node (W2-028).
+ * The best server: online and accessible, lowest load, then name, then id.
+ * The SAME rule as Rust's `pick_quick_connect_server` (vpn.rs), so the Connect
+ * button, auto-connect and the tray land on the same node (W2-028); both sides
+ * run `src-tauri/src/commands/fixtures/best_server.json` (REVIEW-WIN-008).
+ *
+ * Names and ids compare with `<`, by UTF-16 code unit, never `localeCompare`:
+ * Rust compares the same code units, while a locale-aware order follows the
+ * user's locale and disagreed with Rust on ties.
  */
 export function pickBestServer(servers: readonly Server[]): Server | null {
   let best: Server | null = null;
   for (const s of servers) {
     if (!s.isOnline || !s.isAccessible) continue;
-    if (
-      !best ||
-      s.load < best.load ||
-      (s.load === best.load && s.name.localeCompare(best.name) < 0)
-    ) {
-      best = s;
-    }
+    if (!best || compareBestServer(s, best) < 0) best = s;
   }
   return best;
+}
+
+function compareBestServer(a: Server, b: Server): number {
+  if (a.load !== b.load) return a.load - b.load;
+  if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+  if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+  return 0;
 }
