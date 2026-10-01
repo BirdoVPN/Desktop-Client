@@ -773,6 +773,62 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     Ok(true)
 }
 
+/// The launch-at-login task's name (the uninstaller removes it by name).
+#[cfg_attr(not(windows), allow(dead_code))]
+const LAUNCH_TASK: &str = "BirdoVPN Launch At Login";
+
+#[cfg(windows)]
+fn schtasks(args: &[&str]) -> Result<std::process::Output, String> {
+    crate::utils::hidden_cmd("schtasks")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run schtasks: {}", e))
+}
+
+/// The `schtasks /Create` arguments for the launch-at-login task: an
+/// elevated logon trigger for `exe`. The action is quoted here — Task
+/// Scheduler splits an unquoted "C:\Program Files\…" at the first space.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn launch_task_create_args(exe: &std::path::Path) -> Vec<String> {
+    [
+        "/Create",
+        "/F",
+        "/TN",
+        LAUNCH_TASK,
+        "/TR",
+        &format!("\"{}\"", exe.display()),
+        "/SC",
+        "ONLOGON",
+        "/RL",
+        "HIGHEST",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect()
+}
+
+#[cfg(windows)]
+fn create_launch_task() -> Result<(), String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to resolve the app path: {}", e))?;
+    let args = launch_task_create_args(&exe);
+    let out = schtasks(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    if !out.status.success() {
+        return Err(format!(
+            "Failed to register the launch-at-login task: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// schtasks error text is localized, so existence is probed by exit code
+/// rather than by parsing "cannot find" out of its stderr.
+#[cfg(windows)]
+fn launch_task_exists() -> Result<bool, String> {
+    Ok(schtasks(&["/Query", "/TN", LAUNCH_TASK])?.status.success())
+}
+
 /// Windows launch-at-login via a logon-triggered Scheduled Task.
 ///
 /// The exe manifest is `requireAdministrator`, and Windows never launches an
@@ -783,8 +839,6 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
 /// prompt; creating one needs admin, which this process always has.
 #[cfg(windows)]
 fn set_autostart_windows(app: &AppHandle, enabled: bool) -> Result<(), String> {
-    const TASK_NAME: &str = "BirdoVPN Launch At Login";
-
     // Older builds wrote the useless Run-key entry; clear it on either toggle
     // so it stops logging an elevation failure at every logon.
     {
@@ -792,45 +846,40 @@ fn set_autostart_windows(app: &AppHandle, enabled: bool) -> Result<(), String> {
         let _ = app.autolaunch().disable();
     }
 
-    let run = |args: &[&str]| -> Result<std::process::Output, String> {
-        crate::utils::hidden_cmd("schtasks")
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run schtasks: {}", e))
-    };
-
     if enabled {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("Failed to resolve the app path: {}", e))?;
-        // Quote the action ourselves — Task Scheduler splits an unquoted
-        // "C:\Program Files\…" at the first space.
-        let action = format!("\"{}\"", exe.display());
-        let out = run(&[
-            "/Create", "/F", "/TN", TASK_NAME, "/TR", &action, "/SC", "ONLOGON", "/RL", "HIGHEST",
-        ])?;
+        create_launch_task()?;
+        tracing::info!("Registered elevated launch-at-login task");
+    } else if launch_task_exists()? {
+        let out = schtasks(&["/Delete", "/F", "/TN", LAUNCH_TASK])?;
         if !out.status.success() {
             return Err(format!(
-                "Failed to register the launch-at-login task: {}",
+                "Failed to remove the launch-at-login task: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        tracing::info!("Registered elevated launch-at-login task");
-    } else {
-        // schtasks error text is localized, so probe existence by exit code
-        // instead of parsing "cannot find" out of /Delete's stderr.
-        let exists = run(&["/Query", "/TN", TASK_NAME])?.status.success();
-        if exists {
-            let out = run(&["/Delete", "/F", "/TN", TASK_NAME])?;
-            if !out.status.success() {
-                return Err(format!(
-                    "Failed to remove the launch-at-login task: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            tracing::info!("Removed launch-at-login task");
-        }
+        tracing::info!("Removed launch-at-login task");
     }
     Ok(())
+}
+
+/// Put the launch-at-login task back when the setting says it should exist
+/// and it does not (REVIEW-WIN2-011). A GUI upgrade runs the OLD version's
+/// uninstaller, whose last step deletes the task whatever the reason for the
+/// uninstall; nothing re-created it while the toggle still read ON, so the
+/// next boot did not start BirdoVPN and an auto-connect user booted
+/// unprotected. Called at every start with the setting on, off the main
+/// thread (schtasks is a process); a task that exists is left exactly as it
+/// is.
+#[cfg(windows)]
+pub fn restore_launch_at_login_task() {
+    std::thread::spawn(|| match launch_task_exists() {
+        Ok(true) => {}
+        Ok(false) => match create_launch_task() {
+            Ok(()) => tracing::info!("Re-created the missing launch-at-login task"),
+            Err(e) => tracing::warn!("Could not re-create the launch-at-login task: {}", e),
+        },
+        Err(e) => tracing::warn!("Could not check the launch-at-login task: {}", e),
+    });
 }
 
 #[cfg(test)]
@@ -1205,6 +1254,42 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    /// REVIEW-WIN2-011: the task the start-up repair creates is the toggle's
+    /// own: elevated, at logon, the quoted path of this exe, under the name
+    /// the uninstaller removes.
+    #[test]
+    fn the_launch_task_is_elevated_at_logon_with_a_quoted_path() {
+        let args = launch_task_create_args(std::path::Path::new(
+            r"C:\Program Files\BirdoVPN\BirdoVPN.exe",
+        ));
+        assert_eq!(
+            args,
+            [
+                "/Create",
+                "/F",
+                "/TN",
+                "BirdoVPN Launch At Login",
+                "/TR",
+                r#""C:\Program Files\BirdoVPN\BirdoVPN.exe""#,
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+            ]
+        );
+        assert!(include_str!("../../nsis-hooks.nsh")
+            .contains(r#"schtasks /Delete /F /TN "BirdoVPN Launch At Login""#));
+        // Start-up puts it back whenever the setting is on.
+        let main = include_str!("../main.rs");
+        let repair = main
+            .find("commands::settings::restore_launch_at_login_task()")
+            .expect("start-up repairs the task");
+        let gate = main[..repair]
+            .rfind(".autostart")
+            .expect("only with the setting on");
+        assert!(repair - gate < 200, "the repair is gated on the setting");
     }
 
     /// REVIEW-WIN-007 / REVIEW-WIN2-023: an account boundary forgets the

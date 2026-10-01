@@ -302,6 +302,13 @@ fn main() {
                     .unwrap_or(false),
             );
 
+            // REVIEW-WIN2-011: a GUI upgrade runs the old uninstaller, which
+            // deletes the launch-at-login task; put it back if it is missing.
+            #[cfg(windows)]
+            if startup_settings.as_ref().is_some_and(|s| s.autostart) {
+                commands::settings::restore_launch_at_login_task();
+            }
+
             // Give the forced-version-floor gate a handle so a 426 from ANY
             // request can raise the blocking "update required" screen. Must be
             // set before the first API call is made below.
@@ -627,6 +634,8 @@ fn main() {
             commands::biometric::authenticate_biometric,
             // Deep link captured at cold start
             take_pending_deep_link,
+            // The window up from the tray (re-consent behind Start Minimized)
+            commands::tray::show_main_window,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
