@@ -1994,6 +1994,63 @@ mod tests {
         assert!(park.is_empty() && degraded.is_empty());
     }
 
+    /// The same regression, read the way the heal really reads it: through
+    /// netsh's text. After the erase the adapter shows a DHCP LEASE (the
+    /// router's resolvers), which the parser deliberately does not capture as
+    /// configuration. That reading — DHCP with resolvers present — must still
+    /// classify as the park's leftover (static v4 recorded, empty v6), and the
+    /// write-back must be the recorded list exactly: same servers, same order,
+    /// nothing from the lease.
+    #[test]
+    fn the_erase_seen_through_netsh_with_a_dhcp_lease_is_still_ours_to_restore() {
+        use super::super::tunnel_dns::{parse_dns_config_v4, parse_dns_config_v6};
+        let v4_after_erase = "
+Configuration for interface \"WiFi 3\"
+    DNS servers configured through DHCP:  194.168.4.100
+                                          194.168.8.100
+    Register with which suffix:           Primary only
+";
+        let v6_after_erase = "
+Configuration for interface \"WiFi 3\"
+    DNS servers configured through DHCP:  None
+    Register with which suffix:           Primary only
+";
+        let (v4_dhcp, v4) = parse_dns_config_v4(v4_after_erase);
+        let (v6_dhcp, v6) = parse_dns_config_v6(v6_after_erase);
+        assert!(v4_dhcp && v4.is_empty(), "a lease is not configuration");
+        assert!(v6_dhcp && v6.is_empty());
+        let live = AdapterDnsSnapshot {
+            adapter_name: "WiFi 3".into(),
+            adapter_guid: "{W}".into(),
+            v4_was_dhcp: v4_dhcp,
+            v6_was_dhcp: v6_dhcp,
+            dns_servers: v4,
+            dns_servers_v6: v6,
+        };
+        let recorded = snap("{W}", "WiFi 3", false, &["8.8.8.8", "8.8.4.4"], true, &[]);
+        assert_eq!(entry_state(&recorded, &live), EntryState::NeedsRestore);
+
+        let io = FakeIo::new(Machine {
+            adapters: vec![(adapter("{W}", "WiFi 3"), live)],
+            ..Default::default()
+        });
+        let mut park = BTreeMap::new();
+        park.insert(entry_key(&recorded), recorded.clone());
+        let mut degraded = BTreeMap::new();
+        assert!(restore_pass(&mut park, &io, &mut degraded));
+        let after = io.live("{W}");
+        assert_eq!(
+            (after.v4_was_dhcp, after.dns_servers.clone()),
+            (false, recorded.dns_servers.clone()),
+            "the recorded static list, exactly"
+        );
+        assert_eq!(
+            (after.v6_was_dhcp, after.dns_servers_v6),
+            (true, Vec::<String>::new())
+        );
+        assert!(park.is_empty() && degraded.is_empty());
+    }
+
     #[test]
     fn a_family_is_parked_foreign_or_restored() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
