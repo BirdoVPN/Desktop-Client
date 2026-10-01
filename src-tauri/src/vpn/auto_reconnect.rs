@@ -662,7 +662,7 @@ impl ReconnectLoop {
                     if let Some(key_id) = old_key {
                         if let Some(error) = self.ask_the_old_key(&key_id, now).await {
                             tracing::warn!(
-                                "The server had already ended this session ({:?}) — not                                  re-dialling",
+                                "The server had already ended this session ({:?}) — not re-dialling",
                                 error.code
                             );
                             return self.end_by_server(error).await;
