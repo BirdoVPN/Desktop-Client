@@ -8,6 +8,7 @@
  * nothing said why (W2-008). It now reads the error Rust attaches to the
  * status, or the one the user's own command returned, mapped by code.
  */
+import { useId, useState } from 'react';
 import { AlertCircle, AlertTriangle, ShieldAlert, type LucideIcon } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { errorCopy, giveUpMessage, type ErrorAction } from '@/lib/errors';
@@ -25,6 +26,18 @@ const ACTION_LABEL: Record<Exclude<ErrorAction, null | 'update' | 'sign_in'>, st
 interface HomeBannersProps {
   onAction: (action: ErrorAction) => void;
 }
+
+/**
+ * The DNS banner's one sentence, whatever Rust reported. Its entries are free
+ * text (the IPC shape is a list of strings) and have been technical before
+ * ("… SMHNR may race the tunnel" reached a user's screen), so the banner
+ * never shows one as its message: they sit behind Details. Accurate for every
+ * entry Rust reports today: the tunnel's resolvers could not be set, or an
+ * adapter's settings an older version changed could not be put back. Either
+ * way names may fail to resolve. It claims no leak, because the DNS guard
+ * blocks lookups outside the tunnel while connected.
+ */
+export const DNS_DEGRADED_COPY = "Some DNS settings couldn't be applied, so some websites may not load.";
 
 export function HomeBanners({ onAction }: HomeBannersProps) {
   const { isAdmin, dnsDegraded, giveUp, blocking, error } = useAppStore(
@@ -61,25 +74,12 @@ export function HomeBanners({ onAction }: HomeBannersProps) {
         />
       )}
 
-      {/* DNS degradation. The counterpart to the Protected pill: the Rust
-          side moves every interface's DNS aside to stop the OS racing the
-          ISP's resolvers against the tunnel's, and it reads back every one
-          of those writes. A read-back that did not match means either an
-          adapter still carrying ISP resolvers beside a live tunnel (a DNS
-          leak, while this screen says Protected) or one left without
-          resolvers after a disconnect. Both are invisible everywhere else,
-          so the pill alone would be reassurance drawn from data nobody
-          checked. Rendered on every connection state for that reason. */}
+      {/* DNS degradation: what Rust read back and found wrong (the tunnel's
+          resolvers not set, an adapter an older version changed not put
+          back). Invisible everywhere else, so it renders on every connection
+          state. One human sentence; Rust's own lines behind Details. */}
       {dnsDegraded.length > 0 && (
-        <BannerRow
-          icon={AlertTriangle}
-          tone="warning"
-          text={
-            dnsDegraded.length === 1
-              ? `DNS not fully protected — ${dnsDegraded[0]}`
-              : `DNS not fully protected on ${dnsDegraded.length} adapters — ${dnsDegraded[0]}`
-          }
-        />
+        <BannerRow icon={AlertTriangle} tone="warning" text={DNS_DEGRADED_COPY} details={dnsDegraded} />
       )}
 
       {errorText && (
@@ -106,32 +106,59 @@ function BannerRow({
   text,
   actionLabel,
   onAction,
+  details,
 }: {
   icon: LucideIcon;
   tone: keyof typeof BANNER_TONE;
   text: string;
   actionLabel?: string;
   onAction?: () => void;
+  /** Secondary lines, collapsed behind a Details disclosure. */
+  details?: string[];
 }) {
   const t = BANNER_TONE[tone];
+  const [open, setOpen] = useState(false);
+  const detailsId = useId();
+  const buttonClass = 'shrink-0 rounded-birdo-xs px-2 py-1 text-xs font-semibold hover:bg-white/10';
   return (
     <div
-      className="birdo-banner mb-2.5 flex items-center gap-2.5 rounded-2xl px-3.5 py-3"
+      className="birdo-banner mb-2.5 rounded-2xl px-3.5 py-3"
       style={{ backgroundColor: t.bg, border: `1px solid ${t.border}` }}
     >
-      <Icon size={18} color={t.fg} className="shrink-0" aria-hidden />
-      <p className="flex-1 text-xs leading-snug" style={{ color: t.fg }}>
-        {text}
-      </p>
-      {actionLabel && onAction && (
-        <button
-          type="button"
-          onClick={onAction}
-          className="shrink-0 rounded-birdo-xs px-2 py-1 text-xs font-semibold hover:bg-white/10"
-          style={{ color: t.fg, border: `1px solid ${t.border}` }}
-        >
-          {actionLabel}
-        </button>
+      <div className="flex items-center gap-2.5">
+        <Icon size={18} color={t.fg} className="shrink-0" aria-hidden />
+        <p className="flex-1 text-xs leading-snug" style={{ color: t.fg }}>
+          {text}
+        </p>
+        {details && details.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setOpen((o) => !o)}
+            aria-expanded={open}
+            aria-controls={detailsId}
+            className={buttonClass}
+            style={{ color: t.fg }}
+          >
+            {open ? 'Hide details' : 'Details'}
+          </button>
+        )}
+        {actionLabel && onAction && (
+          <button
+            type="button"
+            onClick={onAction}
+            className={buttonClass}
+            style={{ color: t.fg, border: `1px solid ${t.border}` }}
+          >
+            {actionLabel}
+          </button>
+        )}
+      </div>
+      {details && open && (
+        <ul id={detailsId} className="mt-2 list-disc space-y-1 pl-9 text-[11px] leading-snug" style={{ color: t.fg }}>
+          {details.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
       )}
     </div>
   );
