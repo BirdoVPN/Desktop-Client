@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::timeout;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::api::session_gate::StoredSession;
 use crate::api::types::{ConnectResponse, MultiHopConnectResponse, VpnConfig};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
@@ -925,21 +926,36 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
 
 static EXPIRY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// Contract §3.3: the server rejected the refresh token. Tear the VPN down,
-/// clear the tokens and tell the UI, which routes to sign-in with a banner.
+/// Contract §3.3: the sign-in session is over. Tear the VPN down, clear the
+/// tokens and tell the UI, which routes to sign-in with a banner.
+/// `stored`: whether the keystore's copy goes too — only when the server
+/// rejected the refresh token itself (`session_gate::StoredSession`).
 /// Idempotent: every request in flight can report the same rejection.
-pub async fn handle_session_expired(app: &AppHandle) {
+pub async fn handle_session_expired(app: &AppHandle, stored: StoredSession) {
     if EXPIRY_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return;
     }
-    tracing::warn!("The server rejected the sign-in session — signing out");
+    tracing::warn!("The sign-in session ended — signing out");
+    let api = app.state::<BirdoApi>();
+    // REVIEW-WIN2-021: the tokens to clear are the ones that expired. The UI
+    // is on Login at once, and the teardown below takes seconds: a user who
+    // signs straight back in has new tokens by the time it is over.
+    let expired = api.access_token_value().await;
     end_session(app, EndReason::SessionExpired).await;
-    app.state::<BirdoApi>().clear_tokens().await;
-    if let Err(e) = app.state::<CredentialStore>().clear_tokens() {
-        tracing::warn!(
-            "Could not clear the stored session: {}",
-            crate::utils::redact::sanitize_error(&e.to_string())
-        );
+    if api.clear_tokens_if(expired.as_deref()).await {
+        if stored == StoredSession::Discard {
+            if let Err(e) = app.state::<CredentialStore>().clear_tokens() {
+                tracing::warn!(
+                    "Could not clear the stored session: {}",
+                    crate::utils::redact::sanitize_error(&e.to_string())
+                );
+            }
+        }
+        // REVIEW-WIN-007 / REVIEW-WIN2-023: the next account to sign in on
+        // this machine must not inherit this one's server or route.
+        crate::commands::settings::clear_account_choices(app);
+    } else {
+        tracing::info!("A new sign-in arrived while the expired session ended — keeping it");
     }
     // Only "expired" is emitted: the backend's refresh 401 carries nothing
     // that tells a revoked session apart from an expired one.
@@ -959,11 +975,17 @@ pub async fn handle_session_expired(app: &AppHandle) {
 /// auto-reconnect kept running, watched by nothing, and a later give-up under
 /// lockdown could hold the block behind the Login screen. The UI calls this
 /// whenever it ends a session over such an answer, so Rust ends it too: the
-/// same teardown, token clearing and `session-expired` event as §3.3.
-/// Idempotent, like `handle_session_expired`.
+/// same teardown and `session-expired` event as §3.3.
+///
+/// The keystore's tokens are KEPT here (REVIEW-WIN2-003). A refresh the server
+/// refused has already gone through the gate, which discards them when the
+/// token itself was rejected; whatever else reaches the UI as
+/// `session_expired` — no session in memory, a 401 on a request retried after
+/// a refresh that worked — is no proof the stored session is dead, and a later
+/// launch re-checks it. Idempotent, like `handle_session_expired`.
 #[tauri::command]
 pub async fn end_expired_session(app: AppHandle) {
-    handle_session_expired(&app).await;
+    handle_session_expired(&app, StoredSession::Keep).await;
 }
 
 /// Source pins for the lifecycle ordering. The functions take an `AppHandle`,
@@ -1043,20 +1065,33 @@ mod lifecycle_tests {
     }
 
     /// REVIEW-WIN-012: a command-level `session_expired` ends the session in
-    /// Rust through the same §3.3 path as a rejected refresh.
+    /// Rust through the same §3.3 path as a rejected refresh — keeping the
+    /// keystore's tokens, which only the refresh's own rejection discards
+    /// (REVIEW-WIN2-003). The tokens cleared are the ones that expired, read
+    /// BEFORE the teardown (REVIEW-WIN2-021; `clear_tokens_if` is tested in
+    /// `api::client`).
     #[test]
     fn an_expired_session_reported_by_the_ui_takes_the_same_path() {
         order(
             body("pub async fn end_expired_session("),
-            &["handle_session_expired(&app)"],
+            &["handle_session_expired(&app, StoredSession::Keep)"],
         );
+        let handled = body("pub async fn handle_session_expired(");
         order(
-            body("pub async fn handle_session_expired("),
+            handled,
             &[
+                "api.access_token_value().await",
                 "end_session(app, EndReason::SessionExpired)",
-                "clear_tokens()",
+                "api.clear_tokens_if(expired.as_deref())",
+                "stored == StoredSession::Discard",
+                "CredentialStore>().clear_tokens()",
+                "settings::clear_account_choices(app)",
                 "\"session-expired\"",
             ],
+        );
+        assert!(
+            !handled.contains("api.clear_tokens()") && !handled.contains(".clear_tokens().await"),
+            "an unconditional clear wipes a session signed in during the teardown"
         );
     }
 

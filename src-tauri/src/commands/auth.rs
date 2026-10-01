@@ -3,6 +3,7 @@
 //! Handles login, logout, token refresh, and auth state management.
 
 use crate::api::error::ApiError;
+use crate::api::session_gate::{self, RefreshOutcome, StoredSession};
 use crate::api::types::{AccountNumber, LoginResult, UserProfile};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
@@ -493,8 +494,9 @@ pub async fn get_auth_state(
                 Err(e) => {
                     tracing::info!("Profile fetch failed ({e}) — attempting token refresh");
                     // Token might be expired, try refresh
-                    match api.refresh_token().await {
-                        Ok(new_tokens) => {
+                    let refreshed = api.refresh_token().await;
+                    match (session_gate::refresh_outcome(&refreshed), refreshed) {
+                        (_, Ok(new_tokens)) => {
                             // Use rotated refresh token if server returned one, else keep existing
                             let refresh_to_store = new_tokens
                                 .refresh_token
@@ -544,26 +546,34 @@ pub async fn get_auth_state(
                         // costs one failed request next launch, discarding a live one
                         // costs the account.
                         //
-                        // ApiError::Unauthorized specifically means the server rejected
-                        // the refresh token — that token will never work again, so
-                        // clearing is right. Everything else (Network, ServerError,
-                        // RateLimited, CertificatePinningFailed, Parse) may well succeed
-                        // on the next attempt, so the session is kept and reported as
-                        // signed-in-with-unknown-identity, exactly as the profile-fetch
-                        // failure above already does.
+                        // The session gate decides (REVIEW-WIN2-003, Android/iOS
+                        // `RefreshOutcome` parity): a 401 means the server rejected
+                        // the refresh token — it will never work again, so clearing
+                        // is right; a 403 ends the session but keeps the stored
+                        // tokens. Everything else (Network, ServerError,
+                        // RateLimited, CertificatePinningFailed, Parse) may well
+                        // succeed on the next attempt, so the session is kept and
+                        // reported as signed-in-with-unknown-identity, exactly as the
+                        // profile-fetch failure above already does.
                         //
                         // NOTE: this distinction only became reliable once
                         // classify_error_response stopped collapsing every backend 401
                         // into ApiError::Unknown. Before that, Unauthorized was
                         // unreachable and this arm could not have told the cases apart.
-                        Err(ApiError::Unauthorized) => {
-                            tracing::info!(
-                                "Refresh token rejected by the server — clearing stored session"
-                            );
-                            let _ = credentials.clear_tokens();
+                        (RefreshOutcome::Unauthorized, Err(e)) => {
+                            if session_gate::stored_session_after(&e) == StoredSession::Discard {
+                                tracing::info!(
+                                    "Refresh token rejected by the server — clearing stored session"
+                                );
+                                let _ = credentials.clear_tokens();
+                            } else {
+                                tracing::info!(
+                                    "Refresh refused by the server — signed out, stored session kept"
+                                );
+                            }
                             Ok(AuthState::unknown_identity(false))
                         }
-                        Err(e) => {
+                        (_, Err(e)) => {
                             tracing::warn!(
                                 "Token refresh failed transiently ({e}) — KEEPING the stored \
                                  session; identity unknown this cycle"

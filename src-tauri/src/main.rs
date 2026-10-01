@@ -370,10 +370,10 @@ fn main() {
             // session everywhere — tunnel, tokens — and the UI is told.
             {
                 let handle = app.handle().clone();
-                crate::api::session_gate::set_handler(move || {
+                crate::api::session_gate::set_handler(move |stored| {
                     let app = handle.clone();
                     tauri::async_runtime::spawn(async move {
-                        commands::session::handle_session_expired(&app).await;
+                        commands::session::handle_session_expired(&app, stored).await;
                     });
                 });
             }

@@ -282,6 +282,23 @@ impl BirdoApi {
         *self.refresh_token.write().await = None;
     }
 
+    /// Clear the tokens only while the session in memory is still the one
+    /// holding `expected` (REVIEW-WIN2-021). Ending an expired session takes
+    /// seconds (the tunnel comes down first) while the UI is already on Login,
+    /// and a user who signs straight back in must not have the NEW session's
+    /// tokens wiped by the old one's teardown. Compared and cleared under the
+    /// access-token lock, so a sign-in cannot land in between. Returns whether
+    /// it cleared.
+    pub async fn clear_tokens_if(&self, expected: Option<&str>) -> bool {
+        let mut access = self.access_token.write().await;
+        if access.as_ref().map(|t| t.as_str()) != expected {
+            return false;
+        }
+        *access = None;
+        *self.refresh_token.write().await = None;
+        true
+    }
+
     /// Check if user is authenticated
     pub async fn is_authenticated(&self) -> bool {
         self.access_token.read().await.is_some()
@@ -473,7 +490,7 @@ impl BirdoApi {
                     if self.access_token_value().await == token_before {
                         self.refresh_token_internal()
                             .await
-                            .map_err(|_| ApiError::Unauthorized)?;
+                            .map_err(super::session_gate::error_after_failed_refresh)?;
                     }
                 }
                 self.send_gdpr_delete(&body).await?
@@ -988,8 +1005,10 @@ impl BirdoApi {
                     }
                     Err(e) => {
                         tracing::warn!("Token refresh failed: {}", e);
-                        // Return the original 401 error
-                        return Err(ApiError::Unauthorized);
+                        // Only the server's refusal is `Unauthorized`
+                        // (session expired); a transient failure answers as
+                        // itself and the session survives it (REVIEW-WIN2-003).
+                        return Err(super::session_gate::error_after_failed_refresh(e));
                     }
                 }
             }
@@ -1372,5 +1391,60 @@ mod token_restore_tests {
                 .await
         );
         assert!(api.is_authenticated().await);
+    }
+
+    /// REVIEW-WIN2-003: both refresh-and-retry paths answer a failed refresh
+    /// through the gate's classification (tested in `session_gate`), never a
+    /// blanket `Unauthorized` — which the UI reads as "session expired" and
+    /// signs the user out over.
+    #[test]
+    fn a_failed_refresh_is_classified_not_collapsed() {
+        const SOURCE: &str = include_str!("client.rs");
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            // The fn's own closing brace: the only line in it indented 4.
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        for signature in [
+            "async fn request_with_retry<",
+            "pub async fn delete_account(",
+        ] {
+            let body = fn_body(signature);
+            assert!(
+                body.contains("session_gate::error_after_failed_refresh"),
+                "{signature}"
+            );
+            assert!(!body.contains("|_| ApiError::Unauthorized"), "{signature}");
+            assert!(
+                !body.contains("Err(ApiError::Unauthorized);"),
+                "{signature}"
+            );
+        }
+    }
+
+    /// REVIEW-WIN2-021: the expired session's teardown clears ITS tokens, and
+    /// leaves a session signed in while it ran.
+    #[tokio::test]
+    async fn an_expiry_clears_only_the_session_that_expired() {
+        let api = BirdoApi::new();
+        api.set_tokens("expired-access".into(), "expired-refresh".into())
+            .await;
+        let expired = api.access_token_value().await;
+
+        // The user signs straight back in while the old session ends.
+        api.set_tokens("new-access".into(), "new-refresh".into())
+            .await;
+        assert!(!api.clear_tokens_if(expired.as_deref()).await);
+        assert_eq!(
+            refresh_in_memory(&api).await.as_deref(),
+            Some("new-refresh")
+        );
+
+        // Nobody signed in: the expired session's tokens go.
+        let current = api.access_token_value().await;
+        assert!(api.clear_tokens_if(current.as_deref()).await);
+        assert!(!api.is_authenticated().await);
+        assert_eq!(refresh_in_memory(&api).await, None);
     }
 }
