@@ -42,7 +42,7 @@ import {
   Bug,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
-import { isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
+import { isPrivateDnsAddress, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
 import {
   BirdoCard,
   BirdoSectionHeader,
@@ -566,6 +566,7 @@ export function Settings() {
  */
 function CustomDnsFields() {
   const saved = useAppStore((s) => s.settings.customDns);
+  const lanSharing = useAppStore((s) => s.settings.localNetworkSharing);
   const [primary, setPrimary] = useState(saved?.[0] ?? '');
   const [secondary, setSecondary] = useState(saved?.[1] ?? '');
   const [errors, setErrors] = useState<{ primary: string | null; secondary: string | null }>({
@@ -619,6 +620,15 @@ function CustomDnsFields() {
       <p className="text-xs" style={{ color: white.w60 }}>
         Popular: 1.1.1.1 (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9). Saved when you leave a field.
       </p>
+      {/* REVIEW-WIN2-006: a resolver on the user's own network is reached
+          outside the tunnel, and only with Local Network Sharing on. */}
+      {[primary, secondary].some((v) => isPrivateDnsAddress(v.trim())) && (
+        <p className="text-xs" style={{ color: white.w60 }}>
+          {lanSharing
+            ? 'A DNS server on your own network is reached directly, outside the VPN tunnel.'
+            : 'A DNS server on your own network can be reached only with Local Network Sharing on.'}
+        </p>
+      )}
     </div>
   );
 }

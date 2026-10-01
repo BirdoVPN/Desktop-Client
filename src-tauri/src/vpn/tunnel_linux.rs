@@ -2240,6 +2240,7 @@ mod configure_ipv6_tests {
             endpoint: "192.0.2.1:51820".into(),
             allowed_ips: vec!["0.0.0.0/0".into()],
             dns: vec![],
+            custom_dns: false,
             client_ip: "10.0.0.2".into(),
             client_ipv6: Some(format!("{V6}/128")),
             // The backend always sends ::/0 (vpn.service.ts). Using the real

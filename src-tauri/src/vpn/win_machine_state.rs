@@ -1623,8 +1623,11 @@ mod tests {
     fn guard() -> DnsGuard {
         DnsGuard {
             resolvers: vec![Ipv4Addr::new(10, 13, 13, 1)],
+            lan_resolvers: vec![],
             tunnel_luid: 9,
             lan_sharing: false,
+            relay: None,
+            self_exe: None,
         }
     }
 

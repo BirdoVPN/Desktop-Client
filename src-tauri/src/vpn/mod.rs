@@ -1439,6 +1439,7 @@ mod scope_tests {
             endpoint: "203.0.113.1:51820".into(),
             allowed_ips: allowed_ips.iter().map(|s| s.to_string()).collect(),
             dns: vec!["10.8.0.1".into()],
+            custom_dns: false,
             client_ip: "10.8.0.2".into(),
             client_ipv6: client_ipv6.map(|s| s.to_string()),
             allowed_ips_v6: allowed_ips_v6.iter().map(|s| s.to_string()).collect(),

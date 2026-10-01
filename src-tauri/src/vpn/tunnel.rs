@@ -1501,8 +1501,9 @@ impl WintunTunnel {
         // otherwise capture the fleet resolver), so DNS never depends on
         // which /24 the tunnel address happens to share. The DNS guard only
         // lets DNS out over the tunnel interface, so a missing pin fails
-        // closed (no DNS), never open.
-        for resolver in self.tunnel_resolvers() {
+        // closed (no DNS), never open. The user's own LAN resolver is not
+        // pinned (REVIEW-WIN2-006): LAN sharing's route takes it to the LAN.
+        for resolver in self.tunnel_resolvers().0 {
             match add_route_native(resolver, 32, Ipv4Addr::UNSPECIFIED, if_index, 5) {
                 Ok(()) => record_tunnel_route(&resolver.to_string(), "255.255.255.255"),
                 Err(e) => tracing::warn!("Resolver route not added ({})", e),
@@ -1671,13 +1672,21 @@ impl WintunTunnel {
     // ===================================================================
 
     /// The config's resolvers as addresses (validate_config has already
-    /// refused anything that is not IPv4).
-    fn tunnel_resolvers(&self) -> Vec<Ipv4Addr> {
-        self.config
+    /// refused anything that is not IPv4): those reached through the tunnel,
+    /// and the user's own LAN resolver, reached outside it
+    /// (`wfp_policy::split_resolvers`, REVIEW-WIN2-006).
+    fn tunnel_resolvers(&self) -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
+        let all: Vec<Ipv4Addr> = self
+            .config
             .dns
             .iter()
             .filter_map(|d| d.parse().ok())
-            .collect()
+            .collect();
+        crate::vpn::wfp_policy::split_resolvers(
+            &all,
+            self.config.custom_dns,
+            self.local_network_sharing,
+        )
     }
 
     /// Install the DNS guard: DNS only to the tunnel's resolvers, only over the
@@ -1691,10 +1700,24 @@ impl WintunTunnel {
             // SAFETY: the union's `Value` is the whole 64-bit LUID.
             unsafe { adapter.get_luid().Value }
         };
+        let (resolvers, lan_resolvers) = self.tunnel_resolvers();
+        // The tunnel's own relay flow, for a relay on a DNS port. A stealth
+        // session's endpoint is the local xray (loopback DNS is permitted);
+        // its relay connection is xray's, named by the kill switch's block.
+        let relay = crate::vpn::wfp_policy::parse_relay(
+            &self.config.endpoint,
+            crate::vpn::wfp_policy::RelayTransport::WireGuardUdp,
+        )
+        .filter(|relay| !relay.ip.is_loopback());
         let dns_guard = crate::vpn::wfp_policy::DnsGuard {
-            resolvers: self.tunnel_resolvers(),
+            resolvers,
+            lan_resolvers,
             tunnel_luid: luid,
             lan_sharing: self.local_network_sharing,
+            relay,
+            self_exe: std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from)),
         };
         let state_gen = self.state_gen;
         tokio::task::block_in_place(|| {
@@ -2296,6 +2319,37 @@ mod adapter_recovery_tests {
                 "tunnel.rs contains `{needle}` again"
             );
         }
+    }
+}
+
+/// REVIEW-WIN2-030: the DNS guard is the whole SMHNR protection now that
+/// adapter parking is gone, and nothing proved a connect installs it. The
+/// `wfp_policy` model tests prove what the guard holds, `win_machine_state`
+/// who may lift it; this pins that `start_inner` installs it, failing the
+/// connect when it cannot, after the adapter has its LUID and BEFORE the first
+/// tunnel route and the tunnel's resolvers.
+#[cfg(test)]
+mod dns_guard_wiring_tests {
+    #[test]
+    fn every_connect_installs_the_dns_guard_before_any_route() {
+        let source = include_str!("tunnel.rs");
+        let start = source
+            .find("async fn start_inner(&self)")
+            .expect("start_inner");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }").expect("end of start_inner")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("start_inner no longer calls `{needle}`"))
+        };
+        let adapter = at("self.configure_adapter().await?;");
+        let guard = at("self.guard_dns().await?;");
+        let routes = at("self.configure_routes(");
+        let dns = at("self.configure_dns().await?;");
+        assert!(adapter < guard, "the guard needs the adapter's LUID");
+        assert!(guard < routes, "a route before the guard lets DNS out");
+        assert!(guard < dns, "the tunnel's resolvers before the guard");
+        assert_eq!(body.matches("guard_dns()").count(), 1);
     }
 }
 

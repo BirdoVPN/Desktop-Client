@@ -134,7 +134,9 @@ pub fn build_vpn_config(
 
     // FIX-R7: Validate DNS addresses to prevent command injection via netsh
     // F-05 FIX: Use custom DNS from user settings if provided, otherwise fall back to server response
-    let dns_source = custom_dns.filter(|d| !d.is_empty()).unwrap_or_else(|| {
+    let custom_dns = custom_dns.filter(|d| !d.is_empty());
+    let dns_is_custom = custom_dns.is_some();
+    let dns_source = custom_dns.unwrap_or_else(|| {
         response.dns.unwrap_or_else(|| {
             // Server supplied no DNS and the user set none — fall back to public
             // resolvers. Log this for transparency: the user's resolver in this
@@ -216,6 +218,7 @@ pub fn build_vpn_config(
         endpoint,
         allowed_ips,
         dns,
+        custom_dns: dns_is_custom,
         client_ip: assigned_ip,
         // Present only for ipv6Enabled nodes — drives the tunnel to ROUTE IPv6
         // instead of blocking it.

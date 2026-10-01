@@ -18,6 +18,12 @@
 //!      over HTTPS via its own pinned certificates.
 //!   2. If DoH fails, we fall back to the system resolver rather
 //!      than failing closed — so we never REGRESS a network that works today.
+//!      NOT while a Windows kill-switch block is up (a reconnect gap, a held
+//!      lockdown block): it lets out only this executable's HTTPS, and port-53
+//!      DNS is blocked off the tunnel (REVIEW-WIN2-031). There Cloudflare DoH
+//!      is the ONLY way to find the API once the cache below expires — with a
+//!      single provider (owner decision D5), a network that blocks Cloudflare
+//!      keeps a lockdown reconnect from resolving the API at all.
 //!      READ THIS BEFORE RELYING ON `vpn::doh`'s FAIL-CLOSED GUARANTEE: that
 //!      guarantee is `vpn::doh`'s, and it ends here. Step 3 explains why that is
 //!      an accepted trade rather than an oversight, but it IS a trade — the

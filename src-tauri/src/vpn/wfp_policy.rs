@@ -18,7 +18,9 @@
 //! | weight | what                                                          |
 //! |-------:|----------------------------------------------------------------|
 //! |     15 | STUN/TURN blocks (while the block-all is up)                  |
-//! |     13 | DNS permits: the tunnel's resolvers over the tunnel; loopback |
+//! |     13 | DNS permits: the tunnel's resolvers over the tunnel; loopback;|
+//! |        | the user's LAN resolver (Custom DNS + LAN sharing); the relay |
+//! |        | flow itself when it runs on a DNS port                        |
 //! |     12 | name-resolution blocks: DNS/DoT/DoQ anywhere else; LLMNR,     |
 //! |        | mDNS and NetBIOS name queries unless LAN sharing is on        |
 //! |     10 | permits: loopback, DHCP, IPv6 neighbor discovery, relay,      |
@@ -28,7 +30,9 @@
 //!
 //! The DNS block sits ABOVE every ordinary permit on purpose: the LAN-sharing
 //! permit would otherwise let a query reach the router, and the tunnel-interface
-//! permit would let one reach any resolver the user types into `nslookup`.
+//! permit would let one reach any resolver the user types into `nslookup`. It
+//! is in force whenever the DNS guard OR the block-all is (REVIEW-WIN2-004), so
+//! a reconnect gap and a held lockdown block keep DNS inside too.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -143,12 +147,52 @@ pub(crate) fn parse_relay(endpoint: &str, transport: RelayTransport) -> Option<R
 /// without the kill switch, for as long as the machine-state owner holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DnsGuard {
-    /// The resolvers the tunnel interface was given (IPv4 by validation).
+    /// The resolvers the tunnel interface was given (IPv4 by validation),
+    /// reached over the tunnel.
     pub resolvers: Vec<Ipv4Addr>,
-    /// The tunnel interface they must be reached over.
+    /// Custom DNS servers on the user's own network (a Pi-hole), reached
+    /// OUTSIDE the tunnel: see [`split_resolvers`]. Empty unless Local Network
+    /// Sharing is on.
+    pub lan_resolvers: Vec<Ipv4Addr>,
+    /// The tunnel interface the resolvers must be reached over.
     pub tunnel_luid: u64,
     /// Local Network Sharing leaves LAN name resolution alone.
     pub lan_sharing: bool,
+    /// The tunnel's own relay. On a DNS port — WireGuard port 53 is a preset
+    /// in VPN Settings — the block would otherwise drop the tunnel itself.
+    pub relay: Option<Relay>,
+    /// This executable, whose WireGuard socket carries the tunnel.
+    pub self_exe: Option<String>,
+}
+
+/// Which of a session's resolvers are reached through the tunnel, and which
+/// on the user's own network (REVIEW-WIN2-006).
+///
+/// A Custom DNS server in a private range, with Local Network Sharing on, is
+/// the user's LAN resolver (a Pi-hole, AdGuard Home): Local Network Sharing
+/// already sends the user's private ranges to the LAN, and the relay cannot
+/// reach that network, so pinning such a resolver into the tunnel left the
+/// session with no DNS at all. It is an explicit, user-chosen exception, and
+/// the only one: the server's own resolvers always stay in the tunnel (the
+/// fleet resolver is itself in 10/8), and without Local Network Sharing a
+/// private Custom DNS server stays pinned to the tunnel — unreachable, but
+/// never reached in the clear.
+pub(crate) fn split_resolvers(
+    resolvers: &[Ipv4Addr],
+    custom: bool,
+    lan_sharing: bool,
+) -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
+    resolvers
+        .iter()
+        .copied()
+        .partition(|ip| !(custom && lan_sharing && in_lan_range(*ip)))
+}
+
+fn in_lan_range(ip: Ipv4Addr) -> bool {
+    LAN_RANGES.iter().any(|(net, prefix, _)| {
+        let mask = u32::MAX << (32 - prefix);
+        u32::from(ip) & mask == u32::from(*net) & mask
+    })
 }
 
 /// The kill switch's block-all and everything it lets through.
@@ -260,10 +304,53 @@ pub(crate) fn filter_specs(
         None if policy.v6_block => standalone_v6_specs(&mut out),
         None => {}
     }
-    if let Some(guard) = &policy.dns_guard {
-        dns_guard_specs(guard, &mut out);
+    // REVIEW-WIN2-004: DNS stays inside for as long as EITHER holds — the
+    // session's guard or the block-all. The guard alone used to carry the DNS
+    // block, and a reconnect's teardown lifts it, so for the whole gap — and
+    // for as long as a lockdown give-up held the block — the block-all's LAN
+    // permit let DNS reach the router while the UI read "all traffic
+    // blocked".
+    if policy.block_all.is_some() || policy.dns_guard.is_some() {
+        name_resolution_specs(policy, app_resolves, &mut out);
     }
     out
+}
+
+/// The tunnel's own flow to `relay` (D-24 / W1-013): only the process that
+/// carries the tunnel — this executable's WireGuard socket over UDP, or the
+/// xray helper over TCP — on the tunnel's protocol and port. Returns the
+/// conditions and the permit's name. With no resolvable app id the flow is
+/// scoped by address, protocol and port, and the name says so.
+fn relay_flow(
+    relay: Relay,
+    self_exe: Option<&str>,
+    stealth_helper: Option<&str>,
+    app_resolves: &dyn Fn(&str) -> bool,
+) -> (Vec<Condition>, String) {
+    let (app, protocol, label) = match relay.transport {
+        RelayTransport::WireGuardUdp => (self_exe, UDP, "WireGuard"),
+        RelayTransport::StealthTcp => (stealth_helper, TCP, "stealth"),
+    };
+    let mut conditions = vec![
+        Condition::RemoteV4 {
+            addr: relay.ip,
+            prefix: 32,
+        },
+        Condition::Protocol(protocol),
+        Condition::RemotePort(relay.port),
+    ];
+    let name = match app.filter(|path| app_resolves(path)) {
+        Some(path) => {
+            conditions.push(Condition::App(path.to_string()));
+            format!("Birdo: Permit the relay ({label})")
+        }
+        // The app id could not be resolved. A tunnel that cannot reach its
+        // relay cannot recover either, so the permit stays — scoped by
+        // address, protocol and port, just not by app. wfp.rs logs this at
+        // ERROR.
+        None => format!("Birdo: Permit the relay ({label}, any app — app id unavailable)"),
+    };
+    (conditions, name)
 }
 
 /// LEAK-2's connect-window IPv6 block: outbound IPv6 blocked, loopback and
@@ -397,36 +484,12 @@ fn block_all_specs(
     // the tunnel, only on the tunnel's protocol and port. It used to be
     // reachable by ANY process, on anything, whenever the block was up.
     if let Some(relay) = block.relay {
-        let (app, protocol, label) = match relay.transport {
-            RelayTransport::WireGuardUdp => (self_app, UDP, "WireGuard"),
-            RelayTransport::StealthTcp => (
-                block
-                    .stealth_helper
-                    .as_deref()
-                    .filter(|path| app_resolves(path)),
-                TCP,
-                "stealth",
-            ),
-        };
-        let mut conditions = vec![
-            Condition::RemoteV4 {
-                addr: relay.ip,
-                prefix: 32,
-            },
-            Condition::Protocol(protocol),
-            Condition::RemotePort(relay.port),
-        ];
-        let name = match app {
-            Some(path) => {
-                conditions.push(Condition::App(path.to_string()));
-                format!("Birdo: Permit the relay ({label})")
-            }
-            // The app id could not be resolved. A tunnel that cannot reach
-            // its relay cannot recover either, so the permit stays — scoped
-            // by address, protocol and port, just not by app. wfp.rs logs this
-            // at ERROR.
-            None => format!("Birdo: Permit the relay ({label}, any app — app id unavailable)"),
-        };
+        let (conditions, name) = relay_flow(
+            relay,
+            block.self_exe.as_deref(),
+            block.stealth_helper.as_deref(),
+            app_resolves,
+        );
         // A TCP relay flow is always initiated here, so only the WireGuard
         // UDP flow gets an inbound twin.
         let inbound = relay.transport == RelayTransport::WireGuardUdp;
@@ -543,9 +606,10 @@ fn block_all_specs(
 
 /// W1-007. What replaced parking every physical adapter on `static none`:
 /// filters in the dynamic session, which the OS removes with the process, so an
-/// unclean exit can no longer leave the machine without DNS.
+/// unclean exit can no longer leave the machine without DNS. In force whenever
+/// the session's DNS guard OR the kill switch's block-all is (REVIEW-WIN2-004).
 ///
-/// Blocked for the whole session:
+/// Blocked:
 ///   * DNS (UDP/TCP 53), DoT (TCP 853) and DoQ (UDP 853) to ANY resolver except
 ///     the tunnel's own, over the tunnel interface. That covers Smart
 ///     Multi-Homed Name Resolution's parallel queries to the physical adapters'
@@ -555,20 +619,28 @@ fn block_all_specs(
 ///     Network Sharing is off — Windows falls back to them for single-label
 ///     names, broadcasting what is being looked up to everyone on the LAN.
 ///
-/// Permitted: the tunnel resolvers over the tunnel, and resolvers on loopback
-/// (a local DNS proxy, which itself can only forward through the tunnel).
+/// Permitted: the tunnel resolvers over the tunnel; resolvers on loopback (a
+/// local DNS proxy, which itself can only forward through the tunnel); the
+/// user's own LAN resolver when they chose one with Local Network Sharing on
+/// ([`split_resolvers`]); and the tunnel's own relay flow when it runs on a
+/// DNS port.
 ///
 /// Not blocked: DNS-over-HTTPS (443) — encrypted, and routed through the
 /// tunnel like any other HTTPS.
-fn dns_guard_specs(guard: &DnsGuard, out: &mut Vec<FilterSpec>) {
+fn name_resolution_specs(
+    policy: &Policy,
+    app_resolves: &dyn Fn(&str) -> bool,
+    out: &mut Vec<FilterSpec>,
+) {
     use Layer::*;
     let dns = || {
         [Condition::Protocol(TCP), Condition::Protocol(UDP)]
             .into_iter()
             .chain(ports(&DNS_PORTS))
     };
+    let guard = policy.dns_guard.as_ref();
 
-    if !guard.resolvers.is_empty() {
+    if let Some(guard) = guard.filter(|g| !g.resolvers.is_empty()) {
         let mut conditions: Vec<Condition> = dns().collect();
         conditions.extend(guard.resolvers.iter().map(|ip| Condition::RemoteV4 {
             addr: *ip,
@@ -583,6 +655,65 @@ fn dns_guard_specs(guard: &DnsGuard, out: &mut Vec<FilterSpec>) {
             conditions,
         ));
     }
+    if let Some(guard) = guard.filter(|g| !g.lan_resolvers.is_empty()) {
+        // No interface condition: Local Network Sharing routes it to the LAN.
+        let mut conditions: Vec<Condition> = dns().collect();
+        conditions.extend(guard.lan_resolvers.iter().map(|ip| Condition::RemoteV4 {
+            addr: *ip,
+            prefix: 32,
+        }));
+        out.push(spec(
+            "Birdo: Permit DNS to your own network's resolver (Custom DNS, Local Network Sharing)",
+            ConnectV4,
+            Action::Permit,
+            WEIGHT_PERMIT_DNS,
+            conditions,
+        ));
+    }
+
+    // The tunnel itself on a DNS port: the relay the block lets the next
+    // handshake reach, and the one the live tunnel's guard names (they differ
+    // for the length of a switch). Same scoping as the relay permit, one
+    // weight above the DNS block.
+    let flows = [
+        policy.block_all.as_ref().and_then(|b| {
+            b.relay.map(|relay| {
+                relay_flow(
+                    relay,
+                    b.self_exe.as_deref(),
+                    b.stealth_helper.as_deref(),
+                    app_resolves,
+                )
+            })
+        }),
+        guard.and_then(|g| {
+            g.relay
+                .map(|relay| relay_flow(relay, g.self_exe.as_deref(), None, app_resolves))
+        }),
+    ];
+    let mut on_dns_ports: Vec<(Vec<Condition>, String)> = Vec::new();
+    for (conditions, name) in flows.into_iter().flatten() {
+        let dns_port = conditions
+            .iter()
+            .any(|c| matches!(c, Condition::RemotePort(p) if DNS_PORTS.contains(p)));
+        if dns_port && !on_dns_ports.iter().any(|(c, _)| *c == conditions) {
+            on_dns_ports.push((conditions, name));
+        }
+    }
+    for (conditions, name) in on_dns_ports {
+        out.push(spec(
+            format!("{name} on a DNS port"),
+            ConnectV4,
+            Action::Permit,
+            WEIGHT_PERMIT_DNS,
+            conditions,
+        ));
+    }
+
+    let lan_sharing = guard.map_or_else(
+        || policy.block_all.as_ref().is_some_and(|b| b.lan_sharing),
+        |g| g.lan_sharing,
+    );
     for layer in [ConnectV4, ConnectV6] {
         out.push(spec(
             "Birdo: Permit DNS on loopback",
@@ -598,7 +729,7 @@ fn dns_guard_specs(guard: &DnsGuard, out: &mut Vec<FilterSpec>) {
             WEIGHT_BLOCK_NAME_RESOLUTION,
             dns().collect(),
         ));
-        if !guard.lan_sharing {
+        if !lan_sharing {
             out.push(spec(
                 "Birdo: Block LLMNR, mDNS and NetBIOS name queries",
                 layer,
@@ -768,8 +899,11 @@ mod tests {
     fn guard(lan_sharing: bool) -> DnsGuard {
         DnsGuard {
             resolvers: vec![RESOLVER],
+            lan_resolvers: vec![],
             tunnel_luid: TUNNEL,
             lan_sharing,
+            relay: Some(wg_relay()),
+            self_exe: Some(SELF.to_string()),
         }
     }
 
@@ -1423,13 +1557,247 @@ mod tests {
             v6_block: false,
             dns_guard: Some(DnsGuard {
                 resolvers: vec![],
-                tunnel_luid: TUNNEL,
-                lan_sharing: false,
+                ..guard(false)
             }),
         };
         let s = specs(&policy);
         assert_eq!(
             decide(&s, &out4(SVCHOST, RESOLVER.octets(), 53, UDP, TUNNEL)),
+            Some(Action::Block)
+        );
+    }
+
+    // ── REVIEW-WIN2-004: the block-all keeps DNS inside on its own ──────
+
+    /// The reconnect gap, and a lockdown give-up's held block: the tunnel is
+    /// gone and its guard lifted, only the block-all is up. With LAN sharing
+    /// on, its LAN permit used to let Windows' resolver reach the router.
+    #[test]
+    fn the_block_all_alone_keeps_dns_inside_even_with_lan_sharing() {
+        let gap = Policy {
+            block_all: Some(BlockAll {
+                tunnel_luid: None,
+                lan_sharing: true,
+                ..block(Some(wg_relay()))
+            }),
+            v6_block: false,
+            dns_guard: None,
+        };
+        let s = specs(&gap);
+        for (protocol, port) in [(UDP, 53), (TCP, 53), (TCP, 853), (UDP, 853)] {
+            assert_eq!(
+                decide(&s, &out4(SVCHOST, [192, 168, 1, 1], port, protocol, WIFI)),
+                Some(Action::Block),
+                "{protocol}/{port}"
+            );
+        }
+        assert_eq!(
+            decide(&s, &out4(EXCEPTED, [9, 9, 9, 9], 53, UDP, WIFI)),
+            Some(Action::Block)
+        );
+        // LAN sharing still works for everything that is not DNS…
+        assert_eq!(
+            decide(&s, &out4(CHROME, [192, 168, 1, 20], 631, TCP, WIFI)),
+            Some(Action::Permit)
+        );
+        // …and so do the re-dial, its control plane and DHCP.
+        assert_eq!(
+            decide(&s, &out4(SELF, RELAY.octets(), 51820, UDP, WIFI)),
+            Some(Action::Permit)
+        );
+        assert_eq!(
+            decide(&s, &out4(SELF, [104, 21, 5, 9], 443, TCP, WIFI)),
+            Some(Action::Permit)
+        );
+        assert_eq!(
+            decide(&s, &out4(SVCHOST, [255, 255, 255, 255], 67, UDP, WIFI)),
+            Some(Action::Permit)
+        );
+        // A local DNS proxy is still loopback.
+        assert_eq!(
+            decide(&s, &out4(SVCHOST, [127, 0, 0, 1], 53, UDP, 1)),
+            Some(Action::Permit)
+        );
+    }
+
+    /// Both up (lockdown, Connected): one name-resolution block, not two.
+    #[test]
+    fn the_block_and_the_guard_share_one_dns_block() {
+        let s = specs(&lockdown());
+        let blocks = s
+            .iter()
+            .filter(|f| f.name == "Birdo: Block DNS outside the tunnel")
+            .count();
+        assert_eq!(blocks, 2, "one per family");
+    }
+
+    // ── The relay on a DNS port ─────────────────────────────────────────
+
+    /// WireGuard port 53 is a preset in VPN Settings. The DNS block must not
+    /// drop the tunnel itself — under the guard alone (reactive, Connected),
+    /// under the block-all alone (the re-dial in a gap) and under both — and
+    /// nothing else may use that hole.
+    #[test]
+    fn a_relay_on_port_53_is_not_blocked_by_the_dns_block() {
+        let on_53 = relay_to(RELAY, 53, RelayTransport::WireGuardUdp);
+        let guarded = DnsGuard {
+            relay: Some(on_53),
+            ..guard(false)
+        };
+        let policies = [
+            Policy {
+                block_all: None,
+                v6_block: true,
+                dns_guard: Some(guarded.clone()),
+            },
+            Policy {
+                block_all: Some(BlockAll {
+                    tunnel_luid: None,
+                    ..block(Some(on_53))
+                }),
+                v6_block: false,
+                dns_guard: None,
+            },
+            Policy {
+                block_all: Some(block(Some(on_53))),
+                v6_block: false,
+                dns_guard: Some(guarded),
+            },
+        ];
+        for policy in policies {
+            let s = specs(&policy);
+            assert_eq!(
+                decide(&s, &out4(SELF, RELAY.octets(), 53, UDP, WIFI)),
+                Some(Action::Permit),
+                "{policy:?}"
+            );
+            // Another process asking the relay's address for DNS.
+            assert_eq!(
+                decide(&s, &out4(SVCHOST, RELAY.octets(), 53, UDP, WIFI)),
+                Some(Action::Block)
+            );
+            // The app's own DNS anywhere else.
+            assert_eq!(
+                decide(&s, &out4(SELF, [8, 8, 8, 8], 53, UDP, WIFI)),
+                Some(Action::Block)
+            );
+            every_permit_to_names_an_app(&s, RELAY);
+        }
+    }
+
+    /// A switch from a relay on port 53 to one on 853 (TCP, Stealth): for the
+    /// length of the switch both flows are the tunnel's own.
+    #[test]
+    fn during_a_switch_both_relays_on_dns_ports_are_the_tunnels() {
+        let next = relay_to(NEXT_RELAY, 853, RelayTransport::StealthTcp);
+        let policy = Policy {
+            block_all: Some(BlockAll {
+                stealth_helper: Some(XRAY.to_string()),
+                ..block(Some(next))
+            }),
+            v6_block: false,
+            dns_guard: Some(DnsGuard {
+                relay: Some(relay_to(RELAY, 53, RelayTransport::WireGuardUdp)),
+                ..guard(false)
+            }),
+        };
+        let s = specs(&policy);
+        assert_eq!(
+            decide(&s, &out4(XRAY, NEXT_RELAY.octets(), 853, TCP, WIFI)),
+            Some(Action::Permit)
+        );
+        assert_eq!(
+            decide(&s, &out4(SELF, RELAY.octets(), 53, UDP, WIFI)),
+            Some(Action::Permit)
+        );
+        assert_eq!(
+            decide(&s, &out4(CHROME, NEXT_RELAY.octets(), 853, TCP, WIFI)),
+            Some(Action::Block)
+        );
+    }
+
+    // ── REVIEW-WIN2-006: a LAN resolver chosen as Custom DNS ────────────
+
+    const PIHOLE: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 2);
+
+    /// Which resolvers leave the tunnel: only the user's own private Custom
+    /// DNS, and only with Local Network Sharing on.
+    #[test]
+    fn only_a_private_custom_resolver_with_lan_sharing_is_the_lans() {
+        let public = Ipv4Addr::new(9, 9, 9, 9);
+        let fleet = Ipv4Addr::new(10, 13, 13, 1);
+        let ten = Ipv4Addr::new(10, 0, 0, 53);
+        let corp = Ipv4Addr::new(172, 20, 0, 53);
+        let all = [PIHOLE, public, ten, corp];
+
+        let (tunnel, lan) = split_resolvers(&all, true, true);
+        assert_eq!(tunnel, vec![public]);
+        assert_eq!(lan, vec![PIHOLE, ten, corp]);
+        // Without LAN sharing it stays pinned to the tunnel (unreachable,
+        // never in the clear).
+        assert_eq!(split_resolvers(&all, true, false), (all.to_vec(), vec![]));
+        // The server's own resolvers never leave — the fleet's is in 10/8.
+        assert_eq!(
+            split_resolvers(&[fleet, public], false, true),
+            (vec![fleet, public], vec![])
+        );
+    }
+
+    #[test]
+    fn a_lan_resolver_is_reachable_with_lan_sharing_and_nothing_else_is() {
+        let lan_guard = DnsGuard {
+            resolvers: vec![],
+            lan_resolvers: vec![PIHOLE],
+            ..guard(true)
+        };
+        let policies = [
+            // Reactive, Connected.
+            Policy {
+                block_all: None,
+                v6_block: true,
+                dns_guard: Some(lan_guard.clone()),
+            },
+            // Lockdown, Connected, LAN sharing on.
+            Policy {
+                block_all: Some(BlockAll {
+                    lan_sharing: true,
+                    ..block(Some(wg_relay()))
+                }),
+                v6_block: false,
+                dns_guard: Some(lan_guard),
+            },
+        ];
+        for policy in policies {
+            let s = specs(&policy);
+            for (protocol, port) in [(UDP, 53), (TCP, 53)] {
+                assert_eq!(
+                    decide(&s, &out4(SVCHOST, PIHOLE.octets(), port, protocol, WIFI)),
+                    Some(Action::Permit),
+                    "{policy:?}"
+                );
+            }
+            // The router, any other LAN host, and the internet stay blocked.
+            for other in [[192, 168, 1, 1], [192, 168, 1, 3], [8, 8, 8, 8]] {
+                assert_eq!(
+                    decide(&s, &out4(SVCHOST, other, 53, UDP, WIFI)),
+                    Some(Action::Block),
+                    "{other:?}"
+                );
+            }
+        }
+        // In the gap the guard is lifted and the LAN resolver goes with it:
+        // nothing resolves, nothing leaves.
+        let gap = Policy {
+            block_all: Some(BlockAll {
+                tunnel_luid: None,
+                lan_sharing: true,
+                ..block(Some(wg_relay()))
+            }),
+            v6_block: false,
+            dns_guard: None,
+        };
+        assert_eq!(
+            decide(&specs(&gap), &out4(SVCHOST, PIHOLE.octets(), 53, UDP, WIFI)),
             Some(Action::Block)
         );
     }

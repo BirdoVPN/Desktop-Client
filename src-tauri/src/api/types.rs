@@ -839,6 +839,11 @@ pub struct VpnConfig {
     pub endpoint: String,
     pub allowed_ips: Vec<String>,
     pub dns: Vec<String>,
+    /// `dns` is the user's Custom DNS, not the server's resolvers. A private
+    /// Custom DNS server with Local Network Sharing on is the user's own LAN
+    /// resolver, reached outside the tunnel (`wfp_policy::split_resolvers`).
+    #[serde(default)]
+    pub custom_dns: bool,
     pub client_ip: String,
     /// Optional IPv6 tunnel address (e.g. "fd00::2/128"). When present, enables
     /// dual-stack routing through the tunnel.
@@ -870,6 +875,7 @@ impl std::fmt::Debug for VpnConfig {
             .field("endpoint", &"[redacted]")
             .field("allowed_ips", &self.allowed_ips)
             .field("dns", &self.dns)
+            .field("custom_dns", &self.custom_dns)
             .field("client_ip", &"[redacted]")
             .field(
                 "client_ipv6",

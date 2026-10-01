@@ -118,6 +118,25 @@ describe('Custom DNS: draft fields, saved on leave', () => {
     await waitFor(() => expect(saves()).toHaveLength(2));
     expect(saves()[1].custom_dns).toEqual(['1.1.1.1']);
   });
+
+  it('a resolver on your own network says how it is reached (REVIEW-WIN2-006)', async () => {
+    const lanNote = /on your own network can be reached only with Local Network Sharing on/;
+    const outsideNote = /on your own network is reached directly, outside the VPN tunnel/;
+    useAppStore.setState({ settings: { ...defaultSettings, customDnsEnabled: true, customDns: ['9.9.9.9'] } });
+    const { unmount } = render(<Settings />);
+    expect(screen.queryByText(lanNote)).not.toBeInTheDocument();
+
+    const secondary = screen.getByRole('textbox', { name: 'Secondary DNS (optional)' });
+    await userEvent.type(secondary, '192.168.1.2');
+    expect(screen.getByText(lanNote)).toBeInTheDocument();
+    unmount();
+
+    useAppStore.setState({
+      settings: { ...defaultSettings, customDnsEnabled: true, customDns: ['192.168.1.2'], localNetworkSharing: true },
+    });
+    render(<Settings />);
+    expect(screen.getByText(outsideNote)).toBeInTheDocument();
+  });
 });
 
 describe('Custom DNS is on every plan (owner decision D6, Account API item 40)', () => {

@@ -1136,6 +1136,7 @@ mod vpn_config_security_tests {
             endpoint: "1.2.3.4:51820".to_string(),
             allowed_ips: vec!["0.0.0.0/0".to_string()],
             dns: vec!["1.1.1.1".to_string()],
+            custom_dns: false,
             client_ip: "10.0.0.2".to_string(),
             client_ipv6: None,
             allowed_ips_v6: Vec::new(),
