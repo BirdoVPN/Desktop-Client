@@ -51,6 +51,52 @@ pub struct PhysicalRoute {
     pub interface: u32,
 }
 
+/// One IPv4 default route (0.0.0.0/0 via a real next hop) as the routing
+/// table reports it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultRouteCandidate {
+    pub gateway: Ipv4Addr,
+    pub interface: u32,
+    /// The route's own metric (`MIB_IPFORWARD_ROW2::Metric`).
+    pub route_metric: u32,
+    /// The interface's metric (`MIB_IPINTERFACE_ROW::Metric`); `None` when it
+    /// could not be read.
+    pub interface_metric: Option<u32>,
+}
+
+/// The default route Windows itself prefers (REVIEW-WIN-005), with a tie-break
+/// that does not depend on table order.
+///
+/// Windows routes by route metric PLUS interface metric. Ranking by the route
+/// metric alone, first-found wins, made the pick follow `GetIpForwardTable2`'s
+/// row order whenever two DHCP defaults both carried route metric 0 — the
+/// normal case for a docked laptop on Ethernet and Wi-Fi at once. A Wi-Fi
+/// renew that reordered the table flipped the pick, the session read that as
+/// `Dead(PathChanged)` and tore a healthy tunnel down, a blackout the breaker
+/// does not count and so could repeat indefinitely. The pinned host route
+/// could equally land on the interface Windows was not using.
+///
+/// Ties on the effective metric go to the lowest interface index, then the
+/// lowest gateway, so the same table always yields the same route whatever
+/// order it is read in. An interface whose metric cannot be read ranks last:
+/// it is usually going away.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn preferred_default_route(candidates: &[DefaultRouteCandidate]) -> Option<PhysicalRoute> {
+    candidates
+        .iter()
+        .min_by_key(|c| {
+            let effective = c
+                .interface_metric
+                .map_or(u32::MAX, |m| m.saturating_add(c.route_metric));
+            (effective, c.interface, u32::from(c.gateway))
+        })
+        .map(|c| PhysicalRoute {
+            gateway: c.gateway,
+            interface: c.interface,
+        })
+}
+
 static RESUMES: AtomicU64 = AtomicU64::new(0);
 static EVENTS: OnceLock<watch::Sender<u64>> = OnceLock::new();
 
@@ -324,6 +370,68 @@ mod tests {
         } else {
             assert_eq!(connectivity_of(None), Connectivity::Unknown);
         }
+    }
+
+    /// REVIEW-WIN-005: a docked laptop with Ethernet and Wi-Fi defaults both at
+    /// route metric 0 must pick the same route whichever order the table is
+    /// read in — the one Windows uses (lower interface metric) — and an exact
+    /// tie must break on a stable key, not on row order.
+    #[test]
+    fn the_default_route_is_the_one_windows_uses_in_any_table_order() {
+        let ethernet = DefaultRouteCandidate {
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            interface: 12,
+            route_metric: 0,
+            interface_metric: Some(25),
+        };
+        let wifi = DefaultRouteCandidate {
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            interface: 7,
+            route_metric: 0,
+            interface_metric: Some(35),
+        };
+        let want = Some(PhysicalRoute {
+            gateway: ethernet.gateway,
+            interface: 12,
+        });
+        assert_eq!(preferred_default_route(&[ethernet, wifi]), want);
+        assert_eq!(preferred_default_route(&[wifi, ethernet]), want);
+
+        // The route metric counts too: a manual high route metric on the
+        // Ethernet default hands the session to Wi-Fi, as Windows would.
+        let heavy = DefaultRouteCandidate {
+            route_metric: 50,
+            ..ethernet
+        };
+        assert_eq!(
+            preferred_default_route(&[heavy, wifi]).map(|r| r.interface),
+            Some(7)
+        );
+
+        // Equal effective metrics: lowest interface index, in either order.
+        let twin = DefaultRouteCandidate {
+            interface_metric: Some(25),
+            ..wifi
+        };
+        assert_eq!(
+            preferred_default_route(&[ethernet, twin]).map(|r| r.interface),
+            Some(7)
+        );
+        assert_eq!(
+            preferred_default_route(&[twin, ethernet]).map(|r| r.interface),
+            Some(7)
+        );
+
+        // An interface whose metric could not be read ranks last.
+        let unknown = DefaultRouteCandidate {
+            interface_metric: None,
+            ..twin
+        };
+        assert_eq!(
+            preferred_default_route(&[unknown, ethernet]).map(|r| r.interface),
+            Some(12)
+        );
+        assert_eq!(preferred_default_route(&[]), None);
     }
 
     /// W1-011: nothing in the reconnect engine may send a packet to find out

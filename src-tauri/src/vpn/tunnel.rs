@@ -23,7 +23,7 @@ fn cmd(program: &str) -> Command {
     crate::utils::hidden_cmd(program)
 }
 
-/// Read the lowest-metric IPv4 default-route next hop via the IP Helper API
+/// The IPv4 default-route next hop Windows prefers, via the IP Helper API
 /// (`GetIpForwardTable2`). Returns `None` on any failure so the caller can fall
 /// back to parsing `route print`. Native + instant; no subprocess.
 #[cfg(windows)]
@@ -31,11 +31,16 @@ fn default_gateway_native() -> Option<String> {
     default_route_native().map(|(gw, _idx)| gw.to_string())
 }
 
-/// Lowest-metric IPv4 default route: returns `(gateway, physical_interface_index)`
-/// via `GetIpForwardTable2`. The interface index is needed to pin the endpoint
-/// host route to the physical NIC natively. `None` on any failure.
+/// The IPv4 default route Windows prefers: returns `(gateway,
+/// physical_interface_index)` via `GetIpForwardTable2`, ranked by
+/// `network_events::preferred_default_route` (route metric + interface
+/// metric, then a stable tie-break — REVIEW-WIN-005). The interface index is
+/// needed to pin the endpoint host route to the physical NIC natively, and the
+/// same pick decides whether a route change is a move (`needs_rebind`).
+/// `None` on any failure.
 #[cfg(windows)]
 pub(crate) fn default_route_native() -> Option<(Ipv4Addr, u32)> {
+    use crate::vpn::network_events::{preferred_default_route, DefaultRouteCandidate};
     use windows::Win32::NetworkManagement::IpHelper::{
         FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
     };
@@ -49,12 +54,12 @@ pub(crate) fn default_route_native() -> Option<(Ipv4Addr, u32)> {
         return None;
     }
 
-    let result = {
+    let mut candidates = Vec::new();
+    {
         // SAFETY: `table` is non-null and points to a valid table allocated by
         // the OS; `NumEntries` describes the length of the trailing `Table` array.
         let t = unsafe { &*table };
         let rows = unsafe { std::slice::from_raw_parts(t.Table.as_ptr(), t.NumEntries as usize) };
-        let mut best: Option<(u32, Ipv4Addr, u32)> = None; // (metric, gateway, if_index)
         for row in rows {
             if row.DestinationPrefix.PrefixLength != 0 {
                 continue; // not a default route (0.0.0.0/0)
@@ -69,18 +74,38 @@ pub(crate) fn default_route_native() -> Option<(Ipv4Addr, u32)> {
             if ip.is_unspecified() {
                 continue;
             }
-            // is_none_or (1.82) — surfaced by clippy::unnecessary_map_or the moment
-            // rust-version rose past 1.82; the lint is MSRV-gated.
-            if best.is_none_or(|(m, _, _)| row.Metric < m) {
-                best = Some((row.Metric, ip, row.InterfaceIndex));
-            }
+            candidates.push(DefaultRouteCandidate {
+                gateway: ip,
+                interface: row.InterfaceIndex,
+                route_metric: row.Metric,
+                interface_metric: None,
+            });
         }
-        best.map(|(_, ip, idx)| (ip, idx))
-    };
-
+    }
     // SAFETY: `table` was allocated by `GetIpForwardTable2` and is non-null.
     unsafe { FreeMibTable(table as *const core::ffi::c_void) };
-    result
+
+    for candidate in &mut candidates {
+        candidate.interface_metric = ipv4_interface_metric(candidate.interface);
+    }
+    preferred_default_route(&candidates).map(|r| (r.gateway, r.interface))
+}
+
+/// The IPv4 metric of interface `if_index` (`GetIpInterfaceEntry`), `None`
+/// when it cannot be read.
+// Clippy: MIB_* FFI rows must be default-initialised and then populated.
+#[allow(clippy::field_reassign_with_default)]
+#[cfg(windows)]
+fn ipv4_interface_metric(if_index: u32) -> Option<u32> {
+    use windows::Win32::NetworkManagement::IpHelper::{GetIpInterfaceEntry, MIB_IPINTERFACE_ROW};
+    use windows::Win32::Networking::WinSock::AF_INET;
+
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    row.Family = AF_INET;
+    row.InterfaceIndex = if_index;
+    // SAFETY: Family + InterfaceIndex are set; the call fills the remaining fields.
+    let err = unsafe { GetIpInterfaceEntry(&mut row) };
+    (err.0 == 0).then_some(row.Metric)
 }
 
 /// Install the endpoint host route: native first, `route.exe` as the fallback,
