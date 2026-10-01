@@ -3,7 +3,7 @@
  * anonymous account number, and the subscription summary.
  */
 import { useState } from 'react';
-import { AlertCircle, Check, Copy, KeyRound, Shield, ShieldAlert, Star } from 'lucide-react';
+import { AlertCircle, Check, Copy, Eye, EyeOff, KeyRound, Shield, ShieldAlert, Star } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { BirdoCard } from '@/components/birdo';
 import { brand, hairline, status as statusTokens, surface, white } from '@/lib/birdo-theme';
@@ -11,7 +11,7 @@ import { planGradient, planName, planRank } from '@/lib/plan';
 import { findLiveServer } from '@/session/vpn-actions';
 import { useAppStore, type LoadStatus } from '@/store/app-store';
 import { selectDisplayState } from '@/store/selectors';
-import { formatAccountNumber, formatDate } from '@/utils/helpers';
+import { formatAccountNumber, formatDate, maskAccountNumber } from '@/utils/helpers';
 
 // ── Identity ────────────────────────────────────────────────────────────────
 
@@ -101,14 +101,41 @@ function ConnectionStatusRow() {
 
 // ── Anonymous account number (recovery credential) ─────────────────────────
 //
-// The 24-digit number is the ONLY way back into an anonymous account. Shown
-// prominently and copyably, grouped in fours with spaces (canonical), and
-// copied as digits only — the old copy inserted pipes the sign-in field then
-// had to strip.
+// The 24-digit number is the ONLY way back into an anonymous account. Grouped
+// in fours with spaces (canonical), copied as digits only — the old copy
+// inserted pipes the sign-in field then had to strip — and MASKED until the
+// user asks to see it (Account API contract item 86): this tab is on screen
+// whenever the window is, and screenshots and screen shares are how a
+// credential that is shown in full gets lost.
+//
+// `null`: an anonymous account whose number the server did not send. The card
+// says so instead of showing an empty or made-up number.
 
-export function AccountNumberCard({ accountNumber }: { accountNumber: string }) {
+export function AccountNumberCard({ accountNumber }: { accountNumber: string | null }) {
+  return (
+    <BirdoCard cornerRadius={20} padding="16px">
+      <div className="flex items-center gap-2">
+        <KeyRound size={16} color={brand.accent} aria-hidden />
+        <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color: white.w60 }}>
+          Account number
+        </span>
+      </div>
+      {accountNumber ? (
+        <AccountNumberRow accountNumber={accountNumber} />
+      ) : (
+        <p className="mt-2 text-[12px]" style={{ color: white.w60 }}>
+          Your account number was shown once, when this account was created, and can&apos;t be shown
+          here. If you saved it, keep it safe: it is the only way back into this account.
+        </p>
+      )}
+    </BirdoCard>
+  );
+}
+
+function AccountNumberRow({ accountNumber }: { accountNumber: string }) {
   const [copied, setCopied] = useState(false);
-  const pretty = formatAccountNumber(accountNumber);
+  const [revealed, setRevealed] = useState(false);
+  const pretty = revealed ? formatAccountNumber(accountNumber) : maskAccountNumber(accountNumber);
 
   const copy = async () => {
     try {
@@ -121,29 +148,44 @@ export function AccountNumberCard({ accountNumber }: { accountNumber: string }) 
   };
 
   return (
-    <BirdoCard cornerRadius={20} padding="16px">
-      <div className="flex items-center gap-2">
-        <KeyRound size={16} color={brand.accent} aria-hidden />
-        <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color: white.w60 }}>
-          Account number
-        </span>
-      </div>
-      <button
-        type="button"
-        onClick={copy}
-        className="mt-2.5 flex w-full items-center gap-3 rounded-birdo-sm px-3 py-2.5 text-left transition-colors hover:bg-white/5"
+    <>
+      <div
+        className="mt-2.5 flex w-full items-center gap-2 rounded-birdo-sm px-3 py-1.5"
         style={{ backgroundColor: surface.s2, border: `1px solid ${hairline.soft}` }}
-        aria-label={`Copy account number ${pretty}`}
       >
-        <span className="min-w-0 flex-1 truncate font-mono text-[13px] tracking-wide" style={{ color: '#FFFFFF' }}>
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-[13px] tracking-wide"
+          style={{ color: '#FFFFFF' }}
+          data-testid="account-number"
+        >
           {pretty}
         </span>
-        {copied ? (
-          <Check size={16} color={brand.accentLight} aria-hidden />
-        ) : (
-          <Copy size={16} color={white.w60} aria-hidden />
-        )}
-      </button>
+        <button
+          type="button"
+          onClick={() => setRevealed((r) => !r)}
+          aria-pressed={revealed}
+          aria-label={revealed ? 'Hide account number' : 'Show account number'}
+          className="rounded-birdo-xs p-1.5 transition-colors hover:bg-white/5"
+        >
+          {revealed ? (
+            <EyeOff size={16} color={white.w60} aria-hidden />
+          ) : (
+            <Eye size={16} color={white.w60} aria-hidden />
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={copy}
+          aria-label="Copy account number"
+          className="rounded-birdo-xs p-1.5 transition-colors hover:bg-white/5"
+        >
+          {copied ? (
+            <Check size={16} color={brand.accentLight} aria-hidden />
+          ) : (
+            <Copy size={16} color={white.w60} aria-hidden />
+          )}
+        </button>
+      </div>
       <p className="mt-2 flex items-start gap-1.5 text-[12px]" style={{ color: white.w60 }}>
         <ShieldAlert size={14} color={statusTokens.yellow} aria-hidden className="mt-0.5 shrink-0" />
         <span>
@@ -151,7 +193,7 @@ export function AccountNumberCard({ accountNumber }: { accountNumber: string }) 
           Save it somewhere safe — we can&apos;t reset it.
         </span>
       </p>
-    </BirdoCard>
+    </>
   );
 }
 

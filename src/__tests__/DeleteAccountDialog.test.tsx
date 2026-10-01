@@ -223,3 +223,114 @@ describe('Delete account dialog', () => {
     await waitFor(() => expect(logout).toHaveBeenCalled());
   });
 });
+
+/** Account API contract 2026-10-01, item 85: deletion on an account with 2FA. */
+describe('Delete account dialog: two-factor accounts', () => {
+  const refusal = (code: string, extra: Record<string, unknown> = {}) => ({
+    code,
+    message: 'x',
+    retryable: true,
+    retry_after_secs: null,
+    ...extra,
+  });
+  const deleteCalls = () => mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'delete_account');
+
+  it('asks for the code when the server requires it, then deletes with it', async () => {
+    const answers = [
+      () => Promise.reject(refusal('two_factor_required')),
+      () => Promise.resolve({ storeSubscriptionsStillBilling: [] }),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openAndConfirm();
+
+    const field = await screen.findByLabelText('Two-factor code');
+    expect(field).toHaveFocus();
+    expect(screen.getByText('Enter the 6-digit code from your authenticator, or a backup code')).toBeInTheDocument();
+    // Nothing happened yet: no tunnel change, nobody signed out.
+    expect(setConnectionState).not.toHaveBeenCalled();
+    expect(logout).not.toHaveBeenCalled();
+    // The code is required before the retry can be sent.
+    expect(screen.getByRole('button', { name: /delete my account/i })).toBeDisabled();
+
+    await userEvent.type(field, '123456');
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(deleteCalls()[1][1]).toEqual({ request: { password: 'hunter2', two_factor_code: '123456' } });
+  });
+
+  it('accepts a backup code in the same field', async () => {
+    const answers = [
+      () => Promise.reject(refusal('two_factor_required')),
+      () => Promise.resolve({ storeSubscriptionsStillBilling: [] }),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openAndConfirm();
+    await userEvent.type(await screen.findByLabelText('Two-factor code'), 'a1b2-c3d4-e5f6-0789');
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(deleteCalls()[1][1]).toEqual({
+      request: { password: 'hunter2', two_factor_code: 'a1b2-c3d4-e5f6-0789' },
+    });
+  });
+
+  it('a wrong code says so and lets the user try again', async () => {
+    const answers = [
+      () => Promise.reject(refusal('two_factor_required')),
+      () => Promise.reject(refusal('two_factor_invalid')),
+      () => Promise.resolve({ storeSubscriptionsStillBilling: [] }),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openAndConfirm();
+    const field = await screen.findByLabelText('Two-factor code');
+    await userEvent.type(field, '000000');
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    expect(
+      await screen.findByText('That verification code is invalid or has expired. Please try again.'),
+    ).toBeInTheDocument();
+    expect(logout).not.toHaveBeenCalled();
+
+    await userEvent.clear(field);
+    await userEvent.type(field, '654321');
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(deleteCalls()[2][1]).toEqual({ request: { password: 'hunter2', two_factor_code: '654321' } });
+  });
+
+  it('a wrong password at the code step is shown on the password, not on the code', async () => {
+    const answers = [
+      () => Promise.reject(refusal('two_factor_required')),
+      () => Promise.reject(refusal('invalid_credentials')),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openAndConfirm();
+    const code = await screen.findByLabelText('Two-factor code');
+    await userEvent.type(code, '123456');
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    await waitFor(() =>
+      expect(screen.getByLabelText('Password')).toHaveAccessibleDescription('Incorrect password. Please try again.'),
+    );
+    expect(code).toHaveAccessibleDescription('Enter the 6-digit code from your authenticator, or a backup code');
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it('too many attempts get the rate-limit copy, and nothing is deleted', async () => {
+    const answers = [
+      () => Promise.reject(refusal('two_factor_required')),
+      () => Promise.reject(refusal('rate_limited', { retryable: true })),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openAndConfirm();
+    await userEvent.type(await screen.findByLabelText('Two-factor code'), '111111');
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    expect(await screen.findByText('Too many attempts. Please wait a moment.')).toBeInTheDocument();
+    expect(logout).not.toHaveBeenCalled();
+    expect(setConnectionState).not.toHaveBeenCalled();
+  });
+
+  it('an account without 2FA (or a server that predates it) never sees a code', async () => {
+    await openAndConfirm();
+    await waitFor(() => expect(logout).toHaveBeenCalled());
+    expect(screen.queryByLabelText('Two-factor code')).not.toBeInTheDocument();
+    expect(deleteCalls()[0][1]).toStrictEqual({ request: { password: 'hunter2' } });
+  });
+});

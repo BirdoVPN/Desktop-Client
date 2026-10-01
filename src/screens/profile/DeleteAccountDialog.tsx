@@ -17,14 +17,27 @@
  *    clearing local state). Disconnecting first left a user who typed a wrong
  *    password, or was offline, disconnected from an account that still exists.
  *  - Local state is only cleared once the server confirms (Rust side).
+ *
+ * Accounts with 2FA (Account API contract 2026-10-01, item 85): the server
+ * answers the first attempt `two_factor_required`, and the dialog stays open
+ * and asks for the code — the sign-in screen's field, TOTP or backup code —
+ * then sends it with the retry. `two_factor_invalid` says the code was wrong
+ * and lets the user try again; a 429 gets the rate-limit copy. A server that
+ * predates the contract never asks, and never sees a code.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ShieldAlert } from 'lucide-react';
 import { BirdoButton, BirdoDialog, BirdoTextField } from '@/components/birdo';
 import { status as statusTokens, white } from '@/lib/birdo-theme';
 import { errorCopy } from '@/lib/errors';
 import { toIpcError } from '@/lib/ipc';
+import {
+  isTwoFactorCode,
+  sanitizeTwoFactorInput,
+  TWO_FACTOR_HINT,
+  TWO_FACTOR_PLACEHOLDER,
+} from '@/lib/two-factor';
 import { useAppStore } from '@/store/app-store';
 
 /** Shape returned by the Rust `delete_account` command. */
@@ -82,8 +95,15 @@ export function DeleteAccountDialog({
 }) {
   const [password, setPassword] = useState('');
   const [confirmText, setConfirmText] = useState('');
+  // Set once the server answered `two_factor_required`.
+  const [askingTwoFactor, setAskingTwoFactor] = useState(false);
+  const [twoFactorCode, setTwoFactorCode] = useState('');
   const [deleting, setDeleting] = useState(false);
+  // A refusal of the password / DELETE confirmation, under that field.
   const [error, setError] = useState<string | null>(null);
+  // A refusal of the code (wrong, or too many tries), under the code field:
+  // a wrong password at the code step must not read as a wrong code.
+  const [codeError, setCodeError] = useState<string | null>(null);
   // Set once the server confirmed the deletion AND reported store
   // subscriptions that are still billing: the account is gone, but the user
   // has to read this before the app signs out.
@@ -112,18 +132,24 @@ export function DeleteAccountDialog({
   const namedStores = preflight?.storeSubscriptionsStillBilling ?? [];
 
   const canSubmit =
-    !deleting && (hasPassword ? password.length > 0 : confirmText.trim().toUpperCase() === 'DELETE');
+    !deleting &&
+    (hasPassword ? password.length > 0 : confirmText.trim().toUpperCase() === 'DELETE') &&
+    (!askingTwoFactor || isTwoFactorCode(twoFactorCode));
 
   const handleConfirm = async () => {
     if (!canSubmit) return;
     setDeleting(true);
     setError(null);
+    setCodeError(null);
     try {
       // Password-less accounts send the typed confirmation token: the server
       // skips the password check for them, and the command's request type is
       // non-optional, so a non-empty value satisfies it without a fake secret.
       const result = await invoke<DeleteAccountResult | null>('delete_account', {
-        request: { password: hasPassword ? password : confirmText.trim() },
+        request: {
+          password: hasPassword ? password : confirmText.trim(),
+          ...(askingTwoFactor ? { two_factor_code: twoFactorCode } : {}),
+        },
       });
       // Confirmed: Rust has already taken the tunnel down. Mirror that now
       // rather than waiting for the next status.
@@ -138,7 +164,17 @@ export function DeleteAccountDialog({
       }
       onDeleted();
     } catch (e: unknown) {
-      setError(deletionErrorText(e));
+      const err = toIpcError(e);
+      if (err.code === 'two_factor_required') {
+        // Not an error the user made: the next step. The field and its hint
+        // say what to do.
+        setAskingTwoFactor(true);
+      } else if (err.code === 'two_factor_invalid' || (askingTwoFactor && err.code === 'rate_limited')) {
+        setAskingTwoFactor(true);
+        setCodeError(deletionErrorText(err));
+      } else {
+        setError(deletionErrorText(err));
+      }
       setDeleting(false);
     }
   };
@@ -207,6 +243,17 @@ export function DeleteAccountDialog({
               autoComplete="current-password"
             />
           )}
+          {askingTwoFactor && (
+            <TwoFactorField
+              value={twoFactorCode}
+              onChange={(v) => {
+                setTwoFactorCode(v);
+                if (codeError) setCodeError(null);
+              }}
+              errorText={codeError}
+              disabled={deleting}
+            />
+          )}
           <div className="flex gap-2.5">
             <BirdoButton text="Cancel" variant="secondary" fullWidth disabled={deleting} onClick={onDismiss} />
             <BirdoButton
@@ -221,6 +268,38 @@ export function DeleteAccountDialog({
         </>
       )}
     </BirdoDialog>
+  );
+}
+
+/** The sign-in screen's code field, for an account with 2FA. Focused on arrival. */
+function TwoFactorField({
+  value,
+  onChange,
+  errorText,
+  disabled,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  errorText: string | null;
+  disabled: boolean;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    ref.current?.focus();
+  }, []);
+  return (
+    <BirdoTextField
+      inputRef={ref}
+      value={value}
+      onChange={(v) => onChange(sanitizeTwoFactorInput(v))}
+      label="Two-factor code"
+      type="text"
+      placeholder={TWO_FACTOR_PLACEHOLDER}
+      hint={TWO_FACTOR_HINT}
+      errorText={errorText}
+      disabled={disabled}
+      autoComplete="one-time-code"
+    />
   );
 }
 

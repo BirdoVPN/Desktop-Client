@@ -33,6 +33,12 @@ pub enum ApiError {
     /// actionable one ("Stealth mode requires an Operative or Sovereign
     /// subscription") rather than a generic "Access denied".
     Rejected { status: u16, message: String },
+    /// The action needs the account's two-factor code (`error:
+    /// "two_factor_required"`, Account API contract item 85). Carries the
+    /// backend's sentence.
+    TwoFactorRequired(String),
+    /// The two-factor code sent was wrong (`error: "two_factor_invalid"`).
+    TwoFactorInvalid(String),
     /// Unknown error
     Unknown(String),
 }
@@ -61,7 +67,9 @@ impl fmt::Display for ApiError {
             ApiError::ServerError(code) => write!(f, "Server error ({})", code),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),
             ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update BirdoVPN to the latest version. ({})", msg),
-            ApiError::Rejected { message, .. } => write!(f, "{}", message),
+            ApiError::Rejected { message, .. }
+            | ApiError::TwoFactorRequired(message)
+            | ApiError::TwoFactorInvalid(message) => write!(f, "{}", message),
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }
     }

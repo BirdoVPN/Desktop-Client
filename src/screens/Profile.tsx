@@ -17,7 +17,7 @@ import { BirdoCard, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
 import { brand, status as statusTokens } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
 import { BILLING_URL } from '@/lib/links';
-import { anonAccountNumber } from '@/utils/helpers';
+import { resolveAnonymousAccount } from '@/utils/helpers';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
@@ -49,9 +49,10 @@ export function Profile() {
   // The email is mirrored in both `account.email` and `userEmail` (set at
   // sign-in); fall back so the card never reads "Anonymous" for a real user.
   const resolvedEmail = account.email ?? userEmail ?? null;
-  // Never render the synthetic `anon_…@anonymous.local`; show the number.
-  const accountNumber = anonAccountNumber(resolvedEmail);
-  const isAnon = accountNumber != null;
+  // Never render the synthetic `anon_…@anonymous.local`; show the number
+  // (item 86: the server's own fields first, the email's shape on an older
+  // backend).
+  const { isAnon, accountNumber } = resolveAnonymousAccount(account, resolvedEmail);
 
   const [showVoucherDialog, setShowVoucherDialog] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -93,7 +94,7 @@ export function Profile() {
       <div className="flex flex-col gap-3 px-5 pb-12 pt-2">
         <IdentityCard email={resolvedEmail} plan={account.plan} isAnon={isAnon} />
 
-        {isAnon && accountNumber && <AccountNumberCard accountNumber={accountNumber} />}
+        {isAnon && <AccountNumberCard accountNumber={accountNumber} />}
 
         <SubscriptionCard
           plan={account.plan}

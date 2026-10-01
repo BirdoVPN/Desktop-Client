@@ -42,6 +42,7 @@ import {
 } from '@/session/vpn-actions';
 import { persistSettings } from '@/session/settings-persist';
 import { loadServers, loadSubscription } from '@/session/session-data';
+import { resolveAnonymousAccount } from '@/utils/helpers';
 
 /** Which hop the multi-hop server sheet is currently picking. */
 type MultiHopTarget = 'entry' | 'exit';
@@ -64,6 +65,7 @@ export function Dashboard() {
     liveServer,
     liveMultiHop,
     userEmail,
+    anonymous,
     plan,
     lastServerId,
     multiHopEnabled,
@@ -87,6 +89,7 @@ export function Dashboard() {
         : findLiveServer(s.servers, s.liveServerId, s.liveServerName),
       liveMultiHop: s.liveMultiHop,
       userEmail: s.account.email ?? s.userEmail,
+      anonymous: resolveAnonymousAccount(s.account, s.account.email ?? s.userEmail).isAnon,
       plan: s.account.plan,
       lastServerId: s.lastServerId,
       multiHopEnabled: s.settings.multiHopEnabled,
@@ -220,6 +223,7 @@ export function Dashboard() {
 
       <HomeTopBar
         userEmail={userEmail}
+        anonymous={anonymous}
         multiHopArmed={multiHopEnabled}
         multiHopUnlocked={multiHopUnlocked}
         multiHopLocked={tunnelActive}

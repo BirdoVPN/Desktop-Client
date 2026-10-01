@@ -23,6 +23,7 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { exit } from '@tauri-apps/plugin-process';
 import { notifyUpdateAvailable } from '@/utils/notifications';
+import { anonymityPatch } from '@/utils/helpers';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 
 interface AuthState {
@@ -32,6 +33,9 @@ interface AuthState {
   plan: string | null;
   /** Optional: absent when talking to a backend that predates the field. */
   has_password?: boolean;
+  /** Account API contract item 86; absent or null on an older backend. */
+  is_anonymous?: boolean | null;
+  account_number?: string | null;
 }
 
 /** Whether the window is on screen; unknown counts as visible (never skip a prompt the user can see). */
@@ -191,7 +195,7 @@ function App() {
           if (authState.email) patch.email = authState.email;
           if (authState.account_id) patch.accountId = authState.account_id;
           if (authState.plan) patch.plan = authState.plan;
-          setAccount(patch);
+          setAccount({ ...patch, ...anonymityPatch(authState) });
         }
       } catch {
         // Auth check failed - assume not authenticated
@@ -227,7 +231,7 @@ function App() {
         }
         if (st?.email) {
           setUserEmail(st.email);
-          const patch: Partial<AccountInfo> = { email: st.email };
+          const patch: Partial<AccountInfo> = { email: st.email, ...anonymityPatch(st) };
           if (st.account_id) patch.accountId = st.account_id;
           if (st.plan) patch.plan = st.plan;
           setAccount(patch);

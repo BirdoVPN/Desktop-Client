@@ -454,8 +454,15 @@ impl BirdoApi {
     ///
     /// Tokens are cleared ONLY on a 2xx: a refused deletion leaves the user
     /// signed in to an account that still exists.
-    pub async fn delete_account(&self, password: &str) -> Result<DeleteAccountResponse, ApiError> {
-        let body = DeleteAccountBody { password };
+    pub async fn delete_account(
+        &self,
+        password: &str,
+        two_factor_code: Option<&str>,
+    ) -> Result<DeleteAccountResponse, ApiError> {
+        let body = DeleteAccountBody {
+            password,
+            two_factor_code,
+        };
         let token_before = self.access_token_value().await;
         let outcome = match self.send_gdpr_delete(&body).await? {
             GdprDeleteOutcome::SessionExpired => {
@@ -1173,6 +1180,19 @@ impl BirdoApi {
 
         if status == StatusCode::UNAUTHORIZED {
             return ApiError::Unauthorized;
+        }
+
+        // A machine-readable reason the client acts on (Account API contract
+        // item 85), mapped by `error`, never by the wording of `message`.
+        let message = || {
+            body.as_ref()
+                .and_then(|b| b.message.clone())
+                .unwrap_or_default()
+        };
+        match body.as_ref().and_then(|b| b.error.as_deref()) {
+            Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
+            Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            _ => {}
         }
 
         if let Some(message) = body.as_ref().and_then(|b| b.message.as_deref()) {

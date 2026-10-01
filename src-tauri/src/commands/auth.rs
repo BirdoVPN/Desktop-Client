@@ -3,7 +3,7 @@
 //! Handles login, logout, token refresh, and auth state management.
 
 use crate::api::error::ApiError;
-use crate::api::types::LoginResult;
+use crate::api::types::{AccountNumber, LoginResult, UserProfile};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::commands::session::{end_session, EndReason};
@@ -30,7 +30,7 @@ static TOTP_ATTEMPTS: Mutex<Option<Vec<Instant>>> = Mutex::new(None);
 const MAX_TOTP_ATTEMPTS: usize = 5;
 const TOTP_WINDOW_SECS: u64 = 120;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct AuthState {
     pub is_authenticated: bool,
     pub email: Option<String>,
@@ -40,6 +40,44 @@ pub struct AuthState {
     /// password from SSO accounts, which have none. `true` whenever the profile
     /// is unknown, so an unresolved identity never silently drops the prompt.
     pub has_password: bool,
+    /// Account API contract item 86: whether the account is anonymous, from
+    /// `isAnonymous` / `accountType`. `None` when the server did not say (an
+    /// older backend, or no profile this cycle); the UI then reads the email's
+    /// shape as before.
+    pub is_anonymous: Option<bool>,
+    /// Item 86: the anonymous account number, for the Profile card. A
+    /// credential: redacted in `Debug`, never logged.
+    pub account_number: Option<AccountNumber>,
+}
+
+impl AuthState {
+    /// A session whose identity is not known this cycle (or no session).
+    fn unknown_identity(is_authenticated: bool) -> Self {
+        Self {
+            is_authenticated,
+            email: None,
+            account_id: None,
+            plan: None,
+            // Unknown → assume a password exists, so the delete dialog keeps
+            // asking for it. Never drop a confirmation because a fetch failed.
+            has_password: true,
+            is_anonymous: None,
+            account_number: None,
+        }
+    }
+
+    /// The signed-in identity `GET /auth/me` returned.
+    fn of(profile: UserProfile) -> Self {
+        Self {
+            is_authenticated: true,
+            is_anonymous: profile.is_anonymous_account(),
+            has_password: profile.has_password,
+            email: Some(profile.email),
+            account_id: Some(profile.id),
+            plan: None,
+            account_number: profile.account_number,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,11 +310,19 @@ pub async fn logout(
 #[derive(Debug, Deserialize)]
 pub struct DeleteAccountRequest {
     pub password: String,
+    /// The TOTP or backup code, once the server has asked for it
+    /// (`two_factor_required`, Account API contract item 85). Absent on the
+    /// first attempt and for accounts without 2FA.
+    #[serde(default)]
+    pub two_factor_code: Option<String>,
 }
 
 impl Drop for DeleteAccountRequest {
     fn drop(&mut self) {
         self.password.zeroize();
+        if let Some(code) = self.two_factor_code.as_mut() {
+            code.zeroize();
+        }
     }
 }
 
@@ -297,6 +343,10 @@ pub struct DeleteAccountResult {
 /// framing.
 fn delete_failure_message(error: &ApiError) -> IpcError {
     let (code, reason) = match error {
+        // The dialog asks for the code / says it was wrong, by code alone.
+        ApiError::TwoFactorRequired(_) | ApiError::TwoFactorInvalid(_) => {
+            return IpcError::from_api(error);
+        }
         ApiError::Rejected { message, .. } | ApiError::Unknown(message) => {
             (IpcError::from_api(error).code, message.clone())
         }
@@ -321,8 +371,13 @@ pub async fn delete_account(
     // Nothing local is touched unless the server confirms the deletion: a
     // refused request (wrong password, expired session, offline) must leave
     // the user signed in to the account that still exists — and connected.
+    let two_factor_code = request
+        .two_factor_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
     let response = api
-        .delete_account(&request.password)
+        .delete_account(&request.password, two_factor_code)
         .await
         .map_err(|e| delete_failure_message(&e))?;
 
@@ -421,13 +476,7 @@ pub async fn get_auth_state(
 
             // Try to get user profile to validate token
             match api.get_profile().await {
-                Ok(profile) => Ok(AuthState {
-                    is_authenticated: true,
-                    email: Some(profile.email),
-                    account_id: Some(profile.id),
-                    plan: None,
-                    has_password: profile.has_password,
-                }),
+                Ok(profile) => Ok(AuthState::of(profile)),
                 // Rate limited — the token is FINE, the server is just asking us
                 // to slow down. Refreshing here would spend another request on
                 // the same exhausted budget (and `/auth/refresh` is itself in the
@@ -439,13 +488,7 @@ pub async fn get_auth_state(
                         "Profile fetch rate limited (429) — NOT refreshing; session kept, \
                          identity unknown this cycle"
                     );
-                    Ok(AuthState {
-                        is_authenticated: true,
-                        email: None,
-                        account_id: None,
-                        plan: None,
-                        has_password: true,
-                    })
+                    Ok(AuthState::unknown_identity(true))
                 }
                 Err(e) => {
                     tracing::info!("Profile fetch failed ({e}) — attempting token refresh");
@@ -474,13 +517,7 @@ pub async fn get_auth_state(
                             // once the access token had expired) made the app show
                             // "Anonymous" for a real signed-in account.
                             match api.get_profile().await {
-                                Ok(profile) => Ok(AuthState {
-                                    is_authenticated: true,
-                                    email: Some(profile.email),
-                                    account_id: Some(profile.id),
-                                    plan: None,
-                                    has_password: profile.has_password,
-                                }),
+                                Ok(profile) => Ok(AuthState::of(profile)),
                                 // The refresh succeeded, so the session IS valid — do
                                 // not sign the user out over what is almost always a
                                 // transient network error. The identity is reported as
@@ -491,16 +528,7 @@ pub async fn get_auth_state(
                                         "Profile fetch failed after a successful token refresh \
                                          ({e}) — session kept, identity unknown this cycle"
                                     );
-                                    Ok(AuthState {
-                                        is_authenticated: true,
-                                        email: None,
-                                        account_id: None,
-                                        plan: None,
-                                        // Unknown → assume a password exists, so the
-                                        // delete dialog keeps asking for it. Never drop
-                                        // a confirmation because a fetch failed.
-                                        has_password: true,
-                                    })
+                                    Ok(AuthState::unknown_identity(true))
                                 }
                             }
                         }
@@ -533,26 +561,14 @@ pub async fn get_auth_state(
                                 "Refresh token rejected by the server — clearing stored session"
                             );
                             let _ = credentials.clear_tokens();
-                            Ok(AuthState {
-                                is_authenticated: false,
-                                email: None,
-                                account_id: None,
-                                plan: None,
-                                has_password: true,
-                            })
+                            Ok(AuthState::unknown_identity(false))
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "Token refresh failed transiently ({e}) — KEEPING the stored \
                                  session; identity unknown this cycle"
                             );
-                            Ok(AuthState {
-                                is_authenticated: true,
-                                email: None,
-                                account_id: None,
-                                plan: None,
-                                has_password: true,
-                            })
+                            Ok(AuthState::unknown_identity(true))
                         }
                     }
                 }
@@ -572,13 +588,7 @@ pub async fn get_auth_state(
                      will appear signed out despite having logged in"
                 );
             }
-            Ok(AuthState {
-                is_authenticated: false,
-                email: None,
-                account_id: None,
-                plan: None,
-                has_password: true,
-            })
+            Ok(AuthState::unknown_identity(false))
         }
     }
 }
@@ -852,8 +862,10 @@ pub async fn login_anonymous(
     }
 
     // Device ID gives the backend trusted-device 2FA context (never identity).
+    // The number is the account's only credential, so no part of it is logged
+    // (Account API contract item 86); the last four used to be.
     let device_id = crate::utils::get_device_id();
-    tracing::info!("Anonymous login attempt (id: …{})", &anonymous_id[20..]);
+    tracing::info!("Anonymous login attempt");
 
     match api
         .login_anonymous(&anonymous_id, request.password.clone(), &device_id)
@@ -955,7 +967,7 @@ mod account_boundary_tests {
     fn deletion_disconnects_only_after_the_server_confirmed() {
         let del = body("delete_account");
         let confirmed = del
-            .find(".delete_account(&request.password)")
+            .find(".delete_account(&request.password, two_factor_code)")
             .expect("the server call");
         let disconnect = del
             .find("end_session(&app, EndReason::AccountDeleted)")
@@ -1060,6 +1072,111 @@ mod account_boundary_tests {
             two_factor_failure_code(&ApiError::ServerError(502)),
             IpcErrorCode::ServerError
         );
+    }
+
+    /// Account API contract item 85: a 2FA refusal reaches the dialog as its
+    /// own code, so it can ask for the code or say it was wrong; a rate limit
+    /// is a rate limit. Old servers' refusals map as before.
+    #[test]
+    fn two_factor_refusals_on_deletion_keep_their_codes() {
+        use super::{delete_failure_message, ApiError, IpcErrorCode};
+        assert_eq!(
+            delete_failure_message(&ApiError::TwoFactorRequired("Enter your code".into())).code,
+            IpcErrorCode::TwoFactorRequired
+        );
+        assert_eq!(
+            delete_failure_message(&ApiError::TwoFactorInvalid("Wrong".into())).code,
+            IpcErrorCode::TwoFactorInvalid
+        );
+        assert_eq!(
+            delete_failure_message(&ApiError::Rejected {
+                status: 429,
+                message: "Too many attempts".into()
+            })
+            .code,
+            IpcErrorCode::RateLimited
+        );
+        assert_eq!(
+            delete_failure_message(&ApiError::RateLimited).code,
+            IpcErrorCode::RateLimited
+        );
+    }
+
+    /// The UI sends `two_factor_code` only on the retry; today's dialog sends
+    /// no such key and must still parse.
+    #[test]
+    fn the_delete_request_takes_an_optional_two_factor_code() {
+        let first: super::DeleteAccountRequest =
+            serde_json::from_value(serde_json::json!({ "password": "pw" })).unwrap();
+        assert_eq!(first.two_factor_code, None);
+        let retry: super::DeleteAccountRequest = serde_json::from_value(
+            serde_json::json!({ "password": "pw", "two_factor_code": "123456" }),
+        )
+        .unwrap();
+        assert_eq!(retry.two_factor_code.as_deref(), Some("123456"));
+    }
+
+    /// Item 86 on an old server (no new fields) and a new one; the account
+    /// number never appears in a `{:?}`.
+    #[test]
+    fn the_auth_state_reads_old_and_new_auth_me() {
+        use crate::api::types::UserProfile;
+        let old: UserProfile = serde_json::from_value(serde_json::json!({
+            "id": "u1", "email": "anon_123456789012345678901234@anonymous.local"
+        }))
+        .unwrap();
+        let state = super::AuthState::of(old);
+        assert_eq!(state.is_anonymous, None, "an old server says nothing");
+        assert!(state.account_number.is_none());
+
+        // Phase 2 of the contract: the email no longer carries the number.
+        let new: UserProfile = serde_json::from_value(serde_json::json!({
+            "id": "u2",
+            "email": "account-u2@anonymous.local",
+            "accountType": "anonymous",
+            "isAnonymous": true,
+            "accountNumber": "123456789012345678901234"
+        }))
+        .unwrap();
+        let state = super::AuthState::of(new);
+        assert_eq!(state.is_anonymous, Some(true));
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["account_number"], "123456789012345678901234");
+        assert_eq!(json["is_anonymous"], true);
+        assert!(
+            !format!("{state:?}").contains("123456789012345678901234"),
+            "the account number reached a Debug string"
+        );
+
+        // A server that no longer returns the number (`accountNumber: null`,
+        // the email carrying none): still anonymous, and no number at all
+        // rather than an empty or made-up one.
+        let unnumbered: UserProfile = serde_json::from_value(serde_json::json!({
+            "id": "u3",
+            "email": "member@anonymous.local",
+            "accountType": "anonymous",
+            "isAnonymous": true,
+            "accountNumber": null
+        }))
+        .unwrap();
+        let state = super::AuthState::of(unnumbered);
+        assert_eq!(state.is_anonymous, Some(true));
+        assert!(state.account_number.is_none());
+        assert_eq!(
+            serde_json::to_value(&state).unwrap()["account_number"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// Item 86: "never log it". No part of the number reaches a log line on
+    /// the anonymous sign-in path (it used to log the last four digits).
+    #[test]
+    fn the_anonymous_sign_in_logs_no_part_of_the_number() {
+        let login = body("login_anonymous");
+        for line in login.lines().filter(|l| l.contains("tracing::")) {
+            assert!(!line.contains("anonymous_id"), "{line}");
+        }
+        assert!(!login.contains("&anonymous_id[20..]"));
     }
 
     /// Second-pass #9: the preflight the dialog shows before confirming.

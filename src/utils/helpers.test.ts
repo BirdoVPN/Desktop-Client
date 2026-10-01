@@ -6,8 +6,11 @@ import {
   formatUptime,
   formatDate,
   anonAccountNumber,
+  anonymityPatch,
   formatAccountNumber,
   isValidMtu,
+  maskAccountNumber,
+  resolveAnonymousAccount,
   type RustSettings,
 } from './helpers';
 
@@ -175,5 +178,57 @@ describe('anonymous identity (P1-parity-007)', () => {
   it('formats the account number in six space-separated groups of four', () => {
     expect(formatAccountNumber('123456789012345678901234')).toBe('1234 5678 9012 3456 7890 1234');
     expect(formatAccountNumber('1234|5678')).toBe('1234 5678');
+  });
+
+  it('masks every group but the last by default (Account API item 86)', () => {
+    expect(maskAccountNumber('123456789012345678901234')).toBe('•••• •••• •••• •••• •••• 1234');
+  });
+});
+
+/** Account API contract 2026-10-01, item 86: `/auth/me` on an old and a new server. */
+describe('anonymous account resolution (item 86)', () => {
+  const synthetic = 'anon_123456789012345678901234@anonymous.local';
+  const unknown = { isAnonymous: null, accountNumber: null };
+
+  it('an old server (no new fields) is read from the email, as before', () => {
+    expect(anonymityPatch({})).toEqual({});
+    expect(resolveAnonymousAccount(unknown, synthetic)).toEqual({
+      isAnon: true,
+      accountNumber: '123456789012345678901234',
+    });
+    expect(resolveAnonymousAccount(unknown, 'me@example.com')).toEqual({ isAnon: false, accountNumber: null });
+  });
+
+  it("a new server's fields win, and the number comes from accountNumber", () => {
+    const patch = anonymityPatch({ is_anonymous: true, account_number: '999988887777666655554444' });
+    expect(patch).toEqual({ isAnonymous: true, accountNumber: '999988887777666655554444' });
+    // Phase 2: the email no longer carries the number at all.
+    expect(resolveAnonymousAccount({ isAnonymous: true, accountNumber: '999988887777666655554444' }, null)).toEqual({
+      isAnon: true,
+      accountNumber: '999988887777666655554444',
+    });
+    expect(resolveAnonymousAccount({ isAnonymous: false, accountNumber: null }, 'me@example.com')).toEqual({
+      isAnon: false,
+      accountNumber: null,
+    });
+  });
+
+  it('a server that sends no number (null, the email carrying none) still reads as anonymous', () => {
+    const patch = anonymityPatch({ is_anonymous: true, account_number: null });
+    expect(patch).toEqual({ isAnonymous: true });
+    expect(resolveAnonymousAccount({ isAnonymous: true, accountNumber: null }, 'member@anonymous.local')).toEqual({
+      isAnon: true,
+      accountNumber: null,
+    });
+  });
+
+  it('a synthetic email is never treated as a real one, whatever the server says', () => {
+    expect(resolveAnonymousAccount({ isAnonymous: false, accountNumber: null }, synthetic).isAnon).toBe(true);
+  });
+
+  it('only the documented 24 digits are taken as an account number', () => {
+    expect(anonymityPatch({ is_anonymous: null, account_number: null })).toEqual({});
+    expect(anonymityPatch({ account_number: '1234' })).toEqual({});
+    expect(anonymityPatch({ account_number: '1234 5678 9012 3456 7890 1234' })).toEqual({});
   });
 });

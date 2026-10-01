@@ -44,14 +44,25 @@ use zeroize::Zeroize;
 pub struct ApiErrorBody {
     #[serde(default)]
     pub message: Option<String>,
+    /// The backend's machine-readable reason, where it sends one
+    /// (`two_factor_required`, `two_factor_invalid` — Account API contract
+    /// 2026-10-01, item 85). Clients map by THIS, never by `message`.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Body of `DELETE /api/v1/gdpr/delete`. Password-less accounts (SSO and
 /// anonymous) send whatever the UI collected; the backend only checks it when
 /// the account has a password hash (`deleteAccountSchema`, max 256 chars).
+///
+/// `twoFactorCode` (Account API contract item 85): the TOTP or backup code an
+/// account with 2FA must add, sent only once the server has asked for it — so
+/// a backend that predates the field never sees it.
 #[derive(Debug, Serialize)]
 pub struct DeleteAccountBody<'a> {
     pub password: &'a str,
+    #[serde(rename = "twoFactorCode", skip_serializing_if = "Option::is_none")]
+    pub two_factor_code: Option<&'a str>,
 }
 
 /// Success body of `DELETE /api/v1/gdpr/delete`.
@@ -584,6 +595,70 @@ pub struct UserProfile {
     /// the first consumer gets the truth instead of a plausible lie.
     #[serde(default, alias = "isSSO")]
     pub is_sso: bool,
+    /// `"anonymous" | "standard"` (Account API contract item 86). Absent on a
+    /// backend that predates it; see `UserProfile::is_anonymous_account`.
+    #[serde(default)]
+    pub account_type: Option<String>,
+    /// Item 86, the boolean twin of `account_type`.
+    #[serde(default)]
+    pub is_anonymous: Option<bool>,
+    /// Item 86: the user's own 24-digit anonymous account number, `null` for a
+    /// standard account. A credential — see [`AccountNumber`].
+    #[serde(default, deserialize_with = "account_number_or_none")]
+    pub account_number: Option<AccountNumber>,
+}
+
+impl UserProfile {
+    /// Whether this is an anonymous account, from the explicit fields when the
+    /// server sends them. `None` on an older backend: the UI then falls back to
+    /// the synthetic email's shape (`anon_<number>@anonymous.local`).
+    pub fn is_anonymous_account(&self) -> Option<bool> {
+        self.is_anonymous.or_else(|| {
+            self.account_type
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("anonymous"))
+        })
+    }
+}
+
+/// An anonymous account number: the bare 24-digit id, and the account's ONLY
+/// credential. Never logged: its `Debug` is redacted, so no `{:?}` of a profile
+/// or an auth state can print it, and the memory is wiped on drop.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct AccountNumber(String);
+
+impl AccountNumber {
+    /// Only the documented shape (`/^\d{24}$/`) is accepted.
+    pub fn parse(raw: &str) -> Option<Self> {
+        (raw.len() == 24 && raw.bytes().all(|b| b.is_ascii_digit())).then(|| Self(raw.to_string()))
+    }
+}
+
+impl std::fmt::Debug for AccountNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccountNumber(<redacted>)")
+    }
+}
+
+impl Drop for AccountNumber {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// `accountNumber` as sent, or `None` for null, absence or anything that is
+/// not the documented 24 digits — never a parse failure, which would blank
+/// the whole identity.
+fn account_number_or_none<'de, D>(deserializer: D) -> Result<Option<AccountNumber>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .and_then(AccountNumber::parse))
 }
 
 /// `GET /api/client-config` — only the fields this client acts on.

@@ -9,7 +9,14 @@ import { BirdoButton, BirdoTextField, AppIconMark } from './birdo';
 import { brand, gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
 import { errorCopy, SESSION_EXPIRED_COPY, type ErrorContext } from '@/lib/errors';
 import { toIpcError } from '@/lib/ipc';
-import { formatAccountNumber } from '@/utils/helpers';
+import { anonymityPatch, formatAccountNumber } from '@/utils/helpers';
+import {
+  isTwoFactorCode,
+  sanitizeTwoFactorInput,
+  TWO_FACTOR_HINT,
+  TWO_FACTOR_MAX_LENGTH,
+  TWO_FACTOR_PLACEHOLDER,
+} from '@/lib/two-factor';
 
 type AuthTab = 'email' | 'anonymous' | 'sso';
 type SsoProvider = 'google' | 'github' | 'apple';
@@ -136,9 +143,11 @@ export function Login() {
         email: string | null;
         account_id: string | null;
         plan: string | null;
+        is_anonymous?: boolean | null;
+        account_number?: string | null;
       }>('get_auth_state');
       if (st?.email) setUserEmail(st.email);
-      const patch: Partial<AccountInfo> = {};
+      const patch: Partial<AccountInfo> = st ? anonymityPatch(st) : {};
       if (st?.email) patch.email = st.email;
       if (st?.account_id) patch.accountId = st.account_id;
       if (st?.plan) patch.plan = st.plan;
@@ -299,7 +308,7 @@ export function Login() {
     setError(null);
   };
 
-  const totpValid = /^\d{6}$/.test(totpCode) || /^[0-9A-Fa-f]{4}(?:-?[0-9A-Fa-f]{4})+$/.test(totpCode);
+  const totpValid = isTwoFactorCode(totpCode);
 
   const handleVerify2FA = async (e: FormEvent) => {
     e.preventDefault();
@@ -490,11 +499,11 @@ export function Login() {
                   autoComplete="one-time-code"
                   value={totpCode}
                   // A 6-digit TOTP OR a hex backup code (16 hex, 19 chars with
-                  // dashes). Keep digits, hex letters and dashes; cap at 19.
-                  onChange={(e) => setTotpCode(e.target.value.replace(/[^0-9A-Fa-f-]/g, '').slice(0, 19))}
-                  placeholder="000000 or backup code"
+                  // dashes).
+                  onChange={(e) => setTotpCode(sanitizeTwoFactorInput(e.target.value))}
+                  placeholder={TWO_FACTOR_PLACEHOLDER}
                   required
-                  maxLength={19}
+                  maxLength={TWO_FACTOR_MAX_LENGTH}
                   aria-describedby="totp-hint"
                   className="w-full rounded-birdo-sub px-4 py-3 text-center text-2xl tracking-[0.3em] outline-hidden"
                   style={{
@@ -504,7 +513,7 @@ export function Login() {
                   }}
                 />
                 <p id="totp-hint" className="text-center text-xs" style={{ color: white.w60 }}>
-                  Enter the 6-digit code from your authenticator, or a backup code
+                  {TWO_FACTOR_HINT}
                 </p>
 
                 {error && <ErrorBanner message={error} />}

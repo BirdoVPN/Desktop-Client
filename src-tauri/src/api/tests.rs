@@ -117,7 +117,13 @@ mod gdpr_request_tests {
     fn gdpr_delete_is_a_delete_to_the_api_prefixed_route() {
         let api = BirdoApi::new();
         let request = api
-            .gdpr_delete_request("tok", &DeleteAccountBody { password: "pw" })
+            .gdpr_delete_request(
+                "tok",
+                &DeleteAccountBody {
+                    password: "pw",
+                    two_factor_code: None,
+                },
+            )
             .build()
             .expect("request builds");
 
@@ -146,6 +152,59 @@ mod gdpr_request_tests {
             json!({ "password": "pw" }),
             "the body deleteAccountSchema validates: an optional password, at most 256 chars"
         );
+    }
+
+    /// Account API contract item 85: the code rides as `twoFactorCode`, and
+    /// only once the server asked for it, so today's servers never see a key
+    /// they do not know.
+    #[test]
+    fn the_two_factor_code_rides_only_when_there_is_one() {
+        let api = BirdoApi::new();
+        let body_of = |code: Option<&str>| -> serde_json::Value {
+            let request = api
+                .gdpr_delete_request(
+                    "tok",
+                    &DeleteAccountBody {
+                        password: "pw",
+                        two_factor_code: code,
+                    },
+                )
+                .build()
+                .unwrap();
+            serde_json::from_slice(request.body().and_then(|b| b.as_bytes()).unwrap()).unwrap()
+        };
+        assert_eq!(body_of(None), json!({ "password": "pw" }));
+        assert_eq!(
+            body_of(Some("123456")),
+            json!({ "password": "pw", "twoFactorCode": "123456" })
+        );
+    }
+
+    /// Item 85: the server's 403s are told apart by `error`, never by the
+    /// sentence; a 403 without it (a plan refusal on any server) maps as
+    /// before, and a 429 is a rate limit.
+    #[test]
+    fn deletion_two_factor_refusals_map_by_error() {
+        let required = r#"{"error":"two_factor_required","message":"Enter your two-factor code to delete your account."}"#;
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::FORBIDDEN, required),
+            GdprDeleteOutcome::Refused(ApiError::TwoFactorRequired(_))
+        ));
+        let invalid = r#"{"error":"two_factor_invalid","message":"Invalid two-factor code."}"#;
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::FORBIDDEN, invalid),
+            GdprDeleteOutcome::Refused(ApiError::TwoFactorInvalid(_))
+        ));
+        let plan =
+            r#"{"statusCode":403,"message":"Stealth mode requires a plan","error":"Forbidden"}"#;
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::FORBIDDEN, plan),
+            GdprDeleteOutcome::Refused(ApiError::Rejected { status: 403, .. })
+        ));
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, ""),
+            GdprDeleteOutcome::Refused(ApiError::RateLimited)
+        ));
     }
 
     #[test]
@@ -473,6 +532,51 @@ mod types_serialization_tests {
         let resp: RefreshResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.access_token, "new_at");
         assert_eq!(resp.expires_in, Some(3600));
+    }
+
+    /// Account API contract item 86: an old server's `/auth/me` (no new
+    /// fields) says nothing about anonymity; a new one says it either way, and
+    /// only the documented 24 digits count as an account number.
+    #[test]
+    fn auth_me_anonymity_fields_are_optional_and_validated() {
+        let old: UserProfile = serde_json::from_str(r#"{"id":"u1","email":"a@b.com"}"#).unwrap();
+        assert_eq!(old.is_anonymous_account(), None);
+        assert!(old.account_number.is_none());
+
+        let standard: UserProfile = serde_json::from_str(
+            r#"{"id":"u2","email":"a@b.com","accountType":"standard","isAnonymous":false,"accountNumber":null}"#,
+        )
+        .unwrap();
+        assert_eq!(standard.is_anonymous_account(), Some(false));
+        assert!(standard.account_number.is_none());
+
+        // accountType alone is enough.
+        let typed: UserProfile =
+            serde_json::from_str(r#"{"id":"u3","email":"x","accountType":"anonymous"}"#).unwrap();
+        assert_eq!(typed.is_anonymous_account(), Some(true));
+
+        let anon: UserProfile = serde_json::from_str(
+            r#"{"id":"u4","email":"x","isAnonymous":true,"accountNumber":"123456789012345678901234"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            anon.account_number,
+            super::super::types::AccountNumber::parse("123456789012345678901234")
+        );
+        assert!(!format!("{anon:?}").contains("123456789012345678901234"));
+
+        for bad in [
+            r#""12345""#,
+            r#""1234 5678 9012 3456 7890 1234""#,
+            "42",
+            r#""abcdefghijklmnopqrstuvwx""#,
+        ] {
+            let user: UserProfile = serde_json::from_str(&format!(
+                r#"{{"id":"u5","email":"x","accountNumber":{bad}}}"#
+            ))
+            .expect("a malformed number must not blank the identity");
+            assert!(user.account_number.is_none(), "{bad}");
+        }
     }
 
     #[test]

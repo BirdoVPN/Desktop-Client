@@ -189,6 +189,12 @@ impl IpcError {
                 Self::new(IpcErrorCode::CertPinFailed, error.to_string())
             }
             ApiError::Rejected { status, message } => Self::from_rejection(*status, message),
+            ApiError::TwoFactorRequired(message) => {
+                Self::new(IpcErrorCode::TwoFactorRequired, message)
+            }
+            ApiError::TwoFactorInvalid(message) => {
+                Self::new(IpcErrorCode::TwoFactorInvalid, message)
+            }
             ApiError::Unknown(message) => Self::unknown(message),
         }
     }
@@ -344,6 +350,14 @@ mod tests {
                 IpcErrorCode::UpgradeRequired,
             ),
             (ApiError::Unknown("x".into()), IpcErrorCode::Unknown),
+            (
+                ApiError::TwoFactorRequired("x".into()),
+                IpcErrorCode::TwoFactorRequired,
+            ),
+            (
+                ApiError::TwoFactorInvalid("x".into()),
+                IpcErrorCode::TwoFactorInvalid,
+            ),
         ];
         for (api, code) in cases {
             assert_eq!(IpcError::from_api(&api).code, code, "{api:?}");

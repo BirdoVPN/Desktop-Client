@@ -9,6 +9,8 @@ import { anonAccountNumber } from '@/utils/helpers';
 
 interface HomeTopBarProps {
   userEmail: string | null;
+  /** `resolveAnonymousAccount` (item 86): the server's answer, or the email's shape. */
+  anonymous: boolean;
   multiHopArmed: boolean;
   /** `null` = plan not known yet: no lock badge, no upsell (W2-011). */
   multiHopUnlocked: boolean | null;
@@ -20,6 +22,7 @@ interface HomeTopBarProps {
 
 export function HomeTopBar({
   userEmail,
+  anonymous,
   multiHopArmed,
   multiHopUnlocked,
   multiHopLocked,
@@ -29,7 +32,7 @@ export function HomeTopBar({
   // Never the synthetic `anon_<account number>@anonymous.local`: it is the
   // account's only credential, on the screen people screenshot most
   // (P1-parity-007). iOS shows the same words.
-  const identity = anonAccountNumber(userEmail) ? 'Anonymous account' : userEmail;
+  const identity = anonymous || anonAccountNumber(userEmail) ? 'Anonymous account' : userEmail;
   return (
     <div
       className="relative z-20 flex items-center gap-2 px-4 pt-3 pb-2"

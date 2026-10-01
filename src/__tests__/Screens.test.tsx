@@ -150,6 +150,63 @@ describe('Profile', () => {
     expect(screen.getByText('Delete Account')).toBeInTheDocument();
   });
 
+  // Account API contract 2026-10-01, item 86.
+  it("shows the server's account number, masked until asked, and copies all of it", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    useAppStore.setState({
+      account: {
+        ...useAppStore.getState().account,
+        email: null,
+        isAnonymous: true,
+        accountNumber: '123456789012345678901234',
+        plan: 'RECON',
+      },
+    });
+    render(<Profile />);
+    // The identity card and the Sign out row both say so.
+    expect(screen.getAllByText('Anonymous account').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('account-number')).toHaveTextContent('•••• •••• •••• •••• •••• 1234');
+    expect(document.body.textContent).not.toContain('1234 5678');
+    await userEvent.click(screen.getByRole('button', { name: 'Show account number' }));
+    expect(screen.getByTestId('account-number')).toHaveTextContent('1234 5678 9012 3456 7890 1234');
+    await userEvent.click(screen.getByRole('button', { name: 'Copy account number' }));
+    expect(writeText).toHaveBeenCalledWith('123456789012345678901234');
+  });
+
+  it('a server that sends no number: still "Anonymous account", no number, and says why', () => {
+    useAppStore.setState({
+      account: {
+        ...useAppStore.getState().account,
+        email: 'member@anonymous.local',
+        isAnonymous: true,
+        accountNumber: null,
+        plan: 'RECON',
+      },
+    });
+    render(<Profile />);
+    expect(screen.getAllByText('Anonymous account').length).toBeGreaterThan(0);
+    expect(screen.queryByTestId('account-number')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy account number' })).not.toBeInTheDocument();
+    expect(screen.getByText(/shown once, when this account was created/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('member@');
+  });
+
+  it('an old server: the account number comes from the synthetic email, still masked', () => {
+    useAppStore.setState({
+      account: {
+        ...useAppStore.getState().account,
+        email: 'anon_123456789012345678901234@anonymous.local',
+        plan: 'RECON',
+      },
+    });
+    render(<Profile />);
+    // The identity card and the Sign out row both say so.
+    expect(screen.getAllByText('Anonymous account').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('account-number')).toHaveTextContent('•••• •••• •••• •••• •••• 1234');
+    expect(document.body.textContent).not.toContain('anon_');
+  });
+
   it('not connected: "Not connected · Click Connect to start"', () => {
     useAppStore.setState({ account: { ...useAppStore.getState().account, plan: 'RECON' } });
     render(<Profile />);

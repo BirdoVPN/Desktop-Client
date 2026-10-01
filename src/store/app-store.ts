@@ -66,6 +66,14 @@ export interface AccountInfo {
    * the confirmation prompt rather than silently dropping it.
    */
   hasPassword: boolean;
+  /**
+   * `isAnonymous` / `accountType` from `/auth/me` (Account API contract item
+   * 86). `null` = the server did not say (a backend that predates the field);
+   * `resolveAnonymousAccount` then reads the email's shape.
+   */
+  isAnonymous: boolean | null;
+  /** Item 86: the anonymous account number. A credential: never logged. */
+  accountNumber: string | null;
 }
 
 export type Protocol = 'wireguard';
@@ -376,6 +384,8 @@ const defaultAccount: AccountInfo = {
   bandwidthLimit: 0,
   status: 'unknown',
   hasPassword: true,
+  isAnonymous: null,
+  accountNumber: null,
 };
 
 export const defaultSettings: AppSettings = {

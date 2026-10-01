@@ -76,9 +76,50 @@ export function anonAccountNumber(email: string | null | undefined): string | nu
   return m ? m[1] : null;
 }
 
+/** What `get_auth_state` says about anonymity (Rust `AuthState`, item 86). */
+export interface AuthStateAnonymity {
+  is_anonymous?: boolean | null;
+  account_number?: string | null;
+}
+
+/**
+ * The store patch for item 86's fields, with only what the server SAID: an
+ * absent field leaves the store alone, so a cycle whose profile fetch failed
+ * does not erase a good answer.
+ */
+export function anonymityPatch(st: AuthStateAnonymity): { isAnonymous?: boolean; accountNumber?: string } {
+  const patch: { isAnonymous?: boolean; accountNumber?: string } = {};
+  if (typeof st.is_anonymous === 'boolean') patch.isAnonymous = st.is_anonymous;
+  if (typeof st.account_number === 'string' && /^\d{24}$/.test(st.account_number)) {
+    patch.accountNumber = st.account_number;
+  }
+  return patch;
+}
+
+/**
+ * Whether the signed-in account is anonymous, and its number (Account API
+ * contract item 86). The server's `isAnonymous` / `accountNumber` are used
+ * when it sends them; a backend that predates them is read from the synthetic
+ * email, as before. The synthetic email always means anonymous — it exists
+ * only on anonymous accounts — so it is never rendered whatever else is said.
+ */
+export function resolveAnonymousAccount(
+  account: { isAnonymous: boolean | null; accountNumber: string | null },
+  email: string | null,
+): { isAnon: boolean; accountNumber: string | null } {
+  const fromEmail = anonAccountNumber(email);
+  const isAnon = fromEmail !== null || account.isAnonymous === true;
+  return { isAnon, accountNumber: isAnon ? account.accountNumber ?? fromEmail : null };
+}
+
 /** "123456789012…" → "1234 5678 9012 …": six groups of four, space-separated (canonical). */
 export function formatAccountNumber(digits: string): string {
   return digits.replace(/\D/g, '').replace(/(\d{4})(?=\d)/g, '$1 ');
+}
+
+/** The masked form shown by default: every group hidden but the last. */
+export function maskAccountNumber(digits: string): string {
+  return formatAccountNumber(digits).replace(/\d(?=.*\s)/g, '•');
 }
 
 /**
