@@ -94,7 +94,7 @@ fn pinned_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Stri
         // W1-004 backstop. On Windows `install()` runs this hook and then
         // `std::process::exit(0)`, so no exit teardown can follow it.
         // `install_update` ends the session BEFORE installing; this only
-        // un-parks DNS a teardown that timed out may have left behind. Setting
+        // retries DNS an older build left parked, if a teardown timed out. Setting
         // the hook replaces the plugin's own, so its cleanup is kept here.
         .on_before_exit(move || {
             #[cfg(target_os = "windows")]
@@ -150,8 +150,8 @@ pub async fn check_for_updates(app: AppHandle) -> Result<Option<UpdateInfo>, Str
 /// W1-004: download, END THE SESSION, then install. On Windows the plugin's
 /// install launches the installer and calls `std::process::exit(0)`: no
 /// `RunEvent::ExitRequested`, so no exit teardown ever ran. Every in-app update
-/// while connected left the adapters parked on `static none` for the whole
-/// install, the server peer held, and xray running with its file locked
+/// while connected left the machine state of the session behind for the
+/// whole install, the server peer held, and xray running with its file locked
 /// against the installer. The download is verified before anything is torn
 /// down, so a failed download leaves the session alone.
 ///

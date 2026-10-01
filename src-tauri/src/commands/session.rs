@@ -347,7 +347,7 @@ async fn attempt(
     }
     // The relay permit moves to the new server together with the guard, so a
     // switch that fails before this point leaves the old session's permit.
-    apply_relay_permit(&prepared.relay_endpoint).await;
+    apply_relay_permit(&prepared.relay_endpoint, prepared.started_stealth).await;
 
     let label = SessionLabel {
         server_name: match &multi_hop {
@@ -684,8 +684,10 @@ pub(crate) async fn prepare_tunnel(
 }
 
 /// Point the kill switch's relay permit at `endpoint`, re-baking an engaged
-/// block so the new handshake is not dropped by it.
-pub(crate) async fn apply_relay_permit(endpoint: &str) {
+/// block so the new handshake is not dropped by it. `stealth`: the relay is
+/// reached by the xray helper over TCP rather than by our own WireGuard socket
+/// over UDP, which is what the Windows permit is scoped to (W1-013).
+pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool) {
     let Some(ip) = parse_endpoint_ip(endpoint) else {
         // P6-CLI-D-03: the endpoint names the relay, so both lines are
         // redacted (`redact_*` is a pass-through in debug builds).
@@ -701,11 +703,26 @@ pub(crate) async fn apply_relay_permit(endpoint: &str) {
         return;
     };
     killswitch::set_vpn_server_ip(Some(ip)).await;
-    // update_vpn_server sets the IP AND re-activates an engaged block atomically.
+    // update_relay sets the permit AND re-activates an engaged block atomically.
     #[cfg(target_os = "windows")]
-    if let Err(e) = crate::vpn::wfp::update_vpn_server(ip).await {
-        tracing::warn!("Failed to update WFP VPN server: {}", e);
+    {
+        use crate::vpn::wfp_policy::{parse_relay, RelayTransport};
+        let transport = if stealth {
+            RelayTransport::StealthTcp
+        } else {
+            RelayTransport::WireGuardUdp
+        };
+        match parse_relay(endpoint, transport) {
+            Some(relay) => {
+                if let Err(e) = crate::vpn::wfp::update_relay(relay).await {
+                    tracing::warn!("Failed to update the WFP relay permit: {}", e);
+                }
+            }
+            None => tracing::warn!("Kill switch relay endpoint has no usable port"),
+        }
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = stealth;
     // Linux twin: the relay is permitted by ADDRESS and the self-permit is
     // scoped to tcp/443, so a connect onto a different server needs the live
     // block re-armed or its handshake is dropped.

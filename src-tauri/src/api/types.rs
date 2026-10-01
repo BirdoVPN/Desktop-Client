@@ -1,10 +1,9 @@
 //! API request and response types
 //!
 //! These types are defined for serialization/deserialization with the API.
-//! Fields on Deserialize structs are populated by serde, not by Rust code,
-//! and are surfaced to the frontend via Tauri commands or read by future
-//! features. Suppress dead-code warnings module-wide.
-#![allow(dead_code)]
+//! W1-035: no module-wide `allow(dead_code)` any more — a field nobody reads
+//! is deleted (serde ignores the key), and the few that must stay for the
+//! wire's sake say why where they are.
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -63,8 +62,6 @@ pub struct DeleteAccountBody<'a> {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteAccountResponse {
-    #[serde(default)]
-    pub message: Option<String>,
     /// App Store / Google Play subscriptions the deletion could NOT cancel
     /// (Birdo cannot cancel a store subscription; only Polar web subscriptions
     /// are cancelled server-side). The backend is adding this field as part of
@@ -156,8 +153,6 @@ pub fn store_subscription_labels(value: &serde_json::Value) -> Vec<String> {
 pub struct UpgradeRequiredDetails {
     #[serde(default, alias = "min_version")]
     pub min_version: Option<String>,
-    #[serde(default, alias = "current_version")]
-    pub current_version: Option<String>,
     #[serde(default, alias = "update_url")]
     pub update_url: Option<String>,
 }
@@ -407,13 +402,21 @@ pub enum LoginResult {
     /// 2FA required — must be tried FIRST because untagged tries in order,
     /// and TwoFactorChallenge has a distinctive `requires_two_factor` field.
     TwoFactorChallenge {
+        // Never read: its PRESENCE is what makes serde(untagged) pick this
+        // variant over `Success`.
+        #[allow(dead_code)]
         #[serde(rename = "requiresTwoFactor")]
         requires_two_factor: bool,
         #[serde(rename = "challengeToken")]
         challenge_token: String,
     },
     /// Successful login with tokens
-    Success { ok: bool, tokens: TokenPair },
+    Success {
+        // Never read: required so a body without it cannot match.
+        #[allow(dead_code)]
+        ok: bool,
+        tokens: TokenPair,
+    },
 }
 
 /// FIX C-2: Request body for 2FA TOTP verification
@@ -438,8 +441,6 @@ impl Drop for TwoFactorVerifyRequest {
 pub struct TwoFactorVerifyResponse {
     pub ok: bool,
     pub tokens: Option<TokenPair>,
-    #[serde(default, rename = "backupCodeUsed")]
-    pub backup_code_used: bool,
 }
 
 /// Native SSO exchange request. Presents the single-use handoff code the web
@@ -548,6 +549,7 @@ pub struct RefreshResponse {
     #[serde(default)]
     pub refresh_token: Option<String>,
     #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub expires_in: Option<u64>,
 }
 
@@ -880,8 +882,6 @@ pub struct ConnectResponse {
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
-    pub config: Option<String>,
-    #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
     // locally on every path (FIX-1-1); a server-generated one would mean the
@@ -938,10 +938,16 @@ pub struct ConnectResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerNodeInfo {
+    // Only `name` is read. The rest are REQUIRED by the wire contract — a
+    // node block without them is refused rather than half-read — so they stay.
+    #[allow(dead_code)]
     pub id: String,
     pub name: String,
+    #[allow(dead_code)]
     pub region: String,
+    #[allow(dead_code)]
     pub country: String,
+    #[allow(dead_code)]
     pub hostname: String,
 }
 
@@ -1010,8 +1016,6 @@ pub struct MultiHopConnectResponse {
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
-    pub config: Option<String>,
-    #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
     // locally on every path (FIX-1-1); a server-generated one would mean the
@@ -1071,7 +1075,6 @@ impl From<MultiHopConnectResponse> for ConnectResponse {
         ConnectResponse {
             success: response.success,
             message: response.message,
-            config: response.config,
             key_id: response.key_id,
             public_key: response.public_key,
             preshared_key: response.preshared_key,

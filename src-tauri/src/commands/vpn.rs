@@ -656,17 +656,16 @@ pub struct VpnStatus {
     pub quantum_active: bool,
     pub pq_mode: crate::vpn::birdo_pq::PqMode,
 
-    /// Network interfaces whose DNS this session could not verifiably suppress
-    /// or could not verifiably put back, one human-readable line each.
+    /// What is wrong with DNS right now, one short human sentence each.
     ///
     /// Populated on ALL THREE platforms, and empty whenever there is nothing
-    /// wrong. It is populated from a read-back that did not match, so it
-    /// describes work that was LOOKED AT — which is the entire point. An adapter
-    /// that keeps its ISP resolvers while the tunnel is up leaks DNS with the UI
-    /// reading Connected, and one that could not be restored leaves the machine
-    /// without resolvers after disconnect. Neither is visible anywhere else, and
-    /// rendering a Connected badge over either is rendering reassurance from
-    /// missing data.
+    /// wrong. Windows (W1-007): the tunnel interface's resolvers could not be
+    /// set (protected, but names will not resolve), or an adapter an OLDER
+    /// build parked could not be verifiably put back. Leaking DNS is not on
+    /// the list because it cannot happen while connected: the DNS guard is
+    /// part of every connect, and a connect whose guard cannot be installed
+    /// fails. Neither entry is visible anywhere else, and rendering a
+    /// Connected badge over either is rendering reassurance from missing data.
     ///
     /// This was hard-coded `Vec::new()` off Windows while the macOS and Linux
     /// restore passes were computing exactly this value and sending it only to
@@ -1239,7 +1238,6 @@ mod tests {
         ConnectResponse {
             success: true,
             message: None,
-            config: None,
             key_id: Some("k1".into()),
             public_key: None,
             preshared_key: None,

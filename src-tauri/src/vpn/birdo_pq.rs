@@ -1096,7 +1096,6 @@ mod tests {
         let resp = ConnectResponse {
             success: true,
             message: None,
-            config: None,
             key_id: None,
             public_key: None,
             preshared_key: None,

@@ -529,15 +529,6 @@ impl UtunTunnel {
         }
     }
 
-    /// Measure latency to the VPN endpoint.
-    pub async fn measure_latency(&self) -> Option<u32> {
-        if let Some(session) = self.wg_session.read().await.as_ref() {
-            session.measure_latency().await
-        } else {
-            None
-        }
-    }
-
     /// Get the client IP address.
     pub fn get_client_ip(&self) -> &str {
         &self.config.client_ip

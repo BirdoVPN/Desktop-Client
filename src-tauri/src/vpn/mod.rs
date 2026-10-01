@@ -25,10 +25,14 @@ pub mod tunnel_macos;
 #[cfg(target_os = "windows")]
 mod tunnel_dns; // netsh DNS reads + their captured-output parsers (Windows only)
 
-// Process-global owner of the Windows machine state a session moves aside: the
-// parked physical-adapter DNS and the installed routes. Lives outside the tunnel
-// because it outlives individual tunnels — see the module docs for the
-// invariants (issues #98, #99, #100, #102, #105).
+// The event-driven Wintun <-> WireGuard packet path (W1-006)
+#[cfg(target_os = "windows")]
+mod data_plane;
+
+// Process-global owner of the Windows machine state a session changes: the DNS
+// guard, the installed routes, and the heal of DNS older builds parked. Lives
+// outside the tunnel because it outlives individual tunnels — see the module
+// docs for the invariants (issues #98, #100, #102, #105; W1-007, W1-041).
 #[cfg(target_os = "windows")]
 pub mod win_machine_state;
 // Removed: pub mod wireguard; - deprecated file with placeholder crypto
@@ -37,6 +41,9 @@ mod wireguard_new;
 // Windows Filtering Platform for kill switch
 #[cfg(target_os = "windows")]
 pub mod wfp;
+// What the WFP session must contain, as testable data (W1-007/013/014)
+#[cfg(target_os = "windows")]
+pub(crate) mod wfp_policy;
 
 // One-time heal of the netsh firewall rules builds <= 1.3.19 left (W1-036)
 #[cfg(target_os = "windows")]
@@ -263,12 +270,27 @@ pub mod dns_journal {
         #[serde(default)]
         os: String,
 
-        /// Windows: every physical adapter `configure_dns` parked, with the
-        /// resolvers it had. Restored through the same helper the clean
-        /// disconnect uses, so the two cannot drift.
+        /// Windows: every physical adapter an OLDER build's `configure_dns`
+        /// parked, with the resolvers it had. Nothing new is parked (W1-007);
+        /// this is kept so those machines are healed.
         #[cfg(target_os = "windows")]
         #[serde(default)]
         adapters: Vec<super::tunnel::AdapterDnsSnapshot>,
+
+        /// Windows: the routes this session installed that outlive the tunnel
+        /// adapter (the endpoint host route, the LAN-sharing routes), so a
+        /// crash no longer leaves them behind (W1-041).
+        #[cfg(target_os = "windows")]
+        #[serde(default)]
+        routes: Vec<super::win_machine_state::OwnedRoute>,
+
+        /// Windows: when the boot that wrote `routes` began (ms since the
+        /// epoch). Routes do not survive a reboot, and after one an interface
+        /// index may name another adapter, so they are only removed in the same
+        /// boot.
+        #[cfg(target_os = "windows")]
+        #[serde(default)]
+        boot: Option<u64>,
 
         /// macOS: every enabled service `configure_dns` repointed, with the
         /// resolvers it had (empty = networksetup's "empty", i.e. back to DHCP).
@@ -765,19 +787,19 @@ pub mod dns_journal {
         }
     }
 
-    /// Record the adapters the machine-state owner is about to park.
-    ///
-    /// Returns whether the record actually reached the disk. The Windows owner
-    /// writes the record for an adapter BEFORE parking it and refuses to park it
-    /// if this fails: a mutation whose record is not durable is a mutation
-    /// nothing can undo (I4).
+    /// Record what the Windows machine-state owner holds: adapters an older
+    /// build parked and could not yet be restored, and the routes that would
+    /// outlive a crash. Returns whether the record actually reached the disk.
     #[cfg(target_os = "windows")]
     pub(super) fn record_windows(
         adapters: &[super::tunnel::AdapterDnsSnapshot],
+        routes: &[super::win_machine_state::OwnedRoute],
     ) -> Result<(), String> {
         write(&DnsJournal {
             os: std::env::consts::OS.to_string(),
             adapters: adapters.to_vec(),
+            routes: routes.to_vec(),
+            boot: super::win_machine_state::boot_epoch_ms(),
         })
     }
 
@@ -842,7 +864,11 @@ pub mod dns_journal {
         // nothing is left to describe.
         #[cfg(target_os = "windows")]
         {
-            super::win_machine_state::reconcile_record(&journal.adapters)
+            super::win_machine_state::reconcile_record(
+                &journal.adapters,
+                &journal.routes,
+                journal.boot,
+            )
         }
 
         #[cfg(not(target_os = "windows"))]

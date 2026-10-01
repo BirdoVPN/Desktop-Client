@@ -861,7 +861,6 @@ mod types_serialization_tests {
         let json = r#"{"success":true}"#;
         let resp: ConnectResponse = serde_json::from_str(json).unwrap();
         assert!(resp.success);
-        assert!(resp.config.is_none());
         assert!(resp.key_id.is_none());
         assert!(resp.dns.is_none());
         assert!(resp.server_node.is_none());

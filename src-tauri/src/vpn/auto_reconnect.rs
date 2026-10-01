@@ -195,7 +195,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// epoch first, and a cancelled dial returns at its next await. But the
 /// tunnel build's machine-state passes are synchronous netsh (documented at
 /// 10-25 s on AV-heavy machines), and aborting the task in the middle of a
-/// build would drop it without the release that hands the DNS park back. So
+/// build would drop it without the release that lifts the DNS guard. So
 /// the grace outlasts a whole build (CONNECT_TIMEOUT) and abort stays a last
 /// resort for a loop that is truly wedged.
 const STOP_GRACE: Duration = Duration::from_secs(35);
@@ -466,8 +466,28 @@ impl ReconnectLoop {
         }
         // W1-003: the socket and the endpoint host route are pinned to the
         // interface the session was built over; if the default route moved,
-        // nothing of ours leaves the machine any more.
+        // nothing of ours leaves the machine any more. Windows follows the new
+        // route in place first (same session, same key); the forced handshake
+        // must then complete inside PATH_VERIFY_WINDOW, or the verify rule
+        // below declares the path dead and the fast re-dial takes over.
         if reconnect_policy::needs_rebind(session.pinned_route.as_ref(), route.as_ref()) {
+            #[cfg(target_os = "windows")]
+            if let (Some(from), Some(to)) = (session.pinned_route, route) {
+                match vm.roam(from, to).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Default route moved — the tunnel followed it; re-proving the path"
+                        );
+                        session.pinned_route = Some(to);
+                        session.verify_since = Some(now);
+                    }
+                    Err(e) => {
+                        tracing::warn!("In-place roam not possible ({}) — re-dialling", e);
+                        return Liveness::Dead(DropCause::PathChanged);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
             return Liveness::Dead(DropCause::PathChanged);
         }
         if session.pinned_route.is_none() {
@@ -479,6 +499,10 @@ impl ReconnectLoop {
         if resumes != session.resumes_seen {
             session.resumes_seen = resumes;
             session.verify_since = Some(now);
+            // What went unanswered before the sleep says nothing about the
+            // path the machine woke on.
+            #[cfg(target_os = "windows")]
+            vm.restart_response_watch().await;
             vm.force_handshake().await;
         }
         // Wi-Fi re-associates for several seconds after a resume. The window
@@ -486,6 +510,18 @@ impl ReconnectLoop {
         // re-association does not read as a broken tunnel.
         if route.is_none() && session.verify_since.is_some() {
             session.verify_since = Some(now);
+        }
+
+        // The fast dead-path rule: with the relay unreachable the tunnel
+        // stops carrying traffic at once, and waiting for the 180 s
+        // handshake-age backstop left the app saying Protected for minutes.
+        #[cfg(target_os = "windows")]
+        if vm.peer_unresponsive().await {
+            tracing::warn!(
+                "The relay stopped answering handshakes while traffic is waiting — declaring \
+                 the tunnel dead"
+            );
+            return Liveness::Dead(DropCause::HandshakeStale);
         }
 
         let Some(age) = vm.handshake_age().await else {
@@ -703,7 +739,11 @@ impl ReconnectLoop {
             &mut private_key,
         )
         .await?;
-        crate::commands::session::apply_relay_permit(&prepared.relay_endpoint).await;
+        crate::commands::session::apply_relay_permit(
+            &prepared.relay_endpoint,
+            prepared.started_stealth,
+        )
+        .await;
 
         vm.set_phase(ConnectPhase::Handshaking);
         vm.connect(

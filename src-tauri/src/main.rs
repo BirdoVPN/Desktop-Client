@@ -649,26 +649,14 @@ fn main() {
                 // here — its install calls std::process::exit(0) — which is why
                 // install_update ends the session before installing.)
                 if *code == Some(tauri::RESTART_EXIT_CODE) {
-                    // The full teardown cannot run here, but ONE piece of it
-                    // outlives the process on Windows and must: configure_dns()
-                    // parks every physical adapter on `static none`. Without
-                    // this, a relaunch while connected leaves the machine with
-                    // no resolvers — and the relaunched instance then cannot
-                    // resolve the API it needs to reconnect.
-                    //
-                    // It is NOT try_read-based (an earlier comment here claimed
-                    // it was, and that stopped being true when the record moved
-                    // out of the tunnel): it takes the machine-state
-                    // `std::sync::Mutex` and issues netsh. The bound on holding
-                    // this thread is therefore "one un-park pass", the same work
-                    // a normal disconnect does, and it must not be made
-                    // conditional — an un-park skipped here is permanent, since
-                    // the process that knew about it is being replaced.
-                    //
-                    // It is also what shuts the refresh ticker down on this
-                    // path: `release_dns_at_exit` un-parks, and the un-park
-                    // closes the data plane in the same critical section (I13),
-                    // so no pass can re-park behind it while the relaunch runs.
+                    // The full teardown cannot run here. Nothing this build
+                    // does to DNS outlives the process (the DNS guard is a
+                    // dynamic WFP filter, and routes are journaled), but an
+                    // adapter an OLDER build parked and this process adopted
+                    // gets its restore attempt now: the relaunched instance
+                    // would otherwise start without its resolvers. Takes the
+                    // machine-state `std::sync::Mutex`, so the bound on this
+                    // thread is one restore pass.
                     #[cfg(target_os = "windows")]
                     {
                         let restored = app_handle.state::<VpnManager>().restore_dns_blocking();
@@ -699,8 +687,7 @@ fn main() {
                             .is_err()
                         {
                             error!("Exit teardown timed out — exiting anyway");
-                            // The one piece that outlives the process on
-                            // Windows: never leave the adapters parked.
+                            // Retry any DNS an older build left parked.
                             #[cfg(target_os = "windows")]
                             {
                                 let _ = app.state::<VpnManager>().restore_dns_blocking();
@@ -785,16 +772,10 @@ fn cleanup_on_crash() {
         // rule names ran here on every panic; it runs once per install now,
         // see `vpn::legacy_firewall`.)
 
-        // DNS is the half WFP does NOT clean up, and this arm restored none of
-        // it. configure_dns parks EVERY connected physical adapter on `static
-        // none` to suppress the SMHNR leak, and the Wintun adapter — the only
-        // thing still holding resolvers — dies with the process, so a panic left
-        // the machine with no resolvers at all. Permanently: the next connect
-        // snapshots the parked state as the user's own configuration, and every
-        // later disconnect then correctly refuses to touch it. The restart path
-        // already got this treatment (manager.rs restore_dns_blocking); this is
-        // its crash twin, driven off the on-disk journal because the in-memory
-        // snapshot is unreachable from here.
+        // What WFP does NOT clean up: the routes this session installed via
+        // the physical gateway (W1-041), and any adapter an OLDER build parked
+        // on `static none`. Both are in the on-disk journal, which is what this
+        // is driven off — the in-memory state is unreachable from here.
         let dns_restored = vpn::dns_journal::reconcile();
         error!(
             "Emergency cleanup completed (WFP dynamic session auto-cleans filters, DNS restored: {})",

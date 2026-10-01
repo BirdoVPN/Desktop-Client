@@ -230,6 +230,9 @@ mod windows_events {
                     tracing::debug!("Default route changed");
                 }
                 events().send_modify(|n| *n = n.wrapping_add(1));
+                // An interface that just got its gateway is an uplink now, not
+                // a host-only network the inbound block may exempt.
+                crate::vpn::wfp::refresh_after_network_change();
             }
         });
 

@@ -208,6 +208,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_JobObjects",   # xray in a kill-on-close job (W1-005)
     "Win32_System_Power",        # resume notifications (W1-003)
+    "Win32_System_SystemInformation", # boot marker for the route journal (W1-041)
     "Win32_System_Threading",
     "Win32_System_Registry",
     "Win32_System_Rpc",

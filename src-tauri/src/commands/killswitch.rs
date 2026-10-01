@@ -104,13 +104,10 @@ async fn activate_platform_block() -> Result<bool, String> {
 
     tracing::warn!("Activating kill switch - blocking all non-VPN traffic");
 
+    // Windows: the relay permit (address, port and transport — W1-013) was
+    // handed to wfp by `session::apply_relay_permit`.
     #[cfg(target_os = "windows")]
     {
-        let server_ip = *VPN_SERVER_IP.read().await;
-        // Set the VPN server IP before activating
-        if let Some(ip) = server_ip {
-            wfp::set_vpn_server(ip).await;
-        }
         if let Err(e) = wfp::activate_blocking().await {
             tracing::error!("Failed to activate blocking filters: {}", e);
             return Err(format!("Failed to activate blocking: {}", e));

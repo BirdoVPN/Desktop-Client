@@ -117,7 +117,7 @@ mod kill_switch_tests {
     fn wfp_filter_weights_are_correctly_ordered() {
         // P1-dk-tautological-buffer-tests (twin): assert on the REAL wfp.rs
         // constants, not locally declared literals.
-        use crate::vpn::wfp::{WEIGHT_BLOCK_ALL, WEIGHT_BLOCK_STUN, WEIGHT_PERMIT};
+        use crate::vpn::wfp_policy::{WEIGHT_BLOCK_ALL, WEIGHT_BLOCK_STUN, WEIGHT_PERMIT};
 
         // Permits must override block-all
         assert!(
@@ -533,13 +533,6 @@ mod vpn_manager_tests {
         let first = mgr.begin_attempt();
         mgr.cancel_in_flight();
         assert!(!mgr.is_current(first));
-    }
-
-    #[tokio::test]
-    async fn measure_latency_returns_none_without_tunnel() {
-        let mgr = VpnManager::new();
-        let latency = mgr.measure_latency().await;
-        assert!(latency.is_none());
     }
 
     #[tokio::test]

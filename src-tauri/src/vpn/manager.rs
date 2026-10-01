@@ -355,8 +355,8 @@ impl std::fmt::Display for VpnError {
 impl std::error::Error for VpnError {}
 
 impl VpnManager {
-    /// Restore physical-adapter DNS synchronously, for exit paths that cannot
-    /// await.
+    /// Release the machine state's DNS side synchronously, for exit paths that
+    /// cannot await.
     ///
     /// WHY THIS EXISTS. Two exits cannot run the async teardown:
     ///   * `RunEvent::ExitRequested` with `RESTART_EXIT_CODE` (a
@@ -367,18 +367,15 @@ impl VpnManager {
     ///     before the plugin calls `std::process::exit(0)` (W1-004).
     ///
     /// `install_update` now performs the full `end_session` teardown BEFORE it
-    /// installs, so on the normal update path this finds nothing parked; it is
-    /// the backstop for a teardown that timed out. Windows is where
-    /// `configure_dns` parks EVERY physical adapter on `static none`, so an
-    /// un-park skipped here leaves the machine without resolvers until the
-    /// next launch reconciles the journal.
+    /// installs, so on the normal update path this finds nothing held; it is
+    /// the backstop for a teardown that timed out. Nothing the current build
+    /// does to DNS outlives the process (the DNS guard is a dynamic WFP
+    /// filter), but an adapter an OLDER build parked and this process adopted
+    /// gets one more restore attempt here.
     ///
     /// Goes straight to the machine-state owner rather than through
-    /// `self.tunnel`. Reading it through the tunnel is what made this fragile:
-    /// a reconnect empties that Option for the whole create + handshake window,
-    /// so an exit landing in that window found `None` and restored nothing. The
-    /// park record no longer lives in the tunnel, so there is nothing to look
-    /// through.
+    /// `self.tunnel`: a reconnect empties that Option for the whole create +
+    /// handshake window, so an exit landing in that window would find `None`.
     ///
     /// Synchronous and lock-free of any async lock, so it can never wedge an
     /// exit that must not be held open.
@@ -706,14 +703,14 @@ impl VpnManager {
             self.set_tunnel_present(false);
         }
 
-        // The machine state (parked DNS + installed routes) is deliberately NOT
-        // released between the outgoing tunnel and the incoming one. Moving it to
-        // a generation the manager holds means the old tunnel's stop()/Drop
-        // cannot un-park or delete anything on its way out, and the new tunnel
-        // ADOPTS it — so the physical NICs never carry ISP resolvers during the
-        // multi-second create + handshake window. Every failure arm below hands
-        // this generation back with `release_after_failed_connect`, so a connect
-        // that never produces a tunnel cannot strand the park.
+        // The machine state (the DNS guard + installed routes) is deliberately
+        // NOT released between the outgoing tunnel and the incoming one. Moving
+        // it to a generation the manager holds means the old tunnel's
+        // stop()/Drop cannot lift or delete anything on its way out, and the
+        // new tunnel ADOPTS it — so DNS cannot leave on the physical NICs during
+        // the multi-second create + handshake window. Every failure arm below
+        // hands this generation back with `release_machine_state_after_failed_connect`,
+        // so a connect that never produces a tunnel cannot strand it.
         #[cfg(target_os = "windows")]
         let transition_gen = crate::vpn::win_machine_state::begin_transition();
 
@@ -746,8 +743,8 @@ impl VpnManager {
 
             // The tunnel is already out of the Option, so the data plane is
             // disposed here and nothing can reach it again. Its stop() will find
-            // that it no longer owns the machine state and will leave the park
-            // and the routes exactly where they are.
+            // that it no longer owns the machine state and will leave the DNS
+            // guard and the routes exactly where they are.
             if let Some(tunnel) = displaced {
                 match timeout(Duration::from_secs(10), tunnel.stop()).await {
                     Ok(Ok(())) => {}
@@ -930,9 +927,8 @@ impl VpnManager {
                     "Tunnel creation/start failed: {}",
                     crate::utils::redact::sanitize_error(&e)
                 );
-                // Un-park BEFORE lifting the IPv6 block, never the reverse: the
-                // reverse leaves an interval with the physical resolvers back and
-                // egress already clear.
+                // Release the machine state BEFORE lifting the IPv6 block, never
+                // the reverse.
                 #[cfg(target_os = "windows")]
                 self.release_machine_state_after_failed_connect(transition_gen)
                     .await;
@@ -942,7 +938,7 @@ impl VpnManager {
             // Timed out, or cancelled: both dropped start() mid-await along with
             // the half-built tunnel; if it had already claimed, its Drop released
             // and this is a no-op. If it never got that far, the generation held
-            // across the teardown still owns the park.
+            // across the teardown still owns the machine state.
             outcome => {
                 let cancelled = outcome.is_none();
                 if cancelled {
@@ -971,22 +967,23 @@ impl VpnManager {
         }
     }
 
-    /// A connect that never produced a live tunnel must not leave the machine's
-    /// resolvers parked or our routes installed either.
+    /// A connect that never produced a live tunnel must not leave the DNS guard
+    /// or our routes installed either.
     ///
     /// A no-op unless `gen` is still the owner — if the new tunnel got as far as
     /// claiming and was then dropped, its own `Drop` already released, and
     /// re-releasing from here would be a second owner acting on state it does not
-    /// hold. `block_in_place` because the un-park is a synchronous netsh pass
-    /// (W1-017): it must not pin a runtime worker, and it must not become
-    /// cancellable either — an un-park abandoned halfway is a stranded park.
+    /// hold. `block_in_place` because the release is synchronous (W1-017): it
+    /// must not pin a runtime worker, and it must not become cancellable either.
     #[cfg(target_os = "windows")]
     async fn release_machine_state_after_failed_connect(
         &self,
         gen: crate::vpn::win_machine_state::Gen,
     ) {
         if tokio::task::block_in_place(|| crate::vpn::win_machine_state::release_all(gen)) {
-            tracing::info!("Un-parked the physical adapters after a failed connect");
+            tracing::info!(
+                "Restored adapter DNS left by an earlier version after a failed connect"
+            );
         }
     }
 
@@ -1139,10 +1136,10 @@ impl VpnManager {
     /// exist.
     ///
     /// It is NOT the I3 machine-state predicate, and must not be used as one.
-    /// I3 asks whether the parked DNS and the installed routes are in force, and
+    /// I3 asks whether the DNS guard and the installed routes are in force, and
     /// this `Option` is emptied by `connect()` itself — deliberately, into
     /// `displaced` — for the whole create + handshake window, during which the
-    /// park is very much still in force under a generation the manager holds.
+    /// machine state is very much still in force under a generation the manager holds.
     /// The predicate for that is `win_machine_state::is_owner`, which reads the
     /// ownership token rather than a container, and every DNS, route and
     /// firewall mutation in this codebase is already gated on it.
@@ -1164,6 +1161,46 @@ impl VpnManager {
     pub async fn handshake_age(&self) -> Option<Duration> {
         let guard = timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await.ok()?;
         guard.as_ref()?.handshake_age().await
+    }
+
+    /// W1-003: move the live tunnel onto a new default route in place (see
+    /// `WintunTunnel::roam`). `Err` means the caller should re-dial.
+    #[cfg(target_os = "windows")]
+    pub async fn roam(
+        &self,
+        from: crate::vpn::network_events::PhysicalRoute,
+        to: crate::vpn::network_events::PhysicalRoute,
+    ) -> Result<(), String> {
+        let guard = timeout(STATE_LOCK_TIMEOUT, self.tunnel.read())
+            .await
+            .map_err(|_| "tunnel lock timeout".to_string())?;
+        let tunnel = guard.as_ref().ok_or_else(|| "no tunnel".to_string())?;
+        tunnel
+            .roam((from.gateway, from.interface), (to.gateway, to.interface))
+            .await
+    }
+
+    /// The fast dead-path signal: the relay has stopped answering handshakes
+    /// while traffic is waiting (see `wireguard_new::peer_unresponsive`).
+    #[cfg(target_os = "windows")]
+    pub async fn peer_unresponsive(&self) -> bool {
+        match timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
+            Ok(guard) => match guard.as_ref() {
+                Some(tunnel) => tunnel.peer_unresponsive().await,
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// Forget unanswered handshakes sent before a resume.
+    #[cfg(target_os = "windows")]
+    pub async fn restart_response_watch(&self) {
+        if let Ok(guard) = timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
+            if let Some(tunnel) = guard.as_ref() {
+                tunnel.restart_response_watch().await;
+            }
+        }
     }
 
     /// Ask the live tunnel for a fresh handshake now (a no-op while one is
@@ -1214,29 +1251,6 @@ impl VpnManager {
                 }
             }
             Err(_) => tracing::error!("Tunnel read lock timeout in update_stats"),
-        }
-    }
-
-    /// Measure latency to the VPN server.
-    ///
-    /// DT-6: the `measure_vpn_latency` IPC command that called this was removed
-    /// (never invoked from the UI). Retained because it is still exercised by a
-    /// unit test and remains a useful manager-level accessor; allow dead_code in
-    /// non-test builds.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn measure_latency(&self) -> Option<u32> {
-        match timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
-            Ok(tunnel_guard) => {
-                if let Some(tunnel) = tunnel_guard.as_ref() {
-                    tunnel.measure_latency().await
-                } else {
-                    None
-                }
-            }
-            Err(_) => {
-                tracing::error!("Tunnel read lock timeout in measure_latency");
-                None
-            }
         }
     }
 }
