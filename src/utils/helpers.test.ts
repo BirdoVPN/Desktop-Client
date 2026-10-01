@@ -8,6 +8,7 @@ import {
   anonAccountNumber,
   anonymityPatch,
   formatAccountNumber,
+  identityPatch,
   isPrivateDnsAddress,
   isValidMtu,
   maskAccountNumber,
@@ -250,5 +251,42 @@ describe('anonymous account resolution (item 86)', () => {
     expect(anonymityPatch({ is_anonymous: null, account_number: null })).toEqual({});
     expect(anonymityPatch({ account_number: '1234' })).toEqual({});
     expect(anonymityPatch({ account_number: '1234 5678 9012 3456 7890 1234' })).toEqual({});
+  });
+});
+
+// WIN-FIX-3: the one identity patch App startup and Login both apply.
+describe('identityPatch', () => {
+  const signedIn = { is_authenticated: true, email: null, account_id: null, plan: null };
+
+  it('carries hasPassword — false for an account without one', () => {
+    expect(identityPatch({ ...signedIn, has_password: false }).hasPassword).toBe(false);
+    expect(identityPatch({ ...signedIn, has_password: true }).hasPassword).toBe(true);
+  });
+
+  it('keeps the password prompt when the backend does not say', () => {
+    expect(identityPatch(signedIn).hasPassword).toBe(true);
+  });
+
+  it('writes only what was received', () => {
+    expect(identityPatch(signedIn)).toEqual({ status: 'active', hasPassword: true });
+    expect(
+      identityPatch({
+        is_authenticated: true,
+        email: 'a@b.co',
+        account_id: 'acc-1',
+        plan: 'operative',
+        has_password: false,
+        is_anonymous: false,
+      }),
+    ).toEqual({
+      email: 'a@b.co',
+      accountId: 'acc-1',
+      plan: 'operative',
+      status: 'active',
+      hasPassword: false,
+      isAnonymous: false,
+    });
+    // Not signed in: no claim about the account's state or password.
+    expect(identityPatch({ ...signedIn, is_authenticated: false, has_password: false })).toEqual({});
   });
 });

@@ -125,6 +125,50 @@ describe('Creating an account (W2-027)', () => {
   });
 });
 
+// WIN-FIX-3: the identity Login hydrates after a sign-in carries hasPassword.
+// It used not to, so a new anonymous or SSO account kept the default `true`:
+// the delete dialog asked for a password the account does not have, with
+// Delete disabled, until the app was restarted.
+describe('After a sign-in', () => {
+  const anonymousAuthState = {
+    is_authenticated: true,
+    email: null,
+    account_id: 'acc-1',
+    plan: null,
+    has_password: false,
+    is_anonymous: true,
+    account_number: '123456789012345678901234',
+  };
+
+  it('a new anonymous account is known to have no password', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'register_anonymous') return { success: true, user: { account_id: '123456789012345678901234' } };
+      if (cmd === 'get_auth_state') return anonymousAuthState;
+      return undefined;
+    });
+    render(<Login />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Anonymous' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Create a new anonymous account' }));
+    await userEvent.click(await screen.findByRole('button', { name: "I've saved it — continue" }));
+    await waitFor(() => expect(useAppStore.getState().isAuthenticated).toBe(true));
+    expect(useAppStore.getState().account.hasPassword).toBe(false);
+    expect(useAppStore.getState().account.isAnonymous).toBe(true);
+  });
+
+  it('an SSO account is known to have no password', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'native_oauth_login') return { success: true };
+      if (cmd === 'get_auth_state') return { ...anonymousAuthState, email: 'sso@example.com', is_anonymous: false };
+      return undefined;
+    });
+    render(<Login />);
+    await userEvent.click(screen.getByRole('tab', { name: 'SSO' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Continue with Google' }));
+    await waitFor(() => expect(useAppStore.getState().isAuthenticated).toBe(true));
+    expect(useAppStore.getState().account.hasPassword).toBe(false);
+  });
+});
+
 describe('SSO', () => {
   it('offers Continue with Apple and calls the same command with provider "apple" (P1-parity-008)', async () => {
     mockedInvoke.mockImplementation(() => new Promise(() => {}));

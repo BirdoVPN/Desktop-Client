@@ -1,7 +1,7 @@
 import { useState, useRef, useId, useEffect, type FormEvent, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
-import { useAppStore, type AccountInfo } from '@/store/app-store';
+import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ShieldCheck, KeyRound, Copy, Check, ShieldAlert, Info } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -9,7 +9,7 @@ import { BirdoButton, BirdoTextField, AppIconMark } from './birdo';
 import { brand, gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
 import { errorCopy, SESSION_EXPIRED_COPY, type ErrorContext } from '@/lib/errors';
 import { toIpcError } from '@/lib/ipc';
-import { anonymityPatch, formatAccountNumber } from '@/utils/helpers';
+import { formatAccountNumber, identityPatch, type AuthStateIdentity } from '@/utils/helpers';
 import {
   isTwoFactorCode,
   sanitizeTwoFactorInput,
@@ -138,20 +138,9 @@ export function Login() {
   // identity on a transient profile-fetch failure.
   const hydrateIdentity = async () => {
     try {
-      const st = await invoke<{
-        is_authenticated: boolean;
-        email: string | null;
-        account_id: string | null;
-        plan: string | null;
-        is_anonymous?: boolean | null;
-        account_number?: string | null;
-      }>('get_auth_state');
+      const st = await invoke<AuthStateIdentity>('get_auth_state');
       if (st?.email) setUserEmail(st.email);
-      const patch: Partial<AccountInfo> = st ? anonymityPatch(st) : {};
-      if (st?.email) patch.email = st.email;
-      if (st?.account_id) patch.accountId = st.account_id;
-      if (st?.plan) patch.plan = st.plan;
-      if (st?.is_authenticated) patch.status = 'active';
+      const patch = st ? identityPatch(st) : {};
       if (Object.keys(patch).length > 0) useAppStore.getState().setAccount(patch);
     } catch {
       /* non-fatal — App startup re-hydrates identity from get_auth_state */
