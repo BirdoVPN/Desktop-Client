@@ -100,6 +100,8 @@ const mockStoreState = {
   portForwards: [],
   setPortForwards: vi.fn(),
   pushRoute: vi.fn(),
+  // The server's per-plan Custom DNS flag (item 40): none, so enabled.
+  customDnsByPlan: {},
 };
 
 vi.mock('@/store/app-store', () => {
