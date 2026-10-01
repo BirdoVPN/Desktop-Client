@@ -21,12 +21,7 @@ cosign verify-blob \
   --certificate-identity-regexp "github.com/BirdoVPN/" \
   BirdoVPN-Setup-1.0.0.exe
 
-# 3. Verify (macOS example)
-cosign verify-blob \
-  --bundle BirdoVPN-1.0.0.dmg.sigstore \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp "github.com/BirdoVPN/" \
-  BirdoVPN-1.0.0.dmg
+# (No macOS download is published: Mac users install Birdo VPN from the Mac App Store.)
 ```
 
 If valid, you'll see:
