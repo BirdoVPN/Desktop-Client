@@ -732,9 +732,8 @@ pub async fn initialize() -> Result<(), String> {
 
 /// STEALTH: record (or clear) the path of the xray helper so the next
 /// block-all permits it — to its relay only (W1-013). Does not re-activate on
-/// its own: in lockdown the tunnel layer re-bakes the block once the new
-/// adapter publishes its LUID, and xray is started before the tunnel exists;
-/// in reactive mode the reconnect path re-activates via `update_relay`.
+/// its own: xray is started before the relay permit moves, and `move_relay`
+/// commits the helper's permit together with the relay's.
 pub async fn set_stealth_helper_exe(path: Option<String>) {
     let mut helper = STEALTH_HELPER_EXE.write().await;
     if *helper != path {
@@ -1048,14 +1047,17 @@ pub fn clear_ipv6_block_intent() {
 
 /// Point the relay permit at a new relay (W1-013: address, port AND the
 /// transport, so the permit can be scoped to the process and protocol that
-/// carry the tunnel).
+/// carry the tunnel), and with `engage` put the block-all up — in ONE
+/// transaction, so the block and the new relay's permit come into force
+/// together (REVIEW-WIN2-001, `wfp_policy::after_relay_move`).
 ///
-/// In LOCKDOWN mode an engaged block is NOT re-activated here: this runs on the
-/// connect path BEFORE the new tunnel exists, so TUNNEL_LUID still holds the
-/// OLD adapter's LUID. Re-activation in lockdown is driven by the tunnel layer
-/// once the NEW adapter publishes its LUID (tunnel.rs `configure_adapter`).
-/// Reactive mode re-activates here to swap the permit.
-pub(crate) async fn update_relay(relay: Relay) -> Result<(), String> {
+/// Runs on the connect and re-dial paths BEFORE the handshake that needs the
+/// permit. A block already in force is rebuilt here in lockdown too. In a live
+/// switch TUNNEL_LUID still names the outgoing adapter, so the rebuilt block
+/// keeps permitting that interface — our own, and already permitted by the
+/// block it replaces; the tunnel layer re-bakes the block with the NEW
+/// adapter's LUID once it is published (tunnel.rs `configure_adapter`).
+pub(crate) async fn move_relay(relay: Relay, engage: bool) -> Result<(), String> {
     *RELAY.lock().unwrap_or_else(|e| e.into_inner()) = Some(relay);
     // The exit node a customer chose: redacted like every other sink for it.
     tracing::debug!(
@@ -1064,13 +1066,35 @@ pub(crate) async fn update_relay(relay: Relay) -> Result<(), String> {
         relay.port,
         relay.transport
     );
-    if IS_BLOCKING.load(Ordering::SeqCst) && !LOCKDOWN_MODE.load(Ordering::SeqCst) {
-        activate_blocking().await?;
-        tracing::info!(
-            "Updated the relay permit: {}",
-            crate::utils::redact_ip(&relay.ip.to_string())
-        );
+    if !IS_INITIALIZED.load(Ordering::SeqCst) {
+        // No engine of the kill switch's own: nothing can be blocking.
+        return if engage {
+            Err("Kill switch not initialized".to_string())
+        } else {
+            Ok(())
+        };
     }
+    let block = current_block_all().await;
+    let mut guard = engine_lock()?;
+    let Some(engine) = guard.as_mut() else {
+        return if engage {
+            Err("WFP engine not open".to_string())
+        } else {
+            Ok(())
+        };
+    };
+    let Some(next) = crate::vpn::wfp_policy::after_relay_move(&engine.installed, block, engage)
+    else {
+        return Ok(());
+    };
+    engine.apply(next)?;
+    IS_BLOCKING.store(true, Ordering::SeqCst);
+    tracing::info!(
+        "Kill switch {} with the relay permit on {} — {} WFP filters committed atomically",
+        if engage { "engaged" } else { "rebuilt" },
+        crate::utils::redact_ip(&relay.ip.to_string()),
+        engine.filter_ids.len()
+    );
     Ok(())
 }
 
@@ -1152,6 +1176,11 @@ pub fn set_lockdown_mode(enabled: bool) {
 /// Whether lockdown (always-on) mode is enabled.
 pub fn is_lockdown_mode() -> bool {
     LOCKDOWN_MODE.load(Ordering::SeqCst)
+}
+
+/// The relay the block-all currently lets the tunnel reach.
+pub(crate) fn current_relay() -> Option<Relay> {
+    *RELAY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Publish the tunnel adapter's interface LUID (from the tunnel layer once the

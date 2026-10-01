@@ -94,6 +94,10 @@ struct AttemptContext {
     /// session rode the stealth transport. Once the count moves, the old
     /// tunnel no longer carries traffic even if it is still held.
     old_stealth_mark: Option<u64>,
+    /// The relay the block permitted when the connect started: what a switch
+    /// that keeps the old session must point the permit back at.
+    #[cfg(target_os = "windows")]
+    old_relay: Option<crate::vpn::wfp_policy::Relay>,
 }
 
 impl AttemptContext {
@@ -183,6 +187,8 @@ pub(crate) async fn connect_session(
         } else {
             None
         },
+        #[cfg(target_os = "windows")]
+        old_relay: crate::vpn::wfp::current_relay(),
     };
     let mut result = attempt(app, &target, None, &mut ctx).await;
 
@@ -382,13 +388,24 @@ async fn attempt(
     // tunnel held right now — not only by what the start of the attempt
     // believed. Whatever it displaces was the user's protection, so a failure
     // from here on holds the block too.
-    if ctx.was_live || vm.holds_tunnel().await {
+    let guard_rebuild = ctx.was_live || vm.holds_tunnel().await;
+    if guard_rebuild {
         ctx.was_live = true;
-        engage_rebuild_block(ctx).await;
+        ctx.block_engaged = true;
     }
-    // The relay permit moves to the new server together with the guard, so a
-    // switch that fails before this point leaves the old session's permit.
-    apply_relay_permit(&prepared.relay_endpoint, prepared.started_stealth).await;
+    // REVIEW-WIN2-001: the guard and the relay permit move in ONE commit, so
+    // the block that goes up already lets the new handshake out. The guard
+    // used to engage first, naming the OLD relay, and lockdown never re-baked
+    // the permit, so every switch's handshake was dropped by our own block. A
+    // block already held (a give-up, lockdown) is rebuilt with the new relay
+    // by the same call. A switch that fails before this point leaves the old
+    // session's permit.
+    apply_relay_permit(
+        &prepared.relay_endpoint,
+        prepared.started_stealth,
+        guard_rebuild,
+    )
+    .await;
 
     let label = SessionLabel {
         server_name: match &multi_hop {
@@ -508,6 +525,18 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
         FailureOutcome::Cancelled => return IpcError::cancelled(),
         FailureOutcome::KeepOldSession => {
             tracing::error!("Switch failed; keeping the current session: {}", error);
+            // The relay permit may already have moved to the new server, just
+            // before the rebuild (REVIEW-WIN2-001); a block held for the
+            // session (lockdown) would then drop the kept session's own
+            // WireGuard traffic. Point it back.
+            #[cfg(target_os = "windows")]
+            if let Some(relay) = ctx.old_relay {
+                if crate::vpn::wfp::current_relay() != Some(relay) {
+                    if let Err(e) = killswitch::move_relay(relay, false).await {
+                        tracing::warn!("Could not put the kept session's relay permit back: {}", e);
+                    }
+                }
+            }
             // Its reconnect info is still the old one (the new target is only
             // stored on success), so the loop goes back to guarding it.
             let _ = vm.set_state(ConnectionState::Connected).await;
@@ -724,27 +753,31 @@ pub(crate) async fn prepare_tunnel(
     })
 }
 
-/// Point the kill switch's relay permit at `endpoint`, re-baking an engaged
-/// block so the new handshake is not dropped by it. `stealth`: the relay is
-/// reached by the xray helper over TCP rather than by our own WireGuard socket
-/// over UDP, which is what the Windows permit is scoped to (W1-013).
-pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool) {
-    let Some(ip) = parse_endpoint_ip(endpoint) else {
-        // P6-CLI-D-03: the endpoint names the relay, so both lines are
-        // redacted (`redact_*` is a pass-through in debug builds).
-        tracing::warn!(
-            "Could not resolve kill switch endpoint IP from '{}'; kill switch may not filter \
-             traffic to the VPN server correctly",
-            crate::utils::redact::redact_hostname(endpoint)
-        );
-        tracing::debug!(
-            "Unresolvable kill switch endpoint: {}",
-            crate::utils::redact_endpoint(endpoint)
-        );
-        return;
-    };
-    killswitch::set_vpn_server_ip(Some(ip)).await;
-    // update_relay sets the permit AND re-activates an engaged block atomically.
+/// Point the kill switch's relay permit at `endpoint` before the handshake
+/// that needs it, rebuilding a block already in force around it. With
+/// `engage`, also put the block-all up for the rebuild of a live session: the
+/// block and the new relay's permit then come into force together
+/// (REVIEW-WIN2-001). `stealth`: the relay is reached by the xray helper over
+/// TCP rather than by our own WireGuard socket over UDP, which is what the
+/// Windows permit is scoped to (W1-013).
+pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bool) {
+    let ip = parse_endpoint_ip(endpoint);
+    match ip {
+        Some(ip) => killswitch::set_vpn_server_ip(Some(ip)).await,
+        None => {
+            // P6-CLI-D-03: the endpoint names the relay, so both lines are
+            // redacted (`redact_*` is a pass-through in debug builds).
+            tracing::warn!(
+                "Could not resolve kill switch endpoint IP from '{}'; kill switch may not \
+                 filter traffic to the VPN server correctly",
+                crate::utils::redact::redact_hostname(endpoint)
+            );
+            tracing::debug!(
+                "Unresolvable kill switch endpoint: {}",
+                crate::utils::redact_endpoint(endpoint)
+            );
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         use crate::vpn::wfp_policy::{parse_relay, RelayTransport};
@@ -755,28 +788,55 @@ pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool) {
         };
         match parse_relay(endpoint, transport) {
             Some(relay) => {
-                if let Err(e) = crate::vpn::wfp::update_relay(relay).await {
-                    tracing::warn!("Failed to update the WFP relay permit: {}", e);
+                if let Err(e) = killswitch::move_relay(relay, engage).await {
+                    tracing::warn!("Failed to move the WFP relay permit: {}", e);
                 }
             }
-            None => tracing::warn!("Kill switch relay endpoint has no usable port"),
+            None => {
+                if ip.is_some() {
+                    tracing::warn!("Kill switch relay endpoint has no usable port");
+                }
+                // No relay to permit, but the rebuild is still guarded.
+                if engage {
+                    if let Err(e) = killswitch::activate_killswitch().await {
+                        tracing::warn!("Kill switch activation before the rebuild failed: {}", e);
+                    }
+                }
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
-    let _ = stealth;
-    // Linux twin: the relay is permitted by ADDRESS and the self-permit is
-    // scoped to tcp/443, so a connect onto a different server needs the live
-    // block re-armed or its handshake is dropped.
-    #[cfg(target_os = "linux")]
-    if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
-        tracing::warn!("Failed to update iptables VPN server: {}", e);
-    }
-    // macOS twin: pf bakes the relay permit into the loaded ruleset, so an
-    // engaged block must be re-loaded with the NEW relay IP (block drop all wins).
-    #[cfg(target_os = "macos")]
-    if killswitch::pf_blocking_active() {
-        if let Err(e) = killswitch::activate_killswitch().await {
-            tracing::warn!("Failed to update pf VPN server permit: {}", e);
+    {
+        let _ = stealth;
+        if engage {
+            // pf and iptables read the relay from VPN_SERVER_IP, recorded
+            // above, so engaging now is one load that already permits it.
+            if let Err(e) = killswitch::activate_killswitch().await {
+                tracing::warn!("Kill switch activation before the rebuild failed: {}", e);
+            }
+            return;
+        }
+        let Some(ip) = ip else {
+            return;
+        };
+        // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+        // scoped to tcp/443, so a connect onto a different server needs the
+        // live block re-armed or its handshake is dropped.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+            tracing::warn!("Failed to update iptables VPN server: {}", e);
+        }
+        // macOS twin: pf bakes the relay permit into the loaded ruleset, so an
+        // engaged block must be re-loaded with the NEW relay IP (block drop
+        // all wins).
+        #[cfg(target_os = "macos")]
+        {
+            let _ = ip;
+            if killswitch::pf_blocking_active() {
+                if let Err(e) = killswitch::activate_killswitch().await {
+                    tracing::warn!("Failed to update pf VPN server permit: {}", e);
+                }
+            }
         }
     }
 }
@@ -1032,17 +1092,28 @@ mod lifecycle_tests {
     /// W1-043: the guard engages after the API/stealth phase, right before
     /// the tunnel is rebuilt — and (REVIEW-WIN-001) whenever a tunnel is held
     /// at that moment, whatever the start of the attempt believed.
+    ///
+    /// REVIEW-WIN2-001: it engages INSIDE the relay move, one commit; what
+    /// that commit holds is tested behaviourally in `wfp_policy`
+    /// (`a_lockdown_switch_commits_the_new_relay_with_the_block` and its
+    /// siblings). This pin only keeps the step where it must be: before the
+    /// handshake, with no separate engage naming the old relay.
     #[test]
-    fn the_switch_guard_engages_just_before_the_rebuild() {
+    fn the_switch_guard_moves_with_the_relay_just_before_the_rebuild() {
+        let attempt = body("async fn attempt(");
         order(
-            body("async fn attempt("),
+            attempt,
             &[
                 "prepare_tunnel(",
                 "vm.holds_tunnel().await",
-                "engage_rebuild_block(ctx)",
                 "apply_relay_permit(",
+                "guard_rebuild,",
                 "vm.connect(",
             ],
+        );
+        assert!(
+            !attempt.contains("engage_rebuild_block("),
+            "a separate engage puts the block up naming the previous relay"
         );
     }
 
@@ -1113,6 +1184,7 @@ mod lifecycle_tests {
             was_live: true,
             block_engaged: false,
             old_stealth_mark: Some(xray.ended_count()),
+            old_relay: None,
         };
 
         // Refused before XrayManager::start: the old transport is untouched.

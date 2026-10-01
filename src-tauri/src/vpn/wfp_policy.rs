@@ -180,6 +180,32 @@ pub(crate) struct Policy {
     pub dns_guard: Option<DnsGuard>,
 }
 
+/// What the session must hold once the relay permit has moved to `block.relay`
+/// (REVIEW-WIN2-001), or `None` when nothing is to be committed.
+///
+/// `engage`: the caller is putting the block-all up for the rebuild of a live
+/// session. Without it, a block already in force is rebuilt around the new
+/// relay at once: lockdown holds the block for the whole session, and a
+/// give-up can leave it held. With no block in force and none being engaged,
+/// the relay is only recorded, for the next block.
+///
+/// Either way the block-all and the new relay's permit come into force in ONE
+/// transaction, before the handshake that needs it. The relay used to be
+/// re-baked only outside lockdown, after the switch guard had already gone up
+/// naming the previous relay, so under lockdown (the Windows default) every
+/// live server switch, port or Stealth change and every connect behind a held
+/// block sent its handshake into our own block-all.
+pub(crate) fn after_relay_move(
+    installed: &Policy,
+    block: BlockAll,
+    engage: bool,
+) -> Option<Policy> {
+    (engage || installed.block_all.is_some()).then(|| Policy {
+        block_all: Some(block),
+        ..installed.clone()
+    })
+}
+
 fn spec(
     name: impl Into<String>,
     layer: Layer,
@@ -919,6 +945,186 @@ mod tests {
                 && f.action == Action::Permit),
             "an unscoped tcp/443 permit would let every app through the block"
         );
+    }
+
+    // ── REVIEW-WIN2-001: the relay moves with the block ─────────────────
+
+    /// The server a switch goes to.
+    const NEXT_RELAY: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 20);
+
+    fn relay_to(ip: Ipv4Addr, port: u16, transport: RelayTransport) -> Relay {
+        Relay {
+            ip,
+            port,
+            transport,
+        }
+    }
+
+    /// Every permit that names `ip` is scoped to an app: moving the relay
+    /// never opens the address to every process on the machine.
+    fn every_permit_to_names_an_app(s: &[FilterSpec], ip: Ipv4Addr) {
+        for f in s.iter().filter(|f| {
+            f.action == Action::Permit
+                && f.conditions.contains(&Condition::RemoteV4 {
+                    addr: ip,
+                    prefix: 32,
+                })
+        }) {
+            assert!(
+                f.conditions.iter().any(|c| matches!(c, Condition::App(_))),
+                "{} is not scoped to an app",
+                f.name
+            );
+        }
+    }
+
+    /// The Windows default: connected to A under lockdown, the user picks B.
+    /// The switch guard's commit already carries B's permit, so the new
+    /// handshake leaves; nothing else reaches B, and A is closed behind it.
+    #[test]
+    fn a_lockdown_switch_commits_the_new_relay_with_the_block() {
+        let installed = lockdown();
+        let next = after_relay_move(
+            &installed,
+            block(Some(relay_to(
+                NEXT_RELAY,
+                51820,
+                RelayTransport::WireGuardUdp,
+            ))),
+            true,
+        )
+        .expect("the switch guard commits");
+        let s = specs(&next);
+        assert_eq!(
+            decide(&s, &out4(SELF, NEXT_RELAY.octets(), 51820, UDP, WIFI)),
+            Some(Action::Permit)
+        );
+        assert_eq!(
+            decide(&s, &out4(CHROME, NEXT_RELAY.octets(), 51820, UDP, WIFI)),
+            Some(Action::Block)
+        );
+        assert_eq!(
+            decide(&s, &out4(SELF, RELAY.octets(), 51820, UDP, WIFI)),
+            Some(Action::Block),
+            "the previous relay stays open behind the switch"
+        );
+        assert_eq!(next.dns_guard, installed.dns_guard);
+        every_permit_to_names_an_app(&s, NEXT_RELAY);
+    }
+
+    /// Lockdown again, with no engage: the block is already in force (held
+    /// for the session, or by a give-up). A port or transport change, a
+    /// re-dial onto another relay, or a connect to another server from the
+    /// blocking state moves the permit at once — this commit used to be
+    /// skipped in lockdown, which left the held block naming the old relay.
+    #[test]
+    fn a_held_block_is_rebuilt_around_the_new_relay_without_an_engage() {
+        let mut gave_up = lockdown();
+        gave_up.dns_guard = None;
+        gave_up.block_all.as_mut().unwrap().tunnel_luid = None;
+        let next = after_relay_move(
+            &gave_up,
+            BlockAll {
+                tunnel_luid: None,
+                ..block(Some(relay_to(NEXT_RELAY, 53, RelayTransport::WireGuardUdp)))
+            },
+            false,
+        )
+        .expect("a held block is rebuilt");
+        let s = specs(&next);
+        assert_eq!(
+            decide(&s, &out4(SELF, NEXT_RELAY.octets(), 53, UDP, WIFI)),
+            Some(Action::Permit)
+        );
+        assert_eq!(
+            decide(&s, &out4(SELF, RELAY.octets(), 51820, UDP, WIFI)),
+            Some(Action::Block)
+        );
+    }
+
+    /// Reactive mode: Connected holds no block-all. The guard's commit is the
+    /// FIRST block of the rebuild, and it already names B — there is no
+    /// moment with the block up and only the old relay permitted.
+    #[test]
+    fn a_reactive_switch_engages_the_block_already_naming_the_new_relay() {
+        let connected = Policy {
+            block_all: None,
+            v6_block: true,
+            dns_guard: Some(guard(false)),
+        };
+        let next = after_relay_move(
+            &connected,
+            BlockAll {
+                tunnel_luid: None,
+                ..block(Some(relay_to(
+                    NEXT_RELAY,
+                    51820,
+                    RelayTransport::WireGuardUdp,
+                )))
+            },
+            true,
+        )
+        .expect("the switch guard commits");
+        let s = specs(&next);
+        assert_eq!(
+            decide(&s, &out4(SELF, NEXT_RELAY.octets(), 51820, UDP, WIFI)),
+            Some(Action::Permit)
+        );
+        assert_eq!(
+            decide(&s, &out4(CHROME, [142, 250, 1, 1], 443, TCP, WIFI)),
+            Some(Action::Block),
+            "the guard is a block-all"
+        );
+        assert!(next.v6_block, "the session's IPv6 intent is kept");
+    }
+
+    /// Nothing blocking and nothing engaged (a fresh connect; the kill switch
+    /// off): the relay is only recorded, and the session is not touched.
+    #[test]
+    fn with_no_block_a_relay_move_commits_nothing() {
+        let reactive = Policy {
+            block_all: None,
+            v6_block: true,
+            dns_guard: Some(guard(false)),
+        };
+        assert_eq!(
+            after_relay_move(&reactive, block(Some(wg_relay())), false),
+            None
+        );
+        assert_eq!(
+            after_relay_move(&Policy::default(), block(Some(wg_relay())), false),
+            None
+        );
+    }
+
+    /// A switch onto Stealth: the same commit lets xray — and only xray —
+    /// reach B over TCP.
+    #[test]
+    fn a_switch_onto_stealth_commits_the_helpers_permit_with_the_block() {
+        let next = after_relay_move(
+            &lockdown(),
+            BlockAll {
+                stealth_helper: Some(XRAY.to_string()),
+                ..block(Some(relay_to(NEXT_RELAY, 443, RelayTransport::StealthTcp)))
+            },
+            true,
+        )
+        .expect("the switch guard commits");
+        let s = specs(&next);
+        assert_eq!(
+            decide(&s, &out4(XRAY, NEXT_RELAY.octets(), 443, TCP, WIFI)),
+            Some(Action::Permit)
+        );
+        assert_eq!(
+            decide(&s, &out4(SELF, NEXT_RELAY.octets(), 443, UDP, WIFI)),
+            Some(Action::Block)
+        );
+        // The app's own HTTPS (the control plane) is the one other way to B.
+        assert_eq!(
+            decide(&s, &out4(CHROME, NEXT_RELAY.octets(), 443, TCP, WIFI)),
+            Some(Action::Block)
+        );
+        every_permit_to_names_an_app(&s, NEXT_RELAY);
     }
 
     // ── W1-014: inbound ─────────────────────────────────────────────────

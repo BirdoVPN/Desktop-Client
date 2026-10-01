@@ -760,9 +760,13 @@ impl ReconnectLoop {
             &mut private_key,
         )
         .await?;
+        // The block `dial` engaged is rebuilt around this relay before the
+        // handshake (REVIEW-WIN2-001: in lockdown it used to keep naming the
+        // relay of the session that died).
         crate::commands::session::apply_relay_permit(
             &prepared.relay_endpoint,
             prepared.started_stealth,
+            false,
         )
         .await;
 
