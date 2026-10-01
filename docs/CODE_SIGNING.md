@@ -20,7 +20,7 @@ Because the client source is public (source-available, CC BY-NC 4.0 — not an
 OSI open-source licence), Sigstore provides **free, transparent, verifiable
 signatures** tied to our GitHub Actions CI — no paid certificates required.
 
-Every release artifact (the Windows installer and the Linux packages) is signed with `cosign sign-blob` using
+Every release artifact (`.exe`, `.dmg`, Linux packages) is signed with `cosign sign-blob` using
 GitHub's OIDC identity token. This produces a `.sigstore` bundle containing:
 
 - A **Fulcio certificate** proving the artifact was built by GitHub Actions from this repo
@@ -51,11 +51,15 @@ This is normal for software without an established signing reputation. The Sigst
 **cryptographically verify** the download came from our CI — something SmartScreen
 can't tell them.
 
-### macOS
+### macOS Gatekeeper
 
-No macOS build of this app is published any more (owner decision, 2026-10-01).
-The unsigned, un-notarised Tauri DMG was retired; Mac users install Birdo VPN
-from the Mac App Store, where Apple signs and notarises it.
+The macOS build is unsigned and un-notarised, so macOS users will see a
+Gatekeeper warning. To bypass:
+1. Right-click -> Open -> "Open" (first launch only)
+2. Or: System Settings -> Privacy & Security -> "Open Anyway"
+
+If macOS code signing (Apple Developer ID) becomes needed, it can be layered
+on top of Sigstore in the `build-macos.yml` workflow.
 
 ### Why Not Authenticode?
 
@@ -115,6 +119,8 @@ Each release includes:
 |------|---------|
 | `BirdoVPN-Setup-X.Y.Z.exe` | NSIS installer (Windows) |
 | `BirdoVPN-Setup-X.Y.Z.exe.sigstore` | Sigstore signature bundle |
+| `BirdoVPN-X.Y.Z.dmg` | DMG installer (macOS, unsigned and un-notarised) |
+| `BirdoVPN-X.Y.Z.dmg.sigstore` | Sigstore signature bundle |
 | `SHA256SUMS.txt` | Checksums for all artifacts |
 | `SHA256SUMS.txt.sigstore` | Signed checksums |
 

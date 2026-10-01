@@ -1,6 +1,6 @@
 # ============================================================================
-# UNIFIED release workflow — Windows + Linux build TOGETHER and
-# publish ONE GitHub Release (marked Latest) from a SINGLE tag (v*.*.* e.g. v1.4.16).
+# UNIFIED release workflow — Windows + Linux + macOS build TOGETHER and
+# publish into ONE draft GitHub Release from a SINGLE tag (v*.*.* e.g. v1.4.16).
 #
 # This superseded the three separate per-platform pipelines
 # (build-windows.yml, build-linux.yml, build-macos.yml). All three are GONE:
@@ -15,7 +15,7 @@
 # signing/attestation behaviour).
 # ============================================================================
 
-name: Release (Windows + Linux)
+name: Release (Windows + Linux + macOS)
 
 on:
   workflow_dispatch:
@@ -751,13 +751,306 @@ jobs:
           retention-days: 30
 
   # ══════════════════════════════════════════════════════════════════════
-  # ONE GitHub Release for Windows + Linux, from ONE tag. Both are REQUIRED
-  # (the release step refuses to run if either did not succeed).
-  # macOS: no DMG is built any more (owner decision 2026-10-01: the unsigned
-  # Tauri DMG is retired; Mac users get the signed Mac App Store app).
+  # Is the signed Mac App Store app live yet? (owner decision 2026-10-01)
+  # The unsigned Tauri DMG keeps shipping ONLY until it is: Mac users must
+  # never be left with no way to install. Apple's public lookup API decides;
+  # a lookup failure counts as 'not live', so the DMG keeps shipping.
+  # ══════════════════════════════════════════════════════════════════════
+  mac-app-store:
+    runs-on: ubuntu-latest
+    outputs:
+      live: ${{ steps.lookup.outputs.live }}
+    steps:
+      - name: Look up BirdoVPN on the Mac App Store
+        id: lookup
+        shell: bash
+        run: |
+          set -uo pipefail
+          live=false
+          for c in gb us; do
+            n=$(curl -fsS -m 20 "https://itunes.apple.com/lookup?bundleId=app.birdo.vpn&entity=macSoftware&country=$c" \
+                | jq '[.results[]? | select(.kind == "mac-software")] | length' 2>/dev/null || echo 0)
+            if [ "${n:-0}" -gt 0 ]; then live=true; fi
+          done
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          if [ "$live" = true ]; then
+            echo "::notice::BirdoVPN is live on the Mac App Store - the unsigned DMG is no longer built."
+          else
+            echo "Not on the Mac App Store yet - building the unsigned DMG for Mac users."
+          fi
+
+  # ══════════════════════════════════════════════════════════════════════
+  # MACOS — faithful copy of build-macos.yml's `build-macos` job, with the
+  # owner's explicit instruction: NO Apple Developer account exists, so this
+  # MUST always build UNSIGNED (no codesign, no notarization). The job
+  # already self-guards on APPLE_CERTIFICATE being present/absent (see
+  # "Detect Apple signing capability" below) — since that secret is not
+  # configured, it naturally always takes the unsigned-fallback path and
+  # skips the notarize/staple step. Sigstore keyless attestation still runs.
+  #
+  # `continue-on-error: true` is added at job level (new) so a macOS build
+  # failure NEVER blocks the Windows/Linux release (see the `release` job's
+  # required-platforms guard at the bottom of this file).
+  # ══════════════════════════════════════════════════════════════════════
+  build-macos:
+    needs: [test, mac-app-store]  # gate on tests too, but stays best-effort (continue-on-error below)
+    if: needs.mac-app-store.outputs.live != 'true'  # retire the DMG once the Mac App Store app is live
+    continue-on-error: true  # macOS is best-effort; must never gate the release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14        # Apple Silicon (M1+)
+            arch: aarch64-apple-darwin
+            label: arm64
+          - runner: macos-15        # Intel x86_64 (macos-13 deprecated)
+            arch: x86_64-apple-darwin
+            label: x64
+    # SENTRY_DSN lives at JOB level, not on the build step.
+    #
+    # It was on the step, which is correct for exactly as long as a job has one
+    # build step — and release.yml's build-macos already has two (the signed
+    # build and the unsigned fallback). A job-level env is the only form that
+    # also covers a step somebody adds next year. Missing one build job is the
+    # twin-drift defect this estate keeps re-finding, and a build with no DSN
+    # now FAILS in build.rs rather than shipping an inert reporter.
+    env:
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write   # Sigstore keyless OIDC
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Rust (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.arch }}
+
+      # dtolnay adds the target to `stable`, but rust-toolchain.toml pins a
+      # specific toolchain that rustup switches to inside the repo — so the cross
+      # target (x86_64-apple-darwin on the arm64 runner) must be added to the
+      # PINNED toolchain explicitly, or `tauri build` fails "target not installed".
+      - name: Add cross-compile target to the pinned toolchain
+        working-directory: src-tauri
+        run: rustup target add ${{ matrix.arch }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Generate macOS icon (icns) from PNG
+        run: |
+          set -euo pipefail
+          mkdir -p icon.iconset
+          sips -z 16 16     src-tauri/icons/icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     src-tauri/icons/icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     src-tauri/icons/icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     src-tauri/icons/icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   src-tauri/icons/icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   src-tauri/icons/icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   src-tauri/icons/icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   src-tauri/icons/icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   src-tauri/icons/icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 src-tauri/icons/icon.png --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o src-tauri/icons/icon.icns
+
+      - name: Prepare resources directory
+        run: |
+          mkdir -p src-tauri/resources
+          touch src-tauri/resources/.gitkeep
+
+      # Download + SHA-verify + bundle the pinned Xray Reality engine, mirroring
+      # the Windows pipeline. Picks the asset for the matrix arch. Without this
+      # the release fails closed: xray.rs refuses to exec an unverified binary
+      # and XRAY_BINARY_SHA256 stays unset.
+      - name: Download pinned Xray Reality engine
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.label }}" = "arm64" ]; then
+            ASSET="Xray-macos-arm64-v8a.zip"
+            EXPECTED="$XRAY_MACOS_ARM64_SHA256"
+          else
+            ASSET="Xray-macos-64.zip"
+            EXPECTED="$XRAY_MACOS_AMD64_SHA256"
+          fi
+          XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${ASSET}"
+          ZIP_PATH="${RUNNER_TEMP}/${ASSET}"
+          curl -fsSL "$XRAY_URL" -o "$ZIP_PATH"
+          ACTUAL=$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Xray zip SHA256 mismatch for $ASSET. Expected $EXPECTED, got $ACTUAL"
+            exit 1
+          fi
+          unzip -o "$ZIP_PATH" -d "${RUNNER_TEMP}/xray"
+          install -m 0755 "${RUNNER_TEMP}/xray/xray" src-tauri/resources/xray
+          BINARY_SHA=$(shasum -a 256 src-tauri/resources/xray | awk '{print $1}')
+          echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
+          echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
+
+      # A tagged release MUST be able to attest itself: without the secret,
+      # option_env! is None and the shipped client silently sends no signature,
+      # which an `enforce` server policy refuses. Fail here rather than ship it.
+      - name: Require the desktop attestation key on tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BIRDO_DESKTOP_ATTEST_SK}" ] || [ -z "${BIRDO_DESKTOP_ATTEST_KID}" ]; then
+            echo "::error::BIRDO_DESKTOP_ATTEST_SK/KID secret is empty — a tagged release cannot ship unattestable. See docs/CLIENT-ATTESTATION.md"
+            exit 1
+          fi
+          echo "Attestation key present (kid: ${BIRDO_DESKTOP_ATTEST_KID})"
+
+      # ── Apple codesign keychain setup ──────────────────────────────
+      # Owner has no Apple Developer account: APPLE_CERTIFICATE is never
+      # configured, so have_apple_signing is always "false" here and every
+      # step below gated on it is always skipped. Kept intact (rather than
+      # deleted) so signing can be turned on later just by adding secrets.
+      - name: Detect Apple signing capability
+        id: signcap
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            echo "have_apple_signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_apple_signing=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::APPLE_CERTIFICATE secret not set — building UNSIGNED DMG. Gatekeeper will quarantine it."
+          fi
+
+      - name: Import Apple Developer ID certificate
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/birdo-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+      # ── Tauri build ────────────────────────────────────────────────
+      - name: Build Tauri application (signed)
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
+          XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
+          # Ed25519 client-attestation key baked in by option_env! — see
+          # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: npx tauri build --target ${{ matrix.arch }}
+
+      - name: Build Tauri application (unsigned fallback)
+        if: steps.signcap.outputs.have_apple_signing != 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CD-3: SHA of the bundled xray binary, verified at runtime by xray.rs.
+          XRAY_BINARY_SHA256: ${{ env.XRAY_BINARY_SHA256 }}
+          # Attestation must ride the fallback too — an unsigned DMG that also
+          # could not attest would be refused by an `enforce` server policy.
+          BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
+          BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
+        run: npx tauri build --target ${{ matrix.arch }}
+
+      # ── Notarize + Staple ──────────────────────────────────────────
+      - name: Notarize and staple DMG
+        if: steps.signcap.outputs.have_apple_signing == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          DMG_FILE=$(find "src-tauri/target/${{ matrix.arch }}/release/bundle/dmg" -name '*.dmg' -print -quit || true)
+          if [ -z "${DMG_FILE:-}" ]; then
+            echo "::error::No DMG produced by Tauri build"
+            exit 1
+          fi
+
+          echo "Notarizing $DMG_FILE ..."
+          xcrun notarytool submit "$DMG_FILE" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 30m
+
+          echo "Stapling notarization ticket ..."
+          xcrun stapler staple "$DMG_FILE"
+          xcrun stapler validate "$DMG_FILE"
+
+          echo "Verifying Gatekeeper acceptance ..."
+          spctl --assess --type open --context context:primary-signature -vv "$DMG_FILE" || \
+            echo "::warning::spctl assessment did not pass — investigate before release"
+
+      # Integrity/provenance is handled ONCE in the release job (unified
+      # SHA256SUMS.txt + one Sigstore bundle over the final asset names).
+      - name: Cleanup keychain
+        if: always() && steps.signcap.outputs.have_apple_signing == 'true'
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/birdo-build.keychain-db"
+          [ -f "$KEYCHAIN_PATH" ] && security delete-keychain "$KEYCHAIN_PATH" || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: birdo-vpn-macos-${{ matrix.label }}
+          path: |
+            src-tauri/target/${{ matrix.arch }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.arch }}/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/${{ matrix.arch }}/release/bundle/macos/*.app.tar.gz.sig
+          retention-days: 30
+          if-no-files-found: error
+
+  # ══════════════════════════════════════════════════════════════════════
+  # ONE GitHub Release for ALL platforms, from ONE tag.
+  # Windows + Linux are REQUIRED (the release step refuses to run if either
+  # did not succeed). macOS is best-effort: its artifacts are attached IF
+  # present, but a macOS failure never blocks or is required for this job
+  # (build-macos also carries `continue-on-error: true` above, belt-and-braces).
   # ══════════════════════════════════════════════════════════════════════
   release:
-    needs: [test, build-windows, build-linux]
+    needs: [test, build-windows, build-linux, build-macos]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -779,7 +1072,7 @@ jobs:
             echo "::error::build-linux result=${{ needs.build-linux.result }} — Linux is a REQUIRED platform, refusing to publish a release"
             exit 1
           fi
-          echo "Windows + Linux OK."
+          echo "Windows + Linux OK. macOS (best-effort) result: ${{ needs.build-macos.result }}"
 
       - name: Download Windows artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -799,6 +1092,26 @@ jobs:
         with:
           name: birdo-vpn-linux-amd64
           path: release-files/linux/
+
+      # macOS is best-effort: if build-macos failed entirely (no artifact was
+      # ever uploaded), these downloads 404 — continue-on-error keeps that
+      # from failing the release job. softprops/action-gh-release's `files:`
+      # glob patterns below simply match nothing in that case (default
+      # fail_on_unmatched_files is false), so the release still publishes
+      # Windows + Linux only.
+      - name: Download macOS arm64 artifacts (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: birdo-vpn-macos-arm64
+          path: release-files/macos-arm64/
+
+      - name: Download macOS x64 artifacts (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: birdo-vpn-macos-x64
+          path: release-files/macos-x64/
 
       # Name every asset for the platform it runs on, and disambiguate the
       # basenames that would otherwise collide.
@@ -851,6 +1164,8 @@ jobs:
           }
           label release-files/windows     Windows windows
           label release-files/linux       Linux   linux
+          label release-files/macos-arm64 macOS   macos-arm64
+          label release-files/macos-x64   macOS   macos-x64
 
       # Fail the release rather than publish assets the updater cannot resolve.
       # A mis-rename is otherwise SILENT: the release looks fine and every
@@ -884,6 +1199,8 @@ jobs:
           }
           check release-files/windows     "Windows NSIS" '\-setup\.exe$'   '(x86[_-]?64|x64|amd64)'
           check release-files/linux       "Linux AppImage" '\.AppImage$'   '(x86[_-]?64|x64|amd64)'
+          check release-files/macos-arm64 "macOS arm64"  '\.app\.tar\.gz$' '(aarch64|arm64)'
+          check release-files/macos-x64   "macOS x64"    '\.app\.tar\.gz$' '(x86[_-]?64|x64|amd64)'
           [ "$fail" -eq 0 ] || { echo "Updater asset contract violated — refusing to publish"; exit 1; }
 
       # ── ONE checksums file over the FINAL asset names ─────────────────
@@ -930,6 +1247,8 @@ jobs:
           files: |
             release-files/windows/*
             release-files/linux/**/*
+            release-files/macos-arm64/**/*
+            release-files/macos-x64/**/*
             release-files/SHA256SUMS.txt
             release-files/SHA256SUMS.txt.sigstore
           generate_release_notes: true
