@@ -92,7 +92,9 @@ describe('useAppStore', () => {
         liveStats: { bytesIn: 2048, bytesOut: 1024, uptimeSeconds: 60, latencyMs: 20 },
         killSwitchBlocking: true,
         pendingAction: 'disconnecting',
+        settingsHydrated: true,
       })
+      useAppStore.getState().updateSettings({ preferredServerId: 'us-1' })
 
       useAppStore.getState().logout()
 
@@ -107,6 +109,10 @@ describe('useAppStore', () => {
       expect(state.liveStats).toBeNull()
       expect(state.killSwitchBlocking).toBe(false)
       expect(state.pendingAction).toBeNull()
+      // REVIEW-WIN-007: nor its mirrored server, and the next session waits
+      // for its own settings load before anything writes them.
+      expect(state.settings.preferredServerId).toBeNull()
+      expect(state.settingsHydrated).toBe(false)
     })
   })
 

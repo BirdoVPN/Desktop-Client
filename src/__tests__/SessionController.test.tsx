@@ -256,6 +256,31 @@ describe('tray actions run in Rust (W1-023, W2-003)', () => {
     await waitFor(() => expect(callsTo('save_settings').length).toBeGreaterThan(0));
   });
 
+  it("the next account's session waits for its own settings before mirroring (REVIEW-WIN-007)", async () => {
+    // Session one was hydrated; signing out must not carry that over.
+    useAppStore.setState({ settingsHydrated: true, lastServerId: 'c' });
+    useAppStore.getState().logout();
+    useAppStore.setState({ isAuthenticated: true });
+
+    let releaseSettings: (v: unknown) => void = () => {};
+    const settingsLoaded = new Promise((r) => { releaseSettings = r; });
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd, args) => {
+      if (cmd === 'get_settings') { await settingsLoaded; return rustSettings; }
+      return base(cmd, args);
+    });
+    // The new user picks a server before their settings have loaded.
+    useAppStore.setState({ lastServerId: 'a' });
+    render(<VpnSessionController />);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(callsTo('save_settings')).toHaveLength(0);
+    releaseSettings(undefined);
+    await waitFor(() =>
+      expect(callsTo('save_settings').some(([, a]) =>
+        (a as { settings: { preferred_server_id: string | null } }).settings.preferred_server_id === 'a')).toBe(true),
+    );
+  });
+
   it('does not rewrite settings when Rust already has the same server', async () => {
     rustSettings = { ...rustSettings, preferred_server_id: 'c' };
     useAppStore.setState({ lastServerId: 'c' });

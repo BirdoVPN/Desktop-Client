@@ -607,7 +607,7 @@ export const useAppStore = create<AppState>()(
       popRoute: () => set((state) => ({ navStack: state.navStack.slice(0, -1) })),
 
       logout: () =>
-        set({
+        set((state) => ({
           isAuthenticated: false,
           userEmail: null,
           account: { ...defaultAccount },
@@ -616,7 +616,14 @@ export const useAppStore = create<AppState>()(
           currentServer: null,
           // Cleared on logout: the next account to sign in on this machine must
           // not inherit the previous user's server choice, server access or usage.
+          // Rust's `preferred_server_id` is cleared by its own logout and
+          // account deletion (REVIEW-WIN-007).
           lastServerId: null,
+          settings: { ...state.settings, preferredServerId: null },
+          // The next session waits for ITS settings load: writers gated on
+          // hydration (the preferred-server mirror) would otherwise save this
+          // session's copy over Rust's before the next one has read it.
+          settingsHydrated: false,
           servers: [],
           serversStatus: 'idle',
           serverPings: {},
@@ -629,7 +636,7 @@ export const useAppStore = create<AppState>()(
           // deep screen (settings/server list) on next login.
           tab: 'home' as TabId,
           navStack: [],
-        }),
+        })),
     }),
     {
       name: 'birdo-vpn-storage',
