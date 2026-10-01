@@ -751,6 +751,35 @@ jobs:
           retention-days: 30
 
   # ══════════════════════════════════════════════════════════════════════
+  # Is the signed Mac App Store app live yet? (owner decision 2026-10-01)
+  # The unsigned Tauri DMG keeps shipping ONLY until it is: Mac users must
+  # never be left with no way to install. Apple's public lookup API decides;
+  # a lookup failure counts as 'not live', so the DMG keeps shipping.
+  # ══════════════════════════════════════════════════════════════════════
+  mac-app-store:
+    runs-on: ubuntu-latest
+    outputs:
+      live: ${{ steps.lookup.outputs.live }}
+    steps:
+      - name: Look up BirdoVPN on the Mac App Store
+        id: lookup
+        shell: bash
+        run: |
+          set -uo pipefail
+          live=false
+          for c in gb us; do
+            n=$(curl -fsS -m 20 "https://itunes.apple.com/lookup?bundleId=app.birdo.vpn&entity=macSoftware&country=$c" \
+                | jq '[.results[]? | select(.kind == "mac-software")] | length' 2>/dev/null || echo 0)
+            if [ "${n:-0}" -gt 0 ]; then live=true; fi
+          done
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          if [ "$live" = true ]; then
+            echo "::notice::BirdoVPN is live on the Mac App Store - the unsigned DMG is no longer built."
+          else
+            echo "Not on the Mac App Store yet - building the unsigned DMG for Mac users."
+          fi
+
+  # ══════════════════════════════════════════════════════════════════════
   # MACOS — faithful copy of build-macos.yml's `build-macos` job, with the
   # owner's explicit instruction: NO Apple Developer account exists, so this
   # MUST always build UNSIGNED (no codesign, no notarization). The job
@@ -764,7 +793,8 @@ jobs:
   # required-platforms guard at the bottom of this file).
   # ══════════════════════════════════════════════════════════════════════
   build-macos:
-    needs: test  # gate on tests too, but stays best-effort (continue-on-error below)
+    needs: [test, mac-app-store]  # gate on tests too, but stays best-effort (continue-on-error below)
+    if: needs.mac-app-store.outputs.live != 'true'  # retire the DMG once the Mac App Store app is live
     continue-on-error: true  # macOS is best-effort; must never gate the release
     strategy:
       fail-fast: false
@@ -1204,11 +1234,11 @@ jobs:
         shell: bash
         run: find release-files -type f -print || true
 
-      # Only actually publish on a real tag push. workflow_dispatch runs
-      # (used for manual/debug builds off a branch) build artifacts above
-      # but intentionally do NOT cut a release — there is no version tag to
-      # attach it to. This mirrors the tag-gating the three old per-platform
-      # release jobs each had (win-v*/linux-v*/mac-v*).
+      # Only actually publish on a real tag push (workflow_dispatch builds are
+      # for manual/debug runs and cut no release). Owner decision 2026-10-01:
+      # GitHub 'Latest' must ALWAYS be the newest fully released build, with no
+      # hand-flipped drafts. The guard above already refuses to get here unless
+      # the test gate and both required platforms succeeded.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -1222,5 +1252,6 @@ jobs:
             release-files/SHA256SUMS.txt
             release-files/SHA256SUMS.txt.sigstore
           generate_release_notes: true
-          draft: true
-          make_latest: false
+          draft: false
+          prerelease: false
+          make_latest: true
