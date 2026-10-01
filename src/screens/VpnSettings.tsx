@@ -9,9 +9,12 @@
  * Every setting here shapes the tunnel, so each save goes through
  * `persistSettings(…, { reapply: true })`: saved, rolled back and reported if
  * the save fails, and applied to a live session by one debounced fail-closed
- * rebuild. The port and MTU fields are drafts saved when the field is left
- * (W2-007): "5" is a valid port on the way to "51820", and saving per
- * keystroke rebuilt the tunnel on port 5.
+ * rebuild. The MTU field is a draft saved when the field is left (W2-007):
+ * saving per keystroke rebuilt the tunnel on every digit.
+ *
+ * The port is Automatic or 51820, nothing else (WIN-FIX-3): the relays accept
+ * WireGuard on 51820 only, and the "53" preset and custom port this screen
+ * used to offer failed the handshake on every one of them.
  */
 import { useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
@@ -25,15 +28,12 @@ import {
   BirdoTextField,
   BirdoRadioGroup,
 } from '@/components/birdo';
-import { useAppStore } from '@/store/app-store';
-import { isValidMtu, isValidPort, isWindowsPlatform } from '@/utils/helpers';
+import { useAppStore, type WireGuardPort } from '@/store/app-store';
+import { isValidMtu, isWindowsPlatform } from '@/utils/helpers';
 import { white, status, brand } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
 import { persistSettings } from '@/session/settings-persist';
 import { loadSubscription } from '@/session/session-data';
-
-type PortChoice = 'auto' | '51820' | '53' | 'custom';
-const PRESET_PORTS = ['auto', '51820', '53'];
 
 export function VpnSettings() {
   const { settings, popRoute, pushRoute, plan, connectionState, dnsFilteringAvailable, reapplying } = useAppStore(
@@ -72,34 +72,8 @@ export function VpnSettings() {
   // Custom DNS, or the fleet gate coming back, restores the user's choice.
   const shieldBlocked = fleetGateOff || customDnsActive;
 
-  // ── WireGuard port (a draft for the custom value) ─────────────────────────
-  const persistedIsCustom = !PRESET_PORTS.includes(settings.wireGuardPort);
-  // "Custom" is UI state as well as a saved value, so choosing it can reveal
-  // the field before a valid port exists.
-  const [customPortMode, setCustomPortMode] = useState(persistedIsCustom);
-  const [portDraft, setPortDraft] = useState(persistedIsCustom ? settings.wireGuardPort : '');
-  const [portError, setPortError] = useState<string | null>(null);
-  const portChoice: PortChoice = customPortMode || persistedIsCustom ? 'custom' : (settings.wireGuardPort as PortChoice);
-
-  const choosePort = (choice: PortChoice) => {
-    setPortError(null);
-    if (choice === 'custom') {
-      setCustomPortMode(true);
-      if (isValidPort(portDraft) && portDraft !== settings.wireGuardPort) save({ wireGuardPort: portDraft });
-      return;
-    }
-    setCustomPortMode(false);
+  const choosePort = (choice: WireGuardPort) => {
     if (choice !== settings.wireGuardPort) save({ wireGuardPort: choice });
-  };
-  const commitPort = () => {
-    const v = portDraft.trim();
-    if (!v) return;
-    if (!isValidPort(v)) {
-      setPortError('Enter a port from 1 to 65535.');
-      return;
-    }
-    setPortError(null);
-    if (v !== settings.wireGuardPort) save({ wireGuardPort: v });
   };
 
   // ── MTU (a draft while custom) ─────────────────────────────────────────────
@@ -208,38 +182,17 @@ export function VpnSettings() {
             <Router size={20} color={brand.accent} aria-hidden />
             <span className="text-[15px] font-medium text-white">WireGuard Port</span>
           </div>
-          <BirdoRadioGroup<PortChoice>
+          <BirdoRadioGroup<WireGuardPort>
             label="WireGuard Port"
             options={[
               { value: 'auto', label: 'Automatic' },
               { value: '51820', label: '51820' },
-              { value: '53', label: '53' },
-              { value: 'custom', label: 'Custom' },
             ]}
-            value={portChoice}
+            value={settings.wireGuardPort}
             onChange={choosePort}
           />
-          {portChoice === 'custom' && (
-            <BirdoTextField
-              className="pt-2"
-              ariaLabel="Custom WireGuard port"
-              placeholder="1-65535"
-              inputMode="numeric"
-              value={portDraft}
-              onChange={(raw) => {
-                setPortDraft(raw.replace(/\D/g, '').slice(0, 5));
-                if (portError) setPortError(null);
-              }}
-              onBlur={commitPort}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') commitPort();
-              }}
-              errorText={portError}
-              hint="Saved when you leave the field."
-            />
-          )}
           <p className="mt-2 text-xs" style={{ color: white.w60 }}>
-            Use port 53 to bypass restrictive firewalls. Default is 51820.
+            BirdoVPN servers accept WireGuard on port 51820 only.
           </p>
         </BirdoCard>
 

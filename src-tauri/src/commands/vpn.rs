@@ -102,7 +102,8 @@ fn connect_failure_message(response: &ConnectResponse) -> String {
 /// from the backend would hand the server the client's secret. The response
 /// types no longer even deserialize a `privateKey` field.
 /// P3-1: `custom_mtu`: 0 = use server default, 1280-1500 = user override.
-/// P3-1: `custom_port`: "auto" = use server endpoint as-is, otherwise override the port.
+/// `custom_port`: the `wireguard_port` setting, applied only as far as
+/// [`dialable_wireguard_port`] allows.
 pub fn build_vpn_config(
     response: ConnectResponse,
     server_id: &str,
@@ -185,19 +186,13 @@ pub fn build_vpn_config(
         response.mtu.unwrap_or(1420)
     };
 
-    // P3-1: Apply custom WireGuard port from user settings
-    let endpoint = if custom_port != "auto" {
-        if let Ok(port) = custom_port.parse::<u16>() {
-            if let Some(colon) = endpoint.rfind(':') {
-                format!("{}:{}", &endpoint[..colon], port)
-            } else {
-                format!("{}:{}", endpoint, port)
-            }
-        } else {
-            endpoint // invalid port string, keep server default
-        }
-    } else {
-        endpoint
+    // The WireGuard port setting, as far as a relay can answer it.
+    let endpoint = match dialable_wireguard_port(custom_port) {
+        Some(port) => match endpoint.rfind(':') {
+            Some(colon) => format!("{}:{}", &endpoint[..colon], port),
+            None => format!("{}:{}", endpoint, port),
+        },
+        None => endpoint,
     };
 
     let persistent_keepalive = response.persistent_keepalive.unwrap_or(25);
@@ -240,6 +235,20 @@ pub fn build_vpn_config(
     Ok((config, server_name))
 }
 
+/// The only port the relays accept WireGuard on: vpn-a3 measured all ten — no
+/// DNAT, nothing listening on a public 53 (WIN-FIX-3).
+pub(crate) const RELAY_WIREGUARD_PORT: u16 = 51820;
+
+/// The port a `wireguard_port` setting may make a connect dial: 51820, or
+/// `None` for the server's own endpoint. "53" and custom numbers, which
+/// earlier builds offered and no relay answers, are never dialled — whatever a
+/// stale settings file or a session's reconnect record still says. The
+/// settings load migrates them to "auto" (`settings::migrate_wireguard_port`);
+/// Android applies the same rule.
+pub(crate) fn dialable_wireguard_port(setting: &str) -> Option<u16> {
+    (setting.trim() == "51820").then_some(RELAY_WIREGUARD_PORT)
+}
+
 /// Generate a X25519 keypair for WireGuard. Returns (local_private_key_b64, client_public_key_b64).
 /// Private key bytes are zeroized immediately after encoding.
 /// pub(crate) (was pub(super)) so api/contract_tests.rs can run the REAL
@@ -262,7 +271,7 @@ pub struct VpnSettings {
     pub local_network_sharing: bool,
     /// 0 = use server default, 1280-1500 = user override.
     pub custom_mtu: u16,
-    /// "auto" = use server default, otherwise a port number string.
+    /// The `wireguard_port` setting; see [`dialable_wireguard_port`].
     pub custom_port: String,
     /// Enable Xray Reality stealth tunnel
     pub stealth_mode: bool,
@@ -456,23 +465,19 @@ pub(crate) async fn start_stealth_tunnel(
     }
 
     // P1-dk-xray-wgport-hardcoded: derive the far-side WireGuard port from the
-    // user's custom-port override, else from the server-supplied WG endpoint,
-    // falling back to 51820 only when neither yields a port. The previous
-    // hardcoded 51820 made any node on a non-default port unreachable through
-    // stealth with no diagnostic, and silently ignored the custom-port setting.
-    let wg_port = if custom_port != "auto" {
-        custom_port.parse::<u16>().ok()
-    } else {
-        None
-    }
-    .or_else(|| {
-        response
-            .endpoint
-            .as_deref()
-            .and_then(|ep| ep.rfind(':').map(|i| &ep[i + 1..]))
-            .and_then(|p| p.parse::<u16>().ok())
-    })
-    .unwrap_or(51820);
+    // port setting (as far as `dialable_wireguard_port` allows), else from the
+    // server-supplied WG endpoint, falling back to the relays' port only when
+    // neither yields one. The previous hardcoded 51820 made any node on a
+    // non-default port unreachable through stealth with no diagnostic.
+    let wg_port = dialable_wireguard_port(custom_port)
+        .or_else(|| {
+            response
+                .endpoint
+                .as_deref()
+                .and_then(|ep| ep.rfind(':').map(|i| &ep[i + 1..]))
+                .and_then(|p| p.parse::<u16>().ok())
+        })
+        .unwrap_or(RELAY_WIREGUARD_PORT);
 
     let xray_config = crate::vpn::xray::XrayConfig {
         endpoint: response.xray_endpoint.clone().ok_or_else(|| {
@@ -1010,6 +1015,35 @@ pub async fn get_usage_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WIN-FIX-3: the relays take WireGuard on 51820 only. "53" and custom
+    /// ports, offered by earlier builds, failed the handshake on every relay;
+    /// a stale value left in a settings file or a reconnect record must never
+    /// be dialled, and 51820 is what "auto" dials anyway.
+    #[test]
+    fn only_the_relays_port_is_ever_dialled() {
+        assert_eq!(dialable_wireguard_port("51820"), Some(51820));
+        for stale in ["auto", "53", "443", "1194", "0", "", "abc", "65535"] {
+            assert_eq!(dialable_wireguard_port(stale), None, "{stale:?}");
+        }
+        let endpoint_for = |setting: &str| {
+            let response: ConnectResponse = serde_json::from_value(serde_json::json!({
+                "success": true,
+                "keyId": "k1",
+                "publicKey": "cGs=",
+                "assignedIp": "10.8.0.2",
+                "serverPublicKey": "c3BrPQ==",
+                "endpoint": "203.0.113.1:51820",
+            }))
+            .unwrap();
+            build_vpn_config(response, "ams-1", None, "a2V5".into(), 0, setting)
+                .map(|(config, _)| config.endpoint.clone())
+                .unwrap()
+        };
+        for setting in ["auto", "51820", "53", "5353", "not-a-port"] {
+            assert_eq!(endpoint_for(setting), "203.0.113.1:51820", "{setting:?}");
+        }
+    }
 
     /// WIN-FIX-3 P0: `get_vpn_status` answers while every lock the engine has
     /// is held (a connect stuck in a synchronous step, a teardown stopping the

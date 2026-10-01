@@ -303,8 +303,8 @@ describe('useAppStore', () => {
     })
 
     it('should update wireguard port', () => {
-      useAppStore.getState().updateSettings({ wireGuardPort: '53' })
-      expect(useAppStore.getState().settings.wireGuardPort).toBe('53')
+      useAppStore.getState().updateSettings({ wireGuardPort: '51820' })
+      expect(useAppStore.getState().settings.wireGuardPort).toBe('51820')
     })
 
     it('should have auto MTU by default', () => {
@@ -490,7 +490,8 @@ describe('useAppStore', () => {
       useAppStore.getState().acceptConsent()
       const blob = localStorage.getItem('birdo-vpn-storage') ?? '{}'
       const stored = JSON.parse(blob)
-      expect(stored.version).toBe(1)
+      // The blob is rewritten under the current version (2 since WIN-FIX-3).
+      expect(stored.version).toBe(2)
       expect(stored.state.acceptedConsentVersion).toBe(CONSENT_VERSION)
       expect(stored.state).not.toHaveProperty('hasAcceptedConsent')
 
@@ -509,6 +510,39 @@ describe('useAppStore', () => {
       expect(migratePersistedState(undefined, 0)).toEqual({ acceptedConsentVersion: 0 })
       // A blob already on version 1 is left alone.
       expect(migratePersistedState({ acceptedConsentVersion: 2 }, 1)).toEqual({ acceptedConsentVersion: 2 })
+    })
+
+    // WIN-FIX-3: no relay answers WireGuard on 53 or a custom port, so a
+    // saved one becomes "auto" once; the two real choices are kept.
+    it('a dead WireGuard port is migrated to auto (1 → 2)', () => {
+      for (const [stored, migrated] of [
+        ['53', 'auto'],
+        ['1194', 'auto'],
+        ['', 'auto'],
+        ['auto', 'auto'],
+        ['51820', '51820'],
+      ]) {
+        const out = migratePersistedState({ settings: { wireGuardPort: stored, autoConnect: true } }, 1) as {
+          settings: Record<string, unknown>
+        }
+        expect(out.settings).toEqual({ wireGuardPort: migrated, autoConnect: true })
+      }
+      // Already on version 2: untouched.
+      expect(migratePersistedState({ settings: { wireGuardPort: '53' } }, 2)).toEqual({
+        settings: { wireGuardPort: '53' },
+      })
+      // No settings in the blob: nothing is added.
+      expect(migratePersistedState({ acceptedConsentVersion: 1 }, 1)).toEqual({ acceptedConsentVersion: 1 })
+    })
+
+    it('a stored port 53 rehydrates as auto', async () => {
+      localStorage.setItem(
+        'birdo-vpn-storage',
+        JSON.stringify({ state: { settings: { wireGuardPort: '53' }, acceptedConsentVersion: 1 }, version: 1 }),
+      )
+      await useAppStore.persist.rehydrate()
+      expect(useAppStore.getState().settings.wireGuardPort).toBe('auto')
+      localStorage.removeItem('birdo-vpn-storage')
     })
   })
 })

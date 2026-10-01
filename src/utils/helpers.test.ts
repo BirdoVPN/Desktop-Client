@@ -70,6 +70,16 @@ describe('settingsFromRust — v1.3.30/31 default guarantees', () => {
     expect(out.stealthMode).toBe(true);
     expect(out.multiHopEnabled).toBe(true);
   });
+
+  // WIN-FIX-3: a port no relay answers, from a file an older build wrote, is
+  // read as "auto" — never shown as a choice the screen no longer has.
+  it('reads a dead WireGuard port as auto', () => {
+    for (const port of ['53', '1194', 'custom', '']) {
+      expect(settingsFromRust({ ...base, wireguard_port: port }).wireGuardPort).toBe('auto');
+    }
+    const { wireguard_port: _omit, ...withoutPort } = base;
+    expect(settingsFromRust(withoutPort as RustSettings).wireGuardPort).toBe('auto');
+  });
 });
 
 describe('BirdoShield (D18) dns_filtering ↔ dnsFiltering', () => {

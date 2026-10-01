@@ -168,14 +168,6 @@ export function isPrivateDnsAddress(ip: string): boolean {
   return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
-/**
- * Validate a WireGuard port number.
- */
-export function isValidPort(port: string): boolean {
-  const n = Number(port);
-  return Number.isInteger(n) && n >= 1 && n <= 65535;
-}
-
 /** WireGuard MTU range the tunnel builder accepts. */
 export function isValidMtu(mtu: string): boolean {
   const n = Number(mtu);
@@ -227,7 +219,14 @@ export interface RustSettings {
   crash_reports_enabled?: boolean;
 }
 
-import type { AppSettings } from '../store/app-store';
+import type { AppSettings, WireGuardPort } from '../store/app-store';
+
+/** A stored or received port setting as one of the two that exist (see
+ * `WireGuardPort`): "51820" stays, anything else — "53", a custom number from
+ * an older build, nothing at all — is "auto". */
+export function normalizeWireGuardPort(value: unknown): WireGuardPort {
+  return value === '51820' ? '51820' : 'auto';
+}
 
 /** Convert Rust snake_case settings to store camelCase. */
 export function settingsFromRust(rs: RustSettings): AppSettings {
@@ -250,7 +249,9 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     customDnsEnabled: (rs.custom_dns ?? []).length > 0,
     protocol: 'wireguard',
     localNetworkSharing: rs.local_network_sharing ?? false,
-    wireGuardPort: rs.wireguard_port ?? 'auto',
+    // A "53" or custom port from an older build is "auto": no relay answers
+    // either (Rust migrates the file too).
+    wireGuardPort: normalizeWireGuardPort(rs.wireguard_port),
     wireGuardMtu: rs.wireguard_mtu ?? 0,
     multiHopEnabled: rs.multi_hop_enabled ?? false,
     multiHopEntryNodeId: rs.multi_hop_entry_node_id ?? null,
