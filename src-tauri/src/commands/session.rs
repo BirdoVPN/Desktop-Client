@@ -807,7 +807,10 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
     // Cancel FIRST: an in-flight connect or re-dial stops at its next await,
     // including mid-build, so nothing below races a tunnel coming up. And
     // again once the lock is held, for a connect that was queued on it
-    // (REVIEW-WIN-003, see `lock_commit_for_teardown`).
+    // (REVIEW-WIN-003, see `lock_commit_for_teardown`). "Next await" is not
+    // always prompt: a build inside a synchronous route/DNS step finishes it
+    // first, and the `disconnect()` below waits behind it for at most the
+    // operation-lock timeout (`vpn::manager` docs, REVIEW-WIN-013).
     let _commit = vm.lock_commit_for_teardown().await;
 
     let ar = app.state::<AutoReconnectService>();

@@ -21,6 +21,26 @@
 //! expiry) bump it, and an attempt whose epoch is no longer current stops at its
 //! next await — including mid-tunnel-build, where it unwinds exactly like the
 //! CONNECT_TIMEOUT path already does.
+//!
+//! ## How long "its next await" can be (REVIEW-WIN-013)
+//! Usually well under a second, but the tunnel build also has SYNCHRONOUS
+//! steps, and neither the cancellation `select!` in `connect` nor
+//! `CONNECT_TIMEOUT` can fire during one: the Wintun adapter open/create, the
+//! route installs (inside `block_in_place`, run to completion on purpose: an
+//! added route must be recorded, I10), the DNS guard and the tunnel DNS. On
+//! the native-API path each takes milliseconds. Where a native call fails and
+//! the `route.exe` / `netsh` fallback runs instead, one such call has been
+//! measured at 10-25 s on AV-heavy machines, and a cancel waits for it.
+//!
+//! What the user sees: `end_session` cancels, then its `disconnect()` queues
+//! on the operation lock the build holds. That wait is capped by
+//! `OPERATION_LOCK_TIMEOUT` (30 s); past it the session is ended and
+//! published as `disconnected` anyway, and the build, when its step returns,
+//! finds its epoch superseded and tears its own tunnel down. A switch adds the
+//! backend notify for the old session in front (capped at 3 s). So a
+//! Disconnect during a connect lands in about a second on the native path,
+//! after the current synchronous step otherwise, and in no case later than
+//! about 35 s.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -1469,6 +1489,20 @@ mod tests {
         mgr.refresh_status();
         assert!(mgr.published().kill_switch_blocking);
         assert_eq!(mgr.published().seq, seq + 1);
+    }
+
+    /// REVIEW-WIN-013: the module docs promise a Disconnect during a stuck
+    /// build lands within the operation-lock timeout (plus the 3 s notify).
+    /// The promise and the constant must not drift apart.
+    #[test]
+    fn the_documented_cancel_bound_is_the_operation_lock_timeout() {
+        // The module docs only: the rest of the file holds this test's own
+        // strings, which would match themselves.
+        let source = include_str!("manager.rs").replace("\r\n", "\n");
+        let docs = &source[..source.find("\nuse ").expect("the first use")];
+        assert_eq!(OPERATION_LOCK_TIMEOUT, Duration::from_secs(30));
+        assert!(docs.contains("`OPERATION_LOCK_TIMEOUT` (30 s)"));
+        assert!(docs.contains("no case later than\n//! about 35 s."));
     }
 
     #[tokio::test]
