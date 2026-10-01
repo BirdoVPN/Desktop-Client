@@ -6,6 +6,7 @@
 //! wire's sake say why where they are.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zeroize::Zeroize;
 
 // ============================================================================
@@ -664,10 +665,10 @@ where
 /// `GET /api/client-config` — only the fields this client acts on.
 ///
 /// Deliberately NOT a full mirror of the payload: the endpoint also serves
-/// cert pins, per-plan feature entitlements and consent copy, none of which the
-/// desktop client reads today (pins are vendored into `third_party/` and
-/// enforced at build time). Adding fields here would create a second source of
-/// truth for each of them.
+/// cert pins, the rest of the per-plan feature entitlements and consent copy,
+/// none of which the desktop client reads (pins are vendored into
+/// `third_party/` and enforced at build time). Adding fields here would create
+/// a second source of truth for each of them.
 ///
 /// Every field is `Option` and defaulted: a payload from an OLDER web deploy —
 /// one that predates the field — must deserialize, not error. `None` means
@@ -688,6 +689,42 @@ pub struct ClientConfigResponse {
     /// happens on an explicit `false`.
     #[serde(default)]
     pub dns_filtering_available: Option<bool>,
+    /// The per-plan `features` map, reduced to the one flag this client acts
+    /// on: `features.<PLAN>.customDns` (Account API contract item 40). Custom
+    /// DNS is on every plan (owner decision D6), so the server sends `true`
+    /// for each; only an explicit `false` turns it off for that plan, and an
+    /// absent map or flag means ENABLED, as for `dns_filtering_available`.
+    #[serde(default, deserialize_with = "plan_features_or_none")]
+    pub features: Option<BTreeMap<String, PlanFeatures>>,
+}
+
+/// One plan's entry in `ClientConfigResponse::features`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanFeatures {
+    /// `None`: the server did not say, which counts as enabled.
+    pub custom_dns: Option<bool>,
+}
+
+/// `features` read flag by flag: a plan entry, or a flag, of a shape this
+/// build does not expect reads as "not said" instead of failing the whole
+/// config, which would also lose `dnsFilteringAvailable`.
+fn plan_features_or_none<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, PlanFeatures>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(|v| v.as_object()).map(|plans| {
+        plans
+            .iter()
+            .map(|(plan, flags)| {
+                let custom_dns = flags.get("customDns").and_then(serde_json::Value::as_bool);
+                (plan.clone(), PlanFeatures { custom_dns })
+            })
+            .collect()
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

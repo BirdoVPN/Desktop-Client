@@ -33,6 +33,7 @@ import {
 } from '@/session/session-data';
 import { connectPreferred, findLiveServer } from '@/session/vpn-actions';
 import { persistSettings } from '@/session/settings-persist';
+import { useCustomDnsGate } from '@/session/custom-dns-gate';
 import {
   connectionNotification,
   initNotifications,
@@ -403,6 +404,7 @@ export function VpnSessionController(): null {
   useStatusSync();
   useStatsPoll();
   usePreferredServerMirror();
+  useCustomDnsGate();
   useSessionExpiry();
   useSessionData();
   useAutoConnectOnce();

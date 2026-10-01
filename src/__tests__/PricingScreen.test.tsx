@@ -66,7 +66,10 @@ describe('Pricing', () => {
     expect(text).toContain('Stealth mode');
     expect(text).toContain('Multi-hop routing');
     expect(text).not.toMatch(/high-speed|priority servers|premium servers|maximum privacy/i);
-    // Custom DNS is not plan-gated on desktop, so no card may sell it as a tier.
-    expect(text).not.toMatch(/custom dns/i);
+    // Custom DNS is on every plan (owner decision D6): listed once, on the free
+    // tier, which every paid card includes ("Everything in Recon"), and never
+    // on a paid card as if it were an upgrade.
+    expect(text.match(/custom dns/gi)).toHaveLength(1);
+    expect(text.indexOf('Custom DNS servers')).toBeLessThan(text.indexOf('Everything in Recon'));
   });
 });

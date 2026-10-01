@@ -63,7 +63,10 @@ const TIERS: Tier[] = [
     // No "Split tunneling": the desktop app has none (vpn/mod.rs — Windows
     // only has Kill Switch Exceptions, which keep traffic IN the tunnel), so
     // listing it here sold a feature that does not exist (audit A-24 / D-4).
-    // Wording follows the mobile paywalls (second-pass #16).
+    // Wording follows the mobile paywalls (second-pass #16). Custom DNS is
+    // on EVERY plan (owner decision D6, 2026-10-01), so it is listed here, on
+    // the free tier, and the paid tiers have it through "Everything in Recon";
+    // listing it on a paid card would sell it as an upgrade.
     features: [
       '1 device connection',
       'Core server locations',
@@ -71,6 +74,7 @@ const TIERS: Tier[] = [
       'WireGuard® encryption',
       'Post-quantum key exchange',
       'Kill switch',
+      'Custom DNS servers',
     ],
   },
   {
@@ -106,10 +110,7 @@ const TIERS: Tier[] = [
     // Second-pass #16: no "Priority servers" line (nothing is prioritised: the
     // backend's isPremium is just minPlan !== 'RECON', and whether any node
     // is Sovereign-only is a per-node owner setting, not a plan feature), and
-    // no "Custom DNS" either: mobile sells it as Sovereign-only, but the
-    // desktop does not gate it by plan (Settings), so listing it here would
-    // misstate what the free and Operative plans get on desktop. Whether it
-    // should be gated everywhere is an owner decision.
+    // no "Custom DNS": it is on every plan (D6, listed on Recon above).
     features: [
       'Everything in Operative',
       '10 device connections',

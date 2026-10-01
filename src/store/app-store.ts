@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { IpcError, LiveMultiHop, VpnPhase, VpnState, VpnStats, VpnStatus } from '@/lib/ipc';
 import { giveUpKind, type GiveUpKind } from '@/lib/errors';
+import type { PlanId } from '@/lib/plan';
 
 export interface Server {
   id: string;
@@ -304,6 +305,17 @@ export interface AppState {
   dnsFilteringAvailable: boolean | undefined;
   setDnsFilteringAvailable: (available: boolean) => void;
 
+  /**
+   * `features.<PLAN>.customDns` from `GET /api/client-config` (Account API
+   * contract item 40), only the plans the server gave an explicit boolean for.
+   * Custom DNS is on every plan (owner decision D6), so the server sends `true`
+   * for each; a plan missing here is ENABLED (`customDnsAvailable`). Like the
+   * fleet gate above: a property of the service, not of the account, so it is
+   * neither persisted nor cleared on logout.
+   */
+  customDnsByPlan: Partial<Record<PlanId, boolean>>;
+  setCustomDnsByPlan: (byPlan: Partial<Record<PlanId, boolean>>) => void;
+
   portForwards: PortForward[];
 
   /** `null` until `get_admin_status` answers, so the warning cannot flash at startup. */
@@ -486,6 +498,8 @@ export const useAppStore = create<AppState>()(
       // See the AppState doc comment: true until the server says otherwise.
       dnsFilteringAvailable: true,
       setDnsFilteringAvailable: (dnsFilteringAvailable) => set({ dnsFilteringAvailable }),
+      customDnsByPlan: {},
+      setCustomDnsByPlan: (customDnsByPlan) => set({ customDnsByPlan }),
 
       portForwards: [],
       isAdmin: null,

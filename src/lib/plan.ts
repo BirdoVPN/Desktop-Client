@@ -23,6 +23,31 @@ export function normalizePlan(plan: string): PlanId {
   return p === 'OPERATIVE' || p === 'SOVEREIGN' ? p : 'RECON';
 }
 
+/**
+ * One of the three plan ids, or `null` for a slug this build does not know.
+ * Unlike `normalizePlan`, an unknown slug is NOT folded into the free tier:
+ * a per-plan server flag must never be read for the wrong plan.
+ */
+export function knownPlanId(plan: string): PlanId | null {
+  const p = plan.toUpperCase();
+  return p === 'RECON' || p === 'OPERATIVE' || p === 'SOVEREIGN' ? p : null;
+}
+
+/**
+ * Whether Custom DNS may be used on this plan (Account API contract item 40,
+ * `features.<PLAN>.customDns`). It is on every plan (owner decision D6): only
+ * an explicit `false` for the user's own, known plan turns it off. An unknown
+ * or not-yet-loaded plan, a plan the server said nothing about, or no answer
+ * at all is ENABLED.
+ */
+export function customDnsAvailable(
+  plan: string | null | undefined,
+  byPlan: Partial<Record<PlanId, boolean>>,
+): boolean {
+  const id = plan == null ? null : knownPlanId(plan);
+  return id === null || byPlan[id] !== false;
+}
+
 /** "Free", "Operative", "Sovereign" — the prose names (P1-parity casing rules). */
 export function planName(plan: string): string {
   switch (normalizePlan(plan)) {

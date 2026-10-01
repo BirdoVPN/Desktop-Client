@@ -41,6 +41,7 @@ beforeEach(() => {
     notice: null,
     settings: { ...defaultSettings },
     account: { ...useAppStore.getState().account, plan: 'OPERATIVE' },
+    customDnsByPlan: {},
   });
   mockedInvoke.mockReset();
   mockedInvoke.mockImplementation(async (cmd: string) => {
@@ -116,6 +117,51 @@ describe('Custom DNS: draft fields, saved on leave', () => {
     expect(screen.getByRole('textbox', { name: 'Primary DNS' })).toHaveValue('1.1.1.1');
     await waitFor(() => expect(saves()).toHaveLength(2));
     expect(saves()[1].custom_dns).toEqual(['1.1.1.1']);
+  });
+});
+
+describe('Custom DNS is on every plan (owner decision D6, Account API item 40)', () => {
+  it.each(['RECON', 'OPERATIVE', 'SOVEREIGN', null])('plan %s: the switch works and nothing upsells it', async (plan) => {
+    useAppStore.setState({ account: { ...useAppStore.getState().account, plan } });
+    render(<Settings />);
+    const toggle = screen.getByRole('switch', { name: 'Custom DNS Servers' });
+    expect(toggle).not.toBeDisabled();
+    expect(toggle).not.toHaveAttribute('aria-disabled', 'true');
+    await userEvent.click(toggle);
+    expect(screen.getByRole('textbox', { name: 'Primary DNS' })).toBeInTheDocument();
+    await waitFor(() => expect(saves()).toHaveLength(1));
+    expect(document.body.textContent).not.toMatch(/sovereign|upgrade|view plans/i);
+  });
+});
+
+describe('Custom DNS follows the server flag for the plan (client-config features.customDns)', () => {
+  it('an explicit false for this plan: the row reads off, cannot be switched on, and the fields go', async () => {
+    useAppStore.setState({
+      settings: { ...defaultSettings, customDnsEnabled: true, customDns: ['9.9.9.9'] },
+      customDnsByPlan: { OPERATIVE: false, RECON: true },
+    });
+    render(<Settings />);
+    const toggle = screen.getByRole('switch', { name: 'Custom DNS Servers' });
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+    expect(toggle).toHaveAttribute('aria-disabled', 'true');
+    expect(toggle).toHaveAccessibleDescription('Custom DNS is not available on your plan right now.');
+    expect(screen.queryByRole('textbox', { name: 'Primary DNS' })).not.toBeInTheDocument();
+    await userEvent.click(toggle);
+    expect(saves()).toHaveLength(0);
+    // Not an upsell: nothing offers a plan for it.
+    expect(document.body.textContent).not.toMatch(/upgrade|view plans/i);
+  });
+
+  it('true, or a false for another plan, leaves it as it is', () => {
+    useAppStore.setState({
+      settings: { ...defaultSettings, customDnsEnabled: true, customDns: ['9.9.9.9'] },
+      customDnsByPlan: { OPERATIVE: true, SOVEREIGN: false },
+    });
+    render(<Settings />);
+    const toggle = screen.getByRole('switch', { name: 'Custom DNS Servers' });
+    expect(toggle).toHaveAttribute('aria-checked', 'true');
+    expect(toggle).not.toHaveAttribute('aria-disabled', 'true');
+    expect(screen.getByRole('textbox', { name: 'Primary DNS' })).toBeInTheDocument();
   });
 });
 

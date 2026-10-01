@@ -1028,6 +1028,52 @@ mod types_serialization_tests {
         assert_eq!(cfg.dns_filtering_available, Some(false));
     }
 
+    /// Account API contract item 40 (owner decision D6): `features.<PLAN>.
+    /// customDns`. Today's server sends no such flag, which must read as "not
+    /// said" (enabled); a new one sends `true` for every plan; only an explicit
+    /// `false` is a `false`, and a flag of an unexpected shape never takes the
+    /// rest of the config down with it.
+    #[test]
+    fn client_config_custom_dns_is_per_plan_and_optional() {
+        let today: ClientConfigResponse = serde_json::from_str(
+            r#"{"dnsFilteringAvailable":true,"features":{"RECON":{"dnsFiltering":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            today.features.unwrap()["RECON"],
+            PlanFeatures { custom_dns: None }
+        );
+        let no_map: ClientConfigResponse = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert!(no_map.features.is_none());
+
+        let new: ClientConfigResponse = serde_json::from_str(
+            r#"{"features":{"RECON":{"customDns":true},"OPERATIVE":{"customDns":true},"SOVEREIGN":{"customDns":false}}}"#,
+        )
+        .unwrap();
+        let features = new.features.as_ref().unwrap();
+        assert_eq!(features["RECON"].custom_dns, Some(true));
+        assert_eq!(features["SOVEREIGN"].custom_dns, Some(false));
+
+        let odd: ClientConfigResponse = serde_json::from_str(
+            r#"{"dnsFilteringAvailable":false,"features":{"RECON":{"customDns":"yes"},"OPERATIVE":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(odd.dns_filtering_available, Some(false));
+        let features = odd.features.unwrap();
+        assert_eq!(features["RECON"].custom_dns, None);
+        assert_eq!(features["OPERATIVE"].custom_dns, None);
+        let not_a_map: ClientConfigResponse =
+            serde_json::from_str(r#"{"dnsFilteringAvailable":true,"features":[1]}"#).unwrap();
+        assert_eq!(not_a_map.dns_filtering_available, Some(true));
+        assert!(not_a_map.features.is_none());
+
+        // What the UI receives: the same camelCase shape the server sent.
+        assert_eq!(
+            serde_json::to_value(&new).unwrap()["features"]["SOVEREIGN"],
+            serde_json::json!({ "customDns": false })
+        );
+    }
+
     /// The in-app anonymous-registration body must serialize with the exact
     /// camelCase keys the backend's DeviceInfoSchema expects.
     #[test]

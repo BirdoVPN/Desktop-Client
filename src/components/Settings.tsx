@@ -59,6 +59,7 @@ import { brand, status as statusTokens, white } from '@/lib/birdo-theme';
 import { persistSettings, setKillSwitch } from '@/session/settings-persist';
 import { loadAppVersion, useUpdater } from '@/session/updater';
 import { DASHBOARD_URL, PRIVACY_URL, TERMS_URL } from '@/lib/links';
+import { customDnsAvailable } from '@/lib/plan';
 import type { WindowCorner } from '@/store/app-store';
 
 
@@ -91,13 +92,14 @@ export const KILL_SWITCH_DISABLE_BODY =
   'reconnects. For the strongest protection, keep it on.';
 
 export function Settings() {
-  const { settings, windowCorner, setWindowCorner, pushRoute, connected } = useAppStore(
+  const { settings, windowCorner, setWindowCorner, pushRoute, connected, customDnsOffered } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       windowCorner: s.windowCorner,
       setWindowCorner: s.setWindowCorner,
       pushRoute: s.pushRoute,
       connected: s.connectionState === 'connected',
+      customDnsOffered: customDnsAvailable(s.account.plan, s.customDnsByPlan),
     })),
   );
   const appVersion = useUpdater((s) => s.appVersion);
@@ -412,13 +414,22 @@ export function Settings() {
               leadingTint={statusTokens.blue}
               onClick={() => pushRoute('vpnSettings')}
             />
+            {/* On every plan (owner decision D6): no lock and no upsell. Only
+                an explicit `false` from the server for this plan (item 40)
+                turns it off, and `useCustomDnsGate` then switches it off in
+                Rust too, so the row never reads differently from the tunnel. */}
             <BirdoToggleRow
               title="Custom DNS Servers"
-              subtitle="Use your own DNS servers instead of the VPN defaults."
+              subtitle={
+                customDnsOffered
+                  ? 'Use your own DNS servers instead of the VPN defaults.'
+                  : 'Custom DNS is not available on your plan right now.'
+              }
               subtitleWrap
               leadingIcon={Globe}
               leadingTint={brand.accent}
-              checked={settings.customDnsEnabled}
+              enabled={customDnsOffered}
+              checked={settings.customDnsEnabled && customDnsOffered}
               // Switching off keeps the addresses (P1-parity-042); it only
               // stops sending them, which is a tunnel change when any exist.
               onCheckedChange={(v) =>
@@ -428,7 +439,7 @@ export function Settings() {
                 )
               }
             />
-            {settings.customDnsEnabled && <CustomDnsFields />}
+            {settings.customDnsEnabled && customDnsOffered && <CustomDnsFields />}
             <BirdoNavRow
               title="Port Forwarding"
               subtitle="Expose ports through your VPN tunnel."

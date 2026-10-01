@@ -16,18 +16,38 @@ import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '@/store/app-store';
+import { knownPlanId, type PlanId } from '@/lib/plan';
 
 /**
  * The slice of `/api/client-config` this client acts on. The route also serves
- * cert pins, per-plan feature maps and consent copy; the desktop client reads
- * none of them (pins are vendored and enforced at build time), and the Rust
- * `ClientConfigResponse` deliberately models only this field.
+ * cert pins, the rest of the per-plan feature maps and consent copy; the
+ * desktop client reads none of them (pins are vendored and enforced at build
+ * time), and the Rust `ClientConfigResponse` deliberately models only these.
  *
  * `null` is as real as `undefined`: an older web deploy predating birdo-web#465
  * omits the key, and JSON `null` survives the Rust `Option<bool>` the same way.
+ * `features` is reduced by Rust to `{ <PLAN>: { customDns } }` (item 40).
  */
 export interface ClientConfig {
   dnsFilteringAvailable?: boolean | null;
+  features?: Record<string, { customDns?: boolean | null } | null> | null;
+}
+
+/**
+ * Item 40: the plans the server gave an explicit `customDns` boolean for.
+ * `null` when the payload has no `features` map at all, so a deploy that
+ * predates it leaves the store as it is (every plan enabled).
+ */
+export function customDnsFlags(cfg: ClientConfig | null | undefined): Partial<Record<PlanId, boolean>> | null {
+  const features = cfg?.features;
+  if (!features || typeof features !== 'object') return null;
+  const byPlan: Partial<Record<PlanId, boolean>> = {};
+  for (const [plan, flags] of Object.entries(features)) {
+    const id = knownPlanId(plan);
+    const flag = flags?.customDns;
+    if (id !== null && typeof flag === 'boolean') byPlan[id] = flag;
+  }
+  return byPlan;
 }
 
 /**
@@ -161,6 +181,7 @@ export const GATE_POLL_INTERVAL_MS = 60_000;
  */
 export function useClientConfig(): void {
   const setDnsFilteringAvailable = useAppStore((s) => s.setDnsFilteringAvailable);
+  const setCustomDnsByPlan = useAppStore((s) => s.setCustomDnsByPlan);
 
   useEffect(() => {
     let cancelled = false;
@@ -186,6 +207,9 @@ export function useClientConfig(): void {
           if (typeof cfg?.dnsFilteringAvailable === 'boolean') {
             setDnsFilteringAvailable(cfg.dnsFilteringAvailable);
           }
+          // Item 40, the same rule: only explicit booleans count.
+          const customDns = customDnsFlags(cfg);
+          if (customDns) setCustomDnsByPlan(customDns);
         })
         // GUARD 2: the catch deliberately does NOTHING. The store default is
         // `true`; an offline client, a 500, a 429 or a cold start must leave
@@ -227,5 +251,5 @@ export function useClientConfig(): void {
       window.clearInterval(poll);
       unlistenShown.then((off) => off()).catch(() => {});
     };
-  }, [setDnsFilteringAvailable]);
+  }, [setDnsFilteringAvailable, setCustomDnsByPlan]);
 }
