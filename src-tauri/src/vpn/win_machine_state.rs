@@ -199,7 +199,8 @@ pub(super) trait MachineIo {
         -> Result<(), String>;
     fn clear_record(&self);
     fn add_route(&self, route: &OwnedRoute) -> Result<(), String>;
-    fn delete_route(&self, route: &OwnedRoute);
+    /// Whether the route is gone (deleted, or already not there).
+    fn delete_route(&self, route: &OwnedRoute) -> bool;
     fn install_dns_guard(&self, guard: &DnsGuard) -> Result<(), String>;
     fn release_dns_guard(&self);
 }
@@ -264,8 +265,8 @@ impl MachineIo for SystemIo {
         }
     }
 
-    fn delete_route(&self, route: &OwnedRoute) {
-        delete_owned_route(route);
+    fn delete_route(&self, route: &OwnedRoute) -> bool {
+        delete_owned_route(route)
     }
 
     fn install_dns_guard(&self, guard: &DnsGuard) -> Result<(), String> {
@@ -822,11 +823,21 @@ fn release_routes_locked(st: &mut MachineState, io: &dyn MachineIo, gen: Gen) {
         return;
     }
     let routes = std::mem::take(&mut st.routes);
-    for route in &routes {
-        io.delete_route(route);
-    }
-    if !routes.is_empty() {
-        tracing::debug!("Removed {} owned route(s)", routes.len());
+    // A route whose delete failed is still ours and still installed: it
+    // stays recorded (and journaled, when it outlives the tunnel), so the
+    // owner keeps it and the next release or start-up retries it
+    // (REVIEW-WIN2-032).
+    let total = routes.len();
+    st.routes = routes
+        .into_iter()
+        .filter(|route| !io.delete_route(route))
+        .collect();
+    if total > 0 {
+        tracing::debug!(
+            "Removed {} of {} owned route(s)",
+            total - st.routes.len(),
+            total
+        );
         flush_record(st, io);
     }
     release_owner_if_clean(st);
@@ -957,8 +968,7 @@ fn replace_route_locked(
     io.add_route(&new)?;
     push_owned_route(&mut st.routes, new);
     flush_record(st, io);
-    if st.routes.contains(&old) {
-        io.delete_route(&old);
+    if st.routes.contains(&old) && io.delete_route(&old) {
         st.routes.retain(|r| *r != old);
         flush_record(st, io);
     }
@@ -1128,6 +1138,9 @@ fn reconcile_record_with(
     if entries.is_empty() && routes.is_empty() {
         return false;
     }
+    // REVIEW-WIN2-032: a route whose delete failed stays on record, for the
+    // next start in this boot; it used to be forgotten with the rest.
+    let mut undeleted: Vec<OwnedRoute> = Vec::new();
     if !routes.is_empty() {
         if this_boot {
             tracing::warn!(
@@ -1135,7 +1148,9 @@ fn reconcile_record_with(
                 routes.len()
             );
             for route in routes.iter().filter(|r| r.outlives_the_tunnel()) {
-                io.delete_route(route);
+                if !io.delete_route(route) {
+                    undeleted.push(*route);
+                }
             }
         } else {
             tracing::info!(
@@ -1157,12 +1172,13 @@ fn reconcile_record_with(
         );
         restore_pass(&mut park, io, &mut degraded)
     };
-    // Flush what survives: adapters only (the routes are dealt with).
+    // Flush what survives: the adapters not yet restored, and the routes
+    // that could not be deleted.
     let survivors = MachineState {
         owner: None,
         dns_guard: false,
         park: park.clone(),
-        routes: Vec::new(),
+        routes: undeleted,
         degraded: BTreeMap::new(),
     };
     flush_record(&survivors, io);
@@ -1384,7 +1400,8 @@ fn delete_route_native(route: &OwnedRoute) -> Result<(), String> {
     Ok(())
 }
 
-fn delete_owned_route(route: &OwnedRoute) {
+/// Whether the route is gone afterwards.
+fn delete_owned_route(route: &OwnedRoute) -> bool {
     match delete_route_native(route) {
         Ok(()) => {
             tracing::debug!(
@@ -1393,7 +1410,7 @@ fn delete_owned_route(route: &OwnedRoute) {
                 route.prefix_len,
                 route.if_index
             );
-            return;
+            return true;
         }
         Err(e) => tracing::debug!(
             "Native delete of {}/{} on IF {} failed ({}); falling back to route.exe",
@@ -1410,9 +1427,12 @@ fn delete_owned_route(route: &OwnedRoute) {
             route.dest,
             route.prefix_len
         );
-        return;
+        return false;
     };
-    let _ = cmd("route").args(&argv).output();
+    cmd("route")
+        .args(&argv)
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 #[cfg(test)]
@@ -1455,6 +1475,8 @@ mod tests {
         added_routes: Vec<OwnedRoute>,
         add_route_fails: bool,
         deleted_routes: Vec<OwnedRoute>,
+        /// Routes whose delete fails (native and route.exe both).
+        delete_fails: Vec<OwnedRoute>,
         guard: Option<DnsGuard>,
         guard_fails: bool,
     }
@@ -1557,8 +1579,14 @@ mod tests {
             })
         }
 
-        fn delete_route(&self, route: &OwnedRoute) {
-            self.with(|m| m.deleted_routes.push(*route));
+        fn delete_route(&self, route: &OwnedRoute) -> bool {
+            self.with(|m| {
+                if m.delete_fails.contains(route) {
+                    return false;
+                }
+                m.deleted_routes.push(*route);
+                true
+            })
         }
 
         fn install_dns_guard(&self, guard: &DnsGuard) -> Result<(), String> {
@@ -1759,6 +1787,45 @@ mod tests {
 
         // A clean teardown empties the journal again.
         release_routes_locked(&mut st, &io, 7);
+        assert!(io.with(|m| m.persisted.is_none()));
+    }
+
+    /// REVIEW-WIN2-032: a route whose delete failed (native AND route.exe)
+    /// is still installed, so it stays on record — journaled for the next
+    /// start in this boot after a crash, and kept by its owner after a
+    /// teardown — instead of being forgotten with the rest.
+    #[test]
+    fn a_route_that_could_not_be_deleted_stays_on_record() {
+        let stuck = route("203.0.113.7", 32, "192.168.1.1", 12);
+        let gone = route("10.0.0.0", 8, "192.168.1.1", 12);
+
+        // After a crash: the journal keeps only the one still installed.
+        let io = FakeIo::new(Machine {
+            delete_fails: vec![stuck],
+            ..Machine::default()
+        });
+        reconcile_record_with(&io, &[], &[stuck, gone], true);
+        assert_eq!(io.with(|m| m.deleted_routes.clone()), vec![gone]);
+        assert_eq!(io.journaled_routes(), vec![stuck]);
+
+        // After a teardown: the owner keeps it, and it stays journaled.
+        let io = FakeIo::new(Machine {
+            delete_fails: vec![stuck],
+            ..Machine::default()
+        });
+        let mut st = state_owned_by(7);
+        record_route_locked(&mut st, &io, 7, stuck);
+        record_route_locked(&mut st, &io, 7, gone);
+        release_routes_locked(&mut st, &io, 7);
+        assert_eq!(st.routes, vec![stuck]);
+        assert_eq!(st.owner, Some(7), "the owner still holds a route");
+        assert_eq!(io.journaled_routes(), vec![stuck]);
+
+        // The next release deletes it once it can.
+        io.with(|m| m.delete_fails.clear());
+        release_routes_locked(&mut st, &io, 7);
+        assert!(st.routes.is_empty());
+        assert_eq!(st.owner, None);
         assert!(io.with(|m| m.persisted.is_none()));
     }
 
