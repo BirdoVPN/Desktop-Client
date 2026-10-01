@@ -382,3 +382,47 @@ describe('App: the controller runs under the biometric cover (W2-001, W2-026)', 
     await waitFor(() => expect(useAppStore.getState().connectionState).toBe('disconnected'));
   });
 });
+
+/** birdo-web #590: the Free allowance, inside and after its grace window. */
+describe('the Free data allowance', () => {
+  it('a grace warning is a notice with View plans and a system notification; the tunnel is untouched', async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    emit('vpn-status-changed', { state: 'connected', seq: 2, kill_switch_blocking: false, error: null });
+
+    emit('quota-warning', { secondsRemaining: 540 });
+    const notice = useAppStore.getState().notice;
+    expect(notice?.text).toBe('Free data allowance used — your connection ends in 9 min.');
+    expect(notice?.actionLabel).toBe('View plans');
+    await waitFor(() =>
+      expect(sendNotification).toHaveBeenCalledWith({
+        title: 'BirdoVPN — Free data allowance used',
+        body: 'Free data allowance used — your connection ends in 9 min.',
+      }),
+    );
+    act(() => notice?.onAction?.());
+    expect(useAppStore.getState().navStack).toEqual(['pricing']);
+    expect(useAppStore.getState().connectionState).toBe('connected');
+    expect(callsTo('disconnect_vpn')).toHaveLength(0);
+  });
+
+  it('when the server ends the session, the error says why', async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    emit('vpn-status-changed', { state: 'connected', seq: 2, kill_switch_blocking: false, error: null });
+    emit('vpn-status-changed', {
+      state: 'error',
+      seq: 3,
+      kill_switch_blocking: false,
+      error: { code: 'quota_exceeded', message: 'x', retryable: false, retry_after_secs: null },
+    });
+    expect(useAppStore.getState().vpnError?.code).toBe('quota_exceeded');
+    expect(useAppStore.getState().giveUp).toBeNull();
+    await waitFor(() =>
+      expect(sendNotification).toHaveBeenCalledWith({
+        title: 'BirdoVPN — Connection error',
+        body: "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.",
+      }),
+    );
+  });
+});

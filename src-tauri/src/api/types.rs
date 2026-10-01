@@ -47,9 +47,13 @@ pub struct ApiErrorBody {
     pub message: Option<String>,
     /// The backend's machine-readable reason, where it sends one
     /// (`two_factor_required`, `two_factor_invalid` — Account API contract
-    /// 2026-10-01, item 85). Clients map by THIS, never by `message`.
+    /// 2026-10-01, item 85; `quota_check_unavailable`, birdo-web #590).
+    /// Clients map by THIS, never by `message`.
     #[serde(default)]
     pub error: Option<String>,
+    /// Structured extras (`retryAfterSeconds`), read leniently where used.
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
 }
 
 /// Body of `DELETE /api/v1/gdpr/delete`. Password-less accounts (SSO and
@@ -293,6 +297,33 @@ pub struct HeartbeatResponse {
     pub server_online: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// The Free plan's monthly allowance is used up (birdo-web #590; absent on
+    /// older servers). With `valid:true` the session is inside its grace
+    /// window; with `valid:false` it is over and the peer already removed.
+    #[serde(default)]
+    pub quota_exceeded: bool,
+    /// Seconds left in the grace window, when the server says.
+    #[serde(default, deserialize_with = "seconds_or_none")]
+    pub quota_grace_seconds_remaining: Option<u64>,
+    /// Why `valid:false` (`"quota_exceeded"`); absent on older servers.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A count of seconds as sent, or `None` for anything else: an odd value must
+/// not fail the whole heartbeat, which would also hide a `valid:false`.
+fn seconds_or_none<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(|v| {
+        v.as_u64().or_else(|| {
+            v.as_f64()
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .map(|s| s.ceil() as u64)
+        })
+    }))
 }
 
 fn default_true() -> bool {

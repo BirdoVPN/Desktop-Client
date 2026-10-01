@@ -87,6 +87,10 @@ export function notifyConnectionError(message: string): void {
   notify('BirdoVPN — Connection error', message);
 }
 
+export function notifyQuotaGrace(message: string): void {
+  notify('BirdoVPN — Free data allowance used', message);
+}
+
 export function notifyKillSwitchActive(): void {
   notify(
     'BirdoVPN — Kill Switch — all traffic blocked',

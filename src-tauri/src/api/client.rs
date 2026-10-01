@@ -1192,6 +1192,17 @@ impl BirdoApi {
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            // birdo-web #590: a Free connect while the allowance check is
+            // down. Without this it read as a 503 "server unavailable", whose
+            // advice (try another location) cannot help.
+            Some("quota_check_unavailable") => {
+                let retry_after_secs = body
+                    .as_ref()
+                    .and_then(|b| b.details.as_ref())
+                    .and_then(|d| d.get("retryAfterSeconds"))
+                    .and_then(serde_json::Value::as_u64);
+                return ApiError::QuotaCheckUnavailable { retry_after_secs };
+            }
             _ => {}
         }
 

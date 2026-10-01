@@ -11,6 +11,8 @@ import {
   giveUpMessage,
   isSilentError,
   PQ_FAILED_COPY,
+  QUOTA_EXCEEDED_COPY,
+  quotaGraceMessage,
   REVOKED_COPY,
   SESSION_EXPIRED_COPY,
   STEALTH_FAILED_COPY,
@@ -32,6 +34,7 @@ const ALL: IpcErrorCode[] = [
   'server_unavailable',
   'session_expired',
   'revoked',
+  'quota_exceeded',
   'device_limit',
   'subscription_required',
   'upgrade_required',
@@ -69,6 +72,10 @@ describe('errorCopy', () => {
     expect(errorCopy(err('pq_failed'))).toEqual({ message: PQ_FAILED_COPY, action: 'open_settings' });
     expect(errorCopy(err('stealth_failed')).message).toBe(STEALTH_FAILED_COPY);
     expect(errorCopy(err('revoked'))).toEqual({ message: REVOKED_COPY, action: 'connect' });
+    expect(errorCopy(err('quota_exceeded'))).toEqual({ message: QUOTA_EXCEEDED_COPY, action: 'view_plans' });
+    expect(QUOTA_EXCEEDED_COPY).toBe(
+      "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.",
+    );
     expect(errorCopy(err('session_expired'))).toEqual({ message: SESSION_EXPIRED_COPY, action: 'sign_in' });
     expect(errorCopy(err('upgrade_required')).message).toBe(UPDATE_REQUIRED_COPY);
     expect(errorCopy(err('rate_limited')).message).toBe('Too many attempts. Please wait a moment.');
@@ -122,5 +129,18 @@ describe('reconnect give-up (P1-parity-020)', () => {
     expect(m).not.toContain('no longer being blocked');
     expect(m).toContain('still blocking traffic');
     expect(m).toContain('after 1 attempt:');
+  });
+});
+
+/** birdo-web #590: the heads-up inside the Free allowance's grace window. */
+describe('quotaGraceMessage', () => {
+  it('says how many minutes are left, rounded up, never "0 min"', () => {
+    expect(quotaGraceMessage(540)).toBe('Free data allowance used — your connection ends in 9 min.');
+    expect(quotaGraceMessage(61)).toBe('Free data allowance used — your connection ends in 2 min.');
+    expect(quotaGraceMessage(5)).toBe('Free data allowance used — your connection ends in 1 min.');
+  });
+
+  it('without a figure from the server, says soon', () => {
+    expect(quotaGraceMessage(null)).toBe('Free data allowance used — your connection ends soon.');
   });
 });

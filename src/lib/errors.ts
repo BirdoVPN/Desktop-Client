@@ -36,6 +36,8 @@ export const STEALTH_FAILED_COPY =
   "Stealth Mode couldn't start. Not connecting, so your traffic isn't sent unprotected. " +
   'Try again, or choose another location.';
 export const REVOKED_COPY = 'Connection has been revoked. Please reconnect.';
+export const QUOTA_EXCEEDED_COPY =
+  "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.";
 export const SESSION_EXPIRED_COPY = 'Your session has expired. Sign in again.';
 export const UPDATE_REQUIRED_COPY =
   'This version of BirdoVPN is no longer supported. Update to keep connecting.';
@@ -57,6 +59,9 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   },
   session_expired: { message: SESSION_EXPIRED_COPY, action: 'sign_in' },
   revoked: { message: REVOKED_COPY, action: 'connect' },
+  // The server ended the session over the Free allowance (birdo-web #590):
+  // reconnecting cannot help, a plan can.
+  quota_exceeded: { message: QUOTA_EXCEEDED_COPY, action: 'view_plans' },
   device_limit: { message: DEVICE_LIMIT_COPY, action: 'view_plans' },
   subscription_required: {
     message: "Your plan doesn't include this server or feature. Upgrade to unlock.",
@@ -106,6 +111,16 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   },
   unknown: { message: 'Something went wrong. Please try again.', action: 'retry' },
 };
+
+/**
+ * The heads-up inside the Free allowance's grace window (birdo-web #590): the
+ * session is still up, and ends when the window closes.
+ */
+export function quotaGraceMessage(secondsRemaining: number | null): string {
+  if (secondsRemaining === null) return 'Free data allowance used — your connection ends soon.';
+  const minutes = Math.max(1, Math.ceil(secondsRemaining / 60));
+  return `Free data allowance used — your connection ends in ${minutes} min.`;
+}
 
 /** `cancelled` is the user's own Disconnect during a connect: nothing to say. */
 export function isSilentError(e: IpcError | null | undefined): boolean {

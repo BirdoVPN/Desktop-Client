@@ -25,6 +25,7 @@ export type IpcErrorCode =
   | 'server_unavailable'
   | 'session_expired'
   | 'revoked'
+  | 'quota_exceeded'
   | 'device_limit'
   | 'subscription_required'
   | 'upgrade_required'
@@ -48,6 +49,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'server_unavailable',
   'session_expired',
   'revoked',
+  'quota_exceeded',
   'device_limit',
   'subscription_required',
   'upgrade_required',
@@ -274,6 +276,16 @@ export function parseVpnStats(raw: unknown): VpnStats | null {
     uptimeSeconds: num(pick(raw, 'uptimeSeconds', 'uptime_seconds')) ?? 0,
     latencyMs: num(pick(raw, 'currentLatencyMs', 'current_latency_ms')),
   };
+}
+
+/**
+ * `quota-warning` (contract §4, birdo-web #590): the Free allowance is used up
+ * and the server ends the session when its grace window closes. `null` when
+ * the server did not say how long is left.
+ */
+export function parseQuotaWarning(raw: unknown): { secondsRemaining: number | null } {
+  const secs = isObj(raw) ? num(pick(raw, 'secondsRemaining', 'seconds_remaining')) : null;
+  return { secondsRemaining: secs !== null && secs >= 0 ? secs : null };
 }
 
 /** `session-expired` (contract §3.3). An unrecognised reason is treated as expiry. */

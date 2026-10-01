@@ -30,6 +30,9 @@ pub enum IpcErrorCode {
     ServerUnavailable,
     SessionExpired,
     Revoked,
+    /// The Free plan's monthly allowance is used up and the server ended the
+    /// session (heartbeat `reason: "quota_exceeded"`, birdo-web #590).
+    QuotaExceeded,
     DeviceLimit,
     SubscriptionRequired,
     UpgradeRequired,
@@ -57,6 +60,7 @@ impl IpcErrorCode {
             self,
             IpcErrorCode::SessionExpired
                 | IpcErrorCode::Revoked
+                | IpcErrorCode::QuotaExceeded
                 | IpcErrorCode::DeviceLimit
                 | IpcErrorCode::SubscriptionRequired
                 | IpcErrorCode::UpgradeRequired
@@ -74,6 +78,7 @@ impl IpcErrorCode {
             self,
             IpcErrorCode::SessionExpired
                 | IpcErrorCode::Revoked
+                | IpcErrorCode::QuotaExceeded
                 | IpcErrorCode::DeviceLimit
                 | IpcErrorCode::SubscriptionRequired
                 | IpcErrorCode::UpgradeRequired
@@ -195,6 +200,18 @@ impl IpcError {
             ApiError::TwoFactorInvalid(message) => {
                 Self::new(IpcErrorCode::TwoFactorInvalid, message)
             }
+            // Retryable by nature: the check is down, the account was not refused.
+            ApiError::QuotaCheckUnavailable { retry_after_secs } => {
+                let err = Self::new(
+                    IpcErrorCode::ServerError,
+                    "BirdoVPN couldn't check your plan's data allowance just now. Please try \
+                     again in a moment.",
+                );
+                match retry_after_secs {
+                    Some(secs) => err.with_retry_after(*secs),
+                    None => err,
+                }
+            }
             ApiError::Unknown(message) => Self::unknown(message),
         }
     }
@@ -297,6 +314,7 @@ mod tests {
             (IpcErrorCode::ServerUnavailable, "server_unavailable"),
             (IpcErrorCode::SessionExpired, "session_expired"),
             (IpcErrorCode::Revoked, "revoked"),
+            (IpcErrorCode::QuotaExceeded, "quota_exceeded"),
             (IpcErrorCode::DeviceLimit, "device_limit"),
             (IpcErrorCode::SubscriptionRequired, "subscription_required"),
             (IpcErrorCode::UpgradeRequired, "upgrade_required"),
@@ -357,6 +375,12 @@ mod tests {
             (
                 ApiError::TwoFactorInvalid("x".into()),
                 IpcErrorCode::TwoFactorInvalid,
+            ),
+            (
+                ApiError::QuotaCheckUnavailable {
+                    retry_after_secs: Some(30),
+                },
+                IpcErrorCode::ServerError,
             ),
         ];
         for (api, code) in cases {
@@ -439,6 +463,7 @@ mod tests {
         for code in [
             IpcErrorCode::SessionExpired,
             IpcErrorCode::Revoked,
+            IpcErrorCode::QuotaExceeded,
             IpcErrorCode::DeviceLimit,
             IpcErrorCode::SubscriptionRequired,
             IpcErrorCode::UpgradeRequired,
@@ -457,6 +482,47 @@ mod tests {
         ] {
             assert!(!code.is_hard_refusal(), "{code:?}");
         }
+    }
+
+    /// birdo-web #590: a Free connect while the allowance check is down is a
+    /// retryable server error with the server's wait, never "this server is
+    /// unavailable, try another location".
+    #[test]
+    fn an_unavailable_quota_check_is_retryable_with_its_wait() {
+        let body = r#"{"statusCode":503,"error":"quota_check_unavailable","message":"Try again shortly","details":{"retryable":true,"retryAfterSeconds":30}}"#;
+        let api = crate::api::BirdoApi::classify_error_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body,
+        );
+        assert!(matches!(
+            api,
+            ApiError::QuotaCheckUnavailable {
+                retry_after_secs: Some(30)
+            }
+        ));
+        let err = IpcError::from_api(&api);
+        assert_eq!(err.code, IpcErrorCode::ServerError);
+        assert!(err.retryable);
+        assert_eq!(err.retry_after_secs, Some(30));
+
+        // Without `details`, still retryable, just without a wait.
+        let bare = IpcError::from_api(&crate::api::BirdoApi::classify_error_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"quota_check_unavailable"}"#,
+        ));
+        assert_eq!(bare.code, IpcErrorCode::ServerError);
+        assert!(bare.retryable);
+        assert_eq!(bare.retry_after_secs, None);
+
+        // Any other 503 maps as before.
+        let other = crate::api::BirdoApi::classify_error_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "",
+        );
+        assert_eq!(
+            IpcError::from_api(&other).code,
+            IpcErrorCode::ServerUnavailable
+        );
     }
 
     #[test]

@@ -19,8 +19,8 @@
 import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
-import { errorCopy, giveUpMessage } from '@/lib/errors';
+import { parseQuotaWarning, parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
+import { errorCopy, giveUpMessage, quotaGraceMessage } from '@/lib/errors';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 import { endSession } from '@/session/session';
@@ -42,6 +42,7 @@ import {
   notifyConnectionLost,
   notifyDisconnected,
   notifyKillSwitchActive,
+  notifyQuotaGrace,
   notifyReconnected,
 } from '@/utils/notifications';
 
@@ -399,6 +400,33 @@ function useStealthFallbackNotice(): void {
   );
 }
 
+/**
+ * The Free allowance is used up and the server ends the session when its grace
+ * window closes (birdo-web #590). Rust sends this once per session; the
+ * session itself is untouched until the server ends it, which arrives as an
+ * `error` status with `quota_exceeded`. Non-blocking: a notice in the window
+ * and, since the app usually sits in the tray, a system notification.
+ */
+function useQuotaWarning(): void {
+  useEffect(
+    () =>
+      unlistenLater(
+        listen('quota-warning', (e) => {
+          const text = quotaGraceMessage(parseQuotaWarning(e.payload).secondsRemaining);
+          const s = useAppStore.getState();
+          s.showNotice({
+            text,
+            tone: 'info',
+            actionLabel: 'View plans',
+            onAction: () => useAppStore.getState().pushRoute('pricing'),
+          });
+          notifyQuotaGrace(text);
+        }),
+      ),
+    [],
+  );
+}
+
 /** Renderless. Mounted by App for the whole signed-in session. */
 export function VpnSessionController(): null {
   useStatusSync();
@@ -413,5 +441,6 @@ export function VpnSessionController(): null {
   useDeepLinkConnect();
   useMultiHopPrune();
   useStealthFallbackNotice();
+  useQuotaWarning();
   return null;
 }

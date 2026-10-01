@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Manager};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{watch, Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, MissedTickBehavior};
@@ -26,7 +27,7 @@ use super::manager::{
 };
 use super::network_events::{self, PhysicalRoute};
 use super::reconnect_policy::{
-    self, Action, Budget, DropCause, Liveness, Observed, ReconnectPolicy, Tick,
+    self, Action, Budget, DropCause, HeartbeatVerdict, Liveness, Observed, ReconnectPolicy, Tick,
 };
 use super::xray::XrayManager;
 use crate::api::attestation::DesktopAttestation;
@@ -192,6 +193,19 @@ impl AutoReconnectConfig {
 /// `valid:false` answer is how a revocation arrives.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Emitted once per session when the heartbeat reports the Free allowance used
+/// up inside its grace window (birdo-web #590, contract v2 §4). The session
+/// itself is untouched until the server ends it.
+const QUOTA_WARNING_EVENT: &str = "quota-warning";
+
+/// The `quota-warning` payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaWarning {
+    /// Seconds until the server ends the session, when it said.
+    seconds_remaining: Option<u64>,
+}
+
 /// How long `stop()` waits for the loop to finish its current step before
 /// aborting it. Normally milliseconds: every caller cancels the manager's
 /// epoch first, and a cancelled dial returns at its next await. But the
@@ -350,6 +364,8 @@ struct SessionWatch {
     /// A resume asked the path to be re-proven at this instant.
     verify_since: Option<Instant>,
     last_heartbeat: Option<Instant>,
+    /// The Free-allowance grace warning went out for this session.
+    quota_warned: bool,
 }
 
 enum Wake {
@@ -775,34 +791,50 @@ impl ReconnectLoop {
             r = self.api.heartbeat(&key_id) => r,
             _ = self.shutdown.changed() => return Flow::Stop,
         };
-        match result {
-            Ok(resp) if !resp.valid => {
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!("Heartbeat failed: {}", e);
+                return Flow::Continue;
+            }
+        };
+        match reconnect_policy::heartbeat_verdict(&resp) {
+            HeartbeatVerdict::End(error) => {
                 // The server ended this VPN session: another device took the
-                // slot, or the peer was reaped. The AUTH session is intact, so
-                // this is `revoked`, not `session_expired` — and the owner
-                // default (iOS parity, P1-parity-021) is: tear down, release
-                // the block, no auto-retry.
-                tracing::warn!("Heartbeat: the server ended this VPN session (revoked)");
-                // Not a give-up: nothing was reconnecting. The UI words it
-                // as a revocation (canonical copy), not "stopped reconnecting".
-                self.give_up(
-                    reconnect_policy::revoked_error(resp.message.as_deref()),
-                    None,
-                )
-                .await;
+                // slot, the peer was reaped (`revoked`), or the Free allowance
+                // ran out after its grace window (`quota_exceeded`, birdo-web
+                // #590; the peer is already gone). The AUTH session is intact,
+                // so this is not `session_expired`, and the owner default (iOS
+                // parity, P1-parity-021) is: tear down, release the block, no
+                // auto-retry.
+                tracing::warn!(
+                    "Heartbeat: the server ended this VPN session ({:?})",
+                    error.code
+                );
+                // Not a give-up: nothing was reconnecting. The UI words it by
+                // its code, not as "stopped reconnecting".
+                self.give_up(error, None).await;
                 *self.last_reconnect_info.write().await = None;
                 Flow::Stop
             }
-            Ok(resp) if !resp.server_online => {
+            HeartbeatVerdict::QuotaGrace { seconds_remaining } => {
+                // Once per session: the heartbeat repeats every 30 s for the
+                // whole grace window, and the warning is news only once.
+                if !self.session.quota_warned {
+                    self.session.quota_warned = true;
+                    tracing::warn!("Heartbeat: the Free data allowance is used up (grace window)");
+                    if let Some(app) = &self.app {
+                        let _ = app.emit(QUOTA_WARNING_EVENT, QuotaWarning { seconds_remaining });
+                    }
+                }
+                Flow::Continue
+            }
+            HeartbeatVerdict::ServerGoingOffline => {
                 tracing::warn!("Heartbeat: server going offline");
                 Flow::Continue
             }
-            Ok(_) => {
+            HeartbeatVerdict::Fine => {
                 tracing::debug!("Heartbeat sent");
-                Flow::Continue
-            }
-            Err(e) => {
-                tracing::debug!("Heartbeat failed: {}", e);
                 Flow::Continue
             }
         }
@@ -981,8 +1013,32 @@ mod tests {
         assert!(arm.contains("attempts: self.policy.attempts()"), "{arm}");
         assert!(arm.contains("self.give_up(error, Some(gave_up))"), "{arm}");
 
-        let revoked = &source[source.find("reconnect_policy::revoked_error(").unwrap()..];
-        let revoked = &revoked[..revoked.find(".await").unwrap()];
-        assert!(revoked.contains("None,"), "{revoked}");
+        let ended = &source[source.find("HeartbeatVerdict::End(error) => {").unwrap()..];
+        let ended = &ended[..ended.find("Flow::Stop").unwrap()];
+        assert!(ended.contains("self.give_up(error, None)"), "{ended}");
+    }
+
+    /// The grace warning goes out once per session, not on every 30 s
+    /// heartbeat of the 15-minute window.
+    #[test]
+    fn the_quota_warning_goes_out_once_per_session() {
+        let source = include_str!("auto_reconnect.rs");
+        let arm = &source[source
+            .find("HeartbeatVerdict::QuotaGrace { seconds_remaining } => {")
+            .unwrap()..];
+        let arm = &arm[..arm.find("Flow::Continue").unwrap()];
+        let check = arm
+            .find("if !self.session.quota_warned")
+            .expect("a once-per-session check");
+        let mark = arm
+            .find("self.session.quota_warned = true")
+            .expect("marked");
+        let emit = arm.find("QUOTA_WARNING_EVENT").expect("emitted");
+        assert!(check < mark && mark < emit, "{arm}");
+        let payload = serde_json::to_value(QuotaWarning {
+            seconds_remaining: Some(540),
+        })
+        .unwrap();
+        assert_eq!(payload, serde_json::json!({ "secondsRemaining": 540 }));
     }
 }

@@ -24,6 +24,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::api::types::HeartbeatResponse;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 
 /// Liveness is not judged until the session has been up this long, so the
@@ -137,11 +138,60 @@ pub fn needs_rebind<R: PartialEq>(pinned: Option<&R>, now: Option<&R>) -> bool {
 }
 
 /// Whether a give-up keeps the block-all engaged. Always-on (lockdown) keeps
-/// blocking — the user asked for exactly that — EXCEPT for a revocation: the
-/// server ended the session and the owner default (iOS parity, P1-parity-021)
-/// is to release the block and stop.
+/// blocking — the user asked for exactly that — EXCEPT when the server ended
+/// the session: a revocation (owner default, iOS parity, P1-parity-021) or a
+/// used-up Free allowance. No reconnect can bring either back, so blocking
+/// would only hold the machine offline.
 pub fn give_up_keeps_block(code: IpcErrorCode, lockdown: bool) -> bool {
-    lockdown && code != IpcErrorCode::Revoked
+    lockdown && !matches!(code, IpcErrorCode::Revoked | IpcErrorCode::QuotaExceeded)
+}
+
+/// What a heartbeat answer means for the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatVerdict {
+    Fine,
+    /// The relay is going offline; informational.
+    ServerGoingOffline,
+    /// The Free allowance is used up and the session ends when the grace
+    /// window closes (birdo-web #590): tell the user, keep the tunnel.
+    QuotaGrace {
+        seconds_remaining: Option<u64>,
+    },
+    /// The server ended the session: tear down, release the block, no retry.
+    End(IpcError),
+}
+
+/// The heartbeat's answer, decided. `valid:false` ends the session: with the
+/// quota mark it is `quota_exceeded`, otherwise a revocation. `valid:true`
+/// with the quota mark is the grace window. An older server sends neither
+/// mark, and everything behaves as before.
+pub fn heartbeat_verdict(resp: &HeartbeatResponse) -> HeartbeatVerdict {
+    let quota = resp.quota_exceeded || resp.reason.as_deref() == Some("quota_exceeded");
+    if !resp.valid {
+        return HeartbeatVerdict::End(if quota {
+            quota_exceeded_error()
+        } else {
+            revoked_error(resp.message.as_deref())
+        });
+    }
+    if quota {
+        return HeartbeatVerdict::QuotaGrace {
+            seconds_remaining: resp.quota_grace_seconds_remaining,
+        };
+    }
+    if !resp.server_online {
+        return HeartbeatVerdict::ServerGoingOffline;
+    }
+    HeartbeatVerdict::Fine
+}
+
+/// The error for a session the server ended over the Free allowance. The UI
+/// words it by code (and offers View plans); this is the secondary sentence.
+pub fn quota_exceeded_error() -> IpcError {
+    IpcError::new(
+        IpcErrorCode::QuotaExceeded,
+        "You've used this month's free data allowance. Upgrade to keep using BirdoVPN.",
+    )
 }
 
 /// The error for a heartbeat `valid:false`. The server's own sentence wins
@@ -724,6 +774,65 @@ mod tests {
         assert!(!needs_rebind(Some(&(1, 7)), Some(&(1, 7))));
         assert!(!needs_rebind(Some(&(1, 7)), None));
         assert!(!needs_rebind::<(u8, u8)>(None, Some(&(1, 7))));
+    }
+
+    fn heartbeat(json: &str) -> HeartbeatResponse {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// birdo-web #590, all three shapes, and today's server.
+    #[test]
+    fn heartbeat_answers_decide_the_session() {
+        assert_eq!(
+            heartbeat_verdict(&heartbeat(r#"{"valid":true}"#)),
+            HeartbeatVerdict::Fine
+        );
+        assert_eq!(
+            heartbeat_verdict(&heartbeat(r#"{"valid":true,"serverOnline":false}"#)),
+            HeartbeatVerdict::ServerGoingOffline
+        );
+        // An old server's revocation: unchanged.
+        match heartbeat_verdict(&heartbeat(r#"{"valid":false,"message":"Session ended"}"#)) {
+            HeartbeatVerdict::End(e) => assert_eq!(e.code, IpcErrorCode::Revoked),
+            other => panic!("{other:?}"),
+        }
+        // Inside the grace window: a warning, and the tunnel stays.
+        assert_eq!(
+            heartbeat_verdict(&heartbeat(
+                r#"{"valid":true,"quotaExceeded":true,"quotaGraceEndsAt":"2026-10-01T12:15:00Z","quotaGraceSecondsRemaining":540,"message":"Free data allowance used"}"#
+            )),
+            HeartbeatVerdict::QuotaGrace {
+                seconds_remaining: Some(540)
+            }
+        );
+        assert_eq!(
+            heartbeat_verdict(&heartbeat(
+                r#"{"valid":true,"quotaExceeded":true,"quotaGraceSecondsRemaining":"soon"}"#
+            )),
+            HeartbeatVerdict::QuotaGrace {
+                seconds_remaining: None
+            }
+        );
+        // After it: terminal, and not a revocation.
+        for after in [
+            r#"{"valid":false,"quotaExceeded":true,"reason":"quota_exceeded","message":"x"}"#,
+            r#"{"valid":false,"reason":"quota_exceeded"}"#,
+        ] {
+            match heartbeat_verdict(&heartbeat(after)) {
+                HeartbeatVerdict::End(e) => {
+                    assert_eq!(e.code, IpcErrorCode::QuotaExceeded);
+                    assert!(!e.retryable);
+                    assert!(e.code.is_hard_refusal());
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_used_up_allowance_releases_the_block_even_in_lockdown() {
+        assert!(!give_up_keeps_block(IpcErrorCode::QuotaExceeded, true));
+        assert!(!give_up_keeps_block(IpcErrorCode::QuotaExceeded, false));
     }
 
     #[test]
