@@ -131,15 +131,17 @@ impl ErrorSummary {
     }
 }
 
-/// The two halves of a running packet path. Dropping it without `stop()`
-/// leaves them running, so `WintunTunnel::stop` always stops it.
+/// The two halves of a running packet path. `stop()` signals and joins them;
+/// a DataPlane dropped without it (a connect cancelled at its very last await,
+/// the tunnel's emergency `Drop`) still signals them, so neither can go on
+/// holding the Wintun session.
 pub(super) struct DataPlane {
     session: Arc<Session>,
     running: Arc<AtomicBool>,
     shutdown: watch::Sender<bool>,
-    rx_task: tokio::task::JoinHandle<()>,
-    tx_thread: std::thread::JoinHandle<()>,
-    tx_exited: oneshot::Receiver<()>,
+    rx_task: Option<tokio::task::JoinHandle<()>>,
+    tx_thread: Option<std::thread::JoinHandle<()>>,
+    tx_exited: Option<oneshot::Receiver<()>>,
 }
 
 impl DataPlane {
@@ -180,42 +182,59 @@ impl DataPlane {
             session,
             running,
             shutdown,
-            rx_task,
-            tx_thread,
-            tx_exited,
+            rx_task: Some(rx_task),
+            tx_thread: Some(tx_thread),
+            tx_exited: Some(tx_exited),
         })
     }
 
-    /// Stop both halves and wait for them, so neither still holds the Wintun
-    /// session when the caller releases the adapter — a session outliving its
-    /// tunnel is what made a server switch fail to recreate the adapter.
-    pub(super) async fn stop(self) {
+    /// Tell both halves to exit. Idempotent.
+    fn signal(&self) {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown.send(true);
         // Wakes the send thread out of receive_blocking.
         if let Err(e) = self.session.shutdown() {
             tracing::warn!("Could not signal the Wintun session to shut down: {}", e);
         }
+    }
 
-        let abort = self.rx_task.abort_handle();
-        if timeout(JOIN_CAP, self.rx_task).await.is_err() {
-            tracing::warn!(
-                "Receive task did not exit within {:?} — aborting it",
-                JOIN_CAP
-            );
-            abort.abort();
-        }
-        match timeout(JOIN_CAP, self.tx_exited).await {
-            Ok(_) => {
-                let thread = self.tx_thread;
-                let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+    /// Stop both halves and wait for them, so neither still holds the Wintun
+    /// session when the caller releases the adapter — a session outliving its
+    /// tunnel is what made a server switch fail to recreate the adapter.
+    pub(super) async fn stop(mut self) {
+        self.signal();
+
+        if let Some(rx_task) = self.rx_task.take() {
+            let abort = rx_task.abort_handle();
+            if timeout(JOIN_CAP, rx_task).await.is_err() {
+                tracing::warn!(
+                    "Receive task did not exit within {:?} — aborting it",
+                    JOIN_CAP
+                );
+                abort.abort();
             }
-            Err(_) => tracing::error!(
-                "Send thread did not exit within {:?} — the adapter may stay held",
-                JOIN_CAP
-            ),
+        }
+        if let (Some(exited), Some(thread)) = (self.tx_exited.take(), self.tx_thread.take()) {
+            match timeout(JOIN_CAP, exited).await {
+                Ok(_) => {
+                    let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+                }
+                Err(_) => tracing::error!(
+                    "Send thread did not exit within {:?} — the adapter may stay held",
+                    JOIN_CAP
+                ),
+            }
         }
         tracing::debug!("Data plane stopped");
+    }
+}
+
+impl Drop for DataPlane {
+    fn drop(&mut self) {
+        if self.rx_task.is_some() || self.tx_thread.is_some() {
+            tracing::warn!("Data plane dropped without stop() — signalling it to exit");
+            self.signal();
+        }
     }
 }
 
@@ -477,6 +496,40 @@ mod tests {
     fn the_send_buffer_fits_the_largest_wintun_packet() {
         assert!(MAX_SEALED >= u16::MAX as usize + 32);
         assert!(MAX_PACKET_SIZE >= 9000 + WIREGUARD_OVERHEAD);
+    }
+
+    /// A DataPlane needs a live Wintun session, which a unit test cannot open
+    /// (driver + elevation), so the drop path is pinned at the source: a plane
+    /// dropped without `stop()` must still signal both halves, and `stop()`
+    /// must take the handles first so its own drop is silent.
+    #[test]
+    fn a_dropped_data_plane_still_signals_both_halves() {
+        let src = include_str!("data_plane.rs");
+        let body = |head: &str| -> String {
+            src.split(head)
+                .nth(1)
+                .and_then(|rest| rest.split("\n    }\n").next())
+                .unwrap_or_else(|| panic!("`{head}` not found"))
+                .to_string()
+        };
+        let drop_impl = body("impl Drop for DataPlane {");
+        assert!(drop_impl.contains("self.signal();"), "{drop_impl}");
+        let stop = body("pub(super) async fn stop(mut self) {");
+        for step in [
+            "self.signal();",
+            "self.rx_task.take()",
+            "self.tx_thread.take()",
+        ] {
+            assert!(stop.contains(step), "stop() lost `{step}`");
+        }
+        let signal = body("fn signal(&self) {");
+        for step in [
+            "self.running.store(false",
+            "self.shutdown.send(true)",
+            "self.session.shutdown()",
+        ] {
+            assert!(signal.contains(step), "signal() lost `{step}`");
+        }
     }
 }
 
