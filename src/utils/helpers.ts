@@ -157,6 +157,18 @@ export function isValidDnsAddress(ip: string): { valid: boolean; error?: string 
 }
 
 /**
+ * Whether a valid Custom DNS address is on a private network (10/8,
+ * 172.16/12, 192.168/16): the user's own resolver, a Pi-hole for instance.
+ * Rust reaches one outside the tunnel, and only with Local Network Sharing on
+ * (`wfp_policy::split_resolvers`, REVIEW-WIN2-006).
+ */
+export function isPrivateDnsAddress(ip: string): boolean {
+  if (!isValidDnsAddress(ip).valid) return false;
+  const [a, b] = ip.split('.').map(Number);
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/**
  * Validate a WireGuard port number.
  */
 export function isValidPort(port: string): boolean {

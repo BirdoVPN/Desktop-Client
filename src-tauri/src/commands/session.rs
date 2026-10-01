@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::timeout;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::api::session_gate::StoredSession;
 use crate::api::types::{ConnectResponse, MultiHopConnectResponse, VpnConfig};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
@@ -94,6 +95,10 @@ struct AttemptContext {
     /// session rode the stealth transport. Once the count moves, the old
     /// tunnel no longer carries traffic even if it is still held.
     old_stealth_mark: Option<u64>,
+    /// The relay the block permitted when the connect started: what a switch
+    /// that keeps the old session must point the permit back at.
+    #[cfg(target_os = "windows")]
+    old_relay: Option<crate::vpn::wfp_policy::Relay>,
 }
 
 impl AttemptContext {
@@ -183,6 +188,8 @@ pub(crate) async fn connect_session(
         } else {
             None
         },
+        #[cfg(target_os = "windows")]
+        old_relay: crate::vpn::wfp::current_relay(),
     };
     let mut result = attempt(app, &target, None, &mut ctx).await;
 
@@ -350,7 +357,7 @@ async fn attempt(
             .clone()
             .unwrap_or_else(|| "Connection failed".to_string());
         tracing::error!("Server rejected connection: {}", message);
-        return Err(IpcError::connect_refused(&message));
+        return Err(IpcError::connect_refused(&message, response.quota_exceeded));
     }
 
     let prepared = prepare_tunnel(
@@ -382,13 +389,24 @@ async fn attempt(
     // tunnel held right now — not only by what the start of the attempt
     // believed. Whatever it displaces was the user's protection, so a failure
     // from here on holds the block too.
-    if ctx.was_live || vm.holds_tunnel().await {
+    let guard_rebuild = ctx.was_live || vm.holds_tunnel().await;
+    if guard_rebuild {
         ctx.was_live = true;
-        engage_rebuild_block(ctx).await;
+        ctx.block_engaged = true;
     }
-    // The relay permit moves to the new server together with the guard, so a
-    // switch that fails before this point leaves the old session's permit.
-    apply_relay_permit(&prepared.relay_endpoint, prepared.started_stealth).await;
+    // REVIEW-WIN2-001: the guard and the relay permit move in ONE commit, so
+    // the block that goes up already lets the new handshake out. The guard
+    // used to engage first, naming the OLD relay, and lockdown never re-baked
+    // the permit, so every switch's handshake was dropped by our own block. A
+    // block already held (a give-up, lockdown) is rebuilt with the new relay
+    // by the same call. A switch that fails before this point leaves the old
+    // session's permit.
+    apply_relay_permit(
+        &prepared.relay_endpoint,
+        prepared.started_stealth,
+        guard_rebuild,
+    )
+    .await;
 
     let label = SessionLabel {
         server_name: match &multi_hop {
@@ -508,6 +526,18 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
         FailureOutcome::Cancelled => return IpcError::cancelled(),
         FailureOutcome::KeepOldSession => {
             tracing::error!("Switch failed; keeping the current session: {}", error);
+            // The relay permit may already have moved to the new server, just
+            // before the rebuild (REVIEW-WIN2-001); a block held for the
+            // session (lockdown) would then drop the kept session's own
+            // WireGuard traffic. Point it back.
+            #[cfg(target_os = "windows")]
+            if let Some(relay) = ctx.old_relay {
+                if crate::vpn::wfp::current_relay() != Some(relay) {
+                    if let Err(e) = killswitch::move_relay(relay, false).await {
+                        tracing::warn!("Could not put the kept session's relay permit back: {}", e);
+                    }
+                }
+            }
             // Its reconnect info is still the old one (the new target is only
             // stored on success), so the loop goes back to guarding it.
             let _ = vm.set_state(ConnectionState::Connected).await;
@@ -568,6 +598,7 @@ pub(crate) fn verified_multi_hop_response(
                 .message
                 .as_deref()
                 .unwrap_or("Multi-hop connection failed"),
+            response.quota_exceeded,
         ));
     }
     let Some(route) = response.multi_hop.as_ref() else {
@@ -724,27 +755,31 @@ pub(crate) async fn prepare_tunnel(
     })
 }
 
-/// Point the kill switch's relay permit at `endpoint`, re-baking an engaged
-/// block so the new handshake is not dropped by it. `stealth`: the relay is
-/// reached by the xray helper over TCP rather than by our own WireGuard socket
-/// over UDP, which is what the Windows permit is scoped to (W1-013).
-pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool) {
-    let Some(ip) = parse_endpoint_ip(endpoint) else {
-        // P6-CLI-D-03: the endpoint names the relay, so both lines are
-        // redacted (`redact_*` is a pass-through in debug builds).
-        tracing::warn!(
-            "Could not resolve kill switch endpoint IP from '{}'; kill switch may not filter \
-             traffic to the VPN server correctly",
-            crate::utils::redact::redact_hostname(endpoint)
-        );
-        tracing::debug!(
-            "Unresolvable kill switch endpoint: {}",
-            crate::utils::redact_endpoint(endpoint)
-        );
-        return;
-    };
-    killswitch::set_vpn_server_ip(Some(ip)).await;
-    // update_relay sets the permit AND re-activates an engaged block atomically.
+/// Point the kill switch's relay permit at `endpoint` before the handshake
+/// that needs it, rebuilding a block already in force around it. With
+/// `engage`, also put the block-all up for the rebuild of a live session: the
+/// block and the new relay's permit then come into force together
+/// (REVIEW-WIN2-001). `stealth`: the relay is reached by the xray helper over
+/// TCP rather than by our own WireGuard socket over UDP, which is what the
+/// Windows permit is scoped to (W1-013).
+pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bool) {
+    let ip = parse_endpoint_ip(endpoint);
+    match ip {
+        Some(ip) => killswitch::set_vpn_server_ip(Some(ip)).await,
+        None => {
+            // P6-CLI-D-03: the endpoint names the relay, so both lines are
+            // redacted (`redact_*` is a pass-through in debug builds).
+            tracing::warn!(
+                "Could not resolve kill switch endpoint IP from '{}'; kill switch may not \
+                 filter traffic to the VPN server correctly",
+                crate::utils::redact::redact_hostname(endpoint)
+            );
+            tracing::debug!(
+                "Unresolvable kill switch endpoint: {}",
+                crate::utils::redact_endpoint(endpoint)
+            );
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         use crate::vpn::wfp_policy::{parse_relay, RelayTransport};
@@ -755,28 +790,55 @@ pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool) {
         };
         match parse_relay(endpoint, transport) {
             Some(relay) => {
-                if let Err(e) = crate::vpn::wfp::update_relay(relay).await {
-                    tracing::warn!("Failed to update the WFP relay permit: {}", e);
+                if let Err(e) = killswitch::move_relay(relay, engage).await {
+                    tracing::warn!("Failed to move the WFP relay permit: {}", e);
                 }
             }
-            None => tracing::warn!("Kill switch relay endpoint has no usable port"),
+            None => {
+                if ip.is_some() {
+                    tracing::warn!("Kill switch relay endpoint has no usable port");
+                }
+                // No relay to permit, but the rebuild is still guarded.
+                if engage {
+                    if let Err(e) = killswitch::activate_killswitch().await {
+                        tracing::warn!("Kill switch activation before the rebuild failed: {}", e);
+                    }
+                }
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
-    let _ = stealth;
-    // Linux twin: the relay is permitted by ADDRESS and the self-permit is
-    // scoped to tcp/443, so a connect onto a different server needs the live
-    // block re-armed or its handshake is dropped.
-    #[cfg(target_os = "linux")]
-    if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
-        tracing::warn!("Failed to update iptables VPN server: {}", e);
-    }
-    // macOS twin: pf bakes the relay permit into the loaded ruleset, so an
-    // engaged block must be re-loaded with the NEW relay IP (block drop all wins).
-    #[cfg(target_os = "macos")]
-    if killswitch::pf_blocking_active() {
-        if let Err(e) = killswitch::activate_killswitch().await {
-            tracing::warn!("Failed to update pf VPN server permit: {}", e);
+    {
+        let _ = stealth;
+        if engage {
+            // pf and iptables read the relay from VPN_SERVER_IP, recorded
+            // above, so engaging now is one load that already permits it.
+            if let Err(e) = killswitch::activate_killswitch().await {
+                tracing::warn!("Kill switch activation before the rebuild failed: {}", e);
+            }
+            return;
+        }
+        let Some(ip) = ip else {
+            return;
+        };
+        // Linux twin: the relay is permitted by ADDRESS and the self-permit is
+        // scoped to tcp/443, so a connect onto a different server needs the
+        // live block re-armed or its handshake is dropped.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
+            tracing::warn!("Failed to update iptables VPN server: {}", e);
+        }
+        // macOS twin: pf bakes the relay permit into the loaded ruleset, so an
+        // engaged block must be re-loaded with the NEW relay IP (block drop
+        // all wins).
+        #[cfg(target_os = "macos")]
+        {
+            let _ = ip;
+            if killswitch::pf_blocking_active() {
+                if let Err(e) = killswitch::activate_killswitch().await {
+                    tracing::warn!("Failed to update pf VPN server permit: {}", e);
+                }
+            }
         }
     }
 }
@@ -864,21 +926,36 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
 
 static EXPIRY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// Contract §3.3: the server rejected the refresh token. Tear the VPN down,
-/// clear the tokens and tell the UI, which routes to sign-in with a banner.
+/// Contract §3.3: the sign-in session is over. Tear the VPN down, clear the
+/// tokens and tell the UI, which routes to sign-in with a banner.
+/// `stored`: whether the keystore's copy goes too — only when the server
+/// rejected the refresh token itself (`session_gate::StoredSession`).
 /// Idempotent: every request in flight can report the same rejection.
-pub async fn handle_session_expired(app: &AppHandle) {
+pub async fn handle_session_expired(app: &AppHandle, stored: StoredSession) {
     if EXPIRY_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return;
     }
-    tracing::warn!("The server rejected the sign-in session — signing out");
+    tracing::warn!("The sign-in session ended — signing out");
+    let api = app.state::<BirdoApi>();
+    // REVIEW-WIN2-021: the tokens to clear are the ones that expired. The UI
+    // is on Login at once, and the teardown below takes seconds: a user who
+    // signs straight back in has new tokens by the time it is over.
+    let expired = api.access_token_value().await;
     end_session(app, EndReason::SessionExpired).await;
-    app.state::<BirdoApi>().clear_tokens().await;
-    if let Err(e) = app.state::<CredentialStore>().clear_tokens() {
-        tracing::warn!(
-            "Could not clear the stored session: {}",
-            crate::utils::redact::sanitize_error(&e.to_string())
-        );
+    if api.clear_tokens_if(expired.as_deref()).await {
+        if stored == StoredSession::Discard {
+            if let Err(e) = app.state::<CredentialStore>().clear_tokens() {
+                tracing::warn!(
+                    "Could not clear the stored session: {}",
+                    crate::utils::redact::sanitize_error(&e.to_string())
+                );
+            }
+        }
+        // REVIEW-WIN-007 / REVIEW-WIN2-023: the next account to sign in on
+        // this machine must not inherit this one's server or route.
+        crate::commands::settings::clear_account_choices(app);
+    } else {
+        tracing::info!("A new sign-in arrived while the expired session ended — keeping it");
     }
     // Only "expired" is emitted: the backend's refresh 401 carries nothing
     // that tells a revoked session apart from an expired one.
@@ -898,11 +975,17 @@ pub async fn handle_session_expired(app: &AppHandle) {
 /// auto-reconnect kept running, watched by nothing, and a later give-up under
 /// lockdown could hold the block behind the Login screen. The UI calls this
 /// whenever it ends a session over such an answer, so Rust ends it too: the
-/// same teardown, token clearing and `session-expired` event as §3.3.
-/// Idempotent, like `handle_session_expired`.
+/// same teardown and `session-expired` event as §3.3.
+///
+/// The keystore's tokens are KEPT here (REVIEW-WIN2-003). A refresh the server
+/// refused has already gone through the gate, which discards them when the
+/// token itself was rejected; whatever else reaches the UI as
+/// `session_expired` — no session in memory, a 401 on a request retried after
+/// a refresh that worked — is no proof the stored session is dead, and a later
+/// launch re-checks it. Idempotent, like `handle_session_expired`.
 #[tauri::command]
 pub async fn end_expired_session(app: AppHandle) {
-    handle_session_expired(&app).await;
+    handle_session_expired(&app, StoredSession::Keep).await;
 }
 
 /// Source pins for the lifecycle ordering. The functions take an `AppHandle`,
@@ -982,20 +1065,33 @@ mod lifecycle_tests {
     }
 
     /// REVIEW-WIN-012: a command-level `session_expired` ends the session in
-    /// Rust through the same §3.3 path as a rejected refresh.
+    /// Rust through the same §3.3 path as a rejected refresh — keeping the
+    /// keystore's tokens, which only the refresh's own rejection discards
+    /// (REVIEW-WIN2-003). The tokens cleared are the ones that expired, read
+    /// BEFORE the teardown (REVIEW-WIN2-021; `clear_tokens_if` is tested in
+    /// `api::client`).
     #[test]
     fn an_expired_session_reported_by_the_ui_takes_the_same_path() {
         order(
             body("pub async fn end_expired_session("),
-            &["handle_session_expired(&app)"],
+            &["handle_session_expired(&app, StoredSession::Keep)"],
         );
+        let handled = body("pub async fn handle_session_expired(");
         order(
-            body("pub async fn handle_session_expired("),
+            handled,
             &[
+                "api.access_token_value().await",
                 "end_session(app, EndReason::SessionExpired)",
-                "clear_tokens()",
+                "api.clear_tokens_if(expired.as_deref())",
+                "stored == StoredSession::Discard",
+                "CredentialStore>().clear_tokens()",
+                "settings::clear_account_choices(app)",
                 "\"session-expired\"",
             ],
+        );
+        assert!(
+            !handled.contains("api.clear_tokens()") && !handled.contains(".clear_tokens().await"),
+            "an unconditional clear wipes a session signed in during the teardown"
         );
     }
 
@@ -1032,17 +1128,28 @@ mod lifecycle_tests {
     /// W1-043: the guard engages after the API/stealth phase, right before
     /// the tunnel is rebuilt — and (REVIEW-WIN-001) whenever a tunnel is held
     /// at that moment, whatever the start of the attempt believed.
+    ///
+    /// REVIEW-WIN2-001: it engages INSIDE the relay move, one commit; what
+    /// that commit holds is tested behaviourally in `wfp_policy`
+    /// (`a_lockdown_switch_commits_the_new_relay_with_the_block` and its
+    /// siblings). This pin only keeps the step where it must be: before the
+    /// handshake, with no separate engage naming the old relay.
     #[test]
-    fn the_switch_guard_engages_just_before_the_rebuild() {
+    fn the_switch_guard_moves_with_the_relay_just_before_the_rebuild() {
+        let attempt = body("async fn attempt(");
         order(
-            body("async fn attempt("),
+            attempt,
             &[
                 "prepare_tunnel(",
                 "vm.holds_tunnel().await",
-                "engage_rebuild_block(ctx)",
                 "apply_relay_permit(",
+                "guard_rebuild,",
                 "vm.connect(",
             ],
+        );
+        assert!(
+            !attempt.contains("engage_rebuild_block("),
+            "a separate engage puts the block up naming the previous relay"
         );
     }
 
@@ -1113,6 +1220,7 @@ mod lifecycle_tests {
             was_live: true,
             block_engaged: false,
             old_stealth_mark: Some(xray.ended_count()),
+            old_relay: None,
         };
 
         // Refused before XrayManager::start: the old transport is untouched.

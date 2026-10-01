@@ -27,6 +27,14 @@ pub fn restore_and_focus(app: &AppHandle) {
     }
 }
 
+/// Bring the window up from the tray when the UI has something the user must
+/// answer before the app can work — the re-consent of D7 behind Start
+/// Minimized (REVIEW-WIN2-010).
+#[tauri::command]
+pub fn show_main_window(app: AppHandle) {
+    restore_and_focus(&app);
+}
+
 /// Show or hide the tray icon. Unlike dropping it (what Tauri's
 /// `cleanup_before_exit` does), hiding can be undone — which is the whole
 /// point for the updater, whose install can fail after the hook ran

@@ -3,6 +3,7 @@
 //! Handles login, logout, token refresh, and auth state management.
 
 use crate::api::error::ApiError;
+use crate::api::session_gate::{self, RefreshOutcome, StoredSession};
 use crate::api::types::{AccountNumber, LoginResult, UserProfile};
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
@@ -30,7 +31,7 @@ static TOTP_ATTEMPTS: Mutex<Option<Vec<Instant>>> = Mutex::new(None);
 const MAX_TOTP_ATTEMPTS: usize = 5;
 const TOTP_WINDOW_SECS: u64 = 120;
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct AuthState {
     pub is_authenticated: bool,
     pub email: Option<String>,
@@ -48,6 +49,22 @@ pub struct AuthState {
     /// Item 86: the anonymous account number, for the Profile card. A
     /// credential: redacted in `Debug`, never logged.
     pub account_number: Option<AccountNumber>,
+}
+
+/// Manual: phase 1's anonymous email carries the account number (see
+/// `UserProfile`'s Debug, REVIEW-WIN2-027).
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthState")
+            .field("is_authenticated", &self.is_authenticated)
+            .field("email", &self.email.as_ref().map(|_| "<redacted>"))
+            .field("account_id", &self.account_id)
+            .field("plan", &self.plan)
+            .field("has_password", &self.has_password)
+            .field("is_anonymous", &self.is_anonymous)
+            .field("account_number", &self.account_number)
+            .finish()
+    }
 }
 
 impl AuthState {
@@ -72,7 +89,7 @@ impl AuthState {
             is_authenticated: true,
             is_anonymous: profile.is_anonymous_account(),
             has_password: profile.has_password,
-            email: Some(profile.email),
+            email: profile.email,
             account_id: Some(profile.id),
             plan: None,
             account_number: profile.account_number,
@@ -359,6 +376,29 @@ fn delete_failure_message(error: &ApiError) -> IpcError {
     IpcError::new(code, format!("Account deletion failed: {}", reason))
 }
 
+/// The physical interface's address while a tunnel is up, for a request that
+/// must not ride it (REVIEW-WIN2-007). Windows only: elsewhere the request
+/// keeps today's path.
+async fn around_the_tunnel(app: &AppHandle) -> Option<std::net::IpAddr> {
+    #[cfg(target_os = "windows")]
+    {
+        use tauri::Manager;
+        if app
+            .state::<crate::vpn::manager::VpnManager>()
+            .holds_tunnel()
+            .await
+        {
+            return crate::vpn::network_events::physical_source_address();
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        None
+    }
+}
+
 #[tauri::command]
 pub async fn delete_account(
     request: DeleteAccountRequest,
@@ -376,8 +416,16 @@ pub async fn delete_account(
         .as_deref()
         .map(str::trim)
         .filter(|c| !c.is_empty());
+    // REVIEW-WIN2-007: with a tunnel up, the request goes AROUND it. The
+    // server removes the account's peers before it answers, so an answer
+    // through the tunnel was dropped at the relay: a deletion that succeeded
+    // was reported as failed, the dead tunnel's re-dial then hit a 401, and
+    // the app fell to Login with "your session expired". Keeping the tunnel
+    // until the server confirms is still the rule; only the request's path
+    // changes.
+    let around_the_tunnel = around_the_tunnel(&app).await;
     let response = api
-        .delete_account(&request.password, two_factor_code)
+        .delete_account(&request.password, two_factor_code, around_the_tunnel)
         .await
         .map_err(|e| delete_failure_message(&e))?;
 
@@ -493,8 +541,9 @@ pub async fn get_auth_state(
                 Err(e) => {
                     tracing::info!("Profile fetch failed ({e}) — attempting token refresh");
                     // Token might be expired, try refresh
-                    match api.refresh_token().await {
-                        Ok(new_tokens) => {
+                    let refreshed = api.refresh_token().await;
+                    match (session_gate::refresh_outcome(&refreshed), refreshed) {
+                        (_, Ok(new_tokens)) => {
                             // Use rotated refresh token if server returned one, else keep existing
                             let refresh_to_store = new_tokens
                                 .refresh_token
@@ -544,26 +593,34 @@ pub async fn get_auth_state(
                         // costs one failed request next launch, discarding a live one
                         // costs the account.
                         //
-                        // ApiError::Unauthorized specifically means the server rejected
-                        // the refresh token — that token will never work again, so
-                        // clearing is right. Everything else (Network, ServerError,
-                        // RateLimited, CertificatePinningFailed, Parse) may well succeed
-                        // on the next attempt, so the session is kept and reported as
-                        // signed-in-with-unknown-identity, exactly as the profile-fetch
-                        // failure above already does.
+                        // The session gate decides (REVIEW-WIN2-003, Android/iOS
+                        // `RefreshOutcome` parity): a 401 means the server rejected
+                        // the refresh token — it will never work again, so clearing
+                        // is right; a 403 ends the session but keeps the stored
+                        // tokens. Everything else (Network, ServerError,
+                        // RateLimited, CertificatePinningFailed, Parse) may well
+                        // succeed on the next attempt, so the session is kept and
+                        // reported as signed-in-with-unknown-identity, exactly as the
+                        // profile-fetch failure above already does.
                         //
                         // NOTE: this distinction only became reliable once
                         // classify_error_response stopped collapsing every backend 401
                         // into ApiError::Unknown. Before that, Unauthorized was
                         // unreachable and this arm could not have told the cases apart.
-                        Err(ApiError::Unauthorized) => {
-                            tracing::info!(
-                                "Refresh token rejected by the server — clearing stored session"
-                            );
-                            let _ = credentials.clear_tokens();
+                        (RefreshOutcome::Unauthorized, Err(e)) => {
+                            if session_gate::stored_session_after(&e) == StoredSession::Discard {
+                                tracing::info!(
+                                    "Refresh token rejected by the server — clearing stored session"
+                                );
+                                let _ = credentials.clear_tokens();
+                            } else {
+                                tracing::info!(
+                                    "Refresh refused by the server — signed out, stored session kept"
+                                );
+                            }
                             Ok(AuthState::unknown_identity(false))
                         }
-                        Err(e) => {
+                        (_, Err(e)) => {
                             tracing::warn!(
                                 "Token refresh failed transiently ({e}) — KEEPING the stored \
                                  session; identity unknown this cycle"
@@ -951,6 +1008,15 @@ mod account_boundary_tests {
         &rest[..end]
     }
 
+    /// The body of the fn whose signature starts `signature`.
+    fn body_of(signature: &str) -> &'static str {
+        let start = SOURCE
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &SOURCE[start..];
+        &rest[..rest.find("\n}").expect("closing brace at column 0")]
+    }
+
     #[test]
     fn sign_out_does_not_rotate_the_device_id() {
         // Second-pass #14: same policy as iOS and Android (deletion only).
@@ -963,12 +1029,26 @@ mod account_boundary_tests {
     /// leave the tunnel up; a confirmed one takes it down before the local
     /// state is cleared. (W1-009 moved the teardown to `end_session`, the one
     /// Rust teardown every sign-out path shares.)
+    ///
+    /// REVIEW-WIN2-007: the request itself goes around a live tunnel, so the
+    /// confirmation can arrive at all (the client half is tested in
+    /// `api::client`).
     #[test]
     fn deletion_disconnects_only_after_the_server_confirmed() {
         let del = body("delete_account");
+        let around = del
+            .find("let around_the_tunnel = around_the_tunnel(&app).await;")
+            .expect("the path around the tunnel");
         let confirmed = del
-            .find(".delete_account(&request.password, two_factor_code)")
+            .find(".delete_account(&request.password, two_factor_code, around_the_tunnel)")
             .expect("the server call");
+        assert!(around < confirmed);
+        let path = body_of("async fn around_the_tunnel(");
+        assert!(
+            path.contains(".holds_tunnel()"),
+            "only while a tunnel is up"
+        );
+        assert!(path.contains("network_events::physical_source_address()"));
         let disconnect = del
             .find("end_session(&app, EndReason::AccountDeleted)")
             .expect("the disconnect after the 2xx");
@@ -1125,9 +1205,18 @@ mod account_boundary_tests {
             "id": "u1", "email": "anon_123456789012345678901234@anonymous.local"
         }))
         .unwrap();
+        // Phase 1's email IS the number: no `{:?}` may print it
+        // (REVIEW-WIN2-027).
+        assert!(!format!("{old:?}").contains("123456789012345678901234"));
         let state = super::AuthState::of(old);
         assert_eq!(state.is_anonymous, None, "an old server says nothing");
         assert!(state.account_number.is_none());
+        assert!(!format!("{state:?}").contains("123456789012345678901234"));
+        assert_eq!(
+            serde_json::to_value(&state).unwrap()["email"],
+            "anon_123456789012345678901234@anonymous.local",
+            "the UI still gets it (the email-shape fallback)"
+        );
 
         // Phase 2 of the contract: the email no longer carries the number.
         let new: UserProfile = serde_json::from_value(serde_json::json!({
@@ -1166,6 +1255,48 @@ mod account_boundary_tests {
             serde_json::to_value(&state).unwrap()["account_number"],
             serde_json::Value::Null
         );
+    }
+
+    /// REVIEW-WIN2-009: phase 2 of the contract really sends `email: null`
+    /// for an anonymous account (the test above only changed its shape). The
+    /// whole profile must still parse — the identity, the number and
+    /// `hasPassword` with it — and a missing email reads the same.
+    #[test]
+    fn phase_two_email_null_still_reads_the_identity() {
+        use crate::api::types::UserProfile;
+        for body in [
+            serde_json::json!({
+                "id": "u4",
+                "email": null,
+                "accountType": "anonymous",
+                "isAnonymous": true,
+                "accountNumber": "123456789012345678901234",
+                "hasPassword": false
+            }),
+            serde_json::json!({
+                "id": "u4",
+                "isAnonymous": true,
+                "accountNumber": "123456789012345678901234",
+                "hasPassword": false
+            }),
+        ] {
+            let profile: UserProfile =
+                serde_json::from_value(body).expect("email: null must not fail the parse");
+            let state = super::AuthState::of(profile);
+            assert!(state.is_authenticated);
+            assert_eq!(state.email, None);
+            assert_eq!(state.account_id.as_deref(), Some("u4"));
+            assert_eq!(state.is_anonymous, Some(true));
+            assert!(state.account_number.is_some());
+            assert!(
+                !state.has_password,
+                "an anonymous account is not asked for a password"
+            );
+            assert_eq!(
+                serde_json::to_value(&state).unwrap()["email"],
+                serde_json::Value::Null
+            );
+        }
     }
 
     /// Item 86: "never log it". No part of the number reaches a log line on

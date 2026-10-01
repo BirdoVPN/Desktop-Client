@@ -600,11 +600,17 @@ pub struct RefreshResponse {
 // User Types
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserProfile {
     pub id: String,
-    pub email: String,
+    /// Optional (REVIEW-WIN2-009): phase 2 of the Account API contract (item
+    /// 86) sends `email: null` for an anonymous account, and a required field
+    /// failed the WHOLE `/auth/me` parse — the identity, `isAnonymous`, the
+    /// number card and `hasPassword` with it, and a token rotation on every
+    /// launch's retry.
+    #[serde(default)]
+    pub email: Option<String>,
     pub name: Option<String>,
     #[serde(default)]
     pub email_verified: bool,
@@ -640,6 +646,25 @@ pub struct UserProfile {
     pub account_number: Option<AccountNumber>,
 }
 
+/// Manual, like `VpnConfig`'s: in phase 1 an anonymous account's email is
+/// `anon_<the 24-digit number>@anonymous.local`, and the number is the
+/// account's only credential (REVIEW-WIN2-027). A `{:?}` must never carry it.
+impl std::fmt::Debug for UserProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserProfile")
+            .field("id", &self.id)
+            .field("email", &self.email.as_ref().map(|_| "<redacted>"))
+            .field("name", &self.name.as_ref().map(|_| "<redacted>"))
+            .field("email_verified", &self.email_verified)
+            .field("has_password", &self.has_password)
+            .field("is_sso", &self.is_sso)
+            .field("account_type", &self.account_type)
+            .field("is_anonymous", &self.is_anonymous)
+            .field("account_number", &self.account_number)
+            .finish_non_exhaustive()
+    }
+}
+
 impl UserProfile {
     /// Whether this is an anonymous account, from the explicit fields when the
     /// server sends them. `None` on an older backend: the UI then falls back to
@@ -654,8 +679,12 @@ impl UserProfile {
 }
 
 /// An anonymous account number: the bare 24-digit id, and the account's ONLY
-/// credential. Never logged: its `Debug` is redacted, so no `{:?}` of a profile
-/// or an auth state can print it, and the memory is wiped on drop.
+/// credential. Never logged: its `Debug` is redacted, and so are the emails of
+/// the structs that carry it (phase 1's synthetic email holds the same
+/// digits), so no `{:?}` of a profile or an auth state can print it. THIS copy
+/// is wiped on drop; the others are not (REVIEW-WIN2-027): the response body
+/// and serde's intermediate value it was parsed from, the IPC JSON, and the
+/// webview's store all hold it in ordinary memory.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct AccountNumber(String);
@@ -839,6 +868,11 @@ pub struct VpnConfig {
     pub endpoint: String,
     pub allowed_ips: Vec<String>,
     pub dns: Vec<String>,
+    /// `dns` is the user's Custom DNS, not the server's resolvers. A private
+    /// Custom DNS server with Local Network Sharing on is the user's own LAN
+    /// resolver, reached outside the tunnel (`wfp_policy::split_resolvers`).
+    #[serde(default)]
+    pub custom_dns: bool,
     pub client_ip: String,
     /// Optional IPv6 tunnel address (e.g. "fd00::2/128"). When present, enables
     /// dual-stack routing through the tunnel.
@@ -870,6 +904,7 @@ impl std::fmt::Debug for VpnConfig {
             .field("endpoint", &"[redacted]")
             .field("allowed_ips", &self.allowed_ips)
             .field("dns", &self.dns)
+            .field("custom_dns", &self.custom_dns)
             .field("client_ip", &"[redacted]")
             .field(
                 "client_ipv6",
@@ -1024,6 +1059,13 @@ pub struct ConnectResponse {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// With `success:false`: the Free plan's monthly allowance is used up
+    /// (birdo-web #590's connect gate; absent on older servers). A refusal no
+    /// retry can change before the reset or an upgrade — and on Windows the
+    /// ONLY way #590's end of a session reaches the client: the heartbeat that
+    /// says so rides the peer the server has just removed (REVIEW-WIN2-002).
+    #[serde(default)]
+    pub quota_exceeded: bool,
     #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
@@ -1158,6 +1200,10 @@ pub struct MultiHopConnectResponse {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// See `ConnectResponse::quota_exceeded`: the Multi-Hop door runs the same
+    /// connect gate (MultiHopService returns its refusal as-is).
+    #[serde(default)]
+    pub quota_exceeded: bool,
     #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
@@ -1218,6 +1264,7 @@ impl From<MultiHopConnectResponse> for ConnectResponse {
         ConnectResponse {
             success: response.success,
             message: response.message,
+            quota_exceeded: response.quota_exceeded,
             key_id: response.key_id,
             public_key: response.public_key,
             preshared_key: response.preshared_key,

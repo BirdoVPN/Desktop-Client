@@ -8,6 +8,7 @@ import {
   anonAccountNumber,
   anonymityPatch,
   formatAccountNumber,
+  isPrivateDnsAddress,
   isValidMtu,
   maskAccountNumber,
   resolveAnonymousAccount,
@@ -131,6 +132,15 @@ describe('Custom DNS on/off (P1-parity-042): Rust has no flag, so off = null on 
   it('switched ON with no addresses sends null, never an empty list', () => {
     const s = { ...settingsFromRust(base), customDnsEnabled: true, customDns: [] };
     expect(settingsToRust(s).custom_dns).toBeNull();
+  });
+
+  it('a private address is the user\'s own resolver (REVIEW-WIN2-006, the ranges Rust uses)', () => {
+    for (const lan of ['192.168.1.2', '10.0.0.53', '172.16.0.1', '172.31.255.254']) {
+      expect(isPrivateDnsAddress(lan)).toBe(true);
+    }
+    for (const other of ['9.9.9.9', '172.32.0.1', '172.15.0.1', '192.169.0.1', '11.0.0.1', '192.168.1.', 'x']) {
+      expect(isPrivateDnsAddress(other)).toBe(false);
+    }
   });
 });
 

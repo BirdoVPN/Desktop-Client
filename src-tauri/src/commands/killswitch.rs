@@ -105,7 +105,7 @@ async fn activate_platform_block() -> Result<bool, String> {
     tracing::warn!("Activating kill switch - blocking all non-VPN traffic");
 
     // Windows: the relay permit (address, port and transport — W1-013) was
-    // handed to wfp by `session::apply_relay_permit`.
+    // handed to wfp by `session::apply_relay_permit` (`move_relay`).
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = wfp::activate_blocking().await {
@@ -134,6 +134,20 @@ async fn activate_platform_block() -> Result<bool, String> {
 
     // SEC-C3 FIX: Removed KILLSWITCH_ACTIVE.store — wfp::is_blocking() is the source of truth
     Ok(true)
+}
+
+/// Windows: point the block's relay permit at `relay` and, with `engage`, put
+/// the block-all up for a rebuild — one WFP transaction (REVIEW-WIN2-001, see
+/// `wfp::move_relay`). `engage` honours the user's kill-switch preference like
+/// [`activate_killswitch`]; a block already in force is rebuilt whatever it.
+#[cfg(target_os = "windows")]
+pub(crate) async fn move_relay(
+    relay: crate::vpn::wfp_policy::Relay,
+    engage: bool,
+) -> Result<(), String> {
+    let result = wfp::move_relay(relay, engage && KILLSWITCH_ENABLED.load(Ordering::SeqCst)).await;
+    blocking_may_have_changed();
+    result
 }
 
 /// Deactivate the kill switch (restore normal traffic).

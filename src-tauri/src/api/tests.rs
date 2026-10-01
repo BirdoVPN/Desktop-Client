@@ -625,7 +625,7 @@ mod types_serialization_tests {
         let user: UserProfile = serde_json::from_str(json)
             .expect("the live /auth/me payload must deserialize — a strict field here blanks the user's identity");
         // The identity the whole app hangs off of.
-        assert_eq!(user.email, "someone@gmail.com");
+        assert_eq!(user.email.as_deref(), Some("someone@gmail.com"));
         assert_eq!(user.id, "cmnz74oyc0000o001dgr9gwec");
         // Absent optional fields must degrade to None, not fail the parse.
         assert_eq!(user.name, None);
@@ -1136,6 +1136,7 @@ mod vpn_config_security_tests {
             endpoint: "1.2.3.4:51820".to_string(),
             allowed_ips: vec!["0.0.0.0/0".to_string()],
             dns: vec!["1.1.1.1".to_string()],
+            custom_dns: false,
             client_ip: "10.0.0.2".to_string(),
             client_ipv6: None,
             allowed_ips_v6: Vec::new(),

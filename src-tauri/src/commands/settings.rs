@@ -623,7 +623,11 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
 /// nothing and the UI rolled the user's change back with "Couldn't save".
 /// The lock also covers the key read, so two first-run saves cannot mint two
 /// different signing keys.
-static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+///
+/// Re-entrant, so a read-modify-write can hold it across the load — whose
+/// legacy-format migrations save — and the save (REVIEW-WIN2-023, see
+/// `clear_account_choices`).
+static SETTINGS_WRITE: parking_lot::ReentrantMutex<()> = parking_lot::const_reentrant_mutex(());
 
 /// Sign `settings` with `sign` and write them to `path`, the whole save under
 /// [`SETTINGS_WRITE`]. `sign` is a parameter so a test can sign without the
@@ -633,7 +637,7 @@ fn write_signed_settings(
     settings: &AppSettings,
     sign: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<(), String> {
-    let _write = SETTINGS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let _write = SETTINGS_WRITE.lock();
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
@@ -682,21 +686,30 @@ pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool
     Ok(true)
 }
 
-/// Settings are per MACHINE, but `preferred_server_id` is one ACCOUNT's
-/// choice: the UI mirrors the user's server into it so tray Quick Connect
-/// dials what the Connect button would. Left behind at sign-out, the next
-/// account to sign in on this machine had its first tray Quick Connect dial
-/// the previous user's server (REVIEW-WIN-007). Returns whether anything
-/// changed.
+/// Settings are per MACHINE, but the server a session dials is one ACCOUNT's
+/// choice: the UI mirrors the user's server into `preferred_server_id`, and
+/// the armed Multi-Hop route, so tray Quick Connect dials what the Connect
+/// button would. Left behind, the next account to sign in on this machine had
+/// its first tray Quick Connect dial the previous user's server
+/// (REVIEW-WIN-007) — or the previous user's Multi-Hop pair, which the first
+/// fix left out (REVIEW-WIN2-023). Returns whether anything changed.
 pub(crate) fn forget_account_choices(settings: &mut AppSettings) -> bool {
-    settings.preferred_server_id.take().is_some()
+    let server = settings.preferred_server_id.take().is_some();
+    let entry = settings.multi_hop_entry_node_id.take().is_some();
+    let exit = settings.multi_hop_exit_node_id.take().is_some();
+    let armed = std::mem::take(&mut settings.multi_hop_enabled);
+    server || entry || exit || armed
 }
 
-/// [`forget_account_choices`] on the settings file. Best effort: a sign-out
-/// must not fail over it. Writes only when there was something to forget, so
-/// settings served as defaults (an unreadable signing key) are never written
-/// over the real file.
+/// [`forget_account_choices`] on the settings file, at every account boundary
+/// (sign-out, deletion, an expired session). Best effort: a sign-out must not
+/// fail over it. Writes only when there was something to forget, so settings
+/// served as defaults (an unreadable signing key) are never written over the
+/// real file. The whole read-modify-write holds the settings lock, so a
+/// concurrent save (the UI's preferred-server mirror) cannot land between the
+/// read and the write and put the old server back (REVIEW-WIN2-023).
 pub(crate) fn clear_account_choices(app: &AppHandle) {
+    let _write = SETTINGS_WRITE.lock();
     match load_settings_sync(app) {
         Ok(mut settings) => {
             if forget_account_choices(&mut settings) {
@@ -760,6 +773,62 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     Ok(true)
 }
 
+/// The launch-at-login task's name (the uninstaller removes it by name).
+#[cfg_attr(not(windows), allow(dead_code))]
+const LAUNCH_TASK: &str = "BirdoVPN Launch At Login";
+
+#[cfg(windows)]
+fn schtasks(args: &[&str]) -> Result<std::process::Output, String> {
+    crate::utils::hidden_cmd("schtasks")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run schtasks: {}", e))
+}
+
+/// The `schtasks /Create` arguments for the launch-at-login task: an
+/// elevated logon trigger for `exe`. The action is quoted here — Task
+/// Scheduler splits an unquoted "C:\Program Files\…" at the first space.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn launch_task_create_args(exe: &std::path::Path) -> Vec<String> {
+    [
+        "/Create",
+        "/F",
+        "/TN",
+        LAUNCH_TASK,
+        "/TR",
+        &format!("\"{}\"", exe.display()),
+        "/SC",
+        "ONLOGON",
+        "/RL",
+        "HIGHEST",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect()
+}
+
+#[cfg(windows)]
+fn create_launch_task() -> Result<(), String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to resolve the app path: {}", e))?;
+    let args = launch_task_create_args(&exe);
+    let out = schtasks(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    if !out.status.success() {
+        return Err(format!(
+            "Failed to register the launch-at-login task: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// schtasks error text is localized, so existence is probed by exit code
+/// rather than by parsing "cannot find" out of its stderr.
+#[cfg(windows)]
+fn launch_task_exists() -> Result<bool, String> {
+    Ok(schtasks(&["/Query", "/TN", LAUNCH_TASK])?.status.success())
+}
+
 /// Windows launch-at-login via a logon-triggered Scheduled Task.
 ///
 /// The exe manifest is `requireAdministrator`, and Windows never launches an
@@ -770,8 +839,6 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
 /// prompt; creating one needs admin, which this process always has.
 #[cfg(windows)]
 fn set_autostart_windows(app: &AppHandle, enabled: bool) -> Result<(), String> {
-    const TASK_NAME: &str = "BirdoVPN Launch At Login";
-
     // Older builds wrote the useless Run-key entry; clear it on either toggle
     // so it stops logging an elevation failure at every logon.
     {
@@ -779,45 +846,40 @@ fn set_autostart_windows(app: &AppHandle, enabled: bool) -> Result<(), String> {
         let _ = app.autolaunch().disable();
     }
 
-    let run = |args: &[&str]| -> Result<std::process::Output, String> {
-        crate::utils::hidden_cmd("schtasks")
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run schtasks: {}", e))
-    };
-
     if enabled {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("Failed to resolve the app path: {}", e))?;
-        // Quote the action ourselves — Task Scheduler splits an unquoted
-        // "C:\Program Files\…" at the first space.
-        let action = format!("\"{}\"", exe.display());
-        let out = run(&[
-            "/Create", "/F", "/TN", TASK_NAME, "/TR", &action, "/SC", "ONLOGON", "/RL", "HIGHEST",
-        ])?;
+        create_launch_task()?;
+        tracing::info!("Registered elevated launch-at-login task");
+    } else if launch_task_exists()? {
+        let out = schtasks(&["/Delete", "/F", "/TN", LAUNCH_TASK])?;
         if !out.status.success() {
             return Err(format!(
-                "Failed to register the launch-at-login task: {}",
+                "Failed to remove the launch-at-login task: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        tracing::info!("Registered elevated launch-at-login task");
-    } else {
-        // schtasks error text is localized, so probe existence by exit code
-        // instead of parsing "cannot find" out of /Delete's stderr.
-        let exists = run(&["/Query", "/TN", TASK_NAME])?.status.success();
-        if exists {
-            let out = run(&["/Delete", "/F", "/TN", TASK_NAME])?;
-            if !out.status.success() {
-                return Err(format!(
-                    "Failed to remove the launch-at-login task: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            tracing::info!("Removed launch-at-login task");
-        }
+        tracing::info!("Removed launch-at-login task");
     }
     Ok(())
+}
+
+/// Put the launch-at-login task back when the setting says it should exist
+/// and it does not (REVIEW-WIN2-011). A GUI upgrade runs the OLD version's
+/// uninstaller, whose last step deletes the task whatever the reason for the
+/// uninstall; nothing re-created it while the toggle still read ON, so the
+/// next boot did not start BirdoVPN and an auto-connect user booted
+/// unprotected. Called at every start with the setting on, off the main
+/// thread (schtasks is a process); a task that exists is left exactly as it
+/// is.
+#[cfg(windows)]
+pub fn restore_launch_at_login_task() {
+    std::thread::spawn(|| match launch_task_exists() {
+        Ok(true) => {}
+        Ok(false) => match create_launch_task() {
+            Ok(()) => tracing::info!("Re-created the missing launch-at-login task"),
+            Err(e) => tracing::warn!("Could not re-create the launch-at-login task: {}", e),
+        },
+        Err(e) => tracing::warn!("Could not check the launch-at-login task: {}", e),
+    });
 }
 
 #[cfg(test)]
@@ -1194,19 +1256,107 @@ mod tests {
         );
     }
 
-    /// REVIEW-WIN-007: signing out forgets the account's server and nothing
-    /// else on the machine.
+    /// REVIEW-WIN2-011: the task the start-up repair creates is the toggle's
+    /// own: elevated, at logon, the quoted path of this exe, under the name
+    /// the uninstaller removes.
+    #[test]
+    fn the_launch_task_is_elevated_at_logon_with_a_quoted_path() {
+        let args = launch_task_create_args(std::path::Path::new(
+            r"C:\Program Files\BirdoVPN\BirdoVPN.exe",
+        ));
+        assert_eq!(
+            args,
+            [
+                "/Create",
+                "/F",
+                "/TN",
+                "BirdoVPN Launch At Login",
+                "/TR",
+                r#""C:\Program Files\BirdoVPN\BirdoVPN.exe""#,
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+            ]
+        );
+        assert!(include_str!("../../nsis-hooks.nsh")
+            .contains(r#"schtasks /Delete /F /TN "BirdoVPN Launch At Login""#));
+        // Start-up puts it back whenever the setting is on.
+        let main = include_str!("../main.rs");
+        let repair = main
+            .find("commands::settings::restore_launch_at_login_task()")
+            .expect("start-up repairs the task");
+        let gate = main[..repair]
+            .rfind(".autostart")
+            .expect("only with the setting on");
+        assert!(repair - gate < 200, "the repair is gated on the setting");
+    }
+
+    /// REVIEW-WIN-007 / REVIEW-WIN2-023: an account boundary forgets the
+    /// account's server and its Multi-Hop route — what tray Quick Connect
+    /// dials — and nothing else on the machine.
     #[test]
     fn signing_out_forgets_the_accounts_server_only() {
         let mut settings = AppSettings {
             preferred_server_id: Some("node-7".into()),
+            multi_hop_enabled: true,
+            multi_hop_entry_node_id: Some("ch-1".into()),
+            multi_hop_exit_node_id: Some("is-1".into()),
             custom_dns: Some(vec!["9.9.9.9".into()]),
+            local_network_sharing: true,
             ..AppSettings::default()
         };
         assert!(forget_account_choices(&mut settings));
         assert_eq!(settings.preferred_server_id, None);
+        assert!(!settings.multi_hop_enabled);
+        assert_eq!(settings.multi_hop_entry_node_id, None);
+        assert_eq!(settings.multi_hop_exit_node_id, None);
         assert_eq!(settings.custom_dns, Some(vec!["9.9.9.9".to_string()]));
+        assert!(settings.local_network_sharing);
         // Nothing to forget: nothing to write.
         assert!(!forget_account_choices(&mut settings));
+
+        // A route alone is still the account's.
+        let mut route_only = AppSettings {
+            multi_hop_exit_node_id: Some("is-1".into()),
+            ..AppSettings::default()
+        };
+        assert!(forget_account_choices(&mut route_only));
+    }
+
+    /// REVIEW-WIN2-023: the account-boundary read-modify-write holds the
+    /// settings lock across the load, whose migrations save — so the lock
+    /// must let the same thread save inside it, and keep every other writer
+    /// out until the whole read-modify-write is done.
+    #[test]
+    fn a_read_modify_write_holds_the_settings_lock_throughout() {
+        const KEY: &[u8] = b"unit-test-hmac-key-32-bytes-pad!";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sign = |json: &str| compute_hmac(json, KEY);
+
+        let held = SETTINGS_WRITE.lock();
+        // The same thread saves inside it (a migration during the load).
+        write_signed_settings(&path, &AppSettings::default(), sign)
+            .expect("a nested save deadlocked or failed");
+
+        // Another writer waits for the whole read-modify-write.
+        let other = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let settings = AppSettings {
+                    preferred_server_id: Some("mirrored".into()),
+                    ..AppSettings::default()
+                };
+                write_signed_settings(&path, &settings, |json| compute_hmac(json, KEY)).unwrap();
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !other.is_finished(),
+            "a writer got in mid read-modify-write"
+        );
+        drop(held);
+        other.join().unwrap();
     }
 }

@@ -71,15 +71,32 @@ export const PREFLIGHT_WEB_CANCELLED =
   'Your web subscription bought on birdo.app will be cancelled automatically.';
 
 /**
+ * The refusals a deletion can meet, worded by code. Any other code (a 403
+ * without a 2FA reason reads `subscription_required`, whose copy is about a
+ * plan and a server — REVIEW-WIN2-025) gets the sentence about THIS action.
+ */
+const DELETION_CODES: ReadonlySet<string> = new Set([
+  'invalid_credentials',
+  'two_factor_required',
+  'two_factor_invalid',
+  'rate_limited',
+  'session_expired',
+  'network_offline',
+  'server_error',
+  'cert_pin_failed',
+  'upgrade_required',
+]);
+
+/**
  * A refusal, in words (W2-012). A wrong password is `invalid_credentials`;
- * anything the contract has no code for gets a sentence about THIS action
- * rather than Rust's raw text.
+ * anything else a deletion cannot be refused for gets a sentence about THIS
+ * action rather than another screen's copy or Rust's raw text.
  */
 function deletionErrorText(e: unknown): string {
   const err = toIpcError(e);
-  return err.code === 'unknown'
-    ? "Couldn't delete your account. Please try again."
-    : errorCopy(err, 'password_confirm').message;
+  return DELETION_CODES.has(err.code)
+    ? errorCopy(err, 'password_confirm').message
+    : "Couldn't delete your account. Please try again.";
 }
 
 export function DeleteAccountDialog({
@@ -167,7 +184,9 @@ export function DeleteAccountDialog({
       const err = toIpcError(e);
       if (err.code === 'two_factor_required') {
         // Not an error the user made: the next step. The field and its hint
-        // say what to do.
+        // say what to do. Asked AGAIN after a code was sent, though, it is an
+        // answer, and silence read as nothing happening (REVIEW-WIN2-025).
+        if (askingTwoFactor) setCodeError(deletionErrorText(err));
         setAskingTwoFactor(true);
       } else if (err.code === 'two_factor_invalid' || (askingTwoFactor && err.code === 'rate_limited')) {
         setAskingTwoFactor(true);

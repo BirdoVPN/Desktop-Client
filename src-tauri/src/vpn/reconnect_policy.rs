@@ -79,11 +79,52 @@ pub enum DropCause {
     /// could not be re-proven (W1-003). The node is not at fault, so this
     /// never counts toward the breaker, and it is re-dialled without backoff.
     PathChanged,
+    /// Declared dead while there was no route off the machine at all: a
+    /// local outage (Wi-Fi dropped, a train tunnel), not a dead peer
+    /// (REVIEW-WIN2-005). Never counts toward the breaker; the offline pause
+    /// covers the wait.
+    NetworkLost,
 }
 
 impl DropCause {
     fn counts_toward_breaker(self) -> bool {
-        !matches!(self, DropCause::PathChanged)
+        !matches!(self, DropCause::PathChanged | DropCause::NetworkLost)
+    }
+}
+
+/// What a Connected session's liveness check makes of the machine's own
+/// connectivity, tick by tick (REVIEW-WIN2-005).
+///
+/// With no route off the machine nothing can answer a handshake, so the fast
+/// dead-peer rule cannot judge the peer: the initiations boringtun keeps
+/// counting while the link is down used to declare the tunnel dead about 30 s
+/// into any Wi-Fi drop, and every drop counted toward the breaker — four in
+/// ten minutes ended in a give-up that held a lockdown block over a healthy
+/// server. When the link comes back on the same path, the path is re-proven
+/// the way a resume is: what went unanswered while it was down says nothing.
+#[derive(Debug, Default)]
+pub struct LocalLink {
+    offline: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    Online,
+    /// No route off the machine: skip the fast dead-peer rule.
+    Offline,
+    /// Back after being offline: re-prove the path now.
+    Returned,
+}
+
+impl LocalLink {
+    pub fn observe(&mut self, connectivity: Connectivity) -> LinkState {
+        let offline = connectivity == Connectivity::Offline;
+        let was_offline = std::mem::replace(&mut self.offline, offline);
+        match (was_offline, offline) {
+            (_, true) => LinkState::Offline,
+            (true, false) => LinkState::Returned,
+            (false, false) => LinkState::Online,
+        }
     }
 }
 
@@ -137,13 +178,28 @@ pub fn needs_rebind<R: PartialEq>(pinned: Option<&R>, now: Option<&R>) -> bool {
     matches!((pinned, now), (Some(a), Some(b)) if a != b)
 }
 
+/// Whether the SERVER ended the session: a revocation (owner default, iOS
+/// parity, P1-parity-021) or a used-up Free allowance (birdo-web #590). No
+/// reconnect can bring either back.
+pub fn server_ended(code: IpcErrorCode) -> bool {
+    matches!(code, IpcErrorCode::Revoked | IpcErrorCode::QuotaExceeded)
+}
+
 /// Whether a give-up keeps the block-all engaged. Always-on (lockdown) keeps
 /// blocking — the user asked for exactly that — EXCEPT when the server ended
-/// the session: a revocation (owner default, iOS parity, P1-parity-021) or a
-/// used-up Free allowance. No reconnect can bring either back, so blocking
-/// would only hold the machine offline.
+/// the session: blocking would only hold the machine offline.
 pub fn give_up_keeps_block(code: IpcErrorCode, lockdown: bool) -> bool {
-    lockdown && !matches!(code, IpcErrorCode::Revoked | IpcErrorCode::QuotaExceeded)
+    lockdown && !server_ended(code)
+}
+
+/// Whether the final `error` status is marked as a recovery that gave up
+/// (`gave_up`, REVIEW-WIN-009). An ending the server decided is reported by
+/// its own code whichever path brought it. A used-up allowance reaches a
+/// Windows client as the RE-DIAL's refusal, not as the heartbeat's answer
+/// (REVIEW-WIN2-002); marked, the UI showed "stopped reconnecting: the
+/// connection keeps dropping" instead of the allowance and View plans.
+pub fn marks_give_up(code: IpcErrorCode) -> bool {
+    !server_ended(code)
 }
 
 /// What a heartbeat answer means for the session.
@@ -183,6 +239,71 @@ pub fn heartbeat_verdict(resp: &HeartbeatResponse) -> HeartbeatVerdict {
         return HeartbeatVerdict::ServerGoingOffline;
     }
     HeartbeatVerdict::Fine
+}
+
+/// How long a session counts as recently alive after it connected or a
+/// heartbeat answered for it: the server's stale reap needs five minutes of
+/// silence (WEB-HB), so a key gone sooner was taken, not reaped.
+pub const ALIVE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Whether a key the server says it no longer has was taken away from this
+/// device rather than reaped: the session was confirmed alive (connected, or
+/// a heartbeat answered) within [`ALIVE_WINDOW`], with no resume since — a
+/// machine that slept can have been reaped whatever the clock says.
+pub fn recently_alive(alive_at: Option<Instant>, now: Instant, resumed_since: bool) -> bool {
+    !resumed_since && alive_at.is_some_and(|at| now.duration_since(at) < ALIVE_WINDOW)
+}
+
+/// Whether a death is the kind a server-side removal causes — the relay
+/// stopped answering — and so worth asking the old key about before a
+/// re-dial. Not a moved path, a local outage or the stealth helper exiting.
+pub fn asks_the_old_key(cause: DropCause) -> bool {
+    cause == DropCause::HandshakeStale
+}
+
+/// What the dead session's own key says, asked ONCE after the dead tunnel
+/// came down and before any re-dial (REVIEW-WIN2-002 generalised;
+/// REVIEW-AND2-001). `Some(error)` ends the session with no re-dial; `None`
+/// re-dials.
+///
+/// WHY. The backend removes a key's peer from its node BEFORE it answers —
+/// on an eviction (the device cap), a revocation (another device's
+/// "disconnect", sign-out everywhere), the #590 quota end and a drain — and
+/// on Windows the heartbeat rides the tunnel, so the answer that says so dies
+/// with the peer. The tunnel just went quiet, and the re-dial that followed
+/// undid the server's decision: two devices on a one-device plan evicted each
+/// other for ever, a remote disconnect was reversed, and the allowance's end
+/// was never seen. With the tunnel gone, this probe leaves over the physical
+/// network through the app's own control-plane permit, like the re-dial it
+/// precedes.
+///
+/// `answer`: the reply, `None` when the probe failed or timed out (an outage
+/// must not delay recovery: re-dial). `recently_alive`: see
+/// [`recently_alive`].
+///
+/// | reply | verdict |
+/// |---|---|
+/// | none, or `valid:true` (`ok`, a server going offline, the quota grace) | re-dial |
+/// | `quota_exceeded` | end: `quota_exceeded` |
+/// | `evicted`, `revoked` | end: `revoked` |
+/// | `reaped`, `server_offline` (a drain) | re-dial |
+/// | `not_found`, no `reason` (a server before WEB-HB), anything newer | end as `revoked` if recently alive, else re-dial (WEB-HB's client table) |
+pub fn after_teardown(
+    answer: Option<&HeartbeatResponse>,
+    recently_alive: bool,
+) -> Option<IpcError> {
+    let resp = answer?;
+    if resp.valid {
+        return None;
+    }
+    if resp.quota_exceeded || resp.reason.as_deref() == Some("quota_exceeded") {
+        return Some(quota_exceeded_error());
+    }
+    match resp.reason.as_deref() {
+        Some("evicted" | "revoked") => Some(revoked_error(resp.message.as_deref())),
+        Some("reaped" | "server_offline") => None,
+        _ => recently_alive.then(|| revoked_error(resp.message.as_deref())),
+    }
 }
 
 /// The error for a session the server ended over the Free allowance. The UI
@@ -403,6 +524,13 @@ impl ReconnectPolicy {
                     Liveness::Healthy => Action::Idle,
                     Liveness::Nudge => Action::Nudge,
                     Liveness::Dead(cause) => {
+                        // Whatever rule fired, with no route off the machine
+                        // the node is not what failed (REVIEW-WIN2-005).
+                        let cause = if tick.connectivity == Connectivity::Offline {
+                            DropCause::NetworkLost
+                        } else {
+                            cause
+                        };
                         self.open_episode(cause, tick.now);
                         Action::TearDown { cause }
                     }
@@ -739,6 +867,71 @@ mod tests {
         }
     }
 
+    /// REVIEW-WIN2-005: a laptop on flaky Wi-Fi, four drops in ten minutes.
+    /// A tunnel declared dead while there was no route off the machine is a
+    /// local outage: it never trips the breaker, and the next decision waits
+    /// for the network instead of dialling into nothing.
+    #[test]
+    fn local_outages_never_trip_the_breaker() {
+        let mut p = ReconnectPolicy::new(budget());
+        let start = Instant::now();
+        for i in 0..(BREAKER_DROPS as u64 * 2) {
+            let now = start + Duration::from_secs(60 * i);
+            let mut t = tick(now, Observed::Connected);
+            t.connectivity = Connectivity::Offline;
+            t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+            assert_eq!(
+                p.decide(&t),
+                Action::TearDown {
+                    cause: DropCause::NetworkLost
+                },
+                "drop {i}"
+            );
+            let mut gone = not_connected(now);
+            gone.connectivity = Connectivity::Offline;
+            assert_eq!(p.decide(&gone), Action::PauseOffline { attempt: 1 });
+            // The Wi-Fi is back: at once, a full budget.
+            assert_eq!(
+                p.decide(&not_connected(now)),
+                Action::Dial {
+                    attempt: 1,
+                    delay: Duration::ZERO
+                }
+            );
+            assert_eq!(p.decide(&tick(now, Observed::Connected)), Action::Recovered);
+        }
+    }
+
+    /// The same drops with a route up ARE the node's: the breaker still
+    /// trips on them (iOS parity is unchanged).
+    #[test]
+    fn a_dead_peer_with_a_route_up_still_counts() {
+        let mut p = ReconnectPolicy::new(budget());
+        let now = Instant::now();
+        let mut t = tick(now, Observed::Connected);
+        t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+        assert_eq!(
+            p.decide(&t),
+            Action::TearDown {
+                cause: DropCause::HandshakeStale
+            }
+        );
+    }
+
+    /// The liveness check's view of the link: offline skips the fast rule,
+    /// and coming back re-proves the path once.
+    #[test]
+    fn the_link_reports_loss_and_return_once() {
+        let mut link = LocalLink::default();
+        assert_eq!(link.observe(Connectivity::Online), LinkState::Online);
+        assert_eq!(link.observe(Connectivity::Offline), LinkState::Offline);
+        assert_eq!(link.observe(Connectivity::Offline), LinkState::Offline);
+        assert_eq!(link.observe(Connectivity::Online), LinkState::Returned);
+        assert_eq!(link.observe(Connectivity::Online), LinkState::Online);
+        // A platform with no route signal is never "offline".
+        assert_eq!(link.observe(Connectivity::Unknown), LinkState::Online);
+    }
+
     #[test]
     fn liveness_follows_handshake_age() {
         let s = Duration::from_secs;
@@ -829,10 +1022,166 @@ mod tests {
         }
     }
 
+    /// The probe of the old key after a teardown, every row of the table,
+    /// against the replies birdo-web sends today (no `reason` except the
+    /// quota's) and after WEB-HB (a `reason` on every reply).
+    #[test]
+    fn the_old_keys_answer_decides_between_ending_and_re_dialling() {
+        let ends = |json: &str, alive: bool| after_teardown(Some(&heartbeat(json)), alive);
+
+        // No answer (offline, timed out): never delays a recovery.
+        assert_eq!(after_teardown(None, true), None);
+        // The key lives: the path failed, not the session.
+        for live in [
+            r#"{"valid":true,"serverOnline":true,"reason":"ok"}"#,
+            r#"{"valid":true,"serverOnline":false,"reason":"server_offline"}"#,
+            r#"{"valid":true,"quotaExceeded":true,"quotaGraceSecondsRemaining":60}"#,
+            r#"{"valid":true}"#,
+        ] {
+            assert_eq!(ends(live, true), None, "{live}");
+        }
+        // The server ended it: stop, whatever the timing.
+        for (gone, code) in [
+            (
+                r#"{"valid":false,"serverOnline":false,"reason":"evicted"}"#,
+                IpcErrorCode::Revoked,
+            ),
+            (
+                r#"{"valid":false,"serverOnline":false,"reason":"revoked"}"#,
+                IpcErrorCode::Revoked,
+            ),
+            (
+                r#"{"valid":false,"serverOnline":true,"quotaExceeded":true,"reason":"quota_exceeded","message":"x"}"#,
+                IpcErrorCode::QuotaExceeded,
+            ),
+        ] {
+            for alive in [true, false] {
+                let err = ends(gone, alive).unwrap_or_else(|| panic!("{gone}: re-dialled"));
+                assert_eq!(err.code, code, "{gone}");
+                assert!(!give_up_keeps_block(err.code, true), "{gone}");
+                assert!(!marks_give_up(err.code), "{gone}");
+            }
+        }
+        // Reaped or drained: a re-dial is what the server expects.
+        for redial in [
+            r#"{"valid":false,"serverOnline":false,"reason":"reaped"}"#,
+            r#"{"valid":false,"serverOnline":false,"reason":"server_offline"}"#,
+        ] {
+            assert_eq!(ends(redial, true), None, "{redial}");
+        }
+        // Not found — and today's server, which says only "not found": taken
+        // from a device that was just checking in, reaped from one that was
+        // not (or slept).
+        for unknown in [
+            r#"{"valid":false,"serverOnline":false,"reason":"not_found"}"#,
+            r#"{"valid":false,"serverOnline":false,"message":"Connection not found. Please reconnect."}"#,
+            r#"{"valid":false,"serverOnline":false,"reason":"something_newer"}"#,
+        ] {
+            assert_eq!(
+                ends(unknown, true).map(|e| e.code),
+                Some(IpcErrorCode::Revoked),
+                "{unknown}"
+            );
+            assert_eq!(ends(unknown, false), None, "{unknown}");
+        }
+    }
+
+    /// The eviction ping-pong, end to end through the policy: device A is
+    /// evicted by B on a one-device plan. A's dead tunnel is torn down, the
+    /// old key answers that it was taken, and A stops — no re-dial, so B is
+    /// never evicted back.
+    #[test]
+    fn an_evicted_device_stops_instead_of_evicting_the_other_one_back() {
+        let mut p = ReconnectPolicy::new(budget());
+        let now = Instant::now();
+        let mut t = tick(now, Observed::Connected);
+        t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+        let Action::TearDown { cause } = p.decide(&t) else {
+            panic!("expected a teardown");
+        };
+        assert!(asks_the_old_key(cause));
+        let alive = recently_alive(Some(now - Duration::from_secs(25)), now, false);
+        let verdict = after_teardown(
+            Some(&heartbeat(
+                r#"{"valid":false,"serverOnline":false,"message":"Connection not found. Please reconnect."}"#,
+            )),
+            alive,
+        );
+        assert_eq!(verdict.map(|e| e.code), Some(IpcErrorCode::Revoked));
+        // Only a dead peer is worth the question.
+        for other in [
+            DropCause::PathChanged,
+            DropCause::NetworkLost,
+            DropCause::TransportDied,
+        ] {
+            assert!(!asks_the_old_key(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn alive_means_confirmed_within_the_reap_window_and_no_sleep_since() {
+        let now = Instant::now();
+        let ago = |s| Some(now - Duration::from_secs(s));
+        assert!(recently_alive(ago(30), now, false));
+        assert!(recently_alive(ago(299), now, false));
+        assert!(!recently_alive(ago(300), now, false));
+        assert!(!recently_alive(ago(30), now, true), "a resume since");
+        assert!(!recently_alive(None, now, false));
+    }
+
     #[test]
     fn a_used_up_allowance_releases_the_block_even_in_lockdown() {
         assert!(!give_up_keeps_block(IpcErrorCode::QuotaExceeded, true));
         assert!(!give_up_keeps_block(IpcErrorCode::QuotaExceeded, false));
+    }
+
+    /// REVIEW-WIN2-002, the path #590 really takes on Windows: the heartbeat's
+    /// answer is lost with the removed peer, the dead tunnel is torn down, and
+    /// the FIRST re-dial is refused with `quotaExceeded`. Recovery ends there
+    /// — no second dial, no backoff — with the allowance's own code, the block
+    /// released even under lockdown, and no "stopped reconnecting" mark.
+    #[test]
+    fn a_quota_refusal_on_the_re_dial_ends_the_session_at_once() {
+        let mut p = ReconnectPolicy::new(Budget {
+            max_attempts: 10,
+            ..budget()
+        });
+        let now = Instant::now();
+        let mut t = tick(now, Observed::Connected);
+        t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+        assert!(matches!(p.decide(&t), Action::TearDown { .. }));
+        assert!(matches!(
+            p.decide(&not_connected(now)),
+            Action::Dial { attempt: 1, .. }
+        ));
+        p.on_dial_failed(crate::commands::ipc_error::IpcError::connect_refused(
+            "Free-tier data limit reached",
+            true,
+        ));
+        match p.decide(&not_connected(now)) {
+            Action::GiveUp(err) => {
+                assert_eq!(err.code, IpcErrorCode::QuotaExceeded);
+                assert_eq!(p.attempts(), 1, "no second dial");
+                assert!(!give_up_keeps_block(err.code, true));
+                assert!(!marks_give_up(err.code));
+            }
+            other => panic!("expected the session to end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_a_recovery_that_failed_is_marked_as_a_give_up() {
+        for ended in [IpcErrorCode::QuotaExceeded, IpcErrorCode::Revoked] {
+            assert!(!marks_give_up(ended), "{ended:?}");
+        }
+        for failed in [
+            IpcErrorCode::ServerUnreachable,
+            IpcErrorCode::ServerUnavailable,
+            IpcErrorCode::StealthFailed,
+            IpcErrorCode::DeviceLimit,
+        ] {
+            assert!(marks_give_up(failed), "{failed:?}");
+        }
     }
 
     #[test]

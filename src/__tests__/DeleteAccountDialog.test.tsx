@@ -327,6 +327,30 @@ describe('Delete account dialog: two-factor accounts', () => {
     expect(setConnectionState).not.toHaveBeenCalled();
   });
 
+  it('a code the server asks for again is an answer, not silence (REVIEW-WIN2-025)', async () => {
+    const answers = [
+      () => Promise.reject(refusal('two_factor_required')),
+      () => Promise.reject(refusal('two_factor_required')),
+    ];
+    deleteResult = () => answers.shift()!();
+    await openAndConfirm();
+    const code = await screen.findByLabelText('Two-factor code');
+    await userEvent.type(code, '123456');
+    await userEvent.click(screen.getByRole('button', { name: /delete my account/i }));
+    await waitFor(() =>
+      expect(code).toHaveAccessibleDescription('Enter the 6-digit code from your authenticator app.'),
+    );
+    expect(logout).not.toHaveBeenCalled();
+  });
+
+  it('a 403 with no 2FA reason is not worded as a plan or a server (REVIEW-WIN2-025)', async () => {
+    deleteResult = () => Promise.reject(refusal('subscription_required', { retryable: false }));
+    await openAndConfirm();
+    expect(await screen.findByText("Couldn't delete your account. Please try again.")).toBeInTheDocument();
+    expect(screen.queryByText(/Upgrade to unlock/)).not.toBeInTheDocument();
+    expect(logout).not.toHaveBeenCalled();
+  });
+
   it('an account without 2FA (or a server that predates it) never sees a code', async () => {
     await openAndConfirm();
     await waitFor(() => expect(logout).toHaveBeenCalled());

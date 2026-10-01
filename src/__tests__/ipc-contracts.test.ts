@@ -368,6 +368,8 @@ const FRONTEND_COMMANDS = [
   'authenticate_biometric',
   // Deep link captured at cold start
   'take_pending_deep_link',
+  // The window up from the tray: re-consent behind Start Minimized (REVIEW-WIN2-010)
+  'show_main_window',
 ] as const;
 
 function sourceFiles(dir: string): string[] {

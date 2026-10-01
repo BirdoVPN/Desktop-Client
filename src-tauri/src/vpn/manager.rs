@@ -1592,6 +1592,7 @@ mod tests {
             endpoint: "203.0.113.1:51820".into(),
             allowed_ips: vec!["0.0.0.0/0".into()],
             dns: vec!["10.0.0.1".into()],
+            custom_dns: false,
             client_ip: "10.0.0.2".into(),
             client_ipv6: None,
             allowed_ips_v6: vec![],

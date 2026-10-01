@@ -172,6 +172,25 @@ function App() {
   // F5 / Ctrl+R / Ctrl+P and friends (W2-033).
   useEffect(() => installBrowserShortcutGuard(), []);
 
+  // D7 re-consent behind Start Minimized (REVIEW-WIN2-010). Starting in the
+  // tray, the consent screen rendered in a hidden window, and auto-connect —
+  // which waits for consent — silently never ran: the user booted unprotected
+  // with nothing saying why. A launch that needs the user's answer first
+  // brings the window up. Once, at launch: closing it to the tray after that
+  // is the user's own choice.
+  useEffect(() => {
+    if (hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)) return;
+    getCurrentWindow()
+      .isVisible()
+      .catch(() => false)
+      .then((visible) => {
+        if (!visible) return invoke('show_main_window');
+      })
+      .catch(() => {
+        /* best effort: the tray's Show Window still reaches it */
+      });
+  }, []);
+
   // NOTE: the tray icon, tooltip and menu are driven by Rust from its state
   // choke point (contract v2, W1-023). This used to push `set_tray_state` from
   // here, keyed on a connection state only Dashboard's poll kept current.

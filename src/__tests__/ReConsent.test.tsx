@@ -18,11 +18,14 @@ import App from '@/App';
 import { useAppStore } from '@/store/app-store';
 import { CONSENT_VERSION } from '@/lib/consent';
 
+// Start Minimized keeps the window hidden at launch (REVIEW-WIN2-010).
+const appWindow = vi.hoisted(() => ({ visible: true }));
+
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock('@tauri-apps/api/window', () => ({
   getCurrentWindow: () => ({
-    isVisible: async () => true,
+    isVisible: async () => appWindow.visible,
     onScaleChanged: async () => () => {},
     setDecorations: async () => {},
     setSize: async () => {},
@@ -45,6 +48,7 @@ const mockedInvoke = vi.mocked(invoke);
 const callsTo = (cmd: string) => mockedInvoke.mock.calls.filter(([c]) => c === cmd);
 
 beforeEach(() => {
+  appWindow.visible = true;
   vi.mocked(exit).mockClear();
   mockedInvoke.mockReset();
   mockedInvoke.mockImplementation(async (cmd: string) => {
@@ -70,7 +74,11 @@ describe('versioned re-consent (D7)', () => {
 
     expect(useAppStore.getState().acceptedConsentVersion).toBe(CONSENT_VERSION);
     await waitFor(() => expect(callsTo('get_auth_state')).toHaveLength(1));
-    expect(screen.queryByRole('button', { name: /i agree & continue/i })).not.toBeInTheDocument();
+    // The screen leaves through its exit animation, which can outlast the
+    // sign-in check under a loaded test run.
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /i agree & continue/i })).not.toBeInTheDocument(),
+    );
   });
 
   it('holds the sign-in check until the user has answered', async () => {
@@ -94,5 +102,26 @@ describe('versioned re-consent (D7)', () => {
     render(<App />);
     await waitFor(() => expect(callsTo('get_auth_state')).toHaveLength(1));
     expect(screen.queryByRole('button', { name: /i agree & continue/i })).not.toBeInTheDocument();
+  });
+
+  it('behind Start Minimized, the consent the app waits for brings the window up (REVIEW-WIN2-010)', async () => {
+    appWindow.visible = false;
+    useAppStore.setState({ acceptedConsentVersion: 1 });
+    render(<App />);
+    await agree();
+    await waitFor(() => expect(callsTo('show_main_window')).toHaveLength(1));
+  });
+
+  it('a visible window, or nothing to answer, is left alone', async () => {
+    useAppStore.setState({ acceptedConsentVersion: 1 });
+    const { unmount } = render(<App />);
+    await agree();
+    unmount();
+
+    appWindow.visible = false;
+    useAppStore.setState({ acceptedConsentVersion: CONSENT_VERSION });
+    render(<App />);
+    await waitFor(() => expect(callsTo('get_auth_state')).toHaveLength(1));
+    expect(callsTo('show_main_window')).toHaveLength(0);
   });
 });

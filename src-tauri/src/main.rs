@@ -89,8 +89,13 @@ const RECONCILE_AND_EXIT: &str = "--reconcile-and-exit";
 /// W1-008: the uninstaller's — and support's — way to undo what a BirdoVPN
 /// that was killed rather than quit left on the machine: DNS an older version
 /// parked, routes a crash stranded. The same journal-driven reconcile `setup()`
-/// runs at every start, with no window, tray or single-instance plugin, so it
-/// works whether or not another instance is (still) running.
+/// runs at every start, with no window, tray or single-instance plugin.
+///
+/// Only for a machine where BirdoVPN is NOT running: it deletes every route
+/// the journal names and rewrites the journal, and beside a live session
+/// those are that session's routes — its tunnel dies and its record is lost
+/// (REVIEW-WIN2-008). The uninstaller therefore stops the app first
+/// (nsis-hooks.nsh, NSIS_HOOK_PREUNINSTALL).
 fn reconcile_and_exit() -> ! {
     info!(
         "{}: restoring what a previous session left behind",
@@ -297,6 +302,13 @@ fn main() {
                     .unwrap_or(false),
             );
 
+            // REVIEW-WIN2-011: a GUI upgrade runs the old uninstaller, which
+            // deletes the launch-at-login task; put it back if it is missing.
+            #[cfg(windows)]
+            if startup_settings.as_ref().is_some_and(|s| s.autostart) {
+                commands::settings::restore_launch_at_login_task();
+            }
+
             // Give the forced-version-floor gate a handle so a 426 from ANY
             // request can raise the blocking "update required" screen. Must be
             // set before the first API call is made below.
@@ -370,10 +382,10 @@ fn main() {
             // session everywhere — tunnel, tokens — and the UI is told.
             {
                 let handle = app.handle().clone();
-                crate::api::session_gate::set_handler(move || {
+                crate::api::session_gate::set_handler(move |stored| {
                     let app = handle.clone();
                     tauri::async_runtime::spawn(async move {
-                        commands::session::handle_session_expired(&app).await;
+                        commands::session::handle_session_expired(&app, stored).await;
                     });
                 });
             }
@@ -622,6 +634,8 @@ fn main() {
             commands::biometric::authenticate_biometric,
             // Deep link captured at cold start
             take_pending_deep_link,
+            // The window up from the tray (re-consent behind Start Minimized)
+            commands::tray::show_main_window,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

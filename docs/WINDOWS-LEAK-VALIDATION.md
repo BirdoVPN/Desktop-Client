@@ -33,6 +33,13 @@ the first tunnel route. A connect whose guard cannot be installed fails.
 | `Birdo: Permit DNS on loopback` | connect v4, v6 | 13 | a local DNS proxy (127/8, ::1) |
 | `Birdo: Block DNS outside the tunnel` | connect v4, v6 | 12 | UDP/TCP 53 and 853 (DNS, DoT, DoQ) to any other resolver, on any interface |
 | `Birdo: Block LLMNR, mDNS and NetBIOS name queries` | connect v4, v6 | 12 | UDP 5355, 5353, 137 — only while **Local Network Sharing is off** |
+| `Birdo: Permit DNS to your own network's resolver (Custom DNS, Local Network Sharing)` | connect v4 | 13 | only when a Custom DNS server is in a private range AND Local Network Sharing is on: that resolver, any interface |
+| `Birdo: Permit the relay (WireGuard) on a DNS port` | connect v4 | 13 | only when the WireGuard port is 53: BirdoVPN.exe + relay/32 + UDP 53 |
+
+The block (12) and the loopback permit (13) are also carried by the kill
+switch's block-all, so they hold through a reconnect gap and behind a held
+lockdown block, after the tunnel's guard is lifted (REVIEW-WIN2-004). With both
+up there is one set, not two.
 
 Why each:
 
