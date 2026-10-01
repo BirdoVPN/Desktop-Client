@@ -5,6 +5,103 @@
 ; because the requireAdministrator exe can never be launched from the HKCU Run
 ; key. The uninstaller must remove that task, or it lingers pointing at a
 ; missing exe and fires a silent failure at every logon.
+;
+; This file is !included near the top of Tauri's installer.nsi (tauri-bundler,
+; @tauri-apps/cli 2.11.4), BEFORE the template defines MANUFACTURER,
+; PRODUCTNAME and MANUPRODUCTKEY. Code outside the NSIS_HOOK_* macros is
+; parsed right here, so it uses its own literals; NSIS_HOOK_PREINSTALL, which
+; expands later, checks at compile time that they match the template's.
+
+!include LogicLib.nsh
+
+; ── D8 (owner decision 2026-10-01): publisher "Birdo Networks Ltd" ─────────
+;
+; tauri.conf.json `bundle.publisher` is the template's MANUFACTURER. It does
+; NOT name the Apps & features entry: that key is
+; ...\CurrentVersion\Uninstall\${PRODUCTNAME} ("BirdoVPN"), so an upgrade
+; rewrites the SAME entry, Publisher value included, and there is one entry.
+; What the publisher does name is the install's own record,
+; Software\${MANUFACTURER}\${PRODUCTNAME}, whose default value is the install
+; folder. Every release up to 1.4.45 wrote it under "Birdo VPN". Under the new
+; name it is missing, and the template then
+;   - installs into the DEFAULT folder (.onInit, RestorePreviousInstallLocation),
+;     not the one the user chose, leaving the old folder behind; and
+;   - when the user picks "Uninstall before installing" on its reinstall page,
+;     runs the old uninstaller with `_?=` and an EMPTY folder.
+; So the old record is adopted before any page reads it, and dropped once the
+; install has succeeded. User data never depended on the publisher: it lives
+; under the bundle identifier and the fixed BirdoVPN names below.
+!define BIRDO_MANUPRODUCTKEY "Software\Birdo Networks Ltd\BirdoVPN"
+!define BIRDO_LEGACY_MANUKEY "Software\Birdo VPN"
+!define BIRDO_LEGACY_MANUPRODUCTKEY "${BIRDO_LEGACY_MANUKEY}\BirdoVPN"
+
+Var BirdoAdoptedLegacyRecord
+
+; Carry the old publisher's record over to the new one, once, if this machine
+; has only the old one. Runs from the GUI init (GUI and passive installs, the
+; in-app updater's included), before the reinstall and folder pages, and again
+; from NSIS_HOOK_PREINSTALL for a silent install, which has no GUI init.
+Function BirdoAdoptLegacyRecord
+  Push $0
+  ReadRegStr $0 SHCTX "${BIRDO_MANUPRODUCTKEY}" ""
+  ${If} $0 == ""
+    ReadRegStr $0 SHCTX "${BIRDO_LEGACY_MANUPRODUCTKEY}" ""
+    ${If} $0 != ""
+      WriteRegStr SHCTX "${BIRDO_MANUPRODUCTKEY}" "" $0
+      StrCpy $BirdoAdoptedLegacyRecord 1
+      ; .onInit fell back to the default folder for lack of the record; the
+      ; folder to update is the old install's. A folder given with /D stays.
+      ${If} $INSTDIR == "$PROGRAMFILES64\BirdoVPN"
+        StrCpy $INSTDIR $0
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  Pop $0
+FunctionEnd
+
+; Cancelled before installing: leave the registry as the old install had it.
+Function BirdoForgetAdoptedRecord
+  ${If} $BirdoAdoptedLegacyRecord == 1
+    DeleteRegKey SHCTX "${BIRDO_MANUPRODUCTKEY}"
+    DeleteRegKey /ifempty SHCTX "Software\Birdo Networks Ltd"
+  ${EndIf}
+FunctionEnd
+
+; Modern UI calls these from the .onGUIInit and .onUserAbort it generates
+; (the template defines neither name itself).
+!define MUI_CUSTOMFUNCTION_GUIINIT BirdoAdoptLegacyRecord
+!define MUI_CUSTOMFUNCTION_ABORT BirdoForgetAdoptedRecord
+
+; The old publisher's record, and the installer language MUI keeps beside it
+; for the user who ran the installer. Only the "BirdoVPN" product key: a 1.0.0
+; install (product "Birdo VPN") has a record of its own under the same parent.
+!macro BIRDO_DROP_LEGACY_PUBLISHER_RECORD
+  DeleteRegKey SHCTX "${BIRDO_LEGACY_MANUPRODUCTKEY}"
+  DeleteRegKey /ifempty SHCTX "${BIRDO_LEGACY_MANUKEY}"
+  DeleteRegValue HKCU "${BIRDO_LEGACY_MANUPRODUCTKEY}" "Installer Language"
+  DeleteRegKey /ifempty HKCU "${BIRDO_LEGACY_MANUPRODUCTKEY}"
+  DeleteRegKey /ifempty HKCU "${BIRDO_LEGACY_MANUKEY}"
+!macroend
+
+!macro NSIS_HOOK_PREINSTALL
+  ; The literals above must be the template's, or the adoption writes a key
+  ; nothing reads: fail the build instead.
+  !if "${BIRDO_MANUPRODUCTKEY}" != "${MANUPRODUCTKEY}"
+    !error "nsis-hooks.nsh: BIRDO_MANUPRODUCTKEY is not Software\<bundle.publisher>\<productName>"
+  !endif
+  !if "${PRODUCTNAME}" != "BirdoVPN"
+    !error "nsis-hooks.nsh: the D8 migration assumes productName BirdoVPN"
+  !endif
+  Call BirdoAdoptLegacyRecord
+  ; The template set the output path before this hook; the adoption may have
+  ; moved $INSTDIR to the old install's folder.
+  SetOutPath $INSTDIR
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  ; Installed: the record lives under the new publisher now.
+  !insertmacro BIRDO_DROP_LEGACY_PUBLISHER_RECORD
+!macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
   ; W1-008: put back what a BirdoVPN that was killed rather than quit left
@@ -28,6 +125,9 @@
   ; Remove the legacy Run-key entry older builds wrote via tauri-plugin-autostart
   ; (it never worked — Windows refuses to launch elevated binaries from Run).
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "BirdoVPN"
+  ; D8: an old-publisher record the install never adopted (it is dropped on
+  ; every successful install, so normally there is none left to find).
+  !insertmacro BIRDO_DROP_LEGACY_PUBLISHER_RECORD
 
   ; D-23 (audit 2026-09-29): "Delete the application data".
   ;

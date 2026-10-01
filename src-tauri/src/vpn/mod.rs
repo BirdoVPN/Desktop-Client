@@ -1211,6 +1211,79 @@ pub mod dns_journal {
                 .expect("and copied back");
             assert!(keep < restore);
         }
+
+        /// The body of `!macro <name>` in the hooks, up to its `!macroend`.
+        fn hook_macro(name: &str) -> &'static str {
+            let start = HOOKS
+                .find(&format!("!macro {name}"))
+                .unwrap_or_else(|| panic!("no macro {name}"));
+            let body = &HOOKS[start..];
+            &body[..body.find("!macroend").expect("!macroend")]
+        }
+
+        /// D8: the installer publishes as "Birdo Networks Ltd", and the hooks'
+        /// own literal for the install record is the one Tauri's template
+        /// derives from it (`Software\<publisher>\<productName>`). The build
+        /// fails on a mismatch too (`!error` in NSIS_HOOK_PREINSTALL); this
+        /// catches it without a Windows bundle.
+        #[test]
+        fn the_installer_publishes_as_birdo_networks_ltd() {
+            let conf: serde_json::Value =
+                serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+            let publisher = conf["bundle"]["publisher"].as_str().unwrap();
+            let product = conf["productName"].as_str().unwrap();
+            assert_eq!(publisher, "Birdo Networks Ltd");
+            assert!(
+                HOOKS.contains(&format!(
+                    r#"!define BIRDO_MANUPRODUCTKEY "Software\{publisher}\{product}""#
+                )),
+                "the hooks' record key does not follow bundle.publisher / productName"
+            );
+            let pre = hook_macro("NSIS_HOOK_PREINSTALL");
+            assert!(pre.contains(r#"!if "${BIRDO_MANUPRODUCTKEY}" != "${MANUPRODUCTKEY}""#));
+            assert!(pre.contains("!error"));
+        }
+
+        /// D8: an upgrade from the old publisher adopts its install record
+        /// before any page reads it (GUI and passive: Modern UI's GUI init;
+        /// silent: PREINSTALL), drops it once installed, and a cancelled
+        /// install puts the registry back.
+        #[test]
+        fn an_upgrade_adopts_the_old_publishers_record() {
+            assert!(HOOKS.contains(r#"!define BIRDO_LEGACY_MANUKEY "Software\Birdo VPN""#));
+            assert!(HOOKS.contains("!define MUI_CUSTOMFUNCTION_GUIINIT BirdoAdoptLegacyRecord"));
+            assert!(HOOKS.contains("!define MUI_CUSTOMFUNCTION_ABORT BirdoForgetAdoptedRecord"));
+
+            let adopt = &HOOKS[HOOKS.find("Function BirdoAdoptLegacyRecord").unwrap()..];
+            let adopt = &adopt[..adopt.find("FunctionEnd").unwrap()];
+            let read_new = adopt
+                .find(r#"ReadRegStr $0 SHCTX "${BIRDO_MANUPRODUCTKEY}" """#)
+                .unwrap();
+            let read_old = adopt
+                .find(r#"ReadRegStr $0 SHCTX "${BIRDO_LEGACY_MANUPRODUCTKEY}" """#)
+                .unwrap();
+            let write_new = adopt
+                .find(r#"WriteRegStr SHCTX "${BIRDO_MANUPRODUCTKEY}" "" $0"#)
+                .unwrap();
+            assert!(
+                read_new < read_old && read_old < write_new,
+                "only a machine without the new record adopts the old one"
+            );
+            assert!(adopt.contains("StrCpy $INSTDIR $0"));
+
+            let pre = hook_macro("NSIS_HOOK_PREINSTALL");
+            let adopt_call = pre.find("Call BirdoAdoptLegacyRecord").unwrap();
+            assert!(adopt_call < pre.find("SetOutPath $INSTDIR").unwrap());
+
+            assert!(hook_macro("NSIS_HOOK_POSTINSTALL")
+                .contains("!insertmacro BIRDO_DROP_LEGACY_PUBLISHER_RECORD"));
+            let drop = hook_macro("BIRDO_DROP_LEGACY_PUBLISHER_RECORD");
+            assert!(drop.contains(r#"DeleteRegKey SHCTX "${BIRDO_LEGACY_MANUPRODUCTKEY}""#));
+            // Never the whole old publisher key: a 1.0.0 install ("Birdo VPN"
+            // product) keeps its own record under it.
+            assert!(drop.contains(r#"DeleteRegKey /ifempty SHCTX "${BIRDO_LEGACY_MANUKEY}""#));
+            assert!(!drop.contains(r#"DeleteRegKey SHCTX "${BIRDO_LEGACY_MANUKEY}""#));
+        }
     }
 
     /// Durability of the record itself — the property every other invariant in
