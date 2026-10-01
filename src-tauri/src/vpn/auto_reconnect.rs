@@ -1186,9 +1186,13 @@ impl ReconnectLoop {
     /// costs [`OLD_KEY_PROBE_TIMEOUT`]. `Some` ends the session
     /// (`reconnect_policy::after_teardown`).
     async fn ask_the_old_key(&mut self, key_id: &str, now: Instant) -> Option<IpcError> {
-        let answer = tokio::select! {
-            r = timeout(OLD_KEY_PROBE_TIMEOUT, self.api.heartbeat(key_id)) => r.ok().and_then(Result::ok),
-            _ = self.shutdown.changed() => None,
+        let reply = tokio::select! {
+            r = timeout(OLD_KEY_PROBE_TIMEOUT, self.api.heartbeat(key_id)) => match r {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(_)) => Err("request failed"),
+                Err(_) => Err("no answer in time"),
+            },
+            _ = self.shutdown.changed() => Err("shutting down"),
         };
         let alive = reconnect_policy::recently_alive(
             self.alive.map(|(at, _)| at),
@@ -1196,7 +1200,22 @@ impl ReconnectLoop {
             self.alive
                 .is_some_and(|(_, resumes)| resumes != network_events::resume_count()),
         );
-        reconnect_policy::after_teardown(answer.as_ref(), alive)
+        let ending = reconnect_policy::after_teardown(reply.as_ref().ok(), alive);
+        // One line either way, with no identifiers (the node-agent privacy
+        // convention), so a re-dial after a takeover can be told apart from
+        // a probe that never got its answer (Android logs the same).
+        let answer = match &reply {
+            Ok(r) if r.valid => "valid",
+            Ok(r) => r.reason.as_deref().unwrap_or("invalid, no reason"),
+            Err(why) => why,
+        };
+        let outcome = if ending.is_some() {
+            "end the session"
+        } else {
+            "re-dial"
+        };
+        tracing::info!("Old-key probe: {answer} (recently alive: {alive}) -> {outcome}");
+        ending
     }
 
     /// End recovery in `Error`. Always-on keeps the block engaged (the user
