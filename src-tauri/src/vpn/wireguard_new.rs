@@ -1295,6 +1295,47 @@ mod handshake_tests {
         );
     }
 
+    /// W1-003: a roam swaps the socket in place — the receive loop's
+    /// subscription sees the new one — and proves the new path with a forced
+    /// initiation on the SAME session, which the relay answers at the new
+    /// source address. The response watch starts the new path clean.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_rebind_moves_the_session_to_a_new_socket_and_proves_the_path() {
+        let r = responder(false, 0).await;
+        let session = connect(&r).await.expect("handshake");
+        let mut follower = session.subscribe_socket();
+        let old = session.socket().local_addr().unwrap();
+
+        session.rebind().await.expect("rebind");
+
+        let new = session.socket().local_addr().unwrap();
+        assert_ne!(old.port(), new.port(), "a fresh socket, not the old one");
+        assert!(follower.has_changed().unwrap(), "the receive loop is told");
+        assert_eq!(
+            follower.borrow_and_update().local_addr().unwrap(),
+            new,
+            "and it gets the new socket"
+        );
+
+        let mut buf = [0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(2), session.socket().recv(&mut buf))
+            .await
+            .expect("the relay answers on the new path")
+            .unwrap();
+        let mut out = [0u8; 2048];
+        assert!(
+            matches!(session.open(&buf[..n], &mut out), Opened::Reply(_)),
+            "a handshake response, confirmed with a keepalive"
+        );
+        assert_eq!(
+            r.initiations_seen.load(Ordering::SeqCst),
+            2,
+            "one initiation for the connect, one for the new path"
+        );
+        assert!(!session.peer_unresponsive());
+    }
+
     #[test]
     fn done_without_a_session_is_a_cookie_reply() {
         assert!(matches!(
