@@ -79,11 +79,52 @@ pub enum DropCause {
     /// could not be re-proven (W1-003). The node is not at fault, so this
     /// never counts toward the breaker, and it is re-dialled without backoff.
     PathChanged,
+    /// Declared dead while there was no route off the machine at all: a
+    /// local outage (Wi-Fi dropped, a train tunnel), not a dead peer
+    /// (REVIEW-WIN2-005). Never counts toward the breaker; the offline pause
+    /// covers the wait.
+    NetworkLost,
 }
 
 impl DropCause {
     fn counts_toward_breaker(self) -> bool {
-        !matches!(self, DropCause::PathChanged)
+        !matches!(self, DropCause::PathChanged | DropCause::NetworkLost)
+    }
+}
+
+/// What a Connected session's liveness check makes of the machine's own
+/// connectivity, tick by tick (REVIEW-WIN2-005).
+///
+/// With no route off the machine nothing can answer a handshake, so the fast
+/// dead-peer rule cannot judge the peer: the initiations boringtun keeps
+/// counting while the link is down used to declare the tunnel dead about 30 s
+/// into any Wi-Fi drop, and every drop counted toward the breaker — four in
+/// ten minutes ended in a give-up that held a lockdown block over a healthy
+/// server. When the link comes back on the same path, the path is re-proven
+/// the way a resume is: what went unanswered while it was down says nothing.
+#[derive(Debug, Default)]
+pub struct LocalLink {
+    offline: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    Online,
+    /// No route off the machine: skip the fast dead-peer rule.
+    Offline,
+    /// Back after being offline: re-prove the path now.
+    Returned,
+}
+
+impl LocalLink {
+    pub fn observe(&mut self, connectivity: Connectivity) -> LinkState {
+        let offline = connectivity == Connectivity::Offline;
+        let was_offline = std::mem::replace(&mut self.offline, offline);
+        match (was_offline, offline) {
+            (_, true) => LinkState::Offline,
+            (true, false) => LinkState::Returned,
+            (false, false) => LinkState::Online,
+        }
     }
 }
 
@@ -418,6 +459,13 @@ impl ReconnectPolicy {
                     Liveness::Healthy => Action::Idle,
                     Liveness::Nudge => Action::Nudge,
                     Liveness::Dead(cause) => {
+                        // Whatever rule fired, with no route off the machine
+                        // the node is not what failed (REVIEW-WIN2-005).
+                        let cause = if tick.connectivity == Connectivity::Offline {
+                            DropCause::NetworkLost
+                        } else {
+                            cause
+                        };
                         self.open_episode(cause, tick.now);
                         Action::TearDown { cause }
                     }
@@ -752,6 +800,71 @@ mod tests {
             );
             assert_eq!(p.decide(&tick(now, Observed::Connected)), Action::Recovered);
         }
+    }
+
+    /// REVIEW-WIN2-005: a laptop on flaky Wi-Fi, four drops in ten minutes.
+    /// A tunnel declared dead while there was no route off the machine is a
+    /// local outage: it never trips the breaker, and the next decision waits
+    /// for the network instead of dialling into nothing.
+    #[test]
+    fn local_outages_never_trip_the_breaker() {
+        let mut p = ReconnectPolicy::new(budget());
+        let start = Instant::now();
+        for i in 0..(BREAKER_DROPS as u64 * 2) {
+            let now = start + Duration::from_secs(60 * i);
+            let mut t = tick(now, Observed::Connected);
+            t.connectivity = Connectivity::Offline;
+            t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+            assert_eq!(
+                p.decide(&t),
+                Action::TearDown {
+                    cause: DropCause::NetworkLost
+                },
+                "drop {i}"
+            );
+            let mut gone = not_connected(now);
+            gone.connectivity = Connectivity::Offline;
+            assert_eq!(p.decide(&gone), Action::PauseOffline { attempt: 1 });
+            // The Wi-Fi is back: at once, a full budget.
+            assert_eq!(
+                p.decide(&not_connected(now)),
+                Action::Dial {
+                    attempt: 1,
+                    delay: Duration::ZERO
+                }
+            );
+            assert_eq!(p.decide(&tick(now, Observed::Connected)), Action::Recovered);
+        }
+    }
+
+    /// The same drops with a route up ARE the node's: the breaker still
+    /// trips on them (iOS parity is unchanged).
+    #[test]
+    fn a_dead_peer_with_a_route_up_still_counts() {
+        let mut p = ReconnectPolicy::new(budget());
+        let now = Instant::now();
+        let mut t = tick(now, Observed::Connected);
+        t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+        assert_eq!(
+            p.decide(&t),
+            Action::TearDown {
+                cause: DropCause::HandshakeStale
+            }
+        );
+    }
+
+    /// The liveness check's view of the link: offline skips the fast rule,
+    /// and coming back re-proves the path once.
+    #[test]
+    fn the_link_reports_loss_and_return_once() {
+        let mut link = LocalLink::default();
+        assert_eq!(link.observe(Connectivity::Online), LinkState::Online);
+        assert_eq!(link.observe(Connectivity::Offline), LinkState::Offline);
+        assert_eq!(link.observe(Connectivity::Offline), LinkState::Offline);
+        assert_eq!(link.observe(Connectivity::Online), LinkState::Returned);
+        assert_eq!(link.observe(Connectivity::Online), LinkState::Online);
+        // A platform with no route signal is never "offline".
+        assert_eq!(link.observe(Connectivity::Unknown), LinkState::Online);
     }
 
     #[test]

@@ -27,7 +27,8 @@ use super::manager::{
 };
 use super::network_events::{self, PhysicalRoute};
 use super::reconnect_policy::{
-    self, Action, Budget, DropCause, HeartbeatVerdict, Liveness, Observed, ReconnectPolicy, Tick,
+    self, Action, Budget, DropCause, HeartbeatVerdict, LinkState, Liveness, LocalLink, Observed,
+    ReconnectPolicy, Tick,
 };
 use super::xray::XrayManager;
 use crate::api::attestation::DesktopAttestation;
@@ -391,6 +392,8 @@ struct SessionWatch {
     /// A resume asked the path to be re-proven at this instant.
     verify_since: Option<Instant>,
     last_heartbeat: Option<Instant>,
+    /// Whether the machine had a route off it at the last look.
+    link: LocalLink,
 }
 
 enum Wake {
@@ -555,12 +558,25 @@ impl ReconnectLoop {
         if route.is_none() && session.verify_since.is_some() {
             session.verify_since = Some(now);
         }
+        // REVIEW-WIN2-005: a local outage is not a dead peer. While there is
+        // no route off the machine the fast rule below cannot judge the
+        // relay; when the route comes back on the same path (a different one
+        // was handled above), the path is re-proven like after a resume.
+        let link = session
+            .link
+            .observe(network_events::connectivity_of(route.as_ref()));
+        if link == LinkState::Returned {
+            session.verify_since = Some(now);
+            #[cfg(target_os = "windows")]
+            vm.restart_response_watch().await;
+            vm.force_handshake().await;
+        }
 
         // The fast dead-path rule: with the relay unreachable the tunnel
         // stops carrying traffic at once, and waiting for the 180 s
         // handshake-age backstop left the app saying Protected for minutes.
         #[cfg(target_os = "windows")]
-        if vm.peer_unresponsive().await {
+        if link != LinkState::Offline && vm.peer_unresponsive().await {
             tracing::warn!(
                 "The relay stopped answering handshakes while traffic is waiting — declaring \
                  the tunnel dead"
@@ -1040,6 +1056,34 @@ mod tests {
             ..info
         };
         assert_eq!(single.label().server_id, "entry-1");
+    }
+
+    /// REVIEW-WIN2-005, the wiring of `reconnect_policy::LocalLink` (tested
+    /// there): the fast dead-peer rule is not consulted while there is no
+    /// route off the machine, and a route that comes back re-proves the path
+    /// with the unanswered run forgotten.
+    #[test]
+    fn a_local_outage_is_not_judged_by_the_fast_rule() {
+        let source = include_str!("auto_reconnect.rs");
+        let start = source.find("async fn check_liveness(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }").unwrap()];
+        let mut last = 0;
+        for needle in [
+            ".link\n",
+            ".observe(network_events::connectivity_of(route.as_ref()))",
+            "if link == LinkState::Returned {",
+            "session.verify_since = Some(now);",
+            "vm.restart_response_watch().await;",
+            "vm.force_handshake().await;",
+            "if link != LinkState::Offline && vm.peer_unresponsive().await {",
+        ] {
+            let needle = needle.trim_end_matches('\n');
+            let at = body[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+            last += at + needle.len();
+        }
     }
 
     /// REVIEW-WIN-009: every give-up the POLICY decides is marked on the final
