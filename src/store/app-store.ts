@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 import type { IpcError, LiveMultiHop, VpnPhase, VpnState, VpnStats, VpnStatus } from '@/lib/ipc';
 import { giveUpKind, type GiveUpKind } from '@/lib/errors';
 import type { PlanId } from '@/lib/plan';
+import { CONSENT_VERSION } from '@/lib/consent';
 
 export interface Server {
   id: string;
@@ -201,7 +202,11 @@ export interface AppState {
   sessionEndedReason: 'expired' | 'revoked' | null;
 
   // Consent
-  hasAcceptedConsent: boolean;
+  /**
+   * The consent text version the user accepted, 0 for none (D7). The screen
+   * shows while it is older than `CONSENT_VERSION` (`hasCurrentConsent`).
+   */
+  acceptedConsentVersion: number;
 
   // Account
   account: AccountInfo;
@@ -347,7 +352,8 @@ export interface AppState {
   setLoading: (loading: boolean) => void;
   setUserEmail: (email: string | null) => void;
   setSessionEndedReason: (reason: 'expired' | 'revoked' | null) => void;
-  setConsent: (accepted: boolean) => void;
+  /** Accept the CURRENT consent text. */
+  acceptConsent: () => void;
   setAccount: (account: Partial<AccountInfo>) => void;
   setPlanStatus: (status: LoadStatus) => void;
   setIsAdmin: (admin: boolean) => void;
@@ -399,6 +405,25 @@ const defaultAccount: AccountInfo = {
   isAnonymous: null,
   accountNumber: null,
 };
+
+/**
+ * Persisted-state migrations, from the version the blob was written under.
+ *
+ * 0 → 1 (D7): `hasAcceptedConsent: boolean` becomes `acceptedConsentVersion`.
+ * A `true` was given to the text that preceded versioning, version 1, so an
+ * existing user sees the current text once; anything else is 0 (never
+ * accepted). The rest of the blob is untouched: `merge` lays the settings over
+ * the defaults as before.
+ */
+export function migratePersistedState(persisted: unknown, fromVersion: number): unknown {
+  const p: Record<string, unknown> =
+    typeof persisted === 'object' && persisted !== null ? { ...(persisted as Record<string, unknown>) } : {};
+  if (fromVersion < 1) {
+    p.acceptedConsentVersion = p.hasAcceptedConsent === true ? 1 : 0;
+    delete p.hasAcceptedConsent;
+  }
+  return p;
+}
 
 export const defaultSettings: AppSettings = {
   killSwitchEnabled: true,
@@ -473,7 +498,7 @@ export const useAppStore = create<AppState>()(
       isLoading: false,
       userEmail: null,
       sessionEndedReason: null,
-      hasAcceptedConsent: false,
+      acceptedConsentVersion: 0,
       isOnline: true,
       account: { ...defaultAccount },
       planStatus: 'idle',
@@ -514,7 +539,7 @@ export const useAppStore = create<AppState>()(
       setLoading: (loading) => set({ isLoading: loading }),
       setUserEmail: (email) => set({ userEmail: email }),
       setSessionEndedReason: (sessionEndedReason) => set({ sessionEndedReason }),
-      setConsent: (accepted) => set({ hasAcceptedConsent: accepted }),
+      acceptConsent: () => set({ acceptedConsentVersion: CONSENT_VERSION }),
       setAccount: (partial) => set((state) => ({ account: { ...state.account, ...partial } })),
       setPlanStatus: (planStatus) => set({ planStatus }),
       setIsAdmin: (admin) => set({ isAdmin: admin }),
@@ -670,9 +695,12 @@ export const useAppStore = create<AppState>()(
         favoriteServers: state.favoriteServers,
         lastServerId: state.lastServerId,
         settings: state.settings,
-        hasAcceptedConsent: state.hasAcceptedConsent,
+        acceptedConsentVersion: state.acceptedConsentVersion,
         windowCorner: state.windowCorner,
       }),
+      // 1: the consent boolean became a version (D7); see migratePersistedState.
+      version: 1,
+      migrate: migratePersistedState,
       // The default merge is shallow, so a settings object saved by an older
       // build would REPLACE the defaults wholesale and leave any field added
       // since (customDnsEnabled) undefined. Merge it over the defaults instead,

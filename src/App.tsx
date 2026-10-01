@@ -24,6 +24,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { exit } from '@tauri-apps/plugin-process';
 import { notifyUpdateAvailable } from '@/utils/notifications';
 import { anonymityPatch } from '@/utils/helpers';
+import { hasCurrentConsent } from '@/lib/consent';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 
 interface AuthState {
@@ -48,21 +49,25 @@ async function windowIsVisible(): Promise<boolean> {
 }
 
 function App() {
-  const { isAuthenticated, hasAcceptedConsent, setAuthenticated, setLoading, setUserEmail, setAccount, setConsent, windowCorner, pushed } =
+  const { isAuthenticated, hasAcceptedConsent, setAuthenticated, setLoading, setUserEmail, setAccount, acceptConsent, windowCorner, pushed } =
     useAppStore(
       useShallow((s) => ({
         isAuthenticated: s.isAuthenticated,
-        hasAcceptedConsent: s.hasAcceptedConsent,
+        // The CURRENT text (D7): an older acceptance shows the screen again.
+        hasAcceptedConsent: hasCurrentConsent(s.acceptedConsentVersion),
         setAuthenticated: s.setAuthenticated,
         setLoading: s.setLoading,
         setUserEmail: s.setUserEmail,
         setAccount: s.setAccount,
-        setConsent: s.setConsent,
+        acceptConsent: s.acceptConsent,
         windowCorner: s.windowCorner,
         pushed: s.navStack.length > 0,
       })),
     );
-  const [initializing, setInitializing] = useState(true);
+  // The startup sign-in check has answered. It runs only once the CURRENT
+  // consent is in (below), so until then there is nothing to wait for.
+  const [authChecked, setAuthChecked] = useState(false);
+  const initializing = hasAcceptedConsent && !authChecked;
 
   // Forced client-version floor. The backend answers every request from a
   // too-old build with a structured 426; api::upgrade_gate latches that
@@ -172,6 +177,11 @@ function App() {
   // here, keyed on a connection state only Dashboard's poll kept current.
 
   useEffect(() => {
+    // Not before consent (D7, audit D-12): with a stored session this asks
+    // api.birdo.app who the user is, and a signed-in user whose consent is to
+    // an OLDER text sees the consent screen first. Accepting runs it, behind
+    // the loading screen rather than a flash of Login.
+    if (!hasAcceptedConsent) return;
     // Check for stored authentication on startup
     const checkAuth = async () => {
       try {
@@ -202,12 +212,12 @@ function App() {
         setAuthenticated(false);
       } finally {
         setLoading(false);
-        setInitializing(false);
+        setAuthChecked(true);
       }
     };
 
     checkAuth();
-  }, [setAuthenticated, setLoading, setUserEmail, setAccount]);
+  }, [hasAcceptedConsent, setAuthenticated, setLoading, setUserEmail, setAccount]);
 
   // Retry identity hydration when we are signed in but the email never
   // arrived (`get_auth_state` keeps a valid session alive through a transient
@@ -311,7 +321,7 @@ function App() {
   // that has not been hydrated from Rust yet. Default OFF; a failed write
   // leaves it OFF, which is the safe direction.
   const handleAcceptConsent = (crashReportsEnabled: boolean) => {
-    setConsent(true);
+    acceptConsent();
     useAppStore.getState().updateSettings({ crashReportsEnabled });
     invoke('set_crash_reports_enabled', { enabled: crashReportsEnabled }).catch((err) => {
       console.error('Failed to save the crash-report choice', err);

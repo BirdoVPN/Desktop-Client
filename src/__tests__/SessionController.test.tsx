@@ -24,6 +24,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { VpnSessionController, RESYNC_INTERVAL_MS } from '@/session/controller';
 import { useAppStore, defaultSettings, type Server } from '@/store/app-store';
 import { resetSessionData } from '@/session/session-data';
+import { CONSENT_VERSION } from '@/lib/consent';
 
 vi.mock('@tauri-apps/api/core');
 
@@ -368,7 +369,7 @@ describe('App: the controller runs under the biometric cover (W2-001, W2-026)', 
           return undefined;
       }
     });
-    useAppStore.setState({ hasAcceptedConsent: true });
+    useAppStore.setState({ acceptedConsentVersion: CONSENT_VERSION });
     const { default: App } = await import('@/App');
     render(<App />);
     expect(await screen.findByText('BirdoVPN is locked')).toBeInTheDocument();

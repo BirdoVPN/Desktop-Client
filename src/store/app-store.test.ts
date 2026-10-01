@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { useAppStore } from './app-store'
+import { migratePersistedState, useAppStore } from './app-store'
 import { selectDisplayState, selectTunnelActive } from './selectors'
 import { parseVpnStatus, type VpnStatus } from '@/lib/ipc'
+import { CONSENT_VERSION, hasCurrentConsent } from '@/lib/consent'
 
 /** A v2 status payload (snake_case), parsed exactly as the controller parses one. */
 function status(fields: Record<string, unknown>): VpnStatus {
@@ -54,7 +55,7 @@ describe('useAppStore', () => {
         lockdownMode: true,
         crashReportsEnabled: false,
       },
-      hasAcceptedConsent: false,
+      acceptedConsentVersion: 0,
       isOnline: true,
     })
   })
@@ -242,12 +243,14 @@ describe('useAppStore', () => {
 
   describe('consent', () => {
     it('should start without consent', () => {
-      expect(useAppStore.getState().hasAcceptedConsent).toBe(false)
+      expect(useAppStore.getState().acceptedConsentVersion).toBe(0)
+      expect(hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)).toBe(false)
     })
 
-    it('should accept consent', () => {
-      useAppStore.getState().setConsent(true)
-      expect(useAppStore.getState().hasAcceptedConsent).toBe(true)
+    it('accepting records the CURRENT text version (D7)', () => {
+      useAppStore.getState().acceptConsent()
+      expect(useAppStore.getState().acceptedConsentVersion).toBe(CONSENT_VERSION)
+      expect(hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)).toBe(true)
     })
   })
 
@@ -462,6 +465,41 @@ describe('useAppStore', () => {
       // A field the old object never had comes from the defaults, not undefined.
       expect(s.lockdownMode).toBe(true)
       localStorage.removeItem('birdo-vpn-storage')
+    })
+
+    // D7: the consent boolean became the version of the text accepted.
+    it('an old consent TRUE becomes version 1, so an existing user sees the current text once', async () => {
+      localStorage.setItem(
+        'birdo-vpn-storage',
+        JSON.stringify({ state: { hasAcceptedConsent: true, settings: { killSwitchEnabled: false } }, version: 0 }),
+      )
+      await useAppStore.persist.rehydrate()
+      expect(useAppStore.getState().acceptedConsentVersion).toBe(1)
+      expect(hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)).toBe(false)
+      expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false)
+
+      useAppStore.getState().acceptConsent()
+      const blob = localStorage.getItem('birdo-vpn-storage') ?? '{}'
+      const stored = JSON.parse(blob)
+      expect(stored.version).toBe(1)
+      expect(stored.state.acceptedConsentVersion).toBe(CONSENT_VERSION)
+      expect(stored.state).not.toHaveProperty('hasAcceptedConsent')
+
+      // The next start reads the current version: not asked again. (The
+      // reset below is persisted too, so the saved blob is put back first.)
+      useAppStore.setState({ acceptedConsentVersion: 0 })
+      localStorage.setItem('birdo-vpn-storage', blob)
+      await useAppStore.persist.rehydrate()
+      expect(hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)).toBe(true)
+      localStorage.removeItem('birdo-vpn-storage')
+    })
+
+    it('an old FALSE, or no answer at all, is never-accepted', () => {
+      expect(migratePersistedState({ hasAcceptedConsent: false }, 0)).toEqual({ acceptedConsentVersion: 0 })
+      expect(migratePersistedState({ lastServerId: 'x' }, 0)).toEqual({ lastServerId: 'x', acceptedConsentVersion: 0 })
+      expect(migratePersistedState(undefined, 0)).toEqual({ acceptedConsentVersion: 0 })
+      // A blob already on version 1 is left alone.
+      expect(migratePersistedState({ acceptedConsentVersion: 2 }, 1)).toEqual({ acceptedConsentVersion: 2 })
     })
   })
 })
