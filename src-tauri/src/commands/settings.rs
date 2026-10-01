@@ -606,6 +606,34 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
 /// Internal save function used by both save_settings command and migration
 fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = get_settings_path(app)?;
+    write_signed_settings(&path, settings, |json| {
+        compute_hmac(json, &get_hmac_key(&path)?)
+    })
+}
+
+/// Serialises every settings write in this process (REVIEW-WIN-006).
+///
+/// `save_settings` is an async command, so two saves run in parallel on the
+/// runtime, and since the UI mirrors the chosen server into
+/// `preferred_server_id` with no user action, a background save racing a
+/// toggle is ordinary. Both used to write the SAME `settings.json.tmp` and
+/// rename it: one truncated the file the other was writing, one renamed a
+/// partial file into place (which then failed its HMAC on the next load and
+/// was quarantined, resetting every preference), or the second rename found
+/// nothing and the UI rolled the user's change back with "Couldn't save".
+/// The lock also covers the key read, so two first-run saves cannot mint two
+/// different signing keys.
+static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sign `settings` with `sign` and write them to `path`, the whole save under
+/// [`SETTINGS_WRITE`]. `sign` is a parameter so a test can sign without the
+/// OS credential store.
+fn write_signed_settings(
+    path: &Path,
+    settings: &AppSettings,
+    sign: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    let _write = SETTINGS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
@@ -613,27 +641,29 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
 
     let settings_json =
         serde_json::to_string(settings).map_err(|e| format!("Failed to serialize: {}", e))?;
-
-    let hmac_key = get_hmac_key(&path)?;
-    let hmac = compute_hmac(&settings_json, &hmac_key)?;
-
     let signed = SignedSettings {
         settings: settings.clone(),
-        hmac,
+        hmac: sign(&settings_json)?,
     };
-
     let content = serde_json::to_string_pretty(&signed)
         .map_err(|e| format!("Failed to serialize signed settings: {}", e))?;
+    write_atomically(path, &content)
+}
 
-    // FIX-2-6: Atomic write — write to temp file then rename.
-    // Prevents corruption if process crashes or power is lost mid-write.
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &content).map_err(|e| {
+/// FIX-2-6: write to a temp file, then rename over `path`, so a crash or a
+/// power cut mid-write never leaves a torn settings file. The temp name is
+/// unique to this write (process id + a counter): a fixed name is shared by
+/// every writer, which is half of REVIEW-WIN-006.
+fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
+    fs::write(&tmp_path, content).map_err(|e| {
         // Clean up partial temp file on write failure
         let _ = fs::remove_file(&tmp_path);
         format!("Failed to write temp settings: {}", e)
     })?;
-    fs::rename(&tmp_path, &path).map_err(|e| {
+    fs::rename(&tmp_path, path).map_err(|e| {
         // Clean up temp file on rename failure
         let _ = fs::remove_file(&tmp_path);
         format!("Failed to atomically replace settings file: {}", e)
@@ -650,6 +680,36 @@ pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool
     crate::utils::crash_report::set_opted_in(settings.crash_reports_enabled);
     tracing::info!("Settings saved successfully");
     Ok(true)
+}
+
+/// Settings are per MACHINE, but `preferred_server_id` is one ACCOUNT's
+/// choice: the UI mirrors the user's server into it so tray Quick Connect
+/// dials what the Connect button would. Left behind at sign-out, the next
+/// account to sign in on this machine had its first tray Quick Connect dial
+/// the previous user's server (REVIEW-WIN-007). Returns whether anything
+/// changed.
+pub(crate) fn forget_account_choices(settings: &mut AppSettings) -> bool {
+    settings.preferred_server_id.take().is_some()
+}
+
+/// [`forget_account_choices`] on the settings file. Best effort: a sign-out
+/// must not fail over it. Writes only when there was something to forget, so
+/// settings served as defaults (an unreadable signing key) are never written
+/// over the real file.
+pub(crate) fn clear_account_choices(app: &AppHandle) {
+    match load_settings_sync(app) {
+        Ok(mut settings) => {
+            if forget_account_choices(&mut settings) {
+                if let Err(e) = save_settings_inner(app, &settings) {
+                    tracing::warn!("Could not clear the signed-out account's server: {}", e);
+                }
+            }
+        }
+        Err(e) => tracing::warn!(
+            "Could not read settings to clear the account's server: {}",
+            e
+        ),
+    }
 }
 
 /// Turn crash reporting on or off (consent screen and Settings › Privacy).
@@ -1082,5 +1142,71 @@ mod tests {
         );
         assert!(!current.dns_filtering);
         assert!(current.multi_hop_enabled, "user values pass through");
+    }
+
+    /// REVIEW-WIN-006: concurrent saves — the preferred-server mirror racing a
+    /// user toggle — never fail, never leave a torn or foreign file, and leave
+    /// no temp file behind. With the shared `settings.json.tmp` and no lock,
+    /// writers truncated each other's temp file and lost renames.
+    #[test]
+    fn concurrent_saves_neither_fail_nor_tear_the_file() {
+        const KEY: &[u8] = b"unit-test-hmac-key-32-bytes-pad!";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let writers: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        let settings = AppSettings {
+                            preferred_server_id: Some(format!("node-{t}-{i}")),
+                            ..AppSettings::default()
+                        };
+                        write_signed_settings(&path, &settings, |json| compute_hmac(json, KEY))
+                            .expect("a concurrent save failed");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        let content = fs::read_to_string(&path).unwrap();
+        let signed: SignedSettings = serde_json::from_str(&content).expect("a whole file");
+        let json = serde_json::to_string(&signed.settings).unwrap();
+        assert!(
+            verify_hmac(&json, &signed.hmac, KEY),
+            "torn or mismatched file"
+        );
+        assert!(signed
+            .settings
+            .preferred_server_id
+            .is_some_and(|id| id.ends_with("-24")));
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "settings.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// REVIEW-WIN-007: signing out forgets the account's server and nothing
+    /// else on the machine.
+    #[test]
+    fn signing_out_forgets_the_accounts_server_only() {
+        let mut settings = AppSettings {
+            preferred_server_id: Some("node-7".into()),
+            custom_dns: Some(vec!["9.9.9.9".into()]),
+            ..AppSettings::default()
+        };
+        assert!(forget_account_choices(&mut settings));
+        assert_eq!(settings.preferred_server_id, None);
+        assert_eq!(settings.custom_dns, Some(vec!["9.9.9.9".to_string()]));
+        // Nothing to forget: nothing to write.
+        assert!(!forget_account_choices(&mut settings));
     }
 }

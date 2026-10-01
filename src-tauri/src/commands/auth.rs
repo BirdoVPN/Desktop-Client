@@ -230,6 +230,9 @@ pub async fn logout(
     // came up for a signed-out user and auto-reconnect kept re-dialling with
     // the previous account's session.
     end_session(&app, EndReason::SignOut).await;
+    // The next account on this machine must not inherit this one's server
+    // (REVIEW-WIN-007): tray Quick Connect reads it.
+    crate::commands::settings::clear_account_choices(&app);
 
     // Try to logout on server (best effort)
     let _ = api.logout().await;
@@ -333,6 +336,7 @@ pub async fn delete_account(
     // backend disconnect call: the account is gone, and a 401 from it would
     // read as an expired session.
     end_session(&app, EndReason::AccountDeleted).await;
+    crate::commands::settings::clear_account_choices(&app);
 
     // Clear all local credentials after successful server-side deletion,
     // including the persistent ML-KEM identity (same hygiene as logout —
@@ -984,6 +988,26 @@ mod account_boundary_tests {
             ended < cleared,
             "credentials cleared before the session ended"
         );
+    }
+
+    /// REVIEW-WIN-007: both account boundaries forget the account's server,
+    /// after the session is over.
+    #[test]
+    fn account_boundaries_forget_the_accounts_server() {
+        for (name, ended) in [
+            ("logout", "end_session(&app, EndReason::SignOut)"),
+            (
+                "delete_account",
+                "end_session(&app, EndReason::AccountDeleted)",
+            ),
+        ] {
+            let b = body(name);
+            let end = b.find(ended).expect("the session ends");
+            let forget = b
+                .find("settings::clear_account_choices(&app)")
+                .unwrap_or_else(|| panic!("{name} keeps the account's server"));
+            assert!(end < forget, "{name}");
+        }
     }
 
     #[test]
