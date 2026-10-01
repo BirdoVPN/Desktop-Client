@@ -74,7 +74,11 @@ describe('versioned re-consent (D7)', () => {
 
     expect(useAppStore.getState().acceptedConsentVersion).toBe(CONSENT_VERSION);
     await waitFor(() => expect(callsTo('get_auth_state')).toHaveLength(1));
-    expect(screen.queryByRole('button', { name: /i agree & continue/i })).not.toBeInTheDocument();
+    // The screen leaves through its exit animation, which can outlast the
+    // sign-in check under a loaded test run.
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /i agree & continue/i })).not.toBeInTheDocument(),
+    );
   });
 
   it('holds the sign-in check until the user has answered', async () => {
