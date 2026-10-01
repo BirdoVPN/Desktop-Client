@@ -13,6 +13,14 @@
 //!
 //! Every name here is one of ours, so deleting it can only ever remove
 //! something BirdoVPN created.
+//!
+//! The marker is written only after a pass that VERIFIABLY ran
+//! (REVIEW-WIN-011): the firewall service answered before and after it, and
+//! every delete completed. It used to be written whatever happened, so a heal
+//! that ran while the firewall service (MpsSvc) was unavailable left a
+//! <= 1.3.19 upgrader's persistent rules — `BirdoVPN_BlockAll` among them,
+//! which blocks everything — in place for good, with no later build ever
+//! trying again.
 
 use std::path::{Path, PathBuf};
 
@@ -41,13 +49,45 @@ fn marker_path() -> Option<PathBuf> {
     Some(dir.join("legacy-firewall-cleanup.done"))
 }
 
+/// What one `delete rule` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deleted {
+    /// The command ran to completion. netsh exits non-zero both for "No rules
+    /// match" and for a failure, and its text is localised, so this cannot
+    /// tell them apart; the firewall-service probe around the pass is what
+    /// rules out the failure.
+    Completed,
+    /// The command could not be run.
+    Failed,
+}
+
 /// Delete every legacy rule with `delete`, unless `marker` says it was done.
-fn run_once_with(marker: &Path, mut delete: impl FnMut(&str)) {
+/// `firewall_answers` probes that the firewall service is up; the marker is
+/// written only when it answered before AND after the pass and every delete
+/// completed. Otherwise the next start tries again.
+fn run_once_with(
+    marker: &Path,
+    mut firewall_answers: impl FnMut() -> bool,
+    mut delete: impl FnMut(&str) -> Deleted,
+) {
     if marker.exists() {
         return;
     }
+    if !firewall_answers() {
+        tracing::warn!(
+            "Legacy firewall cleanup postponed: the Windows Firewall service did not answer"
+        );
+        return;
+    }
+    let mut complete = true;
     for rule in LEGACY_RULE_NAMES {
-        delete(rule);
+        if delete(rule) == Deleted::Failed {
+            complete = false;
+        }
+    }
+    if !complete || !firewall_answers() {
+        tracing::warn!("Legacy firewall cleanup incomplete; it will run again at the next start");
+        return;
     }
     if let Some(dir) = marker.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -63,17 +103,22 @@ pub fn spawn_once() {
         return;
     };
     std::thread::spawn(move || {
-        run_once_with(&marker, |rule| {
-            let _ = crate::utils::hidden_cmd("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "delete",
-                    "rule",
-                    &format!("name={rule}"),
-                ])
-                .output();
-        });
+        let netsh = |args: &[&str]| crate::utils::hidden_cmd("netsh").args(args).output();
+        run_once_with(
+            &marker,
+            // Read-only, and it fails while the firewall service is stopped.
+            || {
+                netsh(&["advfirewall", "show", "currentprofile"])
+                    .is_ok_and(|out| out.status.success())
+            },
+            |rule| {
+                let name = format!("name={rule}");
+                match netsh(&["advfirewall", "firewall", "delete", "rule", &name]) {
+                    Ok(_) => Deleted::Completed,
+                    Err(_) => Deleted::Failed,
+                }
+            },
+        );
     });
 }
 
@@ -86,13 +131,82 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("BirdoVPN").join("done");
         let mut deleted = Vec::new();
-        run_once_with(&marker, |rule| deleted.push(rule.to_string()));
+        run_once_with(
+            &marker,
+            || true,
+            |rule| {
+                deleted.push(rule.to_string());
+                Deleted::Completed
+            },
+        );
         assert_eq!(deleted.len(), LEGACY_RULE_NAMES.len());
         assert!(marker.exists());
 
         let mut again = 0;
-        run_once_with(&marker, |_| again += 1);
+        run_once_with(
+            &marker,
+            || true,
+            |_| {
+                again += 1;
+                Deleted::Completed
+            },
+        );
         assert_eq!(again, 0, "the heal ran twice");
+    }
+
+    /// REVIEW-WIN-011: a pass that did not verifiably run — the firewall
+    /// service down before or after it, or a delete that could not be run —
+    /// writes no marker, and the next start runs the heal again.
+    #[test]
+    fn an_unverified_pass_is_retried_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("BirdoVPN").join("done");
+
+        // MpsSvc down: nothing is attempted, nothing is recorded.
+        let mut attempted = 0;
+        run_once_with(
+            &marker,
+            || false,
+            |_| {
+                attempted += 1;
+                Deleted::Completed
+            },
+        );
+        assert_eq!(attempted, 0);
+        assert!(!marker.exists(), "marker written with the firewall down");
+
+        // One delete could not be run.
+        run_once_with(
+            &marker,
+            || true,
+            |rule| {
+                if rule == "BirdoVPN_BlockAll" {
+                    Deleted::Failed
+                } else {
+                    Deleted::Completed
+                }
+            },
+        );
+        assert!(!marker.exists(), "marker written over a failed delete");
+
+        // The service went away during the pass.
+        let mut probes = 0;
+        run_once_with(
+            &marker,
+            || {
+                probes += 1;
+                probes == 1
+            },
+            |_| Deleted::Completed,
+        );
+        assert!(
+            !marker.exists(),
+            "marker written after the service vanished"
+        );
+
+        // A clean pass at the next start finishes the job.
+        run_once_with(&marker, || true, |_| Deleted::Completed);
+        assert!(marker.exists());
     }
 
     /// The names are ours alone — deleting one can never touch another
