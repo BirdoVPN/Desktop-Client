@@ -625,7 +625,7 @@ mod types_serialization_tests {
         let user: UserProfile = serde_json::from_str(json)
             .expect("the live /auth/me payload must deserialize — a strict field here blanks the user's identity");
         // The identity the whole app hangs off of.
-        assert_eq!(user.email, "someone@gmail.com");
+        assert_eq!(user.email.as_deref(), Some("someone@gmail.com"));
         assert_eq!(user.id, "cmnz74oyc0000o001dgr9gwec");
         // Absent optional fields must degrade to None, not fail the parse.
         assert_eq!(user.name, None);

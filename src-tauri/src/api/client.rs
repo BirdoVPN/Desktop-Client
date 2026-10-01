@@ -209,35 +209,65 @@ pub struct BirdoApi {
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// The ONE builder every control-plane client starts from, so a second client
+/// can never be built without the hardening.
+///
+/// SEC-C1 FIX: TLS hardening — enforce HTTPS and install the CA-chain SPKI
+/// pinning rustls config (see super::cert_pin). The custom rustls
+/// ServerCertVerifier does full standard validation (chain/hostname/expiry)
+/// AND pins the intermediate/root public keys during the handshake — matching
+/// the Android client and surviving leaf rotations. TLS 1.2 minimum + versions
+/// are set by the rustls config itself.
+fn hardened_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        // Bound the TCP handshake separately from the overall request budget.
+        // Without this, ONE unreachable address (e.g. an IPv6 candidate that
+        // our own leak block rejects, or a black-holing middlebox) could eat
+        // the entire 30 s timeout before reqwest ever tried the next address,
+        // which is what made a server switch look frozen instead of simply
+        // retrying over IPv4.
+        .connect_timeout(Duration::from_secs(8))
+        .user_agent(USER_AGENT)
+        .pool_max_idle_per_host(5)
+        .https_only(true)
+        // F5 FIX: resolve the control plane via the cert-pinned DoH resolver
+        // (system-resolver fallback) so a censoring ISP / captive portal that
+        // hijacks or blocks DNS for api.birdo.app can no longer block desktop
+        // login — matching the Android client. See super::doh_resolver.
+        .dns_resolver(std::sync::Arc::new(
+            super::doh_resolver::DohApiResolver::new(),
+        ))
+        .use_preconfigured_tls(super::cert_pin::rustls_config())
+}
+
+/// A one-off hardened client whose connections are bound to `local`, the
+/// PHYSICAL interface's address, so a request leaves AROUND a live tunnel
+/// (REVIEW-WIN2-007). Windows' strong-host model sends from a bound address
+/// only through the interface that owns it, so the tunnel's /1 routes do not
+/// apply; the kill switch's control-plane permit lets this executable's HTTPS
+/// through a block. `Err` when it cannot be built, which never weakens the
+/// hardening: the caller keeps the ordinary client.
+fn client_around_the_tunnel(local: std::net::IpAddr) -> Result<Client, ApiError> {
+    hardened_client_builder()
+        .local_address(local)
+        .build()
+        .map_err(|e| ApiError::Unknown(e.to_string()))
+}
+
+/// Whether a request that failed on the path around the tunnel never reached
+/// the server, so the tunnel may carry it instead: the connection itself (TCP
+/// or TLS) failed — a network that blocks the API outside the tunnel, or a
+/// host setting under which the bound address does not hold. A request that
+/// was SENT is never re-sent: the deletion may have happened.
+pub(crate) fn never_left(error: &reqwest::Error) -> bool {
+    error.is_connect()
+}
+
 impl BirdoApi {
     /// Create a new API client instance
     pub fn new() -> Self {
-        // SEC-C1 FIX: TLS hardening — enforce HTTPS and install the CA-chain
-        // SPKI pinning rustls config (see super::cert_pin). The custom rustls
-        // ServerCertVerifier does full standard validation (chain/hostname/
-        // expiry) AND pins the intermediate/root public keys during the
-        // handshake — matching the Android client and surviving leaf rotations.
-        // TLS 1.2 minimum + versions are set by the rustls config itself.
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            // Bound the TCP handshake separately from the overall request budget.
-            // Without this, ONE unreachable address (e.g. an IPv6 candidate that
-            // our own leak block rejects, or a black-holing middlebox) could eat
-            // the entire 30 s timeout before reqwest ever tried the next address,
-            // which is what made a server switch look frozen instead of simply
-            // retrying over IPv4.
-            .connect_timeout(Duration::from_secs(8))
-            .user_agent(USER_AGENT)
-            .pool_max_idle_per_host(5)
-            .https_only(true)
-            // F5 FIX: resolve the control plane via the cert-pinned DoH resolver
-            // (system-resolver fallback) so a censoring ISP / captive portal that
-            // hijacks or blocks DNS for api.birdo.app can no longer block desktop
-            // login — matching the Android client. See super::doh_resolver.
-            .dns_resolver(std::sync::Arc::new(
-                super::doh_resolver::DohApiResolver::new(),
-            ))
-            .use_preconfigured_tls(super::cert_pin::rustls_config())
+        let client = hardened_client_builder()
             .build()
             // SEC-C1 FIX: Do NOT fall back to Client::new() — that would
             // silently downgrade to an unpinned, un-hardened client.
@@ -471,17 +501,25 @@ impl BirdoApi {
     ///
     /// Tokens are cleared ONLY on a 2xx: a refused deletion leaves the user
     /// signed in to an account that still exists.
+    ///
+    /// `around_the_tunnel`: the physical interface's address while a tunnel is
+    /// up (REVIEW-WIN2-007). The server removes the account's WireGuard peers
+    /// BEFORE it answers, so an answer through the tunnel was dropped at the
+    /// relay, and a deletion that succeeded read as failed. Sent around it,
+    /// the answer arrives; see [`never_left`] for when the tunnel is used
+    /// instead.
     pub async fn delete_account(
         &self,
         password: &str,
         two_factor_code: Option<&str>,
+        around_the_tunnel: Option<std::net::IpAddr>,
     ) -> Result<DeleteAccountResponse, ApiError> {
         let body = DeleteAccountBody {
             password,
             two_factor_code,
         };
         let token_before = self.access_token_value().await;
-        let outcome = match self.send_gdpr_delete(&body).await? {
+        let outcome = match self.send_gdpr_delete(&body, around_the_tunnel).await? {
             GdprDeleteOutcome::SessionExpired => {
                 {
                     // Same serialisation as request_with_retry: only refresh if
@@ -493,7 +531,7 @@ impl BirdoApi {
                             .map_err(super::session_gate::error_after_failed_refresh)?;
                     }
                 }
-                self.send_gdpr_delete(&body).await?
+                self.send_gdpr_delete(&body, around_the_tunnel).await?
             }
             other => other,
         };
@@ -515,7 +553,15 @@ impl BirdoApi {
         access_token: &str,
         body: &DeleteAccountBody<'_>,
     ) -> reqwest::RequestBuilder {
-        self.client
+        Self::gdpr_delete_request_on(&self.client, access_token, body)
+    }
+
+    fn gdpr_delete_request_on(
+        client: &Client,
+        access_token: &str,
+        body: &DeleteAccountBody<'_>,
+    ) -> reqwest::RequestBuilder {
+        client
             .request(
                 reqwest::Method::DELETE,
                 format!("{}{}", API_BASE_URL, endpoints::auth::GDPR_DELETE),
@@ -534,6 +580,7 @@ impl BirdoApi {
     async fn send_gdpr_delete(
         &self,
         body: &DeleteAccountBody<'_>,
+        around_the_tunnel: Option<std::net::IpAddr>,
     ) -> Result<GdprDeleteOutcome, ApiError> {
         let token = self
             .access_token
@@ -541,11 +588,34 @@ impl BirdoApi {
             .await
             .clone()
             .ok_or(ApiError::NotAuthenticated)?;
-        let response = self
-            .gdpr_delete_request(token.as_str(), body)
-            .send()
-            .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let around = around_the_tunnel.and_then(|local| match client_around_the_tunnel(local) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not build the client around the tunnel ({e}); using the tunnel"
+                );
+                None
+            }
+        });
+        let sent = match around {
+            Some(around) => {
+                match Self::gdpr_delete_request_on(&around, token.as_str(), body)
+                    .send()
+                    .await
+                {
+                    Err(e) if never_left(&e) => {
+                        tracing::info!(
+                            "The path around the tunnel refused the connection — sending the \
+                             deletion through the tunnel"
+                        );
+                        self.gdpr_delete_request(token.as_str(), body).send().await
+                    }
+                    other => other,
+                }
+            }
+            None => self.gdpr_delete_request(token.as_str(), body).send().await,
+        };
+        let response = sent.map_err(|e| ApiError::Network(e.to_string()))?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         let outcome = Self::classify_gdpr_delete_response(status, &text);
@@ -1326,6 +1396,63 @@ impl Clone for BirdoApi {
             refresh_token: Arc::clone(&self.refresh_token),
             refresh_lock: Arc::clone(&self.refresh_lock),
         }
+    }
+}
+
+/// REVIEW-WIN2-007, the client half. Local sockets only: nothing here reaches
+/// beyond 127.0.0.1.
+#[cfg(test)]
+mod around_the_tunnel_tests {
+    use super::{client_around_the_tunnel, never_left};
+
+    /// The deletion falls back to the tunnel only when the request around it
+    /// never reached the server (the connection was refused) — never when it
+    /// was sent and its answer was lost, because the account may already be
+    /// gone and a second delete would answer 401 and read as an expired
+    /// session.
+    #[tokio::test]
+    async fn only_a_request_that_never_left_falls_back_to_the_tunnel() {
+        let plain = reqwest::Client::new();
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let refused = plain
+            .post(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(never_left(&refused), "{refused:?}");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            // The request arrived; the answer never does.
+        });
+        let lost = plain
+            .post(format!("http://{addr}/"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!never_left(&lost), "{lost:?}");
+        server.await.unwrap();
+    }
+
+    /// The client around the tunnel is the hardened one, only bound.
+    #[test]
+    fn the_client_around_the_tunnel_builds_from_the_hardened_builder() {
+        assert!(
+            client_around_the_tunnel(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).is_ok()
+        );
+        let source = include_str!("client.rs");
+        let around = &source[source.find("fn client_around_the_tunnel(").unwrap()..];
+        let around = &around[..around.find("\n}").unwrap()];
+        assert!(around.contains("hardened_client_builder()"), "{around}");
+        assert!(around.contains(".local_address(local)"), "{around}");
     }
 }
 

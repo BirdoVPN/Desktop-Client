@@ -139,6 +139,32 @@ pub fn default_route() -> Option<PhysicalRoute> {
     }
 }
 
+/// The address this machine reaches its physical default gateway from: what
+/// a request bound to leave AROUND the tunnel uses (REVIEW-WIN2-007). `None`
+/// without a default route. The tunnel's /1 routes do not capture the gateway
+/// (it is on the physical interface's own, more specific subnet).
+#[cfg(target_os = "windows")]
+pub fn physical_source_address() -> Option<std::net::IpAddr> {
+    source_address_toward(std::net::IpAddr::V4(default_route()?.gateway))
+}
+
+/// The local address the routing table picks to reach `to`. A connected UDP
+/// socket reports it, and connecting one sends nothing.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn source_address_toward(to: std::net::IpAddr) -> Option<std::net::IpAddr> {
+    if to.is_unspecified() {
+        return None;
+    }
+    let any: std::net::IpAddr = match to {
+        std::net::IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        std::net::IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+    };
+    let socket = std::net::UdpSocket::bind((any, 0)).ok()?;
+    socket.connect((to, 9)).ok()?;
+    let local = socket.local_addr().ok()?.ip();
+    (!local.is_unspecified()).then_some(local)
+}
+
 /// `route` as a connectivity reading (see the module docs).
 pub fn connectivity_of(route: Option<&PhysicalRoute>) -> Connectivity {
     if !HAS_ROUTE_SIGNAL {
@@ -334,6 +360,19 @@ mod windows_events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REVIEW-WIN2-007: the source address is what the routing table picks,
+    /// read off a connected UDP socket that sends nothing (loopback here).
+    #[test]
+    fn the_source_address_is_the_one_the_route_picks() {
+        let loopback = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(source_address_toward(loopback), Some(loopback));
+        assert_eq!(
+            source_address_toward(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            None,
+            "an on-link default route has no gateway to aim at"
+        );
+    }
 
     const TABLE: &str =
         "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\

@@ -600,11 +600,17 @@ pub struct RefreshResponse {
 // User Types
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserProfile {
     pub id: String,
-    pub email: String,
+    /// Optional (REVIEW-WIN2-009): phase 2 of the Account API contract (item
+    /// 86) sends `email: null` for an anonymous account, and a required field
+    /// failed the WHOLE `/auth/me` parse — the identity, `isAnonymous`, the
+    /// number card and `hasPassword` with it, and a token rotation on every
+    /// launch's retry.
+    #[serde(default)]
+    pub email: Option<String>,
     pub name: Option<String>,
     #[serde(default)]
     pub email_verified: bool,
@@ -640,6 +646,25 @@ pub struct UserProfile {
     pub account_number: Option<AccountNumber>,
 }
 
+/// Manual, like `VpnConfig`'s: in phase 1 an anonymous account's email is
+/// `anon_<the 24-digit number>@anonymous.local`, and the number is the
+/// account's only credential (REVIEW-WIN2-027). A `{:?}` must never carry it.
+impl std::fmt::Debug for UserProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserProfile")
+            .field("id", &self.id)
+            .field("email", &self.email.as_ref().map(|_| "<redacted>"))
+            .field("name", &self.name.as_ref().map(|_| "<redacted>"))
+            .field("email_verified", &self.email_verified)
+            .field("has_password", &self.has_password)
+            .field("is_sso", &self.is_sso)
+            .field("account_type", &self.account_type)
+            .field("is_anonymous", &self.is_anonymous)
+            .field("account_number", &self.account_number)
+            .finish_non_exhaustive()
+    }
+}
+
 impl UserProfile {
     /// Whether this is an anonymous account, from the explicit fields when the
     /// server sends them. `None` on an older backend: the UI then falls back to
@@ -654,8 +679,12 @@ impl UserProfile {
 }
 
 /// An anonymous account number: the bare 24-digit id, and the account's ONLY
-/// credential. Never logged: its `Debug` is redacted, so no `{:?}` of a profile
-/// or an auth state can print it, and the memory is wiped on drop.
+/// credential. Never logged: its `Debug` is redacted, and so are the emails of
+/// the structs that carry it (phase 1's synthetic email holds the same
+/// digits), so no `{:?}` of a profile or an auth state can print it. THIS copy
+/// is wiped on drop; the others are not (REVIEW-WIN2-027): the response body
+/// and serde's intermediate value it was parsed from, the IPC JSON, and the
+/// webview's store all hold it in ordinary memory.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct AccountNumber(String);
