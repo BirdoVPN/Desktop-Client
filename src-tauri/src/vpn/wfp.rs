@@ -1377,6 +1377,28 @@ mod split_tunnel_resolution_tests {
     }
 }
 
+/// Nothing WFP holds may outlive the process: no provider, no persistent or
+/// boot-time object, one DYNAMIC session. That is what makes a crash, an End
+/// task or an uninstall of a killed app unable to leave a filter (or the DNS
+/// guard) behind, and why the uninstaller has none to remove (W1-008).
+#[cfg(test)]
+mod lifetime_tests {
+    #[test]
+    fn every_wfp_object_lives_in_the_dynamic_session() {
+        let text = include_str!("wfp.rs");
+        assert!(text.contains("session.flags = FWPM_SESSION_FLAG_DYNAMIC;"));
+        // Built at run time so this file does not match its own needles.
+        for needle in [
+            ["FwpmProvider", "Add0"].concat(),
+            ["FWPM_FILTER_FLAG_", "PERSISTENT"].concat(),
+            ["FWPM_FILTER_FLAG_", "BOOTTIME"].concat(),
+            ["FWPM_SUBLAYER_FLAG_", "PERSISTENT"].concat(),
+        ] {
+            assert!(!text.contains(&needle), "wfp.rs uses {needle}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

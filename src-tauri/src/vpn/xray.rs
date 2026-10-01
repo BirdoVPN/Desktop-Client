@@ -315,13 +315,11 @@ impl XrayManager {
                     let reader = BufReader::new(stderr_async);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        if line.contains("panic")
-                            || line.contains("fatal")
-                            || line.contains("FATAL")
-                        {
-                            tracing::error!(target: "xray::stderr", "CRASH: {}", line);
+                        let (crashed, safe) = xray_stderr_line(&line);
+                        if crashed {
+                            tracing::error!(target: "xray::stderr", "CRASH: {}", safe);
                         } else {
-                            tracing::warn!(target: "xray::stderr", "{}", line);
+                            tracing::warn!(target: "xray::stderr", "{}", safe);
                         }
                     }
                 });
@@ -597,6 +595,19 @@ fn find_available_port(start: u16) -> Option<u16> {
     None
 }
 
+/// One line of xray's stderr as it may reach the persistent log (W1-020):
+/// `(is it a crash, the redacted line)`.
+///
+/// xray's warnings name what it was dialling — the relay's address, and in
+/// some failures the VLESS user id — and these lines are written at WARN, which
+/// release builds persist. Everything else that can name the relay is redacted
+/// (LOG-001), so this is too, ALWAYS: `sanitize_always`, not `sanitize_error`,
+/// because a debug build's log is still a file a user may send.
+fn xray_stderr_line(line: &str) -> (bool, String) {
+    let crashed = line.contains("panic") || line.contains("fatal") || line.contains("FATAL");
+    (crashed, crate::utils::redact::sanitize_always(line))
+}
+
 /// Parse "host:port" endpoint string
 fn parse_endpoint(endpoint: &str) -> Result<(String, u16), String> {
     // P6-CLI-D-03: these Err strings reach release-level catch-all loggers verbatim.
@@ -797,6 +808,41 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
          are no longer accepted (AUDIT-N4).",
         XRAY_BIN
     ))
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::xray_stderr_line;
+
+    /// W1-020: a failed dial names the relay; the log line must not.
+    #[test]
+    fn a_dial_failure_reaches_the_log_without_the_relay_address() {
+        let (crashed, line) = xray_stderr_line(
+            "2026/09/30 12:00:01 [Warning] failed to dial tcp 203.0.113.7:8443: i/o timeout",
+        );
+        assert!(!crashed);
+        assert!(!line.contains("203.0.113.7"), "{line}");
+        assert!(line.contains("i/o timeout"), "{line}");
+    }
+
+    #[test]
+    fn the_user_id_and_a_hostname_are_redacted_too() {
+        let (_, line) = xray_stderr_line(
+            "[Error] invalid user 123e4567-e89b-12d3-a456-426614174000 at relay-ams-3.birdo.app",
+        );
+        assert!(
+            !line.contains("123e4567-e89b-12d3-a456-426614174000"),
+            "{line}"
+        );
+        assert!(!line.contains("birdo.app"), "{line}");
+    }
+
+    #[test]
+    fn a_crash_is_still_recognised() {
+        let (crashed, line) = xray_stderr_line("panic: runtime error: index out of range");
+        assert!(crashed);
+        assert!(line.contains("panic"));
+    }
 }
 
 #[cfg(test)]

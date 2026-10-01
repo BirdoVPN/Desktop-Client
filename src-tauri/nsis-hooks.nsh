@@ -6,6 +6,21 @@
 ; key. The uninstaller must remove that task, or it lingers pointing at a
 ; missing exe and fires a silent failure at every logon.
 
+!macro NSIS_HOOK_PREUNINSTALL
+  ; W1-008: put back what a BirdoVPN that was killed rather than quit left
+  ; behind — DNS an OLDER version parked on the physical adapters, routes a
+  ; crash stranded — BEFORE anything is deleted. The exe is the only program
+  ; that can, and $APPDATA\BirdoVPN\dns-restore.json is the only record of the
+  ; user's own resolvers; uninstalling first used to strand the machine with
+  ; no DNS for good. `--reconcile-and-exit` (main.rs) does that and exits
+  ; before any window, tray or single-instance check.
+  ;
+  ; The uninstaller is elevated (per-machine install), so the
+  ; requireAdministrator exe starts without a prompt. The hook and the flag
+  ; ship in the same build, so an older uninstaller never runs a newer flag.
+  ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --reconcile-and-exit' $0
+!macroend
+
 !macro NSIS_HOOK_POSTUNINSTALL
   ; Remove the launch-at-login task, if the user had it enabled.
   nsExec::Exec 'schtasks /Delete /F /TN "BirdoVPN Launch At Login"'
@@ -33,11 +48,25 @@
   ; template's block having run first. Both variables are declared by Tauri's
   ; installer.nsi, into which this macro is expanded.
   ;
+  ; W1-008: dns-restore.json survives the deletion when it still exists. The
+  ; pre-uninstall reconcile deletes it once everything it describes is back;
+  ; one that is left describes resolvers that could NOT be restored, and it is
+  ; what lets a reinstall (whose start-up reconcile reads it) or a support
+  ; session still put them back.
+  ;
   ; Not removed: the Wintun driver/adapter (shared, system-wide).
   ${If} $DeleteAppDataCheckboxState = 1
   ${AndIf} $UpdateMode <> 1
     SetShellVarContext current
-    RMDir /r "$APPDATA\BirdoVPN"
+    ${If} ${FileExists} "$APPDATA\BirdoVPN\dns-restore.json"
+      CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json" "$TEMP\birdo-dns-restore.json"
+      RMDir /r "$APPDATA\BirdoVPN"
+      CreateDirectory "$APPDATA\BirdoVPN"
+      CopyFiles /SILENT "$TEMP\birdo-dns-restore.json" "$APPDATA\BirdoVPN\dns-restore.json"
+      Delete "$TEMP\birdo-dns-restore.json"
+    ${Else}
+      RMDir /r "$APPDATA\BirdoVPN"
+    ${EndIf}
     RMDir /r "$LOCALAPPDATA\BirdoVPN"
     RMDir /r "$LOCALAPPDATA\Birdo VPN"
     ; CredDeleteW(target, CRED_TYPE_GENERIC = 1, 0). A missing entry just

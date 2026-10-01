@@ -297,6 +297,93 @@ pub fn rotate_if_large(path: &Path) {
     }
 }
 
+/// Open `path` for appending, owner-only on multi-user Unix hosts.
+///
+/// P6-CLI-D-08: the log records which VPN nodes were used and when. (Windows
+/// relies on the per-user %APPDATA% ACL, same as the settings file.)
+pub fn open_for_append(path: &Path) -> io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// The persistent log's writer: rotates when the file passes its cap instead
+/// of going silent (W1-019).
+///
+/// The cap used to be enforced by handing tracing an `io::sink()` once the
+/// file passed 2 × [`MAX_LOG_BYTES`], so a session that hit it — exactly the
+/// failure storms support needs logs for — recorded nothing more until the
+/// next launch, the reconnect and give-up lines included. Now the file is moved
+/// to [`rotated_path`] and a fresh one opened in its place, the same rotation
+/// the start-up check performs. The sink survives only as the last resort for
+/// a rotation the OS refuses (a scanner holding the file) on a file already
+/// past twice the cap, so the disk stays bounded.
+pub struct RotatingLog {
+    path: PathBuf,
+    cap: u64,
+    state: std::sync::Mutex<RotatingState>,
+}
+
+struct RotatingState {
+    file: std::fs::File,
+    /// When a rotation last failed; it is not retried on every line.
+    failed_at: Option<std::time::Instant>,
+}
+
+/// How long a refused rotation waits before it is tried again.
+const ROTATION_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl RotatingLog {
+    pub fn open(path: &Path, cap: u64) -> io::Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            cap,
+            state: std::sync::Mutex::new(RotatingState {
+                file: open_for_append(path)?,
+                failed_at: None,
+            }),
+        })
+    }
+
+    /// A writer for one log event. Never fails: losing one line beats taking
+    /// the process down from inside the logging path.
+    pub fn writer(&self) -> Box<dyn Write> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let len = state.file.metadata().map(|m| m.len()).unwrap_or(0);
+        if len > self.cap {
+            let may_retry = state
+                .failed_at
+                .is_none_or(|at| at.elapsed() >= ROTATION_RETRY);
+            if may_retry {
+                match std::fs::rename(&self.path, rotated_path(&self.path))
+                    .and_then(|()| open_for_append(&self.path))
+                {
+                    Ok(fresh) => {
+                        state.file = fresh;
+                        state.failed_at = None;
+                    }
+                    Err(e) => {
+                        eprintln!("birdo.log rotation failed (continuing to append): {}", e);
+                        state.failed_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            if state.failed_at.is_some() && len > 2 * self.cap {
+                return Box::new(io::sink());
+            }
+        }
+        match state.file.try_clone() {
+            Ok(f) => Box::new(f),
+            Err(_) => Box::new(io::sink()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +668,26 @@ mod tests {
     /// would leave every test in this module green while the log went back to
     /// spanning the lifetime of the install. Same technique, and same reason,
     /// as `log_hygiene::the_on_disk_log_clamp_is_still_wired_into_main`.
+    /// W1-019: past its cap the in-session log ROTATES and keeps recording;
+    /// it used to drop every later line until the next launch.
+    #[test]
+    fn the_in_session_cap_rotates_instead_of_going_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("birdo.log");
+        let log = RotatingLog::open(&path, 100).unwrap();
+        log.writer().write_all(&[b'a'; 150]).unwrap();
+        // The next event finds the file past the cap.
+        log.writer()
+            .write_all(b"reconnect attempt 3 of 10\n")
+            .unwrap();
+        assert_eq!(std::fs::read(rotated_path(&path)).unwrap(), vec![b'a'; 150]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "reconnect attempt 3 of 10\n",
+            "the line after the cap must be recorded, not sunk"
+        );
+    }
+
     #[test]
     fn the_retention_sweep_is_still_wired_into_main() {
         let main_rs = Path::new(env!("CARGO_MANIFEST_DIR"))

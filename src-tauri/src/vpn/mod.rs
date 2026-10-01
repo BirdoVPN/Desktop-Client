@@ -1165,6 +1165,54 @@ pub mod dns_journal {
         }
     }
 
+    /// W1-008: the uninstaller restores what the journal describes BEFORE it
+    /// deletes anything, and keeps a journal that still describes something.
+    /// Source pins: the hook script is not reachable from a unit test.
+    #[cfg(test)]
+    mod uninstall_tests {
+        const HOOKS: &str = include_str!("../../nsis-hooks.nsh");
+        const MAIN: &str = include_str!("../main.rs");
+
+        #[test]
+        fn the_uninstaller_reconciles_before_it_deletes_anything() {
+            let pre = HOOKS
+                .find("!macro NSIS_HOOK_PREUNINSTALL")
+                .expect("a pre-uninstall hook");
+            let post = HOOKS
+                .find("!macro NSIS_HOOK_POSTUNINSTALL")
+                .expect("a post-uninstall hook");
+            let pre_body = &HOOKS[pre..post];
+            assert!(pre_body.contains("--reconcile-and-exit"));
+            assert!(
+                pre_body.contains("ExecWait"),
+                "it must finish before deletion"
+            );
+            assert!(!pre_body.contains("RMDir"));
+            // The flag main() honours is the one the hook passes.
+            assert!(MAIN.contains(r#"const RECONCILE_AND_EXIT: &str = "--reconcile-and-exit";"#));
+            let flag = MAIN
+                .find("arg == RECONCILE_AND_EXIT")
+                .expect("main() handles it");
+            let tauri = MAIN.find("tauri::Builder::default()").expect("the app");
+            assert!(
+                flag < tauri,
+                "the flag is handled before any window or plugin"
+            );
+        }
+
+        #[test]
+        fn a_journal_that_still_describes_something_survives_the_deletion() {
+            let post = &HOOKS[HOOKS.find("!macro NSIS_HOOK_POSTUNINSTALL").unwrap()..];
+            let keep = post
+                .find(r#"${FileExists} "$APPDATA\BirdoVPN\dns-restore.json""#)
+                .expect("the journal is checked for");
+            let restore = post
+                .rfind(r#""$APPDATA\BirdoVPN\dns-restore.json""#)
+                .expect("and copied back");
+            assert!(keep < restore);
+        }
+    }
+
     /// Durability of the record itself — the property every other invariant in
     /// `win_machine_state` is standing on (I4). These drive the path-taking
     /// helpers directly rather than `write`/`read`, which resolve their own

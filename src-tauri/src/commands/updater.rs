@@ -219,4 +219,19 @@ mod tests {
         assert!(download < teardown && teardown < install);
         assert!(!body.contains(&["download", "_and_install"].concat()));
     }
+
+    /// W1-038: the updater plugin (v2) reads only endpoints, pubkey, windows
+    /// and the dangerous_* switches. The v1 `active` / `dialog` keys did
+    /// nothing, while suggesting an update dialog that does not exist.
+    #[test]
+    fn the_updater_config_carries_only_keys_the_plugin_reads() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).expect("tauri.conf.json");
+        let updater = conf["plugins"]["updater"]
+            .as_object()
+            .expect("plugins.updater");
+        let mut keys: Vec<&str> = updater.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["endpoints", "pubkey"]);
+    }
 }

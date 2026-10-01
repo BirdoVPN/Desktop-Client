@@ -93,6 +93,25 @@ fn deliver_deep_link(app: &tauri::AppHandle, url: &str) {
     }
 }
 
+/// The uninstaller's PREUNINSTALL hook (nsis-hooks.nsh) runs the exe with this
+/// flag: put back what a previous session left behind, then exit (W1-008).
+const RECONCILE_AND_EXIT: &str = "--reconcile-and-exit";
+
+/// W1-008: the uninstaller's — and support's — way to undo what a BirdoVPN
+/// that was killed rather than quit left on the machine: DNS an older version
+/// parked, routes a crash stranded. The same journal-driven reconcile `setup()`
+/// runs at every start, with no window, tray or single-instance plugin, so it
+/// works whether or not another instance is (still) running.
+fn reconcile_and_exit() -> ! {
+    info!(
+        "{}: restoring what a previous session left behind",
+        RECONCILE_AND_EXIT
+    );
+    let restored = vpn::dns_journal::reconcile();
+    info!("{} done (DNS restored: {})", RECONCILE_AND_EXIT, restored);
+    std::process::exit(0)
+}
+
 fn main() {
     // Set custom panic hook for crash recovery
     setup_panic_hook();
@@ -132,44 +151,19 @@ fn main() {
         // the cap, and rotating first would only push expired content into
         // .1 to be pruned there.
         crate::utils::log_retention::rotate_if_large(&p);
-        let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.create(true).append(true);
-        // P6-CLI-D-08: the log records which VPN nodes were used and when —
-        // keep it owner-readable only on multi-user Unix hosts. (Windows
-        // relies on the per-user %APPDATA% ACL, same as the settings file.)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open_opts.mode(0o600);
-        }
-        let file = open_opts.open(&p).ok()?;
+        // The in-session twin of that rotation (W1-019): a weeks-long session
+        // passes the cap too, and once it did, every later line used to be
+        // dropped until the next launch. A stat per log event at info level is
+        // negligible. Owner-only on multi-user Unix hosts (P6-CLI-D-08).
+        let log = crate::utils::log_retention::RotatingLog::open(
+            &p,
+            crate::utils::log_retention::MAX_LOG_BYTES,
+        )
+        .ok()?;
         Some(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                // Resilient writer: a per-write try_clone() can fail (FD
-                // exhaustion, transient OS error). Panicking here would take
-                // down the whole process from inside the logging path — and
-                // possibly before earlier logs are flushed. Degrade gracefully
-                // by dropping that single log line (io::sink) instead.
-                //
-                // PWR-5 addendum: the rotation above only runs at startup, so a
-                // weeks-long session used to grow birdo.log without bound. Hard
-                // in-session cap: once the file passes 2x MAX_LOG_BYTES, drop
-                // further lines (the next launch rotates it aside). A stat per
-                // log event at info level is negligible.
-                .with_writer(move || -> Box<dyn std::io::Write> {
-                    if file
-                        .metadata()
-                        .map(|m| m.len() > 2 * crate::utils::log_retention::MAX_LOG_BYTES)
-                        .unwrap_or(false)
-                    {
-                        return Box::new(std::io::sink());
-                    }
-                    match file.try_clone() {
-                        Ok(f) => Box::new(f),
-                        Err(_) => Box::new(std::io::sink()),
-                    }
-                })
+                .with_writer(move || log.writer())
                 // CLAMP THE PERSISTENT LOG. The redaction strategy leans on
                 // "debug never ships": `redact_ip`/`redact_hostname` are
                 // pass-throughs under `debug_assertions`, and several
@@ -210,6 +204,10 @@ fn main() {
         .with(tracing_subscriber::fmt::layer())
         .with(file_layer)
         .init();
+
+    if std::env::args().any(|arg| arg == RECONCILE_AND_EXIT) {
+        reconcile_and_exit();
+    }
 
     info!("Birdo VPN Client starting...");
 
