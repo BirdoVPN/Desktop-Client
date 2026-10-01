@@ -20,7 +20,7 @@ import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
-import { errorCopy } from '@/lib/errors';
+import { errorCopy, giveUpMessage } from '@/lib/errors';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 import { endSession } from '@/session/session';
@@ -262,9 +262,15 @@ function useConnectionNotifications(): void {
           notifyDisconnected();
           break;
         case 'error': {
+          // A give-up says that reconnecting stopped and whether traffic is
+          // still blocked, as the Home banner does (REVIEW-WIN-009).
           const err = next.vpnError ?? next.commandError;
           notifyConnectionError(
-            err ? errorCopy(err, 'vpn').message : 'The VPN connection stopped. Open BirdoVPN to reconnect.',
+            next.giveUp
+              ? giveUpMessage(next.giveUp.kind, next.giveUp.attempts, next.killSwitchBlocking)
+              : err
+                ? errorCopy(err, 'vpn').message
+                : 'The VPN connection stopped. Open BirdoVPN to reconnect.',
           );
           break;
         }

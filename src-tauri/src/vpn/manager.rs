@@ -150,6 +150,22 @@ pub struct MultiHopStatus {
     pub exit_name: String,
 }
 
+/// Auto-reconnect gave up (contract §1 `gaveUp`, REVIEW-WIN-009).
+///
+/// Set only on the `error` status that ENDS a recovery — the budget spent, the
+/// circuit breaker, a hard refusal — and cleared with that state. The UI used
+/// to infer a give-up from seeing `reconnecting` turn into `error`, but the
+/// emitter publishes the latest snapshot behind a `watch`, so a breaker trip
+/// (TearDown and GiveUp back to back) can reach it as `connected → error`: no
+/// "stopped reconnecting" copy, and a generic error notification instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GaveUp {
+    /// Re-dials spent in the episode that gave up (0 for a breaker trip,
+    /// which gives up before dialling).
+    pub attempts: u32,
+}
+
 /// What a session is on, published together with the Connected state so a
 /// status can never show one server's state with another's name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +188,7 @@ pub struct PublishedStatus {
     pub kill_switch_blocking: bool,
     pub server_id: Option<String>,
     pub multi_hop: Option<MultiHopStatus>,
+    pub gave_up: Option<GaveUp>,
 }
 
 /// The kill-switch facts `kill_switch_blocking` is derived from. A function
@@ -236,6 +253,7 @@ impl StatusBus {
                 kill_switch_blocking: false,
                 server_id: None,
                 multi_hop: None,
+                gave_up: None,
             }),
             tx,
             probe,
@@ -255,6 +273,9 @@ impl StatusBus {
         }
         if !matches!(p.state, ConnectionState::Reconnecting { .. }) {
             p.reconnect_max = None;
+        }
+        if !matches!(p.state, ConnectionState::Error(_)) {
+            p.gave_up = None;
         }
         p.kill_switch_blocking = kill_switch_blocking(probe, &p.state, tunnel_present);
         p.seq = before.seq;
@@ -1042,6 +1063,29 @@ impl VpnManager {
     /// STATE-FIX: Wraps tunnel stop in a 15s timeout with forced cleanup.
     /// A stuck Disconnecting state is worse than a dirty Disconnected state.
     pub async fn disconnect_to(&self, final_state: ConnectionState) -> Result<(), String> {
+        self.disconnect_to_with(final_state, |_| {}).await
+    }
+
+    /// End a recovery that gave up: tear down whatever tunnel is still held
+    /// and land in `Error` marked [`GaveUp`] — ONE visible change either way.
+    /// `gave_up: None` is an `Error` that ends no recovery (a revocation
+    /// noticed on a healthy session).
+    pub async fn end_in_error(&self, error: IpcError, gave_up: Option<GaveUp>) {
+        let state = ConnectionState::Error(error);
+        if self.holds_tunnel().await {
+            let _ = self
+                .disconnect_to_with(state, |p| p.gave_up = gave_up)
+                .await;
+        } else {
+            let _ = self.write_state_with(state, |p| p.gave_up = gave_up).await;
+        }
+    }
+
+    async fn disconnect_to_with(
+        &self,
+        final_state: ConnectionState,
+        extra: impl FnOnce(&mut PublishedStatus),
+    ) -> Result<(), String> {
         // SM-002: Acquire operation lock first
         let _operation_guard = self
             .acquire_operation_lock()
@@ -1127,6 +1171,7 @@ impl VpnManager {
             .write_state_with(final_state, |p| {
                 p.server_id = None;
                 p.multi_hop = None;
+                extra(p);
             })
             .await;
 
@@ -1549,6 +1594,29 @@ mod tests {
         assert_eq!(after.seq, before + 1, "an intermediate state was published");
         assert_eq!(after.state, ConnectionState::Error(verdict));
         assert_eq!(after.reconnect_max, None);
+    }
+
+    /// REVIEW-WIN-009: the give-up is ON the final status, not inferred from a
+    /// transition the UI may never see; and it does not outlive the error.
+    #[tokio::test]
+    async fn a_give_up_is_marked_on_the_error_status_itself() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        mgr.set_reconnecting(10, None, Some(10)).await;
+        let verdict = IpcError::new(IpcErrorCode::ServerUnreachable, "gave up");
+        mgr.end_in_error(verdict.clone(), Some(GaveUp { attempts: 10 }))
+            .await;
+        let p = mgr.published();
+        assert_eq!(p.state, ConnectionState::Error(verdict));
+        assert_eq!(p.gave_up, Some(GaveUp { attempts: 10 }));
+
+        // An error that ends no recovery carries no mark.
+        mgr.end_in_error(IpcError::unknown("revoked"), None).await;
+        assert_eq!(mgr.published().gave_up, None);
+
+        mgr.end_in_error(IpcError::unknown("again"), Some(GaveUp { attempts: 0 }))
+            .await;
+        mgr.set_state(ConnectionState::Connecting).await.unwrap();
+        assert_eq!(mgr.published().gave_up, None, "the mark outlived the error");
     }
 
     #[tokio::test]

@@ -523,14 +523,16 @@ export const useAppStore = create<AppState>()(
         if (st.error !== undefined && !sameError(st.error, s.vpnError)) patch.vpnError = st.error;
         if (st.state === 'connected' && s.commandError) patch.commandError = null;
 
-        // Auto-reconnect gave up: the only way into `error` from `reconnecting`.
-        if (s.connectionState === 'reconnecting' && st.state === 'error') {
-          patch.giveUp = {
-            kind: giveUpKind(st.error ?? null),
-            attempts: st.reconnectAttempt ?? st.reconnectMax,
-          };
-        } else if (st.state !== 'error' && s.giveUp) {
-          patch.giveUp = null;
+        // Auto-reconnect gave up: Rust marks the final status itself
+        // (REVIEW-WIN-009). Inferring it from a `reconnecting → error`
+        // transition missed every give-up whose intermediate status was
+        // coalesced away (a breaker trip arrives as `connected → error`).
+        const giveUp: GiveUp | null =
+          st.state === 'error' && st.gaveUp
+            ? { kind: giveUpKind(st.error ?? null), attempts: st.gaveUp.attempts }
+            : null;
+        if (giveUp?.kind !== s.giveUp?.kind || giveUp?.attempts !== s.giveUp?.attempts) {
+          patch.giveUp = giveUp;
         }
 
         if (Object.keys(patch).length > 0) set(patch);

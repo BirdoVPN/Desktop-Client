@@ -170,6 +170,13 @@ export interface VpnStatus {
   error: IpcError | null | undefined;
   serverId: string | null;
   multiHop: LiveMultiHop | null;
+  /**
+   * Set only on the `error` status that ENDED an auto-reconnect recovery
+   * (REVIEW-WIN-009). Give-up is read from here, never inferred from seeing
+   * `reconnecting` turn into `error`: Rust publishes the latest snapshot, so
+   * that transition can arrive as `connected → error`.
+   */
+  gaveUp: { attempts: number } | null;
   /** `null` on a pre-v2 backend: nothing to order by, so it is applied as-is. */
   seq: number | null;
   bytesSent: number;
@@ -193,6 +200,11 @@ const LEGACY_STATES: Record<string, { state: VpnState; phase?: VpnPhase; blockin
   rekeying: { state: 'connected' },
   kill_switch_active: { state: 'disconnected', blocking: true },
 };
+
+function parseGaveUp(v: unknown): { attempts: number } | null {
+  if (!isObj(v)) return null;
+  return { attempts: num(v.attempts) ?? 0 };
+}
 
 function parseMultiHop(v: unknown): LiveMultiHop | null {
   if (!isObj(v)) return null;
@@ -232,6 +244,7 @@ export function parseVpnStatus(raw: unknown): VpnStatus | null {
     error,
     serverId: str(pick(raw, 'serverId', 'server_id')),
     multiHop: parseMultiHop(pick(raw, 'multiHop', 'multi_hop')),
+    gaveUp: parseGaveUp(pick(raw, 'gaveUp', 'gave_up')),
     seq: num(raw.seq),
     bytesSent: num(pick(raw, 'bytesSent', 'bytes_sent')) ?? 0,
     bytesReceived: num(pick(raw, 'bytesReceived', 'bytes_received')) ?? 0,

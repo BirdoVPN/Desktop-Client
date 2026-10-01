@@ -141,9 +141,9 @@ export function errorText(e: unknown, context: ErrorContext = 'general'): string
 
 /**
  * Why auto-reconnect stopped, in the three kinds iOS's TunnelCircuitBreaker
- * distinguishes. The contract carries no explicit give-up flag; the error code
- * on the final `error` status says why (§3.4), and these are the codes that
- * map onto iOS's kinds.
+ * distinguishes. The final `error` status says THAT it gave up (`gaveUp`,
+ * REVIEW-WIN-009) and its error code says why (§3.4); these are the codes
+ * that map onto iOS's kinds.
  */
 export type GiveUpKind = 'revoked' | 'never_established' | 'died_after_handshake';
 

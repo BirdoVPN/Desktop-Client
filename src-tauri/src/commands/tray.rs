@@ -154,6 +154,7 @@ mod tests {
             error: None,
             server_id: None,
             multi_hop: None,
+            gave_up: None,
             seq: 1,
             bytes_sent: 0,
             bytes_received: 0,

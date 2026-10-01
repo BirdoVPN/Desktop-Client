@@ -381,19 +381,47 @@ describe('useAppStore', () => {
       expect(useAppStore.getState().commandError?.code).toBe('device_limit')
     })
 
-    it('records a reconnect give-up (reconnecting → error) with its kind and attempts (P1-parity-020)', () => {
+    it('records a reconnect give-up with its kind and attempts (P1-parity-020)', () => {
       useAppStore.getState().applyVpnStatus(status({ state: 'reconnecting', seq: 1, reconnect_attempt: 9, reconnect_max: 10 }))
       useAppStore.getState().applyVpnStatus(
         status({
           state: 'error',
           seq: 2,
-          reconnect_attempt: 10,
-          reconnect_max: 10,
+          gave_up: { attempts: 10 },
           error: { code: 'server_unreachable', message: 'x', retryable: true, retry_after_secs: null },
         }),
       )
       expect(useAppStore.getState().giveUp).toEqual({ kind: 'never_established', attempts: 10 })
       useAppStore.getState().applyVpnStatus(status({ state: 'connecting', seq: 3 }))
+      expect(useAppStore.getState().giveUp).toBeNull()
+    })
+
+    it('sees a give-up whose reconnecting status was coalesced away (REVIEW-WIN-009)', () => {
+      // A breaker trip: TearDown (connected → reconnecting) and GiveUp
+      // (→ error) back to back. The emitter sends the latest snapshot only, so
+      // the UI can go straight from connected to error.
+      useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 1 }))
+      useAppStore.getState().applyVpnStatus(
+        status({
+          state: 'error',
+          seq: 3,
+          gaveUp: { attempts: 0 },
+          error: { code: 'server_unreachable', message: 'x', retryable: true, retry_after_secs: null },
+        }),
+      )
+      expect(useAppStore.getState().giveUp).toEqual({ kind: 'never_established', attempts: 0 })
+    })
+
+    it('an error that ends no recovery is not a give-up, whatever came before it', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'reconnecting', seq: 1 }))
+      useAppStore.getState().applyVpnStatus(
+        status({
+          state: 'error',
+          seq: 2,
+          gaveUp: null,
+          error: { code: 'revoked', message: 'x', retryable: false, retry_after_secs: null },
+        }),
+      )
       expect(useAppStore.getState().giveUp).toBeNull()
     })
   })

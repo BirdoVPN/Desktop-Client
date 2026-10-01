@@ -175,8 +175,7 @@ describe('Dashboard: errors with a way forward', () => {
       state: 'error',
       seq: null,
       kill_switch_blocking: true,
-      reconnect_attempt: 10,
-      reconnect_max: 10,
+      gaveUp: { attempts: 10 },
       error: { code: 'server_unreachable', message: '' },
     })!;
     useAppStore.getState().applyVpnStatus(giveUp);

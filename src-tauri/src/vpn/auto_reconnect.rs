@@ -21,7 +21,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use zeroize::Zeroizing;
 
-use super::manager::{ConnectPhase, ConnectionState, MultiHopStatus, SessionLabel, VpnManager};
+use super::manager::{
+    ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, SessionLabel, VpnManager,
+};
 use super::network_events::{self, PhysicalRoute};
 use super::reconnect_policy::{
     self, Action, Budget, DropCause, Liveness, Observed, ReconnectPolicy, Tick,
@@ -596,7 +598,10 @@ impl ReconnectLoop {
             }
             Action::Dial { attempt, delay } => self.dial(attempt, delay).await,
             Action::GiveUp(error) => {
-                self.give_up(error).await;
+                let gave_up = GaveUp {
+                    attempts: self.policy.attempts(),
+                };
+                self.give_up(error, Some(gave_up)).await;
                 Flow::Stop
             }
             Action::Halt => {
@@ -778,8 +783,13 @@ impl ReconnectLoop {
                 // default (iOS parity, P1-parity-021) is: tear down, release
                 // the block, no auto-retry.
                 tracing::warn!("Heartbeat: the server ended this VPN session (revoked)");
-                self.give_up(reconnect_policy::revoked_error(resp.message.as_deref()))
-                    .await;
+                // Not a give-up: nothing was reconnecting. The UI words it
+                // as a revocation (canonical copy), not "stopped reconnecting".
+                self.give_up(
+                    reconnect_policy::revoked_error(resp.message.as_deref()),
+                    None,
+                )
+                .await;
                 *self.last_reconnect_info.write().await = None;
                 Flow::Stop
             }
@@ -801,7 +811,8 @@ impl ReconnectLoop {
     /// End recovery in `Error`. Always-on keeps the block engaged (the user
     /// asked for exactly that) except for a revocation; otherwise the block is
     /// released so a session that is over cannot hold the machine offline.
-    async fn give_up(&mut self, error: IpcError) {
+    /// `gave_up` marks the status as the end of a recovery (REVIEW-WIN-009).
+    async fn give_up(&mut self, error: IpcError, gave_up: Option<GaveUp>) {
         let vm = Arc::clone(&self.vpn_manager);
         let keep_block =
             reconnect_policy::give_up_keeps_block(error.code, killswitch::is_lockdown_mode());
@@ -820,11 +831,7 @@ impl ReconnectLoop {
 
         // Anything still held is dead: tear it down with the block (if any)
         // still engaged, and land in Error either way.
-        if vm.holds_tunnel().await {
-            let _ = vm.disconnect_to(ConnectionState::Error(error)).await;
-        } else {
-            let _ = vm.set_state(ConnectionState::Error(error)).await;
-        }
+        vm.end_in_error(error, gave_up).await;
         if let Some(app) = &self.app {
             app.state::<XrayManager>().stop().await;
         }
@@ -961,5 +968,21 @@ mod tests {
             ..info
         };
         assert_eq!(single.label().server_id, "entry-1");
+    }
+
+    /// REVIEW-WIN-009: every give-up the POLICY decides is marked on the final
+    /// status with the attempts it spent; the heartbeat's revocation, which
+    /// ends no recovery, is not.
+    #[test]
+    fn policy_give_ups_are_marked_and_revocations_are_not() {
+        let source = include_str!("auto_reconnect.rs");
+        let arm = &source[source.find("Action::GiveUp(error) => {").unwrap()..];
+        let arm = &arm[..arm.find("Flow::Stop").unwrap()];
+        assert!(arm.contains("attempts: self.policy.attempts()"), "{arm}");
+        assert!(arm.contains("self.give_up(error, Some(gave_up))"), "{arm}");
+
+        let revoked = &source[source.find("reconnect_policy::revoked_error(").unwrap()..];
+        let revoked = &revoked[..revoked.find(".await").unwrap()];
+        assert!(revoked.contains("None,"), "{revoked}");
     }
 }

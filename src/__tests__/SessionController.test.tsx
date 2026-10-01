@@ -157,6 +157,29 @@ describe('status sync: Rust events first, resync as the fallback', () => {
   });
 });
 
+describe('give-up (REVIEW-WIN-009)', () => {
+  it('a give-up that reaches the UI as connected → error still says reconnecting stopped', async () => {
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    emit('vpn-status-changed', { state: 'connected', seq: 2, server_id: 'b', error: null });
+    // The breaker trip's `reconnecting` (seq 3) was coalesced away.
+    emit('vpn-status-changed', {
+      state: 'error',
+      seq: 4,
+      gaveUp: { attempts: 0 },
+      error: { code: 'adapter_failed', message: '', retryable: true, retry_after_secs: null },
+    });
+    await waitFor(() =>
+      expect(sendNotification).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'BirdoVPN — Connection error',
+          body: expect.stringContaining('BirdoVPN stopped reconnecting'),
+        }),
+      ),
+    );
+  });
+});
+
 describe('session expiry (W2-006, contract §3.3)', () => {
   it('the session-expired event routes to Login and says why', async () => {
     render(<VpnSessionController />);

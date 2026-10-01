@@ -16,7 +16,7 @@ use crate::commands::session::{
 };
 use crate::commands::settings::get_settings;
 use crate::storage::CredentialStore;
-use crate::vpn::manager::{ConnectPhase, ConnectionState, MultiHopStatus, VpnManager};
+use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
 use crate::vpn::xray::XrayManager;
 use crate::vpn::AutoReconnectService;
 
@@ -646,6 +646,9 @@ pub struct VpnStatus {
     pub error: Option<IpcError>,
     pub server_id: Option<String>,
     pub multi_hop: Option<MultiHopStatus>,
+    /// Non-null only on the `error` status that ended an auto-reconnect
+    /// recovery (REVIEW-WIN-009); see `manager::GaveUp`.
+    pub gave_up: Option<GaveUp>,
     pub seq: u64,
 
     pub bytes_sent: u64,
@@ -711,6 +714,7 @@ pub(crate) async fn build_vpn_status(
         error,
         server_id: published.server_id,
         multi_hop: published.multi_hop,
+        gave_up: published.gave_up,
         seq: published.seq,
         bytes_sent: stats.bytes_sent,
         bytes_received: stats.bytes_received,
@@ -1160,6 +1164,7 @@ mod tests {
                 exit_id: "exit-1".into(),
                 exit_name: "Reykjavik".into(),
             }),
+            gave_up: Some(GaveUp { attempts: 10 }),
             seq: 7,
             bytes_sent: 1,
             bytes_received: 2,
@@ -1186,6 +1191,7 @@ mod tests {
                 "connectedAt",
                 "dnsDegraded",
                 "error",
+                "gaveUp",
                 "killSwitchBlocking",
                 "multiHop",
                 "phase",
@@ -1201,6 +1207,7 @@ mod tests {
             ]
         );
         assert_eq!(json["phase"], "handshaking");
+        assert_eq!(json["gaveUp"], serde_json::json!({ "attempts": 10 }));
         assert_eq!(json["error"]["code"], "server_unreachable");
         assert!(json["error"].get("retry_after_secs").is_some());
         assert_eq!(

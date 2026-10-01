@@ -103,7 +103,16 @@ describe('VpnStatus (contract §1) → parseVpnStatus', () => {
       stealthActive: false,
       quantumActive: true,
       dnsDegraded: ['Ethernet: 192.0.2.53 still set'],
+      gaveUp: null,
     });
+  });
+
+  it('reads the give-up mark Rust sets on the final error status, in both casings (REVIEW-WIN-009)', () => {
+    const base = { state: 'error', error: { code: 'server_unreachable', message: '' } };
+    expect(parseVpnStatus({ ...base, gaveUp: { attempts: 10 } })?.gaveUp).toEqual({ attempts: 10 });
+    expect(parseVpnStatus({ ...base, gave_up: { attempts: 0 } })?.gaveUp).toEqual({ attempts: 0 });
+    expect(parseVpnStatus({ ...base, gaveUp: null })?.gaveUp).toBeNull();
+    expect(parseVpnStatus(base)?.gaveUp).toBeNull();
   });
 
   it('accepts every v2 state, including the new `switching`', () => {
