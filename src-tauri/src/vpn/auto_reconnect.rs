@@ -194,6 +194,10 @@ impl AutoReconnectConfig {
 /// `valid:false` answer is how a revocation arrives.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The one heartbeat for a dead session's key, after its tunnel came down: a
+/// network that is down must not hold the recovery up for longer than this.
+const OLD_KEY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Emitted once per session when the heartbeat reports the Free allowance used
 /// up inside its grace window (birdo-web #590, contract v2 §4). The session
 /// itself is untouched until the server ends it.
@@ -342,6 +346,7 @@ impl AutoReconnectService {
             policy: ReconnectPolicy::new(cfg.budget()),
             session: SessionWatch::default(),
             quota_notice: self.quota_notice.clone(),
+            alive: None,
         };
         let live_loops = Arc::clone(&self.live_loops);
         let check_interval = Duration::from_millis(cfg.health_check_interval_ms);
@@ -421,6 +426,11 @@ struct ReconnectLoop {
     policy: ReconnectPolicy,
     session: SessionWatch,
     quota_notice: QuotaNotice,
+    /// When the session was last known to be alive on the server — it
+    /// connected, or a heartbeat answered for it — and the resume count then.
+    /// Kept across teardowns: it is what reads the old key's answer
+    /// (`reconnect_policy::recently_alive`).
+    alive: Option<(Instant, u64)>,
 }
 
 async fn transport_exit(exits: &mut Option<watch::Receiver<u64>>) {
@@ -499,6 +509,10 @@ impl ReconnectLoop {
         now: Instant,
     ) -> Liveness {
         let vm = Arc::clone(&self.vpn_manager);
+        if self.session.connected_since.is_none() {
+            // A new tunnel: the server has just accepted this session's key.
+            self.alive = Some((now, network_events::resume_count()));
+        }
         let session = &mut self.session;
         let connected_since = *session.connected_since.get_or_insert_with(|| {
             session.pinned_route = route;
@@ -628,6 +642,8 @@ impl ReconnectLoop {
                 if let Err(e) = killswitch::activate_killswitch().await {
                     tracing::warn!("Kill switch activation before teardown failed: {}", e);
                 }
+                // The dead session's key, read before the teardown clears it.
+                let old_key = vm.get_key_id().await;
                 let attempt = self.policy.attempts() + 1;
                 let last_error = self.policy.last_error().cloned();
                 let _ = vm
@@ -639,6 +655,20 @@ impl ReconnectLoop {
                 vm.set_reconnecting(attempt, last_error, self.policy.reconnect_max())
                     .await;
                 self.session = SessionWatch::default();
+                // REVIEW-WIN2-002 / REVIEW-AND2-001: before any re-dial, ask
+                // the old key whether the server took it. Its answer to the
+                // heartbeat that rode the tunnel died with the peer.
+                if reconnect_policy::asks_the_old_key(cause) {
+                    if let Some(key_id) = old_key {
+                        if let Some(error) = self.ask_the_old_key(&key_id, now).await {
+                            tracing::warn!(
+                                "The server had already ended this session ({:?}) — not                                  re-dialling",
+                                error.code
+                            );
+                            return self.end_by_server(error).await;
+                        }
+                    }
+                }
                 Flow::Again
             }
             Action::PauseOffline { attempt } => {
@@ -847,6 +877,9 @@ impl ReconnectLoop {
                 return Flow::Continue;
             }
         };
+        if resp.valid {
+            self.alive = Some((now, network_events::resume_count()));
+        }
         match reconnect_policy::heartbeat_verdict(&resp) {
             HeartbeatVerdict::End(error) => {
                 // The server ended this VPN session: another device took the
@@ -860,12 +893,7 @@ impl ReconnectLoop {
                     "Heartbeat: the server ended this VPN session ({:?})",
                     error.code
                 );
-                // Not a give-up: nothing was reconnecting. The UI words it by
-                // its code, not as "stopped reconnecting".
-                self.give_up(error, None).await;
-                *self.last_reconnect_info.write().await = None;
-                self.quota_notice.reset();
-                Flow::Stop
+                self.end_by_server(error).await
             }
             HeartbeatVerdict::QuotaGrace { seconds_remaining } => {
                 // Once per session: the heartbeat repeats every 30 s for the
@@ -888,6 +916,36 @@ impl ReconnectLoop {
                 Flow::Continue
             }
         }
+    }
+
+    /// The server ended the session (a heartbeat said so, or the old key's
+    /// answer after a teardown). Not a give-up: the UI words it by its code,
+    /// not as "stopped reconnecting". The owner default (iOS parity,
+    /// P1-parity-021): tear down, release the block, no auto-retry.
+    async fn end_by_server(&mut self, error: IpcError) -> Flow {
+        self.give_up(error, None).await;
+        *self.last_reconnect_info.write().await = None;
+        self.quota_notice.reset();
+        Flow::Stop
+    }
+
+    /// One heartbeat for the dead session's key, sent once its tunnel is
+    /// down — so over the physical network, through the app's control-plane
+    /// permit, like the re-dial it precedes. Bounded, so an outage only
+    /// costs [`OLD_KEY_PROBE_TIMEOUT`]. `Some` ends the session
+    /// (`reconnect_policy::after_teardown`).
+    async fn ask_the_old_key(&mut self, key_id: &str, now: Instant) -> Option<IpcError> {
+        let answer = tokio::select! {
+            r = timeout(OLD_KEY_PROBE_TIMEOUT, self.api.heartbeat(key_id)) => r.ok().and_then(Result::ok),
+            _ = self.shutdown.changed() => None,
+        };
+        let alive = reconnect_policy::recently_alive(
+            self.alive.map(|(at, _)| at),
+            now,
+            self.alive
+                .is_some_and(|(_, resumes)| resumes != network_events::resume_count()),
+        );
+        reconnect_policy::after_teardown(answer.as_ref(), alive)
     }
 
     /// End recovery in `Error`. Always-on keeps the block engaged (the user
@@ -1102,9 +1160,46 @@ mod tests {
         assert!(arm.contains("attempts: self.policy.attempts()"), "{arm}");
         assert!(arm.contains("self.give_up(error, gave_up)"), "{arm}");
 
+        // Both ways the server's ending arrives — the heartbeat, and the old
+        // key's answer after a teardown — end unmarked, with no re-dial.
         let ended = &source[source.find("HeartbeatVerdict::End(error) => {").unwrap()..];
-        let ended = &ended[..ended.find("Flow::Stop").unwrap()];
-        assert!(ended.contains("self.give_up(error, None)"), "{ended}");
+        let ended = &ended[..ended.find("HeartbeatVerdict::QuotaGrace").unwrap()];
+        assert!(ended.contains("self.end_by_server(error).await"), "{ended}");
+        let helper = &source[source.find("async fn end_by_server(").unwrap()..];
+        let helper = &helper[..helper.find("Flow::Stop").unwrap()];
+        assert!(helper.contains("self.give_up(error, None)"), "{helper}");
+        assert!(helper.contains("last_reconnect_info.write().await = None"));
+    }
+
+    /// REVIEW-WIN2-002 generalised (REVIEW-AND2-001), the wiring of
+    /// `reconnect_policy::after_teardown` (its table is tested there): the
+    /// key is read BEFORE the teardown clears it, asked only after the
+    /// tunnel is down (so the probe leaves over the physical network), and
+    /// before the re-dial; an ending stops the loop.
+    #[test]
+    fn a_dead_session_asks_its_old_key_before_re_dialling() {
+        let source = include_str!("auto_reconnect.rs");
+        let arm = &source[source.find("Action::TearDown { cause } => {").unwrap()..];
+        let arm = &arm[..arm.find("Action::PauseOffline").unwrap()];
+        let mut last = 0;
+        for needle in [
+            "let old_key = vm.get_key_id().await;",
+            ".disconnect_to(ConnectionState::Reconnecting {",
+            "reconnect_policy::asks_the_old_key(cause)",
+            "self.ask_the_old_key(&key_id, now).await",
+            "return self.end_by_server(error).await;",
+            "Flow::Again",
+        ] {
+            let at = arm[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+            last += at + needle.len();
+        }
+        let probe = &source[source.find("async fn ask_the_old_key(").unwrap()..];
+        let probe = &probe[..probe.find("\n    }").unwrap()];
+        assert!(probe.contains("timeout(OLD_KEY_PROBE_TIMEOUT, self.api.heartbeat(key_id))"));
+        assert!(probe.contains("reconnect_policy::after_teardown("));
+        assert_eq!(OLD_KEY_PROBE_TIMEOUT, Duration::from_secs(5));
     }
 
     /// The grace warning goes out once per session, not on every 30 s
