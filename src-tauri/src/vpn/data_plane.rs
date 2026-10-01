@@ -479,3 +479,217 @@ mod tests {
         assert!(MAX_PACKET_SIZE >= 9000 + WIREGUARD_OVERHEAD);
     }
 }
+
+/// W1-006 measurement: the receive path's scheduling, old against new, on
+/// loopback UDP. Run on demand:
+///
+/// ```text
+/// cargo test --lib --release data_plane_bench -- --ignored --nocapture
+/// ```
+///
+/// What it does NOT measure: Wintun (needs the driver and elevation) and the
+/// relay path. The cost of sealing and opening is identical in both designs,
+/// so it is left out; what differs is how the loop learns that a datagram
+/// arrived, and that is what is measured — wake-ups while idle, the delay from
+/// send to handling for sparse traffic, and a burst's drain time.
+#[cfg(test)]
+mod data_plane_bench {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::net::UdpSocket;
+
+    #[derive(Clone, Copy)]
+    enum Design {
+        /// The removed loop: tokio sleeps of 10 µs / 500 µs / 5 ms by idle
+        /// tier, then up to 64 `try_recv`s.
+        SleepPolling,
+        /// The new one: await readiness, plus the 250 ms timer interval.
+        Readiness,
+    }
+
+    struct Probe {
+        wakeups: AtomicU64,
+        handled: AtomicU64,
+        /// Sum of send-to-handle delays, in ns, of the stamped datagrams.
+        delay_ns: AtomicU64,
+        delays: std::sync::Mutex<Vec<u64>>,
+        /// When the last datagram was handled, in ns since the epoch.
+        last_handled_ns: AtomicU64,
+        stop: AtomicBool,
+    }
+
+    fn handle(probe: &Probe, buf: &[u8], epoch: Instant) {
+        probe.handled.fetch_add(1, Ordering::Relaxed);
+        probe
+            .last_handled_ns
+            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if buf.len() >= 8 {
+            let sent = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            if sent > 0 {
+                let now = epoch.elapsed().as_nanos() as u64;
+                let d = now.saturating_sub(sent);
+                probe.delay_ns.fetch_add(d, Ordering::Relaxed);
+                probe.delays.lock().unwrap().push(d);
+            }
+        }
+    }
+
+    async fn receiver(design: Design, socket: Arc<UdpSocket>, probe: Arc<Probe>, epoch: Instant) {
+        let mut buf = vec![0u8; 2048];
+        match design {
+            Design::SleepPolling => {
+                let mut idle_cycles: u32 = 0;
+                while !probe.stop.load(Ordering::Relaxed) {
+                    let us = if idle_cycles > 2_000 {
+                        5_000
+                    } else if idle_cycles > 100 {
+                        500
+                    } else {
+                        10
+                    };
+                    tokio::time::sleep(Duration::from_micros(us)).await;
+                    probe.wakeups.fetch_add(1, Ordering::Relaxed);
+                    let mut activity = false;
+                    for _ in 0..64 {
+                        match socket.try_recv(&mut buf) {
+                            Ok(n) => {
+                                activity = true;
+                                handle(&probe, &buf[..n], epoch);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    idle_cycles = if activity {
+                        0
+                    } else {
+                        idle_cycles.saturating_add(1)
+                    };
+                }
+            }
+            Design::Readiness => {
+                let mut timers = tokio::time::interval(Duration::from_millis(250));
+                timers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                while !probe.stop.load(Ordering::Relaxed) {
+                    tokio::select! {
+                        _ = timers.tick() => {
+                            probe.wakeups.fetch_add(1, Ordering::Relaxed);
+                        }
+                        r = socket.recv(&mut buf) => {
+                            probe.wakeups.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(n) = r {
+                                handle(&probe, &buf[..n], epoch);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct Report {
+        idle_wakeups_per_s: f64,
+        p50_us: f64,
+        p99_us: f64,
+        burst_ms: f64,
+        handled: u64,
+        sent: u64,
+    }
+
+    async fn run(design: Design) -> Report {
+        let rx = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        // The production receive buffer (wireguard_new::connected_socket).
+        socket2::SockRef::from(&*rx)
+            .set_recv_buffer_size(4 * 1024 * 1024)
+            .unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tx.connect(rx.local_addr().unwrap()).await.unwrap();
+        rx.connect(tx.local_addr().unwrap()).await.unwrap();
+        let probe = Arc::new(Probe {
+            wakeups: AtomicU64::new(0),
+            handled: AtomicU64::new(0),
+            delay_ns: AtomicU64::new(0),
+            delays: std::sync::Mutex::new(Vec::new()),
+            last_handled_ns: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+        });
+        let epoch = Instant::now();
+        let task = tokio::spawn(receiver(design, Arc::clone(&rx), Arc::clone(&probe), epoch));
+
+        // 1. Idle: settle into the deepest tier, then count wake-ups.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let w0 = probe.wakeups.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let idle = (probe.wakeups.load(Ordering::Relaxed) - w0) as f64 / 3.0;
+
+        // 2. Sparse traffic (interactive: one datagram every 50 ms), stamped.
+        for _ in 0..100 {
+            let stamp = (epoch.elapsed().as_nanos() as u64).to_le_bytes();
+            let mut msg = [0u8; 120];
+            msg[..8].copy_from_slice(&stamp);
+            tx.send(&msg).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut delays = probe.delays.lock().unwrap().clone();
+        delays.sort_unstable();
+        let pct = |p: f64| delays[((delays.len() as f64 - 1.0) * p) as usize] as f64 / 1000.0;
+        let (p50, p99) = (pct(0.5), pct(0.99));
+
+        // 3. A burst of 20 000 unstamped 1 400-byte datagrams, sent as fast as
+        // the sender can: how many the loop handles, and how long it takes.
+        let before = probe.handled.load(Ordering::Relaxed);
+        let start_ns = epoch.elapsed().as_nanos() as u64;
+        let msg = [0u8; 1400];
+        let mut sent = 0u64;
+        for _ in 0..20_000 {
+            if tx.send(&msg).await.is_ok() {
+                sent += 1;
+            }
+        }
+        // Settled once nothing new has been handled for half a second.
+        let mut last = u64::MAX;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let now = probe.handled.load(Ordering::Relaxed);
+            if now == last {
+                break;
+            }
+            last = now;
+        }
+        let handled = last - before;
+        let burst_ms = probe
+            .last_handled_ns
+            .load(Ordering::Relaxed)
+            .saturating_sub(start_ns) as f64
+            / 1e6;
+
+        probe.stop.store(true, Ordering::Relaxed);
+        let _ = tx.send(&[0u8; 1]).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        Report {
+            idle_wakeups_per_s: idle,
+            p50_us: p50,
+            p99_us: p99,
+            burst_ms,
+            handled,
+            sent,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "a measurement, not a check: run on demand"]
+    async fn data_plane_bench() {
+        for (label, design) in [
+            ("sleep-polling (removed)", Design::SleepPolling),
+            ("readiness (new)", Design::Readiness),
+        ] {
+            let r = run(design).await;
+            println!(
+                "{label:<24} idle wake-ups/s {:>6.1} | sparse delay p50 {:>8.1} us, p99 {:>8.1} us | \
+                 burst: {} of {} handled, last at {:>7.1} ms",
+                r.idle_wakeups_per_s, r.p50_us, r.p99_us, r.handled, r.sent, r.burst_ms
+            );
+        }
+    }
+}
