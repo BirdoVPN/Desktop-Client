@@ -585,6 +585,7 @@ fn main() {
             commands::auth::delete_account, // GDPR account deletion
             commands::auth::deletion_preflight, // what a deletion leaves billing
             commands::auth::export_user_data, // GDPR data export
+            commands::session::end_expired_session, // a command answered session_expired
             // VPN operations
             commands::vpn::connect_vpn,
             commands::vpn::disconnect_vpn,

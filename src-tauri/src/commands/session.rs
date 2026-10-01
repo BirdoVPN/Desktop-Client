@@ -886,6 +886,22 @@ pub async fn handle_session_expired(app: &AppHandle) {
     EXPIRY_IN_FLIGHT.store(false, Ordering::SeqCst);
 }
 
+/// A command was refused with `session_expired` (REVIEW-WIN-012).
+///
+/// Rust ends the session on its own only when the REFRESH is rejected (the
+/// `session_gate`). An `Unauthorized` on a request retried after a successful
+/// refresh, or a call with no session at all, also maps to `session_expired`,
+/// and the UI then signs out and shows Login — while the tunnel stayed up and
+/// auto-reconnect kept running, watched by nothing, and a later give-up under
+/// lockdown could hold the block behind the Login screen. The UI calls this
+/// whenever it ends a session over such an answer, so Rust ends it too: the
+/// same teardown, token clearing and `session-expired` event as §3.3.
+/// Idempotent, like `handle_session_expired`.
+#[tauri::command]
+pub async fn end_expired_session(app: AppHandle) {
+    handle_session_expired(&app).await;
+}
+
 /// Source pins for the lifecycle ordering. The functions take an `AppHandle`,
 /// which a unit test cannot build, so these read this file the way
 /// `ipv6_binding_tests` reads `src/vpn`.
@@ -958,6 +974,24 @@ mod lifecycle_tests {
                 "killswitch::arm(app)",
                 "ar.store_last_config(",
                 "ar.start()",
+            ],
+        );
+    }
+
+    /// REVIEW-WIN-012: a command-level `session_expired` ends the session in
+    /// Rust through the same §3.3 path as a rejected refresh.
+    #[test]
+    fn an_expired_session_reported_by_the_ui_takes_the_same_path() {
+        order(
+            body("pub async fn end_expired_session("),
+            &["handle_session_expired(&app)"],
+        );
+        order(
+            body("pub async fn handle_session_expired("),
+            &[
+                "end_session(app, EndReason::SessionExpired)",
+                "clear_tokens()",
+                "\"session-expired\"",
             ],
         );
     }

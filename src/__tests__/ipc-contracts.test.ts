@@ -322,6 +322,8 @@ const FRONTEND_COMMANDS = [
   'delete_account',
   'deletion_preflight',
   'export_user_data',
+  // A command answered session_expired: Rust ends the session too (REVIEW-WIN-012)
+  'end_expired_session',
   // VPN operations
   'connect_vpn',
   'disconnect_vpn',

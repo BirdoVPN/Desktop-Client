@@ -18,6 +18,22 @@ export function endSession(reason: 'expired' | 'revoked'): void {
 }
 
 /**
+ * A command answered `session_expired` (REVIEW-WIN-012). Rust ends the
+ * session by itself only when the refresh is rejected; an `Unauthorized`
+ * after a good refresh, or a call with no session, reaches only the UI. Left
+ * there, Login sat over a live tunnel and a running reconnect loop that
+ * nothing watched any more. So Rust is told to end it too (the same teardown
+ * as §3.3, idempotent), and the UI drops to Login at once.
+ */
+export function expireSession(): void {
+  if (!useAppStore.getState().isAuthenticated) return;
+  invoke('end_expired_session').catch(() => {
+    /* best effort: the UI is signed out either way */
+  });
+  endSession('expired');
+}
+
+/**
  * The user signs out (W2-005). One implementation for Home, Profile and every
  * future caller: the two copies this replaces each disconnected only in
  * connected / connecting / reconnecting, so signing out after a failed switch

@@ -199,6 +199,17 @@ describe('session expiry (W2-006, contract §3.3)', () => {
     render(<VpnSessionController />);
     await waitFor(() => expect(useAppStore.getState().isAuthenticated).toBe(false));
     expect(useAppStore.getState().sessionEndedReason).toBe('expired');
+    // REVIEW-WIN-012: and Rust is told, so no tunnel or reconnect loop
+    // outlives the session behind the Login screen. Once, however many
+    // commands fail the same way.
+    expect(callsTo('end_expired_session')).toHaveLength(1);
+  });
+
+  it('the session-expired EVENT does not echo back to Rust (Rust already ended it)', async () => {
+    render(<VpnSessionController />);
+    emit('session-expired', { reason: 'expired' });
+    expect(useAppStore.getState().isAuthenticated).toBe(false);
+    expect(callsTo('end_expired_session')).toHaveLength(0);
   });
 });
 
