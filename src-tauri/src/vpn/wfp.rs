@@ -232,46 +232,25 @@ fn file_name(path: &str) -> &str {
 /// what the kill switch can do.
 fn resolve_apps(policy: &Policy) -> HashMap<String, AppBlob> {
     let mut apps = HashMap::new();
-    let Some(block) = &policy.block_all else {
-        return apps;
-    };
-    let mut resolve = |path: &str, consequence: &str, error: bool| {
-        if apps.contains_key(path) {
-            return;
+    for named in crate::vpn::wfp_policy::named_apps(policy) {
+        if apps.contains_key(named.path) {
+            continue;
         }
-        match app_id(path) {
+        match app_id(named.path) {
             Some(blob) => {
-                apps.insert(path.to_string(), blob);
+                apps.insert(named.path.to_string(), blob);
             }
-            None if error => tracing::error!(
+            None if named.loud => tracing::error!(
                 "Kill switch: no WFP app id for {} — {}",
-                file_name(path),
-                consequence
+                file_name(named.path),
+                named.consequence
             ),
             None => tracing::warn!(
                 "Kill switch: no WFP app id for {} — {}",
-                file_name(path),
-                consequence
+                file_name(named.path),
+                named.consequence
             ),
         }
-    };
-    if let Some(path) = block.self_exe.as_deref() {
-        resolve(
-            path,
-            "the relay permit falls back to address scope and the control plane is blocked \
-             while the block is up",
-            true,
-        );
-    }
-    if let Some(path) = block.stealth_helper.as_deref() {
-        resolve(
-            path,
-            "the stealth relay permit falls back to address scope",
-            true,
-        );
-    }
-    for path in &block.exceptions {
-        resolve(path, "this kill-switch exception is skipped", false);
     }
     apps
 }

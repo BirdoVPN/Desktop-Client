@@ -316,6 +316,57 @@ pub(crate) fn filter_specs(
     out
 }
 
+/// An executable `policy` scopes a permit to, whose WFP app id `wfp.rs` must
+/// resolve before the specs are built.
+pub(crate) struct NamedApp<'a> {
+    pub path: &'a str,
+    /// What an unresolvable id costs, for the log.
+    pub consequence: &'static str,
+    /// Log at ERROR (a permit the session depends on) rather than WARN.
+    pub loud: bool,
+}
+
+/// Every executable `policy` names. The DNS guard names this executable too,
+/// for its relay flow on a DNS port: without that, a guard alone (reactive
+/// mode, Connected) built that permit unscoped, for any app.
+pub(crate) fn named_apps(policy: &Policy) -> Vec<NamedApp<'_>> {
+    let mut out = Vec::new();
+    if let Some(block) = &policy.block_all {
+        if let Some(path) = block.self_exe.as_deref() {
+            out.push(NamedApp {
+                path,
+                consequence: "the relay permit falls back to address scope and the control \
+                              plane is blocked while the block is up",
+                loud: true,
+            });
+        }
+        if let Some(path) = block.stealth_helper.as_deref() {
+            out.push(NamedApp {
+                path,
+                consequence: "the stealth relay permit falls back to address scope",
+                loud: true,
+            });
+        }
+        for path in &block.exceptions {
+            out.push(NamedApp {
+                path,
+                consequence: "this kill-switch exception is skipped",
+                loud: false,
+            });
+        }
+    }
+    if let Some(guard) = policy.dns_guard.as_ref().filter(|g| g.relay.is_some()) {
+        if let Some(path) = guard.self_exe.as_deref() {
+            out.push(NamedApp {
+                path,
+                consequence: "the relay permit on a DNS port falls back to address scope",
+                loud: false,
+            });
+        }
+    }
+    out
+}
+
 /// The tunnel's own flow to `relay` (D-24 / W1-013): only the process that
 /// carries the tunnel — this executable's WireGuard socket over UDP, or the
 /// xray helper over TCP — on the tunnel's protocol and port. Returns the
@@ -1683,6 +1734,42 @@ mod tests {
             );
             every_permit_to_names_an_app(&s, RELAY);
         }
+    }
+
+    /// `wfp.rs` resolves app ids only for the executables the policy names,
+    /// and an unresolved one builds its permit for any app. A guard alone
+    /// names this executable, for its relay flow; without that the permit
+    /// above was built unscoped in reactive mode.
+    #[test]
+    fn the_guard_names_the_app_its_relay_permit_is_scoped_to() {
+        let guard_only = Policy {
+            block_all: None,
+            v6_block: true,
+            dns_guard: Some(guard(false)),
+        };
+        let names = |policy: &Policy| -> Vec<String> {
+            named_apps(policy)
+                .iter()
+                .map(|a| a.path.to_string())
+                .collect()
+        };
+        assert_eq!(names(&guard_only), vec![SELF.to_string()]);
+        // Scoped only when it resolves: what `wfp.rs` hands filter_specs.
+        let on_53 = Policy {
+            dns_guard: Some(DnsGuard {
+                relay: Some(relay_to(RELAY, 53, RelayTransport::WireGuardUdp)),
+                ..guard(false)
+            }),
+            ..guard_only
+        };
+        let resolvable = names(&on_53);
+        let resolved = |path: &str| resolvable.iter().any(|p| p == path);
+        every_permit_to_names_an_app(&filter_specs(&on_53, &resolved), RELAY);
+
+        let lockdown_names = names(&lockdown());
+        assert!(lockdown_names.iter().any(|p| p == SELF));
+        assert!(lockdown_names.iter().any(|p| p == EXCEPTED));
+        assert!(named_apps(&Policy::default()).is_empty());
     }
 
     /// A switch from a relay on port 53 to one on 853 (TCP, Stealth): for the
