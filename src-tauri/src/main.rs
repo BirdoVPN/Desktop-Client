@@ -89,8 +89,13 @@ const RECONCILE_AND_EXIT: &str = "--reconcile-and-exit";
 /// W1-008: the uninstaller's — and support's — way to undo what a BirdoVPN
 /// that was killed rather than quit left on the machine: DNS an older version
 /// parked, routes a crash stranded. The same journal-driven reconcile `setup()`
-/// runs at every start, with no window, tray or single-instance plugin, so it
-/// works whether or not another instance is (still) running.
+/// runs at every start, with no window, tray or single-instance plugin.
+///
+/// Only for a machine where BirdoVPN is NOT running: it deletes every route
+/// the journal names and rewrites the journal, and beside a live session
+/// those are that session's routes — its tunnel dies and its record is lost
+/// (REVIEW-WIN2-008). The uninstaller therefore stops the app first
+/// (nsis-hooks.nsh, NSIS_HOOK_PREUNINSTALL).
 fn reconcile_and_exit() -> ! {
     info!(
         "{}: restoring what a previous session left behind",

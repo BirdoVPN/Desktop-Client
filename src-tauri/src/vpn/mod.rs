@@ -1167,27 +1167,43 @@ pub mod dns_journal {
 
     /// W1-008: the uninstaller restores what the journal describes BEFORE it
     /// deletes anything, and keeps a journal that still describes something.
-    /// Source pins: the hook script is not reachable from a unit test.
+    /// Source pins: the hook script is not reachable from a unit test, and
+    /// they cannot see the template around it — the compile-only makensis
+    /// harness does (lanes/WIN-FIX-1/tmp/d8-harness/build.sh, REVIEW-WIN2-020).
     #[cfg(test)]
     mod uninstall_tests {
         const HOOKS: &str = include_str!("../../nsis-hooks.nsh");
         const MAIN: &str = include_str!("../main.rs");
 
+        /// `needles` appear in `haystack` in this order, each after the last.
+        fn in_order(haystack: &str, needles: &[&str]) {
+            let mut last = 0;
+            for needle in needles {
+                let at = haystack[last..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+                last += at + needle.len();
+            }
+        }
+
         #[test]
         fn the_uninstaller_reconciles_before_it_deletes_anything() {
-            let pre = HOOKS
-                .find("!macro NSIS_HOOK_PREUNINSTALL")
-                .expect("a pre-uninstall hook");
-            let post = HOOKS
-                .find("!macro NSIS_HOOK_POSTUNINSTALL")
-                .expect("a post-uninstall hook");
-            let pre_body = &HOOKS[pre..post];
-            assert!(pre_body.contains("--reconcile-and-exit"));
-            assert!(
-                pre_body.contains("ExecWait"),
-                "it must finish before deletion"
+            let pre = hook_macro("NSIS_HOOK_PREUNINSTALL");
+            // REVIEW-WIN2-008: a running app is stopped FIRST — the template
+            // does it only after this hook, and the reconcile beside a live
+            // session deleted its routes and rewrote its journal. Then the
+            // reconcile, which must finish (nsExec waits; REVIEW-WIN2-019: it
+            // is bounded) before anything is deleted.
+            in_order(
+                pre,
+                &[
+                    r#"!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}""#,
+                    "nsExec::Exec /TIMEOUT=",
+                    "--reconcile-and-exit",
+                ],
             );
-            assert!(!pre_body.contains("RMDir"));
+            assert!(!pre.contains("RMDir"));
+            assert!(!pre.contains("ExecWait"), "unbounded");
             // The flag main() honours is the one the hook passes.
             assert!(MAIN.contains(r#"const RECONCILE_AND_EXIT: &str = "--reconcile-and-exit";"#));
             let flag = MAIN
@@ -1200,16 +1216,64 @@ pub mod dns_journal {
             );
         }
 
+        /// REVIEW-WIN2-020: this used to `rfind` a path that also matched
+        /// inside the `${FileExists}` line, so deleting both copies left it
+        /// green. Each step is a distinct line now, in order, and a failed
+        /// copy never reaches the deletion of the folder that holds the
+        /// record (REVIEW-WIN2-018).
         #[test]
         fn a_journal_that_still_describes_something_survives_the_deletion() {
-            let post = &HOOKS[HOOKS.find("!macro NSIS_HOOK_POSTUNINSTALL").unwrap()..];
-            let keep = post
-                .find(r#"${FileExists} "$APPDATA\BirdoVPN\dns-restore.json""#)
-                .expect("the journal is checked for");
-            let restore = post
-                .rfind(r#""$APPDATA\BirdoVPN\dns-restore.json""#)
-                .expect("and copied back");
-            assert!(keep < restore);
+            let post = hook_macro("NSIS_HOOK_POSTUNINSTALL");
+            let delete = &post[post
+                .find("${If} $DeleteAppDataCheckboxState = 1")
+                .expect("the delete-app-data block")..];
+            in_order(
+                delete,
+                &[
+                    r#"${If} ${FileExists} "$APPDATA\BirdoVPN\dns-restore.json*""#,
+                    "ClearErrors",
+                    r#"CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json*" "$TEMP\birdo-journal-keep""#,
+                    "${IfNot} ${Errors}",
+                    r#"RMDir /r "$APPDATA\BirdoVPN""#,
+                    r#"CreateDirectory "$APPDATA\BirdoVPN""#,
+                    r#"CopyFiles /SILENT "$TEMP\birdo-journal-keep\dns-restore.json*" "$APPDATA\BirdoVPN""#,
+                    // The copy failed: only the logs go.
+                    "${Else}",
+                    r#"RMDir /r "$APPDATA\BirdoVPN\logs""#,
+                    // No journal at all: the whole folder.
+                    "${Else}",
+                    r#"RMDir /r "$APPDATA\BirdoVPN""#,
+                ],
+            );
+            // The `*` keeps the journal the app set aside as unreadable
+            // (`dns-restore.json.corrupt`, kept for support) — the name
+            // `vpn/mod.rs` gives it.
+            assert!(
+                super::preserved_path(std::path::Path::new("dns-restore.json"))
+                    .to_string_lossy()
+                    .starts_with("dns-restore.json")
+            );
+            // Nothing deletes the folder before the journal is safe.
+            let first_folder_delete = delete.find(r#"RMDir /r "$APPDATA\BirdoVPN""#).unwrap();
+            let copied = delete
+                .find(r#"CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json*""#)
+                .unwrap();
+            assert!(copied < first_folder_delete);
+        }
+
+        /// REVIEW-WIN2-011: an in-place update keeps the launch-at-login
+        /// task, like everything else.
+        #[test]
+        fn an_update_keeps_the_launch_at_login_task() {
+            let post = hook_macro("NSIS_HOOK_POSTUNINSTALL");
+            in_order(
+                post,
+                &[
+                    "${If} $UpdateMode <> 1",
+                    r#"schtasks /Delete /F /TN "BirdoVPN Launch At Login""#,
+                    "${EndIf}",
+                ],
+            );
         }
 
         /// The body of `!macro <name>` in the hooks, up to its `!macroend`.
@@ -1221,11 +1285,22 @@ pub mod dns_journal {
             &body[..body.find("!macroend").expect("!macroend")]
         }
 
+        /// The body of `Function <name>` in the hooks, up to `FunctionEnd`.
+        fn hook_function(name: &str) -> &'static str {
+            let start = HOOKS
+                .find(&format!("Function {name}\n"))
+                .or_else(|| HOOKS.find(&format!("Function {name}\r\n")))
+                .unwrap_or_else(|| panic!("no function {name}"));
+            let body = &HOOKS[start..];
+            &body[..body.find("FunctionEnd").expect("FunctionEnd")]
+        }
+
         /// D8: the installer publishes as "Birdo Networks Ltd", and the hooks'
-        /// own literal for the install record is the one Tauri's template
-        /// derives from it (`Software\<publisher>\<productName>`). The build
-        /// fails on a mismatch too (`!error` in NSIS_HOOK_PREINSTALL); this
-        /// catches it without a Windows bundle.
+        /// own literals for the install record and its parent are the ones
+        /// Tauri's template derives from it (`Software\<publisher>[\<product>]`).
+        /// The build fails on a mismatch too (`!error` in NSIS_HOOK_PREINSTALL,
+        /// the parent key included since REVIEW-WIN2-017); this catches it
+        /// without a Windows bundle.
         #[test]
         fn the_installer_publishes_as_birdo_networks_ltd() {
             let conf: serde_json::Value =
@@ -1234,55 +1309,90 @@ pub mod dns_journal {
             let product = conf["productName"].as_str().unwrap();
             assert_eq!(publisher, "Birdo Networks Ltd");
             assert!(
+                HOOKS.contains(&format!(r#"!define BIRDO_MANUKEY "Software\{publisher}""#)),
+                "the hooks' publisher key does not follow bundle.publisher"
+            );
+            assert!(
                 HOOKS.contains(&format!(
-                    r#"!define BIRDO_MANUPRODUCTKEY "Software\{publisher}\{product}""#
+                    r#"!define BIRDO_MANUPRODUCTKEY "${{BIRDO_MANUKEY}}\{product}""#
                 )),
-                "the hooks' record key does not follow bundle.publisher / productName"
+                "the hooks' record key does not follow productName"
+            );
+            assert_eq!(
+                conf["bundle"]["windows"]["nsis"]["installMode"], "perMachine",
+                "the machine records are written to HKLM"
             );
             let pre = hook_macro("NSIS_HOOK_PREINSTALL");
-            assert!(pre.contains(r#"!if "${BIRDO_MANUPRODUCTKEY}" != "${MANUPRODUCTKEY}""#));
-            assert!(pre.contains("!error"));
+            for guard in [
+                r#"!if "${BIRDO_MANUPRODUCTKEY}" != "${MANUPRODUCTKEY}""#,
+                r#"!if "${BIRDO_MANUKEY}" != "${MANUKEY}""#,
+                r#"!if "${INSTALLMODE}" != "perMachine""#,
+            ] {
+                assert!(pre.contains(guard), "{guard}");
+            }
+            assert_eq!(pre.matches("!error").count(), 4);
+            // No second, unguarded copy of the parent key's literal.
+            assert_eq!(HOOKS.matches(r#""Software\Birdo Networks Ltd"#).count(), 1);
         }
 
         /// D8: an upgrade from the old publisher adopts its install record
         /// before any page reads it (GUI and passive: Modern UI's GUI init;
-        /// silent: PREINSTALL), drops it once installed, and a cancelled
-        /// install puts the registry back.
+        /// silent: PREINSTALL); a cancelled OR failed install puts the
+        /// registry back (REVIEW-WIN2-014); a successful one keeps the old
+        /// record as a mirror for a rollback (REVIEW-WIN2-013), which the
+        /// uninstaller drops — as HKLM, whatever SHCTX the template switched
+        /// to (REVIEW-WIN2-016).
         #[test]
         fn an_upgrade_adopts_the_old_publishers_record() {
             assert!(HOOKS.contains(r#"!define BIRDO_LEGACY_MANUKEY "Software\Birdo VPN""#));
             assert!(HOOKS.contains("!define MUI_CUSTOMFUNCTION_GUIINIT BirdoAdoptLegacyRecord"));
             assert!(HOOKS.contains("!define MUI_CUSTOMFUNCTION_ABORT BirdoForgetAdoptedRecord"));
+            assert!(hook_function(".onInstFailed").contains("Call BirdoForgetAdoptedRecord"));
 
-            let adopt = &HOOKS[HOOKS.find("Function BirdoAdoptLegacyRecord").unwrap()..];
-            let adopt = &adopt[..adopt.find("FunctionEnd").unwrap()];
-            let read_new = adopt
-                .find(r#"ReadRegStr $0 SHCTX "${BIRDO_MANUPRODUCTKEY}" """#)
-                .unwrap();
-            let read_old = adopt
-                .find(r#"ReadRegStr $0 SHCTX "${BIRDO_LEGACY_MANUPRODUCTKEY}" """#)
-                .unwrap();
-            let write_new = adopt
-                .find(r#"WriteRegStr SHCTX "${BIRDO_MANUPRODUCTKEY}" "" $0"#)
-                .unwrap();
-            assert!(
-                read_new < read_old && read_old < write_new,
-                "only a machine without the new record adopts the old one"
+            let adopt = hook_function("BirdoAdoptLegacyRecord");
+            in_order(
+                adopt,
+                &[
+                    r#"ReadRegStr $0 SHCTX "${BIRDO_MANUPRODUCTKEY}" """#,
+                    r#"ReadRegStr $0 SHCTX "${BIRDO_LEGACY_MANUPRODUCTKEY}" """#,
+                    r#"WriteRegStr SHCTX "${BIRDO_MANUPRODUCTKEY}" "" $0"#,
+                ],
             );
             assert!(adopt.contains("StrCpy $INSTDIR $0"));
 
-            let pre = hook_macro("NSIS_HOOK_PREINSTALL");
-            let adopt_call = pre.find("Call BirdoAdoptLegacyRecord").unwrap();
-            assert!(adopt_call < pre.find("SetOutPath $INSTDIR").unwrap());
+            // Silent: adopt, move the output path, and only then remove the
+            // folder the template created first — if it is empty
+            // (REVIEW-WIN2-015: it was the working directory until then).
+            in_order(
+                hook_macro("NSIS_HOOK_PREINSTALL"),
+                &[
+                    "StrCpy $BirdoOutPathBeforeAdoption $INSTDIR",
+                    "Call BirdoAdoptLegacyRecord",
+                    "SetOutPath $INSTDIR",
+                    "${If} $INSTDIR != $BirdoOutPathBeforeAdoption",
+                    "RMDir $BirdoOutPathBeforeAdoption",
+                ],
+            );
+            assert!(!hook_macro("NSIS_HOOK_PREINSTALL").contains("RMDir /r"));
 
-            assert!(hook_macro("NSIS_HOOK_POSTINSTALL")
+            let post = hook_macro("NSIS_HOOK_POSTINSTALL");
+            assert!(
+                post.contains(r#"WriteRegStr HKLM "${BIRDO_LEGACY_MANUPRODUCTKEY}" "" $INSTDIR"#)
+            );
+            assert!(!post.contains("BIRDO_DROP_LEGACY_PUBLISHER_RECORD"));
+
+            assert!(hook_macro("NSIS_HOOK_POSTUNINSTALL")
                 .contains("!insertmacro BIRDO_DROP_LEGACY_PUBLISHER_RECORD"));
             let drop = hook_macro("BIRDO_DROP_LEGACY_PUBLISHER_RECORD");
-            assert!(drop.contains(r#"DeleteRegKey SHCTX "${BIRDO_LEGACY_MANUPRODUCTKEY}""#));
+            assert!(drop.contains(r#"DeleteRegKey HKLM "${BIRDO_LEGACY_MANUPRODUCTKEY}""#));
+            assert!(
+                !drop.contains("SHCTX"),
+                "SHCTX is HKCU after the template's T:881"
+            );
             // Never the whole old publisher key: a 1.0.0 install ("Birdo VPN"
             // product) keeps its own record under it.
-            assert!(drop.contains(r#"DeleteRegKey /ifempty SHCTX "${BIRDO_LEGACY_MANUKEY}""#));
-            assert!(!drop.contains(r#"DeleteRegKey SHCTX "${BIRDO_LEGACY_MANUKEY}""#));
+            assert!(drop.contains(r#"DeleteRegKey /ifempty HKLM "${BIRDO_LEGACY_MANUKEY}""#));
+            assert!(!drop.contains(r#"DeleteRegKey HKLM "${BIRDO_LEGACY_MANUKEY}""#));
         }
     }
 
