@@ -12,9 +12,10 @@ use crate::api::types::VpnConfig;
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::commands::session::{
-    connect_session, end_session, ensure_signed_in, ConnectTarget, EndReason,
+    connect_session, connect_session_for, end_session, ensure_signed_in, ConnectPurpose,
+    ConnectTarget, EndReason,
 };
-use crate::commands::settings::get_settings;
+use crate::commands::settings::{get_settings, AppSettings};
 use crate::storage::CredentialStore;
 use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
 use crate::vpn::xray::XrayManager;
@@ -76,6 +77,14 @@ pub(crate) fn transport_fallback_reason(error: &IpcError) -> Option<&'static str
         TransportFailure::NoResponse => Some(FALLBACK_HANDSHAKE_TIMEOUT),
         TransportFailure::Refused => Some(FALLBACK_TRANSPORT_BLOCKED),
     }
+}
+
+/// A stored `fallbackReason` as the wire value it was, `None` for anything
+/// that is not one.
+pub(crate) fn known_fallback_reason(reason: &str) -> Option<&'static str> {
+    [FALLBACK_HANDSHAKE_TIMEOUT, FALLBACK_TRANSPORT_BLOCKED]
+        .into_iter()
+        .find(|known| *known == reason)
 }
 
 fn connect_failure_message(response: &ConnectResponse) -> String {
@@ -280,6 +289,10 @@ pub struct VpnSettings {
     /// BirdoShield: request the fleet's filtering DNS resolver for this
     /// device (per-device `dnsFiltering` connect flag, OPEN-WORK D18).
     pub dns_filtering: bool,
+    /// The whole settings file these were read from: what a later settings
+    /// reapply goes back to if it cannot be applied (WIN-FIX-3). `None` when
+    /// the file could not be read.
+    pub snapshot: Option<AppSettings>,
 }
 
 /// The BirdoShield flag a connect body may carry, given the stored preference
@@ -376,6 +389,7 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         stealth_mode,
         quantum_protection,
         dns_filtering,
+        snapshot: settings,
     }
 }
 
@@ -916,36 +930,51 @@ pub(crate) fn pick_quick_connect_server(
     })
 }
 
+/// What a live settings reapply came to (contract §3, WIN-FIX-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReapplyOutcome {
+    /// No live session: the saved change applies at the next connect.
+    NotConnected,
+    /// The live session runs on the new settings.
+    Applied,
+    /// The new settings could not be applied. The previous ones are saved
+    /// back and the session runs on them; the UI re-reads its settings and
+    /// says so.
+    Reverted,
+}
+
 /// Live-reapply tunnel-affecting settings to the ACTIVE session (mobile parity).
 ///
 /// The frontend persists the change via `save_settings` first, then calls this
 /// (debounced). The live tunnel is rebuilt through the SAME connect path as a
-/// server switch — `connect_session`, which re-reads the fresh settings — so
-/// there is no parallel rebuild path to drift. What a failed rebuild leaves is
-/// that path's contract (W1-010): a failure before the old tunnel was touched
-/// keeps the old session; anything later ends in `error` with the block held
-/// where the kill switch is armed, shown as `kill_switch_blocking` with a
-/// working Disconnect. (This comment used to say the auto-reconnect loop then
-/// owned recovery and would release the block; the loop had already been
-/// stopped on that path, so nothing ever did.)
+/// server switch — `connect_session_for`, which re-reads the fresh settings —
+/// so there is no parallel rebuild path to drift, on the transport the session
+/// already runs on (`ConnectPurpose::SettingsReapply`).
 ///
-/// Returns Ok(false) when there is no active session (nothing to reapply — the
-/// persisted change already applies at the next connect).
+/// WIN-FIX-3: a rebuild that fails is reverted rather than left to strand the
+/// user. Live, a switch to a port no relay answers failed its handshake, the
+/// Adaptive Transport then tried Stealth (pointless for a settings change),
+/// and under lockdown the block held the machine offline in `error` until the
+/// user found Disconnect. Now the settings the session connected with
+/// (`AutoReconnectService::connected_settings`) are saved back over the
+/// tunnel-shaping fields and the session is rebuilt on them — unless it never
+/// went down (a failure before the old tunnel was touched keeps it, W1-010).
+/// Only if THAT fails does the rebuild end in `error`, with the block held
+/// where the kill switch is armed and a working Disconnect, as before.
 #[tauri::command]
-pub async fn reapply_vpn_settings(app: AppHandle) -> Result<bool, IpcError> {
-    if !app
-        .state::<VpnManager>()
-        .get_state()
-        .await
-        .is_tunnel_active()
-    {
+pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcError> {
+    let vm = app.state::<VpnManager>();
+    if !vm.get_state().await.is_tunnel_active() {
         tracing::debug!("reapply_vpn_settings: no active session — applies at next connect");
-        return Ok(false);
+        return Ok(ReapplyOutcome::NotConnected);
     }
-    let Some(info) = app.state::<AutoReconnectService>().current_info().await else {
+    let ar = app.state::<AutoReconnectService>();
+    let Some(info) = ar.current_info().await else {
         tracing::warn!("reapply_vpn_settings: no stored target — cannot rebuild");
-        return Ok(false);
+        return Ok(ReapplyOutcome::NotConnected);
     };
+    let previous = ar.connected_settings().await;
 
     // P6-CLI-D-03: the node being rebuilt to is connection history.
     tracing::info!("Reapplying VPN settings — rebuilding the tunnel");
@@ -953,9 +982,63 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<bool, IpcError> {
         "Reapplying VPN settings — rebuilding tunnel to {}",
         info.server_id
     );
-    connect_session(&app, ConnectTarget::of(&info))
+    let target = ConnectTarget::of(&info);
+    let purpose = ConnectPurpose::SettingsReapply {
+        fallback_reason: info
+            .fallback_reason
+            .as_deref()
+            .and_then(known_fallback_reason),
+    };
+    let error = match connect_session_for(&app, target.clone(), purpose).await {
+        Ok(()) => return Ok(ReapplyOutcome::Applied),
+        Err(error) => error,
+    };
+    let plan = failed_reapply(
+        error.code == IpcErrorCode::Cancelled,
+        previous.is_some(),
+        vm.get_state().await.is_tunnel_active(),
+    );
+    let Some(previous) = previous.filter(|_| plan != FailedReapply::Report) else {
+        return Err(error);
+    };
+    tracing::warn!(
+        "The settings change could not be applied ({:?}) — restoring the previous settings",
+        error.code
+    );
+    if let Err(e) = crate::commands::settings::restore_tunnel_settings(&app, &previous) {
+        tracing::error!("Could not save the previous settings back: {}", e);
+        return Err(error);
+    }
+    if plan == FailedReapply::RestoreSettings {
+        return Ok(ReapplyOutcome::Reverted);
+    }
+    connect_session_for(&app, target, purpose)
         .await
-        .map(|()| true)
+        .map(|()| ReapplyOutcome::Reverted)
+}
+
+/// What a settings reapply that failed does next (WIN-FIX-3). Pure, so every
+/// branch is tested.
+#[derive(Debug, PartialEq, Eq)]
+enum FailedReapply {
+    /// The error stands: a disconnect or a newer connect superseded the
+    /// rebuild (it owns the state), or there is nothing to go back to.
+    Report,
+    /// Save the previous settings back. The rebuild failed before the old
+    /// tunnel was touched, so the session still runs on them (W1-010).
+    RestoreSettings,
+    /// Save the previous settings back and rebuild the session on them.
+    RestoreAndReconnect,
+}
+
+fn failed_reapply(cancelled: bool, have_previous: bool, session_alive: bool) -> FailedReapply {
+    if cancelled || !have_previous {
+        FailedReapply::Report
+    } else if session_alive {
+        FailedReapply::RestoreSettings
+    } else {
+        FailedReapply::RestoreAndReconnect
+    }
 }
 
 /// Parse the endpoint IP from a "host:port" string.
@@ -1015,6 +1098,49 @@ pub async fn get_usage_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WIN-FIX-3: a reapply that fails goes back to what the session ran on,
+    /// and is rebuilt on it when the old tunnel is gone — never when a
+    /// disconnect superseded it, and only with something to go back to.
+    #[test]
+    fn a_failed_reapply_goes_back_to_the_previous_settings() {
+        use FailedReapply::*;
+        assert_eq!(failed_reapply(false, true, false), RestoreAndReconnect);
+        assert_eq!(failed_reapply(false, true, true), RestoreSettings);
+        assert_eq!(failed_reapply(true, true, false), Report);
+        assert_eq!(failed_reapply(true, true, true), Report);
+        assert_eq!(failed_reapply(false, false, false), Report);
+
+        // The wiring: the rebuild, then the restore, then the second rebuild
+        // on the same purpose (the session's own transport, no stealth retry).
+        let source = include_str!("vpn.rs");
+        let body = &source[source.find("pub async fn reapply_vpn_settings(").unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let mut last = 0;
+        for needle in [
+            "ar.connected_settings().await",
+            "ConnectPurpose::SettingsReapply {",
+            "connect_session_for(&app, target.clone(), purpose)",
+            "failed_reapply(",
+            "restore_tunnel_settings(&app, &previous)",
+            "FailedReapply::RestoreSettings",
+            "connect_session_for(&app, target, purpose)",
+            "ReapplyOutcome::Reverted",
+        ] {
+            let at = body[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+            last += at + needle.len();
+        }
+        assert_eq!(
+            serde_json::to_value(ReapplyOutcome::Reverted).unwrap(),
+            serde_json::json!("reverted")
+        );
+        assert_eq!(
+            serde_json::to_value(ReapplyOutcome::NotConnected).unwrap(),
+            serde_json::json!("not_connected")
+        );
+    }
 
     /// WIN-FIX-3: the relays take WireGuard on 51820 only. "53" and custom
     /// ports, offered by earlier builds, failed the handshake on every relay;

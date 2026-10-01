@@ -46,6 +46,7 @@ use crate::api::types::{ConnectRequest, ConnectResponse, MultiHopConnectRequest}
 use crate::api::BirdoApi;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::commands::killswitch;
+use crate::commands::settings::AppSettings;
 
 /// H-5 FIX: Instead of storing the full VpnConfig (which has zeroized keys),
 /// store only the metadata needed to request fresh keys from the backend.
@@ -290,6 +291,10 @@ pub struct AutoReconnectService {
     /// Fresh keys are fetched from the API on each reconnect attempt.
     last_reconnect_info: Arc<RwLock<Option<ReconnectInfo>>>,
 
+    /// The settings file as the session on record connected with: what a
+    /// settings reapply that cannot be applied goes back to (WIN-FIX-3).
+    connected_settings: Arc<RwLock<Option<AppSettings>>>,
+
     /// API client for fetching fresh VPN configs on reconnect
     api: Arc<BirdoApi>,
 
@@ -383,6 +388,7 @@ impl AutoReconnectService {
             config: Arc::new(RwLock::new(AutoReconnectConfig::default())),
             vpn_manager,
             last_reconnect_info: Arc::new(RwLock::new(None)),
+            connected_settings: Arc::new(RwLock::new(None)),
             api,
             app_handle: Arc::new(std::sync::RwLock::new(None)),
             task: Arc::new(TokioMutex::new(None)),
@@ -416,10 +422,21 @@ impl AutoReconnectService {
         self.last_reconnect_info.read().await.clone()
     }
 
+    /// Record the settings the session on record connected with.
+    pub async fn store_connected_settings(&self, settings: Option<AppSettings>) {
+        *self.connected_settings.write().await = settings;
+    }
+
+    /// See `connected_settings`. None when there is no session.
+    pub async fn connected_settings(&self) -> Option<AppSettings> {
+        self.connected_settings.read().await.clone()
+    }
+
     /// Clear stored config (called on intentional disconnect): the session
     /// is over.
     pub async fn clear_last_config(&self) {
         *self.last_reconnect_info.write().await = None;
+        *self.connected_settings.write().await = None;
         self.quota_notice.reset();
     }
 

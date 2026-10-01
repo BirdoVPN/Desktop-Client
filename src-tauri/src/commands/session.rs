@@ -81,6 +81,23 @@ impl ConnectTarget {
     }
 }
 
+/// Why a connect runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectPurpose {
+    /// The user picked where to go: connect, quick connect, Multi-Hop, a
+    /// server switch. A direct attempt the network filters is retried once
+    /// over the stealth transport (Adaptive Transport).
+    User,
+    /// A settings change is being applied to the live session (WIN-FIX-3).
+    /// It is rebuilt on the transport it already runs on — the stealth grant
+    /// it was given, if any — and gets no Adaptive Transport retry of its
+    /// own: a rebuild that fails over a settings change is reverted to the
+    /// previous settings instead (`vpn::reapply_vpn_settings`).
+    SettingsReapply {
+        fallback_reason: Option<&'static str>,
+    },
+}
+
 /// What one attempt learned that the failure path needs.
 struct AttemptContext {
     epoch: u64,
@@ -133,10 +150,19 @@ fn session_was_live(state: &ConnectionState, holds_tunnel: bool) -> bool {
         )
 }
 
-/// Connect (or switch) to `target`. See the module docs.
+/// Connect (or switch) to `target` for the user. See the module docs.
 pub(crate) async fn connect_session(
     app: &AppHandle,
     target: ConnectTarget,
+) -> Result<(), IpcError> {
+    connect_session_for(app, target, ConnectPurpose::User).await
+}
+
+/// [`connect_session`] for `purpose`.
+pub(crate) async fn connect_session_for(
+    app: &AppHandle,
+    target: ConnectTarget,
+    purpose: ConnectPurpose,
 ) -> Result<(), IpcError> {
     // Pre-flight: Wintun adapter creation is an in-process FFI call that
     // requires administrator — failing early with a clear error beats a
@@ -191,14 +217,19 @@ pub(crate) async fn connect_session(
         #[cfg(target_os = "windows")]
         old_relay: crate::vpn::wfp::current_relay(),
     };
-    let mut result = attempt(app, &target, None, &mut ctx).await;
+    let (first_transport, adaptive) = match purpose {
+        ConnectPurpose::User => (None, true),
+        ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false),
+    };
+    let mut result = attempt(app, &target, first_transport, &mut ctx).await;
 
     // ADAPTIVE TRANSPORT: when the direct attempt failed in the
     // transport-shaped way (the establish-time handshake was unanswered or
     // refused), retry ONCE with the backend's any-plan stealth grant. A single
     // retry cannot loop: the stealth attempt's handshake runs against the
     // local Xray proxy, whose failures do not classify as transport-shaped.
-    if let Err(direct) = &result {
+    // Not for a settings reapply (see `ConnectPurpose`).
+    if let Some(direct) = result.as_ref().err().filter(|_| adaptive) {
         if let Some(reason) = fallback_reason_for(app, &target, direct).await {
             tracing::warn!(
                 "Adaptive Transport: direct WireGuard failed ({reason}) — rebuilding over the \
@@ -453,6 +484,8 @@ async fn attempt(
     // the fallback reason for this session so a drop rebuilds over the
     // transport that is KNOWN to work here.
     let ar = app.state::<AutoReconnectService>();
+    // What a later settings reapply goes back to if it cannot be applied.
+    ar.store_connected_settings(settings.snapshot).await;
     ar.store_last_config(ReconnectInfo {
         server_id: dialled_id.to_string(),
         server_name: label.server_name,
@@ -1098,17 +1131,44 @@ mod lifecycle_tests {
         );
     }
 
+    /// WIN-FIX-3: a settings reapply is rebuilt on the session's own
+    /// transport and never runs the Adaptive Transport retry; a user connect
+    /// starts direct and does. The session's settings are recorded at the
+    /// commit, beside its reconnect record, for the reapply's revert.
+    #[test]
+    fn a_settings_reapply_keeps_its_transport_and_gets_no_stealth_retry() {
+        let connect = body("pub(crate) async fn connect_session_for(");
+        order(
+            connect,
+            &[
+                "ConnectPurpose::User => (None, true)",
+                "ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false)",
+                "attempt(app, &target, first_transport, &mut ctx)",
+                ".filter(|_| adaptive)",
+                "fallback_reason_for(app, &target, direct)",
+            ],
+        );
+        order(
+            body("async fn attempt("),
+            &[
+                "killswitch::arm(app)",
+                "ar.store_connected_settings(settings.snapshot)",
+                "ar.store_last_config(",
+            ],
+        );
+    }
+
     /// W1-022: every target stops auto-reconnect before anything is dialled,
     /// under the commit lock, with a fresh epoch.
     #[test]
     fn connect_session_supersedes_and_stops_the_loop_first() {
         order(
-            body("pub(crate) async fn connect_session("),
+            body("pub(crate) async fn connect_session_for("),
             &[
                 "vm.lock_commit()",
                 "vm.begin_attempt()",
                 "ar.stop()",
-                "attempt(app, &target, None",
+                "attempt(app, &target, first_transport",
             ],
         );
     }

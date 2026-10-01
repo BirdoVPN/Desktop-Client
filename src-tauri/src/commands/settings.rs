@@ -752,6 +752,37 @@ pub(crate) fn clear_account_choices(app: &AppHandle) {
     }
 }
 
+/// Put the tunnel-shaping settings of `good` back over what is saved now, and
+/// save: the revert of a settings change the live session could not apply
+/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved.
+pub(crate) fn restore_tunnel_settings(
+    app: &AppHandle,
+    good: &AppSettings,
+) -> Result<AppSettings, String> {
+    let _write = SETTINGS_WRITE.lock();
+    let restored = with_tunnel_settings_of(load_settings_sync(app)?, good);
+    save_settings_inner(app, &restored)?;
+    Ok(restored)
+}
+
+/// `current` with every setting a live reapply rebuilds the tunnel for taken
+/// from `good`. Only those: anything else changed since (a notification
+/// toggle, the server the user picked) is not part of the revert.
+fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSettings {
+    AppSettings {
+        custom_dns: good.custom_dns.clone(),
+        local_network_sharing: good.local_network_sharing,
+        wireguard_port: good.wireguard_port.clone(),
+        wireguard_mtu: good.wireguard_mtu,
+        stealth_mode: good.stealth_mode,
+        quantum_protection: good.quantum_protection,
+        dns_filtering: good.dns_filtering,
+        split_tunneling_enabled: good.split_tunneling_enabled,
+        split_tunnel_apps: good.split_tunnel_apps.clone(),
+        ..current
+    }
+}
+
 /// Turn crash reporting on or off (consent screen and Settings › Privacy).
 ///
 /// A dedicated command rather than a full-object `save_settings`, because the
@@ -1056,6 +1087,45 @@ mod tests {
         assert!(matches!(s.protocol, Protocol::Wireguard));
         assert!(s.split_tunneling_enabled);
         assert_eq!(s.wireguard_port, "51820");
+    }
+
+    /// WIN-FIX-3: a reapply that cannot be applied puts back what the live
+    /// session runs on — every tunnel-shaping setting — and nothing else.
+    #[test]
+    fn a_revert_restores_the_tunnel_settings_and_keeps_the_rest() {
+        let good = AppSettings::default();
+        let changed = AppSettings {
+            wireguard_port: "51820".into(),
+            wireguard_mtu: 1280,
+            custom_dns: Some(vec!["9.9.9.9".into()]),
+            local_network_sharing: true,
+            stealth_mode: true,
+            quantum_protection: false,
+            dns_filtering: true,
+            split_tunneling_enabled: true,
+            split_tunnel_apps: vec!["C:\\apps\\game.exe".into()],
+            // Not part of the revert:
+            notifications_enabled: true,
+            preferred_server_id: Some("fra-1".into()),
+            auto_connect: true,
+            ..AppSettings::default()
+        };
+        let restored = with_tunnel_settings_of(changed, &good);
+        assert_eq!(restored.wireguard_port, good.wireguard_port);
+        assert_eq!(restored.wireguard_mtu, good.wireguard_mtu);
+        assert_eq!(restored.custom_dns, good.custom_dns);
+        assert_eq!(restored.local_network_sharing, good.local_network_sharing);
+        assert_eq!(restored.stealth_mode, good.stealth_mode);
+        assert_eq!(restored.quantum_protection, good.quantum_protection);
+        assert_eq!(restored.dns_filtering, good.dns_filtering);
+        assert_eq!(
+            restored.split_tunneling_enabled,
+            good.split_tunneling_enabled
+        );
+        assert_eq!(restored.split_tunnel_apps, good.split_tunnel_apps);
+        assert!(restored.notifications_enabled);
+        assert_eq!(restored.preferred_server_id.as_deref(), Some("fra-1"));
+        assert!(restored.auto_connect);
     }
 
     /// WIN-FIX-3: "53" and custom ports, which no relay answers, load as

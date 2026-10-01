@@ -80,6 +80,14 @@ export function VpnSettings() {
   const mtuAuto = settings.wireGuardMtu === 0;
   const [mtuDraft, setMtuDraft] = useState(settings.wireGuardMtu > 0 ? String(settings.wireGuardMtu) : '');
   const [mtuError, setMtuError] = useState<string | null>(null);
+  // A change Rust could not apply is put back (WIN-FIX-3): follow the saved
+  // value when it changes under the field (it does not while typing). Adjusted
+  // during render, the way React documents for state derived from a prop.
+  const [mtuSaved, setMtuSaved] = useState(settings.wireGuardMtu);
+  if (mtuSaved !== settings.wireGuardMtu) {
+    setMtuSaved(settings.wireGuardMtu);
+    setMtuDraft(settings.wireGuardMtu > 0 ? String(settings.wireGuardMtu) : '');
+  }
   const commitMtu = () => {
     const v = mtuDraft.trim();
     if (!v) return;
