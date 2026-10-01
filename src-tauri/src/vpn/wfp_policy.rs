@@ -21,8 +21,9 @@
 //! |     13 | DNS permits: the tunnel's resolvers over the tunnel; loopback |
 //! |     12 | name-resolution blocks: DNS/DoT/DoQ anywhere else; LLMNR,     |
 //! |        | mDNS and NetBIOS name queries unless LAN sharing is on        |
-//! |     10 | permits: loopback, DHCP, relay, control plane, tunnel, LAN,   |
-//! |        | kill-switch exceptions, host-only virtual networks (inbound)  |
+//! |     10 | permits: loopback, DHCP, IPv6 neighbor discovery, relay,      |
+//! |        | control plane, tunnel, LAN, kill-switch exceptions, host-only |
+//! |        | virtual networks (inbound)                                    |
 //! |      1 | block-all (while the kill switch blocks)                      |
 //!
 //! The DNS block sits ABOVE every ordinary permit on purpose: the LAN-sharing
@@ -39,6 +40,7 @@ pub(crate) const WEIGHT_BLOCK_STUN: u8 = 15;
 
 const TCP: u8 = 6;
 const UDP: u8 = 17;
+const ICMPV6: u8 = 58;
 
 /// Plain DNS (UDP/TCP 53), DNS-over-TLS (TCP 853) and DNS-over-QUIC (UDP 853).
 const DNS_PORTS: [u16; 2] = [53, 853];
@@ -341,6 +343,29 @@ fn block_all_specs(
             Condition::RemotePort(547),
         ],
     ));
+
+    // IPv6 neighbor discovery (router solicitation 133, advertisement 134,
+    // neighbor solicitation 135 / advertisement 136, redirect 137). It is
+    // link-local and carries no traffic of anyone's, but the ALE layers see
+    // it: with the inbound block up and no permit, the physical NIC's IPv6
+    // would decay over a long lockdown session (no router advertisements, no
+    // answers to neighbor solicitations). WFP carries the ICMP type in the
+    // local-port field. The same set wireguard-windows permits.
+    for (layer, types) in [
+        (ConnectV6, &[133u16, 135, 136][..]),
+        (RecvAcceptV6, &[134u16, 135, 136, 137][..]),
+    ] {
+        out.push(spec(
+            "Birdo: Permit IPv6 neighbor discovery",
+            layer,
+            Action::Permit,
+            WEIGHT_PERMIT,
+            [Condition::Protocol(ICMPV6)]
+                .into_iter()
+                .chain(types.iter().map(|t| Condition::LocalPort(*t)))
+                .collect(),
+        ));
+    }
 
     // D-24 / W1-013: the relay is reachable only by the process that carries
     // the tunnel, only on the tunnel's protocol and port. It used to be
@@ -950,6 +975,39 @@ mod tests {
         assert_eq!(
             decide(&s, &in4(SVCHOST, [192, 168, 56, 101], 445, TCP, VBOX)),
             Some(Action::Permit)
+        );
+    }
+
+    #[test]
+    fn neighbor_discovery_survives_the_block_but_inbound_ping_does_not() {
+        let s = specs(&lockdown());
+        let icmp6 = |layer: Layer, icmp_type: u16| Flow {
+            layer,
+            app: SVCHOST,
+            remote: "fe80::1".parse().unwrap(),
+            remote_port: 0,
+            local_port: icmp_type,
+            protocol: ICMPV6,
+            interface: WIFI,
+        };
+        for t in [134, 135, 136, 137] {
+            assert_eq!(
+                decide(&s, &icmp6(Layer::RecvAcceptV6, t)),
+                Some(Action::Permit),
+                "{t}"
+            );
+        }
+        for t in [133, 135, 136] {
+            assert_eq!(
+                decide(&s, &icmp6(Layer::ConnectV6, t)),
+                Some(Action::Permit),
+                "{t}"
+            );
+        }
+        // An echo request from outside is not neighbor discovery.
+        assert_eq!(
+            decide(&s, &icmp6(Layer::RecvAcceptV6, 128)),
+            Some(Action::Block)
         );
     }
 
