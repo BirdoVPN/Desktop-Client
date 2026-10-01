@@ -142,12 +142,22 @@ describe('ConsentScreen controls', () => {
  * sees the screen again, so the text must never change under the same
  * number. The fingerprint is of everything the screen says, not only
  * CONSENT_COPY, so a heading or the age line changing counts too.
+ *
+ * A tripwire, not a lock (REVIEW-WIN2-028): it fires when the text changes,
+ * but a hash edited in place under the same number would pass. What stops
+ * that is review: an entry here is never changed, only added — one per
+ * version, which the second test checks.
  */
 const CONSENT_TEXT_FINGERPRINTS: Record<number, string> = {
   2: '5fcddce0de685ce26e80ef04a509b9b0bd694e5bb4f11a2d40c15ca31628bf49',
 };
 
 describe('consent version (D7)', () => {
+  it('every version since versioning began keeps its fingerprint', () => {
+    const versions = Object.keys(CONSENT_TEXT_FINGERPRINTS).map(Number);
+    expect(versions).toEqual(Array.from({ length: CONSENT_VERSION - 1 }, (_, i) => i + 2));
+  });
+
   it('the text on screen is the one CONSENT_VERSION stands for', () => {
     const { container } = render(<ConsentScreen onAccept={onAccept} onDecline={onDecline} />);
     const digest = createHash('sha256').update(container.textContent ?? '').digest('hex');
