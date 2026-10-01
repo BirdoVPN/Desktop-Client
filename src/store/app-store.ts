@@ -664,11 +664,18 @@ export const useAppStore = create<AppState>()(
           ...idleConnection,
           currentServer: null,
           // Cleared on logout: the next account to sign in on this machine must
-          // not inherit the previous user's server choice, server access or usage.
-          // Rust's `preferred_server_id` is cleared by its own logout and
-          // account deletion (REVIEW-WIN-007).
+          // not inherit the previous user's server choice, Multi-Hop route,
+          // server access or usage. Rust forgets the same at its own account
+          // boundaries (sign-out, deletion, an expired session — REVIEW-WIN-007,
+          // REVIEW-WIN2-023).
           lastServerId: null,
-          settings: { ...state.settings, preferredServerId: null },
+          settings: {
+            ...state.settings,
+            preferredServerId: null,
+            multiHopEnabled: false,
+            multiHopEntryNodeId: null,
+            multiHopExitNodeId: null,
+          },
           // The next session waits for ITS settings load: writers gated on
           // hydration (the preferred-server mirror) would otherwise save this
           // session's copy over Rust's before the next one has read it.

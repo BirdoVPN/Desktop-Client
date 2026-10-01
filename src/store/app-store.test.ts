@@ -95,7 +95,12 @@ describe('useAppStore', () => {
         pendingAction: 'disconnecting',
         settingsHydrated: true,
       })
-      useAppStore.getState().updateSettings({ preferredServerId: 'us-1' })
+      useAppStore.getState().updateSettings({
+        preferredServerId: 'us-1',
+        multiHopEnabled: true,
+        multiHopEntryNodeId: 'ch-1',
+        multiHopExitNodeId: 'is-1',
+      })
 
       useAppStore.getState().logout()
 
@@ -113,6 +118,10 @@ describe('useAppStore', () => {
       // REVIEW-WIN-007: nor its mirrored server, and the next session waits
       // for its own settings load before anything writes them.
       expect(state.settings.preferredServerId).toBeNull()
+      // REVIEW-WIN2-023: nor its Multi-Hop route, which tray Quick Connect dials.
+      expect(state.settings.multiHopEnabled).toBe(false)
+      expect(state.settings.multiHopEntryNodeId).toBeNull()
+      expect(state.settings.multiHopExitNodeId).toBeNull()
       expect(state.settingsHydrated).toBe(false)
     })
   })

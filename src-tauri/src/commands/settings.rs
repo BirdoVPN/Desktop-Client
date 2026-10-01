@@ -623,7 +623,11 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
 /// nothing and the UI rolled the user's change back with "Couldn't save".
 /// The lock also covers the key read, so two first-run saves cannot mint two
 /// different signing keys.
-static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+///
+/// Re-entrant, so a read-modify-write can hold it across the load — whose
+/// legacy-format migrations save — and the save (REVIEW-WIN2-023, see
+/// `clear_account_choices`).
+static SETTINGS_WRITE: parking_lot::ReentrantMutex<()> = parking_lot::const_reentrant_mutex(());
 
 /// Sign `settings` with `sign` and write them to `path`, the whole save under
 /// [`SETTINGS_WRITE`]. `sign` is a parameter so a test can sign without the
@@ -633,7 +637,7 @@ fn write_signed_settings(
     settings: &AppSettings,
     sign: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<(), String> {
-    let _write = SETTINGS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let _write = SETTINGS_WRITE.lock();
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
@@ -682,21 +686,30 @@ pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool
     Ok(true)
 }
 
-/// Settings are per MACHINE, but `preferred_server_id` is one ACCOUNT's
-/// choice: the UI mirrors the user's server into it so tray Quick Connect
-/// dials what the Connect button would. Left behind at sign-out, the next
-/// account to sign in on this machine had its first tray Quick Connect dial
-/// the previous user's server (REVIEW-WIN-007). Returns whether anything
-/// changed.
+/// Settings are per MACHINE, but the server a session dials is one ACCOUNT's
+/// choice: the UI mirrors the user's server into `preferred_server_id`, and
+/// the armed Multi-Hop route, so tray Quick Connect dials what the Connect
+/// button would. Left behind, the next account to sign in on this machine had
+/// its first tray Quick Connect dial the previous user's server
+/// (REVIEW-WIN-007) — or the previous user's Multi-Hop pair, which the first
+/// fix left out (REVIEW-WIN2-023). Returns whether anything changed.
 pub(crate) fn forget_account_choices(settings: &mut AppSettings) -> bool {
-    settings.preferred_server_id.take().is_some()
+    let server = settings.preferred_server_id.take().is_some();
+    let entry = settings.multi_hop_entry_node_id.take().is_some();
+    let exit = settings.multi_hop_exit_node_id.take().is_some();
+    let armed = std::mem::take(&mut settings.multi_hop_enabled);
+    server || entry || exit || armed
 }
 
-/// [`forget_account_choices`] on the settings file. Best effort: a sign-out
-/// must not fail over it. Writes only when there was something to forget, so
-/// settings served as defaults (an unreadable signing key) are never written
-/// over the real file.
+/// [`forget_account_choices`] on the settings file, at every account boundary
+/// (sign-out, deletion, an expired session). Best effort: a sign-out must not
+/// fail over it. Writes only when there was something to forget, so settings
+/// served as defaults (an unreadable signing key) are never written over the
+/// real file. The whole read-modify-write holds the settings lock, so a
+/// concurrent save (the UI's preferred-server mirror) cannot land between the
+/// read and the write and put the old server back (REVIEW-WIN2-023).
 pub(crate) fn clear_account_choices(app: &AppHandle) {
+    let _write = SETTINGS_WRITE.lock();
     match load_settings_sync(app) {
         Ok(mut settings) => {
             if forget_account_choices(&mut settings) {
@@ -1194,19 +1207,71 @@ mod tests {
         );
     }
 
-    /// REVIEW-WIN-007: signing out forgets the account's server and nothing
-    /// else on the machine.
+    /// REVIEW-WIN-007 / REVIEW-WIN2-023: an account boundary forgets the
+    /// account's server and its Multi-Hop route — what tray Quick Connect
+    /// dials — and nothing else on the machine.
     #[test]
     fn signing_out_forgets_the_accounts_server_only() {
         let mut settings = AppSettings {
             preferred_server_id: Some("node-7".into()),
+            multi_hop_enabled: true,
+            multi_hop_entry_node_id: Some("ch-1".into()),
+            multi_hop_exit_node_id: Some("is-1".into()),
             custom_dns: Some(vec!["9.9.9.9".into()]),
+            local_network_sharing: true,
             ..AppSettings::default()
         };
         assert!(forget_account_choices(&mut settings));
         assert_eq!(settings.preferred_server_id, None);
+        assert!(!settings.multi_hop_enabled);
+        assert_eq!(settings.multi_hop_entry_node_id, None);
+        assert_eq!(settings.multi_hop_exit_node_id, None);
         assert_eq!(settings.custom_dns, Some(vec!["9.9.9.9".to_string()]));
+        assert!(settings.local_network_sharing);
         // Nothing to forget: nothing to write.
         assert!(!forget_account_choices(&mut settings));
+
+        // A route alone is still the account's.
+        let mut route_only = AppSettings {
+            multi_hop_exit_node_id: Some("is-1".into()),
+            ..AppSettings::default()
+        };
+        assert!(forget_account_choices(&mut route_only));
+    }
+
+    /// REVIEW-WIN2-023: the account-boundary read-modify-write holds the
+    /// settings lock across the load, whose migrations save — so the lock
+    /// must let the same thread save inside it, and keep every other writer
+    /// out until the whole read-modify-write is done.
+    #[test]
+    fn a_read_modify_write_holds_the_settings_lock_throughout() {
+        const KEY: &[u8] = b"unit-test-hmac-key-32-bytes-pad!";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sign = |json: &str| compute_hmac(json, KEY);
+
+        let held = SETTINGS_WRITE.lock();
+        // The same thread saves inside it (a migration during the load).
+        write_signed_settings(&path, &AppSettings::default(), sign)
+            .expect("a nested save deadlocked or failed");
+
+        // Another writer waits for the whole read-modify-write.
+        let other = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let settings = AppSettings {
+                    preferred_server_id: Some("mirrored".into()),
+                    ..AppSettings::default()
+                };
+                write_signed_settings(&path, &settings, |json| compute_hmac(json, KEY)).unwrap();
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !other.is_finished(),
+            "a writer got in mid read-modify-write"
+        );
+        drop(held);
+        other.join().unwrap();
     }
 }
