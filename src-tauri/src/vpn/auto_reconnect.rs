@@ -1117,14 +1117,17 @@ impl ReconnectLoop {
         };
         let resp = match result {
             Ok(Ok(resp)) => resp,
+            // Visible, not debug: the server reaps a session it has not heard
+            // from for 5 minutes, so heartbeats failing in a row end in an
+            // outage, and the log must say why (live retest 2026-10-02).
             Ok(Err(e)) => {
-                tracing::debug!("Heartbeat failed: {}", e);
+                tracing::warn!("Heartbeat failed: {}", heartbeat_failure(&e));
                 return Flow::Continue;
             }
             Err(_) => {
                 // A heartbeat that rides a dead tunnel never answers; the
                 // liveness rules, not this, decide that the tunnel is dead.
-                tracing::debug!("Heartbeat unanswered after {:?}", HEARTBEAT_TIMEOUT);
+                tracing::warn!("Heartbeat unanswered after {:?}", HEARTBEAT_TIMEOUT);
                 return Flow::Continue;
             }
         };
@@ -1327,9 +1330,51 @@ async fn flush_dns_cache() {
     .await;
 }
 
+/// What a failed heartbeat met, for the log: a status or a kind, never the
+/// error's text — a transport error names the URL, and the heartbeat's URL
+/// carries the session's key id (the node-agent privacy convention).
+fn heartbeat_failure(e: &crate::api::ApiError) -> String {
+    use crate::api::ApiError as E;
+    match e {
+        E::Network(_) => "network error".into(),
+        E::NotAuthenticated => "not signed in".into(),
+        E::Unauthorized => "HTTP 401".into(),
+        E::Forbidden => "HTTP 403".into(),
+        E::NotFound => "HTTP 404".into(),
+        E::RateLimited => "HTTP 429".into(),
+        E::UpgradeRequired(_) => "HTTP 426".into(),
+        E::ServerError(status) | E::Rejected { status, .. } => format!("HTTP {status}"),
+        E::Parse(_) => "unreadable reply".into(),
+        E::CertificatePinningFailed(_) => "certificate pin mismatch".into(),
+        _ => "other error".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_heartbeat_is_logged_without_its_url() {
+        use crate::api::ApiError;
+        let url = "error sending request for url (https://api.birdo.app/vpn/heartbeat/key-123)";
+        for e in [
+            ApiError::Network(url.into()),
+            ApiError::Parse(url.into()),
+            ApiError::Unknown(url.into()),
+            ApiError::Rejected {
+                status: 409,
+                message: url.into(),
+            },
+        ] {
+            let line = heartbeat_failure(&e);
+            assert!(
+                !line.contains("key-123") && !line.contains("http"),
+                "{line}"
+            );
+        }
+        assert_eq!(heartbeat_failure(&ApiError::ServerError(503)), "HTTP 503");
+    }
 
     fn service() -> AutoReconnectService {
         AutoReconnectService::new(Arc::new(VpnManager::new()), Arc::new(BirdoApi::new()))
