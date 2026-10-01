@@ -14,13 +14,29 @@
 //! synchronous primitives (`seal`, `open`, `next_queued`, `tick_timers`) from
 //! the event-driven data plane in `vpn::data_plane` (W1-006). Both paths go
 //! through the same primitives, so the protocol handling cannot drift apart.
+//!
+//! # Only the packet path takes boringtun's lock (WIN-FIX-3 P0)
+//!
+//! boringtun writes its own log lines while the session lock is held
+//! (`HANDSHAKE(REKEY_TIMEOUT)` every 5 s once a relay goes quiet), so a log
+//! write that stalls stalls whoever holds the lock — and everyone waiting for
+//! it. It used to be taken on tokio worker threads by the status choke point
+//! (`get_latency_ms`, polled every 2 s), by the reconnect loop
+//! (`handshake_age`, `force_handshake`) and by the packet path itself: one
+//! stalled line (T5, 2026-10-01) froze the tunnel, then parked one runtime
+//! worker per status poll until IPC, Disconnect and recovery were all dead
+//! with the kill switch's block up. Now every timer tick (the packet path's
+//! own cadence) publishes what the others need — the last handshake, its
+//! round trip and the tick itself — and they read that. What still needs the
+//! lock off the packet path (`force_handshake`, `rebind`) waits for it at most
+//! [`TUNNEL_LOCK_WAIT`].
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use parking_lot::Mutex as FastMutex;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -28,6 +44,42 @@ use tokio::sync::watch;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::buffer_pool::WIREGUARD_OVERHEAD;
+
+/// The longest anything outside the packet path waits for boringtun's lock.
+/// The packet path holds it for microseconds per packet; a holder that keeps
+/// it longer is stalled (see the module docs), and the caller skips its step.
+const TUNNEL_LOCK_WAIT: Duration = Duration::from_millis(100);
+
+/// The cap on one control datagram (a handshake initiation, a keepalive, a
+/// handshake answer). A UDP send that has not gone in this long is not going:
+/// waiting on it stopped boringtun's timers along with it.
+pub(crate) const CONTROL_SEND_CAP: Duration = Duration::from_secs(1);
+
+/// The packet path ticks boringtun's timers every 250 ms. Silent this long, it
+/// has stopped running: a dead tunnel, whatever the relay is doing.
+pub(crate) const PACKET_PATH_STALL: Duration = Duration::from_secs(10);
+
+/// No round trip measured yet (`latency_ms`).
+const NO_RTT: u32 = u32::MAX;
+
+/// Send one control datagram within [`CONTROL_SEND_CAP`].
+pub(crate) async fn send_capped(socket: &UdpSocket, datagram: &[u8]) -> Result<(), String> {
+    match tokio::time::timeout(CONTROL_SEND_CAP, socket.send(datagram)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "the socket did not take the datagram within {:?}",
+            CONTROL_SEND_CAP
+        )),
+    }
+}
+
+/// Whether a packet path last seen ticking at `last_tick` has stopped. One that
+/// has not ticked yet is still starting — the reconnect loop can look before
+/// the receive task has first been polled.
+pub(crate) fn packet_path_stalled(last_tick: Option<Instant>, now: Instant) -> bool {
+    last_tick.is_some_and(|tick| now.saturating_duration_since(tick) >= PACKET_PATH_STALL)
+}
 
 /// Persistent-keepalive bounds (seconds) applied to the server-provided value.
 const KEEPALIVE_MIN_SECS: u16 = 15;
@@ -332,8 +384,14 @@ pub struct WireGuardSession {
     /// it when it expires a session (`time_since_last_handshake()` goes to
     /// `None`), so it is carried here to keep the age growing through an
     /// outage — the same semantics as wg-go's `last_handshake_time_sec`, which
-    /// is what the iOS and Android liveness rules read.
+    /// is what the iOS and Android liveness rules read. Published by every
+    /// timer tick, so reading it never needs boringtun's lock.
     last_handshake: FastMutex<Option<Instant>>,
+    /// The last handshake's round trip in ms ([`NO_RTT`] until there is one),
+    /// published with `last_handshake`.
+    latency_ms: AtomicU32,
+    /// When the packet path last ticked boringtun's timers.
+    last_tick: FastMutex<Option<Instant>>,
     /// Answers seen from the relay, for the fast dead-path rule.
     responses: FastMutex<ResponseWatch>,
 }
@@ -529,6 +587,8 @@ impl WireGuardSession {
             expiry_reported: AtomicBool::new(false),
             created_at: Instant::now(),
             last_handshake: FastMutex::new(None),
+            latency_ms: AtomicU32::new(NO_RTT),
+            last_tick: FastMutex::new(None),
             responses: FastMutex::new(ResponseWatch::default()),
         };
 
@@ -655,14 +715,17 @@ impl WireGuardSession {
             tracing::debug!("Received {} bytes response", n);
 
             let mut out = [0u8; 2048];
-            let reply = {
+            let (reply, rtt) = {
                 let mut tunnel = self.tunnel.lock();
                 let result = tunnel.decapsulate(None, &buf[..n], &mut out);
                 let established = tunnel.time_since_last_handshake().is_some();
-                handshake_reply(result, established)
+                (handshake_reply(result, established), tunnel.stats().4)
             };
             match reply {
                 HandshakeReply::Established { confirm } => {
+                    if let Some(rtt) = rtt {
+                        self.latency_ms.store(rtt, Ordering::SeqCst);
+                    }
                     if let Some(keepalive) = confirm {
                         socket
                             .send(keepalive)
@@ -759,8 +822,16 @@ impl WireGuardSession {
 
     /// Run boringtun's timers; `Ok(Some(..))` is a keepalive or a rekey
     /// initiation to send. boringtun expects this every ~250 ms.
+    ///
+    /// Each tick also publishes what is read outside the packet path (the
+    /// module docs): the last handshake, its round trip, and the tick itself.
     pub(crate) fn tick_timers<'a>(&self, dst: &'a mut [u8]) -> Result<Option<&'a [u8]>, String> {
-        let result = self.tunnel.lock().update_timers(dst);
+        let (result, observed_age, rtt) = {
+            let mut tunnel = self.tunnel.lock();
+            let result = tunnel.update_timers(dst);
+            (result, tunnel.time_since_last_handshake(), tunnel.stats().4)
+        };
+        self.publish(observed_age, rtt, Instant::now());
         match result {
             TunnResult::WriteToNetwork(data) => {
                 let now = Instant::now();
@@ -794,6 +865,23 @@ impl WireGuardSession {
         }
     }
 
+    /// Record one timer tick's reading of the session (see `tick_timers`).
+    fn publish(&self, observed_age: Option<Duration>, rtt: Option<u32>, now: Instant) {
+        {
+            let mut last = self.last_handshake.lock();
+            let carried = carry_last_handshake(*last, observed_age, now);
+            if carried != *last {
+                // A new handshake completed: the next expiry is news again.
+                self.expiry_reported.store(false, Ordering::SeqCst);
+                *last = carried;
+            }
+        }
+        if let Some(rtt) = rtt {
+            self.latency_ms.store(rtt, Ordering::SeqCst);
+        }
+        *self.last_tick.lock() = Some(now);
+    }
+
     /// Move the session onto a new socket after the path changed (W1-003).
     ///
     /// The caller has ALREADY moved the endpoint host route to the new
@@ -808,7 +896,10 @@ impl WireGuardSession {
         self.restart_response_watch();
         let mut dst = [0u8; WIREGUARD_OVERHEAD];
         let initiation = {
-            let mut tunnel = self.tunnel.lock();
+            let mut tunnel = self
+                .tunnel
+                .try_lock_for(TUNNEL_LOCK_WAIT)
+                .ok_or("the tunnel's packet path is stalled")?;
             match tunnel.format_handshake_initiation(&mut dst, true) {
                 TunnResult::WriteToNetwork(data) => Some(data.len()),
                 _ => None,
@@ -816,8 +907,7 @@ impl WireGuardSession {
         };
         if let Some(len) = initiation {
             self.responses.lock().initiation_sent(Instant::now());
-            self.socket()
-                .send(&dst[..len])
+            send_capped(&self.socket(), &dst[..len])
                 .await
                 .map_err(|e| format!("Failed to send handshake on the new path: {}", e))?;
         }
@@ -897,8 +987,7 @@ impl WireGuardSession {
         // that, and a const assertion in buffer_pool.rs keeps it so.
         let mut dst = [0u8; WIREGUARD_OVERHEAD];
         if let Some(data) = self.tick_timers(&mut dst)? {
-            self.socket()
-                .send(data)
+            send_capped(&self.socket(), data)
                 .await
                 .map_err(|e| format!("Failed to send keepalive: {}", e))?;
         }
@@ -915,16 +1004,22 @@ impl WireGuardSession {
     /// Time since the last COMPLETED handshake (W1-002). Survives boringtun
     /// expiring the session — see the `last_handshake` field. Before the first
     /// handshake it is the session's age, which the liveness grace covers.
+    ///
+    /// As of the last timer tick, never from boringtun itself (the module
+    /// docs): a packet path that stopped ticking reads as an age that keeps
+    /// growing, never as a reader that waits for it.
     pub fn handshake_age(&self) -> Duration {
-        let observed = self.tunnel.lock().time_since_last_handshake();
-        let mut last = self.last_handshake.lock();
-        let carried = carry_last_handshake(*last, observed, Instant::now());
-        if carried != *last {
-            // A new handshake completed: the next expiry is news again.
-            self.expiry_reported.store(false, Ordering::SeqCst);
-            *last = carried;
-        }
-        last.unwrap_or(self.created_at).elapsed()
+        self.last_handshake
+            .lock()
+            .unwrap_or(self.created_at)
+            .elapsed()
+    }
+
+    /// Whether the packet path has stopped ticking boringtun's timers (see
+    /// [`packet_path_stalled`]).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn packet_path_stalled(&self) -> bool {
+        packet_path_stalled(*self.last_tick.lock(), Instant::now())
     }
 
     /// Start a handshake now unless one is already in flight.
@@ -933,11 +1028,18 @@ impl WireGuardSession {
     /// rekey it, so its handshake age would grow past the liveness limit on a
     /// perfectly healthy peer. Also what re-handshakes an expired session that
     /// has no traffic queued, and what proves the path after a resume.
+    ///
+    /// Skipped when boringtun's lock is not free within [`TUNNEL_LOCK_WAIT`]:
+    /// its holder has stalled, and the packet-path stall rule is what answers
+    /// that, not a nudge.
     pub async fn force_handshake(&self) {
         // WIREGUARD_OVERHEAD is sized for exactly this message (148 bytes).
         let mut dst = [0u8; WIREGUARD_OVERHEAD];
         let initiation = {
-            let mut tunnel = self.tunnel.lock();
+            let Some(mut tunnel) = self.tunnel.try_lock_for(TUNNEL_LOCK_WAIT) else {
+                tracing::debug!("Forced handshake skipped: the packet path holds the session");
+                return;
+            };
             match tunnel.format_handshake_initiation(&mut dst, false) {
                 TunnResult::WriteToNetwork(packet) => Some(packet.len()),
                 _ => None,
@@ -945,7 +1047,7 @@ impl WireGuardSession {
         };
         if let Some(len) = initiation {
             self.responses.lock().initiation_sent(Instant::now());
-            if let Err(e) = self.socket().send(&dst[..len]).await {
+            if let Err(e) = send_capped(&self.socket(), &dst[..len]).await {
                 tracing::debug!("Forced handshake could not be sent: {}", e);
             }
         }
@@ -970,9 +1072,14 @@ impl WireGuardSession {
     /// Round-trip time of the last handshake, in ms: a real measurement of the
     /// path to the relay, taken by boringtun itself. (W1-032: the explicit
     /// probe that used to back this up was never called, and would have stolen
-    /// datagrams from the packet loop if it had been.)
+    /// datagrams from the packet loop if it had been.) As of the last timer
+    /// tick: the status choke point reads this every 2 s and must never wait
+    /// for boringtun (the module docs).
     pub async fn get_latency_ms(&self) -> Option<u32> {
-        self.tunnel.lock().stats().4
+        match self.latency_ms.load(Ordering::SeqCst) {
+            NO_RTT => None,
+            rtt => Some(rtt),
+        }
     }
 
     /// Close the WireGuard session
@@ -1334,6 +1441,63 @@ mod handshake_tests {
             "one initiation for the connect, one for the new path"
         );
         assert!(!session.peer_unresponsive());
+    }
+
+    /// WIN-FIX-3 P0, reproduced. boringtun stalls inside its own lock — it
+    /// logs from there, and in T5 a log write did not return — while the
+    /// status choke point, the stats poll and the reconnect loop go on asking
+    /// the session how it is. Before the fix each of them took that lock on a
+    /// tokio worker: `handshake_age` and `get_latency_ms` here never returned,
+    /// one worker was lost per 2 s stats poll, and once they were all gone
+    /// IPC, Disconnect and recovery went with them while the kill switch held
+    /// the block. Now they read what the last timer tick published, and a
+    /// nudge that needs the lock gives up on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nothing_outside_the_packet_path_waits_for_a_stalled_session() {
+        let r = responder(false, 0).await;
+        let session = Arc::new(connect(&r).await.expect("handshake"));
+        let mut timer = [0u8; WIREGUARD_OVERHEAD];
+        let _ = session.tick_timers(&mut timer);
+
+        let stalled = session.tunnel.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&session);
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let readings = runtime.block_on(async {
+                let age = reader.handshake_age();
+                let rtt = reader.get_latency_ms().await;
+                let unresponsive = reader.peer_unresponsive();
+                let stalled_path = reader.packet_path_stalled();
+                reader.force_handshake().await;
+                (age, rtt, unresponsive, stalled_path)
+            });
+            let _ = tx.send(readings);
+        });
+        let readings = rx.recv_timeout(Duration::from_secs(3));
+        drop(stalled);
+        thread.join().unwrap();
+
+        let (age, rtt, unresponsive, stalled_path) =
+            readings.expect("a reader waited on boringtun's lock");
+        assert!(age < Duration::from_secs(5), "{age:?}");
+        assert!(rtt.is_some(), "the handshake's round trip is published");
+        assert!(!unresponsive);
+        assert!(!stalled_path, "it ticked just now");
+    }
+
+    /// The tick is what the stall rule reads, and a session that has not
+    /// ticked yet is starting, not stalled.
+    #[test]
+    fn a_packet_path_is_stalled_only_after_ticking_and_falling_silent() {
+        let t0 = Instant::now();
+        assert!(!packet_path_stalled(None, t0 + Duration::from_secs(600)));
+        assert!(!packet_path_stalled(Some(t0), t0 + Duration::from_secs(9)));
+        assert!(packet_path_stalled(Some(t0), t0 + PACKET_PATH_STALL));
+        assert_eq!(PACKET_PATH_STALL, Duration::from_secs(10));
     }
 
     #[test]

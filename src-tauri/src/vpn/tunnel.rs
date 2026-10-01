@@ -2209,6 +2209,16 @@ impl WintunTunnel {
             .is_some_and(|wg| wg.peer_unresponsive())
     }
 
+    /// Has the packet path stopped running? (see
+    /// `wireguard_new::packet_path_stalled`). False with no session.
+    pub async fn packet_path_stalled(&self) -> bool {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|wg| wg.packet_path_stalled())
+    }
+
     /// Forget the unanswered-handshake run (after a resume).
     pub async fn restart_response_watch(&self) {
         if let Some(wg) = self.wg_session.read().await.as_ref() {

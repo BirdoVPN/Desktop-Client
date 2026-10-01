@@ -39,7 +39,7 @@ use wintun::Session;
 use zeroize::Zeroizing;
 
 use super::buffer_pool::{MAX_PACKET_SIZE, WIREGUARD_OVERHEAD};
-use super::wireguard_new::{Opened, Outbound, WireGuardSession};
+use super::wireguard_new::{send_capped, Opened, Outbound, WireGuardSession, CONTROL_SEND_CAP};
 
 /// boringtun's timer cadence (its own device implementation uses the same).
 const TIMER_INTERVAL: Duration = Duration::from_millis(250);
@@ -250,7 +250,9 @@ impl Drop for ExitSignal {
 
 /// Send one datagram from outside the runtime. A UDP send only waits when the
 /// socket buffer is full; then it parks this thread until the socket is
-/// writable again.
+/// writable again — for at most [`CONTROL_SEND_CAP`], after which the packet
+/// is counted as a send failure. A socket that never drains must not hold the
+/// thread (and with it the adapter ring) for good.
 fn send_blocking(
     socket: &UdpSocket,
     data: &[u8],
@@ -259,9 +261,17 @@ fn send_blocking(
     loop {
         match socket.try_send(data) {
             Ok(_) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => runtime
-                .block_on(socket.writable())
-                .map_err(|e| format!("Failed to send: {}", e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                match runtime.block_on(timeout(CONTROL_SEND_CAP, socket.writable())) {
+                    Ok(ready) => ready.map_err(|e| format!("Failed to send: {}", e))?,
+                    Err(_) => {
+                        return Err(format!(
+                            "Failed to send: the socket stayed full for {:?}",
+                            CONTROL_SEND_CAP
+                        ))
+                    }
+                }
+            }
             Err(e) => return Err(format!("Failed to send: {}", e)),
         }
     }
@@ -328,6 +338,10 @@ fn send_loop(
 }
 
 /// Relay → adapter, plus boringtun's timers.
+///
+/// Every send in here is capped (`send_capped`): the loop is one task, and a
+/// send awaited without a bound inside the timer arm would stop boringtun's
+/// timers — the retransmits the dead-peer rule counts — along with it.
 async fn receive_loop(
     session: Arc<Session>,
     wg: Arc<WireGuardSession>,
@@ -359,7 +373,7 @@ async fn receive_loop(
             _ = timers.tick() => {
                 let now = Instant::now();
                 if let Ok(Some(message)) = wg.tick_timers(&mut timer_buf) {
-                    let _ = socket.send(message).await;
+                    let _ = send_capped(&socket, message).await;
                 }
                 for summary in [&mut receive_failures, &mut adapter_failures] {
                     if let Some(line) = summary.flush(now) {
@@ -407,7 +421,7 @@ async fn receive_loop(
                         false
                     }
                     Opened::Reply(message) => {
-                        let _ = socket.send(message).await;
+                        let _ = send_capped(&socket, message).await;
                         true
                     }
                     Opened::Nothing => false,
@@ -416,7 +430,7 @@ async fn receive_loop(
                     // boringtun's contract after any WriteToNetwork: send what
                     // it queued behind the handshake.
                     while let Some(queued) = wg.next_queued(&mut plain) {
-                        let _ = socket.send(queued).await;
+                        let _ = send_capped(&socket, queued).await;
                     }
                 }
             }
@@ -488,6 +502,28 @@ mod tests {
     fn nothing_to_flush_without_failures() {
         let mut summary = ErrorSummary::new("x", SUMMARY_INTERVAL);
         assert_eq!(summary.flush(Instant::now() + SUMMARY_INTERVAL), None);
+    }
+
+    /// WIN-FIX-3: the receive task is one loop, and a send awaited there
+    /// without a cap — in the timer arm above all — stopped boringtun's timers
+    /// (the retransmits, and the tick the stall rule watches) along with it.
+    /// The send thread's wait for a full socket is capped the same way.
+    #[test]
+    fn no_send_on_the_packet_path_waits_unbounded() {
+        let src = include_str!("data_plane.rs");
+        let receive = src
+            .split("async fn receive_loop(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Copy one decrypted packet").next())
+            .expect("receive_loop");
+        assert!(!receive.contains("socket.send("), "{receive}");
+        assert_eq!(receive.matches("send_capped(&socket, ").count(), 3);
+        let blocking = src
+            .split("fn send_blocking(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Adapter → relay.").next())
+            .expect("send_blocking");
+        assert!(blocking.contains("timeout(CONTROL_SEND_CAP, socket.writable())"));
     }
 
     /// The sealing buffer takes any packet Wintun can hand out, plus framing.

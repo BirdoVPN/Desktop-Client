@@ -1,5 +1,6 @@
 //! Utility modules
 
+pub mod console_log;
 pub mod crash_report;
 pub mod device_id;
 pub mod elevation;

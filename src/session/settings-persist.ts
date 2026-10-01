@@ -15,16 +15,28 @@
 import { invoke } from '@tauri-apps/api/core';
 import { settingsToRust } from '@/utils/helpers';
 import { useAppStore, type AppSettings, type ConnectionState } from '@/store/app-store';
+import { loadSettings } from '@/session/session-data';
 
 const REAPPLY_DEBOUNCE_MS = 900;
 let reapplyTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** What `reapply_vpn_settings` came to (contract §3, WIN-FIX-3). */
+export type ReapplyOutcome = 'not_connected' | 'applied' | 'reverted';
+
+export const REAPPLY_REVERTED_COPY = "Couldn't apply that change — your previous setting was restored.";
 
 async function runReapply(): Promise<void> {
   const s = useAppStore.getState();
   if (s.connectionState !== 'connected') return;
   s.setReapplying(true);
   try {
-    await invoke('reapply_vpn_settings');
+    const outcome = await invoke<ReapplyOutcome>('reapply_vpn_settings');
+    if (outcome === 'reverted') {
+      // Rust could not apply the change, saved the previous settings back
+      // and reconnected on them: show what is really in force, and say so.
+      await loadSettings();
+      useAppStore.getState().showNotice({ text: REAPPLY_REVERTED_COPY, tone: 'danger' });
+    }
   } catch {
     // The rebuild is fail-closed: Rust keeps traffic blocked rather than
     // leaving the old settings silently in force, and the status (blocking

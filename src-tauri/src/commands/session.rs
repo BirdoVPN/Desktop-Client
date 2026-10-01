@@ -81,6 +81,23 @@ impl ConnectTarget {
     }
 }
 
+/// Why a connect runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectPurpose {
+    /// The user picked where to go: connect, quick connect, Multi-Hop, a
+    /// server switch. A direct attempt the network filters is retried once
+    /// over the stealth transport (Adaptive Transport).
+    User,
+    /// A settings change is being applied to the live session (WIN-FIX-3).
+    /// It is rebuilt on the transport it already runs on — the stealth grant
+    /// it was given, if any — and gets no Adaptive Transport retry of its
+    /// own: a rebuild that fails over a settings change is reverted to the
+    /// previous settings instead (`vpn::reapply_vpn_settings`).
+    SettingsReapply {
+        fallback_reason: Option<&'static str>,
+    },
+}
+
 /// What one attempt learned that the failure path needs.
 struct AttemptContext {
     epoch: u64,
@@ -133,10 +150,19 @@ fn session_was_live(state: &ConnectionState, holds_tunnel: bool) -> bool {
         )
 }
 
-/// Connect (or switch) to `target`. See the module docs.
+/// Connect (or switch) to `target` for the user. See the module docs.
 pub(crate) async fn connect_session(
     app: &AppHandle,
     target: ConnectTarget,
+) -> Result<(), IpcError> {
+    connect_session_for(app, target, ConnectPurpose::User).await
+}
+
+/// [`connect_session`] for `purpose`.
+pub(crate) async fn connect_session_for(
+    app: &AppHandle,
+    target: ConnectTarget,
+    purpose: ConnectPurpose,
 ) -> Result<(), IpcError> {
     // Pre-flight: Wintun adapter creation is an in-process FFI call that
     // requires administrator — failing early with a clear error beats a
@@ -191,14 +217,19 @@ pub(crate) async fn connect_session(
         #[cfg(target_os = "windows")]
         old_relay: crate::vpn::wfp::current_relay(),
     };
-    let mut result = attempt(app, &target, None, &mut ctx).await;
+    let (first_transport, adaptive) = match purpose {
+        ConnectPurpose::User => (None, true),
+        ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false),
+    };
+    let mut result = attempt(app, &target, first_transport, &mut ctx).await;
 
     // ADAPTIVE TRANSPORT: when the direct attempt failed in the
     // transport-shaped way (the establish-time handshake was unanswered or
     // refused), retry ONCE with the backend's any-plan stealth grant. A single
     // retry cannot loop: the stealth attempt's handshake runs against the
     // local Xray proxy, whose failures do not classify as transport-shaped.
-    if let Err(direct) = &result {
+    // Not for a settings reapply (see `ConnectPurpose`).
+    if let Some(direct) = result.as_ref().err().filter(|_| adaptive) {
         if let Some(reason) = fallback_reason_for(app, &target, direct).await {
             tracing::warn!(
                 "Adaptive Transport: direct WireGuard failed ({reason}) — rebuilding over the \
@@ -453,6 +484,8 @@ async fn attempt(
     // the fallback reason for this session so a drop rebuilds over the
     // transport that is KNOWN to work here.
     let ar = app.state::<AutoReconnectService>();
+    // What a later settings reapply goes back to if it cannot be applied.
+    ar.store_connected_settings(settings.snapshot).await;
     ar.store_last_config(ReconnectInfo {
         server_id: dialled_id.to_string(),
         server_name: label.server_name,
@@ -857,14 +890,53 @@ pub enum EndReason {
     SessionExpired,
 }
 
+/// The longest a session end waits for its teardown before it releases the
+/// block anyway (WIN-FIX-3). Every step of the teardown has its own bound,
+/// the reconnect loop's stop grace (35 s) the longest, so this fires only on
+/// an engine that is wedged — and then the user's Disconnect still frees the
+/// machine instead of waiting on it.
+const RELEASE_DEADLINE: Duration = Duration::from_secs(40);
+
 /// End the session from ANY state (contract §3.1): cancel an in-flight
 /// connect or re-dial, stop auto-reconnect, stop the stealth transport,
 /// release the server-side peer, tear the tunnel down and release the WFP
 /// block — an explicit end ALWAYS releases, always-on included — ending at
 /// `disconnected` with `kill_switch_blocking=false`.
+///
+/// The block is released last, once the teardown is done — or at
+/// [`RELEASE_DEADLINE`], whichever comes first: a wedged engine must never
+/// hold the block with Disconnect pressed (WIN-FIX-3). A teardown past the
+/// deadline carries on behind the release; it cannot re-engage the block
+/// (`disarm` clears the kill switch's intent), and a new connect waits for it
+/// on the commit lock it holds.
 pub async fn end_session(app: &AppHandle, reason: EndReason) {
-    let vm = app.state::<VpnManager>();
     tracing::info!("Ending the VPN session ({reason:?})");
+    let teardown = tauri::async_runtime::spawn(tear_down(app.clone(), reason));
+    if timeout(RELEASE_DEADLINE, teardown).await.is_err() {
+        tracing::error!(
+            "The session teardown has not finished after {} s — releasing the kill switch's \
+             block anyway; the teardown carries on",
+            RELEASE_DEADLINE.as_secs()
+        );
+    }
+
+    // The 3e6f1e2 escape hatch, unconditionally: ending the session is the
+    // user releasing the block, and is_lockdown_mode() is hard false
+    // off-Windows, so any gate here would leave macOS/Linux behind a kernel
+    // firewall with no session to own it. A no-op if never armed.
+    let _ = killswitch::disarm().await;
+    // `disconnect()` returns early when no tunnel is held (an Error after a
+    // give-up), so the end state is written here, whatever came before.
+    let _ = app
+        .state::<VpnManager>()
+        .set_state(ConnectionState::Disconnected)
+        .await;
+}
+
+/// Everything [`end_session`] does before it releases the block, in order.
+async fn tear_down(app: AppHandle, reason: EndReason) {
+    let app = &app;
+    let vm = app.state::<VpnManager>();
 
     // Cancel FIRST: an in-flight connect or re-dial stops at its next await,
     // including mid-build, so nothing below races a tunnel coming up. And
@@ -913,15 +985,6 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
         tracing::error!("Tunnel disconnect failed: {}", e);
     }
     app.state::<XrayManager>().stop().await;
-
-    // The 3e6f1e2 escape hatch, unconditionally: ending the session is the
-    // user releasing the block, and is_lockdown_mode() is hard false
-    // off-Windows, so any gate here would leave macOS/Linux behind a kernel
-    // firewall with no session to own it. A no-op if never armed.
-    let _ = killswitch::disarm().await;
-    // `disconnect()` returns early when no tunnel is held (an Error after a
-    // give-up), so the end state is written here, whatever came before.
-    let _ = vm.set_state(ConnectionState::Disconnected).await;
 }
 
 static EXPIRY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -1015,10 +1078,12 @@ mod lifecycle_tests {
 
     /// W1-009 / W1-021 / contract §3.1: cancel before anything else, stop the
     /// loop before touching the tunnel, disarm last, end Disconnected.
+    /// WIN-FIX-3: "last" is after the teardown or at the release deadline,
+    /// whichever comes first.
     #[test]
     fn end_session_cancels_first_and_disarms_last() {
         order(
-            body("pub async fn end_session("),
+            body("async fn tear_down("),
             &[
                 "vm.lock_commit_for_teardown()",
                 "ar.stop()",
@@ -1026,8 +1091,69 @@ mod lifecycle_tests {
                 "api.disconnect_vpn(&key_id)",
                 "vm.disconnect()",
                 "XrayManager>().stop()",
+            ],
+        );
+        order(
+            body("pub async fn end_session("),
+            &[
+                "spawn(tear_down(app.clone(), reason))",
+                "timeout(RELEASE_DEADLINE, teardown)",
                 "killswitch::disarm()",
                 "ConnectionState::Disconnected",
+            ],
+        );
+        assert!(!body("async fn tear_down(").contains("killswitch::disarm()"));
+        assert_eq!(super::RELEASE_DEADLINE, std::time::Duration::from_secs(40));
+    }
+
+    /// WIN-FIX-3: quitting never depends on the async runtime. Its teardown
+    /// is a task on that runtime; a runtime that cannot run it (every worker
+    /// stuck, the T5 hang) held the exit open for good, with the block up. A
+    /// plain thread exits past the cap, and the WFP block — a dynamic session
+    /// — goes with the process.
+    #[test]
+    fn quitting_exits_even_when_the_runtime_cannot_run_the_teardown() {
+        let main_rs = include_str!("../main.rs");
+        let held = &main_rs[main_rs
+            .find("if !EXIT_TEARDOWN_STARTED.swap(true")
+            .expect("the first exit request")..];
+        let held = &held[..held.find("} else if").expect("the branch end")];
+        order(
+            held,
+            &[
+                "api.prevent_exit();",
+                "std::thread::Builder::new()",
+                "std::thread::sleep(EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN)",
+                "if !EXIT_TEARDOWN_DONE.load(",
+                "std::process::exit(0)",
+                "tauri::async_runtime::spawn(async move {",
+            ],
+        );
+    }
+
+    /// WIN-FIX-3: a settings reapply is rebuilt on the session's own
+    /// transport and never runs the Adaptive Transport retry; a user connect
+    /// starts direct and does. The session's settings are recorded at the
+    /// commit, beside its reconnect record, for the reapply's revert.
+    #[test]
+    fn a_settings_reapply_keeps_its_transport_and_gets_no_stealth_retry() {
+        let connect = body("pub(crate) async fn connect_session_for(");
+        order(
+            connect,
+            &[
+                "ConnectPurpose::User => (None, true)",
+                "ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false)",
+                "attempt(app, &target, first_transport, &mut ctx)",
+                ".filter(|_| adaptive)",
+                "fallback_reason_for(app, &target, direct)",
+            ],
+        );
+        order(
+            body("async fn attempt("),
+            &[
+                "killswitch::arm(app)",
+                "ar.store_connected_settings(settings.snapshot)",
+                "ar.store_last_config(",
             ],
         );
     }
@@ -1037,12 +1163,12 @@ mod lifecycle_tests {
     #[test]
     fn connect_session_supersedes_and_stops_the_loop_first() {
         order(
-            body("pub(crate) async fn connect_session("),
+            body("pub(crate) async fn connect_session_for("),
             &[
                 "vm.lock_commit()",
                 "vm.begin_attempt()",
                 "ar.stop()",
-                "attempt(app, &target, None",
+                "attempt(app, &target, first_transport",
             ],
         );
     }

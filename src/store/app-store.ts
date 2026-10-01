@@ -4,6 +4,7 @@ import type { IpcError, LiveMultiHop, VpnPhase, VpnState, VpnStats, VpnStatus } 
 import { giveUpKind, type GiveUpKind } from '@/lib/errors';
 import type { PlanId } from '@/lib/plan';
 import { CONSENT_VERSION } from '@/lib/consent';
+import { normalizeWireGuardPort } from '@/utils/helpers';
 
 export interface Server {
   id: string;
@@ -128,7 +129,7 @@ export interface AppSettings {
   protocol: Protocol;
   // VPN settings (matching Android VpnSettingsScreen)
   localNetworkSharing: boolean;
-  wireGuardPort: string; // 'auto' | '51820' | '53' | custom port
+  wireGuardPort: WireGuardPort;
   wireGuardMtu: number;  // 0 = automatic, 1280-1500 custom
   // Multi-Hop (Double VPN)
   multiHopEnabled: boolean;
@@ -407,6 +408,15 @@ const defaultAccount: AccountInfo = {
 };
 
 /**
+ * The WireGuard ports a setting can hold. The relays accept WireGuard on UDP
+ * 51820 only (all ten measured: no DNAT, nothing on a public 53), so "53" and
+ * a custom port are gone; "Automatic" dials the server's endpoint, which is
+ * 51820 too. Same rule in Rust (`dialable_wireguard_port`) and on Android;
+ * `normalizeWireGuardPort` maps anything else to "auto".
+ */
+export type WireGuardPort = 'auto' | '51820';
+
+/**
  * Persisted-state migrations, from the version the blob was written under.
  *
  * 0 → 1 (D7): `hasAcceptedConsent: boolean` becomes `acceptedConsentVersion`.
@@ -414,6 +424,9 @@ const defaultAccount: AccountInfo = {
  * existing user sees the current text once; anything else is 0 (never
  * accepted). The rest of the blob is untouched: `merge` lays the settings over
  * the defaults as before.
+ *
+ * 1 → 2 (WIN-FIX-3): a WireGuard port of "53" or a custom number, which no
+ * relay answers, becomes "auto".
  */
 export function migratePersistedState(persisted: unknown, fromVersion: number): unknown {
   const p: Record<string, unknown> =
@@ -421,6 +434,12 @@ export function migratePersistedState(persisted: unknown, fromVersion: number): 
   if (fromVersion < 1) {
     p.acceptedConsentVersion = p.hasAcceptedConsent === true ? 1 : 0;
     delete p.hasAcceptedConsent;
+  }
+  if (fromVersion < 2 && typeof p.settings === 'object' && p.settings !== null) {
+    const settings = p.settings as Record<string, unknown>;
+    if ('wireGuardPort' in settings) {
+      p.settings = { ...settings, wireGuardPort: normalizeWireGuardPort(settings.wireGuardPort) };
+    }
   }
   return p;
 }
@@ -705,8 +724,9 @@ export const useAppStore = create<AppState>()(
         acceptedConsentVersion: state.acceptedConsentVersion,
         windowCorner: state.windowCorner,
       }),
-      // 1: the consent boolean became a version (D7); see migratePersistedState.
-      version: 1,
+      // 1: the consent boolean became a version (D7); 2: the dead WireGuard
+      // ports became "auto" (WIN-FIX-3). See migratePersistedState.
+      version: 2,
       migrate: migratePersistedState,
       // The default merge is shallow, so a settings object saved by an older
       // build would REPLACE the defaults wholesale and leave any field added

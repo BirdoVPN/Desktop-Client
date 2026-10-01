@@ -13,13 +13,14 @@
  * Run: npx vitest run src/__tests__/SettingsPersistence.test.tsx
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { act, render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Settings } from '@/components/Settings';
 import { VpnSettings } from '@/screens/VpnSettings';
 import { defaultSettings, useAppStore } from '@/store/app-store';
-import { cancelScheduledReapply } from '@/session/settings-persist';
+import { cancelScheduledReapply, REAPPLY_REVERTED_COPY } from '@/session/settings-persist';
+import { settingsToRust } from '@/utils/helpers';
 import { resetUpdater } from '@/session/updater';
 
 vi.mock('@tauri-apps/api/core');
@@ -216,25 +217,58 @@ describe('a failed save is rolled back and reported (W2-013)', () => {
     await waitFor(() => expect(useAppStore.getState().notice?.actionLabel).toBe('Retry'), { timeout: 3000 });
     expect(useAppStore.getState().notice?.text).toBe("Couldn't apply that change to your live connection.");
   });
+
+  // WIN-FIX-3: Rust could not apply the change, saved the previous settings
+  // back and reconnected on them. The screen shows what is really in force
+  // and says what happened — not a stranded error.
+  it('a change the live connection could not take is put back, and the user is told', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'reapply_vpn_settings') return 'reverted';
+      if (cmd === 'get_settings') return settingsToRust(defaultSettings);
+      if (cmd === 'check_biometric_available') return { available: false, enabled: false, method: 'none' };
+      return undefined;
+    });
+    useAppStore.setState({ connectionState: 'connected' });
+    render(<Settings />);
+    const pq = screen.getByRole('switch', { name: 'Quantum Protection' });
+    expect(pq).toHaveAttribute('aria-checked', 'true');
+    await userEvent.click(pq);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(REAPPLY_REVERTED_COPY), {
+      timeout: 3000,
+    });
+    expect(REAPPLY_REVERTED_COPY).toBe("Couldn't apply that change — your previous setting was restored.");
+    expect(useAppStore.getState().notice?.actionLabel).toBeUndefined();
+    expect(useAppStore.getState().settings.quantumProtection).toBe(true);
+    expect(screen.getByRole('switch', { name: 'Quantum Protection' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('an applied change says nothing', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'reapply_vpn_settings') return 'applied';
+      if (cmd === 'check_biometric_available') return { available: false, enabled: false, method: 'none' };
+      return undefined;
+    });
+    useAppStore.setState({ connectionState: 'connected' });
+    render(<Settings />);
+    await userEvent.click(screen.getByRole('switch', { name: 'Quantum Protection' }));
+    await waitFor(() => expect(reapplies()).toHaveLength(1), { timeout: 3000 });
+    await waitFor(() => expect(useAppStore.getState().reapplying).toBe(false));
+    expect(useAppStore.getState().notice).toBeNull();
+    expect(useAppStore.getState().settings.quantumProtection).toBe(false);
+  });
 });
 
-describe('VPN Settings: port and MTU are drafts too', () => {
-  it('a custom port saves on leave, never mid-typing, and an out-of-range one is refused', async () => {
+describe('VPN Settings: the port, and MTU as a draft', () => {
+  // WIN-FIX-3: the relays accept WireGuard on 51820 only; the "53" preset and
+  // the custom port failed the handshake on every one of them.
+  it('offers Automatic and 51820 only', () => {
     render(<VpnSettings />);
-    await userEvent.click(screen.getByRole('radio', { name: 'Custom' }));
-    const port = screen.getByRole('textbox', { name: 'Custom WireGuard port' });
-    await userEvent.type(port, '5182');
-    expect(saves()).toHaveLength(0);
-    await userEvent.type(port, '0');
-    fireEvent.blur(port);
-    await waitFor(() => expect(saves()).toHaveLength(1));
-    expect(saves()[0].wireguard_port).toBe('51820');
-
-    await userEvent.clear(port);
-    await userEvent.type(port, '70000');
-    fireEvent.blur(port);
-    expect(await screen.findByText('Enter a port from 1 to 65535.')).toBeInTheDocument();
-    expect(saves()).toHaveLength(1);
+    const group = screen.getByRole('radiogroup', { name: 'WireGuard Port' });
+    expect(within(group).getAllByRole('radio').map((r) => r.textContent)).toEqual(['Automatic', '51820']);
+    expect(screen.queryByRole('radio', { name: '53' })).toBeNull();
+    expect(screen.queryByRole('radio', { name: 'Custom' })).toBeNull();
+    expect(screen.queryByRole('textbox', { name: 'Custom WireGuard port' })).toBeNull();
+    expect(screen.queryByText(/port 53/)).toBeNull();
   });
 
   it('the port options are a real radio group with arrow keys (W2-035)', async () => {
@@ -243,7 +277,7 @@ describe('VPN Settings: port and MTU are drafts too', () => {
     const auto = screen.getByRole('radio', { name: 'Automatic' });
     expect(auto).toHaveAttribute('aria-checked', 'true');
     expect(auto).toHaveAttribute('tabindex', '0');
-    expect(screen.getByRole('radio', { name: '53' })).toHaveAttribute('tabindex', '-1');
+    expect(screen.getByRole('radio', { name: '51820' })).toHaveAttribute('tabindex', '-1');
     auto.focus();
     await userEvent.keyboard('{ArrowDown}');
     await waitFor(() => expect(saves()).toHaveLength(1));
@@ -260,5 +294,14 @@ describe('VPN Settings: port and MTU are drafts too', () => {
     fireEvent.blur(mtu);
     expect(await screen.findByText('Enter a value from 1280 to 1500.')).toBeInTheDocument();
     expect(saves()).toHaveLength(0);
+  });
+
+  // WIN-FIX-3: a change Rust put back reaches the field, not only the store.
+  it('the MTU field follows a value put back under it', async () => {
+    useAppStore.setState({ settings: { ...defaultSettings, wireGuardMtu: 1280 } });
+    render(<VpnSettings />);
+    expect(screen.getByRole('textbox', { name: 'WireGuard MTU' })).toHaveValue('1280');
+    act(() => useAppStore.getState().updateSettings({ wireGuardMtu: 1420 }));
+    expect(screen.getByRole('textbox', { name: 'WireGuard MTU' })).toHaveValue('1420');
   });
 });

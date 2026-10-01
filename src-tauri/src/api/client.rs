@@ -1520,6 +1520,34 @@ mod token_restore_tests {
         assert!(api.is_authenticated().await);
     }
 
+    /// WIN-FIX-3: every control-plane request has a hard cap, because the
+    /// refresh (and the deletion's refresh) runs under `refresh_lock`, which
+    /// every other request's refresh waits for. One builder makes every
+    /// client, the deletion's around-the-tunnel one included, and it sets
+    /// both the total timeout and the connect timeout.
+    #[test]
+    fn every_control_plane_request_is_capped() {
+        const SOURCE: &str = include_str!("client.rs");
+        let builder = &SOURCE[SOURCE
+            .find("fn hardened_client_builder() -> reqwest::ClientBuilder {")
+            .unwrap()..];
+        let builder = &builder[..builder.find("\n}").unwrap()];
+        assert!(
+            builder.contains(".timeout(Duration::from_secs(30))"),
+            "{builder}"
+        );
+        assert!(
+            builder.contains(".connect_timeout(Duration::from_secs(8))"),
+            "{builder}"
+        );
+        assert_eq!(
+            // Split, or this line would be the second match.
+            SOURCE.matches(concat!("Client::", "builder()")).count(),
+            1,
+            "a second builder"
+        );
+    }
+
     /// REVIEW-WIN2-003: both refresh-and-retry paths answer a failed refresh
     /// through the gate's classification (tested in `session_gate`), never a
     /// blanket `Unauthorized` — which the UI reads as "session expired" and

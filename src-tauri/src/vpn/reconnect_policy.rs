@@ -84,11 +84,25 @@ pub enum DropCause {
     /// (REVIEW-WIN2-005). Never counts toward the breaker; the offline pause
     /// covers the wait.
     NetworkLost,
+    /// The tunnel's own packet path stopped running: it has not ticked
+    /// boringtun's timers for `wireguard_new::PACKET_PATH_STALL`, whatever the
+    /// relay is doing (WIN-FIX-3 P0). This client is at fault, not the node:
+    /// it never counts toward the breaker and is re-dialled without backoff,
+    /// like a moved path.
+    PacketPathStalled,
 }
 
 impl DropCause {
     fn counts_toward_breaker(self) -> bool {
-        !matches!(self, DropCause::PathChanged | DropCause::NetworkLost)
+        !matches!(
+            self,
+            DropCause::PathChanged | DropCause::NetworkLost | DropCause::PacketPathStalled
+        )
+    }
+
+    /// The node was never at fault: re-dial without backoff.
+    fn redials_at_once(self) -> bool {
+        matches!(self, DropCause::PathChanged | DropCause::PacketPathStalled)
     }
 }
 
@@ -450,7 +464,7 @@ impl ReconnectPolicy {
         self.attempts = 0;
         self.recovering = true;
         self.last_error = None;
-        self.immediate = cause == DropCause::PathChanged;
+        self.immediate = cause.redials_at_once();
         if cause.counts_toward_breaker() {
             while self
                 .drops
@@ -916,6 +930,36 @@ mod tests {
                 cause: DropCause::HandshakeStale
             }
         );
+    }
+
+    /// WIN-FIX-3 P0: a packet path that stopped running is torn down and
+    /// re-dialled at once, however often it happens — the node did nothing
+    /// wrong, so the breaker never hears of it.
+    #[test]
+    fn a_stalled_packet_path_redials_at_once_and_never_trips_the_breaker() {
+        let mut p = ReconnectPolicy::new(budget());
+        let start = Instant::now();
+        for i in 0..(BREAKER_DROPS as u64 * 2) {
+            let now = start + Duration::from_secs(60 * i);
+            let mut t = tick(now, Observed::Connected);
+            t.liveness = Liveness::Dead(DropCause::PacketPathStalled);
+            assert_eq!(
+                p.decide(&t),
+                Action::TearDown {
+                    cause: DropCause::PacketPathStalled
+                }
+            );
+            assert_eq!(
+                p.decide(&not_connected(now)),
+                Action::Dial {
+                    attempt: 1,
+                    delay: Duration::ZERO
+                },
+                "stall {i}"
+            );
+            assert_eq!(p.decide(&tick(now, Observed::Connected)), Action::Recovered);
+        }
+        assert!(!asks_the_old_key(DropCause::PacketPathStalled));
     }
 
     /// The liveness check's view of the link: offline skips the fast rule,

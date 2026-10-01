@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
-import { useAppStore, type AccountInfo } from '@/store/app-store';
+import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ConsentScreen } from '@/components/ConsentScreen';
 import { Login } from '@/components/Login';
@@ -23,21 +23,9 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { exit } from '@tauri-apps/plugin-process';
 import { notifyUpdateAvailable } from '@/utils/notifications';
-import { anonymityPatch } from '@/utils/helpers';
+import { identityPatch, type AuthStateIdentity } from '@/utils/helpers';
 import { hasCurrentConsent } from '@/lib/consent';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
-
-interface AuthState {
-  is_authenticated: boolean;
-  email: string | null;
-  account_id: string | null;
-  plan: string | null;
-  /** Optional: absent when talking to a backend that predates the field. */
-  has_password?: boolean;
-  /** Account API contract item 86; absent or null on an older backend. */
-  is_anonymous?: boolean | null;
-  account_number?: string | null;
-}
 
 /** Whether the window is on screen; unknown counts as visible (never skip a prompt the user can see). */
 async function windowIsVisible(): Promise<boolean> {
@@ -205,7 +193,7 @@ function App() {
     const checkAuth = async () => {
       try {
         setLoading(true);
-        const authState = await invoke<AuthState>('get_auth_state');
+        const authState = await invoke<AuthStateIdentity>('get_auth_state');
         setAuthenticated(authState.is_authenticated);
 
         if (authState.is_authenticated) {
@@ -215,16 +203,7 @@ function App() {
           // the session alive with an unknown identity in that case rather than
           // signing the user out). Absent means "unchanged", not "cleared".
           if (authState.email) setUserEmail(authState.email);
-          const patch: Partial<AccountInfo> = {
-            status: 'active',
-            // `?? true` keeps the password prompt when the backend predates the
-            // field — a stale `false` would REMOVE a safety prompt.
-            hasPassword: authState.has_password ?? true,
-          };
-          if (authState.email) patch.email = authState.email;
-          if (authState.account_id) patch.accountId = authState.account_id;
-          if (authState.plan) patch.plan = authState.plan;
-          setAccount({ ...patch, ...anonymityPatch(authState) });
+          setAccount(identityPatch(authState));
         }
       } catch {
         // Auth check failed - assume not authenticated
@@ -253,17 +232,14 @@ function App() {
     const delayMs = 4000 * 2 ** identityAttempt;
     const timer = setTimeout(async () => {
       try {
-        const st = await invoke<AuthState>('get_auth_state');
+        const st = await invoke<AuthStateIdentity>('get_auth_state');
         if (st && st.is_authenticated === false) {
           endSession('expired');
           return;
         }
         if (st?.email) {
           setUserEmail(st.email);
-          const patch: Partial<AccountInfo> = { email: st.email, ...anonymityPatch(st) };
-          if (st.account_id) patch.accountId = st.account_id;
-          if (st.plan) patch.plan = st.plan;
-          setAccount(patch);
+          setAccount(identityPatch(st));
         }
       } catch {
         /* non-fatal — the backoff above bounds how often this runs */

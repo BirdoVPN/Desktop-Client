@@ -63,7 +63,9 @@ pub struct AppSettings {
     /// Allow LAN access while connected (printers, NAS, etc.)
     #[serde(default)]
     pub local_network_sharing: bool,
-    /// WireGuard port: "auto", "51820", "53", or custom port number
+    /// WireGuard port: "auto" or "51820" (the relays accept no other). "53"
+    /// and custom numbers from earlier builds are migrated to "auto" on load
+    /// (`migrate_wireguard_port`).
     #[serde(default = "default_wireguard_port")]
     pub wireguard_port: String,
     /// WireGuard MTU: 0 = automatic (server default), 1280-1500 = custom
@@ -456,8 +458,22 @@ fn verify_hmac(settings_json: &str, expected_hmac: &str, key: &[u8]) -> bool {
 /// choke-point for both the signed and legacy load paths so any future
 /// invariants stay in lock-step and remain unit-testable without a Tauri
 /// `AppHandle`/filesystem.
-fn normalize_loaded_settings(settings: AppSettings) -> AppSettings {
+fn normalize_loaded_settings(mut settings: AppSettings) -> AppSettings {
+    migrate_wireguard_port(&mut settings);
     settings
+}
+
+/// WIN-FIX-3: the relays accept WireGuard on UDP 51820 only (vpn-a3, all
+/// ten: no DNAT, nothing on a public 53). The "53" preset and the custom port
+/// that earlier builds offered failed the handshake on every relay, so a
+/// saved value of either becomes "auto" — the same rule as Android. Returns
+/// whether it changed anything, so a signed file is re-saved once.
+fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
+    if matches!(settings.wireguard_port.as_str(), "auto" | "51820") {
+        return false;
+    }
+    settings.wireguard_port = default_wireguard_port();
+    true
 }
 
 /// Get current application settings
@@ -526,7 +542,18 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
         for key in &candidates {
             if verify_hmac(&settings_json, &signed.hmac, key) {
                 sync_hmac_key_sources(&path, key);
-                return Ok(normalize_loaded_settings(signed.settings));
+                let port_before = signed.settings.wireguard_port.clone();
+                let settings = normalize_loaded_settings(signed.settings);
+                // Persist a migration once rather than redo it on every load.
+                if settings.wireguard_port != port_before {
+                    if let Err(e) = save_settings_inner(app, &settings) {
+                        tracing::warn!(
+                            "Failed to save migrated settings: {} (will retry next load)",
+                            e
+                        );
+                    }
+                }
+                return Ok(settings);
             }
         }
 
@@ -722,6 +749,37 @@ pub(crate) fn clear_account_choices(app: &AppHandle) {
             "Could not read settings to clear the account's server: {}",
             e
         ),
+    }
+}
+
+/// Put the tunnel-shaping settings of `good` back over what is saved now, and
+/// save: the revert of a settings change the live session could not apply
+/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved.
+pub(crate) fn restore_tunnel_settings(
+    app: &AppHandle,
+    good: &AppSettings,
+) -> Result<AppSettings, String> {
+    let _write = SETTINGS_WRITE.lock();
+    let restored = with_tunnel_settings_of(load_settings_sync(app)?, good);
+    save_settings_inner(app, &restored)?;
+    Ok(restored)
+}
+
+/// `current` with every setting a live reapply rebuilds the tunnel for taken
+/// from `good`. Only those: anything else changed since (a notification
+/// toggle, the server the user picked) is not part of the revert.
+fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSettings {
+    AppSettings {
+        custom_dns: good.custom_dns.clone(),
+        local_network_sharing: good.local_network_sharing,
+        wireguard_port: good.wireguard_port.clone(),
+        wireguard_mtu: good.wireguard_mtu,
+        stealth_mode: good.stealth_mode,
+        quantum_protection: good.quantum_protection,
+        dns_filtering: good.dns_filtering,
+        split_tunneling_enabled: good.split_tunneling_enabled,
+        split_tunnel_apps: good.split_tunnel_apps.clone(),
+        ..current
     }
 }
 
@@ -1029,6 +1087,75 @@ mod tests {
         assert!(matches!(s.protocol, Protocol::Wireguard));
         assert!(s.split_tunneling_enabled);
         assert_eq!(s.wireguard_port, "51820");
+    }
+
+    /// WIN-FIX-3: a reapply that cannot be applied puts back what the live
+    /// session runs on — every tunnel-shaping setting — and nothing else.
+    #[test]
+    fn a_revert_restores_the_tunnel_settings_and_keeps_the_rest() {
+        let good = AppSettings::default();
+        let changed = AppSettings {
+            wireguard_port: "51820".into(),
+            wireguard_mtu: 1280,
+            custom_dns: Some(vec!["9.9.9.9".into()]),
+            local_network_sharing: true,
+            stealth_mode: true,
+            quantum_protection: false,
+            dns_filtering: true,
+            split_tunneling_enabled: true,
+            split_tunnel_apps: vec!["C:\\apps\\game.exe".into()],
+            // Not part of the revert:
+            notifications_enabled: true,
+            preferred_server_id: Some("fra-1".into()),
+            auto_connect: true,
+            ..AppSettings::default()
+        };
+        let restored = with_tunnel_settings_of(changed, &good);
+        assert_eq!(restored.wireguard_port, good.wireguard_port);
+        assert_eq!(restored.wireguard_mtu, good.wireguard_mtu);
+        assert_eq!(restored.custom_dns, good.custom_dns);
+        assert_eq!(restored.local_network_sharing, good.local_network_sharing);
+        assert_eq!(restored.stealth_mode, good.stealth_mode);
+        assert_eq!(restored.quantum_protection, good.quantum_protection);
+        assert_eq!(restored.dns_filtering, good.dns_filtering);
+        assert_eq!(
+            restored.split_tunneling_enabled,
+            good.split_tunneling_enabled
+        );
+        assert_eq!(restored.split_tunnel_apps, good.split_tunnel_apps);
+        assert!(restored.notifications_enabled);
+        assert_eq!(restored.preferred_server_id.as_deref(), Some("fra-1"));
+        assert!(restored.auto_connect);
+    }
+
+    /// WIN-FIX-3: "53" and custom ports, which no relay answers, load as
+    /// "auto"; the two real choices are kept.
+    #[test]
+    fn a_dead_wireguard_port_loads_as_auto() {
+        for (stored, loaded) in [
+            ("auto", "auto"),
+            ("51820", "51820"),
+            ("53", "auto"),
+            ("443", "auto"),
+            ("5353", "auto"),
+            ("", "auto"),
+        ] {
+            let settings = normalize_loaded_settings(AppSettings {
+                wireguard_port: stored.into(),
+                ..AppSettings::default()
+            });
+            assert_eq!(settings.wireguard_port, loaded, "{stored:?}");
+        }
+        let mut kept = AppSettings {
+            wireguard_port: "51820".into(),
+            ..AppSettings::default()
+        };
+        assert!(!migrate_wireguard_port(&mut kept), "nothing to re-save");
+        let mut dead = AppSettings {
+            wireguard_port: "53".into(),
+            ..AppSettings::default()
+        };
+        assert!(migrate_wireguard_port(&mut dead), "re-saved once");
     }
 
     /// The kill switch is now a real user preference: a persisted `false` must

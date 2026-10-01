@@ -46,6 +46,10 @@ static EXIT_TEARDOWN_DONE: std::sync::atomic::AtomicBool =
 /// the backend notify 3 s, the tunnel 6 s).
 const EXIT_TEARDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long past [`EXIT_TEARDOWN_CAP`] the exit fallback thread waits before
+/// it exits without the teardown (WIN-FIX-3, see `RunEvent::ExitRequested`).
+const EXIT_FALLBACK_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Best-effort teardown run while an exit request is held open. It is the SAME
 /// teardown as a user Disconnect (`session::end_session`): quitting IS the user
 /// ending the session, so the kill switch is disarmed unconditionally — on
@@ -195,7 +199,13 @@ fn main() {
                 }
             }),
         ))
-        .with(tracing_subscriber::fmt::layer())
+        // The console's writes are queued for a thread of their own: a console
+        // that stops taking output must never hold up the thread that logged
+        // (WIN-FIX-3 P0, see utils::console_log).
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(crate::utils::console_log::ConsoleLog::stdout()),
+        )
         .with(file_layer)
         .init();
 
@@ -680,6 +690,26 @@ fn main() {
                     // teardown, then re-request the exit.
                     info!("Application exit requested — tearing down VPN + kill switch first");
                     api.prevent_exit();
+                    // WIN-FIX-3: the teardown below is a task on the async
+                    // runtime, and so is the cap around it. A runtime that
+                    // cannot run it (every worker stuck, as in the T5 hang)
+                    // held the exit open for good, kill-switch block and all.
+                    // This thread needs nothing from the runtime: past the cap
+                    // it puts back what an older build parked and exits, and
+                    // the WFP block, a dynamic session, goes with the process.
+                    let _ = std::thread::Builder::new()
+                        .name("birdo-exit-fallback".into())
+                        .spawn(|| {
+                            std::thread::sleep(EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN);
+                            if !EXIT_TEARDOWN_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+                                error!("Exit teardown never ran to its end — exiting without it");
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let _ = vpn::win_machine_state::release_dns_at_exit();
+                                }
+                                std::process::exit(0);
+                            }
+                        });
                     let app = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
                         // Hard cap over the whole teardown: quitting must never

@@ -82,6 +82,42 @@ export interface AuthStateAnonymity {
   account_number?: string | null;
 }
 
+/** The `get_auth_state` answer, as far as the account store reads it. */
+export interface AuthStateIdentity extends AuthStateAnonymity {
+  is_authenticated: boolean;
+  email: string | null;
+  account_id: string | null;
+  plan: string | null;
+  /** Absent when talking to a backend that predates the field. */
+  has_password?: boolean;
+}
+
+/**
+ * What a `get_auth_state` answer says about the signed-in account, as a merge
+ * patch for `setAccount`. App startup and every post-sign-in hydration in
+ * Login use this one function: Login's own copy left out `hasPassword`, so a
+ * new anonymous or SSO account was asked for a password it does not have —
+ * Delete disabled — until the app restarted (WIN-FIX-3).
+ *
+ * Only what was received is written: `setAccount` MERGES, and an explicit
+ * null would wipe a known-good identity whenever the profile fetch failed
+ * transiently (`get_auth_state` keeps the session alive with an unknown
+ * identity in that case).
+ */
+export function identityPatch(st: AuthStateIdentity): Partial<AccountInfo> {
+  const patch: Partial<AccountInfo> = anonymityPatch(st);
+  if (st.email) patch.email = st.email;
+  if (st.account_id) patch.accountId = st.account_id;
+  if (st.plan) patch.plan = st.plan;
+  if (st.is_authenticated) {
+    patch.status = 'active';
+    // `?? true` keeps the password prompt when the backend predates the
+    // field: a stale `false` would REMOVE a safety prompt.
+    patch.hasPassword = st.has_password ?? true;
+  }
+  return patch;
+}
+
 /**
  * The store patch for item 86's fields, with only what the server SAID: an
  * absent field leaves the store alone, so a cycle whose profile fetch failed
@@ -168,14 +204,6 @@ export function isPrivateDnsAddress(ip: string): boolean {
   return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
-/**
- * Validate a WireGuard port number.
- */
-export function isValidPort(port: string): boolean {
-  const n = Number(port);
-  return Number.isInteger(n) && n >= 1 && n <= 65535;
-}
-
 /** WireGuard MTU range the tunnel builder accepts. */
 export function isValidMtu(mtu: string): boolean {
   const n = Number(mtu);
@@ -227,7 +255,14 @@ export interface RustSettings {
   crash_reports_enabled?: boolean;
 }
 
-import type { AppSettings } from '../store/app-store';
+import type { AccountInfo, AppSettings, WireGuardPort } from '../store/app-store';
+
+/** A stored or received port setting as one of the two that exist (see
+ * `WireGuardPort`): "51820" stays, anything else — "53", a custom number from
+ * an older build, nothing at all — is "auto". */
+export function normalizeWireGuardPort(value: unknown): WireGuardPort {
+  return value === '51820' ? '51820' : 'auto';
+}
 
 /** Convert Rust snake_case settings to store camelCase. */
 export function settingsFromRust(rs: RustSettings): AppSettings {
@@ -250,7 +285,9 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     customDnsEnabled: (rs.custom_dns ?? []).length > 0,
     protocol: 'wireguard',
     localNetworkSharing: rs.local_network_sharing ?? false,
-    wireGuardPort: rs.wireguard_port ?? 'auto',
+    // A "53" or custom port from an older build is "auto": no relay answers
+    // either (Rust migrates the file too).
+    wireGuardPort: normalizeWireGuardPort(rs.wireguard_port),
     wireGuardMtu: rs.wireguard_mtu ?? 0,
     multiHopEnabled: rs.multi_hop_enabled ?? false,
     multiHopEntryNodeId: rs.multi_hop_entry_node_id ?? null,

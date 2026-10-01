@@ -1276,6 +1276,19 @@ impl VpnManager {
         }
     }
 
+    /// The packet path has stopped ticking (see
+    /// `wireguard_new::packet_path_stalled`).
+    #[cfg(target_os = "windows")]
+    pub async fn packet_path_stalled(&self) -> bool {
+        match timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
+            Ok(guard) => match guard.as_ref() {
+                Some(tunnel) => tunnel.packet_path_stalled().await,
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// Forget unanswered handshakes sent before a resume.
     #[cfg(target_os = "windows")]
     pub async fn restart_response_watch(&self) {
@@ -1308,32 +1321,35 @@ impl VpnManager {
         }
     }
 
-    /// Update bandwidth stats (called periodically)
+    /// Refresh the byte counters and the latency from the live tunnel.
+    ///
+    /// The status choke point runs this on every `get_vpn_status`, every 2 s
+    /// stats poll and every status event, so it NEVER waits (WIN-FIX-3 P0): a
+    /// connect or a teardown holding the tunnel (a stop takes up to 15 s) or
+    /// the stats skips the refresh, and the last counters are served. The
+    /// tunnel's own readings are lock-free (`wireguard_new` module docs).
     pub async fn update_stats(&self) {
-        match timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
-            Ok(tunnel_guard) => {
-                if let Some(tunnel) = tunnel_guard.as_ref() {
-                    let (sent, received, pkts_sent, pkts_received) = tunnel.get_stats();
-                    let latency = tunnel.get_latency_ms().await;
-                    match timeout(STATE_LOCK_TIMEOUT, self.stats.write()).await {
-                        Ok(mut stats) => {
-                            stats.bytes_sent = sent;
-                            stats.bytes_received = received;
-                            stats.packets_sent = pkts_sent;
-                            stats.packets_received = pkts_received;
-                            // P1-dk-fabricated-quality-telemetry: only OVERWRITE
-                            // the latency when the tunnel actually measured one
-                            // (the handshake RTT, W1-002), so a session that has
-                            // not rekeyed yet keeps "unmeasured" rather than 0.
-                            if let Some(lat) = latency {
-                                stats.latency_ms = Some(lat);
-                            }
-                        }
-                        Err(_) => tracing::error!("Stats write lock timeout in update_stats"),
-                    }
-                }
-            }
-            Err(_) => tracing::error!("Tunnel read lock timeout in update_stats"),
+        let Ok(tunnel_guard) = self.tunnel.try_read() else {
+            return;
+        };
+        let Some(tunnel) = tunnel_guard.as_ref() else {
+            return;
+        };
+        let (sent, received, pkts_sent, pkts_received) = tunnel.get_stats();
+        let latency = tunnel.get_latency_ms().await;
+        drop(tunnel_guard);
+        let Ok(mut stats) = self.stats.try_write() else {
+            return;
+        };
+        stats.bytes_sent = sent;
+        stats.bytes_received = received;
+        stats.packets_sent = pkts_sent;
+        stats.packets_received = pkts_received;
+        // P1-dk-fabricated-quality-telemetry: only OVERWRITE the latency when
+        // the tunnel actually measured one (the handshake RTT, W1-002), so a
+        // session that has not rekeyed yet keeps "unmeasured" rather than 0.
+        if let Some(lat) = latency {
+            stats.latency_ms = Some(lat);
         }
     }
 }
@@ -1341,6 +1357,29 @@ impl VpnManager {
 impl Default for VpnManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Every lock the engine has, held as a wedged engine would hold them: a
+/// connect stuck in a synchronous step (the operation and commit locks), a
+/// teardown stopping the tunnel (its write lock), a state write in progress.
+#[cfg(test)]
+pub(crate) struct WedgedEngine<'a> {
+    _operation: MutexGuard<'a, ()>,
+    _commit: MutexGuard<'a, ()>,
+    _state: tokio::sync::RwLockWriteGuard<'a, ConnectionState>,
+    _tunnel: tokio::sync::RwLockWriteGuard<'a, Option<PlatformTunnel>>,
+}
+
+#[cfg(test)]
+impl VpnManager {
+    pub(crate) async fn wedge_for_test(&self) -> WedgedEngine<'_> {
+        WedgedEngine {
+            _operation: self.operation_lock.lock().await,
+            _commit: self.commit_lock.lock().await,
+            _state: self.state.write().await,
+            _tunnel: self.tunnel.write().await,
+        }
     }
 }
 
@@ -1652,6 +1691,19 @@ mod tests {
             .await;
         mgr.set_state(ConnectionState::Connecting).await.unwrap();
         assert_eq!(mgr.published().gave_up, None, "the mark outlived the error");
+    }
+
+    /// WIN-FIX-3 P0: the stats refresh behind every status read skips a
+    /// tunnel that is busy instead of waiting for it. It used to wait up to
+    /// 5 s per call for a teardown's tunnel lock (a stop holds it 15 s), on
+    /// every status read, stats poll and status event.
+    #[tokio::test]
+    async fn the_stats_refresh_never_waits_for_a_busy_tunnel() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        let _wedged = mgr.wedge_for_test().await;
+        tokio::time::timeout(Duration::from_millis(200), mgr.update_stats())
+            .await
+            .expect("update_stats waited on the engine");
     }
 
     #[tokio::test]
