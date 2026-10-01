@@ -1024,6 +1024,13 @@ pub struct ConnectResponse {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// With `success:false`: the Free plan's monthly allowance is used up
+    /// (birdo-web #590's connect gate; absent on older servers). A refusal no
+    /// retry can change before the reset or an upgrade — and on Windows the
+    /// ONLY way #590's end of a session reaches the client: the heartbeat that
+    /// says so rides the peer the server has just removed (REVIEW-WIN2-002).
+    #[serde(default)]
+    pub quota_exceeded: bool,
     #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
@@ -1158,6 +1165,10 @@ pub struct MultiHopConnectResponse {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// See `ConnectResponse::quota_exceeded`: the Multi-Hop door runs the same
+    /// connect gate (MultiHopService returns its refusal as-is).
+    #[serde(default)]
+    pub quota_exceeded: bool,
     #[serde(default)]
     pub key_id: Option<String>,
     // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
@@ -1218,6 +1229,7 @@ impl From<MultiHopConnectResponse> for ConnectResponse {
         ConnectResponse {
             success: response.success,
             message: response.message,
+            quota_exceeded: response.quota_exceeded,
             key_id: response.key_id,
             public_key: response.public_key,
             preshared_key: response.preshared_key,

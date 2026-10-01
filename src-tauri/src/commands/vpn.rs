@@ -1255,6 +1255,7 @@ mod tests {
         ConnectResponse {
             success: true,
             message: None,
+            quota_exceeded: false,
             key_id: Some("k1".into()),
             public_key: None,
             preshared_key: None,

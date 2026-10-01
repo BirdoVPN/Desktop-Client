@@ -137,13 +137,28 @@ pub fn needs_rebind<R: PartialEq>(pinned: Option<&R>, now: Option<&R>) -> bool {
     matches!((pinned, now), (Some(a), Some(b)) if a != b)
 }
 
+/// Whether the SERVER ended the session: a revocation (owner default, iOS
+/// parity, P1-parity-021) or a used-up Free allowance (birdo-web #590). No
+/// reconnect can bring either back.
+pub fn server_ended(code: IpcErrorCode) -> bool {
+    matches!(code, IpcErrorCode::Revoked | IpcErrorCode::QuotaExceeded)
+}
+
 /// Whether a give-up keeps the block-all engaged. Always-on (lockdown) keeps
 /// blocking — the user asked for exactly that — EXCEPT when the server ended
-/// the session: a revocation (owner default, iOS parity, P1-parity-021) or a
-/// used-up Free allowance. No reconnect can bring either back, so blocking
-/// would only hold the machine offline.
+/// the session: blocking would only hold the machine offline.
 pub fn give_up_keeps_block(code: IpcErrorCode, lockdown: bool) -> bool {
-    lockdown && !matches!(code, IpcErrorCode::Revoked | IpcErrorCode::QuotaExceeded)
+    lockdown && !server_ended(code)
+}
+
+/// Whether the final `error` status is marked as a recovery that gave up
+/// (`gave_up`, REVIEW-WIN-009). An ending the server decided is reported by
+/// its own code whichever path brought it. A used-up allowance reaches a
+/// Windows client as the RE-DIAL's refusal, not as the heartbeat's answer
+/// (REVIEW-WIN2-002); marked, the UI showed "stopped reconnecting: the
+/// connection keeps dropping" instead of the allowance and View plans.
+pub fn marks_give_up(code: IpcErrorCode) -> bool {
+    !server_ended(code)
 }
 
 /// What a heartbeat answer means for the session.
@@ -833,6 +848,55 @@ mod tests {
     fn a_used_up_allowance_releases_the_block_even_in_lockdown() {
         assert!(!give_up_keeps_block(IpcErrorCode::QuotaExceeded, true));
         assert!(!give_up_keeps_block(IpcErrorCode::QuotaExceeded, false));
+    }
+
+    /// REVIEW-WIN2-002, the path #590 really takes on Windows: the heartbeat's
+    /// answer is lost with the removed peer, the dead tunnel is torn down, and
+    /// the FIRST re-dial is refused with `quotaExceeded`. Recovery ends there
+    /// — no second dial, no backoff — with the allowance's own code, the block
+    /// released even under lockdown, and no "stopped reconnecting" mark.
+    #[test]
+    fn a_quota_refusal_on_the_re_dial_ends_the_session_at_once() {
+        let mut p = ReconnectPolicy::new(Budget {
+            max_attempts: 10,
+            ..budget()
+        });
+        let now = Instant::now();
+        let mut t = tick(now, Observed::Connected);
+        t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+        assert!(matches!(p.decide(&t), Action::TearDown { .. }));
+        assert!(matches!(
+            p.decide(&not_connected(now)),
+            Action::Dial { attempt: 1, .. }
+        ));
+        p.on_dial_failed(crate::commands::ipc_error::IpcError::connect_refused(
+            "Free-tier data limit reached",
+            true,
+        ));
+        match p.decide(&not_connected(now)) {
+            Action::GiveUp(err) => {
+                assert_eq!(err.code, IpcErrorCode::QuotaExceeded);
+                assert_eq!(p.attempts(), 1, "no second dial");
+                assert!(!give_up_keeps_block(err.code, true));
+                assert!(!marks_give_up(err.code));
+            }
+            other => panic!("expected the session to end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_a_recovery_that_failed_is_marked_as_a_give_up() {
+        for ended in [IpcErrorCode::QuotaExceeded, IpcErrorCode::Revoked] {
+            assert!(!marks_give_up(ended), "{ended:?}");
+        }
+        for failed in [
+            IpcErrorCode::ServerUnreachable,
+            IpcErrorCode::ServerUnavailable,
+            IpcErrorCode::StealthFailed,
+            IpcErrorCode::DeviceLimit,
+        ] {
+            assert!(marks_give_up(failed), "{failed:?}");
+        }
     }
 
     #[test]

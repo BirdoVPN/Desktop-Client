@@ -11,7 +11,7 @@
 //!     `network_events`;
 //!   * the stealth transport exiting under the session (W1-005).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -221,6 +221,26 @@ struct LoopTask {
     handle: JoinHandle<()>,
 }
 
+/// The Free-allowance grace warning (birdo-web #590): at most once per
+/// SESSION (REVIEW-WIN2-024). A reconnect or a settings reapply inside the
+/// grace window builds a new tunnel and starts a new loop, and the mark used
+/// to live in the loop's per-tunnel `SessionWatch`, so each of them sent the
+/// notice and the system notification again. The service holds it, and it is
+/// cleared with the session on record.
+#[derive(Clone, Default)]
+struct QuotaNotice(Arc<AtomicBool>);
+
+impl QuotaNotice {
+    /// True the first time it is asked in a session.
+    fn claim(&self) -> bool {
+        !self.0.swap(true, Ordering::SeqCst)
+    }
+
+    fn reset(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Auto-reconnect service
 #[derive(Clone)]
 pub struct AutoReconnectService {
@@ -245,6 +265,9 @@ pub struct AutoReconnectService {
 
     /// How many loops are alive right now; the tests assert it never exceeds 1.
     live_loops: Arc<AtomicUsize>,
+
+    /// Shared with every loop of the session.
+    quota_notice: QuotaNotice,
 }
 
 impl AutoReconnectService {
@@ -258,6 +281,7 @@ impl AutoReconnectService {
             app_handle: Arc::new(std::sync::RwLock::new(None)),
             task: Arc::new(TokioMutex::new(None)),
             live_loops: Arc::new(AtomicUsize::new(0)),
+            quota_notice: QuotaNotice::default(),
         }
     }
 
@@ -283,9 +307,11 @@ impl AutoReconnectService {
         self.last_reconnect_info.read().await.clone()
     }
 
-    /// Clear stored config (called on intentional disconnect)
+    /// Clear stored config (called on intentional disconnect): the session
+    /// is over.
     pub async fn clear_last_config(&self) {
         *self.last_reconnect_info.write().await = None;
+        self.quota_notice.reset();
     }
 
     /// Start the health check monitoring loop. Idempotent.
@@ -314,6 +340,7 @@ impl AutoReconnectService {
             transport_exits,
             policy: ReconnectPolicy::new(cfg.budget()),
             session: SessionWatch::default(),
+            quota_notice: self.quota_notice.clone(),
         };
         let live_loops = Arc::clone(&self.live_loops);
         let check_interval = Duration::from_millis(cfg.health_check_interval_ms);
@@ -364,8 +391,6 @@ struct SessionWatch {
     /// A resume asked the path to be re-proven at this instant.
     verify_since: Option<Instant>,
     last_heartbeat: Option<Instant>,
-    /// The Free-allowance grace warning went out for this session.
-    quota_warned: bool,
 }
 
 enum Wake {
@@ -392,6 +417,7 @@ struct ReconnectLoop {
     transport_exits: Option<watch::Receiver<u64>>,
     policy: ReconnectPolicy,
     session: SessionWatch,
+    quota_notice: QuotaNotice,
 }
 
 async fn transport_exit(exits: &mut Option<watch::Receiver<u64>>) {
@@ -614,10 +640,13 @@ impl ReconnectLoop {
             }
             Action::Dial { attempt, delay } => self.dial(attempt, delay).await,
             Action::GiveUp(error) => {
-                let gave_up = GaveUp {
+                // An ending the server decided (the re-dial refused over the
+                // Free allowance, REVIEW-WIN2-002) is not a recovery that
+                // failed: it reads by its own code, unmarked.
+                let gave_up = reconnect_policy::marks_give_up(error.code).then(|| GaveUp {
                     attempts: self.policy.attempts(),
-                };
-                self.give_up(error, Some(gave_up)).await;
+                });
+                self.give_up(error, gave_up).await;
                 Flow::Stop
             }
             Action::Halt => {
@@ -819,13 +848,14 @@ impl ReconnectLoop {
                 // its code, not as "stopped reconnecting".
                 self.give_up(error, None).await;
                 *self.last_reconnect_info.write().await = None;
+                self.quota_notice.reset();
                 Flow::Stop
             }
             HeartbeatVerdict::QuotaGrace { seconds_remaining } => {
                 // Once per session: the heartbeat repeats every 30 s for the
-                // whole grace window, and the warning is news only once.
-                if !self.session.quota_warned {
-                    self.session.quota_warned = true;
+                // whole grace window, and a reconnect or a reapply inside it
+                // starts a new tunnel; the warning is news only once.
+                if self.quota_notice.claim() {
                     tracing::warn!("Heartbeat: the Free data allowance is used up (grace window)");
                     if let Some(app) = &self.app {
                         let _ = app.emit(QUOTA_WARNING_EVENT, QuotaWarning { seconds_remaining });
@@ -922,9 +952,15 @@ async fn request_fresh_response(
         );
         api.post_connect_request(&payload).await?
     };
+    // REVIEW-WIN2-002: a used-up Free allowance arrives HERE on Windows. The
+    // server removes the peer before it answers the heartbeat that says so,
+    // and that answer rides the removed peer; the tunnel then dies, and this
+    // re-dial is refused with `quotaExceeded` — a hard refusal that ends the
+    // recovery at once, releasing the block (`give_up_keeps_block`).
     if !response.success {
         return Err(IpcError::connect_refused(
             response.message.as_deref().unwrap_or("Connection failed"),
+            response.quota_exceeded,
         ));
     }
     Ok(response)
@@ -1007,15 +1043,20 @@ mod tests {
     }
 
     /// REVIEW-WIN-009: every give-up the POLICY decides is marked on the final
-    /// status with the attempts it spent; the heartbeat's revocation, which
-    /// ends no recovery, is not.
+    /// status with the attempts it spent — except an ending the server decided
+    /// (REVIEW-WIN2-002, `reconnect_policy::marks_give_up`); the heartbeat's
+    /// revocation, which ends no recovery, is not marked either.
     #[test]
     fn policy_give_ups_are_marked_and_revocations_are_not() {
         let source = include_str!("auto_reconnect.rs");
         let arm = &source[source.find("Action::GiveUp(error) => {").unwrap()..];
         let arm = &arm[..arm.find("Flow::Stop").unwrap()];
+        assert!(
+            arm.contains("reconnect_policy::marks_give_up(error.code).then("),
+            "{arm}"
+        );
         assert!(arm.contains("attempts: self.policy.attempts()"), "{arm}");
-        assert!(arm.contains("self.give_up(error, Some(gave_up))"), "{arm}");
+        assert!(arm.contains("self.give_up(error, gave_up)"), "{arm}");
 
         let ended = &source[source.find("HeartbeatVerdict::End(error) => {").unwrap()..];
         let ended = &ended[..ended.find("Flow::Stop").unwrap()];
@@ -1024,21 +1065,36 @@ mod tests {
 
     /// The grace warning goes out once per session, not on every 30 s
     /// heartbeat of the 15-minute window.
-    #[test]
-    fn the_quota_warning_goes_out_once_per_session() {
+    #[tokio::test]
+    async fn the_quota_warning_goes_out_once_per_session() {
+        let svc = service();
+        assert!(svc.quota_notice.claim(), "the first grace heartbeat warns");
+        assert!(!svc.quota_notice.claim(), "the next one does not");
+
+        // REVIEW-WIN2-024: a reconnect or a settings reapply inside the grace
+        // window starts a NEW loop over a new tunnel. It shares the session's
+        // notice, so it does not warn again.
+        svc.start().await.unwrap();
+        svc.stop().await;
+        svc.start().await.unwrap();
+        svc.stop().await;
+        assert!(!svc.quota_notice.claim());
+
+        // The session ends (disconnect, sign-out): the next one may warn.
+        svc.clear_last_config().await;
+        assert!(svc.quota_notice.claim());
+
+        // The heartbeat arm asks the shared notice, not the per-tunnel watch.
         let source = include_str!("auto_reconnect.rs");
         let arm = &source[source
             .find("HeartbeatVerdict::QuotaGrace { seconds_remaining } => {")
             .unwrap()..];
         let arm = &arm[..arm.find("Flow::Continue").unwrap()];
         let check = arm
-            .find("if !self.session.quota_warned")
+            .find("if self.quota_notice.claim()")
             .expect("a once-per-session check");
-        let mark = arm
-            .find("self.session.quota_warned = true")
-            .expect("marked");
         let emit = arm.find("QUOTA_WARNING_EVENT").expect("emitted");
-        assert!(check < mark && mark < emit, "{arm}");
+        assert!(check < emit, "{arm}");
         let payload = serde_json::to_value(QuotaWarning {
             seconds_remaining: Some(540),
         })

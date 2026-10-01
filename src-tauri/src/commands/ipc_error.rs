@@ -236,8 +236,17 @@ impl IpcError {
 
     /// `/vpn/connect` answered 2xx with `success:false`: the backend refused
     /// THIS server (full, offline, removed) — or, when it says so, the device
-    /// limit.
-    pub fn connect_refused(message: &str) -> Self {
+    /// limit, or (`quotaExceeded`, birdo-web #590) the Free allowance.
+    ///
+    /// The allowance is a hard refusal with the canonical copy, exactly as
+    /// when the heartbeat brings it. It used to read as "server unavailable",
+    /// which is retryable: the re-dial after an over-cap session was ended
+    /// spent its whole budget, then held a lockdown block with the generic
+    /// give-up text (REVIEW-WIN2-002).
+    pub fn connect_refused(message: &str, quota_exceeded: bool) -> Self {
+        if quota_exceeded {
+            return crate::vpn::reconnect_policy::quota_exceeded_error();
+        }
         let code = if is_device_limit_message(message) {
             IpcErrorCode::DeviceLimit
         } else {
@@ -528,12 +537,54 @@ mod tests {
     #[test]
     fn connect_refusals_distinguish_the_device_limit() {
         assert_eq!(
-            IpcError::connect_refused("All VPN servers are currently offline").code,
+            IpcError::connect_refused("All VPN servers are currently offline", false).code,
             IpcErrorCode::ServerUnavailable
         );
         assert_eq!(
-            IpcError::connect_refused("You have reached your device limit").code,
+            IpcError::connect_refused("You have reached your device limit", false).code,
             IpcErrorCode::DeviceLimit
+        );
+    }
+
+    /// REVIEW-WIN2-002: birdo-web #590's connect gate, as the backend sends it
+    /// (`{success:false, quotaExceeded:true, message}`, HTTP 200), single-hop
+    /// and Multi-Hop, read through the real response types. A hard refusal
+    /// with the allowance code — never "server unavailable", which is
+    /// retryable and offers "try another location".
+    #[test]
+    fn a_used_up_allowance_at_connect_is_a_hard_quota_refusal() {
+        use crate::api::types::{ConnectResponse, MultiHopConnectResponse};
+        let body = serde_json::json!({
+            "success": false,
+            "quotaExceeded": true,
+            "message": "Free-tier data limit reached (10.0 / 10 GB this period). Your allowance \
+                        resets after 12 Oct. Upgrade to Operative for unlimited data."
+        });
+        let single: ConnectResponse = serde_json::from_value(body.clone()).unwrap();
+        let multi: ConnectResponse =
+            ConnectResponse::from(serde_json::from_value::<MultiHopConnectResponse>(body).unwrap());
+        for response in [single, multi] {
+            assert!(!response.success);
+            let err = IpcError::connect_refused(
+                response.message.as_deref().unwrap_or_default(),
+                response.quota_exceeded,
+            );
+            assert_eq!(err.code, IpcErrorCode::QuotaExceeded);
+            assert!(err.code.is_hard_refusal());
+            assert!(!err.retryable);
+            assert!(!crate::vpn::reconnect_policy::give_up_keeps_block(
+                err.code, true
+            ));
+        }
+
+        // An older server's refusal says nothing about the allowance.
+        let old: ConnectResponse =
+            serde_json::from_value(serde_json::json!({ "success": false, "message": "Full" }))
+                .unwrap();
+        assert!(!old.quota_exceeded);
+        assert_eq!(
+            IpcError::connect_refused("Full", old.quota_exceeded).code,
+            IpcErrorCode::ServerUnavailable
         );
     }
 }

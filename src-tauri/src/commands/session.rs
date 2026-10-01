@@ -356,7 +356,7 @@ async fn attempt(
             .clone()
             .unwrap_or_else(|| "Connection failed".to_string());
         tracing::error!("Server rejected connection: {}", message);
-        return Err(IpcError::connect_refused(&message));
+        return Err(IpcError::connect_refused(&message, response.quota_exceeded));
     }
 
     let prepared = prepare_tunnel(
@@ -597,6 +597,7 @@ pub(crate) fn verified_multi_hop_response(
                 .message
                 .as_deref()
                 .unwrap_or("Multi-hop connection failed"),
+            response.quota_exceeded,
         ));
     }
     let Some(route) = response.multi_hop.as_ref() else {
