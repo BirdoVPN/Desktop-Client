@@ -692,6 +692,11 @@ pub struct VpnStatus {
 /// The one status builder: `get_vpn_status` and the event emitter both call
 /// it, so a poll and an event can never disagree on shape. The state part is
 /// ONE published snapshot (see `PublishedStatus`); the rest is data.
+///
+/// It answers from snapshots and NEVER waits on the operation lock, the
+/// tunnel or the stealth transport (WIN-FIX-3 P0): a status that queued behind
+/// the engine is what turned one stalled tunnel into a dead UI.
+/// `update_stats` and `is_running_now` skip a refresh rather than wait.
 pub(crate) async fn build_vpn_status(
     vpn_manager: &VpnManager,
     xray_manager: &XrayManager,
@@ -723,7 +728,7 @@ pub(crate) async fn build_vpn_status(
         bytes_received: stats.bytes_received,
         connected_at: stats.connected_at.map(|t| t.to_rfc3339()),
         server_name: stats.server_name,
-        stealth_active: xray_manager.is_running().await,
+        stealth_active: xray_manager.is_running_now(),
         quantum_active: crate::vpn::birdo_pq::current_mode()
             == crate::vpn::birdo_pq::PqMode::Bilateral,
         pq_mode: crate::vpn::birdo_pq::current_mode(),
@@ -1005,6 +1010,32 @@ pub async fn get_usage_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WIN-FIX-3 P0: `get_vpn_status` answers while every lock the engine has
+    /// is held (a connect stuck in a synchronous step, a teardown stopping the
+    /// tunnel) and while the stealth helper's slot is busy. In T5 the status
+    /// queued behind a stalled tunnel and the UI went dead with it.
+    #[tokio::test]
+    async fn the_status_answers_while_the_engine_is_wedged() {
+        fn not_blocking() -> crate::vpn::manager::BlockProbe {
+            crate::vpn::manager::BlockProbe {
+                blocking: false,
+                holds_block_while_connected: false,
+            }
+        }
+        let vm = VpnManager::with_block_probe(not_blocking);
+        let xray = XrayManager::new();
+        let _engine = vm.wedge_for_test().await;
+        let _transport = xray.hold_slot_for_test().await;
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            build_vpn_status(&vm, &xray),
+        )
+        .await
+        .expect("the status waited on the engine");
+        assert_eq!(status.state, "disconnected");
+        assert!(!status.stealth_active);
+    }
 
     // ------------------------------------------------------------------
     // PR #160 review, must-fix 1: BirdoShield vs Custom DNS. `build_vpn_config`

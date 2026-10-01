@@ -17,7 +17,7 @@ use std::io::Write;
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
@@ -162,6 +162,9 @@ pub struct XrayManager {
     /// saw at the start to learn whether the transport carrying the OLD
     /// session is still the one running (REVIEW-WIN-010).
     ended: Arc<AtomicU64>,
+    /// What the slot held at the last look: the answer `is_running_now` gives
+    /// while a start or stop holds the slot.
+    seen_running: Arc<AtomicBool>,
 }
 
 impl Default for XrayManager {
@@ -177,6 +180,7 @@ impl XrayManager {
             health_cancel: Arc::new(Mutex::new(None)),
             exits: watch::channel(0).0,
             ended: Arc::new(AtomicU64::new(0)),
+            seen_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -190,6 +194,12 @@ impl XrayManager {
     #[cfg(test)]
     pub(crate) async fn adopt_for_test(&self, child: Child) {
         *self.process.lock().await = Some(child);
+    }
+
+    /// Hold the slot as a `stop()` waiting for the process to exit does.
+    #[cfg(test)]
+    pub(crate) async fn hold_slot_for_test(&self) -> tokio::sync::MutexGuard<'_, Option<Child>> {
+        self.process.lock().await
     }
 
     /// Wakes when xray dies under a session. The reconnect engine treats that
@@ -507,20 +517,33 @@ impl XrayManager {
     /// Check if Xray process is currently running
     pub async fn is_running(&self) -> bool {
         let mut proc = self.process.lock().await;
-        if let Some(ref mut child) = *proc {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    // Process has exited
-                    proc.take();
-                    self.ended.fetch_add(1, Ordering::SeqCst);
-                    false
-                }
-                Ok(None) => true,
-                Err(_) => false,
-            }
-        } else {
-            false
+        self.look(&mut proc)
+    }
+
+    /// [`is_running`](Self::is_running) for the status choke point, which
+    /// must never wait (WIN-FIX-3): `stop()` holds the slot while the process
+    /// exits, and a start while it comes up. Then the last look answers.
+    pub fn is_running_now(&self) -> bool {
+        match self.process.try_lock() {
+            Ok(mut proc) => self.look(&mut proc),
+            Err(_) => self.seen_running.load(Ordering::SeqCst),
         }
+    }
+
+    /// Whether the slot holds a live process, reaping one that exited.
+    fn look(&self, proc: &mut Option<Child>) -> bool {
+        let running = match proc.as_mut().map(Child::try_wait) {
+            Some(Ok(None)) => true,
+            Some(Ok(Some(_))) => {
+                // Process has exited
+                proc.take();
+                self.ended.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+            Some(Err(_)) | None => false,
+        };
+        self.seen_running.store(running, Ordering::SeqCst);
+        running
     }
 }
 
