@@ -1,5 +1,13 @@
 # Device test: the Windows DNS subsystem (#105)
 
+> **Superseded for current builds (W1-007, 2026-10).** Builds from the client
+> overhaul no longer park adapter DNS: a WFP DNS guard in the dynamic session
+> replaced it, and `docs/WINDOWS-LEAK-VALIDATION.md` is the checklist to run.
+> What survives from this document: S1 and S7 (machine-state ownership and
+> owner-qualified route deletion, I1/I10) and the journal heal in S6, which
+> still repairs machines parked by OLDER builds (`WINDOWS-LEAK-VALIDATION.md`
+> B4 and B9). S3, S4 and S5 describe the retired park and its refresh ticker.
+
 The Windows DNS cluster — **#98**, **#99**, **#100**, **#102** — merged as **#114**
 and is on `main`. It is gated, mutation-checked and structurally sound. **Nothing
 in it has run on a real machine.** No real `netsh`, no real adapter, no real
