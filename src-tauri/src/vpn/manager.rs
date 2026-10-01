@@ -506,6 +506,24 @@ impl VpnManager {
         self.commit_lock.lock().await
     }
 
+    /// The commit lock for a TEARDOWN (`end_session`): cancel whatever is in
+    /// flight, wait for the lock, then cancel AGAIN.
+    ///
+    /// The first cancel interrupts an attempt that is mid-build and holds no
+    /// lock. The second is the one REVIEW-WIN-003 found missing: a connect
+    /// begins its attempt only once it holds this same lock, and tokio's mutex
+    /// is FIFO, so a connect that queued on the lock before the teardown did
+    /// acquires first and takes a FRESH epoch the first cancel never saw. Its
+    /// tunnel then came up after the user's Disconnect, armed the kill switch
+    /// and started auto-reconnect. Cancelling once more under the lock
+    /// supersedes it at its next await.
+    pub async fn lock_commit_for_teardown(&self) -> MutexGuard<'_, ()> {
+        self.cancel_in_flight();
+        let guard = self.commit_lock.lock().await;
+        self.cancel_in_flight();
+        guard
+    }
+
     // ── State ───────────────────────────────────────────────────────────
 
     /// SM-002: Acquire state read lock with timeout to prevent deadlock
@@ -1434,6 +1452,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(out.unwrap_err().code, IpcErrorCode::Cancelled);
+    }
+
+    /// REVIEW-WIN-003: a connect queued on the commit lock AHEAD of a teardown
+    /// begins its attempt once the lock frees — after the teardown's first
+    /// cancel — so the teardown must cancel again once it holds the lock.
+    /// With a single cancel before the wait, the connect's epoch is still
+    /// current when the teardown finishes, and its tunnel would come up after
+    /// the user's Disconnect.
+    #[tokio::test]
+    async fn a_connect_queued_ahead_of_a_teardown_is_still_cancelled() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        // A failing switch holds the lock through its teardown (fail_connect).
+        let held = mgr.lock_commit().await;
+
+        // Tray Quick Connect queues on the lock, exactly as connect_session
+        // takes its epoch.
+        let connect = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move {
+                let _commit = mgr.lock_commit().await;
+                mgr.begin_attempt()
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // Tray Disconnect queues behind it.
+        let teardown = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move {
+                let _commit = mgr.lock_commit_for_teardown().await;
+            })
+        };
+        tokio::task::yield_now().await;
+
+        drop(held);
+        let epoch = connect.await.unwrap();
+        teardown.await.unwrap();
+        assert!(
+            !mgr.is_current(epoch),
+            "the connect that queued ahead of the Disconnect survived it"
+        );
     }
 
     /// W1-021: a connect whose epoch was superseded before it could start

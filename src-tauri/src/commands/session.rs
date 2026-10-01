@@ -83,14 +83,49 @@ impl ConnectTarget {
 /// What one attempt learned that the failure path needs.
 struct AttemptContext {
     epoch: u64,
-    /// A protected session was up when the connect started (a switch).
+    /// A protected session was up when the connect started (a switch), or
+    /// this connect displaced a tunnel it found held (see `session_was_live`
+    /// and the guard before `vm.connect`).
     was_live: bool,
     /// The block-all was engaged for the rebuild and must be released on
     /// success where the platform does not hold it for the session.
     block_engaged: bool,
-    /// The OLD session's stealth transport was restarted for the new one, so
-    /// the old tunnel no longer carries traffic even if it is still held.
-    old_transport_touched: bool,
+    /// `XrayManager::ended_count` when the connect started, if the OLD
+    /// session rode the stealth transport. Once the count moves, the old
+    /// tunnel no longer carries traffic even if it is still held.
+    old_stealth_mark: Option<u64>,
+}
+
+impl AttemptContext {
+    /// REVIEW-WIN-010: the old session's stealth transport was actually
+    /// stopped. Read from the transport itself rather than predicted from the
+    /// response: the early refusals in `prepare_tunnel` (protection
+    /// enforcement, the fallback check, the Xray parameter validation) all
+    /// return before `XrayManager::start` stops anything, and a switch they
+    /// refuse must keep the old session (iOS #354).
+    fn old_transport_touched(&self, xray: &XrayManager) -> bool {
+        self.old_stealth_mark
+            .is_some_and(|mark| xray.ended_count() != mark)
+    }
+}
+
+/// REVIEW-WIN-001: whether a protected session is live, from POSSESSION of a
+/// tunnel rather than from the published label alone.
+///
+/// The label it replaced, `is_tunnel_active()`, is `Connected` only. A connect
+/// that supersedes a switch still in its API phase reads the `Switching` that
+/// switch wrote, while the OLD tunnel is still held and carrying traffic: it
+/// then skipped the rebuild guard, displaced that tunnel unguarded (the
+/// reactive kill switch leaks for the whole rebuild) and, on failure, released
+/// nothing it had promised to hold. `Switching` with a tunnel held is exactly
+/// that case. `Reconnecting` and `Error` with a tunnel held are a DEAD tunnel
+/// the reconnect loop had not torn down yet: not a session to keep.
+fn session_was_live(state: &ConnectionState, holds_tunnel: bool) -> bool {
+    holds_tunnel
+        && matches!(
+            state,
+            ConnectionState::Connected | ConnectionState::Switching
+        )
 }
 
 /// Connect (or switch) to `target`. See the module docs.
@@ -123,7 +158,7 @@ pub(crate) async fn connect_session(
         epoch
     };
 
-    let was_live = vm.get_state().await.is_tunnel_active() && vm.holds_tunnel().await;
+    let was_live = session_was_live(&vm.get_state().await, vm.holds_tunnel().await);
     let _ = vm
         .set_state(if was_live {
             ConnectionState::Switching
@@ -132,6 +167,7 @@ pub(crate) async fn connect_session(
         })
         .await;
 
+    let xray = app.state::<XrayManager>();
     let mut ctx = AttemptContext {
         epoch,
         was_live,
@@ -140,7 +176,13 @@ pub(crate) async fn connect_session(
         // left alone, a reactive block (no tunnel permit) would hold the new
         // session's traffic under a "Protected" UI.
         block_engaged: killswitch::platform_is_blocking(),
-        old_transport_touched: false,
+        // A live xray is the old session's transport: the commit stops any
+        // xray a non-stealth session would otherwise inherit.
+        old_stealth_mark: if was_live && xray.is_running().await {
+            Some(xray.ended_count())
+        } else {
+            None
+        },
     };
     let mut result = attempt(app, &target, None, &mut ctx).await;
 
@@ -311,13 +353,6 @@ async fn attempt(
         return Err(IpcError::connect_refused(&message));
     }
 
-    // Starting stealth restarts xray, which is what carried an old stealth
-    // session: from here that session is gone even though its tunnel is held.
-    let starts_stealth =
-        response.stealth_enabled.unwrap_or(false) && response.xray_endpoint.is_some();
-    if starts_stealth && app.state::<XrayManager>().is_running().await {
-        ctx.old_transport_touched = true;
-    }
     let prepared = prepare_tunnel(
         app,
         &vm,
@@ -342,7 +377,13 @@ async fn attempt(
     // HEALTHY old tunnel's traffic for the whole API + stealth window. From
     // here to the new handshake nothing carries traffic, which is the window
     // the guard exists for.
-    if ctx.was_live {
+    //
+    // REVIEW-WIN-001: decided by what `vm.connect` is about to displace — a
+    // tunnel held right now — not only by what the start of the attempt
+    // believed. Whatever it displaces was the user's protection, so a failure
+    // from here on holds the block too.
+    if ctx.was_live || vm.holds_tunnel().await {
+        ctx.was_live = true;
         engage_rebuild_block(ctx).await;
     }
     // The relay permit moves to the new server together with the guard, so a
@@ -460,7 +501,7 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
     let outcome = failure_outcome(
         error.code == IpcErrorCode::Cancelled || !vm.is_current(ctx.epoch),
         ctx.was_live,
-        ctx.old_transport_touched,
+        ctx.old_transport_touched(&app.state::<XrayManager>()),
         vm.holds_tunnel().await,
     );
     let hold_block = match outcome {
@@ -764,9 +805,10 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
     tracing::info!("Ending the VPN session ({reason:?})");
 
     // Cancel FIRST: an in-flight connect or re-dial stops at its next await,
-    // including mid-build, so nothing below races a tunnel coming up.
-    vm.cancel_in_flight();
-    let _commit = vm.lock_commit().await;
+    // including mid-build, so nothing below races a tunnel coming up. And
+    // again once the lock is held, for a connect that was queued on it
+    // (REVIEW-WIN-003, see `lock_commit_for_teardown`).
+    let _commit = vm.lock_commit_for_teardown().await;
 
     let ar = app.state::<AutoReconnectService>();
     ar.stop().await;
@@ -876,8 +918,7 @@ mod lifecycle_tests {
         order(
             body("pub async fn end_session("),
             &[
-                "vm.cancel_in_flight()",
-                "vm.lock_commit()",
+                "vm.lock_commit_for_teardown()",
                 "ar.stop()",
                 "ar.clear_last_config()",
                 "api.disconnect_vpn(&key_id)",
@@ -952,17 +993,105 @@ mod lifecycle_tests {
     }
 
     /// W1-043: the guard engages after the API/stealth phase, right before
-    /// the tunnel is rebuilt.
+    /// the tunnel is rebuilt — and (REVIEW-WIN-001) whenever a tunnel is held
+    /// at that moment, whatever the start of the attempt believed.
     #[test]
     fn the_switch_guard_engages_just_before_the_rebuild() {
         order(
             body("async fn attempt("),
             &[
                 "prepare_tunnel(",
+                "vm.holds_tunnel().await",
                 "engage_rebuild_block(ctx)",
                 "apply_relay_permit(",
                 "vm.connect(",
             ],
+        );
+    }
+
+    /// REVIEW-WIN-001, the reapply-racing-a-switch scenario. Connected to A;
+    /// switch B is in its API call and has published `Switching`; a settings
+    /// reapply C supersedes it. Tunnel A is still held and carrying traffic,
+    /// so C must treat the session as live: guard the rebuild, keep A if C
+    /// fails before touching it, and hold the block if C fails after. The old
+    /// derivation (`is_tunnel_active()`, i.e. `Connected` only) read B's
+    /// `Switching` as "nothing live".
+    #[test]
+    fn a_connect_superseding_a_switch_still_sees_the_live_session() {
+        use super::{failure_outcome, session_was_live, FailureOutcome};
+        use crate::vpn::manager::ConnectionState;
+
+        let was_live = session_was_live(&ConnectionState::Switching, true);
+        assert!(was_live, "Switching over a held tunnel is a live session");
+        assert_eq!(
+            failure_outcome(false, was_live, false, true),
+            FailureOutcome::KeepOldSession
+        );
+        assert_eq!(
+            failure_outcome(false, was_live, false, false),
+            FailureOutcome::Error { hold_block: true }
+        );
+
+        assert!(session_was_live(&ConnectionState::Connected, true));
+        // Nothing held: nothing to protect, whatever the label says.
+        assert!(!session_was_live(&ConnectionState::Connected, false));
+        assert!(!session_was_live(&ConnectionState::Switching, false));
+        // A dead tunnel the reconnect loop had not torn down is not a session
+        // to keep (the guard before `vm.connect` still covers its rebuild).
+        for dead in [
+            ConnectionState::Reconnecting {
+                attempt: 1,
+                last_error: None,
+            },
+            ConnectionState::Error(crate::commands::ipc_error::IpcError::unknown("x")),
+        ] {
+            assert!(!session_was_live(&dead, true), "{dead:?}");
+        }
+    }
+
+    /// REVIEW-WIN-010: a switch the new node refuses before the old xray was
+    /// stopped (a requested protection missing, bad Xray parameters) keeps the
+    /// old stealth session; once the old transport has really been stopped,
+    /// the session is over and the block is held. The child only pings
+    /// loopback; nothing leaves the machine.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn only_a_stopped_old_transport_ends_the_old_session() {
+        use super::{failure_outcome, AttemptContext, FailureOutcome};
+        use crate::vpn::xray::XrayManager;
+
+        let xray = XrayManager::new();
+        xray.adopt_for_test(
+            std::process::Command::new("cmd.exe")
+                .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a long-running child"),
+        )
+        .await;
+        let ctx = AttemptContext {
+            epoch: 1,
+            was_live: true,
+            block_engaged: false,
+            old_stealth_mark: Some(xray.ended_count()),
+        };
+
+        // Refused before XrayManager::start: the old transport is untouched.
+        assert!(!ctx.old_transport_touched(&xray));
+        assert_eq!(
+            failure_outcome(false, ctx.was_live, ctx.old_transport_touched(&xray), true),
+            FailureOutcome::KeepOldSession
+        );
+
+        // XrayManager::start begins with stop(): from here the old session
+        // is gone even though its tunnel is still held.
+        xray.stop().await;
+        assert!(ctx.old_transport_touched(&xray));
+        assert_eq!(
+            failure_outcome(false, ctx.was_live, ctx.old_transport_touched(&xray), true),
+            FailureOutcome::Error { hold_block: true }
         );
     }
 }
