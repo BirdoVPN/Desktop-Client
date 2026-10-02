@@ -486,10 +486,40 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
 /// callers that need settings before the frontend is up (e.g. main.rs setup
 /// honoring `start_minimized`).
 pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
+    load_settings(app).map(Loaded::settings)
+}
+
+/// What a load found (WIN3-010).
+enum Loaded {
+    /// What is saved: the verified file — or the defaults where there is no
+    /// file to lose (none yet, or one just quarantined as tampered).
+    Saved(AppSettings),
+    /// Defaults served for this session because the file could not be
+    /// verified right now (its signing key is unreadable). The file is left
+    /// as it is, and nothing may be saved from these: that would replace
+    /// every real preference with its default.
+    Unverified(AppSettings),
+}
+
+impl Loaded {
+    fn settings(self) -> AppSettings {
+        match self {
+            Loaded::Saved(settings) | Loaded::Unverified(settings) => settings,
+        }
+    }
+}
+
+/// [`load_settings_sync`], saying whether the settings may be saved back.
+///
+/// The whole load holds [`SETTINGS_WRITE`] (WIN3-010): the migrations below
+/// save what they read, and a save that landed between their read and their
+/// write was lost.
+fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
+    let _write = SETTINGS_WRITE.lock();
     let path = get_settings_path(app)?;
 
     if !path.exists() {
-        return Ok(AppSettings::default());
+        return Ok(Loaded::Saved(AppSettings::default()));
     }
 
     let content =
@@ -534,7 +564,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
                     "no key in the credential store, no key file"
                 }
             );
-            return Ok(AppSettings::default());
+            return Ok(Loaded::Unverified(AppSettings::default()));
         }
 
         let settings_json = serde_json::to_string(&signed.settings)
@@ -553,7 +583,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
                         );
                     }
                 }
-                return Ok(settings);
+                return Ok(Loaded::Saved(settings));
             }
         }
 
@@ -581,7 +611,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
                             e
                         );
                     }
-                    return Ok(settings);
+                    return Ok(Loaded::Saved(settings));
                 }
             }
         }
@@ -593,7 +623,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
             tracing::error!(
                 "Settings signature matches no readable key while the credential store is unreachable — using defaults for this session without resetting"
             );
-            return Ok(AppSettings::default());
+            return Ok(Loaded::Unverified(AppSettings::default()));
         }
 
         // Every key source was readable and none verifies: genuine mismatch.
@@ -607,7 +637,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
         if let Err(e) = fs::rename(&path, &quarantine) {
             tracing::warn!("Could not preserve the unverified settings file: {}", e);
         }
-        return Ok(AppSettings::default());
+        return Ok(Loaded::Saved(AppSettings::default()));
     }
 
     // Legacy format (unsigned) — migrate by parsing and re-saving with HMAC
@@ -624,7 +654,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
                     e
                 );
             }
-            Ok(settings)
+            Ok(Loaded::Saved(settings))
         }
         Err(e) => Err(format!("Failed to parse settings: {}", e)),
     }
@@ -760,9 +790,23 @@ pub(crate) fn restore_tunnel_settings(
     good: &AppSettings,
 ) -> Result<AppSettings, String> {
     let _write = SETTINGS_WRITE.lock();
-    let restored = with_tunnel_settings_of(load_settings_sync(app)?, good);
+    let restored = restored_over(load_settings(app)?, good)?;
     save_settings_inner(app, &restored)?;
     Ok(restored)
+}
+
+/// What the revert saves, over what was `loaded` (WIN3-010). Never over the
+/// defaults a load serves while it cannot verify the file: saved, they
+/// replaced the user's kill switch, lockdown, autostart, server and every
+/// other preference with defaults. The revert then fails, and the error the
+/// reapply met stands.
+fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, String> {
+    match loaded {
+        Loaded::Saved(current) => Ok(with_tunnel_settings_of(current, good)),
+        Loaded::Unverified(_) => {
+            Err("the settings file could not be verified, so it was left as it is".into())
+        }
+    }
 }
 
 /// `current` with every setting a live reapply rebuilds the tunnel for taken
@@ -1126,6 +1170,53 @@ mod tests {
         assert!(restored.notifications_enabled);
         assert_eq!(restored.preferred_server_id.as_deref(), Some("fra-1"));
         assert!(restored.auto_connect);
+    }
+
+    /// WIN3-010: a revert never saves over the defaults a load serves while
+    /// it cannot verify the file (its signing key unreadable): they are not
+    /// the user's settings, and saving them replaced every preference. Over
+    /// what is really saved it restores as before. The load holds the
+    /// settings lock throughout, so a migration's re-save cannot drop a save
+    /// that landed after its read.
+    #[test]
+    fn a_revert_never_saves_over_unverified_defaults() {
+        let good = AppSettings {
+            wireguard_mtu: 1280,
+            ..AppSettings::default()
+        };
+        assert!(restored_over(Loaded::Unverified(AppSettings::default()), &good).is_err());
+        let saved = AppSettings {
+            killswitch_enabled: false,
+            wireguard_mtu: 1420,
+            ..AppSettings::default()
+        };
+        let restored = restored_over(Loaded::Saved(saved), &good).expect("a verified file");
+        assert_eq!(restored.wireguard_mtu, 1280);
+        assert!(!restored.killswitch_enabled, "not part of the revert");
+
+        let source = include_str!("settings.rs");
+        let body = |signature: &str| {
+            let start = source.find(signature).expect(signature);
+            let rest = &source[start..];
+            &rest[..rest
+                .find(
+                    "
+}",
+                )
+                .expect("end of fn")]
+        };
+        let restore = body("pub(crate) fn restore_tunnel_settings(");
+        assert!(restore.contains("restored_over(load_settings(app)?, good)?"));
+        let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, String> {");
+        // The two branches that serve defaults and touch nothing.
+        assert_eq!(
+            load.matches("Loaded::Unverified(AppSettings::default())")
+                .count(),
+            2
+        );
+        let lock = load.find("SETTINGS_WRITE.lock()").expect("the lock");
+        assert!(lock < load.find("get_settings_path(app)?").unwrap());
+        assert!(lock < load.find("save_settings_inner(").unwrap());
     }
 
     /// WIN-FIX-3: "53" and custom ports, which no relay answers, load as
