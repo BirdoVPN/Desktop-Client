@@ -105,10 +105,31 @@ pub(crate) struct StallWatch {
     suspect: Option<(Instant, Instant)>,
 }
 
+/// The packet path's last sign of progress (WIN3-012): its last timer tick,
+/// or — while the send thread holds a packet — when it took that packet, if
+/// that is older.
+///
+/// The two halves run apart: the receive task ticks boringtun's timers, the
+/// send thread (adapter → relay) wakes per packet. Watching the tick alone, a
+/// send thread stuck with a packet in hand (sealing, or in a log write)
+/// stopped all outbound traffic while ticks, keepalives and handshakes went
+/// on, and nothing fired: `peer_unresponsive` needs traffic waiting, and the
+/// tick looked healthy. The UI stayed Protected.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn packet_path_progress(
+    tick: Option<Instant>,
+    outbound_since: Option<Instant>,
+) -> Option<Instant> {
+    match (tick, outbound_since) {
+        (Some(tick), Some(held)) => Some(tick.min(held)),
+        (tick, held) => tick.or(held),
+    }
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl StallWatch {
-    /// One look at a packet path that last ticked at `last_tick`: has it
-    /// stalled?
+    /// One look at a packet path whose last progress was at `last_tick`
+    /// ([`packet_path_progress`]): has it stalled?
     pub(crate) fn observe(&mut self, last_tick: Option<Instant>, now: Instant) -> bool {
         let Some(tick) = last_tick.filter(|_| packet_path_stalled(last_tick, now)) else {
             self.suspect = None;
@@ -439,6 +460,8 @@ pub struct WireGuardSession {
     latency_ms: AtomicU32,
     /// When the packet path last ticked boringtun's timers.
     last_tick: FastMutex<Option<Instant>>,
+    /// While the send thread holds a packet, when it took it (WIN3-012).
+    outbound_since: FastMutex<Option<Instant>>,
     /// Answers seen from the relay, for the fast dead-path rule.
     responses: FastMutex<ResponseWatch>,
 }
@@ -636,6 +659,7 @@ impl WireGuardSession {
             last_handshake: FastMutex::new(None),
             latency_ms: AtomicU32::new(NO_RTT),
             last_tick: FastMutex::new(None),
+            outbound_since: FastMutex::new(None),
             responses: FastMutex::new(ResponseWatch::default()),
         };
 
@@ -1062,11 +1086,24 @@ impl WireGuardSession {
             .elapsed()
     }
 
-    /// When the packet path last ticked boringtun's timers (`None`: not yet).
-    /// What the stall rule reads ([`StallWatch`]).
+    /// When the packet path last showed progress ([`packet_path_progress`];
+    /// `None`: not yet). What the stall rule reads ([`StallWatch`]).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub fn last_tick(&self) -> Option<Instant> {
-        *self.last_tick.lock()
+    pub fn last_progress(&self) -> Option<Instant> {
+        let tick = *self.last_tick.lock();
+        packet_path_progress(tick, *self.outbound_since.lock())
+    }
+
+    /// The send thread took a packet off the adapter at `at` (WIN3-012).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn outbound_taken(&self, at: Instant) {
+        *self.outbound_since.lock() = Some(at);
+    }
+
+    /// The send thread is done with its packet.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn outbound_done(&self) {
+        *self.outbound_since.lock() = None;
     }
 
     /// Start a handshake now unless one is already in flight.
@@ -1518,7 +1555,7 @@ mod handshake_tests {
                 let age = reader.handshake_age();
                 let rtt = reader.get_latency_ms().await;
                 let unresponsive = reader.peer_unresponsive();
-                let stalled_path = packet_path_stalled(reader.last_tick(), Instant::now());
+                let stalled_path = packet_path_stalled(reader.last_progress(), Instant::now());
                 reader.force_handshake().await;
                 (age, rtt, unresponsive, stalled_path)
             });
@@ -1585,6 +1622,35 @@ mod handshake_tests {
             assert!(body.contains("send_capped(&self.socket(), "), "{signature}");
             assert!(!body.contains(".send("), "{signature}");
         }
+    }
+
+    /// WIN3-012: a send thread stuck with a packet in hand is a stalled
+    /// packet path, however freshly the receive task ticks; one that is done
+    /// with its packet is not judged by it.
+    #[test]
+    fn a_send_thread_stuck_on_a_packet_stalls_the_path() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        assert_eq!(packet_path_progress(None, None), None);
+        assert_eq!(packet_path_progress(Some(t0), None), Some(t0));
+        assert_eq!(packet_path_progress(None, Some(t0)), Some(t0));
+        assert_eq!(packet_path_progress(Some(t0 + s(9)), Some(t0)), Some(t0));
+        assert_eq!(packet_path_progress(Some(t0), Some(t0 + s(1))), Some(t0));
+
+        let mut watch = StallWatch::default();
+        let look = |at: Duration| (packet_path_progress(Some(t0 + at), Some(t0)), t0 + at);
+        let (progress, now) = look(PACKET_PATH_STALL);
+        assert!(!watch.observe(progress, now));
+        let (progress, now) = look(PACKET_PATH_STALL + STALL_CONFIRM);
+        assert!(
+            watch.observe(progress, now),
+            "ticks went on; the send did not"
+        );
+
+        let mut watch = StallWatch::default();
+        let done = packet_path_progress(Some(t0 + s(12)), None);
+        assert!(!watch.observe(done, t0 + s(12)));
+        assert!(!watch.observe(done, t0 + s(14)));
     }
 
     /// The second look must give the path [`STALL_CONFIRM`] to tick, and a

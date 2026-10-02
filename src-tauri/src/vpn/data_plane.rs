@@ -306,6 +306,10 @@ fn send_loop(
         if socket_rx.has_changed().unwrap_or(false) {
             socket = socket_rx.borrow_and_update().clone();
         }
+        // WIN3-012: a packet in hand is progress the stall rule can see stop
+        // (`wireguard_new::packet_path_progress`) — until the logging below
+        // is done too, since a stalled log write holds this thread as well.
+        wg.outbound_taken(Instant::now());
 
         let result = {
             let data = packet.bytes();
@@ -330,6 +334,7 @@ fn send_loop(
         } else if let Some(line) = failures.flush(now) {
             tracing::warn!("{}", line);
         }
+        wg.outbound_done();
     }
     if let Some(line) = failures.flush(Instant::now() + SUMMARY_INTERVAL) {
         tracing::warn!("{}", line);
@@ -524,6 +529,34 @@ mod tests {
             .and_then(|rest| rest.split("/// Adapter → relay.").next())
             .expect("send_blocking");
         assert!(blocking.contains("timeout(CONTROL_SEND_CAP, socket.writable())"));
+    }
+
+    /// WIN3-012: the send thread holds a packet in view of the stall rule
+    /// from the moment it takes it until it is done with it — logging
+    /// included — so a send thread stuck while the receive task ticks on is
+    /// a stalled packet path (`packet_path_progress` is tested beside it).
+    #[test]
+    fn the_send_thread_shows_the_packet_it_holds() {
+        let src = include_str!("data_plane.rs");
+        let send = src
+            .split("fn send_loop(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Relay → adapter").next())
+            .expect("send_loop");
+        let mut last = 0;
+        for needle in [
+            "session.receive_blocking()",
+            "wg.outbound_taken(Instant::now());",
+            "wg.seal(data, &mut sealed)",
+            "drop(packet);",
+            "tracing::warn!",
+            "wg.outbound_done();",
+        ] {
+            let at = send[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+            last += at + needle.len();
+        }
     }
 
     /// The sealing buffer takes any packet Wintun can hand out, plus framing.

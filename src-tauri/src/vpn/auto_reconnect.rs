@@ -909,7 +909,7 @@ impl ReconnectLoop {
         #[cfg(target_os = "windows")]
         if session
             .stall
-            .observe(vm.packet_path_tick().await, Instant::now())
+            .observe(vm.packet_path_progress().await, Instant::now())
         {
             tracing::warn!("The tunnel's packet path stopped running — declaring the tunnel dead");
             return Liveness::Dead(DropCause::PacketPathStalled);
@@ -1720,7 +1720,7 @@ mod tests {
 
         let liveness = body("async fn check_liveness(");
         let stall = liveness
-            .find("ifsession.stall.observe(vm.packet_path_tick().await,Instant::now()){")
+            .find("ifsession.stall.observe(vm.packet_path_progress().await,Instant::now()){")
             .expect("the stall rule");
         let fast = liveness
             .find("vm.peer_unresponsive().await")
