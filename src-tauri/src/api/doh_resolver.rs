@@ -70,9 +70,16 @@ pub struct DohApiResolver {
 }
 
 impl DohApiResolver {
+    /// Every resolver shares ONE cache, process-wide. A one-off client (the
+    /// deletion around the tunnel, the old-key probe's fresh connections)
+    /// then finds the address the main client already resolved, instead of
+    /// needing DoH at the worst moment: behind a block, just after a
+    /// teardown, where a failed DoH lookup has no fallback that works
+    /// (WIN3-001).
     pub fn new() -> Self {
+        static SHARED: std::sync::OnceLock<Arc<Mutex<CacheMap>>> = std::sync::OnceLock::new();
         Self {
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::clone(SHARED.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))),
         }
     }
 }
@@ -208,6 +215,16 @@ mod tests {
         cache_put(&cache, "api.birdo.app", vec![sample_addr()], CACHE_TTL);
         let got = cache_get(&cache, "api.birdo.app").expect("entry should be cached");
         assert_eq!(got, vec![sample_addr()]);
+    }
+
+    /// WIN3-001: what one client resolved, every other client finds.
+    #[test]
+    fn every_resolver_shares_one_cache() {
+        let main = DohApiResolver::new();
+        let one_off = DohApiResolver::new();
+        let host = "shared-cache.test.invalid";
+        cache_put(&main.cache, host, vec![sample_addr()], CACHE_TTL);
+        assert_eq!(cache_get(&one_off.cache, host), Some(vec![sample_addr()]));
     }
 
     #[test]

@@ -290,6 +290,33 @@ impl BirdoApi {
         }
     }
 
+    /// This API on a client that keeps no idle connection, so every request
+    /// it sends opens a fresh one — bound to `local` when given, like
+    /// [`client_around_the_tunnel`]. The tokens and the refresh lock are
+    /// shared: a 401 is refreshed exactly as on the main client.
+    ///
+    /// WIN3-001: for a request sent right after a tunnel teardown. The main
+    /// client's pool keeps the keep-alive connections the heartbeats opened
+    /// THROUGH the tunnel, from an address the teardown has just removed, and
+    /// hands one out until it notices; a request written into it fails at
+    /// once.
+    pub(crate) fn on_fresh_connections(
+        &self,
+        local: Option<std::net::IpAddr>,
+    ) -> Result<Self, ApiError> {
+        let client = hardened_client_builder()
+            .pool_max_idle_per_host(0)
+            .local_address(local)
+            .build()
+            .map_err(|e| ApiError::Unknown(e.to_string()))?;
+        Ok(Self {
+            client,
+            access_token: Arc::clone(&self.access_token),
+            refresh_token: Arc::clone(&self.refresh_token),
+            refresh_lock: Arc::clone(&self.refresh_lock),
+        })
+    }
+
     /// Set authentication tokens
     pub async fn set_tokens(&self, access: String, refresh: String) {
         *self.access_token.write().await = Some(Zeroizing::new(access));
@@ -1460,6 +1487,31 @@ mod around_the_tunnel_tests {
             .unwrap_err();
         assert!(!never_left(&lost), "{lost:?}");
         server.await.unwrap();
+    }
+
+    /// WIN3-001: the old-key probe's client is the hardened one with nothing
+    /// kept idle, so no request on it can be handed a connection the tunnel
+    /// teardown left dead; and it is the same session, so a refresh on one is
+    /// seen by the other.
+    #[tokio::test]
+    async fn fresh_connections_share_the_session_and_keep_nothing_idle() {
+        let api = super::BirdoApi::new();
+        let fresh = api
+            .on_fresh_connections(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+            .expect("bound");
+        assert!(api.on_fresh_connections(None).is_ok());
+        api.set_tokens("access".into(), "refresh".into()).await;
+        assert_eq!(fresh.access_token_value().await.as_deref(), Some("access"));
+        assert!(std::sync::Arc::ptr_eq(
+            &api.refresh_lock,
+            &fresh.refresh_lock
+        ));
+
+        let source = include_str!("client.rs");
+        let fresh = &source[source.find("fn on_fresh_connections(").unwrap()..];
+        let fresh = &fresh[..fresh.find("\n    }").unwrap()];
+        assert!(fresh.contains("hardened_client_builder()"), "{fresh}");
+        assert!(fresh.contains(".pool_max_idle_per_host(0)"), "{fresh}");
     }
 
     /// The client around the tunnel is the hardened one, only bound.

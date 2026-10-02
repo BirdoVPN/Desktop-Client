@@ -1188,13 +1188,24 @@ impl ReconnectLoop {
     /// permit, like the re-dial it precedes. Bounded, so an outage only
     /// costs [`OLD_KEY_PROBE_TIMEOUT`]. `Some` ends the session
     /// (`reconnect_policy::after_teardown`).
+    ///
+    /// WIN3-001: no answer re-dials, and the re-dial evicts the device that
+    /// took the slot, so the probe must not fail for reasons of its own. Live,
+    /// it failed in 0.4 s: the shared client handed it a keep-alive connection
+    /// the heartbeats had opened through the tunnel the teardown had just
+    /// removed. It now sends on connections of its own (bound to the physical
+    /// address on Windows) and asks once more if a request fails.
     async fn ask_the_old_key(&mut self, key_id: &str, now: Instant) -> Option<IpcError> {
+        #[cfg(target_os = "windows")]
+        let local = network_events::physical_source_address();
+        #[cfg(not(target_os = "windows"))]
+        let local = None;
+        let api = self.api.on_fresh_connections(local).unwrap_or_else(|e| {
+            tracing::warn!("Old-key probe: no client of its own ({e}); using the shared one");
+            (*self.api).clone()
+        });
         let reply = tokio::select! {
-            r = timeout(OLD_KEY_PROBE_TIMEOUT, self.api.heartbeat(key_id)) => match r {
-                Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(_)) => Err("request failed"),
-                Err(_) => Err("no answer in time"),
-            },
+            r = ask_twice(OLD_KEY_PROBE_TIMEOUT, || api.heartbeat(key_id)) => r,
             _ = self.shutdown.changed() => Err("shutting down"),
         };
         let alive = reconnect_policy::recently_alive(
@@ -1312,6 +1323,33 @@ async fn request_fresh_response(
         ));
     }
     Ok(response)
+}
+
+/// Ask, and ask once more if the request FAILED, all inside `budget`
+/// (WIN3-001). A request that ran out of time is not repeated: the budget is
+/// spent. `Err` says which, for the probe's log line.
+async fn ask_twice<T, Fut>(
+    budget: Duration,
+    mut ask: impl FnMut() -> Fut,
+) -> Result<T, &'static str>
+where
+    Fut: std::future::Future<Output = Result<T, crate::api::ApiError>>,
+{
+    let asked = async {
+        match ask().await {
+            Ok(answer) => Ok(answer),
+            Err(first) => {
+                tracing::info!(
+                    "Old-key probe: the request failed ({}) — asking once more",
+                    heartbeat_failure(&first)
+                );
+                ask().await.map_err(|_| "request failed twice")
+            }
+        }
+    };
+    timeout(budget, asked)
+        .await
+        .unwrap_or(Err("no answer in time"))
 }
 
 /// Flush the system DNS cache, off the runtime's worker threads and bounded
@@ -1474,7 +1512,9 @@ mod tests {
         let redial = body("async fn redial(&self, epoch: u64)");
         assert!(redial.contains("timeout(REDIAL_API_TIMEOUT,request_fresh_response("));
         let probe = body("async fn ask_the_old_key(");
-        assert!(probe.contains("timeout(OLD_KEY_PROBE_TIMEOUT,self.api.heartbeat(key_id))"));
+        assert!(probe.contains("ask_twice(OLD_KEY_PROBE_TIMEOUT,||api.heartbeat(key_id))"));
+        let twice = body("async fn ask_twice<");
+        assert!(twice.contains("timeout(budget,asked)"));
 
         let liveness = body("async fn check_liveness(");
         let stall = liveness
@@ -1596,9 +1636,59 @@ mod tests {
         }
         let probe = &source[source.find("async fn ask_the_old_key(").unwrap()..];
         let probe = &probe[..probe.find("\n    }").unwrap()];
-        assert!(probe.contains("timeout(OLD_KEY_PROBE_TIMEOUT, self.api.heartbeat(key_id))"));
+        // WIN3-001: on connections of its own, not the pool the tunnel's
+        // heartbeats left behind.
+        assert!(probe.contains("self.api.on_fresh_connections(local)"));
+        assert!(probe.contains("ask_twice(OLD_KEY_PROBE_TIMEOUT, || api.heartbeat(key_id))"));
         assert!(probe.contains("reconnect_policy::after_teardown("));
         assert_eq!(OLD_KEY_PROBE_TIMEOUT, Duration::from_secs(5));
+    }
+
+    /// WIN3-001: the probe's first request can meet a connection that died
+    /// with the tunnel. It is asked once more inside the same budget, and
+    /// that answer counts. Twice failed is no answer; a probe that ran out of
+    /// time is not asked again.
+    #[tokio::test]
+    async fn an_old_key_probe_that_fails_is_asked_once_more() {
+        use crate::api::ApiError;
+        let budget = Duration::from_secs(5);
+
+        let calls = AtomicUsize::new(0);
+        let answer = ask_twice(budget, || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    Err(ApiError::Network("connection aborted".into()))
+                } else {
+                    Ok("valid:false, revoked")
+                }
+            }
+        })
+        .await;
+        assert_eq!(answer, Ok("valid:false, revoked"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let calls = AtomicUsize::new(0);
+        let answer: Result<(), _> = ask_twice(budget, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(ApiError::Network("connection refused".into())) }
+        })
+        .await;
+        assert_eq!(answer, Err("request failed twice"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a third try");
+
+        let calls = AtomicUsize::new(0);
+        let answer: Result<(), _> = ask_twice(Duration::from_millis(50), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<(), ApiError>>()
+        })
+        .await;
+        assert_eq!(answer, Err("no answer in time"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a spent budget was asked again"
+        );
     }
 
     /// The grace warning goes out once per session, not on every 30 s
