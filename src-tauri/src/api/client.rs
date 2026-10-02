@@ -264,6 +264,25 @@ pub(crate) fn never_left(error: &reqwest::Error) -> bool {
     error.is_connect()
 }
 
+/// `work` to its end on a task of its own, holding `lock` until it is done.
+/// Dropping the caller drops neither (see `BirdoApi::refresh_detached`).
+async fn run_holding<T: Send + 'static>(
+    lock: tokio::sync::OwnedMutexGuard<()>,
+    work: impl std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::spawn(async move {
+        let done = work.await;
+        drop(lock);
+        done
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(ApiError::Unknown(format!(
+            "the token refresh did not finish: {e}"
+        )))
+    })
+}
+
 /// The body of a POST that carries nothing: `{}`. Never `&()` — serde writes
 /// the unit as `null`, which the backend's strict JSON parser answers with 400
 /// before any handler runs. Every heartbeat since v1.0.0 died that way, so the
@@ -560,9 +579,9 @@ impl BirdoApi {
                 {
                     // Same serialisation as request_with_retry: only refresh if
                     // nobody else already did while we waited for the lock.
-                    let _guard = self.refresh_lock.lock().await;
+                    let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
                     if self.access_token_value().await == token_before {
-                        self.refresh_token_internal()
+                        self.refresh_detached(lock)
                             .await
                             .map_err(super::session_gate::error_after_failed_refresh)?;
                     }
@@ -1091,7 +1110,7 @@ impl BirdoApi {
             if has_refresh {
                 // H-1 FIX: Serialize token refresh attempts to prevent concurrent
                 // refreshes from racing and overwriting each other's tokens.
-                let _guard = self.refresh_lock.lock().await;
+                let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
                 // Re-check: another task may have already refreshed while we
                 // waited on the lock. Only if the token actually CHANGED is a
                 // pre-refresh retry worth a round-trip; otherwise go straight to
@@ -1103,7 +1122,7 @@ impl BirdoApi {
                     }
                 }
                 tracing::info!("Got 401 — attempting transparent token refresh");
-                match self.refresh_token_internal().await {
+                match self.refresh_detached(lock).await {
                     Ok(_) => {
                         tracing::info!("Token refreshed successfully, retrying request");
                         // Retry the original request with the new token
@@ -1159,7 +1178,28 @@ impl BirdoApi {
         self.handle_response(response).await
     }
 
-    /// Internal: refresh access token (used by retry interceptor)
+    /// The refresh, run to its end whatever happens to the caller: on a task
+    /// of its own that holds `lock` — the refresh lock, taken by the caller —
+    /// until the rotated pair is stored (WIN3-004).
+    ///
+    /// The refresh used to run inside the request that met the 401, and the
+    /// heartbeat (10 s) and the re-dial (45 s) cap theirs. A cap that fired
+    /// after `/auth/refresh` reached the server dropped the rotated pair, and
+    /// the client kept the refresh token the server had just CONSUMED: the
+    /// next refresh signed the user out, or, past the server's 30 s rotation
+    /// grace, read as token theft and revoked every session and WireGuard
+    /// peer on the account. Holding the lock to the end also stops a second
+    /// refresh from presenting that consumed token while the first is out.
+    async fn refresh_detached(
+        &self,
+        lock: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), ApiError> {
+        let api = self.clone();
+        run_holding(lock, async move { api.refresh_token_internal().await }).await
+    }
+
+    /// Internal: refresh the access token. Only ever run through
+    /// [`refresh_detached`](Self::refresh_detached).
     async fn refresh_token_internal(&self) -> Result<(), ApiError> {
         let refresh = self
             .refresh_token
@@ -1579,6 +1619,78 @@ mod token_restore_tests {
         assert_eq!(
             refresh_in_memory(&api).await.as_deref(),
             Some("rotated-refresh")
+        );
+    }
+
+    /// WIN3-004: the refresh outlives a caller whose cap fired (the
+    /// heartbeat's 10 s, the re-dial's 45 s) while `/auth/refresh` was out:
+    /// the server's answer, which carries the rotated pair, is still stored.
+    /// And it keeps the refresh lock until then, so no second refresh
+    /// presents the token the first one is consuming.
+    #[tokio::test]
+    async fn a_refresh_outlives_a_caller_that_gave_up_on_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let stored = Arc::new(AtomicBool::new(false));
+        let (server, answer) = tokio::sync::oneshot::channel::<()>();
+        let refresh = {
+            let stored = Arc::clone(&stored);
+            async move {
+                let _ = answer.await;
+                stored.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let caller = super::run_holding(Arc::clone(&lock).lock_owned().await, refresh);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), caller)
+                .await
+                .is_err(),
+            "the cap fires first"
+        );
+        assert!(lock.try_lock().is_err(), "the lock went with the caller");
+
+        let _ = server.send(());
+        let _next = tokio::time::timeout(Duration::from_secs(5), lock.lock())
+            .await
+            .expect("the refresh never finished");
+        assert!(
+            stored.load(Ordering::SeqCst),
+            "the rotated pair was dropped"
+        );
+    }
+
+    /// WIN3-004, the wiring: every refresh after a 401 goes through the
+    /// detached runner, with the lock handed to it.
+    #[test]
+    fn every_refresh_after_a_401_is_detached() {
+        const SOURCE: &str = include_str!("client.rs");
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        for signature in [
+            "async fn request_with_retry<",
+            "pub async fn delete_account(",
+        ] {
+            let body = fn_body(signature);
+            assert!(
+                body.contains("Arc::clone(&self.refresh_lock).lock_owned().await"),
+                "{signature}"
+            );
+            assert!(body.contains("self.refresh_detached(lock)"), "{signature}");
+        }
+        assert!(fn_body("async fn refresh_detached(")
+            .contains("run_holding(lock, async move { api.refresh_token_internal().await })"));
+        let code = &SOURCE[..SOURCE.find("mod empty_body_tests").unwrap()];
+        assert_eq!(
+            code.matches(".refresh_token_internal()").count(),
+            1,
+            "a refresh run inline"
         );
     }
 
