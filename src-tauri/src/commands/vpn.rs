@@ -393,6 +393,28 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     }
 }
 
+/// Bring the kill switch's process-wide settings back in line with the
+/// settings file, and rebuild a block in force with them (WIN3-005).
+///
+/// Every connect attempt applies its settings' kill-switch side — the
+/// exceptions, LAN sharing, lockdown — process-wide before it dials
+/// ([`apply_vpn_settings`]). A reapply that failed and was reverted left the
+/// FAILED values there: an app the user had just excepted, which the file and
+/// the UI now say is not, got out on the physical NIC through the next block.
+/// A block in force now (lockdown holds one for the whole session) is rebuilt
+/// at once; any later one reads the restored values.
+async fn reapply_kill_switch_settings(app: &AppHandle) {
+    apply_vpn_settings(app).await;
+    if crate::commands::killswitch::platform_is_blocking() {
+        if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
+            tracing::warn!(
+                "Could not rebuild the kill switch's block with the restored settings: {}",
+                e
+            );
+        }
+    }
+}
+
 fn stealth_failed(detail: impl AsRef<str>) -> IpcError {
     IpcError::new(IpcErrorCode::StealthFailed, detail)
 }
@@ -1010,6 +1032,7 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
         tracing::error!("Could not save the previous settings back: {}", e);
         return Err(error);
     }
+    reapply_kill_switch_settings(&app).await;
     if plan == FailedReapply::RestoreSettings {
         return Ok(ReapplyOutcome::Reverted);
     }
@@ -1136,6 +1159,9 @@ mod tests {
             "let rebuild = connect_session_for(&app, target.clone(), purpose, None)",
             "failed_reapply(",
             "restore_tunnel_settings(&app, &previous)",
+            // WIN3-005: the failed attempt's kill-switch globals go, before
+            // either outcome — the session kept, or rebuilt on the old ones.
+            "reapply_kill_switch_settings(&app).await;",
             "FailedReapply::RestoreSettings",
             "let Some(rebuild_epoch) = rebuild.epoch else {",
             "connect_session_for(&app, target, purpose, Some(rebuild_epoch))",
@@ -1154,6 +1180,43 @@ mod tests {
             serde_json::to_value(ReapplyOutcome::NotConnected).unwrap(),
             serde_json::json!("not_connected")
         );
+    }
+
+    /// WIN3-005: a reverted reapply puts the kill switch's side back too —
+    /// the globals from the restored file, and a block in force rebuilt with
+    /// them. A source pin: both halves need an `AppHandle` and the real WFP
+    /// engine, which a unit test must not touch.
+    #[test]
+    fn a_reverted_reapply_puts_the_kill_switch_settings_back() {
+        let source = include_str!("vpn.rs");
+        let body = &source[source
+            .find("async fn reapply_kill_switch_settings(")
+            .unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let mut last = 0;
+        for needle in [
+            "apply_vpn_settings(app).await;",
+            "killswitch::platform_is_blocking()",
+            "killswitch::activate_killswitch().await",
+        ] {
+            let at = body[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+            last += at + needle.len();
+        }
+        // What apply_vpn_settings sets is exactly the kill switch's side.
+        let apply = &source[source
+            .find("pub(super) async fn apply_vpn_settings(")
+            .unwrap()..];
+        let apply = &apply[..apply.find("\n}").unwrap()];
+        for global in [
+            "killswitch::set_lan_sharing(local_network_sharing)",
+            "wfp::set_local_network_sharing(local_network_sharing)",
+            "wfp::set_lockdown_mode(lockdown_mode)",
+            "wfp::set_split_tunnel_apps(split_tunnel_apps)",
+        ] {
+            assert!(apply.contains(global), "{global}");
+        }
     }
 
     /// WIN-FIX-3: the relays take WireGuard on 51820 only. "53" and custom
