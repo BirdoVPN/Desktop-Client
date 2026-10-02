@@ -50,6 +50,10 @@ const EXIT_TEARDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(15
 /// it exits without the teardown (WIN-FIX-3, see `RunEvent::ExitRequested`).
 const EXIT_FALLBACK_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What the exit fallback gives its own last steps (the log line, the DNS
+/// restore) before it exits regardless (WIN3-006).
+const EXIT_FALLBACK_CLEANUP: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Best-effort teardown run while an exit request is held open. It is the SAME
 /// teardown as a user Disconnect (`session::end_session`): quitting IS the user
 /// ending the session, so the kill switch is disarmed unconditionally — on
@@ -697,16 +701,32 @@ fn main() {
                     // This thread needs nothing from the runtime: past the cap
                     // it puts back what an older build parked and exits, and
                     // the WFP block, a dynamic session, goes with the process.
+                    //
+                    // WIN3-006: and it needs nothing the wedged teardown may
+                    // hold. The log line writes birdo.log, the DNS restore
+                    // takes the machine-state lock and WFP's engine; either can
+                    // be what the teardown is stuck in. They get a few seconds
+                    // on a thread of their own, and the exit does not wait for
+                    // them past that.
                     let _ = std::thread::Builder::new()
                         .name("birdo-exit-fallback".into())
                         .spawn(|| {
                             std::thread::sleep(EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN);
                             if !EXIT_TEARDOWN_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-                                error!("Exit teardown never ran to its end — exiting without it");
-                                #[cfg(target_os = "windows")]
-                                {
-                                    let _ = vpn::win_machine_state::release_dns_at_exit();
-                                }
+                                utils::run_on_helper_for(
+                                    "birdo-exit-cleanup",
+                                    EXIT_FALLBACK_CLEANUP,
+                                    || {
+                                        error!(
+                                            "Exit teardown never ran to its end — exiting \
+                                             without it"
+                                        );
+                                        #[cfg(target_os = "windows")]
+                                        {
+                                            let _ = vpn::win_machine_state::release_dns_at_exit();
+                                        }
+                                    },
+                                );
                                 std::process::exit(0);
                             }
                         });

@@ -66,6 +66,25 @@ pub async fn run_bounded(
     }
 }
 
+/// Run `work` on a thread of its own and wait for it at most `limit`; `true`
+/// if it finished. Whatever `work` waits on — a lock a wedged teardown holds,
+/// a log write that does not return — holds that thread, never the caller
+/// past `limit` (WIN3-006: the exit fallback must exit).
+pub fn run_on_helper_for(
+    name: &str,
+    limit: std::time::Duration,
+    work: impl FnOnce() + Send + 'static,
+) -> bool {
+    let (done, finished) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            work();
+            let _ = done.send(());
+        });
+    spawned.is_ok() && finished.recv_timeout(limit).is_ok()
+}
+
 /// This install's device identifier: a random `desktop_<uuid-v4>`, persisted
 /// per install and rotated on account deletion (not on sign-out). See
 /// `utils::device_id` for why it is no longer derived from the machine.
@@ -155,6 +174,42 @@ mod bounded_process_tests {
         .await
         .expect("cmd.exe runs");
         assert!(String::from_utf8_lossy(&out.stdout).contains("birdo"));
+    }
+
+    /// WIN3-006: work that waits on a lock nobody releases — the machine
+    /// state, WFP's engine or the log writer, held by a wedged teardown —
+    /// costs the caller the limit, and no more.
+    #[test]
+    fn a_wedged_helper_never_holds_the_caller() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let lock = Arc::new(Mutex::new(()));
+        let held = lock.lock().unwrap();
+        let wanted = Arc::clone(&lock);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::run_on_helper_for(
+                "test-wedged",
+                Duration::from_millis(100),
+                move || {
+                    let _wedged = wanted.lock();
+                },
+            ));
+        });
+        let finished = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the caller waited on the lock");
+        assert!(!finished);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(held);
+
+        assert!(super::run_on_helper_for(
+            "test-quick",
+            Duration::from_secs(5),
+            || {}
+        ));
     }
 }
 
