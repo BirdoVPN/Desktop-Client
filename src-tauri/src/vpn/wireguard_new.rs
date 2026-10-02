@@ -1568,6 +1568,25 @@ mod handshake_tests {
         assert!(watch.observe(Some(last), last + PACKET_PATH_STALL + s(5)));
     }
 
+    /// WIN3-013: the sends off the packet path are capped like the ones on
+    /// it (`data_plane`'s pin covers the receive loop). A forced handshake,
+    /// a rebind or a timer tick whose UDP send waited unbounded held up the
+    /// reconnect loop's step, or the unix packet loop, with it.
+    #[test]
+    fn every_control_send_off_the_packet_path_is_capped() {
+        let source = include_str!("wireguard_new.rs");
+        for signature in [
+            "pub async fn force_handshake(&self)",
+            "pub(crate) async fn rebind(&self)",
+            "pub async fn update_timers(&self)",
+        ] {
+            let body = &source[source.find(signature).expect(signature)..];
+            let body = &body[..body.find("\n    }").expect("end of fn")];
+            assert!(body.contains("send_capped(&self.socket(), "), "{signature}");
+            assert!(!body.contains(".send("), "{signature}");
+        }
+    }
+
     /// The second look must give the path [`STALL_CONFIRM`] to tick, and a
     /// looker that was itself away as long as the rule's window starts over.
     #[test]
