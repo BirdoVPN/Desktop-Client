@@ -259,6 +259,8 @@ const STOP_GRACE: Duration = Duration::from_secs(35);
 struct LoopTask {
     shutdown: watch::Sender<bool>,
     handle: JoinHandle<()>,
+    /// The loop's generation, as it checks in (see `Beat`).
+    generation: u64,
 }
 
 /// The Free-allowance grace warning (birdo-web #590): at most once per
@@ -349,6 +351,22 @@ impl Pulse {
 
     fn read(&self) -> Option<Beat> {
         *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Give the loop of `generation` a fresh `allowance` from now — only
+    /// while its beat is still the one on record. A loop that ended has
+    /// cleared it, and a cleared pulse stays clear: re-beating it is what had
+    /// the watchdog restart a loop that had already finished (WIN3-008).
+    fn renew(&self, generation: u64, allowance: Duration) -> bool {
+        let mut beat = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match beat.as_mut() {
+            Some(b) if b.generation == generation => {
+                b.at = Instant::now();
+                b.allowance = allowance;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The loop of `generation` is gone: there is nothing to watch.
@@ -496,6 +514,12 @@ impl AutoReconnectService {
     /// (`main.rs`).
     pub async fn start(&self) -> Result<(), String> {
         let mut task = self.task.lock().await;
+        self.start_locked(&mut task).await
+    }
+
+    /// [`start`](Self::start) with the task slot already held, so a restart
+    /// can replace a loop in ONE hold of it (WIN3-008).
+    async fn start_locked(&self, task: &mut Option<LoopTask>) -> Result<(), String> {
         if task.as_ref().is_some_and(|t| !t.handle.is_finished()) {
             return Ok(());
         }
@@ -541,6 +565,7 @@ impl AutoReconnectService {
         *task = Some(LoopTask {
             shutdown: shutdown_tx,
             handle,
+            generation,
         });
         self.spawn_watchdog(check_interval);
 
@@ -576,16 +601,21 @@ impl AutoReconnectService {
                     if !overdue(silent_for, beat.allowance) {
                         continue;
                     }
+                    // The restart gets a whole allowance before the next
+                    // verdict — unless the loop has ended meanwhile.
+                    if !svc.pulse.renew(beat.generation, beat.allowance) {
+                        continue;
+                    }
                     tracing::error!(
-                    "Auto-reconnect has not checked in for {} s (allowed {} s) — restarting it; \
-                     the kill switch's block is left as it is (blocking: {})",
-                    silent_for.as_secs(),
-                    beat.allowance.as_secs(),
-                    killswitch::platform_is_blocking()
-                );
-                    svc.pulse.beat(beat.generation, beat.allowance);
+                        "Auto-reconnect has not checked in for {} s (allowed {} s) — restarting \
+                         it; the kill switch's block is left as it is (blocking: {})",
+                        silent_for.as_secs(),
+                        beat.allowance.as_secs(),
+                        killswitch::platform_is_blocking()
+                    );
                     let svc = svc.clone();
-                    runtime.spawn(async move { svc.restart_stalled().await });
+                    let generation = beat.generation;
+                    runtime.spawn(async move { svc.restart_stalled(generation).await });
                 }
             });
         if spawned.is_err() {
@@ -594,22 +624,40 @@ impl AutoReconnectService {
         }
     }
 
-    /// Replace a loop that stopped checking in. It is aborted at its current
-    /// await; one stuck in a synchronous call ends at its next one. A loop
-    /// stopped on purpose (`stop` took it) is not brought back.
-    async fn restart_stalled(&self) {
+    /// Replace the loop of `generation`, which stopped checking in. It is
+    /// aborted at its current await; one stuck in a synchronous call ends at
+    /// its next one.
+    ///
+    /// WIN3-008: only that loop, only while it still runs, and in one hold of
+    /// the task slot. A loop stopped on purpose (`stop` took it), one that
+    /// finished on its own (a give-up, which a restart would undo) and a
+    /// newer loop a connect has started since (possibly mid-dial) are all
+    /// left alone; and a `stop` cannot slip in between the abort and the new
+    /// start and miss the loop that start creates.
+    async fn restart_stalled(&self, generation: u64) {
+        let mut task = self.task.lock().await;
+        if !task
+            .as_ref()
+            .is_some_and(|t| t.generation == generation && !t.handle.is_finished())
         {
-            let mut task = self.task.lock().await;
-            let Some(LoopTask { shutdown, handle }) = task.take() else {
-                return;
-            };
-            let _ = shutdown.send(true);
-            handle.abort();
+            return;
         }
-        self.restarts.fetch_add(1, Ordering::SeqCst);
-        if let Err(e) = self.start().await {
+        let Some(LoopTask {
+            shutdown, handle, ..
+        }) = task.take()
+        else {
+            return;
+        };
+        let _ = shutdown.send(true);
+        handle.abort();
+        // A loop parked at an await is gone at once; wait that moment, so the
+        // new one never runs beside it. One stuck in a synchronous call is
+        // not waited for.
+        let _ = timeout(Duration::from_secs(1), handle).await;
+        if let Err(e) = self.start_locked(&mut task).await {
             tracing::error!("The auto-reconnect loop could not be restarted: {}", e);
         }
+        self.restarts.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Stop the loop and WAIT for it to exit (W1-018: `stop()` used to flip a
@@ -617,7 +665,10 @@ impl AutoReconnectService {
     /// old loop running beside the new one).
     pub async fn stop(&self) {
         let mut task = self.task.lock().await;
-        let Some(LoopTask { shutdown, handle }) = task.take() else {
+        let Some(LoopTask {
+            shutdown, handle, ..
+        }) = task.take()
+        else {
             return;
         };
         let _ = shutdown.send(true);
@@ -1527,6 +1578,71 @@ mod tests {
         svc.stop().await;
         assert_eq!(svc.live_loops(), 0);
         assert!(svc.pulse.read().is_none(), "a stopped loop is not watched");
+    }
+
+    /// The generation of the loop that is running now, if one is.
+    async fn running(svc: &AutoReconnectService) -> Option<u64> {
+        svc.task
+            .lock()
+            .await
+            .as_ref()
+            .filter(|t| !t.handle.is_finished())
+            .map(|t| t.generation)
+    }
+
+    /// WIN3-008: a restart replaces exactly the loop the watchdog judged,
+    /// and only while it still runs. A loop `stop()` took, a newer one a
+    /// connect has started since (possibly mid-dial), and one that finished
+    /// on its own (a give-up, which a restart would undo) are left alone —
+    /// and a pulse a finished loop cleared is never brought back.
+    #[tokio::test]
+    async fn a_restart_replaces_only_the_loop_it_judged() {
+        let svc = service();
+        svc.start().await.unwrap();
+        let stopped = running(&svc).await.expect("a loop");
+        svc.stop().await;
+        svc.restart_stalled(stopped).await;
+        assert_eq!(running(&svc).await, None, "a stopped loop came back");
+
+        svc.start().await.unwrap();
+        let newer = running(&svc).await.expect("a loop");
+        svc.restart_stalled(stopped).await;
+        assert_eq!(
+            running(&svc).await,
+            Some(newer),
+            "a newer loop was replaced"
+        );
+
+        svc.task.lock().await.as_ref().unwrap().handle.abort();
+        wait_until("the loop to finish", || {
+            svc.task
+                .try_lock()
+                .is_ok_and(|t| t.as_ref().is_some_and(|t| t.handle.is_finished()))
+        })
+        .await;
+        svc.restart_stalled(newer).await;
+        assert_eq!(running(&svc).await, None, "a finished loop was restarted");
+        assert_eq!(svc.restarts.load(Ordering::SeqCst), 0);
+
+        svc.start().await.unwrap();
+        let stuck = running(&svc).await.expect("a loop");
+        svc.restart_stalled(stuck).await;
+        let replaced = running(&svc).await.expect("a new loop");
+        assert_ne!(replaced, stuck);
+        assert_eq!(svc.restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(svc.live_loops(), 1, "the new loop ran beside the old one");
+        svc.stop().await;
+
+        let pulse = Pulse::default();
+        pulse.beat(7, Duration::from_secs(30));
+        assert!(pulse.renew(7, Duration::from_secs(30)));
+        assert!(
+            !pulse.renew(8, Duration::from_secs(30)),
+            "another loop's beat"
+        );
+        pulse.clear(7);
+        assert!(!pulse.renew(7, Duration::from_secs(30)));
+        assert!(pulse.read().is_none(), "a cleared pulse was re-beaten");
     }
 
     #[test]
