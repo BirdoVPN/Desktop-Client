@@ -403,8 +403,21 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
 /// the UI now say is not, got out on the physical NIC through the next block.
 /// A block in force now (lockdown holds one for the whole session) is rebuilt
 /// at once; any later one reads the restored values.
-async fn reapply_kill_switch_settings(app: &AppHandle) {
+///
+/// The rebuild is the failed rebuild's own (REVIEW-WIN4-001): under the commit
+/// lock, and only while its `epoch` is current, the `fail_connect` pattern. A
+/// Disconnect that landed first moved the epoch, and the rebuild is skipped;
+/// one that lands after waits for it and disarms after. Unserialised, a pfctl
+/// or iptables load finishing after the Disconnect's `disarm` left the
+/// block-all in force with no session (macOS, Linux). The process-wide values
+/// are set either way: they only describe the file.
+async fn reapply_kill_switch_settings(app: &AppHandle, epoch: Option<u64>) {
     apply_vpn_settings(app).await;
+    let vm = app.state::<VpnManager>();
+    let _commit = vm.lock_commit().await;
+    if !epoch.is_some_and(|epoch| vm.is_current(epoch)) {
+        return;
+    }
     if crate::commands::killswitch::platform_is_blocking() {
         if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
             tracing::warn!(
@@ -1032,7 +1045,7 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
         tracing::error!("Could not save the previous settings back: {}", e);
         return Err(error);
     }
-    reapply_kill_switch_settings(&app).await;
+    reapply_kill_switch_settings(&app, rebuild.epoch).await;
     if plan == FailedReapply::RestoreSettings {
         return Ok(ReapplyOutcome::Reverted);
     }
@@ -1041,13 +1054,20 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
     // moved the epoch, and then this reconnect begins nothing (`cancelled`):
     // it must never bring back a session the user ended, or a server the
     // user left. A rebuild that never began has nothing to follow up.
+    // Past the restore every error says so: the UI re-reads the settings only
+    // then (REVIEW-WIN4-004).
+    let restored = |mut error: IpcError| {
+        error.settings_restored = true;
+        error
+    };
     let Some(rebuild_epoch) = rebuild.epoch else {
-        return Err(error);
+        return Err(restored(error));
     };
     connect_session_for(&app, target, purpose, Some(rebuild_epoch))
         .await
         .result
         .map(|()| ReapplyOutcome::Reverted)
+        .map_err(restored)
 }
 
 /// What a settings reapply that failed does next (WIN-FIX-3). Pure, so every
@@ -1161,11 +1181,12 @@ mod tests {
             "restore_tunnel_settings(&app, &previous)",
             // WIN3-005: the failed attempt's kill-switch globals go, before
             // either outcome — the session kept, or rebuilt on the old ones.
-            "reapply_kill_switch_settings(&app).await;",
+            "reapply_kill_switch_settings(&app, rebuild.epoch).await;",
             "FailedReapply::RestoreSettings",
             "let Some(rebuild_epoch) = rebuild.epoch else {",
             "connect_session_for(&app, target, purpose, Some(rebuild_epoch))",
             "ReapplyOutcome::Reverted",
+            ".map_err(restored)",
         ] {
             let at = body[last..]
                 .find(needle)
@@ -1196,6 +1217,10 @@ mod tests {
         let mut last = 0;
         for needle in [
             "apply_vpn_settings(app).await;",
+            // REVIEW-WIN4-001: the block only for the session it was asked
+            // for, serialised against a Disconnect's teardown.
+            "let _commit = vm.lock_commit().await;",
+            "vm.is_current(epoch)",
             "killswitch::platform_is_blocking()",
             "killswitch::activate_killswitch().await",
         ] {

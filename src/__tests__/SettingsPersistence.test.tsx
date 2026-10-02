@@ -19,7 +19,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { Settings } from '@/components/Settings';
 import { VpnSettings } from '@/screens/VpnSettings';
 import { defaultSettings, useAppStore } from '@/store/app-store';
-import { cancelScheduledReapply, REAPPLY_REVERTED_COPY } from '@/session/settings-persist';
+import {
+  cancelScheduledReapply,
+  persistSettings,
+  REAPPLY_REVERTED_COPY,
+  REAPPLY_WAIT_MS,
+  scheduleReapply,
+} from '@/session/settings-persist';
 import { settingsToRust } from '@/utils/helpers';
 import { resetUpdater } from '@/session/updater';
 
@@ -248,7 +254,8 @@ describe('a failed save is rolled back and reported (W2-013)', () => {
   // reported as a failure.
   it('a revert the user disconnected under says nothing and shows the saved settings', async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'reapply_vpn_settings') throw { code: 'cancelled', message: 'Cancelled.' };
+      // Rust had saved the previous settings back before the Disconnect.
+      if (cmd === 'reapply_vpn_settings') throw { code: 'cancelled', message: 'Cancelled.', settings_restored: true };
       if (cmd === 'get_settings') return settingsToRust(defaultSettings);
       if (cmd === 'check_biometric_available') return { available: false, enabled: false, method: 'none' };
       return undefined;
@@ -291,6 +298,56 @@ describe('a failed save is rolled back and reported (W2-013)', () => {
     expect(saves()[1].auto_connect).toBe(true);
     expect(useAppStore.getState().settings.quantumProtection).toBe(true);
     expect(useAppStore.getState().settings.autoConnect).toBe(true);
+  });
+
+  // REVIEW-WIN4-004: a failure with nothing saved back (a refused restore: the
+  // settings file could not be verified) leaves the screen as it is. Re-reading
+  // would hydrate the defaults Rust refused to save, and the next save would
+  // write them over the user's file.
+  it('a failed reapply that restored nothing does not re-read the settings', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'reapply_vpn_settings') throw { code: 'server_unreachable', message: 'Unreachable.' };
+      if (cmd === 'get_settings') return settingsToRust(defaultSettings);
+      if (cmd === 'check_biometric_available') return { available: false, enabled: false, method: 'none' };
+      return undefined;
+    });
+    useAppStore.setState({ connectionState: 'connected' });
+    render(<Settings />);
+    const reads = () => mockedInvoke.mock.calls.filter(([c]) => c === 'get_settings').length;
+    const readsBefore = reads();
+    await userEvent.click(screen.getByRole('switch', { name: 'Quantum Protection' }));
+    await waitFor(() => expect(reapplies()).toHaveLength(1), { timeout: 3000 });
+    await waitFor(() => expect(useAppStore.getState().reapplying).toBe(false));
+    expect(reads()).toBe(readsBefore);
+    expect(useAppStore.getState().settings.quantumProtection).toBe(false);
+    expect(useAppStore.getState().notice?.text).toBe("Couldn't apply that change to your live connection.");
+  });
+
+  // REVIEW-WIN4-003: a reapply that never answers holds a save only so long;
+  // then the save re-reads the file and goes on top of it.
+  it('a save waits for a wedged reapply only so long', async () => {
+    vi.useFakeTimers();
+    try {
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === 'reapply_vpn_settings') return new Promise(() => {});
+        if (cmd === 'get_settings') return settingsToRust(defaultSettings);
+        return undefined;
+      });
+      useAppStore.setState({ connectionState: 'connected' });
+      scheduleReapply();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(reapplies()).toHaveLength(1);
+
+      const saved = persistSettings({ killSwitchEnabled: false });
+      await vi.advanceTimersByTimeAsync(REAPPLY_WAIT_MS - 1000);
+      expect(saves()).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(saved).resolves.toBe(true);
+      expect(saves()).toHaveLength(1);
+      expect(saves()[0].killswitch_enabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('an applied change says nothing', async () => {

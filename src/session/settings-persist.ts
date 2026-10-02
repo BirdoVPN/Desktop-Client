@@ -30,6 +30,33 @@ export const REAPPLY_REVERTED_COPY = "Couldn't apply that change — your previo
 /** The live reapply in flight, if any (see `persistSettings`). */
 let reapplyInFlight: Promise<void> | null = null;
 
+/**
+ * How long a save waits for a reapply in flight (REVIEW-WIN4-003). A reapply
+ * that wedged must not hold every later save, Kill Switch OFF included; past
+ * this the save re-reads what is on disk and goes on top of it.
+ */
+export const REAPPLY_WAIT_MS = 45_000;
+
+/** Whether the reapply's error says Rust saved the previous settings back. */
+function settingsRestored(e: unknown): boolean {
+  if (typeof e !== 'object' || e === null) return false;
+  const o = e as Record<string, unknown>;
+  return o.settingsRestored === true || o.settings_restored === true;
+}
+
+/** `p` settled within `ms` (true), or the time ran out first (false). */
+async function settledWithin(p: Promise<void>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([p.then(() => true), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function runReapply(): Promise<void> {
   const run = reapply().finally(() => {
     if (reapplyInFlight === run) reapplyInFlight = null;
@@ -51,10 +78,12 @@ async function reapply(): Promise<void> {
       useAppStore.getState().showNotice({ text: REAPPLY_REVERTED_COPY, tone: 'danger' });
     }
   } catch (e) {
-    // Rust may have saved the previous settings back before this failed (a
-    // revert whose reconnect failed, or that a Disconnect came before): show
-    // what is saved, or the next save writes the failed value back.
-    await loadSettings();
+    // Rust saved the previous settings back before this failed (a revert
+    // whose reconnect failed, or that a Disconnect came before): show what is
+    // saved, or the next save writes the failed value back. Only then: a
+    // restore Rust refused saved nothing, and re-reading an unverifiable file
+    // hydrates the defaults the next save would write over it (REVIEW-WIN4-004).
+    if (settingsRestored(e)) await loadSettings();
     // The user's own Disconnect (or a newer connect) superseded the rebuild:
     // nothing went wrong that they did not ask for (WIN3-002).
     if (isSilentError(toIpcError(e))) return;
@@ -86,10 +115,11 @@ export function scheduleReapply(): void {
   }, REAPPLY_DEBOUNCE_MS);
 }
 
-/** For tests: drop a pending debounced reapply. */
+/** For tests: drop a pending debounced reapply, and forget one in flight. */
 export function cancelScheduledReapply(): void {
   if (reapplyTimer) clearTimeout(reapplyTimer);
   reapplyTimer = null;
+  reapplyInFlight = null;
 }
 
 /**
@@ -115,7 +145,7 @@ export async function persistSettings(
   useAppStore.getState().updateSettings(patch);
   if (reapplyInFlight) {
     const original = before;
-    await reapplyInFlight;
+    if (!(await settledWithin(reapplyInFlight, REAPPLY_WAIT_MS))) await loadSettings();
     // What a failed save puts back: what the reapply re-read from disk, or,
     // for a key it did not touch, what the key was.
     const settled = useAppStore.getState().settings;

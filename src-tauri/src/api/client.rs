@@ -1225,13 +1225,14 @@ impl BirdoApi {
             .await
             .inspect_err(super::session_gate::report_refresh_failure)?;
 
-        *self.access_token.write().await = Some(Zeroizing::new(response.access_token.clone()));
-        // FIX C-1: Also update refresh token if rotated
-        if let Some(new_refresh) = response.refresh_token.clone() {
-            *self.refresh_token.write().await = Some(Zeroizing::new(new_refresh));
-        }
-
-        // Persist the rotated pair to the OS keystore.
+        // REVIEW-WIN4-002: adopted only by the session that asked. A refresh
+        // runs detached (WIN3-004), so it can outlive a Sign Out, or a sign-in
+        // to another account, that cleared or replaced the tokens; writing
+        // them back would sign the user in again at the next launch, or put
+        // one account's tokens over another's.
+        //
+        // Persisted to the OS keystore under the same hold, so a Sign Out that
+        // waits for it clears the keystore after it, never before.
         //
         // The server ROTATES refresh tokens and treats a second use of a consumed
         // one as token THEFT — which revokes the whole session server-side. This
@@ -1240,31 +1241,60 @@ impl BirdoApi {
         // one and the next app launch replays it: the user is force-signed-out and
         // the backend records a theft event against a legitimate client.
         //
-        // Latent until now only because the keystore was a mock that persisted
-        // nothing; making persistence work makes this reachable, so the two must
-        // ship together. Best-effort: a keystore failure must not fail the request
-        // that triggered the refresh — the in-memory tokens are still valid for
-        // this session — but it is logged loudly because it costs the next one.
-        {
-            use crate::storage::credentials::{CredentialKey, CredentialStore};
-            // `None` means the server did not rotate, so the stored refresh
-            // token is still current and must be left alone.
-            let refresh_to_store = response.refresh_token.clone();
-            if let Err(e) =
-                CredentialStore::store(CredentialKey::AccessToken, &response.access_token)
-            {
-                tracing::error!("Could not persist refreshed access token ({e})");
-            }
-            if let Some(rotated) = refresh_to_store {
-                if let Err(e) = CredentialStore::store(CredentialKey::RefreshToken, &rotated) {
-                    tracing::error!(
-                        "Could not persist ROTATED refresh token ({e}) — the next launch will \
-                         replay a consumed token and the session will be revoked"
-                    );
-                }
-            }
+        // Best-effort: a keystore failure must not fail the request that
+        // triggered the refresh — the in-memory tokens are still valid for this
+        // session — but it is logged loudly because it costs the next one.
+        let adopted = self
+            .adopt_refreshed(
+                refresh.as_str(),
+                response.access_token,
+                response.refresh_token,
+                |access, rotated| {
+                    use crate::storage::credentials::{CredentialKey, CredentialStore};
+                    if let Err(e) = CredentialStore::store(CredentialKey::AccessToken, access) {
+                        tracing::error!("Could not persist refreshed access token ({e})");
+                    }
+                    // `None` means the server did not rotate, so the stored
+                    // refresh token is still current and must be left alone.
+                    if let Some(rotated) = rotated {
+                        if let Err(e) = CredentialStore::store(CredentialKey::RefreshToken, rotated)
+                        {
+                            tracing::error!(
+                                "Could not persist ROTATED refresh token ({e}) — the next launch                                  will replay a consumed token and the session will be revoked"
+                            );
+                        }
+                    }
+                },
+            )
+            .await;
+        if !adopted {
+            tracing::info!("The session ended while a token refresh ran — its tokens are dropped");
+            return Err(ApiError::NotAuthenticated);
         }
         Ok(())
+    }
+
+    /// Store a refresh's result only if the refresh token it presented is
+    /// still this client's, in the lock order of `clear_tokens_if` (access,
+    /// then refresh). `persist` runs under both locks.
+    async fn adopt_refreshed(
+        &self,
+        presented: &str,
+        access: String,
+        rotated: Option<String>,
+        persist: impl FnOnce(&str, Option<&str>),
+    ) -> bool {
+        let mut access_slot = self.access_token.write().await;
+        let mut refresh_slot = self.refresh_token.write().await;
+        if refresh_slot.as_ref().map(|t| t.as_str()) != Some(presented) {
+            return false;
+        }
+        persist(&access, rotated.as_deref());
+        *access_slot = Some(Zeroizing::new(access));
+        if let Some(rotated) = rotated {
+            *refresh_slot = Some(Zeroizing::new(rotated));
+        }
+        true
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str, auth: bool) -> Result<T, ApiError> {
@@ -1692,6 +1722,49 @@ mod token_restore_tests {
             1,
             "a refresh run inline"
         );
+    }
+
+    /// REVIEW-WIN4-002: a refresh that outlived its session never puts the
+    /// tokens back: not after a Sign Out cleared them, not over another
+    /// account's. The one that still matches is stored, and persisted.
+    #[tokio::test]
+    async fn a_refresh_is_adopted_only_by_the_session_that_asked() {
+        let api = BirdoApi::new();
+        let mut persisted = Vec::new();
+
+        // Signed out while the refresh ran.
+        assert!(
+            !api.adopt_refreshed("r1", "a2".into(), Some("r2".into()), |a, r| {
+                persisted.push((a.to_owned(), r.map(str::to_owned)))
+            })
+            .await
+        );
+        assert!(!api.is_authenticated().await);
+
+        // Another account signed in meanwhile.
+        api.set_tokens("b-access".into(), "b-refresh".into()).await;
+        assert!(
+            !api.adopt_refreshed("r1", "a2".into(), Some("r2".into()), |a, r| {
+                persisted.push((a.to_owned(), r.map(str::to_owned)))
+            })
+            .await
+        );
+        assert_eq!(api.access_token_value().await.as_deref(), Some("b-access"));
+        assert!(
+            persisted.is_empty(),
+            "a dropped refresh reached the keystore"
+        );
+
+        // Still the session that asked.
+        api.set_tokens("a1".into(), "r1".into()).await;
+        assert!(
+            api.adopt_refreshed("r1", "a2".into(), Some("r2".into()), |a, r| {
+                persisted.push((a.to_owned(), r.map(str::to_owned)))
+            })
+            .await
+        );
+        assert_eq!(api.access_token_value().await.as_deref(), Some("a2"));
+        assert_eq!(persisted, vec![("a2".to_owned(), Some("r2".to_owned()))]);
     }
 
     #[tokio::test]

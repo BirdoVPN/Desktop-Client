@@ -106,6 +106,12 @@ pub struct IpcError {
     pub message: String,
     pub retryable: bool,
     pub retry_after_secs: Option<u64>,
+    /// Settings reapply only (REVIEW-WIN4-004): the previous settings were
+    /// saved back before this failure, so the UI re-reads them. Absent from
+    /// the wire unless set: a refused restore saved nothing, and re-reading
+    /// would hydrate defaults the next save writes over the user's file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub settings_restored: bool,
     #[serde(skip)]
     pub transport: Option<TransportFailure>,
 }
@@ -125,6 +131,7 @@ impl IpcError {
             message: crate::utils::redact::sanitize_always(message.as_ref()),
             retryable: code.retryable(),
             retry_after_secs: None,
+            settings_restored: false,
             transport: None,
         }
     }
@@ -299,6 +306,18 @@ impl From<ApiError> for IpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REVIEW-WIN4-004: `settings_restored` is on the wire only when set, so
+    /// every other error keeps the contract shape.
+    #[test]
+    fn settings_restored_is_sent_only_when_set() {
+        let mut error = IpcError::new(IpcErrorCode::ServerUnreachable, "x");
+        let plain = serde_json::to_value(&error).unwrap();
+        assert!(plain.get("settings_restored").is_none(), "{plain}");
+        error.settings_restored = true;
+        let marked = serde_json::to_value(&error).unwrap();
+        assert_eq!(marked["settings_restored"], serde_json::json!(true));
+    }
 
     #[test]
     fn serializes_to_the_contract_shape() {
