@@ -264,6 +264,15 @@ pub(crate) fn never_left(error: &reqwest::Error) -> bool {
     error.is_connect()
 }
 
+/// The body of a POST that carries nothing: `{}`. Never `&()` — serde writes
+/// the unit as `null`, which the backend's strict JSON parser answers with 400
+/// before any handler runs. Every heartbeat since v1.0.0 died that way, so the
+/// server never saw one and reaped each desktop session 5 minutes after it
+/// connected; sign-out never reached the server either (live retest
+/// 2026-10-02).
+#[derive(Serialize)]
+struct EmptyBody {}
+
 impl BirdoApi {
     /// Create a new API client instance
     pub fn new() -> Self {
@@ -480,7 +489,7 @@ impl BirdoApi {
     /// Logout (invalidate tokens on server)
     pub async fn logout(&self) -> Result<(), ApiError> {
         let _ = self
-            .post::<_, serde_json::Value>(endpoints::auth::LOGOUT, &(), true)
+            .post::<_, serde_json::Value>(endpoints::auth::LOGOUT, &EmptyBody {}, true)
             .await;
         self.clear_tokens().await;
         Ok(())
@@ -798,7 +807,7 @@ impl BirdoApi {
     /// FIX-2-13: Called periodically by auto_reconnect health check loop
     /// P1-9: Now returns HeartbeatResponse so callers can act on valid/serverOnline
     pub async fn heartbeat(&self, key_id: &str) -> Result<HeartbeatResponse, ApiError> {
-        self.post::<_, HeartbeatResponse>(&endpoints::vpn::heartbeat(key_id), &(), true)
+        self.post::<_, HeartbeatResponse>(&endpoints::vpn::heartbeat(key_id), &EmptyBody {}, true)
             .await
     }
 
@@ -1401,6 +1410,17 @@ impl Clone for BirdoApi {
 
 /// REVIEW-WIN2-007, the client half. Local sockets only: nothing here reaches
 /// beyond 127.0.0.1.
+#[cfg(test)]
+mod empty_body_tests {
+    #[test]
+    fn a_bodiless_post_sends_an_empty_object_never_null() {
+        assert_eq!(serde_json::to_string(&super::EmptyBody {}).unwrap(), "{}");
+        let source = include_str!("client.rs");
+        let unit_body = ["&()", ", true)"].concat();
+        assert!(!source.contains(&unit_body), "a POST sends `null`");
+    }
+}
+
 #[cfg(test)]
 mod around_the_tunnel_tests {
     use super::{client_around_the_tunnel, never_left};
