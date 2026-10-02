@@ -57,6 +57,11 @@ pub const BREAKER_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// `redialBudget(.diedAfterHandshake)`).
 pub const BREAKER_DROPS: usize = 4;
 
+/// Packet-path stalls inside [`BREAKER_WINDOW`] from which a stall is no
+/// longer a one-off (WIN3-007): from the third on, it waits out the backoff
+/// and counts toward the breaker like any other drop.
+pub const RECURRING_STALLS: usize = 3;
+
 /// What the OS says about getting off this machine. Read from the routing
 /// table, never from a probe: see `network_events`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,8 +92,8 @@ pub enum DropCause {
     /// The tunnel's own packet path stopped running: it has not ticked
     /// boringtun's timers for `wireguard_new::PACKET_PATH_STALL`, whatever the
     /// relay is doing (WIN-FIX-3 P0). This client is at fault, not the node:
-    /// it never counts toward the breaker and is re-dialled without backoff,
-    /// like a moved path.
+    /// a one-off is re-dialled without backoff and never counts toward the
+    /// breaker, like a moved path — but see [`RECURRING_STALLS`].
     PacketPathStalled,
 }
 
@@ -413,6 +418,19 @@ pub fn backoff_delay(attempts: u32, budget: &Budget) -> Duration {
     Duration::from_millis(delay_ms as u64).min(budget.max_delay)
 }
 
+/// Record an event at `now` in `events`, forgetting those older than
+/// [`BREAKER_WINDOW`]; how many the window now holds.
+fn record_in_window(events: &mut VecDeque<Instant>, now: Instant) -> usize {
+    while events
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > BREAKER_WINDOW)
+    {
+        events.pop_front();
+    }
+    events.push_back(now);
+    events.len()
+}
+
 pub struct ReconnectPolicy {
     budget: Budget,
     /// Dials spent in the current episode.
@@ -425,6 +443,8 @@ pub struct ReconnectPolicy {
     immediate: bool,
     last_error: Option<IpcError>,
     drops: VecDeque<Instant>,
+    /// Packet-path stalls inside the breaker's window (WIN3-007).
+    stalls: VecDeque<Instant>,
     tripped: bool,
 }
 
@@ -438,6 +458,7 @@ impl ReconnectPolicy {
             immediate: false,
             last_error: None,
             drops: VecDeque::new(),
+            stalls: VecDeque::new(),
             tripped: false,
         }
     }
@@ -464,19 +485,17 @@ impl ReconnectPolicy {
         self.attempts = 0;
         self.recovering = true;
         self.last_error = None;
-        self.immediate = cause.redials_at_once();
-        if cause.counts_toward_breaker() {
-            while self
-                .drops
-                .front()
-                .is_some_and(|t| now.duration_since(*t) > BREAKER_WINDOW)
-            {
-                self.drops.pop_front();
-            }
-            self.drops.push_back(now);
-            if self.drops.len() >= BREAKER_DROPS {
-                self.tripped = true;
-            }
+        // WIN3-007: a stall that keeps coming back is not a one-off of this
+        // client's. Re-dialled at once and never counted, it tore down and
+        // rebuilt the tunnel every 10-15 s for ever, the UI flapping — and if
+        // its cause pins a runtime worker, one more worker per cycle.
+        let recurring = cause == DropCause::PacketPathStalled
+            && record_in_window(&mut self.stalls, now) >= RECURRING_STALLS;
+        self.immediate = cause.redials_at_once() && !recurring;
+        if (cause.counts_toward_breaker() || recurring)
+            && record_in_window(&mut self.drops, now) >= BREAKER_DROPS
+        {
+            self.tripped = true;
         }
     }
 
@@ -933,14 +952,15 @@ mod tests {
     }
 
     /// WIN-FIX-3 P0: a packet path that stopped running is torn down and
-    /// re-dialled at once, however often it happens — the node did nothing
-    /// wrong, so the breaker never hears of it.
+    /// re-dialled at once — the node did nothing wrong, so the breaker never
+    /// hears of a one-off. Two inside the window, over and over, stay that
+    /// (WIN3-007 narrowed "however often it happens" to this).
     #[test]
     fn a_stalled_packet_path_redials_at_once_and_never_trips_the_breaker() {
         let mut p = ReconnectPolicy::new(budget());
         let start = Instant::now();
-        for i in 0..(BREAKER_DROPS as u64 * 2) {
-            let now = start + Duration::from_secs(60 * i);
+        for i in 0..(BREAKER_DROPS as u32 * 2) {
+            let now = start + (BREAKER_WINDOW / 2 + Duration::from_secs(1)) * i;
             let mut t = tick(now, Observed::Connected);
             t.liveness = Liveness::Dead(DropCause::PacketPathStalled);
             assert_eq!(
@@ -960,6 +980,50 @@ mod tests {
             assert_eq!(p.decide(&tick(now, Observed::Connected)), Action::Recovered);
         }
         assert!(!asks_the_old_key(DropCause::PacketPathStalled));
+    }
+
+    /// WIN3-007: a stall that recurs — the third inside the breaker's window —
+    /// waits out the backoff and counts toward the breaker, which then ends
+    /// the cycle instead of rebuilding the tunnel every 10-15 s for ever.
+    #[test]
+    fn a_recurring_stall_backs_off_and_trips_the_breaker() {
+        let mut p = ReconnectPolicy::new(budget());
+        let start = Instant::now();
+        let mut stall = |i: u64| {
+            let now = start + Duration::from_secs(15 * i);
+            let mut t = tick(now, Observed::Connected);
+            t.liveness = Liveness::Dead(DropCause::PacketPathStalled);
+            assert!(matches!(p.decide(&t), Action::TearDown { .. }));
+            let next = p.decide(&not_connected(now));
+            if matches!(next, Action::Dial { .. }) {
+                assert_eq!(p.decide(&tick(now, Observed::Connected)), Action::Recovered);
+            }
+            next
+        };
+        for i in 0..(RECURRING_STALLS as u64 - 1) {
+            assert_eq!(
+                stall(i),
+                Action::Dial {
+                    attempt: 1,
+                    delay: Duration::ZERO
+                }
+            );
+        }
+        let counted = RECURRING_STALLS as u64 - 1;
+        for i in counted..counted + BREAKER_DROPS as u64 - 1 {
+            assert_eq!(
+                stall(i),
+                Action::Dial {
+                    attempt: 1,
+                    delay: budget().initial_delay
+                },
+                "stall {i}"
+            );
+        }
+        match stall(counted + BREAKER_DROPS as u64 - 1) {
+            Action::GiveUp(err) => assert!(err.message.contains("keeps dropping")),
+            other => panic!("expected the breaker to trip, got {other:?}"),
+        }
     }
 
     /// The liveness check's view of the link: offline skips the fast rule,
