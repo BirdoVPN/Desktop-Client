@@ -1430,7 +1430,9 @@ mod tests {
     /// writers truncated each other's temp file and lost renames.
     #[test]
     fn concurrent_saves_neither_fail_nor_tear_the_file() {
-        const KEY: &[u8] = b"unit-test-hmac-key-32-bytes-pad!";
+        // A fresh random key per run, leaked for the threads: a literal would be a
+        // hard-coded cryptographic value to CodeQL, and these tests need no fixed one.
+        let key: &'static [u8] = Box::leak(Box::new(rand::random::<[u8; 32]>()));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let writers: Vec<_> = (0..8)
@@ -1442,7 +1444,7 @@ mod tests {
                             preferred_server_id: Some(format!("node-{t}-{i}")),
                             ..AppSettings::default()
                         };
-                        write_signed_settings(&path, &settings, |json| compute_hmac(json, KEY))
+                        write_signed_settings(&path, &settings, |json| compute_hmac(json, key))
                             .expect("a concurrent save failed");
                     }
                 })
@@ -1456,7 +1458,7 @@ mod tests {
         let signed: SignedSettings = serde_json::from_str(&content).expect("a whole file");
         let json = serde_json::to_string(&signed.settings).unwrap();
         assert!(
-            verify_hmac(&json, &signed.hmac, KEY),
+            verify_hmac(&json, &signed.hmac, key),
             "torn or mismatched file"
         );
         assert!(signed
@@ -1548,10 +1550,12 @@ mod tests {
     /// out until the whole read-modify-write is done.
     #[test]
     fn a_read_modify_write_holds_the_settings_lock_throughout() {
-        const KEY: &[u8] = b"unit-test-hmac-key-32-bytes-pad!";
+        // A fresh random key per run, leaked for the threads: a literal would be a
+        // hard-coded cryptographic value to CodeQL, and these tests need no fixed one.
+        let key: &'static [u8] = Box::leak(Box::new(rand::random::<[u8; 32]>()));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let sign = |json: &str| compute_hmac(json, KEY);
+        let sign = |json: &str| compute_hmac(json, key);
 
         let held = SETTINGS_WRITE.lock();
         // The same thread saves inside it (a migration during the load).
@@ -1566,7 +1570,7 @@ mod tests {
                     preferred_server_id: Some("mirrored".into()),
                     ..AppSettings::default()
                 };
-                write_signed_settings(&path, &settings, |json| compute_hmac(json, KEY)).unwrap();
+                write_signed_settings(&path, &settings, |json| compute_hmac(json, key)).unwrap();
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(50));

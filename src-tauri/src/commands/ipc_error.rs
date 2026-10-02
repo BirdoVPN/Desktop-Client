@@ -392,8 +392,10 @@ mod tests {
                 IpcErrorCode::ServerError,
             ),
         ];
-        for (api, code) in cases {
-            assert_eq!(IpcError::from_api(&api).code, code, "{api:?}");
+        // Cases are named by index, not by `{api:?}`: an ApiError can carry what a
+        // user typed, and CodeQL reads formatting it as cleartext logging.
+        for (i, (api, code)) in cases.iter().enumerate() {
+            assert_eq!(IpcError::from_api(api).code, *code, "case {i}");
         }
     }
 

@@ -1201,7 +1201,9 @@ mod tests {
     #[test]
     fn an_evicted_device_stops_instead_of_evicting_the_other_one_back() {
         let mut p = ReconnectPolicy::new(budget());
-        let now = Instant::now();
+        // An hour ahead: "N s ago" must not reach before boot (a Windows Instant counts
+        // from boot, and a fresh CI runner has been up for less than the 5-minute window).
+        let now = Instant::now() + Duration::from_secs(3600);
         let mut t = tick(now, Observed::Connected);
         t.liveness = Liveness::Dead(DropCause::HandshakeStale);
         let Action::TearDown { cause } = p.decide(&t) else {
@@ -1228,7 +1230,9 @@ mod tests {
 
     #[test]
     fn alive_means_confirmed_within_the_reap_window_and_no_sleep_since() {
-        let now = Instant::now();
+        // An hour ahead: "N s ago" must not reach before boot (a Windows Instant counts
+        // from boot, and a fresh CI runner has been up for less than the 5-minute window).
+        let now = Instant::now() + Duration::from_secs(3600);
         let ago = |s| Some(now - Duration::from_secs(s));
         assert!(recently_alive(ago(30), now, false));
         assert!(recently_alive(ago(299), now, false));
