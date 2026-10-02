@@ -16,6 +16,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { settingsToRust } from '@/utils/helpers';
 import { useAppStore, type AppSettings, type ConnectionState } from '@/store/app-store';
 import { loadSettings } from '@/session/session-data';
+import { isSilentError } from '@/lib/errors';
+import { toIpcError } from '@/lib/ipc';
 
 const REAPPLY_DEBOUNCE_MS = 900;
 let reapplyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -37,7 +39,14 @@ async function runReapply(): Promise<void> {
       await loadSettings();
       useAppStore.getState().showNotice({ text: REAPPLY_REVERTED_COPY, tone: 'danger' });
     }
-  } catch {
+  } catch (e) {
+    // Rust may have saved the previous settings back before this failed (a
+    // revert whose reconnect failed, or that a Disconnect came before): show
+    // what is saved, or the next save writes the failed value back.
+    await loadSettings();
+    // The user's own Disconnect (or a newer connect) superseded the rebuild:
+    // nothing went wrong that they did not ask for (WIN3-002).
+    if (isSilentError(toIpcError(e))) return;
     // The rebuild is fail-closed: Rust keeps traffic blocked rather than
     // leaving the old settings silently in force, and the status (blocking
     // banner, Disconnect) shows that. This says why it happened.

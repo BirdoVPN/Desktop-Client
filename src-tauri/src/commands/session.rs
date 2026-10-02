@@ -155,23 +155,51 @@ pub(crate) async fn connect_session(
     app: &AppHandle,
     target: ConnectTarget,
 ) -> Result<(), IpcError> {
-    connect_session_for(app, target, ConnectPurpose::User).await
+    connect_session_for(app, target, ConnectPurpose::User, None)
+        .await
+        .result
+}
+
+/// How a connect ended, and the epoch it ran under (`None`: it never
+/// began). A connect that follows it up checks that epoch has not moved
+/// (WIN3-002, see `connect_session_for`).
+pub(crate) struct ConnectOutcome {
+    pub(crate) epoch: Option<u64>,
+    pub(crate) result: Result<(), IpcError>,
+}
+
+impl ConnectOutcome {
+    fn never_began(error: IpcError) -> Self {
+        Self {
+            epoch: None,
+            result: Err(error),
+        }
+    }
 }
 
 /// [`connect_session`] for `purpose`.
+///
+/// `follows`: the epoch of the attempt this connect follows up — the
+/// settings revert follows the rebuild that failed. It begins only while that
+/// epoch is still current, so a Disconnect or a newer connect since then wins
+/// and this resolves `cancelled` (`VpnManager::begin_follow_up`). `None`
+/// supersedes whatever is in flight, as a user's connect must.
 pub(crate) async fn connect_session_for(
     app: &AppHandle,
     target: ConnectTarget,
     purpose: ConnectPurpose,
-) -> Result<(), IpcError> {
+    follows: Option<u64>,
+) -> ConnectOutcome {
     // Pre-flight: Wintun adapter creation is an in-process FFI call that
     // requires administrator — failing early with a clear error beats a
     // cryptic Win32 one deep in the tunnel code.
     if !crate::utils::elevation::is_elevated() {
-        return Err(IpcError::not_elevated());
+        return ConnectOutcome::never_began(IpcError::not_elevated());
     }
     let api = app.state::<BirdoApi>();
-    ensure_signed_in(&api, &app.state::<CredentialStore>()).await?;
+    if let Err(error) = ensure_signed_in(&api, &app.state::<CredentialStore>()).await {
+        return ConnectOutcome::never_began(error);
+    }
     let vm = app.state::<VpnManager>();
     let ar = app.state::<AutoReconnectService>();
 
@@ -182,11 +210,20 @@ pub(crate) async fn connect_session_for(
     // server the user just switched away from. Under the commit lock, so an
     // older attempt either finished committing before this (and its loop is
     // stopped here) or sees its epoch superseded and commits nothing.
-    let epoch = {
+    let began = {
         let _commit = vm.lock_commit().await;
-        let epoch = vm.begin_attempt();
-        ar.stop().await;
-        epoch
+        let began = match follows {
+            None => Some(vm.begin_attempt()),
+            Some(of) => vm.begin_follow_up(of),
+        };
+        if began.is_some() {
+            ar.stop().await;
+        }
+        began
+    };
+    let Some(epoch) = began else {
+        tracing::info!("A disconnect or a newer connect came first — not reconnecting");
+        return ConnectOutcome::never_began(IpcError::cancelled());
     };
 
     let was_live = session_was_live(&vm.get_state().await, vm.holds_tunnel().await);
@@ -252,9 +289,13 @@ pub(crate) async fn connect_session_for(
         }
     }
 
-    match result {
+    let result = match result {
         Ok(()) => Ok(()),
         Err(error) => Err(fail_connect(app, error, &ctx).await),
+    };
+    ConnectOutcome {
+        epoch: Some(epoch),
+        result,
     }
 }
 
@@ -1159,17 +1200,29 @@ mod lifecycle_tests {
     }
 
     /// W1-022: every target stops auto-reconnect before anything is dialled,
-    /// under the commit lock, with a fresh epoch.
+    /// under the commit lock, with a fresh epoch. WIN3-002: a follow-up (the
+    /// settings revert) takes its epoch only while the attempt it follows is
+    /// still current — checked under the same lock — and otherwise touches
+    /// nothing, the loop included (`begin_follow_up` is tested in `manager`).
     #[test]
     fn connect_session_supersedes_and_stops_the_loop_first() {
+        let connect = body("pub(crate) async fn connect_session_for(");
         order(
-            body("pub(crate) async fn connect_session_for("),
+            connect,
             &[
                 "vm.lock_commit()",
-                "vm.begin_attempt()",
+                "None => Some(vm.begin_attempt())",
+                "Some(of) => vm.begin_follow_up(of)",
+                "if began.is_some() {",
                 "ar.stop()",
+                "let Some(epoch) = began else {",
+                "ConnectOutcome::never_began(IpcError::cancelled())",
                 "attempt(app, &target, first_transport",
             ],
+        );
+        order(
+            body("pub(crate) async fn connect_session("),
+            &["connect_session_for(app, target, ConnectPurpose::User, None)"],
         );
     }
 

@@ -989,7 +989,8 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
             .as_deref()
             .and_then(known_fallback_reason),
     };
-    let error = match connect_session_for(&app, target.clone(), purpose).await {
+    let rebuild = connect_session_for(&app, target.clone(), purpose, None).await;
+    let error = match rebuild.result {
         Ok(()) => return Ok(ReapplyOutcome::Applied),
         Err(error) => error,
     };
@@ -1012,8 +1013,17 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
     if plan == FailedReapply::RestoreSettings {
         return Ok(ReapplyOutcome::Reverted);
     }
-    connect_session_for(&app, target, purpose)
+    // WIN3-002: the rebuild's failure is on screen by now, and the user may
+    // have pressed Disconnect or picked another server since. Either one
+    // moved the epoch, and then this reconnect begins nothing (`cancelled`):
+    // it must never bring back a session the user ended, or a server the
+    // user left. A rebuild that never began has nothing to follow up.
+    let Some(rebuild_epoch) = rebuild.epoch else {
+        return Err(error);
+    };
+    connect_session_for(&app, target, purpose, Some(rebuild_epoch))
         .await
+        .result
         .map(|()| ReapplyOutcome::Reverted)
 }
 
@@ -1112,7 +1122,10 @@ mod tests {
         assert_eq!(failed_reapply(false, false, false), Report);
 
         // The wiring: the rebuild, then the restore, then the second rebuild
-        // on the same purpose (the session's own transport, no stealth retry).
+        // on the same purpose (the session's own transport, no stealth retry)
+        // — as a follow-up of the first, so a Disconnect or a newer connect
+        // in between wins (WIN3-002; `begin_follow_up` is tested in
+        // `vpn::manager`).
         let source = include_str!("vpn.rs");
         let body = &source[source.find("pub async fn reapply_vpn_settings(").unwrap()..];
         let body = &body[..body.find("\n}").unwrap()];
@@ -1120,11 +1133,12 @@ mod tests {
         for needle in [
             "ar.connected_settings().await",
             "ConnectPurpose::SettingsReapply {",
-            "connect_session_for(&app, target.clone(), purpose)",
+            "let rebuild = connect_session_for(&app, target.clone(), purpose, None)",
             "failed_reapply(",
             "restore_tunnel_settings(&app, &previous)",
             "FailedReapply::RestoreSettings",
-            "connect_session_for(&app, target, purpose)",
+            "let Some(rebuild_epoch) = rebuild.epoch else {",
+            "connect_session_for(&app, target, purpose, Some(rebuild_epoch))",
             "ReapplyOutcome::Reverted",
         ] {
             let at = body[last..]

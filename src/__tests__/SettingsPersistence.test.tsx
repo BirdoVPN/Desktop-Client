@@ -242,6 +242,26 @@ describe('a failed save is rolled back and reported (W2-013)', () => {
     expect(screen.getByRole('switch', { name: 'Quantum Protection' })).toHaveAttribute('aria-checked', 'true');
   });
 
+  // WIN3-002: the user pressed Disconnect while the change was being put
+  // back. Rust saved the previous settings and did not reconnect; the screen
+  // shows what is saved, and the Disconnect the user asked for is not
+  // reported as a failure.
+  it('a revert the user disconnected under says nothing and shows the saved settings', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'reapply_vpn_settings') throw { code: 'cancelled', message: 'Cancelled.' };
+      if (cmd === 'get_settings') return settingsToRust(defaultSettings);
+      if (cmd === 'check_biometric_available') return { available: false, enabled: false, method: 'none' };
+      return undefined;
+    });
+    useAppStore.setState({ connectionState: 'connected' });
+    render(<Settings />);
+    await userEvent.click(screen.getByRole('switch', { name: 'Quantum Protection' }));
+    await waitFor(() => expect(reapplies()).toHaveLength(1), { timeout: 3000 });
+    await waitFor(() => expect(useAppStore.getState().reapplying).toBe(false));
+    expect(useAppStore.getState().notice).toBeNull();
+    expect(useAppStore.getState().settings.quantumProtection).toBe(true);
+  });
+
   it('an applied change says nothing', async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'reapply_vpn_settings') return 'applied';

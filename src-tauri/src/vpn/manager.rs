@@ -499,6 +499,29 @@ impl VpnManager {
         self.bump_epoch()
     }
 
+    /// [`begin_attempt`](Self::begin_attempt) for a connect that FOLLOWS UP
+    /// the attempt of epoch `of`: it begins only while that epoch is still
+    /// current. `None`: something superseded it, and nothing began.
+    ///
+    /// WIN3-002: the settings revert reconnects after its rebuild failed, and
+    /// the failure is published first — which is when the user presses
+    /// Disconnect, or picks another server. Both move the epoch. A revert that
+    /// took a fresh one regardless brought the tunnel and the block back
+    /// after the Disconnect, or dragged the user back to the old server. The
+    /// check and the bump are one step, under the commit lock at the caller.
+    pub fn begin_follow_up(&self, of: u64) -> Option<u64> {
+        let mut began = None;
+        self.epoch.send_if_modified(|e| {
+            if *e != of {
+                return false;
+            }
+            *e = e.wrapping_add(1);
+            began = Some(*e);
+            true
+        });
+        began
+    }
+
     /// Cancel whatever connect or re-dial is in flight (disconnect, logout,
     /// exit, session expiry). The cancelled attempt resolves with `cancelled`.
     pub fn cancel_in_flight(&self) {
@@ -1611,6 +1634,54 @@ mod tests {
             !mgr.is_current(epoch),
             "the connect that queued ahead of the Disconnect survived it"
         );
+    }
+
+    /// WIN3-002: the settings revert follows up the rebuild that failed. A
+    /// Disconnect pressed in between — the failure's `error` is on screen
+    /// while the failing rebuild still holds the commit lock — or a newer
+    /// connect wins: the revert begins nothing. With nothing in between it
+    /// begins as before.
+    #[tokio::test]
+    async fn a_revert_never_undoes_a_disconnect_pressed_after_the_failure() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        let rebuild = mgr.begin_attempt();
+
+        // fail_connect publishes the error under the lock; the user's
+        // Disconnect cancels and queues behind it.
+        let failing = mgr.lock_commit().await;
+        let teardown = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move {
+                let _commit = mgr.lock_commit_for_teardown().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(failing);
+        teardown.await.unwrap();
+
+        // The revert's reconnect, queued after the teardown.
+        let _commit = mgr.lock_commit().await;
+        let epoch = mgr.current_epoch();
+        assert_eq!(
+            mgr.begin_follow_up(rebuild),
+            None,
+            "the revert reconnected after the user's Disconnect"
+        );
+        assert_eq!(
+            mgr.current_epoch(),
+            epoch,
+            "a refused revert moved the epoch"
+        );
+
+        // A newer connect (another server) supersedes the same way.
+        let rebuild = mgr.begin_attempt();
+        let _newer = mgr.begin_attempt();
+        assert_eq!(mgr.begin_follow_up(rebuild), None);
+
+        // Nothing in between: the revert begins, and supersedes the rebuild.
+        let rebuild = mgr.begin_attempt();
+        let revert = mgr.begin_follow_up(rebuild).expect("the revert begins");
+        assert!(mgr.is_current(revert) && !mgr.is_current(rebuild));
     }
 
     /// W1-021: a connect whose epoch was superseded before it could start
