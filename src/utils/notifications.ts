@@ -1,8 +1,12 @@
 /**
- * Native notification utility for Birdo VPN
+ * Native notification utility for BirdoVPN.
  *
- * Sends native desktop notifications for VPN connection events,
- * gated behind the user's notification preference.
+ * Sends native desktop notifications for VPN connection events, gated behind
+ * the user's notification preference. Copy is the canonical set (P1-parity-028):
+ * "BirdoVPN — Protected / Reconnecting… / Not connected / Connection error /
+ * Kill Switch — all traffic blocked", body "via {server}[ · location][ · IP]" —
+ * one word per event on every client, where this used to say "Connected",
+ * "Secured" and "Connection Lost" for what the phones call "Protected".
  */
 
 import {
@@ -10,7 +14,7 @@ import {
   requestPermission,
   sendNotification,
 } from '@tauri-apps/plugin-notification';
-import { useAppStore } from '@/store/app-store';
+import { useAppStore, type ConnectionState } from '@/store/app-store';
 
 let permissionReady = false;
 
@@ -55,7 +59,7 @@ export interface ConnectionDetails {
  */
 function connectionBody(prefix: string, serverName: string, details?: ConnectionDetails): string {
   const settings = useAppStore.getState().settings;
-  let body = `${prefix} ${serverName || 'VPN Server'}`;
+  let body = `${prefix} ${serverName || 'your VPN server'}`;
   const extras: string[] = [];
   if (settings?.showLocationInNotification && details?.location) extras.push(details.location);
   if (settings?.showIpInNotification && details?.ip) extras.push(details.ip);
@@ -64,23 +68,69 @@ function connectionBody(prefix: string, serverName: string, details?: Connection
 }
 
 export function notifyConnected(serverName: string, details?: ConnectionDetails): void {
-  notify('VPN Connected', connectionBody('Secured via', serverName, details));
-}
-
-export function notifyDisconnected(): void {
-  notify('VPN Disconnected', 'Your connection is no longer protected');
-}
-
-export function notifyConnectionLost(): void {
-  notify('Connection Lost', 'Attempting to reconnect...');
-}
-
-export function notifyKillSwitchActive(): void {
-  notify('Kill Switch Active', 'Internet traffic is blocked for your protection');
+  notify('BirdoVPN — Protected', connectionBody('via', serverName, details));
 }
 
 export function notifyReconnected(serverName: string, details?: ConnectionDetails): void {
-  notify('VPN Reconnected', connectionBody('Back online via', serverName, details));
+  notify('BirdoVPN — Protected', connectionBody('Reconnected via', serverName, details));
+}
+
+export function notifyDisconnected(): void {
+  notify('BirdoVPN — Not connected', 'Your connection is no longer protected.');
+}
+
+export function notifyConnectionLost(): void {
+  notify('BirdoVPN — Reconnecting…', 'The connection dropped. BirdoVPN is restoring it.');
+}
+
+export function notifyConnectionError(message: string): void {
+  notify('BirdoVPN — Connection error', message);
+}
+
+export function notifyQuotaGrace(message: string): void {
+  notify('BirdoVPN — Free data allowance used', message);
+}
+
+export function notifyKillSwitchActive(): void {
+  notify(
+    'BirdoVPN — Kill Switch — all traffic blocked',
+    'Traffic is held until the VPN reconnects. Open BirdoVPN to disconnect.',
+  );
+}
+
+/**
+ * Which notification (if any) a state change deserves. Pure, so the rules are
+ * testable without a store or a plugin: only transitions Rust REPORTED count,
+ * and a Disconnect the user pressed (`userInitiated`) is not news to them.
+ */
+export type ConnectionNotification =
+  | { kind: 'protected'; reconnected: boolean }
+  | { kind: 'reconnecting' }
+  | { kind: 'not_connected' }
+  | { kind: 'error' }
+  | { kind: 'blocking' };
+
+export function connectionNotification(
+  prev: { state: ConnectionState; blocking: boolean },
+  next: { state: ConnectionState; blocking: boolean },
+  userInitiated: boolean,
+): ConnectionNotification | null {
+  if (next.blocking && !prev.blocking) return { kind: 'blocking' };
+  if (prev.state === next.state) return null;
+  if (next.state === 'connected') {
+    return { kind: 'protected', reconnected: prev.state === 'reconnecting' };
+  }
+  if (next.state === 'reconnecting' && prev.state === 'connected') return { kind: 'reconnecting' };
+  if (
+    next.state === 'error' &&
+    (prev.state === 'connected' || prev.state === 'reconnecting' || prev.state === 'switching')
+  ) {
+    return { kind: 'error' };
+  }
+  if (next.state === 'disconnected' && prev.state === 'connected' && !userInitiated) {
+    return { kind: 'not_connected' };
+  }
+  return null;
 }
 
 /**
@@ -94,7 +144,7 @@ export function notifyUpdateAvailable(version: string): void {
   try {
     sendNotification({
       title: 'BirdoVPN update available',
-      body: `Version ${version} is ready — open Settings → Software Updates to install.`,
+      body: `Version ${version} is ready — open Settings › About to install.`,
     });
   } catch (err) {
     console.error('Failed to send update notification:', err);

@@ -3,12 +3,10 @@
 //! Handles server listing and latency testing.
 
 use crate::api::BirdoApi;
+use crate::commands::ipc_error::IpcError;
 use crate::storage::CredentialStore;
 use serde::Serialize;
-use std::time::{Duration, Instant};
 use tauri::State;
-use tokio::net::TcpStream;
-use tokio::time::timeout;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,13 +35,14 @@ pub struct ServerInfo {
 pub async fn get_servers(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
-) -> Result<Vec<ServerInfo>, String> {
+) -> Result<Vec<ServerInfo>, IpcError> {
     tracing::trace!("get_servers command called");
 
-    // Set tokens in API client if available
+    // W1-028: only when memory holds no session. This used to overwrite the
+    // in-memory tokens from the keystore on EVERY server-list refresh, which
+    // can put a consumed refresh token back mid-rotation.
     if let Ok(tokens) = credentials.get_tokens() {
-        tracing::trace!("Setting tokens in API client");
-        api.set_tokens(tokens.access_token.clone(), tokens.refresh_token.clone())
+        api.restore_tokens_if_absent(tokens.access_token.clone(), tokens.refresh_token.clone())
             .await;
     } else {
         tracing::trace!("No tokens available in credential store");
@@ -52,7 +51,7 @@ pub async fn get_servers(
     tracing::trace!("Calling api.get_servers()");
     let servers = api.get_servers().await.map_err(|e| {
         tracing::warn!("Failed to fetch servers: {}", e);
-        format!("Failed to fetch servers: {}", e)
+        IpcError::from(e)
     })?;
 
     tracing::trace!("Got {} servers from API", servers.len());
@@ -75,111 +74,42 @@ pub async fn get_servers(
             is_port_forwarding: s.is_port_forwarding,
             is_online: s.is_online,
             accessible: s.accessible,
-            latency_ms: None, // Will be filled by ping_server
+            latency_ms: None, // unmeasured: see ping_server
         })
         .collect())
 }
 
-/// Ping a specific server to measure latency
+/// Server-list latency: always `null` (W1-026).
 ///
-/// SEC-SCAN FIX: Restricts allowed ports to known VPN service ports
-/// to prevent abuse as a port scanner from the user's machine.
-/// Only WireGuard (51820) and common VPN ports are permitted.
+/// This used to TCP-connect to each server's WireGuard port. WireGuard is UDP,
+/// so on every WireGuard-only node the connect could only time out or be
+/// refused — latency was blank by construction — and on every launch it
+/// resolved the whole fleet's hostnames through the plain system resolver,
+/// showing the ISP resolver the list of Birdo nodes on exactly the networks
+/// Stealth Mode exists for. There is no honest, cheap measurement of a node
+/// this client is not connected to, so none is made: the UI hides latency
+/// when it is null. The LIVE session's latency is a real one (the last
+/// handshake's round trip, `get_vpn_stats.current_latency_ms`).
+///
+/// Kept as a command, its arguments ignored, so the current UI's call
+/// resolves to "unmeasured" instead of rejecting.
 #[tauri::command]
-pub async fn ping_server(hostname: String, port: Option<u16>) -> Result<Option<u32>, String> {
-    let port = port.unwrap_or(51820);
+pub fn ping_server() -> Option<u32> {
+    None
+}
 
-    // SEC-SCAN FIX: Allowlist of legitimate VPN server ports.
-    // Prevents a compromised webview from using this command for port scanning.
-    const ALLOWED_PORTS: &[u16] = &[51820, 51821, 443, 1194, 500, 4500];
-    if !ALLOWED_PORTS.contains(&port) {
-        tracing::warn!("ping_server blocked: port {} not in allowlist", port);
-        return Err(format!("Port {} is not allowed for latency testing", port));
-    }
-
-    // Basic shape check before resolving.
-    if hostname.is_empty() || hostname.contains('/') || hostname.contains('\\') {
-        return Err("Invalid hostname for latency testing".to_string());
-    }
-
-    // P1-dk-ping-server-private-filter-bypass: the old check was a string-prefix
-    // filter on the INPUT ("127.", "10.", ...), trivially bypassed with
-    // "0177.0.0.1", "2130706433", a DNS name resolving to 127.0.0.1, or any
-    // IPv6 literal form. Resolve first, then reject any resolved address that
-    // is loopback/private/link-local/unspecified, and connect to the vetted
-    // SocketAddr (not the hostname) so a resolve/connect TOCTOU cannot rebind.
-    fn is_disallowed(ip: &std::net::IpAddr) -> bool {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])
-                // CGNAT
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local
-                    || v6.to_ipv4_mapped().is_some_and(|v4| {
-                        std::net::IpAddr::V4(v4) != *ip && is_disallowed(&std::net::IpAddr::V4(v4))
-                    })
-            }
-        }
-    }
-
-    let lookup_target = format!("{}:{}", hostname, port);
-    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&lookup_target)
-        .await
-        .map_err(|_| "Invalid hostname for latency testing".to_string())?
-        .collect();
-
-    if resolved.is_empty() || resolved.iter().any(|a| is_disallowed(&a.ip())) {
-        tracing::warn!(
-            "ping_server blocked: hostname '{}' resolves to a private/loopback address",
-            crate::utils::redact::redact_hostname(&hostname)
-        );
-        return Err("Invalid hostname for latency testing".to_string());
-    }
-    let addr = resolved[0];
-
-    tracing::debug!(
-        "Pinging server: {}",
-        crate::utils::redact_ip(&addr.ip().to_string())
-    );
-
-    let start = Instant::now();
-
-    // Try TCP connection as a proxy for latency — to the vetted resolved address.
-    match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => {
-            let latency = start.elapsed().as_millis() as u32;
-            tracing::debug!(
-                "Server {} latency: {}ms",
-                crate::utils::redact::redact_hostname(&hostname),
-                latency
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn server_latency_is_unmeasured_and_nothing_is_probed() {
+        assert_eq!(super::ping_server(), None);
+        // Built at run time so this file does not match its own needles.
+        let source = include_str!("servers.rs");
+        for needle in [["lookup", "_host"].concat(), ["Tcp", "Stream"].concat()] {
+            assert!(
+                !source.contains(&needle),
+                "servers.rs probes again: {needle}"
             );
-            Ok(Some(latency))
-        }
-        Ok(Err(e)) => {
-            // LOG-001: `addr` is the chosen VPN node — redact so birdo.log
-            // carries no plaintext connection history.
-            tracing::warn!(
-                "Failed to connect to {}: {}",
-                crate::utils::redact_endpoint(&addr.to_string()),
-                e
-            );
-            Ok(None)
-        }
-        Err(_) => {
-            tracing::warn!(
-                "Timeout connecting to {}",
-                crate::utils::redact_endpoint(&addr.to_string())
-            );
-            Ok(None)
         }
     }
 }

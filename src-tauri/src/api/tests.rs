@@ -117,7 +117,13 @@ mod gdpr_request_tests {
     fn gdpr_delete_is_a_delete_to_the_api_prefixed_route() {
         let api = BirdoApi::new();
         let request = api
-            .gdpr_delete_request("tok", &DeleteAccountBody { password: "pw" })
+            .gdpr_delete_request(
+                "tok",
+                &DeleteAccountBody {
+                    password: "pw",
+                    two_factor_code: None,
+                },
+            )
             .build()
             .expect("request builds");
 
@@ -146,6 +152,59 @@ mod gdpr_request_tests {
             json!({ "password": "pw" }),
             "the body deleteAccountSchema validates: an optional password, at most 256 chars"
         );
+    }
+
+    /// Account API contract item 85: the code rides as `twoFactorCode`, and
+    /// only once the server asked for it, so today's servers never see a key
+    /// they do not know.
+    #[test]
+    fn the_two_factor_code_rides_only_when_there_is_one() {
+        let api = BirdoApi::new();
+        let body_of = |code: Option<&str>| -> serde_json::Value {
+            let request = api
+                .gdpr_delete_request(
+                    "tok",
+                    &DeleteAccountBody {
+                        password: "pw",
+                        two_factor_code: code,
+                    },
+                )
+                .build()
+                .unwrap();
+            serde_json::from_slice(request.body().and_then(|b| b.as_bytes()).unwrap()).unwrap()
+        };
+        assert_eq!(body_of(None), json!({ "password": "pw" }));
+        assert_eq!(
+            body_of(Some("123456")),
+            json!({ "password": "pw", "twoFactorCode": "123456" })
+        );
+    }
+
+    /// Item 85: the server's 403s are told apart by `error`, never by the
+    /// sentence; a 403 without it (a plan refusal on any server) maps as
+    /// before, and a 429 is a rate limit.
+    #[test]
+    fn deletion_two_factor_refusals_map_by_error() {
+        let required = r#"{"error":"two_factor_required","message":"Enter your two-factor code to delete your account."}"#;
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::FORBIDDEN, required),
+            GdprDeleteOutcome::Refused(ApiError::TwoFactorRequired(_))
+        ));
+        let invalid = r#"{"error":"two_factor_invalid","message":"Invalid two-factor code."}"#;
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::FORBIDDEN, invalid),
+            GdprDeleteOutcome::Refused(ApiError::TwoFactorInvalid(_))
+        ));
+        let plan =
+            r#"{"statusCode":403,"message":"Stealth mode requires a plan","error":"Forbidden"}"#;
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::FORBIDDEN, plan),
+            GdprDeleteOutcome::Refused(ApiError::Rejected { status: 403, .. })
+        ));
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, ""),
+            GdprDeleteOutcome::Refused(ApiError::RateLimited)
+        ));
     }
 
     #[test]
@@ -178,7 +237,10 @@ mod gdpr_request_tests {
         let wrong_password =
             r#"{"statusCode":401,"message":"Incorrect password","error":"Unauthorized"}"#;
         match BirdoApi::classify_gdpr_delete_response(StatusCode::UNAUTHORIZED, wrong_password) {
-            GdprDeleteOutcome::Refused(ApiError::Unknown(m)) => assert_eq!(m, "Incorrect password"),
+            GdprDeleteOutcome::Refused(ApiError::Rejected { status, message }) => {
+                assert_eq!(status, 401);
+                assert_eq!(message, "Incorrect password");
+            }
             other => panic!("wrong password must be shown, got {other:?}"),
         }
 
@@ -195,7 +257,10 @@ mod gdpr_request_tests {
     fn other_refusals_keep_the_backend_message() {
         let body = r#"{"statusCode":429,"message":"Slow down"}"#;
         match BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, body) {
-            GdprDeleteOutcome::Refused(ApiError::Unknown(m)) => assert_eq!(m, "Slow down"),
+            GdprDeleteOutcome::Refused(ApiError::Rejected { status, message }) => {
+                assert_eq!(status, 429);
+                assert_eq!(message, "Slow down");
+            }
             other => panic!("{other:?}"),
         }
         assert!(matches!(
@@ -469,6 +534,51 @@ mod types_serialization_tests {
         assert_eq!(resp.expires_in, Some(3600));
     }
 
+    /// Account API contract item 86: an old server's `/auth/me` (no new
+    /// fields) says nothing about anonymity; a new one says it either way, and
+    /// only the documented 24 digits count as an account number.
+    #[test]
+    fn auth_me_anonymity_fields_are_optional_and_validated() {
+        let old: UserProfile = serde_json::from_str(r#"{"id":"u1","email":"a@b.com"}"#).unwrap();
+        assert_eq!(old.is_anonymous_account(), None);
+        assert!(old.account_number.is_none());
+
+        let standard: UserProfile = serde_json::from_str(
+            r#"{"id":"u2","email":"a@b.com","accountType":"standard","isAnonymous":false,"accountNumber":null}"#,
+        )
+        .unwrap();
+        assert_eq!(standard.is_anonymous_account(), Some(false));
+        assert!(standard.account_number.is_none());
+
+        // accountType alone is enough.
+        let typed: UserProfile =
+            serde_json::from_str(r#"{"id":"u3","email":"x","accountType":"anonymous"}"#).unwrap();
+        assert_eq!(typed.is_anonymous_account(), Some(true));
+
+        let anon: UserProfile = serde_json::from_str(
+            r#"{"id":"u4","email":"x","isAnonymous":true,"accountNumber":"123456789012345678901234"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            anon.account_number,
+            super::super::types::AccountNumber::parse("123456789012345678901234")
+        );
+        assert!(!format!("{anon:?}").contains("123456789012345678901234"));
+
+        for bad in [
+            r#""12345""#,
+            r#""1234 5678 9012 3456 7890 1234""#,
+            "42",
+            r#""abcdefghijklmnopqrstuvwx""#,
+        ] {
+            let user: UserProfile = serde_json::from_str(&format!(
+                r#"{{"id":"u5","email":"x","accountNumber":{bad}}}"#
+            ))
+            .expect("a malformed number must not blank the identity");
+            assert!(user.account_number.is_none(), "{bad}");
+        }
+    }
+
     #[test]
     fn user_profile_uses_camel_case() {
         let json = r#"{
@@ -515,7 +625,7 @@ mod types_serialization_tests {
         let user: UserProfile = serde_json::from_str(json)
             .expect("the live /auth/me payload must deserialize — a strict field here blanks the user's identity");
         // The identity the whole app hangs off of.
-        assert_eq!(user.email, "someone@gmail.com");
+        assert_eq!(user.email.as_deref(), Some("someone@gmail.com"));
         assert_eq!(user.id, "cmnz74oyc0000o001dgr9gwec");
         // Absent optional fields must degrade to None, not fail the parse.
         assert_eq!(user.name, None);
@@ -855,9 +965,7 @@ mod types_serialization_tests {
         let json = r#"{"success":true}"#;
         let resp: ConnectResponse = serde_json::from_str(json).unwrap();
         assert!(resp.success);
-        assert!(resp.config.is_none());
         assert!(resp.key_id.is_none());
-        assert!(resp.private_key.is_none());
         assert!(resp.dns.is_none());
         assert!(resp.server_node.is_none());
     }
@@ -918,6 +1026,52 @@ mod types_serialization_tests {
         }"#;
         let cfg: ClientConfigResponse = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.dns_filtering_available, Some(false));
+    }
+
+    /// Account API contract item 40 (owner decision D6): `features.<PLAN>.
+    /// customDns`. Today's server sends no such flag, which must read as "not
+    /// said" (enabled); a new one sends `true` for every plan; only an explicit
+    /// `false` is a `false`, and a flag of an unexpected shape never takes the
+    /// rest of the config down with it.
+    #[test]
+    fn client_config_custom_dns_is_per_plan_and_optional() {
+        let today: ClientConfigResponse = serde_json::from_str(
+            r#"{"dnsFilteringAvailable":true,"features":{"RECON":{"dnsFiltering":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            today.features.unwrap()["RECON"],
+            PlanFeatures { custom_dns: None }
+        );
+        let no_map: ClientConfigResponse = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert!(no_map.features.is_none());
+
+        let new: ClientConfigResponse = serde_json::from_str(
+            r#"{"features":{"RECON":{"customDns":true},"OPERATIVE":{"customDns":true},"SOVEREIGN":{"customDns":false}}}"#,
+        )
+        .unwrap();
+        let features = new.features.as_ref().unwrap();
+        assert_eq!(features["RECON"].custom_dns, Some(true));
+        assert_eq!(features["SOVEREIGN"].custom_dns, Some(false));
+
+        let odd: ClientConfigResponse = serde_json::from_str(
+            r#"{"dnsFilteringAvailable":false,"features":{"RECON":{"customDns":"yes"},"OPERATIVE":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(odd.dns_filtering_available, Some(false));
+        let features = odd.features.unwrap();
+        assert_eq!(features["RECON"].custom_dns, None);
+        assert_eq!(features["OPERATIVE"].custom_dns, None);
+        let not_a_map: ClientConfigResponse =
+            serde_json::from_str(r#"{"dnsFilteringAvailable":true,"features":[1]}"#).unwrap();
+        assert_eq!(not_a_map.dns_filtering_available, Some(true));
+        assert!(not_a_map.features.is_none());
+
+        // What the UI receives: the same camelCase shape the server sent.
+        assert_eq!(
+            serde_json::to_value(&new).unwrap()["features"]["SOVEREIGN"],
+            serde_json::json!({ "customDns": false })
+        );
     }
 
     /// The in-app anonymous-registration body must serialize with the exact
@@ -982,6 +1136,7 @@ mod vpn_config_security_tests {
             endpoint: "1.2.3.4:51820".to_string(),
             allowed_ips: vec!["0.0.0.0/0".to_string()],
             dns: vec!["1.1.1.1".to_string()],
+            custom_dns: false,
             client_ip: "10.0.0.2".to_string(),
             client_ipv6: None,
             allowed_ips_v6: Vec::new(),
@@ -1117,7 +1272,10 @@ mod error_classification_tests {
         let body = r#"{"statusCode":403,"message":"Stealth mode requires an Operative or Sovereign subscription"}"#;
         let err = BirdoApi::classify_error_response(StatusCode::FORBIDDEN, body);
         match err {
-            ApiError::Unknown(msg) => assert!(msg.contains("Stealth mode requires")),
+            ApiError::Rejected { status, message } => {
+                assert_eq!(status, 403);
+                assert!(message.contains("Stealth mode requires"));
+            }
             other => panic!("403 should surface the backend's explanation, got {other:?}"),
         }
     }

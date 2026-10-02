@@ -6,7 +6,9 @@
  * 3. Speed: Eliminates 2× DNS + HTTPS round trips on startup
  *
  * Font source: https://rsms.me/inter/ — SIL Open Font License 1.1
- * Variable font covers weights 100-900 in a single ~300 KB file.
+ * Variable font covers weights 100-900 in a single ~300 KB file. Upright only:
+ * the app renders no italic text, and the italic face was ~388 KB of bundle
+ * nobody saw (W2-039).
  *
  * To regenerate: download InterVariable.woff2 from
  *   https://github.com/rsms/inter/releases
@@ -19,12 +21,4 @@
   font-weight: 100 900;
   font-display: swap;
   src: url('../assets/fonts/Inter-Variable.woff2') format('woff2');
-}
-
-@font-face {
-  font-family: 'Inter';
-  font-style: italic;
-  font-weight: 100 900;
-  font-display: swap;
-  src: url('../assets/fonts/Inter-Variable-Italic.woff2') format('woff2');
 }

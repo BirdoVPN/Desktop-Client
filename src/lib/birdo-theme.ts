@@ -1,22 +1,21 @@
 /**
  * Birdo design tokens.
  *
- * COLOR DIVERGENCE (2026-07 brand pivot, web #201): desktop is EMERALD; mobile's
- * Color.kt / Brand.kt are still violet until the mobile rebrand round lands. The
- * structure, motion and radius scales below still mirror mobile — only the accent
- * family diverges. Do NOT copy colour values across the two clients until mobile
- * is rebranded.
+ * REFERENCE: `iosApp/iosApp/Theme/BirdoTheme.swift` (mobile repo), which
+ * Android's Color.kt / Brand.kt match value for value. All three clients are
+ * one emerald product now; the old note here ("mobile is still violet — do not
+ * copy colours across") predates the mobile rebrand and was the reason the
+ * Windows connected-green, idle CTA and Operative colour drifted (P1-parity-005).
+ * When a value changes, change it on iOS/Android too.
  *
- * GREEN BUDGET. Emerald is the brand accent, but green already means "connected"
- * in this app, so the two must never be confusable:
- *   - `status.green` (#22C55E) is reserved for CONNECTED surfaces (the connect
- *     button fill, the Protected pill, the tray icon). It is the only opaque
- *     green fill in the UI.
- *   - `brand.*` emerald is for chrome accents only (tabs, switches, focus rings,
- *     outlines, badges). The idle connect button is neutral glass with an emerald
- *     OUTLINE — never an emerald fill.
- *   - The globe's idle server dots are BLUE, not emerald, so the globe keeps its
- *     own connected-vs-idle signal (see WorldGlobe.tsx).
+ * THE GREEN BUDGET (iOS's hard rule): the brand is green, so connection state
+ * is separated by LUMINANCE, not hue. The idle Connect button is DEEP emerald
+ * (`gradient.connectIdle`); connected is luminous mint (`status.green`) with a
+ * glow. Never brighten the idle button to brand green. The globe's idle server
+ * dots stay BLUE so green on the globe keeps meaning "connected to this node".
+ *
+ * Corporate and restrained (owner direction): the only gradients left are
+ * two stops of ONE hue, exactly as iOS has them. No multi-colour gradients.
  */
 
 // ── Surface elevation tiers (dark) ───────────────────────────────────────
@@ -29,7 +28,7 @@ export const surface = {
   cardGlass: 'rgba(20,20,25,0.70)', // BirdoCard glass fill
 } as const;
 
-// ── Brand stops (emerald — shade-for-shade with web #201) ─────────────────
+// ── Brand stops (emerald) ────────────────────────────────────────────────
 export const brand = {
   accentDeep: '#047857', // emerald-700
   accentMid: '#059669', // emerald-600
@@ -37,45 +36,42 @@ export const brand = {
   accentLight: '#34D399', // emerald-400
   accentSoft: '#6EE7B7', // emerald-300 — accent text on dark
   accentBg: 'rgba(16,185,129,0.10)', // accent fill / brand badge bg
-  pink: '#EC4899',
-  cyan: '#22D3EE',
-  teal: '#14B8A6',
-  indigo: '#6366F1',
+  teal: '#14B8A6', // Operative identity
+  slate: '#64748B', // Free (Recon) identity
 } as const;
 
 /**
  * Accent rgba at an arbitrary alpha. Every accent tint in the app goes through
- * this so the brand colour lives in exactly one place (the swap to emerald left
- * ~25 hardcoded `rgba(168,85,247,…)` literals scattered across components).
+ * this so the brand colour lives in exactly one place.
  */
 export const accentA = (alpha: number): string => `rgba(16,185,129,${alpha})`;
 
-// ── Status colors ─────────────────────────────────────────────────────────
+// ── Status colors (muted: green good / amber warning / red danger) ────────
 export const status = {
-  green: '#22C55E',
-  greenLight: '#4ADE80',
-  greenBg: 'rgba(34,197,94,0.10)',
-  greenShadow: 'rgba(34,197,94,0.30)',
+  green: '#34D399', // "luminous mint" — CONNECTED only
+  greenLight: '#6EE7B7',
+  greenBg: 'rgba(52,211,153,0.10)',
+  greenShadow: 'rgba(52,211,153,0.30)',
   yellow: '#EAB308',
   yellowLight: '#FACC15',
   yellowBg: 'rgba(234,179,8,0.10)',
   red: '#F87171',
   redBg: 'rgba(248,113,113,0.10)',
+  redBorder: 'rgba(248,113,113,0.30)',
   blue: '#3B82F6',
   blueBg: 'rgba(59,130,246,0.10)',
-  emerald: '#10B981', // update UI accent
-  emeraldBg: 'rgba(16,185,129,0.10)',
 } as const;
 
 // ── White-scale alphas ───────────────────────────────────────────────────
 // w40 is BELOW WCAG AA (~3.4:1 on #050507) — it is for decorative icons and
-// dividers only. Any text under 14px must use w55 or brighter.
+// dividers only. Any text must use w55 or brighter; `ContrastGuard.test.ts`
+// fails the build on a text use of w40.
 export const white = {
   w100: '#F2F2F2',
   w80: 'rgba(255,255,255,0.80)',
   w60: 'rgba(255,255,255,0.60)',
   w55: 'rgba(255,255,255,0.55)', // caption tier — smallest AA-passing text
-  w40: 'rgba(255,255,255,0.40)', // decorative only (fails AA for small text)
+  w40: 'rgba(255,255,255,0.40)', // decorative only (fails AA for text)
   w20: 'rgba(255,255,255,0.20)',
   w10: 'rgba(255,255,255,0.10)',
   w06: 'rgba(255,255,255,0.06)', // GlassStrong — secondary btn / topbar bg
@@ -90,52 +86,39 @@ export const hairline = {
   soft: 'rgba(255,255,255,0.08)',
 } as const;
 
-// ── Brushes / gradients (CSS strings) ────────────────────────────────────
+const linear = (from: string, to: string) => `linear-gradient(135deg, ${from} 0%, ${to} 100%)`;
+
+// ── Brushes (CSS strings; iOS `BirdoTheme.Gradients`) ────────────────────
 export const gradient = {
-  /** Primary brand fill — emerald CTA (Login / Consent / Split-Tunnel apply). */
-  primary: 'linear-gradient(135deg, #059669 0%, #064E3B 100%)',
-  /** Cool secondary — info / tech accents. */
-  info: `linear-gradient(135deg, ${brand.indigo} 0%, ${brand.cyan} 100%)`,
-  /** Connected (green disc → transparent). */
-  connected: `radial-gradient(circle, rgba(34,197,94,0.28) 0%, transparent 70%)`,
-  /** Idle ambient — BLUE, never emerald (green must stay = connected). */
-  idle: `radial-gradient(circle, rgba(59,130,246,0.14) 0%, transparent 70%)`,
-  /** Error halo. */
-  error: `radial-gradient(circle, rgba(248,113,113,0.25) 0%, transparent 70%)`,
+  /** Primary brand fill — DEEP emerald (the green budget). */
+  primary: linear('#047857', '#064E3B'),
   /** Glass card stroke — silver-to-transparent border. */
   glassStroke:
     'linear-gradient(135deg, rgba(255,255,255,0.18) 0%, rgba(255,255,255,0.04) 50%, rgba(255,255,255,0.12) 100%)',
-  /** Headline text gradient — white → soft white. */
-  headlineText:
-    'linear-gradient(180deg, #FFFFFF 0%, rgba(255,255,255,0.55) 100%)',
-  /** Brand text gradient — emerald → cyan for accent words. */
-  brandText: `linear-gradient(135deg, ${brand.accentSoft} 0%, ${brand.cyan} 100%)`,
+  /** Headline text — white to 55% white, one hue. */
+  headlineText: 'linear-gradient(180deg, #FFFFFF 0%, rgba(255,255,255,0.55) 100%)',
 
-  // ── Connect button states ──────────────────────────────────────────────
-  // These four must be instantly distinguishable at a glance. Only `connectGreen`
-  // is an opaque green fill; idle is neutral glass (emerald shows in the border
-  // only), busy is a translucent emerald wash behind a spinner, and multi-hop is
-  // teal — a different hue from both the idle glass and the connected green.
-  /** Idle — neutral glass. The emerald lives in the BORDER, not the fill. */
-  connectIdle:
-    'linear-gradient(135deg, rgba(255,255,255,0.10) 0%, rgba(255,255,255,0.04) 100%)',
-  /** Busy — translucent emerald wash (never mistakable for the connected fill). */
-  connectBusy:
-    'linear-gradient(135deg, rgba(110,231,183,0.22) 0%, rgba(4,120,87,0.30) 100%)',
-  /** Connected — the ONE opaque green fill in the app. */
-  connectGreen: `linear-gradient(135deg, ${status.green} 0%, #166534 100%)`,
-  /** Multi-hop ready — teal, hue-separated from connected green. */
-  connectMultiHop: `linear-gradient(135deg, #0D9488 0%, #115E59 100%)`,
+  // ── Connect button states (iOS connectIdle / Busy / Connected / MultiHop) ──
+  connectIdle: linear('#047857', '#064E3B'),
+  connectBusy: linear('#6EE7B7', '#047857'),
+  connectGreen: linear('#34D399', '#059669'),
+  connectMultiHop: linear('#10B981', '#047857'),
 } as const;
 
-// ── Motion timings (mirrors mobile's BirdoMotion.kt) ─────────────────────
+/** Plan chip / avatar fills — iOS `planSovereign` / `planOperative` / `planRecon`. */
+export const PLAN_GRADIENT = {
+  SOVEREIGN: linear('#059669', '#064E3B'),
+  OPERATIVE: linear('#0D9488', '#115E59'),
+  RECON: linear('#475569', '#334155'),
+} as const;
+
+// ── Motion timings (iOS BirdoTheme.Motion / Android BirdoMotion.kt) ───────
 export const motion = {
   instant: 0.09, // 90ms
-  fast: 0.16, // Quick (160ms) — was 0.15
+  fast: 0.16, // Quick (160ms)
   standard: 0.24, // 240ms
   emphasis: 0.36, // 360ms
-  slow: 0.36,
-  slow520: 0.52, // 520ms
+  slow: 0.52, // 520ms — was 0.36 here while iOS said 0.52 (W2-034)
   ease: [0.2, 0.0, 0.0, 1.0] as [number, number, number, number], // EaseStandard
   easeOut: [0.0, 0.0, 0.2, 1.0] as [number, number, number, number],
   accel: [0.3, 0.0, 0.8, 0.15] as [number, number, number, number],

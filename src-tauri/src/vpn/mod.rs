@@ -9,7 +9,8 @@ pub mod birdo_pq; // AUDIT-C1: BirdoPQ v1 ML-KEM-1024 PSK derivation (mirror of 
 pub mod buffer_pool; // FIX-2-4: Reduced to packet size constants only
 pub mod doh; // DNS-over-HTTPS resolver for SEC-002
 pub mod manager;
-pub mod network_monitor; // P2-15: System network connectivity monitor
+pub mod network_events; // OS route/resume signals for reconnect — zero packets (W1-011)
+pub mod reconnect_policy; // Pure auto-reconnect decisions + circuit breaker (W1-029)
 pub mod speed_test; // On-device speed test (P3-26)
 pub mod xray; // Xray Reality stealth tunnel (matching Android XrayManager)
 
@@ -24,10 +25,14 @@ pub mod tunnel_macos;
 #[cfg(target_os = "windows")]
 mod tunnel_dns; // netsh DNS reads + their captured-output parsers (Windows only)
 
-// Process-global owner of the Windows machine state a session moves aside: the
-// parked physical-adapter DNS and the installed routes. Lives outside the tunnel
-// because it outlives individual tunnels — see the module docs for the
-// invariants (issues #98, #99, #100, #102, #105).
+// The event-driven Wintun <-> WireGuard packet path (W1-006)
+#[cfg(target_os = "windows")]
+mod data_plane;
+
+// Process-global owner of the Windows machine state a session changes: the DNS
+// guard, the installed routes, and the heal of DNS older builds parked. Lives
+// outside the tunnel because it outlives individual tunnels — see the module
+// docs for the invariants (issues #98, #100, #102, #105; W1-007, W1-041).
 #[cfg(target_os = "windows")]
 pub mod win_machine_state;
 // Removed: pub mod wireguard; - deprecated file with placeholder crypto
@@ -36,6 +41,13 @@ mod wireguard_new;
 // Windows Filtering Platform for kill switch
 #[cfg(target_os = "windows")]
 pub mod wfp;
+// What the WFP session must contain, as testable data (W1-007/013/014)
+#[cfg(target_os = "windows")]
+pub(crate) mod wfp_policy;
+
+// One-time heal of the netsh firewall rules builds <= 1.3.19 left (W1-036)
+#[cfg(target_os = "windows")]
+pub mod legacy_firewall;
 
 // Linux iptables firewall for kill switch
 #[cfg(target_os = "linux")]
@@ -258,12 +270,27 @@ pub mod dns_journal {
         #[serde(default)]
         os: String,
 
-        /// Windows: every physical adapter `configure_dns` parked, with the
-        /// resolvers it had. Restored through the same helper the clean
-        /// disconnect uses, so the two cannot drift.
+        /// Windows: every physical adapter an OLDER build's `configure_dns`
+        /// parked, with the resolvers it had. Nothing new is parked (W1-007);
+        /// this is kept so those machines are healed.
         #[cfg(target_os = "windows")]
         #[serde(default)]
         adapters: Vec<super::tunnel::AdapterDnsSnapshot>,
+
+        /// Windows: the routes this session installed that outlive the tunnel
+        /// adapter (the endpoint host route, the LAN-sharing routes), so a
+        /// crash no longer leaves them behind (W1-041).
+        #[cfg(target_os = "windows")]
+        #[serde(default)]
+        routes: Vec<super::win_machine_state::OwnedRoute>,
+
+        /// Windows: when the boot that wrote `routes` began (ms since the
+        /// epoch). Routes do not survive a reboot, and after one an interface
+        /// index may name another adapter, so they are only removed in the same
+        /// boot.
+        #[cfg(target_os = "windows")]
+        #[serde(default)]
+        boot: Option<u64>,
 
         /// macOS: every enabled service `configure_dns` repointed, with the
         /// resolvers it had (empty = networksetup's "empty", i.e. back to DHCP).
@@ -760,19 +787,19 @@ pub mod dns_journal {
         }
     }
 
-    /// Record the adapters the machine-state owner is about to park.
-    ///
-    /// Returns whether the record actually reached the disk. The Windows owner
-    /// writes the record for an adapter BEFORE parking it and refuses to park it
-    /// if this fails: a mutation whose record is not durable is a mutation
-    /// nothing can undo (I4).
+    /// Record what the Windows machine-state owner holds: adapters an older
+    /// build parked and could not yet be restored, and the routes that would
+    /// outlive a crash. Returns whether the record actually reached the disk.
     #[cfg(target_os = "windows")]
     pub(super) fn record_windows(
         adapters: &[super::tunnel::AdapterDnsSnapshot],
+        routes: &[super::win_machine_state::OwnedRoute],
     ) -> Result<(), String> {
         write(&DnsJournal {
             os: std::env::consts::OS.to_string(),
             adapters: adapters.to_vec(),
+            routes: routes.to_vec(),
+            boot: super::win_machine_state::boot_epoch_ms(),
         })
     }
 
@@ -837,7 +864,11 @@ pub mod dns_journal {
         // nothing is left to describe.
         #[cfg(target_os = "windows")]
         {
-            super::win_machine_state::reconcile_record(&journal.adapters)
+            super::win_machine_state::reconcile_record(
+                &journal.adapters,
+                &journal.routes,
+                journal.boot,
+            )
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -1134,6 +1165,237 @@ pub mod dns_journal {
         }
     }
 
+    /// W1-008: the uninstaller restores what the journal describes BEFORE it
+    /// deletes anything, and keeps a journal that still describes something.
+    /// Source pins: the hook script is not reachable from a unit test, and
+    /// they cannot see the template around it — the compile-only makensis
+    /// harness does (lanes/WIN-FIX-1/tmp/d8-harness/build.sh, REVIEW-WIN2-020).
+    #[cfg(test)]
+    mod uninstall_tests {
+        const HOOKS: &str = include_str!("../../nsis-hooks.nsh");
+        const MAIN: &str = include_str!("../main.rs");
+
+        /// `needles` appear in `haystack` in this order, each after the last.
+        fn in_order(haystack: &str, needles: &[&str]) {
+            let mut last = 0;
+            for needle in needles {
+                let at = haystack[last..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+                last += at + needle.len();
+            }
+        }
+
+        #[test]
+        fn the_uninstaller_reconciles_before_it_deletes_anything() {
+            let pre = hook_macro("NSIS_HOOK_PREUNINSTALL");
+            // REVIEW-WIN2-008: a running app is stopped FIRST — the template
+            // does it only after this hook, and the reconcile beside a live
+            // session deleted its routes and rewrote its journal. Then the
+            // reconcile, which must finish (nsExec waits; REVIEW-WIN2-019: it
+            // is bounded) before anything is deleted.
+            in_order(
+                pre,
+                &[
+                    r#"!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}""#,
+                    "nsExec::Exec /TIMEOUT=",
+                    "--reconcile-and-exit",
+                ],
+            );
+            assert!(!pre.contains("RMDir"));
+            assert!(!pre.contains("ExecWait"), "unbounded");
+            // The flag main() honours is the one the hook passes.
+            assert!(MAIN.contains(r#"const RECONCILE_AND_EXIT: &str = "--reconcile-and-exit";"#));
+            let flag = MAIN
+                .find("arg == RECONCILE_AND_EXIT")
+                .expect("main() handles it");
+            let tauri = MAIN.find("tauri::Builder::default()").expect("the app");
+            assert!(
+                flag < tauri,
+                "the flag is handled before any window or plugin"
+            );
+        }
+
+        /// REVIEW-WIN2-020: this used to `rfind` a path that also matched
+        /// inside the `${FileExists}` line, so deleting both copies left it
+        /// green. Each step is a distinct line now, in order, and a failed
+        /// copy never reaches the deletion of the folder that holds the
+        /// record (REVIEW-WIN2-018).
+        #[test]
+        fn a_journal_that_still_describes_something_survives_the_deletion() {
+            let post = hook_macro("NSIS_HOOK_POSTUNINSTALL");
+            let delete = &post[post
+                .find("${If} $DeleteAppDataCheckboxState = 1")
+                .expect("the delete-app-data block")..];
+            in_order(
+                delete,
+                &[
+                    r#"${If} ${FileExists} "$APPDATA\BirdoVPN\dns-restore.json*""#,
+                    "ClearErrors",
+                    r#"CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json*" "$TEMP\birdo-journal-keep""#,
+                    "${IfNot} ${Errors}",
+                    r#"RMDir /r "$APPDATA\BirdoVPN""#,
+                    r#"CreateDirectory "$APPDATA\BirdoVPN""#,
+                    r#"CopyFiles /SILENT "$TEMP\birdo-journal-keep\dns-restore.json*" "$APPDATA\BirdoVPN""#,
+                    // The copy failed: only the logs go.
+                    "${Else}",
+                    r#"RMDir /r "$APPDATA\BirdoVPN\logs""#,
+                    // No journal at all: the whole folder.
+                    "${Else}",
+                    r#"RMDir /r "$APPDATA\BirdoVPN""#,
+                ],
+            );
+            // The `*` keeps the journal the app set aside as unreadable
+            // (`dns-restore.json.corrupt`, kept for support) — the name
+            // `vpn/mod.rs` gives it.
+            assert!(
+                super::preserved_path(std::path::Path::new("dns-restore.json"))
+                    .to_string_lossy()
+                    .starts_with("dns-restore.json")
+            );
+            // Nothing deletes the folder before the journal is safe.
+            let first_folder_delete = delete.find(r#"RMDir /r "$APPDATA\BirdoVPN""#).unwrap();
+            let copied = delete
+                .find(r#"CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json*""#)
+                .unwrap();
+            assert!(copied < first_folder_delete);
+        }
+
+        /// REVIEW-WIN2-011: an in-place update keeps the launch-at-login
+        /// task, like everything else.
+        #[test]
+        fn an_update_keeps_the_launch_at_login_task() {
+            let post = hook_macro("NSIS_HOOK_POSTUNINSTALL");
+            in_order(
+                post,
+                &[
+                    "${If} $UpdateMode <> 1",
+                    r#"schtasks /Delete /F /TN "BirdoVPN Launch At Login""#,
+                    "${EndIf}",
+                ],
+            );
+        }
+
+        /// The body of `!macro <name>` in the hooks, up to its `!macroend`.
+        fn hook_macro(name: &str) -> &'static str {
+            let start = HOOKS
+                .find(&format!("!macro {name}"))
+                .unwrap_or_else(|| panic!("no macro {name}"));
+            let body = &HOOKS[start..];
+            &body[..body.find("!macroend").expect("!macroend")]
+        }
+
+        /// The body of `Function <name>` in the hooks, up to `FunctionEnd`.
+        fn hook_function(name: &str) -> &'static str {
+            let start = HOOKS
+                .find(&format!("Function {name}\n"))
+                .or_else(|| HOOKS.find(&format!("Function {name}\r\n")))
+                .unwrap_or_else(|| panic!("no function {name}"));
+            let body = &HOOKS[start..];
+            &body[..body.find("FunctionEnd").expect("FunctionEnd")]
+        }
+
+        /// D8: the installer publishes as "Birdo Networks Ltd", and the hooks'
+        /// own literals for the install record and its parent are the ones
+        /// Tauri's template derives from it (`Software\<publisher>[\<product>]`).
+        /// The build fails on a mismatch too (`!error` in NSIS_HOOK_PREINSTALL,
+        /// the parent key included since REVIEW-WIN2-017); this catches it
+        /// without a Windows bundle.
+        #[test]
+        fn the_installer_publishes_as_birdo_networks_ltd() {
+            let conf: serde_json::Value =
+                serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+            let publisher = conf["bundle"]["publisher"].as_str().unwrap();
+            let product = conf["productName"].as_str().unwrap();
+            assert_eq!(publisher, "Birdo Networks Ltd");
+            assert!(
+                HOOKS.contains(&format!(r#"!define BIRDO_MANUKEY "Software\{publisher}""#)),
+                "the hooks' publisher key does not follow bundle.publisher"
+            );
+            assert!(
+                HOOKS.contains(&format!(
+                    r#"!define BIRDO_MANUPRODUCTKEY "${{BIRDO_MANUKEY}}\{product}""#
+                )),
+                "the hooks' record key does not follow productName"
+            );
+            assert_eq!(
+                conf["bundle"]["windows"]["nsis"]["installMode"], "perMachine",
+                "the machine records are written to HKLM"
+            );
+            let pre = hook_macro("NSIS_HOOK_PREINSTALL");
+            for guard in [
+                r#"!if "${BIRDO_MANUPRODUCTKEY}" != "${MANUPRODUCTKEY}""#,
+                r#"!if "${BIRDO_MANUKEY}" != "${MANUKEY}""#,
+                r#"!if "${INSTALLMODE}" != "perMachine""#,
+            ] {
+                assert!(pre.contains(guard), "{guard}");
+            }
+            assert_eq!(pre.matches("!error").count(), 4);
+            // No second, unguarded copy of the parent key's literal.
+            assert_eq!(HOOKS.matches(r#""Software\Birdo Networks Ltd"#).count(), 1);
+        }
+
+        /// D8: an upgrade from the old publisher adopts its install record
+        /// before any page reads it (GUI and passive: Modern UI's GUI init;
+        /// silent: PREINSTALL); a cancelled OR failed install puts the
+        /// registry back (REVIEW-WIN2-014); a successful one keeps the old
+        /// record as a mirror for a rollback (REVIEW-WIN2-013), which the
+        /// uninstaller drops — as HKLM, whatever SHCTX the template switched
+        /// to (REVIEW-WIN2-016).
+        #[test]
+        fn an_upgrade_adopts_the_old_publishers_record() {
+            assert!(HOOKS.contains(r#"!define BIRDO_LEGACY_MANUKEY "Software\Birdo VPN""#));
+            assert!(HOOKS.contains("!define MUI_CUSTOMFUNCTION_GUIINIT BirdoAdoptLegacyRecord"));
+            assert!(HOOKS.contains("!define MUI_CUSTOMFUNCTION_ABORT BirdoForgetAdoptedRecord"));
+            assert!(hook_function(".onInstFailed").contains("Call BirdoForgetAdoptedRecord"));
+
+            let adopt = hook_function("BirdoAdoptLegacyRecord");
+            in_order(
+                adopt,
+                &[
+                    r#"ReadRegStr $0 SHCTX "${BIRDO_MANUPRODUCTKEY}" """#,
+                    r#"ReadRegStr $0 SHCTX "${BIRDO_LEGACY_MANUPRODUCTKEY}" """#,
+                    r#"WriteRegStr SHCTX "${BIRDO_MANUPRODUCTKEY}" "" $0"#,
+                ],
+            );
+            assert!(adopt.contains("StrCpy $INSTDIR $0"));
+
+            // Silent: adopt, move the output path, and only then remove the
+            // folder the template created first — if it is empty
+            // (REVIEW-WIN2-015: it was the working directory until then).
+            in_order(
+                hook_macro("NSIS_HOOK_PREINSTALL"),
+                &[
+                    "StrCpy $BirdoOutPathBeforeAdoption $INSTDIR",
+                    "Call BirdoAdoptLegacyRecord",
+                    "SetOutPath $INSTDIR",
+                    "${If} $INSTDIR != $BirdoOutPathBeforeAdoption",
+                    "RMDir $BirdoOutPathBeforeAdoption",
+                ],
+            );
+            assert!(!hook_macro("NSIS_HOOK_PREINSTALL").contains("RMDir /r"));
+
+            let post = hook_macro("NSIS_HOOK_POSTINSTALL");
+            assert!(
+                post.contains(r#"WriteRegStr HKLM "${BIRDO_LEGACY_MANUPRODUCTKEY}" "" $INSTDIR"#)
+            );
+            assert!(!post.contains("BIRDO_DROP_LEGACY_PUBLISHER_RECORD"));
+
+            assert!(hook_macro("NSIS_HOOK_POSTUNINSTALL")
+                .contains("!insertmacro BIRDO_DROP_LEGACY_PUBLISHER_RECORD"));
+            let drop = hook_macro("BIRDO_DROP_LEGACY_PUBLISHER_RECORD");
+            assert!(drop.contains(r#"DeleteRegKey HKLM "${BIRDO_LEGACY_MANUPRODUCTKEY}""#));
+            assert!(
+                !drop.contains("SHCTX"),
+                "SHCTX is HKCU after the template's T:881"
+            );
+            // Never the whole old publisher key: a 1.0.0 install ("Birdo VPN"
+            // product) keeps its own record under it.
+            assert!(drop.contains(r#"DeleteRegKey /ifempty HKLM "${BIRDO_LEGACY_MANUKEY}""#));
+            assert!(!drop.contains(r#"DeleteRegKey HKLM "${BIRDO_LEGACY_MANUKEY}""#));
+        }
+    }
+
     /// Durability of the record itself — the property every other invariant in
     /// `win_machine_state` is standing on (I4). These drive the path-taking
     /// helpers directly rather than `write`/`read`, which resolve their own
@@ -1287,6 +1549,7 @@ mod scope_tests {
             endpoint: "203.0.113.1:51820".into(),
             allowed_ips: allowed_ips.iter().map(|s| s.to_string()).collect(),
             dns: vec!["10.8.0.1".into()],
+            custom_dns: false,
             client_ip: "10.8.0.2".into(),
             client_ipv6: client_ipv6.map(|s| s.to_string()),
             allowed_ips_v6: allowed_ips_v6.iter().map(|s| s.to_string()).collect(),

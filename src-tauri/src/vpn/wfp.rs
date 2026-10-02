@@ -1,4 +1,5 @@
-//! Windows Filtering Platform (WFP) Kill Switch Implementation
+//! Windows Filtering Platform (WFP): the kill switch, the IPv6 connect-window
+//! block and the DNS guard.
 //!
 //! Clippy: WFP FFI structs (`FWPM_*`) are canonically initialised as
 //! `..Default::default()` followed by field assignment — the C-style pattern
@@ -18,6 +19,21 @@
 //!   engine handle is closed, *including abnormal process termination*.
 //! - **Performance** — direct FFI (~100 μs) vs. spawning netsh.exe (~200 ms).
 //! - **Reliability** — no text parsing of netsh stdout/stderr.
+//!
+//! ## What the session holds, and who decides it
+//!
+//! ONE filter set, installed and replaced as a whole. Its contents are a pure
+//! function of a [`Policy`] (`wfp_policy::filter_specs`), which is where the
+//! decisions live and where they are tested: the kill switch's block-all with
+//! its app-scoped permits (W1-013) at both the connect and the receive-accept
+//! layers (W1-014), the LEAK-2 IPv6 block, and the DNS guard (W1-007). Every
+//! change — arm, refresh, release, a new relay, a DNS guard, an interface that
+//! appeared — computes the next policy and swaps the whole set inside one
+//! transaction, so an abort leaves the previous set in force.
+//!
+//! No persistent filters and no boot-time filters, ever: every object here is
+//! created in the dynamic session, so nothing survives the process — see
+//! AUDIT-L below for what that costs.
 //!
 //! ## AUDIT-L (design trade-off): fail-OPEN on app crash
 //!
@@ -46,36 +62,26 @@
 //!     network stack falls back to the physical interface within a single
 //!     OS poll cycle, not a sustained leak.
 //!   * STUN/TURN UDP destinations are blocked at a higher weight than
-//!     general permits — but ONLY while the block-all is active (the
-//!     STUN/TURN filters are installed by `activate_blocking` and removed
-//!     with it). During a normal reactive-mode session, and on non-Windows
-//!     platforms, WebRTC/STUN is NOT filtered; steady-state protection there
-//!     relies on routing all traffic through the tunnel. Do not read this
-//!     module as providing session-long WebRTC leak protection.
+//!     general permits — but ONLY while the block-all is active. During a
+//!     normal reactive-mode session, and on non-Windows platforms,
+//!     WebRTC/STUN is NOT filtered; steady-state protection there relies on
+//!     routing all traffic through the tunnel.
 //!
-//! For users who need a true "fail-CLOSED on crash" posture (paranoid /
-//! journalist threat model), a future v2 could ship a separate Windows
-//! service running as `LocalSystem` that holds a non-dynamic WFP session
-//! across GUI restarts. Tracked as a post-launch hardening item — NOT a
-//! blocker per the security audit because the residual leak window is
-//! sub-second and cannot be triggered remotely without prior local code
-//! execution.
-//!
-//! Architecture:
-//!   1. One `WfpEngine` handle is opened at `initialize()` and held for the
-//!      lifetime of the VPN session (closed at `cleanup()`).
-//!   2. A custom sublayer (`BIRDO_SUBLAYER_KEY`) groups all our filters.
-//!   3. Permit rules (weight 10) are evaluated before the catch-all block
-//!      (weight 1). STUN/TURN blocks use weight 15 to override permits.
-//!   4. `activate_blocking()` wraps all filter additions in a single
-//!      `FwpmTransactionBegin0` / `FwpmTransactionCommit0` pair.
+//! A true "fail-CLOSED on crash" posture needs a LocalSystem service holding a
+//! non-dynamic session across GUI restarts — the next phase (owner decision
+//! D1), not this one.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::utils::elevation::is_elevated as is_admin;
+
+use super::wfp_policy::{
+    filter_specs, host_only_interfaces, Action, BlockAll, Condition, DnsGuard, FilterSpec,
+    InterfaceFacts, Layer, Policy, Relay,
+};
 
 use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
@@ -87,15 +93,8 @@ use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 // objects from a previous dynamic session (shouldn't exist, but belt &
 // suspenders).
 
-/// Sublayer that groups every Birdo VPN kill-switch filter.
+/// Sublayer that groups every Birdo VPN filter.
 const BIRDO_SUBLAYER_KEY: GUID = GUID::from_u128(0xe5f4c3b2_8f9d_5ea0_c1b6_000023456789);
-
-// ── Filter weight constants ──────────────────────────────────────────
-// Within our sublayer the first matching filter wins.  Higher weight is
-// evaluated first.
-pub(crate) const WEIGHT_BLOCK_ALL: u8 = 1; // catch-all, checked last
-pub(crate) const WEIGHT_PERMIT: u8 = 10; // permit exceptions
-pub(crate) const WEIGHT_BLOCK_STUN: u8 = 15; // STUN block overrides permits
 
 // ── Global state ─────────────────────────────────────────────────────
 static IS_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -110,7 +109,7 @@ static IPV6_ONLY_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// filters are installed *right now*. The two diverge during a reactive
 /// kill-switch cycle, where the kill switch's own block-all temporarily owns the
 /// IPv6 block — and the intent is what must survive that cycle, because
-/// `deactivate_blocking()` removes EVERY filter including the v6 block.
+/// `deactivate_blocking()` replaces the whole filter set.
 static IPV6_BLOCK_WANTED: AtomicBool = AtomicBool::new(false);
 
 /// True while a tunnel is being torn down with a replacement already committed
@@ -118,18 +117,18 @@ static IPV6_BLOCK_WANTED: AtomicBool = AtomicBool::new(false);
 /// IPv6 egresses the physical NIC for the whole teardown + setup of the new
 /// tunnel.
 static IPV6_BLOCK_HELD: AtomicBool = AtomicBool::new(false);
-static VPN_SERVER_IP: once_cell::sync::Lazy<Arc<RwLock<Option<Ipv4Addr>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
+
+/// The relay the block-all lets the tunnel reach: address, port and transport
+/// (W1-013). Set on every connect and re-dial, before the handshake.
+static RELAY: std::sync::Mutex<Option<Relay>> = std::sync::Mutex::new(None);
 
 /// STEALTH: the xray.exe the client spawned for a Reality tunnel. In stealth
 /// mode the WireGuard endpoint is 127.0.0.1:<local_port> and it is THIS
-/// process — not ours — that carries the tunnel to the relay over TCP 8443.
-/// The own-process permit below does not cover it, so a lockdown block that
-/// is already installed (always-on, or held after a failed connect) silently
-/// dropped its SYNs: on 2026-09-17 every stealth connect timed out at the
-/// handshake while node captures showed zero packets from the PC on :8443,
-/// and a hand-sent packet to the same xray reached the node instantly once
-/// no block was active. Set by XrayManager::start, cleared by stop.
+/// process — not ours — that carries the tunnel to the relay over TCP. A
+/// lockdown block that did not permit it silently dropped its SYNs: on
+/// 2026-09-17 every stealth connect timed out at the handshake while node
+/// captures showed zero packets from the PC. Set by XrayManager::start,
+/// cleared by stop.
 static STEALTH_HELPER_EXE: once_cell::sync::Lazy<Arc<RwLock<Option<String>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
@@ -145,32 +144,25 @@ static LOCAL_NETWORK_SHARING: AtomicBool = AtomicBool::new(false);
 /// #34, the TunnelVision fix) and is user-switchable in Settings › Security ›
 /// "Always-on kill switch". This static is only the pre-connect value: it
 /// starts false and `commands::vpn::apply_vpn_settings` sets it from the
-/// setting on every connect and settings reapply. (This comment used to say
-/// "OFF by default"; that stopped being true with #34 — audit 2026-09-29,
-/// D-21.)
+/// setting on every connect and settings reapply. (D-21.)
 ///
 /// When false: the kill switch is REACTIVE — the block-all is only
 /// installed during a reconnect gap, and steady-state Connected traffic is
-/// contained by routing. Small (~5-30s) detection window on a drop, but the
-/// block is never active during normal browsing, so it cannot mis-block.
+/// contained by routing.
 ///
 /// When true (the Windows default): Mullvad-style ALWAYS-ON. The block-all
 /// stays installed the whole time the tunnel is up, and an INTERFACE-scoped
-/// permit on the tunnel adapter LUID (see TUNNEL_LUID /
-/// add_permit_tunnel_interface) lets tunneled traffic through while
-/// everything on the physical NIC stays blocked — so there is NO leak window,
-/// including across reconnects, while the app is running. The default shipped
-/// ON before the on-device run of `docs/WINDOWS-LEAK-VALIDATION.md` §A1 was
-/// recorded: an always-on block that mis-resolves the tunnel LUID would block
-/// the user's own tunneled traffic, which is why activate_blocking refuses to
-/// install a block-all without a LUID. The dynamic WFP session still
-/// guarantees crash-safety (filters auto-removed if the process dies) — which
-/// is also why none of this protects anything once the app has exited.
+/// permit on the tunnel adapter LUID (see TUNNEL_LUID) lets tunneled traffic
+/// through while everything on the physical NIC stays blocked — so there is
+/// NO leak window, including across reconnects, while the app is running. The
+/// dynamic WFP session still guarantees crash-safety (filters auto-removed if
+/// the process dies) — which is also why none of this protects anything once
+/// the app has exited.
 static LOCKDOWN_MODE: AtomicBool = AtomicBool::new(false);
 
 /// The WireGuard tunnel adapter's interface LUID, published by the tunnel layer
 /// once the Wintun adapter exists (0 = unknown). Lockdown mode permits all
-/// traffic egressing this interface so tunneled browsing keeps working under the
+/// traffic on this interface so tunneled browsing keeps working under the
 /// always-on block-all.
 static TUNNEL_LUID: AtomicU64 = AtomicU64::new(0);
 
@@ -179,58 +171,98 @@ static TUNNEL_LUID: AtomicU64 = AtomicU64::new(0);
 static ENGINE: once_cell::sync::Lazy<std::sync::Mutex<Option<WfpEngine>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 
-// ── Backward-compat exports for crash cleanup (main.rs) ─────────────
-// FIX-2-1: With dynamic sessions the OS cleans up automatically, so the
-// netsh-based crash cleanup in main.rs is now a harmless no-op.  We keep
-// these constants so the existing `cleanup_on_crash()` still compiles.
-const RULE_BLOCK_ALL: &str = "BirdoVPN_BlockAll";
-const RULE_PERMIT_VPN: &str = "BirdoVPN_PermitVPN";
-const RULE_PERMIT_LOCALHOST: &str = "BirdoVPN_PermitLocalhost";
-const RULE_PERMIT_DHCP: &str = "BirdoVPN_PermitDHCP";
-const RULE_BLOCK_IPV6: &str = "BirdoVPN_BlockIPv6";
-const RULE_BLOCK_STUN: &str = "BirdoVPN_BlockSTUN";
-const RULE_BLOCK_TURN: &str = "BirdoVPN_BlockTURN";
-
-/// L-1: Public rule name constants for use in crash cleanup (main.rs)
-/// so hardcoded strings don't drift out of sync with the actual values.
-/// NOTE: With the WFP migration these are only needed for the legacy
-/// netsh cleanup fallback, which is now a harmless no-op.
-pub struct RuleNames {
-    pub block_all: &'static str,
-    pub permit_vpn: &'static str,
-    pub permit_localhost: &'static str,
-    pub permit_dhcp: &'static str,
-    pub block_ipv6: &'static str,
-    pub block_stun: &'static str,
-    pub block_turn: &'static str,
-}
-
-pub static RULE_NAMES: RuleNames = RuleNames {
-    block_all: RULE_BLOCK_ALL,
-    permit_vpn: RULE_PERMIT_VPN,
-    permit_localhost: RULE_PERMIT_LOCALHOST,
-    permit_dhcp: RULE_PERMIT_DHCP,
-    block_ipv6: RULE_BLOCK_IPV6,
-    block_stun: RULE_BLOCK_STUN,
-    block_turn: RULE_BLOCK_TURN,
-};
-
 // ── WFP engine wrapper ──────────────────────────────────────────────
 
-/// Holds an open WFP engine handle and tracks the filter IDs that we
-/// have installed so they can be removed on deactivation.
+/// Holds an open WFP engine handle, the filter IDs we installed and the policy
+/// they implement.
 struct WfpEngine {
     handle: HANDLE,
     filter_ids: Vec<u64>,
     sublayer_added: bool,
-    /// Map from permit_id (V4 filter ID) → (app_path, all filter IDs for that app)
-    split_tunnel_map: std::collections::HashMap<u64, (String, Vec<u64>)>,
+    /// What `filter_ids` implements. Every change starts from this.
+    installed: Policy,
 }
 
 // SAFETY: The WFP engine handle is a plain kernel object handle that
 // can safely be sent between threads.  All access is serialized by the
 // `ENGINE` mutex.
 unsafe impl Send for WfpEngine {}
+
+/// A WFP app id from `FwpmGetAppIdFromFileName0`, freed with `FwpmFreeMemory0`.
+struct AppBlob(*mut FWP_BYTE_BLOB);
+
+impl Drop for AppBlob {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from FwpmGetAppIdFromFileName0 and is freed
+        // exactly once, here.
+        unsafe { FwpmFreeMemory0(&mut (self.0 as *mut std::ffi::c_void)) };
+    }
+}
+
+/// Resolve an executable's WFP app id. `None` when WFP cannot (the file is
+/// missing, or the path cannot be converted to a device path).
+fn app_id(path: &str) -> Option<AppBlob> {
+    let wide_path = wide_nul(path);
+    let mut blob: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
+    // SAFETY: `wide_path` is a valid NUL-terminated UTF-16 string for the call;
+    // `blob` is an out-param receiving an OS-allocated blob, owned by AppBlob.
+    let err =
+        unsafe { FwpmGetAppIdFromFileName0(windows::core::PCWSTR(wide_path.as_ptr()), &mut blob) };
+    // A null out-param is a failure too, which keeps the later deref sound
+    // (CodeQL rust/access-invalid-pointer).
+    if err != 0 || blob.is_null() {
+        tracing::debug!(
+            "FwpmGetAppIdFromFileName0 failed for '{}': 0x{:08X}",
+            file_name(path),
+            err
+        );
+        return None;
+    }
+    Some(AppBlob(blob))
+}
+
+fn file_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+}
+
+/// Resolve every app the policy names, reporting the failures that change
+/// what the kill switch can do.
+fn resolve_apps(policy: &Policy) -> HashMap<String, AppBlob> {
+    let mut apps = HashMap::new();
+    for named in crate::vpn::wfp_policy::named_apps(policy) {
+        if apps.contains_key(named.path) {
+            continue;
+        }
+        match app_id(named.path) {
+            Some(blob) => {
+                apps.insert(named.path.to_string(), blob);
+            }
+            None if named.loud => tracing::error!(
+                "Kill switch: no WFP app id for {} — {}",
+                file_name(named.path),
+                named.consequence
+            ),
+            None => tracing::warn!(
+                "Kill switch: no WFP app id for {} — {}",
+                file_name(named.path),
+                named.consequence
+            ),
+        }
+    }
+    apps
+}
+
+fn layer_key(layer: Layer) -> GUID {
+    match layer {
+        Layer::ConnectV4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        Layer::ConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        Layer::RecvAcceptV4 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+        Layer::RecvAcceptV6 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+    }
+}
 
 impl WfpEngine {
     // ── Lifecycle ────────────────────────────────────────────────────
@@ -265,7 +297,7 @@ impl WfpEngine {
             handle,
             filter_ids: Vec::new(),
             sublayer_added: false,
-            split_tunnel_map: std::collections::HashMap::new(),
+            installed: Policy::default(),
         })
     }
 
@@ -283,7 +315,7 @@ impl WfpEngine {
             self.handle = HANDLE::default();
             self.filter_ids.clear();
             self.sublayer_added = false;
-            self.split_tunnel_map.clear();
+            self.installed = Policy::default();
         }
         Ok(())
     }
@@ -323,7 +355,7 @@ impl WfpEngine {
 
     fn add_sublayer(&mut self) -> Result<(), String> {
         let name = wide_nul("Birdo VPN Kill Switch");
-        let desc = wide_nul("Blocks non-VPN traffic to prevent IP leaks");
+        let desc = wide_nul("Blocks non-VPN traffic to prevent IP and DNS leaks");
 
         let mut sublayer = FWPM_SUBLAYER0::default();
         sublayer.subLayerKey = BIRDO_SUBLAYER_KEY;
@@ -363,28 +395,7 @@ impl WfpEngine {
         }
     }
 
-    // ── Single-filter helpers ───────────────────────────────────────
-
-    fn add_filter(&mut self, filter: &FWPM_FILTER0) -> Result<u64, String> {
-        let mut id: u64 = 0;
-        // SAFETY: `self.handle` is a valid WFP engine handle.  `filter` is a
-        // caller-constructed struct whose field pointers are valid for this call.
-        // `id` is an out-param written by the OS on success; we track it in
-        // `self.filter_ids` for cleanup.
-        let err = unsafe {
-            FwpmFilterAdd0(
-                self.handle,
-                filter,
-                windows::Win32::Security::PSECURITY_DESCRIPTOR::default(),
-                Some(&mut id),
-            )
-        };
-        if err != 0 {
-            return Err(format!("FwpmFilterAdd0 failed: 0x{:08X}", err));
-        }
-        self.filter_ids.push(id);
-        Ok(id)
-    }
+    // ── Filters ─────────────────────────────────────────────────────
 
     fn remove_all_filters(&mut self) {
         let ids: Vec<u64> = self.filter_ids.drain(..).collect();
@@ -397,592 +408,182 @@ impl WfpEngine {
                 tracing::debug!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
             }
         }
-        // Split tunnel map entries reference filter_ids that were just removed
-        self.split_tunnel_map.clear();
     }
 
-    // ── High-level filter builders ──────────────────────────────────
+    /// Add one filter built from `spec`.
+    fn add_spec(
+        &mut self,
+        spec: &FilterSpec,
+        apps: &HashMap<String, AppBlob>,
+    ) -> Result<(), String> {
+        let name = wide_nul(&spec.name);
 
-    /// Block ALL outbound IPv4 connections (catch-all, lowest weight).
-    fn add_block_all_v4(&mut self) -> Result<(), String> {
-        let name = wide_nul("Birdo: Block all outbound IPv4");
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWP_ACTION_BLOCK,
-            WEIGHT_BLOCK_ALL,
-        );
-        filter.numFilterConditions = 0;
-        filter.filterCondition = std::ptr::null_mut();
-        self.add_filter(&filter)?;
-        Ok(())
-    }
+        // What the conditions point into. Boxed so every address stays put
+        // until FwpmFilterAdd0 has copied the filter.
+        let mut v4: Vec<Box<FWP_V4_ADDR_AND_MASK>> = Vec::new();
+        let mut v6: Vec<Box<FWP_V6_ADDR_AND_MASK>> = Vec::new();
+        let mut ranges: Vec<Box<FWP_RANGE0>> = Vec::new();
+        let mut luids: Vec<Box<u64>> = Vec::new();
+        let mut conditions: Vec<FWPM_FILTER_CONDITION0> = Vec::with_capacity(spec.conditions.len());
 
-    /// Block ALL outbound IPv6 connections (prevents IPv6 leaks).
-    fn add_block_all_v6(&mut self) -> Result<(), String> {
-        let name = wide_nul("Birdo: Block all outbound IPv6");
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            FWP_ACTION_BLOCK,
-            WEIGHT_BLOCK_ALL,
-        );
-        filter.numFilterConditions = 0;
-        filter.filterCondition = std::ptr::null_mut();
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    /// Permit IPv6 localhost (::1/128).
-    fn add_permit_localhost_v6(&mut self) -> Result<(), String> {
-        let name = wide_nul("Birdo: Permit IPv6 localhost");
-        // ::1 = 16 bytes, /128 mask = all ones
-        let mut addr_mask = FWP_V6_ADDR_AND_MASK {
-            addr: Ipv6Addr::LOCALHOST.octets(),
-            prefixLength: 128,
-        };
-
-        let mut condition = FWPM_FILTER_CONDITION0::default();
-        condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
-        condition.matchType = FWP_MATCH_EQUAL;
-        condition.conditionValue.r#type = FWP_V6_ADDR_MASK;
-        condition.conditionValue.Anonymous.v6AddrMask = &mut addr_mask;
-
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
-        filter.numFilterConditions = 1;
-        filter.filterCondition = &mut condition;
-
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    /// Permit DHCPv6 (UDP ports 546-547).
-    fn add_permit_dhcpv6(&mut self) -> Result<(), String> {
-        let name = wide_nul("Birdo: Permit DHCPv6");
-
-        // Condition 1: protocol == UDP (17)
-        let mut cond_proto = FWPM_FILTER_CONDITION0::default();
-        cond_proto.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
-        cond_proto.matchType = FWP_MATCH_EQUAL;
-        cond_proto.conditionValue.r#type = FWP_UINT8;
-        cond_proto.conditionValue.Anonymous.uint8 = 17; // IPPROTO_UDP
-
-        // Condition 2: remote port in range 546..=547
-        let mut port_range = FWP_RANGE0::default();
-        port_range.valueLow.r#type = FWP_UINT16;
-        port_range.valueLow.Anonymous.uint16 = 546;
-        port_range.valueHigh.r#type = FWP_UINT16;
-        port_range.valueHigh.Anonymous.uint16 = 547;
-
-        let mut cond_port = FWPM_FILTER_CONDITION0::default();
-        cond_port.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
-        cond_port.matchType = FWP_MATCH_RANGE;
-        cond_port.conditionValue.r#type = FWP_RANGE_TYPE;
-        cond_port.conditionValue.Anonymous.rangeValue = &mut port_range;
-
-        let mut conditions = [cond_proto, cond_port];
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
-        filter.numFilterConditions = conditions.len() as u32;
-        filter.filterCondition = conditions.as_mut_ptr();
-
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    /// Install the STANDALONE IPv6 block (block-all v6 + localhost/DHCPv6
-    /// permits) in a single transaction. Shared by `block_ipv6()` and by
-    /// `deactivate_blocking()`, which must rebuild this block after tearing down
-    /// the kill switch's filters if the session still wants IPv6 contained.
-    fn install_standalone_v6_block(&mut self) -> Result<(), String> {
-        self.begin_transaction()?;
-        let result = (|| -> Result<(), String> {
-            self.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
-            self.add_block_all_v6()?;
-            self.add_permit_localhost_v6()?;
-            self.add_permit_dhcpv6()?;
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => self.commit_transaction(),
-            Err(e) => {
-                self.abort_transaction();
-                Err(e)
+        for condition in &spec.conditions {
+            let mut c = FWPM_FILTER_CONDITION0::default();
+            c.matchType = FWP_MATCH_EQUAL;
+            match condition {
+                Condition::RemoteV4 { addr, prefix } => {
+                    let mask = if *prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - u32::from(*prefix))
+                    };
+                    let mut value = Box::new(FWP_V4_ADDR_AND_MASK {
+                        addr: u32::from(*addr),
+                        mask,
+                    });
+                    c.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+                    c.conditionValue.r#type = FWP_V4_ADDR_MASK;
+                    c.conditionValue.Anonymous.v4AddrMask = &mut *value;
+                    v4.push(value);
+                }
+                Condition::RemoteV6 { addr, prefix } => {
+                    let mut value = Box::new(FWP_V6_ADDR_AND_MASK {
+                        addr: addr.octets(),
+                        prefixLength: *prefix,
+                    });
+                    c.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+                    c.conditionValue.r#type = FWP_V6_ADDR_MASK;
+                    c.conditionValue.Anonymous.v6AddrMask = &mut *value;
+                    v6.push(value);
+                }
+                Condition::Protocol(protocol) => {
+                    c.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+                    c.conditionValue.r#type = FWP_UINT8;
+                    c.conditionValue.Anonymous.uint8 = *protocol;
+                }
+                Condition::RemotePort(port) => {
+                    c.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+                    c.conditionValue.r#type = FWP_UINT16;
+                    c.conditionValue.Anonymous.uint16 = *port;
+                }
+                Condition::RemotePortRange(low, high) => {
+                    let mut value = Box::new(FWP_RANGE0::default());
+                    value.valueLow.r#type = FWP_UINT16;
+                    value.valueLow.Anonymous.uint16 = *low;
+                    value.valueHigh.r#type = FWP_UINT16;
+                    value.valueHigh.Anonymous.uint16 = *high;
+                    c.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+                    c.matchType = FWP_MATCH_RANGE;
+                    c.conditionValue.r#type = FWP_RANGE_TYPE;
+                    c.conditionValue.Anonymous.rangeValue = &mut *value;
+                    ranges.push(value);
+                }
+                Condition::LocalPort(port) => {
+                    c.fieldKey = FWPM_CONDITION_IP_LOCAL_PORT;
+                    c.conditionValue.r#type = FWP_UINT16;
+                    c.conditionValue.Anonymous.uint16 = *port;
+                }
+                Condition::LocalInterface(luid) => {
+                    // IP_LOCAL_INTERFACE matches on the 64-bit interface LUID.
+                    let mut value = Box::new(*luid);
+                    c.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
+                    c.conditionValue.r#type = FWP_UINT64;
+                    c.conditionValue.Anonymous.uint64 = &mut *value;
+                    luids.push(value);
+                }
+                Condition::App(path) => {
+                    let blob = apps
+                        .get(path)
+                        .ok_or_else(|| format!("no app id for {}", file_name(path)))?;
+                    c.fieldKey = FWPM_CONDITION_ALE_APP_ID;
+                    c.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
+                    c.conditionValue.Anonymous.byteBlob = blob.0;
+                }
             }
-        }
-    }
-
-    /// Permit a split-tunnel app on the IPv6 layer.
-    /// Returns the filter ID on success, or 0 if the app could not be resolved.
-    fn add_permit_app_v6(&mut self, exe_path: &str) -> Result<u64, String> {
-        let wide_path = wide_nul(exe_path);
-
-        let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
-        let err = unsafe {
-            FwpmGetAppIdFromFileName0(windows::core::PCWSTR(wide_path.as_ptr()), &mut app_id)
-        };
-        // Null-guard the out-param so the later `&mut *app_id` is provably sound
-        // (see add_permit_app / CodeQL rust/access-invalid-pointer).
-        if err != 0 || app_id.is_null() {
-            // Non-fatal: skip. The V4 layer only warns when V4 *also* fails, so
-            // surface the V6-only failure here — otherwise a split-tunnel app that
-            // resolved on V4 but not V6 is left silently IPv4-only.
-            tracing::warn!(
-                "FwpmGetAppIdFromFileName0 (v6) failed for '{}': 0x{:08X} — split tunnel will be IPv4-only for this app",
-                exe_path,
-                err
-            );
-            return Ok(0);
+            conditions.push(c);
         }
 
-        let label = format!(
-            "Birdo: Permit split-tunnel app v6 ({})",
-            std::path::Path::new(exe_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(exe_path)
-        );
-        let name = wide_nul(&label);
-
-        let mut condition = FWPM_FILTER_CONDITION0::default();
-        condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
-        condition.matchType = FWP_MATCH_EQUAL;
-        condition.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
-        condition.conditionValue.Anonymous.byteBlob = unsafe { &mut *app_id };
-
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
-        filter.numFilterConditions = 1;
-        filter.filterCondition = &mut condition;
-
-        let result = self.add_filter(&filter);
-
-        unsafe {
-            FwpmFreeMemory0(&mut (app_id as *mut std::ffi::c_void));
-        }
-
-        result.inspect(|&id| {
-            tracing::debug!(
-                "Split tunnel permit v6 added for: {} (filter_id={})",
-                exe_path,
-                id
-            );
-        })
-    }
-
-    /// Block STUN/TURN ports on IPv6 layer (mirrors IPv4 STUN blocking).
-    fn add_block_stun_turn_v6(&mut self) -> Result<(), String> {
-        self.add_port_range_block_v6("Birdo: Block STUN/UDP v6", 17, 3478, 3497)?;
-        self.add_port_range_block_v6("Birdo: Block TURN/TCP v6", 6, 3478, 3497)?;
-        self.add_port_range_block_v6("Birdo: Block Google STUN v6", 17, 19302, 19302)?;
-        Ok(())
-    }
-
-    /// Helper — block a remote port range for a given IP protocol on IPv6 layer.
-    fn add_port_range_block_v6(
-        &mut self,
-        label: &str,
-        protocol: u8,
-        port_low: u16,
-        port_high: u16,
-    ) -> Result<(), String> {
-        let name = wide_nul(label);
-
-        let mut cond_proto = FWPM_FILTER_CONDITION0::default();
-        cond_proto.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
-        cond_proto.matchType = FWP_MATCH_EQUAL;
-        cond_proto.conditionValue.r#type = FWP_UINT8;
-        cond_proto.conditionValue.Anonymous.uint8 = protocol;
-
-        let mut port_range = FWP_RANGE0::default();
-        port_range.valueLow.r#type = FWP_UINT16;
-        port_range.valueLow.Anonymous.uint16 = port_low;
-        port_range.valueHigh.r#type = FWP_UINT16;
-        port_range.valueHigh.Anonymous.uint16 = port_high;
-
-        let mut cond_port = FWPM_FILTER_CONDITION0::default();
-        cond_port.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
-        cond_port.matchType = FWP_MATCH_RANGE;
-        cond_port.conditionValue.r#type = FWP_RANGE_TYPE;
-        cond_port.conditionValue.Anonymous.rangeValue = &mut port_range;
-
-        let mut conditions = [cond_proto, cond_port];
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            FWP_ACTION_BLOCK,
-            WEIGHT_BLOCK_STUN,
-        );
-        filter.numFilterConditions = conditions.len() as u32;
-        filter.filterCondition = conditions.as_mut_ptr();
-
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    /// Permit localhost (127.0.0.0/8).
-    fn add_permit_localhost(&mut self) -> Result<(), String> {
-        let name = wide_nul("Birdo: Permit localhost");
-        let mut addr_mask = FWP_V4_ADDR_AND_MASK {
-            addr: u32::from(Ipv4Addr::new(127, 0, 0, 0)),
-            mask: u32::from(Ipv4Addr::new(255, 0, 0, 0)),
-        };
-
-        let mut condition = FWPM_FILTER_CONDITION0::default();
-        condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
-        condition.matchType = FWP_MATCH_EQUAL;
-        condition.conditionValue.r#type = FWP_V4_ADDR_MASK;
-        condition.conditionValue.Anonymous.v4AddrMask = &mut addr_mask;
-
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
-        filter.numFilterConditions = 1;
-        filter.filterCondition = &mut condition;
-
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    /// Permit DHCP (UDP ports 67-68 for network discovery).
-    fn add_permit_dhcp(&mut self) -> Result<(), String> {
-        let name = wide_nul("Birdo: Permit DHCP");
-
-        // Condition 1: protocol == UDP (17)
-        let mut cond_proto = FWPM_FILTER_CONDITION0::default();
-        cond_proto.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
-        cond_proto.matchType = FWP_MATCH_EQUAL;
-        cond_proto.conditionValue.r#type = FWP_UINT8;
-        cond_proto.conditionValue.Anonymous.uint8 = 17; // IPPROTO_UDP
-
-        // Condition 2: remote port in range 67..=68
-        let mut port_range = FWP_RANGE0::default();
-        port_range.valueLow.r#type = FWP_UINT16;
-        port_range.valueLow.Anonymous.uint16 = 67;
-        port_range.valueHigh.r#type = FWP_UINT16;
-        port_range.valueHigh.Anonymous.uint16 = 68;
-
-        let mut cond_port = FWPM_FILTER_CONDITION0::default();
-        cond_port.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
-        cond_port.matchType = FWP_MATCH_RANGE;
-        cond_port.conditionValue.r#type = FWP_RANGE_TYPE;
-        cond_port.conditionValue.Anonymous.rangeValue = &mut port_range;
-
-        let mut conditions = [cond_proto, cond_port];
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
-        filter.numFilterConditions = conditions.len() as u32;
-        filter.filterCondition = conditions.as_mut_ptr();
-
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    /// Permit traffic to a specific VPN server IP (/32).
-    fn add_permit_vpn_server(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-        let name = wide_nul("Birdo: Permit VPN server");
-        let mut addr_mask = FWP_V4_ADDR_AND_MASK {
-            addr: u32::from(ip),
-            mask: 0xFFFF_FFFF, // /32
-        };
-
-        let mut condition = FWPM_FILTER_CONDITION0::default();
-        condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
-        condition.matchType = FWP_MATCH_EQUAL;
-        condition.conditionValue.r#type = FWP_V4_ADDR_MASK;
-        condition.conditionValue.Anonymous.v4AddrMask = &mut addr_mask;
-
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
-        filter.numFilterConditions = 1;
-        filter.filterCondition = &mut condition;
-
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    /// LOCKDOWN: permit ALL outbound traffic that egresses the tunnel (Wintun)
-    /// interface, matched by its interface LUID. This is the load-bearing
-    /// primitive for always-on mode: it lets tunneled traffic through while a
-    /// block-all on the physical NIC stays in force, so there is no leak window.
-    /// Call once per ALE layer (v4 and v6).
-    ///
-    /// `IP_LOCAL_INTERFACE` matches on the 64-bit interface LUID (FWP_UINT64).
-    fn add_permit_tunnel_interface(
-        &mut self,
-        luid: u64,
-        layer: GUID,
-        label: &str,
-    ) -> Result<(), String> {
-        let name = wide_nul(label);
-        // The condition value holds a POINTER to the u64; keep it alive until
-        // add_filter() copies the filter into WFP (same pattern as the
-        // V4_ADDR_AND_MASK in add_permit_vpn_server).
-        let mut luid_val: u64 = luid;
-
-        let mut condition = FWPM_FILTER_CONDITION0::default();
-        condition.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
-        condition.matchType = FWP_MATCH_EQUAL;
-        condition.conditionValue.r#type = FWP_UINT64;
-        condition.conditionValue.Anonymous.uint64 = &mut luid_val;
-
-        let mut filter = self.make_base_filter(&name, layer, FWP_ACTION_PERMIT, WEIGHT_PERMIT);
-        filter.numFilterConditions = 1;
-        filter.filterCondition = &mut condition;
-
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    /// Block WebRTC STUN/TURN ports to prevent IP leak via WebRTC.
-    /// - UDP 3478-3497 (standard STUN/TURN)
-    /// - TCP 3478-3497 (TURN over TCP)
-    /// - UDP 19302     (Google STUN — Chrome/Edge)
-    fn add_block_stun_turn(&mut self) -> Result<(), String> {
-        self.add_port_range_block("Birdo: Block STUN/UDP", 17, 3478, 3497)?;
-        self.add_port_range_block("Birdo: Block TURN/TCP", 6, 3478, 3497)?;
-        self.add_port_range_block("Birdo: Block Google STUN", 17, 19302, 19309)?;
-        Ok(())
-    }
-
-    /// Helper — block a remote port range for a given IP protocol.
-    fn add_port_range_block(
-        &mut self,
-        label: &str,
-        protocol: u8,
-        port_low: u16,
-        port_high: u16,
-    ) -> Result<(), String> {
-        let name = wide_nul(label);
-
-        // Condition 1: IP protocol
-        let mut cond_proto = FWPM_FILTER_CONDITION0::default();
-        cond_proto.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
-        cond_proto.matchType = FWP_MATCH_EQUAL;
-        cond_proto.conditionValue.r#type = FWP_UINT8;
-        cond_proto.conditionValue.Anonymous.uint8 = protocol;
-
-        // Condition 2: remote port range
-        let mut port_range = FWP_RANGE0::default();
-        port_range.valueLow.r#type = FWP_UINT16;
-        port_range.valueLow.Anonymous.uint16 = port_low;
-        port_range.valueHigh.r#type = FWP_UINT16;
-        port_range.valueHigh.Anonymous.uint16 = port_high;
-
-        let mut cond_port = FWPM_FILTER_CONDITION0::default();
-        cond_port.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
-        cond_port.matchType = FWP_MATCH_RANGE;
-        cond_port.conditionValue.r#type = FWP_RANGE_TYPE;
-        cond_port.conditionValue.Anonymous.rangeValue = &mut port_range;
-
-        let mut conditions = [cond_proto, cond_port];
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWP_ACTION_BLOCK,
-            WEIGHT_BLOCK_STUN,
-        );
-        filter.numFilterConditions = conditions.len() as u32;
-        filter.filterCondition = conditions.as_mut_ptr();
-
-        self.add_filter(&filter)?;
-        Ok(())
-    }
-
-    // ── Local network sharing filters ────────────────────────────────
-
-    /// Permit RFC1918 private network traffic (local network sharing).
-    /// Adds permit filters for 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-    /// so users can access printers, NAS devices, and other LAN resources
-    /// while the kill switch is active.
-    fn add_permit_local_networks(&mut self) -> Result<(), String> {
-        let ranges: [(&str, Ipv4Addr, Ipv4Addr); 3] = [
-            (
-                "Birdo: Permit LAN 10.0.0.0/8",
-                Ipv4Addr::new(10, 0, 0, 0),
-                Ipv4Addr::new(255, 0, 0, 0),
-            ),
-            (
-                "Birdo: Permit LAN 172.16.0.0/12",
-                Ipv4Addr::new(172, 16, 0, 0),
-                Ipv4Addr::new(255, 240, 0, 0),
-            ),
-            (
-                "Birdo: Permit LAN 192.168.0.0/16",
-                Ipv4Addr::new(192, 168, 0, 0),
-                Ipv4Addr::new(255, 255, 0, 0),
-            ),
-        ];
-
-        for (label, network, mask) in &ranges {
-            let name = wide_nul(label);
-            let mut addr_mask = FWP_V4_ADDR_AND_MASK {
-                addr: u32::from(*network),
-                mask: u32::from(*mask),
-            };
-
-            let mut condition = FWPM_FILTER_CONDITION0::default();
-            condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
-            condition.matchType = FWP_MATCH_EQUAL;
-            condition.conditionValue.r#type = FWP_V4_ADDR_MASK;
-            condition.conditionValue.Anonymous.v4AddrMask = &mut addr_mask;
-
-            let mut filter = self.make_base_filter(
-                &name,
-                FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                FWP_ACTION_PERMIT,
-                WEIGHT_PERMIT,
-            );
-            filter.numFilterConditions = 1;
-            filter.filterCondition = &mut condition;
-
-            self.add_filter(&filter)?;
-            tracing::debug!("Permitted local network: {}", label);
-        }
-
-        // Also permit link-local (169.254.0.0/16) for mDNS/AirPrint discovery
-        let name = wide_nul("Birdo: Permit link-local");
-        let mut addr_mask = FWP_V4_ADDR_AND_MASK {
-            addr: u32::from(Ipv4Addr::new(169, 254, 0, 0)),
-            mask: u32::from(Ipv4Addr::new(255, 255, 0, 0)),
-        };
-        let mut condition = FWPM_FILTER_CONDITION0::default();
-        condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
-        condition.matchType = FWP_MATCH_EQUAL;
-        condition.conditionValue.r#type = FWP_V4_ADDR_MASK;
-        condition.conditionValue.Anonymous.v4AddrMask = &mut addr_mask;
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
-        filter.numFilterConditions = 1;
-        filter.filterCondition = &mut condition;
-        self.add_filter(&filter)?;
-
-        tracing::info!("Local network sharing: 4 permit filters added (RFC1918 + link-local)");
-        Ok(())
-    }
-
-    // ── Split tunneling filters ─────────────────────────────────────
-
-    /// Permit all traffic from a specific application executable.
-    /// Uses FwpmGetAppIdFromFileName0 to get the WFP app ID blob,
-    /// then adds a permit filter matching that app ID.
-    fn add_permit_app(&mut self, exe_path: &str) -> Result<u64, String> {
-        let wide_path = wide_nul(exe_path);
-
-        // Get the WFP application ID blob for this executable
-        let mut app_id: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
-        // SAFETY: `wide_path` is a valid null-terminated UTF-16 string.
-        // `app_id` is an out-param that receives a pointer to an OS-allocated blob.
-        // We free it with `FwpmFreeMemory0` after building the filter.
-        let err = unsafe {
-            FwpmGetAppIdFromFileName0(windows::core::PCWSTR(wide_path.as_ptr()), &mut app_id)
-        };
-        // Treat a null out-param as failure too: FwpmGetAppIdFromFileName0 is
-        // documented to populate `app_id` on ERROR_SUCCESS, but guarding the
-        // pointer explicitly makes the later `&mut *app_id` deref provably sound
-        // (and silences CodeQL rust/access-invalid-pointer).
-        if err != 0 || app_id.is_null() {
-            tracing::warn!(
-                "FwpmGetAppIdFromFileName0 failed for '{}': 0x{:08X} — skipping",
-                exe_path,
-                err
-            );
-            return Ok(0); // Non-fatal: skip this app rather than fail the whole transaction
-        }
-
-        let label = format!(
-            "Birdo: Permit split-tunnel app ({})",
-            std::path::Path::new(exe_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(exe_path)
-        );
-        let name = wide_nul(&label);
-
-        let mut condition = FWPM_FILTER_CONDITION0::default();
-        condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
-        condition.matchType = FWP_MATCH_EQUAL;
-        condition.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
-        // SAFETY: `app_id` was successfully obtained from FwpmGetAppIdFromFileName0
-        // and is valid until we call FwpmFreeMemory0.
-        condition.conditionValue.Anonymous.byteBlob = unsafe { &mut *app_id };
-
-        let mut filter = self.make_base_filter(
-            &name,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWP_ACTION_PERMIT,
-            WEIGHT_PERMIT,
-        );
-        filter.numFilterConditions = 1;
-        filter.filterCondition = &mut condition;
-
-        let result = self.add_filter(&filter);
-
-        // SAFETY: Free the OS-allocated blob. The filter has been committed
-        // (or will be via transaction), so the blob is no longer needed.
-        unsafe {
-            FwpmFreeMemory0(&mut (app_id as *mut std::ffi::c_void));
-        }
-
-        result.inspect(|&id| {
-            tracing::debug!(
-                "Split tunnel permit added for: {} (filter_id={})",
-                exe_path,
-                id
-            );
-        })
-    }
-
-    // ── Shared filter template ──────────────────────────────────────
-
-    /// Build a `FWPM_FILTER0` with common fields set.
-    /// Caller must fill `numFilterConditions`, `filterCondition`, and
-    /// call `add_filter()`.
-    fn make_base_filter(
-        &self,
-        name: &[u16], // null-terminated UTF-16
-        layer: GUID,
-        action: FWP_ACTION_TYPE,
-        weight: u8,
-    ) -> FWPM_FILTER0 {
         let mut filter = FWPM_FILTER0::default();
         filter.displayData.name = windows::core::PWSTR(name.as_ptr() as *mut u16);
         filter.flags = FWPM_FILTER_FLAG_NONE;
-        filter.layerKey = layer;
+        filter.layerKey = layer_key(spec.layer);
         filter.subLayerKey = BIRDO_SUBLAYER_KEY;
         filter.weight.r#type = FWP_UINT8;
-        filter.weight.Anonymous.uint8 = weight;
-        filter.action.r#type = action;
-        filter
+        filter.weight.Anonymous.uint8 = spec.weight;
+        filter.action.r#type = match spec.action {
+            Action::Permit => FWP_ACTION_PERMIT,
+            Action::Block => FWP_ACTION_BLOCK,
+        };
+        filter.numFilterConditions = conditions.len() as u32;
+        filter.filterCondition = if conditions.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            conditions.as_mut_ptr()
+        };
+
+        let mut id: u64 = 0;
+        // SAFETY: `self.handle` is a valid WFP engine handle. `filter` and every
+        // pointer inside it (name, conditions, and the boxed values and app
+        // blobs they point to) stay alive until this call returns; WFP copies
+        // the filter. `id` receives the new filter's id, tracked for removal.
+        let err = unsafe {
+            FwpmFilterAdd0(
+                self.handle,
+                &filter,
+                windows::Win32::Security::PSECURITY_DESCRIPTOR::default(),
+                Some(&mut id),
+            )
+        };
+        drop((v4, v6, ranges, luids));
+        if err != 0 {
+            return Err(format!(
+                "FwpmFilterAdd0 ({}) failed: 0x{:08X}",
+                spec.name, err
+            ));
+        }
+        self.filter_ids.push(id);
+        Ok(())
+    }
+
+    /// Replace the installed filter set with the one `next` calls for, in ONE
+    /// transaction. The old filters are deleted INSIDE it, so the swap has no
+    /// gap on commit, and an abort rolls the deletes back: the previous set
+    /// stays in force and the bookkeeping is restored to match it.
+    fn apply(&mut self, next: Policy) -> Result<(), String> {
+        let apps = resolve_apps(&next);
+        let specs = filter_specs(&next, &|path| apps.contains_key(path));
+
+        let saved_filter_ids = self.filter_ids.clone();
+        let saved_sublayer_added = self.sublayer_added;
+
+        self.begin_transaction()?;
+        let result = (|| -> Result<(), String> {
+            self.remove_all_filters();
+            if specs.is_empty() {
+                self.delete_sublayer();
+                return Ok(());
+            }
+            self.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
+            for spec in &specs {
+                self.add_spec(spec, &apps)?;
+            }
+            Ok(())
+        })()
+        .and_then(|()| self.commit_transaction());
+
+        match result {
+            Ok(()) => {
+                tracing::debug!("WFP policy applied — {} filters", self.filter_ids.len());
+                self.installed = next;
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("WFP policy change failed, previous filters kept: {}", e);
+                self.abort_transaction();
+                self.filter_ids = saved_filter_ids;
+                self.sublayer_added = saved_sublayer_added;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1004,9 +605,93 @@ fn wide_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0u16)).collect()
 }
 
+/// Every adapter's LUID, state and whether it has a default gateway, for the
+/// host-only exemption of the inbound block. Empty on failure, which exempts
+/// nothing (fail closed).
+fn interface_facts() -> Vec<InterfaceFacts> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST,
+        GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST,
+        IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::AF_UNSPEC;
+
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    let flags = GAA_FLAG_INCLUDE_GATEWAYS
+        | GAA_FLAG_SKIP_UNICAST
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size: u32 = 16 * 1024;
+    // u64-backed so the buffer is 8-byte aligned for IP_ADAPTER_ADDRESSES_LH.
+    let mut buf: Vec<u64> = Vec::new();
+    for _ in 0..4 {
+        buf.clear();
+        buf.resize((size as usize).div_ceil(8), 0);
+        // SAFETY: `buf` is at least `size` bytes and correctly aligned; `size`
+        // is an in/out parameter the OS updates with the required length.
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC.0 as u32,
+                flags,
+                None,
+                Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
+                &mut size,
+            )
+        };
+        if rc == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if rc != 0 {
+            tracing::warn!(
+                "GetAdaptersAddresses failed ({}) — no host-only exemptions",
+                rc
+            );
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut cursor = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        while !cursor.is_null() {
+            // SAFETY: the OS built this list in `buf`; `Next` is either null or
+            // points at another entry inside the same buffer.
+            let entry = unsafe { &*cursor };
+            cursor = entry.Next as *const IP_ADAPTER_ADDRESSES_LH;
+            out.push(InterfaceFacts {
+                // SAFETY: the union's `Value` is the whole 64-bit LUID.
+                luid: unsafe { entry.Luid.Value },
+                up: entry.OperStatus == IfOperStatusUp,
+                loopback: entry.IfType == IF_TYPE_SOFTWARE_LOOPBACK,
+                has_gateway: !entry.FirstGatewayAddress.is_null(),
+            });
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+/// Open the engine if it is not open yet. Caller holds the ENGINE lock.
+fn ensure_engine(guard: &mut Option<WfpEngine>) -> Result<&mut WfpEngine, String> {
+    if guard.is_none() {
+        if !is_admin() {
+            return Err("Administrator privileges required for WFP filters".to_string());
+        }
+        *guard = Some(WfpEngine::open()?);
+        IS_INITIALIZED.store(true, Ordering::SeqCst);
+        tracing::info!("WFP engine opened (dynamic session)");
+    }
+    guard
+        .as_mut()
+        .ok_or_else(|| "WFP engine not open".to_string())
+}
+
+fn engine_lock() -> Result<std::sync::MutexGuard<'static, Option<WfpEngine>>, String> {
+    ENGINE
+        .lock()
+        .map_err(|e| format!("engine lock poisoned: {}", e))
+}
+
 // ── Public API ───────────────────────────────────────────────────────
-// Function signatures are unchanged from the netsh era so that
-// `killswitch.rs` and `auto_reconnect.rs` need zero changes.
 
 /// Initialize the kill switch subsystem.
 ///
@@ -1016,49 +701,18 @@ pub async fn initialize() -> Result<(), String> {
         tracing::debug!("Kill switch already initialized");
         return Ok(());
     }
-
-    if !is_admin() {
-        return Err("Administrator privileges required for kill switch".to_string());
-    }
-
-    tracing::info!("Initializing kill switch (WFP API — FIX-2-1)");
-
-    // P1-ks-wfp-initialize-toctou-handle-leak: perform the initialized
-    // re-check, the engine open, and the store under ONE ENGINE lock so a
-    // concurrent initialize() cannot overwrite a stored engine (leaking its
-    // kernel handle and orphaning its dynamic session).
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
-    if guard.is_some() && IS_INITIALIZED.load(Ordering::SeqCst) {
-        tracing::debug!("Kill switch already initialized (raced)");
-        return Ok(());
-    }
-    if let Some(stale) = guard.as_mut() {
-        // A previous session whose cleanup failed — close it before replacing.
-        let _ = stale.close();
-    }
-
-    let engine = WfpEngine::open().map_err(|e| {
-        tracing::error!("Failed to open WFP engine: {}", e);
-        e
-    })?;
-    *guard = Some(engine);
-    drop(guard);
-
-    IS_INITIALIZED.store(true, Ordering::SeqCst);
-    tracing::info!("Kill switch initialized (WFP dynamic session)");
+    // P1-ks-wfp-initialize-toctou-handle-leak: the check, the open and the
+    // store happen under ONE lock, so a concurrent initialize() cannot
+    // overwrite a stored engine (leaking its handle and its dynamic session).
+    let mut guard = engine_lock()?;
+    ensure_engine(&mut guard)?;
     Ok(())
 }
 
-/// Set the VPN server IP that should be permitted through the kill switch.
 /// STEALTH: record (or clear) the path of the xray helper so the next
-/// `activate_blocking()` permits it. Does not re-activate on its own: in
-/// lockdown the tunnel layer re-bakes the block once the new adapter
-/// publishes its LUID (before the handshake), and xray is started before the
-/// tunnel exists, so the permit is always in the set the handshake runs
-/// under; in reactive mode no block is active during a user-initiated
-/// connect and the reconnect path re-activates via update_vpn_server.
+/// block-all permits it — to its relay only (W1-013). Does not re-activate on
+/// its own: xray is started before the relay permit moves, and `move_relay`
+/// commits the helper's permit together with the relay's.
 pub async fn set_stealth_helper_exe(path: Option<String>) {
     let mut helper = STEALTH_HELPER_EXE.write().await;
     if *helper != path {
@@ -1070,289 +724,137 @@ pub async fn set_stealth_helper_exe(path: Option<String>) {
     *helper = path;
 }
 
-pub async fn set_vpn_server(ip: Ipv4Addr) {
-    let mut server = VPN_SERVER_IP.write().await;
-    *server = Some(ip);
-    // The exit node a customer chose. Redacted like every other sink for it
-    // (commands/killswitch.rs logs only whether one is set).
-    tracing::debug!(
-        "VPN server IP set to: {}",
-        crate::utils::redact_ip(&ip.to_string())
-    );
+/// The block-all as the current settings describe it.
+async fn current_block_all() -> BlockAll {
+    let tunnel_luid = match TUNNEL_LUID.load(Ordering::SeqCst) {
+        0 => None,
+        luid => Some(luid),
+    };
+    let lockdown = LOCKDOWN_MODE.load(Ordering::SeqCst);
+    if lockdown && tunnel_luid.is_none() {
+        // Installing the block WITHOUT the tunnel permit is strictly MORE
+        // restrictive, never less: the relay and control-plane permits still
+        // let the reconnect run, and tunnel.rs re-activates with the new LUID
+        // the moment the adapter is back. (Refusing here used to deadlock the
+        // reconnect loop with the previous block still installed.)
+        tracing::warn!(
+            "Lockdown: no tunnel interface LUID (tunnel is down) — installing the block-all \
+             without a tunnel permit; it is re-installed with the permit as soon as the \
+             adapter is published"
+        );
+    }
+    let exceptions = match SPLIT_TUNNEL_APPS.try_read() {
+        Ok(apps) => apps.clone(),
+        Err(e) => {
+            // Contended or poisoned: skip the exceptions this activation, and
+            // say so — otherwise excepted apps die with no indication why.
+            tracing::warn!(
+                "Split tunnel apps lock unavailable ({}) — skipping kill-switch exceptions \
+                 this activation",
+                e
+            );
+            Vec::new()
+        }
+    };
+    let self_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from));
+    if self_exe.is_none() {
+        tracing::error!(
+            "Kill switch: could NOT determine own exe path — reconnect may be blocked while the \
+             kill switch is active"
+        );
+    }
+    let stealth_helper = STEALTH_HELPER_EXE.read().await.clone();
+    let relay = *RELAY.lock().unwrap_or_else(|e| e.into_inner());
+    BlockAll {
+        self_exe,
+        relay,
+        stealth_helper,
+        tunnel_luid: tunnel_luid.filter(|_| lockdown),
+        lan_sharing: LOCAL_NETWORK_SHARING.load(Ordering::SeqCst),
+        exceptions,
+        host_only_interfaces: host_only_interfaces(&interface_facts(), tunnel_luid),
+    }
 }
 
-/// Activate the kill switch — block all traffic except VPN, localhost,
-/// and DHCP inside a single atomic WFP transaction.
+/// Activate the kill switch — block all traffic except the tunnel's own
+/// flows, loopback, DHCP and the configured exceptions, in both directions,
+/// inside a single atomic WFP transaction.
 pub async fn activate_blocking() -> Result<(), String> {
     if !IS_INITIALIZED.load(Ordering::SeqCst) {
         return Err("Kill switch not initialized".to_string());
     }
+    let block = current_block_all().await;
 
-    let vpn_ip = *VPN_SERVER_IP.read().await;
-    let stealth_helper = STEALTH_HELPER_EXE.read().await.clone();
-
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
+    let mut guard = engine_lock()?;
     let engine = guard.as_mut().ok_or("WFP engine not open")?;
-
-    // Snapshot the current WFP bookkeeping so it can be restored if a REFRESH
-    // transaction aborts. The teardown of the existing filters now runs INSIDE
-    // the transaction (below), so an abort rolls those deletes back and the OLD
-    // filter set survives in WFP — our in-memory tracking must then match it.
     let was_blocking = IS_BLOCKING.load(Ordering::SeqCst);
-    let saved_filter_ids = engine.filter_ids.clone();
-    let saved_sublayer_added = engine.sublayer_added;
-    let saved_split_tunnel_map = engine.split_tunnel_map.clone();
-
-    tracing::info!("Activating kill switch (WFP atomic transaction)");
-    engine.begin_transaction()?;
-
-    let result = (|| -> Result<(), String> {
-        // Refresh path: tear down the existing filters INSIDE the transaction so
-        // the delete is atomic with the rebuild. On commit the old->new swap has
-        // ZERO gap; on abort the deletes roll back so the old filters keep
-        // blocking — closing the leak window that existed when the teardown ran
-        // BEFORE begin_transaction().
+    tracing::info!(
+        "{} kill switch (WFP atomic transaction)",
         if was_blocking {
-            tracing::debug!("Kill switch already active — refreshing filters in-transaction");
-            engine.remove_all_filters();
-            engine.delete_sublayer();
+            "Refreshing"
+        } else {
+            "Activating"
         }
-        engine.add_sublayer()?;
-
-        // Block-all rules (low weight, evaluated last)
-        engine.add_block_all_v4()?;
-        engine.add_block_all_v6()?;
-
-        // Permit exceptions (high weight, evaluated first)
-        engine.add_permit_localhost()?;
-        engine.add_permit_localhost_v6()?;
-        engine.add_permit_dhcp()?;
-        engine.add_permit_dhcpv6()?;
-
-        if let Some(ip) = vpn_ip {
-            engine.add_permit_vpn_server(ip)?;
-            tracing::debug!(
-                "VPN server {} permitted through kill switch",
-                crate::utils::redact_ip(&ip.to_string())
-            );
-        }
-
-        // CRITICAL (AUDIT-2026-06-19): permit the Birdo client's OWN process.
-        //
-        // The kill switch's block-all is active during the reconnect gap, but
-        // auto-reconnect must reach api.birdo.app — over the PHYSICAL adapter,
-        // since the tunnel is down — to fetch a fresh config, and that control
-        // plane is NOT the VPN server /32. Without this permit, arming the kill
-        // switch blocks auto-reconnect's own API call and reconnect can never
-        // succeed. Permitting our own executable lets the client's cert-pinned
-        // control-plane HTTPS, its DoH lookups, and its in-process WireGuard
-        // socket through, while every OTHER application stays blocked — so user
-        // traffic still cannot leak. (We bypass the kill switch only for the VPN
-        // client itself, which is exactly the process that must keep talking to
-        // the VPN infrastructure to restore the tunnel.)
-        match std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-        {
-            Some(self_exe) => {
-                let v4 = engine.add_permit_app(&self_exe)?;
-                if v4 != 0 {
-                    let _ = engine.add_permit_app_v6(&self_exe)?;
-                }
-                tracing::info!(
-                    "Kill switch: permitted own process for control-plane / reconnect access"
-                );
-            }
-            None => {
-                // Fail loud but do not abort the whole transaction: a kill switch
-                // that cannot self-permit will break reconnect, but we still want
-                // user traffic blocked. Surface it so it is not silent.
-                tracing::error!(
-                    "Kill switch: could NOT determine own exe path — reconnect may be blocked while the kill switch is active"
-                );
-            }
-        }
-
-        // STEALTH: the Reality helper is a separate process (see
-        // STEALTH_HELPER_EXE). Permit it exactly like our own exe; the
-        // integrity check in vpn::xray already proved the binary before it was
-        // spawned, so the permit cannot widen to an untrusted executable.
-        if let Some(helper) = stealth_helper.as_deref() {
-            let v4 = engine.add_permit_app(helper)?;
-            if v4 != 0 {
-                let _ = engine.add_permit_app_v6(helper)?;
-            }
-            tracing::info!("Kill switch: permitted the stealth (xray) helper process");
-        }
-
-        // LOCKDOWN (always-on): permit the tunnel interface so tunneled traffic
-        // flows while the block-all on the physical NIC stays in force. This is
-        // what makes a continuously-active block-all safe — without it, an
-        // always-on block would block the user's own tunneled browsing.
-        //
-        // A missing LUID no longer refuses the activation. It used to, and that
-        // deadlocked the client after any drop: tunnel teardown clears the LUID
-        // (tunnel.rs), so the reconnect loop's very next activate_blocking()
-        // returned Err with the previous block-all still installed — machine
-        // fully blocked, no reconnect attempted, and the give-up release
-        // unreachable. Installing the block WITHOUT the tunnel permit is strictly
-        // MORE restrictive, never less: the self-permit and relay permit still let
-        // the reconnect run, and tunnel.rs re-activates with the new LUID the
-        // moment the adapter is back, which is what restores tunneled traffic.
-        if LOCKDOWN_MODE.load(Ordering::SeqCst) {
-            let luid = TUNNEL_LUID.load(Ordering::SeqCst);
-            if luid == 0 {
-                tracing::warn!(
-                    "Lockdown: no tunnel interface LUID (tunnel is down) — installing the \
-                     block-all without a tunnel permit; it is re-installed with the permit \
-                     as soon as the adapter is published"
-                );
-            } else {
-                engine.add_permit_tunnel_interface(
-                    luid,
-                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-                    "Birdo: Permit tunnel interface (v4)",
-                )?;
-                engine.add_permit_tunnel_interface(
-                    luid,
-                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-                    "Birdo: Permit tunnel interface (v6)",
-                )?;
-                tracing::info!(
-                    "Lockdown: permitted tunnel interface LUID {} (zero-window always-on)",
-                    luid
-                );
-            }
-        }
-
-        // Local network sharing: permit RFC1918 private ranges
-        if LOCAL_NETWORK_SHARING.load(Ordering::SeqCst) {
-            engine.add_permit_local_networks()?;
-        }
-
-        // Kill-switch exceptions (stored under the historical split_tunnel
-        // names): permit traffic from excepted apps (IPv4 + IPv6). A permit
-        // filter EXEMPTS the app from the block — it cannot route the app
-        // outside the tunnel, which is why the UI calls this "Kill Switch
-        // Exceptions" and not split tunneling.
-        let split_apps = SPLIT_TUNNEL_APPS.try_read();
-        if let Err(e) = &split_apps {
-            // Lock poisoned (prior writer panicked) or momentarily contended:
-            // split-tunnel permits are skipped this activation. Warn rather than
-            // disable silently — otherwise excluded apps get killed by the switch
-            // with no indication why.
-            tracing::warn!(
-                "Split tunnel apps lock unavailable ({}) — skipping split-tunnel permits this activation",
-                e
-            );
-        }
-        if let Ok(apps) = split_apps {
-            if !apps.is_empty() {
-                tracing::info!("Adding split tunnel permits for {} app(s)", apps.len());
-                for app_path in apps.iter() {
-                    let v4_id = engine.add_permit_app(app_path)?;
-                    if v4_id != 0 {
-                        let mut ids = vec![v4_id];
-                        let v6_id = engine.add_permit_app_v6(app_path)?;
-                        if v6_id != 0 {
-                            ids.push(v6_id);
-                        }
-                        engine
-                            .split_tunnel_map
-                            .insert(v4_id, (app_path.clone(), ids));
-                    }
-                }
-            }
-        }
-
-        // WebRTC STUN/TURN leak prevention (highest weight, IPv4 + IPv6)
-        engine.add_block_stun_turn()?;
-        engine.add_block_stun_turn_v6()?;
-
-        Ok(())
-    })();
-
-    match result {
+    );
+    let next = Policy {
+        block_all: Some(block),
+        ..engine.installed.clone()
+    };
+    match engine.apply(next) {
         Ok(()) => {
-            engine.commit_transaction()?;
             IS_BLOCKING.store(true, Ordering::SeqCst);
             tracing::info!(
-                "Kill switch activated — {} WFP filters committed atomically",
+                "Kill switch active — {} WFP filters committed atomically",
                 engine.filter_ids.len()
             );
             Ok(())
         }
         Err(e) => {
-            tracing::error!("Filter setup failed, aborting transaction: {}", e);
-            engine.abort_transaction();
             if was_blocking {
-                // The abort rolled back the in-transaction deletes, so the OLD
-                // filter set is still active in WFP. Restore the bookkeeping to
-                // match and stay blocking — no leak; IS_BLOCKING stays true.
-                engine.filter_ids = saved_filter_ids;
-                engine.sublayer_added = saved_sublayer_added;
-                engine.split_tunnel_map = saved_split_tunnel_map;
                 tracing::warn!(
                     "Kill-switch refresh failed; retained the previous filter set (still blocking)"
                 );
-            } else {
-                // Fresh activation failed and nothing was blocking before — clear
-                // bookkeeping and remain unblocked.
-                engine.filter_ids.clear();
-                engine.sublayer_added = false;
-                IS_BLOCKING.store(false, Ordering::SeqCst);
             }
             Err(e)
         }
     }
 }
 
-/// Deactivate the kill switch (restore normal traffic).
+/// Deactivate the kill switch (restore normal traffic). The session's IPv6
+/// block and DNS guard stay: they are the tunnel's, not the kill switch's.
 pub async fn deactivate_blocking() -> Result<(), String> {
     if !IS_BLOCKING.load(Ordering::SeqCst) {
         tracing::debug!("Kill switch not active");
         return Ok(());
     }
-
     tracing::info!("Deactivating kill switch");
 
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
-    if let Some(engine) = guard.as_mut() {
-        engine.remove_all_filters();
-        engine.delete_sublayer();
-    }
-
-    IS_BLOCKING.store(false, Ordering::SeqCst);
-
-    // The filters just removed included the kill switch's own IPv6 block. If the
-    // session still wants IPv6 contained (a tunnel is up or coming up), rebuild
-    // the standalone block in the same call — otherwise a reconnect cycle ends
+    let mut guard = engine_lock()?;
+    let Some(engine) = guard.as_mut() else {
+        IS_BLOCKING.store(false, Ordering::SeqCst);
+        return Ok(());
+    };
+    // The block-all carried the session's IPv6 block. If the session still
+    // wants IPv6 contained (a tunnel is up or coming up), the standalone block
+    // replaces it IN THE SAME TRANSACTION — otherwise a reconnect cycle ends
     // with IPv6 wide open for the rest of the session.
-    if v6_state::on_deactivate() {
-        let reinstalled = match guard.as_mut() {
-            Some(engine) => engine.install_standalone_v6_block(),
-            None => Err("WFP engine not open".to_string()),
-        };
-        match reinstalled {
-            Ok(()) => {
-                v6_state::mark_installed(true);
-                tracing::info!("Standalone IPv6 block re-installed after kill-switch deactivation");
-            }
-            Err(e) => {
-                v6_state::mark_installed(false);
-                tracing::error!(
-                    "Kill switch deactivated but the standalone IPv6 block could NOT be re-installed: {} — IPv6 may leak",
-                    e
-                );
-                return Err(format!("IPv6 block re-install failed: {}", e));
-            }
-        }
-    }
-
+    let v6_block = v6_state::on_deactivate();
+    let next = Policy {
+        block_all: None,
+        v6_block,
+        ..engine.installed.clone()
+    };
+    engine.apply(next).map_err(|e| {
+        tracing::error!(
+            "Kill switch could NOT be deactivated ({}) — the block stays in force",
+            e
+        );
+        format!("Kill switch deactivation failed: {}", e)
+    })?;
+    IS_BLOCKING.store(false, Ordering::SeqCst);
+    v6_state::mark_installed(v6_block);
     tracing::info!("Kill switch deactivated — normal traffic restored");
     Ok(())
 }
@@ -1450,16 +952,13 @@ pub async fn block_ipv6() -> Result<(), String> {
         tracing::debug!("IPv6 block already in force — intent recorded, no filters added");
         return Ok(());
     }
-    if !IS_INITIALIZED.load(Ordering::SeqCst) {
-        initialize().await?;
-    }
-
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
-    let engine = guard.as_mut().ok_or("WFP engine not open")?;
-
-    engine.install_standalone_v6_block()?;
+    let mut guard = engine_lock()?;
+    let engine = ensure_engine(&mut guard)?;
+    let next = Policy {
+        v6_block: true,
+        ..engine.installed.clone()
+    };
+    engine.apply(next)?;
     v6_state::mark_installed(true);
     tracing::info!("IPv6 leak protection enabled (native WFP)");
     Ok(())
@@ -1472,7 +971,7 @@ pub async fn unblock_ipv6() -> Result<(), String> {
     if !v6_state::on_unblock() {
         return Ok(());
     }
-    remove_standalone_v6_filters()
+    remove_standalone_v6_block()
 }
 
 /// Lift the IPv6 block for a DUAL-STACK tunnel, which routes IPv6 through the
@@ -1485,18 +984,19 @@ pub async fn unblock_ipv6_dual_stack() -> Result<(), String> {
     if !v6_state::on_dual_stack() {
         return Ok(());
     }
-    remove_standalone_v6_filters()
+    remove_standalone_v6_block()
 }
 
-/// Drop every filter we hold. Only ever called when the kill switch is NOT
-/// active, so the engine holds our standalone IPv6 filters and nothing else.
-fn remove_standalone_v6_filters() -> Result<(), String> {
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
+/// Drop the standalone IPv6 block, keeping everything else the session holds
+/// (the DNS guard in particular).
+fn remove_standalone_v6_block() -> Result<(), String> {
+    let mut guard = engine_lock()?;
     if let Some(engine) = guard.as_mut() {
-        engine.remove_all_filters();
-        engine.delete_sublayer();
+        let next = Policy {
+            v6_block: false,
+            ..engine.installed.clone()
+        };
+        engine.apply(next)?;
     }
     tracing::debug!("Standalone IPv6 block removed (native WFP)");
     Ok(())
@@ -1517,45 +1017,126 @@ pub fn hold_ipv6_block(held: bool) {
 /// For the one path where the session ends but the kill switch is still armed and
 /// about to be deactivated: auto-reconnect giving up. There, the caller wants full
 /// connectivity restored, so the intent must be dropped BEFORE `deactivate_blocking()`
-/// runs — otherwise it removes the kill-switch filters and then, seeing the intent
-/// still set, RE-INSTALLS a standalone IPv6 block for a session that no longer
-/// exists, blackholing IPv6 for the rest of the run with nothing left to remove it.
-/// (`cleanup()` also clears the intent, but it closes the engine, which the give-up
-/// path is not doing.)
+/// runs — otherwise it replaces the kill-switch filters with a standalone IPv6
+/// block for a session that no longer exists, blackholing IPv6 for the rest of
+/// the run with nothing left to remove it.
 pub fn clear_ipv6_block_intent() {
     v6_state::on_cleanup();
 }
 
-/// Update the VPN server IP in an active kill switch.
+/// Point the relay permit at a new relay (W1-013: address, port AND the
+/// transport, so the permit can be scoped to the process and protocol that
+/// carry the tunnel), and with `engage` put the block-all up — in ONE
+/// transaction, so the block and the new relay's permit come into force
+/// together (REVIEW-WIN2-001, `wfp_policy::after_relay_move`).
 ///
-/// Rebuilds all filters atomically to swap the permitted server.
-pub async fn update_vpn_server(ip: Ipv4Addr) -> Result<(), String> {
-    set_vpn_server(ip).await;
-
-    // In LOCKDOWN mode, do NOT re-activate here: this is called on the connect
-    // path BEFORE the new tunnel exists, so TUNNEL_LUID still holds the OLD
-    // (about-to-be-freed) adapter's LUID — re-activating now would permit a stale
-    // interface LUID that Windows may reassign to a physical NIC. Re-activation
-    // in lockdown is driven by the tunnel layer once the NEW adapter publishes
-    // its LUID (see tunnel.rs configure_adapter), so the active block always
-    // permits the CURRENT tunnel interface. Reactive mode re-activates here as
-    // before to swap the server permit.
-    if IS_BLOCKING.load(Ordering::SeqCst) && !LOCKDOWN_MODE.load(Ordering::SeqCst) {
-        // Re-activate atomically with the new VPN server IP
-        activate_blocking().await?;
-        // Redacted like every neighbouring site. `ip` is the upstream EXIT node
-        // (config.endpoint has been swapped to loopback by then), release builds log
-        // at info, and the file logger appends to disk — so this wrote the chosen
-        // exit node into birdo.log for the whole session. macOS and Linux log
-        // nothing containing the IP here, making Windows the outlier. Invisible in
-        // development because redact_ip is a no-op under debug_assertions.
-        tracing::info!(
-            "Updated VPN server permit: {}",
-            crate::utils::redact_ip(&ip.to_string())
-        );
+/// Runs on the connect and re-dial paths BEFORE the handshake that needs the
+/// permit. A block already in force is rebuilt here in lockdown too. In a live
+/// switch TUNNEL_LUID still names the outgoing adapter, so the rebuilt block
+/// keeps permitting that interface — our own, and already permitted by the
+/// block it replaces; the tunnel layer re-bakes the block with the NEW
+/// adapter's LUID once it is published (tunnel.rs `configure_adapter`).
+pub(crate) async fn move_relay(relay: Relay, engage: bool) -> Result<(), String> {
+    *RELAY.lock().unwrap_or_else(|e| e.into_inner()) = Some(relay);
+    // The exit node a customer chose: redacted like every other sink for it.
+    tracing::debug!(
+        "Kill switch relay set to {}:{} ({:?})",
+        crate::utils::redact_ip(&relay.ip.to_string()),
+        relay.port,
+        relay.transport
+    );
+    if !IS_INITIALIZED.load(Ordering::SeqCst) {
+        // No engine of the kill switch's own: nothing can be blocking.
+        return if engage {
+            Err("Kill switch not initialized".to_string())
+        } else {
+            Ok(())
+        };
     }
-
+    let block = current_block_all().await;
+    let mut guard = engine_lock()?;
+    let Some(engine) = guard.as_mut() else {
+        return if engage {
+            Err("WFP engine not open".to_string())
+        } else {
+            Ok(())
+        };
+    };
+    let Some(next) = crate::vpn::wfp_policy::after_relay_move(&engine.installed, block, engage)
+    else {
+        return Ok(());
+    };
+    engine.apply(next)?;
+    IS_BLOCKING.store(true, Ordering::SeqCst);
+    tracing::info!(
+        "Kill switch {} with the relay permit on {} — {} WFP filters committed atomically",
+        if engage { "engaged" } else { "rebuilt" },
+        crate::utils::redact_ip(&relay.ip.to_string()),
+        engine.filter_ids.len()
+    );
     Ok(())
+}
+
+/// Install (`Some`) or lift (`None`) the DNS guard (W1-007). Synchronous: it is
+/// driven by the machine-state owner, which must be callable from `Drop`.
+///
+/// Installing opens the engine if nothing has yet; lifting with no engine is a
+/// no-op — the dynamic session that held it is already gone.
+pub(crate) fn set_dns_guard(dns_guard: Option<DnsGuard>) -> Result<(), String> {
+    let mut guard = engine_lock()?;
+    if dns_guard.is_none() && guard.is_none() {
+        return Ok(());
+    }
+    let engine = ensure_engine(&mut guard)?;
+    let installing = dns_guard.is_some();
+    let next = Policy {
+        dns_guard,
+        ..engine.installed.clone()
+    };
+    engine.apply(next)?;
+    tracing::info!(
+        "DNS guard {}",
+        if installing {
+            "installed — DNS only through the tunnel"
+        } else {
+            "lifted"
+        }
+    );
+    Ok(())
+}
+
+/// A default route came or went: re-derive which interfaces are host-only
+/// virtual networks, so an uplink that got its gateway after the block was
+/// installed stops being exempt from the inbound block. Cheap when nothing
+/// changed. Called from the network-events thread.
+pub fn refresh_after_network_change() {
+    if !IS_BLOCKING.load(Ordering::SeqCst) {
+        return;
+    }
+    let Ok(mut guard) = engine_lock() else {
+        return;
+    };
+    let Some(engine) = guard.as_mut() else {
+        return;
+    };
+    let Some(block) = engine.installed.block_all.clone() else {
+        return;
+    };
+    let tunnel = TUNNEL_LUID.load(Ordering::SeqCst);
+    let host_only = host_only_interfaces(&interface_facts(), (tunnel != 0).then_some(tunnel));
+    if host_only == block.host_only_interfaces {
+        return;
+    }
+    let next = Policy {
+        block_all: Some(BlockAll {
+            host_only_interfaces: host_only,
+            ..block
+        }),
+        ..engine.installed.clone()
+    };
+    if let Err(e) = engine.apply(next) {
+        tracing::warn!("Could not refresh the inbound exemptions: {}", e);
+    }
 }
 
 /// Check if the kill switch is currently active.
@@ -1576,6 +1157,11 @@ pub fn is_lockdown_mode() -> bool {
     LOCKDOWN_MODE.load(Ordering::SeqCst)
 }
 
+/// The relay the block-all currently lets the tunnel reach.
+pub(crate) fn current_relay() -> Option<Relay> {
+    *RELAY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Publish the tunnel adapter's interface LUID (from the tunnel layer once the
 /// Wintun adapter exists). Lockdown mode permits this interface so tunneled
 /// traffic flows under the always-on block-all.
@@ -1589,27 +1175,20 @@ pub fn clear_tunnel_luid() {
     TUNNEL_LUID.store(0, Ordering::SeqCst);
 }
 
-/// Clean up and release all resources.
+/// Clean up and release all resources: the end of the session.
 ///
-/// Deactivates blocking (if active), then closes the WFP engine handle.
-/// Because the session is dynamic, Windows removes any straggling
-/// filters automatically.
+/// Closing the engine removes every filter at once — the dynamic session owns
+/// them — so nothing needs deleting one by one first.
 pub async fn cleanup() -> Result<(), String> {
     tracing::info!("Cleaning up kill switch resources");
 
     // Drop the IPv6-block intent FIRST: cleanup() is the end of the session (a
     // user-initiated disconnect calls it via killswitch::disarm(), including one
-    // issued mid-reconnect), so the deactivate_blocking() below must NOT rebuild
-    // a standalone IPv6 block that no tunnel would ever remove.
+    // issued mid-reconnect), so nothing may rebuild a standalone IPv6 block
+    // that no tunnel would ever remove.
     v6_state::on_cleanup();
 
-    if IS_BLOCKING.load(Ordering::SeqCst) {
-        deactivate_blocking().await?;
-    }
-
-    let mut guard = ENGINE
-        .lock()
-        .map_err(|e| format!("engine lock poisoned: {}", e))?;
+    let mut guard = engine_lock()?;
     // P1-ks-wfp-initialize-toctou-handle-leak: even if close() errors, drop the
     // engine and clear IS_INITIALIZED — otherwise the module believes it is
     // initialized with an engine whose handle may be invalid, and every later
@@ -1620,6 +1199,7 @@ pub async fn cleanup() -> Result<(), String> {
     };
     *guard = None;
 
+    IS_BLOCKING.store(false, Ordering::SeqCst);
     IS_INITIALIZED.store(false, Ordering::SeqCst);
     close_result?;
     tracing::info!("Kill switch cleanup complete");
@@ -1636,10 +1216,59 @@ pub fn set_local_network_sharing(enabled: bool) {
 /// Set the list of split-tunnel app executable paths.
 /// Uses `where.exe` to resolve short names like "chrome.exe" to full paths.
 /// Takes effect on the next `activate_blocking()` call.
+///
+/// W1-044: this runs on every connect and settings reapply, and resolving a
+/// short name spawns `where.exe` and walks Program Files two levels deep. That
+/// work now runs on the blocking pool — it used to run inside this async fn and
+/// pin a runtime worker for seconds — and its result is reused while the
+/// requested list is unchanged and every resolved path still exists.
 pub async fn set_split_tunnel_apps(app_names: Vec<String>) {
-    let mut resolved_paths = Vec::new();
+    let resolved_paths =
+        match tokio::task::spawn_blocking(move || resolve_split_tunnel_apps(&app_names)).await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!(
+                    "Kill-switch exception resolution failed ({}) — none applied",
+                    e
+                );
+                Vec::new()
+            }
+        };
 
-    for name in &app_names {
+    let mut apps = SPLIT_TUNNEL_APPS.write().await;
+    *apps = resolved_paths;
+}
+
+/// The last resolution: (requested names, resolved paths).
+static RESOLVED_SPLIT_TUNNEL: std::sync::Mutex<Option<(Vec<String>, Vec<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// A cached resolution stands only while the request is unchanged, every name
+/// resolved, and every path still exists — so an app that moved to a new
+/// versioned folder, or was installed since, is resolved again.
+fn can_reuse_resolution(
+    requested: &[String],
+    resolved: &[String],
+    now: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> bool {
+    requested == now && resolved.len() == requested.len() && resolved.iter().all(|p| exists(p))
+}
+
+fn resolve_split_tunnel_apps(app_names: &[String]) -> Vec<String> {
+    let mut cache = RESOLVED_SPLIT_TUNNEL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((requested, resolved)) = cache.as_ref() {
+        if can_reuse_resolution(requested, resolved, app_names, |p| {
+            std::path::Path::new(p).exists()
+        }) {
+            return resolved.clone();
+        }
+    }
+
+    let mut resolved_paths = Vec::new();
+    for name in app_names {
         if let Some(path) = resolve_app_path(name) {
             resolved_paths.push(path);
         } else {
@@ -1652,9 +1281,8 @@ pub async fn set_split_tunnel_apps(app_names: Vec<String>) {
         app_names.len(),
         resolved_paths.len()
     );
-
-    let mut apps = SPLIT_TUNNEL_APPS.write().await;
-    *apps = resolved_paths;
+    *cache = Some((app_names.to_vec(), resolved_paths.clone()));
+    resolved_paths
 }
 
 /// Resolve an app name or path to a full executable path.
@@ -1721,6 +1349,62 @@ fn resolve_app_path(name: &str) -> Option<String> {
     // sending an invalid path to WFP (which would fail FwpmGetAppIdFromFileName0)
     tracing::debug!("Could not resolve '{}', skipping", name);
     None
+}
+
+#[cfg(test)]
+mod split_tunnel_resolution_tests {
+    use super::can_reuse_resolution;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_unchanged_request_reuses_the_resolution() {
+        let req = v(&["chrome.exe"]);
+        let res = v(&[r"C:\Apps\chrome.exe"]);
+        assert!(can_reuse_resolution(&req, &res, &req, |_| true));
+    }
+
+    #[test]
+    fn anything_that_could_have_changed_resolves_again() {
+        let req = v(&["chrome.exe", "slack.exe"]);
+        let res = v(&[r"C:\Apps\chrome.exe", r"C:\Apps\slack.exe"]);
+        // A different list.
+        assert!(!can_reuse_resolution(
+            &req,
+            &res,
+            &v(&["chrome.exe"]),
+            |_| true
+        ));
+        // A path that moved (an app updated into a versioned folder).
+        assert!(!can_reuse_resolution(&req, &res, &req, |p| !p.contains("slack")));
+        // A name that did not resolve last time may resolve now.
+        let partial = v(&[r"C:\Apps\chrome.exe"]);
+        assert!(!can_reuse_resolution(&req, &partial, &req, |_| true));
+    }
+}
+
+/// Nothing WFP holds may outlive the process: no provider, no persistent or
+/// boot-time object, one DYNAMIC session. That is what makes a crash, an End
+/// task or an uninstall of a killed app unable to leave a filter (or the DNS
+/// guard) behind, and why the uninstaller has none to remove (W1-008).
+#[cfg(test)]
+mod lifetime_tests {
+    #[test]
+    fn every_wfp_object_lives_in_the_dynamic_session() {
+        let text = include_str!("wfp.rs");
+        assert!(text.contains("session.flags = FWPM_SESSION_FLAG_DYNAMIC;"));
+        // Built at run time so this file does not match its own needles.
+        for needle in [
+            ["FwpmProvider", "Add0"].concat(),
+            ["FWPM_FILTER_FLAG_", "PERSISTENT"].concat(),
+            ["FWPM_FILTER_FLAG_", "BOOTTIME"].concat(),
+            ["FWPM_SUBLAYER_FLAG_", "PERSISTENT"].concat(),
+        ] {
+            assert!(!text.contains(&needle), "wfp.rs uses {needle}");
+        }
+    }
 }
 
 #[cfg(test)]

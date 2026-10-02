@@ -17,6 +17,7 @@ use std::io::Write;
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
@@ -144,10 +145,26 @@ pub struct XrayConfig {
     pub wg_port: u16,
 }
 
+/// How often the health monitor checks that xray is still alive. An exit is
+/// reported to the reconnect engine at the next check (W1-005), so this bounds
+/// how long a stealth session can sit dead under a "Protected" UI.
+const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Manages the lifecycle of an Xray Reality stealth tunnel process
 pub struct XrayManager {
     process: Arc<Mutex<Option<Child>>>,
     health_cancel: Arc<Mutex<Option<watch::Sender<bool>>>>,
+    /// Bumped each time xray exits WITHOUT being asked to (a crash, End task).
+    /// An intentional `stop()` cancels the monitor first, so it never counts.
+    exits: watch::Sender<u64>,
+    /// Bumped each time a process leaves the slot for ANY reason — stopped,
+    /// restarted, or found dead. A connect compares it against the value it
+    /// saw at the start to learn whether the transport carrying the OLD
+    /// session is still the one running (REVIEW-WIN-010).
+    ended: Arc<AtomicU64>,
+    /// What the slot held at the last look: the answer `is_running_now` gives
+    /// while a start or stop holds the slot.
+    seen_running: Arc<AtomicBool>,
 }
 
 impl Default for XrayManager {
@@ -161,7 +178,35 @@ impl XrayManager {
         Self {
             process: Arc::new(Mutex::new(None)),
             health_cancel: Arc::new(Mutex::new(None)),
+            exits: watch::channel(0).0,
+            ended: Arc::new(AtomicU64::new(0)),
+            seen_running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// How many xray processes have left the slot so far. See the `ended`
+    /// field.
+    pub fn ended_count(&self) -> u64 {
+        self.ended.load(Ordering::SeqCst)
+    }
+
+    /// Put `child` in the slot as if `start()` had spawned it.
+    #[cfg(test)]
+    pub(crate) async fn adopt_for_test(&self, child: Child) {
+        *self.process.lock().await = Some(child);
+    }
+
+    /// Hold the slot as a `stop()` waiting for the process to exit does.
+    #[cfg(test)]
+    pub(crate) async fn hold_slot_for_test(&self) -> tokio::sync::MutexGuard<'_, Option<Child>> {
+        self.process.lock().await
+    }
+
+    /// Wakes when xray dies under a session. The reconnect engine treats that
+    /// as a dead data plane and re-dials at once, instead of waiting for the
+    /// handshake to go stale (W1-005).
+    pub fn subscribe_exits(&self) -> watch::Receiver<u64> {
+        self.exits.subscribe()
     }
 
     /// Start the Xray Reality tunnel. Returns the local port to use as WireGuard endpoint.
@@ -246,6 +291,18 @@ impl XrayManager {
             )
         })?;
 
+        // W1-005: tie xray's lifetime to ours. stop() and Drop only run on a
+        // clean exit; a crash, End task or the updater's process::exit(0)
+        // skipped both and left xray running with a live Reality session and
+        // the file locked against the installer. The job's only handle closes
+        // when this process does, whatever the reason, and the OS then kills
+        // everything in it. A failure is logged, not fatal: an orphaned xray
+        // talks only to the relay, so it is a leftover, not a leak.
+        #[cfg(target_os = "windows")]
+        if let Err(e) = kill_on_close_job::adopt(&child) {
+            tracing::warn!("Could not tie xray to the app's lifetime: {}", e);
+        }
+
         // P1-dk-xray-orphan-on-early-return: take the pipes and store the Child
         // BEFORE any fallible post-spawn work, so every error path below can
         // reap the process via stop() instead of orphaning a live xray holding
@@ -287,13 +344,11 @@ impl XrayManager {
                     let reader = BufReader::new(stderr_async);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        if line.contains("panic")
-                            || line.contains("fatal")
-                            || line.contains("FATAL")
-                        {
-                            tracing::error!(target: "xray::stderr", "CRASH: {}", line);
+                        let (crashed, safe) = xray_stderr_line(&line);
+                        if crashed {
+                            tracing::error!(target: "xray::stderr", "CRASH: {}", safe);
                         } else {
-                            tracing::warn!(target: "xray::stderr", "{}", line);
+                            tracing::warn!(target: "xray::stderr", "{}", safe);
                         }
                     }
                 });
@@ -314,6 +369,7 @@ impl XrayManager {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     let _ = proc.take(); // Clean up
+                    self.ended.fetch_add(1, Ordering::SeqCst);
                     return Err(format!(
                         "Xray process exited immediately with status: {}",
                         status
@@ -346,6 +402,7 @@ impl XrayManager {
 
         let mut proc = self.process.lock().await;
         if let Some(mut child) = proc.take() {
+            self.ended.fetch_add(1, Ordering::SeqCst);
             tracing::info!("Stopping Xray Reality tunnel (PID: {})", child.id());
             // Try graceful kill first, then force
             let _ = child.kill();
@@ -364,43 +421,69 @@ impl XrayManager {
         *self.health_cancel.lock().await = Some(cancel_tx);
 
         let process = Arc::clone(&self.process);
+        let exits = self.exits.clone();
+        let ended = Arc::clone(&self.ended);
 
         tokio::spawn(async move {
             let mut consecutive_failures: u32 = 0;
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = tokio::time::sleep(HEALTH_CHECK_INTERVAL) => {}
                     _ = cancel_rx.changed() => break,
                 }
 
-                if *cancel_rx.borrow() {
-                    break;
-                }
-
-                // Check 1: Is the process still alive?
-                let proc_alive = {
+                // Check 1: Is the process still alive? Decided UNDER the
+                // process lock, cancellation included (REVIEW-WIN-004).
+                // `stop()` signals the cancel BEFORE it takes this lock, so
+                // whatever a cancelled monitor finds in the slot — nothing, or
+                // the next session's process — is not its business. Reading
+                // the cancel before the lock, as this did, let a monitor pass
+                // the check, lose the lock to an intentional `stop()`, find
+                // the slot empty and report the stop as a crash: the loop then
+                // tore down the healthy session a stealth re-dial had just
+                // built, and counted the drop toward the breaker.
+                let step = {
                     let mut proc = process.lock().await;
-                    if let Some(ref mut child) = *proc {
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
+                    let slot = match proc.as_mut().map(Child::try_wait) {
+                        None => Slot::Empty,
+                        Some(Ok(None)) => Slot::Running,
+                        Some(Ok(Some(status))) => Slot::Exited(status.to_string()),
+                        Some(Err(e)) => Slot::Unreadable(e.to_string()),
+                    };
+                    let step = monitor_step(*cancel_rx.borrow(), &slot);
+                    if step == MonitorStep::ReportExit {
+                        match &slot {
+                            Slot::Exited(status) => {
                                 tracing::error!("Xray process exited unexpectedly: {}", status);
                                 proc.take();
-                                false
+                                ended.fetch_add(1, Ordering::SeqCst);
                             }
-                            Ok(None) => true,
-                            Err(e) => {
+                            Slot::Unreadable(e) => {
                                 tracing::warn!("Failed to check Xray process: {}", e);
-                                false
                             }
+                            // Empty: a status read (`is_running`) reaped the
+                            // dead process before this check came round. Still
+                            // a crash, because no cancel was signalled.
+                            Slot::Empty | Slot::Running => {}
                         }
-                    } else {
-                        false
                     }
+                    step
                 };
 
-                if !proc_alive {
-                    tracing::error!("Xray health monitor: process not running, stopping monitor");
-                    break;
+                match step {
+                    MonitorStep::Stop => break,
+                    MonitorStep::ReportExit => {
+                        // W1-005: this used to stop the monitor and say nothing,
+                        // so WireGuard kept sending into a dead loopback port
+                        // with the UI reading Connected until the watchdog
+                        // noticed.
+                        tracing::error!(
+                            "Xray exited under the session — reporting a dead transport"
+                        );
+                        exits.send_modify(|n| *n = n.wrapping_add(1));
+                        break;
+                    }
+                    MonitorStep::Continue => {}
                 }
 
                 // Check 2: is the dokodemo-door inbound still bound? It is a UDP
@@ -434,19 +517,64 @@ impl XrayManager {
     /// Check if Xray process is currently running
     pub async fn is_running(&self) -> bool {
         let mut proc = self.process.lock().await;
-        if let Some(ref mut child) = *proc {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    // Process has exited
-                    proc.take();
-                    false
-                }
-                Ok(None) => true,
-                Err(_) => false,
-            }
-        } else {
-            false
+        self.look(&mut proc)
+    }
+
+    /// [`is_running`](Self::is_running) for the status choke point, which
+    /// must never wait (WIN-FIX-3): `stop()` holds the slot while the process
+    /// exits, and a start while it comes up. Then the last look answers.
+    pub fn is_running_now(&self) -> bool {
+        match self.process.try_lock() {
+            Ok(mut proc) => self.look(&mut proc),
+            Err(_) => self.seen_running.load(Ordering::SeqCst),
         }
+    }
+
+    /// Whether the slot holds a live process, reaping one that exited.
+    fn look(&self, proc: &mut Option<Child>) -> bool {
+        let running = match proc.as_mut().map(Child::try_wait) {
+            Some(Ok(None)) => true,
+            Some(Ok(Some(_))) => {
+                // Process has exited
+                proc.take();
+                self.ended.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+            Some(Err(_)) | None => false,
+        };
+        self.seen_running.store(running, Ordering::SeqCst);
+        running
+    }
+}
+
+/// What the health monitor found in the process slot, under its lock.
+#[derive(Debug)]
+enum Slot {
+    Empty,
+    Running,
+    Exited(String),
+    Unreadable(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MonitorStep {
+    Continue,
+    /// This monitor was cancelled: someone stopped or replaced xray on
+    /// purpose. Say nothing.
+    Stop,
+    /// Xray died under the session: report a dead transport.
+    ReportExit,
+}
+
+/// One health check's verdict (REVIEW-WIN-004). `cancelled` must be read under
+/// the same process lock as `slot`; see `start_health_monitor`.
+fn monitor_step(cancelled: bool, slot: &Slot) -> MonitorStep {
+    if cancelled {
+        return MonitorStep::Stop;
+    }
+    match slot {
+        Slot::Running => MonitorStep::Continue,
+        Slot::Empty | Slot::Exited(_) | Slot::Unreadable(_) => MonitorStep::ReportExit,
     }
 }
 
@@ -472,6 +600,79 @@ impl Drop for XrayManager {
     }
 }
 
+/// A Job Object with KILL_ON_JOB_CLOSE that xray is placed in (W1-005).
+///
+/// Its one handle is held in a static and never closed, so it lives exactly as
+/// long as this process; when the process ends — for any reason — the OS
+/// closes the handle and terminates every process in the job.
+#[cfg(target_os = "windows")]
+mod kill_on_close_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub(super) struct Job(HANDLE);
+
+    // SAFETY: a job handle is a kernel object handle, usable from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        pub(super) fn new() -> Result<Self, String> {
+            // SAFETY: no security attributes, no name; the handle is owned by
+            // the returned Job.
+            let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+                .map_err(|e| format!("CreateJobObjectW: {e}"))?;
+            let job = Job(handle);
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `info` is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION and
+            // the length passed is its exact size.
+            unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            }
+            .map_err(|e| format!("SetInformationJobObject: {e}"))?;
+            Ok(job)
+        }
+
+        pub(super) fn assign(&self, child: &std::process::Child) -> Result<(), String> {
+            // SAFETY: both handles are valid for the call: the job is owned by
+            // `self`, the process handle by `child`.
+            unsafe { AssignProcessToJobObject(self.0, HANDLE(child.as_raw_handle())) }
+                .map_err(|e| format!("AssignProcessToJobObject: {e}"))
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle is owned by this Job and closed exactly once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    static PROCESS_JOB: OnceLock<Result<Job, String>> = OnceLock::new();
+
+    /// Put `child` in the process-lifetime job.
+    pub(super) fn adopt(child: &std::process::Child) -> Result<(), String> {
+        match PROCESS_JOB.get_or_init(Job::new) {
+            Ok(job) => job.assign(child),
+            Err(e) => Err(e.clone()),
+        }
+    }
+}
+
 /// Find an available TCP/UDP port starting from the given port.
 ///
 /// The dokodemo-door inbound binds the chosen port for UDP, so a port that is
@@ -489,6 +690,19 @@ fn find_available_port(start: u16) -> Option<u16> {
         }
     }
     None
+}
+
+/// One line of xray's stderr as it may reach the persistent log (W1-020):
+/// `(is it a crash, the redacted line)`.
+///
+/// xray's warnings name what it was dialling — the relay's address, and in
+/// some failures the VLESS user id — and these lines are written at WARN, which
+/// release builds persist. Everything else that can name the relay is redacted
+/// (LOG-001), so this is too, ALWAYS: `sanitize_always`, not `sanitize_error`,
+/// because a debug build's log is still a file a user may send.
+fn xray_stderr_line(line: &str) -> (bool, String) {
+    let crashed = line.contains("panic") || line.contains("fatal") || line.contains("FATAL");
+    (crashed, crate::utils::redact::sanitize_always(line))
 }
 
 /// Parse "host:port" endpoint string
@@ -694,6 +908,41 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
 }
 
 #[cfg(test)]
+mod stderr_tests {
+    use super::xray_stderr_line;
+
+    /// W1-020: a failed dial names the relay; the log line must not.
+    #[test]
+    fn a_dial_failure_reaches_the_log_without_the_relay_address() {
+        let (crashed, line) = xray_stderr_line(
+            "2026/09/30 12:00:01 [Warning] failed to dial tcp 203.0.113.7:8443: i/o timeout",
+        );
+        assert!(!crashed);
+        assert!(!line.contains("203.0.113.7"), "{line}");
+        assert!(line.contains("i/o timeout"), "{line}");
+    }
+
+    #[test]
+    fn the_user_id_and_a_hostname_are_redacted_too() {
+        let (_, line) = xray_stderr_line(
+            "[Error] invalid user 123e4567-e89b-12d3-a456-426614174000 at relay-ams-3.birdo.app",
+        );
+        assert!(
+            !line.contains("123e4567-e89b-12d3-a456-426614174000"),
+            "{line}"
+        );
+        assert!(!line.contains("birdo.app"), "{line}");
+    }
+
+    #[test]
+    fn a_crash_is_still_recognised() {
+        let (crashed, line) = xray_stderr_line("panic: runtime error: index out of range");
+        assert!(crashed);
+        assert!(line.contains("panic"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -722,6 +971,41 @@ mod tests {
         assert!(err.contains(&good), "expected digest missing from {err}");
         let rewritten = hex::encode(Sha256::digest(b"not really xray+sig"));
         assert!(err.contains(&rewritten), "actual digest missing from {err}");
+    }
+
+    /// W1-005: closing the job kills what is in it. This is the property that
+    /// takes xray down with the app on a crash, End task or an update's
+    /// process::exit — the static job's handle is closed by the OS then. The
+    /// child only pings loopback; nothing leaves the machine.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn closing_the_job_kills_its_processes() {
+        let job = kill_on_close_job::Job::new().expect("job object");
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a long-running child");
+        job.assign(&child).expect("assign to job");
+        assert!(child.try_wait().unwrap().is_none(), "child is running");
+
+        drop(job);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let exited = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        if !exited {
+            let _ = child.kill();
+        }
+        assert!(exited, "closing the job must terminate its processes");
     }
 
     /// FIPS 180-4 "abc" vector, compared against what the release pipeline
@@ -757,8 +1041,20 @@ mod tests {
             !udp_port_held(port),
             "after the listener is gone the port is free"
         );
-        // a TCP listener on the same port is NOT the proxy: UDP stays free
-        let tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        // a TCP listener on the same port is NOT the proxy: UDP stays free.
+        // The port must be usable by BOTH protocols, which one bind cannot
+        // promise: Hyper-V reserves separate TCP and UDP blocks inside the
+        // dynamic range, and landing in one failed the setup — not the probe
+        // under test. So look for a port both accept.
+        let (tcp, port) = (0..50)
+            .find_map(|_| {
+                let udp = UdpSocket::bind(("127.0.0.1", 0)).ok()?;
+                let port = udp.local_addr().ok()?.port();
+                drop(udp);
+                let tcp = TcpListener::bind(("127.0.0.1", port)).ok()?;
+                Some((tcp, port))
+            })
+            .expect("a loopback port free for both TCP and UDP");
         assert!(!udp_port_held(port));
         drop(tcp);
     }
@@ -857,5 +1153,72 @@ mod tests {
                 inbound["tag"]
             );
         }
+    }
+
+    /// REVIEW-WIN-004: an intentional stop must never read as a crash. A
+    /// cancelled monitor stops quietly whatever it finds in the slot — empty
+    /// (the stop took the process) or occupied (the next session's xray); only
+    /// an UNcancelled monitor reports, including for a slot a status read
+    /// reaped after a real crash.
+    #[test]
+    fn only_an_uncancelled_monitor_reports_an_exit() {
+        let exited = Slot::Exited("exit code: 1".into());
+        for slot in [Slot::Empty, Slot::Running, exited] {
+            assert_eq!(monitor_step(true, &slot), MonitorStep::Stop, "{slot:?}");
+        }
+        assert_eq!(monitor_step(false, &Slot::Running), MonitorStep::Continue);
+        assert_eq!(monitor_step(false, &Slot::Empty), MonitorStep::ReportExit);
+        assert_eq!(
+            monitor_step(false, &Slot::Exited("exit code: 1".into())),
+            MonitorStep::ReportExit
+        );
+        assert_eq!(
+            monitor_step(false, &Slot::Unreadable("denied".into())),
+            MonitorStep::ReportExit
+        );
+    }
+
+    /// The monitor reads its cancel flag under the process lock, after
+    /// `stop()` could have signalled it — never before taking the lock.
+    #[test]
+    fn the_monitor_reads_its_cancel_under_the_process_lock() {
+        let source = include_str!("xray.rs");
+        let body = &source[source.find("async fn start_health_monitor(").unwrap()..];
+        let lock = body.find("process.lock().await").expect("lock");
+        let verdict = body
+            .find("monitor_step(*cancel_rx.borrow()")
+            .expect("verdict under the lock");
+        assert!(lock < verdict);
+        assert!(
+            !body[..lock].contains("*cancel_rx.borrow()"),
+            "the cancel is read before the lock again"
+        );
+    }
+
+    /// REVIEW-WIN-010: `ended_count` moves exactly when a process leaves the
+    /// slot, so a connect can tell whether the OLD session's transport was
+    /// really stopped. The child only pings loopback; nothing leaves the
+    /// machine.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn ended_count_moves_only_when_a_process_is_stopped() {
+        let xray = XrayManager::new();
+        xray.stop().await;
+        assert_eq!(xray.ended_count(), 0, "stopping nothing ended something");
+
+        let child = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a long-running child");
+        xray.adopt_for_test(child).await;
+        assert!(xray.is_running().await);
+        let mark = xray.ended_count();
+
+        xray.stop().await;
+        assert_eq!(xray.ended_count(), mark + 1);
+        assert!(!xray.is_running().await);
     }
 }

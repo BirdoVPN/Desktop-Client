@@ -5,28 +5,35 @@
 //! or blocks DNS for `api.birdo.app`, desktop login/connect would fail — while
 //! the Android client survived because it already resolves the control plane via
 //! DoH. This adapter closes that gap by routing the desktop control-plane client
-//! through the SAME cert-pinned, multi-provider DoH resolver the VPN layer uses
-//! (`crate::vpn::doh`), matching the Android client's behaviour.
+//! through the SAME cert-pinned DoH resolver the VPN layer uses
+//! (`crate::vpn::doh`), matching the Android client's behaviour: Cloudflare
+//! only (owner decision D5, 2026-10-01).
 //!
 //! SECURITY MODEL (defense-in-depth):
-//!   1. DoH (Cloudflare → Google → Quad9) is tried first, each provider pinned
-//!      by CA-CHAIN SPKI inside the TLS handshake — NOT leaf-pinned, which this
+//!   1. DoH (Cloudflare) is tried first, pinned by CA-CHAIN SPKI inside the
+//!      TLS handshake — NOT leaf-pinned, which this
 //!      comment claimed long after `vpn::doh` moved off leaf-DER hashing
 //!      precisely because leaf pins self-disable on every ~90-day renewal. This
 //!      defeats plain DNS blocking/poisoning because the providers are reached
-//!      over HTTPS via their own pinned certificates.
-//!   2. If EVERY DoH provider fails, we fall back to the system resolver rather
+//!      over HTTPS via its own pinned certificates.
+//!   2. If DoH fails, we fall back to the system resolver rather
 //!      than failing closed — so we never REGRESS a network that works today.
+//!      NOT while a Windows kill-switch block is up (a reconnect gap, a held
+//!      lockdown block): it lets out only this executable's HTTPS, and port-53
+//!      DNS is blocked off the tunnel (REVIEW-WIN2-031). There Cloudflare DoH
+//!      is the ONLY way to find the API once the cache below expires — with a
+//!      single provider (owner decision D5), a network that blocks Cloudflare
+//!      keeps a lockdown reconnect from resolving the API at all.
 //!      READ THIS BEFORE RELYING ON `vpn::doh`'s FAIL-CLOSED GUARANTEE: that
 //!      guarantee is `vpn::doh`'s, and it ends here. Step 3 explains why that is
 //!      an accepted trade rather than an oversight, but it IS a trade — the
-//!      fallback fires even when every provider failed *pinning* specifically
+//!      fallback fires even when the provider failed *pinning* specifically
 //!      (`resolve_via_doh`'s "all providers failed certificate verification"),
 //!      which is the case that looks most like an attack. It is also, far more
-//!      often, a stale pin set: that is exactly what happened to dns.google, and
-//!      failing closed there would have bricked the control plane on any network
-//!      where the other two providers were blocked. The all-providers-failed
-//!      case is reported to Sentry from `vpn::doh` so it cannot be silent.
+//!      often, a stale pin set (what happened to dns.google, a former provider),
+//!      and with a single provider failing closed would brick the control plane
+//!      every time Cloudflare's chain moves. That case is reported to Sentry
+//!      from `vpn::doh` so it cannot be silent.
 //!   3. A poisoned IP obtained through the fallback cannot mount a MITM: the
 //!      `BirdoApi` client still enforces CA-chain SPKI certificate pinning
 //!      (see `super::cert_pin`) during the TLS handshake, so a forged
@@ -63,9 +70,16 @@ pub struct DohApiResolver {
 }
 
 impl DohApiResolver {
+    /// Every resolver shares ONE cache, process-wide. A one-off client (the
+    /// deletion around the tunnel, the old-key probe's fresh connections)
+    /// then finds the address the main client already resolved, instead of
+    /// needing DoH at the worst moment: behind a block, just after a
+    /// teardown, where a failed DoH lookup has no fallback that works
+    /// (WIN3-001).
     pub fn new() -> Self {
+        static SHARED: std::sync::OnceLock<Arc<Mutex<CacheMap>>> = std::sync::OnceLock::new();
         Self {
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::clone(SHARED.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))),
         }
     }
 }
@@ -107,9 +121,8 @@ impl Resolve for DohApiResolver {
                     //    was previously indistinguishable in the log.
                     if e.contains(crate::vpn::doh::ALL_PROVIDERS_PINNING_FAILED) {
                         tracing::error!(
-                            "DoH resolution for {host} failed because EVERY provider \
-                             failed CERTIFICATE PINNING, not because the network was \
-                             unreachable. Falling back to the system resolver anyway: \
+                            "DoH resolution for {host} failed CERTIFICATE PINNING, \
+                             not because the network was unreachable. Falling back to the system resolver anyway: \
                              api.birdo.app is itself CA-chain SPKI pinned \
                              (api::cert_pin), so a poisoned address cannot mount a \
                              MITM — but encrypted resolution is GONE for this client \
@@ -202,6 +215,16 @@ mod tests {
         cache_put(&cache, "api.birdo.app", vec![sample_addr()], CACHE_TTL);
         let got = cache_get(&cache, "api.birdo.app").expect("entry should be cached");
         assert_eq!(got, vec![sample_addr()]);
+    }
+
+    /// WIN3-001: what one client resolved, every other client finds.
+    #[test]
+    fn every_resolver_shares_one_cache() {
+        let main = DohApiResolver::new();
+        let one_off = DohApiResolver::new();
+        let host = "shared-cache.test.invalid";
+        cache_put(&main.cache, host, vec![sample_addr()], CACHE_TTL);
+        assert_eq!(cache_get(&one_off.cache, host), Some(vec![sample_addr()]));
     }
 
     #[test]

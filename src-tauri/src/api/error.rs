@@ -27,6 +27,22 @@ pub enum ApiError {
     Parse(String),
     /// SEC-C1: TLS certificate pinning verification failed (possible MITM)
     CertificatePinningFailed(String),
+    /// Any other non-2xx answer that carried the backend's own sentence. The
+    /// status travels with it so `commands::ipc_error` can pick an error code
+    /// by status instead of by wording, and the sentence stays the specific,
+    /// actionable one ("Stealth mode requires an Operative or Sovereign
+    /// subscription") rather than a generic "Access denied".
+    Rejected { status: u16, message: String },
+    /// The action needs the account's two-factor code (`error:
+    /// "two_factor_required"`, Account API contract item 85). Carries the
+    /// backend's sentence.
+    TwoFactorRequired(String),
+    /// The two-factor code sent was wrong (`error: "two_factor_invalid"`).
+    TwoFactorInvalid(String),
+    /// 503 `error: "quota_check_unavailable"` (birdo-web #590): the server
+    /// could not check a Free plan's allowance just now. Worth retrying, after
+    /// `retry_after_secs` when the server says.
+    QuotaCheckUnavailable { retry_after_secs: Option<u64> },
     /// Unknown error
     Unknown(String),
 }
@@ -55,6 +71,12 @@ impl fmt::Display for ApiError {
             ApiError::ServerError(code) => write!(f, "Server error ({})", code),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),
             ApiError::CertificatePinningFailed(msg) => write!(f, "Security verification failed. This may mean the app needs updating or your connection is being intercepted. Please update BirdoVPN to the latest version. ({})", msg),
+            ApiError::Rejected { message, .. }
+            | ApiError::TwoFactorRequired(message)
+            | ApiError::TwoFactorInvalid(message) => write!(f, "{}", message),
+            ApiError::QuotaCheckUnavailable { .. } => {
+                write!(f, "The data allowance check is unavailable right now")
+            }
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }
     }

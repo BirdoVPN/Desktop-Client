@@ -1,5 +1,20 @@
 import { describe, it, expect } from 'vitest';
-import { settingsFromRust, settingsToRust, friendlyVpnError, type RustSettings } from './helpers';
+import {
+  settingsFromRust,
+  settingsToRust,
+  formatBytes,
+  formatUptime,
+  formatDate,
+  anonAccountNumber,
+  anonymityPatch,
+  formatAccountNumber,
+  identityPatch,
+  isPrivateDnsAddress,
+  isValidMtu,
+  maskAccountNumber,
+  resolveAnonymousAccount,
+  type RustSettings,
+} from './helpers';
 
 // A complete RustSettings payload; individual tests override single fields
 // (and cast to RustSettings when deliberately omitting one to exercise the
@@ -56,6 +71,16 @@ describe('settingsFromRust — v1.3.30/31 default guarantees', () => {
     expect(out.stealthMode).toBe(true);
     expect(out.multiHopEnabled).toBe(true);
   });
+
+  // WIN-FIX-3: a port no relay answers, from a file an older build wrote, is
+  // read as "auto" — never shown as a choice the screen no longer has.
+  it('reads a dead WireGuard port as auto', () => {
+    for (const port of ['53', '1194', 'custom', '']) {
+      expect(settingsFromRust({ ...base, wireguard_port: port }).wireGuardPort).toBe('auto');
+    }
+    const { wireguard_port: _omit, ...withoutPort } = base;
+    expect(settingsFromRust(withoutPort as RustSettings).wireGuardPort).toBe('auto');
+  });
 });
 
 describe('BirdoShield (D18) dns_filtering ↔ dnsFiltering', () => {
@@ -99,35 +124,169 @@ describe('crash reports (C-3) crash_reports_enabled ↔ crashReportsEnabled', ()
   });
 });
 
-describe('friendlyVpnError — surfaces the real reason', () => {
-  it('maps known patterns to friendly copy', () => {
-    expect(friendlyVpnError('Device limit reached (1 devices for RECON plan)')).toMatch(
-      /Subscription limit|device/i,
-    );
-    expect(friendlyVpnError('handshake did not complete')).toMatch(/timed out|busy/i);
+// friendlyVpnError (substring-matching free text) is gone: errors are mapped by
+// their v2 code in lib/errors.ts (W2-012), tested in lib/errors.test.ts.
+
+describe('Custom DNS on/off (P1-parity-042): Rust has no flag, so off = null on the wire', () => {
+  it('a non-empty list from Rust reads as ON', () => {
+    const s = settingsFromRust({ ...base, custom_dns: ['1.1.1.1'] });
+    expect(s.customDnsEnabled).toBe(true);
+    expect(s.customDns).toEqual(['1.1.1.1']);
   });
 
-  it("surfaces the server's clean message instead of the generic fallback", () => {
-    // This is exactly the message the live outage produced — it must reach the user.
-    expect(friendlyVpnError('Failed to configure VPN server. Please try again.')).toBe(
-      'Failed to configure VPN server. Please try again.',
-    );
+  it('switched OFF sends null but the addresses stay in the store', () => {
+    const s = { ...settingsFromRust({ ...base, custom_dns: ['1.1.1.1', '8.8.8.8'] }), customDnsEnabled: false };
+    expect(settingsToRust(s).custom_dns).toBeNull();
+    expect(s.customDns).toEqual(['1.1.1.1', '8.8.8.8']);
+  });
+
+  it('switched ON with no addresses sends null, never an empty list', () => {
+    const s = { ...settingsFromRust(base), customDnsEnabled: true, customDns: [] };
+    expect(settingsToRust(s).custom_dns).toBeNull();
+  });
+
+  it('a private address is the user\'s own resolver (REVIEW-WIN2-006, the ranges Rust uses)', () => {
+    for (const lan of ['192.168.1.2', '10.0.0.53', '172.16.0.1', '172.31.255.254']) {
+      expect(isPrivateDnsAddress(lan)).toBe(true);
+    }
+    for (const other of ['9.9.9.9', '172.32.0.1', '172.15.0.1', '192.169.0.1', '11.0.0.1', '192.168.1.', 'x']) {
+      expect(isPrivateDnsAddress(other)).toBe(false);
+    }
+  });
+});
+
+describe('formatting (iOS / Android FormatUtils parity, W2-031)', () => {
+  it('uptime is MM:SS under an hour and H:MM:SS above', () => {
+    expect(formatUptime(0)).toBe('00:00');
+    expect(formatUptime(65)).toBe('01:05');
+    expect(formatUptime(3599)).toBe('59:59');
+    expect(formatUptime(3600)).toBe('1:00:00');
+    expect(formatUptime(3 * 3600 + 7 * 60 + 9)).toBe('3:07:09');
+  });
+
+  it('bytes: KB and MB with one decimal, GB with two', () => {
+    expect(formatBytes(0)).toBe('0 B');
+    expect(formatBytes(512)).toBe('512 B');
+    expect(formatBytes(1536)).toBe('1.5 KB');
+    expect(formatBytes(5 * 1024 * 1024)).toBe('5.0 MB');
+    expect(formatBytes(1.5 * 1024 ** 3)).toBe('1.50 GB');
+  });
+
+  it('dates read "MMM d, yyyy", and a bare calendar date is not shifted a day by the timezone', () => {
+    expect(formatDate('2026-07-31')).toBe('Jul 31, 2026');
+    expect(formatDate('')).toBeNull();
+    expect(formatDate('not a date')).toBeNull();
+    expect(formatDate('2026-01-05T12:00:00Z')).toMatch(/^Jan [45], 2026$/);
+  });
+
+  it('MTU accepts 1280–1500 only', () => {
+    expect(isValidMtu('1280')).toBe(true);
+    expect(isValidMtu('1500')).toBe(true);
+    expect(isValidMtu('1279')).toBe(false);
+    expect(isValidMtu('14')).toBe(false);
+  });
+});
+
+describe('anonymous identity (P1-parity-007)', () => {
+  const synthetic = 'anon_123456789012345678901234@anonymous.local';
+
+  it('recognises the synthetic address and extracts the account number', () => {
+    expect(anonAccountNumber(synthetic)).toBe('123456789012345678901234');
+    expect(anonAccountNumber('someone@example.com')).toBeNull();
+    expect(anonAccountNumber(null)).toBeNull();
+  });
+
+  it('formats the account number in six space-separated groups of four', () => {
+    expect(formatAccountNumber('123456789012345678901234')).toBe('1234 5678 9012 3456 7890 1234');
+    expect(formatAccountNumber('1234|5678')).toBe('1234 5678');
+  });
+
+  it('masks every group but the last by default (Account API item 86)', () => {
+    expect(maskAccountNumber('123456789012345678901234')).toBe('•••• •••• •••• •••• •••• 1234');
+  });
+});
+
+/** Account API contract 2026-10-01, item 86: `/auth/me` on an old and a new server. */
+describe('anonymous account resolution (item 86)', () => {
+  const synthetic = 'anon_123456789012345678901234@anonymous.local';
+  const unknown = { isAnonymous: null, accountNumber: null };
+
+  it('an old server (no new fields) is read from the email, as before', () => {
+    expect(anonymityPatch({})).toEqual({});
+    expect(resolveAnonymousAccount(unknown, synthetic)).toEqual({
+      isAnon: true,
+      accountNumber: '123456789012345678901234',
+    });
+    expect(resolveAnonymousAccount(unknown, 'me@example.com')).toEqual({ isAnon: false, accountNumber: null });
+  });
+
+  it("a new server's fields win, and the number comes from accountNumber", () => {
+    const patch = anonymityPatch({ is_anonymous: true, account_number: '999988887777666655554444' });
+    expect(patch).toEqual({ isAnonymous: true, accountNumber: '999988887777666655554444' });
+    // Phase 2: the email no longer carries the number at all.
+    expect(resolveAnonymousAccount({ isAnonymous: true, accountNumber: '999988887777666655554444' }, null)).toEqual({
+      isAnon: true,
+      accountNumber: '999988887777666655554444',
+    });
+    expect(resolveAnonymousAccount({ isAnonymous: false, accountNumber: null }, 'me@example.com')).toEqual({
+      isAnon: false,
+      accountNumber: null,
+    });
+  });
+
+  it('a server that sends no number (null, the email carrying none) still reads as anonymous', () => {
+    const patch = anonymityPatch({ is_anonymous: true, account_number: null });
+    expect(patch).toEqual({ isAnonymous: true });
+    expect(resolveAnonymousAccount({ isAnonymous: true, accountNumber: null }, 'member@anonymous.local')).toEqual({
+      isAnon: true,
+      accountNumber: null,
+    });
+  });
+
+  it('a synthetic email is never treated as a real one, whatever the server says', () => {
+    expect(resolveAnonymousAccount({ isAnonymous: false, accountNumber: null }, synthetic).isAnon).toBe(true);
+  });
+
+  it('only the documented 24 digits are taken as an account number', () => {
+    expect(anonymityPatch({ is_anonymous: null, account_number: null })).toEqual({});
+    expect(anonymityPatch({ account_number: '1234' })).toEqual({});
+    expect(anonymityPatch({ account_number: '1234 5678 9012 3456 7890 1234' })).toEqual({});
+  });
+});
+
+// WIN-FIX-3: the one identity patch App startup and Login both apply.
+describe('identityPatch', () => {
+  const signedIn = { is_authenticated: true, email: null, account_id: null, plan: null };
+
+  it('carries hasPassword — false for an account without one', () => {
+    expect(identityPatch({ ...signedIn, has_password: false }).hasPassword).toBe(false);
+    expect(identityPatch({ ...signedIn, has_password: true }).hasPassword).toBe(true);
+  });
+
+  it('keeps the password prompt when the backend does not say', () => {
+    expect(identityPatch(signedIn).hasPassword).toBe(true);
+  });
+
+  it('writes only what was received', () => {
+    expect(identityPatch(signedIn)).toEqual({ status: 'active', hasPassword: true });
     expect(
-      friendlyVpnError('All VPN servers are currently offline. Please try again shortly.'),
-    ).toBe('All VPN servers are currently offline. Please try again shortly.');
-  });
-
-  it('adds trailing punctuation to a clean fragment', () => {
-    expect(friendlyVpnError('Server is rebooting')).toBe('Server is rebooting.');
-  });
-
-  it('falls back to generic for empty or obviously-technical errors', () => {
-    expect(friendlyVpnError('')).toBe('Connection failed. Please try again.');
-    expect(
-      friendlyVpnError("thread 'main' panicked at src/x.rs:1:1: boom"),
-    ).toBe('Connection failed. Please try again.');
-    expect(friendlyVpnError('connect: os error 10061')).toBe(
-      'Connection failed. Please try again.',
-    );
+      identityPatch({
+        is_authenticated: true,
+        email: 'a@b.co',
+        account_id: 'acc-1',
+        plan: 'operative',
+        has_password: false,
+        is_anonymous: false,
+      }),
+    ).toEqual({
+      email: 'a@b.co',
+      accountId: 'acc-1',
+      plan: 'operative',
+      status: 'active',
+      hasPassword: false,
+      isAnonymous: false,
+    });
+    // Not signed in: no claim about the account's state or password.
+    expect(identityPatch({ ...signedIn, is_authenticated: false, has_password: false })).toEqual({});
   });
 });

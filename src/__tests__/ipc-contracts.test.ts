@@ -1,306 +1,314 @@
 /**
- * L-10: IPC contract integration test scaffold
+ * IPC contract tests — v2 (contracts/WINDOWS-IPC-V2.md).
  *
- * These tests verify that the frontend's invoke() calls match the
- * Rust #[tauri::command] signatures.
+ * W2-040: the old layer 1 called `invoke(x, payload)` on the MOCK and asserted
+ * the mock had been called with `payload` — a tautology that could never fail.
+ * Everything here exercises the REAL code on each side of the boundary:
  *
- * Two layers:
- *  1. The per-command describe blocks below exercise the invoke() call
- *     SHAPES (command name + argument object) against the shared Tauri mock.
- *  2. The "command registry cross-check" block at the bottom reads the real
- *     Rust `generate_handler!` list out of src-tauri/src/main.rs and asserts
- *     every command the frontend invokes is actually registered there. That
- *     turns this file from a mock-only tautology into a genuine cross-language
- *     contract: a frontend invoke('foo') whose #[tauri::command] was never
- *     wired into generate_handler! now fails CI instead of only blowing up at
- *     runtime with "command foo not found".
+ *  1. Rust → UI: the v2 payloads (`VpnStatus`, `IpcError`, `session-expired`)
+ *     as the contract writes them, fed through the parsers every component
+ *     reads through. Both casings, because the contract says "stays
+ *     snake_case as today" while today's `VpnStatus` is camelCase.
+ *  2. UI → Rust: the argument objects our real action functions send, and the
+ *     `save_settings` payload checked field-by-field against the Rust
+ *     `AppSettings` struct read out of src-tauri.
+ *  3. The command registry: every command the UI invokes (scanned from the
+ *     source, so the list cannot drift) is registered in main.rs.
  *
  * Run: npx vitest run src/__tests__/ipc-contracts.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
-import { readFileSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { parseServers, parseSessionExpired, parseVpnStats, parseVpnStatus, toIpcError } from '@/lib/ipc';
+import { connectMultiHop, connectToServer, disconnectVpn } from '@/session/vpn-actions';
+import { persistSettings } from '@/session/settings-persist';
+import { useAppStore, type Server } from '@/store/app-store';
+import { settingsToRust } from '@/utils/helpers';
 
-// Auto-mock via __mocks__/@tauri-apps/api/core.ts
 vi.mock('@tauri-apps/api/core');
-
 const mockedInvoke = vi.mocked(invoke);
 
 beforeEach(() => {
   mockedInvoke.mockReset();
   mockedInvoke.mockResolvedValue(undefined);
+  useAppStore.getState().logout();
+  useAppStore.setState({ isAuthenticated: true });
 });
 
-describe('IPC Contract: Authentication', () => {
-  it('login sends correct payload shape', async () => {
-    mockedInvoke.mockResolvedValueOnce({
-      success: true,
-      email: 'test@example.com',
-      tokens: { access_token: 'a', refresh_token: 'r' },
-    });
+// ── 1. Rust → UI ────────────────────────────────────────────────────────────
 
-    await invoke('login', {
-      request: { email: 'test@example.com', password: 'pass123' },
-    });
+/** Contract §1, every field, snake_case as the contract table spells it. */
+const V2_STATUS_SNAKE = {
+  state: 'reconnecting',
+  phase: 'handshaking',
+  reconnect_attempt: 3,
+  reconnect_max: 10,
+  kill_switch_blocking: true,
+  error: { code: 'server_unreachable', message: 'Handshake timed out', retryable: true, retry_after_secs: null },
+  server_id: 'de-fra-1',
+  multi_hop: { entry_id: 'ch-1', entry_name: 'Zurich', exit_id: 'de-fra-1', exit_name: 'Frankfurt' },
+  seq: 42,
+  bytes_sent: 1024,
+  bytes_received: 2048,
+  connected_at: '2026-09-30T10:00:00Z',
+  server_name: 'Frankfurt #1',
+  stealth_active: false,
+  quantum_active: true,
+  pq_mode: 'bilateral',
+  dns_degraded: ['Ethernet: 192.0.2.53 still set'],
+};
 
-    expect(mockedInvoke).toHaveBeenCalledWith('login', {
-      request: { email: 'test@example.com', password: 'pass123' },
-    });
-  });
+/** The same, as it arrives if Rust keeps `rename_all = "camelCase"`. */
+const V2_STATUS_CAMEL = {
+  state: 'reconnecting',
+  phase: 'handshaking',
+  reconnectAttempt: 3,
+  reconnectMax: 10,
+  killSwitchBlocking: true,
+  error: { code: 'server_unreachable', message: 'Handshake timed out', retryable: true, retryAfterSecs: null },
+  serverId: 'de-fra-1',
+  multiHop: { entryId: 'ch-1', entryName: 'Zurich', exitId: 'de-fra-1', exitName: 'Frankfurt' },
+  seq: 42,
+  bytesSent: 1024,
+  bytesReceived: 2048,
+  connectedAt: '2026-09-30T10:00:00Z',
+  serverName: 'Frankfurt #1',
+  stealthActive: false,
+  quantumActive: true,
+  pqMode: 'bilateral',
+  dnsDegraded: ['Ethernet: 192.0.2.53 still set'],
+};
 
-  it('logout requires no arguments', async () => {
-    await invoke('logout');
-    expect(mockedInvoke).toHaveBeenCalledWith('logout');
-  });
-
-  it('get_auth_state requires no arguments', async () => {
-    mockedInvoke.mockResolvedValueOnce({
-      is_authenticated: false,
-      email: null,
-    });
-    await invoke('get_auth_state');
-    expect(mockedInvoke).toHaveBeenCalledWith('get_auth_state');
-  });
-});
-
-describe('IPC Contract: VPN Operations', () => {
-  it('connect_vpn sends server_id', async () => {
-    mockedInvoke.mockResolvedValueOnce({ success: true });
-
-    await invoke('connect_vpn', { serverId: 'us-east-1' });
-
-    expect(mockedInvoke).toHaveBeenCalledWith('connect_vpn', {
-      serverId: 'us-east-1',
-    });
-  });
-
-  it('disconnect_vpn requires no arguments', async () => {
-    await invoke('disconnect_vpn');
-    expect(mockedInvoke).toHaveBeenCalledWith('disconnect_vpn');
-  });
-
-  it('get_vpn_status returns expected shape', async () => {
-    const mockStatus = {
-      state: 'connected',
+describe('VpnStatus (contract §1) → parseVpnStatus', () => {
+  it.each([
+    ['snake_case', V2_STATUS_SNAKE],
+    ['camelCase', V2_STATUS_CAMEL],
+  ])('reads every v2 field from a %s payload', (_casing, payload) => {
+    expect(parseVpnStatus(payload)).toEqual({
+      state: 'reconnecting',
+      phase: 'handshaking',
+      reconnectAttempt: 3,
+      reconnectMax: 10,
+      killSwitchBlocking: true,
+      error: { code: 'server_unreachable', message: 'Handshake timed out', retryable: true, retry_after_secs: null },
+      serverId: 'de-fra-1',
+      multiHop: { entryId: 'ch-1', entryName: 'Zurich', exitId: 'de-fra-1', exitName: 'Frankfurt' },
+      seq: 42,
       bytesSent: 1024,
       bytesReceived: 2048,
-      connectedAt: '2025-01-01T00:00:00Z',
-    };
-    mockedInvoke.mockResolvedValueOnce(mockStatus);
-
-    const result = await invoke('get_vpn_status');
-    expect(result).toEqual(mockStatus);
+      connectedAt: '2026-09-30T10:00:00Z',
+      serverName: 'Frankfurt #1',
+      stealthActive: false,
+      quantumActive: true,
+      dnsDegraded: ['Ethernet: 192.0.2.53 still set'],
+      gaveUp: null,
+    });
   });
 
-  it('quick_connect requires no arguments', async () => {
-    mockedInvoke.mockResolvedValueOnce({ success: true });
-    await invoke('quick_connect');
-    expect(mockedInvoke).toHaveBeenCalledWith('quick_connect');
+  it('reads the give-up mark Rust sets on the final error status, in both casings (REVIEW-WIN-009)', () => {
+    const base = { state: 'error', error: { code: 'server_unreachable', message: '' } };
+    expect(parseVpnStatus({ ...base, gaveUp: { attempts: 10 } })?.gaveUp).toEqual({ attempts: 10 });
+    expect(parseVpnStatus({ ...base, gave_up: { attempts: 0 } })?.gaveUp).toEqual({ attempts: 0 });
+    expect(parseVpnStatus({ ...base, gaveUp: null })?.gaveUp).toBeNull();
+    expect(parseVpnStatus(base)?.gaveUp).toBeNull();
   });
-});
 
-describe('IPC Contract: Kill Switch', () => {
-  // enable_killswitch / disable_killswitch were removed from the IPC surface
-  // (dead commands — never called by the frontend; kill switch is driven by
-  // arm()/disarm() on the connect lifecycle and set_killswitch_live).
-  it('get_killswitch_status returns expected shape', async () => {
-    const mockStatus = {
-      enabled: true,
-      active: false,
-      blocking_connections: 0,
-    };
-    mockedInvoke.mockResolvedValueOnce(mockStatus);
-
-    const result = await invoke('get_killswitch_status');
-    expect(result).toEqual(mockStatus);
+  it('accepts every v2 state, including the new `switching`', () => {
+    for (const state of ['disconnected', 'connecting', 'connected', 'disconnecting', 'reconnecting', 'switching', 'error']) {
+      expect(parseVpnStatus({ state })?.state).toBe(state);
+    }
   });
-});
 
-describe('IPC Contract: Servers', () => {
-  it('get_servers returns array', async () => {
-    mockedInvoke.mockResolvedValueOnce([
-      {
-        id: 'us-1',
-        name: 'US East',
-        country: 'United States',
-        countryCode: 'US',
-        city: 'New York',
-        load: 42,
-        isPremium: false,
-        minPlan: 'RECON',
-        isHighSpeed: false,
-        isPortForwarding: false,
-        isOnline: true,
-      },
+  it('maps the v1 states a not-yet-updated backend can still send', () => {
+    expect(parseVpnStatus({ state: 'authenticating' })).toMatchObject({ state: 'connecting', phase: 'authenticating' });
+    expect(parseVpnStatus({ state: 'stealth_connecting' })).toMatchObject({ state: 'connecting', phase: 'starting_stealth' });
+    expect(parseVpnStatus({ state: 'rekeying' })?.state).toBe('connected');
+    expect(parseVpnStatus({ state: 'kill_switch_active' })).toMatchObject({ state: 'disconnected', killSwitchBlocking: true });
+  });
+
+  it('a pre-v2 payload leaves the v2 fields explicitly unknown, never "fine"', () => {
+    const st = parseVpnStatus({ state: 'connected', bytesSent: 1, bytesReceived: 2 })!;
+    expect(st.seq).toBeNull();
+    expect(st.error).toBeUndefined();
+    expect(st.dnsDegraded).toBeUndefined();
+    expect(st.killSwitchBlocking).toBe(false);
+  });
+
+  it('rejects what is not a status instead of throwing or guessing', () => {
+    for (const bad of [null, undefined, 'connected', 42, [], {}, { state: 'teleporting' }, { state: 3 }]) {
+      expect(parseVpnStatus(bad)).toBeNull();
+    }
+  });
+
+  it('get_vpn_stats (snake_case VpnStats) → parseVpnStats', () => {
+    expect(
+      parseVpnStats({ bytes_in: 10, bytes_out: 20, packets_in: 1, packets_out: 2, uptime_seconds: 61, current_latency_ms: 33 }),
+    ).toEqual({ bytesIn: 10, bytesOut: 20, uptimeSeconds: 61, latencyMs: 33 });
+    expect(parseVpnStats({ uptime_seconds: 5, current_latency_ms: null })?.latencyMs).toBeNull();
+  });
+
+  it('get_servers (camelCase ServerInfo) → parseServers, dropping rows without an id', () => {
+    const servers = parseServers([
+      { id: 'a', name: 'A', country: 'Germany', countryCode: 'DE', city: 'Berlin', load: 10, isOnline: false, accessible: false, minPlan: 'SOVEREIGN' },
+      { id: 'b', name: 'B', country: 'France', country_code: 'FR', city: 'Paris', is_online: true },
+      { name: 'no id' },
     ]);
-
-    const result = await invoke('get_servers');
-    expect(Array.isArray(result)).toBe(true);
+    expect(servers.map((s) => s.id)).toEqual(['a', 'b']);
+    expect(servers[0]).toMatchObject({ countryCode: 'DE', isOnline: false, isAccessible: false, minPlan: 'SOVEREIGN' });
+    expect(servers[1]).toMatchObject({ countryCode: 'FR', isOnline: true, isAccessible: true, load: 0 });
   });
 });
 
-describe('IPC Contract: Settings', () => {
-  it('get_settings returns object', async () => {
-    mockedInvoke.mockResolvedValueOnce({
-      auto_connect: false,
-      kill_switch: true,
-      notifications: true,
-    });
-    const result = await invoke('get_settings');
-    expect(result).toBeDefined();
+describe('IpcError (contract §2) → toIpcError', () => {
+  it('reads the v2 error object as the contract spells it', () => {
+    expect(
+      toIpcError({ code: 'rate_limited', message: 'Too many requests', retryable: true, retry_after_secs: 30 }),
+    ).toEqual({ code: 'rate_limited', message: 'Too many requests', retryable: true, retry_after_secs: 30 });
   });
 
-  it('save_settings sends settings object with VPN settings fields', async () => {
-    const settings = {
-      auto_connect: true,
-      kill_switch: true,
-      notifications: false,
-      local_network_sharing: true,
-      wireguard_port: '53',
-      wireguard_mtu: 1420,
-    };
-    await invoke('save_settings', { settings });
-    expect(mockedInvoke).toHaveBeenCalledWith('save_settings', { settings });
+  it('turns a legacy String error into code "unknown" (commands outside the contract list)', () => {
+    expect(toIpcError('Failed to save settings')).toEqual({
+      code: 'unknown',
+      message: 'Failed to save settings',
+      retryable: true,
+      retry_after_secs: null,
+    });
+  });
+
+  it('never classifies free text: a pin warning mentioning "connection" stays unknown', () => {
+    expect(toIpcError('your connection is being intercepted').code).toBe('unknown');
+  });
+
+  it('an unrecognised code is "unknown", not a crash or a pass-through', () => {
+    expect(toIpcError({ code: 'quantum_flux', message: 'x' }).code).toBe('unknown');
+  });
+
+  it('handles an Error and garbage', () => {
+    expect(toIpcError(new Error('boom'))).toMatchObject({ code: 'unknown', message: 'boom' });
+    expect(toIpcError(undefined)).toMatchObject({ code: 'unknown', message: '' });
   });
 });
 
-describe('IPC Contract: Account Deletion', () => {
-  it('delete_account resolves with the store subscriptions still billing (camelCase)', async () => {
-    mockedInvoke.mockResolvedValueOnce({ storeSubscriptionsStillBilling: ['Google Play'] });
-
-    const result = await invoke<{ storeSubscriptionsStillBilling: string[] }>('delete_account', {
-      request: { password: 'mypassword123' },
-    });
-
-    expect(result.storeSubscriptionsStillBilling).toEqual(['Google Play']);
-  });
-
-  it('delete_account sends password payload', async () => {
-    mockedInvoke.mockResolvedValueOnce(undefined);
-
-    await invoke('delete_account', { request: { password: 'mypassword123' } });
-
-    expect(mockedInvoke).toHaveBeenCalledWith('delete_account', {
-      request: { password: 'mypassword123' },
-    });
-  });
-
-  it('deletion_preflight takes no arguments and resolves camelCase store names', async () => {
-    mockedInvoke.mockResolvedValueOnce({
-      storeSubscriptionsStillBilling: ['Apple App Store'],
-      webSubscriptionWillBeCancelled: false,
-    });
-
-    const result = await invoke<{
-      storeSubscriptionsStillBilling: string[];
-      webSubscriptionWillBeCancelled: boolean;
-    }>('deletion_preflight');
-
-    expect(mockedInvoke).toHaveBeenCalledWith('deletion_preflight');
-    expect(result.storeSubscriptionsStillBilling).toEqual(['Apple App Store']);
-    expect(result.webSubscriptionWillBeCancelled).toBe(false);
-  });
-
-  it('delete_account rejects on 401', async () => {
-    mockedInvoke.mockRejectedValueOnce(new Error('Invalid password'));
-
-    await expect(
-      invoke('delete_account', { request: { password: 'wrong' } })
-    ).rejects.toThrow('Invalid password');
+describe('session-expired (contract §3.3)', () => {
+  it('reads the reason, treating anything unrecognised as expiry', () => {
+    expect(parseSessionExpired({ reason: 'revoked' })).toBe('revoked');
+    expect(parseSessionExpired({ reason: 'expired' })).toBe('expired');
+    expect(parseSessionExpired(null)).toBe('expired');
   });
 });
 
-describe('IPC Contract: Multi-Hop', () => {
-  it('connect_multi_hop sends entry and exit node IDs', async () => {
-    mockedInvoke.mockResolvedValueOnce({ success: true });
+// ── 2. UI → Rust ────────────────────────────────────────────────────────────
 
-    await invoke('connect_multi_hop', {
-      entryNodeId: 'de-1',
-      exitNodeId: 'us-1',
-    });
+const SERVER: Server = {
+  id: 'de-fra-1',
+  name: 'Frankfurt #1',
+  country: 'Germany',
+  countryCode: 'DE',
+  city: 'Frankfurt',
+  load: 10,
+  isPremium: false,
+  isHighSpeed: false,
+  isPortForwarding: false,
+  isOnline: true,
+  isAccessible: true,
+};
 
-    expect(mockedInvoke).toHaveBeenCalledWith('connect_multi_hop', {
-      entryNodeId: 'de-1',
-      exitNodeId: 'us-1',
-    });
+const callsTo = (cmd: string) => mockedInvoke.mock.calls.filter(([c]) => c === cmd);
+
+describe('what the real actions send', () => {
+  it('connect_vpn { serverId }', async () => {
+    await connectToServer(SERVER);
+    expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'de-fra-1' }]]);
   });
 
-  it('get_multi_hop_routes returns array', async () => {
-    mockedInvoke.mockResolvedValueOnce([
-      { entryNodeId: 'de-1', exitNodeId: 'us-1', entryCountry: 'Germany', exitCountry: 'United States' },
+  it('connect_multi_hop { entryNodeId, exitNodeId }', async () => {
+    await connectMultiHop('ch-1', 'de-fra-1');
+    expect(callsTo('connect_multi_hop')).toEqual([
+      ['connect_multi_hop', { entryNodeId: 'ch-1', exitNodeId: 'de-fra-1' }],
     ]);
+  });
 
-    const result = await invoke('get_multi_hop_routes');
-    expect(Array.isArray(result)).toBe(true);
+  it('disconnect_vpn takes no arguments', async () => {
+    await disconnectVpn();
+    expect(callsTo('disconnect_vpn')).toEqual([['disconnect_vpn']]);
+  });
+
+  it('save_settings { settings } carries the full object, never a partial', async () => {
+    await persistSettings({ autoConnect: true });
+    const [[, args]] = callsTo('save_settings') as [[string, { settings: Record<string, unknown> }]];
+    expect(Object.keys(args.settings).sort()).toEqual(Object.keys(settingsToRust(useAppStore.getState().settings)).sort());
+    expect(args.settings.auto_connect).toBe(true);
   });
 });
 
-describe('IPC Contract: Port Forwarding', () => {
-  it('create_port_forward sends port and protocol', async () => {
-    mockedInvoke.mockResolvedValueOnce({ id: 'pf-1', externalPort: 8080 });
+function findUp(rel: string): string {
+  let dir = process.cwd();
+  for (let i = 0; i < 6; i++) {
+    const candidate = resolve(dir, rel);
+    if (existsSync(candidate)) return candidate;
+    const parent = resolve(dir, '..');
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return resolve(process.cwd(), rel);
+}
 
-    await invoke('create_port_forward', {
-      request: { internalPort: 8080, protocol: 'tcp' },
-    });
+/** `pub <field>: <type>` lines of the Rust `AppSettings`, with whether serde defaults each. */
+function rustAppSettingsFields(): { name: string; defaulted: boolean }[] {
+  const src = readFileSync(findUp('src-tauri/src/commands/settings.rs'), 'utf8');
+  const start = src.indexOf('pub struct AppSettings');
+  if (start === -1) throw new Error('pub struct AppSettings not found in commands/settings.rs');
+  const body = src.slice(start, src.indexOf('\n}', start));
+  const fields: { name: string; defaulted: boolean }[] = [];
+  let pendingDefault = false;
+  for (const line of body.split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('#[serde(') && t.includes('default')) pendingDefault = true;
+    const m = /^pub ([a-z_][a-z0-9_]*):\s*(.+?),?$/.exec(t);
+    if (m) {
+      // serde treats a missing Option<_> as None even without a default.
+      fields.push({ name: m[1], defaulted: pendingDefault || m[2].startsWith('Option<') });
+      pendingDefault = false;
+    }
+  }
+  return fields;
+}
 
-    expect(mockedInvoke).toHaveBeenCalledWith('create_port_forward', {
-      request: { internalPort: 8080, protocol: 'tcp' },
-    });
+describe('save_settings payload ↔ Rust AppSettings (commands/settings.rs)', () => {
+  const fields = rustAppSettingsFields();
+  const written = Object.keys(settingsToRust(useAppStore.getState().settings));
+
+  it('parses a non-trivial field list', () => {
+    expect(fields.length).toBeGreaterThan(15);
   });
 
-  it('delete_port_forward sends id', async () => {
-    mockedInvoke.mockResolvedValueOnce(undefined);
+  it('writes only fields Rust knows (a stray key is silently dropped by serde)', () => {
+    const known = new Set(fields.map((f) => f.name));
+    expect(written.filter((k) => !known.has(k))).toEqual([]);
+  });
 
-    await invoke('delete_port_forward', { id: 'pf-1' });
+  it('writes every field Rust has no default for (save_settings REPLACES the struct)', () => {
+    const required = fields.filter((f) => !f.defaulted).map((f) => f.name);
+    expect(required.filter((k) => !written.includes(k))).toEqual([]);
+  });
 
-    expect(mockedInvoke).toHaveBeenCalledWith('delete_port_forward', {
-      id: 'pf-1',
-    });
+  it('round-trips the flags whose serde default would silently flip a user choice', () => {
+    for (const k of ['lockdown_mode', 'quantum_protection', 'killswitch_enabled', 'dns_filtering', 'crash_reports_enabled']) {
+      expect(written).toContain(k);
+    }
   });
 });
 
-describe('IPC Contract: Vouchers', () => {
-  it('redeem_voucher sends the code and returns the redemption result', async () => {
-    mockedInvoke.mockResolvedValueOnce({
-      ok: true,
-      plan: 'OPERATIVE',
-      durationDays: 30,
-      extended: true,
-    });
-
-    const res = await invoke('redeem_voucher', { code: 'BIRD-AAAA-BBBB-CCCC' });
-
-    expect(mockedInvoke).toHaveBeenCalledWith('redeem_voucher', {
-      code: 'BIRD-AAAA-BBBB-CCCC',
-    });
-    expect(res).toMatchObject({ ok: true, plan: 'OPERATIVE', durationDays: 30 });
-  });
-
-  it('redeem_voucher surfaces a backend rejection (mapped error string)', async () => {
-    mockedInvoke.mockRejectedValueOnce(
-      "We couldn't find that voucher code. Double-check it and try again.",
-    );
-
-    await expect(invoke('redeem_voucher', { code: 'BAD' })).rejects.toContain(
-      "couldn't find",
-    );
-  });
-});
-
-// ───────────────────────────────────────────────────────────────────────────
-// REAL contract cross-check: frontend invoke() names ⊆ Rust generate_handler!
-// ───────────────────────────────────────────────────────────────────────────
+// ── 3. The command registry ─────────────────────────────────────────────────
 
 /**
- * Command names the frontend calls via invoke(). Keep this in sync whenever a
- * new invoke() call site is added — every entry MUST have a matching
- * #[tauri::command] registered in src-tauri/src/main.rs's generate_handler!
- * block, or the call rejects at runtime with "command <name> not found".
- *
- * (This is the SSOT the old tests lacked: previously each test only proved the
- * mock echoed back whatever name it was handed — it could never catch a
- * command that the Rust side never registered.)
+ * Every command the UI invokes. Kept by hand so a reviewer sees the IPC
+ * surface in one place, and pinned against the source scan below so it can
+ * never go stale again (set_tray_state, set_window_position,
+ * get_killswitch_status and get_multi_hop_routes were listed long after the
+ * UI stopped calling them, or before it ever did).
  */
 const FRONTEND_COMMANDS = [
   // Authentication
@@ -314,6 +322,8 @@ const FRONTEND_COMMANDS = [
   'delete_account',
   'deletion_preflight',
   'export_user_data',
+  // A command answered session_expired: Rust ends the session too (REVIEW-WIN-012)
+  'end_expired_session',
   // VPN operations
   'connect_vpn',
   'disconnect_vpn',
@@ -322,7 +332,8 @@ const FRONTEND_COMMANDS = [
   'quick_connect',
   'reapply_vpn_settings',
   'get_admin_status',
-  // Server management
+  'connect_multi_hop',
+  // Servers
   'get_servers',
   'ping_server',
   // Settings
@@ -330,26 +341,19 @@ const FRONTEND_COMMANDS = [
   'save_settings',
   'set_autostart',
   'set_crash_reports_enabled',
-  // System tray / window
-  'set_tray_state',
-  'set_window_position',
   // Kill switch
-  'get_killswitch_status',
   'set_killswitch_live',
-  // Split tunneling
+  // Kill Switch Exceptions
   'list_installed_apps',
-  // Auto-updater (pinned Rust client — see src-tauri/src/commands/updater.rs)
+  // Updater (pinned Rust client — commands/updater.rs)
   'get_app_version',
   'check_for_updates',
   'install_update',
   'get_required_update',
-  // Extended VPN info
+  // Account data
   'get_subscription_status',
   'get_usage_stats',
   'get_client_config',
-  // Multi-hop (Double VPN)
-  'get_multi_hop_routes',
-  'connect_multi_hop',
   // Port forwarding
   'get_port_forwards',
   'create_port_forward',
@@ -358,64 +362,63 @@ const FRONTEND_COMMANDS = [
   'redeem_voucher',
   // Speed test
   'run_speed_test_command',
-  // Biometric (Windows Hello)
+  // Hide App Contents (Windows Hello / Touch ID)
   'check_biometric_available',
   'set_biometric_enabled',
   'authenticate_biometric',
   // Deep link captured at cold start
   'take_pending_deep_link',
+  // The window up from the tray: re-consent behind Start Minimized (REVIEW-WIN2-010)
+  'show_main_window',
 ] as const;
 
-/**
- * Parse the Rust `generate_handler![ ... ]` list in src-tauri/src/main.rs and
- * return the registered command idents (the last `::` path segment of each
- * entry). Reads from disk — vitest runs under Node, so node:fs is available
- * even in the jsdom test environment. vitest runs from the repo root (its
- * config's include globs are root-relative), so resolve from process.cwd();
- * fall back to a short upward walk in case a runner starts elsewhere.
- */
-function resolveMainRs(): string {
-  const rel = 'src-tauri/src/main.rs';
-  let dir = process.cwd();
-  for (let i = 0; i < 6; i++) {
-    const candidate = resolve(dir, rel);
-    if (existsSync(candidate)) return candidate;
-    const parent = resolve(dir, '..');
-    if (parent === dir) break;
-    dir = parent;
+function sourceFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) {
+      if (name === '__tests__' || name === '__mocks__') continue;
+      out.push(...sourceFiles(p));
+    } else if (/\.(ts|tsx)$/.test(name) && !/\.test\.tsx?$/.test(name)) {
+      out.push(p);
+    }
   }
-  // Last resort: return the cwd-relative path so readFileSync throws a clear
-  // ENOENT naming the path it looked for, rather than failing silently.
-  return resolve(process.cwd(), rel);
+  return out;
+}
+
+/**
+ * Commands passed to `invoke(...)` / `command(...)` anywhere in src (not
+ * tests), plus vpn-actions' `run(pending, 'cmd', …)` wrapper.
+ */
+function scannedCommands(): string[] {
+  const found = new Set<string>();
+  const patterns = [
+    /\b(?:invoke|command)(?:<[^>]*>)?\(\s*'([a-z_][a-z0-9_]*)'/g,
+    /\brun\(\s*'[a-z]+',\s*'([a-z_][a-z0-9_]*)'/g,
+  ];
+  for (const file of sourceFiles(findUp('src'))) {
+    const text = readFileSync(file, 'utf8');
+    for (const re of patterns) for (const m of text.matchAll(re)) found.add(m[1]);
+  }
+  return [...found].sort();
 }
 
 function loadRegisteredCommands(): string[] {
-  const src = readFileSync(resolveMainRs(), 'utf8');
-
+  const src = readFileSync(findUp('src-tauri/src/main.rs'), 'utf8');
   const marker = 'generate_handler![';
   const start = src.indexOf(marker);
-  if (start === -1) {
-    throw new Error('generate_handler![ block not found in main.rs');
-  }
+  if (start === -1) throw new Error('generate_handler![ block not found in main.rs');
   const from = start + marker.length;
   const end = src.indexOf(']', from);
-  if (end === -1) {
-    throw new Error('generate_handler![ block was not terminated in main.rs');
-  }
-
+  if (end === -1) throw new Error('generate_handler![ block was not terminated in main.rs');
   const commands: string[] = [];
   for (const rawLine of src.slice(from, end).split('\n')) {
-    // Drop `// ...` line comments before tokenising.
     const line = rawLine.replace(/\/\/.*$/, '');
     for (const token of line.split(',')) {
       const entry = token.trim();
       if (!entry) continue;
-      // `commands::auth::login` -> `login`; a bare `take_pending_deep_link`
-      // stays as-is.
       const ident = entry.split('::').pop()!.trim();
-      if (/^[a-z_][a-z0-9_]*$/.test(ident)) {
-        commands.push(ident);
-      }
+      if (/^[a-z_][a-z0-9_]*$/.test(ident)) commands.push(ident);
     }
   }
   return commands;
@@ -426,34 +429,19 @@ describe('IPC Contract: command registry cross-check (frontend ↔ Rust)', () =>
   const registeredSet = new Set(registered);
 
   it('parses a non-trivial command set from main.rs generate_handler!', () => {
-    // Guards the parser itself: if extraction silently returned nothing (the
-    // block was renamed/moved), every ⊆ assertion below would vacuously pass.
+    // Guards the parser: an empty extraction would make every ⊆ below vacuous.
     expect(registered.length).toBeGreaterThan(20);
   });
 
   it('registers no command twice in generate_handler!', () => {
-    const duplicates = registered.filter(
-      (cmd, i) => registered.indexOf(cmd) !== i,
-    );
-    expect(duplicates).toEqual([]);
+    expect(registered.filter((cmd, i) => registered.indexOf(cmd) !== i)).toEqual([]);
   });
 
-  it('every registered command is a valid snake_case ident', () => {
-    const invalid = registered.filter((cmd) => !/^[a-z_][a-z0-9_]*$/.test(cmd));
-    expect(invalid).toEqual([]);
+  it('the hand-kept list is exactly what the source invokes', () => {
+    expect([...FRONTEND_COMMANDS].sort()).toEqual(scannedCommands());
   });
 
-  it('the frontend command list has no duplicates', () => {
-    const duplicates = FRONTEND_COMMANDS.filter(
-      (cmd, i) => FRONTEND_COMMANDS.indexOf(cmd) !== i,
-    );
-    expect(duplicates).toEqual([]);
+  it.each(FRONTEND_COMMANDS)("frontend command '%s' is registered in main.rs generate_handler!", (cmd) => {
+    expect(registeredSet.has(cmd)).toBe(true);
   });
-
-  it.each(FRONTEND_COMMANDS)(
-    "frontend command '%s' is registered in main.rs generate_handler!",
-    (cmd) => {
-      expect(registeredSet.has(cmd)).toBe(true);
-    },
-  );
 });

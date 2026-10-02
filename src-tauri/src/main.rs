@@ -17,6 +17,7 @@ mod utils;
 mod vpn;
 
 use api::BirdoApi;
+use commands::tray::restore_and_focus;
 use storage::CredentialStore;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -40,50 +41,26 @@ static EXIT_TEARDOWN_STARTED: std::sync::atomic::AtomicBool =
 static EXIT_TEARDOWN_DONE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Best-effort teardown run while an exit request is held open: stop
-/// auto-reconnect, bring the tunnel down (routes/DNS/IPv6 restore) and disarm
-/// the kill switch. Every step is capped so quitting can never hang.
+/// Hard cap over the whole exit teardown: quitting must never hang. The steps
+/// inside `end_session` carry their own tighter budgets (auto-reconnect 3 s,
+/// the backend notify 3 s, the tunnel 6 s).
+const EXIT_TEARDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long past [`EXIT_TEARDOWN_CAP`] the exit fallback thread waits before
+/// it exits without the teardown (WIN-FIX-3, see `RunEvent::ExitRequested`).
+const EXIT_FALLBACK_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What the exit fallback gives its own last steps (the log line, the DNS
+/// restore) before it exits regardless (WIN3-006).
+const EXIT_FALLBACK_CLEANUP: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Best-effort teardown run while an exit request is held open. It is the SAME
+/// teardown as a user Disconnect (`session::end_session`): quitting IS the user
+/// ending the session, so the kill switch is disarmed unconditionally — on
+/// macOS/Linux a gate there would leave the machine behind a kernel firewall
+/// with no running app to disarm it.
 async fn teardown_for_exit(app: &tauri::AppHandle) {
-    use std::time::Duration;
-
-    // Quit is user intent: neutralize auto-reconnect first so it cannot race
-    // the teardown and bring the tunnel (and kill-switch arming) back up.
-    let auto_reconnect = app.state::<AutoReconnectService>();
-    auto_reconnect.set_user_disconnected();
-    auto_reconnect.stop().await;
-
-    let vpn_manager = app.state::<VpnManager>();
-    vpn_manager.set_user_disconnected(true);
-
-    // Stop the Xray stealth transport if it is running.
-    app.state::<crate::vpn::xray::XrayManager>().stop().await;
-
-    // Free the server-side peer while the tunnel is still up (mirrors
-    // disconnect_vpn). Courtesy call — tightly capped, never stalls the exit.
-    if let Some(key_id) = vpn_manager.get_key_id().await {
-        let api = app.state::<BirdoApi>();
-        match tokio::time::timeout(Duration::from_secs(3), api.disconnect_vpn(&key_id)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => info!("Exit teardown: backend disconnect notify failed: {}", e),
-            Err(_) => info!("Exit teardown: backend disconnect notify timed out"),
-        }
-    }
-
-    // Tunnel teardown: routes, DNS restore, session IPv6 leak block. Inner cap
-    // so a hung stop can never starve the disarm below out of running — the
-    // disarm is the piece whose absence outlives the process.
-    match tokio::time::timeout(Duration::from_secs(6), vpn_manager.disconnect()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("Exit teardown: tunnel disconnect failed: {}", e),
-        Err(_) => error!("Exit teardown: tunnel disconnect timed out"),
-    }
-
-    // Disarm the kill switch UNCONDITIONALLY, exactly as disconnect_vpn does
-    // (the 3e6f1e2 escape hatch): quitting IS the user ending the session, and
-    // is_lockdown_mode() is hard false off-Windows, so any gate here would
-    // leave macOS/Linux behind a kernel firewall with no running app to disarm
-    // it. disarm() is a no-op if the switch was never armed.
-    let _ = crate::commands::killswitch::disarm().await;
+    commands::session::end_session(app, commands::session::EndReason::AppExit).await;
 }
 
 /// A birdo:// URL captured from the launch argv at cold start, held until the
@@ -100,18 +77,6 @@ fn take_pending_deep_link(pending: tauri::State<'_, PendingDeepLink>) -> Option<
     pending.0.lock().ok().and_then(|mut g| g.take())
 }
 
-/// Bring the main window back to the foreground (tray click, "Show", quick
-/// actions, deep link, single-instance relaunch, post-SSO). Emits "app-shown"
-/// so the biometric app-lock can re-challenge after a close-to-tray.
-fn restore_and_focus(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = window.emit("app-shown", ());
-    }
-}
-
 /// Surface the window and hand a birdo:// URL to the frontend router. Shared by
 /// the runtime deep-link listener and the cold-start path.
 fn deliver_deep_link(app: &tauri::AppHandle, url: &str) {
@@ -123,6 +88,30 @@ fn deliver_deep_link(app: &tauri::AppHandle, url: &str) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.emit("deep-link", url);
     }
+}
+
+/// The uninstaller's PREUNINSTALL hook (nsis-hooks.nsh) runs the exe with this
+/// flag: put back what a previous session left behind, then exit (W1-008).
+const RECONCILE_AND_EXIT: &str = "--reconcile-and-exit";
+
+/// W1-008: the uninstaller's — and support's — way to undo what a BirdoVPN
+/// that was killed rather than quit left on the machine: DNS an older version
+/// parked, routes a crash stranded. The same journal-driven reconcile `setup()`
+/// runs at every start, with no window, tray or single-instance plugin.
+///
+/// Only for a machine where BirdoVPN is NOT running: it deletes every route
+/// the journal names and rewrites the journal, and beside a live session
+/// those are that session's routes — its tunnel dies and its record is lost
+/// (REVIEW-WIN2-008). The uninstaller therefore stops the app first
+/// (nsis-hooks.nsh, NSIS_HOOK_PREUNINSTALL).
+fn reconcile_and_exit() -> ! {
+    info!(
+        "{}: restoring what a previous session left behind",
+        RECONCILE_AND_EXIT
+    );
+    let restored = vpn::dns_journal::reconcile();
+    info!("{} done (DNS restored: {})", RECONCILE_AND_EXIT, restored);
+    std::process::exit(0)
 }
 
 fn main() {
@@ -164,44 +153,19 @@ fn main() {
         // the cap, and rotating first would only push expired content into
         // .1 to be pruned there.
         crate::utils::log_retention::rotate_if_large(&p);
-        let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.create(true).append(true);
-        // P6-CLI-D-08: the log records which VPN nodes were used and when —
-        // keep it owner-readable only on multi-user Unix hosts. (Windows
-        // relies on the per-user %APPDATA% ACL, same as the settings file.)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open_opts.mode(0o600);
-        }
-        let file = open_opts.open(&p).ok()?;
+        // The in-session twin of that rotation (W1-019): a weeks-long session
+        // passes the cap too, and once it did, every later line used to be
+        // dropped until the next launch. A stat per log event at info level is
+        // negligible. Owner-only on multi-user Unix hosts (P6-CLI-D-08).
+        let log = crate::utils::log_retention::RotatingLog::open(
+            &p,
+            crate::utils::log_retention::MAX_LOG_BYTES,
+        )
+        .ok()?;
         Some(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                // Resilient writer: a per-write try_clone() can fail (FD
-                // exhaustion, transient OS error). Panicking here would take
-                // down the whole process from inside the logging path — and
-                // possibly before earlier logs are flushed. Degrade gracefully
-                // by dropping that single log line (io::sink) instead.
-                //
-                // PWR-5 addendum: the rotation above only runs at startup, so a
-                // weeks-long session used to grow birdo.log without bound. Hard
-                // in-session cap: once the file passes 2x MAX_LOG_BYTES, drop
-                // further lines (the next launch rotates it aside). A stat per
-                // log event at info level is negligible.
-                .with_writer(move || -> Box<dyn std::io::Write> {
-                    if file
-                        .metadata()
-                        .map(|m| m.len() > 2 * crate::utils::log_retention::MAX_LOG_BYTES)
-                        .unwrap_or(false)
-                    {
-                        return Box::new(std::io::sink());
-                    }
-                    match file.try_clone() {
-                        Ok(f) => Box::new(f),
-                        Err(_) => Box::new(std::io::sink()),
-                    }
-                })
+                .with_writer(move || log.writer())
                 // CLAMP THE PERSISTENT LOG. The redaction strategy leans on
                 // "debug never ships": `redact_ip`/`redact_hostname` are
                 // pass-throughs under `debug_assertions`, and several
@@ -239,9 +203,19 @@ fn main() {
                 }
             }),
         ))
-        .with(tracing_subscriber::fmt::layer())
+        // The console's writes are queued for a thread of their own: a console
+        // that stops taking output must never hold up the thread that logged
+        // (WIN-FIX-3 P0, see utils::console_log).
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(crate::utils::console_log::ConsoleLog::stdout()),
+        )
         .with(file_layer)
         .init();
+
+    if std::env::args().any(|arg| arg == RECONCILE_AND_EXIT) {
+        reconcile_and_exit();
+    }
 
     info!("Birdo VPN Client starting...");
 
@@ -267,48 +241,21 @@ fn main() {
     // reaches `setup_panic_hook` (local log + local crash file) and nothing
     // else.
 
-    // ── Self-elevation ──────────────────────────────────────────────────
+    // ── Elevation ───────────────────────────────────────────────────────
     // Wintun adapter creation is an in-process FFI call that requires
-    // administrator privileges. If we're not elevated, relaunch with
-    // "runas" and exit this non-elevated instance.
-    //
-    // Only in production builds (custom-protocol feature). During development
-    // with `tauri dev`, the elevated relaunch can't reconnect to the Vite
-    // dev server. For dev: run your terminal as Administrator first.
-    #[cfg(all(windows, feature = "custom-protocol"))]
+    // administrator privileges. The embedded manifest is requireAdministrator
+    // (build.rs), so Windows starts this process elevated or not at all.
+    // W1-037: the ShellExecuteW "runas" self-relaunch that used to follow could
+    // only ever run under a compatibility shim, and it re-joined argv without
+    // quoting. A process that is somehow not elevated says so here, and every
+    // connect is refused with `not_elevated`. (`tauri dev`: run the terminal as
+    // Administrator.)
+    #[cfg(windows)]
     {
-        use crate::utils::elevation::is_elevated;
-        if !is_elevated() {
-            info!("Not running as administrator — attempting self-elevation via ShellExecuteW");
-            match self_elevate() {
-                Ok(()) => {
-                    info!("Elevated instance launched, exiting non-elevated instance");
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    error!(
-                        "Self-elevation failed: {}. Continuing without admin — VPN will not work.",
-                        e
-                    );
-                    // Continue anyway so the UI shows the error to the user
-                }
-            }
-        } else {
-            info!("Running with administrator privileges [OK]");
-        }
-    }
-
-    // In dev mode, just log the elevation status
-    #[cfg(all(windows, not(feature = "custom-protocol")))]
-    {
-        use crate::utils::elevation::is_elevated;
-        if is_elevated() {
+        if crate::utils::elevation::is_elevated() {
             info!("Running with administrator privileges [OK]");
         } else {
-            error!(
-                "[WARN] NOT running as administrator — VPN will fail. \
-                 Run your terminal as Administrator and retry `npm run tauri dev`."
-            );
+            error!("NOT running as administrator — connecting will fail (not_elevated)");
         }
     }
 
@@ -369,6 +316,13 @@ fn main() {
                     .unwrap_or(false),
             );
 
+            // REVIEW-WIN2-011: a GUI upgrade runs the old uninstaller, which
+            // deletes the launch-at-login task; put it back if it is missing.
+            #[cfg(windows)]
+            if startup_settings.as_ref().is_some_and(|s| s.autostart) {
+                commands::settings::restore_launch_at_login_task();
+            }
+
             // Give the forced-version-floor gate a handle so a 426 from ANY
             // request can raise the blocking "update required" screen. Must be
             // set before the first API call is made below.
@@ -426,6 +380,35 @@ fn main() {
                 info!("Auto-reconnect service registered");
             }
 
+            // The OS network signals the reconnect engine reads (default-route
+            // changes, resume). Registered once for the process: zero packets,
+            // nothing to start or stop per session (W1-011, W1-018).
+            crate::vpn::network_events::start();
+
+            // Contract §1: `kill_switch_blocking` follows the block even when
+            // the connection state does not change.
+            {
+                let vpn_manager = app.state::<VpnManager>().inner().clone();
+                commands::killswitch::set_blocking_observer(move || vpn_manager.refresh_status());
+            }
+
+            // Contract §3.3: a refresh token the server rejects ends the
+            // session everywhere — tunnel, tokens — and the UI is told.
+            {
+                let handle = app.handle().clone();
+                crate::api::session_gate::set_handler(move |stored| {
+                    let app = handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        commands::session::handle_session_expired(&app, stored).await;
+                    });
+                });
+            }
+
+            // W1-036: heal the <= 1.3.19 firewall rules once per install, in
+            // the background, instead of on every disconnect.
+            #[cfg(target_os = "windows")]
+            crate::vpn::legacy_firewall::spawn_once();
+
             // Create system tray menu
             let quit = MenuItem::with_id(app, "quit", "Quit BirdoVPN", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
@@ -435,19 +418,19 @@ fn main() {
 
             let menu = Menu::with_items(app, &[&connect, &disconnect, &show, &quit])?;
 
-            // Hold handles to the state-dependent menu items so `set_tray_state`
-            // can enable/disable them as the connection state changes. Without
-            // this, "Disconnect" (created disabled above) would stay permanently
-            // greyed out and the tray Disconnect would never work.
+            // Hold handles to the state-dependent menu items so the status
+            // emitter below can enable/disable them as the connection state
+            // changes. Without this, "Disconnect" (created disabled above) would
+            // stay permanently greyed out and the tray Disconnect would never work.
             app.manage(commands::tray::TrayMenuItems {
                 connect: connect.clone(),
                 disconnect: disconnect.clone(),
             });
 
             // Build system tray. The icon starts in the "disconnected" state and
-            // is updated live (icon + tooltip) by the `set_tray_state` command as
-            // the connection state changes. The id "main" lets that command find
-            // this tray via `app.tray_by_id("main")`.
+            // is updated live (icon, tooltip, menu) from the Rust status
+            // emitter below (W1-023). The id "main" lets it find this tray via
+            // `app.tray_by_id("main")`.
             let tray_icon =
                 commands::tray::load_tray_image(include_bytes!("../icons/tray-disconnected.png"))
                     .expect("embedded tray-disconnected.png is a valid image");
@@ -455,7 +438,7 @@ fn main() {
                 .icon(tray_icon)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .tooltip("BirdoVPN - Disconnected")
+                .tooltip("BirdoVPN — Not connected")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
                         // app.exit() raises RunEvent::ExitRequested, so this
@@ -467,23 +450,38 @@ fn main() {
                     "show" => {
                         restore_and_focus(app);
                     }
+                    // W1-023 / W2-003: both tray actions run in Rust, so they work
+                    // with the window hidden, behind the biometric lock or with no
+                    // UI listener mounted. The events still fire as notifications
+                    // (contract §4); the UI must not repeat the action on them.
                     "connect" => {
                         info!("Quick connect triggered from tray");
-                        // Surface the window first so the action is never silent —
-                        // the connect executor (Dashboard) only exists once the user
-                        // is past the login / consent / biometric-lock screens, and
-                        // the tray click previously did nothing visible there.
-                        restore_and_focus(app);
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.emit("tray-quick-connect", ());
-                        }
+                        let _ = app.emit("tray-quick-connect", ());
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let result =
+                                commands::vpn::quick_connect(app.clone(), app.state(), app.state())
+                                    .await;
+                            if let Err(e) = result {
+                                // The tray has no room for why (sign-in needed, no
+                                // servers, …): show the window, which does.
+                                if e.code != commands::ipc_error::IpcErrorCode::Cancelled {
+                                    restore_and_focus(&app);
+                                }
+                            }
+                        });
                     }
                     "disconnect" => {
                         info!("Disconnect triggered from tray");
-                        restore_and_focus(app);
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.emit("tray-disconnect", ());
-                        }
+                        let _ = app.emit("tray-disconnect", ());
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            commands::session::end_session(
+                                &app,
+                                commands::session::EndReason::UserDisconnect,
+                            )
+                            .await;
+                        });
                     }
                     _ => {}
                 })
@@ -498,6 +496,31 @@ fn main() {
                     }
                 })
                 .build(app)?;
+
+            // Contract §1: push every state change to the UI and the tray from
+            // the ONE choke point (`VpnManager`'s published status). The watch
+            // channel coalesces bursts, and one consumer keeps them in order;
+            // the `seq` in each status lets the UI drop anything stale. Needs
+            // no window: emitting with none open is a no-op, and the tray
+            // update is Rust's own.
+            {
+                let handle = app.handle().clone();
+                let mut changes = app.state::<VpnManager>().subscribe_status();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let status = commands::vpn::build_vpn_status(
+                            &handle.state::<VpnManager>(),
+                            &handle.state::<crate::vpn::xray::XrayManager>(),
+                        )
+                        .await;
+                        let _ = handle.emit("vpn-status-changed", &status);
+                        commands::tray::apply_tray_status(&handle, &status);
+                        if changes.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
 
             // Pin the window to the top-left corner and show it. The window is
             // frameless (decorations:false) and has no drag regions, so it is
@@ -577,6 +600,7 @@ fn main() {
             commands::auth::delete_account, // GDPR account deletion
             commands::auth::deletion_preflight, // what a deletion leaves billing
             commands::auth::export_user_data, // GDPR data export
+            commands::session::end_expired_session, // a command answered session_expired
             // VPN operations
             commands::vpn::connect_vpn,
             commands::vpn::disconnect_vpn,
@@ -593,10 +617,6 @@ fn main() {
             commands::settings::save_settings,
             commands::settings::set_autostart,
             commands::settings::set_crash_reports_enabled,
-            // System tray
-            commands::tray::set_tray_state,
-            // Window placement (corner anchor / draggable)
-            commands::window::set_window_position,
             // Kill switch
             commands::killswitch::get_killswitch_status,
             commands::killswitch::set_killswitch_live,
@@ -628,37 +648,31 @@ fn main() {
             commands::biometric::authenticate_biometric,
             // Deep link captured at cold start
             take_pending_deep_link,
+            // The window up from the tray (re-consent behind Start Minimized)
+            commands::tray::show_main_window,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let RunEvent::ExitRequested { code, api, .. } = &event {
-                // A restart (updater relaunch) cannot be held open —
-                // prevent_exit() is a documented no-op for RESTART_EXIT_CODE —
-                // and must not be turned into a plain exit. Let it through; the
-                // startup reconcile (setup(), F-001/F-032) clears any stale
-                // kernel firewall state in the relaunched instance.
+                // A restart (`plugin-process` relaunch: the frontend's
+                // relaunch() after an install on macOS/Linux) cannot be held
+                // open — prevent_exit() is a documented no-op for
+                // RESTART_EXIT_CODE — and must not be turned into a plain exit.
+                // Let it through; the startup reconcile (setup(), F-001/F-032)
+                // clears any stale kernel firewall state in the relaunched
+                // instance. (W1-004: the Windows updater never comes through
+                // here — its install calls std::process::exit(0) — which is why
+                // install_update ends the session before installing.)
                 if *code == Some(tauri::RESTART_EXIT_CODE) {
-                    // The full teardown cannot run here, but ONE piece of it
-                    // outlives the process on Windows and must: configure_dns()
-                    // parks every physical adapter on `static none`. Without
-                    // this, updating in-app while connected leaves the machine
-                    // with no resolvers — and the relaunched instance then
-                    // cannot resolve the API it needs to reconnect.
-                    //
-                    // It is NOT try_read-based (an earlier comment here claimed
-                    // it was, and that stopped being true when the record moved
-                    // out of the tunnel): it takes the machine-state
-                    // `std::sync::Mutex` and issues netsh. The bound on holding
-                    // this thread is therefore "one un-park pass", the same work
-                    // a normal disconnect does, and it must not be made
-                    // conditional — an un-park skipped here is permanent, since
-                    // the process that knew about it is being replaced.
-                    //
-                    // It is also what shuts the refresh ticker down on this
-                    // path: `release_dns_at_exit` un-parks, and the un-park
-                    // closes the data plane in the same critical section (I13),
-                    // so no pass can re-park behind it while the relaunch runs.
+                    // The full teardown cannot run here. Nothing this build
+                    // does to DNS outlives the process (the DNS guard is a
+                    // dynamic WFP filter, and routes are journaled), but an
+                    // adapter an OLDER build parked and this process adopted
+                    // gets its restore attempt now: the relaunched instance
+                    // would otherwise start without its resolvers. Takes the
+                    // machine-state `std::sync::Mutex`, so the bound on this
+                    // thread is one restore pass.
                     #[cfg(target_os = "windows")]
                     {
                         let restored = app_handle.state::<VpnManager>().restore_dns_blocking();
@@ -680,18 +694,56 @@ fn main() {
                     // teardown, then re-request the exit.
                     info!("Application exit requested — tearing down VPN + kill switch first");
                     api.prevent_exit();
+                    // WIN-FIX-3: the teardown below is a task on the async
+                    // runtime, and so is the cap around it. A runtime that
+                    // cannot run it (every worker stuck, as in the T5 hang)
+                    // held the exit open for good, kill-switch block and all.
+                    // This thread needs nothing from the runtime: past the cap
+                    // it puts back what an older build parked and exits, and
+                    // the WFP block, a dynamic session, goes with the process.
+                    //
+                    // WIN3-006: and it needs nothing the wedged teardown may
+                    // hold. The log line writes birdo.log, the DNS restore
+                    // takes the machine-state lock and WFP's engine; either can
+                    // be what the teardown is stuck in. They get a few seconds
+                    // on a thread of their own, and the exit does not wait for
+                    // them past that.
+                    let _ = std::thread::Builder::new()
+                        .name("birdo-exit-fallback".into())
+                        .spawn(|| {
+                            std::thread::sleep(EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN);
+                            if !EXIT_TEARDOWN_DONE.load(std::sync::atomic::Ordering::SeqCst) {
+                                utils::run_on_helper_for(
+                                    "birdo-exit-cleanup",
+                                    EXIT_FALLBACK_CLEANUP,
+                                    || {
+                                        error!(
+                                            "Exit teardown never ran to its end — exiting \
+                                             without it"
+                                        );
+                                        #[cfg(target_os = "windows")]
+                                        {
+                                            let _ = vpn::win_machine_state::release_dns_at_exit();
+                                        }
+                                    },
+                                );
+                                std::process::exit(0);
+                            }
+                        });
                     let app = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
                         // Hard cap over the whole teardown: quitting must never
                         // hang. The inner steps carry their own tighter budgets.
-                        if tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            teardown_for_exit(&app),
-                        )
-                        .await
-                        .is_err()
+                        if tokio::time::timeout(EXIT_TEARDOWN_CAP, teardown_for_exit(&app))
+                            .await
+                            .is_err()
                         {
                             error!("Exit teardown timed out — exiting anyway");
+                            // Retry any DNS an older build left parked.
+                            #[cfg(target_os = "windows")]
+                            {
+                                let _ = app.state::<VpnManager>().restore_dns_blocking();
+                            }
                         }
                         EXIT_TEARDOWN_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
                         // Second-pass #17: the lazily built Sentry client has
@@ -767,42 +819,15 @@ fn cleanup_on_crash() {
 
     #[cfg(target_os = "windows")]
     {
-        // Legacy netsh fallback — harmless no-op since FIX-2-1 (rules are now
-        // managed via WFP dynamic sessions, not netsh).  Kept in case a mixed
-        // upgrade scenario leaves stale netsh rules from a pre-2-1 version.
-        let rules = [
-            vpn::wfp::RULE_NAMES.block_all,
-            vpn::wfp::RULE_NAMES.permit_vpn,
-            vpn::wfp::RULE_NAMES.permit_localhost,
-            vpn::wfp::RULE_NAMES.permit_dhcp,
-            vpn::wfp::RULE_NAMES.block_ipv6,
-            vpn::wfp::RULE_NAMES.block_stun,
-            vpn::wfp::RULE_NAMES.block_turn,
-        ];
-        for rule in rules {
-            let _ = crate::utils::hidden_cmd("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "delete",
-                    "rule",
-                    &format!("name={}", rule),
-                ])
-                .output();
-        }
-        // WFP engine handle will be closed automatically when the process exits,
-        // triggering removal of all dynamic-session filters.
+        // WFP filters live in a dynamic session, closed with the process —
+        // nothing to remove here. (W1-036: a netsh deletion of the pre-WFP
+        // rule names ran here on every panic; it runs once per install now,
+        // see `vpn::legacy_firewall`.)
 
-        // DNS is the half WFP does NOT clean up, and this arm restored none of
-        // it. configure_dns parks EVERY connected physical adapter on `static
-        // none` to suppress the SMHNR leak, and the Wintun adapter — the only
-        // thing still holding resolvers — dies with the process, so a panic left
-        // the machine with no resolvers at all. Permanently: the next connect
-        // snapshots the parked state as the user's own configuration, and every
-        // later disconnect then correctly refuses to touch it. The restart path
-        // already got this treatment (manager.rs restore_dns_blocking); this is
-        // its crash twin, driven off the on-disk journal because the in-memory
-        // snapshot is unreachable from here.
+        // What WFP does NOT clean up: the routes this session installed via
+        // the physical gateway (W1-041), and any adapter an OLDER build parked
+        // on `static none`. Both are in the on-disk journal, which is what this
+        // is driven off — the in-memory state is unreachable from here.
         let dns_restored = vpn::dns_journal::reconcile();
         error!(
             "Emergency cleanup completed (WFP dynamic session auto-cleans filters, DNS restored: {})",
@@ -955,64 +980,5 @@ fn write_crash_report(location: &str, message: &str) {
         let _ = writeln!(file, "{}", crate::utils::redact::sanitize_error(&backtrace));
 
         error!("Crash report written to {:?}", crash_file);
-    }
-}
-
-/// Relaunch the current process with administrator privileges via ShellExecuteW "runas".
-/// Returns Ok(()) if the elevated process was launched successfully (caller should exit).
-#[cfg(windows)]
-fn self_elevate() -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let exe_path =
-        std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))?;
-
-    // Collect command-line args (skip argv[0] which is the exe itself)
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let args_str = args.join(" ");
-
-    // P6-CLI-D-03: argv carries the birdo:// deep-link URL on a cold start, and that
-    // URL names the target server. This runs BEFORE deliver_deep_link, so redacting
-    // only there left the payload in the log one code path earlier.
-    info!("Self-elevating");
-    debug!("Self-elevating: {:?} {}", exe_path, args_str);
-
-    // Convert to wide strings for ShellExecuteW
-    let operation: Vec<u16> = std::ffi::OsStr::new("runas")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let file: Vec<u16> = exe_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let parameters: Vec<u16> = std::ffi::OsStr::new(&args_str)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    // SAFETY: ShellExecuteW is a well-documented Win32 API.
-    // We pass valid null-terminated UTF-16 strings and check the return value.
-    let result = unsafe {
-        windows::Win32::UI::Shell::ShellExecuteW(
-            windows::Win32::Foundation::HWND::default(),
-            windows::core::PCWSTR(operation.as_ptr()),
-            windows::core::PCWSTR(file.as_ptr()),
-            windows::core::PCWSTR(parameters.as_ptr()),
-            windows::core::PCWSTR::null(),
-            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
-        )
-    };
-
-    // ShellExecuteW returns an HINSTANCE; values > 32 indicate success
-    let result_val = result.0 as isize;
-    if result_val > 32 {
-        Ok(())
-    } else {
-        Err(format!(
-            "ShellExecuteW returned {} (user may have denied UAC prompt)",
-            result_val
-        ))
     }
 }

@@ -1,12 +1,12 @@
 //! API request and response types
 //!
 //! These types are defined for serialization/deserialization with the API.
-//! Fields on Deserialize structs are populated by serde, not by Rust code,
-//! and are surfaced to the frontend via Tauri commands or read by future
-//! features. Suppress dead-code warnings module-wide.
-#![allow(dead_code)]
+//! W1-035: no module-wide `allow(dead_code)` any more — a field nobody reads
+//! is deleted (serde ignores the key), and the few that must stay for the
+//! wire's sake say why where they are.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zeroize::Zeroize;
 
 // ============================================================================
@@ -45,14 +45,29 @@ use zeroize::Zeroize;
 pub struct ApiErrorBody {
     #[serde(default)]
     pub message: Option<String>,
+    /// The backend's machine-readable reason, where it sends one
+    /// (`two_factor_required`, `two_factor_invalid` — Account API contract
+    /// 2026-10-01, item 85; `quota_check_unavailable`, birdo-web #590).
+    /// Clients map by THIS, never by `message`.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Structured extras (`retryAfterSeconds`), read leniently where used.
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
 }
 
 /// Body of `DELETE /api/v1/gdpr/delete`. Password-less accounts (SSO and
 /// anonymous) send whatever the UI collected; the backend only checks it when
 /// the account has a password hash (`deleteAccountSchema`, max 256 chars).
+///
+/// `twoFactorCode` (Account API contract item 85): the TOTP or backup code an
+/// account with 2FA must add, sent only once the server has asked for it — so
+/// a backend that predates the field never sees it.
 #[derive(Debug, Serialize)]
 pub struct DeleteAccountBody<'a> {
     pub password: &'a str,
+    #[serde(rename = "twoFactorCode", skip_serializing_if = "Option::is_none")]
+    pub two_factor_code: Option<&'a str>,
 }
 
 /// Success body of `DELETE /api/v1/gdpr/delete`.
@@ -63,8 +78,6 @@ pub struct DeleteAccountBody<'a> {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteAccountResponse {
-    #[serde(default)]
-    pub message: Option<String>,
     /// App Store / Google Play subscriptions the deletion could NOT cancel
     /// (Birdo cannot cancel a store subscription; only Polar web subscriptions
     /// are cancelled server-side). The backend is adding this field as part of
@@ -156,8 +169,6 @@ pub fn store_subscription_labels(value: &serde_json::Value) -> Vec<String> {
 pub struct UpgradeRequiredDetails {
     #[serde(default, alias = "min_version")]
     pub min_version: Option<String>,
-    #[serde(default, alias = "current_version")]
-    pub current_version: Option<String>,
     #[serde(default, alias = "update_url")]
     pub update_url: Option<String>,
 }
@@ -286,6 +297,33 @@ pub struct HeartbeatResponse {
     pub server_online: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// The Free plan's monthly allowance is used up (birdo-web #590; absent on
+    /// older servers). With `valid:true` the session is inside its grace
+    /// window; with `valid:false` it is over and the peer already removed.
+    #[serde(default)]
+    pub quota_exceeded: bool,
+    /// Seconds left in the grace window, when the server says.
+    #[serde(default, deserialize_with = "seconds_or_none")]
+    pub quota_grace_seconds_remaining: Option<u64>,
+    /// Why `valid:false` (`"quota_exceeded"`); absent on older servers.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A count of seconds as sent, or `None` for anything else: an odd value must
+/// not fail the whole heartbeat, which would also hide a `valid:false`.
+fn seconds_or_none<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(|v| {
+        v.as_u64().or_else(|| {
+            v.as_f64()
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .map(|s| s.ceil() as u64)
+        })
+    }))
 }
 
 fn default_true() -> bool {
@@ -407,13 +445,21 @@ pub enum LoginResult {
     /// 2FA required — must be tried FIRST because untagged tries in order,
     /// and TwoFactorChallenge has a distinctive `requires_two_factor` field.
     TwoFactorChallenge {
+        // Never read: its PRESENCE is what makes serde(untagged) pick this
+        // variant over `Success`.
+        #[allow(dead_code)]
         #[serde(rename = "requiresTwoFactor")]
         requires_two_factor: bool,
         #[serde(rename = "challengeToken")]
         challenge_token: String,
     },
     /// Successful login with tokens
-    Success { ok: bool, tokens: TokenPair },
+    Success {
+        // Never read: required so a body without it cannot match.
+        #[allow(dead_code)]
+        ok: bool,
+        tokens: TokenPair,
+    },
 }
 
 /// FIX C-2: Request body for 2FA TOTP verification
@@ -438,8 +484,6 @@ impl Drop for TwoFactorVerifyRequest {
 pub struct TwoFactorVerifyResponse {
     pub ok: bool,
     pub tokens: Option<TokenPair>,
-    #[serde(default, rename = "backupCodeUsed")]
-    pub backup_code_used: bool,
 }
 
 /// Native SSO exchange request. Presents the single-use handoff code the web
@@ -548,6 +592,7 @@ pub struct RefreshResponse {
     #[serde(default)]
     pub refresh_token: Option<String>,
     #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub expires_in: Option<u64>,
 }
 
@@ -555,11 +600,17 @@ pub struct RefreshResponse {
 // User Types
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserProfile {
     pub id: String,
-    pub email: String,
+    /// Optional (REVIEW-WIN2-009): phase 2 of the Account API contract (item
+    /// 86) sends `email: null` for an anonymous account, and a required field
+    /// failed the WHOLE `/auth/me` parse — the identity, `isAnonymous`, the
+    /// number card and `hasPassword` with it, and a token rotation on every
+    /// launch's retry.
+    #[serde(default)]
+    pub email: Option<String>,
     pub name: Option<String>,
     #[serde(default)]
     pub email_verified: bool,
@@ -582,15 +633,102 @@ pub struct UserProfile {
     /// the first consumer gets the truth instead of a plausible lie.
     #[serde(default, alias = "isSSO")]
     pub is_sso: bool,
+    /// `"anonymous" | "standard"` (Account API contract item 86). Absent on a
+    /// backend that predates it; see `UserProfile::is_anonymous_account`.
+    #[serde(default)]
+    pub account_type: Option<String>,
+    /// Item 86, the boolean twin of `account_type`.
+    #[serde(default)]
+    pub is_anonymous: Option<bool>,
+    /// Item 86: the user's own 24-digit anonymous account number, `null` for a
+    /// standard account. A credential — see [`AccountNumber`].
+    #[serde(default, deserialize_with = "account_number_or_none")]
+    pub account_number: Option<AccountNumber>,
+}
+
+/// Manual, like `VpnConfig`'s: in phase 1 an anonymous account's email is
+/// `anon_<the 24-digit number>@anonymous.local`, and the number is the
+/// account's only credential (REVIEW-WIN2-027). A `{:?}` must never carry it.
+impl std::fmt::Debug for UserProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserProfile")
+            .field("id", &self.id)
+            .field("email", &self.email.as_ref().map(|_| "<redacted>"))
+            .field("name", &self.name.as_ref().map(|_| "<redacted>"))
+            .field("email_verified", &self.email_verified)
+            .field("has_password", &self.has_password)
+            .field("is_sso", &self.is_sso)
+            .field("account_type", &self.account_type)
+            .field("is_anonymous", &self.is_anonymous)
+            .field("account_number", &self.account_number)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserProfile {
+    /// Whether this is an anonymous account, from the explicit fields when the
+    /// server sends them. `None` on an older backend: the UI then falls back to
+    /// the synthetic email's shape (`anon_<number>@anonymous.local`).
+    pub fn is_anonymous_account(&self) -> Option<bool> {
+        self.is_anonymous.or_else(|| {
+            self.account_type
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("anonymous"))
+        })
+    }
+}
+
+/// An anonymous account number: the bare 24-digit id, and the account's ONLY
+/// credential. Never logged: its `Debug` is redacted, and so are the emails of
+/// the structs that carry it (phase 1's synthetic email holds the same
+/// digits), so no `{:?}` of a profile or an auth state can print it. THIS copy
+/// is wiped on drop; the others are not (REVIEW-WIN2-027): the response body
+/// and serde's intermediate value it was parsed from, the IPC JSON, and the
+/// webview's store all hold it in ordinary memory.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct AccountNumber(String);
+
+impl AccountNumber {
+    /// Only the documented shape (`/^\d{24}$/`) is accepted.
+    pub fn parse(raw: &str) -> Option<Self> {
+        (raw.len() == 24 && raw.bytes().all(|b| b.is_ascii_digit())).then(|| Self(raw.to_string()))
+    }
+}
+
+impl std::fmt::Debug for AccountNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccountNumber(<redacted>)")
+    }
+}
+
+impl Drop for AccountNumber {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// `accountNumber` as sent, or `None` for null, absence or anything that is
+/// not the documented 24 digits — never a parse failure, which would blank
+/// the whole identity.
+fn account_number_or_none<'de, D>(deserializer: D) -> Result<Option<AccountNumber>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .and_then(AccountNumber::parse))
 }
 
 /// `GET /api/client-config` — only the fields this client acts on.
 ///
 /// Deliberately NOT a full mirror of the payload: the endpoint also serves
-/// cert pins, per-plan feature entitlements and consent copy, none of which the
-/// desktop client reads today (pins are vendored into `third_party/` and
-/// enforced at build time). Adding fields here would create a second source of
-/// truth for each of them.
+/// cert pins, the rest of the per-plan feature entitlements and consent copy,
+/// none of which the desktop client reads (pins are vendored into
+/// `third_party/` and enforced at build time). Adding fields here would create
+/// a second source of truth for each of them.
 ///
 /// Every field is `Option` and defaulted: a payload from an OLDER web deploy —
 /// one that predates the field — must deserialize, not error. `None` means
@@ -611,6 +749,42 @@ pub struct ClientConfigResponse {
     /// happens on an explicit `false`.
     #[serde(default)]
     pub dns_filtering_available: Option<bool>,
+    /// The per-plan `features` map, reduced to the one flag this client acts
+    /// on: `features.<PLAN>.customDns` (Account API contract item 40). Custom
+    /// DNS is on every plan (owner decision D6), so the server sends `true`
+    /// for each; only an explicit `false` turns it off for that plan, and an
+    /// absent map or flag means ENABLED, as for `dns_filtering_available`.
+    #[serde(default, deserialize_with = "plan_features_or_none")]
+    pub features: Option<BTreeMap<String, PlanFeatures>>,
+}
+
+/// One plan's entry in `ClientConfigResponse::features`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanFeatures {
+    /// `None`: the server did not say, which counts as enabled.
+    pub custom_dns: Option<bool>,
+}
+
+/// `features` read flag by flag: a plan entry, or a flag, of a shape this
+/// build does not expect reads as "not said" instead of failing the whole
+/// config, which would also lose `dnsFilteringAvailable`.
+fn plan_features_or_none<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, PlanFeatures>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(|v| v.as_object()).map(|plans| {
+        plans
+            .iter()
+            .map(|(plan, flags)| {
+                let custom_dns = flags.get("customDns").and_then(serde_json::Value::as_bool);
+                (plan.clone(), PlanFeatures { custom_dns })
+            })
+            .collect()
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -694,6 +868,11 @@ pub struct VpnConfig {
     pub endpoint: String,
     pub allowed_ips: Vec<String>,
     pub dns: Vec<String>,
+    /// `dns` is the user's Custom DNS, not the server's resolvers. A private
+    /// Custom DNS server with Local Network Sharing on is the user's own LAN
+    /// resolver, reached outside the tunnel (`wfp_policy::split_resolvers`).
+    #[serde(default)]
+    pub custom_dns: bool,
     pub client_ip: String,
     /// Optional IPv6 tunnel address (e.g. "fd00::2/128"). When present, enables
     /// dual-stack routing through the tunnel.
@@ -725,6 +904,7 @@ impl std::fmt::Debug for VpnConfig {
             .field("endpoint", &"[redacted]")
             .field("allowed_ips", &self.allowed_ips)
             .field("dns", &self.dns)
+            .field("custom_dns", &self.custom_dns)
             .field("client_ip", &"[redacted]")
             .field(
                 "client_ipv6",
@@ -879,12 +1059,19 @@ pub struct ConnectResponse {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// With `success:false`: the Free plan's monthly allowance is used up
+    /// (birdo-web #590's connect gate; absent on older servers). A refusal no
+    /// retry can change before the reset or an upgrade — and on Windows the
+    /// ONLY way #590's end of a session reaches the client: the heartbeat that
+    /// says so rides the peer the server has just removed (REVIEW-WIN2-002).
     #[serde(default)]
-    pub config: Option<String>,
+    pub quota_exceeded: bool,
     #[serde(default)]
     pub key_id: Option<String>,
-    #[serde(default)]
-    pub private_key: Option<String>,
+    // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
+    // locally on every path (FIX-1-1); a server-generated one would mean the
+    // backend knows the client's secret. serde ignores the field if an old
+    // backend still sends it, so it can never be read, copied or kept.
     #[serde(default)]
     pub public_key: Option<String>,
     #[serde(default)]
@@ -936,10 +1123,16 @@ pub struct ConnectResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerNodeInfo {
+    // Only `name` is read. The rest are REQUIRED by the wire contract — a
+    // node block without them is refused rather than half-read — so they stay.
+    #[allow(dead_code)]
     pub id: String,
     pub name: String,
+    #[allow(dead_code)]
     pub region: String,
+    #[allow(dead_code)]
     pub country: String,
+    #[allow(dead_code)]
     pub hostname: String,
 }
 
@@ -1007,12 +1200,16 @@ pub struct MultiHopConnectResponse {
     pub success: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// See `ConnectResponse::quota_exceeded`: the Multi-Hop door runs the same
+    /// connect gate (MultiHopService returns its refusal as-is).
     #[serde(default)]
-    pub config: Option<String>,
+    pub quota_exceeded: bool,
     #[serde(default)]
     pub key_id: Option<String>,
-    #[serde(default)]
-    pub private_key: Option<String>,
+    // C-24 (W1-031): NO `private_key`. The client generates its WireGuard key
+    // locally on every path (FIX-1-1); a server-generated one would mean the
+    // backend knows the client's secret. serde ignores the field if an old
+    // backend still sends it, so it can never be read, copied or kept.
     #[serde(default)]
     pub public_key: Option<String>,
     #[serde(default)]
@@ -1057,6 +1254,43 @@ pub struct MultiHopConnectResponse {
     pub rosenpass_public_key: Option<String>,
     #[serde(default, rename = "rosenpassEndpoint")]
     pub rosenpass_endpoint: Option<String>,
+}
+
+impl From<MultiHopConnectResponse> for ConnectResponse {
+    /// A Multi-Hop answer carries the same tunnel fields as a single-hop one,
+    /// so one `build_vpn_config` serves both. The route block is checked by
+    /// the caller BEFORE converting (`session::verified_multi_hop_response`).
+    fn from(response: MultiHopConnectResponse) -> Self {
+        ConnectResponse {
+            success: response.success,
+            message: response.message,
+            quota_exceeded: response.quota_exceeded,
+            key_id: response.key_id,
+            public_key: response.public_key,
+            preshared_key: response.preshared_key,
+            assigned_ip: response.assigned_ip,
+            // Dual-stack parity with single-hop: the exit node's assigned IPv6
+            // makes build_vpn_config route IPv6 exactly as single-hop does.
+            client_ipv6: response.client_ipv6,
+            server_public_key: response.server_public_key,
+            endpoint: response.endpoint,
+            dns: response.dns,
+            allowed_ips: response.allowed_ips,
+            mtu: response.mtu,
+            persistent_keepalive: response.persistent_keepalive,
+            server_node: None,
+            stealth_enabled: response.stealth_enabled,
+            xray_endpoint: response.xray_endpoint,
+            xray_uuid: response.xray_uuid,
+            xray_public_key: response.xray_public_key,
+            xray_short_id: response.xray_short_id,
+            xray_sni: response.xray_sni,
+            xray_flow: response.xray_flow,
+            quantum_enabled: response.quantum_enabled,
+            rosenpass_public_key: response.rosenpass_public_key,
+            rosenpass_endpoint: response.rosenpass_endpoint,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

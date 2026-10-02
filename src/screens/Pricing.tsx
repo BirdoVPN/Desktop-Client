@@ -24,14 +24,11 @@ import { Check, Shield, Zap, Crown, ExternalLink } from 'lucide-react';
 import { BirdoTopBar, BirdoCard, BirdoButton, BirdoBadge } from '@/components/birdo';
 import { useAppStore } from '@/store/app-store';
 import { brand, white, hairline, surface, accentA } from '@/lib/birdo-theme';
+import { PLAN_RANK, normalizePlan, type PlanId } from '@/lib/plan';
+import { BILLING_URL } from '@/lib/links';
 
-// Billing lives on the web (the same host Settings.tsx opens for "Manage on
-// web"). `DASHBOARD_URL` is a module-local const in Settings.tsx (not exported),
-// so — per the task's guidance — we replicate the same constant and the same
-// `open`-from-plugin-shell helper here rather than hardcode a bare URL inline.
-const DASHBOARD_URL = 'https://dashboard.birdo.app';
+// Billing lives on the web (the same host Settings opens for "Manage on web").
 
-type PlanId = 'RECON' | 'OPERATIVE' | 'SOVEREIGN';
 type BillingPeriod = 'monthly' | 'yearly';
 
 interface Tier {
@@ -66,7 +63,10 @@ const TIERS: Tier[] = [
     // No "Split tunneling": the desktop app has none (vpn/mod.rs — Windows
     // only has Kill Switch Exceptions, which keep traffic IN the tunnel), so
     // listing it here sold a feature that does not exist (audit A-24 / D-4).
-    // Wording follows the mobile paywalls (second-pass #16).
+    // Wording follows the mobile paywalls (second-pass #16). Custom DNS is
+    // on EVERY plan (owner decision D6, 2026-10-01), so it is listed here, on
+    // the free tier, and the paid tiers have it through "Everything in Recon";
+    // listing it on a paid card would sell it as an upgrade.
     features: [
       '1 device connection',
       'Core server locations',
@@ -74,6 +74,7 @@ const TIERS: Tier[] = [
       'WireGuard® encryption',
       'Post-quantum key exchange',
       'Kill switch',
+      'Custom DNS servers',
     ],
   },
   {
@@ -109,10 +110,7 @@ const TIERS: Tier[] = [
     // Second-pass #16: no "Priority servers" line (nothing is prioritised: the
     // backend's isPremium is just minPlan !== 'RECON', and whether any node
     // is Sovereign-only is a per-node owner setting, not a plan feature), and
-    // no "Custom DNS" either: mobile sells it as Sovereign-only, but the
-    // desktop does not gate it by plan (Settings), so listing it here would
-    // misstate what the free and Operative plans get on desktop. Whether it
-    // should be gated everywhere is an owner decision.
+    // no "Custom DNS": it is on every plan (D6, listed on Recon above).
     features: [
       'Everything in Operative',
       '10 device connections',
@@ -122,23 +120,17 @@ const TIERS: Tier[] = [
   },
 ];
 
-const PLAN_RANK: Record<PlanId, number> = { RECON: 0, OPERATIVE: 1, SOVEREIGN: 2 };
-
-/** Normalize the store's free-form plan string to a known tier (null → RECON). */
-function normalizePlan(plan: string | null | undefined): PlanId {
-  const p = (plan ?? '').toUpperCase();
-  return p === 'OPERATIVE' || p === 'SOVEREIGN' ? p : 'RECON';
-}
-
 export function Pricing() {
   const { account, popRoute } = useAppStore(
     useShallow((s) => ({ account: s.account, popRoute: s.popRoute })),
   );
-  const currentPlan = normalizePlan(account.plan);
+  // `null` while the plan is not known yet: no tier is marked current and no
+  // Upgrade button is offered to someone who may already be on it (W2-011).
+  const currentPlan = account.plan === null ? null : normalizePlan(account.plan);
   // Default to yearly (matches mobile) so the discounted annual price leads.
   const [period, setPeriod] = useState<BillingPeriod>('yearly');
 
-  const openBilling = () => openExternal(`${DASHBOARD_URL}/billing`).catch(() => {});
+  const openBilling = () => openExternal(BILLING_URL).catch(() => {});
 
   return (
     // Transparent so the App-level PixelCanvas backdrop shows through (matches
@@ -148,8 +140,8 @@ export function Pricing() {
 
       <div className="flex-1 overflow-y-auto px-4 pb-8 pt-3">
         <p className="px-1 text-[13px]" style={{ color: white.w60 }}>
-          Upgrade for unlimited bandwidth, every server location and more devices
-          features. Billing is managed securely on the web.
+          Upgrade for unlimited bandwidth, every server location and more devices. Billing is
+          managed securely on the web.
         </p>
 
         {/* Monthly / Yearly segmented toggle — mirrors the segmented control
@@ -202,7 +194,7 @@ export function Pricing() {
 
         {/* VAT wording per REMEDIATION-DECISIONS §3: checkout is Polar's
             (merchant of record), whose tax behaviour decides the total. */}
-        <p className="mt-5 px-1 text-xs" style={{ color: white.w40 }}>
+        <p className="mt-5 px-1 text-xs" style={{ color: white.w60 }}>
           Prices in GBP. Prices include VAT for customers in the UK, EU and most
           other countries. In the United States, Canada and India, sales tax is
           added at checkout. Polar, our reseller, shows the final total before
@@ -217,7 +209,7 @@ export function Pricing() {
 interface TierCardProps {
   tier: Tier;
   period: BillingPeriod;
-  currentPlan: PlanId;
+  currentPlan: PlanId | null;
   onUpgrade: () => void;
 }
 
@@ -225,9 +217,9 @@ function TierCard({ tier, period, currentPlan, onUpgrade }: TierCardProps) {
   const Icon = tier.icon;
   const isFree = tier.monthly === null;
   const tRank = PLAN_RANK[tier.id];
-  const cRank = PLAN_RANK[currentPlan];
-  const isCurrent = tRank === cRank;
-  const isUpgrade = tRank > cRank;
+  const cRank = currentPlan === null ? null : PLAN_RANK[currentPlan];
+  const isCurrent = cRank !== null && tRank === cRank;
+  const isUpgrade = cRank !== null && tRank > cRank;
 
   // `?? ''` keeps this non-null-assertion-free (eslint no-non-null-assertion is
   // a warning, and lint runs at --max-warnings 0). For a paid tier both prices
@@ -315,6 +307,14 @@ function TierCard({ tier, period, currentPlan, onUpgrade }: TierCardProps) {
           >
             <Check size={16} aria-hidden />
             Current plan
+          </div>
+        ) : cRank === null ? (
+          <div
+            className="flex h-12 items-center justify-center rounded-birdo-md text-[13px] font-medium"
+            style={{ backgroundColor: white.w05, color: white.w60 }}
+            aria-busy="true"
+          >
+            Checking your plan…
           </div>
         ) : isUpgrade ? (
           <BirdoButton

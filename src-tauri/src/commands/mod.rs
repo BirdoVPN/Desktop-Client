@@ -4,9 +4,11 @@
 
 pub mod auth;
 pub mod biometric;
+pub mod ipc_error;
 pub mod killswitch;
 pub mod oauth;
 pub mod servers;
+pub mod session;
 pub mod settings;
 pub mod speed_test;
 pub mod split_tunnel;
@@ -16,4 +18,3 @@ pub mod vouchers;
 pub mod vpn;
 pub mod vpn_multi_hop;
 pub mod vpn_port_forward;
-pub mod window;

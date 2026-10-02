@@ -1096,9 +1096,8 @@ mod tests {
         let resp = ConnectResponse {
             success: true,
             message: None,
-            config: None,
+            quota_exceeded: false,
             key_id: None,
-            private_key: None,
             public_key: None,
             preshared_key: None,
             assigned_ip: None,

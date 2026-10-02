@@ -22,12 +22,15 @@
  *  - Each excepted app renders as a mobile-style list row: icon + label + an
  *    EXEMPT pill + a remove action (the desktop analogue of mobile's AppItem).
  *
- * Persists split_tunnel_apps + split_tunneling_enabled by sending the FULL
- * settings object through `settingsToRust` to `invoke('save_settings', …)`.
+ * Persists split_tunnel_apps + split_tunneling_enabled through the shared
+ * `persistSettings` — this screen's own rollback-on-failed-save was the
+ * pattern the rest of the app now uses (W2-013), so it is the one copy now —
+ * and applies them to a live session with the same fail-closed rebuild.
  */
 import { useCallback, useMemo, useState, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
+import { persistSettings } from '@/session/settings-persist';
 import { useShallow } from 'zustand/react/shallow';
 import { AppWindow, FolderOpen, Info, Plus, Scissors, Search, X } from 'lucide-react';
 import { useAppStore, type AppSettings } from '@/store/app-store';
@@ -37,9 +40,9 @@ import {
   BirdoTextField,
   BirdoSwitch,
   BirdoEmptyState,
-  AppIconMark,
+  BirdoDialog,
 } from '@/components/birdo';
-import { settingsToRust, isWindowsPlatform } from '@/utils/helpers';
+import { isWindowsPlatform } from '@/utils/helpers';
 import { brand, white, hairline, status } from '@/lib/birdo-theme';
 
 /** An installed app returned by the Rust `list_installed_apps` command. */
@@ -52,10 +55,9 @@ interface InstalledApp {
 const baseName = (s: string): string => s.split(/[\\/]/).pop() || s;
 
 export function SplitTunnel() {
-  const { settings, updateSettings, popRoute } = useAppStore(
+  const { settings, popRoute } = useAppStore(
     useShallow((s) => ({
       settings: s.settings,
-      updateSettings: s.updateSettings,
       popRoute: s.popRoute,
     })),
   );
@@ -78,39 +80,15 @@ export function SplitTunnel() {
   const apps = settings.splitTunnelApps;
   const exceptionCount = apps.length;
 
-  // ── Persist: always send the FULL settings object (mirrors SplitTunnelCard) ──
-  const persist = useCallback(
-    async (patch: Partial<AppSettings>) => {
-      const next = { ...settings, ...patch };
-      // Snapshot the keys we're optimistically changing so we can roll back if
-      // the save rejects, keeping the UI in sync with what's actually stored.
-      const rollback = Object.fromEntries(
-        (Object.keys(patch) as (keyof AppSettings)[]).map((k) => [k, settings[k]]),
-      ) as Partial<AppSettings>;
-      setPersistError(false);
-      updateSettings(patch);
-      try {
-        await invoke('save_settings', { settings: settingsToRust(next) });
-        // Live-apply to an active session. The WFP kill-switch-exception permits
-        // are populated ONCE at connect from saved settings (apply_vpn_settings →
-        // set_split_tunnel_apps), so a mid-session add/remove/toggle here never
-        // reached the live engine: a just-removed app kept its permit and could
-        // still bypass the block-all on a tunnel drop until the next reconnect.
-        // Trigger the same fail-closed rebuild VpnSettings uses so the change
-        // takes effect immediately. No-op when disconnected (applies at connect).
-        if (useAppStore.getState().connectionState === 'connected') {
-          invoke('reapply_vpn_settings').catch(() => {
-            /* Rust backend logs the error */
-          });
-        }
-      } catch {
-        // Revert the optimistic update and tell the user it didn't persist.
-        updateSettings(rollback);
-        setPersistError(true);
-      }
-    },
-    [settings, updateSettings],
-  );
+  // Optimistic update, full-object save, rollback on failure, then a live
+  // reapply: the WFP permits are populated once at connect, so without the
+  // rebuild a just-removed app kept its permit (and could bypass the block on
+  // a tunnel drop) until the next reconnect.
+  const persist = useCallback(async (patch: Partial<AppSettings>) => {
+    setPersistError(false);
+    const ok = await persistSettings(patch, { reapply: true });
+    if (!ok) setPersistError(true);
+  }, []);
 
   const toggleEnabled = useCallback(() => {
     persist({ splitTunnelingEnabled: !settings.splitTunnelingEnabled });
@@ -280,10 +258,10 @@ export function SplitTunnel() {
           style={{ backgroundColor: brand.accentBg }}
         >
           <Info size={18} color={brand.accent} aria-hidden className="mt-px shrink-0" />
-          <p className="text-xs leading-relaxed" style={{ color: 'rgba(16,185,129,0.85)' }}>
-            {exceptionCount} {exceptionCount === 1 ? 'app keeps' : 'apps keep'} internet access when
-            the kill switch blocks traffic. While the VPN is connected, their traffic still goes
-            through the VPN.
+          <p className="text-xs leading-relaxed" style={{ color: brand.accentSoft }}>
+            {enabled
+              ? `${exceptionCount} ${exceptionCount === 1 ? 'app keeps' : 'apps keep'} internet access when the kill switch blocks traffic. While the VPN is connected, their traffic still goes through the VPN.`
+              : 'Exceptions are off. Turn them on to keep chosen apps online while the kill switch blocks traffic.'}
           </p>
         </div>
 
@@ -305,7 +283,11 @@ export function SplitTunnel() {
           <>
             {/* ── Add by path/name, installed-app picker, or file browse ── */}
             <div className="mt-3">
-              <label className="mb-1.5 block pl-1 text-xs font-medium" style={{ color: white.w60 }}>
+              <label
+                htmlFor="kill-switch-exception-input"
+                className="mb-1.5 block pl-1 text-xs font-medium"
+                style={{ color: white.w60 }}
+              >
                 Add by path or name
               </label>
               <div className="flex gap-2">
@@ -318,15 +300,15 @@ export function SplitTunnel() {
                     border: `1px solid ${hairline.soft}`,
                   }}
                 >
-                  <Plus size={18} color={white.w40} aria-hidden className="shrink-0" />
+                  <Plus size={18} color={white.w60} aria-hidden className="shrink-0" />
                   <input
+                    id="kill-switch-exception-input"
                     type="text"
                     value={appInput}
                     onChange={(e) => setAppInput(e.target.value)}
                     onKeyDown={handleInputKeyDown}
                     placeholder="e.g. chrome.exe"
-                    aria-label="App path or name"
-                    className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-hidden placeholder:text-w40"
+                    className="birdo-field-input min-w-0 flex-1 bg-transparent text-sm outline-hidden placeholder:text-w60"
                     style={{ color: white.w100 }}
                   />
                 </div>
@@ -399,7 +381,15 @@ export function SplitTunnel() {
                     border: `1px solid ${hairline.soft}`,
                   }}
                 >
-                  <AppIconMark size={36} />
+                  {/* A generic app glyph: these are the user's apps, and the
+                      Birdo logo on every row read as Birdo entries (W2-043). */}
+                  <span
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-birdo-sm"
+                    style={{ backgroundColor: white.w05 }}
+                    aria-hidden
+                  >
+                    <AppWindow size={18} color={white.w80} />
+                  </span>
                   <div className="min-w-0 flex-1" title={appName}>
                     <div
                       className="truncate text-[15px] font-medium"
@@ -420,7 +410,7 @@ export function SplitTunnel() {
                     aria-label={`Remove ${appName}`}
                     className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-white/10"
                   >
-                    <X size={16} color={white.w40} aria-hidden />
+                    <X size={16} color={white.w60} aria-hidden />
                   </button>
                 </div>
               ))}
@@ -443,115 +433,94 @@ export function SplitTunnel() {
         )}
       </div>
 
-      {/* ── Installed-apps picker overlay ── */}
-      {/* top-8 clears the 32px custom TitleBar (z-100) so the header isn't
-          rendered under the window chrome. */}
-      {pickerOpen && (
-        <div
-          className="fixed inset-0 top-8 z-50 flex flex-col"
-          style={{ backgroundColor: 'rgba(11,11,16,0.985)' }}
-        >
-          <div className="flex items-center gap-2 px-4 pb-2 pt-4">
-            <AppWindow size={18} color={brand.accent} aria-hidden />
-            <span className="flex-1 text-[15px] font-semibold" style={{ color: white.w100 }}>
-              Installed apps
-            </span>
-            <button
-              type="button"
-              onClick={() => setPickerOpen(false)}
-              aria-label="Close installed apps"
-              className="flex h-7 w-7 items-center justify-center rounded-full transition-colors hover:bg-white/10"
-            >
-              <X size={18} color={white.w60} aria-hidden />
-            </button>
-          </div>
-          <div className="px-4 pb-2">
-            <BirdoTextField
-              value={pickerSearch}
-              onChange={setPickerSearch}
-              placeholder="Search installed apps…"
-              ariaLabel="Search installed apps"
-              leadingIcon={Search}
+      {/* ── Installed-apps picker ── */}
+      <BirdoDialog
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        title="Installed apps"
+        icon={AppWindow}
+        iconColor={brand.accent}
+      >
+        <BirdoTextField
+          value={pickerSearch}
+          onChange={setPickerSearch}
+          placeholder="Search installed apps…"
+          ariaLabel="Search installed apps"
+          leadingIcon={Search}
+        />
+        <div className="max-h-[300px] overflow-y-auto">
+          {installed === null ? (
+            <p className="pt-6 text-center text-sm" style={{ color: white.w60 }} aria-live="polite">
+              Scanning installed apps…
+            </p>
+          ) : pickerError ? (
+            <BirdoEmptyState
+              icon={AppWindow}
+              title="Couldn’t scan apps"
+              description="Use Browse… to pick an .exe directly, or try again."
+              action={
+                <BirdoButton
+                  text="Try again"
+                  onClick={() => {
+                    void loadInstalled();
+                  }}
+                  variant="secondary"
+                  size="medium"
+                  ariaLabel="Retry scanning installed apps"
+                />
+              }
             />
-          </div>
-          <div className="flex-1 overflow-y-auto px-4 pb-4">
-            {installed === null ? (
-              <p className="pt-6 text-center text-sm" style={{ color: white.w40 }}>
-                Scanning installed apps…
-              </p>
-            ) : pickerError ? (
-              <BirdoEmptyState
-                icon={AppWindow}
-                title="Couldn’t scan apps"
-                description="Use Browse… to pick an .exe directly, or try again."
-                action={
-                  <BirdoButton
-                    text="Try again"
+          ) : pickerResults.length === 0 ? (
+            <BirdoEmptyState
+              icon={AppWindow}
+              title={pickerSearch.trim() ? 'No matches' : 'No apps found'}
+              description={
+                pickerSearch.trim()
+                  ? `Nothing matches "${pickerSearch.trim()}".`
+                  : 'Use Browse… to pick an .exe directly.'
+              }
+            />
+          ) : (
+            <div className="space-y-1.5">
+              {pickerResults.map((app) => {
+                const added = apps.includes(app.path);
+                return (
+                  <button
+                    key={app.path}
+                    type="button"
+                    disabled={added}
                     onClick={() => {
-                      void loadInstalled();
+                      addInstalled(app.path);
+                      setPickerOpen(false);
                     }}
-                    variant="secondary"
-                    size="medium"
-                    ariaLabel="Retry scanning installed apps"
-                  />
-                }
-                className="pt-6"
-              />
-            ) : pickerResults.length === 0 ? (
-              <BirdoEmptyState
-                icon={AppWindow}
-                title={pickerSearch.trim() ? 'No matches' : 'No apps found'}
-                description={
-                  pickerSearch.trim()
-                    ? `Nothing matches "${pickerSearch.trim()}".`
-                    : 'Use Browse… to pick an .exe directly.'
-                }
-                className="pt-6"
-              />
-            ) : (
-              <div className="space-y-1.5">
-                {pickerResults.map((app) => {
-                  const added = apps.includes(app.path);
-                  return (
-                    <button
-                      key={app.path}
-                      type="button"
-                      disabled={added}
-                      onClick={() => {
-                        addInstalled(app.path);
-                        setPickerOpen(false);
-                      }}
-                      title={app.path}
-                      className="flex w-full items-center gap-3 rounded-birdo-md px-3.5 py-2.5 text-left transition-colors hover:bg-white/6 disabled:opacity-50"
-                      style={{ backgroundColor: white.w04, border: `1px solid ${hairline.soft}` }}
-                    >
-                      <AppIconMark size={32} />
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-[14px] font-medium" style={{ color: white.w80 }}>
-                          {app.name}
-                        </div>
-                        <div className="truncate text-[11px]" style={{ color: white.w40 }}>
-                          {baseName(app.path)}
-                        </div>
+                    title={app.path}
+                    aria-label={added ? `${app.name} (already added)` : `Add ${app.name}`}
+                    className="flex w-full items-center gap-3 rounded-birdo-md px-3 py-2.5 text-left transition-colors hover:bg-white/6 disabled:opacity-50"
+                    style={{ backgroundColor: white.w04, border: `1px solid ${hairline.soft}` }}
+                  >
+                    <AppWindow size={18} color={white.w80} aria-hidden className="shrink-0" />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[14px] font-medium" style={{ color: white.w80 }}>
+                        {app.name}
                       </div>
-                      {added ? (
-                        <span
-                          className="shrink-0 text-[10px] font-semibold"
-                          style={{ color: brand.accent }}
-                        >
-                          ADDED
-                        </span>
-                      ) : (
-                        <Plus size={16} color={white.w40} aria-hidden className="shrink-0" />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+                      <div className="truncate text-[11px]" style={{ color: white.w60 }}>
+                        {baseName(app.path)}
+                      </div>
+                    </div>
+                    {added ? (
+                      <span className="shrink-0 text-[10px] font-semibold" style={{ color: brand.accent }}>
+                        ADDED
+                      </span>
+                    ) : (
+                      <Plus size={16} color={white.w60} aria-hidden className="shrink-0" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
-      )}
+      </BirdoDialog>
     </div>
   );
 }

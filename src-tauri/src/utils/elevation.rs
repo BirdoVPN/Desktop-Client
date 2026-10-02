@@ -88,3 +88,22 @@ pub fn is_elevated() -> bool {
             .unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// W1-037: under requireAdministrator the process starts elevated or not
+    /// at all, so the "runas" self-relaunch (which also re-joined argv without
+    /// quoting) was dead weight. It must not come back.
+    #[test]
+    fn the_app_does_not_relaunch_itself_elevated() {
+        let main = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("read main.rs");
+        // The call and the function, not the words: the comment explaining
+        // the removal names both.
+        for needle in ["UI::Shell::ShellExecuteW", "fn self_elevate"] {
+            assert!(!main.contains(needle), "main.rs: {needle}");
+        }
+    }
+}

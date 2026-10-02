@@ -126,7 +126,7 @@ export function BirdoButton({
       aria-label={ariaLabel ?? text}
       whileHover={hoverAnim}
       whileTap={!isInactive ? { scale: 0.97, y: 0 } : undefined}
-      transition={{ duration: 0.14, ease: motionTokens.ease }}
+      transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
       className={`relative flex items-center justify-center rounded-birdo-md font-semibold transition-opacity disabled:cursor-not-allowed ${
         fullWidth ? 'w-full' : ''
       } ${className}`}

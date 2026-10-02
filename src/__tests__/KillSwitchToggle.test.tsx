@@ -7,7 +7,15 @@
  * tunnel was Reconnecting / Error / Rekeying — the only states in which the
  * reactive block is actually up — never reached Rust. These tests drive the
  * real Settings component (switch → confirm dialog → "Turn off") per state
- * and assert whether the IPC was sent.
+ * and asserts whether the IPC was sent.
+ *
+ * Updated for the v2 connection states (contract WINDOWS-IPC-V2 §1):
+ * `authenticating` / `stealth_connecting` folded into `connecting`, `rekeying`
+ * and `kill_switch_active` never existed on the wire, and `switching` is new —
+ * a live rebuild, treated like `connecting` for ON. Blocking is its own bit:
+ * OFF must reach Rust even in `disconnected` when the always-on block is up.
+ * The rule moved to session/settings-persist.ts with the shared write path,
+ * and the confirm dialog uses the iOS/Android wording (P1-parity-031).
  *
  * Run: npx vitest run src/__tests__/KillSwitchToggle.test.tsx
  */
@@ -15,7 +23,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings, killSwitchLiveApplies } from '@/components/Settings';
+import { Settings, KILL_SWITCH_DISABLE_BODY } from '@/components/Settings';
+import { killSwitchLiveApplies } from '@/session/settings-persist';
 import type { ConnectionState } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
@@ -73,6 +82,8 @@ const mockStoreState = {
   },
   updateSettings: vi.fn(),
   hydrateSettings: vi.fn(),
+  showNotice: vi.fn(),
+  killSwitchBlocking: false,
   account: {
     email: 'test@birdo.app',
     plan: 'operative',
@@ -89,6 +100,8 @@ const mockStoreState = {
   portForwards: [],
   setPortForwards: vi.fn(),
   pushRoute: vi.fn(),
+  // The server's per-plan Custom DNS flag (item 40): none, so enabled.
+  customDnsByPlan: {},
 };
 
 vi.mock('@/store/app-store', () => {
@@ -107,6 +120,7 @@ const mockedInvoke = vi.mocked(invoke);
 beforeEach(() => {
   mockedInvoke.mockReset();
   mockStoreState.settings.killSwitchEnabled = true;
+  mockStoreState.killSwitchBlocking = false;
   mockedInvoke.mockImplementation((cmd: string) => {
     switch (cmd) {
       case 'get_app_version':
@@ -126,8 +140,9 @@ async function turnKillSwitchOff(state: ConnectionState) {
   render(<Settings />);
   const row = await screen.findByRole('switch', { name: /kill switch/i });
   await userEvent.click(row);
-  // Disabling asks for confirmation first (mobile parity).
-  await userEvent.click(await screen.findByRole('button', { name: /turn off/i }));
+  // Disabling asks for confirmation first, in the shared iOS/Android words.
+  expect(await screen.findByText(KILL_SWITCH_DISABLE_BODY)).toBeInTheDocument();
+  await userEvent.click(await screen.findByRole('button', { name: /turn off anyway/i }));
   // The persist is awaited BEFORE the live-apply (arm() re-reads the file).
   await waitFor(() => {
     expect(mockedInvoke).toHaveBeenCalledWith('save_settings', expect.anything());
@@ -140,37 +155,32 @@ const liveCalls = () =>
 const ALL_STATES: ConnectionState[] = [
   'disconnected',
   'connecting',
-  'authenticating',
-  'stealth_connecting',
   'connected',
   'disconnecting',
   'reconnecting',
-  'rekeying',
-  'kill_switch_active',
+  'switching',
   'error',
 ];
 
 describe('killSwitchLiveApplies', () => {
   it('OFF applies in every state that can be holding the block, and only skips the two with no session', () => {
     const applies = ALL_STATES.filter((s) => killSwitchLiveApplies(s, false));
-    expect(applies).toEqual([
-      'connecting',
-      'authenticating',
-      'stealth_connecting',
-      'connected',
-      'reconnecting',
-      'rekeying',
-      'kill_switch_active',
-      'error',
-    ]);
+    expect(applies).toEqual(['connecting', 'connected', 'reconnecting', 'switching', 'error']);
+  });
+
+  it('OFF while disconnected reaches Rust when the always-on block is up (the one case it must land)', () => {
+    expect(killSwitchLiveApplies('disconnected', false, true)).toBe(true);
+    expect(killSwitchLiveApplies('disconnected', false, false)).toBe(false);
+    // ON never needs pushing with no session: the next dial arms it.
+    expect(killSwitchLiveApplies('disconnected', true, true)).toBe(false);
   });
 
   it('ON additionally skips the pre-tunnel states, where arm() would block before VPN_SERVER_IP / the LUID exist', () => {
     const applies = ALL_STATES.filter((s) => killSwitchLiveApplies(s, true));
-    expect(applies).toEqual(['connected', 'reconnecting', 'rekeying', 'kill_switch_active', 'error']);
+    expect(applies).toEqual(['connected', 'reconnecting', 'error']);
   });
 
-  it.each<ConnectionState>(['connecting', 'authenticating', 'stealth_connecting'])(
+  it.each<ConnectionState>(['connecting', 'switching'])(
     'ON during %s is persisted only while OFF still applies (the asymmetry is the point)',
     (state) => {
       expect(killSwitchLiveApplies(state, true)).toBe(false);
@@ -180,7 +190,7 @@ describe('killSwitchLiveApplies', () => {
 });
 
 describe('Kill switch toggle → set_killswitch_live', () => {
-  it.each<ConnectionState>(['reconnecting', 'error', 'rekeying'])(
+  it.each<ConnectionState>(['reconnecting', 'error', 'switching'])(
     'OFF during %s reaches Rust (the block is up in exactly these states)',
     async (state) => {
       await turnKillSwitchOff(state);
@@ -225,7 +235,7 @@ describe('Kill switch toggle → set_killswitch_live', () => {
     });
   });
 
-  it.each<ConnectionState>(['connecting', 'authenticating', 'stealth_connecting'])(
+  it.each<ConnectionState>(['connecting', 'switching'])(
     'ON during %s is persisted only (arm() before the tunnel exists would block-all with no relay permit)',
     async (state) => {
       mockStoreState.settings.killSwitchEnabled = false;

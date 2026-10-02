@@ -1,5 +1,6 @@
 //! Utility modules
 
+pub mod console_log;
 pub mod crash_report;
 pub mod device_id;
 pub mod elevation;
@@ -33,6 +34,55 @@ pub fn hidden_cmd(program: &str) -> std::process::Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+/// `hidden_cmd`'s async twin, for subprocesses run from async code (W1-017).
+///
+/// A `std::process::Command` awaited nowhere blocks a runtime worker for as
+/// long as the child runs, and no `tokio::time::timeout` around it can fire.
+/// Pair this with [`run_bounded`], which kills the child on timeout.
+pub fn hidden_async_cmd(program: &str) -> tokio::process::Command {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Run `cmd` to completion within `limit`. The child is killed if the limit
+/// passes or the caller is cancelled (`kill_on_drop`), so nothing it does can
+/// outlive the step that started it.
+pub async fn run_bounded(
+    cmd: &mut tokio::process::Command,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    cmd.kill_on_drop(true).stdin(std::process::Stdio::null());
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(_) => Err(format!("timed out after {limit:?}")),
+    }
+}
+
+/// Run `work` on a thread of its own and wait for it at most `limit`; `true`
+/// if it finished. Whatever `work` waits on — a lock a wedged teardown holds,
+/// a log write that does not return — holds that thread, never the caller
+/// past `limit` (WIN3-006: the exit fallback must exit).
+pub fn run_on_helper_for(
+    name: &str,
+    limit: std::time::Duration,
+    work: impl FnOnce() + Send + 'static,
+) -> bool {
+    let (done, finished) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            work();
+            let _ = done.send(());
+        });
+    spawned.is_ok() && finished.recv_timeout(limit).is_ok()
 }
 
 /// This install's device identifier: a random `desktop_<uuid-v4>`, persisted
@@ -94,6 +144,72 @@ pub fn device_platform() -> &'static str {
         "macos" => "MACOS",
         "linux" => "LINUX",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod bounded_process_tests {
+    /// W1-017's test plan: a hung subprocess is cut off at the limit instead
+    /// of pinning the caller for as long as it runs.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_hung_subprocess_is_cut_off_at_the_limit() {
+        let started = std::time::Instant::now();
+        let result = super::run_bounded(
+            super::hidden_async_cmd("cmd.exe").args(["/c", "ping -n 30 127.0.0.1 >nul"]),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_quick_subprocess_returns_its_output() {
+        let out = super::run_bounded(
+            super::hidden_async_cmd("cmd.exe").args(["/c", "echo birdo"]),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("cmd.exe runs");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("birdo"));
+    }
+
+    /// WIN3-006: work that waits on a lock nobody releases — the machine
+    /// state, WFP's engine or the log writer, held by a wedged teardown —
+    /// costs the caller the limit, and no more.
+    #[test]
+    fn a_wedged_helper_never_holds_the_caller() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let lock = Arc::new(Mutex::new(()));
+        let held = lock.lock().unwrap();
+        let wanted = Arc::clone(&lock);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::run_on_helper_for(
+                "test-wedged",
+                Duration::from_millis(100),
+                move || {
+                    let _wedged = wanted.lock();
+                },
+            ));
+        });
+        let finished = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the caller waited on the lock");
+        assert!(!finished);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(held);
+
+        assert!(super::run_on_helper_for(
+            "test-quick",
+            Duration::from_secs(5),
+            || {}
+        ));
     }
 }
 

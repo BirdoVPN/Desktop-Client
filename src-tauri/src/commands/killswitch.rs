@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tokio::sync::RwLock;
 
+use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::utils::elevation::is_elevated;
 #[cfg(target_os = "linux")]
 use crate::vpn::firewall_linux;
@@ -46,25 +47,67 @@ pub struct KillSwitchStatus {
 // switch is driven by `arm()`/`disarm()` on the connect lifecycle and by
 // `set_killswitch_live` from the settings screen.
 
+type BlockingObserver = Box<dyn Fn() + Send + Sync>;
+
+static BLOCKING_OBSERVER: std::sync::OnceLock<BlockingObserver> = std::sync::OnceLock::new();
+
+/// Register what runs after the block-all may have engaged or released, so
+/// the published VPN status (`kill_switch_blocking`) follows it even when the
+/// connection state does not change — a Settings toggle during an error, the
+/// give-up releasing the block (IPC contract v2, §1). Wired to
+/// `VpnManager::refresh_status` at start-up; the first registration wins.
+pub fn set_blocking_observer(observer: impl Fn() + Send + Sync + 'static) {
+    let _ = BLOCKING_OBSERVER.set(Box::new(observer));
+}
+
+fn blocking_may_have_changed() {
+    if let Some(observer) = BLOCKING_OBSERVER.get() {
+        observer();
+    }
+}
+
+/// Is the platform block-all engaged right now (WFP / pf / iptables)?
+pub fn platform_is_blocking() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        wfp::is_blocking()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PF_BLOCKING.load(Ordering::SeqCst)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        firewall_linux::is_blocking()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
 /// Activate the kill switch (block all non-VPN traffic).
 ///
 /// DT-7: Not a Tauri IPC command — called internally by the auto-reconnect
 /// service when the VPN drops unexpectedly. Kept as a plain async fn to shrink
 /// the IPC attack surface (the frontend never invoked it).
 pub async fn activate_killswitch() -> Result<bool, String> {
+    let result = activate_platform_block().await;
+    blocking_may_have_changed();
+    result
+}
+
+async fn activate_platform_block() -> Result<bool, String> {
     if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
         return Ok(false);
     }
 
     tracing::warn!("Activating kill switch - blocking all non-VPN traffic");
 
+    // Windows: the relay permit (address, port and transport — W1-013) was
+    // handed to wfp by `session::apply_relay_permit` (`move_relay`).
     #[cfg(target_os = "windows")]
     {
-        let server_ip = *VPN_SERVER_IP.read().await;
-        // Set the VPN server IP before activating
-        if let Some(ip) = server_ip {
-            wfp::set_vpn_server(ip).await;
-        }
         if let Err(e) = wfp::activate_blocking().await {
             tracing::error!("Failed to activate blocking filters: {}", e);
             return Err(format!("Failed to activate blocking: {}", e));
@@ -93,12 +136,32 @@ pub async fn activate_killswitch() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Windows: point the block's relay permit at `relay` and, with `engage`, put
+/// the block-all up for a rebuild — one WFP transaction (REVIEW-WIN2-001, see
+/// `wfp::move_relay`). `engage` honours the user's kill-switch preference like
+/// [`activate_killswitch`]; a block already in force is rebuilt whatever it.
+#[cfg(target_os = "windows")]
+pub(crate) async fn move_relay(
+    relay: crate::vpn::wfp_policy::Relay,
+    engage: bool,
+) -> Result<(), String> {
+    let result = wfp::move_relay(relay, engage && KILLSWITCH_ENABLED.load(Ordering::SeqCst)).await;
+    blocking_may_have_changed();
+    result
+}
+
 /// Deactivate the kill switch (restore normal traffic).
 ///
 /// DT-7: Not a Tauri IPC command — called internally by the auto-reconnect
 /// service when the VPN reconnects. Kept as a plain async fn (the frontend
 /// never invoked it).
 pub async fn deactivate_killswitch() -> Result<bool, String> {
+    let result = deactivate_platform_block().await;
+    blocking_may_have_changed();
+    result
+}
+
+async fn deactivate_platform_block() -> Result<bool, String> {
     tracing::info!("Deactivating kill switch - restoring normal traffic");
 
     #[cfg(target_os = "windows")]
@@ -150,7 +213,7 @@ pub async fn set_killswitch_live(
     enabled: bool,
     app: AppHandle,
     vpn_manager: State<'_, VpnManager>,
-) -> Result<bool, String> {
+) -> Result<bool, IpcError> {
     let state = vpn_manager.get_state().await;
     let active = state.is_tunnel_active() || state.can_disconnect();
     if !active {
@@ -161,7 +224,9 @@ pub async fn set_killswitch_live(
     if enabled {
         // arm() re-reads the (already-persisted) preference and initializes WFP,
         // engaging the reactive protection for the live session.
-        arm(&app).await
+        arm(&app)
+            .await
+            .map_err(|e| IpcError::new(IpcErrorCode::KillswitchFailed, e))
     } else {
         KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
 
@@ -175,16 +240,7 @@ pub async fn set_killswitch_live(
         // On macOS this does NOT lift the F-001 IPv6 leak block: that block is
         // owned by the tunnel session, not the kill switch, so `deactivate` falls
         // back to it rather than to `/etc/pf.conf`.
-        #[cfg(target_os = "windows")]
-        let blocking = wfp::is_blocking();
-        #[cfg(target_os = "macos")]
-        let blocking = PF_BLOCKING.load(Ordering::SeqCst);
-        #[cfg(target_os = "linux")]
-        let blocking = firewall_linux::is_blocking();
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        let blocking = false;
-
-        if blocking {
+        if platform_is_blocking() {
             let _ = deactivate_killswitch().await;
         }
 
@@ -196,17 +252,9 @@ pub async fn set_killswitch_live(
 /// Get kill switch status
 /// SEC-C3 FIX: Active state now reads from wfp.rs (single source of truth)
 #[tauri::command]
-pub async fn get_killswitch_status() -> Result<KillSwitchStatus, String> {
+pub async fn get_killswitch_status() -> Result<KillSwitchStatus, IpcError> {
     let enabled = is_enabled();
-
-    #[cfg(target_os = "windows")]
-    let active = wfp::is_blocking();
-    #[cfg(target_os = "macos")]
-    let active = PF_BLOCKING.load(Ordering::SeqCst);
-    #[cfg(target_os = "linux")]
-    let active = firewall_linux::is_blocking();
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    let active = false;
+    let active = platform_is_blocking();
 
     // blocking_connections is deprecated, always 0
     let blocking_connections = 0u32;
@@ -477,6 +525,12 @@ async fn arm_with_preference(enabled: bool) -> Result<bool, String> {
 /// user-initiated disconnect path so disconnecting can never strand the machine
 /// behind an active block-all filter set.
 pub async fn disarm() -> Result<(), String> {
+    let result = disarm_platform().await;
+    blocking_may_have_changed();
+    result
+}
+
+async fn disarm_platform() -> Result<(), String> {
     KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
 
     #[cfg(target_os = "windows")]

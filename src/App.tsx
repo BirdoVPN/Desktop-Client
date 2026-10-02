@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { useAppStore, type AccountInfo } from '@/store/app-store';
+import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
+import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ConsentScreen } from '@/components/ConsentScreen';
 import { Login } from '@/components/Login';
@@ -7,49 +7,55 @@ import { AppShell } from '@/components/AppShell';
 import { OfflineBanner } from '@/components/OfflineBanner';
 import { PixelCanvas } from '@/components/PixelCanvas';
 import { TitleBar } from '@/components/TitleBar';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { LiveAnnouncer } from '@/components/LiveAnnouncer';
+import { NoticeHost } from '@/components/NoticeHost';
+import { MODAL_ROOT_ID } from '@/components/birdo/Dialog';
 import { UpdateRequired, type RequiredUpdate } from '@/components/UpdateRequired';
+import { VpnSessionController } from '@/session/controller';
+import { endSession } from '@/session/session';
+import { checkForUpdates } from '@/session/updater';
+import { applyWindowPlacement } from '@/lib/window-placement';
+import { installBrowserShortcutGuard } from '@/lib/keyboard';
+import { motion as motionTokens } from '@/lib/birdo-theme';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { exit } from '@tauri-apps/plugin-process';
 import { notifyUpdateAvailable } from '@/utils/notifications';
+import { identityPatch, type AuthStateIdentity } from '@/utils/helpers';
+import { hasCurrentConsent } from '@/lib/consent';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 
-interface AuthState {
-  is_authenticated: boolean;
-  email: string | null;
-  account_id: string | null;
-  plan: string | null;
-  /** Optional: absent when talking to a backend that predates the field. */
-  has_password?: boolean;
+/** Whether the window is on screen; unknown counts as visible (never skip a prompt the user can see). */
+async function windowIsVisible(): Promise<boolean> {
+  try {
+    return await getCurrentWindow().isVisible();
+  } catch {
+    return true;
+  }
 }
 
 function App() {
-  const {
-    isAuthenticated,
-    hasAcceptedConsent,
-    setAuthenticated,
-    setLoading,
-    setUserEmail,
-    setAccount,
-    setConsent,
-    connectionState,
-    currentServerName,
-    windowCorner,
-  } = useAppStore(
-    useShallow((s) => ({
-      isAuthenticated: s.isAuthenticated,
-      hasAcceptedConsent: s.hasAcceptedConsent,
-      setAuthenticated: s.setAuthenticated,
-      setLoading: s.setLoading,
-      setUserEmail: s.setUserEmail,
-      setAccount: s.setAccount,
-      setConsent: s.setConsent,
-      connectionState: s.connectionState,
-      currentServerName: s.currentServer?.name ?? null,
-      windowCorner: s.windowCorner,
-    }))
-  );
-  const [initializing, setInitializing] = useState(true);
+  const { isAuthenticated, hasAcceptedConsent, setAuthenticated, setLoading, setUserEmail, setAccount, acceptConsent, windowCorner, pushed } =
+    useAppStore(
+      useShallow((s) => ({
+        isAuthenticated: s.isAuthenticated,
+        // The CURRENT text (D7): an older acceptance shows the screen again.
+        hasAcceptedConsent: hasCurrentConsent(s.acceptedConsentVersion),
+        setAuthenticated: s.setAuthenticated,
+        setLoading: s.setLoading,
+        setUserEmail: s.setUserEmail,
+        setAccount: s.setAccount,
+        acceptConsent: s.acceptConsent,
+        windowCorner: s.windowCorner,
+        pushed: s.navStack.length > 0,
+      })),
+    );
+  // The startup sign-in check has answered. It runs only once the CURRENT
+  // consent is in (below), so until then there is nothing to wait for.
+  const [authChecked, setAuthChecked] = useState(false);
+  const initializing = hasAcceptedConsent && !authChecked;
 
   // Forced client-version floor. The backend answers every request from a
   // too-old build with a structured 426; api::upgrade_gate latches that
@@ -76,11 +82,10 @@ function App() {
     };
   }, []);
 
-  // Biometric app-lock. When "Biometric Unlock" is enabled in Settings the
-  // entire UI must stay behind an unlock screen until Windows Hello / Touch ID
-  // succeeds — previously the flag was persisted but never enforced, so the
-  // advertised lock was a no-op (same class of bug as the Android fix in
-  // Mobile #146). 'checking' avoids a flash of unlocked content at boot.
+  // Hide App Contents (the biometric cover). It covers the SCREEN only: the
+  // session controller below keeps running behind it, so the VPN — including
+  // Auto-Connect, the tray and notifications — works while it is up (W2-026;
+  // iOS says the same in its copy). 'checking' avoids a flash of the app.
   const [bioLock, setBioLock] = useState<'checking' | 'locked' | 'open'>('checking');
 
   const requestBiometricUnlock = async () => {
@@ -96,11 +101,14 @@ function App() {
 
   useEffect(() => {
     invoke<{ available: boolean; enabled: boolean }>('check_biometric_available')
-      .then((st) => {
+      .then(async (st) => {
         if (st?.available && st?.enabled) {
           setBioLock('locked');
-          // Prompt immediately at launch; the lock screen offers a retry.
-          requestBiometricUnlock();
+          // Prompt only if the window is actually on screen. With Start
+          // Minimized the app boots into the tray, and a Windows Hello prompt
+          // appearing at sign-in over nothing is alarming; `app-shown` below
+          // prompts when the user opens the window.
+          if (await windowIsVisible()) requestBiometricUnlock();
         } else {
           setBioLock('open');
         }
@@ -108,24 +116,16 @@ function App() {
       .catch(() => setBioLock('open'));
   }, []);
 
-  // Re-arm the biometric lock when the app is hidden to the tray and re-prompt
-  // when it returns. Without this the opt-in lock only guarded the cold start —
-  // close-to-tray then reopen left the authenticated UI one tray-click away for
-  // anyone at the machine. Mirrors mobile's onStop re-arm + onResume re-prompt.
-  // (Keyed off hide-to-tray, not plain blur, so alt-tabbing never re-locks.)
+  // Re-arm the cover when the app is hidden to the tray and re-prompt when it
+  // returns. Keyed off hide-to-tray, not blur, so alt-tabbing never re-locks.
   const bioLockRef = useRef(bioLock);
-  // In an effect, not during render (react-hooks/refs). The only reader is
-  // the async 'app-hidden' listener below, which always runs after commit,
-  // so the one-tick delay versus a render-time write is unobservable.
   useEffect(() => {
     bioLockRef.current = bioLock;
   }, [bioLock]);
   useEffect(() => {
     const unlistenHidden = listen('app-hidden', async () => {
       try {
-        const st = await invoke<{ available: boolean; enabled: boolean }>(
-          'check_biometric_available'
-        );
+        const st = await invoke<{ available: boolean; enabled: boolean }>('check_biometric_available');
         if (st?.available && st?.enabled) setBioLock('locked');
       } catch {
         /* non-fatal — leave current lock state */
@@ -140,106 +140,91 @@ function App() {
     };
   }, []);
 
-  // Apply the saved window-position preference (corner anchor / draggable).
-  // Runs on startup and whenever the user changes it in Settings. main.rs pins
-  // top-left at launch as the pre-load default, so non-default corners reposition
-  // once on first paint.
+  // Window size + position from the monitor work area (W2-020), on startup,
+  // when the preference changes, and when the window moves to a display with a
+  // different scale factor.
   useEffect(() => {
-    invoke('set_window_position', { corner: windowCorner }).catch(() => {
+    applyWindowPlacement(windowCorner).catch(() => {
       /* window not ready / non-fatal */
     });
+    const off = getCurrentWindow()
+      .onScaleChanged(() => {
+        applyWindowPlacement(windowCorner).catch(() => {});
+      })
+      .catch(() => undefined);
+    return () => {
+      off.then((fn) => fn?.()).catch(() => {});
+    };
   }, [windowCorner]);
 
-  // Keep the system-tray icon + tooltip in sync with the live connection state.
-  // The Rust `set_tray_state` command swaps the embedded status icon (green /
-  // amber / slate) and the hover tooltip. Every in-progress phase maps to the
-  // amber "connecting" icon — EXCEPT kill_switch_active, which used to fall
-  // into that catch-all: the tray (often the only visible surface, the window
-  // being hidden) said "Connecting…" while every packet on the machine was
-  // being dropped. It now gets the slate icon and an explicit tooltip.
+  // F5 / Ctrl+R / Ctrl+P and friends (W2-033).
+  useEffect(() => installBrowserShortcutGuard(), []);
+
+  // D7 re-consent behind Start Minimized (REVIEW-WIN2-010). Starting in the
+  // tray, the consent screen rendered in a hidden window, and auto-connect —
+  // which waits for consent — silently never ran: the user booted unprotected
+  // with nothing saying why. A launch that needs the user's answer first
+  // brings the window up. Once, at launch: closing it to the tray after that
+  // is the user's own choice.
   useEffect(() => {
-    const trayState =
-      connectionState === 'connected'
-        ? 'connected'
-        : connectionState === 'disconnected'
-            || connectionState === 'error'
-            || connectionState === 'kill_switch_active'
-          ? 'disconnected'
-          : 'connecting';
-    const tooltip =
-      connectionState === 'kill_switch_active'
-        ? 'BirdoVPN — Kill switch active: traffic blocked'
-        : trayState === 'connected'
-          ? `BirdoVPN — Connected${currentServerName ? ` · ${currentServerName}` : ''}`
-          : trayState === 'connecting'
-            ? 'BirdoVPN — Connecting…'
-            : 'BirdoVPN — Disconnected';
-    invoke('set_tray_state', { state: trayState, tooltip }).catch(() => {
-      /* tray not ready / non-fatal */
-    });
-  }, [connectionState, currentServerName]);
+    if (hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)) return;
+    getCurrentWindow()
+      .isVisible()
+      .catch(() => false)
+      .then((visible) => {
+        if (!visible) return invoke('show_main_window');
+      })
+      .catch(() => {
+        /* best effort: the tray's Show Window still reaches it */
+      });
+  }, []);
+
+  // NOTE: the tray icon, tooltip and menu are driven by Rust from its state
+  // choke point (contract v2, W1-023). This used to push `set_tray_state` from
+  // here, keyed on a connection state only Dashboard's poll kept current.
 
   useEffect(() => {
+    // Not before consent (D7, audit D-12): with a stored session this asks
+    // api.birdo.app who the user is, and a signed-in user whose consent is to
+    // an OLDER text sees the consent screen first. Accepting runs it, behind
+    // the loading screen rather than a flash of Login.
+    if (!hasAcceptedConsent) return;
     // Check for stored authentication on startup
     const checkAuth = async () => {
       try {
         setLoading(true);
-        const authState = await invoke<AuthState>('get_auth_state');
+        const authState = await invoke<AuthStateIdentity>('get_auth_state');
         setAuthenticated(authState.is_authenticated);
 
         if (authState.is_authenticated) {
-          // Populate user email + account info from auth state. Always set the
-          // account when authenticated — gating on plan/account_id meant a
-          // stored session that returns only an email left `account` null, so
-          // the Profile screen rendered "Anonymous" for a real email login.
-          if (authState.email) setUserEmail(authState.email);
           // Merge only the fields we actually received. `setAccount` MERGES, so
           // passing explicit nulls would wipe a good identity whenever the
           // profile fetch failed transiently (get_auth_state deliberately keeps
           // the session alive with an unknown identity in that case rather than
           // signing the user out). Absent means "unchanged", not "cleared".
-          const patch: Partial<AccountInfo> = {
-            status: 'active',
-            // Always set, and `?? true` keeps the password prompt when the
-            // backend predates the field — never drop a confirmation because a
-            // value went missing. Unlike the identity fields, a stale `false`
-            // here would REMOVE a safety prompt, so absent must mean "ask".
-            hasPassword: authState.has_password ?? true,
-          };
-          if (authState.email) patch.email = authState.email;
-          if (authState.account_id) patch.accountId = authState.account_id;
-          if (authState.plan) patch.plan = authState.plan;
-          setAccount(patch);
+          if (authState.email) setUserEmail(authState.email);
+          setAccount(identityPatch(authState));
         }
       } catch {
         // Auth check failed - assume not authenticated
         setAuthenticated(false);
       } finally {
         setLoading(false);
-        setInitializing(false);
+        setAuthChecked(true);
       }
     };
 
     checkAuth();
-  }, [setAuthenticated, setLoading, setUserEmail, setAccount]);
+  }, [hasAcceptedConsent, setAuthenticated, setLoading, setUserEmail, setAccount]);
 
-  // Retry identity hydration when we are signed in but the email never arrived.
+  // Retry identity hydration when we are signed in but the email never
+  // arrived (`get_auth_state` keeps a valid session alive through a transient
+  // profile-fetch failure). Backs off 4s, 8s, 16s and stops after 3 attempts;
+  // the attempt counter is STATE so a failed attempt re-runs the effect.
   //
-  // `get_auth_state` deliberately keeps a valid session alive when the profile
-  // fetch fails (a rate-limit or a network blip) and reports the identity as
-  // unknown rather than signing the user out. Nothing re-fetched it though, so a
-  // single transient failure left the Profile stuck on "Loading your account…"
-  // until the app was restarted — a momentary error turned permanent.
-  //
-  // Backs off (4s, 8s, 16s) so a retry cannot itself become the thing keeping
-  // the rate-limit window saturated, and stops after 3 attempts.
-  //
-  // The attempt counter is STATE (not a ref) on purpose: bumping it after a
-  // failed attempt re-runs this effect, which is what schedules the next try.
-  // The previous ref-based version never re-ran on failure — the documented
-  // 3-attempt ladder was actually a single attempt, and a profile fetch still
-  // failing 4 s after sign-in left the Profile stuck on "Loading your
-  // account…" until an app restart.
+  // A reply of `is_authenticated: false` is NOT a transient failure: Rust
+  // cleared a rejected refresh token, so the session is over (W2-006). It used
+  // to be ignored, leaving a signed-in shell that could do nothing.
   const [identityAttempt, setIdentityAttempt] = useState(0);
   const accountEmail = useAppStore((s) => s.account.email);
   useEffect(() => {
@@ -247,53 +232,36 @@ function App() {
     const delayMs = 4000 * 2 ** identityAttempt;
     const timer = setTimeout(async () => {
       try {
-        const st = await invoke<AuthState>('get_auth_state');
+        const st = await invoke<AuthStateIdentity>('get_auth_state');
+        if (st && st.is_authenticated === false) {
+          endSession('expired');
+          return;
+        }
         if (st?.email) {
           setUserEmail(st.email);
-          const patch: Partial<AccountInfo> = { email: st.email };
-          if (st.account_id) patch.accountId = st.account_id;
-          if (st.plan) patch.plan = st.plan;
-          setAccount(patch);
+          setAccount(identityPatch(st));
         }
       } catch {
         /* non-fatal — the backoff above bounds how often this runs */
       } finally {
-        // On success `accountEmail` gates the effect off; on failure this
-        // re-triggers it to schedule the next backed-off attempt.
         setIdentityAttempt((a) => a + 1);
       }
     }, delayMs);
     return () => clearTimeout(timer);
   }, [isAuthenticated, accountEmail, identityAttempt, setUserEmail, setAccount]);
 
-  // Daily background update check. The per-platform update endpoint is live
-  // (api.birdo.app/updates/…), but the only in-app check used to be the manual
-  // button in Settings → Software Updates — users who never opened it would
-  // never learn about security fixes. Checks shortly after startup and then
-  // every 24h; notifies at most once per app run.
-  //
-  // Goes through the Rust `check_for_updates` command, which runs the updater
-  // over the cert-pinned client (commands/updater.rs). The un-pinned
-  // @tauri-apps/plugin-updater JS path is no longer reachable from the webview.
-  //
-  // Not before consent (audit D-12): the check is a request to api.birdo.app,
-  // and nothing on the consent screen needs it.
+  // Daily background update check through the pinned Rust updater. Shortly
+  // after startup, then every 24h; notifies at most once per app run. Not
+  // before consent (audit D-12): the check is a request to api.birdo.app.
   useEffect(() => {
     if (!hasAcceptedConsent) return;
     let notified = false;
     const runCheck = async () => {
       if (notified) return;
-      try {
-        const update = await Promise.race([
-          invoke<{ version: string } | null>('check_for_updates'),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 15000)),
-        ]);
-        if (update) {
-          notified = true;
-          notifyUpdateAvailable(update.version);
-        }
-      } catch {
-        // Offline / endpoint hiccup — silent; the next interval retries.
+      const update = await checkForUpdates(true);
+      if (update) {
+        notified = true;
+        notifyUpdateAvailable(update.version);
       }
     };
     const initial = setTimeout(runCheck, 20_000); // let startup settle first
@@ -316,11 +284,10 @@ function App() {
         // birdo://connect/<server-id>
         // Validate: allow only alphanumeric, dashes, underscores, max 64 chars
         if (!/^[a-zA-Z0-9_-]{1,64}$/.test(path)) return;
-        // Ensure the Home tab is foregrounded so Dashboard handles the connect.
+        // Show the Connect tab; the session controller stages the confirmation.
         useAppStore.getState().setTab('home');
         useAppStore.getState().setDeepLinkAction({ action: 'connect', serverId: path });
       } else if (action === 'settings') {
-        // birdo://settings → route to the Settings tab (router refactor).
         useAppStore.getState().setTab('settings');
         useAppStore.getState().setDeepLinkAction({ action: 'settings' });
       }
@@ -342,91 +309,6 @@ function App() {
     return () => { unlisten.then((fn) => fn()).catch(() => {}); };
   }, [handleDeepLinkUrl]);
 
-  if (initializing || bioLock === 'checking') {
-    return (
-      <div className="relative flex h-screen flex-col overflow-hidden bg-[#000000]">
-        <PixelCanvas />
-        <TitleBar />
-
-        <div className="relative z-10 flex flex-1 flex-col items-center justify-center">
-          <motion.div
-            className="flex flex-col items-center gap-4"
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.5 }}
-          >
-            <div className="relative">
-              <div className="h-16 w-16 animate-spin rounded-full border-2 border-white/10 border-t-white" />
-            </div>
-            <p className="text-sm text-white/60">Loading...</p>
-          </motion.div>
-        </div>
-      </div>
-    );
-  }
-
-  // Biometric lock screen — nothing behind it renders until unlock succeeds.
-  if (bioLock === 'locked') {
-    return (
-      <div className="relative flex h-screen flex-col overflow-hidden bg-[#000000]">
-        <PixelCanvas />
-        <TitleBar />
-
-        <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-6 px-8">
-          <motion.div
-            className="flex flex-col items-center gap-3 text-center"
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.3 }}
-          >
-            <h1 className="text-lg font-semibold text-white">BirdoVPN is locked</h1>
-            <p className="max-w-xs text-sm text-white/60">
-              Biometric Unlock is enabled for this app. Authenticate to continue.
-            </p>
-          </motion.div>
-          <div className="flex flex-col items-center gap-3">
-            <button
-              type="button"
-              onClick={requestBiometricUnlock}
-              className="rounded-lg bg-white px-6 py-2.5 text-sm font-semibold text-black transition hover:bg-white/90"
-            >
-              Unlock
-            </button>
-            <button
-              type="button"
-              onClick={() => exit(0).catch(() => window.close())}
-              className="text-xs text-white/50 transition hover:text-white/80"
-            >
-              Quit
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Forced version floor — a hard block over the whole app. Rendered as its own
-  // screen rather than as an error on the dashboard because nothing behind it
-  // can work: the backend refuses every request from this build.
-  //
-  // Deliberately BELOW the biometric lock. That lock is the user's own
-  // device-security boundary and its invariant is that nothing renders until
-  // unlock succeeds; a version problem is not a reason to punch through it.
-  // The wall is waiting on the other side, and everything it offers (update,
-  // manual download, quit) is still one click away after unlocking.
-  if (requiredUpdate) {
-    return (
-      <div className="relative flex h-screen flex-col overflow-hidden bg-[#000000]">
-        <PixelCanvas />
-        <TitleBar />
-
-        <div className="relative z-10 flex flex-1 flex-col">
-          <UpdateRequired info={requiredUpdate} />
-        </div>
-      </div>
-    );
-  }
-
   // ── Consent handlers ──────────────────────────────────────────
   // The crash-report choice made on the consent screen goes straight to Rust
   // through the dedicated command (it reads settings.json, flips the one
@@ -434,7 +316,7 @@ function App() {
   // that has not been hydrated from Rust yet. Default OFF; a failed write
   // leaves it OFF, which is the safe direction.
   const handleAcceptConsent = (crashReportsEnabled: boolean) => {
-    setConsent(true);
+    acceptConsent();
     useAppStore.getState().updateSettings({ crashReportsEnabled });
     invoke('set_crash_reports_enabled', { enabled: crashReportsEnabled }).catch((err) => {
       console.error('Failed to save the crash-report choice', err);
@@ -455,58 +337,107 @@ function App() {
     }
   };
 
-  return (
-    <MotionConfig reducedMotion="user">
-    <div className="relative flex h-screen flex-col overflow-hidden bg-birdo-black">
-      <PixelCanvas />
-      <TitleBar />
-
-      <div className="relative z-10 flex-1 overflow-hidden">
-      {/* Global offline banner — shows on every screen (matches mobile's
-          above-NavHost placement), not just the dashboard. */}
-      <OfflineBanner />
-
-      <AnimatePresence mode="wait">
-        {!hasAcceptedConsent ? (
-          <motion.div
-            key="consent"
-            className="relative z-10 h-full"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0, x: -20 }}
-            transition={{ duration: 0.3 }}
-          >
-            <ConsentScreen
-              onAccept={handleAcceptConsent}
-              onDecline={handleDeclineConsent}
-            />
-          </motion.div>
-        ) : isAuthenticated ? (
-          <motion.div
-            key="appshell"
-            className="relative z-10 h-full"
-            initial={{ opacity: 0, x: 20 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: -20 }}
-            transition={{ duration: 0.3 }}
-          >
-            <AppShell />
-          </motion.div>
-        ) : (
-          <motion.div
-            key="login"
-            className="relative z-10 h-full"
-            initial={{ opacity: 0, x: -20 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: 20 }}
-            transition={{ duration: 0.3 }}
-          >
-            <Login />
-          </motion.div>
-        )}
-      </AnimatePresence>
+  // ── Which screen ──────────────────────────────────────────────
+  // Order: initialising, then the biometric cover (the user's own
+  // device-security boundary: nothing renders until unlock succeeds, not even
+  // the version wall), then the version wall, then consent / login / the app.
+  let screen: ReactNode;
+  let screenKey: string;
+  if (initializing || bioLock === 'checking') {
+    screenKey = 'loading';
+    screen = (
+      <div className="flex h-full flex-col items-center justify-center gap-4">
+        <div className="h-16 w-16 animate-spin rounded-full border-2 border-white/10 border-t-white" />
+        <p className="text-sm text-white/60">Loading…</p>
       </div>
-    </div>
+    );
+  } else if (bioLock === 'locked') {
+    screenKey = 'locked';
+    screen = (
+      <div className="flex h-full flex-col items-center justify-center gap-6 px-8">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <h1 className="text-lg font-semibold text-white">BirdoVPN is locked</h1>
+          <p className="max-w-xs text-sm text-white/60">
+            Hide App Contents is on. Verify it's you to continue. The VPN keeps running in the background.
+          </p>
+        </div>
+        <div className="flex flex-col items-center gap-3">
+          <button
+            type="button"
+            onClick={requestBiometricUnlock}
+            className="rounded-lg bg-white px-6 py-2.5 text-sm font-semibold text-black transition hover:bg-white/90"
+          >
+            Unlock
+          </button>
+          <button
+            type="button"
+            onClick={() => exit(0).catch(() => window.close())}
+            className="text-xs text-white/60 transition hover:text-white/80"
+          >
+            Quit
+          </button>
+        </div>
+      </div>
+    );
+  } else if (requiredUpdate) {
+    // A hard block: the backend refuses every request from this build.
+    screenKey = 'update-required';
+    screen = <UpdateRequired info={requiredUpdate} />;
+  } else if (!hasAcceptedConsent) {
+    screenKey = 'consent';
+    screen = <ConsentScreen onAccept={handleAcceptConsent} onDecline={handleDeclineConsent} />;
+  } else if (isAuthenticated) {
+    screenKey = 'appshell';
+    screen = <AppShell />;
+  } else {
+    screenKey = 'login';
+    screen = <Login />;
+  }
+
+  return (
+    // MotionConfig wraps EVERY screen: the loading, lock and update screens
+    // used to animate outside it, ignoring reduced motion (W2-034).
+    <MotionConfig reducedMotion="user">
+      <div className="relative flex h-screen flex-col overflow-hidden bg-birdo-black">
+        {/* Parked while a pushed sub-screen (which has its own) covers it. */}
+        <PixelCanvas paused={pushed} />
+        {/* Outside the content boundary: a crash in a screen must never take
+            the frameless window's only controls with it (W2-044). */}
+        <TitleBar />
+
+        {/* The session controller runs for the whole signed-in session —
+            under the biometric cover and the version wall too — so the VPN
+            is watched and driven whatever the screen shows (W2-001). */}
+        {isAuthenticated && hasAcceptedConsent && <VpnSessionController />}
+
+        {/* A column: the offline banner takes its height and the screen gets
+            the rest. It used to sit above a 100%-height screen and push the
+            bottom navigation out of the window (W2-021). */}
+        <div className="relative z-10 flex min-h-0 flex-1 flex-col overflow-hidden">
+          <OfflineBanner />
+          <div className="relative min-h-0 flex-1">
+            {/* Dialogs portal here (BirdoDialog): over the screen, under the
+                title bar, never clipped by the card they are declared in. */}
+            <div id={MODAL_ROOT_ID} className="pointer-events-none absolute inset-0 z-50" />
+            <ErrorBoundary>
+              <AnimatePresence mode="wait">
+                <motion.div
+                  key={screenKey}
+                  className="relative z-10 h-full"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
+                >
+                  {screen}
+                </motion.div>
+              </AnimatePresence>
+            </ErrorBoundary>
+          </div>
+          <NoticeHost />
+        </div>
+        {isAuthenticated && <LiveAnnouncer />}
+      </div>
     </MotionConfig>
   );
 }

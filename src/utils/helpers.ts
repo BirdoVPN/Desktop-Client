@@ -20,23 +20,142 @@ export function countryCodeToFlag(countryCode: string): string {
 }
 
 /**
- * Format bytes to a human-readable string (B, KB, MB, GB, TB).
+ * Bytes for the stats tiles: KB/MB with one decimal, GB with two — the iOS /
+ * Android `FormatUtils` rule (W2-031), so the same session reads the same on
+ * every client.
  */
 export function formatBytes(bytes: number): string {
-  if (bytes <= 0) return '0 B';
+  if (!(bytes > 0)) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+  const places = i === 0 ? 0 : i >= 3 ? 2 : 1;
+  return `${(bytes / Math.pow(1024, i)).toFixed(places)} ${units[i]}`;
+}
+
+/** Session duration as MM:SS under an hour, H:MM:SS above (iOS HomeView). */
+export function formatUptime(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (v: number) => String(v).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
 /**
- * Format seconds to HH:MM:SS.
+ * A date as "MMM d, yyyy" (P1-parity canonical; was `yyyy-MM-dd`). A bare
+ * `yyyy-MM-dd` is a calendar date, not an instant, so it is formatted in UTC —
+ * reading it as local midnight would show the day before for anyone west of
+ * Greenwich.
  */
-export function formatUptime(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  return [h, m, s].map((v) => String(v).padStart(2, '0')).join(':');
+export function formatDate(raw: string | null | undefined): string | null {
+  const v = (raw ?? '').trim();
+  if (!v) return null;
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(v);
+  const parsed = new Date(dateOnly ? `${v}T00:00:00Z` : v);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    ...(dateOnly ? { timeZone: 'UTC' } : {}),
+  }).format(parsed);
+}
+
+/**
+ * Anonymous accounts carry a synthetic email `anon_<24-digit-id>@anonymous.local`,
+ * and the 24 digits are the account's ONLY recovery credential. Every surface
+ * that shows an identity must go through this, so the synthetic address (and
+ * the credential inside it) is never rendered raw — the Connect screen's top
+ * bar used to print the first ~20 characters of it (P1-parity-007).
+ */
+const ANON_EMAIL_RE = /^anon_(\d{24})@anonymous\.local$/i;
+export function anonAccountNumber(email: string | null | undefined): string | null {
+  if (!email) return null;
+  const m = ANON_EMAIL_RE.exec(email.trim());
+  return m ? m[1] : null;
+}
+
+/** What `get_auth_state` says about anonymity (Rust `AuthState`, item 86). */
+export interface AuthStateAnonymity {
+  is_anonymous?: boolean | null;
+  account_number?: string | null;
+}
+
+/** The `get_auth_state` answer, as far as the account store reads it. */
+export interface AuthStateIdentity extends AuthStateAnonymity {
+  is_authenticated: boolean;
+  email: string | null;
+  account_id: string | null;
+  plan: string | null;
+  /** Absent when talking to a backend that predates the field. */
+  has_password?: boolean;
+}
+
+/**
+ * What a `get_auth_state` answer says about the signed-in account, as a merge
+ * patch for `setAccount`. App startup and every post-sign-in hydration in
+ * Login use this one function: Login's own copy left out `hasPassword`, so a
+ * new anonymous or SSO account was asked for a password it does not have —
+ * Delete disabled — until the app restarted (WIN-FIX-3).
+ *
+ * Only what was received is written: `setAccount` MERGES, and an explicit
+ * null would wipe a known-good identity whenever the profile fetch failed
+ * transiently (`get_auth_state` keeps the session alive with an unknown
+ * identity in that case).
+ */
+export function identityPatch(st: AuthStateIdentity): Partial<AccountInfo> {
+  const patch: Partial<AccountInfo> = anonymityPatch(st);
+  if (st.email) patch.email = st.email;
+  if (st.account_id) patch.accountId = st.account_id;
+  if (st.plan) patch.plan = st.plan;
+  if (st.is_authenticated) {
+    patch.status = 'active';
+    // `?? true` keeps the password prompt when the backend predates the
+    // field: a stale `false` would REMOVE a safety prompt.
+    patch.hasPassword = st.has_password ?? true;
+  }
+  return patch;
+}
+
+/**
+ * The store patch for item 86's fields, with only what the server SAID: an
+ * absent field leaves the store alone, so a cycle whose profile fetch failed
+ * does not erase a good answer.
+ */
+export function anonymityPatch(st: AuthStateAnonymity): { isAnonymous?: boolean; accountNumber?: string } {
+  const patch: { isAnonymous?: boolean; accountNumber?: string } = {};
+  if (typeof st.is_anonymous === 'boolean') patch.isAnonymous = st.is_anonymous;
+  if (typeof st.account_number === 'string' && /^\d{24}$/.test(st.account_number)) {
+    patch.accountNumber = st.account_number;
+  }
+  return patch;
+}
+
+/**
+ * Whether the signed-in account is anonymous, and its number (Account API
+ * contract item 86). The server's `isAnonymous` / `accountNumber` are used
+ * when it sends them; a backend that predates them is read from the synthetic
+ * email, as before. The synthetic email always means anonymous — it exists
+ * only on anonymous accounts — so it is never rendered whatever else is said.
+ */
+export function resolveAnonymousAccount(
+  account: { isAnonymous: boolean | null; accountNumber: string | null },
+  email: string | null,
+): { isAnon: boolean; accountNumber: string | null } {
+  const fromEmail = anonAccountNumber(email);
+  const isAnon = fromEmail !== null || account.isAnonymous === true;
+  return { isAnon, accountNumber: isAnon ? account.accountNumber ?? fromEmail : null };
+}
+
+/** "123456789012…" → "1234 5678 9012 …": six groups of four, space-separated (canonical). */
+export function formatAccountNumber(digits: string): string {
+  return digits.replace(/\D/g, '').replace(/(\d{4})(?=\d)/g, '$1 ');
+}
+
+/** The masked form shown by default: every group hidden but the last. */
+export function maskAccountNumber(digits: string): string {
+  return formatAccountNumber(digits).replace(/\d(?=.*\s)/g, '•');
 }
 
 /**
@@ -74,57 +193,21 @@ export function isValidDnsAddress(ip: string): { valid: boolean; error?: string 
 }
 
 /**
- * Validate a WireGuard port number.
+ * Whether a valid Custom DNS address is on a private network (10/8,
+ * 172.16/12, 192.168/16): the user's own resolver, a Pi-hole for instance.
+ * Rust reaches one outside the tunnel, and only with Local Network Sharing on
+ * (`wfp_policy::split_resolvers`, REVIEW-WIN2-006).
  */
-export function isValidPort(port: string): boolean {
-  const n = Number(port);
-  return Number.isInteger(n) && n >= 1 && n <= 65535;
+export function isPrivateDnsAddress(ip: string): boolean {
+  if (!isValidDnsAddress(ip).valid) return false;
+  const [a, b] = ip.split('.').map(Number);
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
-/**
- * Extract a user-facing message from an unknown error value.
- */
-export function extractErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * Map raw Rust/backend VPN errors to user-friendly messages.
- * Prevents leaking server IPs, hostnames, or internal details in the UI.
- */
-export function friendlyVpnError(error: unknown): string {
-  const original = extractErrorMessage(error).trim();
-  const raw = original.toLowerCase();
-  if (raw.includes('multi-hop is temporarily unavailable') || raw.includes('multi-hop unavailable')) return 'Multi-Hop unavailable on this route. Try a different entry or exit server.';
-  if (raw.includes('mesh') && raw.includes('forwarding')) return 'Failed to set up Multi-Hop forwarding between servers. Try a different exit.';
-  if (raw.includes('sovereign')) return 'Multi-Hop requires a Sovereign subscription.';
-  if (raw.includes('connection refused') || raw.includes('connect to')) return 'Unable to reach the VPN server. Please try another server.';
-  if (raw.includes('handshake') || raw.includes('timeout')) return 'Connection timed out. The server may be busy — try again or switch servers.';
-  if (raw.includes('authentication') || raw.includes('unauthorized') || raw.includes('401')) return 'Authentication failed. Please log in again.';
-  if (raw.includes('access denied') || raw.includes('forbidden') || raw.includes('403')) return 'Access denied for this connection. Please check your subscription, device limit, or account permissions.';
-  if (raw.includes('no servers') || raw.includes('server list')) return 'No servers available. Check your internet connection.';
-  if (raw.includes('already connected') || raw.includes('already active')) return 'VPN is already connected.';
-  if (raw.includes('dns') || raw.includes('resolve')) return 'DNS resolution failed. Check your network settings.';
-  if (raw.includes('permission') || raw.includes('elevation') || raw.includes('privilege')) return 'Administrator permission is required for this operation.';
-  if (raw.includes('wintun') || raw.includes('loadlibrary') || raw.includes('driver') || raw.includes('adapter') || raw.includes('tunnel')) return 'Could not start the VPN network adapter. Try reinstalling, or temporarily disable antivirus blocking the Wintun driver.';
-  if (raw.includes('kill switch') || raw.includes('killswitch')) return 'Kill switch error. Please disconnect and try again.';
-  if (raw.includes('subscription') || raw.includes('plan') || raw.includes('device limit')) return 'Subscription limit reached. Upgrade your plan or disconnect other devices.';
-
-  // Fallback: surface the server's OWN message when it reads like a clean,
-  // user-facing sentence. The backend's connect rejections (e.g. "Failed to
-  // configure VPN server. Please try again.", "All VPN servers are currently
-  // offline…") and the Rust layer's errors are already PII-sanitized, so
-  // showing them tells the user the actual reason instead of an opaque
-  // "Connection failed". Guard against empty / oversized / obviously-technical
-  // strings (stack traces, raw "error:" dumps) which we'd rather not surface.
-  const looksTechnical = /\b(panic|thread '|stack backtrace|os error|0x[0-9a-f]{4}|undefined|null pointer|\bat\s+[A-Za-z]:\\)/i.test(
-    original,
-  );
-  if (original && original.length <= 160 && /\s/.test(original) && !looksTechnical) {
-    // Ensure it ends with sentence punctuation for a tidy toast.
-    return /[.!?]$/.test(original) ? original : `${original}.`;
-  }
-  return 'Connection failed. Please try again.';
+/** WireGuard MTU range the tunnel builder accepts. */
+export function isValidMtu(mtu: string): boolean {
+  const n = Number(mtu);
+  return Number.isInteger(n) && n >= 1280 && n <= 1500;
 }
 
 // ── Settings snake_case ↔ camelCase mapping ────────────────────────
@@ -172,7 +255,14 @@ export interface RustSettings {
   crash_reports_enabled?: boolean;
 }
 
-import type { AppSettings } from '../store/app-store';
+import type { AccountInfo, AppSettings, WireGuardPort } from '../store/app-store';
+
+/** A stored or received port setting as one of the two that exist (see
+ * `WireGuardPort`): "51820" stays, anything else — "53", a custom number from
+ * an older build, nothing at all — is "auto". */
+export function normalizeWireGuardPort(value: unknown): WireGuardPort {
+  return value === '51820' ? '51820' : 'auto';
+}
 
 /** Convert Rust snake_case settings to store camelCase. */
 export function settingsFromRust(rs: RustSettings): AppSettings {
@@ -191,9 +281,13 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     splitTunnelingEnabled: rs.split_tunneling_enabled ?? false,
     splitTunnelApps: rs.split_tunnel_apps ?? [],
     customDns: rs.custom_dns ?? null,
+    // Rust has no on/off flag: a non-empty list IS "on" on the wire.
+    customDnsEnabled: (rs.custom_dns ?? []).length > 0,
     protocol: 'wireguard',
     localNetworkSharing: rs.local_network_sharing ?? false,
-    wireGuardPort: rs.wireguard_port ?? 'auto',
+    // A "53" or custom port from an older build is "auto": no relay answers
+    // either (Rust migrates the file too).
+    wireGuardPort: normalizeWireGuardPort(rs.wireguard_port),
     wireGuardMtu: rs.wireguard_mtu ?? 0,
     multiHopEnabled: rs.multi_hop_enabled ?? false,
     multiHopEntryNodeId: rs.multi_hop_entry_node_id ?? null,
@@ -222,7 +316,8 @@ export function settingsToRust(s: AppSettings): RustSettings {
     preferred_server_id: s.preferredServerId,
     split_tunneling_enabled: s.splitTunnelingEnabled,
     split_tunnel_apps: s.splitTunnelApps,
-    custom_dns: s.customDns,
+    // Switched off = null on the wire, whatever addresses are kept locally.
+    custom_dns: s.customDnsEnabled && (s.customDns ?? []).length > 0 ? s.customDns : null,
     local_network_sharing: s.localNetworkSharing,
     wireguard_port: s.wireGuardPort,
     wireguard_mtu: s.wireGuardMtu,
