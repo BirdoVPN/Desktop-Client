@@ -262,6 +262,37 @@ describe('a failed save is rolled back and reported (W2-013)', () => {
     expect(useAppStore.getState().settings.quantumProtection).toBe(true);
   });
 
+  // WIN3-009: Rust is putting Quantum Protection back (the change failed) when
+  // the user flips Auto-Connect. That full-object save must not write the
+  // failed Quantum value back over the restored one: it waits for the
+  // reapply and goes on top of what was saved.
+  it('a save during a reapply that reverts goes on top of the restored settings', async () => {
+    let finishReapply: (outcome: string) => void = () => {};
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'reapply_vpn_settings') return new Promise((resolve) => (finishReapply = resolve));
+      if (cmd === 'get_settings') return settingsToRust(defaultSettings);
+      if (cmd === 'check_biometric_available') return { available: false, enabled: false, method: 'none' };
+      return undefined;
+    });
+    useAppStore.setState({ connectionState: 'connected' });
+    render(<Settings />);
+    await userEvent.click(screen.getByRole('switch', { name: 'Quantum Protection' }));
+    await waitFor(() => expect(reapplies()).toHaveLength(1), { timeout: 3000 });
+    expect(saves()).toHaveLength(1);
+    expect(saves()[0].quantum_protection).toBe(false);
+
+    await userEvent.click(screen.getByRole('switch', { name: 'Auto-Connect' }));
+    expect(saves()).toHaveLength(1);
+    expect(useAppStore.getState().settings.autoConnect).toBe(true);
+
+    await act(async () => finishReapply('reverted'));
+    await waitFor(() => expect(saves()).toHaveLength(2));
+    expect(saves()[1].quantum_protection).toBe(true);
+    expect(saves()[1].auto_connect).toBe(true);
+    expect(useAppStore.getState().settings.quantumProtection).toBe(true);
+    expect(useAppStore.getState().settings.autoConnect).toBe(true);
+  });
+
   it('an applied change says nothing', async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'reapply_vpn_settings') return 'applied';

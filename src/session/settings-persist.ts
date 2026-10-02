@@ -27,7 +27,18 @@ export type ReapplyOutcome = 'not_connected' | 'applied' | 'reverted';
 
 export const REAPPLY_REVERTED_COPY = "Couldn't apply that change — your previous setting was restored.";
 
-async function runReapply(): Promise<void> {
+/** The live reapply in flight, if any (see `persistSettings`). */
+let reapplyInFlight: Promise<void> | null = null;
+
+function runReapply(): Promise<void> {
+  const run = reapply().finally(() => {
+    if (reapplyInFlight === run) reapplyInFlight = null;
+  });
+  reapplyInFlight = run;
+  return run;
+}
+
+async function reapply(): Promise<void> {
   const s = useAppStore.getState();
   if (s.connectionState !== 'connected') return;
   s.setReapplying(true);
@@ -86,21 +97,42 @@ export function cancelScheduledReapply(): void {
  * keys this call changed (unless something newer has changed them since) and
  * tell the user. `reapply` is for tunnel-shaping settings only: routing a
  * notification toggle through it would rebuild the tunnel for nothing.
+ *
+ * WIN3-009: while a live reapply is in flight the save waits for it. A
+ * reapply that fails saves the PREVIOUS settings back, and until it is done
+ * this store still holds the value that failed: a full-object save in that
+ * window wrote it back over them — before the revert's reconnect read the
+ * file (which then failed again), or after (the screen showing it beside
+ * "your previous setting was restored"). The change then goes on top of
+ * what the reapply left saved.
  */
 export async function persistSettings(
   patch: Partial<AppSettings>,
   opts: { reapply?: boolean; quiet?: boolean } = {},
 ): Promise<boolean> {
-  const store = useAppStore.getState();
-  const before = store.settings;
+  const keys = Object.keys(patch) as (keyof AppSettings)[];
+  let before = useAppStore.getState().settings;
+  useAppStore.getState().updateSettings(patch);
+  if (reapplyInFlight) {
+    const original = before;
+    await reapplyInFlight;
+    // What a failed save puts back: what the reapply re-read from disk, or,
+    // for a key it did not touch, what the key was.
+    const settled = useAppStore.getState().settings;
+    const untouched: Partial<AppSettings> = {};
+    for (const key of keys) {
+      if (settled[key] === patch[key]) (untouched as Record<string, unknown>)[key] = original[key];
+    }
+    before = { ...settled, ...untouched };
+    useAppStore.getState().updateSettings(patch);
+  }
   const next = { ...before, ...patch };
-  store.updateSettings(patch);
   try {
     await invoke('save_settings', { settings: settingsToRust(next) });
   } catch {
     const current = useAppStore.getState().settings;
     const revert: Partial<AppSettings> = {};
-    for (const key of Object.keys(patch) as (keyof AppSettings)[]) {
+    for (const key of keys) {
       if (current[key] === patch[key]) {
         (revert as Record<string, unknown>)[key] = before[key];
       }
