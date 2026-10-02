@@ -368,7 +368,18 @@ impl RotatingLog {
                         state.failed_at = None;
                     }
                     Err(e) => {
-                        eprintln!("birdo.log rotation failed (continuing to append): {}", e);
+                        // WIN3-011: noted in the log itself, never on stderr.
+                        // This runs on whichever thread logs, with the log's
+                        // lock held, and a console that stopped taking output
+                        // (a QuickEdit selection) held every logging thread
+                        // behind one `eprintln!`. Dated like any line, so the
+                        // retention sweep treats it like one.
+                        let _ = writeln!(
+                            state.file,
+                            "{} WARN birdo.log rotation failed (continuing to append): {}",
+                            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                            e
+                        );
                         state.failed_at = Some(std::time::Instant::now());
                     }
                 }
@@ -574,6 +585,31 @@ mod tests {
             rotated_path(&p).exists(),
             "rotation wrote a name the sweep does not look at"
         );
+    }
+
+    /// WIN3-011: a rotation the OS refuses is noted in the log itself, never
+    /// on stderr — the writer holds the log's lock on whichever thread logs,
+    /// and a paused console blocked every one of them behind it.
+    #[test]
+    fn a_refused_rotation_is_noted_in_the_log_not_on_the_console() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), "birdo.log", &line(20, &"x".repeat(64)));
+        // A directory where the rotated file goes: the rename is refused.
+        std::fs::create_dir(rotated_path(&p)).unwrap();
+        let log = RotatingLog::open(&p, 16).unwrap();
+        drop(log.writer());
+
+        let text = read(&p);
+        let note = text
+            .lines()
+            .find(|l| l.contains("birdo.log rotation failed"))
+            .unwrap_or_else(|| panic!("the refusal is not in the log: {text}"));
+        assert!(line_timestamp(note.as_bytes()).is_some(), "{note}");
+
+        let source = include_str!("log_retention.rs");
+        let writer = &source[source.find("pub fn writer(&self)").unwrap()..];
+        let writer = &writer[..writer.find("\n    }").unwrap()];
+        assert!(!writer.contains(concat!("eprint", "ln!(")), "{writer}");
     }
 
     #[test]
