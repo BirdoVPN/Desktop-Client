@@ -1299,16 +1299,17 @@ impl VpnManager {
         }
     }
 
-    /// The packet path has stopped ticking (see
-    /// `wireguard_new::packet_path_stalled`).
+    /// When the live tunnel's packet path last ticked, for the stall rule
+    /// (`wireguard_new::StallWatch`). `None` with no tunnel, or one that has
+    /// not ticked yet.
     #[cfg(target_os = "windows")]
-    pub async fn packet_path_stalled(&self) -> bool {
+    pub async fn packet_path_tick(&self) -> Option<std::time::Instant> {
         match timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await {
             Ok(guard) => match guard.as_ref() {
-                Some(tunnel) => tunnel.packet_path_stalled().await,
-                None => false,
+                Some(tunnel) => tunnel.packet_path_tick().await,
+                None => None,
             },
-            Err(_) => false,
+            Err(_) => None,
         }
     }
 

@@ -366,6 +366,43 @@ fn overdue(silent_for: Duration, allowance: Duration) -> bool {
     silent_for > allowance
 }
 
+/// The watchdog's measure of a loop's silence (WIN3-003).
+///
+/// `Instant` on Windows counts the time the machine spent in standby; the
+/// watchdog's `thread::sleep` does not. After a wake it looked at a beat
+/// from before the sleep, read the whole sleep as silence, and restarted a
+/// healthy loop — losing its policy, its session watch and a pending roam.
+/// A look more than two periods after the previous one means the watchdog
+/// itself was away (asleep with the machine, or frozen with the process),
+/// and the loop could not have run either: silence counts from the waking.
+struct WatchdogClock {
+    last_look: Instant,
+    awake_since: Instant,
+}
+
+impl WatchdogClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_look: now,
+            awake_since: now,
+        }
+    }
+
+    /// Record a look at `now`, one `period` after the last one was due.
+    fn look(&mut self, now: Instant, period: Duration) {
+        if now.saturating_duration_since(self.last_look) > period * 2 {
+            self.awake_since = now;
+        }
+        self.last_look = now;
+    }
+
+    /// How long a loop that checked in at `beat` has been silent as of
+    /// `now`, counting only time the watchdog was awake to see.
+    fn silent_for(&self, beat: Instant, now: Instant) -> Duration {
+        now.saturating_duration_since(beat.max(self.awake_since))
+    }
+}
+
 /// Held by a loop task for as long as it lives — an aborted one included,
 /// which never reaches the end of its body.
 struct LoopAlive {
@@ -526,25 +563,30 @@ impl AutoReconnectService {
         let svc = self.clone();
         let spawned = std::thread::Builder::new()
             .name("birdo-reconnect-watchdog".into())
-            .spawn(move || loop {
-                std::thread::sleep(period);
-                let Some(beat) = svc.pulse.read() else {
-                    continue;
-                };
-                let silent_for = beat.at.elapsed();
-                if !overdue(silent_for, beat.allowance) {
-                    continue;
-                }
-                tracing::error!(
+            .spawn(move || {
+                let mut clock = WatchdogClock::new(Instant::now());
+                loop {
+                    std::thread::sleep(period);
+                    let now = Instant::now();
+                    clock.look(now, period);
+                    let Some(beat) = svc.pulse.read() else {
+                        continue;
+                    };
+                    let silent_for = clock.silent_for(beat.at, now);
+                    if !overdue(silent_for, beat.allowance) {
+                        continue;
+                    }
+                    tracing::error!(
                     "Auto-reconnect has not checked in for {} s (allowed {} s) — restarting it; \
                      the kill switch's block is left as it is (blocking: {})",
                     silent_for.as_secs(),
                     beat.allowance.as_secs(),
                     killswitch::platform_is_blocking()
                 );
-                svc.pulse.beat(beat.generation, beat.allowance);
-                let svc = svc.clone();
-                runtime.spawn(async move { svc.restart_stalled().await });
+                    svc.pulse.beat(beat.generation, beat.allowance);
+                    let svc = svc.clone();
+                    runtime.spawn(async move { svc.restart_stalled().await });
+                }
             });
         if spawned.is_err() {
             tracing::warn!("Could not start the auto-reconnect watchdog");
@@ -605,6 +647,9 @@ struct SessionWatch {
     last_heartbeat: Option<Instant>,
     /// Whether the machine had a route off it at the last look.
     link: LocalLink,
+    /// The packet path's tick across looks (WIN3-003).
+    #[cfg(target_os = "windows")]
+    stall: super::wireguard_new::StallWatch,
 }
 
 enum Wake {
@@ -807,9 +852,14 @@ impl ReconnectLoop {
         // WIN-FIX-3 P0: the packet path itself stopped running. Nothing it
         // carries gets through, the relay's answers included, and boringtun's
         // retransmits (what the fast rule below counts) stop with it — the
-        // T5 hang sat here, Protected, until the 180 s backstop.
+        // T5 hang sat here, Protected, until the 180 s backstop. Judged over
+        // two looks, so a sleep the machine just woke from is not one
+        // (WIN3-003).
         #[cfg(target_os = "windows")]
-        if vm.packet_path_stalled().await {
+        if session
+            .stall
+            .observe(vm.packet_path_tick().await, Instant::now())
+        {
             tracing::warn!("The tunnel's packet path stopped running — declaring the tunnel dead");
             return Liveness::Dead(DropCause::PacketPathStalled);
         }
@@ -1493,6 +1543,42 @@ mod tests {
         assert!(Duration::from_secs(30 + 15 + 5) + OLD_KEY_PROBE_TIMEOUT < TEARDOWN_ALLOWANCE);
     }
 
+    /// WIN3-003: a standby is not a stuck loop. The watchdog's sleep stops
+    /// while the machine sleeps and `Instant` does not, so its first look
+    /// after an hour in standby found a beat an hour old and restarted a
+    /// healthy loop. A loop that really stops is still caught, one allowance
+    /// after the wake.
+    #[test]
+    fn the_watchdog_does_not_count_a_sleep_as_silence() {
+        let s = Duration::from_secs;
+        let (period, allowance) = (s(5), s(30));
+        let t0 = Instant::now();
+        let mut clock = WatchdogClock::new(t0);
+        let beat = t0;
+
+        clock.look(t0 + period, period);
+        assert_eq!(clock.silent_for(beat, t0 + period), period);
+
+        let woke = t0 + period + s(3600);
+        clock.look(woke, period);
+        assert!(
+            !overdue(clock.silent_for(beat, woke), allowance),
+            "the sleep read as silence"
+        );
+
+        let mut now = woke;
+        for _ in 0..6 {
+            now += period;
+            clock.look(now, period);
+        }
+        assert_eq!(clock.silent_for(beat, now), allowance);
+        now += period;
+        clock.look(now, period);
+        assert!(overdue(clock.silent_for(beat, now), allowance));
+        // A beat after the wake counts from the beat.
+        assert_eq!(clock.silent_for(now - s(1), now), s(1));
+    }
+
     /// WIN-FIX-3: every network call the loop makes is capped, and a stalled
     /// packet path is judged before the fast rule (which cannot fire once
     /// the retransmits it counts have stopped with it).
@@ -1518,7 +1604,7 @@ mod tests {
 
         let liveness = body("async fn check_liveness(");
         let stall = liveness
-            .find("ifvm.packet_path_stalled().await{")
+            .find("ifsession.stall.observe(vm.packet_path_tick().await,Instant::now()){")
             .expect("the stall rule");
         let fast = liveness
             .find("vm.peer_unresponsive().await")

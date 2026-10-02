@@ -81,6 +81,53 @@ pub(crate) fn packet_path_stalled(last_tick: Option<Instant>, now: Instant) -> b
     last_tick.is_some_and(|tick| now.saturating_duration_since(tick) >= PACKET_PATH_STALL)
 }
 
+/// How far apart two looks that find the same stale tick must be before the
+/// stall is believed: time for a receive task that was frozen with the
+/// machine to tick again (it ticks every 250 ms).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) const STALL_CONFIRM: Duration = Duration::from_secs(2);
+
+/// The stall rule across looks (WIN3-003).
+///
+/// `Instant` on Windows counts the time the machine spent in standby or
+/// hibernation, when nothing of ours ran. The first look after a wake read
+/// the tick from before the sleep as a path silent for the whole sleep — and
+/// the reconnect loop's overdue ticker often runs before the receive task's,
+/// so a wake tore the tunnel down and re-dialled instead of re-proving it in
+/// place. A stall is now declared only when a second look, at least
+/// [`STALL_CONFIRM`] after the first, finds the SAME tick still stale. Looks
+/// [`PACKET_PATH_STALL`] or more apart say the looker itself was away
+/// (frozen or asleep, the packet path with it): the second starts over.
+#[derive(Debug, Default)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) struct StallWatch {
+    /// The stale tick a look found, and when it looked.
+    suspect: Option<(Instant, Instant)>,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl StallWatch {
+    /// One look at a packet path that last ticked at `last_tick`: has it
+    /// stalled?
+    pub(crate) fn observe(&mut self, last_tick: Option<Instant>, now: Instant) -> bool {
+        let Some(tick) = last_tick.filter(|_| packet_path_stalled(last_tick, now)) else {
+            self.suspect = None;
+            return false;
+        };
+        match self.suspect {
+            Some((seen, since)) if seen == tick => {
+                let apart = now.saturating_duration_since(since);
+                if apart < PACKET_PATH_STALL {
+                    return apart >= STALL_CONFIRM;
+                }
+            }
+            _ => {}
+        }
+        self.suspect = Some((tick, now));
+        false
+    }
+}
+
 /// Persistent-keepalive bounds (seconds) applied to the server-provided value.
 const KEEPALIVE_MIN_SECS: u16 = 15;
 const KEEPALIVE_MAX_SECS: u16 = 120;
@@ -1015,11 +1062,11 @@ impl WireGuardSession {
             .elapsed()
     }
 
-    /// Whether the packet path has stopped ticking boringtun's timers (see
-    /// [`packet_path_stalled`]).
+    /// When the packet path last ticked boringtun's timers (`None`: not yet).
+    /// What the stall rule reads ([`StallWatch`]).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub fn packet_path_stalled(&self) -> bool {
-        packet_path_stalled(*self.last_tick.lock(), Instant::now())
+    pub fn last_tick(&self) -> Option<Instant> {
+        *self.last_tick.lock()
     }
 
     /// Start a handshake now unless one is already in flight.
@@ -1471,7 +1518,7 @@ mod handshake_tests {
                 let age = reader.handshake_age();
                 let rtt = reader.get_latency_ms().await;
                 let unresponsive = reader.peer_unresponsive();
-                let stalled_path = reader.packet_path_stalled();
+                let stalled_path = packet_path_stalled(reader.last_tick(), Instant::now());
                 reader.force_handshake().await;
                 (age, rtt, unresponsive, stalled_path)
             });
@@ -1498,6 +1545,51 @@ mod handshake_tests {
         assert!(!packet_path_stalled(Some(t0), t0 + Duration::from_secs(9)));
         assert!(packet_path_stalled(Some(t0), t0 + PACKET_PATH_STALL));
         assert_eq!(PACKET_PATH_STALL, Duration::from_secs(10));
+    }
+
+    /// WIN3-003: a sleep is not a stall. The first look after an hour in
+    /// standby finds the tick from before it — `Instant` counted the hour —
+    /// and the receive task ticks again a moment later. Judged on that one
+    /// look, the tunnel was torn down and re-dialled on every such wake.
+    #[test]
+    fn a_sleep_is_not_a_stalled_packet_path() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut watch = StallWatch::default();
+        let woke = t0 + s(3600);
+        assert!(!watch.observe(Some(t0), woke), "judged on one look");
+        let ticked = woke + Duration::from_millis(250);
+        assert!(!watch.observe(Some(ticked), woke + s(5)));
+        assert!(!watch.observe(Some(woke + s(9)), woke + s(10)));
+
+        // A path that stops after that is still found, on the second look.
+        let last = woke + s(10);
+        assert!(!watch.observe(Some(last), last + PACKET_PATH_STALL));
+        assert!(watch.observe(Some(last), last + PACKET_PATH_STALL + s(5)));
+    }
+
+    /// The second look must give the path [`STALL_CONFIRM`] to tick, and a
+    /// looker that was itself away as long as the rule's window starts over.
+    #[test]
+    fn a_stall_needs_two_looks_at_the_same_tick() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut watch = StallWatch::default();
+        let first = t0 + PACKET_PATH_STALL;
+        assert!(!watch.observe(Some(t0), first));
+        assert!(!watch.observe(Some(t0), first + s(1)), "too soon to tell");
+        assert!(watch.observe(Some(t0), first + STALL_CONFIRM));
+
+        // The looker froze between its looks: no verdict from that pair.
+        let mut watch = StallWatch::default();
+        assert!(!watch.observe(Some(t0), first));
+        assert!(!watch.observe(Some(t0), first + PACKET_PATH_STALL));
+        assert!(watch.observe(Some(t0), first + PACKET_PATH_STALL + s(5)));
+
+        // Not ticked yet, or ticking: nothing to suspect.
+        assert!(!watch.observe(None, first + s(60)));
+        assert!(!watch.observe(Some(first + s(59)), first + s(60)));
+        assert_eq!(STALL_CONFIRM, s(2));
     }
 
     #[test]

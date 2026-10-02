@@ -2209,14 +2209,14 @@ impl WintunTunnel {
             .is_some_and(|wg| wg.peer_unresponsive())
     }
 
-    /// Has the packet path stopped running? (see
-    /// `wireguard_new::packet_path_stalled`). False with no session.
-    pub async fn packet_path_stalled(&self) -> bool {
+    /// When the packet path last ticked (see `wireguard_new::StallWatch`).
+    /// `None` with no session.
+    pub async fn packet_path_tick(&self) -> Option<std::time::Instant> {
         self.wg_session
             .read()
             .await
             .as_ref()
-            .is_some_and(|wg| wg.packet_path_stalled())
+            .and_then(|wg| wg.last_tick())
     }
 
     /// Forget the unanswered-handshake run (after a resume).
