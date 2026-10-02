@@ -1394,10 +1394,12 @@ mod tests {
     /// the response type, and the config key is always the local one.
     #[test]
     fn connect_response_private_key_is_never_used() {
+        // Zero entropy on purpose, so no secret scanner reads it as a real key.
+        let server_sent_key = "k".repeat(44);
         let response: ConnectResponse = serde_json::from_value(serde_json::json!({
             "success": true,
             "keyId": "key-1",
-            "privateKey": "c2VydmVyLWdlbmVyYXRlZC1wcml2YXRlLWtleS0xMjM0NTY=",
+            "privateKey": server_sent_key,
             "publicKey": "pub",
             "assignedIp": "10.0.0.2",
             "serverPublicKey": "spk",
@@ -1410,10 +1412,7 @@ mod tests {
         let (config, _) =
             build_vpn_config(response, "server-1", None, local.clone(), 0, "auto").unwrap();
         assert_eq!(config.private_key, local);
-        assert_ne!(
-            config.private_key,
-            "c2VydmVyLWdlbmVyYXRlZC1wcml2YXRlLWtleS0xMjM0NTY="
-        );
+        assert_ne!(config.private_key, server_sent_key);
     }
 
     /// Contract §1: the exact key set of `VpnStatus`, camelCase throughout
