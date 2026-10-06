@@ -191,6 +191,28 @@ pub fn for_ipc(error: impl std::fmt::Display) -> String {
     sanitize_always(&error.to_string())
 }
 
+/// File extensions this app's errors and backtraces name, which the hostname
+/// pattern would otherwise take for a top-level domain. Three are also real
+/// ccTLDs/gTLDs (`.md`, `.rs`, `.zip`); no relay or service of ours lives
+/// under them, and a source path in a backtrace is worth more than covering
+/// a host there.
+const FILE_EXTENSIONS: &[&str] = &[
+    "bat", "cfg", "conf", "crt", "dat", "dll", "exe", "html", "ico", "ini", "js", "json", "lock",
+    "log", "md", "msi", "pem", "plist", "png", "ps1", "rs", "svg", "sys", "tmp", "toml", "ts",
+    "tsx", "txt", "xml", "yaml", "yml", "zip",
+];
+
+/// Whether a dotted name the hostname pattern matched, ending in `tld`, is a
+/// host (review of #222). DNS names reach error text lowercased (URLs are
+/// normalised), so a last label with a capital is a code identifier —
+/// `Windows.Security.Credentials.UI`, `System.IO.IOException` — and one in
+/// [`FILE_EXTENSIONS`] is a file: `tauri.conf.json`, `birdo-vpn.exe`,
+/// `src/vpn/tunnel.rs`. Both used to come out as `[redacted-host]`.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn looks_like_a_host(tld: &str) -> bool {
+    tld.bytes().all(|b| b.is_ascii_lowercase()) && !FILE_EXTENSIONS.contains(&tld)
+}
+
 /// The redaction itself, with NO `debug_assertions` escape hatch.
 ///
 /// [`sanitize_error`] is deliberately a pass-through in debug builds so a
@@ -223,9 +245,10 @@ pub fn sanitize_always(msg: &str) -> String {
         });
         // Matches common hostname patterns. P1-dk-redaction-incomplete: two
         // labels are enough ("birdo.app" is as identifying as "api.birdo.app"),
-        // so the repeated-label group is now optional.
+        // so the repeated-label group is now optional. The last label is
+        // captured for `looks_like_a_host`.
         static HOST_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){0,}\.[a-zA-Z]{2,}\b").expect("hostname regex")
+            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){0,}\.([a-zA-Z]{2,})\b").expect("hostname regex")
         });
         // P1-dk-redaction-incomplete: IPv6 literals. Two shapes — an expanded
         // run of >= 5 hex groups (>= 5 avoids matching hh:mm:ss timestamps),
@@ -294,7 +317,15 @@ pub fn sanitize_always(msg: &str) -> String {
             .replace_all(&result, "[redacted-email]")
             .to_string();
 
-        let result = HOST_RE.replace_all(&result, "[redacted-host]").to_string();
+        let result = HOST_RE
+            .replace_all(&result, |caps: &regex::Captures| {
+                if looks_like_a_host(&caps[1]) {
+                    "[redacted-host]".to_string()
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .to_string();
 
         // P2-20: Truncate to 200 chars (aligned with Android InputValidator.sanitizeErrorMessage)
         truncate_for_display(result)
@@ -428,6 +459,33 @@ mod tests {
             "connect [[redacted-ipv6]:[redacted-ipv4]]:443 refused"
         );
         assert_eq!(mask_ip("::ffff:185.199.110.153"), ":x:x:x:x:x:x:x");
+    }
+
+    /// Review of #222 (P3.6): file names and dotted code identifiers are not
+    /// hosts. They used to come out as `[redacted-host]`, which emptied
+    /// errors of what made them useful (and crash backtraces of their source
+    /// paths), while hosts are still redacted.
+    #[test]
+    fn file_names_and_code_identifiers_are_not_hosts() {
+        for readable in [
+            r"Failed to read C:\ProgramData\BirdoVPN\settings.json: access denied",
+            "birdo-vpn.exe exited with code 1",
+            "Windows.Security.Credentials.UI.UserConsentVerifier failed",
+            "System.IO.IOException: The process cannot access the file",
+            r"panicked at src\vpn\tunnel.rs:1182:9",
+            "tauri.conf.json is missing frontendDist",
+        ] {
+            assert_eq!(sanitize_always(readable), readable);
+        }
+        for host in [
+            "api.birdo.app",
+            "de-fra-01.birdo.app",
+            "vpn.example.com",
+            "birdo.app",
+        ] {
+            let out = sanitize_always(&format!("could not reach {host}: timed out"));
+            assert_eq!(out, "could not reach [redacted-host]: timed out", "{host}");
+        }
     }
 
     /// The point of splitting the two: a message with no address in it comes
