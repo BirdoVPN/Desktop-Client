@@ -224,6 +224,25 @@ fn looks_like_a_host(name: &str, tld: &str, after_separator: bool) -> bool {
         || (after_separator && EXTENSIONS_THAT_ARE_TLDS.contains(&tld.as_str())))
 }
 
+/// Whether a name that starts right after `before` follows a path separator:
+/// a `/`, or a run of `\` (a path printed with `{:?}` doubles them, and one
+/// printed twice doubles them again) with a path component before it. Not
+/// the `//` of a URL's `scheme://` (round 4 of the review of #222), and not
+/// the leading `\\` of a UNC path (`\\nas.example.zip\share`, round 5):
+/// what follows those is a host.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn follows_a_path_separator(before: &str) -> bool {
+    if let Some(rest) = before.strip_suffix('/') {
+        return !rest.ends_with('/');
+    }
+    let rest = before.trim_end_matches('\\');
+    rest.len() < before.len()
+        && rest
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_whitespace() && !"\"'`([<{=,".contains(c))
+}
+
 /// The redaction itself, with NO `debug_assertions` escape hatch.
 ///
 /// [`sanitize_error`] is deliberately a pass-through in debug builds so a
@@ -285,12 +304,11 @@ pub fn sanitize_always(msg: &str) -> String {
         // Round 3 of the review of #222: the account name in a home folder
         // (`C:\Users\Jane.Doe\…`, `/Users/jane/…`, `/home/jane/…`).
         static USER_DIR_RE: Lazy<Regex> = Lazy::new(|| {
-            // One or two backslashes: `{path:?}` prints `C:\\Users\\Jane\\…`
-            // (round 4 of the review).
-            Regex::new(
-                r#"(?i)(\b[a-z]:\\{1,2}users\\{1,2})[^\\/:*?"<>|\r\n]+|(/(?:Users|home)/)[^/\s:]+"#,
-            )
-            .expect("user folder regex")
+            // Any run of backslashes: `{path:?}` prints `C:\\Users\\Jane\\…`
+            // (round 4 of the review), and a message quoted twice doubles
+            // them again (round 5).
+            Regex::new(r#"(?i)(\b[a-z]:\\+users\\+)[^\\/:*?"<>|\r\n]+|(/(?:Users|home)/)[^/\s:]+"#)
+                .expect("user folder regex")
         });
         // P2-13: Strip stack traces (lines starting with "at " or Java-style exception patterns)
         static STACK_TRACE_RE: Lazy<Regex> =
@@ -351,12 +369,7 @@ pub fn sanitize_always(msg: &str) -> String {
         let result = HOST_RE
             .replace_all(&result, |caps: &regex::Captures| {
                 let start = caps.get(0).map_or(0, |m| m.start());
-                let before = &result[..start];
-                // A path separator, not the `//` of a URL's `scheme://`
-                // (round 4 of the review: `https://dns.example.rs/…` went
-                // through as a file).
-                let after_separator =
-                    before.ends_with('\\') || (before.ends_with('/') && !before.ends_with("//"));
+                let after_separator = follows_a_path_separator(&result[..start]);
                 if looks_like_a_host(&caps[0], &caps[1], after_separator) {
                     "[redacted-host]".to_string()
                 } else {
@@ -600,6 +613,30 @@ mod tests {
             sanitize_always("open file:///home/dev/src/main.rs failed"),
             "open file:///home/[redacted-user]/src/main.rs failed"
         );
+    }
+
+    /// Round 5 of the review (N6): a home folder in a message escaped twice
+    /// (`\\\\` between components) names no one either, and a UNC server is
+    /// a host even when its name ends in a file extension that is a TLD.
+    #[test]
+    fn doubly_escaped_home_folders_and_unc_hosts_are_redacted() {
+        assert_eq!(
+            sanitize_always(r#"save "C:\\\\Users\\\\jdoe\\\\AppData\\\\x.json" failed"#),
+            r#"save "C:\\\\Users\\\\[redacted-user]\\\\AppData\\\\x.json" failed"#
+        );
+        assert_eq!(
+            sanitize_always(r"open \\nas.example.zip\share\config.json failed"),
+            r"open \\[redacted-host]\share\config.json failed"
+        );
+        assert_eq!(
+            sanitize_always(r#"open "\\\\nas.example.rs\\share" failed"#),
+            r#"open "\\\\[redacted-host]\\share" failed"#
+        );
+        // A file after a separator, however escaped, is still a file.
+        for path in [r"src\vpn\tunnel.rs", r"src\\vpn\\tunnel.rs", r"C:\notes.md"] {
+            let msg = format!("panicked at {path}:12");
+            assert_eq!(sanitize_always(&msg), msg, "{path}");
+        }
     }
 
     /// The point of splitting the two: a message with no address in it comes

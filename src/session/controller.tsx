@@ -32,7 +32,7 @@ import {
   resetSessionData,
 } from '@/session/session-data';
 import { connectPreferred, findLiveServer } from '@/session/vpn-actions';
-import { persistSettings } from '@/session/settings-persist';
+import { persistSettings, watchKillSwitchAcrossDials } from '@/session/settings-persist';
 import { useCustomDnsGate } from '@/session/custom-dns-gate';
 import {
   connectionNotification,
@@ -427,6 +427,14 @@ function useQuotaWarning(): void {
   );
 }
 
+/**
+ * The kill switch toggle across dials (round 5 of the review of #222;
+ * `watchKillSwitchAcrossDials`).
+ */
+function useKillSwitchAcrossDials(): void {
+  useEffect(() => watchKillSwitchAcrossDials(), []);
+}
+
 /** Renderless. Mounted by App for the whole signed-in session. */
 export function VpnSessionController(): null {
   useStatusSync();
@@ -442,5 +450,6 @@ export function VpnSessionController(): null {
   useMultiHopPrune();
   useStealthFallbackNotice();
   useQuotaWarning();
+  useKillSwitchAcrossDials();
   return null;
 }
