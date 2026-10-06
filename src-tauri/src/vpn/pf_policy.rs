@@ -167,11 +167,16 @@ pub(crate) fn block_all_ruleset(b: &BlockAll<'_>) -> String {
     // switch exists to seal (P1-ks-macos-root-443-permit).
     //
     // The destination is now the table above: the DoH provider the app dials
-    // by address and the addresses it last resolved for its own hosts. What a
-    // root process can still reach on tcp/443 while blocked is those
-    // addresses, and nothing else. They are CDN addresses, so that is narrow,
-    // not empty. Without a single address there is no permit at all, and the
-    // re-dial fails closed. `keep state` so replies come back.
+    // by address, and every address a DoH answer gave our own hosts. That is
+    // narrower than `any`, but it is NOT narrow, and must not be described as
+    // if it were (P3-2): these are SHARED Cloudflare edge addresses — 1.1.1.1
+    // and its siblings, and the anycast front of api.birdo.app — and an edge
+    // serves every Cloudflare-hosted site by SNI. So a root process can most
+    // likely still reach other Cloudflare-hosted HTTPS sites on tcp/443
+    // through the block, from the real address. Only per-process scoping
+    // closes that, and pf has none. Without a single address there is no
+    // permit at all, and the re-dial fails closed. `keep state` so replies
+    // come back.
     if !b.control_plane.is_empty() {
         r.push_str(&format!(
             "pass out quick inet proto tcp to <{CONTROL_PLANE_TABLE}> port {CONTROL_PLANE_PORT} user {} keep state\n",
@@ -702,6 +707,22 @@ fn root_permits_are_scoped(text: &str) -> bool {
         .all(|l| l.contains(&table))
 }
 
+/// Every rule that mentions tcp/443 is the control-plane permit: scoped to
+/// the table AND to a user. Holds for our text (`port 443 user 0`) and pf's
+/// printout of it (`port = 443 user = 0`).
+#[cfg(test)]
+fn port_443_is_scoped(text: &str) -> bool {
+    let table = format!("<{CONTROL_PLANE_TABLE}>");
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.contains("port 443") || l.contains("port = 443"))
+        .all(|l| {
+            l.starts_with("pass out quick inet proto tcp")
+                && l.contains(&table)
+                && (l.contains(" user 0 ") || l.contains(" user = 0 "))
+        })
+}
+
 /// The utun interfaces `text` permits (`pass quick on utunN ...`), in order —
 /// our ruleset text and pf's printout of it alike.
 pub(crate) fn tunnel_permits(text: &str) -> Vec<String> {
@@ -774,6 +795,57 @@ mod tests {
         for shape in every_shape(&[DOH, API]) {
             let r = block_all_ruleset(&shape);
             assert!(root_permits_are_scoped(&r), "{r}");
+        }
+    }
+
+    /// P3-8: after `block drop all` there is NOTHING but the rules each input
+    /// asks for — an exhaustive whitelist, not a search for one bad rule. A
+    /// new permit (or a changed one: `to any`, a lost `user 0`) fails here.
+    #[test]
+    fn every_rule_after_the_block_is_whitelisted() {
+        for control_plane in [&[DOH, API][..], &[][..]] {
+            for shape in every_shape(control_plane) {
+                let r = block_all_ruleset(&shape);
+                let mut allowed = vec![
+                    "pass quick on lo0 all".to_string(),
+                    "pass out quick proto udp from any port 68 to any port 67 no state".to_string(),
+                    "pass in quick proto udp from any port 67 to any port 68 no state".to_string(),
+                ];
+                if let Some(t) = shape.tunnel_interface {
+                    allowed.push(format!("pass quick on {t} all"));
+                }
+                if shape.lan_sharing {
+                    allowed.push(
+                        "pass quick to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } no state"
+                            .to_string(),
+                    );
+                }
+                if !control_plane.is_empty() {
+                    allowed.push(
+                        "pass out quick inet proto tcp to <birdo_control> port 443 user 0 keep state"
+                            .to_string(),
+                    );
+                }
+                if let Some(ip) = shape.relay {
+                    allowed.push(format!(
+                        "pass out quick inet proto {{ udp tcp }} to {ip} keep state"
+                    ));
+                    allowed.push(format!(
+                        "pass in quick inet proto {{ udp tcp }} from {ip} keep state"
+                    ));
+                }
+                let after: Vec<&str> = r
+                    .lines()
+                    .skip_while(|l| *l != "block drop all")
+                    .skip(1)
+                    .collect();
+                let mut want: Vec<&str> = allowed.iter().map(String::as_str).collect();
+                let mut got = after.clone();
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(got, want, "unexpected permits in:\n{r}");
+                assert!(port_443_is_scoped(&r), "{r}");
+            }
         }
     }
 
@@ -1612,6 +1684,7 @@ mod pfctl_parse_tests {
                 "the control-plane permit must name the table:\n{printed}"
             );
             assert!(root_permits_are_scoped(&printed), "{printed}");
+            assert!(port_443_is_scoped(&printed), "{printed}");
         }
     }
 
@@ -1628,5 +1701,50 @@ mod pfctl_parse_tests {
         let printed = pfctl_parse(&rules);
         assert!(block_all_loaded(&printed), "{printed}");
         assert!(!printed.contains(" user "), "{printed}");
+    }
+
+    fn pfctl(args: &[&str]) -> std::process::Output {
+        Command::new("pfctl")
+            .args(args)
+            .output()
+            .expect("spawn pfctl")
+    }
+
+    fn pf_running() -> bool {
+        parse_enabled(&String::from_utf8_lossy(&pfctl(&["-s", "info"]).stdout))
+    }
+
+    /// P2-3 against the real pfctl: `-E` prints a token `parse_token` reads,
+    /// and `-X` of exactly that token leaves pf as it was. This takes and
+    /// drops one reference on the runner's pf, loading no rules.
+    #[test]
+    #[ignore = "needs root and macOS pfctl; run by tests.yml's pf parse-check step"]
+    fn a_pf_reference_round_trips_through_its_token() {
+        let before = pf_running();
+        let taken = pfctl(&["-E"]);
+        assert!(
+            taken.status.success(),
+            "pfctl -E: {}",
+            String::from_utf8_lossy(&taken.stderr)
+        );
+        let printed = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&taken.stdout),
+            String::from_utf8_lossy(&taken.stderr)
+        );
+        println!("--- pfctl -E printed ---\n{printed}");
+        let token = parse_token(&printed).expect("pfctl -E printed a token parse_token reads");
+        assert!(pf_running(), "a reference enables pf");
+        let released = pfctl(&["-X", &token.to_string()]);
+        assert!(
+            released.status.success(),
+            "pfctl -X {token}: {}",
+            String::from_utf8_lossy(&released.stderr)
+        );
+        assert_eq!(
+            pf_running(),
+            before,
+            "dropping our reference restores pf's state"
+        );
     }
 }
