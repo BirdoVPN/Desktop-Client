@@ -48,6 +48,10 @@ pub enum IpcErrorCode {
     NotElevated,
     Cancelled,
     ServerError,
+    /// The settings file cannot be verified right now (its signing key is
+    /// unreadable), so a save was refused rather than written over it. The UI
+    /// offers `reset_settings`.
+    SettingsUnverified,
     Unknown,
 }
 
@@ -358,6 +362,7 @@ mod tests {
             (IpcErrorCode::NotElevated, "not_elevated"),
             (IpcErrorCode::Cancelled, "cancelled"),
             (IpcErrorCode::ServerError, "server_error"),
+            (IpcErrorCode::SettingsUnverified, "settings_unverified"),
             (IpcErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in pairs {
@@ -659,8 +664,10 @@ mod tests {
                 }
             }
         }
+        // The settings commands answer an IpcError since the review of #222;
+        // these six still answer String.
         assert!(
-            string_commands >= 9,
+            string_commands >= 6,
             "the scan found {string_commands} commands"
         );
         assert!(

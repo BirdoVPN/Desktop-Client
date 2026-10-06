@@ -16,7 +16,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { settingsToRust } from '@/utils/helpers';
 import { useAppStore, type AppSettings, type ConnectionState } from '@/store/app-store';
 import { loadSettings } from '@/session/session-data';
-import { isSilentError } from '@/lib/errors';
+import { errorCopy, isSilentError } from '@/lib/errors';
 import { toIpcError } from '@/lib/ipc';
 
 const REAPPLY_DEBOUNCE_MS = 900;
@@ -159,7 +159,7 @@ export async function persistSettings(
   const next = { ...before, ...patch };
   try {
     await invoke('save_settings', { settings: settingsToRust(next) });
-  } catch {
+  } catch (e) {
     const current = useAppStore.getState().settings;
     const revert: Partial<AppSettings> = {};
     for (const key of keys) {
@@ -171,15 +171,44 @@ export async function persistSettings(
     // A background mirror the user never touched must not raise a notice
     // about "that setting"; it rolls back the same way and retries next time.
     if (!opts.quiet) {
-      useAppStore.getState().showNotice({
-        text: "Couldn't save that setting. It has been put back — please try again.",
-        tone: 'danger',
-      });
+      const err = toIpcError(e);
+      useAppStore.getState().showNotice(
+        err.code === 'settings_unverified'
+          ? {
+              text: errorCopy(err).message,
+              tone: 'danger',
+              actionLabel: 'Reset settings',
+              onAction: () => void resetSettings(),
+            }
+          : {
+              text: "Couldn't save that setting. It has been put back — please try again.",
+              tone: 'danger',
+            },
+      );
     }
     return false;
   }
   if (opts.reapply) scheduleReapply();
   return true;
+}
+
+/**
+ * The way out of `settings_unverified` (review of #222), run only when the
+ * user chooses it: Rust sets the file it cannot verify aside (kept on disk as
+ * settings.json.unverified) and saves the defaults, and the screen then shows
+ * what is saved.
+ */
+export async function resetSettings(): Promise<void> {
+  try {
+    await invoke('reset_settings');
+    await loadSettings();
+    useAppStore.getState().showNotice({ text: 'Your settings were reset to their defaults.', tone: 'info' });
+  } catch {
+    useAppStore.getState().showNotice({
+      text: "Couldn't reset your settings. Please try again.",
+      tone: 'danger',
+    });
+  }
 }
 
 /**

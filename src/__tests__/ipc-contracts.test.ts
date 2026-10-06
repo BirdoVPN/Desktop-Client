@@ -383,6 +383,7 @@ const FRONTEND_COMMANDS = [
   'get_settings',
   'save_settings',
   'set_autostart',
+  'reset_settings',
   'set_crash_reports_enabled',
   // Kill switch
   'set_killswitch_live',

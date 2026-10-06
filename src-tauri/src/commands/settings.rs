@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
-use crate::utils::redact::for_ipc;
+use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -505,10 +505,8 @@ fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
 
 /// Get current application settings
 #[tauri::command]
-pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
-    off_the_runtime(move || load_settings_sync(&app))
-        .await
-        .map_err(for_ipc)
+pub async fn get_settings(app: AppHandle) -> Result<AppSettings, IpcError> {
+    off_the_runtime(move || load_settings_sync(&app).map_err(IpcError::unknown)).await
 }
 
 /// Run a settings command's synchronous work on the blocking pool.
@@ -521,12 +519,15 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
 /// took — the same workers the status choke point, the reconnect loop and
 /// every other command need. `biometric.rs` moved its keystore calls the same
 /// way.
+///
+/// The commands answer an `IpcError` (whose message is always redacted), so
+/// a refusal can carry its own code: `settings_unverified`.
 async fn off_the_runtime<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, String> + Send + 'static,
-) -> Result<T, String> {
+    work: impl FnOnce() -> Result<T, IpcError> + Send + 'static,
+) -> Result<T, IpcError> {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|e| format!("Settings task failed: {e}"))?
+        .map_err(|e| IpcError::unknown(format!("Settings task failed: {e}")))?
 }
 
 /// Synchronous settings loader shared by the `get_settings` command and Rust
@@ -564,6 +565,12 @@ impl std::fmt::Display for LoadError {
 impl From<LoadError> for String {
     fn from(error: LoadError) -> Self {
         error.to_string()
+    }
+}
+
+impl From<LoadError> for IpcError {
+    fn from(error: LoadError) -> Self {
+        IpcError::unknown(error.to_string())
     }
 }
 
@@ -818,19 +825,17 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
 
 /// Save application settings
 #[tauri::command]
-pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool, String> {
-    off_the_runtime(move || save_settings_blocking(&app, &settings))
-        .await
-        .map_err(for_ipc)
+pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool, IpcError> {
+    off_the_runtime(move || save_settings_blocking(&app, &settings)).await
 }
 
 /// The whole-object save behind `save_settings`. Holds the settings lock
 /// across the check and the write, so a file cannot turn unverifiable in
 /// between.
-fn save_settings_blocking(app: &AppHandle, settings: &AppSettings) -> Result<bool, String> {
+fn save_settings_blocking(app: &AppHandle, settings: &AppSettings) -> Result<bool, IpcError> {
     let _write = SETTINGS_WRITE.lock();
     may_save_over(load_settings(app))?;
-    save_settings_inner(app, settings)?;
+    save_settings_inner(app, settings).map_err(IpcError::unknown)?;
     // Keep the live crash-reporting gate equal to what is on disk, whichever
     // screen saved.
     crate::utils::crash_report::set_opted_in(settings.crash_reports_enabled);
@@ -896,7 +901,9 @@ pub(crate) fn restore_tunnel_settings(
 /// other preference with defaults. The revert then fails, and the error the
 /// reapply met stands.
 fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, String> {
-    verified(loaded).map(|current| with_tunnel_settings_of(current, good))
+    verified(loaded)
+        .map(|current| with_tunnel_settings_of(current, good))
+        .map_err(|refusal| refusal.message)
 }
 
 /// What is saved, for a change made on top of it — or a refusal when the
@@ -904,12 +911,17 @@ fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, Stri
 /// (WIN3-010). Those are not the user's settings: written back, they replace
 /// every preference, and the save may mint a new signing key the old file
 /// never verifies against again.
-fn verified(loaded: Loaded) -> Result<AppSettings, String> {
+///
+/// The refusal has its own code, `settings_unverified` (review of #222): the
+/// UI offers a reset with it (`reset_settings`), the way out when the key
+/// source stays unreadable.
+fn verified(loaded: Loaded) -> Result<AppSettings, IpcError> {
     match loaded {
         Loaded::Saved(settings) => Ok(settings),
-        Loaded::Unverified(_) => {
-            Err("the settings file could not be verified, so it was left as it is".into())
-        }
+        Loaded::Unverified(_) => Err(IpcError::new(
+            IpcErrorCode::SettingsUnverified,
+            "the settings file could not be verified, so it was left as it is",
+        )),
     }
 }
 
@@ -927,7 +939,7 @@ fn verified(loaded: Loaded) -> Result<AppSettings, String> {
 /// not that (review of #222): an antivirus sharing violation looks the same
 /// to the caller, and the file behind it is usually the user's own. The save
 /// is refused, and the next one, once the file is readable again, goes ahead.
-fn may_save_over(loaded: Result<Loaded, LoadError>) -> Result<(), String> {
+fn may_save_over(loaded: Result<Loaded, LoadError>) -> Result<(), IpcError> {
     match loaded {
         Ok(loaded) => verified(loaded).map(drop),
         Err(LoadError::Unparseable(_)) => Ok(()),
@@ -962,37 +974,69 @@ fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSetti
 /// writes it back. Takes effect immediately in both directions (see
 /// `utils::crash_report`), so no restart is needed.
 #[tauri::command]
-pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<bool, IpcError> {
     off_the_runtime(move || {
         // MR-692: one field over what is saved — never over the defaults a
         // load serves while it cannot verify the file.
         let _write = SETTINGS_WRITE.lock();
         let mut settings = verified(load_settings(&app)?)?;
         settings.crash_reports_enabled = enabled;
-        save_settings_inner(&app, &settings)?;
+        save_settings_inner(&app, &settings).map_err(IpcError::unknown)?;
         crate::utils::crash_report::set_opted_in(enabled);
         Ok(enabled)
     })
     .await
-    .map_err(for_ipc)
+}
+
+/// Put the settings back to their defaults: the way out of a file that cannot
+/// be verified (`settings_unverified`) when its key source stays unreadable,
+/// offered by the UI and run only when the user chooses it.
+///
+/// The file is set aside as settings.json.unverified, never deleted, so the
+/// user's settings are still on disk should the key come back. The defaults
+/// are then saved like any save: with the credential store unreachable that
+/// signs them with a new key in the key file, which the store adopts once it
+/// answers again (`sync_hmac_key_sources`).
+#[tauri::command]
+pub async fn reset_settings(app: AppHandle) -> Result<AppSettings, IpcError> {
+    off_the_runtime(move || {
+        let _write = SETTINGS_WRITE.lock();
+        let path = get_settings_path(&app).map_err(IpcError::unknown)?;
+        set_aside(&path)?;
+        let defaults = AppSettings::default();
+        save_settings_inner(&app, &defaults).map_err(IpcError::unknown)?;
+        crate::utils::crash_report::set_opted_in(defaults.crash_reports_enabled);
+        tracing::warn!("Settings reset to their defaults at the user's request");
+        Ok(defaults)
+    })
+    .await
+}
+
+/// Move settings.json aside as settings.json.unverified (nothing to do when
+/// there is none).
+fn set_aside(path: &Path) -> Result<(), IpcError> {
+    match fs::rename(path, path.with_file_name("settings.json.unverified")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(IpcError::unknown(format!(
+            "Could not set the settings file aside: {e}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Enable or disable autostart
 #[tauri::command]
-pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    off_the_runtime(move || set_autostart_blocking(&app, enabled))
-        .await
-        .map_err(for_ipc)
+pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, IpcError> {
+    off_the_runtime(move || set_autostart_blocking(&app, enabled)).await
 }
 
-fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, String> {
+fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, IpcError> {
     // MR-692: read first. A file that cannot be verified is not saved over,
     // and the launch task is not changed for a setting that cannot be saved.
     let _write = SETTINGS_WRITE.lock();
     let mut settings = verified(load_settings(app)?)?;
 
     #[cfg(windows)]
-    set_autostart_windows(app, enabled)?;
+    set_autostart_windows(app, enabled).map_err(IpcError::unknown)?;
 
     #[cfg(not(windows))]
     {
@@ -1003,17 +1047,17 @@ fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, String
         if enabled {
             autostart
                 .enable()
-                .map_err(|e| format!("Failed to enable autostart: {}", e))?;
+                .map_err(|e| IpcError::unknown(format!("Failed to enable autostart: {}", e)))?;
         } else {
             autostart
                 .disable()
-                .map_err(|e| format!("Failed to disable autostart: {}", e))?;
+                .map_err(|e| IpcError::unknown(format!("Failed to disable autostart: {}", e)))?;
         }
     }
 
     // Also update settings file
     settings.autostart = enabled;
-    save_settings_inner(app, &settings)?;
+    save_settings_inner(app, &settings).map_err(IpcError::unknown)?;
 
     Ok(true)
 }
@@ -1738,7 +1782,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let work = off_the_runtime(move || {
             rx.recv_timeout(std::time::Duration::from_secs(5))
-                .map_err(|e| e.to_string())
+                .map_err(|e| IpcError::unknown(e.to_string()))
         });
         let other_task = async move {
             tokio::task::yield_now().await;
@@ -1789,9 +1833,39 @@ mod tests {
             .expect("the read");
         assert!(
             read < autostart
-                .find("set_autostart_windows(app, enabled)?")
+                .find("set_autostart_windows(app, enabled)")
                 .unwrap()
         );
+    }
+
+    /// Review of #222 (P2): the refusal carries its own code, so the UI can
+    /// say what happened and offer a reset instead of "please try again".
+    #[test]
+    fn a_refused_save_says_the_file_could_not_be_verified() {
+        let refusal =
+            may_save_over(Ok(Loaded::Unverified(AppSettings::default()))).expect_err("refused");
+        assert_eq!(refusal.code, IpcErrorCode::SettingsUnverified);
+        assert_eq!(
+            verified(Loaded::Unverified(AppSettings::default()))
+                .expect_err("refused")
+                .code,
+            IpcErrorCode::SettingsUnverified
+        );
+        // Anything else that stops a save is not that.
+        let unreadable = may_save_over(Err(LoadError::Unreadable("busy".into())));
+        assert_eq!(unreadable.expect_err("refused").code, IpcErrorCode::Unknown);
+    }
+
+    /// The reset keeps the unverifiable file on disk, and tolerates none.
+    #[test]
+    fn a_reset_sets_the_unverifiable_file_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        assert_eq!(set_aside(&path), Ok(()));
+        assert!(!path.exists());
+        assert!(dir.path().join("settings.json.unverified").exists());
+        assert_eq!(set_aside(&path), Ok(()), "nothing to set aside is fine");
     }
 
     /// Review of #222 (P3.7): a settings file that could not be READ is not

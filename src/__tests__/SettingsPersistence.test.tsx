@@ -28,6 +28,7 @@ import {
 } from '@/session/settings-persist';
 import { settingsToRust } from '@/utils/helpers';
 import { resetUpdater } from '@/session/updater';
+import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
@@ -188,6 +189,47 @@ describe('Custom DNS follows the server flag for the plan (client-config feature
     expect(toggle).toHaveAttribute('aria-checked', 'true');
     expect(toggle).not.toHaveAttribute('aria-disabled', 'true');
     expect(screen.getByRole('textbox', { name: 'Primary DNS' })).toBeInTheDocument();
+  });
+});
+
+describe('a settings file that cannot be verified (review of #222)', () => {
+  const unverified = {
+    code: 'settings_unverified',
+    message: 'the settings file could not be verified, so it was left as it is',
+    retryable: true,
+    retry_after_secs: null,
+  };
+
+  it('says so instead of "please try again", and offers the reset', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'save_settings') throw unverified;
+      return undefined;
+    });
+    expect(await persistSettings({ autoConnect: true })).toBe(false);
+    const notice = useAppStore.getState().notice;
+    expect(notice?.text).toBe(SETTINGS_UNVERIFIED_COPY);
+    expect(notice?.actionLabel).toBe('Reset settings');
+    expect(useAppStore.getState().settings.autoConnect).toBe(defaultSettings.autoConnect);
+
+    // The reset runs only when chosen, and then shows what is saved.
+    expect(mockedInvoke.mock.calls.some(([c]) => c === 'reset_settings')).toBe(false);
+    notice?.onAction?.();
+    await waitFor(() => {
+      const order = mockedInvoke.mock.calls.map(([c]) => c);
+      expect(order.indexOf('reset_settings')).toBeGreaterThan(-1);
+      expect(order.lastIndexOf('get_settings')).toBeGreaterThan(order.indexOf('reset_settings'));
+    });
+  });
+
+  it('any other failed save keeps the plain message, with no reset', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'save_settings') throw { ...unverified, code: 'unknown' };
+      return undefined;
+    });
+    await persistSettings({ autoConnect: true });
+    const notice = useAppStore.getState().notice;
+    expect(notice?.text).toMatch(/Couldn't save that setting/);
+    expect(notice?.actionLabel).toBeUndefined();
   });
 });
 

@@ -41,6 +41,7 @@ export type IpcErrorCode =
   | 'not_elevated'
   | 'cancelled'
   | 'server_error'
+  | 'settings_unverified'
   | 'unknown';
 
 const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
@@ -65,6 +66,7 @@ const ERROR_CODES: ReadonlySet<string> = new Set<IpcErrorCode>([
   'not_elevated',
   'cancelled',
   'server_error',
+  'settings_unverified',
   'unknown',
 ]);
 

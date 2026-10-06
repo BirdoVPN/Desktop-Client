@@ -625,6 +625,7 @@ fn main() {
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::set_autostart,
+            commands::settings::reset_settings,
             commands::settings::set_crash_reports_enabled,
             // Kill switch
             commands::killswitch::get_killswitch_status,
