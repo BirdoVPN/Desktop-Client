@@ -1176,8 +1176,8 @@ impl WintunTunnel {
                     // never permits a stale/freed LUID. On a fresh connect the block
                     // is not active yet — arm() does the first activation. Through
                     // the kill switch, which reads the user's intent before and after
-                    // the load: a Kill Switch OFF that lifted the block between the
-                    // check here and the rebuild must not be undone by it.
+                    // the load: with the kill switch turned off, the block that is up
+                    // is lifted rather than re-baked.
                     if crate::vpn::wfp::is_lockdown_mode() && crate::vpn::wfp::is_blocking() {
                         if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
                             tracing::error!(

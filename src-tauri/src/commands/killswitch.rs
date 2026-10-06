@@ -27,6 +27,16 @@ use crate::vpn::manager::VpnManager;
 /// Active/blocking state is delegated entirely to wfp.rs.
 static KILLSWITCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Held by everything that WRITES the intent — `arm` from reading the
+/// preference to storing it, the live OFF, `disarm` — and by the re-check
+/// that lifts a block the intent no longer wants (review of #222). Without
+/// it an OFF that landed between `arm`'s read of the preference and its
+/// store was overwritten, and an ON that landed between the re-check's read
+/// and its lift lost its block. Never held across an activation's own lock
+/// attempt: the re-check takes it only when it found the intent off, and the
+/// writers that activate (`arm`) have just stored it on.
+static INTENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Global state for kill switch - stores allowed VPN server IP
 static VPN_SERVER_IP: once_cell::sync::Lazy<Arc<RwLock<Option<Ipv4Addr>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
@@ -92,13 +102,19 @@ pub fn platform_is_blocking() -> bool {
 /// service when the VPN drops unexpectedly. Kept as a plain async fn to shrink
 /// the IPC attack surface (the frontend never invoked it).
 pub async fn activate_killswitch() -> Result<bool, String> {
-    let result = unless_turned_off(activate_platform_block(), deactivate_platform_block).await;
+    let result = unless_turned_off(
+        activate_platform_block(),
+        deactivate_platform_block,
+        platform_is_blocking,
+    )
+    .await;
     blocking_may_have_changed();
     result
 }
 
-/// Run `engage` (which reports whether it put a block up), then make sure the
-/// user still wants it, lifting it through `lift` if not.
+/// Run `engage`, then apply the one rule for the intent: intent OFF plus a
+/// block up (`blocking`) means lift, through `lift` — whatever `engage`
+/// reported.
 ///
 /// An activation reads `KILLSWITCH_ENABLED` BEFORE its firewall load, and the
 /// block is only reported as up (`platform_is_blocking()`) once the load has
@@ -111,17 +127,37 @@ pub async fn activate_killswitch() -> Result<bool, String> {
 /// give-up. Re-reading the intent after the load closes the window from this
 /// side, as the OFF's own `platform_is_blocking()` check closes it from the
 /// other: with both SeqCst, at least one of the two sees the other's write.
-async fn unless_turned_off<E, L, LF>(engage: E, lift: L) -> Result<bool, String>
+///
+/// Review of #222: the rule asks whether a block IS up, not whether this
+/// engage put one up — a refresh that failed keeps the previous block, a
+/// partial iptables load leaves its chains (and reports an error), a rebuild
+/// around a new relay or tunnel LUID reports nothing engaged. And the
+/// re-check runs under [`INTENT`], so an ON that lands between it and the
+/// lift keeps its block instead of losing it.
+async fn unless_turned_off<E, L, LF>(
+    engage: E,
+    lift: L,
+    blocking: impl Fn() -> bool,
+) -> Result<bool, String>
 where
     E: std::future::Future<Output = Result<bool, String>>,
     L: FnOnce() -> LF,
     LF: std::future::Future<Output = Result<bool, String>>,
 {
-    let engaged = engage.await?;
-    if !engaged || KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
-        return Ok(engaged);
+    let engaged = engage.await;
+    if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+        return engaged;
     }
-    tracing::info!("The kill switch was turned off while its block went up — lifting it");
+    let _intent = INTENT.lock().await;
+    if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+        // An ON landed meanwhile: what is up is its block now.
+        return engaged;
+    }
+    if !blocking() {
+        // Nothing up, and nothing wanted: whatever the engage met is moot.
+        return Ok(false);
+    }
+    tracing::info!("The kill switch is off and its block is up — lifting it");
     lift().await.map(|_| false)
 }
 
@@ -178,6 +214,7 @@ pub(crate) async fn move_relay(
     let result = unless_turned_off(
         async move { wfp::move_relay(relay, engage).await.map(|()| engage) },
         deactivate_platform_block,
+        platform_is_blocking,
     )
     .await
     .map(|_| ());
@@ -265,25 +302,47 @@ pub async fn set_killswitch_live(
             .await
             .map_err(|e| IpcError::new(IpcErrorCode::KillswitchFailed, e))
     } else {
-        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
-
-        // F-018: lift any block that is currently up, on EVERY platform. This
-        // branch used to be `#[cfg(windows)]`-only, so on macOS/Linux turning the
-        // kill switch off while the tunnel was Reconnecting/Error (i.e. with the
-        // reactive block installed) cleared the intent flag but left the firewall
-        // block in place — the machine stayed fully firewalled off until the
-        // tunnel recovered, the retry budget ran out, or the user hit Disconnect.
-        //
-        // On macOS this does NOT lift the F-001 IPv6 leak block: that block is
-        // owned by the tunnel session, not the kill switch, so `deactivate` falls
-        // back to it rather than to `/etc/pf.conf`.
-        if platform_is_blocking() {
-            let _ = deactivate_killswitch().await;
-        }
-
-        tracing::info!("Kill switch softened live (intent cleared, any block lifted)");
-        Ok(true)
+        // Review of #222: a lift that failed used to be dropped here and the
+        // OFF reported as applied, with the machine still blocked. It is an
+        // error now, so the UI says the change could not be applied.
+        turn_off(deactivate_killswitch, platform_is_blocking)
+            .await
+            .map_err(|e| {
+                IpcError::new(
+                    IpcErrorCode::KillswitchFailed,
+                    format!("The kill switch could not be turned off: {e}"),
+                )
+            })
     }
+}
+
+/// The live OFF: clear the intent and lift any block that is up, under
+/// [`INTENT`] — so an `arm` that read the preference before it was turned off
+/// finishes first and is then undone, instead of storing its ON over this OFF.
+async fn turn_off<L, LF>(lift: L, blocking: impl Fn() -> bool) -> Result<bool, String>
+where
+    L: FnOnce() -> LF,
+    LF: std::future::Future<Output = Result<bool, String>>,
+{
+    let _intent = INTENT.lock().await;
+    KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+
+    // F-018: lift any block that is currently up, on EVERY platform. This
+    // branch used to be `#[cfg(windows)]`-only, so on macOS/Linux turning the
+    // kill switch off while the tunnel was Reconnecting/Error (i.e. with the
+    // reactive block installed) cleared the intent flag but left the firewall
+    // block in place — the machine stayed fully firewalled off until the
+    // tunnel recovered, the retry budget ran out, or the user hit Disconnect.
+    //
+    // On macOS this does NOT lift the F-001 IPv6 leak block: that block is
+    // owned by the tunnel session, not the kill switch, so `deactivate` falls
+    // back to it rather than to `/etc/pf.conf`.
+    if blocking() {
+        lift().await?;
+    }
+
+    tracing::info!("Kill switch softened live (intent cleared, any block lifted)");
+    Ok(true)
 }
 
 /// Get kill switch status
@@ -425,10 +484,17 @@ pub fn holds_block_while_connected() -> bool {
 /// requires administrator) logs and returns `Ok(false)` rather than failing the
 /// whole connection.
 pub async fn arm(app: &AppHandle) -> Result<bool, String> {
+    // Review of #222: from reading the preference to storing the intent is one
+    // critical section. An OFF that lands in between (the toggle during
+    // `connecting`) waits for it and then clears what it stored; unserialised,
+    // the stale ON was stored over the OFF.
+    let _intent = INTENT.lock().await;
     // Respect the user's kill-switch preference (default ON). Reading it here —
     // the single choke-point every connect path funnels through — keeps all call
     // sites consistent. Fail SAFE: if settings can't be read, treat as enabled.
-    let enabled = crate::commands::settings::load_settings_sync(app)
+    // Read on the blocking pool: it is file and credential-store I/O.
+    let enabled = crate::commands::settings::load_settings_off_runtime(app)
+        .await
         .map(|s| s.killswitch_enabled)
         .unwrap_or(true);
     arm_with_preference(enabled).await
@@ -562,7 +628,10 @@ async fn arm_with_preference(enabled: bool) -> Result<bool, String> {
 /// user-initiated disconnect path so disconnecting can never strand the machine
 /// behind an active block-all filter set.
 pub async fn disarm() -> Result<(), String> {
-    let result = disarm_platform().await;
+    let result = {
+        let _intent = INTENT.lock().await;
+        disarm_platform().await
+    };
     blocking_may_have_changed();
     result
 }
@@ -1076,7 +1145,16 @@ mod tests {
 
     /// Every test that writes `KILLSWITCH_ENABLED` holds this, so one test's
     /// armed intent is never another's precondition.
-    static INTENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static FLAG_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn lift_into(
+        lifted: &'static AtomicBool,
+    ) -> impl FnOnce() -> std::future::Ready<Result<bool, String>> {
+        move || {
+            lifted.store(true, Ordering::SeqCst);
+            std::future::ready(Ok(true))
+        }
+    }
 
     /// F3: an OFF preference must clear a stale armed intent (left by the
     /// auto-reconnect give-up branch, which lifts the block but never clears
@@ -1085,7 +1163,7 @@ mod tests {
     /// block-all engaged for the rest of the session.
     #[tokio::test]
     async fn arm_with_preference_off_clears_stale_armed_intent() {
-        let _intent = INTENT.lock().await;
+        let _tests = FLAG_TESTS.lock().await;
         KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
         assert!(
             is_enabled(),
@@ -1110,7 +1188,7 @@ mod tests {
     /// report that none is held.
     #[tokio::test]
     async fn an_off_that_lands_while_the_block_goes_up_lifts_it() {
-        let _intent = INTENT.lock().await;
+        let _tests = FLAG_TESTS.lock().await;
         KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
         let lifted = AtomicBool::new(false);
 
@@ -1125,6 +1203,7 @@ mod tests {
                 lifted.store(true, Ordering::SeqCst);
                 Ok(true)
             },
+            || true,
         )
         .await;
 
@@ -1136,43 +1215,157 @@ mod tests {
     }
 
     /// The re-check lifts only what the user turned off: an intent still on
-    /// keeps its block, and an activation that put nothing up (the intent was
-    /// already off, or the load failed) has nothing to lift.
+    /// keeps its block, and with nothing up there is nothing to lift (and
+    /// nothing failed that the user still wants).
     #[tokio::test]
     async fn the_recheck_lifts_nothing_the_user_still_wants() {
-        let _intent = INTENT.lock().await;
-        let lift = |lifted: &'static AtomicBool| {
-            move || async move {
-                lifted.store(true, Ordering::SeqCst);
-                Ok(true)
-            }
-        };
+        let _tests = FLAG_TESTS.lock().await;
 
         static KEPT: AtomicBool = AtomicBool::new(false);
         KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
-        assert_eq!(
-            unless_turned_off(async { Ok(true) }, lift(&KEPT)).await,
-            Ok(true)
-        );
+        let kept = unless_turned_off(async { Ok(true) }, lift_into(&KEPT), || true);
+        assert_eq!(kept.await, Ok(true));
         assert!(
             !KEPT.load(Ordering::SeqCst),
             "the switch is on: the block stays"
         );
-
-        static SKIPPED: AtomicBool = AtomicBool::new(false);
-        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
-        assert_eq!(
-            unless_turned_off(async { Ok(false) }, lift(&SKIPPED)).await,
-            Ok(false)
+        let failed = unless_turned_off(
+            async { Err("load failed".into()) },
+            lift_into(&KEPT),
+            || true,
         );
-        assert!(!SKIPPED.load(Ordering::SeqCst), "no block went up");
+        assert_eq!(
+            failed.await,
+            Err("load failed".to_string()),
+            "still wanted: reported"
+        );
 
-        static FAILED: AtomicBool = AtomicBool::new(false);
-        let failed = unless_turned_off(async { Err("load failed".to_string()) }, lift(&FAILED));
-        assert_eq!(failed.await, Err("load failed".to_string()));
+        static NOTHING_UP: AtomicBool = AtomicBool::new(false);
+        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+        let skipped = unless_turned_off(async { Ok(false) }, lift_into(&NOTHING_UP), || false);
+        assert_eq!(skipped.await, Ok(false));
+        let moot = unless_turned_off(
+            async { Err("load failed".into()) },
+            lift_into(&NOTHING_UP),
+            || false,
+        );
+        assert_eq!(
+            moot.await,
+            Ok(false),
+            "off, and nothing up: nothing to report"
+        );
+        assert!(!NOTHING_UP.load(Ordering::SeqCst));
+    }
+
+    /// Review of #222 (P3.1): intent OFF plus a block up means lift, whatever
+    /// the engage reported. A partial iptables load answers an error with its
+    /// chains in place; a rebuild around a new relay or tunnel LUID engages
+    /// nothing new. The old re-check looked at what the engage reported, and
+    /// left both up.
+    #[tokio::test]
+    async fn an_off_with_a_block_up_lifts_it_whatever_the_engage_reported() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+
+        static AFTER_ERROR: AtomicBool = AtomicBool::new(false);
+        let partial = unless_turned_off(
+            async { Err("ip6tables hook failed".into()) },
+            lift_into(&AFTER_ERROR),
+            || true,
+        );
+        assert_eq!(partial.await, Ok(false));
         assert!(
-            !FAILED.load(Ordering::SeqCst),
-            "a failed load is reported as such"
+            AFTER_ERROR.load(Ordering::SeqCst),
+            "the partial block is lifted"
+        );
+
+        static REBUILT: AtomicBool = AtomicBool::new(false);
+        let rebuilt = unless_turned_off(async { Ok(false) }, lift_into(&REBUILT), || true);
+        assert_eq!(rebuilt.await, Ok(false));
+        assert!(
+            REBUILT.load(Ordering::SeqCst),
+            "the rebuilt block is lifted"
+        );
+    }
+
+    /// Review of #222 (P3.2): OFF, then ON, both inside one activation's
+    /// load. The re-check sees the OFF; the ON (an `arm`, holding [`INTENT`])
+    /// stores its intent and engages its block; the re-check, waiting on the
+    /// lock, then sees the ON and leaves the block alone. Unlocked, it lifted
+    /// the ON's block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_on_that_lands_during_the_recheck_keeps_its_block() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+        static LIFTED: AtomicBool = AtomicBool::new(false);
+
+        let arm_in_progress = INTENT.lock().await;
+        let recheck = unless_turned_off(
+            async {
+                KILLSWITCH_ENABLED.store(false, Ordering::SeqCst); // the OFF
+                Ok(true)
+            },
+            lift_into(&LIFTED),
+            || true,
+        );
+        let the_on = async move {
+            tokio::task::yield_now().await;
+            KILLSWITCH_ENABLED.store(true, Ordering::SeqCst); // arm stores the ON
+            drop(arm_in_progress);
+        };
+        let (result, ()) = tokio::join!(recheck, the_on);
+
+        assert_eq!(result, Ok(true));
+        assert!(!LIFTED.load(Ordering::SeqCst), "the ON's block was lifted");
+        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+    }
+
+    /// Review of #222 (P3.3): the toggle turned OFF during `connecting`, while
+    /// `arm` (holding [`INTENT`] from its preference read to its store) still
+    /// had the ON it read. The OFF waits for it and wins. Unlocked, the OFF
+    /// cleared the intent first and `arm` then stored its stale ON over it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_off_during_arm_waits_for_it_and_wins() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+
+        let arm_in_progress = INTENT.lock().await;
+        let off = turn_off(|| std::future::ready(Ok(true)), || false);
+        let arm_finishes = async move {
+            tokio::task::yield_now().await;
+            KILLSWITCH_ENABLED.store(true, Ordering::SeqCst); // the stale ON
+            drop(arm_in_progress);
+        };
+        let (result, ()) = tokio::join!(off, arm_finishes);
+
+        assert_eq!(result, Ok(true));
+        assert!(!is_enabled(), "the OFF must be the last word");
+
+        // And `arm` really holds the lock from the read to the store.
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let arm = &source[source.find("pub async fn arm(app: &AppHandle)").unwrap()..];
+        let arm = &arm[..arm.find("\n}\n").unwrap()];
+        let lock = arm.find("INTENT.lock().await").expect("arm takes the lock");
+        assert!(lock < arm.find("load_settings_off_runtime(app)").unwrap());
+        assert!(lock < arm.find("arm_with_preference(enabled)").unwrap());
+    }
+
+    /// Review of #222 (P3.1): a live OFF whose lift fails says so. It used to
+    /// be dropped and the OFF reported as applied, with the block still up.
+    #[tokio::test]
+    async fn an_off_whose_lift_fails_says_so() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+        let off = turn_off(
+            || std::future::ready(Err("WFP transaction failed".into())),
+            || true,
+        );
+        assert_eq!(off.await, Err("WFP transaction failed".to_string()));
+        assert!(!is_enabled(), "the intent is cleared either way");
+
+        assert_eq!(
+            turn_off(|| std::future::ready(Ok(true)), || false).await,
+            Ok(true)
         );
     }
 
@@ -1189,8 +1382,8 @@ mod tests {
         let live = &source[source.find("pub async fn set_killswitch_live(").unwrap()..];
         let live = &live[..live.find("\n}\n").unwrap()];
         let off = live
-            .find("KILLSWITCH_ENABLED.store(false")
-            .expect("the OFF clears the intent");
+            .find("turn_off(deactivate_killswitch, platform_is_blocking)")
+            .expect("the OFF clears the intent and lifts");
         let gate = live
             .find("no active session")
             .expect("ON still waits for a session");
@@ -1204,6 +1397,8 @@ mod tests {
 
     /// Row 1: every block-all goes up through this module, where the intent
     /// is read before the load and re-read after it ([`unless_turned_off`]).
+    /// The backends are scanned too, except wfp.rs, whose functions are the
+    /// ones named here.
     /// The lockdown re-bake in tunnel.rs called `wfp::activate_blocking`
     /// directly, so an OFF that lifted the block just before it ran was
     /// undone for the rest of the session.
@@ -1226,19 +1421,18 @@ mod tests {
                     .replace('\\', "/");
                 // The backends themselves, and this module.
                 if !rel.ends_with(".rs")
-                    || [
-                        "commands/killswitch.rs",
-                        "vpn/wfp.rs",
-                        "vpn/firewall_linux.rs",
-                    ]
-                    .contains(&rel.as_str())
+                    || ["commands/killswitch.rs", "vpn/wfp.rs"].contains(&rel.as_str())
                 {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
+                // Review of #222 (P3.4): Linux re-armed around a new relay
+                // through firewall_linux::update_vpn_server, which re-loaded
+                // the block with no look at the intent.
                 for call in [
                     "wfp::activate_blocking(",
                     "firewall_linux::activate_blocking(",
+                    "update_vpn_server(",
                 ] {
                     if text.contains(call) {
                         offenders.push(format!("{rel}: {call}"));

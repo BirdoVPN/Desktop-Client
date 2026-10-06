@@ -539,6 +539,16 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
         .map_err(String::from)
 }
 
+/// [`load_settings_sync`] on the blocking pool, for async Rust callers such as
+/// the kill switch's `arm` (review of #222): the load is file and
+/// credential-store I/O, and must not park a runtime worker.
+pub(crate) async fn load_settings_off_runtime(app: &AppHandle) -> Result<AppSettings, String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || load_settings_sync(&app))
+        .await
+        .map_err(|e| format!("Settings task failed: {e}"))?
+}
+
 /// Why a load produced no settings at all.
 #[derive(Debug, PartialEq)]
 enum LoadError {
