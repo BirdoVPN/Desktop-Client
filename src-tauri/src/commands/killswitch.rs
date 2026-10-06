@@ -770,6 +770,8 @@ fn pf_load_ruleset(rules: &str) -> Result<(), String> {
 /// enabled/lockdown setting — exactly as Windows blocks IPv6 at tunnel start.
 #[cfg(target_os = "macos")]
 pub async fn ipv6_block_activate() -> Result<(), String> {
+    // N6: the leak block is watched too, kill switch on or off.
+    ensure_pf_watchdog();
     let mut pf = PF.lock().await;
     let result = pf.ipv6_on(&Pfctl);
     mirror(&pf);
@@ -948,7 +950,7 @@ fn ensure_pf_watchdog() {
 #[cfg(target_os = "macos")]
 async fn pf_watchdog_tick() {
     let mut pf = PF.lock().await;
-    let wanted = pf.wanted;
+    let (loaded, wanted) = (pf.loaded, pf.wanted);
     let outcome = pf.watchdog(&Pfctl, pf_inputs);
     mirror(&pf);
     drop(pf);
@@ -956,6 +958,9 @@ async fn pf_watchdog_tick() {
         return;
     };
     match result {
+        Ok(()) if !loaded => tracing::warn!(
+            "Kill switch watchdog: something else had disabled or replaced the IPv6 leak block; restored"
+        ),
         Ok(()) if wanted => tracing::warn!(
             "Kill switch watchdog: something else had disabled or replaced the pf block; restored"
         ),

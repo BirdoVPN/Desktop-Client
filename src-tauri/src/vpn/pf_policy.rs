@@ -245,6 +245,16 @@ pub(crate) fn block_all_loaded(live_rules: &str) -> bool {
         .any(|l| l.trim_start().starts_with(&line))
 }
 
+/// Whether `live_rules` carries OUR marker anchor (`anchor "com.birdo.vpn"`),
+/// as both the block-all and the IPv6 leak block do. Exact: the block-all's
+/// own `com.birdo.vpn.blockall` anchor does not count.
+pub(crate) fn marker_loaded(live_rules: &str) -> bool {
+    let line = format!("anchor \"{MARKER_ANCHOR}\"");
+    live_rules
+        .lines()
+        .any(|l| l.trim_start().starts_with(&line))
+}
+
 /// The pfctl operations the kill switch sequences: `pfctl` itself on macOS
 /// (`killswitch::Pfctl`), a scripted fake in the tests below. A READ that
 /// fails is an `Err`, never an empty answer: an unreadable pf is not a pf
@@ -294,6 +304,8 @@ pub(crate) struct Observed {
     pub block_all_loaded: bool,
     /// The live ruleset has IPv6 rules (the leak block always does).
     pub has_inet6: bool,
+    /// Our marker anchor is loaded (the block-all or the IPv6 leak block).
+    pub marker_loaded: bool,
     /// The utun interfaces the live ruleset permits (MR-1125, P2-1).
     pub tunnel_permits: Vec<String>,
 }
@@ -307,6 +319,7 @@ impl Observed {
             enabled: parse_enabled(&info),
             block_all_loaded: block_all_loaded(&rules),
             has_inet6: rules.contains("inet6"),
+            marker_loaded: marker_loaded(&rules),
             tunnel_permits: tunnel_permits(&rules),
         })
     }
@@ -564,7 +577,7 @@ impl PfState {
         inputs: impl FnOnce() -> Inputs,
     ) -> Option<Result<(), String>> {
         if !self.loaded {
-            return None;
+            return self.watch_ipv6_baseline(pf);
         }
         if !self.wanted {
             return Some(self.disengage(pf));
@@ -575,6 +588,25 @@ impl PfState {
             return None;
         }
         Some(self.engage(pf, &inputs()))
+    }
+
+    /// N6: the F-001 IPv6 leak block, watched like the kill switch's block.
+    /// It is pf's whole ruleset for the session whenever no block-all is
+    /// loaded, and another tool's `pfctl -f` or `pfctl -d` used to remove it
+    /// for good — IPv6 back on the physical NIC, silently, for the rest of
+    /// the session. Re-loaded when pf is off or our ruleset is not there.
+    fn watch_ipv6_baseline(&mut self, pf: &impl Pf) -> Option<Result<(), String>> {
+        if !self.ipv6_baseline {
+            return None;
+        }
+        let seen = Observed::read(pf);
+        if seen
+            .as_ref()
+            .is_ok_and(|s| s.enabled && s.marker_loaded && s.has_inet6)
+        {
+            return None;
+        }
+        Some(self.load_ipv6_baseline(pf))
     }
 
     /// Engage the block-all if the kill switch is armed — `intent` read under
@@ -1723,6 +1755,59 @@ mod tests {
             tunnel_permits(&pf.rules().unwrap()),
             vec!["utun4".to_string()]
         );
+    }
+
+    // ── N6: the IPv6 leak block is watched too ─────────────────────────
+
+    fn ipv6_only() -> (FakePf, PfState) {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        assert_eq!(state.ipv6_on(&pf), Ok(()));
+        (pf, state)
+    }
+
+    #[test]
+    fn the_watchdog_leaves_a_healthy_ipv6_block_alone() {
+        let (pf, mut state) = ipv6_only();
+        let loads = pf.loads.get();
+        assert_eq!(state.watchdog(&pf, inputs), None);
+        assert_eq!(pf.loads.get(), loads);
+    }
+
+    /// Another tool's `pfctl -f` replaced our ruleset: IPv6 was back on the
+    /// physical NIC for the rest of the session.
+    #[test]
+    fn the_watchdog_restores_an_ipv6_block_another_tool_replaced() {
+        let (pf, mut state) = ipv6_only();
+        pf.load_default().unwrap();
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        let rules = pf.rules().unwrap();
+        assert!(marker_loaded(&rules) && rules.contains("inet6"), "{rules}");
+    }
+
+    #[test]
+    fn the_watchdog_restores_an_ipv6_block_another_tool_disabled() {
+        let (pf, mut state) = ipv6_only();
+        pf.third_party_disables();
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert!(pf.running(), "a new reference of ours");
+    }
+
+    /// Someone else's inet6 rules are not our block.
+    #[test]
+    fn another_tools_inet6_rules_are_not_our_ipv6_block() {
+        let (pf, mut state) = ipv6_only();
+        pf.load("pass quick inet6 from any to any keep state")
+            .unwrap();
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert!(marker_loaded(&pf.rules().unwrap()));
+    }
+
+    #[test]
+    fn the_marker_is_matched_exactly() {
+        assert!(marker_loaded("anchor \"com.birdo.vpn\" all"));
+        assert!(!marker_loaded("anchor \"com.birdo.vpn.blockall\" all"));
+        assert!(!marker_loaded("anchor \"com.apple/*\" all"));
     }
 
     // ── P3-3: the intent, read under the lock ──────────────────────────
