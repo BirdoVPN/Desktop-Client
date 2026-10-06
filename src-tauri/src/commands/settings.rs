@@ -756,8 +756,12 @@ pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool
     off_the_runtime(move || save_settings_blocking(&app, &settings)).await
 }
 
-/// The whole-object save behind `save_settings` and `set_autostart`.
+/// The whole-object save behind `save_settings`. Holds the settings lock
+/// across the check and the write, so a file cannot turn unverifiable in
+/// between.
 fn save_settings_blocking(app: &AppHandle, settings: &AppSettings) -> Result<bool, String> {
+    let _write = SETTINGS_WRITE.lock();
+    may_save_over(load_settings(app))?;
     save_settings_inner(app, settings)?;
     // Keep the live crash-reporting gate equal to what is on disk, whichever
     // screen saved.
@@ -824,11 +828,37 @@ pub(crate) fn restore_tunnel_settings(
 /// other preference with defaults. The revert then fails, and the error the
 /// reapply met stands.
 fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, String> {
+    verified(loaded).map(|current| with_tunnel_settings_of(current, good))
+}
+
+/// What is saved, for a change made on top of it — or a refusal when the
+/// load could only serve defaults because it cannot verify the file
+/// (WIN3-010). Those are not the user's settings: written back, they replace
+/// every preference, and the save may mint a new signing key the old file
+/// never verifies against again.
+fn verified(loaded: Loaded) -> Result<AppSettings, String> {
     match loaded {
-        Loaded::Saved(current) => Ok(with_tunnel_settings_of(current, good)),
+        Loaded::Saved(settings) => Ok(settings),
         Loaded::Unverified(_) => {
             Err("the settings file could not be verified, so it was left as it is".into())
         }
+    }
+}
+
+/// Whether a whole-object save may replace what is on disk (MR-692).
+///
+/// `save_settings` writes the object the UI sends, and the UI's copy came from
+/// `get_settings` — which, while the signing key is unreadable, serves
+/// defaults. The revert already refused to save over such a file; the save
+/// itself did not, so the next toggle wrote those defaults over the user's
+/// real file. Now it is refused while the file cannot be verified (the UI puts
+/// the toggle back and says the save failed) and goes ahead once it can. A
+/// file that does not parse at all has nothing a save could lose, and saving
+/// stays the way out of it.
+fn may_save_over(loaded: Result<Loaded, String>) -> Result<(), String> {
+    match loaded {
+        Ok(loaded) => verified(loaded).map(drop),
+        Err(_) => Ok(()),
     }
 }
 
@@ -861,7 +891,10 @@ fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSetti
 #[tauri::command]
 pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
     off_the_runtime(move || {
-        let mut settings = load_settings_sync(&app)?;
+        // MR-692: one field over what is saved — never over the defaults a
+        // load serves while it cannot verify the file.
+        let _write = SETTINGS_WRITE.lock();
+        let mut settings = verified(load_settings(&app)?)?;
         settings.crash_reports_enabled = enabled;
         save_settings_inner(&app, &settings)?;
         crate::utils::crash_report::set_opted_in(enabled);
@@ -877,6 +910,11 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
 }
 
 fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, String> {
+    // MR-692: read first. A file that cannot be verified is not saved over,
+    // and the launch task is not changed for a setting that cannot be saved.
+    let _write = SETTINGS_WRITE.lock();
+    let mut settings = verified(load_settings(app)?)?;
+
     #[cfg(windows)]
     set_autostart_windows(app, enabled)?;
 
@@ -898,9 +936,8 @@ fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, String
     }
 
     // Also update settings file
-    let mut settings = load_settings_sync(app)?;
     settings.autostart = enabled;
-    save_settings_blocking(app, &settings)?;
+    save_settings_inner(app, &settings)?;
 
     Ok(true)
 }
@@ -1629,6 +1666,50 @@ mod tests {
         };
         let (done, ()) = tokio::join!(work, other_task);
         assert_eq!(done, Ok(()), "the runtime was held while the work waited");
+    }
+
+    /// MR-692: the save itself (not only the revert) never replaces a file it
+    /// cannot verify — the UI's copy of such a file is the defaults
+    /// `get_settings` served — and neither do the two read-modify-write
+    /// commands. A verified file, no file yet, or one that does not parse
+    /// at all is saved over as before.
+    #[test]
+    fn a_save_never_replaces_a_file_it_cannot_verify() {
+        assert!(may_save_over(Ok(Loaded::Unverified(AppSettings::default()))).is_err());
+        assert_eq!(
+            may_save_over(Ok(Loaded::Saved(AppSettings::default()))),
+            Ok(())
+        );
+        assert_eq!(
+            may_save_over(Err("Failed to parse settings".into())),
+            Ok(()),
+            "a file that does not parse has nothing to lose"
+        );
+        assert!(verified(Loaded::Unverified(AppSettings::default())).is_err());
+
+        // A Windows checkout has CRLF endings (core.autocrlf).
+        let source = include_str!("settings.rs").replace('\r', "");
+        let body = |signature: &str| {
+            let start = source.find(signature).expect(signature);
+            let rest = &source[start..];
+            rest[..rest.find("\n}\n").expect("end of fn")].to_string()
+        };
+        let save = body("fn save_settings_blocking(");
+        let check = save
+            .find("may_save_over(load_settings(app))?;")
+            .expect("the check");
+        assert!(check < save.find("save_settings_inner(").unwrap());
+        assert!(body("pub async fn set_crash_reports_enabled(")
+            .contains("verified(load_settings(&app)?)?"));
+        let autostart = body("fn set_autostart_blocking(");
+        let read = autostart
+            .find("verified(load_settings(app)?)?")
+            .expect("the read");
+        assert!(
+            read < autostart
+                .find("set_autostart_windows(app, enabled)?")
+                .unwrap()
+        );
     }
 
     /// Every settings IPC command runs its work through `off_the_runtime`.
