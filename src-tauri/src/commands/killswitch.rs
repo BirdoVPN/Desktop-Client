@@ -345,7 +345,9 @@ async fn deactivate_platform_block() -> Result<bool, String> {
 /// false — so an unexpected drop would NOT fail closed. This mirrors mobile,
 /// which pushes the flag into the running service live.
 ///
-/// The frontend persists the preference first, then calls this. Behaviour:
+/// The frontend persists an ON first, then calls this (`arm` reads the file).
+/// An OFF reads no file: it is sent before its save, and once more after it
+/// (`setKillSwitch`, round 4 of the review of #222). Behaviour:
 /// - enabled=true, session active  → arm now (init WFP + set intent; activate
 ///   immediately in lockdown mode).
 /// - enabled=true, no active session → no-op; the persisted preference
