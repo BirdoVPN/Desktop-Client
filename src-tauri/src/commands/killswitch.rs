@@ -27,12 +27,13 @@ use crate::vpn::manager::VpnManager;
 /// Active/blocking state is delegated entirely to wfp.rs.
 static KILLSWITCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// The intent's write lock, guarding a sequence number every OFF bumps
-/// (review of #222).
+/// The intent's write lock, guarding a sequence number that every write of
+/// the intent bumps, ON and OFF alike (review of #222, rounds 3 and 4).
 ///
-/// INVARIANT: `KILLSWITCH_ENABLED` is written only by [`intent_off`] and
-/// [`intent_on_since`], both under this lock, and the lock is held for those
-/// stores alone — never across an await, a firewall call or settings I/O. A
+/// INVARIANT: `KILLSWITCH_ENABLED` is written only by [`intent_off`],
+/// [`intent_on_since`] and [`intent_off_since`], all three under this lock,
+/// and the lock is held for those stores alone — never across an await, a
+/// firewall call or settings I/O. A
 /// plain mutex therefore cannot keep anyone waiting on slow work: not the
 /// Disconnect escape (`disarm`), not the live OFF. (Round 2 used an async
 /// lock that `arm` held across its settings read; a hung credential store, or
@@ -40,18 +41,21 @@ static KILLSWITCH_ENABLED: AtomicBool = AtomicBool::new(false);
 /// also cannot self-deadlock: no path takes it twice.
 ///
 /// `arm` reads the number BEFORE its slow read of the preference and stores
-/// ON only if no OFF has bumped it since ([`intent_on_since`]), so an OFF
-/// that lands during the read wins.
+/// what it read only if nothing has written the intent since
+/// ([`intent_on_since`], [`intent_off_since`]): an OFF that lands during the
+/// read wins over its ON, and an ON over its OFF.
 static INTENT: parking_lot::Mutex<u64> = parking_lot::const_mutex(0);
 
-/// The intent's current sequence number, for [`intent_on_since`].
+/// The intent's current sequence number, for [`intent_on_since`] and
+/// [`intent_off_since`].
 fn intent_seq() -> u64 {
     *INTENT.lock()
 }
 
-/// Turn the intent OFF (the only way it turns off) and bump the sequence, so
-/// an `arm` that read the preference before this does not store its ON over
-/// it. Whether it was on.
+/// The user's OFF (the live toggle, `disarm`): turn the intent off whatever
+/// was written before, and bump the sequence, so an `arm` that read the
+/// preference before this does not store its ON over it. Whether it was on.
+/// (`arm`'s own OFF is [`intent_off_since`], which stands aside instead.)
 fn intent_off() -> bool {
     let mut seq = INTENT.lock();
     *seq = seq.wrapping_add(1);
@@ -190,10 +194,11 @@ pub async fn activate_killswitch() -> Result<bool, String> {
 /// refresh if its own activation is still to come), an OFF finds none. Round
 /// 3 compared once, so OFF→ON→OFF inside one window left a re-engaged block
 /// that nothing looked at again, and on macOS/Linux no engine close ever
-/// removes it. Bounded by [`AGREEMENT_ROUNDS`]: past it the last answer
-/// stands and the writers' own checks (the OFF's lift, `arm`'s activation)
-/// take it from there. No lock is held across any firewall call (round 3: a
-/// lock held there kept `disarm` waiting on them).
+/// removes it. Bounded by [`AGREEMENT_ROUNDS`]: past it, it fails closed —
+/// the block its last re-engage put up is left up, even if the intent has
+/// flipped to OFF again since — and logs a warning; it stays up until the
+/// next OFF or a Disconnect lifts it. No lock is held across any firewall
+/// call (round 3: a lock held there kept `disarm` waiting on them).
 async fn unless_turned_off<E, L, LF, R, RF>(
     engage: E,
     lift: L,
