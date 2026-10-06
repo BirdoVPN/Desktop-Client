@@ -167,10 +167,16 @@ pub async fn activate_killswitch() -> Result<bool, String> {
 /// around a new relay or tunnel LUID reports nothing engaged.
 ///
 /// An ON can land while the lift runs, its own block going up before the lift
-/// takes it down. So after the lift the intent is read once more, and an ON
-/// found there gets its block back through `reengage` (a no-op refresh if its
-/// own activation is still to come). No lock is held across either firewall
-/// call (round 3: a lock held there kept `disarm` waiting on them).
+/// takes it down; an OFF can land again while that block is re-engaged. So
+/// the intent and the block are compared again after every lift and every
+/// re-engage, until they agree — an ON finds its block (`reengage`, a no-op
+/// refresh if its own activation is still to come), an OFF finds none. Round
+/// 3 compared once, so OFF→ON→OFF inside one window left a re-engaged block
+/// that nothing looked at again, and on macOS/Linux no engine close ever
+/// removes it. Bounded by [`AGREEMENT_ROUNDS`]: past it the last answer
+/// stands and the writers' own checks (the OFF's lift, `arm`'s activation)
+/// take it from there. No lock is held across any firewall call (round 3: a
+/// lock held there kept `disarm` waiting on them).
 async fn unless_turned_off<E, L, LF, R, RF>(
     engage: E,
     lift: L,
@@ -179,27 +185,35 @@ async fn unless_turned_off<E, L, LF, R, RF>(
 ) -> Result<bool, String>
 where
     E: std::future::Future<Output = Result<bool, String>>,
-    L: FnOnce() -> LF,
+    L: Fn() -> LF,
     LF: std::future::Future<Output = Result<bool, String>>,
-    R: FnOnce() -> RF,
+    R: Fn() -> RF,
     RF: std::future::Future<Output = Result<bool, String>>,
 {
-    let engaged = engage.await;
-    if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
-        return engaged;
-    }
-    if !blocking() {
-        // Nothing up, and nothing wanted: whatever the engage met is moot.
-        return Ok(false);
-    }
-    tracing::info!("The kill switch is off and its block is up — lifting it");
-    lift().await?;
-    if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+    let mut engaged = engage.await;
+    for _ in 0..AGREEMENT_ROUNDS {
+        if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+            return engaged;
+        }
+        if !blocking() {
+            // Nothing up, and nothing wanted: whatever the engage met is moot.
+            return Ok(false);
+        }
+        tracing::info!("The kill switch is off and its block is up — lifting it");
+        lift().await?;
+        if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         tracing::info!("The kill switch was turned back on during the lift — re-engaging");
-        return reengage().await;
+        engaged = reengage().await;
     }
-    Ok(false)
+    tracing::warn!("The kill switch kept changing while its block moved — leaving the last answer");
+    engaged
 }
+
+/// How many lift / re-engage rounds [`unless_turned_off`] runs before it stops
+/// chasing an intent that keeps flipping.
+const AGREEMENT_ROUNDS: usize = 4;
 
 async fn activate_platform_block() -> Result<bool, String> {
     if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
@@ -1209,7 +1223,7 @@ mod tests {
 
     fn lift_into(
         lifted: &'static AtomicBool,
-    ) -> impl FnOnce() -> std::future::Ready<Result<bool, String>> {
+    ) -> impl Fn() -> std::future::Ready<Result<bool, String>> {
         move || {
             lifted.store(true, Ordering::SeqCst);
             std::future::ready(Ok(true))
@@ -1401,6 +1415,49 @@ mod tests {
             "the lift took the ON's block"
         );
         KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+    }
+
+    /// Round 4 of the review (P3-5): OFF, ON and OFF again inside one window
+    /// — the lift lets an ON in, the re-engage lets an OFF in. The intent and
+    /// the block are compared until they agree: here both end off. Round 3
+    /// compared once and returned with the re-engaged block up and the
+    /// intent off.
+    #[tokio::test]
+    async fn the_intent_and_the_block_agree_after_off_on_off() {
+        let _tests = FLAG_TESTS.lock().await;
+        static BLOCK_UP: AtomicBool = AtomicBool::new(false);
+        static LIFTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+
+        let result = unless_turned_off(
+            async {
+                BLOCK_UP.store(true, Ordering::SeqCst);
+                KILLSWITCH_ENABLED.store(false, Ordering::SeqCst); // OFF during the load
+                Ok(true)
+            },
+            || {
+                BLOCK_UP.store(false, Ordering::SeqCst);
+                if LIFTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    KILLSWITCH_ENABLED.store(true, Ordering::SeqCst); // ON during the lift
+                }
+                std::future::ready(Ok(true))
+            },
+            || {
+                BLOCK_UP.store(true, Ordering::SeqCst);
+                KILLSWITCH_ENABLED.store(false, Ordering::SeqCst); // OFF during the re-engage
+                std::future::ready(Ok(true))
+            },
+            || BLOCK_UP.load(Ordering::SeqCst),
+        )
+        .await;
+
+        assert_eq!(result, Ok(false));
+        assert!(!is_enabled());
+        assert!(
+            !BLOCK_UP.load(Ordering::SeqCst),
+            "intent off, and the block left up"
+        );
+        assert_eq!(LIFTS.load(Ordering::SeqCst), 2);
     }
 
     /// Review of #222 (P3.3): the toggle turned OFF during `connecting`, while
