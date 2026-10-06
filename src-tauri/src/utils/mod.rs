@@ -66,6 +66,42 @@ pub async fn run_bounded(
     }
 }
 
+/// [`run_bounded`]'s twin for blocking code: run `cmd` to completion within
+/// `limit`, killing the child if it has not exited by then. For short-output
+/// tools (the pipes are drained once the child exits, so a child that fills
+/// one first would read as hung and be cut off at the limit).
+#[cfg_attr(not(windows), allow(dead_code))] // schtasks is its one caller
+pub fn output_within(
+    cmd: &mut std::process::Command,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {limit:?}"));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e.to_string());
+            }
+        }
+    }
+}
+
 /// Run `work` on a thread of its own and wait for it at most `limit`; `true`
 /// if it finished. Whatever `work` waits on — a lock a wedged teardown holds,
 /// a log write that does not return — holds that thread, never the caller
@@ -162,6 +198,28 @@ mod bounded_process_tests {
         .await;
         assert!(result.unwrap_err().contains("timed out"));
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// The blocking twin (round 3 of the review of #222): `schtasks` runs
+    /// under the settings lock, so a hung one used to hold every save, and
+    /// the kill switch's preference read, with it.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_hung_blocking_subprocess_is_cut_off_at_the_limit() {
+        let started = std::time::Instant::now();
+        let result = super::output_within(
+            super::hidden_cmd("cmd.exe").args(["/c", "ping -n 30 127.0.0.1 >nul"]),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        let out = super::output_within(
+            super::hidden_cmd("cmd.exe").args(["/c", "echo birdo"]),
+            std::time::Duration::from_secs(10),
+        )
+        .expect("cmd.exe runs");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("birdo"));
     }
 
     #[cfg(target_os = "windows")]

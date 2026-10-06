@@ -1095,12 +1095,20 @@ fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, IpcErr
 #[cfg_attr(not(windows), allow(dead_code))]
 const LAUNCH_TASK: &str = "BirdoVPN Launch At Login";
 
+/// How long one `schtasks` call may take. It runs under the settings lock
+/// (set_autostart's read-modify-write), which every save and the kill
+/// switch's preference read wait on, so a hung one must not hold them for
+/// good (round 3 of the review of #222).
+#[cfg(windows)]
+const SCHTASKS_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[cfg(windows)]
 fn schtasks(args: &[&str]) -> Result<std::process::Output, String> {
-    crate::utils::hidden_cmd("schtasks")
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to run schtasks: {}", e))
+    crate::utils::output_within(
+        crate::utils::hidden_cmd("schtasks").args(args),
+        SCHTASKS_LIMIT,
+    )
+    .map_err(|e| format!("Failed to run schtasks: {}", e))
 }
 
 /// The `schtasks /Create` arguments for the launch-at-login task: an
