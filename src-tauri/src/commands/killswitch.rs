@@ -58,15 +58,32 @@ fn intent_off() -> bool {
     KILLSWITCH_ENABLED.swap(false, Ordering::SeqCst)
 }
 
-/// Turn the intent ON, unless an OFF landed since `seen` was read. Whether it
-/// stored it.
+/// Turn the intent ON, unless it was written since `seen` was read. Whether it
+/// stored it. The sequence moves on ON too (round 4 of the review of #222), so
+/// an `arm` that read an OFF preference before this ON cannot clear it
+/// ([`intent_off_since`]).
 fn intent_on_since(seen: u64) -> bool {
-    let seq = INTENT.lock();
+    let mut seq = INTENT.lock();
     if *seq != seen {
         return false;
     }
+    *seq = seq.wrapping_add(1);
     KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
     true
+}
+
+/// Turn the intent OFF for a preference read since `seen`: `arm` finding the
+/// preference off. Unlike the user's OFF ([`intent_off`], the live toggle and
+/// `disarm`, which always win) it does not clear an intent written after its
+/// read began — that write is newer than what it read. `None` when it stood
+/// aside; otherwise whether the intent was on.
+fn intent_off_since(seen: u64) -> Option<bool> {
+    let mut seq = INTENT.lock();
+    if *seq != seen {
+        return None;
+    }
+    *seq = seq.wrapping_add(1);
+    Some(KILLSWITCH_ENABLED.swap(false, Ordering::SeqCst))
 }
 
 /// Global state for kill switch - stores allowed VPN server IP
@@ -346,6 +363,11 @@ pub async fn set_killswitch_live(
     vpn_manager: State<'_, VpnManager>,
 ) -> Result<bool, IpcError> {
     if enabled {
+        // The intent's sequence BEFORE the session check (round 4 of the
+        // review of #222): a Disconnect that lands between the two moves it,
+        // and `arm` then neither re-opens the engine nor engages a block for a
+        // session that is gone.
+        let seen = intent_seq();
         let state = vpn_manager.get_state().await;
         if !(state.is_tunnel_active() || state.can_disconnect()) {
             tracing::debug!("set_killswitch_live: no active session — applies at next connect");
@@ -353,7 +375,7 @@ pub async fn set_killswitch_live(
         }
         // arm() re-reads the (already-persisted) preference and initializes WFP,
         // engaging the reactive protection for the live session.
-        arm(&app)
+        arm_since(&app, seen)
             .await
             .map_err(|e| IpcError::new(IpcErrorCode::KillswitchFailed, e))
     } else {
@@ -375,6 +397,13 @@ pub async fn set_killswitch_live(
 /// bumps the intent's sequence ([`intent_off`]), so an `arm` that read the
 /// preference before this does not store its ON over it; nothing here waits
 /// on anyone's I/O.
+///
+/// Parameters, kept stable for the platform lanes: `lift` is the platform's
+/// lift, called at most once, `FnOnce() -> impl Future<Output = Result<bool,
+/// String>>` (its error is the OFF's error); `blocking` says whether a block
+/// is up right now. `set_killswitch_live` passes `deactivate_killswitch` and
+/// `platform_is_blocking`; a backend with a lift of its own (macOS pf) passes
+/// that instead.
 async fn turn_off<L, LF>(lift: L, blocking: impl Fn() -> bool) -> Result<bool, String>
 where
     L: FnOnce() -> LF,
@@ -539,11 +568,17 @@ pub fn holds_block_while_connected() -> bool {
 /// requires administrator) logs and returns `Ok(false)` rather than failing the
 /// whole connection.
 pub async fn arm(app: &AppHandle) -> Result<bool, String> {
+    arm_since(app, intent_seq()).await
+}
+
+/// [`arm`], `seen` the intent's sequence read before anything this arm
+/// depends on (the live ON reads it before its session check).
+async fn arm_since(app: &AppHandle, seen: u64) -> Result<bool, String> {
     // Respect the user's kill-switch preference (default ON). Reading it here —
     // the single choke-point every connect path funnels through — keeps all call
     // sites consistent. Fail SAFE: if settings can't be read, treat as enabled.
     // Read on the blocking pool: it is file and credential-store I/O.
-    arm_reading(async {
+    arm_reading_since(seen, async {
         crate::commands::settings::load_settings_off_runtime(app)
             .await
             .map(|s| s.killswitch_enabled)
@@ -556,11 +591,13 @@ pub async fn arm(app: &AppHandle) -> Result<bool, String> {
 ///
 /// Review of #222: an OFF that lands during the read (the toggle during
 /// `connecting`) must win. The intent's sequence is read BEFORE the
-/// preference and the ON stored only if no OFF has moved it since
+/// preference and the ON stored only if nothing has moved it since
 /// ([`intent_on_since`]). Round 2 held a lock across the read instead, and a
 /// read that hung held `disarm` with it.
-async fn arm_reading(preference: impl std::future::Future<Output = bool>) -> Result<bool, String> {
-    let seen = intent_seq();
+async fn arm_reading_since(
+    seen: u64,
+    preference: impl std::future::Future<Output = bool>,
+) -> Result<bool, String> {
     let enabled = preference.await;
     arm_with_preference(enabled, seen).await
 }
@@ -592,13 +629,28 @@ async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
         //      rest of the session.
         // Clearing it here makes the preference the source of truth on every
         // connect, whichever path armed the previous session.
-        if intent_off() {
-            tracing::info!(
+        //
+        // Only if nothing wrote the intent since this read began (round 4 of
+        // the review of #222): an ON stored meanwhile is newer than the OFF
+        // this read found, and stands.
+        match intent_off_since(seen) {
+            Some(true) => tracing::info!(
                 "Kill switch disabled by user preference — not arming (cleared a stale armed intent from the previous session)"
-            );
-        } else {
-            tracing::info!("Kill switch disabled by user preference — not arming");
+            ),
+            Some(false) => tracing::info!("Kill switch disabled by user preference — not arming"),
+            None => tracing::info!(
+                "Kill switch preference read OFF, but the switch changed since — leaving it"
+            ),
         }
+        return Ok(false);
+    }
+
+    // Before the engine is opened: an OFF or a Disconnect since `seen` means
+    // there is nothing to arm for (round 4: a Disconnect landing between the
+    // live ON's session check and this arm re-opened the engine and engaged
+    // lockdown with no session).
+    if intent_seq() != seen {
+        tracing::info!("Kill switch changed before arming — not arming");
         return Ok(false);
     }
 
@@ -615,7 +667,7 @@ async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
     }
 
     if !intent_on_since(seen) {
-        tracing::info!("Kill switch turned off while arming — not arming");
+        tracing::info!("Kill switch changed while arming — not arming");
         return Ok(false);
     }
 
@@ -1481,15 +1533,51 @@ mod tests {
         assert!(is_enabled());
         intent_off();
 
-        // And `arm` reads the sequence before the preference, and stores
+        // And `arm` takes the sequence before the preference, and stores
         // through intent_on_since. (Its ON store needs an elevated host, so
         // this half is a source check.)
         let source = include_str!("killswitch.rs").replace('\r', "");
-        let read = &source[source.find("async fn arm_reading(").unwrap()..];
+        assert!(source.contains("arm_since(app, intent_seq()).await"));
+        let read = &source[source.find("async fn arm_reading_since(").unwrap()..];
         let read = &read[..read.find("\n}\n").unwrap()];
-        assert!(read.find("intent_seq()").unwrap() < read.find("preference.await").unwrap());
+        assert!(read.contains("arm_with_preference(enabled, seen)"));
         let arm = &source[source.find("async fn arm_with_preference(").unwrap()..];
         assert!(arm.contains("if !intent_on_since(seen) {"));
+    }
+
+    /// Round 4 of the review (P3-6): an `arm` that read the preference OFF
+    /// does not clear an ON stored after its read began — the ON is newer.
+    /// The sequence moves on ON too, and the preference-OFF is conditional
+    /// on it; the user's own OFF (`intent_off`) still always wins.
+    #[tokio::test]
+    async fn a_stale_off_preference_never_clears_a_newer_on() {
+        let _tests = FLAG_TESTS.lock().await;
+        intent_off();
+        let seen = intent_seq(); // this arm starts reading the preference
+        assert!(
+            intent_on_since(intent_seq()),
+            "a newer arm stores ON meanwhile"
+        );
+
+        assert_eq!(arm_with_preference(false, seen).await, Ok(false));
+        assert!(is_enabled(), "the stale OFF read cleared the newer ON");
+
+        assert!(intent_off(), "the user's OFF wins whatever was read");
+        assert!(!is_enabled());
+
+        // And the live ON reads the sequence before its session check, and
+        // arm checks it before opening the engine. (Both need a Tauri State
+        // or an elevated host: source checks.)
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let live = &source[source.find("pub async fn set_killswitch_live(").unwrap()..];
+        assert!(
+            live.find("let seen = intent_seq();").unwrap() < live.find(".get_state()").unwrap()
+        );
+        let arm = &source[source.find("async fn arm_with_preference(").unwrap()..];
+        let check = arm
+            .find("if intent_seq() != seen {")
+            .expect("checked before the engine");
+        assert!(check < arm.find("wfp::initialize()").unwrap());
     }
 
     /// Round 3 of the review (P2-1): a settings read that never returns (a
@@ -1499,7 +1587,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_hung_settings_read_never_holds_up_disarm() {
         let _tests = FLAG_TESTS.lock().await;
-        let arming = arm_reading(std::future::pending::<bool>());
+        let arming = arm_reading_since(intent_seq(), std::future::pending::<bool>());
         let disarming = async {
             tokio::task::yield_now().await; // arm is inside its read now
             tokio::time::timeout(
@@ -1525,12 +1613,12 @@ mod tests {
             .iter()
             .flat_map(|w| code.match_indices(w).map(|(at, _)| at))
             .collect();
-        assert_eq!(writes.len(), 2, "one store in each writer");
+        assert_eq!(writes.len(), 3, "one store in each writer");
         for at in writes {
             let owner = code[..at].rfind("\nfn ").unwrap();
             let name = &code[owner + 4..code[owner..].find('(').unwrap() + owner];
             assert!(
-                ["intent_off", "intent_on_since"].contains(&name),
+                ["intent_off", "intent_on_since", "intent_off_since"].contains(&name),
                 "written in {name}"
             );
             assert!(
