@@ -670,28 +670,112 @@ impl Pf for Pfctl {
     fn flush_rules(&self) -> Result<(), String> {
         pfctl(&["-F", "rules"]).map(drop)
     }
-    fn take_ref(&self) -> Result<u64, String> {
-        let out = crate::utils::hidden_cmd("pfctl")
+    fn take_ref(&self) -> Result<pf_policy::Taken, String> {
+        let child = crate::utils::hidden_cmd("pfctl")
             .args(["-E"])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| format!("pfctl -E could not run: {e}"))?;
+        // The pid `pfctl -s References` lists the reference under (N4).
+        let pid = child.id();
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("pfctl -E: {e}"))?;
         if !out.status.success() {
             return Err(format!(
                 "pfctl -E failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        // The token is printed alongside "pf enabled"; read both streams.
+        // The token is printed (on stderr, measured) after "pf enabled";
+        // read both streams.
         let printed = format!(
-            "{}
-{}",
+            "{}\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        pf_policy::parse_token(&printed).ok_or_else(|| "pfctl -E printed no token".to_string())
+        Ok(pf_policy::Taken {
+            token: pf_policy::parse_token(&printed),
+            pid,
+        })
+    }
+    fn references(&self) -> Result<String, String> {
+        pfctl(&["-s", "References"])
     }
     fn release_ref(&self, token: u64) -> Result<(), String> {
         pfctl(&["-X", &token.to_string()]).map(drop)
+    }
+    fn record_reference(&self, held: Option<pf_policy::PfRef>) {
+        pf_reference_journal::write(held);
+    }
+}
+
+/// N3: the pf reference we hold, on disk. XNU frees a token only on `pfctl -X`
+/// or `pfctl -d` — never when the process that took it exits — so a crash
+/// mid-session (every session holds one for the IPv6 block) kept pf enabled
+/// for good. The next start releases what this names. Root-only: the app runs
+/// as root, so this lives in root's own Application Support, mode 0600.
+#[cfg(target_os = "macos")]
+mod pf_reference_journal {
+    use crate::vpn::pf_policy::{self, PfRef};
+
+    fn path() -> Option<std::path::PathBuf> {
+        let mut dir = dirs::data_dir()?;
+        dir.push("BirdoVPN");
+        std::fs::create_dir_all(&dir).ok()?;
+        dir.push("pf-reference");
+        Some(dir)
+    }
+
+    /// Replace the record with `held` (or remove it), staged and renamed so a
+    /// crash leaves the old record or the new one, never half of one.
+    pub(super) fn write(held: Option<PfRef>) {
+        let Some(path) = path() else {
+            tracing::warn!("pf reference journal: no data directory");
+            return;
+        };
+        let written = match held {
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+            Some(held) => write_atomically(&path, pf_policy::encode_reference(held).as_bytes()),
+        };
+        if let Err(e) = written {
+            tracing::warn!("pf reference journal not updated: {e}");
+        }
+    }
+
+    fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let staging = path.with_extension("tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staging)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&staging, path)
+    }
+
+    /// What a previous run left, if anything.
+    pub(super) fn read() -> Option<PfRef> {
+        pf_policy::decode_reference(&std::fs::read_to_string(path()?).ok()?)
+    }
+}
+
+/// N3: the panic hook's share — drop our pf reference now, if the lock is
+/// free. A panic while it is held leaves the reference to the journal, which
+/// the next start releases.
+#[cfg(target_os = "macos")]
+pub fn release_pf_reference_now() {
+    if let Ok(mut pf) = PF.try_lock() {
+        pf.release_reference(&Pfctl);
+        mirror(&pf);
     }
 }
 
@@ -823,7 +907,20 @@ pub fn reconcile_stale_pf_state() {
         tracing::error!("Kill switch state is locked at startup; stale pf state not reconciled");
         return;
     };
-    match pf.reconcile(&Pfctl) {
+    let reconciled = pf.reconcile(&Pfctl);
+    // N3: the pf reference a crashed earlier run left behind. Released only if
+    // pf still lists it as that run's — token AND pid.
+    if let Some(leftover) = pf_reference_journal::read() {
+        match pf.release_leftover(&Pfctl, leftover) {
+            Ok(()) => tracing::warn!("Released the pf reference a previous run left behind"),
+            Err(e) => tracing::warn!(
+                "The pf reference a previous run left behind was not released ({}); \
+                 retried at the next start",
+                e
+            ),
+        }
+    }
+    match reconciled {
         None => {}
         Some(Ok(())) => {
             tracing::warn!("Found a stale Birdo pf ruleset from a previous run — removed")

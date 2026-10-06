@@ -280,10 +280,83 @@ pub(crate) trait Pf {
     /// `pfctl -F rules`: flush the main ruleset's filter rules.
     fn flush_rules(&self) -> Result<(), String>;
     /// `pfctl -E`: take a reference on pf, enabling it if it was off. The
-    /// token, or why there is none.
-    fn take_ref(&self) -> Result<u64, String>;
+    /// pid of that pfctl, and the token if it printed one.
+    fn take_ref(&self) -> Result<Taken, String>;
+    /// `pfctl -s References`: the live references, as pf lists them.
+    fn references(&self) -> Result<String, String>;
     /// `pfctl -X <token>`: drop exactly that reference.
     fn release_ref(&self, token: u64) -> Result<(), String>;
+    /// Persist the reference we hold (`None`: none) where a crash cannot lose
+    /// it (N3): XNU frees a token only on `-X` or `-d`, never on exit.
+    fn record_reference(&self, held: Option<PfRef>);
+}
+
+/// One reference on pf: its token and the pid of the `pfctl -E` that took it
+/// — the two columns `pfctl -s References` lists it by (measured on the macOS
+/// runner: `PID  Process Name  TOKEN  TIMESTAMP`, where TIMESTAMP is an age
+/// and so not an identity). The pid is what makes it OURS: XNU token values
+/// can recur after a `pfctl -d`, and `-X` of a value someone else now holds
+/// would drop THEIR reference (N4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PfRef {
+    pub token: u64,
+    pub pid: u32,
+}
+
+/// What one `pfctl -E` returned: its pid, and its token if it printed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Taken {
+    pub token: Option<u64>,
+    pub pid: u32,
+}
+
+/// The references `pfctl -s References` lists. A row is
+/// `<pid>  <process name…>  <token>  <d> days <hh:mm:ss>`; the header, the
+/// `TOKENS:` line and "No pf starter references held" are not rows.
+pub(crate) fn parse_references(listing: &str) -> Vec<PfRef> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let n = f.len();
+            if n < 6 || f[n - 2] != "days" {
+                return None;
+            }
+            Some(PfRef {
+                pid: f[0].parse().ok()?,
+                token: f[n - 4].parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Whether a failed `pfctl -X` means the token is DEAD — `pf: token invalid`,
+/// or `pf not enabled` after a `pfctl -d` killed every token (both measured)
+/// — rather than that the release must be retried.
+pub(crate) fn is_dead_token_error(error: &str) -> bool {
+    error.contains("token invalid") || error.contains("pf not enabled")
+}
+
+/// The reference journal's one line (N3).
+pub(crate) fn encode_reference(held: PfRef) -> String {
+    format!("token={} pid={}\n", held.token, held.pid)
+}
+
+/// [`encode_reference`]'s inverse; `None` for anything else.
+pub(crate) fn decode_reference(text: &str) -> Option<PfRef> {
+    let mut token = None;
+    let mut pid = None;
+    for field in text.split_whitespace() {
+        match field.split_once('=')? {
+            ("token", v) => token = Some(v.parse().ok()?),
+            ("pid", v) => pid = Some(v.parse().ok()?),
+            _ => return None,
+        }
+    }
+    Some(PfRef {
+        token: token?,
+        pid: pid?,
+    })
 }
 
 /// The token in `pfctl -E`'s output (`Token : 12345`), on whichever stream
@@ -364,8 +437,9 @@ pub(crate) struct PfState {
     /// lift falls back to, instead of bare `/etc/pf.conf`.
     pub ipv6_baseline: bool,
     /// Our reference on pf (`pfctl -E`), held while any ruleset of ours is
-    /// loaded and released with `pfctl -X` of exactly this token (P2-3).
-    pub token: Option<u64>,
+    /// loaded and released with `pfctl -X` of exactly this token (P2-3) —
+    /// only after `pfctl -s References` confirms it is still ours (N4).
+    pub token: Option<PfRef>,
     /// MR-1125: the utun the live tunnel runs on — the ONLY interface the
     /// block-all permits. Recorded the moment the device is created.
     pub tunnel: Option<String>,
@@ -445,33 +519,115 @@ impl PfState {
         }
     }
 
+    /// Record (and journal) the reference we hold.
+    fn set_token(&mut self, pf: &impl Pf, held: Option<PfRef>) {
+        self.token = held;
+        pf.record_reference(held);
+    }
+
+    /// Whether `held` is still a live reference of OURS — token AND pid in
+    /// `pfctl -s References` — or `None` when pf could not say.
+    fn alive(pf: &impl Pf, held: PfRef) -> Option<bool> {
+        pf.references()
+            .ok()
+            .map(|listing| parse_references(&listing).contains(&held))
+    }
+
     /// Hold a reference on pf (P2-3): ALWAYS our own `pfctl -E`, even when pf
     /// is already running, so another tool's `-X` can never stop the pf our
-    /// block depends on. One is enough: a token we hold while pf runs is
-    /// still good. pf off while we hold one means a `pfctl -d` invalidated
-    /// every token, ours included, so it is replaced, not released.
+    /// block depends on. One is enough, so one we hold is kept — once pf
+    /// confirms it is alive and ours (N4). It used to be trusted whenever pf
+    /// was running: a `pfctl -d` kills every token and someone's `-E` can
+    /// start pf again, and an unreadable `pfctl -s info` counted as "pf off"
+    /// and took a SECOND reference.
     fn hold_reference(&mut self, pf: &impl Pf) {
-        let running = pf.info().map(|i| parse_enabled(&i)) == Ok(true);
-        if self.token.is_some() && running {
-            return;
+        if let Some(held) = self.token {
+            match Self::alive(pf, held) {
+                Some(true) => return,
+                // Killed by a `pfctl -d`, or its value since issued to someone
+                // else: replaced, never released.
+                Some(false) => self.set_token(pf, None),
+                // pf cannot say: keep ours rather than take a second.
+                None => {
+                    tracing::warn!(
+                        "Kill switch: pf references unreadable; keeping the one we hold"
+                    );
+                    return;
+                }
+            }
         }
         match pf.take_ref() {
-            Ok(token) => self.token = Some(token),
+            Ok(Taken {
+                token: Some(token),
+                pid,
+            }) => self.set_token(pf, Some(PfRef { token, pid })),
+            Ok(Taken { token: None, pid }) => {
+                // N4: the reference exists but its token was not printed.
+                // Find it by its pfctl's pid, or it could never be released.
+                let found = pf.references().ok().and_then(|listing| {
+                    parse_references(&listing)
+                        .into_iter()
+                        .find(|r| r.pid == pid)
+                });
+                match found {
+                    Some(held) => self.set_token(pf, Some(held)),
+                    None => tracing::error!(
+                        "Kill switch: pfctl -E took a pf reference but neither printed nor listed \
+                         its token; it cannot be released"
+                    ),
+                }
+            }
             // The read-back that follows decides; this only explains it.
             Err(e) => tracing::warn!("Kill switch: {e}; reading back whether pf is running"),
         }
     }
 
     /// Drop our reference, if we hold one. pf stops only if nobody else
-    /// holds one — never `pfctl -d` (P2-3).
+    /// holds one — never `pfctl -d` (P2-3). Only a reference pf confirms is
+    /// still OURS is released (N4); a dead one is just forgotten. A release
+    /// that fails for any reason but a dead token keeps it, journalled, for
+    /// the next release to retry — it used to be discarded on any error.
     fn release(&mut self, pf: &impl Pf) {
-        if let Some(token) = self.token.take() {
-            if let Err(e) = pf.release_ref(token) {
-                // A `pfctl -d` since we took it invalidated it; nothing of
-                // ours keeps pf on either way.
-                tracing::warn!("Kill switch: releasing our pf reference: {e}");
-            }
+        let Some(held) = self.token else {
+            return;
+        };
+        if Self::alive(pf, held) == Some(false) {
+            self.set_token(pf, None);
+            return;
         }
+        match pf.release_ref(held.token) {
+            Ok(()) => self.set_token(pf, None),
+            Err(e) if is_dead_token_error(&e) => self.set_token(pf, None),
+            Err(e) => tracing::warn!(
+                "Kill switch: releasing our pf reference failed ({e}); kept for the next release"
+            ),
+        }
+    }
+
+    /// N3: drop our reference now — the panic hook, which cannot wait for a
+    /// teardown.
+    pub(crate) fn release_reference(&mut self, pf: &impl Pf) {
+        self.release(pf);
+    }
+
+    /// N3: the reference a crashed earlier run left in the journal. XNU frees
+    /// a token only on `-X` or `-d`, so without this every crash kept pf
+    /// enabled for good. Released only if pf lists it — token AND pid — as
+    /// still alive; the journal is cleared unless the release must be retried
+    /// at the next start.
+    pub(crate) fn release_leftover(&mut self, pf: &impl Pf, leftover: PfRef) -> Result<(), String> {
+        let released = match Self::alive(pf, leftover) {
+            Some(false) => Ok(()),
+            None => Err("pf references could not be read".to_string()),
+            Some(true) => match pf.release_ref(leftover.token) {
+                Err(e) if is_dead_token_error(&e) => Ok(()),
+                other => other,
+            },
+        };
+        if released.is_ok() {
+            pf.record_reference(self.token);
+        }
+        released
     }
 
     /// Load `rules` as the block-all, hold a reference on pf, and record what
@@ -1167,10 +1323,18 @@ mod tests {
     /// held, and `-d` stops it for everyone and invalidates every token.
     #[derive(Default)]
     struct FakePf {
-        refs: RefCell<Vec<u64>>,
+        refs: RefCell<Vec<PfRef>>,
         /// Someone ran a plain `pfctl -e`.
         anonymous: Cell<bool>,
         next_token: Cell<u64>,
+        /// `pfctl -s References` fails.
+        references_fail: Cell<bool>,
+        /// `pfctl -X` fails for a reason other than a dead token.
+        release_fails: Cell<bool>,
+        /// `pfctl -E` takes a reference but prints no token.
+        enable_prints_no_token: bool,
+        /// What the reference journal holds (N3).
+        journal: RefCell<Option<PfRef>>,
         live: RefCell<String>,
         /// `pfctl -s info` / `-s rules` fail (not root, /dev/pf busy).
         unreadable: Cell<bool>,
@@ -1197,19 +1361,32 @@ mod tests {
         fn running(&self) -> bool {
             self.anonymous.get() || !self.refs.borrow().is_empty()
         }
-        fn mint(&self) -> u64 {
+        /// A fresh reference: the next token, from a fresh pfctl pid.
+        fn mint(&self) -> PfRef {
             self.next_token.set(self.next_token.get() + 1);
-            1000 + self.next_token.get()
+            PfRef {
+                token: 1000 + self.next_token.get(),
+                pid: 50_000 + self.next_token.get() as u32,
+            }
         }
         /// Another tool's `pfctl -E`.
         fn third_party_takes_a_ref(&self) -> u64 {
-            let token = self.mint();
-            self.refs.borrow_mut().push(token);
-            token
+            let held = self.mint();
+            self.refs.borrow_mut().push(held);
+            held.token
+        }
+        /// Another tool's `pfctl -E` that happens to get `token` — XNU token
+        /// values can recur after a `pfctl -d`.
+        fn third_party_takes_token(&self, token: u64) {
+            let pid = self.mint().pid;
+            self.refs.borrow_mut().push(PfRef { token, pid });
         }
         /// Another tool's `pfctl -X`.
         fn third_party_releases(&self, token: u64) {
-            self.refs.borrow_mut().retain(|t| *t != token);
+            self.refs.borrow_mut().retain(|r| r.token != token);
+        }
+        fn holds(&self, held: PfRef) -> bool {
+            self.refs.borrow().contains(&held)
         }
         /// Another tool's `pfctl -d`: pf stops for everyone, tokens die.
         fn third_party_disables(&self) {
@@ -1260,26 +1437,58 @@ mod tests {
             self.live.borrow_mut().clear();
             Ok(())
         }
-        fn take_ref(&self) -> Result<u64, String> {
+        fn take_ref(&self) -> Result<Taken, String> {
             self.take_ref_calls.set(self.take_ref_calls.get() + 1);
             if self.enable_fails {
                 return Err("pfctl -E failed: /dev/pf: Resource busy".to_string());
             }
-            let token = self.mint();
+            let held = self.mint();
             if !self.enable_lies {
-                self.refs.borrow_mut().push(token);
+                self.refs.borrow_mut().push(held);
             }
-            Ok(token)
+            Ok(Taken {
+                token: (!self.enable_prints_no_token).then_some(held.token),
+                pid: held.pid,
+            })
         }
+        /// As the macOS runner printed it.
+        fn references(&self) -> Result<String, String> {
+            if self.references_fail.get() {
+                return Err("pfctl -s References failed: /dev/pf: Resource busy".to_string());
+            }
+            let refs = self.refs.borrow();
+            if refs.is_empty() {
+                return Ok("No pf starter references held\n".to_string());
+            }
+            let mut out = String::from(
+                "TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n",
+            );
+            for r in refs.iter() {
+                out.push_str(&format!(
+                    "{:<8} pfctl                        {:<24} 0 days 00:00:00\n",
+                    r.pid, r.token
+                ));
+            }
+            Ok(out)
+        }
+        /// With the messages the macOS runner printed.
         fn release_ref(&self, token: u64) -> Result<(), String> {
             self.released.borrow_mut().push(token);
-            let mut refs = self.refs.borrow_mut();
-            let before = refs.len();
-            refs.retain(|t| *t != token);
-            if refs.len() == before {
-                return Err(format!("pfctl -X {token}: Invalid argument"));
+            if self.release_fails.get() {
+                return Err("pfctl -X could not run: Resource temporarily unavailable".to_string());
             }
+            if !self.running() {
+                return Err("pfctl -X failed: pfctl: pf not enabled".to_string());
+            }
+            let mut refs = self.refs.borrow_mut();
+            let Some(i) = refs.iter().position(|r| r.token == token) else {
+                return Err("pfctl -X failed: pfctl: pf: token invalid".to_string());
+            };
+            refs.remove(i);
             Ok(())
+        }
+        fn record_reference(&self, held: Option<PfRef>) {
+            *self.journal.borrow_mut() = held;
         }
     }
 
@@ -1401,7 +1610,7 @@ mod tests {
         let ours = state.token.unwrap();
 
         assert_eq!(state.disengage(&pf), Ok(()));
-        assert_eq!(*pf.released.borrow(), vec![ours], "only our token");
+        assert_eq!(*pf.released.borrow(), vec![ours.token], "only our token");
         assert!(pf.running(), "their pf is not ours to stop");
     }
 
@@ -2007,6 +2216,203 @@ mod tests {
         let mut state = PfState::new();
         assert_eq!(state.reload_if_loaded(&pf, &inputs()), Ok(()));
         assert_eq!(pf.loads.get(), 0);
+    }
+    // ── N4: a reference is ours only while pf lists it as ours ─────────
+
+    /// Measured on the macOS runner (pfctl -s References / -X).
+    const REFERENCES_TWO: &str = "TOKENS:
+PID      Process Name                 TOKEN                    TIMESTAMP
+28906    pfctl                        5852851722069127749      0 days 00:00:00
+28868    pfctl                        13135966724954164036     0 days 00:00:00
+";
+
+    #[test]
+    fn references_parse_as_pfctl_prints_them() {
+        assert_eq!(
+            parse_references(REFERENCES_TWO),
+            vec![
+                PfRef {
+                    token: 5852851722069127749,
+                    pid: 28906
+                },
+                PfRef {
+                    token: 13135966724954164036,
+                    pid: 28868
+                },
+            ]
+        );
+        assert!(parse_references("No pf starter references held").is_empty());
+        assert!(parse_references("").is_empty());
+        // A process name with spaces still parses.
+        assert_eq!(
+            parse_references("7  Birdo VPN Helper  42  3 days 01:02:03"),
+            vec![PfRef { token: 42, pid: 7 }]
+        );
+    }
+
+    #[test]
+    fn only_a_dead_token_is_a_dead_token() {
+        assert!(is_dead_token_error(
+            "pfctl -X failed: pfctl: pf: token invalid"
+        ));
+        assert!(is_dead_token_error(
+            "pfctl -X failed: pfctl: pf not enabled"
+        ));
+        assert!(!is_dead_token_error(
+            "pfctl -X could not run: Resource temporarily unavailable"
+        ));
+        assert!(!is_dead_token_error("pfctl -X failed: Permission denied"));
+    }
+
+    #[test]
+    fn the_journal_line_round_trips() {
+        let held = PfRef {
+            token: 13135966724954164036,
+            pid: 28868,
+        };
+        assert_eq!(decode_reference(&encode_reference(held)), Some(held));
+        for junk in [
+            "",
+            "token=1",
+            "pid=2",
+            "token=x pid=2",
+            "token=1 pid=2 extra=3",
+        ] {
+            assert_eq!(decode_reference(junk), None, "{junk:?}");
+        }
+    }
+
+    /// N4: XNU token values can recur. After a `pfctl -d` killed ours,
+    /// another tool's reference can carry the SAME value: it is not ours to
+    /// keep, and `-X` of that value would drop THEIRS.
+    #[test]
+    fn a_recurring_token_value_is_never_taken_for_ours() {
+        let (pf, mut state) = engaged();
+        let ours = state.token.unwrap();
+        pf.third_party_disables();
+        pf.third_party_takes_token(ours.token);
+
+        // Re-engaging takes a reference of our own instead of trusting it...
+        state.engage(&pf, &inputs()).unwrap();
+        assert_ne!(state.token, Some(ours));
+        // ...and our teardown never -X'es their value.
+        assert_eq!(state.disengage(&pf), Ok(()));
+        assert!(!pf.released.borrow().contains(&ours.token));
+        assert!(
+            pf.refs.borrow().iter().any(|r| r.token == ours.token),
+            "theirs survives"
+        );
+    }
+
+    /// N4: an unreadable pf is not "pf off": no second reference is taken.
+    #[test]
+    fn an_unreadable_pf_never_takes_a_second_reference() {
+        let (pf, mut state) = engaged();
+        pf.references_fail.set(true);
+        pf.unreadable.set(true);
+        let _ = state.engage(&pf, &inputs());
+        assert_eq!(pf.take_ref_calls.get(), 1);
+        assert_eq!(pf.refs.borrow().len(), 1);
+    }
+
+    /// N4: a release that fails for any reason but a dead token keeps the
+    /// token — journalled — and the next release retries it.
+    #[test]
+    fn a_release_that_must_be_retried_keeps_the_token() {
+        let (pf, mut state) = engaged();
+        let ours = state.token.unwrap();
+        pf.release_fails.set(true);
+        assert_eq!(state.disengage(&pf), Ok(()), "the block itself is lifted");
+        assert_eq!(state.token, Some(ours));
+        assert_eq!(*pf.journal.borrow(), Some(ours));
+        assert!(pf.holds(ours));
+
+        pf.release_fails.set(false);
+        assert_eq!(state.lift_if_loaded(&pf), Ok(false));
+        state.disengage(&pf).unwrap();
+        assert_eq!(state.token, None);
+        assert!(!pf.holds(ours) && !pf.running());
+        assert_eq!(*pf.journal.borrow(), None);
+    }
+
+    /// N4: `pfctl -E` took a reference but printed no token: it is found by
+    /// the pid of that pfctl, so it can still be released.
+    #[test]
+    fn a_reference_whose_token_was_not_printed_is_found_by_its_pid() {
+        let pf = FakePf {
+            enable_prints_no_token: true,
+            ..Default::default()
+        };
+        let mut state = PfState::new();
+        state.tunnel = Some("utun4".to_string());
+        assert_eq!(state.activate(&pf, &inputs(), true), Ok(true));
+        let held = state.token.expect("recovered from the listing");
+        assert!(pf.holds(held));
+        state.disengage(&pf).unwrap();
+        assert!(!pf.running(), "and released");
+    }
+
+    // ── N3: a crash must not leak our reference ────────────────────────
+
+    /// The panic hook drops our reference at once (when the lock is free).
+    #[test]
+    fn the_panic_hook_releases_our_reference() {
+        let (pf, mut state) = engaged();
+        let ours = state.token.unwrap();
+        state.release_reference(&pf);
+        assert!(!pf.holds(ours) && !pf.running());
+        assert_eq!(*pf.journal.borrow(), None);
+    }
+
+    #[test]
+    fn every_change_of_reference_is_journalled() {
+        let (pf, mut state) = engaged();
+        assert_eq!(*pf.journal.borrow(), state.token);
+        assert!(pf.journal.borrow().is_some());
+        state.disengage(&pf).unwrap();
+        assert_eq!(*pf.journal.borrow(), None);
+    }
+
+    /// A crashed run's reference is released at the next start — only if pf
+    /// still lists it, token AND pid.
+    #[test]
+    fn a_crashed_runs_reference_is_released_at_the_next_start() {
+        let pf = FakePf::default();
+        let leftover = pf.mint();
+        pf.refs.borrow_mut().push(leftover);
+        *pf.journal.borrow_mut() = Some(leftover);
+
+        let mut state = PfState::new();
+        assert_eq!(state.release_leftover(&pf, leftover), Ok(()));
+        assert!(!pf.holds(leftover) && !pf.running());
+        assert_eq!(*pf.journal.borrow(), None);
+    }
+
+    #[test]
+    fn a_leftover_value_now_held_by_another_tool_is_left_alone() {
+        let pf = FakePf::default();
+        let leftover = PfRef {
+            token: 77,
+            pid: 4242,
+        };
+        pf.third_party_takes_token(77);
+        let mut state = PfState::new();
+        assert_eq!(state.release_leftover(&pf, leftover), Ok(()));
+        assert!(pf.released.borrow().is_empty(), "never -X'ed");
+        assert!(pf.running());
+        assert_eq!(*pf.journal.borrow(), None);
+    }
+
+    #[test]
+    fn an_unreadable_leftover_is_kept_for_the_next_start() {
+        let pf = FakePf::default();
+        let leftover = pf.mint();
+        pf.refs.borrow_mut().push(leftover);
+        *pf.journal.borrow_mut() = Some(leftover);
+        pf.references_fail.set(true);
+        let mut state = PfState::new();
+        assert!(state.release_leftover(&pf, leftover).is_err());
+        assert_eq!(*pf.journal.borrow(), Some(leftover));
     }
 }
 

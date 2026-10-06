@@ -864,6 +864,10 @@ fn cleanup_on_crash() {
         let _ = std::process::Command::new("pfctl")
             .args(["-a", "com.birdo.vpn.killswitch", "-F", "all"])
             .output();
+        // N3: and drop our pf reference — XNU keeps it past our exit. If the
+        // kill switch's lock is held right now it cannot be taken here; the
+        // journalled reference is then released at the next start.
+        crate::commands::killswitch::release_pf_reference_now();
 
         // Restore DNS on every service configure_dns actually touched.
         //
