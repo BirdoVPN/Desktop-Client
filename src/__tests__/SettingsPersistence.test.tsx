@@ -341,6 +341,38 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     });
   });
   afterEach(() => stopWatching());
+  const statusChecks = () => mockedInvoke.mock.calls.filter(([c]) => c === 'get_killswitch_status');
+
+  it('a refused OFF that lands during a dial still holds once that dial has armed ON (N1)', async () => {
+    useAppStore.setState({ connectionState: 'connecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    expect(intent).toBe(false);
+    expect(useAppStore.getState().notice?.text).toBe(KILL_SWITCH_OFF_THIS_CONNECTION_COPY);
+    // The dial ends: its own arm read the file (or the defaults standing in
+    // for it) and armed ON.
+    intent = true;
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await waitFor(() => expect(intent).toBe(false));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+  });
+
+  it('an ON saved during connecting is pushed once the dial is up without it, and never on a failed dial', async () => {
+    useAppStore.setState({ connectionState: 'connecting', settings: { ...defaultSettings, killSwitchEnabled: false } });
+    await setKillSwitch(true);
+    // Not pushed while connecting; the dial read the file before the save.
+    expect(mockedInvoke.mock.calls.some(([c]) => c === 'set_killswitch_live')).toBe(false);
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await waitFor(() => expect(intent).toBe(true));
+
+    // A dial that fails gets no ON of its own.
+    intent = false;
+    act(() => useAppStore.setState({ connectionState: 'switching' }));
+    act(() => useAppStore.setState({ connectionState: 'error' }));
+    await waitFor(() => expect(statusChecks()).toHaveLength(2));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(intent).toBe(false);
+  });
 
   it('the next dial puts back the kill switch alone, never an unverifiable file\'s stand-in defaults (N2)', async () => {
     const real = { ...defaultSettings, killSwitchEnabled: true, autoConnect: true, localNetworkSharing: true };
@@ -354,6 +386,28 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(useAppStore.getState().settings).toEqual(real);
   });
 
+  it('with settings that did not come from Rust, the toggle shows what the dial armed', async () => {
+    useAppStore.setState({
+      connectionState: 'connecting',
+      settingsHydrated: false,
+      settings: { ...defaultSettings, killSwitchEnabled: false },
+    });
+    intent = true;
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await waitFor(() => expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true));
+
+    // Settings that did come from Rust are what is saved: left alone, and
+    // with no choice to honour there is nothing to ask Rust.
+    useAppStore.setState({
+      connectionState: 'connecting',
+      settingsHydrated: true,
+      settings: { ...defaultSettings, killSwitchEnabled: false },
+    });
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    expect(statusChecks()).toHaveLength(1);
+  });
 });
 
 describe('the crash-report choice on the consent screen (round 4 of the review of #222)', () => {

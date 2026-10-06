@@ -387,6 +387,8 @@ const FRONTEND_COMMANDS = [
   'set_crash_reports_enabled',
   // Kill switch
   'set_killswitch_live',
+  // Rust's intent, checked after every dial (round 5 of the review of #222)
+  'get_killswitch_status',
   // Kill Switch Exceptions
   'list_installed_apps',
   // Updater (pinned Rust client — commands/updater.rs)
