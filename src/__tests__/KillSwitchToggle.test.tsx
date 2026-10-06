@@ -24,7 +24,8 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Settings, KILL_SWITCH_DISABLE_BODY } from '@/components/Settings';
-import { killSwitchLiveApplies } from '@/session/settings-persist';
+import { KILL_SWITCH_OFF_FAILED_COPY, killSwitchLiveApplies } from '@/session/settings-persist';
+import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
 import type { ConnectionState } from '@/store/app-store';
 
 vi.mock('@tauri-apps/api/core');
@@ -256,5 +257,61 @@ describe('Kill switch toggle → set_killswitch_live', () => {
       expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: false });
     });
     expect(liveCalls()).toHaveLength(1);
+  });
+});
+
+describe('Kill switch OFF when something fails (review of #222, round 3)', () => {
+  const unverified = {
+    code: 'settings_unverified',
+    message: 'the settings file could not be verified, so it was left as it is',
+    retryable: true,
+    retry_after_secs: null,
+  };
+  const failSave = () => {
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === 'save_settings' ? Promise.reject(unverified) : base(cmd, args as never),
+    );
+  };
+
+  it('a refused save still lets the OFF lift the block, and says why the setting did not stick', async () => {
+    mockStoreState.showNotice.mockClear();
+    failSave();
+    await turnKillSwitchOff('reconnecting');
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: false });
+    });
+    expect(mockStoreState.showNotice).toHaveBeenCalledWith(
+      expect.objectContaining({ text: SETTINGS_UNVERIFIED_COPY }),
+    );
+  });
+
+  it('a refused save of an ON is not pushed', async () => {
+    failSave();
+    mockStoreState.settings.killSwitchEnabled = false;
+    mockStoreState.connectionState = 'connected';
+    render(<Settings />);
+    await userEvent.click(await screen.findByRole('switch', { name: /kill switch/i }));
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith('save_settings', expect.anything());
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(liveCalls()).toHaveLength(0);
+  });
+
+  it('an OFF that could not be applied says to disconnect, not to wait for the next connection', async () => {
+    mockStoreState.showNotice.mockClear();
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === 'set_killswitch_live'
+        ? Promise.reject({ code: 'killswitch_failed', message: 'x', retryable: true, retry_after_secs: null })
+        : base(cmd, args as never),
+    );
+    await turnKillSwitchOff('reconnecting');
+    await waitFor(() => {
+      expect(mockStoreState.showNotice).toHaveBeenCalledWith(
+        expect.objectContaining({ text: KILL_SWITCH_OFF_FAILED_COPY }),
+      );
+    });
   });
 });

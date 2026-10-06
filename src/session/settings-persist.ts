@@ -268,19 +268,34 @@ export function killSwitchLiveApplies(
   return state !== 'connecting' && state !== 'switching';
 }
 
+export const KILL_SWITCH_OFF_FAILED_COPY =
+  "The kill switch couldn't be turned off on your live connection. Disconnect to lift it.";
+
 /**
  * The kill switch: persist FIRST (`set_killswitch_live` → `arm()` re-reads the
  * file, so arming must not race the write), then push it to a live session.
+ *
+ * Round 3 of the review of #222:
+ * - an OFF is pushed even when the save was refused (`settings_unverified`,
+ *   an unreadable file): the block it lifts must be liftable whatever the
+ *   settings file says. The refusal's own notice stays; the saved
+ *   preference is unchanged, and the next connect follows it.
+ * - an OFF that could not be applied says to disconnect: the block is still
+ *   up, and "it applies from your next connection" told the user to wait
+ *   behind it.
  */
 export async function setKillSwitch(enabled: boolean): Promise<void> {
-  if (!(await persistSettings({ killSwitchEnabled: enabled }))) return;
+  const saved = await persistSettings({ killSwitchEnabled: enabled });
+  if (!saved && enabled) return;
   const s = useAppStore.getState();
   if (!killSwitchLiveApplies(s.connectionState, enabled, s.killSwitchBlocking)) return;
   try {
     await invoke('set_killswitch_live', { enabled });
   } catch {
     s.showNotice({
-      text: 'Saved, but the change could not be applied to your live connection. It applies from your next connection.',
+      text: enabled
+        ? 'Saved, but the change could not be applied to your live connection. It applies from your next connection.'
+        : KILL_SWITCH_OFF_FAILED_COPY,
       tone: 'danger',
     });
   }
