@@ -600,19 +600,26 @@ impl From<LoadError> for IpcError {
 /// What a load found (WIN3-010).
 enum Loaded {
     /// What is saved: the verified file — or the defaults where there is no
-    /// file to lose (none yet, or one just quarantined as tampered).
+    /// file to lose (none yet).
     Saved(AppSettings),
     /// Defaults served for this session because the file could not be
     /// verified right now (its signing key is unreadable). The file is left
     /// as it is, and nothing may be saved from these: that would replace
     /// every real preference with its default.
     Unverified(AppSettings),
+    /// The file was verified by no key, for good, and THIS load quarantined
+    /// it ([`no_verifying_key`]): the defaults are what is saved now, and a
+    /// save may go ahead. Kept apart from `Saved` so a reset whose re-check
+    /// did the quarantine reports a reset (round 4 of the review of #222).
+    Quarantined(AppSettings),
 }
 
 impl Loaded {
     fn settings(self) -> AppSettings {
         match self {
-            Loaded::Saved(settings) | Loaded::Unverified(settings) => settings,
+            Loaded::Saved(settings)
+            | Loaded::Unverified(settings)
+            | Loaded::Quarantined(settings) => settings,
         }
     }
 }
@@ -769,7 +776,7 @@ fn no_verifying_key(path: &Path, key_may_still_exist: bool) -> Loaded {
     if let Err(e) = fs::rename(path, aside_path(path, "tampered")) {
         tracing::warn!("Could not preserve the unverified settings file: {}", e);
     }
-    Loaded::Saved(AppSettings::default())
+    Loaded::Quarantined(AppSettings::default())
 }
 
 /// Internal save function used by both save_settings command and migration
@@ -957,7 +964,7 @@ fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, Stri
 /// source stays unreadable.
 fn verified(loaded: Loaded) -> Result<AppSettings, IpcError> {
     match loaded {
-        Loaded::Saved(settings) => Ok(settings),
+        Loaded::Saved(settings) | Loaded::Quarantined(settings) => Ok(settings),
         Loaded::Unverified(_) => Err(IpcError::new(
             IpcErrorCode::SettingsUnverified,
             "the settings file could not be verified, so it was left as it is",
@@ -1053,9 +1060,8 @@ pub async fn reset_settings(app: AppHandle) -> Result<bool, IpcError> {
             return Ok(false);
         }
         let path = get_settings_path(&app).map_err(IpcError::unknown)?;
-        set_aside(&path, "unverified")?;
         let defaults = AppSettings::default();
-        save_settings_inner(&app, &defaults).map_err(IpcError::unknown)?;
+        reset_over(&path, || save_settings_inner(&app, &defaults))?;
         crate::utils::crash_report::set_opted_in(defaults.crash_reports_enabled);
         if let Err(e) = apply_autostart(&app, defaults.autostart) {
             tracing::warn!("Settings reset, but launch-at-login was not updated: {}", e);
@@ -1068,11 +1074,36 @@ pub async fn reset_settings(app: AppHandle) -> Result<bool, IpcError> {
 
 /// Whether a reset may go ahead over what a load found: only over a file that
 /// still cannot be verified. One that verifies again is left alone
-/// (`Ok(false)`), and a load that failed outright is reported.
+/// (`Ok(false)`), and a load that failed outright is reported. One that the
+/// re-check's own load just quarantined (its key gone for good) is a reset
+/// already: it goes ahead — there is nothing left to set aside, and the
+/// defaults are saved — and is reported as one (round 4 of the review; it
+/// used to read as "nothing was reset").
 fn resettable(loaded: Result<Loaded, LoadError>) -> Result<bool, IpcError> {
     match loaded? {
-        Loaded::Unverified(_) => Ok(true),
+        Loaded::Unverified(_) | Loaded::Quarantined(_) => Ok(true),
         Loaded::Saved(_) => Ok(false),
+    }
+}
+
+/// Set settings.json aside and save the defaults with `save`. If the save
+/// fails, the file is put back, so a failed reset leaves things as they were
+/// (round 4 of the review: it stayed set aside, with nothing saved and the
+/// user told only that the reset failed). If even that rename fails, the
+/// error says the file is still set aside.
+fn reset_over(path: &Path, save: impl FnOnce() -> Result<(), String>) -> Result<(), IpcError> {
+    let aside = set_aside(path, "unverified")?;
+    let Err(e) = save() else {
+        return Ok(());
+    };
+    match aside.map(|aside| fs::rename(aside, path)) {
+        Some(Err(back)) => Err(IpcError::unknown(format!(
+            "The defaults could not be saved ({e}), and the settings file stays set aside \
+             (settings.json.unverified-…): {back}"
+        ))),
+        _ => Err(IpcError::unknown(format!(
+            "The defaults could not be saved, so the settings were not reset: {e}"
+        ))),
     }
 }
 
@@ -1094,14 +1125,16 @@ fn aside_path(path: &Path, tag: &str) -> PathBuf {
     candidate
 }
 
-/// Move settings.json aside ([`aside_path`]); nothing to do when there is
-/// none.
-fn set_aside(path: &Path, tag: &str) -> Result<(), IpcError> {
-    match fs::rename(path, aside_path(path, tag)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(IpcError::unknown(format!(
+/// Move settings.json aside ([`aside_path`]), saying where to; nothing to do
+/// (`None`) when there is none.
+fn set_aside(path: &Path, tag: &str) -> Result<Option<PathBuf>, IpcError> {
+    let aside = aside_path(path, tag);
+    match fs::rename(path, &aside) {
+        Ok(()) => Ok(Some(aside)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(IpcError::unknown(format!(
             "Could not set the settings file aside: {e}"
         ))),
-        _ => Ok(()),
     }
 }
 
@@ -1968,7 +2001,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         for round in ["first", "second"] {
             fs::write(&path, round).unwrap();
-            assert_eq!(set_aside(&path, "unverified"), Ok(()));
+            assert!(set_aside(&path, "unverified").unwrap().is_some());
             assert!(!path.exists());
         }
         let kept = names_in(dir.path(), "settings.json.unverified-");
@@ -1980,7 +2013,7 @@ mod tests {
         assert!(contents.contains(&"first".to_string()));
         assert_eq!(
             set_aside(&path, "unverified"),
-            Ok(()),
+            Ok(None),
             "nothing to set aside is fine"
         );
 
@@ -2011,8 +2044,39 @@ mod tests {
         let reset = &reset[..reset.find("\n}\n").unwrap()];
         let check = reset.find("resettable(load_settings(&app))?").unwrap();
         assert!(reset.find("SETTINGS_WRITE.lock()").unwrap() < check);
-        assert!(check < reset.find("set_aside(&path").unwrap());
+        assert!(check < reset.find("reset_over(&path").unwrap());
         assert!(reset.contains("apply_autostart(&app, defaults.autostart)"));
+    }
+
+    /// Round 4 of the review (P3-7): a reset whose re-check quarantined the
+    /// file (its key gone for good) is reported as a reset, not as "nothing
+    /// was reset"; and a reset whose save fails puts the file back.
+    #[test]
+    fn a_reset_reports_what_happened_and_undoes_a_failed_save() {
+        assert_eq!(
+            resettable(Ok(Loaded::Quarantined(AppSettings::default()))),
+            Ok(true),
+            "the re-check's quarantine is a reset"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "the user's settings").unwrap();
+        let failed = reset_over(&path, || Err("disk full".into()));
+        assert!(failed.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "the user's settings",
+            "a failed reset leaves the file where it was"
+        );
+        assert!(names_in(dir.path(), "settings.json.unverified-").is_empty());
+
+        let saved = reset_over(&path, || {
+            fs::write(&path, "defaults").map_err(|e| e.to_string())
+        });
+        assert_eq!(saved, Ok(()));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "defaults");
+        assert_eq!(names_in(dir.path(), "settings.json.unverified-").len(), 1);
     }
 
     /// Review of #222 (P3.7): a settings file that could not be READ is not
@@ -2051,7 +2115,11 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, r#"{"settings":{},"hmac":"00"}"#).unwrap();
         let loaded = no_verifying_key(&path, false);
-        assert!(matches!(loaded, Loaded::Saved(_)), "saves may go ahead");
+        assert!(
+            matches!(loaded, Loaded::Quarantined(_)),
+            "quarantined, and so said"
+        );
+        assert_eq!(may_save_over(Ok(loaded)), Ok(()), "saves may go ahead");
         assert!(!path.exists());
         assert_eq!(
             names_in(dir.path(), "settings.json.tampered-").len(),
