@@ -7,24 +7,33 @@
 # Every bump still goes through the normal gates (tests.yml, cargo-deny,
 # CodeQL, cert-pins) and the version-consistency check; a Dependabot PR is a
 # proposal, not a merge.
+#
+# cooldown (2026-10-06, org CI standard): a release must be 7 days old before
+# Dependabot proposes it, so a compromised or broken publish is usually yanked
+# before it reaches a PR. Security updates are not delayed by it.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
-      # codeql-action/init and codeql-action/analyze MUST bump as ONE PR:
-      # analyze refuses to consume a config written by a different version,
-      # so split bumps leave neither able to go green.
-      codeql:
-        patterns: ["github/codeql-action*"]
+      # ONE weekly PR for every action. This also keeps codeql-action/init and
+      # codeql-action/analyze together, which they MUST be: analyze refuses to
+      # consume a config written by a different version, so split bumps leave
+      # neither able to go green.
+      github-actions:
+        patterns: ["*"]
 
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       # vitest and its coverage provider are version-locked to each other.
@@ -36,11 +45,29 @@ updates:
       # full — a group cannot be starved that way.
       typescript-eslint:
         patterns: ["@typescript-eslint/*"]
+      # The npm halves of the Tauri crate/npm pairs move together. (The cargo
+      # halves are the `tauri` group below; Dependabot cannot group across
+      # ecosystems here, so tests.yml's version-consistency job still flags a
+      # cargo group that lands without its npm twin - #216 is one.)
+      tauri-npm:
+        patterns: ["@tauri-apps/*"]
+      # Peer-dependency families: a lone bump fails `npm ci` with ERESOLVE.
+      # Measured 2026-09: @types/react 19 without @types/react-dom (2 red
+      # runs), vite 8 without @vitejs/plugin-react (2), eslint 10 ahead of
+      # eslint-plugin-react (3).
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+      vite:
+        patterns: ["vite", "@vitejs/*", "tailwindcss", "@tailwindcss/*"]
+      eslint:
+        patterns: ["eslint", "@eslint/*", "eslint-plugin-*", "globals"]
 
   - package-ecosystem: "cargo"
     directory: "/src-tauri"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       # tauri, tauri-build and the tauri-plugin-* crates move together.
@@ -53,13 +80,7 @@ updates:
       #   error[E0277]: the trait bound `CoreWrapper<...Sha256VarCore...>:
       #     CoreProxy` is not satisfied   --> src/commands/settings.rs
       #   note: there are multiple different versions of crate `digest`
-      # Grouped so the next proposal is the whole generation at once. That
-      # move is deliberately NOT taken as a sweep item: it sits under both the
-      # BirdoPQ PSK derivation (hkdf_to_psk) and the settings-file HMAC, the
-      # existing HMAC tests are round-trip only with no fixed vector, and it
-      # also needs KeyInit at settings.rs, four LowerHex formatting sites
-      # (digest 0.11's Output is a hybrid_array::Array), and rust-version 1.85.
-      # It gets its own PR with a fixed-vector test. No advisory affects the
-      # 0.10/0.12 generation, so nothing forces it.
+      # Grouped so the next proposal is the whole generation at once.
+      # (#187 made that move on 2026-09-17; the group keeps the next one whole.)
       rustcrypto-digest:
         patterns: ["sha2", "hmac", "hkdf"]

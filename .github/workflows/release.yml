@@ -45,9 +45,25 @@ on:
 # Minimum permissions — each job declares its own
 permissions: {}
 
+# One run per ref, never cancelled mid-build/sign/publish. Tag refs are
+# unique, so two tags build in parallel; the `release` job's Latest guard
+# below keeps their publishes from moving GitHub "Latest" backwards. This
+# group cannot collide with a CI group (those are `<workflow>-<PR or ref>`).
+#
+# Merging to main never starts this workflow: it has no branch trigger, only
+# tag pushes (v*) and manual dispatch, and a dispatch never publishes.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
+
+# NO CACHES anywhere in this workflow (no rust-cache, no setup-node cache):
+# a cache a PR or a main-branch run wrote must never feed a build that is
+# signed and published (zizmor cache-poisoning). It cost nothing measurable:
+# a tag run can only read caches from its own tag or main, so all five
+# rust-cache steps reported "No cache found" on v1.4.45 anyway.
+defaults:
+  run:
+    shell: bash
 
 env:
   CARGO_TERM_COLOR: always
@@ -73,12 +89,19 @@ jobs:
   # ══════════════════════════════════════════════════════════════════════
   test:
     name: Test gate (Rust unit tests + frontend vitest)
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 30
     permissions:
       contents: read
+    defaults:
+      run:
+        # Unchanged from before the workflow-level bash default: pwsh, so
+        # RUSTFLAGS' /DELAYLOAD never meets Git Bash's path conversion.
+        shell: pwsh
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # P5-CICD-15: tag↔version gate. tests.yml's `version-consistency` job has
       # no tag trigger, so nothing ever compared a pushed tag against the source
@@ -175,17 +198,14 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
-          cache: 'npm'
+          # No npm cache: a release restores nothing a PR could have written
+          # (zizmor cache-poisoning). Explicit, because setup-node v7 turns
+          # caching on by itself once package.json declares a packageManager.
+          package-manager-cache: false
 
-      # rust-toolchain.toml pins the channel (1.96); this action just ensures a
-      # toolchain is present so the pin resolves.
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: src-tauri
+      # rust-toolchain.toml pins the toolchain (1.96); install exactly that.
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
 
       - name: Install frontend dependencies
         run: npm ci
@@ -218,7 +238,8 @@ jobs:
         # dialog. Same workaround tests.yml uses; scoped to this job's build only.
         env:
           RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
-        run: cargo test --lib
+        # --locked: test exactly the graph Cargo.lock (and cargo-deny) describe.
+        run: cargo test --locked --lib
 
   # ══════════════════════════════════════════════════════════════════════
   # WINDOWS — began as a faithful copy of the retired build-windows.yml `build` job.
@@ -226,7 +247,7 @@ jobs:
   # ══════════════════════════════════════════════════════════════════════
   build-windows:
     needs: test  # never build/sign/publish on a red test suite
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 35  # Hard cap. Rust compile ~12m + signing ~3m. If we hit 35m, signing hung.
     # SENTRY_DSN lives at JOB level, not on the build step.
     #
@@ -241,36 +262,34 @@ jobs:
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     permissions:
-      contents: write
-      id-token: write  # Required for both Sigstore Fulcio AND Azure OIDC
+      contents: read
+      # Azure OIDC login for Trusted Signing. (Sigstore signing happens once,
+      # in the release job; this job publishes nothing, so no contents: write.)
+      id-token: write
+    defaults:
+      run:
+        shell: pwsh # unchanged: every unlabelled step here was pwsh before
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
-          cache: 'npm'
+          # No npm cache: a release restores nothing a PR could have written
+          # (zizmor cache-poisoning). Explicit, because setup-node v7 turns
+          # caching on by itself once package.json declares a packageManager.
+          package-manager-cache: false
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: src-tauri
-
+      # Lint, type-check and vitest ran in the `test` job this one needs, on
+      # this same ref - not repeated here.
       - name: Install frontend dependencies
         run: npm ci
-
-      - name: Lint frontend
-        run: npm run lint
-
-      - name: Type-check frontend
-        run: npm run type-check
-
-      - name: Run unit tests (single-run)
-        run: npm run test:run
 
       # Download wintun.dll (gitignored — must be fetched at build time).
       # Supply-chain: the zip is verified against a pinned SHA-256 before any
@@ -345,7 +364,7 @@ jobs:
         env:
           AUTHENTICODE_DRY_RUN: ${{ inputs.authenticode_dry_run }}
         run: |
-          if ("${{ github.ref }}".StartsWith("refs/tags/")) {
+          if ($env:GITHUB_REF.StartsWith("refs/tags/")) {
             "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             Write-Host "Tag build — Authenticode signing ENABLED"
           } elseif ($env:AUTHENTICODE_DRY_RUN -eq 'true') {
@@ -385,11 +404,15 @@ jobs:
       - name: Write Trusted Signing metadata
         if: steps.sign-mode.outputs.enabled == 'true'
         shell: pwsh
+        env:
+          TS_ENDPOINT: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          TS_ACCOUNT_NAME: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          TS_CERT_PROFILE: ${{ vars.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
         run: |
           $metadata = @{
-            Endpoint = "${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}"
-            CodeSigningAccountName = "${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}"
-            CertificateProfileName = "${{ vars.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}"
+            Endpoint = $env:TS_ENDPOINT
+            CodeSigningAccountName = $env:TS_ACCOUNT_NAME
+            CertificateProfileName = $env:TS_CERT_PROFILE
             ExcludeCredentials = @(
               "ManagedIdentityCredential",
               "EnvironmentCredential",
@@ -529,7 +552,10 @@ jobs:
           # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
           BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
           BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
-        run: npx tauri build
+        # `-- --locked` reaches cargo: the CLI runs `cargo build --locked
+        # --bins --features tauri/custom-protocol --release` (checked with
+        # tauri-cli 2.11.4 and --runner echo). Ship exactly Cargo.lock.
+        run: npx tauri build -- --locked
 
       # OPEN-WORK F4 — the gate that would have caught v1.4.40 and v1.4.41:
       # extract resources\xray.exe from the NSIS installer we are about to
@@ -622,6 +648,8 @@ jobs:
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/nsis/*.exe.sig
           retention-days: 30
+          if-no-files-found: error
+          compression-level: 0 # NSIS installers are already compressed
 
   # ══════════════════════════════════════════════════════════════════════
   # LINUX — began as a faithful copy of the retired build-linux.yml `build-linux` job.
@@ -647,37 +675,32 @@ jobs:
     env:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25  # build ~8.5 min cold (v1.4.45)
+    # Builds and uploads only: Sigstore signing happens once, in the release
+    # job, so no id-token and no contents: write here.
     permissions:
-      contents: write
-      id-token: write  # Required for Sigstore keyless signing
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            patchelf \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev
+        uses: ./.github/actions/linux-deps
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
-          cache: 'npm'
+          # No npm cache: a release restores nothing a PR could have written
+          # (zizmor cache-poisoning). Explicit, because setup-node v7 turns
+          # caching on by itself once package.json declares a packageManager.
+          package-manager-cache: false
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.arch }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: src-tauri
 
       - name: Install frontend dependencies
         run: npm ci
@@ -695,7 +718,7 @@ jobs:
           set -euo pipefail
           XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
           ZIP_PATH="${RUNNER_TEMP}/xray-linux-64.zip"
-          curl -fsSL "$XRAY_URL" -o "$ZIP_PATH"
+          curl -fsSL --retry 3 "$XRAY_URL" -o "$ZIP_PATH"
           ACTUAL=$(sha256sum "$ZIP_PATH" | awk '{print $1}')
           if [ "$ACTUAL" != "$XRAY_LINUX_SHA256" ]; then
             echo "::error::Xray zip SHA256 mismatch. Expected $XRAY_LINUX_SHA256, got $ACTUAL"
@@ -733,7 +756,29 @@ jobs:
           # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
           BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
           BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
-        run: npx tauri build --target ${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+        run: npx tauri build --target "$ARCH" -- --locked
+
+      # MR-720 / MR-736: the Linux twin of build-windows' xray gate. Unpacks the
+      # .deb and the AppImage exactly as shipped and requires
+      # usr/lib/BirdoVPN/resources/xray to be executable and to hash to the
+      # XRAY_BINARY_SHA256 this build compiled in (and that the app binary
+      # really carries that value). Script + self-test: scripts/ci/; passes on
+      # the published v1.4.45 packages.
+      - name: Gate — bundled xray (.deb, .AppImage) must hash to the compiled-in XRAY_BINARY_SHA256
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          bundle="src-tauri/target/$ARCH/release/bundle"
+          shopt -s nullglob
+          debs=("$bundle"/deb/*.deb)
+          appimages=("$bundle"/appimage/*.AppImage)
+          if [ "${#debs[@]}" -ne 1 ] || [ "${#appimages[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .deb and one .AppImage under $bundle (found ${#debs[@]} and ${#appimages[@]})"
+            exit 1
+          fi
+          bash scripts/ci/verify-bundled-xray.sh "${XRAY_BINARY_SHA256:-}" "${debs[0]}" "${appimages[0]}"
 
       # Integrity/provenance is handled ONCE in the release job (unified
       # SHA256SUMS.txt + one Sigstore bundle). The per-artifact .sigstore and
@@ -749,6 +794,8 @@ jobs:
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage
             src-tauri/target/${{ matrix.arch }}/release/bundle/appimage/*.AppImage.sig
           retention-days: 30
+          if-no-files-found: error
+          compression-level: 0 # .deb / AppImage are already compressed
 
   # ══════════════════════════════════════════════════════════════════════
   # Is the signed Mac App Store app live yet? (owner decision 2026-10-01)
@@ -757,7 +804,9 @@ jobs:
   # a lookup failure counts as 'not live', so the DMG keeps shipping.
   # ══════════════════════════════════════════════════════════════════════
   mac-app-store:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
     outputs:
       live: ${{ steps.lookup.outputs.live }}
     steps:
@@ -786,21 +835,31 @@ jobs:
   # already self-guards on APPLE_CERTIFICATE being present/absent (see
   # "Detect Apple signing capability" below) — since that secret is not
   # configured, it naturally always takes the unsigned-fallback path and
-  # skips the notarize/staple step. Sigstore keyless attestation still runs.
+  # skips the notarize/staple step. Sigstore signing of the release (the one
+  # SHA256SUMS.txt bundle) happens in the release job.
   #
-  # `continue-on-error: true` is added at job level (new) so a macOS build
-  # failure NEVER blocks the Windows/Linux release (see the `release` job's
-  # required-platforms guard at the bottom of this file).
+  # REQUIRED while it runs (register MR-720): this job used to carry
+  # `continue-on-error: true`, so a failed macOS build - or a .app that
+  # shipped without its xray - published a release silently missing the Mac
+  # assets or carrying a broken one. The `release` job now refuses to publish
+  # unless this job succeeded, or was skipped because the Mac App Store app
+  # is live (owner decision 2026-10-01: Mac users must never be left with no
+  # way to install).
   # ══════════════════════════════════════════════════════════════════════
   build-macos:
-    needs: [test, mac-app-store]  # gate on tests too, but stays best-effort (continue-on-error below)
+    needs: [test, mac-app-store]  # never build on a red test suite
     if: needs.mac-app-store.outputs.live != 'true'  # retire the DMG once the Mac App Store app is live
-    continue-on-error: true  # macOS is best-effort; must never gate the release
+    # ~8 min build (v1.4.45); 45 leaves room for the 30-minute notarytool
+    # wait if Apple signing is ever configured.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14        # Apple Silicon (M1+)
+          # Apple Silicon (M1+). Was macos-14, which GitHub retires on
+          # 2026-11-02 (brownouts fail jobs before then); macos-15 is the
+          # image the x64 leg below already builds on.
+          - runner: macos-15
             arch: aarch64-apple-darwin
             label: arm64
           - runner: macos-15        # Intel x86_64 (macos-13 deprecated)
@@ -819,33 +878,27 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      id-token: write   # Sigstore keyless OIDC
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
-          cache: 'npm'
+          # No npm cache: a release restores nothing a PR could have written
+          # (zizmor cache-poisoning). Explicit, because setup-node v7 turns
+          # caching on by itself once package.json declares a packageManager.
+          package-manager-cache: false
 
-      - name: Setup Rust (pinned via rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      # Installs the PINNED toolchain and adds the matrix target to it - the
+      # cross target (x86_64-apple-darwin on the arm64 runner) must live on
+      # the pinned toolchain, or `tauri build` fails "target not installed".
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml) + target
+        uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.arch }}
-
-      # dtolnay adds the target to `stable`, but rust-toolchain.toml pins a
-      # specific toolchain that rustup switches to inside the repo — so the cross
-      # target (x86_64-apple-darwin on the arm64 runner) must be added to the
-      # PINNED toolchain explicitly, or `tauri build` fails "target not installed".
-      - name: Add cross-compile target to the pinned toolchain
-        working-directory: src-tauri
-        run: rustup target add ${{ matrix.arch }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: src-tauri
 
       - name: Install frontend dependencies
         run: npm ci
@@ -876,9 +929,11 @@ jobs:
       # the release fails closed: xray.rs refuses to exec an unverified binary
       # and XRAY_BINARY_SHA256 stays unset.
       - name: Download pinned Xray Reality engine
+        env:
+          LABEL: ${{ matrix.label }}
         run: |
           set -euo pipefail
-          if [ "${{ matrix.label }}" = "arm64" ]; then
+          if [ "$LABEL" = "arm64" ]; then
             ASSET="Xray-macos-arm64-v8a.zip"
             EXPECTED="$XRAY_MACOS_ARM64_SHA256"
           else
@@ -887,7 +942,7 @@ jobs:
           fi
           XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${ASSET}"
           ZIP_PATH="${RUNNER_TEMP}/${ASSET}"
-          curl -fsSL "$XRAY_URL" -o "$ZIP_PATH"
+          curl -fsSL --retry 3 "$XRAY_URL" -o "$ZIP_PATH"
           ACTUAL=$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')
           if [ "$ACTUAL" != "$EXPECTED" ]; then
             echo "::error::Xray zip SHA256 mismatch for $ASSET. Expected $EXPECTED, got $ACTUAL"
@@ -954,6 +1009,7 @@ jobs:
             -A -t cert -f pkcs12 \
             -k "$KEYCHAIN_PATH"
 
+          # shellcheck disable=SC2046 # the existing keychain list is meant to word-split into separate arguments
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
@@ -977,7 +1033,8 @@ jobs:
           # src-tauri/src/api/attestation.rs and docs/CLIENT-ATTESTATION.md.
           BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
           BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
-        run: npx tauri build --target ${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+        run: npx tauri build --target "$ARCH" -- --locked
 
       - name: Build Tauri application (unsigned fallback)
         if: steps.signcap.outputs.have_apple_signing != 'true'
@@ -990,7 +1047,8 @@ jobs:
           # could not attest would be refused by an `enforce` server policy.
           BIRDO_DESKTOP_ATTEST_SK: ${{ secrets.BIRDO_DESKTOP_ATTEST_SK }}
           BIRDO_DESKTOP_ATTEST_KID: ${{ secrets.BIRDO_DESKTOP_ATTEST_KID }}
-        run: npx tauri build --target ${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
+        run: npx tauri build --target "$ARCH" -- --locked
 
       # ── Notarize + Staple ──────────────────────────────────────────
       - name: Notarize and staple DMG
@@ -999,9 +1057,10 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          DMG_FILE=$(find "src-tauri/target/${{ matrix.arch }}/release/bundle/dmg" -name '*.dmg' -print -quit || true)
+          DMG_FILE=$(find "src-tauri/target/$ARCH/release/bundle/dmg" -name '*.dmg' -print -quit || true)
           if [ -z "${DMG_FILE:-}" ]; then
             echo "::error::No DMG produced by Tauri build"
             exit 1
@@ -1023,6 +1082,29 @@ jobs:
           spctl --assess --type open --context context:primary-signature -vv "$DMG_FILE" || \
             echo "::warning::spctl assessment did not pass — investigate before release"
 
+      # MR-720 / MR-736: the macOS twin of build-windows' xray gate, on all
+      # three shipped forms - the .app, the updater .app.tar.gz and the .dmg
+      # (mounted read-only). Contents/Resources/resources/xray must be
+      # executable and hash to the XRAY_BINARY_SHA256 this build compiled in,
+      # and the app binary must carry that value. Placed after notarize/staple
+      # so it inspects the final bytes. Passes on the published v1.4.45
+      # packages (both arches). Script + self-test: scripts/ci/.
+      - name: Gate — bundled xray (.app, .app.tar.gz, .dmg) must hash to the compiled-in XRAY_BINARY_SHA256
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          bundle="src-tauri/target/$ARCH/release/bundle"
+          shopt -s nullglob
+          apps=("$bundle"/macos/*.app)
+          tars=("$bundle"/macos/*.app.tar.gz)
+          dmgs=("$bundle"/dmg/*.dmg)
+          if [ "${#apps[@]}" -ne 1 ] || [ "${#tars[@]}" -ne 1 ] || [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .app, one .app.tar.gz and one .dmg under $bundle (found ${#apps[@]}, ${#tars[@]} and ${#dmgs[@]})"
+            exit 1
+          fi
+          bash scripts/ci/verify-bundled-xray.sh "${XRAY_BINARY_SHA256:-}" "${apps[0]}" "${tars[0]}" "${dmgs[0]}"
+
       # Integrity/provenance is handled ONCE in the release job (unified
       # SHA256SUMS.txt + one Sigstore bundle over the final asset names).
       - name: Cleanup keychain
@@ -1041,38 +1123,57 @@ jobs:
             src-tauri/target/${{ matrix.arch }}/release/bundle/macos/*.app.tar.gz.sig
           retention-days: 30
           if-no-files-found: error
+          compression-level: 0 # .dmg / .app.tar.gz are already compressed
 
   # ══════════════════════════════════════════════════════════════════════
   # ONE GitHub Release for ALL platforms, from ONE tag.
-  # Windows + Linux are REQUIRED (the release step refuses to run if either
-  # did not succeed). macOS is best-effort: its artifacts are attached IF
-  # present, but a macOS failure never blocks or is required for this job
-  # (build-macos also carries `continue-on-error: true` above, belt-and-braces).
+  # Windows, Linux AND macOS are REQUIRED: the guard below refuses to publish
+  # unless each succeeded. The only exception is macOS once the Mac App Store
+  # app is live (then build-macos is skipped by design and no DMG ships).
   # ══════════════════════════════════════════════════════════════════════
   release:
-    needs: [test, build-windows, build-linux, build-macos]
+    needs: [test, build-windows, build-linux, mac-app-store, build-macos]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
-      contents: write
+      contents: write  # create the GitHub Release and upload its assets
       id-token: write  # Sigstore keyless signing of the unified SHA256SUMS.txt
     steps:
-      - name: Require the test gate + Windows + Linux builds to have succeeded
+      - name: Require the test gate + every platform build to have succeeded
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          WINDOWS_RESULT: ${{ needs.build-windows.result }}
+          LINUX_RESULT: ${{ needs.build-linux.result }}
+          MAS_RESULT: ${{ needs.mac-app-store.result }}
+          MAS_LIVE: ${{ needs.mac-app-store.outputs.live }}
+          MACOS_RESULT: ${{ needs.build-macos.result }}
         run: |
           set -euo pipefail
-          if [ "${{ needs.test.result }}" != "success" ]; then
-            echo "::error::test result=${{ needs.test.result }} — the Rust unit tests / vitest gate did not pass, refusing to publish a release"
-            exit 1
+          fail=0
+          if [ "$TEST_RESULT" != "success" ]; then
+            echo "::error::test result=$TEST_RESULT — the Rust unit tests / vitest gate did not pass, refusing to publish a release"
+            fail=1
           fi
-          if [ "${{ needs.build-windows.result }}" != "success" ]; then
-            echo "::error::build-windows result=${{ needs.build-windows.result }} — Windows is a REQUIRED platform, refusing to publish a release"
-            exit 1
+          if [ "$WINDOWS_RESULT" != "success" ]; then
+            echo "::error::build-windows result=$WINDOWS_RESULT — Windows is a REQUIRED platform, refusing to publish a release"
+            fail=1
           fi
-          if [ "${{ needs.build-linux.result }}" != "success" ]; then
-            echo "::error::build-linux result=${{ needs.build-linux.result }} — Linux is a REQUIRED platform, refusing to publish a release"
-            exit 1
+          if [ "$LINUX_RESULT" != "success" ]; then
+            echo "::error::build-linux result=$LINUX_RESULT — Linux is a REQUIRED platform, refusing to publish a release"
+            fail=1
           fi
-          echo "Windows + Linux OK. macOS (best-effort) result: ${{ needs.build-macos.result }}"
+          if [ "$MAS_RESULT" != "success" ]; then
+            echo "::error::mac-app-store result=$MAS_RESULT — cannot tell whether the Mac DMG is still required, refusing to publish a release"
+            fail=1
+          elif [ "$MAS_LIVE" = "true" ]; then
+            echo "Mac App Store app is live — no DMG/updater bundle in this release (build-macos: $MACOS_RESULT)"
+          elif [ "$MACOS_RESULT" != "success" ]; then
+            echo "::error::build-macos result=$MACOS_RESULT — macOS is a REQUIRED platform until the Mac App Store app is live (owner decision 2026-10-01), refusing to publish a release without it"
+            fail=1
+          fi
+          [ "$fail" -eq 0 ] || exit 1
+          echo "Test gate, Windows, Linux and macOS OK."
 
       - name: Download Windows artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1093,21 +1194,19 @@ jobs:
           name: birdo-vpn-linux-amd64
           path: release-files/linux/
 
-      # macOS is best-effort: if build-macos failed entirely (no artifact was
-      # ever uploaded), these downloads 404 — continue-on-error keeps that
-      # from failing the release job. softprops/action-gh-release's `files:`
-      # glob patterns below simply match nothing in that case (default
-      # fail_on_unmatched_files is false), so the release still publishes
-      # Windows + Linux only.
-      - name: Download macOS arm64 artifacts (best-effort)
-        continue-on-error: true
+      # The guard above has already refused to publish if macOS was required
+      # and failed, so a skipped build-macos here means only "Mac App Store
+      # app is live"; otherwise both downloads must succeed. The `files:`
+      # globs below match nothing for a skipped platform.
+      - name: Download macOS arm64 artifacts
+        if: needs.build-macos.result == 'success'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: birdo-vpn-macos-arm64
           path: release-files/macos-arm64/
 
-      - name: Download macOS x64 artifacts (best-effort)
-        continue-on-error: true
+      - name: Download macOS x64 artifacts
+        if: needs.build-macos.result == 'success'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: birdo-vpn-macos-x64
@@ -1211,9 +1310,16 @@ jobs:
       # transitively covers every artifact EXCEPT the updater `.sig` files,
       # which the find below deliberately excludes — those are verified
       # independently by the updater against its embedded minisign public key,
-      # not via this checksums file (P5-CICD-25):
-      #   cosign verify-blob --bundle SHA256SUMS.txt.sigstore SHA256SUMS.txt
+      # not via this checksums file (P5-CICD-25). Verify (MR-747: pin the
+      # signer to THIS workflow at THIS tag, or any GitHub Actions identity
+      # passes - cosign v3 refuses to verify at all without an identity):
+      #   cosign verify-blob --bundle SHA256SUMS.txt.sigstore \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     --certificate-identity "https://github.com/BirdoVPN/Desktop-Client/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+      #     SHA256SUMS.txt
       #   sha256sum -c SHA256SUMS.txt --ignore-missing
+      # (Checked against v1.4.45 with cosign v3.1.3: passes; a wrong tag, another
+      # repo's workflow or an edited SHA256SUMS.txt fails. docs/VERIFICATION.md.)
       - name: Install Cosign
         if: startsWith(github.ref, 'refs/tags/')
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -1234,11 +1340,58 @@ jobs:
         shell: bash
         run: find release-files -type f -print || true
 
+      # Owner decision 2026-10-01: GitHub 'Latest' must ALWAYS be the newest
+      # fully released build - and birdo-web's download page reads
+      # /releases/latest. A blanket make_latest: true let an OLDER tag take
+      # Latest back: re-running a previous tag's workflow, or two tags whose
+      # runs finish out of order. So a tag takes Latest only if no newer vX.Y.Z
+      # is already published. On the normal path (the newest tag) this is
+      # true, exactly as before. (Two publishes within the same few seconds can
+      # still race; serialising publishes instead would let a third queued
+      # tag's run cancel the second's - a dropped release is worse.)
+      - name: Decide whether this tag becomes GitHub Latest
+        id: latest
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG is not plain vX.Y.Z - keeping make_latest: true (unchanged behaviour)"
+            exit 0
+          fi
+          # Bounded retry; if the API stays unreachable, fall back to the
+          # behaviour before this guard rather than block the release.
+          published="" listed=false
+          for attempt in 1 2 3; do
+            if published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                 --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name'); then
+              listed=true
+              break
+            fi
+            echo "release listing failed (attempt $attempt/3)"
+            sleep 5
+          done
+          if [ "$listed" != true ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::could not list releases - keeping make_latest: true (the behaviour before this guard)"
+            exit 0
+          fi
+          newest=$(printf '%s\n%s\n' "$published" "$TAG" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if [ "$newest" = "$TAG" ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG is the newest release - it becomes Latest"
+          else
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::$TAG is older than the already-published $newest - publishing it WITHOUT moving GitHub Latest off $newest"
+          fi
+
       # Only actually publish on a real tag push (workflow_dispatch builds are
-      # for manual/debug runs and cut no release). Owner decision 2026-10-01:
-      # GitHub 'Latest' must ALWAYS be the newest fully released build, with no
-      # hand-flipped drafts. The guard above already refuses to get here unless
-      # the test gate and both required platforms succeeded.
+      # for manual/debug runs and cut no release); no hand-flipped drafts. The
+      # guard above already refuses to get here unless the test gate and every
+      # required platform succeeded.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -1254,4 +1407,4 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
-          make_latest: true
+          make_latest: ${{ steps.latest.outputs.make_latest }}

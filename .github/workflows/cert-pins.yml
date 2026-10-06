@@ -76,19 +76,34 @@ on:
     - cron: '17 6 * * *'   # daily 06:17 UTC — catches a CA migration we did not make
   workflow_dispatch: {}
 
-permissions:
-  contents: read
+permissions: {}
+
+# Superseded PR runs are cancelled; main/schedule runs never are.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   divergence:
     name: Pin sets agree with the SSOT
-    runs-on: ubuntu-latest
+    # Forks get no scheduled runs.
+    if: github.event_name != 'schedule' || github.repository == 'BirdoVPN/Desktop-Client'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # --offline skips only check 3 (live chains). Checks 1b (provenance +
       # merge order), 2 (divergence), 2b (live lineages) and 2c (retired pins
       # must not survive anywhere, comments and test fixtures included) all run
-      # here, on every PR that touches a pin file. Check 1 reports SKIP — see
+      # here, on every PR that touches a pin file. Check 1 reports SKIP - see
       # the note at the top.
       - name: check-cert-pins.sh --offline
         run: bash scripts/check-cert-pins.sh --offline
@@ -96,20 +111,27 @@ jobs:
       # (WR2 + GTS Root R1 live, one lineage) must FAIL check 2b, a stale or
       # expired waiver must fail it, and check 3 must fail a chain that matches
       # only a dormant pin or that arrives shortened - and must NOT fail
-      # Google's cross-signed roots. `if: always()` so it runs even when the
-      # step above is red: a broken checker must not hide behind a merge-order
-      # block.
+      # Google's cross-signed roots. It runs even when the step above is red
+      # (a broken checker must not hide behind a merge-order block), but not
+      # after a cancel - hence success() || failure() rather than always().
       - name: test_check_cert_pins.py (the checker against known-bad fixtures)
-        if: always()
+        if: success() || failure()
         run: python3 scripts/test_check_cert_pins.py
 
   liveness:
     name: Live chains still satisfy the pins
     # Only on the schedule / manual runs: a PR must never go red because a
     # third-party CDN was briefly unreachable from a runner.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'BirdoVPN/Desktop-Client' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: check-cert-pins.sh (full, incl. live chains)
         run: bash scripts/check-cert-pins.sh

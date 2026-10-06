@@ -2,92 +2,144 @@ name: Tests
 
 # Runs the automated test suites on every push to main and every PR.
 #
-# WHY THIS EXISTS: the build-* workflows only ever *build* the app (release
-# bundle). Building excludes `#[cfg(test)]` modules, so the Rust unit tests were
-# never executed by CI — which is exactly how a duplicate-field compile error in
-# a test module (birdo_pq.rs) survived on main undetected. This workflow runs
-# `cargo test` (Windows — the supported launch target) and the frontend vitest
-# suite so a broken test can never silently land again.
+# WHY THIS EXISTS: the release build excludes `#[cfg(test)]` modules, so the
+# Rust unit tests were never executed by CI - which is exactly how a
+# duplicate-field compile error in a test module (birdo_pq.rs) survived on
+# main undetected. This workflow runs `cargo test` (Windows - the supported
+# launch target), the Linux/macOS compile + platform tests, and the frontend
+# suite, so a broken test can never silently land again.
 #
-# Linux is intentionally NOT run here: Windows is the supported launch target
-# and the GTK/WebKit system-dev packages make the job slow for little signal.
-# (The old 1.83-vs-edition2024 blocker is gone — the pin is 1.96 now.)
-# macOS/iOS are descoped for this launch.
+# Shape (2026-10-06 rebuild): every job is independent, so they all start at
+# once and the slowest one sets the wall time. Rust caches are written by
+# main only (`save-if`); PRs restore main's cache read-only. PR-scoped copies
+# used to push the repo to 14 GB of caches (10 GB cap) and evict main's.
+# Every cargo invocation is `--locked`: CI tests the exact dependency graph
+# that Cargo.lock (and cargo-deny) describe, or fails.
 
 on:
   push:
     branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
+  # Every base branch, not only main: stacked PRs (e.g. #221/#222 on
+  # overhaul/windows) get the same signal. No branch protection or required
+  # checks exist on this repo; if required checks are ever added, replace
+  # paths-ignore with a `changes` job so docs-only PRs still report.
   pull_request:
+    paths-ignore: ["docs/**", "**/*.md"]
   workflow_dispatch:
 
 permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust-tests:
-    name: Rust unit tests (Windows)
-    runs-on: windows-latest
-    timeout-minutes: 30
+  # rustfmt + clippy, split from the test job so the two run in parallel.
+  rust-lint:
+    name: Rust lint (Windows) - rustfmt + clippy
+    runs-on: windows-2025
+    timeout-minutes: 20
     permissions:
       contents: read
+    defaults:
+      run:
+        # pwsh, not Git Bash: MSYS path conversion rewrites slash-arguments,
+        # and RUSTFLAGS below carries /DELAYLOAD.
+        shell: pwsh
+    env:
+      # Same flags as rust-tests (see there) so a local `cargo clippy` after
+      # `cargo test` reuses the build; harmless for check-mode.
+      RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      # rust-toolchain.toml pins the channel (1.96); this action just ensures a
-      # toolchain is present so the pin resolves.
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      # Lint first: it needs no compile, so formatting fails in seconds.
+      - name: rustfmt check
+        working-directory: src-tauri
+        run: cargo fmt --check
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # tauri::generate_context!() in main.rs requires the frontendDist dir
-      # (../dist) to EXIST at macro-expansion time. The lint/test job doesn't
-      # build the real frontend (that's the release workflow's job), so give
-      # the macro a stub. Without this, clippy on the bin target panics with
-      # "frontendDist is set to ../dist but this path doesn't exist".
+      # (../dist) to EXIST at macro-expansion time. This job does not build the
+      # real frontend, so give the macro a stub. Without this, clippy on the
+      # bin target panics with "frontendDist is set to ../dist but this path
+      # doesn't exist".
       - name: Stub frontend dist for macro expansion
-        shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Set-Content -Path dist/index.html -Value '<!doctype html><title>stub</title>'
 
-      # Lint gates: keep the public repo rustfmt-clean and clippy-clean.
-      # (Validated against the pinned toolchain, so local == CI results.)
-      - name: rustfmt check
-        working-directory: src-tauri
-        run: cargo fmt --check
-
+      # Validated against the pinned toolchain, so local == CI results.
       - name: Clippy (deny warnings)
         working-directory: src-tauri
-        env:
-          RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  rust-tests:
+    name: Rust unit tests (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh # see rust-lint: RUSTFLAGS carries /DELAYLOAD
+    env:
+      # The shipping app binary gets the ComCtl32 v6 manifest dependency via
+      # tauri-build (app.manifest), so it loads ComCtl32 v6 - where
+      # TaskDialogIndirect lives (pulled in transitively by a native-dialog
+      # crate). The unit-TEST binary gets no such manifest, so that import
+      # binds against ComCtl32 v5, the function is absent, and the harness
+      # fails to even start: STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) - on
+      # every Windows machine, including clean runners (which is why the suite
+      # never ran). Delay-load comctl32 so the symbol binds lazily; unit tests
+      # never raise a task dialog. Scoped to CI test builds only - the app
+      # build is untouched. (cargo has no `rustc-link-arg-tests` build-script
+      # instruction, so this is RUSTFLAGS rather than build.rs.)
+      RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Stub frontend dist for macro expansion
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Set-Content -Path dist/index.html -Value '<!doctype html><title>stub</title>'
 
       - name: Run Rust unit tests
         working-directory: src-tauri
-        # The shipping app binary gets the ComCtl32 v6 manifest dependency via
-        # tauri-build (app.manifest), so it loads ComCtl32 v6 — where
-        # TaskDialogIndirect lives (pulled in transitively by a native-dialog
-        # crate). The unit-TEST binary gets no such manifest, so that import binds
-        # against ComCtl32 v5, the function is absent, and the harness fails to
-        # even start: STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) — on every Windows
-        # machine, including clean runners (which is why the suite never ran).
-        # Delay-load comctl32 so the symbol binds lazily; unit tests never raise a
-        # task dialog. Scoped to THIS job's build only — the app build is untouched.
-        # (cargo has no `rustc-link-arg-tests` build-script instruction, so we
-        #  use RUSTFLAGS here rather than build.rs.)
-        env:
-          RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
-        run: cargo test --lib
+        run: cargo test --locked --lib
 
       # The privacy pins (P6-CLI-D-09/10/11) live in tests/privacy_pins.rs, an
       # INTEGRATION target. `cargo test --lib` does not run integration targets
-      # and `cargo check --all-targets` only compiles them — so from the day
+      # and `cargo check --all-targets` only compiles them - so from the day
       # they were written until 2026-09-19 these four assertions had never once
       # executed, in any job, on any branch. They are the tests that prove the
       # crash reporter and panic hook sanitise before writing, that the xray
@@ -96,14 +148,12 @@ jobs:
       # make. A gate that never runs is a comment.
       - name: Run Rust privacy-pin tests (integration target)
         working-directory: src-tauri
-        env:
-          RUSTFLAGS: "-C link-arg=/DELAYLOAD:comctl32.dll -C link-arg=delayimp.lib"
-        run: cargo test --test privacy_pins
+        run: cargo test --locked --test privacy_pins
 
-  # Cross-platform compile guard. The rust-tests job above only compiles the
+  # Cross-platform compile guard. The Windows jobs above only compile the
   # Windows cfg branches, so Linux/macOS-only code (`#[cfg(target_os = ...)]`
   # blocks, and shared code that calls Windows-only modules like vpn::wfp) was
-  # NEVER compiled until a release tag built those platforms — which is how four
+  # NEVER compiled until a release tag built those platforms - which is how four
   # cross-platform breaks (an ungated wfp:: call in the shipped leak fix, a
   # macOS str_as_str, an Intel cross-target, a release asset collision) reached
   # release. `cargo check` (no bundling, no run) is fast and catches them on PRs.
@@ -113,36 +163,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             os: linux
-          - runner: macos-latest
+          # macOS 26 = what macos-latest resolved to before this pin; the
+          # runtime tests below (pfctl, routes) then run on the newest macOS.
+          - runner: macos-26
             os: macos
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Linux system dependencies
         if: matrix.os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            patchelf \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev
+        uses: ./.github/actions/linux-deps
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
           key: ${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # generate_context!() needs ../dist to exist at macro-expansion time.
       - name: Stub frontend dist for macro expansion
@@ -151,16 +199,14 @@ jobs:
           echo '<!doctype html><title>stub</title>' > dist/index.html
 
       # PQ dependency + feature gate. Runs on Linux only (once per PR is
-      # enough; the answer is host-independent) and BEFORE `cargo check`,
-      # which would regenerate a stale Cargo.lock out from under the
-      # banned-crate grep.
+      # enough; the answer is host-independent) and BEFORE `cargo check`.
       #
       # WHY: `zeroize` is what makes ml-kem's DecapsulationKey ZeroizeOnDrop
       # (ml-kem-0.3.2/src/decapsulation_key.rs:142,156 gate `impl Drop` and
       # `impl ZeroizeOnDrop` on that feature), and nothing asserted it. Review
       # of #163 changed the dependency to `features = ["alloc"]` and all 15
-      # crypto tests still passed — no test can observe a Drop that did not
-      # happen — so a Dependabot bump or a refactor could disarm every
+      # crypto tests still passed - no test can observe a Drop that did not
+      # happen - so a Dependabot bump or a refactor could disarm every
       # decapsulation-key wipe with a green build. Mobile-Client has
       # scripts/check_pq_features.sh for exactly this; Desktop-Client had no
       # equivalent. The script also holds the exact `=0.3.2` pin, keeps the
@@ -174,7 +220,7 @@ jobs:
 
       - name: cargo check (all targets)
         working-directory: src-tauri
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
       # The DNS crash-recovery journal is the only record of the user's
       # pre-connect resolvers, so it must survive a restore that did not land.
@@ -184,14 +230,14 @@ jobs:
       # BOTH Unix platforms, and that is the point of the matrix expression.
       # tunnel_macos.rs is `#[cfg(target_os = "macos")]`, so its tests are not
       # even COMPILED by the Windows job that runs `cargo test`, and this job
-      # used to run `cargo check` alone on macOS — so every macOS test in the
+      # used to run `cargo check` alone on macOS - so every macOS test in the
       # repo, including the one named for the regression this whole change
       # exists to stop, executed in no job at all. A test nothing runs is not
       # coverage, it is a comment that costs a compile.
       - name: DNS journal restore + TUN read tests (Linux + macOS)
         working-directory: src-tauri
-        shell: bash
         env:
+          OS: ${{ matrix.os }}
           # Linux: resolv_conf_restore_tests + tun_read_tests (F6: the packet
           # loop's buffer-reuse helper, run on a pipe fd). macOS:
           # dns_journal_restore_tests (restore_services_pass,
@@ -206,21 +252,23 @@ jobs:
           COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests' || 'configure_ipv6_tests ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
         run: |
           set -euo pipefail
+          # $FILTER/$COVERED are space-separated lists; split them explicitly
+          # (libtest ORs several name filters).
+          read -r -a filters <<<"$FILTER"
+          read -r -a covered_list <<<"$COVERED"
           # Captured, not piped: a name filter that matches NOTHING still exits
           # 0, which is a green light for a test suite that never ran.
-          # $FILTER is deliberately unquoted: it is one or more libtest name
-          # filters (see env above), and libtest ORs them.
-          out=$(cargo test --lib -- $FILTER)
+          out=$(cargo test --locked --lib -- "${filters[@]}")
           echo "$out"
           if ! echo "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
-            echo "::error::no tests ran on ${{ matrix.os }} - the filter '$FILTER' matched nothing"
+            echo "::error::no tests ran on $OS - the filter '$FILTER' matched nothing"
             exit 1
           fi
           # Each named module must have run at least one test, or a typo in
           # one filter hides behind the other's passes.
-          for f in $FILTER; do
+          for f in "${filters[@]}"; do
             if ! echo "$out" | grep -qE "^test [a-z0-9_:]*${f}::[a-z0-9_]+ \.\.\. ok"; then
-              echo "::error::filter '$f' matched no passing test on ${{ matrix.os }}"
+              echo "::error::filter '$f' matched no passing test on $OS"
               exit 1
             fi
           done
@@ -235,17 +283,17 @@ jobs:
           # for the regression this workflow step exists to protect, so the rule
           # gets a checker instead of a promise.
           declared=$(grep -oE '^mod [a-z0-9_]+_tests' "$SRC" | awk '{print $2}' | sort | tr '\n' ' ')
-          covered=$(printf '%s\n' $COVERED | sort | tr '\n' ' ')
+          covered=$(printf '%s\n' "${covered_list[@]}" | sort | tr '\n' ' ')
           if [ "$declared" != "$covered" ]; then
             echo "::error::$SRC declares test modules [$declared] but this job executes [$covered] - the difference runs in NO CI job. Add it to FILTER/COVERED."
             exit 1
           fi
           echo "OK - every test module in $SRC is executed by this job: $covered"
 
-      # ── F-001 verification ────────────────────────────────────────────────
+      # -- F-001 verification ------------------------------------------------
       # The IPv6 leak fix is kernel-firewall code that a Windows dev box cannot
       # exercise at all, and full leak-testing needs a dual-stack network we do
-      # not have. These two steps verify everything that CAN be verified without
+      # not have. These steps verify everything that CAN be verified without
       # one, on the real OS, on every push.
 
       # macOS: parse-check the EXACT ruleset bytes we ship. A pf syntax error
@@ -259,16 +307,16 @@ jobs:
         run: |
           set -euo pipefail
           for f in resources/pf/ipv6-block.conf resources/pf/ipv6-block-minimal.conf; do
-            echo "── pfctl -n -f $f"
+            echo "-- pfctl -n -f $f"
             sudo pfctl -n -f "$f"
             echo "   OK"
           done
           # Guard the property the whole design rests on: these rulesets must
           # never mention inet/IPv4. pf's implicit default is pass, so an
-          # inet6-only ruleset cannot break IPv4 — that is what makes loading it
+          # inet6-only ruleset cannot break IPv4 - that is what makes loading it
           # as the MAIN ruleset safe for a whole session.
           if grep -nE '\binet\b' resources/pf/*.conf; then
-            echo "::error::pf leak-block ruleset references IPv4 — it could break IPv4 connectivity"
+            echo "::error::pf leak-block ruleset references IPv4 - it could break IPv4 connectivity"
             exit 1
           fi
 
@@ -279,20 +327,8 @@ jobs:
       - name: IPv6 leak-block functional test (Linux, root)
         if: matrix.os == 'linux'
         working-directory: src-tauri
-        run: sudo -E "$(command -v cargo)" test --lib ipv6_leak_block_tests -- --ignored --nocapture
+        run: sudo -E "$(command -v cargo)" test --locked --lib ipv6_leak_block_tests -- --ignored --nocapture
 
-      # configure_ipv6() itself, which until this step had NEVER EXECUTED — not
-      # in CI, not on a dev box, not anywhere. The bench document opens by saying
-      # so. Every Linux and Windows single-hop connect calls it for real since
-      # route failures became fatal, so without this the first execution would
-      # have been a customer's.
-      #
-      # A dummy interface reaches everything except egress: that the function
-      # runs, that it installs ::/1 + 8000::/1 rather than a ::/0, that the
-      # host's own default survives, that the kernel agrees the tunnel won, and
-      # that a collision on one half is REFUSED rather than swallowed. Proving
-      # IPv6 traffic actually leaves through the tunnel still needs the bench on
-      # a dual-stack line; this is the part that does not.
       # F-008 macOS: the ONE tolerated route failure, proven rather than
       # asserted in a comment. The owner has no Mac, so this runner is the only
       # place it can run. It installs a route to TEST-NET-1 and removes it.
@@ -301,13 +337,24 @@ jobs:
         working-directory: src-tauri
         run: |
           set -euo pipefail
-          out=$(sudo -E "$(command -v cargo)" test --lib endpoint_route_tests -- --ignored --nocapture --test-threads=1)
+          out=$(sudo -E "$(command -v cargo)" test --locked --lib endpoint_route_tests -- --ignored --nocapture --test-threads=1)
           echo "$out"
           if ! echo "$out" | grep -qE 'test result: ok\. 1 passed'; then
             echo "::error::the macOS endpoint-route root test did not run"
             exit 1
           fi
 
+      # configure_ipv6() itself, which until this step had NEVER EXECUTED - not
+      # in CI, not on a dev box, not anywhere. Every Linux and Windows
+      # single-hop connect calls it for real since route failures became fatal,
+      # so without this the first execution would have been a customer's.
+      #
+      # A dummy interface reaches everything except egress: that the function
+      # runs, that it installs ::/1 + 8000::/1 rather than a ::/0, that the
+      # host's own default survives, that the kernel agrees the tunnel won, and
+      # that a collision on one half is REFUSED rather than swallowed. Proving
+      # IPv6 traffic actually leaves through the tunnel still needs the bench on
+      # a dual-stack line; this is the part that does not.
       - name: configure_ipv6 route-shape tests (Linux, root)
         if: matrix.os == 'linux'
         working-directory: src-tauri
@@ -317,7 +364,7 @@ jobs:
           # GLOBAL routing state - ::/1 is ::/1 whichever device claims it - so
           # run in parallel they contend over the same prefix and fail for a
           # reason that has nothing to do with the code under test.
-          out=$(sudo -E "$(command -v cargo)" test --lib configure_ipv6_tests -- --ignored --nocapture --test-threads=1)
+          out=$(sudo -E "$(command -v cargo)" test --locked --lib configure_ipv6_tests -- --ignored --nocapture --test-threads=1)
           echo "$out"
           # Two tests, both required. An --ignored filter that matches nothing
           # still exits 0, which is the exact failure this repo has been bitten
@@ -327,20 +374,74 @@ jobs:
             exit 1
           fi
 
-  frontend-tests:
-    name: Frontend unit tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  # The declared MSRV (src-tauri/Cargo.toml `rust-version`, read here so the
+  # two cannot drift) must really build. It is also a clippy input: clippy's
+  # MSRV-gated lints key off it, so a fictional value silently changes which
+  # lints fire. Nothing compiled at it until 2026-10-06, when it said 1.85
+  # while the locked graph already needed 1.88 (time 0.3.53, sentry 0.49,
+  # plist 1.10, darling 0.23, serde_with 3.22). `cargo check` only, uncached:
+  # it never sits on the critical path, and caching it would cost ~4 GB of the
+  # 10 GB cache budget the main jobs need.
+  msrv:
+    name: MSRV check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            os: linux
+          - runner: windows-2025
+            os: windows
+          - runner: macos-26
+            os: macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        uses: ./.github/actions/linux-deps
+
+      - name: Stub frontend dist for macro expansion
+        run: |
+          mkdir -p dist
+          echo '<!doctype html><title>stub</title>' > dist/index.html
+
+      - name: cargo check --locked --all-targets at the declared rust-version
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          msrv=$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "::error::src-tauri/Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          echo "Declared MSRV: $msrv"
+          rustup toolchain install "$msrv" --profile minimal --no-self-update
+          cargo "+$msrv" check --locked --all-targets
+
+  frontend-tests:
+    name: Frontend unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -355,7 +456,7 @@ jobs:
         run: npm run test:run
 
       # The production bundle. Until 2026-09-17 nothing on a PR ran `vite build`
-      # — this job stopped at lint/type-check/vitest, and the bundle was only
+      # - this job stopped at lint/type-check/vitest, and the bundle was only
       # ever produced by release.yml's `npx tauri build`. So a vite config that
       # breaks ONLY at bundle time surfaced as a red RELEASE, not a red PR. The
       # concrete case: Dependabot's vite 8 bump (#164) kept `minify: 'esbuild'`
@@ -366,45 +467,148 @@ jobs:
       - name: Production bundle builds
         run: npm run build
 
-  # OPEN-WORK F4: self-test of the release pipeline's post-bundle xray gate.
-  # release.yml build-windows runs scripts/ci/verify-bundled-xray-hash.ps1
+      # release.yml's Linux/macOS legs build with
+      # `npx tauri build --target "$ARCH" -- --locked` under bash. Prove the
+      # CLI hands --locked to cargo: an `echo` runner stands in for cargo and
+      # the frontend build is switched off, so nothing compiles (seconds).
+      - name: Release build command passes --locked through to cargo (bash)
+        env:
+          RUSTUP_TOOLCHAIN: stable # the CLI's own `cargo metadata` only
+        run: |
+          set -euo pipefail
+          printf '%s' '{"build":{"beforeBuildCommand":""}}' > "$RUNNER_TEMP/no-frontend.json"
+          # The tauri command itself is EXPECTED to fail (echo builds no
+          # binary); the gate is the grep on the command line it ran.
+          rc=0
+          out=$(npx tauri build --runner echo --no-bundle --config "$RUNNER_TEMP/no-frontend.json" --target x86_64-unknown-linux-gnu -- --locked 2>&1) || rc=$?
+          echo "$out"
+          echo "(tauri exited $rc, as expected with an echo runner)"
+          if ! printf '%s\n' "$out" | grep -qE '^build .*--locked'; then
+            echo "::error::npx tauri build ... -- --locked did not hand --locked to cargo"
+            exit 1
+          fi
+          echo "OK: cargo receives --locked"
+
+  # The Windows twin of the step above, in the release's own shell. Under
+  # pwsh `npx` is the npx.ps1 shim, and a PowerShell script can swallow a bare
+  # `--`; if it did, build-windows' `npx tauri build -- --locked` would build
+  # without --locked (or fail) on the first tag. Nothing else exercises that
+  # command line before a release, so this does, in about a minute.
+  release-cli-contract:
+    name: Release build command passes --locked to cargo (Windows, pwsh)
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh # release.yml build-windows runs `npx tauri build` under pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: npx tauri build -- --locked, exactly as build-windows runs it
+        env:
+          RUSTUP_TOOLCHAIN: stable # the CLI's own `cargo metadata` only
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Set-Content -Path "$env:RUNNER_TEMP\no-frontend.json" -Value '{"build":{"beforeBuildCommand":""}}'
+          # A runner that prints the arguments cargo would have received.
+          Set-Content -Path "$env:RUNNER_TEMP\echo-args.cmd" -Value '@echo %*'
+          # Expected to exit non-zero (no binary appears); the gate is the
+          # match on the command line below.
+          $out = npx tauri build --runner "$env:RUNNER_TEMP\echo-args.cmd" --no-bundle --config "$env:RUNNER_TEMP\no-frontend.json" -- --locked 2>&1 | Out-String
+          Write-Host $out
+          Write-Host "(tauri exited $LASTEXITCODE, as expected with an echo runner)"
+          if ($out -notmatch '(?m)^build .*--locked') {
+            Write-Host "::error::npx tauri build -- --locked under pwsh did not hand --locked to cargo"
+            exit 1
+          }
+          Write-Host "OK: cargo receives --locked through npx under pwsh"
+          exit 0
+
+  # OPEN-WORK F4: self-test of the release pipeline's Windows post-bundle xray
+  # gate. release.yml build-windows runs scripts/ci/verify-bundled-xray-hash.ps1
   # against the produced NSIS installer and fails the release unless the
   # bundled resources\xray.exe hashes to the compiled-in XRAY_BINARY_SHA256
-  # (v1.4.40 and v1.4.41 shipped with a mismatch — Authenticode rewrote the
-  # file after the hash was captured — and nothing noticed). A gate that can
+  # (v1.4.40 and v1.4.41 shipped with a mismatch - Authenticode rewrote the
+  # file after the hash was captured - and nothing noticed). A gate that can
   # be edited into a no-op is worse than none, so every PR proves each of its
   # failure paths still fails, using fake installers 7z extracts like NSIS.
   xray-gate-selftest:
     name: Bundled-xray hash gate self-test (Windows)
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run the gate against fake installers (pass + must-fail scenarios)
         shell: pwsh
         run: ./scripts/ci/verify-bundled-xray-hash.tests.ps1
+
+  # The macOS + Linux twin of the job above (register MR-720/MR-736):
+  # release.yml now gates the .app, the updater .app.tar.gz, the .dmg, the
+  # .deb and the AppImage with scripts/ci/verify-bundled-xray.sh. The Linux
+  # leg runs the .deb scenarios (dpkg-deb), the macOS leg the .dmg ones
+  # (hdiutil); both run the rest. The real-package path was verified against
+  # the published v1.4.45 artifacts when the gate was written.
+  xray-gate-selftest-unix:
+    name: Bundled-xray gate self-test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            os: linux
+          # The image release.yml builds the macOS packages on.
+          - runner: macos-15
+            os: macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the gate against fake packages (pass + must-fail scenarios)
+        run: bash scripts/ci/verify-bundled-xray.tests.sh
 
   # Version-consistency gate. The app version is declared in THREE places:
   # package.json, src-tauri/tauri.conf.json, and src-tauri/Cargo.toml
   # ([package] version). The in-app updater matches installed-vs-release by
   # exact string, so any drift ships a client that either can't self-update or
   # loops re-installing. Fail the build the moment they disagree. Node is the
-  # repo's lingua franca — it parses the two JSON files natively and we pull
+  # repo's lingua franca - it parses the two JSON files natively and we pull
   # [package].version out of the TOML with a scoped regex (no TOML dep needed).
   version-consistency:
     name: Version consistency
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Assert package.json / tauri.conf.json / Cargo.toml versions match
-        shell: bash
         run: |
           node <<'EOF'
           const fs = require('fs');
@@ -438,10 +642,10 @@ jobs:
             );
             process.exit(1);
           }
-          console.log('OK — all version strings match: ' + unique[0]);
+          console.log('OK - all version strings match: ' + unique[0]);
           EOF
 
-      # Every Tauri plugin is TWO packages — a Rust crate and its npm twin —
+      # Every Tauri plugin is TWO packages - a Rust crate and its npm twin -
       # and `tauri build` refuses to run when a pair's major.minor differ
       # ("Found version mismatched Tauri packages"). Dependabot bumps the two
       # ecosystems in separate PRs, so a merged cargo group can leave npm
@@ -450,7 +654,6 @@ jobs:
       # updater 2.11 vs 2.9 and dialog 2.7 vs 2.6. Same defect as 1194757 a
       # release earlier. This applies the CLI's own rule on every PR.
       - name: Assert Tauri crate / npm package pairs share major.minor
-        shell: bash
         run: |
           node <<'EOF'
           const fs = require('fs');
@@ -470,15 +673,15 @@ jobs:
           for (const [crate, cv] of Object.entries(crates).sort()) {
             const n = npmName(crate);
             const entry = npm['node_modules/' + n];
-            if (!entry) { rows.push(`${crate} ${cv}  (no npm twin installed — fine)`); continue; }
+            if (!entry) { rows.push(`${crate} ${cv}  (no npm twin installed - fine)`); continue; }
             const ok = minor(cv) === minor(entry.version);
             if (!ok) bad++;
             rows.push(`${crate} ${cv}  <->  ${n} ${entry.version}  ${ok ? 'OK' : 'MISMATCH'}`);
           }
           console.log(rows.join('\n'));
           if (bad) {
-            console.error(`::error::${bad} Tauri crate/npm pair(s) differ in major.minor — \`tauri build\` will refuse. Bump the lagging side (both lockfiles) in the same PR.`);
+            console.error(`::error::${bad} Tauri crate/npm pair(s) differ in major.minor - \`tauri build\` will refuse. Bump the lagging side (both lockfiles) in the same PR.`);
             process.exit(1);
           }
-          console.log('OK — every Tauri crate/npm pair shares major.minor');
+          console.log('OK - every Tauri crate/npm pair shares major.minor');
           EOF
