@@ -600,8 +600,13 @@ async fn disarm_platform() -> Result<(), String> {
 
 /// Everything the kill switch knows about pf, behind the one lock every writer
 /// of pf's main ruleset takes while the app runs: the block-all, the IPv6
-/// baseline, a tunnel interface change. Two writers run without it, at times
-/// when nothing else does: the startup reconcile and the panic hook in main.rs.
+/// baseline, a tunnel interface change, the startup cleanup (which takes it
+/// before anything else can). One writer does NOT take it: the panic hook in
+/// main.rs restores `/etc/pf.conf` as the process dies, and another thread may
+/// be mid-load right then, so the two can interleave (N11). The process is
+/// going down either way; what is left is the next start's cleanup to remove,
+/// and our pf reference is released there from the journal if the hook could
+/// not take the lock to release it.
 #[cfg(target_os = "macos")]
 static PF: tokio::sync::Mutex<PfState> = tokio::sync::Mutex::const_new(PfState::new());
 

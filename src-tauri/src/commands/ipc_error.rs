@@ -270,6 +270,10 @@ impl IpcError {
         // P3-5: pf refusing to enforce our rules is the kill switch failing,
         // and says so — it used to read as "couldn't start the VPN network
         // adapter … reinstall BirdoVPN", which sends the user the wrong way.
+        // N11: this also covers the IPv6 leak block, which is enforced with
+        // the kill switch OFF, so the kill-switch copy then shows to a user who
+        // turned it off. It is still the nearest true message (the same pf);
+        // copy of its own needs a new IPC code, i.e. a contract change.
         if error.contains(crate::vpn::ERR_FIREWALL_NOT_ENFORCED) {
             return Self::new(
                 IpcErrorCode::KillswitchFailed,
