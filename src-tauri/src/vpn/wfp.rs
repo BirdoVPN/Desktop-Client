@@ -177,7 +177,8 @@ static ENGINE: once_cell::sync::Lazy<std::sync::Mutex<Option<WfpEngine>>> =
 /// they implement.
 struct WfpEngine {
     handle: HANDLE,
-    filter_ids: Vec<u64>,
+    /// Each installed filter's id, and whether it blocks or permits.
+    filter_ids: Vec<(u64, Action)>,
     sublayer_added: bool,
     /// What `filter_ids` implements. Every change starts from this.
     installed: Policy,
@@ -538,7 +539,7 @@ impl WfpEngine {
     fn apply(&mut self, next: Policy) -> Result<(), String> {
         let apps = resolve_apps(&next);
         let specs = filter_specs(&next, &|path| apps.contains_key(path));
-        let lift = lifts_block_all(&self.installed, &next);
+        let lift = lifts_a_block(&self.installed, &next);
         let mut kernel = Kernel {
             handle: self.handle,
             apps: &apps,
@@ -594,16 +595,23 @@ trait FilterKernel {
     fn add_filter(&mut self, spec: &FilterSpec) -> Result<u64, String>;
 }
 
-/// Whether going from `installed` to `next` takes the block-all down.
-fn lifts_block_all(installed: &Policy, next: &Policy) -> bool {
-    installed.block_all.is_some() && next.block_all.is_none()
+/// Whether going from `installed` to `next` takes a block down: the block-all,
+/// or — with no block-all in `next` to stand in for them — the standalone
+/// IPv6 block or the DNS guard (round 3 of the review of #222: those two used
+/// to count as ordinary changes, so a stuck filter of theirs was reported
+/// removed while it still dropped traffic).
+fn lifts_a_block(installed: &Policy, next: &Policy) -> bool {
+    let unblocked = next.block_all.is_none();
+    (installed.block_all.is_some() && unblocked)
+        || (installed.v6_block && !next.v6_block && unblocked)
+        || (installed.dns_guard.is_some() && next.dns_guard.is_none() && unblocked)
 }
 
 /// Delete each of `ids`, returning the ones that are still in the kernel.
-fn undeletable(ids: &[u64], mut delete: impl FnMut(u64) -> u32) -> Vec<u64> {
+fn undeletable(ids: &[(u64, Action)], mut delete: impl FnMut(u64) -> u32) -> Vec<(u64, Action)> {
     ids.iter()
         .copied()
-        .filter(|&id| match delete(id) {
+        .filter(|&(id, _)| match delete(id) {
             0 | FWP_E_FILTER_NOT_FOUND => false,
             err => {
                 tracing::warn!("FwpmFilterDeleteById0({id}) failed: 0x{err:08X}");
@@ -620,19 +628,31 @@ fn undeletable(ids: &[u64], mut delete: impl FnMut(u64) -> u32) -> Vec<u64> {
 ///
 /// A filter that cannot be deleted (P1-ks-wfp-filter-delete-errors-dropped)
 /// keeps its id — it used to be dropped, leaving the filter in the kernel
-/// with no record of it — and what happens next depends on the direction:
-/// - a `lift` (the block-all comes down) fails and is aborted: the block
-///   stays in force and is reported as such, never called gone while it
-///   still drops traffic;
+/// with no record of it — and what happens next depends on the direction and
+/// on what the stuck filter does:
+/// - a `lift` ([`lifts_a_block`]) with a stuck BLOCK filter fails and is
+///   aborted: the block stays in force and is reported as such, never called
+///   gone while it still drops traffic. A stuck permit does not fail it
+///   (round 3 of the review: a permit left behind drops nothing);
 /// - anything else (an activation, a rebuild around a new relay or tunnel
 ///   LUID, the IPv6 block or the DNS guard going in) commits the new set
 ///   with the old filter still beside it. Failing those over it left no
-///   block-all in a reconnect gap at all and abandoned every dial. The kept
-///   id is deleted again by the next change, and the dynamic session takes
-///   the filter with it in any case.
+///   block-all in a reconnect gap at all and abandoned every dial;
+/// - more stuck filters than the new set has fails the change whatever its
+///   direction, so the kept ids stay bounded (at most twice a set) instead
+///   of growing with every change while deletes keep failing.
+///
+/// A stuck PERMIT that the change commits past stays in force, a hole the new
+/// policy does not have, until the next change deletes it or the session
+/// ends: it is logged as an error, so it is never silent. The kept ids are
+/// deleted again by every change, and the dynamic session takes the filters
+/// with it in any case.
+///
+/// Untested assumption (no elevated session in CI, D12): a failed
+/// FwpmFilterDeleteById0 leaves the transaction committable.
 fn commit_policy(
     kernel: &mut impl FilterKernel,
-    ids: &mut Vec<u64>,
+    ids: &mut Vec<(u64, Action)>,
     sublayer_added: &mut bool,
     specs: &[FilterSpec],
     lift: bool,
@@ -643,11 +663,24 @@ fn commit_policy(
     kernel.begin()?;
     let result = (|| -> Result<(), String> {
         let kept = undeletable(ids, |id| kernel.delete_filter(id));
-        if lift && !kept.is_empty() {
+        let stuck_blocks = kept.iter().filter(|(_, a)| *a == Action::Block).count();
+        if lift && stuck_blocks > 0 {
             return Err(format!(
-                "{} filter(s) of the block could not be deleted",
+                "{stuck_blocks} block filter(s) could not be deleted"
+            ));
+        }
+        if kept.len() > specs.len() {
+            return Err(format!(
+                "{} filter(s) could not be deleted, more than the new set has",
                 kept.len()
             ));
+        }
+        let stuck_permits = kept.len() - stuck_blocks;
+        if stuck_permits > 0 {
+            tracing::error!(
+                "{stuck_permits} permit filter(s) the new policy does not have could not be \
+                 deleted and stay in force until the next change or the end of the session"
+            );
         }
         *ids = kept;
         if specs.is_empty() {
@@ -660,7 +693,7 @@ fn commit_policy(
         kernel.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
         *sublayer_added = true;
         for spec in specs {
-            ids.push(kernel.add_filter(spec)?);
+            ids.push((kernel.add_filter(spec)?, spec.action));
         }
         Ok(())
     })()
@@ -1850,6 +1883,9 @@ mod tests {
             .collect()
     }
 
+    const B: Action = Action::Block;
+    const P: Action = Action::Permit;
+
     /// Review of #222, P1: an ACTIVATION (here the block-all going up in a
     /// reconnect gap) commits even though an old filter will not delete. It
     /// used to fail on it, so the gap had no block-all at all and every dial
@@ -1862,7 +1898,7 @@ mod tests {
             undeletable: vec![2],
             ..FakeKernel::default()
         };
-        let mut ids = vec![1, 2];
+        let mut ids = vec![(1, B), (2, P)];
         let mut sublayer_added = true;
 
         let result = commit_policy(
@@ -1875,7 +1911,11 @@ mod tests {
 
         assert_eq!(result, Ok(()), "the block-all must go up");
         assert_eq!(kernel.committed, 1);
-        assert_eq!(ids, vec![2, 101, 102], "the stuck filter keeps its id");
+        assert_eq!(
+            ids,
+            vec![(2, P), (101, B), (102, B)],
+            "the stuck filter keeps its id"
+        );
         assert_eq!(kernel.filters, vec![2, 101, 102]);
 
         // Next change: the delete goes through, and nothing is left behind.
@@ -1888,21 +1928,21 @@ mod tests {
             false,
         );
         assert_eq!(result, Ok(()));
-        assert_eq!(ids, vec![103]);
+        assert_eq!(ids, vec![(103, B)]);
         assert_eq!(kernel.filters, vec![103]);
     }
 
-    /// A LIFT that cannot delete a filter fails: the transaction is aborted,
-    /// the block stays in force and so does its bookkeeping, so the block is
-    /// never reported gone while it still drops traffic.
+    /// A LIFT that cannot delete a BLOCK filter fails: the transaction is
+    /// aborted, the block stays in force and so does its bookkeeping, so the
+    /// block is never reported gone while it still drops traffic.
     #[test]
-    fn a_lift_that_cannot_delete_keeps_the_block_and_says_so() {
+    fn a_lift_that_cannot_delete_a_block_keeps_it_and_says_so() {
         let mut kernel = FakeKernel {
             filters: vec![1, 2, 3],
             undeletable: vec![2],
             ..FakeKernel::default()
         };
-        let mut ids = vec![1, 2, 3];
+        let mut ids = vec![(1, P), (2, B), (3, P)];
         let mut sublayer_added = true;
 
         let result = commit_policy(
@@ -1915,7 +1955,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!((kernel.committed, kernel.aborted), (0, 1));
-        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(ids, vec![(1, P), (2, B), (3, P)]);
         assert_eq!(
             kernel.filters,
             vec![1, 2, 3],
@@ -1924,11 +1964,79 @@ mod tests {
         assert!(sublayer_added);
     }
 
-    /// Only taking the block-all DOWN is a lift; putting it up, rebuilding
-    /// it, or changing the IPv6 block or the DNS guard on either side of it
-    /// is not.
+    /// Round 3 of the review (P3.2): a stuck PERMIT does not fail a lift — it
+    /// drops nothing, and failing kept the whole block up over it. It keeps
+    /// its id, and is reported.
     #[test]
-    fn only_taking_the_block_all_down_is_a_lift() {
+    fn a_stuck_permit_does_not_fail_a_lift() {
+        let mut kernel = FakeKernel {
+            filters: vec![1, 2, 3],
+            undeletable: vec![3],
+            ..FakeKernel::default()
+        };
+        let mut ids = vec![(1, B), (2, B), (3, P)];
+        let mut sublayer_added = true;
+
+        let result = commit_policy(
+            &mut kernel,
+            &mut ids,
+            &mut sublayer_added,
+            &some_specs(1),
+            true,
+        );
+
+        assert_eq!(result, Ok(()), "the block comes down");
+        assert_eq!(ids, vec![(3, P), (101, B)]);
+        assert_eq!(kernel.filters, vec![3, 101]);
+    }
+
+    /// Round 3 of the review (P3.3): more stuck filters than the new set has
+    /// fails the change, so the kept ids cannot grow without bound while
+    /// deletes keep failing.
+    #[test]
+    fn stuck_filters_are_capped_by_the_new_set() {
+        let mut kernel = FakeKernel {
+            filters: vec![1, 2, 3],
+            undeletable: vec![1, 2, 3],
+            ..FakeKernel::default()
+        };
+        let mut ids = vec![(1, P), (2, P), (3, P)];
+        let mut sublayer_added = true;
+
+        let result = commit_policy(
+            &mut kernel,
+            &mut ids,
+            &mut sublayer_added,
+            &some_specs(2),
+            false,
+        );
+
+        assert!(result.is_err(), "3 stuck beside a set of 2");
+        assert_eq!(
+            ids,
+            vec![(1, P), (2, P), (3, P)],
+            "the bookkeeping is the kernel's"
+        );
+        let result = commit_policy(
+            &mut kernel,
+            &mut ids,
+            &mut sublayer_added,
+            &some_specs(3),
+            false,
+        );
+        assert_eq!(
+            result,
+            Ok(()),
+            "3 stuck beside a set of 3 is within the cap"
+        );
+        assert_eq!(ids.len(), 6);
+    }
+
+    /// Taking a block DOWN is a lift — the block-all, and since round 3 of
+    /// the review (P3.4) the standalone IPv6 block and the DNS guard too;
+    /// putting one up or rebuilding it is not.
+    #[test]
+    fn taking_any_block_down_is_a_lift() {
         let block = Policy {
             block_all: Some(BlockAll::default()),
             ..Policy::default()
@@ -1937,10 +2045,30 @@ mod tests {
             v6_block: true,
             ..Policy::default()
         };
-        assert!(lifts_block_all(&block, &v6));
-        assert!(lifts_block_all(&block, &Policy::default()));
-        assert!(!lifts_block_all(&v6, &block));
-        assert!(!lifts_block_all(&block, &block));
-        assert!(!lifts_block_all(&Policy::default(), &v6));
+        let guarded = Policy {
+            dns_guard: Some(DnsGuard {
+                resolvers: Vec::new(),
+                lan_resolvers: Vec::new(),
+                tunnel_luid: 9,
+                lan_sharing: false,
+                relay: None,
+                self_exe: None,
+            }),
+            ..Policy::default()
+        };
+        assert!(lifts_a_block(&block, &v6));
+        assert!(lifts_a_block(&block, &Policy::default()));
+        assert!(
+            lifts_a_block(&v6, &Policy::default()),
+            "the IPv6 block comes down"
+        );
+        assert!(
+            lifts_a_block(&guarded, &Policy::default()),
+            "the DNS guard comes down"
+        );
+        assert!(!lifts_a_block(&v6, &block));
+        assert!(!lifts_a_block(&block, &block));
+        assert!(!lifts_a_block(&Policy::default(), &v6));
+        assert!(!lifts_a_block(&Policy::default(), &guarded));
     }
 }
