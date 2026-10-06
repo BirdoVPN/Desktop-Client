@@ -813,55 +813,30 @@ pub async fn ipv6_block_deactivate() {
 /// unlike Windows WFP dynamic sessions, which self-clean. Without this, a panic
 /// or SIGKILL while blocking leaves the machine either without IPv6 or (worse,
 /// if the kill switch was mid-block) fully firewalled off, with no recovery short
-/// of a reboot. Only reverts rulesets carrying OUR marker anchor, so a third
-/// party's pf configuration is never clobbered. Runs at startup, before anything
-/// else can take the lock.
+/// of a reboot. `PfState::reconcile` decides what to do and records only what pf
+/// reads back afterwards (N8); only rulesets carrying OUR marker are touched, so
+/// a third party's pf configuration is never clobbered. Runs at startup, before
+/// anything else can take the lock.
 #[cfg(target_os = "macos")]
 pub fn reconcile_stale_pf_state() {
-    // Whether our marker is loaded; `None` when pf could not be read.
-    let ours =
-        |rules: Result<String, String>| rules.ok().map(|r| r.contains(pf_policy::MARKER_ANCHOR));
-    // Whether pf is enabled does not matter: a stale block-all in a disabled
-    // pf is one `pfctl -e` (anyone's) from blocking everything (P2-2).
-    if ours(pfctl(&["-s", "rules"])) != Some(true) {
-        return; // not ours, or unreadable — leave it alone
-    }
-    tracing::warn!("Found a stale Birdo pf ruleset from a previous run — restoring /etc/pf.conf");
-    if let Err(e) = pfctl(&["-f", "/etc/pf.conf"]) {
-        tracing::warn!("{e}");
-    }
-
-    // OBSERVE the result — do not infer it from having asked.
-    //
-    // This used to store `false` unconditionally. If the restore failed (an
-    // unreadable /etc/pf.conf, pfctl missing, not root) the kernel kept OUR
-    // block-all ruleset loaded while the app recorded "not blocking" — so the
-    // user had no network at all, the UI said the kill switch was off, and
-    // nothing ever retried, because every recovery path is gated on the flag.
-    // A reboot was the only way out, which is the exact failure this function
-    // exists to prevent.
-    //
-    // The marker anchor is the ground truth: still present — or pf no longer
-    // readable — means still blocking.
-    let still_ours = ours(pfctl(&["-s", "rules"])) != Some(false);
     let Ok(mut pf) = PF.try_lock() else {
-        tracing::error!("Kill switch state is locked at startup; stale pf state not recorded");
+        tracing::error!("Kill switch state is locked at startup; stale pf state not reconciled");
         return;
     };
-    if still_ours {
-        tracing::error!(
-            "Failed to restore /etc/pf.conf — the stale Birdo ruleset is STILL LOADED and this \
-             machine's traffic remains blocked. Leaving the kill switch marked active so the \
-             normal teardown path can retry; `sudo pfctl -f /etc/pf.conf` clears it manually."
-        );
-        pf.loaded = true;
-        pf.enforcing = true;
-        // Retried from here on, whether or not a session ever starts.
-        ensure_pf_watchdog();
-    } else {
-        pf.loaded = false;
-        pf.enforcing = false;
-        pf.ipv6_baseline = false;
+    match pf.reconcile(&Pfctl) {
+        None => {}
+        Some(Ok(())) => {
+            tracing::warn!("Found a stale Birdo pf ruleset from a previous run — removed")
+        }
+        Some(Err(e)) => {
+            tracing::error!(
+                "Stale Birdo pf ruleset NOT removed: {}. Retried every {}s; \
+                 `sudo pfctl -f /etc/pf.conf` clears it manually.",
+                e,
+                PF_WATCHDOG_INTERVAL.as_secs()
+            );
+            ensure_pf_watchdog();
+        }
     }
     mirror(&pf);
 }

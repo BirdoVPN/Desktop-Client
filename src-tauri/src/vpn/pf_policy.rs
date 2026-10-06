@@ -375,6 +375,9 @@ pub(crate) struct PfState {
     /// failed looked wanted, was never retried, and a user's own `pfctl -f`
     /// to get the network back was undone by the watchdog.
     pub wanted: bool,
+    /// N8: a ruleset of ours left by a previous run that the startup
+    /// cleanup could not remove — retried by the watchdog until it goes.
+    pub stale: bool,
 }
 
 impl PfState {
@@ -386,6 +389,7 @@ impl PfState {
             token: None,
             tunnel: None,
             wanted: false,
+            stale: false,
         }
     }
 
@@ -480,6 +484,7 @@ impl PfState {
             self.record(&seen);
             return Err(e);
         }
+        self.stale = false;
         self.hold_reference(pf);
 
         let seen = Observed::read(pf);
@@ -576,6 +581,13 @@ impl PfState {
         pf: &impl Pf,
         inputs: impl FnOnce() -> Inputs,
     ) -> Option<Result<(), String>> {
+        if self.stale && !self.ipv6_baseline {
+            return match self.reconcile(pf) {
+                Some(result) => Some(result),
+                // Gone by other hands: done. Unreadable: try again next time.
+                None => (!self.stale).then_some(Ok(())),
+            };
+        }
         if !self.loaded {
             return self.watch_ipv6_baseline(pf);
         }
@@ -588,6 +600,62 @@ impl PfState {
             return None;
         }
         Some(self.engage(pf, &inputs()))
+    }
+
+    /// The startup cleanup (N8): pf rulesets survive the process, so a crash
+    /// mid-session leaves ours behind — the block-all (no network at all) or
+    /// the IPv6 leak block (no IPv6). No session exists yet, so EVERYTHING of
+    /// ours goes: `/etc/pf.conf` back, and if ours survives that, pf's filter
+    /// rules are flushed; both are read back. Only rulesets carrying our
+    /// marker are touched, so a third party's pf configuration is not.
+    ///
+    /// What is recorded comes from that read-back. It used to be "the restore
+    /// failed, so enforcing" even on a disabled pf, which reported a block that
+    /// was enforcing nothing — and a stale IPv6-only ruleset recorded that way
+    /// got one lift attempt, which "succeeded" because no block-all was
+    /// loaded, and the IPv6 block stayed. Now a remainder of ours is `stale`,
+    /// and the watchdog keeps at it. `None`: nothing of ours, or unreadable.
+    pub(crate) fn reconcile(&mut self, pf: &impl Pf) -> Option<Result<(), String>> {
+        let ours = |s: &Observed| s.marker_loaded || s.block_all_loaded;
+        match Observed::read(pf) {
+            Ok(s) if ours(&s) => {}
+            Ok(_) => {
+                self.stale = false;
+                return None;
+            }
+            // Unreadable: nothing to act on, and nothing learnt either.
+            Err(_) => return None,
+        }
+        let restored = pf.load_default();
+        let mut seen = Observed::read(pf);
+        let mut flushed = Ok(());
+        if seen.as_ref().is_ok_and(ours) {
+            flushed = pf.flush_rules();
+            seen = Observed::read(pf);
+        }
+        self.wanted = false;
+        self.ipv6_baseline = false;
+        self.record(&seen);
+        match seen {
+            Ok(s) if !ours(&s) => {
+                self.stale = false;
+                Some(Ok(()))
+            }
+            Ok(_) => {
+                self.stale = true;
+                Some(Err(format!(
+                    "a ruleset of ours from a previous run is still loaded{}{}",
+                    because(&restored),
+                    because(&flushed)
+                )))
+            }
+            Err(e) => {
+                self.stale = true;
+                Some(Err(format!(
+                    "pf could not be read back after removing our stale ruleset ({e}); it is treated as still loaded"
+                )))
+            }
+        }
     }
 
     /// N6: the F-001 IPv6 leak block, watched like the kill switch's block.
@@ -737,6 +805,7 @@ impl PfState {
                 format!("IPv6 leak block failed to load ({primary}); fallback also failed: {e}")
             })?;
         }
+        self.stale = false;
         self.hold_reference(pf);
         let seen = Observed::read(pf)
             .map_err(|e| format!("IPv6 leak block could not be read back: {e}"))?;
@@ -1754,6 +1823,116 @@ mod tests {
         assert_eq!(
             tunnel_permits(&pf.rules().unwrap()),
             vec!["utun4".to_string()]
+        );
+    }
+
+    // ── N8: the startup cleanup ────────────────────────────────────────
+
+    /// A pf left by a crashed previous run: `rules` loaded, our process
+    /// holding no reference, pf running or not.
+    fn left_behind(rules: &str, running: bool) -> FakePf {
+        let pf = FakePf::default();
+        *pf.live.borrow_mut() = pf_prints(rules);
+        pf.anonymous.set(running);
+        pf
+    }
+
+    #[test]
+    fn nothing_of_ours_at_startup_is_left_alone() {
+        let pf = left_behind(STOCK_PF_CONF, true);
+        let mut state = PfState::new();
+        assert_eq!(state.reconcile(&pf), None);
+        assert_eq!(pf.loads.get(), 0);
+        assert_eq!(pf.flush_calls.get(), 0);
+    }
+
+    #[test]
+    fn a_stale_block_all_is_removed_at_startup() {
+        let pf = left_behind(&ruleset(Some("utun4"), &[DOH]), true);
+        let mut state = PfState::new();
+        assert_eq!(state.reconcile(&pf), Some(Ok(())));
+        assert!(!state.loaded && !state.enforcing && !state.stale);
+        assert!(!marker_loaded(&pf.rules().unwrap()));
+    }
+
+    /// N8: in a DISABLED pf the stale block-all enforces nothing. The old
+    /// cleanup recorded "enforcing" whenever its restore failed.
+    #[test]
+    fn a_stale_block_in_a_disabled_pf_is_owed_but_never_reported_enforcing() {
+        let pf = FakePf {
+            default_fails: true,
+            flush_fails: true,
+            ..left_behind(&ruleset(Some("utun4"), &[DOH]), false)
+        };
+        let mut state = PfState::new();
+        assert!(matches!(state.reconcile(&pf), Some(Err(_))));
+        assert!(state.loaded, "a lift is owed");
+        assert!(!state.enforcing, "pf is disabled: nothing is enforced");
+        assert!(!state.wanted);
+    }
+
+    /// N8: the IPv6-only remainder and an unloadable /etc/pf.conf: flushed.
+    #[test]
+    fn a_stale_ipv6_block_survives_no_unloadable_pf_conf() {
+        let pf = FakePf {
+            default_fails: true,
+            ..left_behind(IPV6_RULESET_FULL, true)
+        };
+        let mut state = PfState::new();
+        assert_eq!(state.reconcile(&pf), Some(Ok(())));
+        assert_eq!(pf.flush_calls.get(), 1);
+        assert!(!marker_loaded(&pf.rules().unwrap()));
+    }
+
+    /// N8: and if even the flush fails, it is not given up on after one
+    /// lift that "succeeded" because no block-all was loaded: the watchdog
+    /// keeps at it until the remainder is gone.
+    #[test]
+    fn a_stale_ipv6_block_that_will_not_go_is_retried_until_it_does() {
+        let stuck = FakePf {
+            default_fails: true,
+            flush_fails: true,
+            ..left_behind(IPV6_RULESET_FULL, true)
+        };
+        let mut state = PfState::new();
+        assert!(matches!(state.reconcile(&stuck), Some(Err(_))));
+        assert!(state.stale && !state.loaded && !state.enforcing);
+        assert!(matches!(state.watchdog(&stuck, inputs), Some(Err(_))));
+        assert!(state.stale, "still there, still owed");
+
+        let pf = FakePf {
+            default_fails: false,
+            flush_fails: false,
+            ..stuck
+        };
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert!(!state.stale);
+        assert!(!marker_loaded(&pf.rules().unwrap()));
+        assert_eq!(state.watchdog(&pf, inputs), None, "and then left alone");
+    }
+
+    /// A new session's own ruleset replaces a stale remainder: no clean-up
+    /// fights the session's IPv6 block.
+    #[test]
+    fn a_new_session_replaces_a_stale_remainder() {
+        let stuck = FakePf {
+            default_fails: true,
+            flush_fails: true,
+            ..left_behind(IPV6_RULESET_FULL, true)
+        };
+        let mut state = PfState::new();
+        let _ = state.reconcile(&stuck);
+        let pf = FakePf {
+            default_fails: false,
+            flush_fails: false,
+            ..stuck
+        };
+        assert_eq!(state.ipv6_on(&pf), Ok(()));
+        assert!(!state.stale);
+        assert_eq!(state.watchdog(&pf, inputs), None);
+        assert!(
+            marker_loaded(&pf.rules().unwrap()),
+            "the session's block stays"
         );
     }
 
