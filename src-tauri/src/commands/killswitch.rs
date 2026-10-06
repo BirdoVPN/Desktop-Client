@@ -482,11 +482,12 @@ async fn arm_with_preference(enabled: bool) -> Result<bool, String> {
     // activate the block-all NOW and keep it engaged for the whole Connected
     // session. The tunnel is already up when arm() runs on the connect path,
     // and all the firewall backends permit tunneled traffic through an engaged
-    // block (pf utun0-15 pass rules, iptables `-o birdo0 ACCEPT`), which the
-    // switch-guard/reapply paths already rely on mid-session. Reactive-only
-    // protection left every SILENT tunnel death (dead peer, expired NAT
-    // mapping, sleep/resume, Wi-Fi→LTE handover) leaking real-IP traffic —
-    // DNS included — for the up-to-~60s the liveness watchdog needs to trip.
+    // block (pf's pass rule on the tunnel's own utun, iptables `-o birdo0
+    // ACCEPT`), which the switch-guard/reapply paths already rely on
+    // mid-session. Reactive-only protection left every SILENT tunnel death
+    // (dead peer, expired NAT mapping, sleep/resume, Wi-Fi→LTE handover)
+    // leaking real-IP traffic — DNS included — for the up-to-~60s the
+    // liveness watchdog needs to trip.
     // With the block held, a dead tunnel fails CLOSED instantly and the
     // watchdog/auto-reconnect still own recovery.
     //
@@ -573,11 +574,17 @@ async fn disarm_platform() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 static PF_BLOCKING: AtomicBool = AtomicBool::new(false);
 
-/// Serialises every writer of pf's main ruleset — the block-all and the IPv6
-/// baseline — so each read-back describes its own load, and two loads built
-/// from different inputs cannot interleave.
+/// Serialises every writer of pf's main ruleset — the block-all, the IPv6
+/// baseline, a tunnel interface change — so each read-back describes its own
+/// load, and two loads built from different inputs cannot interleave.
 #[cfg(target_os = "macos")]
 static PF_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// MR-1125: the utun the live tunnel runs on, the ONLY interface the block-all
+/// permits. Set by tunnel_macos.rs as soon as it creates the device
+/// ([`tunnel_interface_up`]), cleared when the device goes.
+#[cfg(target_os = "macos")]
+static PF_TUNNEL_INTERFACE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// macOS: is the pf block-all ruleset currently loaded? Twin of
 /// `wfp::is_blocking()` / `firewall_linux::is_blocking()`, needed by the
@@ -925,8 +932,8 @@ pub fn reconcile_stale_pf_state() {
 }
 
 /// Activate pf blocking: block everything except what
-/// `pf_policy::block_all_ruleset` permits (loopback, utun0..utun15, DHCP, the
-/// LAN with Local Network Sharing, the control plane, the relay).
+/// `pf_policy::block_all_ruleset` permits (loopback, the tunnel's own utun,
+/// DHCP, the LAN with Local Network Sharing, the control plane, the relay).
 ///
 /// CRITICAL FIX: the rules are loaded as pf's **main ruleset** (`pfctl -f -`),
 /// not into a named anchor. A named anchor is only evaluated when the main
@@ -945,6 +952,7 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
 /// inputs as they are NOW, load it, and record what pf reads back.
 #[cfg(target_os = "macos")]
 fn pf_engage_block(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    let tunnel_interface = recorded_tunnel_interface();
     let control_plane = pf_policy::control_plane_addresses();
     // pf has no application condition, so the control-plane permit matches the
     // euid we run as (root: arm() refuses otherwise) and pf_policy scopes its
@@ -952,12 +960,14 @@ fn pf_engage_block(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
     let euid = unsafe { libc::geteuid() };
     let rules = pf_policy::block_all_ruleset(&pf_policy::BlockAll {
         relay: server_ip,
+        tunnel_interface: tunnel_interface.as_deref(),
         control_plane: &control_plane,
         euid,
         lan_sharing: lan_sharing_enabled(),
     });
     tracing::info!(
-        "Kill switch: control-plane permit for uid {} on tcp/443 to {} addresses",
+        "Kill switch: tunnel permit on {}; control-plane permit for uid {} on tcp/443 to {} addresses",
+        tunnel_interface.as_deref().unwrap_or("no interface (no tunnel yet)"),
         euid,
         control_plane.len()
     );
@@ -982,6 +992,83 @@ fn pf_engage_block(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
     engaged.result
 }
 
+/// The utun the block-all permits right now (MR-1125).
+#[cfg(target_os = "macos")]
+fn recorded_tunnel_interface() -> Option<String> {
+    PF_TUNNEL_INTERFACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// macOS: the tunnel now runs on `name` (MR-1125).
+///
+/// The block-all permits the tunnel by interface NAME, and that one only. A
+/// reconnect or a settings reapply engages the block BEFORE the new device
+/// exists, so the name is recorded here, the moment `create_utun_device`
+/// returns it, and an engaged block is re-loaded at once to let it through.
+/// Until then the block has no tunnel permit at all, which is fail-closed.
+#[cfg(target_os = "macos")]
+pub async fn tunnel_interface_up(name: &str) {
+    {
+        let mut recorded = PF_TUNNEL_INTERFACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recorded.as_deref() == Some(name) {
+            return;
+        }
+        *recorded = Some(name.to_string());
+    }
+    reload_block_if_engaged("the tunnel's new interface").await;
+}
+
+/// macOS: the tunnel's device on `name` is gone (its fd closed). Drop its
+/// permit from an engaged block, or the next owner of the same unit — another
+/// VPN — would pass straight through the kill switch.
+#[cfg(target_os = "macos")]
+pub async fn tunnel_interface_down(name: &str) {
+    if forget_tunnel_interface(name) {
+        reload_block_if_engaged("the tunnel interface going away").await;
+    }
+}
+
+/// Forget `name`, unless a newer tunnel has already been recorded. Synchronous
+/// for the paths that cannot await (a failed start, `Drop`): they only forget,
+/// and the next load — every re-dial loads — drops the permit.
+#[cfg(target_os = "macos")]
+pub fn forget_tunnel_interface(name: &str) -> bool {
+    let mut recorded = PF_TUNNEL_INTERFACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if recorded.as_deref() != Some(name) {
+        return false;
+    }
+    *recorded = None;
+    true
+}
+
+/// Re-load an ENGAGED block-all so it reflects the inputs as they are now. A
+/// block that is not engaged is left alone: its next activation reads them.
+#[cfg(target_os = "macos")]
+async fn reload_block_if_engaged(why: &str) {
+    let server_ip = *VPN_SERVER_IP.read().await;
+    let result = {
+        let _pf = PF_LOCK.lock().await;
+        if !PF_BLOCKING.load(Ordering::SeqCst) {
+            return;
+        }
+        pf_engage_block(server_ip)
+    };
+    if let Err(e) = result {
+        tracing::warn!(
+            "Kill switch: re-loading the block for {} failed: {}",
+            why,
+            e
+        );
+    }
+    blocking_may_have_changed();
+}
+
 /// Deactivate pf blocking: drop the block-all main ruleset and fall back to the
 /// correct baseline — the IPv6 leak block if a tunnel session is still live,
 /// otherwise the system default ruleset (disabling pf only if we enabled it).
@@ -997,8 +1084,8 @@ async fn pf_deactivate_blocking() -> Result<(), String> {
     let keep_ipv6_block = PF_IPV6_BLOCK_ACTIVE.load(Ordering::SeqCst);
     let teardown = if keep_ipv6_block {
         // A failed baseline load leaves the block-all ruleset loaded. That is
-        // both fail-safe and still usable: block-all permits lo0 and utun0-15,
-        // so a healthy tunnel keeps carrying the user's traffic.
+        // both fail-safe and still usable: block-all permits lo0 and the
+        // tunnel's utun, so a healthy tunnel keeps carrying the user's traffic.
         // Falling back to /etc/pf.conf here would restore the IPv6 leak instead.
         pf_apply_ipv6_baseline()
     } else {

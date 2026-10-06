@@ -217,6 +217,13 @@ impl Drop for UtunTunnel {
                     "UtunTunnel dropped with the utun fd still open — closed it to \
                      destroy the interface and release its routes"
                 );
+                // MR-1125: the interface is gone, so is its kill-switch permit
+                // (from the next load; Drop cannot await a re-load).
+                if let Ok(name) = self.utun_name.try_read() {
+                    if let Some(name) = name.as_deref() {
+                        crate::commands::killswitch::forget_tunnel_interface(name);
+                    }
+                }
             }
         }
     }
@@ -271,6 +278,12 @@ impl UtunTunnel {
         *self.utun_name.write().await = Some(utun_name.clone());
         *self.utun_fd.write().await = Some(utun_fd);
 
+        // MR-1125: the kill switch permits the tunnel by interface NAME — this
+        // one, whichever free unit it landed on, and no other — so record it
+        // now. A reconnect or a settings reapply engaged the block before this
+        // device existed; that block is re-loaded here to let it through.
+        crate::commands::killswitch::tunnel_interface_up(&utun_name).await;
+
         // Create WireGuard session BEFORE configuring routes
         // (needs direct network access for DNS resolution of endpoint)
         let wg_session = WireGuardSession::new(
@@ -296,6 +309,9 @@ impl UtunTunnel {
         // This only runs on the error path; the success path is unchanged.
         let close_fd_on_err = |fd: i32| {
             let _ = unsafe { libc::close(fd) };
+            // The device died with its fd: forget its kill-switch permit (the
+            // next load, which every re-dial does, drops it).
+            crate::commands::killswitch::forget_tunnel_interface(&utun_name);
             tracing::warn!("Closed utun file descriptor after startup failure");
         };
 
@@ -472,13 +488,22 @@ impl UtunTunnel {
         }
 
         // Close the utun file descriptor
-        if let Some(fd) = self.utun_fd.write().await.take() {
+        let closed = self.utun_fd.write().await.take();
+        if let Some(fd) = closed {
             let _ = unsafe { libc::close(fd) };
             tracing::info!("Closed utun file descriptor");
         }
 
         // Destroy the utun interface (happens automatically when fd is closed)
-        *self.utun_name.write().await = None;
+        let utun_name = self.utun_name.write().await.take();
+
+        // MR-1125: take the dead interface's permit out of an engaged kill
+        // switch block, so the next owner of the unit is not let through. Only
+        // when THIS stop closed the device: after a failed start the name was
+        // already forgotten, and a newer tunnel may hold the same unit by now.
+        if let (Some(_), Some(name)) = (closed, utun_name) {
+            crate::commands::killswitch::tunnel_interface_down(&name).await;
+        }
 
         // Clear WireGuard session
         *self.wg_session.write().await = None;

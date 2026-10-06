@@ -15,7 +15,7 @@
 //! | rule                                     | why                               |
 //! |------------------------------------------|-----------------------------------|
 //! | `lo0`                                    | local IPC, the stealth helper     |
-//! | `utun0`..`utun15`                        | traffic already inside the VPN    |
+//! | the tunnel's own utun, BY NAME           | traffic already inside the VPN    |
 //! | DHCP, both directions                    | the LAN lease outlives the block  |
 //! | the LAN ranges, with Local Network Sharing | printers, NAS, AirPlay          |
 //! | root's tcp/443 to `<birdo_control>`      | the control plane: API and DoH    |
@@ -51,16 +51,29 @@ pub(crate) const CONTROL_PLANE_TABLE: &str = "birdo_control";
 const CONTROL_PLANE_PORT: u16 = 443;
 
 /// The inputs the block-all ruleset is built from — all of them read at load
-/// time, so every (re-)load carries the current relay and addresses.
+/// time, so every (re-)load carries the current relay, interface and addresses.
 pub(crate) struct BlockAll<'a> {
     /// The relay the tunnel dials (VPN_SERVER_IP). `None` permits no relay.
     pub relay: Option<Ipv4Addr>,
+    /// The utun the live tunnel runs on. `None` while no tunnel exists — a
+    /// reconnect gap, or a reapply that arms the block before the new tunnel
+    /// is built — and then no utun is permitted at all.
+    pub tunnel_interface: Option<&'a str>,
     /// Where the control-plane permit may go: [`control_plane_addresses`].
     pub control_plane: &'a [Ipv4Addr],
     /// The effective uid the app runs as (always 0 on macOS: see below).
     pub euid: u32,
     /// Local Network Sharing.
     pub lan_sharing: bool,
+}
+
+/// `utun` followed by a unit number, as `create_utun_device` names it
+/// (`utun{unit}` for unit 0..256). Anything else is refused before it can be
+/// written into a ruleset that pf parses.
+pub(crate) fn is_utun_name(name: &str) -> bool {
+    name.strip_prefix("utun").is_some_and(|unit| {
+        (1..=3).contains(&unit.len()) && unit.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// The kill switch's block-all, as the text `pfctl -f -` loads as pf's MAIN
@@ -88,15 +101,27 @@ pub(crate) fn block_all_ruleset(b: &BlockAll<'_>) -> String {
          pass quick on lo0 all\n"
     ));
 
-    // Permit utun0..utun15. create_utun_device() probes `for unit in 0..256`
-    // and takes the FIRST FREE unit, so on a Mac where system services already
-    // hold utun0-3 (VPNs, Continuity, Handoff — common) our tunnel lands on
-    // utun4+ and `block drop all` ate its traffic. pfctl tolerates naming
-    // absent interfaces, so listing 16 is safe. The live device name cannot
-    // be used instead: reapply_vpn_settings arms the block BEFORE the new
-    // tunnel exists, so there is no name to bind at rule-load time.
-    for unit in 0..16 {
-        r.push_str(&format!("pass quick on utun{unit} all\n"));
+    // TUNNEL PERMIT (MR-1125): exactly the interface the tunnel is using.
+    //
+    // This was a fixed `utun0`..`utun15` list, because the live name was not
+    // known when reapply_vpn_settings armed the block. Both directions of that
+    // were wrong: create_utun_device() takes the FIRST FREE unit of 0..256, so
+    // on a Mac where other software already holds 16 utuns our tunnel landed on
+    // utun16+ and `block drop all` ate all of its traffic; and every other
+    // utun0-15 — another VPN's, iCloud Private Relay's — passed straight
+    // through the block. The tunnel now records its interface when it creates
+    // it (`killswitch::tunnel_interface_up`), which re-loads an engaged block,
+    // so the not-yet-built case is simply "no tunnel permit yet".
+    match b.tunnel_interface {
+        Some(name) if is_utun_name(name) => r.push_str(&format!("pass quick on {name} all\n")),
+        Some(_) => {
+            // The kernel named it; this cannot happen. Refuse rather than write
+            // an arbitrary string into a ruleset — the tunnel stays blocked.
+            tracing::error!(
+                "Kill switch: refusing a malformed tunnel interface name; no tunnel permit"
+            );
+        }
+        None => {}
     }
 
     // DHCP: both directions are stated explicitly because these rules are
@@ -324,18 +349,33 @@ fn root_permits_are_scoped(text: &str) -> bool {
         .all(|l| l.contains(&table))
 }
 
+/// The utun interfaces `text` permits (`pass quick on utunN ...`), in order.
+#[cfg(test)]
+fn tunnel_permits(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("pass quick on utun"))
+        .map(|rest| {
+            let unit: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            format!("utun{unit}")
+        })
+        .collect()
+}
+
 /// The ruleset shapes a session can load: every input on and off.
 #[cfg(test)]
 fn every_shape<'a>(control_plane: &'a [Ipv4Addr]) -> Vec<BlockAll<'a>> {
     let mut shapes = Vec::new();
     for relay in [None, Some(Ipv4Addr::new(203, 0, 113, 7))] {
-        for lan_sharing in [false, true] {
-            shapes.push(BlockAll {
-                relay,
-                control_plane,
-                euid: 0,
-                lan_sharing,
-            });
+        for tunnel_interface in [None, Some("utun3"), Some("utun17"), Some("utun255")] {
+            for lan_sharing in [false, true] {
+                shapes.push(BlockAll {
+                    relay,
+                    tunnel_interface,
+                    control_plane,
+                    euid: 0,
+                    lan_sharing,
+                });
+            }
         }
     }
     shapes
@@ -349,9 +389,10 @@ mod tests {
     const DOH: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
     const API: Ipv4Addr = Ipv4Addr::new(104, 16, 0, 1);
 
-    fn ruleset(control_plane: &[Ipv4Addr]) -> String {
+    fn ruleset(tunnel_interface: Option<&str>, control_plane: &[Ipv4Addr]) -> String {
         block_all_ruleset(&BlockAll {
             relay: Some(Ipv4Addr::new(203, 0, 113, 7)),
+            tunnel_interface,
             control_plane,
             euid: 0,
             lan_sharing: false,
@@ -362,7 +403,7 @@ mod tests {
 
     #[test]
     fn the_control_plane_permit_goes_to_the_table_and_nowhere_else() {
-        let r = ruleset(&[DOH, API]);
+        let r = ruleset(Some("utun4"), &[DOH, API]);
         assert!(
             r.contains("table <birdo_control> const { 1.1.1.1, 104.16.0.1 }\n"),
             "the table must list exactly the control-plane addresses:\n{r}"
@@ -387,7 +428,7 @@ mod tests {
     /// back to "any".
     #[test]
     fn no_control_plane_address_means_no_root_permit_at_all() {
-        let r = ruleset(&[]);
+        let r = ruleset(Some("utun4"), &[]);
         assert!(!r.contains(" user "), "{r}");
         assert!(!r.contains("table <"), "{r}");
         assert!(!r.contains("port 443"), "{r}");
@@ -405,11 +446,64 @@ mod tests {
         assert_eq!(set, sorted, "sorted and de-duplicated");
     }
 
+    // ── MR-1125 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_tunnel_permit_names_exactly_the_live_utun() {
+        // utun16+ was blocked by the old fixed utun0-15 list.
+        let r = ruleset(Some("utun17"), &[DOH]);
+        assert_eq!(tunnel_permits(&r), vec!["utun17".to_string()], "{r}");
+        // …and another VPN's utun0-15 is no longer let through.
+        let r = ruleset(Some("utun2"), &[DOH]);
+        assert_eq!(tunnel_permits(&r), vec!["utun2".to_string()], "{r}");
+        assert!(!r.contains("utun0"), "{r}");
+        assert!(!r.contains("utun15"), "{r}");
+    }
+
+    /// A reapply arms the block before the new tunnel exists, and a
+    /// reconnect gap has none: no utun is permitted until one is recorded.
+    #[test]
+    fn no_tunnel_means_no_utun_is_permitted() {
+        let r = ruleset(None, &[DOH]);
+        assert!(tunnel_permits(&r).is_empty(), "{r}");
+        assert!(!r.contains("utun"), "{r}");
+    }
+
+    #[test]
+    fn a_malformed_interface_name_never_reaches_the_ruleset() {
+        for bad in [
+            "utun1 all\npass all",
+            "utun",
+            "utun1234",
+            "utunx",
+            "utun-1",
+            "en0",
+            "UTUN3",
+            "",
+        ] {
+            let r = ruleset(Some(bad), &[DOH]);
+            assert!(tunnel_permits(&r).is_empty(), "{bad:?} permitted:\n{r}");
+            assert!(!r.contains("pass all"), "{bad:?} injected a rule:\n{r}");
+        }
+    }
+
+    #[test]
+    fn utun_names_are_recognised_exactly() {
+        for good in ["utun0", "utun9", "utun15", "utun16", "utun255"] {
+            assert!(is_utun_name(good), "{good}");
+        }
+        for bad in [
+            "utun", "utun1234", "utun1a", "tun0", "utun 1", " utun1", "ipsec0",
+        ] {
+            assert!(!is_utun_name(bad), "{bad:?}");
+        }
+    }
+
     // ── The rest of the ruleset, unchanged in substance ────────────────
 
     #[test]
     fn the_block_all_carries_both_markers_and_denies_by_default() {
-        let r = ruleset(&[DOH]);
+        let r = ruleset(Some("utun4"), &[DOH]);
         let lines: Vec<&str> = r.lines().collect();
         assert_eq!(lines[1], "set block-policy drop");
         let block = lines.iter().position(|l| *l == "block drop all").unwrap();
@@ -433,6 +527,7 @@ mod tests {
     fn relay_dhcp_and_lan_permits_are_kept() {
         let with = block_all_ruleset(&BlockAll {
             relay: Some(Ipv4Addr::new(203, 0, 113, 7)),
+            tunnel_interface: Some("utun4"),
             control_plane: &[DOH],
             euid: 0,
             lan_sharing: true,
@@ -448,6 +543,7 @@ mod tests {
         }
         let without = block_all_ruleset(&BlockAll {
             relay: None,
+            tunnel_interface: Some("utun4"),
             control_plane: &[DOH],
             euid: 0,
             lan_sharing: false,
@@ -482,7 +578,10 @@ mod tests {
 
     #[test]
     fn only_the_block_all_reads_back_as_the_block() {
-        assert!(block_all_loaded(&pf_prints(&ruleset(&[DOH]))));
+        assert!(block_all_loaded(&pf_prints(&ruleset(
+            Some("utun4"),
+            &[DOH]
+        ))));
         // The IPv6 leak block carries the shared marker, not ours.
         for baseline in [
             include_str!("../../resources/pf/ipv6-block.conf"),
@@ -549,7 +648,7 @@ mod tests {
     }
 
     fn block() -> String {
-        ruleset(&[DOH])
+        ruleset(Some("utun4"), &[DOH])
     }
 
     #[test]
@@ -600,8 +699,8 @@ mod tests {
         assert!(out.result.unwrap_err().contains("not pf's live ruleset"));
     }
 
-    /// pfctl -f is all or nothing, so a failed re-load (a relay move) leaves
-    /// the previous block in force — and says so.
+    /// pfctl -f is all or nothing, so a failed re-load (a relay move, a new
+    /// tunnel interface) leaves the previous block in force — and says so.
     #[test]
     fn a_failed_load_reports_whatever_is_still_in_force() {
         let held = FakePf {
@@ -735,6 +834,15 @@ mod pfctl_parse_tests {
                 block_all_loaded(&printed),
                 "the read-back would not recognise this block-all:\n{printed}"
             );
+            assert_eq!(
+                tunnel_permits(&printed),
+                shape
+                    .tunnel_interface
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{printed}"
+            );
             assert!(
                 printed.contains("<birdo_control>"),
                 "the control-plane permit must name the table:\n{printed}"
@@ -748,6 +856,7 @@ mod pfctl_parse_tests {
     fn the_shape_without_a_control_plane_parses() {
         let rules = block_all_ruleset(&BlockAll {
             relay: None,
+            tunnel_interface: None,
             control_plane: &[],
             euid: 0,
             lan_sharing: false,
