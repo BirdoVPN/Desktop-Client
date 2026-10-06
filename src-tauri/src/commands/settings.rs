@@ -508,7 +508,38 @@ async fn off_the_runtime<T: Send + 'static>(
 /// callers that need settings before the frontend is up (e.g. main.rs setup
 /// honoring `start_minimized`).
 pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
-    load_settings(app).map(Loaded::settings)
+    load_settings(app)
+        .map(Loaded::settings)
+        .map_err(String::from)
+}
+
+/// Why a load produced no settings at all.
+#[derive(Debug, PartialEq)]
+enum LoadError {
+    /// The file is there and could not be read: a scanner or a backup agent
+    /// holding it open, permissions. What it holds is unknown, and may well
+    /// be the user's settings.
+    Unreadable(String),
+    /// The file was read and is not settings in any format this build knows.
+    Unparseable(String),
+    /// Anything else (no config directory, a serializer failure).
+    Other(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Unreadable(e) | LoadError::Unparseable(e) | LoadError::Other(e) => {
+                f.write_str(e)
+            }
+        }
+    }
+}
+
+impl From<LoadError> for String {
+    fn from(error: LoadError) -> Self {
+        error.to_string()
+    }
 }
 
 /// What a load found (WIN3-010).
@@ -536,16 +567,16 @@ impl Loaded {
 /// The whole load holds [`SETTINGS_WRITE`] (WIN3-010): the migrations below
 /// save what they read, and a save that landed between their read and their
 /// write was lost.
-fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
+fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {
     let _write = SETTINGS_WRITE.lock();
-    let path = get_settings_path(app)?;
+    let path = get_settings_path(app).map_err(LoadError::Other)?;
 
     if !path.exists() {
         return Ok(Loaded::Saved(AppSettings::default()));
     }
 
-    let content =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read settings: {}", e))?;
+    let content = fs::read_to_string(&path)
+        .map_err(|e| LoadError::Unreadable(format!("Failed to read settings: {}", e)))?;
 
     // Try to parse as signed settings (new format)
     if let Ok(signed) = serde_json::from_str::<SignedSettings>(&content) {
@@ -590,7 +621,7 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
         }
 
         let settings_json = serde_json::to_string(&signed.settings)
-            .map_err(|e| format!("Failed to re-serialize settings: {}", e))?;
+            .map_err(|e| LoadError::Other(format!("Failed to re-serialize settings: {}", e)))?;
         for key in &candidates {
             if verify_hmac(&settings_json, &signed.hmac, key) {
                 sync_hmac_key_sources(&path, key);
@@ -618,8 +649,9 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
         if let Ok(legacy) = serde_json::to_value(&signed.settings)
             .and_then(serde_json::from_value::<LegacyAppSettingsV1>)
         {
-            let legacy_json = serde_json::to_string(&legacy)
-                .map_err(|e| format!("Failed to serialize legacy settings: {}", e))?;
+            let legacy_json = serde_json::to_string(&legacy).map_err(|e| {
+                LoadError::Other(format!("Failed to serialize legacy settings: {}", e))
+            })?;
             for key in &candidates {
                 if verify_hmac(&legacy_json, &signed.hmac, key) {
                     tracing::info!(
@@ -678,7 +710,10 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
             }
             Ok(Loaded::Saved(settings))
         }
-        Err(e) => Err(format!("Failed to parse settings: {}", e)),
+        Err(e) => Err(LoadError::Unparseable(format!(
+            "Failed to parse settings: {}",
+            e
+        ))),
     }
 }
 
@@ -858,13 +893,18 @@ fn verified(loaded: Loaded) -> Result<AppSettings, String> {
 /// defaults. The revert already refused to save over such a file; the save
 /// itself did not, so the next toggle wrote those defaults over the user's
 /// real file. Now it is refused while the file cannot be verified (the UI puts
-/// the toggle back and says the save failed) and goes ahead once it can. A
-/// file that does not parse at all has nothing a save could lose, and saving
-/// stays the way out of it.
-fn may_save_over(loaded: Result<Loaded, String>) -> Result<(), String> {
+/// the toggle back and says the save failed) and goes ahead once it can.
+///
+/// A file that was read and does not parse at all has nothing a save could
+/// lose, and saving stays the way out of it. One that could not be READ is
+/// not that (review of #222): an antivirus sharing violation looks the same
+/// to the caller, and the file behind it is usually the user's own. The save
+/// is refused, and the next one, once the file is readable again, goes ahead.
+fn may_save_over(loaded: Result<Loaded, LoadError>) -> Result<(), String> {
     match loaded {
         Ok(loaded) => verified(loaded).map(drop),
-        Err(_) => Ok(()),
+        Err(LoadError::Unparseable(_)) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1283,7 +1323,7 @@ mod tests {
         };
         let restore = body("pub(crate) fn restore_tunnel_settings(");
         assert!(restore.contains("restored_over(load_settings(app)?, good)?"));
-        let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, String> {");
+        let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {");
         // The two branches that serve defaults and touch nothing.
         assert_eq!(
             load.matches("Loaded::Unverified(AppSettings::default())")
@@ -1291,7 +1331,7 @@ mod tests {
             2
         );
         let lock = load.find("SETTINGS_WRITE.lock()").expect("the lock");
-        assert!(lock < load.find("get_settings_path(app)?").unwrap());
+        assert!(lock < load.find("get_settings_path(app)").unwrap());
         assert!(lock < load.find("save_settings_inner(").unwrap());
     }
 
@@ -1690,7 +1730,9 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            may_save_over(Err("Failed to parse settings".into())),
+            may_save_over(Err(LoadError::Unparseable(
+                "Failed to parse settings".into()
+            ))),
             Ok(()),
             "a file that does not parse has nothing to lose"
         );
@@ -1718,6 +1760,30 @@ mod tests {
             read < autostart
                 .find("set_autostart_windows(app, enabled)?")
                 .unwrap()
+        );
+    }
+
+    /// Review of #222 (P3.7): a settings file that could not be READ is not
+    /// saved over, unlike one that was read and does not parse. The read
+    /// failure is usually transient (a scanner holding the file) and the
+    /// file behind it is the user's.
+    #[test]
+    fn a_save_never_replaces_a_file_it_could_not_read() {
+        let unreadable = may_save_over(Err(LoadError::Unreadable(
+            "Failed to read settings: The process cannot access the file because it is being \
+             used by another process. (os error 32)"
+                .into(),
+        )));
+        assert!(
+            unreadable.is_err(),
+            "a sharing violation is not an empty file"
+        );
+        assert!(may_save_over(Err(LoadError::Other("no config dir".into()))).is_err());
+        assert_eq!(
+            may_save_over(Err(LoadError::Unparseable(
+                "Failed to parse settings".into()
+            ))),
+            Ok(())
         );
     }
 
