@@ -158,8 +158,12 @@ pub(crate) struct DnsGuard {
     pub tunnel_luid: u64,
     /// Local Network Sharing leaves LAN name resolution alone.
     pub lan_sharing: bool,
-    /// The tunnel's own relay. On a DNS port — WireGuard port 53 is a preset
-    /// in VPN Settings — the block would otherwise drop the tunnel itself.
+    /// The tunnel's own relay. On a DNS port the block would otherwise drop
+    /// the tunnel itself. The client no longer offers one: the WireGuard
+    /// "53" preset was removed (no relay answers there; settings
+    /// `migrate_wireguard_port`) and stays removed unless the fleet adds a
+    /// 53→51820 DNAT (REMAINING item 36). The permit stays for an endpoint
+    /// the server sends on such a port, which costs nothing when none does.
     pub relay: Option<Relay>,
     /// This executable, whose WireGuard socket carries the tunnel.
     pub self_exe: Option<String>,
@@ -1689,10 +1693,11 @@ mod tests {
 
     // ── The relay on a DNS port ─────────────────────────────────────────
 
-    /// WireGuard port 53 is a preset in VPN Settings. The DNS block must not
-    /// drop the tunnel itself — under the guard alone (reactive, Connected),
-    /// under the block-all alone (the re-dial in a gap) and under both — and
-    /// nothing else may use that hole.
+    /// A relay endpoint on port 53 (no longer a VPN Settings preset — see
+    /// `DnsGuard::relay` — but a port the server may still send). The DNS
+    /// block must not drop the tunnel itself — under the guard alone
+    /// (reactive, Connected), under the block-all alone (the re-dial in a
+    /// gap) and under both — and nothing else may use that hole.
     #[test]
     fn a_relay_on_port_53_is_not_blocked_by_the_dns_block() {
         let on_53 = relay_to(RELAY, 53, RelayTransport::WireGuardUdp);
