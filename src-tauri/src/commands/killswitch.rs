@@ -27,15 +27,47 @@ use crate::vpn::manager::VpnManager;
 /// Active/blocking state is delegated entirely to wfp.rs.
 static KILLSWITCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Held by everything that WRITES the intent — `arm` from reading the
-/// preference to storing it, the live OFF, `disarm` — and by the re-check
-/// that lifts a block the intent no longer wants (review of #222). Without
-/// it an OFF that landed between `arm`'s read of the preference and its
-/// store was overwritten, and an ON that landed between the re-check's read
-/// and its lift lost its block. Never held across an activation's own lock
-/// attempt: the re-check takes it only when it found the intent off, and the
-/// writers that activate (`arm`) have just stored it on.
-static INTENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The intent's write lock, guarding a sequence number every OFF bumps
+/// (review of #222).
+///
+/// INVARIANT: `KILLSWITCH_ENABLED` is written only by [`intent_off`] and
+/// [`intent_on_since`], both under this lock, and the lock is held for those
+/// stores alone — never across an await, a firewall call or settings I/O. A
+/// plain mutex therefore cannot keep anyone waiting on slow work: not the
+/// Disconnect escape (`disarm`), not the live OFF. (Round 2 used an async
+/// lock that `arm` held across its settings read; a hung credential store, or
+/// a `schtasks` holding the settings lock, then held `disarm` for good.) It
+/// also cannot self-deadlock: no path takes it twice.
+///
+/// `arm` reads the number BEFORE its slow read of the preference and stores
+/// ON only if no OFF has bumped it since ([`intent_on_since`]), so an OFF
+/// that lands during the read wins.
+static INTENT: parking_lot::Mutex<u64> = parking_lot::const_mutex(0);
+
+/// The intent's current sequence number, for [`intent_on_since`].
+fn intent_seq() -> u64 {
+    *INTENT.lock()
+}
+
+/// Turn the intent OFF (the only way it turns off) and bump the sequence, so
+/// an `arm` that read the preference before this does not store its ON over
+/// it. Whether it was on.
+fn intent_off() -> bool {
+    let mut seq = INTENT.lock();
+    *seq = seq.wrapping_add(1);
+    KILLSWITCH_ENABLED.swap(false, Ordering::SeqCst)
+}
+
+/// Turn the intent ON, unless an OFF landed since `seen` was read. Whether it
+/// stored it.
+fn intent_on_since(seen: u64) -> bool {
+    let seq = INTENT.lock();
+    if *seq != seen {
+        return false;
+    }
+    KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+    true
+}
 
 /// Global state for kill switch - stores allowed VPN server IP
 static VPN_SERVER_IP: once_cell::sync::Lazy<Arc<RwLock<Option<Ipv4Addr>>>> =
@@ -105,6 +137,7 @@ pub async fn activate_killswitch() -> Result<bool, String> {
     let result = unless_turned_off(
         activate_platform_block(),
         deactivate_platform_block,
+        activate_platform_block,
         platform_is_blocking,
     )
     .await;
@@ -131,26 +164,28 @@ pub async fn activate_killswitch() -> Result<bool, String> {
 /// Review of #222: the rule asks whether a block IS up, not whether this
 /// engage put one up — a refresh that failed keeps the previous block, a
 /// partial iptables load leaves its chains (and reports an error), a rebuild
-/// around a new relay or tunnel LUID reports nothing engaged. And the
-/// re-check runs under [`INTENT`], so an ON that lands between it and the
-/// lift keeps its block instead of losing it.
-async fn unless_turned_off<E, L, LF>(
+/// around a new relay or tunnel LUID reports nothing engaged.
+///
+/// An ON can land while the lift runs, its own block going up before the lift
+/// takes it down. So after the lift the intent is read once more, and an ON
+/// found there gets its block back through `reengage` (a no-op refresh if its
+/// own activation is still to come). No lock is held across either firewall
+/// call (round 3: a lock held there kept `disarm` waiting on them).
+async fn unless_turned_off<E, L, LF, R, RF>(
     engage: E,
     lift: L,
+    reengage: R,
     blocking: impl Fn() -> bool,
 ) -> Result<bool, String>
 where
     E: std::future::Future<Output = Result<bool, String>>,
     L: FnOnce() -> LF,
     LF: std::future::Future<Output = Result<bool, String>>,
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<bool, String>>,
 {
     let engaged = engage.await;
     if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
-        return engaged;
-    }
-    let _intent = INTENT.lock().await;
-    if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
-        // An ON landed meanwhile: what is up is its block now.
         return engaged;
     }
     if !blocking() {
@@ -158,7 +193,12 @@ where
         return Ok(false);
     }
     tracing::info!("The kill switch is off and its block is up — lifting it");
-    lift().await.map(|_| false)
+    lift().await?;
+    if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+        tracing::info!("The kill switch was turned back on during the lift — re-engaging");
+        return reengage().await;
+    }
+    Ok(false)
 }
 
 async fn activate_platform_block() -> Result<bool, String> {
@@ -214,6 +254,7 @@ pub(crate) async fn move_relay(
     let result = unless_turned_off(
         async move { wfp::move_relay(relay, engage).await.map(|()| engage) },
         deactivate_platform_block,
+        activate_platform_block,
         platform_is_blocking,
     )
     .await
@@ -316,16 +357,16 @@ pub async fn set_killswitch_live(
     }
 }
 
-/// The live OFF: clear the intent and lift any block that is up, under
-/// [`INTENT`] — so an `arm` that read the preference before it was turned off
-/// finishes first and is then undone, instead of storing its ON over this OFF.
+/// The live OFF: clear the intent and lift any block that is up. Clearing
+/// bumps the intent's sequence ([`intent_off`]), so an `arm` that read the
+/// preference before this does not store its ON over it; nothing here waits
+/// on anyone's I/O.
 async fn turn_off<L, LF>(lift: L, blocking: impl Fn() -> bool) -> Result<bool, String>
 where
     L: FnOnce() -> LF,
     LF: std::future::Future<Output = Result<bool, String>>,
 {
-    let _intent = INTENT.lock().await;
-    KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+    intent_off();
 
     // F-018: lift any block that is currently up, on EVERY platform. This
     // branch used to be `#[cfg(windows)]`-only, so on macOS/Linux turning the
@@ -484,25 +525,36 @@ pub fn holds_block_while_connected() -> bool {
 /// requires administrator) logs and returns `Ok(false)` rather than failing the
 /// whole connection.
 pub async fn arm(app: &AppHandle) -> Result<bool, String> {
-    // Review of #222: from reading the preference to storing the intent is one
-    // critical section. An OFF that lands in between (the toggle during
-    // `connecting`) waits for it and then clears what it stored; unserialised,
-    // the stale ON was stored over the OFF.
-    let _intent = INTENT.lock().await;
     // Respect the user's kill-switch preference (default ON). Reading it here —
     // the single choke-point every connect path funnels through — keeps all call
     // sites consistent. Fail SAFE: if settings can't be read, treat as enabled.
     // Read on the blocking pool: it is file and credential-store I/O.
-    let enabled = crate::commands::settings::load_settings_off_runtime(app)
-        .await
-        .map(|s| s.killswitch_enabled)
-        .unwrap_or(true);
-    arm_with_preference(enabled).await
+    arm_reading(async {
+        crate::commands::settings::load_settings_off_runtime(app)
+            .await
+            .map(|s| s.killswitch_enabled)
+            .unwrap_or(true)
+    })
+    .await
 }
 
-/// [`arm`] after the preference has been read — split out so the
-/// preference-OFF branch is unit-testable without an `AppHandle`.
-async fn arm_with_preference(enabled: bool) -> Result<bool, String> {
+/// [`arm`] around a `preference` read that may take any time.
+///
+/// Review of #222: an OFF that lands during the read (the toggle during
+/// `connecting`) must win. The intent's sequence is read BEFORE the
+/// preference and the ON stored only if no OFF has moved it since
+/// ([`intent_on_since`]). Round 2 held a lock across the read instead, and a
+/// read that hung held `disarm` with it.
+async fn arm_reading(preference: impl std::future::Future<Output = bool>) -> Result<bool, String> {
+    let seen = intent_seq();
+    let enabled = preference.await;
+    arm_with_preference(enabled, seen).await
+}
+
+/// [`arm`] after the preference has been read, `seen` the intent's sequence
+/// from before that read — split out so the preference-OFF branch is
+/// unit-testable without an `AppHandle`.
+async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
     if !enabled {
         // F3: the OFF preference must also CLEAR the intent flag, not merely
         // skip arming. The stale-flag path (auto_reconnect.rs never calls
@@ -526,7 +578,7 @@ async fn arm_with_preference(enabled: bool) -> Result<bool, String> {
         //      rest of the session.
         // Clearing it here makes the preference the source of truth on every
         // connect, whichever path armed the previous session.
-        if KILLSWITCH_ENABLED.swap(false, Ordering::SeqCst) {
+        if intent_off() {
             tracing::info!(
                 "Kill switch disabled by user preference — not arming (cleared a stale armed intent from the previous session)"
             );
@@ -548,7 +600,10 @@ async fn arm_with_preference(enabled: bool) -> Result<bool, String> {
             .map_err(|e| format!("Failed to initialize kill-switch firewall: {}", e))?;
     }
 
-    KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+    if !intent_on_since(seen) {
+        tracing::info!("Kill switch turned off while arming — not arming");
+        return Ok(false);
+    }
 
     // LOCKDOWN (always-on) mode: activate the block-all NOW and keep it on for
     // the whole session, so there is ZERO reactive detection window. (Reactive
@@ -628,17 +683,22 @@ async fn arm_with_preference(enabled: bool) -> Result<bool, String> {
 /// user-initiated disconnect path so disconnecting can never strand the machine
 /// behind an active block-all filter set.
 pub async fn disarm() -> Result<(), String> {
-    let result = {
-        let _intent = INTENT.lock().await;
-        disarm_platform().await
-    };
+    let result = disarm_with(disarm_platform()).await;
     blocking_may_have_changed();
     result
 }
 
-async fn disarm_platform() -> Result<(), String> {
-    KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+/// Clear the intent, then run `cleanup`. The escape: it waits on nothing but
+/// its own cleanup — the intent's lock is only ever held for two stores, so
+/// no `arm` stuck in a settings read can hold it up (round 3 of the review).
+async fn disarm_with(
+    cleanup: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    intent_off();
+    cleanup.await
+}
 
+async fn disarm_platform() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = wfp::cleanup().await {
@@ -1170,7 +1230,7 @@ mod tests {
             "precondition: intent armed by a previous session"
         );
 
-        let armed = arm_with_preference(false).await.unwrap();
+        let armed = arm_with_preference(false, intent_seq()).await.unwrap();
 
         assert!(!armed, "preference OFF must not arm");
         assert!(
@@ -1178,7 +1238,7 @@ mod tests {
             "preference OFF must clear KILLSWITCH_ENABLED, or the steady-state block is held against the user's setting"
         );
         // Idempotent from the cleared state too.
-        assert_eq!(arm_with_preference(false).await, Ok(false));
+        assert_eq!(arm_with_preference(false, intent_seq()).await, Ok(false));
         assert!(!is_enabled());
     }
 
@@ -1203,6 +1263,7 @@ mod tests {
                 lifted.store(true, Ordering::SeqCst);
                 Ok(true)
             },
+            || std::future::ready(Ok(true)),
             || true,
         )
         .await;
@@ -1223,7 +1284,12 @@ mod tests {
 
         static KEPT: AtomicBool = AtomicBool::new(false);
         KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
-        let kept = unless_turned_off(async { Ok(true) }, lift_into(&KEPT), || true);
+        let kept = unless_turned_off(
+            async { Ok(true) },
+            lift_into(&KEPT),
+            || std::future::ready(Ok(true)),
+            || true,
+        );
         assert_eq!(kept.await, Ok(true));
         assert!(
             !KEPT.load(Ordering::SeqCst),
@@ -1232,6 +1298,7 @@ mod tests {
         let failed = unless_turned_off(
             async { Err("load failed".into()) },
             lift_into(&KEPT),
+            || std::future::ready(Ok(true)),
             || true,
         );
         assert_eq!(
@@ -1242,11 +1309,17 @@ mod tests {
 
         static NOTHING_UP: AtomicBool = AtomicBool::new(false);
         KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
-        let skipped = unless_turned_off(async { Ok(false) }, lift_into(&NOTHING_UP), || false);
+        let skipped = unless_turned_off(
+            async { Ok(false) },
+            lift_into(&NOTHING_UP),
+            || std::future::ready(Ok(true)),
+            || false,
+        );
         assert_eq!(skipped.await, Ok(false));
         let moot = unless_turned_off(
             async { Err("load failed".into()) },
             lift_into(&NOTHING_UP),
+            || std::future::ready(Ok(true)),
             || false,
         );
         assert_eq!(
@@ -1271,6 +1344,7 @@ mod tests {
         let partial = unless_turned_off(
             async { Err("ip6tables hook failed".into()) },
             lift_into(&AFTER_ERROR),
+            || std::future::ready(Ok(true)),
             || true,
         );
         assert_eq!(partial.await, Ok(false));
@@ -1280,7 +1354,12 @@ mod tests {
         );
 
         static REBUILT: AtomicBool = AtomicBool::new(false);
-        let rebuilt = unless_turned_off(async { Ok(false) }, lift_into(&REBUILT), || true);
+        let rebuilt = unless_turned_off(
+            async { Ok(false) },
+            lift_into(&REBUILT),
+            || std::future::ready(Ok(true)),
+            || true,
+        );
         assert_eq!(rebuilt.await, Ok(false));
         assert!(
             REBUILT.load(Ordering::SeqCst),
@@ -1289,65 +1368,119 @@ mod tests {
     }
 
     /// Review of #222 (P3.2): OFF, then ON, both inside one activation's
-    /// load. The re-check sees the OFF; the ON (an `arm`, holding [`INTENT`])
-    /// stores its intent and engages its block; the re-check, waiting on the
-    /// lock, then sees the ON and leaves the block alone. Unlocked, it lifted
-    /// the ON's block.
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_on_that_lands_during_the_recheck_keeps_its_block() {
+    /// load: the re-check sees the OFF and lifts, and the ON lands while the
+    /// lift runs — its own block may already have gone up and come down with
+    /// it. The re-check reads the intent again after the lift and gives the
+    /// ON its block back. (No lock across the lift: round 3.)
+    #[tokio::test]
+    async fn an_on_that_lands_during_the_lift_gets_its_block_back() {
         let _tests = FLAG_TESTS.lock().await;
         KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
-        static LIFTED: AtomicBool = AtomicBool::new(false);
+        static REENGAGED: AtomicBool = AtomicBool::new(false);
 
-        let arm_in_progress = INTENT.lock().await;
-        let recheck = unless_turned_off(
+        let result = unless_turned_off(
             async {
                 KILLSWITCH_ENABLED.store(false, Ordering::SeqCst); // the OFF
                 Ok(true)
             },
-            lift_into(&LIFTED),
+            || async {
+                KILLSWITCH_ENABLED.store(true, Ordering::SeqCst); // the ON, mid-lift
+                Ok(true)
+            },
+            || {
+                REENGAGED.store(true, Ordering::SeqCst);
+                std::future::ready(Ok(true))
+            },
             || true,
-        );
-        let the_on = async move {
-            tokio::task::yield_now().await;
-            KILLSWITCH_ENABLED.store(true, Ordering::SeqCst); // arm stores the ON
-            drop(arm_in_progress);
-        };
-        let (result, ()) = tokio::join!(recheck, the_on);
+        )
+        .await;
 
-        assert_eq!(result, Ok(true));
-        assert!(!LIFTED.load(Ordering::SeqCst), "the ON's block was lifted");
+        assert_eq!(result, Ok(true), "the ON's block is up");
+        assert!(
+            REENGAGED.load(Ordering::SeqCst),
+            "the lift took the ON's block"
+        );
         KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
     }
 
     /// Review of #222 (P3.3): the toggle turned OFF during `connecting`, while
-    /// `arm` (holding [`INTENT`] from its preference read to its store) still
-    /// had the ON it read. The OFF waits for it and wins. Unlocked, the OFF
-    /// cleared the intent first and `arm` then stored its stale ON over it.
-    #[tokio::test(flavor = "current_thread")]
-    async fn an_off_during_arm_waits_for_it_and_wins() {
+    /// `arm` was still reading the ON it would store. The OFF bumps the
+    /// intent's sequence; `arm` stores ON only if it has not moved since its
+    /// read began, so the OFF wins.
+    #[tokio::test]
+    async fn an_off_during_arms_read_wins() {
         let _tests = FLAG_TESTS.lock().await;
         KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
 
-        let arm_in_progress = INTENT.lock().await;
-        let off = turn_off(|| std::future::ready(Ok(true)), || false);
-        let arm_finishes = async move {
-            tokio::task::yield_now().await;
-            KILLSWITCH_ENABLED.store(true, Ordering::SeqCst); // the stale ON
-            drop(arm_in_progress);
-        };
-        let (result, ()) = tokio::join!(off, arm_finishes);
-
-        assert_eq!(result, Ok(true));
+        let seen = intent_seq();
+        intent_off(); // the OFF lands while arm reads the preference
+        assert!(!intent_on_since(seen), "a stale ON is not stored");
         assert!(!is_enabled(), "the OFF must be the last word");
 
-        // And `arm` really holds the lock from the read to the store.
+        assert!(
+            intent_on_since(intent_seq()),
+            "with no OFF since, the ON is stored"
+        );
+        assert!(is_enabled());
+        intent_off();
+
+        // And `arm` reads the sequence before the preference, and stores
+        // through intent_on_since. (Its ON store needs an elevated host, so
+        // this half is a source check.)
         let source = include_str!("killswitch.rs").replace('\r', "");
-        let arm = &source[source.find("pub async fn arm(app: &AppHandle)").unwrap()..];
-        let arm = &arm[..arm.find("\n}\n").unwrap()];
-        let lock = arm.find("INTENT.lock().await").expect("arm takes the lock");
-        assert!(lock < arm.find("load_settings_off_runtime(app)").unwrap());
-        assert!(lock < arm.find("arm_with_preference(enabled)").unwrap());
+        let read = &source[source.find("async fn arm_reading(").unwrap()..];
+        let read = &read[..read.find("\n}\n").unwrap()];
+        assert!(read.find("intent_seq()").unwrap() < read.find("preference.await").unwrap());
+        let arm = &source[source.find("async fn arm_with_preference(").unwrap()..];
+        assert!(arm.contains("if !intent_on_since(seen) {"));
+    }
+
+    /// Round 3 of the review (P2-1): a settings read that never returns (a
+    /// hung credential store, a `schtasks` holding the settings lock) must not
+    /// hold up `disarm`, the Disconnect escape. Round 2's `arm` held an async
+    /// lock across that read, and `disarm` waited on the same lock for good.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hung_settings_read_never_holds_up_disarm() {
+        let _tests = FLAG_TESTS.lock().await;
+        let arming = arm_reading(std::future::pending::<bool>());
+        let disarming = async {
+            tokio::task::yield_now().await; // arm is inside its read now
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                disarm_with(std::future::ready(Ok(()))),
+            )
+            .await
+        };
+        tokio::select! {
+            _ = arming => panic!("the read never completes"),
+            done = disarming => assert_eq!(done, Ok(Ok(())), "disarm waited on arm's read"),
+        }
+        assert!(!is_enabled());
+    }
+
+    /// The invariant [`INTENT`] documents: outside the tests, the intent is
+    /// written only by `intent_off` and `intent_on_since`, under the lock.
+    #[test]
+    fn the_intent_is_written_only_under_its_lock() {
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let writes: Vec<usize> = ["KILLSWITCH_ENABLED.store(", "KILLSWITCH_ENABLED.swap("]
+            .iter()
+            .flat_map(|w| code.match_indices(w).map(|(at, _)| at))
+            .collect();
+        assert_eq!(writes.len(), 2, "one store in each writer");
+        for at in writes {
+            let owner = code[..at].rfind("\nfn ").unwrap();
+            let name = &code[owner + 4..code[owner..].find('(').unwrap() + owner];
+            assert!(
+                ["intent_off", "intent_on_since"].contains(&name),
+                "written in {name}"
+            );
+            assert!(
+                code[owner..at].contains("INTENT.lock()"),
+                "{name} writes unlocked"
+            );
+        }
     }
 
     /// Review of #222 (P3.1): a live OFF whose lift fails says so. It used to
