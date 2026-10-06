@@ -285,8 +285,12 @@ pub fn sanitize_always(msg: &str) -> String {
         // Round 3 of the review of #222: the account name in a home folder
         // (`C:\Users\Jane.Doe\…`, `/Users/jane/…`, `/home/jane/…`).
         static USER_DIR_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r#"(?i)(\b[a-z]:\\users\\)[^\\/:*?"<>|\r\n]+|(/(?:Users|home)/)[^/\s:]+"#)
-                .expect("user folder regex")
+            // One or two backslashes: `{path:?}` prints `C:\\Users\\Jane\\…`
+            // (round 4 of the review).
+            Regex::new(
+                r#"(?i)(\b[a-z]:\\{1,2}users\\{1,2})[^\\/:*?"<>|\r\n]+|(/(?:Users|home)/)[^/\s:]+"#,
+            )
+            .expect("user folder regex")
         });
         // P2-13: Strip stack traces (lines starting with "at " or Java-style exception patterns)
         static STACK_TRACE_RE: Lazy<Regex> =
@@ -347,7 +351,12 @@ pub fn sanitize_always(msg: &str) -> String {
         let result = HOST_RE
             .replace_all(&result, |caps: &regex::Captures| {
                 let start = caps.get(0).map_or(0, |m| m.start());
-                let after_separator = result[..start].ends_with(['\\', '/']);
+                let before = &result[..start];
+                // A path separator, not the `//` of a URL's `scheme://`
+                // (round 4 of the review: `https://dns.example.rs/…` went
+                // through as a file).
+                let after_separator =
+                    before.ends_with('\\') || (before.ends_with('/') && !before.ends_with("//"));
                 if looks_like_a_host(&caps[0], &caps[1], after_separator) {
                     "[redacted-host]".to_string()
                 } else {
@@ -558,6 +567,38 @@ mod tests {
         assert_eq!(
             sanitize_always("open /home/jane.doe/.config/x.json failed"),
             "open /home/[redacted-user]/.config/x.json failed"
+        );
+    }
+
+    /// Round 4 of the review (P3-2): a host in a URL is a host, though the
+    /// `//` before it is a slash — `.rs` and `.zip` counted as files there —
+    /// and a home folder printed with `{:?}` (escaped backslashes, as the PQ
+    /// key and device-id errors print their paths) names no one either.
+    #[test]
+    fn urls_and_escaped_paths_are_redacted_too() {
+        assert_eq!(
+            sanitize_always("DoH query to https://dns.example.rs/dns-query failed"),
+            "DoH query to https://[redacted-host]/dns-query failed"
+        );
+        assert_eq!(
+            sanitize_always("mirror http://mirror.example.zip:8080 refused"),
+            "mirror http://[redacted-host]:8080 refused"
+        );
+        assert_eq!(
+            sanitize_always(
+                r#"read "C:\\Users\\Jane.Doe\\AppData\\Local\\pq_keypair.json": denied"#
+            ),
+            r#"read "C:\\Users\\[redacted-user]\\AppData\\Local\\pq_keypair.json": denied"#
+        );
+        assert_eq!(
+            sanitize_always(r#"create "C:\\Users\\Jane\\AppData\\device_id": denied"#),
+            r#"create "C:\\Users\\[redacted-user]\\AppData\\device_id": denied"#,
+            "a name with no dot is not even a host-looking word"
+        );
+        // A real path separator still makes .rs a file.
+        assert_eq!(
+            sanitize_always("open file:///home/dev/src/main.rs failed"),
+            "open file:///home/[redacted-user]/src/main.rs failed"
         );
     }
 
