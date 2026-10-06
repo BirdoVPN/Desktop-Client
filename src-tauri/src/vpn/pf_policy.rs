@@ -1454,6 +1454,24 @@ mod tests {
     /// teardown — the next `pfctl -E`, ours or anyone's, blocks everything.
     #[test]
     fn a_block_all_left_in_a_disabled_pf_is_not_a_finished_teardown() {
+        // Not enforcing, so not "blocking" — but still loaded, so the lift
+        // goes on: the block-all is flushed and THAT is read back.
+        let (pf, mut state) = engaged();
+        pf.third_party_disables();
+        let pf = FakePf {
+            default_fails: true,
+            ..pf
+        };
+        assert_eq!(state.disengage(&pf), Ok(()));
+        assert_eq!(
+            pf.flush_calls.get(),
+            1,
+            "a disabled pf is no reason to stop"
+        );
+        assert!(!block_all_loaded(&pf.rules().unwrap()));
+        assert!(!state.loaded);
+
+        // And when even the flush fails, the lift stays owed.
         let (pf, mut state) = engaged();
         pf.third_party_disables();
         let pf = FakePf {
