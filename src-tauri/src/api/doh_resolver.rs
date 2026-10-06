@@ -77,11 +77,48 @@ impl DohApiResolver {
     /// teardown, where a failed DoH lookup has no fallback that works
     /// (WIN3-001).
     pub fn new() -> Self {
-        static SHARED: std::sync::OnceLock<Arc<Mutex<CacheMap>>> = std::sync::OnceLock::new();
         Self {
-            cache: Arc::clone(SHARED.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))),
+            cache: Arc::clone(shared_cache()),
         }
     }
+}
+
+/// The one process-wide cache every [`DohApiResolver`] shares.
+fn shared_cache() -> &'static Arc<Mutex<CacheMap>> {
+    static SHARED: std::sync::OnceLock<Arc<Mutex<CacheMap>>> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+/// The IPv4 addresses this process last resolved for its own control plane —
+/// `birdo.app` and its subdomains — expired entries included.
+///
+/// The macOS kill switch scopes its control-plane permit to these plus the DoH
+/// provider (`vpn::pf_policy::control_plane_addresses`, for
+/// P1-ks-macos-root-443-permit). An expired entry is still the last address
+/// the API answered on, which is the best guess a permit can make; a fresh
+/// answer replaces it, and the next load of the block follows. IPv4 only: the
+/// macOS block admits no IPv6 at all.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn control_plane_v4() -> Vec<std::net::Ipv4Addr> {
+    control_plane_v4_in(shared_cache())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn control_plane_v4_in(cache: &Mutex<CacheMap>) -> Vec<std::net::Ipv4Addr> {
+    let Ok(map) = cache.lock() else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter(|(host, _)| {
+            let host = host.to_ascii_lowercase();
+            host == "birdo.app" || host.ends_with(".birdo.app")
+        })
+        .flat_map(|(_, (_, addrs, _))| addrs.iter())
+        .filter_map(|addr| match addr.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
 }
 
 impl Default for DohApiResolver {
@@ -225,6 +262,48 @@ mod tests {
         let host = "shared-cache.test.invalid";
         cache_put(&main.cache, host, vec![sample_addr()], CACHE_TTL);
         assert_eq!(cache_get(&one_off.cache, host), Some(vec![sample_addr()]));
+    }
+
+    /// What the macOS kill switch's control-plane permit may name: our own
+    /// hosts' IPv4 answers, stale ones included, and nothing else.
+    #[test]
+    fn the_control_plane_set_is_our_hosts_ipv4_answers() {
+        let cache = Mutex::new(CacheMap::new());
+        let v4 = |a, b, c, d| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), HTTPS_PORT);
+        let v6 = SocketAddr::new("2606:4700::1".parse().unwrap(), HTTPS_PORT);
+        cache_put(
+            &cache,
+            "api.birdo.app",
+            vec![v4(104, 16, 0, 1), v6],
+            CACHE_TTL,
+        );
+        cache_put(&cache, "birdo.app", vec![v4(104, 16, 0, 2)], FALLBACK_TTL);
+        // Expired the instant it is stored, and still the last answer we had.
+        cache_put(
+            &cache,
+            "updates.birdo.app",
+            vec![v4(104, 16, 0, 3)],
+            Duration::ZERO,
+        );
+        // Not ours: never a reason to let root out.
+        cache_put(&cache, "example.com", vec![v4(93, 184, 215, 14)], CACHE_TTL);
+        cache_put(
+            &cache,
+            "evilbirdo.app",
+            vec![v4(198, 51, 100, 9)],
+            CACHE_TTL,
+        );
+
+        let mut got = control_plane_v4_in(&cache);
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                Ipv4Addr::new(104, 16, 0, 1),
+                Ipv4Addr::new(104, 16, 0, 2),
+                Ipv4Addr::new(104, 16, 0, 3),
+            ]
+        );
     }
 
     #[test]

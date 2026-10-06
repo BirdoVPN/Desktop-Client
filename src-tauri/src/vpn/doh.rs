@@ -212,6 +212,19 @@ const DOH_PROVIDERS: &[DoHProvider] = &[DoHProvider {
     ],
 }];
 
+/// Every address the DoH client dials (see `DoHProvider::bootstrap`).
+///
+/// The macOS kill switch's control-plane permit names these
+/// (`vpn::pf_policy::control_plane_addresses`): once port-53 DNS is blocked,
+/// they are how the app finds the API at all.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn bootstrap_addrs() -> Vec<Ipv4Addr> {
+    DOH_PROVIDERS
+        .iter()
+        .flat_map(|p| p.bootstrap.iter().copied())
+        .collect()
+}
+
 /// Substring `api::doh_resolver` matches on to tell "every provider failed
 /// PINNING" apart from "the network was unreachable".
 ///
@@ -1098,6 +1111,21 @@ mod tests {
                     ip,
                     provider.url
                 );
+            }
+        }
+    }
+
+    /// The kill switch's control-plane permit is built from this list; a
+    /// provider address missing from it is a DoH that cannot work under a
+    /// macOS block.
+    #[test]
+    fn bootstrap_addrs_lists_every_provider_address() {
+        let all = bootstrap_addrs();
+        let expected: usize = DOH_PROVIDERS.iter().map(|p| p.bootstrap.len()).sum();
+        assert_eq!(all.len(), expected);
+        for provider in DOH_PROVIDERS {
+            for ip in provider.bootstrap {
+                assert!(all.contains(ip), "{ip} ({})", provider.host);
             }
         }
     }

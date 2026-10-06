@@ -53,6 +53,11 @@ pub mod legacy_firewall;
 #[cfg(target_os = "linux")]
 pub mod firewall_linux;
 
+// What the macOS pf kill switch loads and reads back, as testable functions.
+// Compiled into every test build too, so the Windows job runs its tests.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod pf_policy;
+
 // Re-export the new boringtun-based implementation
 pub use manager::VpnManager;
 #[allow(unused_imports)]

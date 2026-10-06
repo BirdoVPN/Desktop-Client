@@ -18,6 +18,8 @@ use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::utils::elevation::is_elevated;
 #[cfg(target_os = "linux")]
 use crate::vpn::firewall_linux;
+#[cfg(target_os = "macos")]
+use crate::vpn::pf_policy;
 #[cfg(target_os = "windows")]
 use crate::vpn::wfp;
 
@@ -623,12 +625,6 @@ fn pf_is_enabled() -> bool {
 //   no tunnel              → /etc/pf.conf
 // ──────────────────────────────────────────────────────────────
 
-/// Marker anchor embedded in every ruleset WE load, so a stale ruleset left by a
-/// crash can be positively identified as ours before we replace it. Declaring an
-/// empty anchor is a no-op for packet processing but shows up in `pfctl -s rules`.
-#[cfg(target_os = "macos")]
-const PF_MARKER_ANCHOR: &str = "com.birdo.vpn";
-
 /// The leak-block rulesets live in `resources/pf/` rather than in this source
 /// file, so that CI can parse-check the EXACT bytes we ship with `pfctl -n -f` on
 /// a real macOS runner (see .github/workflows/tests.yml). A pf syntax error here
@@ -827,7 +823,7 @@ pub fn reconcile_stale_pf_state() {
     if !pf_is_enabled() {
         return;
     }
-    if !pf_live_rules().contains(PF_MARKER_ANCHOR) {
+    if !pf_live_rules().contains(pf_policy::MARKER_ANCHOR) {
         return; // not ours — leave it alone
     }
     tracing::warn!("Found a stale Birdo pf ruleset from a previous run — restoring /etc/pf.conf");
@@ -846,7 +842,7 @@ pub fn reconcile_stale_pf_state() {
     // this function exists to prevent.
     //
     // The marker anchor is the ground truth: still present means still blocking.
-    if pf_live_rules().contains(PF_MARKER_ANCHOR) {
+    if pf_live_rules().contains(pf_policy::MARKER_ANCHOR) {
         tracing::error!(
             "Failed to restore /etc/pf.conf — the stale Birdo ruleset is STILL LOADED and this \
              machine's traffic remains blocked. Leaving the kill switch marked active so the \
@@ -860,7 +856,9 @@ pub fn reconcile_stale_pf_state() {
     PF_IPV6_BLOCK_ACTIVE.store(false, Ordering::SeqCst);
 }
 
-/// Activate pf blocking: block all traffic except to the VPN server and localhost.
+/// Activate pf blocking: block everything except what
+/// `pf_policy::block_all_ruleset` permits (loopback, utun0..utun15, DHCP, the
+/// LAN with Local Network Sharing, the control plane, the relay).
 ///
 /// CRITICAL FIX: the rules are loaded as pf's **main ruleset** (`pfctl -f -`),
 /// not into a named anchor. A named anchor is only evaluated when the main
@@ -871,112 +869,21 @@ pub fn reconcile_stale_pf_state() {
 /// evaluated. `pf_deactivate_blocking` restores `/etc/pf.conf`.
 #[cfg(target_os = "macos")]
 async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
-    // Let the tunnel re-establish while blocked by permitting the VPN server.
-    // WireGuard is UDP; allow the server on both transports so a stealth/TCP
-    // fallback can also reconnect through the block.
-    // RELAY PERMIT — must be STATEFUL, and must also permit the INBOUND reply.
-    //
-    // This rule used to be `... to <ip> no state`. `no state` suppresses pf's
-    // implicit state creation, and the ruleset below has no `pass in` rule for
-    // the relay, so the relay's reply packets matched only the non-quick
-    // `block drop all` (pf is last-match) and were silently dropped. The
-    // WireGuard handshake is a REQUEST/RESPONSE exchange, so with the block
-    // engaged no tunnel could EVER be established — the kill switch became a
-    // permanent "cannot connect" rather than a fail-closed gap. `keep state`
-    // plus the explicit inbound permit fixes that; both are scoped to the one
-    // relay IP, so this does not widen the block for anything else.
-    let server_rule = if let Some(ip) = server_ip {
-        format!(
-            "pass out quick inet proto {{ udp tcp }} to {ip} keep state\n\
-             pass in quick inet proto {{ udp tcp }} from {ip} keep state\n"
-        )
-    } else {
-        String::new()
-    };
-
-    // SELF-PERMIT: let OUR OWN process reach the control plane.
-    //
-    // Without this the kill switch makes reconnection impossible, which is the
-    // opposite of what it is for. auto_reconnect arms the block and then calls
-    // https://api.birdo.app for a fresh config — a DIFFERENT host from the
-    // permitted relay, over the physical NIC — and DNS is blocked too. macOS is
-    // worse than Linux here: `block drop all` with no state-passing rule kills
-    // even an already-established socket. So every reconnect attempt fails for a
-    // reason that is not the network, and the loop eventually gives up and drops
-    // the block, leaving the machine fully open.
-    //
-    // Windows uses a per-app WFP permit (ALE_APP_ID). pf has no app condition, so
-    // match the euid we run as and scope it to TCP/443 — narrow enough to be
-    // meaningful, broad enough to survive the control plane changing address.
-    // `keep state` so replies come back.
+    let control_plane = pf_policy::control_plane_addresses();
+    // pf has no application condition, so the control-plane permit matches the
+    // euid we run as (root: arm() refuses otherwise) and pf_policy scopes its
+    // DESTINATION to the control-plane table.
     let euid = unsafe { libc::geteuid() };
-    // LAN permit: honour Local Network Sharing while the block is engaged, so a
-    // dropped tunnel does not also take out the printer and the NAS. Includes
-    // 169.254/16 for mDNS/Bonjour, which is what actually makes AirPlay and
-    // printer discovery work.
-    let lan_permit = if lan_sharing_enabled() {
-        "pass quick to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } no state\n"
-    } else {
-        ""
-    };
-    let self_permit = format!("pass out quick proto tcp to any port 443 user {euid} keep state\n");
-    tracing::info!("Kill switch: self-permit for uid {} on tcp/443", euid);
-
-    // Default-deny with `quick` passes short-circuiting for the allow-list.
-    // Permit utun0..utun15. create_utun_device() probes `for unit in 0..256` and
-    // takes the FIRST FREE unit, so on a Mac where system services already hold
-    // utun0-3 (VPNs, Continuity, Handoff — common) our tunnel lands on utun4+
-    // and `block drop all` ate its traffic. The worst path is not the reconnect
-    // gap: reapply_vpn_settings arms the block and never deactivates, so
-    // CHANGING ANY VPN SETTING WHILE CONNECTED killed all internet for the rest
-    // of the session.
-    //
-    // pfctl tolerates naming absent interfaces (which is how utun2/utun3 already
-    // loaded), so listing 16 is safe. The live device name cannot be used
-    // instead: reapply_vpn_settings arms the block BEFORE the new tunnel exists,
-    // so there is no name to bind at rule-load time.
-    // back up before deactivation lands, traffic already inside the VPN is not
-    // dropped by this main ruleset.
-    //
-    // DHCP: both directions are stated explicitly because these rules are
-    // `no state` — pf will not infer the reply from the request, so each
-    // direction has to match on its own.
-    //     request: client :68 -> server :67
-    //     reply:   server :67 -> client :68
-    // The inbound rule used to read `from any port 68`, which is the CLIENT's
-    // port. A DHCP reply arrives FROM :67, so that rule matched nothing and
-    // every reply fell through to `block drop all` while the kill switch was
-    // armed. The lease could then never be renewed, so a long VPN session ended
-    // with the LAN connection dying underneath it — and, because the tunnel
-    // itself kept working until the lease actually lapsed, the cause looked
-    // nothing like the kill switch.
-    let rules = format!(
-        "# Birdo VPN Kill Switch (main ruleset — pf evaluates this directly)\n\
-         set block-policy drop\n\
-         anchor \"{PF_MARKER_ANCHOR}\"\n\
-         block drop all\n\
-         pass quick on lo0 all\n\
-         pass quick on utun0 all\n\
-         pass quick on utun1 all\n\
-         pass quick on utun2 all\n\
-         pass quick on utun3 all\n\
-         pass quick on utun4 all\n\
-         pass quick on utun5 all\n\
-         pass quick on utun6 all\n\
-         pass quick on utun7 all\n\
-         pass quick on utun8 all\n\
-         pass quick on utun9 all\n\
-         pass quick on utun10 all\n\
-         pass quick on utun11 all\n\
-         pass quick on utun12 all\n\
-         pass quick on utun13 all\n\
-         pass quick on utun14 all\n\
-         pass quick on utun15 all\n\
-         pass out quick proto udp from any port 68 to any port 67 no state\n\
-         pass in quick proto udp from any port 67 to any port 68 no state\n\
-         {lan_permit}\
-         {self_permit}\
-         {server_rule}"
+    let rules = pf_policy::block_all_ruleset(&pf_policy::BlockAll {
+        relay: server_ip,
+        control_plane: &control_plane,
+        euid,
+        lan_sharing: lan_sharing_enabled(),
+    });
+    tracing::info!(
+        "Kill switch: control-plane permit for uid {} on tcp/443 to {} addresses",
+        euid,
+        control_plane.len()
     );
 
     // Record pf's pre-existing state BEFORE we change it, so deactivation only
