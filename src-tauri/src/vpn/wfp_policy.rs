@@ -634,12 +634,17 @@ fn block_all_specs(
         }
     }
 
-    // WebRTC STUN/TURN leak prevention, above every permit.
-    for (layer, google_high) in [(ConnectV4, 19309), (ConnectV6, 19302)] {
+    // WebRTC STUN/TURN leak prevention, above every permit. The SAME ranges on
+    // both families: a WebRTC client tries every address family it has, so a
+    // port left open on one is the leak. Google's STUN servers
+    // (stun.l.google.com) answer on 19302, and Google Meet sends its media to
+    // UDP 19302-19309; f0710b9 widened the IPv4 block to that range and left
+    // the IPv6 twin at 19302 alone, which this used to carry over.
+    for layer in [ConnectV4, ConnectV6] {
         for (label, protocol, low, high) in [
             ("STUN/UDP", UDP, 3478, 3497),
             ("TURN/TCP", TCP, 3478, 3497),
-            ("Google STUN", UDP, 19302, google_high),
+            ("Google STUN", UDP, 19302, 19309),
         ] {
             out.push(spec(
                 format!("Birdo: Block {label}"),
@@ -1937,6 +1942,38 @@ mod tests {
         assert_eq!(
             decide(&s, &out4(CHROME, [142, 250, 1, 1], 443, TCP, TUNNEL)),
             Some(Action::Permit)
+        );
+    }
+
+    /// The STUN residue of P1-ks-wfp-webrtc-claim-false-in-reactive: IPv4
+    /// blocked Google STUN on 19302-19309 and IPv6 on 19302 alone, so Meet's
+    /// media ports were open over IPv6 through the tunnel permit. Both
+    /// families carry the same STUN/TURN blocks now.
+    #[test]
+    fn stun_is_blocked_on_the_same_ports_on_both_families() {
+        let s = specs(&lockdown());
+        let stun = |layer: Layer| -> Vec<(&str, &[Condition])> {
+            s.iter()
+                .filter(|f| f.layer == layer && f.weight == WEIGHT_BLOCK_STUN)
+                .map(|f| (f.name.as_str(), f.conditions.as_slice()))
+                .collect()
+        };
+        assert_eq!(stun(Layer::ConnectV4).len(), 3);
+        assert_eq!(stun(Layer::ConnectV4), stun(Layer::ConnectV6));
+
+        let meet_v6 = Flow {
+            layer: Layer::ConnectV6,
+            app: CHROME,
+            remote: "2001:db8::5".parse().unwrap(),
+            remote_port: 19305,
+            local_port: 50000,
+            protocol: UDP,
+            interface: TUNNEL,
+        };
+        assert_eq!(decide(&s, &meet_v6), Some(Action::Block));
+        assert_eq!(
+            decide(&s, &out4(CHROME, [74, 125, 250, 129], 19309, UDP, TUNNEL)),
+            Some(Action::Block)
         );
     }
 
