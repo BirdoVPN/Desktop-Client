@@ -289,7 +289,8 @@ impl UtunTunnel {
         if let Err(e) = crate::commands::killswitch::tunnel_interface_up(&utun_name).await {
             self.abandon_utun(utun_fd, &utun_name).await;
             return Err(format!(
-                "The kill switch could not let the new tunnel through: {e}"
+                "{}: the kill switch could not let the new tunnel through: {e}",
+                crate::vpn::ERR_FIREWALL_NOT_ENFORCED
             ));
         }
 
@@ -381,7 +382,11 @@ impl UtunTunnel {
         // block does, once macOS routes IPv6.
         if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
             self.abandon_utun(utun_fd, &utun_name).await;
-            return Err(format!("Failed to block IPv6 leaks: {}", e));
+            return Err(format!(
+                "{}: failed to block IPv6 leaks: {}",
+                crate::vpn::ERR_FIREWALL_NOT_ENFORCED,
+                e
+            ));
         }
 
         // Configure DNS.

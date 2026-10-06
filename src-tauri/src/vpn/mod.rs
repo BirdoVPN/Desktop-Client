@@ -68,6 +68,12 @@ pub use wireguard_new::WireGuardSession;
 // without wireguard_new becoming a public module.
 pub(crate) use wireguard_new::{ERR_HANDSHAKE_NO_RESPONSE, ERR_HANDSHAKE_RECV};
 
+/// Marks a connect that failed because the platform firewall (macOS pf)
+/// could not be enforced — the IPv6 leak block, or the kill switch letting
+/// the new tunnel through — so `IpcError::from_tunnel_failure` reports the
+/// kill switch rather than "the VPN adapter" (P3-5).
+pub(crate) const ERR_FIREWALL_NOT_ENFORCED: &str = "the firewall (pf) could not be enforced";
+
 // Re-export DoH resolver (available for future use)
 #[allow(unused_imports)]
 pub use doh::resolve_via_doh;
