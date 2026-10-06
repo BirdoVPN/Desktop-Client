@@ -539,7 +539,10 @@ impl WfpEngine {
     fn apply(&mut self, next: Policy) -> Result<(), String> {
         let apps = resolve_apps(&next);
         let specs = filter_specs(&next, &|path| apps.contains_key(path));
-        let lift = lifts_a_block(&self.installed, &next);
+        let change = Change {
+            lift: lifts_a_block(&self.installed, &next),
+            keeps_block_all: next.block_all.is_some(),
+        };
         let mut kernel = Kernel {
             handle: self.handle,
             apps: &apps,
@@ -549,7 +552,7 @@ impl WfpEngine {
             &mut self.filter_ids,
             &mut self.sublayer_added,
             &specs,
-            lift,
+            change,
         )?;
         tracing::debug!("WFP policy applied — {} filters", self.filter_ids.len());
         self.installed = next;
@@ -621,6 +624,19 @@ fn undeletable(ids: &[(u64, Action)], mut delete: impl FnMut(u64) -> u32) -> Vec
         .collect()
 }
 
+/// What a policy change does, for [`commit_policy`]'s rules.
+#[derive(Debug, Clone, Copy)]
+struct Change {
+    /// A block comes down ([`lifts_a_block`]).
+    lift: bool,
+    /// The new set keeps or adds the block-all.
+    keeps_block_all: bool,
+}
+
+/// The most filter ids [`commit_policy`] tracks — a full set is a few dozen,
+/// so this is dozens of changes whose deletes all failed.
+const MAX_TRACKED_FILTERS: usize = 2048;
+
 /// Replace the installed filter set (`ids`) with `specs`, in ONE transaction.
 /// The old filters are deleted INSIDE it, so the swap has no gap on commit,
 /// and an abort rolls the deletes back: the previous set stays in force and
@@ -638,9 +654,16 @@ fn undeletable(ids: &[(u64, Action)], mut delete: impl FnMut(u64) -> u32) -> Vec
 ///   LUID, the IPv6 block or the DNS guard going in) commits the new set
 ///   with the old filter still beside it. Failing those over it left no
 ///   block-all in a reconnect gap at all and abandoned every dial;
-/// - more stuck filters than the new set has fails the change whatever its
-///   direction, so the kept ids stay bounded (at most twice a set) instead
-///   of growing with every change while deletes keep failing.
+/// - more stuck filters than the new set has fails the change — but only
+///   where failing costs nothing (round 4 of the review): not a lift held up
+///   by stuck permits alone (a DNS-guard teardown would leave port 53
+///   blocked over them), and not a change that keeps or adds the block-all
+///   (a second refresh under a persistent delete failure would refuse the
+///   relay move and the LUID re-bake: the round-1 P1 again);
+/// - whatever the change, the bookkeeping is bounded by
+///   [`MAX_TRACKED_FILTERS`]: a change that would track more fails. By then
+///   deletes have failed through dozens of changes and the engine is broken;
+///   the stuck filters are still in force, so the previous block is too.
 ///
 /// A stuck PERMIT that the change commits past stays in force, a hole the new
 /// policy does not have, until the next change deletes it or the session
@@ -655,7 +678,7 @@ fn commit_policy(
     ids: &mut Vec<(u64, Action)>,
     sublayer_added: &mut bool,
     specs: &[FilterSpec],
-    lift: bool,
+    change: Change,
 ) -> Result<(), String> {
     let saved_ids = ids.clone();
     let saved_sublayer_added = *sublayer_added;
@@ -664,14 +687,21 @@ fn commit_policy(
     let result = (|| -> Result<(), String> {
         let kept = undeletable(ids, |id| kernel.delete_filter(id));
         let stuck_blocks = kept.iter().filter(|(_, a)| *a == Action::Block).count();
-        if lift && stuck_blocks > 0 {
+        if change.lift && stuck_blocks > 0 {
             return Err(format!(
                 "{stuck_blocks} block filter(s) could not be deleted"
             ));
         }
-        if kept.len() > specs.len() {
+        let capped = !change.lift && !change.keeps_block_all;
+        if capped && kept.len() > specs.len() {
             return Err(format!(
                 "{} filter(s) could not be deleted, more than the new set has",
+                kept.len()
+            ));
+        }
+        if kept.len() + specs.len() > MAX_TRACKED_FILTERS {
+            return Err(format!(
+                "{} filter(s) could not be deleted; tracking more than {MAX_TRACKED_FILTERS}",
                 kept.len()
             ));
         }
@@ -1828,6 +1858,8 @@ mod tests {
         filters: Vec<u64>,
         next_id: u64,
         undeletable: Vec<u64>,
+        /// Every delete fails: a persistent delete failure.
+        nothing_deletes: bool,
         committed: u32,
         aborted: u32,
         /// The kernel as it was when the open transaction began.
@@ -1853,7 +1885,7 @@ mod tests {
         fn delete_sublayer(&mut self) {}
         fn delete_filter(&mut self, id: u64) -> u32 {
             const ERROR_ACCESS_DENIED: u32 = 5;
-            if self.undeletable.contains(&id) {
+            if self.nothing_deletes || self.undeletable.contains(&id) {
                 return ERROR_ACCESS_DENIED;
             }
             let before = self.filters.len();
@@ -1885,6 +1917,19 @@ mod tests {
 
     const B: Action = Action::Block;
     const P: Action = Action::Permit;
+    /// A change that neither lifts a block nor keeps the block-all.
+    const OTHER: Change = Change {
+        lift: false,
+        keeps_block_all: false,
+    };
+    const LIFT: Change = Change {
+        lift: true,
+        keeps_block_all: false,
+    };
+    const REFRESH: Change = Change {
+        lift: false,
+        keeps_block_all: true,
+    };
 
     /// Review of #222, P1: an ACTIVATION (here the block-all going up in a
     /// reconnect gap) commits even though an old filter will not delete. It
@@ -1906,7 +1951,7 @@ mod tests {
             &mut ids,
             &mut sublayer_added,
             &some_specs(2),
-            false,
+            OTHER,
         );
 
         assert_eq!(result, Ok(()), "the block-all must go up");
@@ -1925,7 +1970,7 @@ mod tests {
             &mut ids,
             &mut sublayer_added,
             &some_specs(1),
-            false,
+            OTHER,
         );
         assert_eq!(result, Ok(()));
         assert_eq!(ids, vec![(103, B)]);
@@ -1950,7 +1995,7 @@ mod tests {
             &mut ids,
             &mut sublayer_added,
             &some_specs(1),
-            true,
+            LIFT,
         );
 
         assert!(result.is_err());
@@ -1982,7 +2027,7 @@ mod tests {
             &mut ids,
             &mut sublayer_added,
             &some_specs(1),
-            true,
+            LIFT,
         );
 
         assert_eq!(result, Ok(()), "the block comes down");
@@ -2008,7 +2053,7 @@ mod tests {
             &mut ids,
             &mut sublayer_added,
             &some_specs(2),
-            false,
+            OTHER,
         );
 
         assert!(result.is_err(), "3 stuck beside a set of 2");
@@ -2022,7 +2067,7 @@ mod tests {
             &mut ids,
             &mut sublayer_added,
             &some_specs(3),
-            false,
+            OTHER,
         );
         assert_eq!(
             result,
@@ -2030,6 +2075,68 @@ mod tests {
             "3 stuck beside a set of 3 is within the cap"
         );
         assert_eq!(ids.len(), 6);
+    }
+
+    /// Round 4 of the review (P3-3a): a lift to an empty set — a DNS-guard
+    /// teardown — with one stuck permit commits. The cap used to fail it,
+    /// leaving the guard (port 53 blocked) up over a permit that drops
+    /// nothing.
+    #[test]
+    fn a_lift_to_an_empty_set_commits_past_a_stuck_permit() {
+        let mut kernel = FakeKernel {
+            filters: vec![1, 2],
+            undeletable: vec![2],
+            ..FakeKernel::default()
+        };
+        let mut ids = vec![(1, B), (2, P)];
+        let mut sublayer_added = true;
+
+        let result = commit_policy(&mut kernel, &mut ids, &mut sublayer_added, &[], LIFT);
+
+        assert_eq!(result, Ok(()), "the block comes down");
+        assert_eq!(ids, vec![(2, P)]);
+        assert_eq!(kernel.filters, vec![2], "only the harmless permit is left");
+    }
+
+    /// Round 4 of the review (P3-3b): under a persistent delete failure the
+    /// block-all keeps being refreshed — a relay move, a LUID re-bake. The cap
+    /// refused the second refresh (20 stuck beside a set of 10), which failed
+    /// both. The bookkeeping is bounded by MAX_TRACKED_FILTERS instead.
+    #[test]
+    fn block_all_refreshes_keep_committing_under_a_persistent_delete_failure() {
+        let mut kernel = FakeKernel {
+            nothing_deletes: true,
+            ..FakeKernel::default()
+        };
+        let mut ids = Vec::new();
+        let mut sublayer_added = false;
+        for refresh in 1..=5 {
+            let result = commit_policy(
+                &mut kernel,
+                &mut ids,
+                &mut sublayer_added,
+                &some_specs(10),
+                REFRESH,
+            );
+            assert_eq!(result, Ok(()), "refresh {refresh} was refused");
+            assert_eq!(ids.len(), 10 * refresh);
+        }
+
+        let mut ids: Vec<(u64, Action)> =
+            (0..MAX_TRACKED_FILTERS as u64).map(|id| (id, B)).collect();
+        let result = commit_policy(
+            &mut kernel,
+            &mut ids,
+            &mut sublayer_added,
+            &some_specs(10),
+            REFRESH,
+        );
+        assert!(result.is_err(), "past the bound even a refresh fails");
+        assert_eq!(
+            ids.len(),
+            MAX_TRACKED_FILTERS,
+            "the bookkeeping is the kernel's"
+        );
     }
 
     /// Taking a block DOWN is a lift — the block-all, and since round 3 of
