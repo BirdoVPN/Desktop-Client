@@ -213,6 +213,15 @@ fn main() {
         .with(file_layer)
         .init();
 
+    // P6-CLI-D-05 (age): crash reports leave with birdo.log's retention
+    // window at every launch, not only when the next crash is written — a
+    // machine that stopped crashing kept its last five for good.
+    crate::utils::log_retention::prune_crash_reports(
+        &crash_dir(),
+        chrono::Utc::now(),
+        crate::utils::log_retention::KEEP_CRASH_REPORTS,
+    );
+
     if std::env::args().any(|arg| arg == RECONCILE_AND_EXIT) {
         reconcile_and_exit();
     }
@@ -919,40 +928,31 @@ fn cleanup_on_crash() {
     }
 }
 
+/// Where crash reports are written.
+fn crash_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("Birdo VPN")
+        .join("crashes")
+}
+
 /// Write crash report to a file for later analysis
 fn write_crash_report(location: &str, message: &str) {
     use std::io::Write;
 
-    let crash_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("Birdo VPN")
-        .join("crashes");
+    let crash_dir = crash_dir();
 
     let _ = std::fs::create_dir_all(&crash_dir);
 
-    // P6-CLI-D-05: cap the directory — crash files used to accumulate forever
-    // (a permanent, timestamped on-disk history on a product that claims to
-    // retain nothing). Keep the newest few; the filename's timestamp format
-    // sorts lexicographically, so a plain sort is a time sort.
-    const KEEP_CRASH_REPORTS: usize = 5;
-    if let Ok(entries) = std::fs::read_dir(&crash_dir) {
-        let mut crashes: Vec<std::path::PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("crash_") && n.ends_with(".txt"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        crashes.sort();
-        // The report being written below makes KEEP_CRASH_REPORTS total.
-        if crashes.len() + 1 > KEEP_CRASH_REPORTS {
-            for old in &crashes[..crashes.len() + 1 - KEEP_CRASH_REPORTS] {
-                let _ = std::fs::remove_file(old);
-            }
-        }
-    }
+    // P6-CLI-D-05: crash files used to accumulate forever (a permanent,
+    // timestamped on-disk history on a product that claims to retain
+    // nothing). The window, and the newest few — one place short of the cap,
+    // for the report written below.
+    crate::utils::log_retention::prune_crash_reports(
+        &crash_dir,
+        chrono::Utc::now(),
+        crate::utils::log_retention::KEEP_CRASH_REPORTS - 1,
+    );
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
