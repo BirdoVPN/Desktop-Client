@@ -253,6 +253,21 @@ pub async fn set_killswitch_live(
         // On macOS this does NOT lift the F-001 IPv6 leak block: that block is
         // owned by the tunnel session, not the kill switch, so `deactivate` falls
         // back to it rather than to `/etc/pf.conf`.
+        //
+        // macOS decides under the PF lock, from `loaded` (N2): the lock-free
+        // status read missed a block-all held by a disabled pf, and an
+        // activation in flight (that one now completes first, then is lifted).
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = pf_lift_if_loaded().await {
+                tracing::error!(
+                    "Kill switch off, but the pf block could not be lifted: {}",
+                    e
+                );
+            }
+            blocking_may_have_changed();
+        }
+        #[cfg(not(target_os = "macos"))]
         if platform_is_blocking() {
             let _ = deactivate_killswitch().await;
         }
@@ -1012,6 +1027,15 @@ pub fn tunnel_interface_gone_now(name: &str) {
             });
         }
     }
+}
+
+/// macOS: the kill switch turned off (N2) — see `PfState::lift_if_loaded`.
+#[cfg(target_os = "macos")]
+async fn pf_lift_if_loaded() -> Result<bool, String> {
+    let mut pf = PF.lock().await;
+    let result = pf.lift_if_loaded(&Pfctl);
+    mirror(&pf);
+    result
 }
 
 /// macOS: a DoH answer just gave one of our hosts an address the

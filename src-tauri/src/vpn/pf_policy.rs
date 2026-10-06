@@ -594,6 +594,19 @@ impl PfState {
         self.engage(pf, inputs).map(|()| true)
     }
 
+    /// The kill switch turned off (N2): no longer wanted, and lifted if a
+    /// block-all of ours is LOADED — enforcing or not. `Ok(true)` if a lift
+    /// was needed and landed. Decided here, under the caller's lock, rather
+    /// than from a lock-free read of the status: that missed a block-all held
+    /// by a disabled pf, and an activation still in flight.
+    pub(crate) fn lift_if_loaded(&mut self, pf: &impl Pf) -> Result<bool, String> {
+        self.wanted = false;
+        if !self.loaded {
+            return Ok(false);
+        }
+        self.disengage(pf).map(|()| true)
+    }
+
     /// Re-load a block-all of ours around the current inputs (a new
     /// control-plane address). Nothing loaded, nothing to do: the next
     /// activation reads them.
@@ -1401,6 +1414,30 @@ mod tests {
         assert!(!block_all_loaded(&pf.rules().unwrap()), "not re-imposed");
         assert_eq!(pf.loads.get(), loads, "no block-all loaded");
         assert!(!state.loaded);
+    }
+
+    /// N2: turning the kill switch off lifts a block that is LOADED, even
+    /// when pf is not enforcing it — the lock-free status read missed this.
+    #[test]
+    fn turning_the_kill_switch_off_lifts_a_loaded_block_even_if_inert() {
+        let (pf, mut state) = engaged();
+        // pf stopped under us: the block-all is still loaded, nothing is
+        // enforced, and the status says so.
+        pf.third_party_disables();
+        state.enforcing = false;
+        assert_eq!(state.lift_if_loaded(&pf), Ok(true));
+        assert!(!state.loaded && !state.wanted);
+        assert!(!block_all_loaded(&pf.rules().unwrap()));
+    }
+
+    #[test]
+    fn turning_the_kill_switch_off_with_nothing_loaded_touches_nothing() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        state.wanted = true;
+        assert_eq!(state.lift_if_loaded(&pf), Ok(false));
+        assert!(!state.wanted);
+        assert_eq!(pf.loads.get(), 0);
     }
 
     /// N1: a re-load (a new tunnel, a new control-plane address) of a block
