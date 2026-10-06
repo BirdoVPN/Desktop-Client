@@ -3,6 +3,7 @@
 //! Exposes the on-device speed test to the frontend UI.
 
 use crate::api::BirdoApi;
+use crate::utils::redact::for_ipc;
 use crate::vpn::speed_test::{run_speed_test, SpeedTestResult};
 use tauri::State;
 
@@ -20,5 +21,7 @@ const SPEED_TEST_URL: &str = "https://api.birdo.app/vpn/speed-test";
 pub async fn run_speed_test_command(api: State<'_, BirdoApi>) -> Result<SpeedTestResult, String> {
     let client = api.http_client();
     let token = api.access_token_value().await;
-    run_speed_test(&client, SPEED_TEST_URL, SPEED_TEST_URL, token.as_deref()).await
+    run_speed_test(&client, SPEED_TEST_URL, SPEED_TEST_URL, token.as_deref())
+        .await
+        .map_err(for_ipc)
 }

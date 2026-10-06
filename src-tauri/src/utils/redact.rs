@@ -180,6 +180,17 @@ pub fn sanitize_error(msg: &str) -> String {
     }
 }
 
+/// The error of an IPC command that still answers `Result<_, String>`, on its
+/// way to the renderer (P1-dk-redaction-incomplete).
+///
+/// Redacted in every build, like `IpcError::new`'s message and for the same
+/// reason: this text is shown, copied and pasted into support mail, not
+/// written to a developer's console. A raw reqwest or OS error carries the
+/// URL, host or address it failed on.
+pub fn for_ipc(error: impl std::fmt::Display) -> String {
+    sanitize_always(&error.to_string())
+}
+
 /// The redaction itself, with NO `debug_assertions` escape hatch.
 ///
 /// [`sanitize_error`] is deliberately a pass-through in debug builds so a

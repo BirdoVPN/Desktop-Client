@@ -14,6 +14,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
+use crate::utils::redact::for_ipc;
+
 type HmacSha256 = Hmac<Sha256>;
 
 const SETTINGS_HMAC_SERVICE: &str = "BirdoVPN";
@@ -479,7 +481,9 @@ fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
 /// Get current application settings
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
-    off_the_runtime(move || load_settings_sync(&app)).await
+    off_the_runtime(move || load_settings_sync(&app))
+        .await
+        .map_err(for_ipc)
 }
 
 /// Run a settings command's synchronous work on the blocking pool.
@@ -753,7 +757,9 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
 /// Save application settings
 #[tauri::command]
 pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool, String> {
-    off_the_runtime(move || save_settings_blocking(&app, &settings)).await
+    off_the_runtime(move || save_settings_blocking(&app, &settings))
+        .await
+        .map_err(for_ipc)
 }
 
 /// The whole-object save behind `save_settings`. Holds the settings lock
@@ -901,12 +907,15 @@ pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<
         Ok(enabled)
     })
     .await
+    .map_err(for_ipc)
 }
 
 /// Enable or disable autostart
 #[tauri::command]
 pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    off_the_runtime(move || set_autostart_blocking(&app, enabled)).await
+    off_the_runtime(move || set_autostart_blocking(&app, enabled))
+        .await
+        .map_err(for_ipc)
 }
 
 fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, String> {
