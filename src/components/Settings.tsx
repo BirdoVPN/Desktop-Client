@@ -253,7 +253,12 @@ export function Settings() {
                 The WFP / pf / iptables block lives in this process, so it
                 protects only while the app is running. After 10 failed
                 reconnects auto_reconnect releases the block unless Windows
-                lockdown ("always-on") is on, so say so there. */}
+                lockdown ("always-on") is on, so say so there.
+                Not disclosed anywhere yet (MR-1124): macOS blocks ALL IPv6 for
+                the whole connection, kill switch on or off, so IPv6-only sites
+                fail there. It is not this toggle's doing, so it does not belong
+                in this subtitle; the proposed wording is in tunnel_macos.rs at
+                the F-001 block. */}
             <BirdoToggleRow
               title="Kill Switch"
               subtitle={

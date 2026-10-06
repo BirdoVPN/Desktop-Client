@@ -365,6 +365,18 @@ impl UtunTunnel {
         // only leak-safe option on this platform. A macOS user on a dual-stack
         // node therefore gets working IPv4 and no IPv6 — degraded, but never
         // leaking their real address.
+        //
+        // DISCLOSURE (MR-1124): that degradation is user-visible, and nothing
+        // in the app says so. While connected on macOS, every IPv6-only site
+        // and service is unreachable — kill switch on or off, since this block
+        // is not the kill switch's — and the user is told neither that IPv6 is
+        // off nor why. No existing copy fits it: the only protection copy in
+        // Settings is the Kill Switch row's, and this does not depend on that
+        // toggle. Proposed wording for a macOS-only line where the app
+        // describes the connection: "On macOS, IPv6 is blocked while you're
+        // connected, so your real address can't leak over it. Sites that only
+        // work over IPv6 won't load until you disconnect." It goes when this
+        // block does, once macOS routes IPv6.
         if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
             close_fd_on_err(utun_fd);
             *self.utun_fd.write().await = None;
