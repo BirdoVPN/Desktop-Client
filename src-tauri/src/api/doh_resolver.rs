@@ -124,11 +124,13 @@ fn control_plane_memory() -> &'static Mutex<ControlPlaneMemory> {
     MEMORY.get_or_init(|| Mutex::new(ControlPlaneMemory::default()))
 }
 
-/// `birdo.app` or one of its subdomains: the only hosts whose addresses the
-/// kill switch may let root reach.
+/// Exactly the hosts the API client dials (N9): the only hosts whose
+/// addresses the kill switch may let root reach. This was a suffix match on
+/// `*.birdo.app`, which admitted any name under it — a relay's included.
 fn is_control_plane_host(host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    host == "birdo.app" || host.ends_with(".birdo.app")
+    super::client::CONTROL_PLANE_HOSTS
+        .iter()
+        .any(|ours| host.eq_ignore_ascii_case(ours))
 }
 
 /// Remember an answer for `host`: the generation the kill switch's table must
@@ -426,6 +428,9 @@ mod tests {
             ("api.birdo.app", v4(203, 0, 113, 66), Source::System),
             ("example.com", v4(93, 184, 215, 14), Source::Doh),
             ("evilbirdo.app", v4(198, 51, 100, 9), Source::Doh),
+            // N9: under birdo.app, but not a host the API client dials.
+            ("de-fra-01.birdo.app", v4(185, 199, 110, 153), Source::Doh),
+            ("updates.birdo.app", v4(203, 0, 113, 77), Source::Doh),
         ] {
             assert_eq!(
                 remember_in(&mut memory, host, &[addr], source, now),

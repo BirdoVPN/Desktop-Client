@@ -50,6 +50,13 @@ const API_BASE_URL: &str = "https://api.birdo.app";
 /// sake.)
 const WEB_BASE_URL: &str = "https://birdo.app";
 
+/// The hosts this client dials — the hosts of [`API_BASE_URL`] and
+/// [`WEB_BASE_URL`], and nothing else. The macOS kill switch lets root reach
+/// the DoH answers for THESE hosts through its block (N9), so it is an exact
+/// list, not "anything under birdo.app": a relay hostname such as
+/// `de-fra-01.birdo.app` resolved here must never widen the permit.
+pub(crate) const CONTROL_PLANE_HOSTS: [&str; 2] = ["api.birdo.app", "birdo.app"];
+
 /// Per-OS User-Agent. This was `… (Windows)` on every OS, so macOS and Linux
 /// installs were reported as Windows (audit 2026-09-29, D-18). The backend's
 /// parser (`client-version.util.ts` UA_RE) reads only `Birdo-Desktop/<semver>`
@@ -1507,6 +1514,28 @@ impl Clone for BirdoApi {
 
 /// REVIEW-WIN2-007, the client half. Local sockets only: nothing here reaches
 /// beyond 127.0.0.1.
+#[cfg(test)]
+mod control_plane_hosts_tests {
+    use super::*;
+
+    fn host(url: &str) -> &str {
+        url.strip_prefix("https://")
+            .and_then(|rest| rest.split('/').next())
+            .expect("an https base URL")
+    }
+
+    /// N9: the kill switch's allowlist is exactly the hosts this client
+    /// dials. A new base URL that is not on it fails here, not in the field.
+    #[test]
+    fn the_allowlist_is_exactly_the_hosts_the_client_dials() {
+        let mut dialled = vec![host(API_BASE_URL), host(WEB_BASE_URL)];
+        let mut listed = CONTROL_PLANE_HOSTS.to_vec();
+        dialled.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(dialled, listed);
+    }
+}
+
 #[cfg(test)]
 mod empty_body_tests {
     #[test]
