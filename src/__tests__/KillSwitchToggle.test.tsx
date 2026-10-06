@@ -24,7 +24,11 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Settings, KILL_SWITCH_DISABLE_BODY } from '@/components/Settings';
-import { KILL_SWITCH_OFF_FAILED_COPY, killSwitchLiveApplies } from '@/session/settings-persist';
+import {
+  KILL_SWITCH_OFF_FAILED_COPY,
+  killSwitchLiveApplies,
+  setKillSwitch,
+} from '@/session/settings-persist';
 import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
 import type { ConnectionState } from '@/store/app-store';
 
@@ -144,7 +148,6 @@ async function turnKillSwitchOff(state: ConnectionState) {
   // Disabling asks for confirmation first, in the shared iOS/Android words.
   expect(await screen.findByText(KILL_SWITCH_DISABLE_BODY)).toBeInTheDocument();
   await userEvent.click(await screen.findByRole('button', { name: /turn off anyway/i }));
-  // The persist is awaited BEFORE the live-apply (arm() re-reads the file).
   await waitFor(() => {
     expect(mockedInvoke).toHaveBeenCalledWith('save_settings', expect.anything());
   });
@@ -152,6 +155,12 @@ async function turnKillSwitchOff(state: ConnectionState) {
 
 const liveCalls = () =>
   mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'set_killswitch_live');
+
+/** An OFF goes out before its save and once more after it (round 4). */
+const TWO_OFFS = [
+  ['set_killswitch_live', { enabled: false }],
+  ['set_killswitch_live', { enabled: false }],
+];
 
 const ALL_STATES: ConnectionState[] = [
   'disconnected',
@@ -195,10 +204,7 @@ describe('Kill switch toggle → set_killswitch_live', () => {
     'OFF during %s reaches Rust (the block is up in exactly these states)',
     async (state) => {
       await turnKillSwitchOff(state);
-      await waitFor(() => {
-        expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: false });
-      });
-      expect(liveCalls()).toHaveLength(1);
+      await waitFor(() => expect(liveCalls()).toEqual(TWO_OFFS));
     },
   );
 
@@ -209,11 +215,59 @@ describe('Kill switch toggle → set_killswitch_live', () => {
     });
   });
 
-  it('persists before the live-apply, so arm()/set_killswitch_live read the new preference', async () => {
-    await turnKillSwitchOff('reconnecting');
+  it('an ON persists before its live-apply, so arm() reads the new preference', async () => {
+    mockStoreState.settings.killSwitchEnabled = false;
+    mockStoreState.connectionState = 'connected';
+    render(<Settings />);
+    await userEvent.click(await screen.findByRole('switch', { name: /kill switch/i }));
     await waitFor(() => expect(liveCalls()).toHaveLength(1));
     const order = mockedInvoke.mock.calls.map(([cmd]) => cmd);
     expect(order.indexOf('save_settings')).toBeLessThan(order.indexOf('set_killswitch_live'));
+  });
+
+  // Round 4 of the review of #222 (P3-4): the OFF waited for its save — and
+  // the save for a reapply in flight, up to REAPPLY_WAIT_MS — with the block
+  // up all the while. It reads no file, so it goes out first.
+  it('an OFF goes out without waiting for its save, and once more when the save lands', async () => {
+    let landSave: () => void = () => {};
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === 'save_settings'
+        ? new Promise<undefined>((resolve) => {
+            landSave = () => resolve(undefined);
+          })
+        : base(cmd, args as never),
+    );
+    await turnKillSwitchOff('reconnecting');
+    expect(liveCalls()).toEqual([['set_killswitch_live', { enabled: false }]]);
+    const order = mockedInvoke.mock.calls.map(([cmd]) => cmd);
+    expect(order.indexOf('set_killswitch_live')).toBeLessThan(order.indexOf('save_settings'));
+
+    // A dial that finished before the save (a reapply's rebuild, say) armed
+    // from the file that still said ON: the push after the save turns it off.
+    landSave();
+    await waitFor(() => expect(liveCalls()).toEqual(TWO_OFFS));
+  });
+
+  it('a newer choice stops an older OFF from pushing again after its save', async () => {
+    let landSave: () => void = () => {};
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation((cmd: string, args?: unknown) =>
+      cmd === 'save_settings' && !(args as { settings: { killswitch_enabled: boolean } }).settings.killswitch_enabled
+        ? new Promise<undefined>((resolve) => {
+            landSave = () => resolve(undefined);
+          })
+        : base(cmd, args as never),
+    );
+    mockStoreState.connectionState = 'connected';
+    const off = setKillSwitch(false);
+    await setKillSwitch(true);
+    landSave();
+    await off;
+    expect(liveCalls()).toEqual([
+      ['set_killswitch_live', { enabled: false }],
+      ['set_killswitch_live', { enabled: true }],
+    ]);
   });
 
   it.each<ConnectionState>(['disconnected', 'disconnecting'])(
@@ -253,10 +307,7 @@ describe('Kill switch toggle → set_killswitch_live', () => {
 
   it('OFF during connecting still reaches Rust (the narrowing is ON-only)', async () => {
     await turnKillSwitchOff('connecting');
-    await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: false });
-    });
-    expect(liveCalls()).toHaveLength(1);
+    await waitFor(() => expect(liveCalls()).toEqual(TWO_OFFS));
   });
 });
 
@@ -279,11 +330,23 @@ describe('Kill switch OFF when something fails (review of #222, round 3)', () =>
     failSave();
     await turnKillSwitchOff('reconnecting');
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: false });
+      expect(mockStoreState.showNotice).toHaveBeenCalledWith(
+        expect.objectContaining({ text: SETTINGS_UNVERIFIED_COPY }),
+      );
     });
-    expect(mockStoreState.showNotice).toHaveBeenCalledWith(
-      expect.objectContaining({ text: SETTINGS_UNVERIFIED_COPY }),
-    );
+    expect(liveCalls()).toEqual([['set_killswitch_live', { enabled: false }]]);
+  });
+
+  it('a refused OFF with no session to push to says why the setting did not stick', async () => {
+    mockStoreState.showNotice.mockClear();
+    failSave();
+    await turnKillSwitchOff('disconnected');
+    await waitFor(() => {
+      expect(mockStoreState.showNotice).toHaveBeenCalledWith(
+        expect.objectContaining({ text: SETTINGS_UNVERIFIED_COPY }),
+      );
+    });
+    expect(liveCalls()).toHaveLength(0);
   });
 
   it('a refused save of an ON is not pushed', async () => {

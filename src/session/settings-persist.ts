@@ -141,6 +141,26 @@ export async function persistSettings(
   patch: Partial<AppSettings>,
   opts: { reapply?: boolean; quiet?: boolean } = {},
 ): Promise<boolean> {
+  const refused = await trySave(patch, opts);
+  // A background mirror the user never touched must not raise a notice
+  // about "that setting"; it rolls back the same way and retries next time.
+  if (refused && !opts.quiet) {
+    showSaveFailure(refused.error, SAVE_FAILED_COPY);
+  }
+  return refused === null;
+}
+
+const SAVE_FAILED_COPY = "Couldn't save that setting. It has been put back — please try again.";
+
+/**
+ * `persistSettings` without its notice: `null` once saved, or what the
+ * refused save threw, with the keys this call changed already put back. For
+ * a caller whose notice depends on more than the save (the kill switch OFF).
+ */
+async function trySave(
+  patch: Partial<AppSettings>,
+  opts: { reapply?: boolean },
+): Promise<{ error: unknown } | null> {
   const keys = Object.keys(patch) as (keyof AppSettings)[];
   let before = useAppStore.getState().settings;
   useAppStore.getState().updateSettings(patch);
@@ -169,15 +189,10 @@ export async function persistSettings(
       }
     }
     useAppStore.getState().updateSettings(revert);
-    // A background mirror the user never touched must not raise a notice
-    // about "that setting"; it rolls back the same way and retries next time.
-    if (!opts.quiet) {
-      showSaveFailure(e, "Couldn't save that setting. It has been put back — please try again.");
-    }
-    return false;
+    return { error: e };
   }
   if (opts.reapply) scheduleReapply();
-  return true;
+  return null;
 }
 
 /**
@@ -271,32 +286,72 @@ export function killSwitchLiveApplies(
 export const KILL_SWITCH_OFF_FAILED_COPY =
   "The kill switch couldn't be turned off on your live connection. Disconnect to lift it.";
 
+/** Bumped by every kill-switch choice, so an older one's late steps stand down. */
+let killSwitchChoice = 0;
+
 /**
- * The kill switch: persist FIRST (`set_killswitch_live` → `arm()` re-reads the
- * file, so arming must not race the write), then push it to a live session.
+ * The kill switch toggle.
  *
- * Round 3 of the review of #222:
- * - an OFF is pushed even when the save was refused (`settings_unverified`,
- *   an unreadable file): the block it lifts must be liftable whatever the
- *   settings file says. The refusal's own notice stays; the saved
- *   preference is unchanged, and the next connect follows it.
- * - an OFF that could not be applied says to disconnect: the block is still
- *   up, and "it applies from your next connection" told the user to wait
- *   behind it.
+ * An ON is persisted FIRST: `set_killswitch_live` → `arm()` re-reads the
+ * file, so arming must not race the write. A refused ON is not pushed.
+ *
+ * An OFF reads no file, so it goes out first (round 4 of the review of #222,
+ * P3-4): behind its save it waited for a reapply in flight, up to
+ * `REAPPLY_WAIT_MS`, with the block still up. Then:
+ * - once the save lands it is pushed once more: a dial that finished in the
+ *   meantime (a connect, a switch, a reapply's rebuild — the very reapply the
+ *   save waited for) armed from the file as it was before the save, still
+ *   ON. Not when a newer choice came since.
+ * - a refused save (`settings_unverified`, an unreadable file) still lets it
+ *   lift the block (round 3): the block must be liftable whatever the file
+ *   says. The refusal's own notice stays; the saved preference is
+ *   unchanged, and the next connect follows it.
+ * - one that could not be applied says to disconnect (round 3): the block is
+ *   still up, and "it applies from your next connection" told the user to
+ *   wait behind it.
  */
 export async function setKillSwitch(enabled: boolean): Promise<void> {
-  const saved = await persistSettings({ killSwitchEnabled: enabled });
-  if (!saved && enabled) return;
+  const choice = ++killSwitchChoice;
+  if (enabled) await turnKillSwitchOn();
+  else await turnKillSwitchOff(choice);
+}
+
+async function turnKillSwitchOn(): Promise<void> {
+  if (!(await persistSettings({ killSwitchEnabled: true }))) return;
   const s = useAppStore.getState();
-  if (!killSwitchLiveApplies(s.connectionState, enabled, s.killSwitchBlocking)) return;
+  if (!killSwitchLiveApplies(s.connectionState, true, s.killSwitchBlocking)) return;
   try {
-    await invoke('set_killswitch_live', { enabled });
+    await invoke('set_killswitch_live', { enabled: true });
   } catch {
     s.showNotice({
-      text: enabled
-        ? 'Saved, but the change could not be applied to your live connection. It applies from your next connection.'
-        : KILL_SWITCH_OFF_FAILED_COPY,
+      text: 'Saved, but the change could not be applied to your live connection. It applies from your next connection.',
       tone: 'danger',
     });
+  }
+}
+
+async function turnKillSwitchOff(choice: number): Promise<void> {
+  const latest = () => choice === killSwitchChoice;
+  const live = () => {
+    const s = useAppStore.getState();
+    return killSwitchLiveApplies(s.connectionState, false, s.killSwitchBlocking);
+  };
+  const pushOff = () =>
+    invoke('set_killswitch_live', { enabled: false }).then(
+      () => true,
+      () => false,
+    );
+
+  const first = live() ? pushOff() : null;
+  const refused = await trySave({ killSwitchEnabled: false }, {});
+  // Whether the block is lifted: the LAST push says (`null`: none was due).
+  let lifted = first === null ? null : await first;
+  if (refused === null && latest() && live()) lifted = await pushOff();
+
+  const { showNotice } = useAppStore.getState();
+  if (lifted === false) {
+    showNotice({ text: KILL_SWITCH_OFF_FAILED_COPY, tone: 'danger' });
+  } else if (refused) {
+    showSaveFailure(refused.error, SAVE_FAILED_COPY);
   }
 }
