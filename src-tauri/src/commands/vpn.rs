@@ -1041,7 +1041,7 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
         "The settings change could not be applied ({:?}) — restoring the previous settings",
         error.code
     );
-    if let Err(e) = crate::commands::settings::restore_tunnel_settings(&app, &previous) {
+    if let Err(e) = crate::commands::settings::restore_tunnel_settings(&app, &previous).await {
         tracing::error!("Could not save the previous settings back: {}", e);
         return Err(error);
     }

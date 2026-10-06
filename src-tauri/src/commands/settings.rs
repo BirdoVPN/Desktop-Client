@@ -875,7 +875,18 @@ pub(crate) fn forget_account_choices(settings: &mut AppSettings) -> bool {
 /// real file. The whole read-modify-write holds the settings lock, so a
 /// concurrent save (the UI's preferred-server mirror) cannot land between the
 /// read and the write and put the old server back (REVIEW-WIN2-023).
-pub(crate) fn clear_account_choices(app: &AppHandle) {
+///
+/// On the blocking pool (review of #222): it is file and credential-store
+/// I/O, and every caller is an async command (sign-out, account deletion, an
+/// expired session).
+pub(crate) async fn clear_account_choices(app: &AppHandle) {
+    let app = app.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || forget_saved_account_choices(&app)).await {
+        tracing::warn!("Could not clear the account's server: {}", e);
+    }
+}
+
+fn forget_saved_account_choices(app: &AppHandle) {
     let _write = SETTINGS_WRITE.lock();
     match load_settings_sync(app) {
         Ok(mut settings) => {
@@ -894,11 +905,19 @@ pub(crate) fn clear_account_choices(app: &AppHandle) {
 
 /// Put the tunnel-shaping settings of `good` back over what is saved now, and
 /// save: the revert of a settings change the live session could not apply
-/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved.
-pub(crate) fn restore_tunnel_settings(
+/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved. On the
+/// blocking pool, like the commands (review of #222).
+pub(crate) async fn restore_tunnel_settings(
     app: &AppHandle,
     good: &AppSettings,
 ) -> Result<AppSettings, String> {
+    let (app, good) = (app.clone(), good.clone());
+    tokio::task::spawn_blocking(move || restore_tunnel_settings_now(&app, &good))
+        .await
+        .map_err(|e| format!("Settings task failed: {e}"))?
+}
+
+fn restore_tunnel_settings_now(app: &AppHandle, good: &AppSettings) -> Result<AppSettings, String> {
     let _write = SETTINGS_WRITE.lock();
     let restored = restored_over(load_settings(app)?, good)?;
     save_settings_inner(app, &restored)?;
@@ -1402,7 +1421,7 @@ mod tests {
                 )
                 .expect("end of fn")]
         };
-        let restore = body("pub(crate) fn restore_tunnel_settings(");
+        let restore = body("fn restore_tunnel_settings_now(");
         assert!(restore.contains("restored_over(load_settings(app)?, good)?"));
         let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {");
         // The one branch that serves defaults and touches nothing, which
@@ -1959,6 +1978,49 @@ mod tests {
         fs::remove_file(&key).unwrap();
         fs::create_dir(&key).unwrap();
         assert_eq!(read_key_file(&settings), KeyFile::Unreadable);
+    }
+
+    /// Review of #222 (P3.8): the async Rust callers of the settings file do
+    /// their I/O on the blocking pool too — the kill switch's `arm`, the
+    /// account-boundary clear, the reapply's revert. (main.rs reads the
+    /// settings synchronously in `setup`, on the main thread before the
+    /// runtime serves anything, and stays so.)
+    #[test]
+    fn the_async_callers_load_and_save_off_the_runtime() {
+        // A Windows checkout has CRLF endings (core.autocrlf).
+        let source = include_str!("settings.rs").replace('\r', "");
+        for helper in [
+            "pub(crate) async fn load_settings_off_runtime(",
+            "pub(crate) async fn clear_account_choices(",
+            "pub(crate) async fn restore_tunnel_settings(",
+        ] {
+            let body = &source[source.find(helper).expect(helper)..];
+            let body = &body[..body.find("\n}\n").expect("end of fn")];
+            assert!(
+                body.contains("tokio::task::spawn_blocking(move ||"),
+                "{helper}"
+            );
+        }
+        for (file, call) in [
+            (
+                include_str!("auth.rs"),
+                "settings::clear_account_choices(&app).await",
+            ),
+            (
+                include_str!("session.rs"),
+                "settings::clear_account_choices(app).await",
+            ),
+            (
+                include_str!("vpn.rs"),
+                "restore_tunnel_settings(&app, &previous).await",
+            ),
+            (
+                include_str!("killswitch.rs"),
+                "load_settings_off_runtime(app)",
+            ),
+        ] {
+            assert!(file.contains(call), "{call}");
+        }
     }
 
     /// Every settings IPC command runs its work through `off_the_runtime`.

@@ -1067,7 +1067,7 @@ pub async fn handle_session_expired(app: &AppHandle, stored: StoredSession) {
         }
         // REVIEW-WIN-007 / REVIEW-WIN2-023: the next account to sign in on
         // this machine must not inherit this one's server or route.
-        crate::commands::settings::clear_account_choices(app);
+        crate::commands::settings::clear_account_choices(app).await;
     } else {
         tracing::info!("A new sign-in arrived while the expired session ended — keeping it");
     }

@@ -287,7 +287,7 @@ pub async fn logout(
     end_session(&app, EndReason::SignOut).await;
     // The next account on this machine must not inherit this one's server
     // (REVIEW-WIN-007): tray Quick Connect reads it.
-    crate::commands::settings::clear_account_choices(&app);
+    crate::commands::settings::clear_account_choices(&app).await;
 
     // Try to logout on server (best effort)
     let _ = api.logout().await;
@@ -439,7 +439,7 @@ pub async fn delete_account(
     // backend disconnect call: the account is gone, and a 401 from it would
     // read as an expired session.
     end_session(&app, EndReason::AccountDeleted).await;
-    crate::commands::settings::clear_account_choices(&app);
+    crate::commands::settings::clear_account_choices(&app).await;
 
     // Clear all local credentials after successful server-side deletion,
     // including the persistent ML-KEM identity (same hygiene as logout —

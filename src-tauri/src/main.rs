@@ -315,7 +315,9 @@ fn main() {
 
             // Settings first: the crash-reporting opt-in must be applied before
             // anything else in setup can fail, and `start_minimized` is read
-            // from the same load further down.
+            // from the same load further down. A synchronous load is right
+            // here: `setup` runs on the main thread before the async runtime
+            // serves any command, so it parks no worker.
             let startup_settings =
                 commands::settings::load_settings_sync(&app.handle().clone()).ok();
             crate::utils::crash_report::set_opted_in(
