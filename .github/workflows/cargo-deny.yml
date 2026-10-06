@@ -1,57 +1,74 @@
-# Birdo VPN — Dependency Advisory Check
-# Run: cargo deny check advisories
-# Schedule: weekly (or on every PR)
+# Birdo VPN - dependency audit (cargo-deny): advisories, bans, licenses, sources.
+#
+# Runs on every PR (any base branch) and push to main that changes the Rust
+# dependency graph or its policy, and weekly - advisories are published
+# against code that has not changed, so the schedule is what catches a new
+# RUSTSEC on a quiet week (RUSTSEC-2026-0285 landed the day it was published).
 
 name: Dependency Audit (cargo-deny)
 
 on:
   schedule:
-    - cron: '0 9 * * 1' # Every Monday at 09:00 UTC
+    - cron: "0 9 * * 1" # Every Monday at 09:00 UTC
   pull_request:
     paths:
-      - 'src-tauri/Cargo.toml'
-      - 'src-tauri/Cargo.lock'
-      - 'src-tauri/deny.toml'
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/deny.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/cargo-deny.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/deny.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/cargo-deny.yml"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
-    # src-tauri lives at the repo root (the repo IS the desktop client), so the
-    # working dir is just src-tauri — the old birdo-client-desktop/ prefix
-    # pointed at a non-existent path and failed every scheduled run.
+    shell: bash
+    # The desktop client IS this repo, so its crate is at src-tauri/.
     working-directory: src-tauri
 
 jobs:
   cargo-deny:
-    runs-on: ubuntu-latest
-    env:
-      # cargo-deny never builds the app, but the `cargo metadata` it runs must
-      # parse dependency manifests that use edition2024 (e.g. dlopen2_derive).
-      # The repo's pinned toolchain is 1.96 now (src-tauri/rust-toolchain.toml),
-      # which parses those fine; this advisory scan still runs on the runner's
-      # own stable Rust (it needs no reproducible app build), so RUSTUP_TOOLCHAIN
-      # overrides the pinned toml for this job only.
-      RUSTUP_TOOLCHAIN: stable
+    name: cargo-deny (advisories, bans, licenses, sources)
+    # Forks get no scheduled runs.
+    if: github.event_name != 'schedule' || github.repository == 'BirdoVPN/Desktop-Client'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Ensure a recent stable Rust toolchain
-        run: rustup toolchain install stable --profile minimal
+      # cargo-deny never builds the app, but the `cargo metadata` it runs must
+      # parse manifests that use edition2024 - the pinned 1.96 does, and using
+      # it (rather than whatever `stable` is that day) keeps runs reproducible.
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
 
+      # A prebuilt, checksum-verified binary at a pinned version, instead of
+      # `cargo install --locked cargo-deny` compiling the latest release from
+      # source on every run (most of the old 2.4-minute median).
       - name: Install cargo-deny
-        run: cargo install --locked cargo-deny
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny@0.20.2
 
-      - name: Check advisories
-        run: cargo deny check advisories
-
-      - name: Check licenses
-        run: cargo deny check licenses
-
-      - name: Check bans
-        run: cargo deny check bans
-
-      - name: Check sources
-        run: cargo deny check sources
+      # One invocation reports every failing check; separate steps stopped at
+      # the first red one and hid the rest. --locked: audit exactly the graph
+      # Cargo.lock describes - the one CI tests and the release ships.
+      - name: cargo deny check
+        run: cargo deny --locked check advisories bans licenses sources

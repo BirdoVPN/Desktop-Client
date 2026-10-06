@@ -1,0 +1,31 @@
+name: Set up the pinned Rust toolchain
+description: >-
+  Installs exactly the toolchain rust-toolchain.toml pins (channel, components,
+  profile) plus any extra targets. Replaces dtolnay/rust-toolchain@<sha> # stable,
+  whose `stable` commits are regenerated per Rust release and fall off every branch
+  (zizmor impostor-commit); the toml was the real pin all along.
+
+inputs:
+  targets:
+    description: Extra rustup targets for the pinned toolchain, space-separated (e.g. a cross-compile target).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install the rust-toolchain.toml toolchain
+      shell: bash
+      env:
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        set -euo pipefail
+        # With no argument, `rustup toolchain install` installs the toolchain the
+        # override file in the working directory names - channel, components and
+        # profile included - instead of relying on implicit auto-install.
+        rustup toolchain install
+        for t in $TARGETS; do
+          rustup target add "$t"
+        done
+        rustc --version
+        cargo --version

@@ -38,7 +38,8 @@ published as the **Latest** auto-update release. See [`docs/CODE_SIGNING.md`](do
 vault, never in the repo.
 
 What is signed, today: Windows tag builds are Authenticode-signed (Azure Trusted
-Signing) and every platform's artefacts carry a Sigstore (cosign keyless) bundle.
+Signing) and every release's artefacts are listed in one `SHA256SUMS.txt` that carries a
+Sigstore (cosign keyless) signature ([verify a download](docs/VERIFICATION.md)).
 The **macOS** Tauri build is **not** Developer-ID signed or notarised — there is no
 Apple Developer account, so `release.yml` always builds it unsigned. No release
 artefact is PGP-signed.
