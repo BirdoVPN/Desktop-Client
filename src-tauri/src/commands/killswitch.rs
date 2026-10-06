@@ -1014,6 +1014,30 @@ pub fn tunnel_interface_gone_now(name: &str) {
     }
 }
 
+/// macOS: a DoH answer just gave one of our hosts an address the
+/// control-plane table does not hold yet (P2-4). A held block is re-loaded NOW,
+/// before the connection that needs it is dialled: the user's Connect under a
+/// held block used to meet `block drop all` until a re-dial re-loaded it.
+#[cfg(target_os = "macos")]
+pub async fn control_plane_learned() {
+    let mut pf = PF.lock().await;
+    if !pf.loaded {
+        return;
+    }
+    let inputs = pf_inputs();
+    let result = pf.reload_if_loaded(&Pfctl, &inputs);
+    mirror(&pf);
+    drop(pf);
+    match result {
+        Ok(()) => tracing::info!("Kill switch: control-plane table re-loaded with a new address"),
+        Err(e) => tracing::warn!(
+            "Kill switch: re-loading the control-plane table failed: {}",
+            e
+        ),
+    }
+    blocking_may_have_changed();
+}
+
 /// Deactivate pf blocking: drop the block-all main ruleset and fall back to the
 /// correct baseline — the IPv6 leak block if a tunnel session is still live,
 /// otherwise the system default ruleset (dropping our pf reference).

@@ -467,12 +467,24 @@ fn doh_rustls_config() -> ClientConfig {
 /// * `hostname` - The hostname to resolve (e.g., "vpn.example.com")
 ///
 /// # Returns
-/// * `Ok(Ipv4Addr)` - The resolved IPv4 address
+/// * `Ok(Ipv4Addr)` - The resolved IPv4 address (the answer's first A record)
 /// * `Err(String)` - Error message if resolution fails
 pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
+    resolve_all_via_doh(hostname)
+        .await?
+        .first()
+        .copied()
+        .ok_or_else(|| "No A record found in DNS response".to_string())
+}
+
+/// [`resolve_via_doh`], with EVERY A record of the answer, in order, never
+/// empty. The control-plane resolver needs all of them (P2-4): api.birdo.app
+/// publishes two, and the macOS kill switch must permit whichever one a
+/// connection picks.
+pub async fn resolve_all_via_doh(hostname: &str) -> Result<Vec<Ipv4Addr>, String> {
     // Skip DoH for already-IP addresses
     if let Ok(ip) = hostname.parse::<Ipv4Addr>() {
-        return Ok(ip);
+        return Ok(vec![ip]);
     }
 
     // Validate hostname before sending it to DoH providers as a query parameter.
@@ -493,13 +505,13 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
 
     for provider in DOH_PROVIDERS {
         match resolve_single_provider(client, provider, hostname).await {
-            Ok(ip) => {
+            Ok(ips) => {
                 tracing::debug!(
                     "DoH resolved {} via {}",
                     crate::utils::redact::redact_hostname(hostname),
                     provider.url
                 );
-                return Ok(ip);
+                return Ok(ips);
             }
             Err(DoHError::PinningFailed(msg)) => {
                 pinning_failures += 1;
@@ -618,7 +630,7 @@ async fn resolve_single_provider(
     client: &reqwest::Client,
     provider: &DoHProvider,
     hostname: &str,
-) -> Result<Ipv4Addr, DoHError> {
+) -> Result<Vec<Ipv4Addr>, DoHError> {
     let resp = client
         .get(provider.url)
         .query(&[("name", hostname), ("type", "A")])
@@ -656,33 +668,45 @@ async fn resolve_single_provider(
         )));
     }
 
-    // Find the first A record
     let answers = doh_resp
         .answer
         .ok_or_else(|| DoHError::Parse("No DNS answers received".to_string()))?;
+    a_records(&answers)
+}
 
-    for answer in answers {
-        if answer.record_type == DNS_TYPE_A {
-            let ip = answer
-                .data
-                .parse::<Ipv4Addr>()
-                .map_err(|e| DoHError::Parse(format!("Invalid IP in DNS response: {}", e)))?;
-
-            // SECURITY: Reject private/reserved IPs in DNS responses (anti-rebinding)
-            if is_private_ip(ip) {
-                return Err(DoHError::Parse(format!(
-                    "DNS response contained private IP {} — possible DNS rebinding attack",
-                    ip
-                )));
-            }
-
-            return Ok(ip);
+/// Every A record in a DoH answer, in order, de-duplicated, never empty.
+///
+/// This used to stop at the FIRST A record (P2-4). One address was enough to
+/// dial, but not for the macOS kill switch, which permits its control plane
+/// by address: api.birdo.app publishes two A records, and a connection that
+/// picked the other one met `block drop all`.
+///
+/// SECURITY: a private/reserved address anywhere in the answer rejects the
+/// whole answer (anti-rebinding) — it used to be checked on the first record
+/// only, since only the first was used.
+fn a_records(answers: &[DohAnswer]) -> Result<Vec<Ipv4Addr>, DoHError> {
+    let mut ips = Vec::new();
+    for answer in answers.iter().filter(|a| a.record_type == DNS_TYPE_A) {
+        let ip = answer
+            .data
+            .parse::<Ipv4Addr>()
+            .map_err(|e| DoHError::Parse(format!("Invalid IP in DNS response: {}", e)))?;
+        if is_private_ip(ip) {
+            return Err(DoHError::Parse(format!(
+                "DNS response contained private IP {} — possible DNS rebinding attack",
+                ip
+            )));
+        }
+        if !ips.contains(&ip) {
+            ips.push(ip);
         }
     }
-
-    Err(DoHError::Parse(
-        "No A record found in DNS response".to_string(),
-    ))
+    if ips.is_empty() {
+        return Err(DoHError::Parse(
+            "No A record found in DNS response".to_string(),
+        ));
+    }
+    Ok(ips)
 }
 
 /// Check if an IPv4 address is in a private/reserved range.
@@ -1113,6 +1137,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn answer(record_type: i32, data: &str) -> DohAnswer {
+        DohAnswer {
+            record_type,
+            data: data.to_string(),
+        }
+    }
+
+    /// P2-4: every A record, not just the first — skipping CNAMEs and
+    /// duplicates.
+    #[test]
+    fn a_records_returns_every_a_record_of_the_answer() {
+        let answers = [
+            answer(5, "api.birdo.app.cdn.cloudflare.net."),
+            answer(DNS_TYPE_A, "104.21.32.1"),
+            answer(DNS_TYPE_A, "172.67.150.2"),
+            answer(DNS_TYPE_A, "104.21.32.1"),
+        ];
+        let Ok(ips) = a_records(&answers) else {
+            panic!("two A records expected");
+        };
+        assert_eq!(
+            ips,
+            vec![
+                Ipv4Addr::new(104, 21, 32, 1),
+                Ipv4Addr::new(172, 67, 150, 2)
+            ]
+        );
+    }
+
+    /// Anti-rebinding now covers every record, since every record is used.
+    #[test]
+    fn a_private_address_anywhere_rejects_the_answer() {
+        let answers = [
+            answer(DNS_TYPE_A, "104.21.32.1"),
+            answer(DNS_TYPE_A, "192.168.1.10"),
+        ];
+        assert!(matches!(a_records(&answers), Err(DoHError::Parse(_))));
+        assert!(matches!(
+            a_records(&[answer(5, "x.example.")]),
+            Err(DoHError::Parse(_))
+        ));
+        assert!(matches!(a_records(&[]), Err(DoHError::Parse(_))));
     }
 
     /// The kill switch's control-plane permit is built from this list; a

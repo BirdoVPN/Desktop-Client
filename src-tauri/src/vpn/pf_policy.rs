@@ -201,14 +201,13 @@ pub(crate) fn block_all_ruleset(b: &BlockAll<'_>) -> String {
 }
 
 /// The addresses the control-plane permit names: the DoH provider's (how the
-/// app finds the API at all once port-53 DNS is blocked) and the last ones
-/// this process resolved for its own hosts.
+/// app finds the API at all once port-53 DNS is blocked) and every address a
+/// DoH answer gave our own hosts in the last day — all A records, the union
+/// across answers (P2-4), and never a system-resolver answer (P3-1).
 ///
-/// Read when the ruleset is (re-)loaded, which every re-dial does
-/// (auto_reconnect engages the block before each attempt). So an API address
-/// that changed under a block is permitted from the next attempt: the DoH
-/// lookup that found it is itself permitted, and it lands in the resolver's
-/// cache before the connection that needs it fails.
+/// Read whenever the ruleset is (re-)loaded, and a held block is re-loaded
+/// the moment a DoH answer brings an address it does not hold yet
+/// (`killswitch::control_plane_learned`), before that address is dialled.
 pub(crate) fn control_plane_addresses() -> Vec<Ipv4Addr> {
     let mut addrs = crate::vpn::doh::bootstrap_addrs();
     addrs.extend(crate::api::doh_resolver::control_plane_v4());

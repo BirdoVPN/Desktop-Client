@@ -89,35 +89,101 @@ fn shared_cache() -> &'static Arc<Mutex<CacheMap>> {
     SHARED.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
-/// The IPv4 addresses this process last resolved for its own control plane —
-/// `birdo.app` and its subdomains — expired entries included.
-///
-/// The macOS kill switch scopes its control-plane permit to these plus the DoH
-/// provider (`vpn::pf_policy::control_plane_addresses`, for
-/// P1-ks-macos-root-443-permit). An expired entry is still the last address
-/// the API answered on, which is the best guess a permit can make; a fresh
-/// answer replaces it, and the next load of the block follows. IPv4 only: the
-/// macOS block admits no IPv6 at all.
+/// Where an answer came from. Only DoH answers may enter the macOS kill
+/// switch's control-plane table (P3-1): the system resolver's are unfiltered
+/// (no anti-rebinding check) and come from whatever network the user is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Doh,
+    System,
+}
+
+/// How long a DoH answer for one of our hosts is still permitted after it
+/// was last seen. Every API call through an expired cache entry refreshes
+/// it, so this only bounds how long a retired address stays permitted.
+const CONTROL_PLANE_MEMORY: Duration = Duration::from_secs(24 * 3600);
+
+/// At most this many addresses per host are remembered (the newest).
+const CONTROL_PLANE_PER_HOST: usize = 8;
+
+/// Every IPv4 address a DoH answer gave one of our own hosts, with when it
+/// was last seen (P2-4, P3-1). The kill switch's table is their union, not
+/// the cache's current entry: api.birdo.app publishes two A records, and a
+/// pooled connection may still be on an address a newer answer dropped.
+type ControlPlaneMemory = HashMap<String, Vec<(std::net::Ipv4Addr, Instant)>>;
+
+fn control_plane_memory() -> &'static Mutex<ControlPlaneMemory> {
+    static MEMORY: std::sync::OnceLock<Mutex<ControlPlaneMemory>> = std::sync::OnceLock::new();
+    MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `birdo.app` or one of its subdomains: the only hosts whose addresses the
+/// kill switch may let root reach.
+fn is_control_plane_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "birdo.app" || host.ends_with(".birdo.app")
+}
+
+/// Remember an answer for `host`. True when it brought an address not
+/// remembered before — a held macOS block must then be re-loaded BEFORE the
+/// connection that needs it is dialled. A system-resolver answer, or one for
+/// a host that is not ours, is never admitted.
+fn remember_in(
+    memory: &mut ControlPlaneMemory,
+    host: &str,
+    addrs: &[SocketAddr],
+    source: Source,
+    now: Instant,
+) -> bool {
+    if source != Source::Doh || !is_control_plane_host(host) {
+        return false;
+    }
+    let seen = memory.entry(host.to_ascii_lowercase()).or_default();
+    seen.retain(|(_, at)| now.saturating_duration_since(*at) < CONTROL_PLANE_MEMORY);
+    let mut new_address = false;
+    for ip in addrs.iter().filter_map(|a| match a.ip() {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    }) {
+        match seen.iter_mut().find(|(known, _)| *known == ip) {
+            Some(entry) => entry.1 = now,
+            None => {
+                seen.push((ip, now));
+                new_address = true;
+            }
+        }
+    }
+    seen.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    seen.truncate(CONTROL_PLANE_PER_HOST);
+    new_address
+}
+
+fn remember(host: &str, addrs: &[SocketAddr], source: Source) -> bool {
+    match control_plane_memory().lock() {
+        Ok(mut memory) => remember_in(&mut memory, host, addrs, source, Instant::now()),
+        Err(_) => false,
+    }
+}
+
+/// Every IPv4 address a DoH answer gave our own hosts within the memory
+/// window: what the macOS kill switch's control-plane table holds besides
+/// the DoH provider itself (`vpn::pf_policy::control_plane_addresses`).
+/// IPv4 only: the macOS block admits no IPv6 at all.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn control_plane_v4() -> Vec<std::net::Ipv4Addr> {
-    control_plane_v4_in(shared_cache())
+    match control_plane_memory().lock() {
+        Ok(memory) => remembered(&memory, Instant::now()),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn control_plane_v4_in(cache: &Mutex<CacheMap>) -> Vec<std::net::Ipv4Addr> {
-    let Ok(map) = cache.lock() else {
-        return Vec::new();
-    };
-    map.iter()
-        .filter(|(host, _)| {
-            let host = host.to_ascii_lowercase();
-            host == "birdo.app" || host.ends_with(".birdo.app")
-        })
-        .flat_map(|(_, (_, addrs, _))| addrs.iter())
-        .filter_map(|addr| match addr.ip() {
-            IpAddr::V4(ip) => Some(ip),
-            IpAddr::V6(_) => None,
-        })
+fn remembered(memory: &ControlPlaneMemory, now: Instant) -> Vec<std::net::Ipv4Addr> {
+    memory
+        .values()
+        .flatten()
+        .filter(|(_, at)| now.saturating_duration_since(*at) < CONTROL_PLANE_MEMORY)
+        .map(|(ip, _)| *ip)
         .collect()
 }
 
@@ -140,10 +206,24 @@ impl Resolve for DohApiResolver {
 
             // 2) DNS-over-HTTPS (cert-pinned, anti-rebinding). This is the path
             //    that survives ISP/captive-portal DNS interference.
-            match crate::vpn::doh::resolve_via_doh(&host).await {
-                Ok(ip) => {
-                    let addrs = vec![SocketAddr::new(IpAddr::V4(ip), HTTPS_PORT)];
+            match crate::vpn::doh::resolve_all_via_doh(&host).await {
+                Ok(ips) => {
+                    let addrs: Vec<SocketAddr> = ips
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), HTTPS_PORT))
+                        .collect();
                     cache_put(&cache, &host, addrs.clone(), CACHE_TTL);
+                    // P2-4: an address the macOS block does not permit yet is
+                    // let through BEFORE this connection is dialled. The user's
+                    // Connect under a held block used to meet `block drop all`
+                    // until the next re-dial happened to re-load it.
+                    let new_address = remember(&host, &addrs, Source::Doh);
+                    #[cfg(target_os = "macos")]
+                    if new_address {
+                        crate::commands::killswitch::control_plane_learned().await;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = new_address;
                     Ok(boxed(addrs))
                 }
                 Err(e) => {
@@ -180,6 +260,10 @@ impl Resolve for DohApiResolver {
                     // possibly-hostile system answer is re-checked against DoH soon
                     // (cert pinning prevents any MITM in the meantime).
                     cache_put(&cache, &host, addrs.clone(), FALLBACK_TTL);
+                    // P3-1: never admitted to the kill switch's table — this
+                    // answer had no anti-rebinding check and came from the
+                    // network the user is on. Stated, so it stays that way.
+                    remember(&host, &addrs, Source::System);
                     Ok(boxed(addrs))
                 }
             }
@@ -264,45 +348,155 @@ mod tests {
         assert_eq!(cache_get(&one_off.cache, host), Some(vec![sample_addr()]));
     }
 
-    /// What the macOS kill switch's control-plane permit may name: our own
-    /// hosts' IPv4 answers, stale ones included, and nothing else.
-    #[test]
-    fn the_control_plane_set_is_our_hosts_ipv4_answers() {
-        let cache = Mutex::new(CacheMap::new());
-        let v4 = |a, b, c, d| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), HTTPS_PORT);
-        let v6 = SocketAddr::new("2606:4700::1".parse().unwrap(), HTTPS_PORT);
-        cache_put(
-            &cache,
-            "api.birdo.app",
-            vec![v4(104, 16, 0, 1), v6],
-            CACHE_TTL,
-        );
-        cache_put(&cache, "birdo.app", vec![v4(104, 16, 0, 2)], FALLBACK_TTL);
-        // Expired the instant it is stored, and still the last answer we had.
-        cache_put(
-            &cache,
-            "updates.birdo.app",
-            vec![v4(104, 16, 0, 3)],
-            Duration::ZERO,
-        );
-        // Not ours: never a reason to let root out.
-        cache_put(&cache, "example.com", vec![v4(93, 184, 215, 14)], CACHE_TTL);
-        cache_put(
-            &cache,
-            "evilbirdo.app",
-            vec![v4(198, 51, 100, 9)],
-            CACHE_TTL,
-        );
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), HTTPS_PORT)
+    }
 
-        let mut got = control_plane_v4_in(&cache);
-        got.sort_unstable();
+    /// P3-1: a system-resolver answer never enters the kill switch's table,
+    /// nor does any host that is not ours.
+    #[test]
+    fn only_doh_answers_for_our_hosts_are_remembered() {
+        let mut memory = ControlPlaneMemory::new();
+        let now = Instant::now();
+        assert!(!remember_in(
+            &mut memory,
+            "api.birdo.app",
+            &[v4(203, 0, 113, 66)],
+            Source::System,
+            now
+        ));
+        assert!(!remember_in(
+            &mut memory,
+            "example.com",
+            &[v4(93, 184, 215, 14)],
+            Source::Doh,
+            now
+        ));
+        assert!(!remember_in(
+            &mut memory,
+            "evilbirdo.app",
+            &[v4(198, 51, 100, 9)],
+            Source::Doh,
+            now
+        ));
+        assert!(remembered(&memory, now).is_empty());
+
+        let v6 = SocketAddr::new("2606:4700::1".parse().unwrap(), HTTPS_PORT);
+        assert!(remember_in(
+            &mut memory,
+            "API.birdo.app",
+            &[v4(104, 21, 32, 1), v6],
+            Source::Doh,
+            now
+        ));
         assert_eq!(
-            got,
+            remembered(&memory, now),
+            vec![Ipv4Addr::new(104, 21, 32, 1)]
+        );
+    }
+
+    /// P2-4: the table is the UNION of recent DoH answers per host — both A
+    /// records, and an address a newer answer dropped — until it ages out.
+    #[test]
+    fn the_control_plane_is_the_union_of_recent_doh_answers() {
+        let mut memory = ControlPlaneMemory::new();
+        let t0 = Instant::now();
+        assert!(remember_in(
+            &mut memory,
+            "api.birdo.app",
+            &[v4(104, 21, 32, 1), v4(172, 67, 150, 2)],
+            Source::Doh,
+            t0
+        ));
+        let hour = Duration::from_secs(3600);
+        assert!(remember_in(
+            &mut memory,
+            "api.birdo.app",
+            &[v4(104, 21, 40, 3)],
+            Source::Doh,
+            t0 + hour
+        ));
+        assert!(remember_in(
+            &mut memory,
+            "birdo.app",
+            &[v4(104, 21, 50, 4)],
+            Source::Doh,
+            t0 + hour
+        ));
+
+        let mut all = remembered(&memory, t0 + hour);
+        all.sort_unstable();
+        assert_eq!(
+            all,
             vec![
-                Ipv4Addr::new(104, 16, 0, 1),
-                Ipv4Addr::new(104, 16, 0, 2),
-                Ipv4Addr::new(104, 16, 0, 3),
+                Ipv4Addr::new(104, 21, 32, 1),
+                Ipv4Addr::new(104, 21, 40, 3),
+                Ipv4Addr::new(104, 21, 50, 4),
+                Ipv4Addr::new(172, 67, 150, 2),
             ]
+        );
+        // The first answer ages out a day after it was last seen.
+        let mut later = remembered(&memory, t0 + 24 * hour + hour / 2);
+        later.sort_unstable();
+        assert_eq!(
+            later,
+            vec![Ipv4Addr::new(104, 21, 40, 3), Ipv4Addr::new(104, 21, 50, 4)]
+        );
+    }
+
+    /// Only a NEW address asks for a re-load; a repeat answer refreshes it.
+    #[test]
+    fn a_repeat_answer_is_not_a_new_address() {
+        let mut memory = ControlPlaneMemory::new();
+        let t0 = Instant::now();
+        let answer = [v4(104, 21, 32, 1), v4(172, 67, 150, 2)];
+        assert!(remember_in(
+            &mut memory,
+            "api.birdo.app",
+            &answer,
+            Source::Doh,
+            t0
+        ));
+        assert!(!remember_in(
+            &mut memory,
+            "api.birdo.app",
+            &answer,
+            Source::Doh,
+            t0
+        ));
+        let refreshed = t0 + CONTROL_PLANE_MEMORY - Duration::from_secs(1);
+        assert!(!remember_in(
+            &mut memory,
+            "api.birdo.app",
+            &answer,
+            Source::Doh,
+            refreshed
+        ));
+        assert_eq!(
+            remembered(&memory, t0 + CONTROL_PLANE_MEMORY).len(),
+            2,
+            "refreshed, not aged out"
+        );
+    }
+
+    #[test]
+    fn the_memory_per_host_is_bounded() {
+        let mut memory = ControlPlaneMemory::new();
+        let t0 = Instant::now();
+        for i in 0..20u8 {
+            remember_in(
+                &mut memory,
+                "api.birdo.app",
+                &[v4(104, 21, 0, i)],
+                Source::Doh,
+                t0 + Duration::from_secs(u64::from(i)),
+            );
+        }
+        let kept = remembered(&memory, t0 + Duration::from_secs(20));
+        assert_eq!(kept.len(), CONTROL_PLANE_PER_HOST);
+        assert!(
+            kept.contains(&Ipv4Addr::new(104, 21, 0, 19)),
+            "the newest are kept"
         );
     }
 
