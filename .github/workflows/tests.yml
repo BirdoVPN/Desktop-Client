@@ -238,6 +238,10 @@ jobs:
         working-directory: src-tauri
         env:
           OS: ${{ matrix.os }}
+          # Plain text: the workflow-level `always` colours `warning:` with ANSI
+          # codes, which the counter below cannot match (it silently reported 0
+          # on its first run).
+          CARGO_TERM_COLOR: never
         run: |
           set -euo pipefail
           cargo clippy --locked --all-targets --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.log"
@@ -246,6 +250,14 @@ jobs:
           # warnings" summary lines have no file prefix and are not counted).
           grep -E '^[^ ]+:[0-9]+:[0-9]+: warning: ' "$RUNNER_TEMP/clippy.log" | sort -u > "$RUNNER_TEMP/clippy-warnings.txt" || true
           n=$(wc -l < "$RUNNER_TEMP/clippy-warnings.txt" | tr -d ' ')
+          # Self-check: cargo's own "generated N warnings" summary must agree
+          # that there is something to count, or the counter is broken and
+          # would report a false zero.
+          generated=$(grep -oE 'generated [0-9]+ warnings?' "$RUNNER_TEMP/clippy.log" | grep -oE '[0-9]+' | sort -n | tail -n 1 || true)
+          if [ "${generated:-0}" -gt 0 ] && [ "$n" -eq 0 ]; then
+            echo "::error::cargo reported $generated clippy warnings but the counter matched none - the warning parser is broken"
+            exit 1
+          fi
           {
             echo "### clippy on $OS: $n distinct warning(s) (warn-only; follow-up in PR #223)"
             echo '```'
