@@ -648,11 +648,28 @@ impl Pf for Pfctl {
     fn flush_rules(&self) -> Result<(), String> {
         pfctl(&["-F", "rules"]).map(drop)
     }
-    fn enable(&self) -> Result<(), String> {
-        pfctl(&["-e"]).map(drop)
+    fn take_ref(&self) -> Result<u64, String> {
+        let out = crate::utils::hidden_cmd("pfctl")
+            .args(["-E"])
+            .output()
+            .map_err(|e| format!("pfctl -E could not run: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "pfctl -E failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        // The token is printed alongside "pf enabled"; read both streams.
+        let printed = format!(
+            "{}
+{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        pf_policy::parse_token(&printed).ok_or_else(|| "pfctl -E printed no token".to_string())
     }
-    fn disable(&self) -> Result<(), String> {
-        pfctl(&["-d"]).map(drop)
+    fn release_ref(&self, token: u64) -> Result<(), String> {
+        pfctl(&["-X", &token.to_string()]).map(drop)
     }
 }
 
@@ -815,6 +832,8 @@ pub fn reconcile_stale_pf_state() {
         );
         pf.loaded = true;
         pf.enforcing = true;
+        // Retried from here on, whether or not a session ever starts.
+        ensure_pf_watchdog();
     } else {
         pf.loaded = false;
         pf.enforcing = false;
@@ -836,6 +855,7 @@ pub fn reconcile_stale_pf_state() {
 /// evaluated. `pf_deactivate_blocking` restores `/etc/pf.conf`.
 #[cfg(target_os = "macos")]
 async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    ensure_pf_watchdog();
     let mut pf = PF.lock().await;
     engage_block(&mut pf, server_ip)
 }
@@ -844,6 +864,25 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
 /// what pf reads back. Under the `PF` lock.
 #[cfg(target_os = "macos")]
 fn engage_block(pf: &mut PfState, server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    let result = pf.engage(&Pfctl, &block_rules(server_ip));
+    mirror(pf);
+    match &result {
+        Ok(()) => tracing::info!(
+            "macOS pf kill switch activated (read back: pf enabled, block-all loaded)"
+        ),
+        Err(e) => tracing::error!(
+            "macOS pf kill switch NOT confirmed: {} (enforcing={}, lift owed={})",
+            e,
+            pf.enforcing,
+            pf.loaded
+        ),
+    }
+    result
+}
+
+/// The block-all, from the inputs as they are NOW.
+#[cfg(target_os = "macos")]
+fn block_rules(server_ip: Option<Ipv4Addr>) -> String {
     let tunnel_interface = recorded_tunnel_interface();
     let control_plane = pf_policy::control_plane_addresses();
     // pf has no application condition, so the control-plane permit matches the
@@ -863,21 +902,53 @@ fn engage_block(pf: &mut PfState, server_ip: Option<Ipv4Addr>) -> Result<(), Str
         euid,
         control_plane.len()
     );
+    rules
+}
 
-    let result = pf.engage(&Pfctl, &rules);
-    mirror(pf);
-    match &result {
-        Ok(()) => tracing::info!(
-            "macOS pf kill switch activated (read back: pf enabled, block-all loaded)"
+/// How often a held block is re-verified (P2-3): the auto-reconnect
+/// heartbeat's period.
+#[cfg(target_os = "macos")]
+const PF_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Start the pf watchdog, once per process. Cheap while nothing is held: a
+/// lock and a flag every 30 s. Its own task rather than a hook in the
+/// auto-reconnect loop, so it also covers a block held outside a session (a
+/// lift that failed after a give-up, a stale block found at startup).
+#[cfg(target_os = "macos")]
+fn ensure_pf_watchdog() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        tauri::async_runtime::spawn(async {
+            loop {
+                tokio::time::sleep(PF_WATCHDOG_INTERVAL).await;
+                pf_watchdog_tick().await;
+            }
+        });
+    });
+}
+
+/// One watchdog pass: see `PfState::watchdog`.
+#[cfg(target_os = "macos")]
+async fn pf_watchdog_tick() {
+    let server_ip = *VPN_SERVER_IP.read().await;
+    let mut pf = PF.lock().await;
+    let intent = KILLSWITCH_ENABLED.load(Ordering::SeqCst);
+    let outcome = pf.watchdog(&Pfctl, || block_rules(server_ip), intent);
+    mirror(&pf);
+    drop(pf);
+    let Some(result) = outcome else {
+        return;
+    };
+    match result {
+        Ok(()) if intent => tracing::warn!(
+            "Kill switch watchdog: something else had disabled or replaced the pf block; restored"
         ),
-        Err(e) => tracing::error!(
-            "macOS pf kill switch NOT confirmed: {} (enforcing={}, lift owed={})",
-            e,
-            pf.enforcing,
-            pf.loaded
-        ),
+        Ok(()) => {
+            tracing::info!("Kill switch watchdog: retried an owed lift of the pf block; lifted")
+        }
+        Err(e) => tracing::error!("Kill switch watchdog: {}", e),
     }
-    result
+    blocking_may_have_changed();
 }
 
 /// The utun the block-all permits right now (MR-1125).
@@ -958,7 +1029,7 @@ async fn reload_block_if_engaged(why: &str) {
 
 /// Deactivate pf blocking: drop the block-all main ruleset and fall back to the
 /// correct baseline — the IPv6 leak block if a tunnel session is still live,
-/// otherwise the system default ruleset (disabling pf only if we enabled it).
+/// otherwise the system default ruleset (dropping our pf reference).
 /// `PfState::disengage` verifies the lift by reading pf back.
 ///
 /// F-001: the fallback is not optional. This runs on every reconnect (the
