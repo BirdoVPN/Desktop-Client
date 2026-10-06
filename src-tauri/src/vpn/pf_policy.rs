@@ -356,6 +356,12 @@ pub(crate) struct PfState {
     /// MR-1125: the utun the live tunnel runs on — the ONLY interface the
     /// block-all permits. Recorded the moment the device is created.
     pub tunnel: Option<String>,
+    /// N1: the block is WANTED — set by an activation, cleared by every lift
+    /// request. `KILLSWITCH_ENABLED` cannot stand in for it: the give-up
+    /// lifts the block but leaves the intent set (F3), so a give-up lift that
+    /// failed looked wanted, was never retried, and a user's own `pfctl -f`
+    /// to get the network back was undone by the watchdog.
+    pub wanted: bool,
 }
 
 impl PfState {
@@ -366,6 +372,7 @@ impl PfState {
             ipv6_baseline: false,
             token: None,
             tunnel: None,
+            wanted: false,
         }
     }
 
@@ -487,6 +494,7 @@ impl PfState {
     ///
     /// Our pf reference is dropped only once nothing of ours is loaded.
     pub(crate) fn disengage(&mut self, pf: &impl Pf) -> Result<(), String> {
+        self.wanted = false;
         let to_baseline = self.ipv6_baseline;
         let teardown = if to_baseline {
             self.load_ipv6_baseline(pf)
@@ -546,20 +554,19 @@ impl PfState {
     /// tool's `pfctl -d` or `pfctl -f` takes our block away without telling
     /// us, and before this nothing noticed until the next reconnect.
     ///
-    /// `intent` is whether the kill switch is armed. A block we hold without
-    /// it is an owed lift that failed earlier, so that lift is retried
-    /// instead. `inputs` are gathered only if the block must be re-loaded.
-    /// `None`: nothing held, or nothing wrong.
+    /// A block held but no longer WANTED (N1) is a lift that failed — the
+    /// give-up's included — so that lift is retried instead, and a block
+    /// someone else removed is never re-imposed. `inputs` are gathered only if
+    /// the block must be re-loaded. `None`: nothing held, or nothing wrong.
     pub(crate) fn watchdog(
         &mut self,
         pf: &impl Pf,
         inputs: impl FnOnce() -> Inputs,
-        intent: bool,
     ) -> Option<Result<(), String>> {
         if !self.loaded {
             return None;
         }
-        if !intent {
+        if !self.wanted {
             return Some(self.disengage(pf));
         }
         let seen = Observed::read(pf);
@@ -583,6 +590,7 @@ impl PfState {
         if !intent {
             return Ok(false);
         }
+        self.wanted = true;
         self.engage(pf, inputs).map(|()| true)
     }
 
@@ -592,6 +600,10 @@ impl PfState {
     pub(crate) fn reload_if_loaded(&mut self, pf: &impl Pf, inputs: &Inputs) -> Result<(), String> {
         if !self.loaded {
             return Ok(());
+        }
+        if !self.wanted {
+            // A failed lift: re-loading would re-impose what nobody wants.
+            return self.disengage(pf);
         }
         self.engage(pf, inputs)
     }
@@ -1171,7 +1183,7 @@ mod tests {
         let pf = FakePf::default();
         let mut state = PfState::new();
         state.tunnel = Some("utun4".to_string());
-        state.engage(&pf, &inputs()).unwrap();
+        assert_eq!(state.activate(&pf, &inputs(), true), Ok(true));
         (pf, state)
     }
 
@@ -1305,7 +1317,7 @@ mod tests {
     fn the_watchdog_leaves_a_healthy_block_alone() {
         let (pf, mut state) = engaged();
         let loads = pf.loads.get();
-        assert_eq!(state.watchdog(&pf, inputs, true), None);
+        assert_eq!(state.watchdog(&pf, inputs), None);
         assert_eq!(pf.loads.get(), loads, "nothing re-loaded");
         assert!(state.enforcing);
     }
@@ -1317,7 +1329,7 @@ mod tests {
         let (pf, mut state) = engaged();
         let old = state.token.unwrap();
         pf.third_party_disables();
-        assert_eq!(state.watchdog(&pf, inputs, true), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
         assert!(state.enforcing && pf.running());
         assert_ne!(state.token, Some(old), "the dead token was replaced");
         assert!(
@@ -1331,7 +1343,7 @@ mod tests {
     fn the_watchdog_restores_a_block_another_tool_replaced() {
         let (pf, mut state) = engaged();
         pf.load_default().unwrap();
-        assert_eq!(state.watchdog(&pf, inputs, true), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
         assert!(block_all_loaded(&pf.rules().unwrap()));
     }
 
@@ -1340,15 +1352,72 @@ mod tests {
     #[test]
     fn the_watchdog_retries_an_owed_lift_when_the_kill_switch_is_off() {
         let (pf, mut state) = engaged();
-        assert_eq!(state.watchdog(&pf, inputs, false), Some(Ok(())));
+        state.wanted = false;
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
         assert!(!state.loaded && !pf.running());
+    }
+
+    /// N1: the give-up lifts but leaves KILLSWITCH_ENABLED set. A give-up
+    /// lift that FAILED must still be retried — it used to look wanted.
+    #[test]
+    fn a_failed_give_up_lift_is_retried_by_the_watchdog() {
+        let (pf, mut state) = engaged();
+        let stuck = FakePf {
+            default_fails: true,
+            flush_fails: true,
+            ..pf
+        };
+        assert!(state.disengage(&stuck).is_err(), "the give-up's lift fails");
+        assert!(state.loaded && !state.wanted);
+        let pf = FakePf {
+            default_fails: false,
+            flush_fails: false,
+            ..stuck
+        };
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert!(!state.loaded);
+        assert!(!block_all_loaded(&pf.rules().unwrap()));
+    }
+
+    /// N1: after that failed lift the user clears pf themselves
+    /// (`pfctl -f /etc/pf.conf`). The watchdog must not put the block back.
+    #[test]
+    fn the_watchdog_never_reimposes_a_block_nobody_wants() {
+        let (pf, mut state) = engaged();
+        let stuck = FakePf {
+            default_fails: true,
+            flush_fails: true,
+            ..pf
+        };
+        assert!(state.disengage(&stuck).is_err());
+        let pf = FakePf {
+            default_fails: false,
+            flush_fails: false,
+            ..stuck
+        };
+        pf.load_default().unwrap();
+        let loads = pf.loads.get();
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert!(!block_all_loaded(&pf.rules().unwrap()), "not re-imposed");
+        assert_eq!(pf.loads.get(), loads, "no block-all loaded");
+        assert!(!state.loaded);
+    }
+
+    /// N1: a re-load (a new tunnel, a new control-plane address) of a block
+    /// nobody wants retries the lift rather than re-imposing the block.
+    #[test]
+    fn a_reload_of_an_unwanted_block_retries_the_lift() {
+        let (pf, mut state) = engaged();
+        state.wanted = false;
+        assert_eq!(state.tunnel_up(&pf, &inputs(), "utun9"), Ok(()));
+        assert!(!state.loaded && !block_all_loaded(&pf.rules().unwrap()));
     }
 
     #[test]
     fn the_watchdog_ignores_a_block_it_does_not_hold() {
         let pf = FakePf::default();
         let mut state = PfState::new();
-        assert_eq!(state.watchdog(&pf, inputs, true), None);
+        assert_eq!(state.watchdog(&pf, inputs), None);
         assert_eq!(pf.loads.get(), 0);
     }
 
@@ -1612,7 +1681,7 @@ mod tests {
     fn the_watchdog_restores_a_lost_tunnel_permit() {
         let (pf, mut state) = engaged();
         pf.load(&ruleset(None, &[DOH])).unwrap();
-        assert_eq!(state.watchdog(&pf, inputs, true), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
         assert_eq!(
             tunnel_permits(&pf.rules().unwrap()),
             vec!["utun4".to_string()]

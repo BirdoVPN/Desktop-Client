@@ -933,15 +933,15 @@ fn ensure_pf_watchdog() {
 #[cfg(target_os = "macos")]
 async fn pf_watchdog_tick() {
     let mut pf = PF.lock().await;
-    let intent = KILLSWITCH_ENABLED.load(Ordering::SeqCst);
-    let outcome = pf.watchdog(&Pfctl, pf_inputs, intent);
+    let wanted = pf.wanted;
+    let outcome = pf.watchdog(&Pfctl, pf_inputs);
     mirror(&pf);
     drop(pf);
     let Some(result) = outcome else {
         return;
     };
     match result {
-        Ok(()) if intent => tracing::warn!(
+        Ok(()) if wanted => tracing::warn!(
             "Kill switch watchdog: something else had disabled or replaced the pf block; restored"
         ),
         Ok(()) => {
