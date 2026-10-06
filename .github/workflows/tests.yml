@@ -477,12 +477,12 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' '{"build":{"beforeBuildCommand":""}}' > "$RUNNER_TEMP/no-frontend.json"
-          # The tauri command itself is EXPECTED to fail (echo builds no
-          # binary); the gate is the grep on the command line it ran.
+          # tauri's own exit code is irrelevant (it is 0 with --no-bundle);
+          # the gate is the grep on the command line cargo would receive.
           rc=0
           out=$(npx tauri build --runner echo --no-bundle --config "$RUNNER_TEMP/no-frontend.json" --target x86_64-unknown-linux-gnu -- --locked 2>&1) || rc=$?
           echo "$out"
-          echo "(tauri exited $rc, as expected with an echo runner)"
+          echo "(tauri exited $rc; not the gate)"
           if ! printf '%s\n' "$out" | grep -qE '^build .*--locked'; then
             echo "::error::npx tauri build ... -- --locked did not hand --locked to cargo"
             exit 1
@@ -526,11 +526,11 @@ jobs:
           Set-Content -Path "$env:RUNNER_TEMP\no-frontend.json" -Value '{"build":{"beforeBuildCommand":""}}'
           # A runner that prints the arguments cargo would have received.
           Set-Content -Path "$env:RUNNER_TEMP\echo-args.cmd" -Value '@echo %*'
-          # Expected to exit non-zero (no binary appears); the gate is the
-          # match on the command line below.
+          # tauri's own exit code is irrelevant (0 with --no-bundle); the
+          # gate is the match on the command line cargo would receive.
           $out = npx tauri build --runner "$env:RUNNER_TEMP\echo-args.cmd" --no-bundle --config "$env:RUNNER_TEMP\no-frontend.json" -- --locked 2>&1 | Out-String
           Write-Host $out
-          Write-Host "(tauri exited $LASTEXITCODE, as expected with an echo runner)"
+          Write-Host "(tauri exited $LASTEXITCODE; not the gate)"
           if ($out -notmatch '(?m)^build .*--locked') {
             Write-Host "::error::npx tauri build -- --locked under pwsh did not hand --locked to cargo"
             exit 1
