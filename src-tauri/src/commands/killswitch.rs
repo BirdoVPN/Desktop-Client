@@ -19,7 +19,7 @@ use crate::utils::elevation::is_elevated;
 #[cfg(target_os = "linux")]
 use crate::vpn::firewall_linux;
 #[cfg(target_os = "macos")]
-use crate::vpn::pf_policy;
+use crate::vpn::pf_policy::{self, Pf};
 #[cfg(target_os = "windows")]
 use crate::vpn::wfp;
 
@@ -562,11 +562,22 @@ async fn disarm_platform() -> Result<(), String> {
 
 // ──────────────────────────────────────────────────────────────
 // macOS pf (packet filter) kill switch implementation
+//
+// WHAT the block-all permits, and when pf's answer counts as "blocking", is
+// decided in `vpn::pf_policy`: plain functions, unit-tested on every OS. This
+// section runs `pfctl` and records what pf reads back.
 // ──────────────────────────────────────────────────────────────
 
-/// Tracks whether pf blocking rules are active on macOS
+/// Whether pf's block-all is in force on macOS — pf's READ-BACK answer (pf
+/// enabled AND the block-all loaded), never the fact of having asked.
 #[cfg(target_os = "macos")]
 static PF_BLOCKING: AtomicBool = AtomicBool::new(false);
+
+/// Serialises every writer of pf's main ruleset — the block-all and the IPv6
+/// baseline — so each read-back describes its own load, and two loads built
+/// from different inputs cannot interleave.
+#[cfg(target_os = "macos")]
+static PF_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// macOS: is the pf block-all ruleset currently loaded? Twin of
 /// `wfp::is_blocking()` / `firewall_linux::is_blocking()`, needed by the
@@ -600,6 +611,45 @@ fn pf_is_enabled() -> bool {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("Status: Enabled"))
         .unwrap_or(false)
+}
+
+/// `pfctl -e`. A non-zero exit is an error too; it used to be ignored
+/// (P1-ks-macos-pf-enable-unverified). Callers read back whether pf is
+/// running rather than trust either answer.
+#[cfg(target_os = "macos")]
+fn pf_enable() -> Result<(), String> {
+    let out = crate::utils::hidden_cmd("pfctl")
+        .args(["-e"])
+        .output()
+        .map_err(|e| format!("pfctl -e spawn failed: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "pfctl -e failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// `pfctl`, as the [`Pf`] that `pf_policy`'s engage sequencing drives.
+#[cfg(target_os = "macos")]
+struct Pfctl;
+
+#[cfg(target_os = "macos")]
+impl Pf for Pfctl {
+    fn is_enabled(&self) -> bool {
+        pf_is_enabled()
+    }
+    fn load(&self, rules: &str) -> Result<(), String> {
+        pf_load_ruleset(rules)
+    }
+    fn enable(&self) -> Result<(), String> {
+        pf_enable()
+    }
+    fn live_rules(&self) -> String {
+        pf_live_rules()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -721,13 +771,20 @@ fn pf_apply_ipv6_baseline() -> Result<(), String> {
         })?;
     }
 
-    // pf must actually be running or the loaded ruleset is inert.
+    // pf must actually be running or the loaded ruleset is inert — so read it
+    // back rather than trust `pfctl -e`, whose exit status was ignored here too
+    // (P1-ks-macos-pf-enable-unverified).
     if !was_enabled {
-        crate::utils::hidden_cmd("pfctl")
-            .args(["-e"])
-            .output()
-            .map_err(|e| format!("pfctl enable failed: {}", e))?;
+        if let Err(e) = pf_enable() {
+            tracing::warn!("F-001: {e}; reading back whether pf is running");
+        }
+    }
+    let enabled = pf_is_enabled();
+    if !was_enabled && enabled {
         PF_WE_ENABLED.store(true, Ordering::SeqCst);
+    }
+    if !enabled {
+        return Err("IPv6 leak block is not enforced: pf is not enabled".to_string());
     }
 
     // Read back: our ruleset always contains inet6 rules. If pf reports none, the
@@ -771,6 +828,8 @@ fn pf_restore_default_ruleset() {
 /// enabled/lockdown setting — exactly as Windows blocks IPv6 at tunnel start.
 #[cfg(target_os = "macos")]
 pub async fn ipv6_block_activate() -> Result<(), String> {
+    let _pf = PF_LOCK.lock().await;
+
     // Record the intent FIRST so that, if the kill switch is mid-block, its
     // deactivation lands on our baseline instead of bare /etc/pf.conf.
     PF_IPV6_BLOCK_ACTIVE.store(true, Ordering::SeqCst);
@@ -795,6 +854,8 @@ pub async fn ipv6_block_activate() -> Result<(), String> {
 /// fail a disconnect — a stuck block would leave the host without IPv6.
 #[cfg(target_os = "macos")]
 pub async fn ipv6_block_deactivate() {
+    let _pf = PF_LOCK.lock().await;
+
     if !PF_IPV6_BLOCK_ACTIVE.swap(false, Ordering::SeqCst) {
         return;
     }
@@ -869,6 +930,14 @@ pub fn reconcile_stale_pf_state() {
 /// evaluated. `pf_deactivate_blocking` restores `/etc/pf.conf`.
 #[cfg(target_os = "macos")]
 async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    let _pf = PF_LOCK.lock().await;
+    pf_engage_block(server_ip)
+}
+
+/// [`pf_activate_blocking`]'s body, under PF_LOCK: build the block-all from the
+/// inputs as they are NOW, load it, and record what pf reads back.
+#[cfg(target_os = "macos")]
+fn pf_engage_block(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
     let control_plane = pf_policy::control_plane_addresses();
     // pf has no application condition, so the control-plane permit matches the
     // euid we run as (root: arm() refuses otherwise) and pf_policy scopes its
@@ -886,28 +955,24 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
         control_plane.len()
     );
 
-    // Record pf's pre-existing state BEFORE we change it, so deactivation only
-    // disables pf if we were the ones who enabled it.
-    let was_enabled = pf_is_enabled();
-
-    // Pipe rules directly to pfctl via stdin — avoids TOCTOU race and world-readable temp file
-    pf_load_ruleset(&rules)?;
-
-    // Enable pf if it wasn't already, and remember that we did so.
-    if !was_enabled {
-        let en = crate::utils::hidden_cmd("pfctl").args(["-e"]).output();
-        // `pfctl -e` returns non-zero if pf was already enabled; we already
-        // guarded on was_enabled, so treat a spawn failure as fatal — an
-        // un-enabled pf means the loaded block ruleset is not enforced.
-        match en {
-            Ok(_) => PF_WE_ENABLED.store(true, Ordering::SeqCst),
-            Err(e) => return Err(format!("pfctl enable failed: {}", e)),
-        }
+    let engaged = pf_policy::engage(&Pfctl, &rules);
+    if engaged.we_enabled {
+        PF_WE_ENABLED.store(true, Ordering::SeqCst);
     }
-
-    PF_BLOCKING.store(true, Ordering::SeqCst);
-    tracing::info!("macOS pf kill switch activated (main ruleset enforced)");
-    Ok(())
+    PF_BLOCKING.store(engaged.blocking, Ordering::SeqCst);
+    match &engaged.result {
+        Ok(()) => {
+            tracing::info!(
+                "macOS pf kill switch activated (read back: pf enabled, block-all loaded)"
+            )
+        }
+        Err(e) => tracing::error!(
+            "macOS pf kill switch NOT confirmed: {} (blocking={})",
+            e,
+            engaged.blocking
+        ),
+    }
+    engaged.result
 }
 
 /// Deactivate pf blocking: drop the block-all main ruleset and fall back to the
@@ -920,6 +985,7 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
 /// reopen the leak for the rest of the session.
 #[cfg(target_os = "macos")]
 async fn pf_deactivate_blocking() -> Result<(), String> {
+    let _pf = PF_LOCK.lock().await;
     PF_BLOCKING.store(false, Ordering::SeqCst);
 
     if PF_IPV6_BLOCK_ACTIVE.load(Ordering::SeqCst) {

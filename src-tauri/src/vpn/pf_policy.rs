@@ -1,12 +1,14 @@
-//! What the macOS kill switch's pf ruleset contains, as a plain function.
+//! What the macOS kill switch's pf ruleset contains, and how pf's answer is
+//! read back, as plain functions.
 //!
 //! `commands/killswitch.rs` owns pf's MAIN ruleset on macOS and runs `pfctl`.
-//! Everything that decides WHAT that ruleset permits lives here instead, free
-//! of `pfctl`, so it is unit-tested on every OS (the Windows job runs these
-//! tests) rather than only on a Mac nobody on the team has. The macOS CI
-//! runner then feeds every ruleset shape to `pfctl -nv` (`pfctl_parse_tests`,
-//! run by tests.yml's pf parse-check step), which is the part a Windows box
-//! cannot check.
+//! Everything that decides WHAT that ruleset permits, and WHEN the kill switch
+//! may say it is blocking, lives here instead, free of `pfctl`, so it is
+//! unit-tested on every OS (the Windows job runs these tests) rather than only
+//! on a Mac nobody on the team has. The macOS CI runner then feeds every
+//! ruleset shape to `pfctl -nv` and runs pf's own printout through the same
+//! read-back detector (`pfctl_parse_tests`, run by tests.yml's pf parse-check
+//! step), which is the part of the kill switch a Windows box cannot check.
 //!
 //! # What the block-all permits
 //!
@@ -27,8 +29,18 @@ use std::net::Ipv4Addr;
 /// block in `resources/pf/`). Declaring an empty anchor is a no-op for packet
 /// processing but shows up in `pfctl -s rules`, which is how
 /// `reconcile_stale_pf_state` (and the panic hook in main.rs) tell OUR ruleset
-/// apart from a third party's before reverting anything.
+/// apart from a third party's before reverting anything. Rulesets older builds
+/// left behind carry only this one, so the block-all keeps it too.
 pub(crate) const MARKER_ANCHOR: &str = "com.birdo.vpn";
+
+/// Marker anchor carried by the block-all ruleset ONLY.
+///
+/// The IPv6 leak block carries [`MARKER_ANCHOR`] as well, so that marker alone
+/// cannot tell "the kill switch is blocking" apart from "the IPv6 baseline is
+/// loaded" — and the read-back that decides `PF_BLOCKING` must
+/// (P1-ks-macos-pf-enable-unverified). Not `com.birdo.vpn.killswitch`: that is
+/// the pre-#59 anchor the panic hook still flushes on mixed-upgrade hosts.
+pub(crate) const BLOCK_ANCHOR: &str = "com.birdo.vpn.blockall";
 
 /// The pf table the control-plane permit is scoped to.
 pub(crate) const CONTROL_PLANE_TABLE: &str = "birdo_control";
@@ -71,6 +83,7 @@ pub(crate) fn block_all_ruleset(b: &BlockAll<'_>) -> String {
 
     r.push_str(&format!(
         "anchor \"{MARKER_ANCHOR}\"\n\
+         anchor \"{BLOCK_ANCHOR}\"\n\
          block drop all\n\
          pass quick on lo0 all\n"
     ));
@@ -178,6 +191,106 @@ pub(crate) fn control_plane_addresses() -> Vec<Ipv4Addr> {
     addrs
 }
 
+/// Whether `live_rules` — `pfctl -s rules` — shows the block-all as pf's main
+/// ruleset. pf prints an anchor rule as `anchor "<name>" all`.
+pub(crate) fn block_all_loaded(live_rules: &str) -> bool {
+    let line = format!("anchor \"{BLOCK_ANCHOR}\"");
+    live_rules
+        .lines()
+        .any(|l| l.trim_start().starts_with(&line))
+}
+
+/// The pfctl operations the kill switch sequences: `pfctl` itself on macOS
+/// (`killswitch::Pfctl`), a scripted fake in the tests below.
+pub(crate) trait Pf {
+    /// `pfctl -s info` reports `Status: Enabled`.
+    fn is_enabled(&self) -> bool;
+    /// `pfctl -f -`: `rules` becomes pf's main ruleset. All or nothing — a
+    /// failed load leaves whatever was loaded before in force.
+    fn load(&self, rules: &str) -> Result<(), String>;
+    /// `pfctl -e`. `Err` on a spawn failure AND on a non-zero exit.
+    fn enable(&self) -> Result<(), String>;
+    /// `pfctl -s rules`: pf's live main ruleset, as pf prints it.
+    fn live_rules(&self) -> String;
+}
+
+/// What pf reports — read back, never inferred from having asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Observed {
+    pub enabled: bool,
+    pub block_all_loaded: bool,
+}
+
+impl Observed {
+    pub(crate) fn read(pf: &impl Pf) -> Self {
+        Self {
+            enabled: pf.is_enabled(),
+            block_all_loaded: block_all_loaded(&pf.live_rules()),
+        }
+    }
+
+    /// Traffic is blocked only while pf is running AND the block-all is its
+    /// main ruleset. A loaded ruleset in a disabled pf is inert.
+    pub(crate) fn blocking(self) -> bool {
+        self.enabled && self.block_all_loaded
+    }
+}
+
+/// The outcome of [`engage`]: what the kill switch may record.
+#[derive(Debug)]
+pub(crate) struct Engaged {
+    /// What PF_BLOCKING must hold: pf's answer, not the request.
+    pub blocking: bool,
+    /// pf was off before this call and is on after it, so a teardown owes a
+    /// `pfctl -d` (PF_WE_ENABLED is only ever SET from this).
+    pub we_enabled: bool,
+    pub result: Result<(), String>,
+}
+
+/// Load `rules` as the block-all, enable pf if it was off, and report what pf
+/// then says is in force (P1-ks-macos-pf-enable-unverified).
+///
+/// This used to accept any exit status from `pfctl -e` and set PF_BLOCKING
+/// with no read-back, so a pf that failed to start (another process holding
+/// /dev/pf, a policy restriction) held an inert ruleset while the status, the
+/// UI and auto-reconnect all proceeded as if the block were enforced — every
+/// packet of the reconnect gap left in the clear. `Ok` now means pf is running
+/// with the block-all as its main ruleset, read back after the load.
+pub(crate) fn engage(pf: &impl Pf, rules: &str) -> Engaged {
+    let was_enabled = pf.is_enabled();
+
+    if let Err(e) = pf.load(rules) {
+        // All or nothing: whatever was in force before still is. Say which.
+        return Engaged {
+            blocking: Observed::read(pf).blocking(),
+            we_enabled: false,
+            result: Err(e),
+        };
+    }
+
+    if !was_enabled {
+        // Logged, not returned: the read-back below is what decides, so a pf
+        // that some other process enabled in the meantime still counts.
+        if let Err(e) = pf.enable() {
+            tracing::warn!("Kill switch: {e}; reading back whether pf is running");
+        }
+    }
+
+    let seen = Observed::read(pf);
+    let result = if !seen.enabled {
+        Err("pf is not enabled, so the loaded block-all ruleset is not enforced".to_string())
+    } else if !seen.block_all_loaded {
+        Err("the block-all ruleset is not pf's live ruleset after loading it".to_string())
+    } else {
+        Ok(())
+    };
+    Engaged {
+        blocking: seen.blocking(),
+        we_enabled: !was_enabled && seen.enabled,
+        result,
+    }
+}
+
 /// Every pass rule that names a `user` also names the control-plane table —
 /// so no rule lets a uid out to any destination. Holds for our ruleset text
 /// AND for pf's printout of it (`user = 0`).
@@ -210,6 +323,7 @@ fn every_shape<'a>(control_plane: &'a [Ipv4Addr]) -> Vec<BlockAll<'a>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     const DOH: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
     const API: Ipv4Addr = Ipv4Addr::new(104, 16, 0, 1);
@@ -273,7 +387,7 @@ mod tests {
     // ── The rest of the ruleset, unchanged in substance ────────────────
 
     #[test]
-    fn the_block_all_carries_the_marker_and_denies_by_default() {
+    fn the_block_all_carries_both_markers_and_denies_by_default() {
         let r = ruleset(&[DOH]);
         let lines: Vec<&str> = r.lines().collect();
         assert_eq!(lines[1], "set block-policy drop");
@@ -282,7 +396,11 @@ mod tests {
             .iter()
             .position(|l| *l == "anchor \"com.birdo.vpn\"")
             .expect("marker anchor: reconcile_stale_pf_state greps for it");
-        assert!(marker < block, "{r}");
+        let own = lines
+            .iter()
+            .position(|l| *l == "anchor \"com.birdo.vpn.blockall\"")
+            .expect("block-all anchor: the read-back looks for it");
+        assert!(marker < block && own < block, "{r}");
         // Every permit is `quick`, so `block drop all` (pf is last-match)
         // is the answer for everything they do not name.
         for l in &lines[block + 1..] {
@@ -316,10 +434,203 @@ mod tests {
         assert!(!without.contains("203.0.113.7"), "{without}");
         assert!(!without.contains("10.0.0.0/8"), "{without}");
     }
+
+    // ── The read-back detector ─────────────────────────────────────────
+
+    /// What `pfctl -s rules` prints for a loaded ruleset, near enough for the
+    /// detector: filter rules only (no comments, options or tables), anchors
+    /// suffixed ` all`. The real printout is checked on the macOS runner.
+    fn pf_prints(rules: &str) -> String {
+        rules
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| {
+                !l.starts_with("set ") && !l.starts_with("table ") && !l.starts_with("load ")
+            })
+            .map(|l| {
+                if l.starts_with("anchor ") {
+                    format!("{l} all")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn only_the_block_all_reads_back_as_the_block() {
+        assert!(block_all_loaded(&pf_prints(&ruleset(&[DOH]))));
+        // The IPv6 leak block carries the shared marker, not ours.
+        for baseline in [
+            include_str!("../../resources/pf/ipv6-block.conf"),
+            include_str!("../../resources/pf/ipv6-block-minimal.conf"),
+        ] {
+            let printed = pf_prints(baseline);
+            assert!(
+                printed.contains("anchor \"com.birdo.vpn\" all"),
+                "{printed}"
+            );
+            assert!(!block_all_loaded(&printed), "{printed}");
+        }
+        // Stock /etc/pf.conf, and a pfctl that printed nothing (it failed).
+        assert!(!block_all_loaded(
+            "scrub-anchor \"com.apple/*\" all fragment reassemble\nanchor \"com.apple/*\" all"
+        ));
+        assert!(!block_all_loaded(""));
+    }
+
+    // ── engage, against a scripted pf ──────────────────────────────────
+
+    #[derive(Default)]
+    struct FakePf {
+        enabled: Cell<bool>,
+        live: RefCell<String>,
+        /// `pfctl -f -` exits non-zero (and, being atomic, changes nothing).
+        load_fails: bool,
+        /// `pfctl -f -` exits 0, but the live ruleset is not ours afterwards
+        /// (another writer replaced it).
+        load_lost: bool,
+        /// `pfctl -e` exits non-zero and pf stays off.
+        enable_fails: bool,
+        /// `pfctl -e` exits 0, and pf is still off.
+        enable_lies: bool,
+        enable_calls: Cell<u32>,
+    }
+
+    impl Pf for FakePf {
+        fn is_enabled(&self) -> bool {
+            self.enabled.get()
+        }
+        fn load(&self, rules: &str) -> Result<(), String> {
+            if self.load_fails {
+                return Err("pfctl load ruleset failed: syntax error".to_string());
+            }
+            if !self.load_lost {
+                *self.live.borrow_mut() = pf_prints(rules);
+            }
+            Ok(())
+        }
+        fn enable(&self) -> Result<(), String> {
+            self.enable_calls.set(self.enable_calls.get() + 1);
+            if self.enable_fails {
+                return Err("pfctl -e failed: /dev/pf: Resource busy".to_string());
+            }
+            if !self.enable_lies {
+                self.enabled.set(true);
+            }
+            Ok(())
+        }
+        fn live_rules(&self) -> String {
+            self.live.borrow().clone()
+        }
+    }
+
+    fn block() -> String {
+        ruleset(&[DOH])
+    }
+
+    #[test]
+    fn engage_reports_blocking_once_pf_says_so() {
+        let pf = FakePf::default();
+        let out = engage(&pf, &block());
+        assert_eq!(out.result, Ok(()));
+        assert!(out.blocking);
+        assert!(out.we_enabled, "pf was off: teardown owes a pfctl -d");
+        assert_eq!(pf.enable_calls.get(), 1);
+    }
+
+    /// P1-ks-macos-pf-enable-unverified: the old code took `Ok(_)` from
+    /// `pfctl -e` whatever its exit status and stored PF_BLOCKING = true.
+    #[test]
+    fn a_pf_that_would_not_start_is_not_reported_as_blocking() {
+        let pf = FakePf {
+            enable_fails: true,
+            ..Default::default()
+        };
+        let out = engage(&pf, &block());
+        assert!(!out.blocking, "an inert ruleset is not a block");
+        assert!(!out.we_enabled);
+        assert!(out.result.unwrap_err().contains("not enabled"));
+    }
+
+    #[test]
+    fn an_exit_status_of_zero_is_not_taken_as_proof() {
+        let pf = FakePf {
+            enable_lies: true,
+            ..Default::default()
+        };
+        let out = engage(&pf, &block());
+        assert!(!out.blocking);
+        assert!(!out.we_enabled);
+        assert!(out.result.is_err());
+    }
+
+    #[test]
+    fn a_block_all_missing_from_pfs_live_rules_is_not_reported_as_blocking() {
+        let pf = FakePf {
+            load_lost: true,
+            ..Default::default()
+        };
+        pf.enabled.set(true);
+        let out = engage(&pf, &block());
+        assert!(!out.blocking);
+        assert!(out.result.unwrap_err().contains("not pf's live ruleset"));
+    }
+
+    /// pfctl -f is all or nothing, so a failed re-load (a relay move) leaves
+    /// the previous block in force — and says so.
+    #[test]
+    fn a_failed_load_reports_whatever_is_still_in_force() {
+        let held = FakePf {
+            load_fails: true,
+            ..Default::default()
+        };
+        held.enabled.set(true);
+        *held.live.borrow_mut() = pf_prints(&block());
+        let out = engage(&held, &block());
+        assert!(out.result.is_err());
+        assert!(out.blocking, "the previous block-all is still loaded");
+
+        let none = FakePf {
+            load_fails: true,
+            ..Default::default()
+        };
+        let out = engage(&none, &block());
+        assert!(out.result.is_err());
+        assert!(!out.blocking);
+        assert_eq!(
+            none.enable_calls.get(),
+            0,
+            "nothing loaded, nothing to enable"
+        );
+    }
+
+    /// Someone else's pf: never claim we enabled it, or teardown would
+    /// `pfctl -d` it out from under them.
+    #[test]
+    fn re_engaging_a_running_pf_does_not_claim_we_enabled_it() {
+        let pf = FakePf::default();
+        pf.enabled.set(true);
+        let out = engage(&pf, &block());
+        assert_eq!(out.result, Ok(()));
+        assert!(out.blocking);
+        assert!(!out.we_enabled);
+        assert_eq!(pf.enable_calls.get(), 0);
+    }
+
+    /// A disabled pf enforces nothing, whatever is loaded in it.
+    #[test]
+    fn a_disabled_pf_is_not_blocking_even_with_the_block_loaded() {
+        let pf = FakePf::default();
+        *pf.live.borrow_mut() = pf_prints(&block());
+        assert!(!Observed::read(&pf).blocking());
+    }
 }
 
 /// The macOS runner's half: pf itself parses every ruleset shape, and its own
-/// printout keeps root to the table. Root-only (`pfctl` opens /dev/pf even to
+/// printout reads back as the block. Root-only (`pfctl` opens /dev/pf even to
 /// parse), so `#[ignore]`d here and run by tests.yml's "pf ruleset parse-check
 /// (macOS)" step under sudo. `-n` parses without loading: the runner's own
 /// firewall is never touched.
@@ -329,7 +640,8 @@ mod pfctl_parse_tests {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    /// `pfctl -nvf -`: parse `rules` and print them as pf reads them.
+    /// `pfctl -nvf -`: parse `rules` and print them as pf reads them — the
+    /// same printer `pfctl -s rules` (the read-back) uses.
     fn pfctl_parse(rules: &str) -> String {
         let mut child = Command::new("pfctl")
             .args(["-n", "-v", "-f", "-"])
@@ -355,12 +667,16 @@ mod pfctl_parse_tests {
 
     #[test]
     #[ignore = "needs root and macOS pfctl; run by tests.yml's pf parse-check step"]
-    fn every_block_all_shape_parses() {
+    fn every_block_all_shape_parses_and_reads_back_as_the_block() {
         let control_plane = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(104, 16, 0, 1)];
         for shape in every_shape(&control_plane) {
             let rules = block_all_ruleset(&shape);
             let printed = pfctl_parse(&rules);
             println!("--- pfctl -nv printout ---\n{printed}");
+            assert!(
+                block_all_loaded(&printed),
+                "the read-back would not recognise this block-all:\n{printed}"
+            );
             assert!(
                 printed.contains("<birdo_control>"),
                 "the control-plane permit must name the table:\n{printed}"
@@ -379,6 +695,7 @@ mod pfctl_parse_tests {
             lan_sharing: false,
         });
         let printed = pfctl_parse(&rules);
+        assert!(block_all_loaded(&printed), "{printed}");
         assert!(!printed.contains(" user "), "{printed}");
     }
 }
