@@ -31,9 +31,10 @@ on:
 # Least privilege by default; the analyze job grants only what it needs.
 permissions: {}
 
-# Superseded PR runs are cancelled; main runs never are (26 of the 33
-# cancelled runs in the last 30 days were pushes to main, so those commits
-# were never scanned).
+# Superseded PR runs are cancelled. A main scan that has started always
+# finishes: the old `cancel-in-progress: true` killed 26 main scans part-way
+# in 30 days (of 33 cancellations). In a burst of pushes GitHub still keeps
+# only the newest WAITING run per group, so the latest commit is scanned.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

@@ -78,7 +78,8 @@ on:
 
 permissions: {}
 
-# Superseded PR runs are cancelled; main/schedule runs never are.
+# Superseded PR runs are cancelled; a started main/schedule run always
+# finishes (in a push burst GitHub keeps only the newest waiting run).
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

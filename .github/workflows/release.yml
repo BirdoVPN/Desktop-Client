@@ -1111,7 +1111,10 @@ jobs:
         if: always() && steps.signcap.outputs.have_apple_signing == 'true'
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/birdo-build.keychain-db"
-          [ -f "$KEYCHAIN_PATH" ] && security delete-keychain "$KEYCHAIN_PATH" || true
+          # Cleanup must never fail the job (it runs after a failure too).
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
