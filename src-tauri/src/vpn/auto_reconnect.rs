@@ -1812,6 +1812,31 @@ mod tests {
         assert!(helper.contains("last_reconnect_info.write().await = None"));
     }
 
+    /// Proposed row 1 (MR-734): v1.4.45 parked the gap between re-dials in
+    /// `Disconnected` for up to 5 s with the block up, and a Kill Switch OFF
+    /// there was taken for "no session": saved, never applied, re-blocked by
+    /// the next attempt. Every state this loop writes during a recovery is
+    /// `Reconnecting` (the teardown, the offline pause, a failed dial) and it
+    /// ends in `Error`: the loop never publishes `Disconnected`, nor tears
+    /// down to it.
+    #[test]
+    fn the_reconnect_gap_is_never_published_as_disconnected() {
+        // A Windows checkout has CRLF endings (core.autocrlf).
+        let source = include_str!("auto_reconnect.rs").replace('\r', "");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        for write in ["ConnectionState::Disconnected)", ".disconnect().await"] {
+            assert!(!code.contains(write), "the loop writes `{write}`");
+        }
+        let teardown = &code[code.find("Action::TearDown { cause } => {").unwrap()..];
+        assert!(teardown.contains(".disconnect_to(ConnectionState::Reconnecting {"));
+        let dial = &code[code.find("async fn dial(").unwrap()..];
+        let dial = &dial[..dial.find("\n    }\n").unwrap()];
+        assert!(
+            dial.matches("vm.set_reconnecting(attempt,").count() >= 3,
+            "every outcome of a dial that does not connect stays `Reconnecting`"
+        );
+    }
+
     /// REVIEW-WIN2-002 generalised (REVIEW-AND2-001), the wiring of
     /// `reconnect_policy::after_teardown` (its table is tested there): the
     /// key is read BEFORE the teardown clears it, asked only after the

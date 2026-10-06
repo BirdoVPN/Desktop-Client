@@ -92,9 +92,37 @@ pub fn platform_is_blocking() -> bool {
 /// service when the VPN drops unexpectedly. Kept as a plain async fn to shrink
 /// the IPC attack surface (the frontend never invoked it).
 pub async fn activate_killswitch() -> Result<bool, String> {
-    let result = activate_platform_block().await;
+    let result = unless_turned_off(activate_platform_block(), deactivate_platform_block).await;
     blocking_may_have_changed();
     result
+}
+
+/// Run `engage` (which reports whether it put a block up), then make sure the
+/// user still wants it, lifting it through `lift` if not.
+///
+/// An activation reads `KILLSWITCH_ENABLED` BEFORE its firewall load, and the
+/// block is only reported as up (`platform_is_blocking()`) once the load has
+/// committed — a WFP transaction, a pfctl or iptables run, milliseconds to
+/// hundreds of them. A Kill Switch OFF that lands inside that window clears
+/// the intent, finds no block yet and so lifts nothing; the load then commits
+/// a block the user has just turned off. In the reconnect gap the next dial
+/// would not re-engage it, but nothing would lift it either: in Windows
+/// lockdown it was then held for the rest of the session and kept by the
+/// give-up. Re-reading the intent after the load closes the window from this
+/// side, as the OFF's own `platform_is_blocking()` check closes it from the
+/// other: with both SeqCst, at least one of the two sees the other's write.
+async fn unless_turned_off<E, L, LF>(engage: E, lift: L) -> Result<bool, String>
+where
+    E: std::future::Future<Output = Result<bool, String>>,
+    L: FnOnce() -> LF,
+    LF: std::future::Future<Output = Result<bool, String>>,
+{
+    let engaged = engage.await?;
+    if !engaged || KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+        return Ok(engaged);
+    }
+    tracing::info!("The kill switch was turned off while its block went up — lifting it");
+    lift().await.map(|_| false)
 }
 
 async fn activate_platform_block() -> Result<bool, String> {
@@ -139,13 +167,20 @@ async fn activate_platform_block() -> Result<bool, String> {
 /// Windows: point the block's relay permit at `relay` and, with `engage`, put
 /// the block-all up for a rebuild — one WFP transaction (REVIEW-WIN2-001, see
 /// `wfp::move_relay`). `engage` honours the user's kill-switch preference like
-/// [`activate_killswitch`]; a block already in force is rebuilt whatever it.
+/// [`activate_killswitch`], re-checked once the block is up the same way
+/// ([`unless_turned_off`]); a block already in force is rebuilt whatever it.
 #[cfg(target_os = "windows")]
 pub(crate) async fn move_relay(
     relay: crate::vpn::wfp_policy::Relay,
     engage: bool,
 ) -> Result<(), String> {
-    let result = wfp::move_relay(relay, engage && KILLSWITCH_ENABLED.load(Ordering::SeqCst)).await;
+    let engage = engage && KILLSWITCH_ENABLED.load(Ordering::SeqCst);
+    let result = unless_turned_off(
+        async move { wfp::move_relay(relay, engage).await.map(|()| engage) },
+        deactivate_platform_block,
+    )
+    .await
+    .map(|_| ());
     blocking_may_have_changed();
     result
 }
@@ -204,24 +239,26 @@ async fn deactivate_platform_block() -> Result<bool, String> {
 /// The frontend persists the preference first, then calls this. Behaviour:
 /// - enabled=true, session active  → arm now (init WFP + set intent; activate
 ///   immediately in lockdown mode).
-/// - enabled=false, session active → clear the intent so a later drop won't
+/// - enabled=true, no active session → no-op; the persisted preference
+///   applies at next connect.
+/// - enabled=false, in ANY state → clear the intent so a later drop won't
 ///   block, and lift any block currently active; WFP stays initialized and the
-///   disconnect path fully cleans up.
-/// - no active session → no-op; the persisted preference applies at next connect.
+///   disconnect path fully cleans up. Not gated on a session: the UI sends an
+///   OFF with no session only while a block is up (`killSwitchLiveApplies`),
+///   and that is exactly the block the user wants gone. Gated, it was saved
+///   and dropped here, and the block stayed until the next connect.
 #[tauri::command]
 pub async fn set_killswitch_live(
     enabled: bool,
     app: AppHandle,
     vpn_manager: State<'_, VpnManager>,
 ) -> Result<bool, IpcError> {
-    let state = vpn_manager.get_state().await;
-    let active = state.is_tunnel_active() || state.can_disconnect();
-    if !active {
-        tracing::debug!("set_killswitch_live: no active session — applies at next connect");
-        return Ok(false);
-    }
-
     if enabled {
+        let state = vpn_manager.get_state().await;
+        if !(state.is_tunnel_active() || state.can_disconnect()) {
+            tracing::debug!("set_killswitch_live: no active session — applies at next connect");
+            return Ok(false);
+        }
         // arm() re-reads the (already-persisted) preference and initializes WFP,
         // engaging the reactive protection for the live session.
         arm(&app)
@@ -244,7 +281,7 @@ pub async fn set_killswitch_live(
             let _ = deactivate_killswitch().await;
         }
 
-        tracing::info!("Kill switch softened live for the active session (intent cleared)");
+        tracing::info!("Kill switch softened live (intent cleared, any block lifted)");
         Ok(true)
     }
 }
@@ -1037,14 +1074,18 @@ async fn pf_deactivate_blocking() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Every test that writes `KILLSWITCH_ENABLED` holds this, so one test's
+    /// armed intent is never another's precondition.
+    static INTENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// F3: an OFF preference must clear a stale armed intent (left by the
     /// auto-reconnect give-up branch, which lifts the block but never clears
     /// the flag), or the next user connect's drop blocks against the
     /// preference and (Unix) `holds_block_while_connected()` keeps the
-    /// block-all engaged for the rest of the session. Only this test touches
-    /// `KILLSWITCH_ENABLED`, so it needs no serialisation against the others.
+    /// block-all engaged for the rest of the session.
     #[tokio::test]
     async fn arm_with_preference_off_clears_stale_armed_intent() {
+        let _intent = INTENT.lock().await;
         KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
         assert!(
             is_enabled(),
@@ -1061,5 +1102,153 @@ mod tests {
         // Idempotent from the cleared state too.
         assert_eq!(arm_with_preference(false).await, Ok(false));
         assert!(!is_enabled());
+    }
+
+    /// Proposed row 1 (MR-734): Kill Switch OFF lands while a reconnect
+    /// attempt's block is still going up. The OFF finds no block yet, so the
+    /// activation that committed after it must lift the block itself, and
+    /// report that none is held.
+    #[tokio::test]
+    async fn an_off_that_lands_while_the_block_goes_up_lifts_it() {
+        let _intent = INTENT.lock().await;
+        KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+        let lifted = AtomicBool::new(false);
+
+        let result = unless_turned_off(
+            async {
+                // The firewall load is in flight; set_killswitch_live(false)
+                // clears the intent and sees nothing to lift.
+                KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+                Ok(true)
+            },
+            || async {
+                lifted.store(true, Ordering::SeqCst);
+                Ok(true)
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(false), "a block the user turned off is not held");
+        assert!(
+            lifted.load(Ordering::SeqCst),
+            "the block that committed after the OFF must be lifted"
+        );
+    }
+
+    /// The re-check lifts only what the user turned off: an intent still on
+    /// keeps its block, and an activation that put nothing up (the intent was
+    /// already off, or the load failed) has nothing to lift.
+    #[tokio::test]
+    async fn the_recheck_lifts_nothing_the_user_still_wants() {
+        let _intent = INTENT.lock().await;
+        let lift = |lifted: &'static AtomicBool| {
+            move || async move {
+                lifted.store(true, Ordering::SeqCst);
+                Ok(true)
+            }
+        };
+
+        static KEPT: AtomicBool = AtomicBool::new(false);
+        KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+        assert_eq!(
+            unless_turned_off(async { Ok(true) }, lift(&KEPT)).await,
+            Ok(true)
+        );
+        assert!(
+            !KEPT.load(Ordering::SeqCst),
+            "the switch is on: the block stays"
+        );
+
+        static SKIPPED: AtomicBool = AtomicBool::new(false);
+        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+        assert_eq!(
+            unless_turned_off(async { Ok(false) }, lift(&SKIPPED)).await,
+            Ok(false)
+        );
+        assert!(!SKIPPED.load(Ordering::SeqCst), "no block went up");
+
+        static FAILED: AtomicBool = AtomicBool::new(false);
+        let failed = unless_turned_off(async { Err("load failed".to_string()) }, lift(&FAILED));
+        assert_eq!(failed.await, Err("load failed".to_string()));
+        assert!(
+            !FAILED.load(Ordering::SeqCst),
+            "a failed load is reported as such"
+        );
+    }
+
+    /// Proposed row 1 (MR-734): an OFF is applied in every state. v1.4.45 sat
+    /// in `disconnected` between reconnect attempts and this command returned
+    /// before clearing anything; #220 keeps the gap in `reconnecting`, and
+    /// this pins the other half — the session gate guards ON only, so an OFF
+    /// with the block up and no session (the case the UI sends,
+    /// `killSwitchLiveApplies`) is not saved and dropped.
+    #[test]
+    fn an_off_is_not_gated_on_a_live_session() {
+        // A Windows checkout has CRLF endings (core.autocrlf).
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let live = &source[source.find("pub async fn set_killswitch_live(").unwrap()..];
+        let live = &live[..live.find("\n}\n").unwrap()];
+        let off = live
+            .find("KILLSWITCH_ENABLED.store(false")
+            .expect("the OFF clears the intent");
+        let gate = live
+            .find("no active session")
+            .expect("ON still waits for a session");
+        let on = live.find("if enabled {").expect("ON branch");
+        let off_branch = live.find("} else {").expect("OFF branch");
+        assert!(
+            on < gate && gate < off_branch && off_branch < off,
+            "the no-session return must sit inside the ON branch, never ahead of the OFF"
+        );
+    }
+
+    /// Row 1: every block-all goes up through this module, where the intent
+    /// is read before the load and re-read after it ([`unless_turned_off`]).
+    /// The lockdown re-bake in tunnel.rs called `wfp::activate_blocking`
+    /// directly, so an OFF that lifted the block just before it ran was
+    /// undone for the rest of the session.
+    #[test]
+    fn no_block_all_is_engaged_around_the_intent() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root.clone()];
+        let mut offenders = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // The backends themselves, and this module.
+                if !rel.ends_with(".rs")
+                    || [
+                        "commands/killswitch.rs",
+                        "vpn/wfp.rs",
+                        "vpn/firewall_linux.rs",
+                    ]
+                    .contains(&rel.as_str())
+                {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for call in [
+                    "wfp::activate_blocking(",
+                    "firewall_linux::activate_blocking(",
+                ] {
+                    if text.contains(call) {
+                        offenders.push(format!("{rel}: {call}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "engaged around the intent: {offenders:?}"
+        );
     }
 }
