@@ -753,7 +753,7 @@ fn key_may_still_exist(keystore: &Result<Option<Vec<u8>>, String>, key_file: &Ke
 /// not a key). Review of #222 (P2): the second case used to count as "cannot
 /// be read right now" too, so the file stayed unverified on every load and
 /// every save was refused, with no way out. Both now quarantine the file
-/// (settings.json.tampered) instead of leaving it for a save to silently
+/// (settings.json.tampered-…, [`aside_path`]) instead of leaving it for a save to silently
 /// overwrite — the user's data stays recoverable and the reset is visible on
 /// disk — and the defaults load as what is saved.
 fn no_verifying_key(path: &Path, key_may_still_exist: bool) -> Loaded {
@@ -766,8 +766,7 @@ fn no_verifying_key(path: &Path, key_may_still_exist: bool) -> Loaded {
     tracing::warn!(
         "Settings HMAC verification failed — tampered, or its key is gone. Resetting to defaults."
     );
-    let quarantine = path.with_file_name("settings.json.tampered");
-    if let Err(e) = fs::rename(path, &quarantine) {
+    if let Err(e) = fs::rename(path, aside_path(path, "tampered")) {
         tracing::warn!("Could not preserve the unverified settings file: {}", e);
     }
     Loaded::Saved(AppSettings::default())
@@ -1030,33 +1029,75 @@ pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<
 }
 
 /// Put the settings back to their defaults: the way out of a file that cannot
-/// be verified (`settings_unverified`) when its key source stays unreadable,
-/// offered by the UI and run only when the user chooses it.
+/// be verified (`settings_unverified`) when its key source stays unreadable.
+/// The UI asks the user to confirm first, and this re-checks under the
+/// settings lock ([`resettable`]): only a file that STILL cannot be verified
+/// is reset. `Ok(false)`: it verifies again (the key came back), and nothing
+/// was touched.
 ///
-/// The file is set aside as settings.json.unverified, never deleted, so the
-/// user's settings are still on disk should the key come back. The defaults
-/// are then saved like any save: with the credential store unreachable that
-/// signs them with a new key in the key file, which the store adopts once it
-/// answers again (`sync_hmac_key_sources`).
+/// The file is set aside under a timestamped name (`settings.json.unverified-…`,
+/// [`aside_path`]), not deleted — but for manual recovery only: nothing in the
+/// app reads it again. The defaults are signed like any save, which with the
+/// credential store unreachable mints a new key in the key file; once the
+/// store answers again, `sync_hmac_key_sources` writes that new key over the
+/// old one there, after which the set-aside file cannot be verified by the
+/// app at all. The OS launch-at-login entry is set to the defaults' autostart,
+/// so the two agree; the UI then re-reads the settings and rebuilds a live
+/// session on them.
 #[tauri::command]
-pub async fn reset_settings(app: AppHandle) -> Result<AppSettings, IpcError> {
+pub async fn reset_settings(app: AppHandle) -> Result<bool, IpcError> {
     off_the_runtime(move || {
         let _write = SETTINGS_WRITE.lock();
+        if !resettable(load_settings(&app))? {
+            tracing::info!("Settings verify again — nothing to reset");
+            return Ok(false);
+        }
         let path = get_settings_path(&app).map_err(IpcError::unknown)?;
-        set_aside(&path)?;
+        set_aside(&path, "unverified")?;
         let defaults = AppSettings::default();
         save_settings_inner(&app, &defaults).map_err(IpcError::unknown)?;
         crate::utils::crash_report::set_opted_in(defaults.crash_reports_enabled);
+        if let Err(e) = apply_autostart(&app, defaults.autostart) {
+            tracing::warn!("Settings reset, but launch-at-login was not updated: {}", e);
+        }
         tracing::warn!("Settings reset to their defaults at the user's request");
-        Ok(defaults)
+        Ok(true)
     })
     .await
 }
 
-/// Move settings.json aside as settings.json.unverified (nothing to do when
-/// there is none).
-fn set_aside(path: &Path) -> Result<(), IpcError> {
-    match fs::rename(path, path.with_file_name("settings.json.unverified")) {
+/// Whether a reset may go ahead over what a load found: only over a file that
+/// still cannot be verified. One that verifies again is left alone
+/// (`Ok(false)`), and a load that failed outright is reported.
+fn resettable(loaded: Result<Loaded, LoadError>) -> Result<bool, IpcError> {
+    match loaded? {
+        Loaded::Unverified(_) => Ok(true),
+        Loaded::Saved(_) => Ok(false),
+    }
+}
+
+/// Where to move settings.json aside to: `settings.json.<tag>-<UTC time>`,
+/// with a counter when that name is taken. A fixed name was replaced by the
+/// next quarantine or reset (a rename onto an existing file replaces it on
+/// Windows), destroying the copy an earlier one had kept.
+fn aside_path(path: &Path, tag: &str) -> PathBuf {
+    let base = format!(
+        "settings.json.{tag}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    );
+    let mut candidate = path.with_file_name(&base);
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = path.with_file_name(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Move settings.json aside ([`aside_path`]); nothing to do when there is
+/// none.
+fn set_aside(path: &Path, tag: &str) -> Result<(), IpcError> {
+    match fs::rename(path, aside_path(path, tag)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(IpcError::unknown(format!(
             "Could not set the settings file aside: {e}"
         ))),
@@ -1076,31 +1117,38 @@ fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, IpcErr
     let _write = SETTINGS_WRITE.lock();
     let mut settings = verified(load_settings(app)?)?;
 
-    #[cfg(windows)]
-    set_autostart_windows(app, enabled).map_err(IpcError::unknown)?;
-
-    #[cfg(not(windows))]
-    {
-        use tauri_plugin_autostart::ManagerExt;
-
-        let autostart = app.autolaunch();
-
-        if enabled {
-            autostart
-                .enable()
-                .map_err(|e| IpcError::unknown(format!("Failed to enable autostart: {}", e)))?;
-        } else {
-            autostart
-                .disable()
-                .map_err(|e| IpcError::unknown(format!("Failed to disable autostart: {}", e)))?;
-        }
-    }
+    apply_autostart(app, enabled).map_err(IpcError::unknown)?;
 
     // Also update settings file
     settings.autostart = enabled;
     save_settings_inner(app, &settings).map_err(IpcError::unknown)?;
 
     Ok(true)
+}
+
+/// Point the OS launch-at-login entry at `enabled`: the elevated launch task
+/// on Windows, the autostart plugin elsewhere.
+fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        set_autostart_windows(app, enabled)
+    }
+
+    #[cfg(not(windows))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+
+        let autostart = app.autolaunch();
+        if enabled {
+            autostart
+                .enable()
+                .map_err(|e| format!("Failed to enable autostart: {}", e))
+        } else {
+            autostart
+                .disable()
+                .map_err(|e| format!("Failed to disable autostart: {}", e))
+        }
+    }
 }
 
 /// The launch-at-login task's name (the uninstaller removes it by name).
@@ -1880,11 +1928,7 @@ mod tests {
         let read = autostart
             .find("verified(load_settings(app)?)?")
             .expect("the read");
-        assert!(
-            read < autostart
-                .find("set_autostart_windows(app, enabled)")
-                .unwrap()
-        );
+        assert!(read < autostart.find("apply_autostart(app, enabled)").unwrap());
     }
 
     /// Review of #222 (P2): the refusal carries its own code, so the UI can
@@ -1905,16 +1949,70 @@ mod tests {
         assert_eq!(unreadable.expect_err("refused").code, IpcErrorCode::Unknown);
     }
 
+    fn names_in(dir: &Path, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(prefix))
+            .collect();
+        names.sort();
+        names
+    }
+
     /// The reset keeps the unverifiable file on disk, and tolerates none.
+    /// Round 3 of the review (P3.1): a second reset (or quarantine) keeps the
+    /// first copy — a fixed aside name was replaced by the next one.
     #[test]
-    fn a_reset_sets_the_unverifiable_file_aside() {
+    fn every_reset_and_quarantine_keeps_its_own_copy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        fs::write(&path, "{}").unwrap();
-        assert_eq!(set_aside(&path), Ok(()));
-        assert!(!path.exists());
-        assert!(dir.path().join("settings.json.unverified").exists());
-        assert_eq!(set_aside(&path), Ok(()), "nothing to set aside is fine");
+        for round in ["first", "second"] {
+            fs::write(&path, round).unwrap();
+            assert_eq!(set_aside(&path, "unverified"), Ok(()));
+            assert!(!path.exists());
+        }
+        let kept = names_in(dir.path(), "settings.json.unverified-");
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        let contents: Vec<String> = kept
+            .iter()
+            .map(|n| fs::read_to_string(dir.path().join(n)).unwrap())
+            .collect();
+        assert!(contents.contains(&"first".to_string()));
+        assert_eq!(
+            set_aside(&path, "unverified"),
+            Ok(()),
+            "nothing to set aside is fine"
+        );
+
+        for round in ["one", "two"] {
+            fs::write(&path, round).unwrap();
+            let _ = no_verifying_key(&path, false);
+        }
+        assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 2);
+    }
+
+    /// Round 3 of the review (P3.1): the reset re-checks under the settings
+    /// lock and resets only a file that still cannot be verified.
+    #[test]
+    fn a_reset_goes_ahead_only_over_a_file_that_still_cannot_be_verified() {
+        assert_eq!(
+            resettable(Ok(Loaded::Unverified(AppSettings::default()))),
+            Ok(true)
+        );
+        assert_eq!(
+            resettable(Ok(Loaded::Saved(AppSettings::default()))),
+            Ok(false),
+            "the key came back: nothing to reset"
+        );
+        assert!(resettable(Err(LoadError::Unreadable("busy".into()))).is_err());
+
+        let source = include_str!("settings.rs").replace('\r', "");
+        let reset = &source[source.find("pub async fn reset_settings(").unwrap()..];
+        let reset = &reset[..reset.find("\n}\n").unwrap()];
+        let check = reset.find("resettable(load_settings(&app))?").unwrap();
+        assert!(reset.find("SETTINGS_WRITE.lock()").unwrap() < check);
+        assert!(check < reset.find("set_aside(&path").unwrap());
+        assert!(reset.contains("apply_autostart(&app, defaults.autostart)"));
     }
 
     /// Review of #222 (P3.7): a settings file that could not be READ is not
@@ -1955,8 +2053,9 @@ mod tests {
         let loaded = no_verifying_key(&path, false);
         assert!(matches!(loaded, Loaded::Saved(_)), "saves may go ahead");
         assert!(!path.exists());
-        assert!(
-            dir.path().join("settings.json.tampered").exists(),
+        assert_eq!(
+            names_in(dir.path(), "settings.json.tampered-").len(),
+            1,
             "kept, not deleted"
         );
     }
@@ -2076,6 +2175,7 @@ mod tests {
             "pub async fn save_settings(",
             "pub async fn set_crash_reports_enabled(",
             "pub async fn set_autostart(",
+            "pub async fn reset_settings(",
         ] {
             let body = &source[source.find(command).expect(command)..];
             let body = &body[..body.find("\n}\n").expect("end of fn")];

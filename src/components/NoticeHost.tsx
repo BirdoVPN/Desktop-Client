@@ -10,6 +10,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { X } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import { brand, hairline, motion as motionTokens, status, surface, white } from '@/lib/birdo-theme';
+import { ResetSettingsDialog } from '@/components/ResetSettingsDialog';
 
 export const NOTICE_MS = 4_500;
 /** Long enough to reach the button without hurrying. */
@@ -29,52 +30,56 @@ export function NoticeHost() {
   }, [notice, dismissNotice]);
 
   return (
-    <div
-      role="status"
-      aria-live="polite"
-      data-modal-exempt
-      className="pointer-events-none absolute inset-x-0 bottom-20 z-[60] flex justify-center px-5"
-    >
-      <AnimatePresence>
-        {notice && (
-          <motion.div
-            key={notice.id}
-            className="birdo-notice pointer-events-auto flex max-w-sm items-center gap-3 rounded-birdo-md px-4 py-3 text-xs font-medium shadow-lg"
-            style={{
-              backgroundColor: surface.s3,
-              border: `1px solid ${notice.tone === 'danger' ? status.redBorder : hairline.strong}`,
-              color: white.w100,
-            }}
-            initial={{ opacity: 0, y: 12 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 12 }}
-            transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
-          >
-            <span className="flex-1 leading-snug">{notice.text}</span>
-            {notice.actionLabel && notice.onAction && (
+    <>
+      {/* The confirmation a notice's "Reset settings" opens. */}
+      <ResetSettingsDialog />
+      <div
+        role="status"
+        aria-live="polite"
+        data-modal-exempt
+        className="pointer-events-none absolute inset-x-0 bottom-20 z-[60] flex justify-center px-5"
+      >
+        <AnimatePresence>
+          {notice && (
+            <motion.div
+              key={notice.id}
+              className="birdo-notice pointer-events-auto flex max-w-sm items-center gap-3 rounded-birdo-md px-4 py-3 text-xs font-medium shadow-lg"
+              style={{
+                backgroundColor: surface.s3,
+                border: `1px solid ${notice.tone === 'danger' ? status.redBorder : hairline.strong}`,
+                color: white.w100,
+              }}
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 12 }}
+              transition={{ duration: motionTokens.fast, ease: motionTokens.ease }}
+            >
+              <span className="flex-1 leading-snug">{notice.text}</span>
+              {notice.actionLabel && notice.onAction && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    notice.onAction?.();
+                    dismissNotice(notice.id);
+                  }}
+                  className="shrink-0 rounded-birdo-xs px-2 py-1 text-xs font-semibold hover:bg-white/10"
+                  style={{ color: brand.accentSoft }}
+                >
+                  {notice.actionLabel}
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => {
-                  notice.onAction?.();
-                  dismissNotice(notice.id);
-                }}
-                className="shrink-0 rounded-birdo-xs px-2 py-1 text-xs font-semibold hover:bg-white/10"
-                style={{ color: brand.accentSoft }}
+                aria-label="Dismiss"
+                onClick={() => dismissNotice(notice.id)}
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full hover:bg-white/10"
               >
-                {notice.actionLabel}
+                <X size={14} color={white.w60} aria-hidden />
               </button>
-            )}
-            <button
-              type="button"
-              aria-label="Dismiss"
-              onClick={() => dismissNotice(notice.id)}
-              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full hover:bg-white/10"
-            >
-              <X size={14} color={white.w60} aria-hidden />
-            </button>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </>
   );
 }

@@ -20,8 +20,11 @@ import { Settings } from '@/components/Settings';
 import { VpnSettings } from '@/screens/VpnSettings';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import {
+  askToResetSettings,
   cancelScheduledReapply,
   persistSettings,
+  resetSettings,
+  useResetPrompt,
   REAPPLY_REVERTED_COPY,
   REAPPLY_WAIT_MS,
   scheduleReapply,
@@ -29,6 +32,7 @@ import {
 import { settingsToRust } from '@/utils/helpers';
 import { resetUpdater } from '@/session/updater';
 import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
+import { ResetSettingsDialog, RESET_SETTINGS_BODY } from '@/components/ResetSettingsDialog';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
@@ -211,14 +215,36 @@ describe('a settings file that cannot be verified (review of #222)', () => {
     expect(notice?.actionLabel).toBe('Reset settings');
     expect(useAppStore.getState().settings.autoConnect).toBe(defaultSettings.autoConnect);
 
-    // The reset runs only when chosen, and then shows what is saved.
+    // The notice only ASKS (round 3 of the review): nothing is reset until
+    // the user confirms, and then the screen shows what is saved.
+    render(<ResetSettingsDialog />);
+    act(() => notice?.onAction?.());
+    expect(await screen.findByText(RESET_SETTINGS_BODY)).toBeInTheDocument();
     expect(mockedInvoke.mock.calls.some(([c]) => c === 'reset_settings')).toBe(false);
-    notice?.onAction?.();
+    mockedInvoke.mockImplementation(async (cmd: string) => (cmd === 'reset_settings' ? true : undefined));
+    await userEvent.click(screen.getByRole('button', { name: 'Reset settings' }));
     await waitFor(() => {
       const order = mockedInvoke.mock.calls.map(([c]) => c);
       expect(order.indexOf('reset_settings')).toBeGreaterThan(-1);
       expect(order.lastIndexOf('get_settings')).toBeGreaterThan(order.indexOf('reset_settings'));
     });
+    expect(useAppStore.getState().notice?.text).toBe('Your settings were reset to their defaults.');
+  });
+
+  it('the reset is not run when the confirmation is cancelled', async () => {
+    render(<ResetSettingsDialog />);
+    act(() => askToResetSettings());
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    expect(mockedInvoke.mock.calls.some(([c]) => c === 'reset_settings')).toBe(false);
+    expect(useResetPrompt.getState().open).toBe(false);
+  });
+
+  it('a file that verifies again is not reset, and the user is told', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => (cmd === 'reset_settings' ? false : undefined));
+    await resetSettings();
+    expect(useAppStore.getState().notice?.text).toBe(
+      'Your saved settings can be read again, so nothing was reset.',
+    );
   });
 
   it('any other failed save keeps the plain message, with no reset', async () => {

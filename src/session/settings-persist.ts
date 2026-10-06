@@ -13,6 +13,7 @@
  * out is silently reset to its serde default.
  */
 import { invoke } from '@tauri-apps/api/core';
+import { create } from 'zustand';
 import { settingsToRust } from '@/utils/helpers';
 import { useAppStore, type AppSettings, type ConnectionState } from '@/store/app-store';
 import { loadSettings } from '@/session/session-data';
@@ -171,20 +172,7 @@ export async function persistSettings(
     // A background mirror the user never touched must not raise a notice
     // about "that setting"; it rolls back the same way and retries next time.
     if (!opts.quiet) {
-      const err = toIpcError(e);
-      useAppStore.getState().showNotice(
-        err.code === 'settings_unverified'
-          ? {
-              text: errorCopy(err).message,
-              tone: 'danger',
-              actionLabel: 'Reset settings',
-              onAction: () => void resetSettings(),
-            }
-          : {
-              text: "Couldn't save that setting. It has been put back — please try again.",
-              tone: 'danger',
-            },
-      );
+      showSaveFailure(e, "Couldn't save that setting. It has been put back — please try again.");
     }
     return false;
   }
@@ -193,16 +181,54 @@ export async function persistSettings(
 }
 
 /**
- * The way out of `settings_unverified` (review of #222), run only when the
- * user chooses it: Rust sets the file it cannot verify aside (kept on disk as
- * settings.json.unverified) and saves the defaults, and the screen then shows
- * what is saved.
+ * The notice for a settings write Rust refused. `settings_unverified` (review
+ * of #222) says what happened and offers the reset; anything else shows
+ * `fallback`. Shared by every screen that writes settings.
+ */
+export function showSaveFailure(e: unknown, fallback: string): void {
+  const err = toIpcError(e);
+  useAppStore.getState().showNotice(
+    err.code === 'settings_unverified'
+      ? {
+          text: errorCopy(err).message,
+          tone: 'danger',
+          actionLabel: 'Reset settings',
+          onAction: askToResetSettings,
+        }
+      : { text: fallback, tone: 'danger' },
+  );
+}
+
+/** Whether the reset confirmation is open (`ResetSettingsDialog`). */
+export const useResetPrompt = create<{ open: boolean }>(() => ({ open: false }));
+
+/**
+ * Ask before resetting (round 3 of the review of #222): the reset replaces
+ * every setting with its default, so a click on an 8-second toast must not do
+ * it on its own.
+ */
+export function askToResetSettings(): void {
+  useResetPrompt.setState({ open: true });
+}
+
+/**
+ * The way out of `settings_unverified`, run only after the user confirmed it.
+ * Rust re-checks first and resets only a file that still cannot be verified
+ * (it answers `false` when the key came back, and nothing was touched); it
+ * sets the file aside and saves the defaults. The screen then shows what is
+ * saved, and a live session is rebuilt on it.
  */
 export async function resetSettings(): Promise<void> {
   try {
-    await invoke('reset_settings');
+    const reset = await invoke<boolean>('reset_settings');
     await loadSettings();
-    useAppStore.getState().showNotice({ text: 'Your settings were reset to their defaults.', tone: 'info' });
+    if (reset) scheduleReapply();
+    useAppStore.getState().showNotice({
+      text: reset
+        ? 'Your settings were reset to their defaults.'
+        : 'Your saved settings can be read again, so nothing was reset.',
+      tone: 'info',
+    });
   } catch {
     useAppStore.getState().showNotice({
       text: "Couldn't reset your settings. Please try again.",
