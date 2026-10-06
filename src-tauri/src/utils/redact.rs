@@ -268,8 +268,12 @@ pub fn sanitize_always(msg: &str) -> String {
         let result = TOKEN_RE
             .replace_all(&result, "[redacted-token]")
             .to_string();
-        let result = IPV6_RE.replace_all(&result, "[redacted-ipv6]").to_string();
-
+        // IPv4 BEFORE IPv6 (review of #222): an IPv4 address embedded in an
+        // IPv6 one (`::ffff:185.199.110.153`, NAT64 `64:ff9b::…`) went the
+        // other way round: the IPv6 pass took `::ffff:185` as a whole
+        // address and left `.199.110.153`, which no longer matched the IPv4
+        // pattern — three octets out. Now the dotted quad goes first and the
+        // IPv6 prefix after it.
         let result = IPV4_RE
             .replace_all(&result, |caps: &regex::Captures| {
                 // Only redact if all four octets are valid (0-255); otherwise
@@ -283,6 +287,8 @@ pub fn sanitize_always(msg: &str) -> String {
                 }
             })
             .to_string();
+
+        let result = IPV6_RE.replace_all(&result, "[redacted-ipv6]").to_string();
 
         let result = EMAIL_RE
             .replace_all(&result, "[redacted-email]")
@@ -400,6 +406,28 @@ mod tests {
         assert_eq!(out, "relay [redacted-ipv4]:51820 did not answer");
         // Not an address (an octet over 255): left readable.
         assert_eq!(sanitize_always("build 1.4.300.2"), "build 1.4.300.2");
+    }
+
+    /// Review of #222 (P3.5): an IPv4 address inside an IPv6 one loses every
+    /// octet too. `[::ffff:185.199.110.153]:443` used to come out as
+    /// `[[redacted-ipv6].199.110.153]:443`.
+    #[test]
+    fn an_ipv4_mapped_ipv6_address_keeps_none_of_its_octets() {
+        for raw in [
+            "connect [::ffff:185.199.110.153]:443 refused",
+            "via ::ffff:185.199.110.153 timed out",
+            "nat64 64:ff9b::185.199.110.153 unreachable",
+        ] {
+            let out = sanitize_always(raw);
+            for octet in ["185", "199", "110", "153"] {
+                assert!(!out.contains(octet), "{octet} survived in {out}");
+            }
+        }
+        assert_eq!(
+            sanitize_always("connect [::ffff:185.199.110.153]:443 refused"),
+            "connect [[redacted-ipv6]:[redacted-ipv4]]:443 refused"
+        );
+        assert_eq!(mask_ip("::ffff:185.199.110.153"), ":x:x:x:x:x:x:x");
     }
 
     /// The point of splitting the two: a message with no address in it comes
