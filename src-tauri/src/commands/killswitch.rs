@@ -614,10 +614,30 @@ static PF_BLOCKING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static PF_LOADED: AtomicBool = AtomicBool::new(false);
 
+/// The control-plane generation a connection gets through with (N5):
+/// `u64::MAX` while no block-all is loaded.
+#[cfg(target_os = "macos")]
+static PF_PERMITTED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 #[cfg(target_os = "macos")]
 fn mirror(state: &PfState) {
     PF_BLOCKING.store(state.enforcing, Ordering::SeqCst);
     PF_LOADED.store(state.loaded, Ordering::SeqCst);
+    PF_PERMITTED_GEN.store(
+        if state.loaded {
+            state.table_gen
+        } else {
+            u64::MAX
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// macOS: whether control-plane addresses of `generation` already get
+/// through — the resolver's lock-free fast path (N5).
+#[cfg(target_os = "macos")]
+pub fn control_plane_permits(generation: u64) -> bool {
+    PF_PERMITTED_GEN.load(Ordering::SeqCst) >= generation
 }
 
 /// macOS: is a block-all of ours loaded? Twin of `wfp::is_blocking()` /
@@ -979,9 +999,11 @@ async fn pf_activate_blocking() -> Result<bool, String> {
 /// while it waited.
 #[cfg(target_os = "macos")]
 fn pf_inputs() -> pf_policy::Inputs {
+    let (control_plane, control_plane_gen) = pf_policy::control_plane();
     let inputs = pf_policy::Inputs {
         relay: vpn_server_ip(),
-        control_plane: pf_policy::control_plane_addresses(),
+        control_plane,
+        control_plane_gen,
         // pf has no application condition, so the control-plane permit
         // matches the euid we run as (root: arm() refuses otherwise) and
         // pf_policy scopes its DESTINATION to the control-plane table.
@@ -1023,7 +1045,11 @@ fn ensure_pf_watchdog() {
 async fn pf_watchdog_tick() {
     let mut pf = PF.lock().await;
     let (loaded, wanted) = (pf.loaded, pf.wanted);
-    let outcome = pf.watchdog(&Pfctl, pf_inputs);
+    let outcome = pf.watchdog(
+        &Pfctl,
+        pf_inputs,
+        crate::api::doh_resolver::control_plane_generation(),
+    );
     mirror(&pf);
     drop(pf);
     let Some(result) = outcome else {
@@ -1119,28 +1145,25 @@ async fn pf_lift_if_loaded() -> Result<bool, String> {
     result
 }
 
-/// macOS: a DoH answer just gave one of our hosts an address the
-/// control-plane table does not hold yet (P2-4). A held block is re-loaded NOW,
-/// before the connection that needs it is dialled: the user's Connect under a
-/// held block used to meet `block drop all` until a re-dial re-loaded it.
+/// macOS: a DoH answer brought control-plane addresses of `generation` that
+/// the held block's table does not cover (P2-4, N5). The block is re-loaded
+/// NOW, before the resolver caches or hands them out; `Err` makes it cache
+/// nothing, and the watchdog retries by generation.
 #[cfg(target_os = "macos")]
-pub async fn control_plane_learned() {
+pub async fn control_plane_learned(generation: u64) -> Result<(), String> {
     let mut pf = PF.lock().await;
-    if !pf.loaded {
-        return;
-    }
-    let inputs = pf_inputs();
-    let result = pf.reload_if_loaded(&Pfctl, &inputs);
+    let result = pf.control_plane_learned(&Pfctl, pf_inputs, generation);
     mirror(&pf);
     drop(pf);
-    match result {
-        Ok(()) => tracing::info!("Kill switch: control-plane table re-loaded with a new address"),
+    match &result {
+        Ok(()) => tracing::info!("Kill switch: control-plane table covers the new address"),
         Err(e) => tracing::warn!(
             "Kill switch: re-loading the control-plane table failed: {}",
             e
         ),
     }
     blocking_may_have_changed();
+    result
 }
 
 /// Deactivate pf blocking: drop the block-all main ruleset and fall back to the

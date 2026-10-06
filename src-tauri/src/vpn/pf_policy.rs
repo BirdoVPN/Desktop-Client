@@ -213,12 +213,16 @@ pub(crate) fn block_all_ruleset(b: &BlockAll<'_>) -> String {
 /// Read whenever the ruleset is (re-)loaded, and a held block is re-loaded
 /// the moment a DoH answer brings an address it does not hold yet
 /// (`killswitch::control_plane_learned`), before that address is dialled.
-pub(crate) fn control_plane_addresses() -> Vec<Ipv4Addr> {
+///
+/// With the generation that covers every remembered address (N5): a loaded
+/// block records it, and a newer one means its table is out of date.
+pub(crate) fn control_plane() -> (Vec<Ipv4Addr>, u64) {
     let mut addrs = crate::vpn::doh::bootstrap_addrs();
-    addrs.extend(crate::api::doh_resolver::control_plane_v4());
+    let (learned, generation) = crate::api::doh_resolver::control_plane_v4();
+    addrs.extend(learned);
     addrs.sort_unstable();
     addrs.dedup();
-    addrs
+    (addrs, generation)
 }
 
 /// The IPv6 leak block (F-001), as the bytes we ship: `resources/pf/` rather
@@ -419,6 +423,8 @@ fn because(r: &Result<(), String>) -> String {
 pub(crate) struct Inputs {
     pub relay: Option<Ipv4Addr>,
     pub control_plane: Vec<Ipv4Addr>,
+    /// The control-plane generation `control_plane` covers (N5).
+    pub control_plane_gen: u64,
     pub euid: u32,
     pub lan_sharing: bool,
 }
@@ -452,6 +458,8 @@ pub(crate) struct PfState {
     /// N8: a ruleset of ours left by a previous run that the startup
     /// cleanup could not remove — retried by the watchdog until it goes.
     pub stale: bool,
+    /// N5: the control-plane generation the LOADED block-all's table covers.
+    pub table_gen: u64,
 }
 
 impl PfState {
@@ -464,7 +472,14 @@ impl PfState {
             tunnel: None,
             wanted: false,
             stale: false,
+            table_gen: 0,
         }
+    }
+
+    /// Whether a connection to control-plane addresses of `generation` gets
+    /// through: no block-all loaded, or one whose table covers it (N5).
+    pub(crate) fn permits(&self, generation: u64) -> bool {
+        !self.loaded || self.table_gen >= generation
     }
 
     /// The block-all for `inputs` and the recorded tunnel.
@@ -648,7 +663,9 @@ impl PfState {
         let seen = seen.map_err(|e| {
             format!("pf could not be read back after loading the block-all ({e}); it is treated as in force")
         })?;
-        self.check(&seen)
+        self.check(&seen)?;
+        self.table_gen = inputs.control_plane_gen;
+        Ok(())
     }
 
     /// Lift the block-all onto the right baseline — the IPv6 leak block while
@@ -736,6 +753,7 @@ impl PfState {
         &mut self,
         pf: &impl Pf,
         inputs: impl FnOnce() -> Inputs,
+        control_plane_gen: u64,
     ) -> Option<Result<(), String>> {
         if self.stale && !self.ipv6_baseline {
             return match self.reconcile(pf) {
@@ -751,11 +769,30 @@ impl PfState {
             return Some(self.disengage(pf));
         }
         let seen = Observed::read(pf);
-        if seen.as_ref().is_ok_and(|s| self.check(s).is_ok()) {
+        // N5: a table older than what DoH has since learned is a re-load
+        // that failed — retried here.
+        if seen.as_ref().is_ok_and(|s| self.check(s).is_ok()) && self.table_gen >= control_plane_gen
+        {
             self.record(&seen);
             return None;
         }
         Some(self.engage(pf, &inputs()))
+    }
+
+    /// N5: a DoH answer brought control-plane addresses of `generation`. A
+    /// loaded block-all whose table does not cover them is re-loaded NOW,
+    /// before they are cached or dialled. `Err`: they would meet
+    /// `block drop all` — the resolver then caches nothing.
+    pub(crate) fn control_plane_learned(
+        &mut self,
+        pf: &impl Pf,
+        inputs: impl FnOnce() -> Inputs,
+        generation: u64,
+    ) -> Result<(), String> {
+        if self.permits(generation) {
+            return Ok(());
+        }
+        self.reload_if_loaded(pf, &inputs())
     }
 
     /// The startup cleanup (N8): pf rulesets survive the process, so a crash
@@ -1143,7 +1180,7 @@ mod tests {
 
     #[test]
     fn the_control_plane_set_holds_every_doh_bootstrap_address() {
-        let set = control_plane_addresses();
+        let (set, _) = control_plane();
         for ip in crate::vpn::doh::bootstrap_addrs() {
             assert!(set.contains(&ip), "{ip} missing from {set:?}");
         }
@@ -1496,8 +1533,18 @@ mod tests {
         Inputs {
             relay: Some(Ipv4Addr::new(203, 0, 113, 7)),
             control_plane: vec![DOH],
+            control_plane_gen: 1,
             euid: 0,
             lan_sharing: false,
+        }
+    }
+
+    /// The inputs once DoH has learned API's address (generation 2).
+    fn inputs_with_api() -> Inputs {
+        Inputs {
+            control_plane: vec![DOH, API],
+            control_plane_gen: 2,
+            ..inputs()
         }
     }
 
@@ -1640,7 +1687,7 @@ mod tests {
     fn the_watchdog_leaves_a_healthy_block_alone() {
         let (pf, mut state) = engaged();
         let loads = pf.loads.get();
-        assert_eq!(state.watchdog(&pf, inputs), None);
+        assert_eq!(state.watchdog(&pf, inputs, 1), None);
         assert_eq!(pf.loads.get(), loads, "nothing re-loaded");
         assert!(state.enforcing);
     }
@@ -1652,7 +1699,7 @@ mod tests {
         let (pf, mut state) = engaged();
         let old = state.token.unwrap();
         pf.third_party_disables();
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert!(state.enforcing && pf.running());
         assert_ne!(state.token, Some(old), "the dead token was replaced");
         assert!(
@@ -1666,7 +1713,7 @@ mod tests {
     fn the_watchdog_restores_a_block_another_tool_replaced() {
         let (pf, mut state) = engaged();
         pf.load_default().unwrap();
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert!(block_all_loaded(&pf.rules().unwrap()));
     }
 
@@ -1676,7 +1723,7 @@ mod tests {
     fn the_watchdog_retries_an_owed_lift_when_the_kill_switch_is_off() {
         let (pf, mut state) = engaged();
         state.wanted = false;
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert!(!state.loaded && !pf.running());
     }
 
@@ -1697,7 +1744,7 @@ mod tests {
             flush_fails: false,
             ..stuck
         };
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert!(!state.loaded);
         assert!(!block_all_loaded(&pf.rules().unwrap()));
     }
@@ -1720,7 +1767,7 @@ mod tests {
         };
         pf.load_default().unwrap();
         let loads = pf.loads.get();
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert!(!block_all_loaded(&pf.rules().unwrap()), "not re-imposed");
         assert_eq!(pf.loads.get(), loads, "no block-all loaded");
         assert!(!state.loaded);
@@ -1764,7 +1811,7 @@ mod tests {
     fn the_watchdog_ignores_a_block_it_does_not_hold() {
         let pf = FakePf::default();
         let mut state = PfState::new();
-        assert_eq!(state.watchdog(&pf, inputs), None);
+        assert_eq!(state.watchdog(&pf, inputs, 1), None);
         assert_eq!(pf.loads.get(), 0);
     }
 
@@ -2028,7 +2075,7 @@ mod tests {
     fn the_watchdog_restores_a_lost_tunnel_permit() {
         let (pf, mut state) = engaged();
         pf.load(&ruleset(None, &[DOH])).unwrap();
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert_eq!(
             tunnel_permits(&pf.rules().unwrap()),
             vec!["utun4".to_string()]
@@ -2106,7 +2153,7 @@ mod tests {
         let mut state = PfState::new();
         assert!(matches!(state.reconcile(&stuck), Some(Err(_))));
         assert!(state.stale && !state.loaded && !state.enforcing);
-        assert!(matches!(state.watchdog(&stuck, inputs), Some(Err(_))));
+        assert!(matches!(state.watchdog(&stuck, inputs, 1), Some(Err(_))));
         assert!(state.stale, "still there, still owed");
 
         let pf = FakePf {
@@ -2114,10 +2161,10 @@ mod tests {
             flush_fails: false,
             ..stuck
         };
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert!(!state.stale);
         assert!(!marker_loaded(&pf.rules().unwrap()));
-        assert_eq!(state.watchdog(&pf, inputs), None, "and then left alone");
+        assert_eq!(state.watchdog(&pf, inputs, 1), None, "and then left alone");
     }
 
     /// A new session's own ruleset replaces a stale remainder: no clean-up
@@ -2138,7 +2185,7 @@ mod tests {
         };
         assert_eq!(state.ipv6_on(&pf), Ok(()));
         assert!(!state.stale);
-        assert_eq!(state.watchdog(&pf, inputs), None);
+        assert_eq!(state.watchdog(&pf, inputs, 1), None);
         assert!(
             marker_loaded(&pf.rules().unwrap()),
             "the session's block stays"
@@ -2158,7 +2205,7 @@ mod tests {
     fn the_watchdog_leaves_a_healthy_ipv6_block_alone() {
         let (pf, mut state) = ipv6_only();
         let loads = pf.loads.get();
-        assert_eq!(state.watchdog(&pf, inputs), None);
+        assert_eq!(state.watchdog(&pf, inputs, 1), None);
         assert_eq!(pf.loads.get(), loads);
     }
 
@@ -2168,7 +2215,7 @@ mod tests {
     fn the_watchdog_restores_an_ipv6_block_another_tool_replaced() {
         let (pf, mut state) = ipv6_only();
         pf.load_default().unwrap();
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         let rules = pf.rules().unwrap();
         assert!(marker_loaded(&rules) && rules.contains("inet6"), "{rules}");
     }
@@ -2177,7 +2224,7 @@ mod tests {
     fn the_watchdog_restores_an_ipv6_block_another_tool_disabled() {
         let (pf, mut state) = ipv6_only();
         pf.third_party_disables();
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert!(pf.running(), "a new reference of ours");
     }
 
@@ -2187,7 +2234,7 @@ mod tests {
         let (pf, mut state) = ipv6_only();
         pf.load("pass quick inet6 from any to any keep state")
             .unwrap();
-        assert_eq!(state.watchdog(&pf, inputs), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, 1), Some(Ok(())));
         assert!(marker_loaded(&pf.rules().unwrap()));
     }
 
@@ -2196,6 +2243,63 @@ mod tests {
         assert!(marker_loaded("anchor \"com.birdo.vpn\" all"));
         assert!(!marker_loaded("anchor \"com.birdo.vpn.blockall\" all"));
         assert!(!marker_loaded("anchor \"com.apple/*\" all"));
+    }
+
+    // ── N5: a new control-plane address is permitted before it is dialled ─
+
+    #[test]
+    fn a_new_control_plane_address_is_let_through_before_it_is_used() {
+        let (pf, mut state) = engaged();
+        assert!(!state.permits(2));
+        assert_eq!(state.control_plane_learned(&pf, inputs_with_api, 2), Ok(()));
+        assert!(state.permits(2));
+        assert_eq!(state.table_gen, 2);
+        assert!(pf.rules().is_ok());
+        assert_eq!(pf.loads.get(), 2, "one re-load");
+    }
+
+    #[test]
+    fn an_address_the_table_already_covers_needs_no_reload() {
+        let (pf, mut state) = engaged();
+        let loads = pf.loads.get();
+        assert_eq!(state.control_plane_learned(&pf, inputs, 1), Ok(()));
+        assert_eq!(pf.loads.get(), loads);
+    }
+
+    #[test]
+    fn without_a_block_there_is_nothing_to_reload() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        assert!(state.permits(99));
+        assert_eq!(
+            state.control_plane_learned(&pf, inputs_with_api, 99),
+            Ok(())
+        );
+        assert_eq!(pf.loads.get(), 0);
+    }
+
+    /// N5: a re-load that failed is not forgotten: the table stays at its
+    /// old generation, and the watchdog retries it.
+    #[test]
+    fn a_failed_control_plane_reload_is_retried_by_the_watchdog() {
+        let (pf, mut state) = engaged();
+        let failing = FakePf {
+            load_fails: true,
+            ..pf
+        };
+        assert!(state
+            .control_plane_learned(&failing, inputs_with_api, 2)
+            .is_err());
+        assert_eq!(state.table_gen, 1);
+        assert!(!state.permits(2));
+
+        let pf = FakePf {
+            load_fails: false,
+            ..failing
+        };
+        assert_eq!(state.watchdog(&pf, inputs_with_api, 2), Some(Ok(())));
+        assert_eq!(state.table_gen, 2);
+        assert!(state.permits(2));
     }
 
     // ── P3-3: the intent, read under the lock ──────────────────────────
