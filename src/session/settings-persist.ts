@@ -395,3 +395,26 @@ function showOffForThisConnection(): void {
     endOffForThisConnection = null;
   };
 }
+
+/**
+ * The crash-report choice made on the consent screen. It goes straight to
+ * Rust through the dedicated command (it reads settings.json, flips the one
+ * field and applies the opt-in live), never through a full save of a store
+ * that has not been hydrated from Rust yet. Default OFF; a failed write
+ * leaves it OFF, the safe direction, and says so (round 4 of the review of
+ * #222: it was only logged, so a `settings_unverified` refusal offered no
+ * reset and a choice that did not stick went unmentioned).
+ */
+export async function saveConsentCrashChoice(enabled: boolean): Promise<void> {
+  useAppStore.getState().updateSettings({ crashReportsEnabled: enabled });
+  try {
+    await invoke('set_crash_reports_enabled', { enabled });
+  } catch (err) {
+    console.error('Failed to save the crash-report choice', err);
+    useAppStore.getState().updateSettings({ crashReportsEnabled: false });
+    showSaveFailure(err, CONSENT_CRASH_CHOICE_FAILED_COPY);
+  }
+}
+
+export const CONSENT_CRASH_CHOICE_FAILED_COPY =
+  "Your crash-report choice couldn't be saved. Please check it in Settings.";

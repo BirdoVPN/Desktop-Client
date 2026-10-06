@@ -22,9 +22,11 @@ import { defaultSettings, useAppStore } from '@/store/app-store';
 import {
   askToResetSettings,
   cancelScheduledReapply,
+  CONSENT_CRASH_CHOICE_FAILED_COPY,
   KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
   persistSettings,
   resetSettings,
+  saveConsentCrashChoice,
   useResetPrompt,
   REAPPLY_REVERTED_COPY,
   REAPPLY_WAIT_MS,
@@ -34,6 +36,8 @@ import { settingsToRust } from '@/utils/helpers';
 import { resetUpdater } from '@/session/updater';
 import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
 import { ResetSettingsDialog, RESET_SETTINGS_BODY } from '@/components/ResetSettingsDialog';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
@@ -294,6 +298,54 @@ describe('a kill switch OFF whose save is refused (round 4 of the review of #222
     // The next dial arms from the file, which still says ON; so does the toggle.
     act(() => useAppStore.setState({ connectionState: 'connecting' }));
     await waitFor(() => expect(killSwitch()).toHaveAttribute('aria-checked', 'true'));
+  });
+});
+
+describe('the crash-report choice on the consent screen (round 4 of the review of #222)', () => {
+  const refuse = (error: unknown) =>
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'set_crash_reports_enabled') throw error;
+      return undefined;
+    });
+
+  it('a file that cannot be verified is said so, with the reset, and the choice falls back OFF', async () => {
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    refuse({
+      code: 'settings_unverified',
+      message: 'the settings file could not be verified, so it was left as it is',
+      retryable: true,
+      retry_after_secs: null,
+    });
+    await saveConsentCrashChoice(true);
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(false);
+    const notice = useAppStore.getState().notice;
+    expect(notice?.text).toBe(SETTINGS_UNVERIFIED_COPY);
+    expect(notice?.actionLabel).toBe('Reset settings');
+    quiet.mockRestore();
+  });
+
+  it('any other refusal says the choice did not stick', async () => {
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    refuse('disk full');
+    await saveConsentCrashChoice(true);
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(false);
+    expect(useAppStore.getState().notice?.text).toBe(CONSENT_CRASH_CHOICE_FAILED_COPY);
+    quiet.mockRestore();
+  });
+
+  it('a saved choice says nothing', async () => {
+    await saveConsentCrashChoice(true);
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(true);
+    expect(useAppStore.getState().notice).toBeNull();
+  });
+
+  it('the consent screen saves through it', () => {
+    const app = readFileSync(resolve(__dirname, '../App.tsx'), 'utf8');
+    const handler = app.slice(app.indexOf('const handleAcceptConsent'));
+    expect(handler.slice(0, handler.indexOf('};'))).toContain(
+      'saveConsentCrashChoice(crashReportsEnabled)',
+    );
+    expect(app).not.toContain("invoke('set_crash_reports_enabled'");
   });
 });
 
