@@ -67,6 +67,10 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
+  # dtolnay/rust-toolchain exported this into every job; keep it now that the
+  # local setup-rust action replaces it. (Release-profile builds are never
+  # incremental anyway; this keeps the test gate's dev build as before.)
+  CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
   XRAY_VERSION: v26.3.27
   XRAY_WINDOWS_SHA256: d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad

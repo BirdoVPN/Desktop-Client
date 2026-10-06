@@ -40,6 +40,9 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
+  # One-shot CI builds gain nothing from incremental compilation (rust-cache
+  # sets this too; the uncached MSRV jobs need it here).
+  CARGO_INCREMENTAL: 0
 
 jobs:
   # rustfmt + clippy, split from the test job so the two run in parallel.
@@ -379,9 +382,9 @@ jobs:
   # MSRV-gated lints key off it, so a fictional value silently changes which
   # lints fire. Nothing compiled at it until 2026-10-06, when it said 1.85
   # while the locked graph already needed 1.88 (time 0.3.53, sentry 0.49,
-  # plist 1.10, darling 0.23, serde_with 3.22). `cargo check` only, uncached:
-  # it never sits on the critical path, and caching it would cost ~4 GB of the
-  # 10 GB cache budget the main jobs need.
+  # plist 1.10, darling 0.23, serde_with 3.22). `cargo check` only, cached like
+  # every Rust job (main writes, PRs read): uncached, the Windows leg took
+  # 5-6 min and would have become this workflow's critical path.
   msrv:
     name: MSRV check (${{ matrix.os }})
     strategy:
@@ -412,7 +415,7 @@ jobs:
           mkdir -p dist
           echo '<!doctype html><title>stub</title>' > dist/index.html
 
-      - name: cargo check --locked --all-targets at the declared rust-version
+      - name: Install the declared rust-version toolchain
         working-directory: src-tauri
         run: |
           set -euo pipefail
@@ -423,7 +426,22 @@ jobs:
           fi
           echo "Declared MSRV: $msrv"
           rustup toolchain install "$msrv" --profile minimal --no-self-update
-          cargo "+$msrv" check --locked --all-targets
+          # Every later step (rust-cache's key, cargo) uses the MSRV toolchain,
+          # not the 1.96 that rust-toolchain.toml would otherwise select.
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          key: msrv-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo check --locked --all-targets at the declared rust-version
+        working-directory: src-tauri
+        run: |
+          rustc --version
+          cargo check --locked --all-targets
 
   frontend-tests:
     name: Frontend unit tests
