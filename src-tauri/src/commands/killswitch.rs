@@ -632,7 +632,7 @@ fn pf_enable() -> Result<(), String> {
     }
 }
 
-/// `pfctl`, as the [`Pf`] that `pf_policy`'s engage sequencing drives.
+/// `pfctl`, as the [`Pf`] that `pf_policy`'s engage/disengage sequencing drives.
 #[cfg(target_os = "macos")]
 struct Pfctl;
 
@@ -816,9 +816,16 @@ fn pf_restore_default_ruleset() {
     }
 
     // Only disable pf if we enabled it (never disable pf out from under the user
-    // or another tool that had it running).
-    if PF_WE_ENABLED.swap(false, Ordering::SeqCst) {
+    // or another tool that had it running). The debt is cleared once pf is
+    // observed OFF, not when `pfctl -d` was merely asked: a `-d` that failed
+    // with the block-all still loaded must be retried by the next lift.
+    if PF_WE_ENABLED.load(Ordering::SeqCst) {
         let _ = crate::utils::hidden_cmd("pfctl").args(["-d"]).output();
+        if pf_is_enabled() {
+            tracing::warn!("pfctl -d left pf running; the next teardown retries");
+        } else {
+            PF_WE_ENABLED.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -986,24 +993,45 @@ fn pf_engage_block(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 async fn pf_deactivate_blocking() -> Result<(), String> {
     let _pf = PF_LOCK.lock().await;
-    PF_BLOCKING.store(false, Ordering::SeqCst);
 
-    if PF_IPV6_BLOCK_ACTIVE.load(Ordering::SeqCst) {
-        // Propagating the error deliberately leaves the block-all ruleset loaded.
-        // That is both fail-safe and still usable: block-all permits lo0 and utun*,
-        // so a healthy tunnel keeps carrying the user's traffic. Falling back to
-        // /etc/pf.conf here would restore the IPv6 leak instead.
-        pf_apply_ipv6_baseline()?;
-        tracing::info!("macOS pf kill switch deactivated (IPv6 leak block retained)");
-        return Ok(());
+    let keep_ipv6_block = PF_IPV6_BLOCK_ACTIVE.load(Ordering::SeqCst);
+    let teardown = if keep_ipv6_block {
+        // A failed baseline load leaves the block-all ruleset loaded. That is
+        // both fail-safe and still usable: block-all permits lo0 and utun0-15,
+        // so a healthy tunnel keeps carrying the user's traffic.
+        // Falling back to /etc/pf.conf here would restore the IPv6 leak instead.
+        pf_apply_ipv6_baseline()
+    } else {
+        // Reload the default ruleset, dropping our block-all rules. This is the
+        // correct inverse of loading a main ruleset (a per-anchor flush would
+        // leave our main-ruleset block rules in place and keep blocking).
+        pf_restore_default_ruleset();
+        Ok(())
+    };
+
+    // OBSERVE the result — do not infer it from having asked
+    // (P1-ks-macos-linux-deactivate-swallows-errors). This used to store
+    // PF_BLOCKING = false as its FIRST statement, so a teardown that failed
+    // left the kernel blocking while every later lift — all gated on the flag —
+    // believed there was nothing left to lift.
+    let (blocking, result) = pf_policy::disengaged(&Pfctl, teardown);
+    PF_BLOCKING.store(blocking, Ordering::SeqCst);
+    match &result {
+        Ok(()) if keep_ipv6_block => {
+            tracing::info!("macOS pf kill switch deactivated (IPv6 leak block retained)")
+        }
+        Ok(()) => tracing::info!("macOS pf kill switch deactivated"),
+        Err(e) if blocking => tracing::error!(
+            "macOS pf kill switch is STILL BLOCKING: {}. Left marked active so the next \
+             lift retries; `sudo pfctl -f /etc/pf.conf` clears it manually.",
+            e
+        ),
+        Err(e) => tracing::warn!(
+            "macOS pf kill switch lifted, but its fallback ruleset did not apply cleanly: {}",
+            e
+        ),
     }
-
-    // Reload the default ruleset, dropping our block-all rules. This is the
-    // correct inverse of loading a main ruleset (a per-anchor flush would leave
-    // our main-ruleset block rules in place and keep blocking).
-    pf_restore_default_ruleset();
-    tracing::info!("macOS pf kill switch deactivated");
-    Ok(())
+    result
 }
 
 #[cfg(test)]

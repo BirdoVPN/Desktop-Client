@@ -291,6 +291,27 @@ pub(crate) fn engage(pf: &impl Pf, rules: &str) -> Engaged {
     }
 }
 
+/// After a teardown attempt: what PF_BLOCKING must hold, and what to report.
+///
+/// `pf_deactivate_blocking` used to store PF_BLOCKING = false as its FIRST
+/// statement (P1-ks-macos-linux-deactivate-swallows-errors). When the teardown
+/// then failed — the IPv6 baseline refused to load, `/etc/pf.conf` unreadable —
+/// the kernel kept the block-all while the app recorded "not blocking". Every
+/// later lift (set_killswitch_live, the give-up) is gated on that flag, so
+/// nothing ever retried and the Mac had no network until the app restarted.
+/// The Linux half was fixed in bf8af6d4; this is the macOS half: the flag
+/// follows pf's read-back, whatever the teardown returned.
+pub(crate) fn disengaged(pf: &impl Pf, teardown: Result<(), String>) -> (bool, Result<(), String>) {
+    if Observed::read(pf).blocking() {
+        let why = teardown.err().map(|e| format!(": {e}")).unwrap_or_default();
+        return (
+            true,
+            Err(format!("the block-all ruleset is still in force{why}")),
+        );
+    }
+    (false, teardown)
+}
+
 /// Every pass rule that names a `user` also names the control-plane table —
 /// so no rule lets a uid out to any destination. Holds for our ruleset text
 /// AND for pf's printout of it (`user = 0`).
@@ -481,7 +502,7 @@ mod tests {
         assert!(!block_all_loaded(""));
     }
 
-    // ── engage, against a scripted pf ──────────────────────────────────
+    // ── engage / disengaged, against a scripted pf ─────────────────────
 
     #[derive(Default)]
     struct FakePf {
@@ -620,12 +641,49 @@ mod tests {
         assert_eq!(pf.enable_calls.get(), 0);
     }
 
+    /// P1-ks-macos-linux-deactivate-swallows-errors (macOS half): a
+    /// teardown that did not land keeps the flag, so the next lift retries.
+    #[test]
+    fn a_teardown_that_left_the_block_in_force_keeps_the_flag() {
+        let pf = FakePf::default();
+        pf.enabled.set(true);
+        *pf.live.borrow_mut() = pf_prints(&block());
+
+        let (blocking, result) = disengaged(&pf, Err("IPv6 leak block failed to load".into()));
+        assert!(blocking, "the old code stored false before trying");
+        let e = result.unwrap_err();
+        assert!(
+            e.contains("still in force") && e.contains("IPv6 leak block failed"),
+            "{e}"
+        );
+
+        // A teardown that claimed success proves nothing either.
+        let (blocking, result) = disengaged(&pf, Ok(()));
+        assert!(blocking);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_teardown_that_landed_clears_the_flag() {
+        let pf = FakePf::default();
+        pf.enabled.set(true);
+        *pf.live.borrow_mut() = pf_prints(include_str!("../../resources/pf/ipv6-block.conf"));
+        assert_eq!(disengaged(&pf, Ok(())), (false, Ok(())));
+
+        // The block lifted but the fallback did not apply cleanly: not
+        // blocking, and the teardown's own error still reaches the caller.
+        let (blocking, result) = disengaged(&pf, Err("pfctl restore failed".into()));
+        assert!(!blocking);
+        assert_eq!(result, Err("pfctl restore failed".to_string()));
+    }
+
     /// A disabled pf enforces nothing, whatever is loaded in it.
     #[test]
     fn a_disabled_pf_is_not_blocking_even_with_the_block_loaded() {
         let pf = FakePf::default();
         *pf.live.borrow_mut() = pf_prints(&block());
         assert!(!Observed::read(&pf).blocking());
+        assert_eq!(disengaged(&pf, Ok(())), (false, Ok(())));
     }
 }
 
