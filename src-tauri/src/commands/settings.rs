@@ -1055,13 +1055,15 @@ pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<
 pub async fn reset_settings(app: AppHandle) -> Result<bool, IpcError> {
     off_the_runtime(move || {
         let _write = SETTINGS_WRITE.lock();
-        if !resettable(load_settings(&app))? {
+        let loaded = load_settings(&app);
+        let quarantined = matches!(loaded, Ok(Loaded::Quarantined(_)));
+        if !resettable(loaded)? {
             tracing::info!("Settings verify again — nothing to reset");
             return Ok(false);
         }
         let path = get_settings_path(&app).map_err(IpcError::unknown)?;
         let defaults = AppSettings::default();
-        reset_over(&path, || save_settings_inner(&app, &defaults))?;
+        reset_over(&path, quarantined, || save_settings_inner(&app, &defaults))?;
         crate::utils::crash_report::set_opted_in(defaults.crash_reports_enabled);
         if let Err(e) = apply_autostart(&app, defaults.autostart) {
             tracing::warn!("Settings reset, but launch-at-login was not updated: {}", e);
@@ -1090,21 +1092,32 @@ fn resettable(loaded: Result<Loaded, LoadError>) -> Result<bool, IpcError> {
 /// fails, the file is put back, so a failed reset leaves things as they were
 /// (round 4 of the review: it stayed set aside, with nothing saved and the
 /// user told only that the reset failed). If even that rename fails, the
-/// error says the file is still set aside.
-fn reset_over(path: &Path, save: impl FnOnce() -> Result<(), String>) -> Result<(), IpcError> {
+/// error says the file is still set aside. `quarantined`: the re-check's own
+/// load already set the file aside as tampered ([`no_verifying_key`]), so
+/// there is nothing here to put back, and the error says where it went
+/// (round 5 of the review: it said "not reset").
+fn reset_over(
+    path: &Path,
+    quarantined: bool,
+    save: impl FnOnce() -> Result<(), String>,
+) -> Result<(), IpcError> {
     let aside = set_aside(path, "unverified")?;
     let Err(e) = save() else {
         return Ok(());
     };
-    match aside.map(|aside| fs::rename(aside, path)) {
-        Some(Err(back)) => Err(IpcError::unknown(format!(
-            "The defaults could not be saved ({e}), and the settings file stays set aside \
-             (settings.json.unverified-…): {back}"
-        ))),
-        _ => Err(IpcError::unknown(format!(
-            "The defaults could not be saved, so the settings were not reset: {e}"
-        ))),
-    }
+    Err(IpcError::unknown(
+        match aside.map(|aside| fs::rename(aside, path)) {
+            Some(Err(back)) => format!(
+                "The defaults could not be saved ({e}), and the settings file stays set aside \
+                 (settings.json.unverified-…): {back}"
+            ),
+            None if quarantined => format!(
+                "The settings file was set aside (settings.json.tampered-…), but the defaults \
+                 could not be saved: {e}"
+            ),
+            _ => format!("The defaults could not be saved, so the settings were not reset: {e}"),
+        },
+    ))
 }
 
 /// Where to move settings.json aside to: `settings.json.<tag>-<UTC time>`,
@@ -2042,9 +2055,11 @@ mod tests {
         let source = include_str!("settings.rs").replace('\r', "");
         let reset = &source[source.find("pub async fn reset_settings(").unwrap()..];
         let reset = &reset[..reset.find("\n}\n").unwrap()];
-        let check = reset.find("resettable(load_settings(&app))?").unwrap();
-        assert!(reset.find("SETTINGS_WRITE.lock()").unwrap() < check);
-        assert!(check < reset.find("reset_over(&path").unwrap());
+        let load = reset.find("let loaded = load_settings(&app);").unwrap();
+        let check = reset.find("resettable(loaded)?").unwrap();
+        assert!(reset.find("SETTINGS_WRITE.lock()").unwrap() < load);
+        assert!(load < check);
+        assert!(check < reset.find("reset_over(&path, quarantined,").unwrap());
         assert!(reset.contains("apply_autostart(&app, defaults.autostart)"));
     }
 
@@ -2062,7 +2077,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(&path, "the user's settings").unwrap();
-        let failed = reset_over(&path, || Err("disk full".into()));
+        let failed = reset_over(&path, false, || Err("disk full".into()));
         assert!(failed.is_err());
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -2071,12 +2086,33 @@ mod tests {
         );
         assert!(names_in(dir.path(), "settings.json.unverified-").is_empty());
 
-        let saved = reset_over(&path, || {
+        let saved = reset_over(&path, false, || {
             fs::write(&path, "defaults").map_err(|e| e.to_string())
         });
         assert_eq!(saved, Ok(()));
         assert_eq!(fs::read_to_string(&path).unwrap(), "defaults");
         assert_eq!(names_in(dir.path(), "settings.json.unverified-").len(), 1);
+    }
+
+    /// Round 5 of the review (N5): when the re-check's own load quarantined
+    /// the file and the defaults then cannot be saved, the error says the
+    /// file was set aside: the reset did not leave things as they were.
+    #[test]
+    fn a_failed_save_after_the_quarantine_says_the_file_was_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // The quarantine already moved it: nothing is at `path`.
+        let failed = reset_over(&path, true, || Err("disk full".into())).unwrap_err();
+        assert!(
+            failed.message.contains("was set aside"),
+            "{}",
+            failed.message
+        );
+        assert!(!failed.message.contains("not reset"), "{}", failed.message);
+
+        // With no file and no quarantine, nothing was moved: "not reset".
+        let failed = reset_over(&path, false, || Err("disk full".into())).unwrap_err();
+        assert!(failed.message.contains("not reset"), "{}", failed.message);
     }
 
     /// Review of #222 (P3.7): a settings file that could not be READ is not
