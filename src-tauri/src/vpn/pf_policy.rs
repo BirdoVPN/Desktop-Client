@@ -290,6 +290,8 @@ pub(crate) struct Observed {
     pub block_all_loaded: bool,
     /// The live ruleset has IPv6 rules (the leak block always does).
     pub has_inet6: bool,
+    /// The utun interfaces the live ruleset permits (MR-1125, P2-1).
+    pub tunnel_permits: Vec<String>,
 }
 
 impl Observed {
@@ -301,6 +303,7 @@ impl Observed {
             enabled: parse_enabled(&info),
             block_all_loaded: block_all_loaded(&rules),
             has_inet6: rules.contains("inet6"),
+            tunnel_permits: tunnel_permits(&rules),
         })
     }
 
@@ -319,6 +322,17 @@ fn because(r: &Result<(), String>) -> String {
     }
 }
 
+/// The block-all's inputs that live outside `PfState`, read under the same
+/// lock as the state (P3-3): the relay, the control-plane addresses, our
+/// euid, Local Network Sharing.
+#[derive(Debug, Clone)]
+pub(crate) struct Inputs {
+    pub relay: Option<Ipv4Addr>,
+    pub control_plane: Vec<Ipv4Addr>,
+    pub euid: u32,
+    pub lan_sharing: bool,
+}
+
 /// What the macOS kill switch knows about pf, and the only code that changes
 /// it. `killswitch.rs` keeps one of these behind a single async lock and
 /// mirrors `enforcing` / `loaded` into atomics for the lock-free status probe.
@@ -335,6 +349,9 @@ pub(crate) struct PfState {
     /// Our reference on pf (`pfctl -E`), held while any ruleset of ours is
     /// loaded and released with `pfctl -X` of exactly this token (P2-3).
     pub token: Option<u64>,
+    /// MR-1125: the utun the live tunnel runs on — the ONLY interface the
+    /// block-all permits. Recorded the moment the device is created.
+    pub tunnel: Option<String>,
 }
 
 impl PfState {
@@ -344,7 +361,44 @@ impl PfState {
             enforcing: false,
             ipv6_baseline: false,
             token: None,
+            tunnel: None,
         }
+    }
+
+    /// The block-all for `inputs` and the recorded tunnel.
+    pub(crate) fn block_all(&self, inputs: &Inputs) -> String {
+        block_all_ruleset(&BlockAll {
+            relay: inputs.relay,
+            tunnel_interface: self.tunnel.as_deref(),
+            control_plane: &inputs.control_plane,
+            euid: inputs.euid,
+            lan_sharing: inputs.lan_sharing,
+        })
+    }
+
+    /// Whether pf's answer is the block we want: running, the block-all
+    /// loaded, and — P2-1 — permitting the tunnel's own utun. The anchor
+    /// alone cannot prove that: a re-load that never took leaves an older
+    /// block-all, anchor and all, that drops every packet of the new tunnel.
+    fn check(&self, seen: &Observed) -> Result<(), String> {
+        if !seen.enabled {
+            return Err(
+                "pf is not enabled, so the loaded block-all ruleset is not enforced".to_string(),
+            );
+        }
+        if !seen.block_all_loaded {
+            return Err(
+                "the block-all ruleset is not pf's live ruleset after loading it".to_string(),
+            );
+        }
+        if let Some(tunnel) = self.tunnel.as_deref().filter(|t| is_utun_name(t)) {
+            if !seen.tunnel_permits.iter().any(|p| p == tunnel) {
+                return Err(format!(
+                    "the live block-all does not permit the tunnel's interface {tunnel}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Record pf's answer. An answer pf could not give counts as STILL
@@ -395,8 +449,8 @@ impl PfState {
     /// Load `rules` as the block-all, hold a reference on pf, and record what
     /// pf then says is in force (P1-ks-macos-pf-enable-unverified). `Ok`
     /// means pf is running with the block-all as its main ruleset.
-    pub(crate) fn engage(&mut self, pf: &impl Pf, rules: &str) -> Result<(), String> {
-        if let Err(e) = pf.load(rules) {
+    pub(crate) fn engage(&mut self, pf: &impl Pf, inputs: &Inputs) -> Result<(), String> {
+        if let Err(e) = pf.load(&self.block_all(inputs)) {
             // All or nothing: whatever was in force before still is. Say which.
             let seen = Observed::read(pf);
             self.record(&seen);
@@ -409,17 +463,7 @@ impl PfState {
         let seen = seen.map_err(|e| {
             format!("pf could not be read back after loading the block-all ({e}); it is treated as in force")
         })?;
-        if !seen.enabled {
-            return Err(
-                "pf is not enabled, so the loaded block-all ruleset is not enforced".to_string(),
-            );
-        }
-        if !seen.block_all_loaded {
-            return Err(
-                "the block-all ruleset is not pf's live ruleset after loading it".to_string(),
-            );
-        }
-        Ok(())
+        self.check(&seen)
     }
 
     /// Lift the block-all onto the right baseline — the IPv6 leak block while
@@ -500,12 +544,12 @@ impl PfState {
     ///
     /// `intent` is whether the kill switch is armed. A block we hold without
     /// it is an owed lift that failed earlier, so that lift is retried
-    /// instead. `rules` builds the block-all only if it must be re-loaded.
+    /// instead. `inputs` are gathered only if the block must be re-loaded.
     /// `None`: nothing held, or nothing wrong.
     pub(crate) fn watchdog(
         &mut self,
         pf: &impl Pf,
-        rules: impl FnOnce() -> String,
+        inputs: impl FnOnce() -> Inputs,
         intent: bool,
     ) -> Option<Result<(), String>> {
         if !self.loaded {
@@ -515,11 +559,67 @@ impl PfState {
             return Some(self.disengage(pf));
         }
         let seen = Observed::read(pf);
-        if seen.as_ref().is_ok_and(Observed::enforcing) {
+        if seen.as_ref().is_ok_and(|s| self.check(s).is_ok()) {
             self.record(&seen);
             return None;
         }
-        Some(self.engage(pf, &rules()))
+        Some(self.engage(pf, &inputs()))
+    }
+
+    /// Engage the block-all if the kill switch is armed — `intent` read under
+    /// the same lock as this state (P3-3), so a `set_killswitch_live(false)`
+    /// that cleared it while this call waited for the lock is not undone.
+    /// `Ok(false)`: not armed, pf untouched.
+    pub(crate) fn activate(
+        &mut self,
+        pf: &impl Pf,
+        inputs: &Inputs,
+        intent: bool,
+    ) -> Result<bool, String> {
+        if !intent {
+            return Ok(false);
+        }
+        self.engage(pf, inputs).map(|()| true)
+    }
+
+    /// Re-load a block-all of ours around the current inputs (a new
+    /// control-plane address). Nothing loaded, nothing to do: the next
+    /// activation reads them.
+    pub(crate) fn reload_if_loaded(&mut self, pf: &impl Pf, inputs: &Inputs) -> Result<(), String> {
+        if !self.loaded {
+            return Ok(());
+        }
+        self.engage(pf, inputs)
+    }
+
+    /// MR-1125 / P2-1: the tunnel now runs on `name`. Recorded, and a block
+    /// of ours is re-loaded at once and READ BACK permitting exactly that
+    /// utun. `Err` means the tunnel's traffic would meet `block drop all`,
+    /// so the start must fail rather than report Connected.
+    pub(crate) fn tunnel_up(
+        &mut self,
+        pf: &impl Pf,
+        inputs: &Inputs,
+        name: &str,
+    ) -> Result<(), String> {
+        self.tunnel = Some(name.to_string());
+        self.reload_if_loaded(pf, inputs)
+    }
+
+    /// The tunnel on `name` is going away: forget it — unless a newer tunnel
+    /// has been recorded since — and re-load a block of ours without its
+    /// permit, so the next owner of the unit (another VPN) is not let through.
+    pub(crate) fn tunnel_down(
+        &mut self,
+        pf: &impl Pf,
+        inputs: &Inputs,
+        name: &str,
+    ) -> Result<(), String> {
+        if self.tunnel.as_deref() != Some(name) {
+            return Ok(());
+        }
+        self.tunnel = None;
+        self.reload_if_loaded(pf, inputs)
     }
 
     /// F-001: the tunnel session wants the IPv6 leak block as pf's baseline.
@@ -603,9 +703,9 @@ fn root_permits_are_scoped(text: &str) -> bool {
         .all(|l| l.contains(&table))
 }
 
-/// The utun interfaces `text` permits (`pass quick on utunN ...`), in order.
-#[cfg(test)]
-fn tunnel_permits(text: &str) -> Vec<String> {
+/// The utun interfaces `text` permits (`pass quick on utunN ...`), in order —
+/// our ruleset text and pf's printout of it alike.
+pub(crate) fn tunnel_permits(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|l| l.trim().strip_prefix("pass quick on utun"))
         .map(|rest| {
@@ -986,15 +1086,21 @@ mod tests {
         }
     }
 
-    fn block() -> String {
-        ruleset(Some("utun4"), &[DOH])
+    fn inputs() -> Inputs {
+        Inputs {
+            relay: Some(Ipv4Addr::new(203, 0, 113, 7)),
+            control_plane: vec![DOH],
+            euid: 0,
+            lan_sharing: false,
+        }
     }
 
-    /// pf running our block-all, as engage leaves it.
+    /// pf running our block-all around a tunnel on utun4, as engage leaves it.
     fn engaged() -> (FakePf, PfState) {
         let pf = FakePf::default();
         let mut state = PfState::new();
-        state.engage(&pf, &block()).unwrap();
+        state.tunnel = Some("utun4".to_string());
+        state.engage(&pf, &inputs()).unwrap();
         (pf, state)
     }
 
@@ -1031,7 +1137,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = PfState::new();
-        let e = state.engage(&pf, &block()).unwrap_err();
+        let e = state.engage(&pf, &inputs()).unwrap_err();
         assert!(e.contains("not enabled"), "{e}");
         assert!(!state.enforcing, "an inert ruleset is not a block");
         assert!(state.loaded, "...but it is loaded, so a lift is owed");
@@ -1045,7 +1151,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = PfState::new();
-        assert!(state.engage(&pf, &block()).is_err());
+        assert!(state.engage(&pf, &inputs()).is_err());
         assert!(!state.enforcing);
     }
 
@@ -1057,7 +1163,7 @@ mod tests {
         };
         pf.anonymous.set(true);
         let mut state = PfState::new();
-        let e = state.engage(&pf, &block()).unwrap_err();
+        let e = state.engage(&pf, &inputs()).unwrap_err();
         assert!(e.contains("not pf's live ruleset"), "{e}");
         assert!(!state.loaded && !state.enforcing);
     }
@@ -1071,7 +1177,7 @@ mod tests {
             load_fails: true,
             ..held
         };
-        assert!(state.engage(&held, &block()).is_err());
+        assert!(state.engage(&held, &inputs()).is_err());
         assert!(state.enforcing, "the previous block-all is still loaded");
 
         let none = FakePf {
@@ -1079,7 +1185,7 @@ mod tests {
             ..Default::default()
         };
         let mut state = PfState::new();
-        assert!(state.engage(&none, &block()).is_err());
+        assert!(state.engage(&none, &inputs()).is_err());
         assert!(!state.loaded);
         assert_eq!(none.take_ref_calls.get(), 0, "nothing loaded, no reference");
     }
@@ -1093,7 +1199,7 @@ mod tests {
         let pf = FakePf::default();
         pf.anonymous.set(true);
         let mut state = PfState::new();
-        assert_eq!(state.engage(&pf, &block()), Ok(()));
+        assert_eq!(state.engage(&pf, &inputs()), Ok(()));
         assert_eq!(pf.take_ref_calls.get(), 1, "always our own -E");
         let ours = state.token.unwrap();
 
@@ -1109,7 +1215,7 @@ mod tests {
         let pf = FakePf::default();
         let theirs = pf.third_party_takes_a_ref();
         let mut state = PfState::new();
-        state.engage(&pf, &block()).unwrap();
+        state.engage(&pf, &inputs()).unwrap();
         pf.third_party_releases(theirs);
         assert!(pf.running());
         assert!(Observed::read(&pf).unwrap().enforcing());
@@ -1118,8 +1224,8 @@ mod tests {
     #[test]
     fn a_reference_we_hold_is_not_doubled() {
         let (pf, mut state) = engaged();
-        state.engage(&pf, &block()).unwrap();
-        state.engage(&pf, &block()).unwrap();
+        state.engage(&pf, &inputs()).unwrap();
+        state.engage(&pf, &inputs()).unwrap();
         assert_eq!(pf.take_ref_calls.get(), 1);
         assert_eq!(pf.refs.borrow().len(), 1);
     }
@@ -1128,7 +1234,7 @@ mod tests {
     fn the_watchdog_leaves_a_healthy_block_alone() {
         let (pf, mut state) = engaged();
         let loads = pf.loads.get();
-        assert_eq!(state.watchdog(&pf, block, true), None);
+        assert_eq!(state.watchdog(&pf, inputs, true), None);
         assert_eq!(pf.loads.get(), loads, "nothing re-loaded");
         assert!(state.enforcing);
     }
@@ -1140,7 +1246,7 @@ mod tests {
         let (pf, mut state) = engaged();
         let old = state.token.unwrap();
         pf.third_party_disables();
-        assert_eq!(state.watchdog(&pf, block, true), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, true), Some(Ok(())));
         assert!(state.enforcing && pf.running());
         assert_ne!(state.token, Some(old), "the dead token was replaced");
         assert!(
@@ -1154,7 +1260,7 @@ mod tests {
     fn the_watchdog_restores_a_block_another_tool_replaced() {
         let (pf, mut state) = engaged();
         pf.load_default().unwrap();
-        assert_eq!(state.watchdog(&pf, block, true), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, true), Some(Ok(())));
         assert!(block_all_loaded(&pf.rules().unwrap()));
     }
 
@@ -1163,7 +1269,7 @@ mod tests {
     #[test]
     fn the_watchdog_retries_an_owed_lift_when_the_kill_switch_is_off() {
         let (pf, mut state) = engaged();
-        assert_eq!(state.watchdog(&pf, block, false), Some(Ok(())));
+        assert_eq!(state.watchdog(&pf, inputs, false), Some(Ok(())));
         assert!(!state.loaded && !pf.running());
     }
 
@@ -1171,7 +1277,7 @@ mod tests {
     fn the_watchdog_ignores_a_block_it_does_not_hold() {
         let pf = FakePf::default();
         let mut state = PfState::new();
-        assert_eq!(state.watchdog(&pf, block, true), None);
+        assert_eq!(state.watchdog(&pf, inputs, true), None);
         assert_eq!(pf.loads.get(), 0);
     }
 
@@ -1182,7 +1288,7 @@ mod tests {
         let pf = FakePf::default();
         let mut state = PfState::new();
         pf.unreadable.set(true);
-        let e = state.engage(&pf, &block()).unwrap_err();
+        let e = state.engage(&pf, &inputs()).unwrap_err();
         assert!(e.contains("could not be read back"), "{e}");
         assert!(
             state.loaded && state.enforcing,
@@ -1299,7 +1405,7 @@ mod tests {
         assert!(pf.rules().unwrap().contains("inet6") && pf.running());
         // The kill switch engages and lifts back onto the baseline,
         // keeping the one reference.
-        state.engage(&pf, &block()).unwrap();
+        state.engage(&pf, &inputs()).unwrap();
         assert_eq!(state.disengage(&pf), Ok(()));
         assert!(pf.rules().unwrap().contains("inet6"), "baseline retained");
         assert!(pf.running());
@@ -1335,6 +1441,113 @@ mod tests {
         state.ipv6_off(&pf);
         assert!(block_all_loaded(&pf.rules().unwrap()));
         assert!(state.loaded && state.token.is_some());
+    }
+
+    // ── P2-1 / MR-1125: the tunnel's own utun, confirmed ──────────────
+
+    #[test]
+    fn a_new_tunnel_while_blocking_is_reloaded_and_its_permit_read_back() {
+        let (pf, mut state) = engaged();
+        assert_eq!(state.tunnel_up(&pf, &inputs(), "utun17"), Ok(()));
+        assert_eq!(
+            tunnel_permits(&pf.rules().unwrap()),
+            vec!["utun17".to_string()]
+        );
+        assert!(state.enforcing);
+    }
+
+    /// P2-1: a re-load that did not take leaves the OLD block-all — anchor,
+    /// pf enabled and all — dropping every packet of the new tunnel. Only
+    /// reading back the utun permit tells; the start must then fail.
+    #[test]
+    fn a_new_tunnel_whose_permit_never_took_fails_the_start() {
+        let (pf, mut state) = engaged();
+        let pf = FakePf {
+            load_lost: true,
+            ..pf
+        };
+        let e = state.tunnel_up(&pf, &inputs(), "utun17").unwrap_err();
+        assert!(
+            e.contains("does not permit the tunnel's interface utun17"),
+            "{e}"
+        );
+
+        let (pf, mut state) = engaged();
+        let pf = FakePf {
+            load_fails: true,
+            ..pf
+        };
+        assert!(state.tunnel_up(&pf, &inputs(), "utun17").is_err());
+    }
+
+    /// No block held: the name is recorded for the next activation, and pf
+    /// is not touched.
+    #[test]
+    fn a_new_tunnel_without_a_block_is_only_recorded() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        assert_eq!(state.tunnel_up(&pf, &inputs(), "utun5"), Ok(()));
+        assert_eq!(state.tunnel.as_deref(), Some("utun5"));
+        assert_eq!(pf.loads.get(), 0);
+        state.engage(&pf, &inputs()).unwrap();
+        assert_eq!(
+            tunnel_permits(&pf.rules().unwrap()),
+            vec!["utun5".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_tunnel_going_away_takes_its_permit_with_it() {
+        let (pf, mut state) = engaged();
+        assert_eq!(state.tunnel_down(&pf, &inputs(), "utun4"), Ok(()));
+        assert_eq!(state.tunnel, None);
+        assert!(tunnel_permits(&pf.rules().unwrap()).is_empty());
+        assert!(
+            state.enforcing,
+            "still blocking, just without the dead utun"
+        );
+    }
+
+    /// A late teardown of an OLD tunnel must not strip a newer one's permit.
+    #[test]
+    fn a_superseded_tunnel_going_away_changes_nothing() {
+        let (pf, mut state) = engaged();
+        state.tunnel_up(&pf, &inputs(), "utun5").unwrap();
+        let loads = pf.loads.get();
+        assert_eq!(state.tunnel_down(&pf, &inputs(), "utun4"), Ok(()));
+        assert_eq!(state.tunnel.as_deref(), Some("utun5"));
+        assert_eq!(pf.loads.get(), loads);
+    }
+
+    #[test]
+    fn the_watchdog_restores_a_lost_tunnel_permit() {
+        let (pf, mut state) = engaged();
+        pf.load(&ruleset(None, &[DOH])).unwrap();
+        assert_eq!(state.watchdog(&pf, inputs, true), Some(Ok(())));
+        assert_eq!(
+            tunnel_permits(&pf.rules().unwrap()),
+            vec!["utun4".to_string()]
+        );
+    }
+
+    // ── P3-3: the intent, read under the lock ──────────────────────────
+
+    #[test]
+    fn activate_leaves_pf_alone_once_the_kill_switch_is_off() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        assert_eq!(state.activate(&pf, &inputs(), false), Ok(false));
+        assert_eq!(pf.loads.get(), 0);
+        assert_eq!(state.activate(&pf, &inputs(), true), Ok(true));
+        assert!(state.enforcing);
+    }
+
+    #[test]
+    fn a_reload_needs_a_block_to_reload() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        assert_eq!(state.reload_if_loaded(&pf, &inputs()), Ok(()));
+        assert_eq!(pf.loads.get(), 0);
     }
 }
 

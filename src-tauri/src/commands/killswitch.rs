@@ -10,9 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tauri::{AppHandle, State};
-use tokio::sync::RwLock;
 
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::utils::elevation::is_elevated;
@@ -29,9 +27,18 @@ use crate::vpn::manager::VpnManager;
 /// Active/blocking state is delegated entirely to wfp.rs.
 static KILLSWITCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Global state for kill switch - stores allowed VPN server IP
-static VPN_SERVER_IP: once_cell::sync::Lazy<Arc<RwLock<Option<Ipv4Addr>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
+/// Global state for kill switch - stores allowed VPN server IP. A plain
+/// mutex, so the pf backend reads it under its own lock, synchronously, in the
+/// same step that loads it (P3-3).
+static VPN_SERVER_IP: std::sync::Mutex<Option<Ipv4Addr>> = std::sync::Mutex::new(None);
+
+/// The relay the block permits.
+#[cfg(not(target_os = "windows"))]
+fn vpn_server_ip() -> Option<Ipv4Addr> {
+    *VPN_SERVER_IP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KillSwitchStatus {
@@ -116,10 +123,14 @@ async fn activate_platform_block() -> Result<bool, String> {
         }
     }
 
+    // macOS reads the relay AND re-checks the intent under its own lock
+    // (P3-3): a set_killswitch_live(false) that landed while this waited for
+    // the lock must not be undone by a block built from the earlier intent.
     #[cfg(target_os = "macos")]
-    {
-        let server_ip = VPN_SERVER_IP.read().await.clone();
-        if let Err(e) = pf_activate_blocking(server_ip).await {
+    match pf_activate_blocking().await {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(e) => {
             tracing::error!("Failed to activate pf blocking: {}", e);
             return Err(format!("Failed to activate blocking: {}", e));
         }
@@ -127,7 +138,7 @@ async fn activate_platform_block() -> Result<bool, String> {
 
     #[cfg(target_os = "linux")]
     {
-        let server_ip = VPN_SERVER_IP.read().await.clone();
+        let server_ip = vpn_server_ip();
         if let Err(e) = firewall_linux::activate_blocking(server_ip).await {
             tracing::error!("Failed to activate iptables blocking: {}", e);
             return Err(format!("Failed to activate blocking: {}", e));
@@ -300,7 +311,9 @@ pub fn lan_sharing_enabled() -> bool {
     LAN_SHARING_ENABLED.load(Ordering::SeqCst)
 }
 pub async fn set_vpn_server_ip(ip: Option<Ipv4Addr>) {
-    *VPN_SERVER_IP.write().await = ip;
+    *VPN_SERVER_IP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = ip;
     // This is the real exit-node address (set from vpn.rs and vpn_multi_hop.rs),
     // not a local proxy. Log only whether one is set -- the value itself is the
     // record of which server a customer chose.
@@ -592,12 +605,6 @@ fn mirror(state: &PfState) {
     PF_LOADED.store(state.loaded, Ordering::SeqCst);
 }
 
-/// MR-1125: the utun the live tunnel runs on, the ONLY interface the block-all
-/// permits. Set by tunnel_macos.rs as soon as it creates the device
-/// ([`tunnel_interface_up`]), cleared when the device goes.
-#[cfg(target_os = "macos")]
-static PF_TUNNEL_INTERFACE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
 /// macOS: is a block-all of ours loaded? Twin of `wfp::is_blocking()` /
 /// `firewall_linux::is_blocking()`, needed by the connect paths'
 /// update-the-relay-permit step: pf bakes the permitted server IP into the
@@ -853,23 +860,21 @@ pub fn reconcile_stale_pf_state() {
 /// rules pf never evaluated, and the kill switch silently failed OPEN (all
 /// traffic leaked while the UI reported it active). The main ruleset is always
 /// evaluated. `pf_deactivate_blocking` restores `/etc/pf.conf`.
+///
+/// `Ok(false)`: the kill switch was disarmed while this waited for the lock
+/// (P3-3), and pf was left alone.
 #[cfg(target_os = "macos")]
-async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+async fn pf_activate_blocking() -> Result<bool, String> {
     ensure_pf_watchdog();
     let mut pf = PF.lock().await;
-    engage_block(&mut pf, server_ip)
-}
-
-/// Build the block-all from the inputs as they are NOW, load it, and record
-/// what pf reads back. Under the `PF` lock.
-#[cfg(target_os = "macos")]
-fn engage_block(pf: &mut PfState, server_ip: Option<Ipv4Addr>) -> Result<(), String> {
-    let result = pf.engage(&Pfctl, &block_rules(server_ip));
-    mirror(pf);
+    let inputs = pf_inputs();
+    let result = pf.activate(&Pfctl, &inputs, KILLSWITCH_ENABLED.load(Ordering::SeqCst));
+    mirror(&pf);
     match &result {
-        Ok(()) => tracing::info!(
+        Ok(true) => tracing::info!(
             "macOS pf kill switch activated (read back: pf enabled, block-all loaded)"
         ),
+        Ok(false) => tracing::info!("Kill switch disarmed meanwhile; pf left alone"),
         Err(e) => tracing::error!(
             "macOS pf kill switch NOT confirmed: {} (enforcing={}, lift owed={})",
             e,
@@ -880,29 +885,26 @@ fn engage_block(pf: &mut PfState, server_ip: Option<Ipv4Addr>) -> Result<(), Str
     result
 }
 
-/// The block-all, from the inputs as they are NOW.
+/// The block-all's inputs as they are NOW — read while the `PF` lock is held
+/// (P3-3), so a load can never be built from a relay or an intent that changed
+/// while it waited.
 #[cfg(target_os = "macos")]
-fn block_rules(server_ip: Option<Ipv4Addr>) -> String {
-    let tunnel_interface = recorded_tunnel_interface();
-    let control_plane = pf_policy::control_plane_addresses();
-    // pf has no application condition, so the control-plane permit matches the
-    // euid we run as (root: arm() refuses otherwise) and pf_policy scopes its
-    // DESTINATION to the control-plane table.
-    let euid = unsafe { libc::geteuid() };
-    let rules = pf_policy::block_all_ruleset(&pf_policy::BlockAll {
-        relay: server_ip,
-        tunnel_interface: tunnel_interface.as_deref(),
-        control_plane: &control_plane,
-        euid,
+fn pf_inputs() -> pf_policy::Inputs {
+    let inputs = pf_policy::Inputs {
+        relay: vpn_server_ip(),
+        control_plane: pf_policy::control_plane_addresses(),
+        // pf has no application condition, so the control-plane permit
+        // matches the euid we run as (root: arm() refuses otherwise) and
+        // pf_policy scopes its DESTINATION to the control-plane table.
+        euid: unsafe { libc::geteuid() },
         lan_sharing: lan_sharing_enabled(),
-    });
-    tracing::info!(
-        "Kill switch: tunnel permit on {}; control-plane permit for uid {} on tcp/443 to {} addresses",
-        tunnel_interface.as_deref().unwrap_or("no interface (no tunnel yet)"),
-        euid,
-        control_plane.len()
+    };
+    tracing::debug!(
+        "Kill switch inputs: control-plane permit for uid {} on tcp/443 to {} addresses",
+        inputs.euid,
+        inputs.control_plane.len()
     );
-    rules
+    inputs
 }
 
 /// How often a held block is re-verified (P2-3): the auto-reconnect
@@ -930,10 +932,9 @@ fn ensure_pf_watchdog() {
 /// One watchdog pass: see `PfState::watchdog`.
 #[cfg(target_os = "macos")]
 async fn pf_watchdog_tick() {
-    let server_ip = *VPN_SERVER_IP.read().await;
     let mut pf = PF.lock().await;
     let intent = KILLSWITCH_ENABLED.load(Ordering::SeqCst);
-    let outcome = pf.watchdog(&Pfctl, || block_rules(server_ip), intent);
+    let outcome = pf.watchdog(&Pfctl, pf_inputs, intent);
     mirror(&pf);
     drop(pf);
     let Some(result) = outcome else {
@@ -951,80 +952,66 @@ async fn pf_watchdog_tick() {
     blocking_may_have_changed();
 }
 
-/// The utun the block-all permits right now (MR-1125).
-#[cfg(target_os = "macos")]
-fn recorded_tunnel_interface() -> Option<String> {
-    PF_TUNNEL_INTERFACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
-
-/// macOS: the tunnel now runs on `name` (MR-1125).
+/// macOS: the tunnel now runs on `name` (MR-1125, P2-1).
 ///
 /// The block-all permits the tunnel by interface NAME, and that one only. A
 /// reconnect or a settings reapply engages the block BEFORE the new device
 /// exists, so the name is recorded here, the moment `create_utun_device`
-/// returns it, and an engaged block is re-loaded at once to let it through.
-/// Until then the block has no tunnel permit at all, which is fail-closed.
+/// returns it, and a held block is re-loaded at once and READ BACK permitting
+/// it. `Err` — the tunnel's traffic would meet `block drop all` — must fail
+/// the start: this used to be only logged, and an automatic reconnect could
+/// reach Connected behind a block that dropped everything in the tunnel.
 #[cfg(target_os = "macos")]
-pub async fn tunnel_interface_up(name: &str) {
-    {
-        let mut recorded = PF_TUNNEL_INTERFACE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if recorded.as_deref() == Some(name) {
-            return;
-        }
-        *recorded = Some(name.to_string());
+pub async fn tunnel_interface_up(name: &str) -> Result<(), String> {
+    let mut pf = PF.lock().await;
+    let held = pf.loaded;
+    let inputs = pf_inputs();
+    let result = pf.tunnel_up(&Pfctl, &inputs, name);
+    mirror(&pf);
+    drop(pf);
+    if held {
+        blocking_may_have_changed();
     }
-    reload_block_if_engaged("the tunnel's new interface").await;
+    result
 }
 
-/// macOS: the tunnel's device on `name` is gone (its fd closed). Drop its
-/// permit from an engaged block, or the next owner of the same unit — another
-/// VPN — would pass straight through the kill switch.
+/// macOS: the tunnel on `name` is going away. Its permit leaves a held block
+/// BEFORE the device's fd is closed (P3-4): once closed, the unit is free, and
+/// another VPN that took it before the re-load would pass straight through the
+/// kill switch. Best-effort: a teardown must not fail on it.
 #[cfg(target_os = "macos")]
 pub async fn tunnel_interface_down(name: &str) {
-    if forget_tunnel_interface(name) {
-        reload_block_if_engaged("the tunnel interface going away").await;
-    }
-}
-
-/// Forget `name`, unless a newer tunnel has already been recorded. Synchronous
-/// for the paths that cannot await (a failed start, `Drop`): they only forget,
-/// and the next load — every re-dial loads — drops the permit.
-#[cfg(target_os = "macos")]
-pub fn forget_tunnel_interface(name: &str) -> bool {
-    let mut recorded = PF_TUNNEL_INTERFACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if recorded.as_deref() != Some(name) {
-        return false;
-    }
-    *recorded = None;
-    true
-}
-
-/// Re-load a block-all of ours so it reflects the inputs as they are now. A
-/// block that is not loaded is left alone: its next activation reads them.
-#[cfg(target_os = "macos")]
-async fn reload_block_if_engaged(why: &str) {
-    let server_ip = *VPN_SERVER_IP.read().await;
     let mut pf = PF.lock().await;
-    if !pf.loaded {
-        return;
-    }
-    let result = engage_block(&mut pf, server_ip);
+    let inputs = pf_inputs();
+    let result = pf.tunnel_down(&Pfctl, &inputs, name);
+    mirror(&pf);
     drop(pf);
     if let Err(e) = result {
-        tracing::warn!(
-            "Kill switch: re-loading the block for {} failed: {}",
-            why,
-            e
-        );
+        tracing::warn!("Kill switch: re-loading the block without {}: {}", name, e);
     }
     blocking_may_have_changed();
+}
+
+/// [`tunnel_interface_down`] for `Drop`, which cannot await: done in place
+/// when the lock is free, else handed to the runtime (the fd is closed either
+/// way — leaving the device alive is a guaranteed IPv4 blackhole).
+#[cfg(target_os = "macos")]
+pub fn tunnel_interface_gone_now(name: &str) {
+    match PF.try_lock() {
+        Ok(mut pf) => {
+            let inputs = pf_inputs();
+            if let Err(e) = pf.tunnel_down(&Pfctl, &inputs, name) {
+                tracing::warn!("Kill switch: re-loading the block without {}: {}", name, e);
+            }
+            mirror(&pf);
+        }
+        Err(_) => {
+            let name = name.to_string();
+            tauri::async_runtime::spawn(async move {
+                tunnel_interface_down(&name).await;
+            });
+        }
+    }
 }
 
 /// Deactivate pf blocking: drop the block-all main ruleset and fall back to the
