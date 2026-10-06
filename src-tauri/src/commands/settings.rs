@@ -367,17 +367,42 @@ fn read_keystore_key() -> Result<Option<Vec<u8>>, String> {
 /// Read the sibling 0600 key file, WITHOUT ever creating one. `None` means
 /// absent, empty, unreadable or non-hex.
 fn read_file_key(settings_path: &Path) -> Option<Vec<u8>> {
+    match read_key_file(settings_path) {
+        KeyFile::Key(key) => Some(key),
+        KeyFile::Missing | KeyFile::Unreadable => None,
+    }
+}
+
+/// What the key file beside settings.json holds right now.
+#[derive(Debug, PartialEq)]
+enum KeyFile {
+    Key(Vec<u8>),
+    /// No file, or one that is not a key (empty, not hex): no key to find.
+    Missing,
+    /// There, and unreadable right now (a scanner holding it, permissions):
+    /// the key may well be in it.
+    Unreadable,
+}
+
+fn read_key_file(settings_path: &Path) -> KeyFile {
     let key_path = settings_path.with_file_name("settings_hmac.key");
-    let existing = fs::read_to_string(&key_path).ok()?;
+    let existing = match fs::read_to_string(&key_path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return KeyFile::Missing,
+        Err(e) => {
+            tracing::warn!("Settings HMAC key file unreadable ({}); not using it", e);
+            return KeyFile::Unreadable;
+        }
+    };
     let trimmed = existing.trim();
     if trimmed.is_empty() {
-        return None;
+        return KeyFile::Missing;
     }
     match hex::decode(trimmed) {
-        Ok(key) => Some(key),
+        Ok(key) => KeyFile::Key(key),
         Err(e) => {
             tracing::warn!("Corrupted settings HMAC key file ({}); ignoring it", e);
-            None
+            KeyFile::Missing
         }
     }
 }
@@ -585,39 +610,22 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {
         // turn a transient credential-store outage into a permanent signature
         // mismatch. A signature made by EITHER source's key is accepted, and
         // the winning key is then mirrored into both sources so they converge.
-        let mut keystore_unavailable = false;
+        let keystore = read_keystore_key();
+        let key_file = read_key_file(&path);
+        let key_may_still_exist = key_may_still_exist(&keystore, &key_file);
         let mut candidates: Vec<Vec<u8>> = Vec::new();
-        match read_keystore_key() {
+        match keystore {
             Ok(Some(key)) => candidates.push(key),
             Ok(None) => {}
-            Err(e) => {
-                keystore_unavailable = true;
-                tracing::warn!(
-                    "Credential store unavailable while verifying settings ({}); trying the key file",
-                    e
-                );
-            }
+            Err(e) => tracing::warn!(
+                "Credential store unavailable while verifying settings ({}); trying the key file",
+                e
+            ),
         }
-        if let Some(key) = read_file_key(&path) {
+        if let KeyFile::Key(key) = key_file {
             if !candidates.contains(&key) {
                 candidates.push(key);
             }
-        }
-
-        if candidates.is_empty() {
-            // No key is readable RIGHT NOW. If the store is merely locked the
-            // real key may still exist, so this is not tampering: serve
-            // defaults for this session, mint nothing, touch nothing — the
-            // next load retries with the store hopefully unlocked.
-            tracing::error!(
-                "Settings HMAC key unavailable ({}); using defaults for this session without resetting settings.json",
-                if keystore_unavailable {
-                    "credential store unreachable, no key file"
-                } else {
-                    "no key in the credential store, no key file"
-                }
-            );
-            return Ok(Loaded::Unverified(AppSettings::default()));
         }
 
         let settings_json = serde_json::to_string(&signed.settings)
@@ -670,28 +678,7 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {
             }
         }
 
-        if keystore_unavailable {
-            // The signing key may be exactly the one we cannot read right now.
-            // Transient, not tampering: keep the file intact and retry on the
-            // next load.
-            tracing::error!(
-                "Settings signature matches no readable key while the credential store is unreachable — using defaults for this session without resetting"
-            );
-            return Ok(Loaded::Unverified(AppSettings::default()));
-        }
-
-        // Every key source was readable and none verifies: genuine mismatch.
-        // Quarantine the file (settings.json.tampered) instead of leaving it
-        // in place for the next save to silently overwrite — the user's data
-        // stays recoverable and the reset is visible on disk.
-        tracing::warn!(
-            "Settings HMAC verification failed — possible tampering. Resetting to defaults."
-        );
-        let quarantine = path.with_file_name("settings.json.tampered");
-        if let Err(e) = fs::rename(&path, &quarantine) {
-            tracing::warn!("Could not preserve the unverified settings file: {}", e);
-        }
-        return Ok(Loaded::Saved(AppSettings::default()));
+        return Ok(no_verifying_key(&path, key_may_still_exist));
     }
 
     // Legacy format (unsigned) — migrate by parsing and re-saving with HMAC
@@ -715,6 +702,46 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {
             e
         ))),
     }
+}
+
+/// Whether a key that could verify settings.json may exist and be unreadable
+/// right now: the credential store could not answer, or the key file is there
+/// and could not be read. A store that answered "no key" beside a key file
+/// that is missing or not a key is an answer: that key is gone.
+fn key_may_still_exist(keystore: &Result<Option<Vec<u8>>, String>, key_file: &KeyFile) -> bool {
+    keystore.is_err() || *key_file == KeyFile::Unreadable
+}
+
+/// The end of a load whose signed file no readable key verifies.
+///
+/// While a key may still exist ([`key_may_still_exist`]) the file may be
+/// signed by exactly the key that cannot be read: transient, not tampering.
+/// Defaults are served for this session (`Unverified`), nothing is minted and
+/// nothing is touched, and the next load retries.
+///
+/// Otherwise every source answered and none verifies: a genuine mismatch, or
+/// the key is gone for good (the store holds none, the key file is missing or
+/// not a key). Review of #222 (P2): the second case used to count as "cannot
+/// be read right now" too, so the file stayed unverified on every load and
+/// every save was refused, with no way out. Both now quarantine the file
+/// (settings.json.tampered) instead of leaving it for a save to silently
+/// overwrite — the user's data stays recoverable and the reset is visible on
+/// disk — and the defaults load as what is saved.
+fn no_verifying_key(path: &Path, key_may_still_exist: bool) -> Loaded {
+    if key_may_still_exist {
+        tracing::error!(
+            "Settings signature matches no readable key while a key source is unreadable — using defaults for this session without resetting"
+        );
+        return Loaded::Unverified(AppSettings::default());
+    }
+    tracing::warn!(
+        "Settings HMAC verification failed — tampered, or its key is gone. Resetting to defaults."
+    );
+    let quarantine = path.with_file_name("settings.json.tampered");
+    if let Err(e) = fs::rename(path, &quarantine) {
+        tracing::warn!("Could not preserve the unverified settings file: {}", e);
+    }
+    Loaded::Saved(AppSettings::default())
 }
 
 /// Internal save function used by both save_settings command and migration
@@ -1324,11 +1351,15 @@ mod tests {
         let restore = body("pub(crate) fn restore_tunnel_settings(");
         assert!(restore.contains("restored_over(load_settings(app)?, good)?"));
         let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {");
-        // The two branches that serve defaults and touch nothing.
+        // The one branch that serves defaults and touches nothing, which
+        // every unverified signed file reaches.
+        assert!(load.contains("return Ok(no_verifying_key(&path, key_may_still_exist));"));
+        assert!(!load.contains("Loaded::Unverified("));
         assert_eq!(
-            load.matches("Loaded::Unverified(AppSettings::default())")
+            body("fn no_verifying_key(")
+                .matches("Loaded::Unverified(AppSettings::default())")
                 .count(),
-            2
+            1
         );
         let lock = load.find("SETTINGS_WRITE.lock()").expect("the lock");
         assert!(lock < load.find("get_settings_path(app)").unwrap());
@@ -1785,6 +1816,65 @@ mod tests {
             ))),
             Ok(())
         );
+    }
+
+    /// Review of #222 (P2): the credential store answers "no key" and the
+    /// key file is gone or not a key. That key is lost for good, so the file
+    /// is quarantined and the defaults load as saved — it used to stay
+    /// unverified on every load, and every save was refused for ever.
+    #[test]
+    fn a_lost_key_quarantines_the_file_instead_of_refusing_every_save() {
+        assert!(!key_may_still_exist(&Ok(None), &KeyFile::Missing));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"settings":{},"hmac":"00"}"#).unwrap();
+        let loaded = no_verifying_key(&path, false);
+        assert!(matches!(loaded, Loaded::Saved(_)), "saves may go ahead");
+        assert!(!path.exists());
+        assert!(
+            dir.path().join("settings.json.tampered").exists(),
+            "kept, not deleted"
+        );
+    }
+
+    /// The other side: while a key source cannot be read right now, the key
+    /// may be in it. Nothing is touched, and saves wait (`settings_unverified`).
+    #[test]
+    fn a_key_that_may_still_exist_leaves_the_file_alone() {
+        assert!(key_may_still_exist(
+            &Err("store locked".into()),
+            &KeyFile::Missing
+        ));
+        assert!(key_may_still_exist(&Ok(None), &KeyFile::Unreadable));
+        assert!(!key_may_still_exist(&Ok(Some(vec![1])), &KeyFile::Missing));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        assert!(matches!(
+            no_verifying_key(&path, true),
+            Loaded::Unverified(_)
+        ));
+        assert!(path.exists());
+    }
+
+    /// A key file that is absent or not a key holds no key; one that cannot
+    /// be read may.
+    #[test]
+    fn the_key_file_is_read_as_key_missing_or_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let key = dir.path().join("settings_hmac.key");
+        assert_eq!(read_key_file(&settings), KeyFile::Missing);
+        fs::write(&key, "not hex at all").unwrap();
+        assert_eq!(read_key_file(&settings), KeyFile::Missing);
+        fs::write(&key, "0a0b").unwrap();
+        assert_eq!(read_key_file(&settings), KeyFile::Key(vec![10, 11]));
+        // A directory in its place: there, and not readable as a file.
+        fs::remove_file(&key).unwrap();
+        fs::create_dir(&key).unwrap();
+        assert_eq!(read_key_file(&settings), KeyFile::Unreadable);
     }
 
     /// Every settings IPC command runs its work through `off_the_runtime`.
