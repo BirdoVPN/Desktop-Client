@@ -319,10 +319,17 @@ impl WfpEngine {
         }
         Ok(())
     }
+}
 
-    // ── Transaction helpers ─────────────────────────────────────────
+/// The FWPM calls of one policy change, on an open engine.
+struct Kernel<'a> {
+    handle: HANDLE,
+    /// The app ids the change's specs name (`resolve_apps`).
+    apps: &'a HashMap<String, AppBlob>,
+}
 
-    fn begin_transaction(&self) -> Result<(), String> {
+impl FilterKernel for Kernel<'_> {
+    fn begin(&mut self) -> Result<(), String> {
         // SAFETY: `self.handle` is a valid, open WFP engine handle obtained
         // from `FwpmEngineOpen0`.  No aliasing or lifetime concerns.
         let err = unsafe { FwpmTransactionBegin0(self.handle, 0) };
@@ -332,9 +339,9 @@ impl WfpEngine {
         Ok(())
     }
 
-    fn commit_transaction(&self) -> Result<(), String> {
+    fn commit(&mut self) -> Result<(), String> {
         // SAFETY: `self.handle` is a valid, open WFP engine handle with an
-        // active transaction started by `begin_transaction`.
+        // active transaction started by `begin`.
         let err = unsafe { FwpmTransactionCommit0(self.handle) };
         if err != 0 {
             return Err(format!("FwpmTransactionCommit0 failed: 0x{:08X}", err));
@@ -342,7 +349,7 @@ impl WfpEngine {
         Ok(())
     }
 
-    fn abort_transaction(&self) {
+    fn abort(&mut self) {
         // SAFETY: `self.handle` is a valid, open WFP engine handle.  Aborting
         // a non-existent transaction is a benign no-op per WFP semantics.
         let err = unsafe { FwpmTransactionAbort0(self.handle) };
@@ -350,8 +357,6 @@ impl WfpEngine {
             tracing::warn!("FwpmTransactionAbort0 failed: 0x{:08X}", err);
         }
     }
-
-    // ── Sublayer management ─────────────────────────────────────────
 
     fn add_sublayer(&mut self) -> Result<(), String> {
         let name = wide_nul("Birdo VPN Kill Switch");
@@ -378,52 +383,26 @@ impl WfpEngine {
         if err != 0 && err != 0x80320009 {
             return Err(format!("FwpmSubLayerAdd0 failed: 0x{:08X}", err));
         }
-        self.sublayer_added = true;
         Ok(())
     }
 
     fn delete_sublayer(&mut self) {
-        if self.sublayer_added {
-            // SAFETY: `self.handle` is a valid WFP engine handle.
-            // `BIRDO_SUBLAYER_KEY` is a static GUID with 'static lifetime.
-            let err = unsafe { FwpmSubLayerDeleteByKey0(self.handle, &BIRDO_SUBLAYER_KEY) };
-            // 0x80320013 = FWP_E_SUBLAYER_NOT_FOUND — benign
-            if err != 0 && err != 0x80320013 {
-                tracing::warn!("FwpmSubLayerDeleteByKey0 failed: 0x{:08X}", err);
-            }
-            self.sublayer_added = false;
+        // SAFETY: `self.handle` is a valid WFP engine handle.
+        // `BIRDO_SUBLAYER_KEY` is a static GUID with 'static lifetime.
+        let err = unsafe { FwpmSubLayerDeleteByKey0(self.handle, &BIRDO_SUBLAYER_KEY) };
+        // 0x80320013 = FWP_E_SUBLAYER_NOT_FOUND — benign
+        if err != 0 && err != 0x80320013 {
+            tracing::warn!("FwpmSubLayerDeleteByKey0 failed: 0x{:08X}", err);
         }
     }
 
-    // ── Filters ─────────────────────────────────────────────────────
-
-    /// Delete every installed filter, inside the caller's transaction.
-    ///
-    /// P1-ks-wfp-filter-delete-errors-dropped: a failed delete used to be
-    /// logged at debug, and the ids were drained before deleting, so the
-    /// transaction committed with the filter still in the kernel and no
-    /// record of it. On a deactivate that is a block the app reports as gone
-    /// (`IS_BLOCKING` false) while it still drops traffic, and that no later
-    /// change could remove. Now the failure fails the change: `apply` aborts
-    /// the transaction, the previous filter set stays in force, and its ids
-    /// are kept.
-    fn remove_all_filters(&mut self) -> Result<(), String> {
-        let handle = self.handle;
-        delete_filters(&self.filter_ids, |id| {
-            // SAFETY: `handle` is a valid WFP engine handle. `id` was
-            // returned by a prior successful `FwpmFilterAdd0` call.
-            unsafe { FwpmFilterDeleteById0(handle, id) }
-        })?;
-        self.filter_ids.clear();
-        Ok(())
+    fn delete_filter(&mut self, id: u64) -> u32 {
+        // SAFETY: `self.handle` is a valid WFP engine handle. `id` was
+        // returned by a prior successful `FwpmFilterAdd0` call.
+        unsafe { FwpmFilterDeleteById0(self.handle, id) }
     }
 
-    /// Add one filter built from `spec`.
-    fn add_spec(
-        &mut self,
-        spec: &FilterSpec,
-        apps: &HashMap<String, AppBlob>,
-    ) -> Result<(), String> {
+    fn add_filter(&mut self, spec: &FilterSpec) -> Result<u64, String> {
         let name = wide_nul(&spec.name);
 
         // What the conditions point into. Boxed so every address stays put
@@ -499,7 +478,8 @@ impl WfpEngine {
                     luids.push(value);
                 }
                 Condition::App(path) => {
-                    let blob = apps
+                    let blob = self
+                        .apps
                         .get(path)
                         .ok_or_else(|| format!("no app id for {}", file_name(path)))?;
                     c.fieldKey = FWPM_CONDITION_ALE_APP_ID;
@@ -548,50 +528,31 @@ impl WfpEngine {
                 spec.name, err
             ));
         }
-        self.filter_ids.push(id);
-        Ok(())
+        Ok(id)
     }
+}
 
+impl WfpEngine {
     /// Replace the installed filter set with the one `next` calls for, in ONE
-    /// transaction. The old filters are deleted INSIDE it, so the swap has no
-    /// gap on commit, and an abort rolls the deletes back: the previous set
-    /// stays in force and the bookkeeping is restored to match it.
+    /// transaction ([`commit_policy`]).
     fn apply(&mut self, next: Policy) -> Result<(), String> {
         let apps = resolve_apps(&next);
         let specs = filter_specs(&next, &|path| apps.contains_key(path));
-
-        let saved_filter_ids = self.filter_ids.clone();
-        let saved_sublayer_added = self.sublayer_added;
-
-        self.begin_transaction()?;
-        let result = (|| -> Result<(), String> {
-            self.remove_all_filters()?;
-            if specs.is_empty() {
-                self.delete_sublayer();
-                return Ok(());
-            }
-            self.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
-            for spec in &specs {
-                self.add_spec(spec, &apps)?;
-            }
-            Ok(())
-        })()
-        .and_then(|()| self.commit_transaction());
-
-        match result {
-            Ok(()) => {
-                tracing::debug!("WFP policy applied — {} filters", self.filter_ids.len());
-                self.installed = next;
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("WFP policy change failed, previous filters kept: {}", e);
-                self.abort_transaction();
-                self.filter_ids = saved_filter_ids;
-                self.sublayer_added = saved_sublayer_added;
-                Err(e)
-            }
-        }
+        let lift = lifts_block_all(&self.installed, &next);
+        let mut kernel = Kernel {
+            handle: self.handle,
+            apps: &apps,
+        };
+        commit_policy(
+            &mut kernel,
+            &mut self.filter_ids,
+            &mut self.sublayer_added,
+            &specs,
+            lift,
+        )?;
+        tracing::debug!("WFP policy applied — {} filters", self.filter_ids.len());
+        self.installed = next;
+        Ok(())
     }
 }
 
@@ -617,18 +578,101 @@ fn wide_nul(s: &str) -> Vec<u16> {
 /// delete asks for.
 const FWP_E_FILTER_NOT_FOUND: u32 = 0x8032_0003;
 
-/// Delete each of `ids` through `delete` (`FwpmFilterDeleteById0`, which
-/// answers a Win32 error code), stopping at the first that fails for any
-/// reason other than the filter being gone already. Engine-free so the rule
-/// is tested without an elevated WFP session.
-fn delete_filters(ids: &[u64], mut delete: impl FnMut(u64) -> u32) -> Result<(), String> {
-    for &id in ids {
-        let err = delete(id);
-        if err != 0 && err != FWP_E_FILTER_NOT_FOUND {
-            return Err(format!("FwpmFilterDeleteById0({id}) failed: 0x{err:08X}"));
+/// The kernel calls one policy change makes, in the order [`commit_policy`]
+/// makes them. [`Kernel`] is the FWPM API; the tests use a fake that can fail
+/// any of them, so the rules are tested without an elevated WFP session (CI
+/// runners are not elevated).
+trait FilterKernel {
+    fn begin(&mut self) -> Result<(), String>;
+    fn commit(&mut self) -> Result<(), String>;
+    fn abort(&mut self);
+    fn add_sublayer(&mut self) -> Result<(), String>;
+    fn delete_sublayer(&mut self);
+    /// `FwpmFilterDeleteById0`'s Win32 code; 0 on success.
+    fn delete_filter(&mut self, id: u64) -> u32;
+    /// Add one filter and return its id.
+    fn add_filter(&mut self, spec: &FilterSpec) -> Result<u64, String>;
+}
+
+/// Whether going from `installed` to `next` takes the block-all down.
+fn lifts_block_all(installed: &Policy, next: &Policy) -> bool {
+    installed.block_all.is_some() && next.block_all.is_none()
+}
+
+/// Delete each of `ids`, returning the ones that are still in the kernel.
+fn undeletable(ids: &[u64], mut delete: impl FnMut(u64) -> u32) -> Vec<u64> {
+    ids.iter()
+        .copied()
+        .filter(|&id| match delete(id) {
+            0 | FWP_E_FILTER_NOT_FOUND => false,
+            err => {
+                tracing::warn!("FwpmFilterDeleteById0({id}) failed: 0x{err:08X}");
+                true
+            }
+        })
+        .collect()
+}
+
+/// Replace the installed filter set (`ids`) with `specs`, in ONE transaction.
+/// The old filters are deleted INSIDE it, so the swap has no gap on commit,
+/// and an abort rolls the deletes back: the previous set stays in force and
+/// the bookkeeping is restored to match it.
+///
+/// A filter that cannot be deleted (P1-ks-wfp-filter-delete-errors-dropped)
+/// keeps its id — it used to be dropped, leaving the filter in the kernel
+/// with no record of it — and what happens next depends on the direction:
+/// - a `lift` (the block-all comes down) fails and is aborted: the block
+///   stays in force and is reported as such, never called gone while it
+///   still drops traffic;
+/// - anything else (an activation, a rebuild around a new relay or tunnel
+///   LUID, the IPv6 block or the DNS guard going in) commits the new set
+///   with the old filter still beside it. Failing those over it left no
+///   block-all in a reconnect gap at all and abandoned every dial. The kept
+///   id is deleted again by the next change, and the dynamic session takes
+///   the filter with it in any case.
+fn commit_policy(
+    kernel: &mut impl FilterKernel,
+    ids: &mut Vec<u64>,
+    sublayer_added: &mut bool,
+    specs: &[FilterSpec],
+    lift: bool,
+) -> Result<(), String> {
+    let saved_ids = ids.clone();
+    let saved_sublayer_added = *sublayer_added;
+
+    kernel.begin()?;
+    let result = (|| -> Result<(), String> {
+        let kept = undeletable(ids, |id| kernel.delete_filter(id));
+        if lift && !kept.is_empty() {
+            return Err(format!(
+                "{} filter(s) of the block could not be deleted",
+                kept.len()
+            ));
         }
+        *ids = kept;
+        if specs.is_empty() {
+            if ids.is_empty() && *sublayer_added {
+                kernel.delete_sublayer();
+                *sublayer_added = false;
+            }
+            return Ok(());
+        }
+        kernel.add_sublayer()?; // idempotent (ignores ALREADY_EXISTS)
+        *sublayer_added = true;
+        for spec in specs {
+            ids.push(kernel.add_filter(spec)?);
+        }
+        Ok(())
+    })()
+    .and_then(|()| kernel.commit());
+
+    if let Err(e) = &result {
+        tracing::error!("WFP policy change failed, previous filters kept: {}", e);
+        kernel.abort();
+        *ids = saved_ids;
+        *sublayer_added = saved_sublayer_added;
     }
-    Ok(())
+    result
 }
 
 /// Every adapter's LUID, state and whether it has a default gateway, for the
@@ -1743,31 +1787,160 @@ mod tests {
         reset_state();
     }
 
-    /// P1-ks-wfp-filter-delete-errors-dropped: a filter that cannot be
-    /// deleted fails the policy change, so `apply` aborts its transaction and
-    /// keeps the previous set (and its ids) in force, instead of committing
-    /// with the filter left in the kernel and forgotten. A filter that is
-    /// already gone is what a delete asks for.
-    #[test]
-    fn a_filter_that_cannot_be_deleted_fails_the_change() {
-        const ERROR_ACCESS_DENIED: u32 = 5;
-        let mut asked = Vec::new();
-        let result = delete_filters(&[11, 12, 13], |id| {
-            asked.push(id);
-            if id == 12 {
-                ERROR_ACCESS_DENIED
+    /// A kernel that records what a policy change did, and can refuse to
+    /// delete given filters.
+    #[derive(Default)]
+    struct FakeKernel {
+        /// What is in the kernel, by id.
+        filters: Vec<u64>,
+        next_id: u64,
+        undeletable: Vec<u64>,
+        committed: u32,
+        aborted: u32,
+        /// The kernel as it was when the open transaction began.
+        snapshot: Vec<u64>,
+    }
+
+    impl FilterKernel for FakeKernel {
+        fn begin(&mut self) -> Result<(), String> {
+            self.snapshot = self.filters.clone();
+            Ok(())
+        }
+        fn commit(&mut self) -> Result<(), String> {
+            self.committed += 1;
+            Ok(())
+        }
+        fn abort(&mut self) {
+            self.aborted += 1;
+            self.filters = self.snapshot.clone();
+        }
+        fn add_sublayer(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete_sublayer(&mut self) {}
+        fn delete_filter(&mut self, id: u64) -> u32 {
+            const ERROR_ACCESS_DENIED: u32 = 5;
+            if self.undeletable.contains(&id) {
+                return ERROR_ACCESS_DENIED;
+            }
+            let before = self.filters.len();
+            self.filters.retain(|&f| f != id);
+            if self.filters.len() == before {
+                FWP_E_FILTER_NOT_FOUND
             } else {
                 0
             }
-        });
-        assert!(result.is_err(), "a delete that failed must fail the change");
-        assert_eq!(asked, [11, 12], "nothing is attempted past the failure");
+        }
+        fn add_filter(&mut self, _spec: &FilterSpec) -> Result<u64, String> {
+            self.next_id += 1;
+            self.filters.push(100 + self.next_id);
+            Ok(100 + self.next_id)
+        }
+    }
 
-        assert_eq!(
-            delete_filters(&[11, 12], |_| FWP_E_FILTER_NOT_FOUND),
-            Ok(())
+    fn some_specs(n: usize) -> Vec<FilterSpec> {
+        (0..n)
+            .map(|i| FilterSpec {
+                name: format!("Birdo: test filter {i}"),
+                layer: Layer::ConnectV4,
+                action: Action::Block,
+                weight: 0,
+                conditions: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Review of #222, P1: an ACTIVATION (here the block-all going up in a
+    /// reconnect gap) commits even though an old filter will not delete. It
+    /// used to fail on it, so the gap had no block-all at all and every dial
+    /// was abandoned. The old filter keeps its id, and the next change
+    /// deletes it.
+    #[test]
+    fn an_activation_commits_past_a_filter_it_cannot_delete() {
+        let mut kernel = FakeKernel {
+            filters: vec![1, 2],
+            undeletable: vec![2],
+            ..FakeKernel::default()
+        };
+        let mut ids = vec![1, 2];
+        let mut sublayer_added = true;
+
+        let result = commit_policy(
+            &mut kernel,
+            &mut ids,
+            &mut sublayer_added,
+            &some_specs(2),
+            false,
         );
-        assert_eq!(delete_filters(&[11, 12], |_| 0), Ok(()));
-        assert_eq!(delete_filters(&[], |_| ERROR_ACCESS_DENIED), Ok(()));
+
+        assert_eq!(result, Ok(()), "the block-all must go up");
+        assert_eq!(kernel.committed, 1);
+        assert_eq!(ids, vec![2, 101, 102], "the stuck filter keeps its id");
+        assert_eq!(kernel.filters, vec![2, 101, 102]);
+
+        // Next change: the delete goes through, and nothing is left behind.
+        kernel.undeletable.clear();
+        let result = commit_policy(
+            &mut kernel,
+            &mut ids,
+            &mut sublayer_added,
+            &some_specs(1),
+            false,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(ids, vec![103]);
+        assert_eq!(kernel.filters, vec![103]);
+    }
+
+    /// A LIFT that cannot delete a filter fails: the transaction is aborted,
+    /// the block stays in force and so does its bookkeeping, so the block is
+    /// never reported gone while it still drops traffic.
+    #[test]
+    fn a_lift_that_cannot_delete_keeps_the_block_and_says_so() {
+        let mut kernel = FakeKernel {
+            filters: vec![1, 2, 3],
+            undeletable: vec![2],
+            ..FakeKernel::default()
+        };
+        let mut ids = vec![1, 2, 3];
+        let mut sublayer_added = true;
+
+        let result = commit_policy(
+            &mut kernel,
+            &mut ids,
+            &mut sublayer_added,
+            &some_specs(1),
+            true,
+        );
+
+        assert!(result.is_err());
+        assert_eq!((kernel.committed, kernel.aborted), (0, 1));
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(
+            kernel.filters,
+            vec![1, 2, 3],
+            "the abort rolled the deletes back"
+        );
+        assert!(sublayer_added);
+    }
+
+    /// Only taking the block-all DOWN is a lift; putting it up, rebuilding
+    /// it, or changing the IPv6 block or the DNS guard on either side of it
+    /// is not.
+    #[test]
+    fn only_taking_the_block_all_down_is_a_lift() {
+        let block = Policy {
+            block_all: Some(BlockAll::default()),
+            ..Policy::default()
+        };
+        let v6 = Policy {
+            v6_block: true,
+            ..Policy::default()
+        };
+        assert!(lifts_block_all(&block, &v6));
+        assert!(lifts_block_all(&block, &Policy::default()));
+        assert!(!lifts_block_all(&v6, &block));
+        assert!(!lifts_block_all(&block, &block));
+        assert!(!lifts_block_all(&Policy::default(), &v6));
     }
 }
