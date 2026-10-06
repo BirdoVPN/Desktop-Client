@@ -15,7 +15,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import { create } from 'zustand';
 import { settingsToRust } from '@/utils/helpers';
-import { useAppStore, type AppSettings, type ConnectionState } from '@/store/app-store';
+import {
+  useAppStore,
+  type AppSettings,
+  type AppStateSnapshot,
+  type ConnectionState,
+} from '@/store/app-store';
 import { loadSettings } from '@/session/session-data';
 import { errorCopy, isSilentError } from '@/lib/errors';
 import { toIpcError } from '@/lib/ipc';
@@ -292,8 +297,22 @@ export const KILL_SWITCH_OFF_THIS_CONNECTION_COPY =
 /** Bumped by every kill-switch choice, so an older one's late steps stand down. */
 let killSwitchChoice = 0;
 
-/** Ends the wait of a session-only OFF for the next dial, if one is waiting. */
-let endOffForThisConnection: (() => void) | null = null;
+/**
+ * The user's kill-switch choice in this run of the app (round 5 of the
+ * review of #222). A refused OFF holds for this connection only
+ * (`thisConnectionOnly`): it gives way, to the value it was refused over,
+ * when the next dial starts.
+ */
+interface StandingChoice {
+  enabled: boolean;
+  thisConnectionOnly?: { saved: boolean };
+}
+let standingChoice: StandingChoice | null = null;
+
+/** For tests: forget the choices made so far. */
+export function forgetKillSwitchChoices(): void {
+  standingChoice = null;
+}
 
 /**
  * The kill switch toggle.
@@ -319,14 +338,20 @@ let endOffForThisConnection: (() => void) | null = null;
  */
 export async function setKillSwitch(enabled: boolean): Promise<void> {
   const choice = ++killSwitchChoice;
-  if (enabled) await turnKillSwitchOn();
-  else await turnKillSwitchOff(choice);
+  const previous = standingChoice;
+  const mine: StandingChoice = { enabled };
+  standingChoice = mine;
+  const stands = enabled ? await turnKillSwitchOn() : await turnKillSwitchOff(choice, mine);
+  // A choice that did not take leaves the one before it standing, as the
+  // toggle went back to it.
+  if (!stands && standingChoice === mine) standingChoice = previous;
 }
 
-async function turnKillSwitchOn(): Promise<void> {
-  if (!(await persistSettings({ killSwitchEnabled: true }))) return;
+/** Whether the ON was saved. */
+async function turnKillSwitchOn(): Promise<boolean> {
+  if (!(await persistSettings({ killSwitchEnabled: true }))) return false;
   const s = useAppStore.getState();
-  if (!killSwitchLiveApplies(s.connectionState, true, s.killSwitchBlocking)) return;
+  if (!killSwitchLiveApplies(s.connectionState, true, s.killSwitchBlocking)) return true;
   try {
     await invoke('set_killswitch_live', { enabled: true });
   } catch {
@@ -335,9 +360,11 @@ async function turnKillSwitchOn(): Promise<void> {
       tone: 'danger',
     });
   }
+  return true;
 }
 
-async function turnKillSwitchOff(choice: number): Promise<void> {
+/** Whether the OFF stands: saved, or refused but in force for this connection. */
+async function turnKillSwitchOff(choice: number, mine: StandingChoice): Promise<boolean> {
   const latest = () => choice === killSwitchChoice;
   const live = () => {
     const s = useAppStore.getState();
@@ -355,11 +382,16 @@ async function turnKillSwitchOff(choice: number): Promise<void> {
   let lifted = first === null ? null : await first;
   if (refused === null && latest() && live()) lifted = await pushOff();
 
-  const { showNotice } = useAppStore.getState();
+  const { showNotice, updateSettings, settings } = useAppStore.getState();
   if (lifted === false) {
     showNotice({ text: KILL_SWITCH_OFF_FAILED_COPY, tone: 'danger' });
-  } else if (refused && lifted && latest()) {
-    showOffForThisConnection();
+    return refused === null;
+  }
+  if (refused === null) return true;
+  if (lifted && latest()) {
+    // The save put the toggle back; it shows what is live instead.
+    mine.thisConnectionOnly = { saved: settings.killSwitchEnabled };
+    updateSettings({ killSwitchEnabled: false });
     showNotice({
       text: KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
       tone: 'danger',
@@ -367,33 +399,43 @@ async function turnKillSwitchOff(choice: number): Promise<void> {
         ? { actionLabel: 'Reset settings', onAction: askToResetSettings }
         : {}),
     });
-  } else if (refused) {
-    showSaveFailure(refused.error, SAVE_FAILED_COPY);
+    return true;
   }
+  showSaveFailure(refused.error, SAVE_FAILED_COPY);
+  return false;
 }
 
+/** A dial: a connect, a switch, or a reapply's rebuild — each arms from the file. */
+const dialing = (s: AppStateSnapshot) =>
+  s.connectionState === 'connecting' || s.connectionState === 'switching' || s.reapplying;
+
 /**
- * Show the kill switch OFF for the connection a refused OFF was pushed to,
- * and re-read what is saved when the next dial starts — a connect, a switch
- * or a reapply's rebuild, each of which arms from the file. The auto-reconnect
- * does not (it keeps the session's intent, which stays off).
+ * Keep the kill switch toggle in step across dials (round 5 of the review of
+ * #222). The session controller runs it.
+ *
+ * - When a dial starts, a refused OFF's "this connection" is over: the
+ *   toggle goes back to the value it was refused over — that one field, not
+ *   a re-read of the screen (N2: a re-read of an unverifiable file loaded its
+ *   stand-in defaults over every field, and the next whole-object save wrote
+ *   them over the user's file).
+ *
+ * The auto-reconnect is not a dial here: it keeps the session's intent and
+ * does not read the file.
  */
-function showOffForThisConnection(): void {
-  useAppStore.getState().updateSettings({ killSwitchEnabled: false });
-  endOffForThisConnection?.();
-  const unsubscribe = useAppStore.subscribe((next, prev) => {
-    const dials =
-      (next.connectionState !== prev.connectionState &&
-        (next.connectionState === 'connecting' || next.connectionState === 'switching')) ||
-      (next.reapplying && !prev.reapplying);
-    if (!dials) return;
-    endOffForThisConnection?.();
-    void loadSettings();
+export function watchKillSwitchAcrossDials(): () => void {
+  return useAppStore.subscribe((next, prev) => {
+    if (dialing(next) && !dialing(prev)) dialStarted();
   });
-  endOffForThisConnection = () => {
-    unsubscribe();
-    endOffForThisConnection = null;
-  };
+}
+
+function dialStarted(): void {
+  const standing = standingChoice;
+  if (!standing?.thisConnectionOnly) return;
+  standingChoice = null;
+  const s = useAppStore.getState();
+  if (s.settings.killSwitchEnabled === standing.enabled) {
+    s.updateSettings({ killSwitchEnabled: standing.thisConnectionOnly.saved });
+  }
 }
 
 /**
