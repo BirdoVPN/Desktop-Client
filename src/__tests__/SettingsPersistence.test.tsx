@@ -22,6 +22,7 @@ import { defaultSettings, useAppStore } from '@/store/app-store';
 import {
   askToResetSettings,
   cancelScheduledReapply,
+  KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
   persistSettings,
   resetSettings,
   useResetPrompt,
@@ -256,6 +257,43 @@ describe('a settings file that cannot be verified (review of #222)', () => {
     const notice = useAppStore.getState().notice;
     expect(notice?.text).toMatch(/Couldn't save that setting/);
     expect(notice?.actionLabel).toBeUndefined();
+  });
+});
+
+describe('a kill switch OFF whose save is refused (round 4 of the review of #222, P3-1)', () => {
+  it('the toggle shows what is live, OFF for this connection, and what is saved again at the next dial', async () => {
+    useAppStore.setState({
+      connectionState: 'reconnecting',
+      settings: { ...defaultSettings, killSwitchEnabled: true },
+    });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'save_settings') {
+        throw {
+          code: 'settings_unverified',
+          message: 'the settings file could not be verified, so it was left as it is',
+          retryable: true,
+          retry_after_secs: null,
+        };
+      }
+      if (cmd === 'get_settings') return settingsToRust({ ...defaultSettings, killSwitchEnabled: true });
+      if (cmd === 'check_biometric_available') return { available: false, enabled: false, method: 'none' };
+      return undefined;
+    });
+    render(<Settings />);
+    const killSwitch = () => screen.getByRole('switch', { name: /kill switch/i });
+    await userEvent.click(killSwitch());
+    await userEvent.click(await screen.findByRole('button', { name: /turn off anyway/i }));
+    await waitFor(() => {
+      expect(useAppStore.getState().notice?.text).toBe(KILL_SWITCH_OFF_THIS_CONNECTION_COPY);
+    });
+    expect(useAppStore.getState().notice?.actionLabel).toBe('Reset settings');
+    expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: false });
+    // It used to go back to ON here, over a kill switch that was off.
+    expect(killSwitch()).toHaveAttribute('aria-checked', 'false');
+
+    // The next dial arms from the file, which still says ON; so does the toggle.
+    act(() => useAppStore.setState({ connectionState: 'connecting' }));
+    await waitFor(() => expect(killSwitch()).toHaveAttribute('aria-checked', 'true'));
   });
 });
 

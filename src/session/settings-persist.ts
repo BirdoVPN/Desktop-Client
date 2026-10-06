@@ -286,8 +286,14 @@ export function killSwitchLiveApplies(
 export const KILL_SWITCH_OFF_FAILED_COPY =
   "The kill switch couldn't be turned off on your live connection. Disconnect to lift it.";
 
+export const KILL_SWITCH_OFF_THIS_CONNECTION_COPY =
+  "The kill switch is off for this connection only. It couldn't be saved, so it comes back on at your next connection.";
+
 /** Bumped by every kill-switch choice, so an older one's late steps stand down. */
 let killSwitchChoice = 0;
+
+/** Ends the wait of a session-only OFF for the next dial, if one is waiting. */
+let endOffForThisConnection: (() => void) | null = null;
 
 /**
  * The kill switch toggle.
@@ -304,8 +310,9 @@ let killSwitchChoice = 0;
  *   ON. Not when a newer choice came since.
  * - a refused save (`settings_unverified`, an unreadable file) still lets it
  *   lift the block (round 3): the block must be liftable whatever the file
- *   says. The refusal's own notice stays; the saved preference is
- *   unchanged, and the next connect follows it.
+ *   says. The toggle then shows what is live — OFF, for this connection
+ *   only — and says the saved ON comes back at the next connection (round 4,
+ *   P3-1: it went back to ON over a kill switch that was off).
  * - one that could not be applied says to disconnect (round 3): the block is
  *   still up, and "it applies from your next connection" told the user to
  *   wait behind it.
@@ -351,7 +358,40 @@ async function turnKillSwitchOff(choice: number): Promise<void> {
   const { showNotice } = useAppStore.getState();
   if (lifted === false) {
     showNotice({ text: KILL_SWITCH_OFF_FAILED_COPY, tone: 'danger' });
+  } else if (refused && lifted && latest()) {
+    showOffForThisConnection();
+    showNotice({
+      text: KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
+      tone: 'danger',
+      ...(toIpcError(refused.error).code === 'settings_unverified'
+        ? { actionLabel: 'Reset settings', onAction: askToResetSettings }
+        : {}),
+    });
   } else if (refused) {
     showSaveFailure(refused.error, SAVE_FAILED_COPY);
   }
+}
+
+/**
+ * Show the kill switch OFF for the connection a refused OFF was pushed to,
+ * and re-read what is saved when the next dial starts — a connect, a switch
+ * or a reapply's rebuild, each of which arms from the file. The auto-reconnect
+ * does not (it keeps the session's intent, which stays off).
+ */
+function showOffForThisConnection(): void {
+  useAppStore.getState().updateSettings({ killSwitchEnabled: false });
+  endOffForThisConnection?.();
+  const unsubscribe = useAppStore.subscribe((next, prev) => {
+    const dials =
+      (next.connectionState !== prev.connectionState &&
+        (next.connectionState === 'connecting' || next.connectionState === 'switching')) ||
+      (next.reapplying && !prev.reapplying);
+    if (!dials) return;
+    endOffForThisConnection?.();
+    void loadSettings();
+  });
+  endOffForThisConnection = () => {
+    unsubscribe();
+    endOffForThisConnection = null;
+  };
 }

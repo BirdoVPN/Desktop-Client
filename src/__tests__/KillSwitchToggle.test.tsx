@@ -26,6 +26,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Settings, KILL_SWITCH_DISABLE_BODY } from '@/components/Settings';
 import {
   KILL_SWITCH_OFF_FAILED_COPY,
+  KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
   killSwitchLiveApplies,
   setKillSwitch,
 } from '@/session/settings-persist';
@@ -113,6 +114,8 @@ vi.mock('@/store/app-store', () => {
   const useAppStore = vi.fn((selector) => selector(mockStoreState));
   (useAppStore as unknown as { getState: () => typeof mockStoreState }).getState = () =>
     mockStoreState;
+  // The session-only OFF (round 4) waits for the next dial through this.
+  (useAppStore as unknown as { subscribe: () => () => void }).subscribe = vi.fn(() => () => {});
   return { useAppStore };
 });
 
@@ -325,13 +328,18 @@ describe('Kill switch OFF when something fails (review of #222, round 3)', () =>
     );
   };
 
-  it('a refused save still lets the OFF lift the block, and says why the setting did not stick', async () => {
+  // Round 4 (P3-1): the notice says the OFF holds for this connection only,
+  // and still offers the reset. The toggle itself: SettingsPersistence.test.
+  it('a refused save still lets the OFF lift the block, and says it holds for this connection only', async () => {
     mockStoreState.showNotice.mockClear();
     failSave();
     await turnKillSwitchOff('reconnecting');
     await waitFor(() => {
       expect(mockStoreState.showNotice).toHaveBeenCalledWith(
-        expect.objectContaining({ text: SETTINGS_UNVERIFIED_COPY }),
+        expect.objectContaining({
+          text: KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
+          actionLabel: 'Reset settings',
+        }),
       );
     });
     expect(liveCalls()).toEqual([['set_killswitch_live', { enabled: false }]]);
