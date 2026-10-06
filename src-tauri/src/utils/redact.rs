@@ -6,8 +6,8 @@
 //! LOG-001: All error messages and logs should use these functions
 //! to prevent PII exposure.
 
-/// Redact an IP address for logging (shows only first octet in production)
-/// In debug builds, returns the full IP for troubleshooting
+/// Redact an IP address for logging (no IPv4 octet in production, see
+/// [`mask_ip`]). In debug builds, returns the full IP for troubleshooting.
 #[inline]
 pub fn redact_ip(ip: &str) -> String {
     #[cfg(debug_assertions)]
@@ -17,35 +17,28 @@ pub fn redact_ip(ip: &str) -> String {
 
     #[cfg(not(debug_assertions))]
     {
-        // IPv4: Show first octet only (e.g., "192.x.x.x")
-        // IPv6: Show first segment only (e.g., "2001:x:x:x:x:x:x:x")
-        if ip.contains("::") || (ip.contains(':') && ip.matches(':').count() >= 2) {
-            // IPv6
-            ip.split(':')
-                .next()
-                .map(|first| format!("{}:x:x:x:x:x:x:x", first))
-                .unwrap_or_else(|| "[redacted-ipv6]".to_string())
-        } else if ip.contains(':') && ip.matches(':').count() == 1 {
-            // IPv4:port format
-            if let Some(colon_pos) = ip.rfind(':') {
-                let ip_part = &ip[..colon_pos];
-                let port = &ip[colon_pos..];
-                let redacted_ip = ip_part
-                    .split('.')
-                    .next()
-                    .map(|first| format!("{}.x.x.x", first))
-                    .unwrap_or_else(|| "[redacted]".to_string());
-                format!("{}{}", redacted_ip, port)
-            } else {
-                "[redacted]".to_string()
-            }
-        } else {
-            // Plain IPv4
-            ip.split('.')
-                .next()
-                .map(|first| format!("{}.x.x.x", first))
-                .unwrap_or_else(|| "[redacted-ipv4]".to_string())
-        }
+        mask_ip(ip)
+    }
+}
+
+/// What [`redact_ip`] writes in a release build. Split out of the
+/// `not(debug_assertions)` branch so it is reachable from tests.
+///
+/// - IPv4 (with or without `:port`): every octet masked, the port kept
+///   (`x.x.x.x:51820`). P6-CLI-D-06: this used to keep the first octet. That
+///   is a /8, and for a fleet of ten known relays it is often enough to tell
+///   which one a customer used.
+/// - IPv6: the first segment only (`2001:x:x:x:x:x:x:x`), a /16 allocation
+///   block, not a host.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn mask_ip(ip: &str) -> String {
+    if ip.contains("::") || ip.matches(':').count() >= 2 {
+        let first = ip.split(':').next().unwrap_or_default();
+        format!("{first}:x:x:x:x:x:x:x")
+    } else if let Some((_, port)) = ip.split_once(':') {
+        format!("x.x.x.x:{port}")
+    } else {
+        "x.x.x.x".to_string()
     }
 }
 
@@ -270,9 +263,10 @@ pub fn sanitize_always(msg: &str) -> String {
             .replace_all(&result, |caps: &regex::Captures| {
                 // Only redact if all four octets are valid (0-255); otherwise
                 // leave the (non-IP) text untouched to preserve message clarity.
+                // Every octet goes (P6-CLI-D-06, see `mask_ip`).
                 let valid = (1..=4).all(|i| caps[i].parse::<u8>().is_ok());
                 if valid {
-                    format!("{}.x.x.x", &caps[1])
+                    "[redacted-ipv4]".to_string()
                 } else {
                     caps[0].to_string()
                 }
@@ -296,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_redact_ip_v4() {
-        // In release builds, this would be "192.x.x.x"
+        // In release builds, this would be "x.x.x.x" (`mask_ip`)
         let result = redact_ip("192.168.1.100");
         assert!(!result.is_empty());
     }
@@ -380,6 +374,21 @@ mod tests {
             "key: {}",
             key
         );
+    }
+
+    /// P6-CLI-D-06: no octet of an IPv4 address survives, in the log helper
+    /// or the scrubber. The first one used to: a /8, which for a fleet of ten
+    /// known relays often names the relay.
+    #[test]
+    fn an_ipv4_address_keeps_none_of_its_octets() {
+        assert_eq!(mask_ip("185.199.110.153"), "x.x.x.x");
+        assert_eq!(mask_ip("185.199.110.153:51820"), "x.x.x.x:51820");
+        assert_eq!(mask_ip("2001:db8::1"), "2001:x:x:x:x:x:x:x");
+
+        let out = sanitize_always("relay 185.199.110.153:51820 did not answer");
+        assert_eq!(out, "relay [redacted-ipv4]:51820 did not answer");
+        // Not an address (an octet over 255): left readable.
+        assert_eq!(sanitize_always("build 1.4.300.2"), "build 1.4.300.2");
     }
 
     /// The point of splitting the two: a message with no address in it comes
