@@ -479,7 +479,25 @@ fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
 /// Get current application settings
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
-    load_settings_sync(&app)
+    off_the_runtime(move || load_settings_sync(&app)).await
+}
+
+/// Run a settings command's synchronous work on the blocking pool.
+///
+/// P1-dk-blocking-io-on-async-runtime: these are async IPC commands, and a
+/// load or a save reads and writes settings.json, reads the signing key from
+/// the OS credential store (a Secret Service prompt on Linux can wait on the
+/// user; Windows Credential Manager calls are RPCs) and, for autostart, runs
+/// `schtasks`. Done inline, each parked a runtime worker for as long as that
+/// took — the same workers the status choke point, the reconnect loop and
+/// every other command need. `biometric.rs` moved its keystore calls the same
+/// way.
+async fn off_the_runtime<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("Settings task failed: {e}"))?
 }
 
 /// Synchronous settings loader shared by the `get_settings` command and Rust
@@ -735,7 +753,12 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
 /// Save application settings
 #[tauri::command]
 pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool, String> {
-    save_settings_inner(&app, &settings)?;
+    off_the_runtime(move || save_settings_blocking(&app, &settings)).await
+}
+
+/// The whole-object save behind `save_settings` and `set_autostart`.
+fn save_settings_blocking(app: &AppHandle, settings: &AppSettings) -> Result<bool, String> {
+    save_settings_inner(app, settings)?;
     // Keep the live crash-reporting gate equal to what is on disk, whichever
     // screen saved.
     crate::utils::crash_report::set_opted_in(settings.crash_reports_enabled);
@@ -837,18 +860,25 @@ fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSetti
 /// `utils::crash_report`), so no restart is needed.
 #[tauri::command]
 pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    let mut settings = load_settings_sync(&app)?;
-    settings.crash_reports_enabled = enabled;
-    save_settings_inner(&app, &settings)?;
-    crate::utils::crash_report::set_opted_in(enabled);
-    Ok(enabled)
+    off_the_runtime(move || {
+        let mut settings = load_settings_sync(&app)?;
+        settings.crash_reports_enabled = enabled;
+        save_settings_inner(&app, &settings)?;
+        crate::utils::crash_report::set_opted_in(enabled);
+        Ok(enabled)
+    })
+    .await
 }
 
 /// Enable or disable autostart
 #[tauri::command]
 pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    off_the_runtime(move || set_autostart_blocking(&app, enabled)).await
+}
+
+fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, String> {
     #[cfg(windows)]
-    set_autostart_windows(&app, enabled)?;
+    set_autostart_windows(app, enabled)?;
 
     #[cfg(not(windows))]
     {
@@ -868,9 +898,9 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     }
 
     // Also update settings file
-    let mut settings = get_settings(app.clone()).await?;
+    let mut settings = load_settings_sync(app)?;
     settings.autostart = enabled;
-    save_settings(app, settings).await?;
+    save_settings_blocking(app, &settings)?;
 
     Ok(true)
 }
@@ -1580,5 +1610,44 @@ mod tests {
         );
         drop(held);
         other.join().unwrap();
+    }
+
+    /// P1-dk-blocking-io-on-async-runtime: a settings command's synchronous
+    /// work does not hold the async runtime. On a one-thread runtime the work
+    /// below finishes only if another task on that runtime runs while it
+    /// waits, which it cannot when the work runs inline on that one thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn settings_work_does_not_hold_the_async_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let work = off_the_runtime(move || {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| e.to_string())
+        });
+        let other_task = async move {
+            tokio::task::yield_now().await;
+            let _ = tx.send(());
+        };
+        let (done, ()) = tokio::join!(work, other_task);
+        assert_eq!(done, Ok(()), "the runtime was held while the work waited");
+    }
+
+    /// Every settings IPC command runs its work through `off_the_runtime`.
+    #[test]
+    fn every_settings_command_runs_off_the_runtime() {
+        // A Windows checkout has CRLF endings (core.autocrlf).
+        let source = include_str!("settings.rs").replace('\r', "");
+        for command in [
+            "pub async fn get_settings(",
+            "pub async fn save_settings(",
+            "pub async fn set_crash_reports_enabled(",
+            "pub async fn set_autostart(",
+        ] {
+            let body = &source[source.find(command).expect(command)..];
+            let body = &body[..body.find("\n}\n").expect("end of fn")];
+            assert!(
+                body.contains("off_the_runtime(move ||"),
+                "{command} does its work on the async runtime"
+            );
+        }
     }
 }
