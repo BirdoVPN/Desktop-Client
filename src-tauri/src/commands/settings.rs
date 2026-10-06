@@ -503,10 +503,24 @@ fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
     true
 }
 
-/// Get current application settings
+/// The saved settings, for the UI ([`settings_for_the_ui`]).
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<AppSettings, IpcError> {
-    off_the_runtime(move || load_settings_sync(&app).map_err(IpcError::unknown)).await
+    off_the_runtime(move || settings_for_the_ui(load_settings(&app))).await
+}
+
+/// What `get_settings` answers for a load. Round 5 of the review of #222
+/// (N2): a file that cannot be verified right now answers
+/// `settings_unverified`, not the defaults this session runs on
+/// ([`Loaded::Unverified`]). Hydrated into the UI, those defaults replaced
+/// every preference the screen held, and once the file could be verified
+/// again the next whole-object save (the preferred-server mirror makes one
+/// with no user action) wrote them over the user's file. The UI keeps what it
+/// has instead. Rust's own callers ([`load_settings_sync`]) still get the
+/// defaults, and a quarantined file's defaults are what is saved now, so
+/// they are answered.
+fn settings_for_the_ui(loaded: Result<Loaded, LoadError>) -> Result<AppSettings, IpcError> {
+    verified(loaded?)
 }
 
 /// Run a settings command's synchronous work on the blocking pool.
@@ -2092,6 +2106,36 @@ mod tests {
         assert_eq!(saved, Ok(()));
         assert_eq!(fs::read_to_string(&path).unwrap(), "defaults");
         assert_eq!(names_in(dir.path(), "settings.json.unverified-").len(), 1);
+    }
+
+    /// Round 5 of the review (N2): the UI is never handed the defaults that
+    /// stand in for a file that cannot be verified; a verified file, and the
+    /// defaults a quarantine saved, it is.
+    #[test]
+    fn the_ui_is_not_handed_an_unverifiable_files_stand_in_defaults() {
+        let real = AppSettings {
+            killswitch_enabled: false,
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            settings_for_the_ui(Ok(Loaded::Unverified(AppSettings::default())))
+                .unwrap_err()
+                .code,
+            IpcErrorCode::SettingsUnverified
+        );
+        assert!(
+            !settings_for_the_ui(Ok(Loaded::Saved(real)))
+                .unwrap()
+                .killswitch_enabled,
+            "a verified file is answered as it is"
+        );
+        assert!(settings_for_the_ui(Ok(Loaded::Quarantined(AppSettings::default()))).is_ok());
+        assert!(settings_for_the_ui(Err(LoadError::Unreadable("busy".into()))).is_err());
+
+        let source = include_str!("settings.rs").replace('\r', "");
+        let command = &source[source.find("pub async fn get_settings(").unwrap()..];
+        let command = &command[..command.find("\n}\n").unwrap()];
+        assert!(command.contains("settings_for_the_ui(load_settings(&app))"));
     }
 
     /// Round 5 of the review (N5): when the re-check's own load quarantined

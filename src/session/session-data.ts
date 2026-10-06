@@ -45,7 +45,11 @@ export async function loadSettings(): Promise<void> {
     const rs = await invoke<RustSettings>('get_settings');
     useAppStore.getState().hydrateSettings(settingsFromRust(rs));
   } catch {
-    /* keep the persisted preferences; Rust logs the failure */
+    // Keep what the store holds. That includes `settings_unverified` (round 5
+    // of the review of #222): the defaults Rust runs on while it cannot
+    // verify the file are not the user's settings, and hydrating them let
+    // the next whole-object save write them over the file. Rust logs the
+    // failure.
   }
 }
 
