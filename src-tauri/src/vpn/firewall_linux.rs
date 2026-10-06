@@ -493,8 +493,9 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
 ///
 /// The relay is permitted by address, and the self-permit is scoped to tcp/443,
 /// so a reconnect that lands on a different server would have its WireGuard
-/// handshake dropped until the next re-arm. Windows has `wfp::update_vpn_server`
-/// for exactly this; this is the iptables equivalent. No-op when not blocking.
+/// handshake dropped until the next re-arm. Windows moves its relay permit in
+/// `wfp::move_relay` (`session::apply_relay_permit` calls both); this is the
+/// iptables equivalent. No-op when not blocking.
 pub async fn update_vpn_server(ip: Ipv4Addr) -> Result<(), String> {
     if !IPTABLES_BLOCKING.load(Ordering::SeqCst) {
         return Ok(());
