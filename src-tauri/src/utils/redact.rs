@@ -191,26 +191,37 @@ pub fn for_ipc(error: impl std::fmt::Display) -> String {
     sanitize_always(&error.to_string())
 }
 
-/// File extensions this app's errors and backtraces name, which the hostname
-/// pattern would otherwise take for a top-level domain. Three are also real
-/// ccTLDs/gTLDs (`.md`, `.rs`, `.zip`); no relay or service of ours lives
-/// under them, and a source path in a backtrace is worth more than covering
-/// a host there.
+/// File extensions this app's errors and backtraces name that are NOT also
+/// top-level domains: a dotted name ending in one is a file wherever it
+/// appears (`tauri.conf.json`, `birdo-vpn.exe`).
 const FILE_EXTENSIONS: &[&str] = &[
     "bat", "cfg", "conf", "crt", "dat", "dll", "exe", "html", "ico", "ini", "js", "json", "lock",
-    "log", "md", "msi", "pem", "plist", "png", "ps1", "rs", "svg", "sys", "tmp", "toml", "ts",
-    "tsx", "txt", "xml", "yaml", "yml", "zip",
+    "log", "msi", "pem", "plist", "png", "ps1", "svg", "sys", "tmp", "toml", "ts", "tsx", "txt",
+    "xml", "yaml", "yml",
 ];
 
-/// Whether a dotted name the hostname pattern matched, ending in `tld`, is a
-/// host (review of #222). DNS names reach error text lowercased (URLs are
-/// normalised), so a last label with a capital is a code identifier —
-/// `Windows.Security.Credentials.UI`, `System.IO.IOException` — and one in
-/// [`FILE_EXTENSIONS`] is a file: `tauri.conf.json`, `birdo-vpn.exe`,
-/// `src/vpn/tunnel.rs`. Both used to come out as `[redacted-host]`.
+/// File extensions that ARE also top-level domains. A name ending in one is a
+/// file only straight after a path separator (`src\vpn\tunnel.rs` in a
+/// backtrace); anywhere else (`example.rs`) it may be a host, and is redacted.
+const EXTENSIONS_THAT_ARE_TLDS: &[&str] = &["md", "rs", "zip"];
+
+/// Code namespaces whose dotted names are identifiers, not hosts: .NET and
+/// WinRT (`Windows.Security.Credentials.UI`, `System.IO.IOException`).
+const CODE_NAMESPACES: &[&str] = &["Windows", "System", "Microsoft"];
+
+/// Whether `name`, a dotted name the hostname pattern matched ending in `tld`,
+/// is a host. Review of #222: file names and code identifiers used to come out
+/// as `[redacted-host]`; round 3: only what is KNOWN not to be a host is let
+/// through — a name in a code namespace, or one ending in a file extension
+/// (one that is also a TLD only right after a path separator). Case does not
+/// decide: hosts are case-insensitive, and `vpn.example.NET` is a host.
 #[cfg_attr(debug_assertions, allow(dead_code))]
-fn looks_like_a_host(tld: &str) -> bool {
-    tld.bytes().all(|b| b.is_ascii_lowercase()) && !FILE_EXTENSIONS.contains(&tld)
+fn looks_like_a_host(name: &str, tld: &str, after_separator: bool) -> bool {
+    let tld = tld.to_ascii_lowercase();
+    let first = name.split('.').next().unwrap_or(name);
+    !(CODE_NAMESPACES.contains(&first)
+        || FILE_EXTENSIONS.contains(&tld.as_str())
+        || (after_separator && EXTENSIONS_THAT_ARE_TLDS.contains(&tld.as_str())))
 }
 
 /// The redaction itself, with NO `debug_assertions` escape hatch.
@@ -271,6 +282,12 @@ pub fn sanitize_always(msg: &str) -> String {
         // P2-13: Strip HTML tags
         static HTML_TAG_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"<[^>]{1,200}>").expect("HTML tag regex"));
+        // Round 3 of the review of #222: the account name in a home folder
+        // (`C:\Users\Jane.Doe\…`, `/Users/jane/…`, `/home/jane/…`).
+        static USER_DIR_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r#"(?i)(\b[a-z]:\\users\\)[^\\/:*?"<>|\r\n]+|(/(?:Users|home)/)[^/\s:]+"#)
+                .expect("user folder regex")
+        });
         // P2-13: Strip stack traces (lines starting with "at " or Java-style exception patterns)
         static STACK_TRACE_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"(?m)^\s*at .*$").expect("stack trace regex"));
@@ -285,6 +302,16 @@ pub fn sanitize_always(msg: &str) -> String {
 
         // Strip stack trace lines
         let result = STACK_TRACE_RE.replace_all(&result, "").to_string();
+
+        let result = USER_DIR_RE
+            .replace_all(&result, |caps: &regex::Captures| {
+                let folder = caps
+                    .get(1)
+                    .or_else(|| caps.get(2))
+                    .map_or("", |m| m.as_str());
+                format!("{folder}[redacted-user]")
+            })
+            .to_string();
 
         // Tokens/keys first, before the host/IP passes fragment them.
         let result = JWT_RE.replace_all(&result, "[redacted-token]").to_string();
@@ -319,7 +346,9 @@ pub fn sanitize_always(msg: &str) -> String {
 
         let result = HOST_RE
             .replace_all(&result, |caps: &regex::Captures| {
-                if looks_like_a_host(&caps[1]) {
+                let start = caps.get(0).map_or(0, |m| m.start());
+                let after_separator = result[..start].ends_with(['\\', '/']);
+                if looks_like_a_host(&caps[0], &caps[1], after_separator) {
                     "[redacted-host]".to_string()
                 } else {
                     caps[0].to_string()
@@ -486,6 +515,50 @@ mod tests {
             let out = sanitize_always(&format!("could not reach {host}: timed out"));
             assert_eq!(out, "could not reach [redacted-host]: timed out", "{host}");
         }
+    }
+
+    /// Round 3 of the review (P3.5): what round 2 let through. A host is a
+    /// host whatever its case or TLD — `.rs`, `.md` and `.zip` are TLDs too,
+    /// file extensions only straight after a path separator.
+    #[test]
+    fn hosts_are_redacted_whatever_their_case_or_tld() {
+        for host in [
+            "vpn.example.NET",
+            "Api.Birdo.App",
+            "relay.example.rs",
+            "notes.example.md",
+            "mirror.example.zip",
+        ] {
+            let out = sanitize_always(&format!("could not reach {host}: timed out"));
+            assert_eq!(out, "could not reach [redacted-host]: timed out", "{host}");
+        }
+        assert_eq!(
+            sanitize_always(r"panicked at src\vpn\tunnel.rs:1182:9"),
+            r"panicked at src\vpn\tunnel.rs:1182:9",
+            "after a separator, .rs is a file"
+        );
+    }
+
+    /// Round 3 of the review (P3.5): a home folder names its account. The
+    /// name goes, the rest of the path stays readable.
+    #[test]
+    fn a_home_folder_names_no_one() {
+        assert_eq!(
+            sanitize_always(r"Failed to open C:\Users\Jane.Doe\AppData\Roaming\birdo: denied"),
+            r"Failed to open C:\Users\[redacted-user]\AppData\Roaming\birdo: denied"
+        );
+        assert_eq!(
+            sanitize_always(r"open \\?\c:\users\Jane Doe\x.txt failed"),
+            r"open \\?\c:\users\[redacted-user]\x.txt failed"
+        );
+        assert_eq!(
+            sanitize_always("open /Users/jane/Library/Logs/x.log failed"),
+            "open /Users/[redacted-user]/Library/Logs/x.log failed"
+        );
+        assert_eq!(
+            sanitize_always("open /home/jane.doe/.config/x.json failed"),
+            "open /home/[redacted-user]/.config/x.json failed"
+        );
     }
 
     /// The point of splitting the two: a message with no address in it comes
