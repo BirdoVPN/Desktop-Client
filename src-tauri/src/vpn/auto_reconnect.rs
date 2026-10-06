@@ -1141,19 +1141,18 @@ impl ReconnectLoop {
             None
         };
 
+        // MR-691: on connections of its own, like the old-key probe. A re-dial
+        // always follows a teardown, and the shared client's first request
+        // went out on a keep-alive connection the heartbeats had opened
+        // through the dead tunnel: it failed at once and cost the attempt.
+        let api = self.api_after_teardown();
         vm.set_phase(ConnectPhase::Authenticating);
         let response = vm
             .run_cancellable(
                 epoch,
                 timeout(
                     REDIAL_API_TIMEOUT,
-                    request_fresh_response(
-                        &self.api,
-                        &info,
-                        &device_name,
-                        client_public_key,
-                        pq_pk,
-                    ),
+                    request_fresh_response(&api, &info, &device_name, client_public_key, pq_pk),
                 ),
             )
             .await?
@@ -1284,6 +1283,22 @@ impl ReconnectLoop {
         Flow::Stop
     }
 
+    /// The API on connections of its own (bound to the physical address on
+    /// Windows), for the requests sent after a teardown: the old-key probe
+    /// and the re-dial. The shared client's pool keeps the keep-alive
+    /// connections the heartbeats opened THROUGH the tunnel, from an address
+    /// the teardown has just removed (WIN3-001).
+    fn api_after_teardown(&self) -> BirdoApi {
+        #[cfg(target_os = "windows")]
+        let local = network_events::physical_source_address();
+        #[cfg(not(target_os = "windows"))]
+        let local = None;
+        self.api.on_fresh_connections(local).unwrap_or_else(|e| {
+            tracing::warn!("No client of its own after the teardown ({e}); using the shared one");
+            (*self.api).clone()
+        })
+    }
+
     /// One heartbeat for the dead session's key, sent once its tunnel is
     /// down — so over the physical network, through the app's control-plane
     /// permit, like the re-dial it precedes. Bounded, so an outage only
@@ -1297,14 +1312,7 @@ impl ReconnectLoop {
     /// removed. It now sends on connections of its own (bound to the physical
     /// address on Windows) and asks once more if a request fails.
     async fn ask_the_old_key(&mut self, key_id: &str, now: Instant) -> Option<IpcError> {
-        #[cfg(target_os = "windows")]
-        let local = network_events::physical_source_address();
-        #[cfg(not(target_os = "windows"))]
-        let local = None;
-        let api = self.api.on_fresh_connections(local).unwrap_or_else(|e| {
-            tracing::warn!("Old-key probe: no client of its own ({e}); using the shared one");
-            (*self.api).clone()
-        });
+        let api = self.api_after_teardown();
         let reply = tokio::select! {
             r = ask_twice(OLD_KEY_PROBE_TIMEOUT, || api.heartbeat(key_id)) => r,
             _ = self.shutdown.changed() => Err("shutting down"),
@@ -1865,10 +1873,38 @@ mod tests {
         let probe = &probe[..probe.find("\n    }").unwrap()];
         // WIN3-001: on connections of its own, not the pool the tunnel's
         // heartbeats left behind.
-        assert!(probe.contains("self.api.on_fresh_connections(local)"));
+        assert!(probe.contains("let api = self.api_after_teardown();"));
         assert!(probe.contains("ask_twice(OLD_KEY_PROBE_TIMEOUT, || api.heartbeat(key_id))"));
         assert!(probe.contains("reconnect_policy::after_teardown("));
         assert_eq!(OLD_KEY_PROBE_TIMEOUT, Duration::from_secs(5));
+        let fresh = &source[source.find("fn api_after_teardown(&self)").unwrap()..];
+        assert!(fresh[..fresh.find("\n    }").unwrap()]
+            .contains("self.api.on_fresh_connections(local)"));
+    }
+
+    /// MR-691: the re-dial follows a teardown too, so its `/vpn/connect` (or
+    /// multi-hop) request goes out on connections of its own. On the shared
+    /// client the first one met a keep-alive connection that died with the
+    /// tunnel, failed at once and cost the attempt.
+    #[test]
+    fn a_re_dial_goes_out_on_connections_of_its_own() {
+        let source = include_str!("auto_reconnect.rs").replace('\r', "");
+        let redial = &source[source.find("async fn redial(&self, epoch: u64)").unwrap()..];
+        let redial: String = redial[..redial.find("\n    }\n").unwrap()]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let fresh = redial
+            .find("letapi=self.api_after_teardown();")
+            .expect("the re-dial builds its own client");
+        let request = redial
+            .find("request_fresh_response(&api,")
+            .expect("and sends its request on it");
+        assert!(fresh < request);
+        assert!(
+            !redial.contains("&self.api"),
+            "nothing in the re-dial uses the pool"
+        );
     }
 
     /// WIN3-001: the probe's first request can meet a connection that died
