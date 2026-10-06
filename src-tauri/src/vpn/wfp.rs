@@ -397,17 +397,25 @@ impl WfpEngine {
 
     // ── Filters ─────────────────────────────────────────────────────
 
-    fn remove_all_filters(&mut self) {
-        let ids: Vec<u64> = self.filter_ids.drain(..).collect();
-        for id in ids {
-            // SAFETY: `self.handle` is a valid WFP engine handle.  `id` was
+    /// Delete every installed filter, inside the caller's transaction.
+    ///
+    /// P1-ks-wfp-filter-delete-errors-dropped: a failed delete used to be
+    /// logged at debug, and the ids were drained before deleting, so the
+    /// transaction committed with the filter still in the kernel and no
+    /// record of it. On a deactivate that is a block the app reports as gone
+    /// (`IS_BLOCKING` false) while it still drops traffic, and that no later
+    /// change could remove. Now the failure fails the change: `apply` aborts
+    /// the transaction, the previous filter set stays in force, and its ids
+    /// are kept.
+    fn remove_all_filters(&mut self) -> Result<(), String> {
+        let handle = self.handle;
+        delete_filters(&self.filter_ids, |id| {
+            // SAFETY: `handle` is a valid WFP engine handle. `id` was
             // returned by a prior successful `FwpmFilterAdd0` call.
-            let err = unsafe { FwpmFilterDeleteById0(self.handle, id) };
-            // 0x80320003 = FWP_E_FILTER_NOT_FOUND — benign
-            if err != 0 && err != 0x80320003 {
-                tracing::debug!("FwpmFilterDeleteById0({}) warn: 0x{:08X}", id, err);
-            }
-        }
+            unsafe { FwpmFilterDeleteById0(handle, id) }
+        })?;
+        self.filter_ids.clear();
+        Ok(())
     }
 
     /// Add one filter built from `spec`.
@@ -557,7 +565,7 @@ impl WfpEngine {
 
         self.begin_transaction()?;
         let result = (|| -> Result<(), String> {
-            self.remove_all_filters();
+            self.remove_all_filters()?;
             if specs.is_empty() {
                 self.delete_sublayer();
                 return Ok(());
@@ -603,6 +611,24 @@ impl Drop for WfpEngine {
 /// Create a null-terminated UTF-16 string for Win32 wide-char APIs.
 fn wide_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0u16)).collect()
+}
+
+/// `FWP_E_FILTER_NOT_FOUND`: the filter is already gone, which is all a
+/// delete asks for.
+const FWP_E_FILTER_NOT_FOUND: u32 = 0x8032_0003;
+
+/// Delete each of `ids` through `delete` (`FwpmFilterDeleteById0`, which
+/// answers a Win32 error code), stopping at the first that fails for any
+/// reason other than the filter being gone already. Engine-free so the rule
+/// is tested without an elevated WFP session.
+fn delete_filters(ids: &[u64], mut delete: impl FnMut(u64) -> u32) -> Result<(), String> {
+    for &id in ids {
+        let err = delete(id);
+        if err != 0 && err != FWP_E_FILTER_NOT_FOUND {
+            return Err(format!("FwpmFilterDeleteById0({id}) failed: 0x{err:08X}"));
+        }
+    }
+    Ok(())
 }
 
 /// Every adapter's LUID, state and whether it has a default gateway, for the
@@ -1715,5 +1741,33 @@ mod tests {
         assert!(!IPV6_BLOCK_WANTED.load(Ordering::SeqCst));
 
         reset_state();
+    }
+
+    /// P1-ks-wfp-filter-delete-errors-dropped: a filter that cannot be
+    /// deleted fails the policy change, so `apply` aborts its transaction and
+    /// keeps the previous set (and its ids) in force, instead of committing
+    /// with the filter left in the kernel and forgotten. A filter that is
+    /// already gone is what a delete asks for.
+    #[test]
+    fn a_filter_that_cannot_be_deleted_fails_the_change() {
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        let mut asked = Vec::new();
+        let result = delete_filters(&[11, 12, 13], |id| {
+            asked.push(id);
+            if id == 12 {
+                ERROR_ACCESS_DENIED
+            } else {
+                0
+            }
+        });
+        assert!(result.is_err(), "a delete that failed must fail the change");
+        assert_eq!(asked, [11, 12], "nothing is attempted past the failure");
+
+        assert_eq!(
+            delete_filters(&[11, 12], |_| FWP_E_FILTER_NOT_FOUND),
+            Ok(())
+        );
+        assert_eq!(delete_filters(&[11, 12], |_| 0), Ok(()));
+        assert_eq!(delete_filters(&[], |_| ERROR_ACCESS_DENIED), Ok(()));
     }
 }
