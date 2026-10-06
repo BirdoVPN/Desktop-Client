@@ -1164,6 +1164,32 @@ mod tests {
                 got.sort_unstable();
                 assert_eq!(got, want, "unexpected permits in:\n{r}");
                 assert!(port_443_is_scoped(&r), "{r}");
+
+                // N10: and BEFORE it, nothing but the header — a `pass quick`
+                // slipped in above `block drop all` would win over it.
+                let mut header = vec![
+                    "# Birdo VPN Kill Switch (main ruleset - pf evaluates this directly)"
+                        .to_string(),
+                    "set block-policy drop".to_string(),
+                ];
+                if !control_plane.is_empty() {
+                    let addrs: Vec<String> =
+                        control_plane.iter().map(ToString::to_string).collect();
+                    header.push(format!(
+                        "table <birdo_control> const {{ {} }}",
+                        addrs.join(", ")
+                    ));
+                }
+                header.push("anchor \"com.birdo.vpn\"".to_string());
+                header.push("anchor \"com.birdo.vpn.blockall\"".to_string());
+                header.push("block drop all".to_string());
+                let before: Vec<&str> = r.lines().take(header.len()).collect();
+                assert_eq!(before, header, "unexpected header in:\n{r}");
+                assert_eq!(
+                    r.lines().filter(|l| *l == "block drop all").count(),
+                    1,
+                    "{r}"
+                );
             }
         }
     }
@@ -2610,6 +2636,86 @@ mod pfctl_parse_tests {
 
     fn pf_running() -> bool {
         parse_enabled(&String::from_utf8_lossy(&pfctl(&["-s", "info"]).stdout))
+    }
+
+    /// `pfctl -E` as the app runs it: the reference, by token and by the pid
+    /// of the pfctl that took it.
+    fn take_reference() -> PfRef {
+        let child = Command::new("pfctl")
+            .args(["-E"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pfctl -E");
+        let pid = child.id();
+        let out = child.wait_with_output().expect("wait for pfctl -E");
+        assert!(
+            out.status.success(),
+            "pfctl -E: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let printed = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        PfRef {
+            token: parse_token(&printed).expect("a token"),
+            pid,
+        }
+    }
+
+    fn listed() -> Vec<PfRef> {
+        let out = pfctl(&["-s", "References"]);
+        let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+        println!("--- pfctl -s References ---\n{listing}");
+        parse_references(&listing)
+    }
+
+    /// N4/N10 against the real pfctl: a SECOND `-E` on a pf that is already
+    /// running is a reference of its own, listed by its own pfctl's pid;
+    /// dropping the first leaves pf running on the second; a dead token's
+    /// `-X` reads as dead; dropping the last restores pf's state.
+    #[test]
+    #[ignore = "needs root and macOS pfctl; run by tests.yml's pf parse-check step"]
+    fn a_second_reference_on_a_running_pf_is_its_own() {
+        let before = pf_running();
+        let first = take_reference();
+        assert!(pf_running());
+        let second = take_reference();
+        assert_ne!(first, second);
+        let refs = listed();
+        assert!(refs.contains(&first) && refs.contains(&second), "{refs:?}");
+
+        let dropped = pfctl(&["-X", &first.token.to_string()]);
+        assert!(
+            dropped.status.success(),
+            "{}",
+            String::from_utf8_lossy(&dropped.stderr)
+        );
+        assert!(pf_running(), "the second reference keeps pf running");
+        let refs = listed();
+        assert!(!refs.contains(&first) && refs.contains(&second), "{refs:?}");
+
+        let again = pfctl(&["-X", &first.token.to_string()]);
+        assert!(!again.status.success());
+        let why = String::from_utf8_lossy(&again.stderr).into_owned();
+        assert!(
+            is_dead_token_error(&why),
+            "a dead token reads as dead: {why}"
+        );
+
+        let last = pfctl(&["-X", &second.token.to_string()]);
+        assert!(
+            last.status.success(),
+            "{}",
+            String::from_utf8_lossy(&last.stderr)
+        );
+        assert_eq!(
+            pf_running(),
+            before,
+            "dropping our references restores pf's state"
+        );
     }
 
     /// P2-3 against the real pfctl: `-E` prints a token `parse_token` reads,
