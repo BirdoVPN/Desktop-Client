@@ -2,8 +2,9 @@
 //! read back, as plain functions.
 //!
 //! `commands/killswitch.rs` owns pf's MAIN ruleset on macOS and runs `pfctl`.
-//! Everything that decides WHAT that ruleset permits, and WHEN the kill switch
-//! may say it is blocking, lives here instead, free of `pfctl`, so it is
+//! Everything that decides WHAT that ruleset permits, WHEN the kill switch may
+//! say it is blocking, and how a lift is verified (`PfState`) lives here
+//! instead, free of `pfctl`, so it is
 //! unit-tested on every OS (the Windows job runs these tests) rather than only
 //! on a Mac nobody on the team has. The macOS CI runner then feeds every
 //! ruleset shape to `pfctl -nv` and runs pf's own printout through the same
@@ -216,6 +217,21 @@ pub(crate) fn control_plane_addresses() -> Vec<Ipv4Addr> {
     addrs
 }
 
+/// The IPv6 leak block (F-001), as the bytes we ship: `resources/pf/` rather
+/// than this file, so CI can parse-check them with `pfctl -n -f` on a real
+/// macOS runner. The preferred ruleset re-declares the stock `/etc/pf.conf`
+/// anchors so Apple's own pf rules keep working for the session; the minimal
+/// one is for hosts where `/etc/pf.anchors/com.apple` is missing or
+/// unreadable (its `load anchor` line would fail the whole load).
+pub(crate) const IPV6_RULESET_FULL: &str = include_str!("../../resources/pf/ipv6-block.conf");
+pub(crate) const IPV6_RULESET_MINIMAL: &str =
+    include_str!("../../resources/pf/ipv6-block-minimal.conf");
+
+/// Whether `pfctl -s info` reports pf running.
+pub(crate) fn parse_enabled(info: &str) -> bool {
+    info.contains("Status: Enabled")
+}
+
 /// Whether `live_rules` — `pfctl -s rules` — shows the block-all as pf's main
 /// ruleset. pf prints an anchor rule as `anchor "<name>" all`.
 pub(crate) fn block_all_loaded(live_rules: &str) -> bool {
@@ -226,115 +242,302 @@ pub(crate) fn block_all_loaded(live_rules: &str) -> bool {
 }
 
 /// The pfctl operations the kill switch sequences: `pfctl` itself on macOS
-/// (`killswitch::Pfctl`), a scripted fake in the tests below.
+/// (`killswitch::Pfctl`), a scripted fake in the tests below. A READ that
+/// fails is an `Err`, never an empty answer: an unreadable pf is not a pf
+/// with nothing loaded (P2-2).
 pub(crate) trait Pf {
-    /// `pfctl -s info` reports `Status: Enabled`.
-    fn is_enabled(&self) -> bool;
+    /// `pfctl -s info`.
+    fn info(&self) -> Result<String, String>;
+    /// `pfctl -s rules`: pf's live main ruleset, as pf prints it.
+    fn rules(&self) -> Result<String, String>;
     /// `pfctl -f -`: `rules` becomes pf's main ruleset. All or nothing — a
     /// failed load leaves whatever was loaded before in force.
     fn load(&self, rules: &str) -> Result<(), String>;
+    /// `pfctl -f /etc/pf.conf`: the system's own ruleset back.
+    fn load_default(&self) -> Result<(), String>;
+    /// `pfctl -F rules`: flush the main ruleset's filter rules.
+    fn flush_rules(&self) -> Result<(), String>;
     /// `pfctl -e`. `Err` on a spawn failure AND on a non-zero exit.
     fn enable(&self) -> Result<(), String>;
-    /// `pfctl -s rules`: pf's live main ruleset, as pf prints it.
-    fn live_rules(&self) -> String;
+    /// `pfctl -d`.
+    fn disable(&self) -> Result<(), String>;
 }
 
 /// What pf reports — read back, never inferred from having asked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Observed {
     pub enabled: bool,
     pub block_all_loaded: bool,
+    /// The live ruleset has IPv6 rules (the leak block always does).
+    pub has_inet6: bool,
 }
 
 impl Observed {
-    pub(crate) fn read(pf: &impl Pf) -> Self {
-        Self {
-            enabled: pf.is_enabled(),
-            block_all_loaded: block_all_loaded(&pf.live_rules()),
-        }
+    /// Both reads, or why pf could not be read.
+    pub(crate) fn read(pf: &impl Pf) -> Result<Self, String> {
+        let info = pf.info()?;
+        let rules = pf.rules()?;
+        Ok(Self {
+            enabled: parse_enabled(&info),
+            block_all_loaded: block_all_loaded(&rules),
+            has_inet6: rules.contains("inet6"),
+        })
     }
 
     /// Traffic is blocked only while pf is running AND the block-all is its
     /// main ruleset. A loaded ruleset in a disabled pf is inert.
-    pub(crate) fn blocking(self) -> bool {
+    pub(crate) fn enforcing(&self) -> bool {
         self.enabled && self.block_all_loaded
     }
 }
 
-/// The outcome of [`engage`]: what the kill switch may record.
-#[derive(Debug)]
-pub(crate) struct Engaged {
-    /// What PF_BLOCKING must hold: pf's answer, not the request.
-    pub blocking: bool,
-    /// pf was off before this call and is on after it, so a teardown owes a
-    /// `pfctl -d` (PF_WE_ENABLED is only ever SET from this).
-    pub we_enabled: bool,
-    pub result: Result<(), String>,
+/// ` (<why>)` for an error worth carrying into another message.
+fn because(r: &Result<(), String>) -> String {
+    match r {
+        Ok(()) => String::new(),
+        Err(e) => format!(" ({e})"),
+    }
 }
 
-/// Load `rules` as the block-all, enable pf if it was off, and report what pf
-/// then says is in force (P1-ks-macos-pf-enable-unverified).
-///
-/// This used to accept any exit status from `pfctl -e` and set PF_BLOCKING
-/// with no read-back, so a pf that failed to start (another process holding
-/// /dev/pf, a policy restriction) held an inert ruleset while the status, the
-/// UI and auto-reconnect all proceeded as if the block were enforced — every
-/// packet of the reconnect gap left in the clear. `Ok` now means pf is running
-/// with the block-all as its main ruleset, read back after the load.
-pub(crate) fn engage(pf: &impl Pf, rules: &str) -> Engaged {
-    let was_enabled = pf.is_enabled();
+/// What the macOS kill switch knows about pf, and the only code that changes
+/// it. `killswitch.rs` keeps one of these behind a single async lock and
+/// mirrors `enforcing` / `loaded` into atomics for the lock-free status probe.
+#[derive(Debug)]
+pub(crate) struct PfState {
+    /// Our block-all is, or may be, pf's main ruleset — so a lift is owed.
+    /// Follows pf's read-back, and stays set whenever pf cannot be read.
+    pub loaded: bool,
+    /// ...and pf is enforcing it. What the status reports as "blocking".
+    pub enforcing: bool,
+    /// F-001: a tunnel session wants the IPv6 leak block as the baseline a
+    /// lift falls back to, instead of bare `/etc/pf.conf`.
+    pub ipv6_baseline: bool,
+    /// pf was off and WE turned it on, so a full teardown owes a `pfctl -d`.
+    pub we_enabled: bool,
+}
 
-    if let Err(e) = pf.load(rules) {
-        // All or nothing: whatever was in force before still is. Say which.
-        return Engaged {
-            blocking: Observed::read(pf).blocking(),
+impl PfState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            loaded: false,
+            enforcing: false,
+            ipv6_baseline: false,
             we_enabled: false,
-            result: Err(e),
-        };
-    }
-
-    if !was_enabled {
-        // Logged, not returned: the read-back below is what decides, so a pf
-        // that some other process enabled in the meantime still counts.
-        if let Err(e) = pf.enable() {
-            tracing::warn!("Kill switch: {e}; reading back whether pf is running");
         }
     }
 
-    let seen = Observed::read(pf);
-    let result = if !seen.enabled {
-        Err("pf is not enabled, so the loaded block-all ruleset is not enforced".to_string())
-    } else if !seen.block_all_loaded {
-        Err("the block-all ruleset is not pf's live ruleset after loading it".to_string())
-    } else {
-        Ok(())
-    };
-    Engaged {
-        blocking: seen.blocking(),
-        we_enabled: !was_enabled && seen.enabled,
-        result,
+    /// Record pf's answer. An answer pf could not give counts as STILL
+    /// BLOCKING (P2-2): the flag gates every later lift, so "unknown" must
+    /// keep the lift owed rather than declare it done.
+    fn record(&mut self, seen: &Result<Observed, String>) {
+        match seen {
+            Ok(s) => {
+                self.loaded = s.block_all_loaded;
+                self.enforcing = s.enforcing();
+            }
+            Err(_) => {
+                self.loaded = true;
+                self.enforcing = true;
+            }
+        }
     }
-}
 
-/// After a teardown attempt: what PF_BLOCKING must hold, and what to report.
-///
-/// `pf_deactivate_blocking` used to store PF_BLOCKING = false as its FIRST
-/// statement (P1-ks-macos-linux-deactivate-swallows-errors). When the teardown
-/// then failed — the IPv6 baseline refused to load, `/etc/pf.conf` unreadable —
-/// the kernel kept the block-all while the app recorded "not blocking". Every
-/// later lift (set_killswitch_live, the give-up) is gated on that flag, so
-/// nothing ever retried and the Mac had no network until the app restarted.
-/// The Linux half was fixed in bf8af6d4; this is the macOS half: the flag
-/// follows pf's read-back, whatever the teardown returned.
-pub(crate) fn disengaged(pf: &impl Pf, teardown: Result<(), String>) -> (bool, Result<(), String>) {
-    if Observed::read(pf).blocking() {
-        let why = teardown.err().map(|e| format!(": {e}")).unwrap_or_default();
-        return (
-            true,
-            Err(format!("the block-all ruleset is still in force{why}")),
-        );
+    /// Load `rules` as the block-all, enable pf if it was off, and record what
+    /// pf then says is in force (P1-ks-macos-pf-enable-unverified). `Ok`
+    /// means pf is running with the block-all as its main ruleset.
+    pub(crate) fn engage(&mut self, pf: &impl Pf, rules: &str) -> Result<(), String> {
+        let was_enabled = pf.info().map(|i| parse_enabled(&i));
+
+        if let Err(e) = pf.load(rules) {
+            // All or nothing: whatever was in force before still is. Say which.
+            let seen = Observed::read(pf);
+            self.record(&seen);
+            return Err(e);
+        }
+
+        if was_enabled != Ok(true) {
+            // Logged, not returned: the read-back below decides, so a pf
+            // that some other process enabled meanwhile still counts.
+            if let Err(e) = pf.enable() {
+                tracing::warn!("Kill switch: {e}; reading back whether pf is running");
+            }
+        }
+
+        let seen = Observed::read(pf);
+        self.record(&seen);
+        let seen = seen.map_err(|e| {
+            format!("pf could not be read back after loading the block-all ({e}); it is treated as in force")
+        })?;
+        if was_enabled == Ok(false) && seen.enabled {
+            self.we_enabled = true;
+        }
+        if !seen.enabled {
+            return Err(
+                "pf is not enabled, so the loaded block-all ruleset is not enforced".to_string(),
+            );
+        }
+        if !seen.block_all_loaded {
+            return Err(
+                "the block-all ruleset is not pf's live ruleset after loading it".to_string(),
+            );
+        }
+        Ok(())
     }
-    (false, teardown)
+
+    /// Lift the block-all onto the right baseline — the IPv6 leak block while
+    /// a tunnel session wants it, else `/etc/pf.conf` — and record what pf
+    /// then says (P1-ks-macos-linux-deactivate-swallows-errors, P2-2).
+    ///
+    /// The flag used to be cleared FIRST, then whatever the teardown did was
+    /// ignored, so a failed lift left the Mac blocked while every later lift
+    /// (all gated on the flag) believed there was nothing to lift. Now:
+    ///   * pf unreadable afterwards → still blocking, `Err`;
+    ///   * the block-all still loaded — enabled OR NOT: a disabled pf holding
+    ///     it is one `pfctl -e` from blocking everything — is not a finished
+    ///     teardown. Onto the IPv6 baseline it is left in place (fail-safe and
+    ///     usable: it still permits the tunnel; flushing would reopen the IPv6
+    ///     leak). Onto `/etc/pf.conf` the session is over, so pf's filter
+    ///     rules are flushed to get the network back, and that is verified too.
+    pub(crate) fn disengage(&mut self, pf: &impl Pf) -> Result<(), String> {
+        let to_baseline = self.ipv6_baseline;
+        let teardown = if to_baseline {
+            self.load_ipv6_baseline(pf)
+        } else {
+            pf.load_default()
+        };
+
+        let seen = Observed::read(pf);
+        self.record(&seen);
+        let seen = seen.map_err(|e| {
+            format!(
+                "pf could not be read back after lifting the block ({e}); it is treated as still in force{}",
+                because(&teardown)
+            )
+        })?;
+        if !seen.block_all_loaded {
+            if !to_baseline {
+                self.release(pf);
+            }
+            return teardown;
+        }
+
+        if to_baseline {
+            return Err(format!(
+                "the block-all is still loaded{}",
+                because(&teardown)
+            ));
+        }
+
+        tracing::warn!(
+            "Kill switch: the block-all survived restoring /etc/pf.conf{}; flushing pf's rules",
+            because(&teardown)
+        );
+        let flushed = pf.flush_rules();
+        let seen = Observed::read(pf);
+        self.record(&seen);
+        match seen {
+            Ok(s) if !s.block_all_loaded => {
+                tracing::warn!(
+                    "Kill switch lifted by flushing pf's rules; /etc/pf.conf is not loaded until pf is next reloaded"
+                );
+                self.release(pf);
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "the block-all is still loaded after flushing pf's rules{}{}",
+                because(&teardown),
+                because(&flushed)
+            )),
+            Err(e) => Err(format!(
+                "pf could not be read back after flushing its rules ({e}); it is treated as still in force"
+            )),
+        }
+    }
+
+    /// F-001: the tunnel session wants the IPv6 leak block as pf's baseline.
+    pub(crate) fn ipv6_on(&mut self, pf: &impl Pf) -> Result<(), String> {
+        // Record the intent FIRST so that, if the kill switch is mid-block,
+        // its lift lands on this baseline instead of bare /etc/pf.conf.
+        self.ipv6_baseline = true;
+        if self.loaded {
+            // The block-all owns the ruleset and already denies IPv6.
+            return Ok(());
+        }
+        let loaded = self.load_ipv6_baseline(pf);
+        if loaded.is_err() {
+            // Do not leave a claim we could not honour.
+            self.ipv6_baseline = false;
+        }
+        loaded
+    }
+
+    /// F-001: the tunnel session is over. Best-effort, never fails a
+    /// disconnect — a stuck leak block would leave the host without IPv6.
+    pub(crate) fn ipv6_off(&mut self, pf: &impl Pf) {
+        if !std::mem::take(&mut self.ipv6_baseline) {
+            return;
+        }
+        if self.loaded {
+            // The kill switch owns the ruleset; with the baseline cleared its
+            // own lift restores /etc/pf.conf.
+            return;
+        }
+        if let Err(e) = pf.load_default() {
+            tracing::warn!("F-001: restoring /etc/pf.conf after the IPv6 block failed: {e}");
+        }
+        self.release(pf);
+    }
+
+    /// Install the IPv6 leak block as pf's main ruleset, enable pf, and read
+    /// back that it is enforced — a leak fix that silently failed to load is
+    /// worse than none, because the UI would claim protection that is not
+    /// there.
+    fn load_ipv6_baseline(&mut self, pf: &impl Pf) -> Result<(), String> {
+        let was_enabled = pf.info().map(|i| parse_enabled(&i));
+        if let Err(primary) = pf.load(IPV6_RULESET_FULL) {
+            tracing::warn!(
+                "F-001: anchor-preserving IPv6 ruleset failed to load ({primary}); trying the minimal ruleset"
+            );
+            pf.load(IPV6_RULESET_MINIMAL).map_err(|e| {
+                format!("IPv6 leak block failed to load ({primary}); fallback also failed: {e}")
+            })?;
+        }
+        if was_enabled != Ok(true) {
+            if let Err(e) = pf.enable() {
+                tracing::warn!("F-001: {e}; reading back whether pf is running");
+            }
+        }
+        let seen = Observed::read(pf)
+            .map_err(|e| format!("IPv6 leak block could not be read back: {e}"))?;
+        if was_enabled == Ok(false) && seen.enabled {
+            self.we_enabled = true;
+        }
+        if !seen.enabled {
+            return Err("IPv6 leak block is not enforced: pf is not enabled".to_string());
+        }
+        if !seen.has_inet6 {
+            return Err(
+                "IPv6 leak block did not take effect (pf reports no inet6 rules)".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The full teardown's last step: if we turned pf on, turn it back off.
+    /// The debt is cleared once pf is observed OFF, not when `pfctl -d` was
+    /// merely asked.
+    fn release(&mut self, pf: &impl Pf) {
+        if !self.we_enabled {
+            return;
+        }
+        let _ = pf.disable();
+        match pf.info().map(|i| parse_enabled(&i)) {
+            Ok(false) => self.we_enabled = false,
+            _ => tracing::warn!(
+                "pfctl -d left pf running (or unreadable); the next teardown retries"
+            ),
+        }
+    }
 }
 
 /// Every pass rule that names a `user` also names the control-plane table —
@@ -601,27 +804,55 @@ mod tests {
         assert!(!block_all_loaded(""));
     }
 
-    // ── engage / disengaged, against a scripted pf ─────────────────────
+    // ── PfState, against a scripted pf ─────────────────────────────────
+
+    /// The stock macOS /etc/pf.conf, as `pf_prints` sees it once loaded.
+    const STOCK_PF_CONF: &str = "scrub-anchor \"com.apple/*\"\n\
+                                 nat-anchor \"com.apple/*\"\n\
+                                 rdr-anchor \"com.apple/*\"\n\
+                                 dummynet-anchor \"com.apple/*\"\n\
+                                 anchor \"com.apple/*\"\n\
+                                 load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"\n";
 
     #[derive(Default)]
     struct FakePf {
         enabled: Cell<bool>,
         live: RefCell<String>,
+        /// `pfctl -s info` / `-s rules` fail (not root, /dev/pf busy).
+        unreadable: Cell<bool>,
         /// `pfctl -f -` exits non-zero (and, being atomic, changes nothing).
         load_fails: bool,
         /// `pfctl -f -` exits 0, but the live ruleset is not ours afterwards
         /// (another writer replaced it).
         load_lost: bool,
+        /// `pfctl -f /etc/pf.conf` fails (the file is missing or unreadable).
+        default_fails: bool,
+        /// `pfctl -F rules` fails.
+        flush_fails: bool,
         /// `pfctl -e` exits non-zero and pf stays off.
         enable_fails: bool,
         /// `pfctl -e` exits 0, and pf is still off.
         enable_lies: bool,
         enable_calls: Cell<u32>,
+        flush_calls: Cell<u32>,
     }
 
     impl Pf for FakePf {
-        fn is_enabled(&self) -> bool {
-            self.enabled.get()
+        fn info(&self) -> Result<String, String> {
+            if self.unreadable.get() {
+                return Err("pfctl: /dev/pf: Permission denied".to_string());
+            }
+            Ok(if self.enabled.get() {
+                "Status: Enabled for 0 days 00:01:02".to_string()
+            } else {
+                "Status: Disabled for 0 days 00:00:00".to_string()
+            })
+        }
+        fn rules(&self) -> Result<String, String> {
+            if self.unreadable.get() {
+                return Err("pfctl: /dev/pf: Permission denied".to_string());
+            }
+            Ok(self.live.borrow().clone())
         }
         fn load(&self, rules: &str) -> Result<(), String> {
             if self.load_fails {
@@ -630,6 +861,21 @@ mod tests {
             if !self.load_lost {
                 *self.live.borrow_mut() = pf_prints(rules);
             }
+            Ok(())
+        }
+        fn load_default(&self) -> Result<(), String> {
+            if self.default_fails {
+                return Err("pfctl: /etc/pf.conf: No such file or directory".to_string());
+            }
+            *self.live.borrow_mut() = pf_prints(STOCK_PF_CONF);
+            Ok(())
+        }
+        fn flush_rules(&self) -> Result<(), String> {
+            self.flush_calls.set(self.flush_calls.get() + 1);
+            if self.flush_fails {
+                return Err("pfctl -F rules failed".to_string());
+            }
+            self.live.borrow_mut().clear();
             Ok(())
         }
         fn enable(&self) -> Result<(), String> {
@@ -642,8 +888,9 @@ mod tests {
             }
             Ok(())
         }
-        fn live_rules(&self) -> String {
-            self.live.borrow().clone()
+        fn disable(&self) -> Result<(), String> {
+            self.enabled.set(false);
+            Ok(())
         }
     }
 
@@ -651,13 +898,19 @@ mod tests {
         ruleset(Some("utun4"), &[DOH])
     }
 
+    /// pf running our block-all, as engage leaves it.
+    fn engaged() -> (FakePf, PfState) {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        state.engage(&pf, &block()).unwrap();
+        (pf, state)
+    }
+
     #[test]
     fn engage_reports_blocking_once_pf_says_so() {
-        let pf = FakePf::default();
-        let out = engage(&pf, &block());
-        assert_eq!(out.result, Ok(()));
-        assert!(out.blocking);
-        assert!(out.we_enabled, "pf was off: teardown owes a pfctl -d");
+        let (pf, state) = engaged();
+        assert!(state.loaded && state.enforcing);
+        assert!(state.we_enabled, "pf was off: teardown owes a pfctl -d");
         assert_eq!(pf.enable_calls.get(), 1);
     }
 
@@ -669,10 +922,12 @@ mod tests {
             enable_fails: true,
             ..Default::default()
         };
-        let out = engage(&pf, &block());
-        assert!(!out.blocking, "an inert ruleset is not a block");
-        assert!(!out.we_enabled);
-        assert!(out.result.unwrap_err().contains("not enabled"));
+        let mut state = PfState::new();
+        let e = state.engage(&pf, &block()).unwrap_err();
+        assert!(e.contains("not enabled"), "{e}");
+        assert!(!state.enforcing, "an inert ruleset is not a block");
+        assert!(state.loaded, "...but it is loaded, so a lift is owed");
+        assert!(!state.we_enabled);
     }
 
     #[test]
@@ -681,10 +936,10 @@ mod tests {
             enable_lies: true,
             ..Default::default()
         };
-        let out = engage(&pf, &block());
-        assert!(!out.blocking);
-        assert!(!out.we_enabled);
-        assert!(out.result.is_err());
+        let mut state = PfState::new();
+        assert!(state.engage(&pf, &block()).is_err());
+        assert!(!state.enforcing);
+        assert!(!state.we_enabled);
     }
 
     #[test]
@@ -694,13 +949,14 @@ mod tests {
             ..Default::default()
         };
         pf.enabled.set(true);
-        let out = engage(&pf, &block());
-        assert!(!out.blocking);
-        assert!(out.result.unwrap_err().contains("not pf's live ruleset"));
+        let mut state = PfState::new();
+        let e = state.engage(&pf, &block()).unwrap_err();
+        assert!(e.contains("not pf's live ruleset"), "{e}");
+        assert!(!state.loaded && !state.enforcing);
     }
 
-    /// pfctl -f is all or nothing, so a failed re-load (a relay move, a new
-    /// tunnel interface) leaves the previous block in force — and says so.
+    /// pfctl -f is all or nothing, so a failed re-load (a relay move) leaves
+    /// the previous block in force — and says so.
     #[test]
     fn a_failed_load_reports_whatever_is_still_in_force() {
         let held = FakePf {
@@ -709,17 +965,17 @@ mod tests {
         };
         held.enabled.set(true);
         *held.live.borrow_mut() = pf_prints(&block());
-        let out = engage(&held, &block());
-        assert!(out.result.is_err());
-        assert!(out.blocking, "the previous block-all is still loaded");
+        let mut state = PfState::new();
+        assert!(state.engage(&held, &block()).is_err());
+        assert!(state.enforcing, "the previous block-all is still loaded");
 
         let none = FakePf {
             load_fails: true,
             ..Default::default()
         };
-        let out = engage(&none, &block());
-        assert!(out.result.is_err());
-        assert!(!out.blocking);
+        let mut state = PfState::new();
+        assert!(state.engage(&none, &block()).is_err());
+        assert!(!state.loaded);
         assert_eq!(
             none.enable_calls.get(),
             0,
@@ -733,56 +989,160 @@ mod tests {
     fn re_engaging_a_running_pf_does_not_claim_we_enabled_it() {
         let pf = FakePf::default();
         pf.enabled.set(true);
-        let out = engage(&pf, &block());
-        assert_eq!(out.result, Ok(()));
-        assert!(out.blocking);
-        assert!(!out.we_enabled);
+        let mut state = PfState::new();
+        assert_eq!(state.engage(&pf, &block()), Ok(()));
+        assert!(state.enforcing);
+        assert!(!state.we_enabled);
         assert_eq!(pf.enable_calls.get(), 0);
     }
 
-    /// P1-ks-macos-linux-deactivate-swallows-errors (macOS half): a
-    /// teardown that did not land keeps the flag, so the next lift retries.
-    #[test]
-    fn a_teardown_that_left_the_block_in_force_keeps_the_flag() {
-        let pf = FakePf::default();
-        pf.enabled.set(true);
-        *pf.live.borrow_mut() = pf_prints(&block());
+    // ── P2-2: a read that fails is not an answer ───────────────────────
 
-        let (blocking, result) = disengaged(&pf, Err("IPv6 leak block failed to load".into()));
-        assert!(blocking, "the old code stored false before trying");
-        let e = result.unwrap_err();
+    #[test]
+    fn an_unreadable_pf_after_engaging_counts_as_in_force() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        pf.unreadable.set(true);
+        let e = state.engage(&pf, &block()).unwrap_err();
+        assert!(e.contains("could not be read back"), "{e}");
         assert!(
-            e.contains("still in force") && e.contains("IPv6 leak block failed"),
+            state.loaded && state.enforcing,
+            "unknown is not 'not blocking'"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_pf_after_a_teardown_counts_as_still_blocking() {
+        let (pf, mut state) = engaged();
+        pf.unreadable.set(true);
+        let e = state.disengage(&pf).unwrap_err();
+        assert!(e.contains("still in force"), "{e}");
+        assert!(
+            state.loaded,
+            "the lift must stay owed, so the next one retries"
+        );
+        assert!(state.we_enabled, "pf was not turned off on a guess either");
+    }
+
+    // ── P1-ks-macos-linux-deactivate-swallows-errors (macOS half) ──────
+
+    #[test]
+    fn a_teardown_that_landed_clears_the_flag_and_turns_pf_back_off() {
+        let (pf, mut state) = engaged();
+        assert_eq!(state.disengage(&pf), Ok(()));
+        assert!(!state.loaded && !state.enforcing);
+        assert!(!pf.enabled.get(), "we turned pf on, so we turned it off");
+        assert!(!state.we_enabled);
+    }
+
+    /// The IPv6 fallback failing must keep the block-all (fail-safe, and it
+    /// still permits the tunnel) — never flush it, which would reopen the
+    /// IPv6 leak for the rest of the session.
+    #[test]
+    fn a_failed_ipv6_fallback_keeps_the_block_and_never_flushes() {
+        let (pf, mut state) = engaged();
+        state.ipv6_baseline = true;
+        let pf = FakePf {
+            load_fails: true,
+            ..pf
+        };
+        let e = state.disengage(&pf).unwrap_err();
+        assert!(
+            e.contains("still loaded") && e.contains("IPv6 leak block failed"),
             "{e}"
         );
+        assert!(state.loaded && state.enforcing);
+        assert_eq!(pf.flush_calls.get(), 0);
+        assert!(pf.enabled.get(), "pf stays on: the block is still wanted");
+    }
 
-        // A teardown that claimed success proves nothing either.
-        let (blocking, result) = disengaged(&pf, Ok(()));
-        assert!(blocking);
-        assert!(result.is_err());
+    /// P2-2: `/etc/pf.conf` failing to load used to be a warning and a
+    /// "deactivated". The session is over, so the block-all is flushed — and
+    /// the flush is read back like everything else.
+    #[test]
+    fn a_failed_restore_falls_back_to_flushing_and_is_verified() {
+        let (pf, mut state) = engaged();
+        let pf = FakePf {
+            default_fails: true,
+            ..pf
+        };
+        assert_eq!(state.disengage(&pf), Ok(()));
+        assert_eq!(pf.flush_calls.get(), 1);
+        assert!(!state.loaded);
+
+        let (pf, mut state) = engaged();
+        let pf = FakePf {
+            default_fails: true,
+            flush_fails: true,
+            ..pf
+        };
+        let e = state.disengage(&pf).unwrap_err();
+        assert!(
+            e.contains("still loaded") && e.contains("/etc/pf.conf"),
+            "{e}"
+        );
+        assert!(
+            state.loaded && state.enforcing,
+            "the restore error is not swallowed"
+        );
+    }
+
+    /// P2-2: a disabled pf still HOLDING the block-all is not a finished
+    /// teardown — the next `pfctl -e`, ours or anyone's, blocks everything.
+    #[test]
+    fn a_block_all_left_in_a_disabled_pf_is_not_a_finished_teardown() {
+        let (pf, mut state) = engaged();
+        pf.enabled.set(false);
+        let pf = FakePf {
+            default_fails: true,
+            flush_fails: true,
+            ..pf
+        };
+        assert!(state.disengage(&pf).is_err());
+        assert!(state.loaded, "a lift is still owed");
+        assert!(!state.enforcing, "but nothing is being enforced right now");
+    }
+
+    // ── F-001 baseline ─────────────────────────────────────────────────
+
+    #[test]
+    fn the_ipv6_baseline_is_loaded_enforced_and_lifted() {
+        let pf = FakePf::default();
+        let mut state = PfState::new();
+        assert_eq!(state.ipv6_on(&pf), Ok(()));
+        assert!(pf.rules().unwrap().contains("inet6") && pf.enabled.get());
+        // The kill switch engages and lifts back onto the baseline.
+        state.engage(&pf, &block()).unwrap();
+        assert_eq!(state.disengage(&pf), Ok(()));
+        assert!(pf.rules().unwrap().contains("inet6"), "baseline retained");
+        assert!(pf.enabled.get());
+        state.ipv6_off(&pf);
+        assert!(!pf.rules().unwrap().contains("inet6"));
+        assert!(!pf.enabled.get(), "we turned pf on for the baseline");
     }
 
     #[test]
-    fn a_teardown_that_landed_clears_the_flag() {
-        let pf = FakePf::default();
-        pf.enabled.set(true);
-        *pf.live.borrow_mut() = pf_prints(include_str!("../../resources/pf/ipv6-block.conf"));
-        assert_eq!(disengaged(&pf, Ok(())), (false, Ok(())));
-
-        // The block lifted but the fallback did not apply cleanly: not
-        // blocking, and the teardown's own error still reaches the caller.
-        let (blocking, result) = disengaged(&pf, Err("pfctl restore failed".into()));
-        assert!(!blocking);
-        assert_eq!(result, Err("pfctl restore failed".to_string()));
+    fn an_ipv6_baseline_pf_will_not_enforce_is_refused_not_claimed() {
+        let pf = FakePf {
+            enable_fails: true,
+            ..Default::default()
+        };
+        let mut state = PfState::new();
+        let e = state.ipv6_on(&pf).unwrap_err();
+        assert!(e.contains("not enabled"), "{e}");
+        assert!(!state.ipv6_baseline, "no claim we could not honour");
     }
 
-    /// A disabled pf enforces nothing, whatever is loaded in it.
+    /// While the block-all owns the ruleset it already denies IPv6: the
+    /// baseline is only recorded, and released without touching pf.
     #[test]
-    fn a_disabled_pf_is_not_blocking_even_with_the_block_loaded() {
-        let pf = FakePf::default();
-        *pf.live.borrow_mut() = pf_prints(&block());
-        assert!(!Observed::read(&pf).blocking());
-        assert_eq!(disengaged(&pf, Ok(())), (false, Ok(())));
+    fn the_baseline_defers_to_a_loaded_block_all() {
+        let (pf, mut state) = engaged();
+        assert_eq!(state.ipv6_on(&pf), Ok(()));
+        assert!(block_all_loaded(&pf.rules().unwrap()));
+        state.ipv6_off(&pf);
+        assert!(block_all_loaded(&pf.rules().unwrap()));
+        assert!(state.loaded);
     }
 }
 
