@@ -1,6 +1,7 @@
 # ============================================================================
 # UNIFIED release workflow — Windows + Linux + macOS build TOGETHER and
-# publish into ONE draft GitHub Release from a SINGLE tag (v*.*.* e.g. v1.4.16).
+# publish into ONE GitHub Release from a SINGLE tag (v*.*.* e.g. v1.4.16).
+# Published directly (draft: false), not as a draft - owner decision 2026-10-01.
 #
 # This superseded the three separate per-platform pipelines
 # (build-windows.yml, build-linux.yml, build-macos.yml). All three are GONE:
@@ -58,9 +59,10 @@ concurrency:
 
 # NO CACHES anywhere in this workflow (no rust-cache, no setup-node cache):
 # a cache a PR or a main-branch run wrote must never feed a build that is
-# signed and published (zizmor cache-poisoning). It cost nothing measurable:
-# a tag run can only read caches from its own tag or main, so all five
-# rust-cache steps reported "No cache found" on v1.4.45 anyway.
+# signed and published (zizmor cache-poisoning). The cost is a few seconds
+# of npm download per job: a tag run can only read caches from its own tag
+# or main, so all five rust-cache steps reported "No cache found" on
+# v1.4.45 anyway.
 defaults:
   run:
     shell: bash
@@ -247,7 +249,8 @@ jobs:
 
   # ══════════════════════════════════════════════════════════════════════
   # WINDOWS — began as a faithful copy of the retired build-windows.yml `build` job.
-  # Authenticode (Azure OIDC Trusted Signing) + Sigstore + updater .sig.
+  # Authenticode (Azure OIDC Trusted Signing) + the updater .sig. (Sigstore
+  # signs once, in the release job, over SHA256SUMS.txt - not here.)
   # ══════════════════════════════════════════════════════════════════════
   build-windows:
     needs: test  # never build/sign/publish on a red test suite
@@ -360,8 +363,10 @@ jobs:
           Write-Host "Attestation key present (kid: $env:BIRDO_DESKTOP_ATTEST_KID)"
 
       # ── Authenticode signing setup (only on tag builds) ──────────────
-      # Skip for PR/dispatch builds — those produce unsigned binaries that
-      # are still Sigstore-signed. Only tagged releases get Authenticode.
+      # Off for dispatch builds unless authenticode_dry_run is set: those
+      # produce unsigned binaries and no Sigstore signature (only a tag's
+      # release job signs, over SHA256SUMS.txt). Tagged releases always get
+      # Authenticode.
       - name: Determine if this build should be Authenticode-signed
         id: sign-mode
         shell: pwsh
@@ -1356,6 +1361,9 @@ jobs:
       # true, exactly as before. (Two publishes within the same few seconds can
       # still race; serialising publishes instead would let a third queued
       # tag's run cancel the second's - a dropped release is worse.)
+      # A tag that is not plain vX.Y.Z (e.g. v1.5.0-rc.1) is published as a
+      # PRERELEASE and never takes Latest: the website reads /releases/latest,
+      # and the in-app updater ignores prereleases.
       - name: Decide whether this tag becomes GitHub Latest
         id: latest
         if: startsWith(github.ref, 'refs/tags/')
@@ -1365,10 +1373,12 @@ jobs:
         run: |
           set -euo pipefail
           if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "make_latest=true" >> "$GITHUB_OUTPUT"
-            echo "$TAG is not plain vX.Y.Z - keeping make_latest: true (unchanged behaviour)"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is not plain vX.Y.Z - publishing it as a prerelease that does not take Latest"
             exit 0
           fi
+          echo "prerelease=false" >> "$GITHUB_OUTPUT"
           # Bounded retry; if the API stays unreachable, fall back to the
           # behaviour before this guard rather than block the release.
           published="" listed=false
@@ -1413,5 +1423,5 @@ jobs:
             release-files/SHA256SUMS.txt.sigstore
           generate_release_notes: true
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.latest.outputs.prerelease }}
           make_latest: ${{ steps.latest.outputs.make_latest }}

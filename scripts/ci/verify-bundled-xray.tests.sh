@@ -183,6 +183,10 @@ if command -v hdiutil >/dev/null 2>&1; then
   hdiutil create -quiet -fs HFS+ -volname BirdoBad -srcfolder "$work/rewritten" -format UDZO "$work/bad.dmg"
   expect 0 '.dmg passes' 'OK: every artifact' -- "$good_sha" "$work/good.dmg"
   expect 1 '.dmg with rewritten xray fails' 'v1.4.40/v1.4.41' -- "$good_sha" "$work/bad.dmg"
+  # Not a disk image at all: the bounded attach retry must give up and fail
+  # closed (3 attempts), never pass or hang.
+  cp "$payload" "$work/garbage.dmg"
+  expect 1 'unmountable .dmg fails after the bounded attach retry' 'hdiutil attach failed (3 attempts)' -- "$good_sha" "$work/garbage.dmg"
 else
   echo "SKIP  .dmg scenarios (no hdiutil on this OS; the macOS leg runs them)"
 fi

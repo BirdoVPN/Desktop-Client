@@ -202,7 +202,7 @@ jobs:
           echo '<!doctype html><title>stub</title>' > dist/index.html
 
       # PQ dependency + feature gate. Runs on Linux only (once per PR is
-      # enough; the answer is host-independent) and BEFORE `cargo check`.
+      # enough; the answer is host-independent) and BEFORE the clippy step.
       #
       # WHY: `zeroize` is what makes ml-kem's DecapsulationKey ZeroizeOnDrop
       # (ml-kem-0.3.2/src/decapsulation_key.rs:142,156 gate `impl Drop` and
@@ -221,9 +221,14 @@ jobs:
         if: matrix.os == 'linux'
         run: ./scripts/ci/check-pq-features.sh
 
-      - name: cargo check (all targets)
+      # Clippy (deny warnings) on the Linux/macOS cfg code (tunnel_linux.rs,
+      # tunnel_macos.rs, ...), which the Windows rust-lint job never compiles,
+      # with the MSRV-gated lints keyed off Cargo.toml's rust-version. Clippy
+      # is a superset of `cargo check`, so this is still this job's compile
+      # guard for every target.
+      - name: cargo clippy (all targets, deny warnings) - also the compile check
         working-directory: src-tauri
-        run: cargo check --locked --all-targets
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       # The DNS crash-recovery journal is the only record of the user's
       # pre-connect resolvers, so it must survive a restore that did not land.
@@ -382,9 +387,8 @@ jobs:
   # MSRV-gated lints key off it, so a fictional value silently changes which
   # lints fire. Nothing compiled at it until 2026-10-06, when it said 1.85
   # while the locked graph already needed 1.88 (time 0.3.53, sentry 0.49,
-  # plist 1.10, darling 0.23, serde_with 3.22). `cargo check` only, cached like
-  # every Rust job (main writes, PRs read): uncached, the Windows leg took
-  # 5-6 min and would have become this workflow's critical path.
+  # plist 1.10, darling 0.23, serde_with 3.22). `cargo check` only. The Windows
+  # leg is cached (main writes, PRs read); see the cache step for why only it.
   msrv:
     name: MSRV check (${{ matrix.os }})
     strategy:
@@ -430,7 +434,11 @@ jobs:
           # not the 1.96 that rust-toolchain.toml would otherwise select.
           echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
 
+      # Windows only: uncached, its leg took 4-6 min and would set the
+      # workflow's critical path; the Linux/macOS legs (2.5-3.5 min) stay
+      # uncached to spare two ~0.5 GB entries of the 10 GB cache budget.
       - name: Rust cache
+        if: matrix.os == 'windows'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
@@ -485,24 +493,46 @@ jobs:
       - name: Production bundle builds
         run: npm run build
 
-      # release.yml's Linux/macOS legs build with
-      # `npx tauri build --target "$ARCH" -- --locked` under bash. Prove the
-      # CLI hands --locked to cargo: an `echo` runner stands in for cargo and
-      # the frontend build is switched off, so nothing compiles (seconds).
-      - name: Release build command passes --locked through to cargo (bash)
+      # The release's tauri build commands, read FROM release.yml so this
+      # contract cannot drift from it: every one must end in `-- --locked`,
+      # and the Linux/macOS form, run verbatim with an `echo` runner standing
+      # in for cargo and the frontend build switched off (nothing compiles),
+      # must hand --locked to cargo. The Windows form runs in
+      # release-cli-contract below, under pwsh.
+      - name: Release build commands pass --locked through to cargo (bash, read from release.yml)
         env:
           RUSTUP_TOOLCHAIN: stable # the CLI's own `cargo metadata` only
+          ARCH: x86_64-unknown-linux-gnu # what build-linux's matrix passes
         run: |
           set -euo pipefail
+          mapfile -t cmds < <(sed -n 's/^ *run: \(npx tauri build.*\)$/\1/p' .github/workflows/release.yml)
+          echo "release.yml build commands: ${#cmds[@]}"
+          if [ "${#cmds[@]}" -lt 2 ]; then
+            echo "::error::found ${#cmds[@]} 'run: npx tauri build ...' lines in release.yml; expected the Windows, Linux and macOS ones"
+            exit 1
+          fi
+          for c in "${cmds[@]}"; do
+            case "$c" in
+              *' -- --locked') echo "  ok: $c" ;;
+              *) echo "::error::release.yml builds without a trailing '-- --locked': $c"; exit 1 ;;
+            esac
+          done
+          unix_cmd=$(printf '%s\n' "${cmds[@]}" | grep -e '--target' | sort -u)
+          if [ -z "$unix_cmd" ] || [ "$(printf '%s\n' "$unix_cmd" | wc -l)" -ne 1 ]; then
+            echo "::error::expected ONE Linux/macOS build command form in release.yml, got: $unix_cmd"
+            exit 1
+          fi
           printf '%s' '{"build":{"beforeBuildCommand":""}}' > "$RUNNER_TEMP/no-frontend.json"
+          probe="npx tauri build --runner echo --no-bundle --config \"\$RUNNER_TEMP/no-frontend.json\"${unix_cmd#npx tauri build}"
+          echo "probe: $probe"
           # tauri's own exit code is irrelevant (it is 0 with --no-bundle);
           # the gate is the grep on the command line cargo would receive.
           rc=0
-          out=$(npx tauri build --runner echo --no-bundle --config "$RUNNER_TEMP/no-frontend.json" --target x86_64-unknown-linux-gnu -- --locked 2>&1) || rc=$?
+          out=$(eval "$probe" 2>&1) || rc=$?
           echo "$out"
           echo "(tauri exited $rc; not the gate)"
           if ! printf '%s\n' "$out" | grep -qE '^build .*--locked'; then
-            echo "::error::npx tauri build ... -- --locked did not hand --locked to cargo"
+            echo "::error::release.yml's Linux/macOS build command did not hand --locked to cargo"
             exit 1
           fi
           echo "OK: cargo receives --locked"
@@ -536,17 +566,33 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: npx tauri build -- --locked, exactly as build-windows runs it
+      - name: build-windows' tauri build command, read from release.yml and run verbatim
         env:
           RUSTUP_TOOLCHAIN: stable # the CLI's own `cargo metadata` only
         run: |
+          # The Windows command is the one `run: npx tauri build ...` line in
+          # release.yml without --target; drift there now changes what runs here.
+          $cmds = @(Select-String -Path .github/workflows/release.yml -Pattern '^\s*run: (npx tauri build.*)$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() })
+          $win = @($cmds | Where-Object { $_ -notmatch '--target' } | Sort-Object -Unique)
+          if ($win.Count -ne 1) {
+            Write-Host "::error::expected ONE Windows 'run: npx tauri build ...' line in release.yml, found $($win.Count): $($win -join ' | ')"
+            exit 1
+          }
+          Write-Host "build-windows runs: $($win[0])"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Set-Content -Path "$env:RUNNER_TEMP\no-frontend.json" -Value '{"build":{"beforeBuildCommand":""}}'
+          $cfg = "$env:RUNNER_TEMP\no-frontend.json"
+          $runner = "$env:RUNNER_TEMP\echo-args.cmd"
+          Set-Content -Path $cfg -Value '{"build":{"beforeBuildCommand":""}}'
           # A runner that prints the arguments cargo would have received.
-          Set-Content -Path "$env:RUNNER_TEMP\echo-args.cmd" -Value '@echo %*'
-          # tauri's own exit code is irrelevant (0 with --no-bundle); the
-          # gate is the match on the command line cargo would receive.
-          $out = npx tauri build --runner "$env:RUNNER_TEMP\echo-args.cmd" --no-bundle --config "$env:RUNNER_TEMP\no-frontend.json" -- --locked 2>&1 | Out-String
+          Set-Content -Path $runner -Value '@echo %*'
+          $rest = $win[0].Substring('npx tauri build'.Length)
+          $probe = "npx tauri build --runner `"$runner`" --no-bundle --config `"$cfg`"$rest"
+          Write-Host "probe: $probe"
+          # Parsed by pwsh exactly as the release step's script is, so npx.ps1
+          # sees the same tokens. tauri's own exit code is irrelevant (0 with
+          # --no-bundle); the gate is the match on the line cargo would receive.
+          $out = Invoke-Expression "$probe 2>&1" | Out-String
           Write-Host $out
           Write-Host "(tauri exited $LASTEXITCODE; not the gate)"
           if ($out -notmatch '(?m)^build .*--locked') {

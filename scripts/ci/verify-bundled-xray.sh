@@ -174,8 +174,22 @@ for artifact in "$@"; do
       if [ ! -f "$artifact" ]; then err "$label: not found"; continue; fi
       if ! command -v hdiutil >/dev/null 2>&1; then err "$label: hdiutil not available - a .dmg can only be gated on macOS"; continue; fi
       mkdir -p "$dest/mnt"
-      if ! hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$dest/mnt" "$artifact" >/dev/null; then
-        err "$label: hdiutil attach failed"
+      # Bounded retry: a transient "Resource busy" from hdiutil (seen right
+      # after a DMG is written) must not block a release. A DMG that cannot
+      # be mounted at all still fails after the third attempt.
+      attached=false
+      for attempt in 1 2 3; do
+        if hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$dest/mnt" "$artifact" >/dev/null; then
+          attached=true
+          break
+        fi
+        if [ "$attempt" -lt 3 ]; then
+          echo "  hdiutil attach failed (attempt $attempt/3); retrying in $((attempt * 5))s"
+          sleep $((attempt * 5))
+        fi
+      done
+      if [ "$attached" != true ]; then
+        err "$label: hdiutil attach failed (3 attempts)"
         continue
       fi
       mounts+=("$dest/mnt")
