@@ -300,9 +300,12 @@ impl LinuxTunnel {
         // Dual-stack: the fleet DOES have routable IPv6 now (nodes provisioned
         // with enable_ipv6 get a real /64), so when the backend issues a
         // client_ipv6 the correct behaviour is to ROUTE IPv6 through the tunnel,
-        // not to black-hole it. Mirrors tunnel.rs (Windows) exactly: lift the
-        // block immediately before the tunnel's own v6 address and routes go in,
-        // and re-block if any of that fails.
+        // not to black-hole it. The tunnel's own v6 address and routes go in
+        // FIRST, with the block still in force (ip6tables filters packets, it
+        // does not stop address or route configuration), and the block is
+        // lifted only once that succeeded. If it fails, nothing was lifted, so
+        // nothing needs re-blocking: IPv6 simply stays blocked. tunnel.rs
+        // (Windows) uses the same order since W15.
         //
         // Absent client_ipv6 the block simply stays in force, which is the
         // leak-safe behaviour for an IPv4-only node.

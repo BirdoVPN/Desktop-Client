@@ -870,7 +870,7 @@ async fn quick_connect_target(
     // The branch lives in Rust rather than in each caller because the tray and
     // the launch path have no UI to gate on, and duplicating it per call site is
     // how it went missing in the first place.
-    let settings = get_settings(app.clone()).await.map_err(IpcError::unknown)?;
+    let settings = get_settings(app.clone()).await?;
     if settings.multi_hop_enabled {
         return match (
             settings.multi_hop_entry_node_id.as_deref(),
@@ -1041,7 +1041,7 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
         "The settings change could not be applied ({:?}) — restoring the previous settings",
         error.code
     );
-    if let Err(e) = crate::commands::settings::restore_tunnel_settings(&app, &previous) {
+    if let Err(e) = crate::commands::settings::restore_tunnel_settings(&app, &previous).await {
         tracing::error!("Could not save the previous settings back: {}", e);
         return Err(error);
     }

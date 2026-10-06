@@ -48,6 +48,10 @@ pub enum IpcErrorCode {
     NotElevated,
     Cancelled,
     ServerError,
+    /// The settings file cannot be verified right now (its signing key is
+    /// unreadable), so a save was refused rather than written over it. The UI
+    /// offers `reset_settings`.
+    SettingsUnverified,
     Unknown,
 }
 
@@ -371,6 +375,7 @@ mod tests {
             (IpcErrorCode::NotElevated, "not_elevated"),
             (IpcErrorCode::Cancelled, "cancelled"),
             (IpcErrorCode::ServerError, "server_error"),
+            (IpcErrorCode::SettingsUnverified, "settings_unverified"),
             (IpcErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in pairs {
@@ -642,5 +647,85 @@ mod tests {
             IpcError::connect_refused("Full", old.quota_exceeded).code,
             IpcErrorCode::ServerUnavailable
         );
+    }
+
+    /// P1-dk-redaction-incomplete: the commands outside the contract still
+    /// answer `Result<_, String>`, and their text reaches the renderer as
+    /// written. Every one of them passes its error through
+    /// `redact::for_ipc`, like `IpcError::new` does for the rest — scanned
+    /// from the source, so a new String command cannot skip it.
+    #[test]
+    fn every_string_error_command_redacts_its_error() {
+        // Answers `Result<_, String>` but has no error path: every registry
+        // read that fails is skipped, not reported.
+        const NO_ERROR_PATH: &[&str] = &["list_installed_apps"];
+        let sources = [
+            ("auth.rs", include_str!("auth.rs")),
+            ("biometric.rs", include_str!("biometric.rs")),
+            ("killswitch.rs", include_str!("killswitch.rs")),
+            ("oauth.rs", include_str!("oauth.rs")),
+            ("servers.rs", include_str!("servers.rs")),
+            ("session.rs", include_str!("session.rs")),
+            ("settings.rs", include_str!("settings.rs")),
+            ("speed_test.rs", include_str!("speed_test.rs")),
+            ("split_tunnel.rs", include_str!("split_tunnel.rs")),
+            ("tray.rs", include_str!("tray.rs")),
+            ("updater.rs", include_str!("updater.rs")),
+            ("vouchers.rs", include_str!("vouchers.rs")),
+            ("vpn.rs", include_str!("vpn.rs")),
+            ("vpn_multi_hop.rs", include_str!("vpn_multi_hop.rs")),
+            ("vpn_port_forward.rs", include_str!("vpn_port_forward.rs")),
+        ];
+        let mut string_commands = 0;
+        let mut unredacted = Vec::new();
+        for (file, source) in sources {
+            // A Windows checkout has CRLF endings (core.autocrlf).
+            let source = source.replace('\r', "");
+            for item in source.split("#[tauri::command]\n").skip(1) {
+                let item = &item[..item.find("\n}\n").unwrap_or(item.len())];
+                let signature = &item[..item.find('{').unwrap_or(item.len())];
+                let squashed: String = signature.chars().filter(|c| !c.is_whitespace()).collect();
+                if !squashed.ends_with(",String>") {
+                    continue;
+                }
+                let name = signature
+                    .split("fn ")
+                    .nth(1)
+                    .and_then(|rest| rest.split('(').next())
+                    .unwrap_or(signature);
+                string_commands += 1;
+                if !item.contains("for_ipc") && !NO_ERROR_PATH.contains(&name) {
+                    unredacted.push(format!("{file}: {name}"));
+                }
+            }
+        }
+        // The settings commands answer an IpcError since the review of #222;
+        // these six still answer String.
+        assert!(
+            string_commands >= 6,
+            "the scan found {string_commands} commands"
+        );
+        assert!(
+            unredacted.is_empty(),
+            "unredacted String errors: {unredacted:?}"
+        );
+
+        // install_update answers an UpdateFailure, whose message is built in
+        // two places; both redact.
+        let updater = include_str!("updater.rs").replace('\r', "");
+        assert!(updater.contains("message: for_ipc(message),"));
+        assert!(updater.contains("message: for_ipc(format!(\"Update failed: {error}\")),"));
+    }
+
+    /// What `for_ipc` does to a raw transport error a String command used to
+    /// pass through untouched.
+    #[test]
+    fn a_raw_transport_error_reaches_the_renderer_redacted() {
+        let raw = "error sending request for url (https://api.birdo.app/vpn/speed-test/ping): \
+                   connection refused by 185.199.110.153:443";
+        let shown = crate::utils::redact::for_ipc(raw);
+        assert!(!shown.contains("birdo.app"), "{shown}");
+        assert!(!shown.contains("185.199"), "{shown}");
+        assert!(shown.contains("connection refused"), "{shown}");
     }
 }

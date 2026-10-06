@@ -121,6 +121,9 @@ pub const CIPHERTEXT_BYTES: usize = 1568;
 const SEED_BYTES: usize = 64;
 const PSK_LEN: usize = 32;
 const HKDF_SALT: &[u8] = b"BirdoPQ-v1-PSK";
+/// Upper bound for the server's per-connect nonce, the same as Android's
+/// `RosenpassManager.MAX_NONCE_BYTES` (the server mints 32 bytes).
+const MAX_NONCE_BYTES: usize = 64;
 
 /// Which ML-KEM implementation is linked into this binary.
 ///
@@ -568,6 +571,35 @@ pub fn get_client_public_key_b64() -> Option<String> {
     }
 }
 
+/// The per-connect nonce the server sends in `rosenpassEndpoint` (base64),
+/// decoded and bounded to 1..=[`MAX_NONCE_BYTES`] bytes.
+///
+/// Proposed row 13: the length was unbounded here while Android caps it at
+/// 64 before the nonce crosses into Rust. It is the HKDF `info`, so no length
+/// is unsafe for the KDF itself; the bound keeps a malformed or hostile
+/// response from having this process decode and hash a field of any size,
+/// and makes both clients refuse the same responses. The text is bounded
+/// before it is decoded (64 bytes are 88 characters of padded base64).
+fn server_nonce(field: Option<&str>) -> Result<Vec<u8>, String> {
+    let encoded = match field {
+        None | Some("") => return Err("server omitted per-connect nonce".into()),
+        Some(encoded) => encoded,
+    };
+    if encoded.len() > MAX_NONCE_BYTES.div_ceil(3) * 4 {
+        return Err(format!(
+            "PQ nonce out of bounds ({} base64 characters)",
+            encoded.len()
+        ));
+    }
+    let nonce = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("malformed PQ nonce: {e}"))?;
+    if nonce.is_empty() || nonce.len() > MAX_NONCE_BYTES {
+        return Err(format!("PQ nonce out of bounds ({} B)", nonce.len()));
+    }
+    Ok(nonce)
+}
+
 /// Try to derive a bilateral PQ PSK from the server response. Returns
 /// `None` when the server did not include a ciphertext (legacy path) or
 /// when our local keypair is missing.
@@ -615,20 +647,12 @@ pub fn try_decapsulate(response: &ConnectResponse) -> Option<Zeroizing<String>> 
     // silently weaken the protocol. Fail closed: we only reach this line with
     // `quantum_enabled` set, so the `None` below makes `derive_quantum_psk`
     // abort the connect — it is not a demotion to the server-provided PSK.
-    let nonce: Vec<u8> = match response.rosenpass_endpoint.as_deref() {
-        None | Some("") => {
-            tracing::error!(
-                "BirdoPQ: server omitted per-connect nonce — bilateral PQ aborted (PFA-M5)"
-            );
+    let nonce = match server_nonce(response.rosenpass_endpoint.as_deref()) {
+        Ok(nonce) => nonce,
+        Err(e) => {
+            tracing::error!("BirdoPQ: {e} — bilateral PQ aborted (PFA-M5)");
             return None;
         }
-        Some(n) => match base64::engine::general_purpose::STANDARD.decode(n) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("BirdoPQ: malformed PQ nonce: {e}");
-                return None;
-            }
-        },
     };
 
     let (_pk, sk) = match load_or_generate() {
@@ -1121,6 +1145,32 @@ mod tests {
             rosenpass_endpoint: None,
         };
         assert!(try_decapsulate(&resp).is_none());
+    }
+
+    /// Proposed row 13: the server nonce is bounded like Android's
+    /// (`MAX_NONCE_BYTES = 64`). Missing, empty, oversized and malformed are
+    /// refused — an oversized text before it is decoded at all.
+    #[test]
+    fn the_server_nonce_is_bounded_like_android() {
+        let b64 = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![7u8; n]);
+        assert_eq!(
+            server_nonce(Some(&b64(32))).unwrap().len(),
+            32,
+            "what the server mints"
+        );
+        assert_eq!(server_nonce(Some(&b64(1))).unwrap().len(), 1);
+        assert_eq!(server_nonce(Some(&b64(64))).unwrap().len(), 64);
+        assert!(
+            server_nonce(Some(&b64(65))).is_err(),
+            "decoded past the cap"
+        );
+        assert!(
+            server_nonce(Some(&b64(1 << 20))).is_err(),
+            "text past the cap"
+        );
+        assert!(server_nonce(Some("")).is_err());
+        assert!(server_nonce(None).is_err());
+        assert!(server_nonce(Some("not base64!")).is_err());
     }
 
     #[test]

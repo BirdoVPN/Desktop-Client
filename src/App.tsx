@@ -15,6 +15,7 @@ import { UpdateRequired, type RequiredUpdate } from '@/components/UpdateRequired
 import { VpnSessionController } from '@/session/controller';
 import { endSession } from '@/session/session';
 import { checkForUpdates } from '@/session/updater';
+import { saveConsentCrashChoice } from '@/session/settings-persist';
 import { applyWindowPlacement } from '@/lib/window-placement';
 import { installBrowserShortcutGuard } from '@/lib/keyboard';
 import { motion as motionTokens } from '@/lib/birdo-theme';
@@ -310,18 +311,12 @@ function App() {
   }, [handleDeepLinkUrl]);
 
   // ── Consent handlers ──────────────────────────────────────────
-  // The crash-report choice made on the consent screen goes straight to Rust
-  // through the dedicated command (it reads settings.json, flips the one
-  // field and applies the opt-in live), never through a full save of a store
-  // that has not been hydrated from Rust yet. Default OFF; a failed write
-  // leaves it OFF, which is the safe direction.
+  // The crash-report choice goes straight to Rust through the dedicated
+  // command, and a refusal is reported like any other settings write
+  // (`saveConsentCrashChoice`).
   const handleAcceptConsent = (crashReportsEnabled: boolean) => {
     acceptConsent();
-    useAppStore.getState().updateSettings({ crashReportsEnabled });
-    invoke('set_crash_reports_enabled', { enabled: crashReportsEnabled }).catch((err) => {
-      console.error('Failed to save the crash-report choice', err);
-      useAppStore.getState().updateSettings({ crashReportsEnabled: false });
-    });
+    void saveConsentCrashChoice(crashReportsEnabled);
   };
 
   const handleDeclineConsent = async () => {

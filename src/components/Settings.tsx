@@ -56,7 +56,7 @@ import {
 } from '@/components/birdo';
 import { UpdateChecker } from './UpdateChecker';
 import { brand, status as statusTokens, white } from '@/lib/birdo-theme';
-import { persistSettings, setKillSwitch } from '@/session/settings-persist';
+import { persistSettings, setKillSwitch, showSaveFailure } from '@/session/settings-persist';
 import { loadAppVersion, useUpdater } from '@/session/updater';
 import { DASHBOARD_URL, PRIVACY_URL, TERMS_URL } from '@/lib/links';
 import { customDnsAvailable } from '@/lib/plan';
@@ -161,11 +161,9 @@ export function Settings() {
   const handleAutostart = useCallback(async (value: boolean) => {
     try {
       await invoke('set_autostart', { enabled: value });
-    } catch {
-      useAppStore.getState().showNotice({
-        text: "Couldn't change Launch at Login. Please try again.",
-        tone: 'danger',
-      });
+    } catch (e) {
+      // An unverifiable settings file offers the reset (review of #222).
+      showSaveFailure(e, "Couldn't change Launch at Login. Please try again.");
       return;
     }
     await persistSettings({ autostart: value });
@@ -177,9 +175,10 @@ export function Settings() {
     updateSettings({ crashReportsEnabled: value });
     try {
       await invoke('set_crash_reports_enabled', { enabled: value });
-    } catch {
-      // Not persisted: show the state Rust actually has.
+    } catch (e) {
+      // Not persisted: show the state Rust actually has, and say why.
       updateSettings({ crashReportsEnabled: !value });
+      showSaveFailure(e, "Couldn't change crash reporting. Please try again.");
     }
   }, []);
 

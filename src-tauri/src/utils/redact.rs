@@ -6,8 +6,8 @@
 //! LOG-001: All error messages and logs should use these functions
 //! to prevent PII exposure.
 
-/// Redact an IP address for logging (shows only first octet in production)
-/// In debug builds, returns the full IP for troubleshooting
+/// Redact an IP address for logging (no IPv4 octet in production, see
+/// [`mask_ip`]). In debug builds, returns the full IP for troubleshooting.
 #[inline]
 pub fn redact_ip(ip: &str) -> String {
     #[cfg(debug_assertions)]
@@ -17,35 +17,28 @@ pub fn redact_ip(ip: &str) -> String {
 
     #[cfg(not(debug_assertions))]
     {
-        // IPv4: Show first octet only (e.g., "192.x.x.x")
-        // IPv6: Show first segment only (e.g., "2001:x:x:x:x:x:x:x")
-        if ip.contains("::") || (ip.contains(':') && ip.matches(':').count() >= 2) {
-            // IPv6
-            ip.split(':')
-                .next()
-                .map(|first| format!("{}:x:x:x:x:x:x:x", first))
-                .unwrap_or_else(|| "[redacted-ipv6]".to_string())
-        } else if ip.contains(':') && ip.matches(':').count() == 1 {
-            // IPv4:port format
-            if let Some(colon_pos) = ip.rfind(':') {
-                let ip_part = &ip[..colon_pos];
-                let port = &ip[colon_pos..];
-                let redacted_ip = ip_part
-                    .split('.')
-                    .next()
-                    .map(|first| format!("{}.x.x.x", first))
-                    .unwrap_or_else(|| "[redacted]".to_string());
-                format!("{}{}", redacted_ip, port)
-            } else {
-                "[redacted]".to_string()
-            }
-        } else {
-            // Plain IPv4
-            ip.split('.')
-                .next()
-                .map(|first| format!("{}.x.x.x", first))
-                .unwrap_or_else(|| "[redacted-ipv4]".to_string())
-        }
+        mask_ip(ip)
+    }
+}
+
+/// What [`redact_ip`] writes in a release build. Split out of the
+/// `not(debug_assertions)` branch so it is reachable from tests.
+///
+/// - IPv4 (with or without `:port`): every octet masked, the port kept
+///   (`x.x.x.x:51820`). P6-CLI-D-06: this used to keep the first octet. That
+///   is a /8, and for a fleet of ten known relays it is often enough to tell
+///   which one a customer used.
+/// - IPv6: the first segment only (`2001:x:x:x:x:x:x:x`), a /16 allocation
+///   block, not a host.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn mask_ip(ip: &str) -> String {
+    if ip.contains("::") || ip.matches(':').count() >= 2 {
+        let first = ip.split(':').next().unwrap_or_default();
+        format!("{first}:x:x:x:x:x:x:x")
+    } else if let Some((_, port)) = ip.split_once(':') {
+        format!("x.x.x.x:{port}")
+    } else {
+        "x.x.x.x".to_string()
     }
 }
 
@@ -187,6 +180,50 @@ pub fn sanitize_error(msg: &str) -> String {
     }
 }
 
+/// The error of an IPC command that still answers `Result<_, String>`, on its
+/// way to the renderer (P1-dk-redaction-incomplete).
+///
+/// Redacted in every build, like `IpcError::new`'s message and for the same
+/// reason: this text is shown, copied and pasted into support mail, not
+/// written to a developer's console. A raw reqwest or OS error carries the
+/// URL, host or address it failed on.
+pub fn for_ipc(error: impl std::fmt::Display) -> String {
+    sanitize_always(&error.to_string())
+}
+
+/// File extensions this app's errors and backtraces name that are NOT also
+/// top-level domains: a dotted name ending in one is a file wherever it
+/// appears (`tauri.conf.json`, `birdo-vpn.exe`).
+const FILE_EXTENSIONS: &[&str] = &[
+    "bat", "cfg", "conf", "crt", "dat", "dll", "exe", "html", "ico", "ini", "js", "json", "lock",
+    "log", "msi", "pem", "plist", "png", "ps1", "svg", "sys", "tmp", "toml", "ts", "tsx", "txt",
+    "xml", "yaml", "yml",
+];
+
+/// File extensions that ARE also top-level domains. A name ending in one is a
+/// file only straight after a path separator (`src\vpn\tunnel.rs` in a
+/// backtrace); anywhere else (`example.rs`) it may be a host, and is redacted.
+const EXTENSIONS_THAT_ARE_TLDS: &[&str] = &["md", "rs", "zip"];
+
+/// Code namespaces whose dotted names are identifiers, not hosts: .NET and
+/// WinRT (`Windows.Security.Credentials.UI`, `System.IO.IOException`).
+const CODE_NAMESPACES: &[&str] = &["Windows", "System", "Microsoft"];
+
+/// Whether `name`, a dotted name the hostname pattern matched ending in `tld`,
+/// is a host. Review of #222: file names and code identifiers used to come out
+/// as `[redacted-host]`; round 3: only what is KNOWN not to be a host is let
+/// through — a name in a code namespace, or one ending in a file extension
+/// (one that is also a TLD only right after a path separator). Case does not
+/// decide: hosts are case-insensitive, and `vpn.example.NET` is a host.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn looks_like_a_host(name: &str, tld: &str, after_separator: bool) -> bool {
+    let tld = tld.to_ascii_lowercase();
+    let first = name.split('.').next().unwrap_or(name);
+    !(CODE_NAMESPACES.contains(&first)
+        || FILE_EXTENSIONS.contains(&tld.as_str())
+        || (after_separator && EXTENSIONS_THAT_ARE_TLDS.contains(&tld.as_str())))
+}
+
 /// The redaction itself, with NO `debug_assertions` escape hatch.
 ///
 /// [`sanitize_error`] is deliberately a pass-through in debug builds so a
@@ -219,9 +256,10 @@ pub fn sanitize_always(msg: &str) -> String {
         });
         // Matches common hostname patterns. P1-dk-redaction-incomplete: two
         // labels are enough ("birdo.app" is as identifying as "api.birdo.app"),
-        // so the repeated-label group is now optional.
+        // so the repeated-label group is now optional. The last label is
+        // captured for `looks_like_a_host`.
         static HOST_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){0,}\.[a-zA-Z]{2,}\b").expect("hostname regex")
+            Regex::new(r"\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?){0,}\.([a-zA-Z]{2,})\b").expect("hostname regex")
         });
         // P1-dk-redaction-incomplete: IPv6 literals. Two shapes — an expanded
         // run of >= 5 hex groups (>= 5 avoids matching hh:mm:ss timestamps),
@@ -244,6 +282,16 @@ pub fn sanitize_always(msg: &str) -> String {
         // P2-13: Strip HTML tags
         static HTML_TAG_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"<[^>]{1,200}>").expect("HTML tag regex"));
+        // Round 3 of the review of #222: the account name in a home folder
+        // (`C:\Users\Jane.Doe\…`, `/Users/jane/…`, `/home/jane/…`).
+        static USER_DIR_RE: Lazy<Regex> = Lazy::new(|| {
+            // One or two backslashes: `{path:?}` prints `C:\\Users\\Jane\\…`
+            // (round 4 of the review).
+            Regex::new(
+                r#"(?i)(\b[a-z]:\\{1,2}users\\{1,2})[^\\/:*?"<>|\r\n]+|(/(?:Users|home)/)[^/\s:]+"#,
+            )
+            .expect("user folder regex")
+        });
         // P2-13: Strip stack traces (lines starting with "at " or Java-style exception patterns)
         static STACK_TRACE_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"(?m)^\s*at .*$").expect("stack trace regex"));
@@ -259,31 +307,63 @@ pub fn sanitize_always(msg: &str) -> String {
         // Strip stack trace lines
         let result = STACK_TRACE_RE.replace_all(&result, "").to_string();
 
+        let result = USER_DIR_RE
+            .replace_all(&result, |caps: &regex::Captures| {
+                let folder = caps
+                    .get(1)
+                    .or_else(|| caps.get(2))
+                    .map_or("", |m| m.as_str());
+                format!("{folder}[redacted-user]")
+            })
+            .to_string();
+
         // Tokens/keys first, before the host/IP passes fragment them.
         let result = JWT_RE.replace_all(&result, "[redacted-token]").to_string();
         let result = TOKEN_RE
             .replace_all(&result, "[redacted-token]")
             .to_string();
-        let result = IPV6_RE.replace_all(&result, "[redacted-ipv6]").to_string();
-
+        // IPv4 BEFORE IPv6 (review of #222): an IPv4 address embedded in an
+        // IPv6 one (`::ffff:185.199.110.153`, NAT64 `64:ff9b::…`) went the
+        // other way round: the IPv6 pass took `::ffff:185` as a whole
+        // address and left `.199.110.153`, which no longer matched the IPv4
+        // pattern — three octets out. Now the dotted quad goes first and the
+        // IPv6 prefix after it.
         let result = IPV4_RE
             .replace_all(&result, |caps: &regex::Captures| {
                 // Only redact if all four octets are valid (0-255); otherwise
                 // leave the (non-IP) text untouched to preserve message clarity.
+                // Every octet goes (P6-CLI-D-06, see `mask_ip`).
                 let valid = (1..=4).all(|i| caps[i].parse::<u8>().is_ok());
                 if valid {
-                    format!("{}.x.x.x", &caps[1])
+                    "[redacted-ipv4]".to_string()
                 } else {
                     caps[0].to_string()
                 }
             })
             .to_string();
 
+        let result = IPV6_RE.replace_all(&result, "[redacted-ipv6]").to_string();
+
         let result = EMAIL_RE
             .replace_all(&result, "[redacted-email]")
             .to_string();
 
-        let result = HOST_RE.replace_all(&result, "[redacted-host]").to_string();
+        let result = HOST_RE
+            .replace_all(&result, |caps: &regex::Captures| {
+                let start = caps.get(0).map_or(0, |m| m.start());
+                let before = &result[..start];
+                // A path separator, not the `//` of a URL's `scheme://`
+                // (round 4 of the review: `https://dns.example.rs/…` went
+                // through as a file).
+                let after_separator =
+                    before.ends_with('\\') || (before.ends_with('/') && !before.ends_with("//"));
+                if looks_like_a_host(&caps[0], &caps[1], after_separator) {
+                    "[redacted-host]".to_string()
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .to_string();
 
         // P2-20: Truncate to 200 chars (aligned with Android InputValidator.sanitizeErrorMessage)
         truncate_for_display(result)
@@ -296,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_redact_ip_v4() {
-        // In release builds, this would be "192.x.x.x"
+        // In release builds, this would be "x.x.x.x" (`mask_ip`)
         let result = redact_ip("192.168.1.100");
         assert!(!result.is_empty());
     }
@@ -379,6 +459,146 @@ mod tests {
             !key.contains("xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg"),
             "key: {}",
             key
+        );
+    }
+
+    /// P6-CLI-D-06: no octet of an IPv4 address survives, in the log helper
+    /// or the scrubber. The first one used to: a /8, which for a fleet of ten
+    /// known relays often names the relay.
+    #[test]
+    fn an_ipv4_address_keeps_none_of_its_octets() {
+        assert_eq!(mask_ip("185.199.110.153"), "x.x.x.x");
+        assert_eq!(mask_ip("185.199.110.153:51820"), "x.x.x.x:51820");
+        assert_eq!(mask_ip("2001:db8::1"), "2001:x:x:x:x:x:x:x");
+
+        let out = sanitize_always("relay 185.199.110.153:51820 did not answer");
+        assert_eq!(out, "relay [redacted-ipv4]:51820 did not answer");
+        // Not an address (an octet over 255): left readable.
+        assert_eq!(sanitize_always("build 1.4.300.2"), "build 1.4.300.2");
+    }
+
+    /// Review of #222 (P3.5): an IPv4 address inside an IPv6 one loses every
+    /// octet too. `[::ffff:185.199.110.153]:443` used to come out as
+    /// `[[redacted-ipv6].199.110.153]:443`.
+    #[test]
+    fn an_ipv4_mapped_ipv6_address_keeps_none_of_its_octets() {
+        for raw in [
+            "connect [::ffff:185.199.110.153]:443 refused",
+            "via ::ffff:185.199.110.153 timed out",
+            "nat64 64:ff9b::185.199.110.153 unreachable",
+        ] {
+            let out = sanitize_always(raw);
+            for octet in ["185", "199", "110", "153"] {
+                assert!(!out.contains(octet), "{octet} survived in {out}");
+            }
+        }
+        assert_eq!(
+            sanitize_always("connect [::ffff:185.199.110.153]:443 refused"),
+            "connect [[redacted-ipv6]:[redacted-ipv4]]:443 refused"
+        );
+        assert_eq!(mask_ip("::ffff:185.199.110.153"), ":x:x:x:x:x:x:x");
+    }
+
+    /// Review of #222 (P3.6): file names and dotted code identifiers are not
+    /// hosts. They used to come out as `[redacted-host]`, which emptied
+    /// errors of what made them useful (and crash backtraces of their source
+    /// paths), while hosts are still redacted.
+    #[test]
+    fn file_names_and_code_identifiers_are_not_hosts() {
+        for readable in [
+            r"Failed to read C:\ProgramData\BirdoVPN\settings.json: access denied",
+            "birdo-vpn.exe exited with code 1",
+            "Windows.Security.Credentials.UI.UserConsentVerifier failed",
+            "System.IO.IOException: The process cannot access the file",
+            r"panicked at src\vpn\tunnel.rs:1182:9",
+            "tauri.conf.json is missing frontendDist",
+        ] {
+            assert_eq!(sanitize_always(readable), readable);
+        }
+        for host in [
+            "api.birdo.app",
+            "de-fra-01.birdo.app",
+            "vpn.example.com",
+            "birdo.app",
+        ] {
+            let out = sanitize_always(&format!("could not reach {host}: timed out"));
+            assert_eq!(out, "could not reach [redacted-host]: timed out", "{host}");
+        }
+    }
+
+    /// Round 3 of the review (P3.5): what round 2 let through. A host is a
+    /// host whatever its case or TLD — `.rs`, `.md` and `.zip` are TLDs too,
+    /// file extensions only straight after a path separator.
+    #[test]
+    fn hosts_are_redacted_whatever_their_case_or_tld() {
+        for host in [
+            "vpn.example.NET",
+            "Api.Birdo.App",
+            "relay.example.rs",
+            "notes.example.md",
+            "mirror.example.zip",
+        ] {
+            let out = sanitize_always(&format!("could not reach {host}: timed out"));
+            assert_eq!(out, "could not reach [redacted-host]: timed out", "{host}");
+        }
+        assert_eq!(
+            sanitize_always(r"panicked at src\vpn\tunnel.rs:1182:9"),
+            r"panicked at src\vpn\tunnel.rs:1182:9",
+            "after a separator, .rs is a file"
+        );
+    }
+
+    /// Round 3 of the review (P3.5): a home folder names its account. The
+    /// name goes, the rest of the path stays readable.
+    #[test]
+    fn a_home_folder_names_no_one() {
+        assert_eq!(
+            sanitize_always(r"Failed to open C:\Users\Jane.Doe\AppData\Roaming\birdo: denied"),
+            r"Failed to open C:\Users\[redacted-user]\AppData\Roaming\birdo: denied"
+        );
+        assert_eq!(
+            sanitize_always(r"open \\?\c:\users\Jane Doe\x.txt failed"),
+            r"open \\?\c:\users\[redacted-user]\x.txt failed"
+        );
+        assert_eq!(
+            sanitize_always("open /Users/jane/Library/Logs/x.log failed"),
+            "open /Users/[redacted-user]/Library/Logs/x.log failed"
+        );
+        assert_eq!(
+            sanitize_always("open /home/jane.doe/.config/x.json failed"),
+            "open /home/[redacted-user]/.config/x.json failed"
+        );
+    }
+
+    /// Round 4 of the review (P3-2): a host in a URL is a host, though the
+    /// `//` before it is a slash — `.rs` and `.zip` counted as files there —
+    /// and a home folder printed with `{:?}` (escaped backslashes, as the PQ
+    /// key and device-id errors print their paths) names no one either.
+    #[test]
+    fn urls_and_escaped_paths_are_redacted_too() {
+        assert_eq!(
+            sanitize_always("DoH query to https://dns.example.rs/dns-query failed"),
+            "DoH query to https://[redacted-host]/dns-query failed"
+        );
+        assert_eq!(
+            sanitize_always("mirror http://mirror.example.zip:8080 refused"),
+            "mirror http://[redacted-host]:8080 refused"
+        );
+        assert_eq!(
+            sanitize_always(
+                r#"read "C:\\Users\\Jane.Doe\\AppData\\Local\\pq_keypair.json": denied"#
+            ),
+            r#"read "C:\\Users\\[redacted-user]\\AppData\\Local\\pq_keypair.json": denied"#
+        );
+        assert_eq!(
+            sanitize_always(r#"create "C:\\Users\\Jane\\AppData\\device_id": denied"#),
+            r#"create "C:\\Users\\[redacted-user]\\AppData\\device_id": denied"#,
+            "a name with no dot is not even a host-looking word"
+        );
+        // A real path separator still makes .rs a file.
+        assert_eq!(
+            sanitize_always("open file:///home/dev/src/main.rs failed"),
+            "open file:///home/[redacted-user]/src/main.rs failed"
         );
     }
 

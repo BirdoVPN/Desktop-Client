@@ -898,9 +898,19 @@ pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bo
         // Linux twin: the relay is permitted by ADDRESS and the self-permit is
         // scoped to tcp/443, so a connect onto a different server needs the
         // live block re-armed or its handshake is dropped.
+        //
+        // Through the kill switch, like macOS below (review of #222): it reads
+        // the intent before and after the load, and lifts what an OFF no
+        // longer wants — a partial load included. iptables reads the relay
+        // from VPN_SERVER_IP, recorded above.
         #[cfg(target_os = "linux")]
-        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
-            tracing::warn!("Failed to update iptables VPN server: {}", e);
+        {
+            let _ = ip;
+            if killswitch::platform_is_blocking() {
+                if let Err(e) = killswitch::activate_killswitch().await {
+                    tracing::warn!("Failed to update iptables VPN server permit: {}", e);
+                }
+            }
         }
         // macOS twin: pf bakes the relay permit into the loaded ruleset, so an
         // engaged block must be re-loaded with the NEW relay IP (block drop
@@ -1057,7 +1067,7 @@ pub async fn handle_session_expired(app: &AppHandle, stored: StoredSession) {
         }
         // REVIEW-WIN-007 / REVIEW-WIN2-023: the next account to sign in on
         // this machine must not inherit this one's server or route.
-        crate::commands::settings::clear_account_choices(app);
+        crate::commands::settings::clear_account_choices(app).await;
     } else {
         tracing::info!("A new sign-in arrived while the expired session ended — keeping it");
     }

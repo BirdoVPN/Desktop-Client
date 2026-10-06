@@ -14,6 +14,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
+use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+
 type HmacSha256 = Hmac<Sha256>;
 
 const SETTINGS_HMAC_SERVICE: &str = "BirdoVPN";
@@ -365,17 +367,42 @@ fn read_keystore_key() -> Result<Option<Vec<u8>>, String> {
 /// Read the sibling 0600 key file, WITHOUT ever creating one. `None` means
 /// absent, empty, unreadable or non-hex.
 fn read_file_key(settings_path: &Path) -> Option<Vec<u8>> {
+    match read_key_file(settings_path) {
+        KeyFile::Key(key) => Some(key),
+        KeyFile::Missing | KeyFile::Unreadable => None,
+    }
+}
+
+/// What the key file beside settings.json holds right now.
+#[derive(Debug, PartialEq)]
+enum KeyFile {
+    Key(Vec<u8>),
+    /// No file, or one that is not a key (empty, not hex): no key to find.
+    Missing,
+    /// There, and unreadable right now (a scanner holding it, permissions):
+    /// the key may well be in it.
+    Unreadable,
+}
+
+fn read_key_file(settings_path: &Path) -> KeyFile {
     let key_path = settings_path.with_file_name("settings_hmac.key");
-    let existing = fs::read_to_string(&key_path).ok()?;
+    let existing = match fs::read_to_string(&key_path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return KeyFile::Missing,
+        Err(e) => {
+            tracing::warn!("Settings HMAC key file unreadable ({}); not using it", e);
+            return KeyFile::Unreadable;
+        }
+    };
     let trimmed = existing.trim();
     if trimmed.is_empty() {
-        return None;
+        return KeyFile::Missing;
     }
     match hex::decode(trimmed) {
-        Ok(key) => Some(key),
+        Ok(key) => KeyFile::Key(key),
         Err(e) => {
             tracing::warn!("Corrupted settings HMAC key file ({}); ignoring it", e);
-            None
+            KeyFile::Missing
         }
     }
 }
@@ -478,33 +505,121 @@ fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
 
 /// Get current application settings
 #[tauri::command]
-pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
-    load_settings_sync(&app)
+pub async fn get_settings(app: AppHandle) -> Result<AppSettings, IpcError> {
+    off_the_runtime(move || load_settings_sync(&app).map_err(IpcError::unknown)).await
+}
+
+/// Run a settings command's synchronous work on the blocking pool.
+///
+/// P1-dk-blocking-io-on-async-runtime: these are async IPC commands, and a
+/// load or a save reads and writes settings.json, reads the signing key from
+/// the OS credential store (a Secret Service prompt on Linux can wait on the
+/// user; Windows Credential Manager calls are RPCs) and, for autostart, runs
+/// `schtasks`. Done inline, each parked a runtime worker for as long as that
+/// took — the same workers the status choke point, the reconnect loop and
+/// every other command need. `biometric.rs` moved its keystore calls the same
+/// way.
+///
+/// The commands answer an `IpcError` (whose message is always redacted), so
+/// a refusal can carry its own code: `settings_unverified`.
+async fn off_the_runtime<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, IpcError> + Send + 'static,
+) -> Result<T, IpcError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| IpcError::unknown(format!("Settings task failed: {e}")))?
 }
 
 /// Synchronous settings loader shared by the `get_settings` command and Rust
 /// callers that need settings before the frontend is up (e.g. main.rs setup
 /// honoring `start_minimized`).
 pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
-    load_settings(app).map(Loaded::settings)
+    load_settings(app)
+        .map(Loaded::settings)
+        .map_err(String::from)
+}
+
+/// [`load_settings_sync`] on the blocking pool, for async Rust callers such as
+/// the kill switch's `arm` (review of #222): the load is file and
+/// credential-store I/O, and must not park a runtime worker.
+pub(crate) async fn load_settings_off_runtime(app: &AppHandle) -> Result<AppSettings, String> {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || load_settings_sync(&app))
+        .await
+        .map_err(|e| format!("Settings task failed: {e}"))?
+}
+
+/// Why a load produced no settings at all.
+#[derive(Debug, PartialEq)]
+enum LoadError {
+    /// The file is there and could not be read: a scanner or a backup agent
+    /// holding it open, permissions. What it holds is unknown, and may well
+    /// be the user's settings.
+    Unreadable(String),
+    /// The file was read and is not settings in any format this build knows.
+    Unparseable(String),
+    /// Anything else (no config directory, a serializer failure).
+    Other(String),
+}
+
+/// What a failed read of settings.json means. Bytes that are not UTF-8 are
+/// a file that does not parse — nothing a save could lose, and saving is the
+/// way out of it — not one that could not be read (round 3 of the review of
+/// #222: mapped to Unreadable, such a file could never be saved again, and no
+/// reset was offered). Every other read error is Unreadable.
+fn read_error(e: std::io::Error) -> LoadError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        LoadError::Unparseable(format!("Failed to parse settings (not UTF-8): {}", e))
+    } else {
+        LoadError::Unreadable(format!("Failed to read settings: {}", e))
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Unreadable(e) | LoadError::Unparseable(e) | LoadError::Other(e) => {
+                f.write_str(e)
+            }
+        }
+    }
+}
+
+impl From<LoadError> for String {
+    fn from(error: LoadError) -> Self {
+        error.to_string()
+    }
+}
+
+impl From<LoadError> for IpcError {
+    fn from(error: LoadError) -> Self {
+        IpcError::unknown(error.to_string())
+    }
 }
 
 /// What a load found (WIN3-010).
 enum Loaded {
     /// What is saved: the verified file — or the defaults where there is no
-    /// file to lose (none yet, or one just quarantined as tampered).
+    /// file to lose (none yet).
     Saved(AppSettings),
     /// Defaults served for this session because the file could not be
     /// verified right now (its signing key is unreadable). The file is left
     /// as it is, and nothing may be saved from these: that would replace
     /// every real preference with its default.
     Unverified(AppSettings),
+    /// The file was verified by no key, for good, and THIS load quarantined
+    /// it ([`no_verifying_key`]): the defaults are what is saved now, and a
+    /// save may go ahead. Kept apart from `Saved` so a reset whose re-check
+    /// did the quarantine reports a reset (round 4 of the review of #222).
+    Quarantined(AppSettings),
 }
 
 impl Loaded {
     fn settings(self) -> AppSettings {
         match self {
-            Loaded::Saved(settings) | Loaded::Unverified(settings) => settings,
+            Loaded::Saved(settings)
+            | Loaded::Unverified(settings)
+            | Loaded::Quarantined(settings) => settings,
         }
     }
 }
@@ -514,16 +629,15 @@ impl Loaded {
 /// The whole load holds [`SETTINGS_WRITE`] (WIN3-010): the migrations below
 /// save what they read, and a save that landed between their read and their
 /// write was lost.
-fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
+fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {
     let _write = SETTINGS_WRITE.lock();
-    let path = get_settings_path(app)?;
+    let path = get_settings_path(app).map_err(LoadError::Other)?;
 
     if !path.exists() {
         return Ok(Loaded::Saved(AppSettings::default()));
     }
 
-    let content =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read settings: {}", e))?;
+    let content = fs::read_to_string(&path).map_err(read_error)?;
 
     // Try to parse as signed settings (new format)
     if let Ok(signed) = serde_json::from_str::<SignedSettings>(&content) {
@@ -532,43 +646,26 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
         // turn a transient credential-store outage into a permanent signature
         // mismatch. A signature made by EITHER source's key is accepted, and
         // the winning key is then mirrored into both sources so they converge.
-        let mut keystore_unavailable = false;
+        let keystore = read_keystore_key();
+        let key_file = read_key_file(&path);
+        let key_may_still_exist = key_may_still_exist(&keystore, &key_file);
         let mut candidates: Vec<Vec<u8>> = Vec::new();
-        match read_keystore_key() {
+        match keystore {
             Ok(Some(key)) => candidates.push(key),
             Ok(None) => {}
-            Err(e) => {
-                keystore_unavailable = true;
-                tracing::warn!(
-                    "Credential store unavailable while verifying settings ({}); trying the key file",
-                    e
-                );
-            }
+            Err(e) => tracing::warn!(
+                "Credential store unavailable while verifying settings ({}); trying the key file",
+                e
+            ),
         }
-        if let Some(key) = read_file_key(&path) {
+        if let KeyFile::Key(key) = key_file {
             if !candidates.contains(&key) {
                 candidates.push(key);
             }
         }
 
-        if candidates.is_empty() {
-            // No key is readable RIGHT NOW. If the store is merely locked the
-            // real key may still exist, so this is not tampering: serve
-            // defaults for this session, mint nothing, touch nothing — the
-            // next load retries with the store hopefully unlocked.
-            tracing::error!(
-                "Settings HMAC key unavailable ({}); using defaults for this session without resetting settings.json",
-                if keystore_unavailable {
-                    "credential store unreachable, no key file"
-                } else {
-                    "no key in the credential store, no key file"
-                }
-            );
-            return Ok(Loaded::Unverified(AppSettings::default()));
-        }
-
         let settings_json = serde_json::to_string(&signed.settings)
-            .map_err(|e| format!("Failed to re-serialize settings: {}", e))?;
+            .map_err(|e| LoadError::Other(format!("Failed to re-serialize settings: {}", e)))?;
         for key in &candidates {
             if verify_hmac(&settings_json, &signed.hmac, key) {
                 sync_hmac_key_sources(&path, key);
@@ -596,8 +693,9 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
         if let Ok(legacy) = serde_json::to_value(&signed.settings)
             .and_then(serde_json::from_value::<LegacyAppSettingsV1>)
         {
-            let legacy_json = serde_json::to_string(&legacy)
-                .map_err(|e| format!("Failed to serialize legacy settings: {}", e))?;
+            let legacy_json = serde_json::to_string(&legacy).map_err(|e| {
+                LoadError::Other(format!("Failed to serialize legacy settings: {}", e))
+            })?;
             for key in &candidates {
                 if verify_hmac(&legacy_json, &signed.hmac, key) {
                     tracing::info!(
@@ -616,28 +714,7 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
             }
         }
 
-        if keystore_unavailable {
-            // The signing key may be exactly the one we cannot read right now.
-            // Transient, not tampering: keep the file intact and retry on the
-            // next load.
-            tracing::error!(
-                "Settings signature matches no readable key while the credential store is unreachable — using defaults for this session without resetting"
-            );
-            return Ok(Loaded::Unverified(AppSettings::default()));
-        }
-
-        // Every key source was readable and none verifies: genuine mismatch.
-        // Quarantine the file (settings.json.tampered) instead of leaving it
-        // in place for the next save to silently overwrite — the user's data
-        // stays recoverable and the reset is visible on disk.
-        tracing::warn!(
-            "Settings HMAC verification failed — possible tampering. Resetting to defaults."
-        );
-        let quarantine = path.with_file_name("settings.json.tampered");
-        if let Err(e) = fs::rename(&path, &quarantine) {
-            tracing::warn!("Could not preserve the unverified settings file: {}", e);
-        }
-        return Ok(Loaded::Saved(AppSettings::default()));
+        return Ok(no_verifying_key(&path, key_may_still_exist));
     }
 
     // Legacy format (unsigned) — migrate by parsing and re-saving with HMAC
@@ -656,8 +733,50 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
             }
             Ok(Loaded::Saved(settings))
         }
-        Err(e) => Err(format!("Failed to parse settings: {}", e)),
+        Err(e) => Err(LoadError::Unparseable(format!(
+            "Failed to parse settings: {}",
+            e
+        ))),
     }
+}
+
+/// Whether a key that could verify settings.json may exist and be unreadable
+/// right now: the credential store could not answer, or the key file is there
+/// and could not be read. A store that answered "no key" beside a key file
+/// that is missing or not a key is an answer: that key is gone.
+fn key_may_still_exist(keystore: &Result<Option<Vec<u8>>, String>, key_file: &KeyFile) -> bool {
+    keystore.is_err() || *key_file == KeyFile::Unreadable
+}
+
+/// The end of a load whose signed file no readable key verifies.
+///
+/// While a key may still exist ([`key_may_still_exist`]) the file may be
+/// signed by exactly the key that cannot be read: transient, not tampering.
+/// Defaults are served for this session (`Unverified`), nothing is minted and
+/// nothing is touched, and the next load retries.
+///
+/// Otherwise every source answered and none verifies: a genuine mismatch, or
+/// the key is gone for good (the store holds none, the key file is missing or
+/// not a key). Review of #222 (P2): the second case used to count as "cannot
+/// be read right now" too, so the file stayed unverified on every load and
+/// every save was refused, with no way out. Both now quarantine the file
+/// (settings.json.tampered-…, [`aside_path`]) instead of leaving it for a save to silently
+/// overwrite — the user's data stays recoverable and the reset is visible on
+/// disk — and the defaults load as what is saved.
+fn no_verifying_key(path: &Path, key_may_still_exist: bool) -> Loaded {
+    if key_may_still_exist {
+        tracing::error!(
+            "Settings signature matches no readable key while a key source is unreadable — using defaults for this session without resetting"
+        );
+        return Loaded::Unverified(AppSettings::default());
+    }
+    tracing::warn!(
+        "Settings HMAC verification failed — tampered, or its key is gone. Resetting to defaults."
+    );
+    if let Err(e) = fs::rename(path, aside_path(path, "tampered")) {
+        tracing::warn!("Could not preserve the unverified settings file: {}", e);
+    }
+    Loaded::Quarantined(AppSettings::default())
 }
 
 /// Internal save function used by both save_settings command and migration
@@ -734,8 +853,17 @@ fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
 
 /// Save application settings
 #[tauri::command]
-pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool, String> {
-    save_settings_inner(&app, &settings)?;
+pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool, IpcError> {
+    off_the_runtime(move || save_settings_blocking(&app, &settings)).await
+}
+
+/// The whole-object save behind `save_settings`. Holds the settings lock
+/// across the check and the write, so a file cannot turn unverifiable in
+/// between.
+fn save_settings_blocking(app: &AppHandle, settings: &AppSettings) -> Result<bool, IpcError> {
+    let _write = SETTINGS_WRITE.lock();
+    may_save_over(load_settings(app))?;
+    save_settings_inner(app, settings).map_err(IpcError::unknown)?;
     // Keep the live crash-reporting gate equal to what is on disk, whichever
     // screen saved.
     crate::utils::crash_report::set_opted_in(settings.crash_reports_enabled);
@@ -765,7 +893,18 @@ pub(crate) fn forget_account_choices(settings: &mut AppSettings) -> bool {
 /// real file. The whole read-modify-write holds the settings lock, so a
 /// concurrent save (the UI's preferred-server mirror) cannot land between the
 /// read and the write and put the old server back (REVIEW-WIN2-023).
-pub(crate) fn clear_account_choices(app: &AppHandle) {
+///
+/// On the blocking pool (review of #222): it is file and credential-store
+/// I/O, and every caller is an async command (sign-out, account deletion, an
+/// expired session).
+pub(crate) async fn clear_account_choices(app: &AppHandle) {
+    let app = app.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || forget_saved_account_choices(&app)).await {
+        tracing::warn!("Could not clear the account's server: {}", e);
+    }
+}
+
+fn forget_saved_account_choices(app: &AppHandle) {
     let _write = SETTINGS_WRITE.lock();
     match load_settings_sync(app) {
         Ok(mut settings) => {
@@ -784,11 +923,19 @@ pub(crate) fn clear_account_choices(app: &AppHandle) {
 
 /// Put the tunnel-shaping settings of `good` back over what is saved now, and
 /// save: the revert of a settings change the live session could not apply
-/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved.
-pub(crate) fn restore_tunnel_settings(
+/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved. On the
+/// blocking pool, like the commands (review of #222).
+pub(crate) async fn restore_tunnel_settings(
     app: &AppHandle,
     good: &AppSettings,
 ) -> Result<AppSettings, String> {
+    let (app, good) = (app.clone(), good.clone());
+    tokio::task::spawn_blocking(move || restore_tunnel_settings_now(&app, &good))
+        .await
+        .map_err(|e| format!("Settings task failed: {e}"))?
+}
+
+fn restore_tunnel_settings_now(app: &AppHandle, good: &AppSettings) -> Result<AppSettings, String> {
     let _write = SETTINGS_WRITE.lock();
     let restored = restored_over(load_settings(app)?, good)?;
     save_settings_inner(app, &restored)?;
@@ -801,11 +948,49 @@ pub(crate) fn restore_tunnel_settings(
 /// other preference with defaults. The revert then fails, and the error the
 /// reapply met stands.
 fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, String> {
+    verified(loaded)
+        .map(|current| with_tunnel_settings_of(current, good))
+        .map_err(|refusal| refusal.message)
+}
+
+/// What is saved, for a change made on top of it — or a refusal when the
+/// load could only serve defaults because it cannot verify the file
+/// (WIN3-010). Those are not the user's settings: written back, they replace
+/// every preference, and the save may mint a new signing key the old file
+/// never verifies against again.
+///
+/// The refusal has its own code, `settings_unverified` (review of #222): the
+/// UI offers a reset with it (`reset_settings`), the way out when the key
+/// source stays unreadable.
+fn verified(loaded: Loaded) -> Result<AppSettings, IpcError> {
     match loaded {
-        Loaded::Saved(current) => Ok(with_tunnel_settings_of(current, good)),
-        Loaded::Unverified(_) => {
-            Err("the settings file could not be verified, so it was left as it is".into())
-        }
+        Loaded::Saved(settings) | Loaded::Quarantined(settings) => Ok(settings),
+        Loaded::Unverified(_) => Err(IpcError::new(
+            IpcErrorCode::SettingsUnverified,
+            "the settings file could not be verified, so it was left as it is",
+        )),
+    }
+}
+
+/// Whether a whole-object save may replace what is on disk (MR-692).
+///
+/// `save_settings` writes the object the UI sends, and the UI's copy came from
+/// `get_settings` — which, while the signing key is unreadable, serves
+/// defaults. The revert already refused to save over such a file; the save
+/// itself did not, so the next toggle wrote those defaults over the user's
+/// real file. Now it is refused while the file cannot be verified (the UI puts
+/// the toggle back and says the save failed) and goes ahead once it can.
+///
+/// A file that was read and does not parse at all has nothing a save could
+/// lose, and saving stays the way out of it. One that could not be READ is
+/// not that (review of #222): an antivirus sharing violation looks the same
+/// to the caller, and the file behind it is usually the user's own. The save
+/// is refused, and the next one, once the file is readable again, goes ahead.
+fn may_save_over(loaded: Result<Loaded, LoadError>) -> Result<(), IpcError> {
+    match loaded {
+        Ok(loaded) => verified(loaded).map(drop),
+        Err(LoadError::Unparseable(_)) => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -836,55 +1021,187 @@ fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSetti
 /// writes it back. Takes effect immediately in both directions (see
 /// `utils::crash_report`), so no restart is needed.
 #[tauri::command]
-pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
-    let mut settings = load_settings_sync(&app)?;
-    settings.crash_reports_enabled = enabled;
-    save_settings_inner(&app, &settings)?;
-    crate::utils::crash_report::set_opted_in(enabled);
-    Ok(enabled)
+pub async fn set_crash_reports_enabled(app: AppHandle, enabled: bool) -> Result<bool, IpcError> {
+    off_the_runtime(move || {
+        // MR-692: one field over what is saved — never over the defaults a
+        // load serves while it cannot verify the file.
+        let _write = SETTINGS_WRITE.lock();
+        let mut settings = verified(load_settings(&app)?)?;
+        settings.crash_reports_enabled = enabled;
+        save_settings_inner(&app, &settings).map_err(IpcError::unknown)?;
+        crate::utils::crash_report::set_opted_in(enabled);
+        Ok(enabled)
+    })
+    .await
+}
+
+/// Put the settings back to their defaults: the way out of a file that cannot
+/// be verified (`settings_unverified`) when its key source stays unreadable.
+/// The UI asks the user to confirm first, and this re-checks under the
+/// settings lock ([`resettable`]): only a file that STILL cannot be verified
+/// is reset. `Ok(false)`: it verifies again (the key came back), and nothing
+/// was touched.
+///
+/// The file is set aside under a timestamped name (`settings.json.unverified-…`,
+/// [`aside_path`]), not deleted — but for manual recovery only: nothing in the
+/// app reads it again. The defaults are signed like any save, which with the
+/// credential store unreachable mints a new key in the key file; once the
+/// store answers again, `sync_hmac_key_sources` writes that new key over the
+/// old one there, after which the set-aside file cannot be verified by the
+/// app at all. The OS launch-at-login entry is set to the defaults' autostart,
+/// so the two agree; the UI then re-reads the settings and rebuilds a live
+/// session on them.
+#[tauri::command]
+pub async fn reset_settings(app: AppHandle) -> Result<bool, IpcError> {
+    off_the_runtime(move || {
+        let _write = SETTINGS_WRITE.lock();
+        if !resettable(load_settings(&app))? {
+            tracing::info!("Settings verify again — nothing to reset");
+            return Ok(false);
+        }
+        let path = get_settings_path(&app).map_err(IpcError::unknown)?;
+        let defaults = AppSettings::default();
+        reset_over(&path, || save_settings_inner(&app, &defaults))?;
+        crate::utils::crash_report::set_opted_in(defaults.crash_reports_enabled);
+        if let Err(e) = apply_autostart(&app, defaults.autostart) {
+            tracing::warn!("Settings reset, but launch-at-login was not updated: {}", e);
+        }
+        tracing::warn!("Settings reset to their defaults at the user's request");
+        Ok(true)
+    })
+    .await
+}
+
+/// Whether a reset may go ahead over what a load found: only over a file that
+/// still cannot be verified. One that verifies again is left alone
+/// (`Ok(false)`), and a load that failed outright is reported. One that the
+/// re-check's own load just quarantined (its key gone for good) is a reset
+/// already: it goes ahead — there is nothing left to set aside, and the
+/// defaults are saved — and is reported as one (round 4 of the review; it
+/// used to read as "nothing was reset").
+fn resettable(loaded: Result<Loaded, LoadError>) -> Result<bool, IpcError> {
+    match loaded? {
+        Loaded::Unverified(_) | Loaded::Quarantined(_) => Ok(true),
+        Loaded::Saved(_) => Ok(false),
+    }
+}
+
+/// Set settings.json aside and save the defaults with `save`. If the save
+/// fails, the file is put back, so a failed reset leaves things as they were
+/// (round 4 of the review: it stayed set aside, with nothing saved and the
+/// user told only that the reset failed). If even that rename fails, the
+/// error says the file is still set aside.
+fn reset_over(path: &Path, save: impl FnOnce() -> Result<(), String>) -> Result<(), IpcError> {
+    let aside = set_aside(path, "unverified")?;
+    let Err(e) = save() else {
+        return Ok(());
+    };
+    match aside.map(|aside| fs::rename(aside, path)) {
+        Some(Err(back)) => Err(IpcError::unknown(format!(
+            "The defaults could not be saved ({e}), and the settings file stays set aside \
+             (settings.json.unverified-…): {back}"
+        ))),
+        _ => Err(IpcError::unknown(format!(
+            "The defaults could not be saved, so the settings were not reset: {e}"
+        ))),
+    }
+}
+
+/// Where to move settings.json aside to: `settings.json.<tag>-<UTC time>`,
+/// with a counter when that name is taken. A fixed name was replaced by the
+/// next quarantine or reset (a rename onto an existing file replaces it on
+/// Windows), destroying the copy an earlier one had kept.
+fn aside_path(path: &Path, tag: &str) -> PathBuf {
+    let base = format!(
+        "settings.json.{tag}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    );
+    let mut candidate = path.with_file_name(&base);
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = path.with_file_name(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Move settings.json aside ([`aside_path`]), saying where to; nothing to do
+/// (`None`) when there is none.
+fn set_aside(path: &Path, tag: &str) -> Result<Option<PathBuf>, IpcError> {
+    let aside = aside_path(path, tag);
+    match fs::rename(path, &aside) {
+        Ok(()) => Ok(Some(aside)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(IpcError::unknown(format!(
+            "Could not set the settings file aside: {e}"
+        ))),
+    }
 }
 
 /// Enable or disable autostart
 #[tauri::command]
-pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, IpcError> {
+    off_the_runtime(move || set_autostart_blocking(&app, enabled)).await
+}
+
+fn set_autostart_blocking(app: &AppHandle, enabled: bool) -> Result<bool, IpcError> {
+    // MR-692: read first. A file that cannot be verified is not saved over,
+    // and the launch task is not changed for a setting that cannot be saved.
+    let _write = SETTINGS_WRITE.lock();
+    let mut settings = verified(load_settings(app)?)?;
+
+    apply_autostart(app, enabled).map_err(IpcError::unknown)?;
+
+    // Also update settings file
+    settings.autostart = enabled;
+    save_settings_inner(app, &settings).map_err(IpcError::unknown)?;
+
+    Ok(true)
+}
+
+/// Point the OS launch-at-login entry at `enabled`: the elevated launch task
+/// on Windows, the autostart plugin elsewhere.
+fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
     #[cfg(windows)]
-    set_autostart_windows(&app, enabled)?;
+    {
+        set_autostart_windows(app, enabled)
+    }
 
     #[cfg(not(windows))]
     {
         use tauri_plugin_autostart::ManagerExt;
 
         let autostart = app.autolaunch();
-
         if enabled {
             autostart
                 .enable()
-                .map_err(|e| format!("Failed to enable autostart: {}", e))?;
+                .map_err(|e| format!("Failed to enable autostart: {}", e))
         } else {
             autostart
                 .disable()
-                .map_err(|e| format!("Failed to disable autostart: {}", e))?;
+                .map_err(|e| format!("Failed to disable autostart: {}", e))
         }
     }
-
-    // Also update settings file
-    let mut settings = get_settings(app.clone()).await?;
-    settings.autostart = enabled;
-    save_settings(app, settings).await?;
-
-    Ok(true)
 }
 
 /// The launch-at-login task's name (the uninstaller removes it by name).
 #[cfg_attr(not(windows), allow(dead_code))]
 const LAUNCH_TASK: &str = "BirdoVPN Launch At Login";
 
+/// How long one `schtasks` call may take. It runs under the settings lock
+/// (set_autostart's read-modify-write), which every save and the kill
+/// switch's preference read wait on, so a hung one must not hold them for
+/// good (round 3 of the review of #222).
+#[cfg(windows)]
+const SCHTASKS_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[cfg(windows)]
 fn schtasks(args: &[&str]) -> Result<std::process::Output, String> {
-    crate::utils::hidden_cmd("schtasks")
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to run schtasks: {}", e))
+    crate::utils::output_within(
+        crate::utils::hidden_cmd("schtasks").args(args),
+        SCHTASKS_LIMIT,
+    )
+    .map_err(|e| format!("Failed to run schtasks: {}", e))
 }
 
 /// The `schtasks /Create` arguments for the launch-at-login task: an
@@ -1205,17 +1522,21 @@ mod tests {
                 )
                 .expect("end of fn")]
         };
-        let restore = body("pub(crate) fn restore_tunnel_settings(");
+        let restore = body("fn restore_tunnel_settings_now(");
         assert!(restore.contains("restored_over(load_settings(app)?, good)?"));
-        let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, String> {");
-        // The two branches that serve defaults and touch nothing.
+        let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {");
+        // The one branch that serves defaults and touches nothing, which
+        // every unverified signed file reaches.
+        assert!(load.contains("return Ok(no_verifying_key(&path, key_may_still_exist));"));
+        assert!(!load.contains("Loaded::Unverified("));
         assert_eq!(
-            load.matches("Loaded::Unverified(AppSettings::default())")
+            body("fn no_verifying_key(")
+                .matches("Loaded::Unverified(AppSettings::default())")
                 .count(),
-            2
+            1
         );
         let lock = load.find("SETTINGS_WRITE.lock()").expect("the lock");
-        assert!(lock < load.find("get_settings_path(app)?").unwrap());
+        assert!(lock < load.find("get_settings_path(app)").unwrap());
         assert!(lock < load.find("save_settings_inner(").unwrap());
     }
 
@@ -1580,5 +1901,356 @@ mod tests {
         );
         drop(held);
         other.join().unwrap();
+    }
+
+    /// P1-dk-blocking-io-on-async-runtime: a settings command's synchronous
+    /// work does not hold the async runtime. On a one-thread runtime the work
+    /// below finishes only if another task on that runtime runs while it
+    /// waits, which it cannot when the work runs inline on that one thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn settings_work_does_not_hold_the_async_runtime() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let work = off_the_runtime(move || {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| IpcError::unknown(e.to_string()))
+        });
+        let other_task = async move {
+            tokio::task::yield_now().await;
+            let _ = tx.send(());
+        };
+        let (done, ()) = tokio::join!(work, other_task);
+        assert_eq!(done, Ok(()), "the runtime was held while the work waited");
+    }
+
+    /// MR-692: the save itself (not only the revert) never replaces a file it
+    /// cannot verify — the UI's copy of such a file is the defaults
+    /// `get_settings` served — and neither do the two read-modify-write
+    /// commands. A verified file, no file yet, or one that does not parse
+    /// at all is saved over as before.
+    #[test]
+    fn a_save_never_replaces_a_file_it_cannot_verify() {
+        assert!(may_save_over(Ok(Loaded::Unverified(AppSettings::default()))).is_err());
+        assert_eq!(
+            may_save_over(Ok(Loaded::Saved(AppSettings::default()))),
+            Ok(())
+        );
+        assert_eq!(
+            may_save_over(Err(LoadError::Unparseable(
+                "Failed to parse settings".into()
+            ))),
+            Ok(()),
+            "a file that does not parse has nothing to lose"
+        );
+        assert!(verified(Loaded::Unverified(AppSettings::default())).is_err());
+
+        // A Windows checkout has CRLF endings (core.autocrlf).
+        let source = include_str!("settings.rs").replace('\r', "");
+        let body = |signature: &str| {
+            let start = source.find(signature).expect(signature);
+            let rest = &source[start..];
+            rest[..rest.find("\n}\n").expect("end of fn")].to_string()
+        };
+        let save = body("fn save_settings_blocking(");
+        let check = save
+            .find("may_save_over(load_settings(app))?;")
+            .expect("the check");
+        assert!(check < save.find("save_settings_inner(").unwrap());
+        assert!(body("pub async fn set_crash_reports_enabled(")
+            .contains("verified(load_settings(&app)?)?"));
+        let autostart = body("fn set_autostart_blocking(");
+        let read = autostart
+            .find("verified(load_settings(app)?)?")
+            .expect("the read");
+        assert!(read < autostart.find("apply_autostart(app, enabled)").unwrap());
+    }
+
+    /// Review of #222 (P2): the refusal carries its own code, so the UI can
+    /// say what happened and offer a reset instead of "please try again".
+    #[test]
+    fn a_refused_save_says_the_file_could_not_be_verified() {
+        let refusal =
+            may_save_over(Ok(Loaded::Unverified(AppSettings::default()))).expect_err("refused");
+        assert_eq!(refusal.code, IpcErrorCode::SettingsUnverified);
+        assert_eq!(
+            verified(Loaded::Unverified(AppSettings::default()))
+                .expect_err("refused")
+                .code,
+            IpcErrorCode::SettingsUnverified
+        );
+        // Anything else that stops a save is not that.
+        let unreadable = may_save_over(Err(LoadError::Unreadable("busy".into())));
+        assert_eq!(unreadable.expect_err("refused").code, IpcErrorCode::Unknown);
+    }
+
+    fn names_in(dir: &Path, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(prefix))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The reset keeps the unverifiable file on disk, and tolerates none.
+    /// Round 3 of the review (P3.1): a second reset (or quarantine) keeps the
+    /// first copy — a fixed aside name was replaced by the next one.
+    #[test]
+    fn every_reset_and_quarantine_keeps_its_own_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for round in ["first", "second"] {
+            fs::write(&path, round).unwrap();
+            assert!(set_aside(&path, "unverified").unwrap().is_some());
+            assert!(!path.exists());
+        }
+        let kept = names_in(dir.path(), "settings.json.unverified-");
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        let contents: Vec<String> = kept
+            .iter()
+            .map(|n| fs::read_to_string(dir.path().join(n)).unwrap())
+            .collect();
+        assert!(contents.contains(&"first".to_string()));
+        assert_eq!(
+            set_aside(&path, "unverified"),
+            Ok(None),
+            "nothing to set aside is fine"
+        );
+
+        for round in ["one", "two"] {
+            fs::write(&path, round).unwrap();
+            let _ = no_verifying_key(&path, false);
+        }
+        assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 2);
+    }
+
+    /// Round 3 of the review (P3.1): the reset re-checks under the settings
+    /// lock and resets only a file that still cannot be verified.
+    #[test]
+    fn a_reset_goes_ahead_only_over_a_file_that_still_cannot_be_verified() {
+        assert_eq!(
+            resettable(Ok(Loaded::Unverified(AppSettings::default()))),
+            Ok(true)
+        );
+        assert_eq!(
+            resettable(Ok(Loaded::Saved(AppSettings::default()))),
+            Ok(false),
+            "the key came back: nothing to reset"
+        );
+        assert!(resettable(Err(LoadError::Unreadable("busy".into()))).is_err());
+
+        let source = include_str!("settings.rs").replace('\r', "");
+        let reset = &source[source.find("pub async fn reset_settings(").unwrap()..];
+        let reset = &reset[..reset.find("\n}\n").unwrap()];
+        let check = reset.find("resettable(load_settings(&app))?").unwrap();
+        assert!(reset.find("SETTINGS_WRITE.lock()").unwrap() < check);
+        assert!(check < reset.find("reset_over(&path").unwrap());
+        assert!(reset.contains("apply_autostart(&app, defaults.autostart)"));
+    }
+
+    /// Round 4 of the review (P3-7): a reset whose re-check quarantined the
+    /// file (its key gone for good) is reported as a reset, not as "nothing
+    /// was reset"; and a reset whose save fails puts the file back.
+    #[test]
+    fn a_reset_reports_what_happened_and_undoes_a_failed_save() {
+        assert_eq!(
+            resettable(Ok(Loaded::Quarantined(AppSettings::default()))),
+            Ok(true),
+            "the re-check's quarantine is a reset"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "the user's settings").unwrap();
+        let failed = reset_over(&path, || Err("disk full".into()));
+        assert!(failed.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "the user's settings",
+            "a failed reset leaves the file where it was"
+        );
+        assert!(names_in(dir.path(), "settings.json.unverified-").is_empty());
+
+        let saved = reset_over(&path, || {
+            fs::write(&path, "defaults").map_err(|e| e.to_string())
+        });
+        assert_eq!(saved, Ok(()));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "defaults");
+        assert_eq!(names_in(dir.path(), "settings.json.unverified-").len(), 1);
+    }
+
+    /// Review of #222 (P3.7): a settings file that could not be READ is not
+    /// saved over, unlike one that was read and does not parse. The read
+    /// failure is usually transient (a scanner holding the file) and the
+    /// file behind it is the user's.
+    #[test]
+    fn a_save_never_replaces_a_file_it_could_not_read() {
+        let unreadable = may_save_over(Err(LoadError::Unreadable(
+            "Failed to read settings: The process cannot access the file because it is being \
+             used by another process. (os error 32)"
+                .into(),
+        )));
+        assert!(
+            unreadable.is_err(),
+            "a sharing violation is not an empty file"
+        );
+        assert!(may_save_over(Err(LoadError::Other("no config dir".into()))).is_err());
+        assert_eq!(
+            may_save_over(Err(LoadError::Unparseable(
+                "Failed to parse settings".into()
+            ))),
+            Ok(())
+        );
+    }
+
+    /// Review of #222 (P2): the credential store answers "no key" and the
+    /// key file is gone or not a key. That key is lost for good, so the file
+    /// is quarantined and the defaults load as saved — it used to stay
+    /// unverified on every load, and every save was refused for ever.
+    #[test]
+    fn a_lost_key_quarantines_the_file_instead_of_refusing_every_save() {
+        assert!(!key_may_still_exist(&Ok(None), &KeyFile::Missing));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"settings":{},"hmac":"00"}"#).unwrap();
+        let loaded = no_verifying_key(&path, false);
+        assert!(
+            matches!(loaded, Loaded::Quarantined(_)),
+            "quarantined, and so said"
+        );
+        assert_eq!(may_save_over(Ok(loaded)), Ok(()), "saves may go ahead");
+        assert!(!path.exists());
+        assert_eq!(
+            names_in(dir.path(), "settings.json.tampered-").len(),
+            1,
+            "kept, not deleted"
+        );
+    }
+
+    /// The other side: while a key source cannot be read right now, the key
+    /// may be in it. Nothing is touched, and saves wait (`settings_unverified`).
+    #[test]
+    fn a_key_that_may_still_exist_leaves_the_file_alone() {
+        assert!(key_may_still_exist(
+            &Err("store locked".into()),
+            &KeyFile::Missing
+        ));
+        assert!(key_may_still_exist(&Ok(None), &KeyFile::Unreadable));
+        assert!(!key_may_still_exist(&Ok(Some(vec![1])), &KeyFile::Missing));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        assert!(matches!(
+            no_verifying_key(&path, true),
+            Loaded::Unverified(_)
+        ));
+        assert!(path.exists());
+    }
+
+    /// A key file that is absent or not a key holds no key; one that cannot
+    /// be read may.
+    #[test]
+    fn the_key_file_is_read_as_key_missing_or_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let key = dir.path().join("settings_hmac.key");
+        assert_eq!(read_key_file(&settings), KeyFile::Missing);
+        fs::write(&key, "not hex at all").unwrap();
+        assert_eq!(read_key_file(&settings), KeyFile::Missing);
+        fs::write(&key, "0a0b").unwrap();
+        assert_eq!(read_key_file(&settings), KeyFile::Key(vec![10, 11]));
+        // A directory in its place: there, and not readable as a file.
+        fs::remove_file(&key).unwrap();
+        fs::create_dir(&key).unwrap();
+        assert_eq!(read_key_file(&settings), KeyFile::Unreadable);
+    }
+
+    /// Review of #222 (P3.8): the async Rust callers of the settings file do
+    /// their I/O on the blocking pool too — the kill switch's `arm`, the
+    /// account-boundary clear, the reapply's revert. (main.rs reads the
+    /// settings synchronously in `setup`, on the main thread before the
+    /// runtime serves anything, and stays so.)
+    #[test]
+    fn the_async_callers_load_and_save_off_the_runtime() {
+        // A Windows checkout has CRLF endings (core.autocrlf).
+        let source = include_str!("settings.rs").replace('\r', "");
+        for helper in [
+            "pub(crate) async fn load_settings_off_runtime(",
+            "pub(crate) async fn clear_account_choices(",
+            "pub(crate) async fn restore_tunnel_settings(",
+        ] {
+            let body = &source[source.find(helper).expect(helper)..];
+            let body = &body[..body.find("\n}\n").expect("end of fn")];
+            assert!(
+                body.contains("tokio::task::spawn_blocking(move ||"),
+                "{helper}"
+            );
+        }
+        for (file, call) in [
+            (
+                include_str!("auth.rs"),
+                "settings::clear_account_choices(&app).await",
+            ),
+            (
+                include_str!("session.rs"),
+                "settings::clear_account_choices(app).await",
+            ),
+            (
+                include_str!("vpn.rs"),
+                "restore_tunnel_settings(&app, &previous).await",
+            ),
+            (
+                include_str!("killswitch.rs"),
+                "load_settings_off_runtime(app)",
+            ),
+        ] {
+            assert!(file.contains(call), "{call}");
+        }
+    }
+
+    /// Round 3 of the review (P2-2): how a failed read maps. A settings.json
+    /// that is not UTF-8 fails `read_to_string` with InvalidData; it is a file
+    /// that does not parse, and a save may replace it. Before, every read
+    /// error was Unreadable, and such a file could never be saved again.
+    #[test]
+    fn a_settings_file_that_is_not_utf8_does_not_parse_rather_than_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, [0xFF, 0xFE, 0x00, 0x7B]).unwrap();
+        let error = fs::read_to_string(&path).expect_err("not UTF-8");
+        let mapped = read_error(error);
+        assert!(matches!(mapped, LoadError::Unparseable(_)), "{mapped:?}");
+        assert_eq!(may_save_over(Err(mapped)), Ok(()), "a save may replace it");
+
+        let denied = read_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(matches!(denied, LoadError::Unreadable(_)), "{denied:?}");
+        assert!(may_save_over(Err(denied)).is_err());
+        assert!(matches!(
+            read_error(std::io::Error::other("sharing violation")),
+            LoadError::Unreadable(_)
+        ));
+    }
+
+    /// Every settings IPC command runs its work through `off_the_runtime`.
+    #[test]
+    fn every_settings_command_runs_off_the_runtime() {
+        // A Windows checkout has CRLF endings (core.autocrlf).
+        let source = include_str!("settings.rs").replace('\r', "");
+        for command in [
+            "pub async fn get_settings(",
+            "pub async fn save_settings(",
+            "pub async fn set_crash_reports_enabled(",
+            "pub async fn set_autostart(",
+            "pub async fn reset_settings(",
+        ] {
+            let body = &source[source.find(command).expect(command)..];
+            let body = &body[..body.find("\n}\n").expect("end of fn")];
+            assert!(
+                body.contains("off_the_runtime(move ||"),
+                "{command} does its work on the async runtime"
+            );
+        }
     }
 }

@@ -46,6 +46,9 @@ export const DEVICE_LIMIT_COPY =
   'Disconnect another device or upgrade your plan.';
 export const SERVER_UNREACHABLE_COPY =
   "Couldn't establish a secure tunnel to this server. Try another location.";
+export const SETTINGS_UNVERIFIED_COPY =
+  "Your saved settings couldn't be verified right now, so this change wasn't saved. " +
+  'Try again in a moment, or reset your settings to their defaults.';
 
 const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   network_offline: {
@@ -109,6 +112,9 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
     message: 'Something went wrong on our side. Please try again in a moment.',
     action: 'retry',
   },
+  // The settings file's signing key is unreadable, so Rust refused to write
+  // over the file. The save notice offers the reset itself.
+  settings_unverified: { message: SETTINGS_UNVERIFIED_COPY, action: null },
   unknown: { message: 'Something went wrong. Please try again.', action: 'retry' },
 };
 

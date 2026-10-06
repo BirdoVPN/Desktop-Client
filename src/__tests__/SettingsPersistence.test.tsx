@@ -20,14 +20,24 @@ import { Settings } from '@/components/Settings';
 import { VpnSettings } from '@/screens/VpnSettings';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import {
+  askToResetSettings,
   cancelScheduledReapply,
+  CONSENT_CRASH_CHOICE_FAILED_COPY,
+  KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
   persistSettings,
+  resetSettings,
+  saveConsentCrashChoice,
+  useResetPrompt,
   REAPPLY_REVERTED_COPY,
   REAPPLY_WAIT_MS,
   scheduleReapply,
 } from '@/session/settings-persist';
 import { settingsToRust } from '@/utils/helpers';
 import { resetUpdater } from '@/session/updater';
+import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
+import { ResetSettingsDialog, RESET_SETTINGS_BODY } from '@/components/ResetSettingsDialog';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
@@ -188,6 +198,154 @@ describe('Custom DNS follows the server flag for the plan (client-config feature
     expect(toggle).toHaveAttribute('aria-checked', 'true');
     expect(toggle).not.toHaveAttribute('aria-disabled', 'true');
     expect(screen.getByRole('textbox', { name: 'Primary DNS' })).toBeInTheDocument();
+  });
+});
+
+describe('a settings file that cannot be verified (review of #222)', () => {
+  const unverified = {
+    code: 'settings_unverified',
+    message: 'the settings file could not be verified, so it was left as it is',
+    retryable: true,
+    retry_after_secs: null,
+  };
+
+  it('says so instead of "please try again", and offers the reset', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'save_settings') throw unverified;
+      return undefined;
+    });
+    expect(await persistSettings({ autoConnect: true })).toBe(false);
+    const notice = useAppStore.getState().notice;
+    expect(notice?.text).toBe(SETTINGS_UNVERIFIED_COPY);
+    expect(notice?.actionLabel).toBe('Reset settings');
+    expect(useAppStore.getState().settings.autoConnect).toBe(defaultSettings.autoConnect);
+
+    // The notice only ASKS (round 3 of the review): nothing is reset until
+    // the user confirms, and then the screen shows what is saved.
+    render(<ResetSettingsDialog />);
+    act(() => notice?.onAction?.());
+    expect(await screen.findByText(RESET_SETTINGS_BODY)).toBeInTheDocument();
+    expect(mockedInvoke.mock.calls.some(([c]) => c === 'reset_settings')).toBe(false);
+    mockedInvoke.mockImplementation(async (cmd: string) => (cmd === 'reset_settings' ? true : undefined));
+    await userEvent.click(screen.getByRole('button', { name: 'Reset settings' }));
+    await waitFor(() => {
+      const order = mockedInvoke.mock.calls.map(([c]) => c);
+      expect(order.indexOf('reset_settings')).toBeGreaterThan(-1);
+      expect(order.lastIndexOf('get_settings')).toBeGreaterThan(order.indexOf('reset_settings'));
+    });
+    expect(useAppStore.getState().notice?.text).toBe('Your settings were reset to their defaults.');
+  });
+
+  it('the reset is not run when the confirmation is cancelled', async () => {
+    render(<ResetSettingsDialog />);
+    act(() => askToResetSettings());
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    expect(mockedInvoke.mock.calls.some(([c]) => c === 'reset_settings')).toBe(false);
+    expect(useResetPrompt.getState().open).toBe(false);
+  });
+
+  it('a file that verifies again is not reset, and the user is told', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => (cmd === 'reset_settings' ? false : undefined));
+    await resetSettings();
+    expect(useAppStore.getState().notice?.text).toBe(
+      'Your saved settings can be read again, so nothing was reset.',
+    );
+  });
+
+  it('any other failed save keeps the plain message, with no reset', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'save_settings') throw { ...unverified, code: 'unknown' };
+      return undefined;
+    });
+    await persistSettings({ autoConnect: true });
+    const notice = useAppStore.getState().notice;
+    expect(notice?.text).toMatch(/Couldn't save that setting/);
+    expect(notice?.actionLabel).toBeUndefined();
+  });
+});
+
+describe('a kill switch OFF whose save is refused (round 4 of the review of #222, P3-1)', () => {
+  it('the toggle shows what is live, OFF for this connection, and what is saved again at the next dial', async () => {
+    useAppStore.setState({
+      connectionState: 'reconnecting',
+      settings: { ...defaultSettings, killSwitchEnabled: true },
+    });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'save_settings') {
+        throw {
+          code: 'settings_unverified',
+          message: 'the settings file could not be verified, so it was left as it is',
+          retryable: true,
+          retry_after_secs: null,
+        };
+      }
+      if (cmd === 'get_settings') return settingsToRust({ ...defaultSettings, killSwitchEnabled: true });
+      if (cmd === 'check_biometric_available') return { available: false, enabled: false, method: 'none' };
+      return undefined;
+    });
+    render(<Settings />);
+    const killSwitch = () => screen.getByRole('switch', { name: /kill switch/i });
+    await userEvent.click(killSwitch());
+    await userEvent.click(await screen.findByRole('button', { name: /turn off anyway/i }));
+    await waitFor(() => {
+      expect(useAppStore.getState().notice?.text).toBe(KILL_SWITCH_OFF_THIS_CONNECTION_COPY);
+    });
+    expect(useAppStore.getState().notice?.actionLabel).toBe('Reset settings');
+    expect(mockedInvoke).toHaveBeenCalledWith('set_killswitch_live', { enabled: false });
+    // It used to go back to ON here, over a kill switch that was off.
+    expect(killSwitch()).toHaveAttribute('aria-checked', 'false');
+
+    // The next dial arms from the file, which still says ON; so does the toggle.
+    act(() => useAppStore.setState({ connectionState: 'connecting' }));
+    await waitFor(() => expect(killSwitch()).toHaveAttribute('aria-checked', 'true'));
+  });
+});
+
+describe('the crash-report choice on the consent screen (round 4 of the review of #222)', () => {
+  const refuse = (error: unknown) =>
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'set_crash_reports_enabled') throw error;
+      return undefined;
+    });
+
+  it('a file that cannot be verified is said so, with the reset, and the choice falls back OFF', async () => {
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    refuse({
+      code: 'settings_unverified',
+      message: 'the settings file could not be verified, so it was left as it is',
+      retryable: true,
+      retry_after_secs: null,
+    });
+    await saveConsentCrashChoice(true);
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(false);
+    const notice = useAppStore.getState().notice;
+    expect(notice?.text).toBe(SETTINGS_UNVERIFIED_COPY);
+    expect(notice?.actionLabel).toBe('Reset settings');
+    quiet.mockRestore();
+  });
+
+  it('any other refusal says the choice did not stick', async () => {
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    refuse('disk full');
+    await saveConsentCrashChoice(true);
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(false);
+    expect(useAppStore.getState().notice?.text).toBe(CONSENT_CRASH_CHOICE_FAILED_COPY);
+    quiet.mockRestore();
+  });
+
+  it('a saved choice says nothing', async () => {
+    await saveConsentCrashChoice(true);
+    expect(useAppStore.getState().settings.crashReportsEnabled).toBe(true);
+    expect(useAppStore.getState().notice).toBeNull();
+  });
+
+  it('the consent screen saves through it', () => {
+    const app = readFileSync(resolve(__dirname, '../App.tsx'), 'utf8');
+    const handler = app.slice(app.indexOf('const handleAcceptConsent'));
+    expect(handler.slice(0, handler.indexOf('};'))).toContain(
+      'saveConsentCrashChoice(crashReportsEnabled)',
+    );
+    expect(app).not.toContain("invoke('set_crash_reports_enabled'");
   });
 });
 

@@ -50,6 +50,7 @@ const ALL: IpcErrorCode[] = [
   'not_elevated',
   'cancelled',
   'server_error',
+  'settings_unverified',
   'unknown',
 ];
 

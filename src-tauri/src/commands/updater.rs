@@ -41,6 +41,7 @@ use tauri_plugin_updater::UpdaterExt;
 
 use crate::commands::session::{connect_session, end_session, ConnectTarget, EndReason};
 use crate::commands::tray::{restore_and_focus, set_tray_visible};
+use crate::utils::redact::for_ipc;
 use crate::vpn::AutoReconnectService;
 
 /// Event carrying installer download progress to the frontend.
@@ -136,7 +137,11 @@ fn pinned_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Stri
 /// Check the pinned update endpoint. `Ok(None)` means "already up to date".
 #[tauri::command]
 pub async fn check_for_updates(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater = pinned_updater(&app)?;
+    check(&app).await.map_err(for_ipc)
+}
+
+async fn check(app: &AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let updater = pinned_updater(app)?;
     match updater.check().await {
         Ok(Some(update)) => Ok(Some(UpdateInfo {
             version: update.version.clone(),
@@ -180,7 +185,7 @@ impl UpdateFailure {
     fn before_install(code: &'static str, message: String) -> Self {
         Self {
             code,
-            message,
+            message: for_ipc(message),
             reconnect: Reconnect::None,
         }
     }
@@ -221,7 +226,7 @@ async fn recover_from_failed_install(
     }
     UpdateFailure {
         code: "install_failed",
-        message: format!("Update failed: {error}"),
+        message: for_ipc(format!("Update failed: {error}")),
         reconnect,
     }
 }
