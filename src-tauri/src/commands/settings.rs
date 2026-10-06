@@ -562,6 +562,19 @@ enum LoadError {
     Other(String),
 }
 
+/// What a failed read of settings.json means. Bytes that are not UTF-8 are
+/// a file that does not parse — nothing a save could lose, and saving is the
+/// way out of it — not one that could not be read (round 3 of the review of
+/// #222: mapped to Unreadable, such a file could never be saved again, and no
+/// reset was offered). Every other read error is Unreadable.
+fn read_error(e: std::io::Error) -> LoadError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        LoadError::Unparseable(format!("Failed to parse settings (not UTF-8): {}", e))
+    } else {
+        LoadError::Unreadable(format!("Failed to read settings: {}", e))
+    }
+}
+
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -617,8 +630,7 @@ fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {
         return Ok(Loaded::Saved(AppSettings::default()));
     }
 
-    let content = fs::read_to_string(&path)
-        .map_err(|e| LoadError::Unreadable(format!("Failed to read settings: {}", e)))?;
+    let content = fs::read_to_string(&path).map_err(read_error)?;
 
     // Try to parse as signed settings (new format)
     if let Ok(signed) = serde_json::from_str::<SignedSettings>(&content) {
@@ -2029,6 +2041,29 @@ mod tests {
         ] {
             assert!(file.contains(call), "{call}");
         }
+    }
+
+    /// Round 3 of the review (P2-2): how a failed read maps. A settings.json
+    /// that is not UTF-8 fails `read_to_string` with InvalidData; it is a file
+    /// that does not parse, and a save may replace it. Before, every read
+    /// error was Unreadable, and such a file could never be saved again.
+    #[test]
+    fn a_settings_file_that_is_not_utf8_does_not_parse_rather_than_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, [0xFF, 0xFE, 0x00, 0x7B]).unwrap();
+        let error = fs::read_to_string(&path).expect_err("not UTF-8");
+        let mapped = read_error(error);
+        assert!(matches!(mapped, LoadError::Unparseable(_)), "{mapped:?}");
+        assert_eq!(may_save_over(Err(mapped)), Ok(()), "a save may replace it");
+
+        let denied = read_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(matches!(denied, LoadError::Unreadable(_)), "{denied:?}");
+        assert!(may_save_over(Err(denied)).is_err());
+        assert!(matches!(
+            read_error(std::io::Error::other("sharing violation")),
+            LoadError::Unreadable(_)
+        ));
     }
 
     /// Every settings IPC command runs its work through `off_the_runtime`.
