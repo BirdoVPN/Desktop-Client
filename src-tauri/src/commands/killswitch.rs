@@ -987,11 +987,12 @@ pub async fn tunnel_interface_down(name: &str) {
     blocking_may_have_changed();
 }
 
-/// [`tunnel_interface_down`] for `Drop`, which cannot await: done in place
-/// when the lock is free, else handed to the runtime (the fd is closed either
-/// way — leaving the device alive is a guaranteed IPv4 blackhole).
+/// [`tunnel_interface_down`] for `Drop`, which cannot await, followed by
+/// `close` — always in that order (P3-4). In place when the lock is free;
+/// otherwise the re-load AND the close are handed to the runtime, so the device
+/// stays open until its permit has left the block, never the other way round.
 #[cfg(target_os = "macos")]
-pub fn tunnel_interface_gone_now(name: &str) {
+pub fn tunnel_interface_gone_then(name: &str, close: impl FnOnce() + Send + 'static) {
     match PF.try_lock() {
         Ok(mut pf) => {
             let inputs = pf_inputs();
@@ -999,11 +1000,14 @@ pub fn tunnel_interface_gone_now(name: &str) {
                 tracing::warn!("Kill switch: re-loading the block without {}: {}", name, e);
             }
             mirror(&pf);
+            drop(pf);
+            close();
         }
         Err(_) => {
             let name = name.to_string();
             tauri::async_runtime::spawn(async move {
                 tunnel_interface_down(&name).await;
+                close();
             });
         }
     }
