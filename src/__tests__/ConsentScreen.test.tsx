@@ -10,6 +10,8 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { open as openExternal } from '@tauri-apps/plugin-shell';
 import { ConsentScreen, CONSENT_COPY, TERMS_URL, PRIVACY_URL } from '@/components/ConsentScreen';
+import { createHash } from 'node:crypto';
+import { CONSENT_VERSION } from '@/lib/consent';
 
 vi.mock('@tauri-apps/plugin-shell', () => ({
   open: vi.fn().mockResolvedValue(undefined),
@@ -131,5 +133,38 @@ describe('ConsentScreen controls', () => {
     await userEvent.click(screen.getByRole('button', { name: /^decline$/i }));
     expect(onDecline).toHaveBeenCalled();
     expect(onAccept).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Owner decision D7 (versioned re-consent): every text the screen has shown,
+ * by the version that stands for it. A user who accepted an older version
+ * sees the screen again, so the text must never change under the same
+ * number. The fingerprint is of everything the screen says, not only
+ * CONSENT_COPY, so a heading or the age line changing counts too.
+ *
+ * A tripwire, not a lock (REVIEW-WIN2-028): it fires when the text changes,
+ * but a hash edited in place under the same number would pass. What stops
+ * that is review: an entry here is never changed, only added — one per
+ * version, which the second test checks.
+ */
+const CONSENT_TEXT_FINGERPRINTS: Record<number, string> = {
+  2: '5fcddce0de685ce26e80ef04a509b9b0bd694e5bb4f11a2d40c15ca31628bf49',
+};
+
+describe('consent version (D7)', () => {
+  it('every version since versioning began keeps its fingerprint', () => {
+    const versions = Object.keys(CONSENT_TEXT_FINGERPRINTS).map(Number);
+    expect(versions).toEqual(Array.from({ length: CONSENT_VERSION - 1 }, (_, i) => i + 2));
+  });
+
+  it('the text on screen is the one CONSENT_VERSION stands for', () => {
+    const { container } = render(<ConsentScreen onAccept={onAccept} onDecline={onDecline} />);
+    const digest = createHash('sha256').update(container.textContent ?? '').digest('hex');
+    expect(
+      digest,
+      'The consent text changed: bump CONSENT_VERSION (src/lib/consent.ts) so every user sees it ' +
+        'once, and record the new text fingerprint here under the new number.',
+    ).toBe(CONSENT_TEXT_FINGERPRINTS[CONSENT_VERSION]);
   });
 });

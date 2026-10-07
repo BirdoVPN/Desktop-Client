@@ -22,7 +22,7 @@
         "decorations": false,
         "transparent": false,
         "minWidth": 380,
-        "minHeight": 640,
+        "minHeight": 520,
         "maxWidth": 380,
         "maxHeight": 640,
         "visible": true
@@ -76,7 +76,7 @@
         "bundleMediaFramework": false
       }
     },
-    "publisher": "Birdo VPN",
+    "publisher": "Birdo Networks Ltd",
     "copyright": "© 2026 Birdo Networks Ltd. All rights reserved.",
     "category": "Utility",
     "shortDescription": "Privacy-First VPN Client",
@@ -87,11 +87,9 @@
       "open": "^https://(birdo\\.app|[a-zA-Z0-9-]+\\.birdo\\.app)(/.*)?$"
     },
     "updater": {
-      "active": true,
       "endpoints": [
         "https://api.birdo.app/updates/{{target}}/{{arch}}/{{current_version}}"
       ],
-      "dialog": true,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MjREQjkxNjE0Nzk1MUUKUldRZWxVZGhrZHNrUjVmLzE5NUwvd0s1Zi9QVHhnK1NsT200MS9zSkJnZFZiZFhIdjFGWWZsTDgK"
     },
     "deep-link": {

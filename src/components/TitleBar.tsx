@@ -29,6 +29,8 @@ export function TitleBar() {
 
   return (
     <div
+      // Window controls stay usable while a dialog makes the app inert.
+      data-modal-exempt
       className="relative z-100 flex h-8 shrink-0 select-none items-center justify-between border-b border-white/6 px-2.5"
       // No backdrop-filter: a blur() that samples the continuously-repainting
       // globe canvas behind it smears into vertical "stretched line" streaks on

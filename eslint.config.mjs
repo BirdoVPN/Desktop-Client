@@ -8,6 +8,7 @@ import tsParser from '@typescript-eslint/parser'
 import tsPlugin from '@typescript-eslint/eslint-plugin'
 import reactPlugin from 'eslint-plugin-react'
 import reactHooks from 'eslint-plugin-react-hooks'
+import jsxA11y from 'eslint-plugin-jsx-a11y'
 
 export default [
   // Global ignores — must be a lone object to apply repo-wide.
@@ -47,6 +48,7 @@ export default [
       '@typescript-eslint': tsPlugin,
       react: reactPlugin,
       'react-hooks': reactHooks,
+      'jsx-a11y': jsxA11y,
     },
     settings: {
       react: { version: 'detect' },
@@ -55,6 +57,9 @@ export default [
       ...tsPlugin.configs.recommended.rules,
       ...reactPlugin.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
+      // Accessibility (W2-036): the dialog, live-region and radio-group
+      // regressions this app shipped (W2-016/017/035) are what these catch.
+      ...jsxA11y.flatConfigs.recommended.rules,
 
       // TypeScript handles undefined-symbol detection better than ESLint.
       // Disabling `no-undef` avoids duplicate diagnostics for TS/JSX symbols.

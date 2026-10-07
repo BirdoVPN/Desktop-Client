@@ -63,7 +63,9 @@ pub struct AppSettings {
     /// Allow LAN access while connected (printers, NAS, etc.)
     #[serde(default)]
     pub local_network_sharing: bool,
-    /// WireGuard port: "auto", "51820", "53", or custom port number
+    /// WireGuard port: "auto" or "51820" (the relays accept no other). "53"
+    /// and custom numbers from earlier builds are migrated to "auto" on load
+    /// (`migrate_wireguard_port`).
     #[serde(default = "default_wireguard_port")]
     pub wireguard_port: String,
     /// WireGuard MTU: 0 = automatic (server default), 1280-1500 = custom
@@ -456,8 +458,22 @@ fn verify_hmac(settings_json: &str, expected_hmac: &str, key: &[u8]) -> bool {
 /// choke-point for both the signed and legacy load paths so any future
 /// invariants stay in lock-step and remain unit-testable without a Tauri
 /// `AppHandle`/filesystem.
-fn normalize_loaded_settings(settings: AppSettings) -> AppSettings {
+fn normalize_loaded_settings(mut settings: AppSettings) -> AppSettings {
+    migrate_wireguard_port(&mut settings);
     settings
+}
+
+/// WIN-FIX-3: the relays accept WireGuard on UDP 51820 only (vpn-a3, all
+/// ten: no DNAT, nothing on a public 53). The "53" preset and the custom port
+/// that earlier builds offered failed the handshake on every relay, so a
+/// saved value of either becomes "auto" — the same rule as Android. Returns
+/// whether it changed anything, so a signed file is re-saved once.
+fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
+    if matches!(settings.wireguard_port.as_str(), "auto" | "51820") {
+        return false;
+    }
+    settings.wireguard_port = default_wireguard_port();
+    true
 }
 
 /// Get current application settings
@@ -470,10 +486,40 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
 /// callers that need settings before the frontend is up (e.g. main.rs setup
 /// honoring `start_minimized`).
 pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
+    load_settings(app).map(Loaded::settings)
+}
+
+/// What a load found (WIN3-010).
+enum Loaded {
+    /// What is saved: the verified file — or the defaults where there is no
+    /// file to lose (none yet, or one just quarantined as tampered).
+    Saved(AppSettings),
+    /// Defaults served for this session because the file could not be
+    /// verified right now (its signing key is unreadable). The file is left
+    /// as it is, and nothing may be saved from these: that would replace
+    /// every real preference with its default.
+    Unverified(AppSettings),
+}
+
+impl Loaded {
+    fn settings(self) -> AppSettings {
+        match self {
+            Loaded::Saved(settings) | Loaded::Unverified(settings) => settings,
+        }
+    }
+}
+
+/// [`load_settings_sync`], saying whether the settings may be saved back.
+///
+/// The whole load holds [`SETTINGS_WRITE`] (WIN3-010): the migrations below
+/// save what they read, and a save that landed between their read and their
+/// write was lost.
+fn load_settings(app: &AppHandle) -> Result<Loaded, String> {
+    let _write = SETTINGS_WRITE.lock();
     let path = get_settings_path(app)?;
 
     if !path.exists() {
-        return Ok(AppSettings::default());
+        return Ok(Loaded::Saved(AppSettings::default()));
     }
 
     let content =
@@ -518,7 +564,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
                     "no key in the credential store, no key file"
                 }
             );
-            return Ok(AppSettings::default());
+            return Ok(Loaded::Unverified(AppSettings::default()));
         }
 
         let settings_json = serde_json::to_string(&signed.settings)
@@ -526,7 +572,18 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
         for key in &candidates {
             if verify_hmac(&settings_json, &signed.hmac, key) {
                 sync_hmac_key_sources(&path, key);
-                return Ok(normalize_loaded_settings(signed.settings));
+                let port_before = signed.settings.wireguard_port.clone();
+                let settings = normalize_loaded_settings(signed.settings);
+                // Persist a migration once rather than redo it on every load.
+                if settings.wireguard_port != port_before {
+                    if let Err(e) = save_settings_inner(app, &settings) {
+                        tracing::warn!(
+                            "Failed to save migrated settings: {} (will retry next load)",
+                            e
+                        );
+                    }
+                }
+                return Ok(Loaded::Saved(settings));
             }
         }
 
@@ -554,7 +611,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
                             e
                         );
                     }
-                    return Ok(settings);
+                    return Ok(Loaded::Saved(settings));
                 }
             }
         }
@@ -566,7 +623,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
             tracing::error!(
                 "Settings signature matches no readable key while the credential store is unreachable — using defaults for this session without resetting"
             );
-            return Ok(AppSettings::default());
+            return Ok(Loaded::Unverified(AppSettings::default()));
         }
 
         // Every key source was readable and none verifies: genuine mismatch.
@@ -580,7 +637,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
         if let Err(e) = fs::rename(&path, &quarantine) {
             tracing::warn!("Could not preserve the unverified settings file: {}", e);
         }
-        return Ok(AppSettings::default());
+        return Ok(Loaded::Saved(AppSettings::default()));
     }
 
     // Legacy format (unsigned) — migrate by parsing and re-saving with HMAC
@@ -597,7 +654,7 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
                     e
                 );
             }
-            Ok(settings)
+            Ok(Loaded::Saved(settings))
         }
         Err(e) => Err(format!("Failed to parse settings: {}", e)),
     }
@@ -606,6 +663,38 @@ pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
 /// Internal save function used by both save_settings command and migration
 fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = get_settings_path(app)?;
+    write_signed_settings(&path, settings, |json| {
+        compute_hmac(json, &get_hmac_key(&path)?)
+    })
+}
+
+/// Serialises every settings write in this process (REVIEW-WIN-006).
+///
+/// `save_settings` is an async command, so two saves run in parallel on the
+/// runtime, and since the UI mirrors the chosen server into
+/// `preferred_server_id` with no user action, a background save racing a
+/// toggle is ordinary. Both used to write the SAME `settings.json.tmp` and
+/// rename it: one truncated the file the other was writing, one renamed a
+/// partial file into place (which then failed its HMAC on the next load and
+/// was quarantined, resetting every preference), or the second rename found
+/// nothing and the UI rolled the user's change back with "Couldn't save".
+/// The lock also covers the key read, so two first-run saves cannot mint two
+/// different signing keys.
+///
+/// Re-entrant, so a read-modify-write can hold it across the load — whose
+/// legacy-format migrations save — and the save (REVIEW-WIN2-023, see
+/// `clear_account_choices`).
+static SETTINGS_WRITE: parking_lot::ReentrantMutex<()> = parking_lot::const_reentrant_mutex(());
+
+/// Sign `settings` with `sign` and write them to `path`, the whole save under
+/// [`SETTINGS_WRITE`]. `sign` is a parameter so a test can sign without the
+/// OS credential store.
+fn write_signed_settings(
+    path: &Path,
+    settings: &AppSettings,
+    sign: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    let _write = SETTINGS_WRITE.lock();
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
@@ -613,27 +702,29 @@ fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), St
 
     let settings_json =
         serde_json::to_string(settings).map_err(|e| format!("Failed to serialize: {}", e))?;
-
-    let hmac_key = get_hmac_key(&path)?;
-    let hmac = compute_hmac(&settings_json, &hmac_key)?;
-
     let signed = SignedSettings {
         settings: settings.clone(),
-        hmac,
+        hmac: sign(&settings_json)?,
     };
-
     let content = serde_json::to_string_pretty(&signed)
         .map_err(|e| format!("Failed to serialize signed settings: {}", e))?;
+    write_atomically(path, &content)
+}
 
-    // FIX-2-6: Atomic write — write to temp file then rename.
-    // Prevents corruption if process crashes or power is lost mid-write.
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &content).map_err(|e| {
+/// FIX-2-6: write to a temp file, then rename over `path`, so a crash or a
+/// power cut mid-write never leaves a torn settings file. The temp name is
+/// unique to this write (process id + a counter): a fixed name is shared by
+/// every writer, which is half of REVIEW-WIN-006.
+fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
+    fs::write(&tmp_path, content).map_err(|e| {
         // Clean up partial temp file on write failure
         let _ = fs::remove_file(&tmp_path);
         format!("Failed to write temp settings: {}", e)
     })?;
-    fs::rename(&tmp_path, &path).map_err(|e| {
+    fs::rename(&tmp_path, path).map_err(|e| {
         // Clean up temp file on rename failure
         let _ = fs::remove_file(&tmp_path);
         format!("Failed to atomically replace settings file: {}", e)
@@ -650,6 +741,90 @@ pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<bool
     crate::utils::crash_report::set_opted_in(settings.crash_reports_enabled);
     tracing::info!("Settings saved successfully");
     Ok(true)
+}
+
+/// Settings are per MACHINE, but the server a session dials is one ACCOUNT's
+/// choice: the UI mirrors the user's server into `preferred_server_id`, and
+/// the armed Multi-Hop route, so tray Quick Connect dials what the Connect
+/// button would. Left behind, the next account to sign in on this machine had
+/// its first tray Quick Connect dial the previous user's server
+/// (REVIEW-WIN-007) — or the previous user's Multi-Hop pair, which the first
+/// fix left out (REVIEW-WIN2-023). Returns whether anything changed.
+pub(crate) fn forget_account_choices(settings: &mut AppSettings) -> bool {
+    let server = settings.preferred_server_id.take().is_some();
+    let entry = settings.multi_hop_entry_node_id.take().is_some();
+    let exit = settings.multi_hop_exit_node_id.take().is_some();
+    let armed = std::mem::take(&mut settings.multi_hop_enabled);
+    server || entry || exit || armed
+}
+
+/// [`forget_account_choices`] on the settings file, at every account boundary
+/// (sign-out, deletion, an expired session). Best effort: a sign-out must not
+/// fail over it. Writes only when there was something to forget, so settings
+/// served as defaults (an unreadable signing key) are never written over the
+/// real file. The whole read-modify-write holds the settings lock, so a
+/// concurrent save (the UI's preferred-server mirror) cannot land between the
+/// read and the write and put the old server back (REVIEW-WIN2-023).
+pub(crate) fn clear_account_choices(app: &AppHandle) {
+    let _write = SETTINGS_WRITE.lock();
+    match load_settings_sync(app) {
+        Ok(mut settings) => {
+            if forget_account_choices(&mut settings) {
+                if let Err(e) = save_settings_inner(app, &settings) {
+                    tracing::warn!("Could not clear the signed-out account's server: {}", e);
+                }
+            }
+        }
+        Err(e) => tracing::warn!(
+            "Could not read settings to clear the account's server: {}",
+            e
+        ),
+    }
+}
+
+/// Put the tunnel-shaping settings of `good` back over what is saved now, and
+/// save: the revert of a settings change the live session could not apply
+/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved.
+pub(crate) fn restore_tunnel_settings(
+    app: &AppHandle,
+    good: &AppSettings,
+) -> Result<AppSettings, String> {
+    let _write = SETTINGS_WRITE.lock();
+    let restored = restored_over(load_settings(app)?, good)?;
+    save_settings_inner(app, &restored)?;
+    Ok(restored)
+}
+
+/// What the revert saves, over what was `loaded` (WIN3-010). Never over the
+/// defaults a load serves while it cannot verify the file: saved, they
+/// replaced the user's kill switch, lockdown, autostart, server and every
+/// other preference with defaults. The revert then fails, and the error the
+/// reapply met stands.
+fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, String> {
+    match loaded {
+        Loaded::Saved(current) => Ok(with_tunnel_settings_of(current, good)),
+        Loaded::Unverified(_) => {
+            Err("the settings file could not be verified, so it was left as it is".into())
+        }
+    }
+}
+
+/// `current` with every setting a live reapply rebuilds the tunnel for taken
+/// from `good`. Only those: anything else changed since (a notification
+/// toggle, the server the user picked) is not part of the revert.
+fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSettings {
+    AppSettings {
+        custom_dns: good.custom_dns.clone(),
+        local_network_sharing: good.local_network_sharing,
+        wireguard_port: good.wireguard_port.clone(),
+        wireguard_mtu: good.wireguard_mtu,
+        stealth_mode: good.stealth_mode,
+        quantum_protection: good.quantum_protection,
+        dns_filtering: good.dns_filtering,
+        split_tunneling_enabled: good.split_tunneling_enabled,
+        split_tunnel_apps: good.split_tunnel_apps.clone(),
+        ..current
+    }
 }
 
 /// Turn crash reporting on or off (consent screen and Settings › Privacy).
@@ -700,6 +875,62 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
     Ok(true)
 }
 
+/// The launch-at-login task's name (the uninstaller removes it by name).
+#[cfg_attr(not(windows), allow(dead_code))]
+const LAUNCH_TASK: &str = "BirdoVPN Launch At Login";
+
+#[cfg(windows)]
+fn schtasks(args: &[&str]) -> Result<std::process::Output, String> {
+    crate::utils::hidden_cmd("schtasks")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run schtasks: {}", e))
+}
+
+/// The `schtasks /Create` arguments for the launch-at-login task: an
+/// elevated logon trigger for `exe`. The action is quoted here — Task
+/// Scheduler splits an unquoted "C:\Program Files\…" at the first space.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn launch_task_create_args(exe: &std::path::Path) -> Vec<String> {
+    [
+        "/Create",
+        "/F",
+        "/TN",
+        LAUNCH_TASK,
+        "/TR",
+        &format!("\"{}\"", exe.display()),
+        "/SC",
+        "ONLOGON",
+        "/RL",
+        "HIGHEST",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect()
+}
+
+#[cfg(windows)]
+fn create_launch_task() -> Result<(), String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to resolve the app path: {}", e))?;
+    let args = launch_task_create_args(&exe);
+    let out = schtasks(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    if !out.status.success() {
+        return Err(format!(
+            "Failed to register the launch-at-login task: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// schtasks error text is localized, so existence is probed by exit code
+/// rather than by parsing "cannot find" out of its stderr.
+#[cfg(windows)]
+fn launch_task_exists() -> Result<bool, String> {
+    Ok(schtasks(&["/Query", "/TN", LAUNCH_TASK])?.status.success())
+}
+
 /// Windows launch-at-login via a logon-triggered Scheduled Task.
 ///
 /// The exe manifest is `requireAdministrator`, and Windows never launches an
@@ -710,8 +941,6 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String
 /// prompt; creating one needs admin, which this process always has.
 #[cfg(windows)]
 fn set_autostart_windows(app: &AppHandle, enabled: bool) -> Result<(), String> {
-    const TASK_NAME: &str = "BirdoVPN Launch At Login";
-
     // Older builds wrote the useless Run-key entry; clear it on either toggle
     // so it stops logging an elevation failure at every logon.
     {
@@ -719,45 +948,40 @@ fn set_autostart_windows(app: &AppHandle, enabled: bool) -> Result<(), String> {
         let _ = app.autolaunch().disable();
     }
 
-    let run = |args: &[&str]| -> Result<std::process::Output, String> {
-        crate::utils::hidden_cmd("schtasks")
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run schtasks: {}", e))
-    };
-
     if enabled {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("Failed to resolve the app path: {}", e))?;
-        // Quote the action ourselves — Task Scheduler splits an unquoted
-        // "C:\Program Files\…" at the first space.
-        let action = format!("\"{}\"", exe.display());
-        let out = run(&[
-            "/Create", "/F", "/TN", TASK_NAME, "/TR", &action, "/SC", "ONLOGON", "/RL", "HIGHEST",
-        ])?;
+        create_launch_task()?;
+        tracing::info!("Registered elevated launch-at-login task");
+    } else if launch_task_exists()? {
+        let out = schtasks(&["/Delete", "/F", "/TN", LAUNCH_TASK])?;
         if !out.status.success() {
             return Err(format!(
-                "Failed to register the launch-at-login task: {}",
+                "Failed to remove the launch-at-login task: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        tracing::info!("Registered elevated launch-at-login task");
-    } else {
-        // schtasks error text is localized, so probe existence by exit code
-        // instead of parsing "cannot find" out of /Delete's stderr.
-        let exists = run(&["/Query", "/TN", TASK_NAME])?.status.success();
-        if exists {
-            let out = run(&["/Delete", "/F", "/TN", TASK_NAME])?;
-            if !out.status.success() {
-                return Err(format!(
-                    "Failed to remove the launch-at-login task: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            tracing::info!("Removed launch-at-login task");
-        }
+        tracing::info!("Removed launch-at-login task");
     }
     Ok(())
+}
+
+/// Put the launch-at-login task back when the setting says it should exist
+/// and it does not (REVIEW-WIN2-011). A GUI upgrade runs the OLD version's
+/// uninstaller, whose last step deletes the task whatever the reason for the
+/// uninstall; nothing re-created it while the toggle still read ON, so the
+/// next boot did not start BirdoVPN and an auto-connect user booted
+/// unprotected. Called at every start with the setting on, off the main
+/// thread (schtasks is a process); a task that exists is left exactly as it
+/// is.
+#[cfg(windows)]
+pub fn restore_launch_at_login_task() {
+    std::thread::spawn(|| match launch_task_exists() {
+        Ok(true) => {}
+        Ok(false) => match create_launch_task() {
+            Ok(()) => tracing::info!("Re-created the missing launch-at-login task"),
+            Err(e) => tracing::warn!("Could not re-create the launch-at-login task: {}", e),
+        },
+        Err(e) => tracing::warn!("Could not check the launch-at-login task: {}", e),
+    });
 }
 
 #[cfg(test)]
@@ -907,6 +1131,122 @@ mod tests {
         assert!(matches!(s.protocol, Protocol::Wireguard));
         assert!(s.split_tunneling_enabled);
         assert_eq!(s.wireguard_port, "51820");
+    }
+
+    /// WIN-FIX-3: a reapply that cannot be applied puts back what the live
+    /// session runs on — every tunnel-shaping setting — and nothing else.
+    #[test]
+    fn a_revert_restores_the_tunnel_settings_and_keeps_the_rest() {
+        let good = AppSettings::default();
+        let changed = AppSettings {
+            wireguard_port: "51820".into(),
+            wireguard_mtu: 1280,
+            custom_dns: Some(vec!["9.9.9.9".into()]),
+            local_network_sharing: true,
+            stealth_mode: true,
+            quantum_protection: false,
+            dns_filtering: true,
+            split_tunneling_enabled: true,
+            split_tunnel_apps: vec!["C:\\apps\\game.exe".into()],
+            // Not part of the revert:
+            notifications_enabled: true,
+            preferred_server_id: Some("fra-1".into()),
+            auto_connect: true,
+            ..AppSettings::default()
+        };
+        let restored = with_tunnel_settings_of(changed, &good);
+        assert_eq!(restored.wireguard_port, good.wireguard_port);
+        assert_eq!(restored.wireguard_mtu, good.wireguard_mtu);
+        assert_eq!(restored.custom_dns, good.custom_dns);
+        assert_eq!(restored.local_network_sharing, good.local_network_sharing);
+        assert_eq!(restored.stealth_mode, good.stealth_mode);
+        assert_eq!(restored.quantum_protection, good.quantum_protection);
+        assert_eq!(restored.dns_filtering, good.dns_filtering);
+        assert_eq!(
+            restored.split_tunneling_enabled,
+            good.split_tunneling_enabled
+        );
+        assert_eq!(restored.split_tunnel_apps, good.split_tunnel_apps);
+        assert!(restored.notifications_enabled);
+        assert_eq!(restored.preferred_server_id.as_deref(), Some("fra-1"));
+        assert!(restored.auto_connect);
+    }
+
+    /// WIN3-010: a revert never saves over the defaults a load serves while
+    /// it cannot verify the file (its signing key unreadable): they are not
+    /// the user's settings, and saving them replaced every preference. Over
+    /// what is really saved it restores as before. The load holds the
+    /// settings lock throughout, so a migration's re-save cannot drop a save
+    /// that landed after its read.
+    #[test]
+    fn a_revert_never_saves_over_unverified_defaults() {
+        let good = AppSettings {
+            wireguard_mtu: 1280,
+            ..AppSettings::default()
+        };
+        assert!(restored_over(Loaded::Unverified(AppSettings::default()), &good).is_err());
+        let saved = AppSettings {
+            killswitch_enabled: false,
+            wireguard_mtu: 1420,
+            ..AppSettings::default()
+        };
+        let restored = restored_over(Loaded::Saved(saved), &good).expect("a verified file");
+        assert_eq!(restored.wireguard_mtu, 1280);
+        assert!(!restored.killswitch_enabled, "not part of the revert");
+
+        let source = include_str!("settings.rs");
+        let body = |signature: &str| {
+            let start = source.find(signature).expect(signature);
+            let rest = &source[start..];
+            &rest[..rest
+                .find(
+                    "
+}",
+                )
+                .expect("end of fn")]
+        };
+        let restore = body("pub(crate) fn restore_tunnel_settings(");
+        assert!(restore.contains("restored_over(load_settings(app)?, good)?"));
+        let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, String> {");
+        // The two branches that serve defaults and touch nothing.
+        assert_eq!(
+            load.matches("Loaded::Unverified(AppSettings::default())")
+                .count(),
+            2
+        );
+        let lock = load.find("SETTINGS_WRITE.lock()").expect("the lock");
+        assert!(lock < load.find("get_settings_path(app)?").unwrap());
+        assert!(lock < load.find("save_settings_inner(").unwrap());
+    }
+
+    /// WIN-FIX-3: "53" and custom ports, which no relay answers, load as
+    /// "auto"; the two real choices are kept.
+    #[test]
+    fn a_dead_wireguard_port_loads_as_auto() {
+        for (stored, loaded) in [
+            ("auto", "auto"),
+            ("51820", "51820"),
+            ("53", "auto"),
+            ("443", "auto"),
+            ("5353", "auto"),
+            ("", "auto"),
+        ] {
+            let settings = normalize_loaded_settings(AppSettings {
+                wireguard_port: stored.into(),
+                ..AppSettings::default()
+            });
+            assert_eq!(settings.wireguard_port, loaded, "{stored:?}");
+        }
+        let mut kept = AppSettings {
+            wireguard_port: "51820".into(),
+            ..AppSettings::default()
+        };
+        assert!(!migrate_wireguard_port(&mut kept), "nothing to re-save");
+        let mut dead = AppSettings {
+            wireguard_port: "53".into(),
+            ..AppSettings::default()
+        };
+        assert!(migrate_wireguard_port(&mut dead), "re-saved once");
     }
 
     /// The kill switch is now a real user preference: a persisted `false` must
@@ -1082,5 +1422,163 @@ mod tests {
         );
         assert!(!current.dns_filtering);
         assert!(current.multi_hop_enabled, "user values pass through");
+    }
+
+    /// REVIEW-WIN-006: concurrent saves — the preferred-server mirror racing a
+    /// user toggle — never fail, never leave a torn or foreign file, and leave
+    /// no temp file behind. With the shared `settings.json.tmp` and no lock,
+    /// writers truncated each other's temp file and lost renames.
+    #[test]
+    fn concurrent_saves_neither_fail_nor_tear_the_file() {
+        // A fresh random key per run, leaked for the threads: a literal would be a
+        // hard-coded cryptographic value to CodeQL, and these tests need no fixed one.
+        let key: &'static [u8] = Box::leak(Box::new(rand::random::<[u8; 32]>()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let writers: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        let settings = AppSettings {
+                            preferred_server_id: Some(format!("node-{t}-{i}")),
+                            ..AppSettings::default()
+                        };
+                        write_signed_settings(&path, &settings, |json| compute_hmac(json, key))
+                            .expect("a concurrent save failed");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        let content = fs::read_to_string(&path).unwrap();
+        let signed: SignedSettings = serde_json::from_str(&content).expect("a whole file");
+        let json = serde_json::to_string(&signed.settings).unwrap();
+        assert!(
+            verify_hmac(&json, &signed.hmac, key),
+            "torn or mismatched file"
+        );
+        assert!(signed
+            .settings
+            .preferred_server_id
+            .is_some_and(|id| id.ends_with("-24")));
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "settings.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// REVIEW-WIN2-011: the task the start-up repair creates is the toggle's
+    /// own: elevated, at logon, the quoted path of this exe, under the name
+    /// the uninstaller removes.
+    #[test]
+    fn the_launch_task_is_elevated_at_logon_with_a_quoted_path() {
+        let args = launch_task_create_args(std::path::Path::new(
+            r"C:\Program Files\BirdoVPN\BirdoVPN.exe",
+        ));
+        assert_eq!(
+            args,
+            [
+                "/Create",
+                "/F",
+                "/TN",
+                "BirdoVPN Launch At Login",
+                "/TR",
+                r#""C:\Program Files\BirdoVPN\BirdoVPN.exe""#,
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+            ]
+        );
+        assert!(include_str!("../../nsis-hooks.nsh")
+            .contains(r#"schtasks /Delete /F /TN "BirdoVPN Launch At Login""#));
+        // Start-up puts it back whenever the setting is on.
+        let main = include_str!("../main.rs");
+        let repair = main
+            .find("commands::settings::restore_launch_at_login_task()")
+            .expect("start-up repairs the task");
+        let gate = main[..repair]
+            .rfind(".autostart")
+            .expect("only with the setting on");
+        assert!(repair - gate < 200, "the repair is gated on the setting");
+    }
+
+    /// REVIEW-WIN-007 / REVIEW-WIN2-023: an account boundary forgets the
+    /// account's server and its Multi-Hop route — what tray Quick Connect
+    /// dials — and nothing else on the machine.
+    #[test]
+    fn signing_out_forgets_the_accounts_server_only() {
+        let mut settings = AppSettings {
+            preferred_server_id: Some("node-7".into()),
+            multi_hop_enabled: true,
+            multi_hop_entry_node_id: Some("ch-1".into()),
+            multi_hop_exit_node_id: Some("is-1".into()),
+            custom_dns: Some(vec!["9.9.9.9".into()]),
+            local_network_sharing: true,
+            ..AppSettings::default()
+        };
+        assert!(forget_account_choices(&mut settings));
+        assert_eq!(settings.preferred_server_id, None);
+        assert!(!settings.multi_hop_enabled);
+        assert_eq!(settings.multi_hop_entry_node_id, None);
+        assert_eq!(settings.multi_hop_exit_node_id, None);
+        assert_eq!(settings.custom_dns, Some(vec!["9.9.9.9".to_string()]));
+        assert!(settings.local_network_sharing);
+        // Nothing to forget: nothing to write.
+        assert!(!forget_account_choices(&mut settings));
+
+        // A route alone is still the account's.
+        let mut route_only = AppSettings {
+            multi_hop_exit_node_id: Some("is-1".into()),
+            ..AppSettings::default()
+        };
+        assert!(forget_account_choices(&mut route_only));
+    }
+
+    /// REVIEW-WIN2-023: the account-boundary read-modify-write holds the
+    /// settings lock across the load, whose migrations save — so the lock
+    /// must let the same thread save inside it, and keep every other writer
+    /// out until the whole read-modify-write is done.
+    #[test]
+    fn a_read_modify_write_holds_the_settings_lock_throughout() {
+        // A fresh random key per run, leaked for the threads: a literal would be a
+        // hard-coded cryptographic value to CodeQL, and these tests need no fixed one.
+        let key: &'static [u8] = Box::leak(Box::new(rand::random::<[u8; 32]>()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let sign = |json: &str| compute_hmac(json, key);
+
+        let held = SETTINGS_WRITE.lock();
+        // The same thread saves inside it (a migration during the load).
+        write_signed_settings(&path, &AppSettings::default(), sign)
+            .expect("a nested save deadlocked or failed");
+
+        // Another writer waits for the whole read-modify-write.
+        let other = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let settings = AppSettings {
+                    preferred_server_id: Some("mirrored".into()),
+                    ..AppSettings::default()
+                };
+                write_signed_settings(&path, &settings, |json| compute_hmac(json, key)).unwrap();
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !other.is_finished(),
+            "a writer got in mid read-modify-write"
+        );
+        drop(held);
+        other.join().unwrap();
     }
 }

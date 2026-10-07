@@ -44,3 +44,9 @@ export type { WorldGlobeProps } from './WorldGlobe';
 
 export { ServerSelectorSheet } from './ServerSelectorSheet';
 export type { ServerSelectorSheetProps } from './ServerSelectorSheet';
+
+export { BirdoDialog } from './Dialog';
+export type { BirdoDialogProps } from './Dialog';
+
+export { BirdoRadioGroup } from './RadioGroup';
+export type { BirdoRadioGroupProps, RadioOption } from './RadioGroup';

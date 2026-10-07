@@ -2,19 +2,18 @@
 //!
 //! Creates and manages the Wintun virtual network adapter for WireGuard VPN.
 
-#![allow(dead_code)]
-
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 use wintun::{Adapter, Session};
 
+use super::data_plane::{Counters, DataPlane};
 use super::wireguard_new::WireGuardSession;
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
@@ -24,7 +23,7 @@ fn cmd(program: &str) -> Command {
     crate::utils::hidden_cmd(program)
 }
 
-/// Read the lowest-metric IPv4 default-route next hop via the IP Helper API
+/// The IPv4 default-route next hop Windows prefers, via the IP Helper API
 /// (`GetIpForwardTable2`). Returns `None` on any failure so the caller can fall
 /// back to parsing `route print`. Native + instant; no subprocess.
 #[cfg(windows)]
@@ -32,11 +31,16 @@ fn default_gateway_native() -> Option<String> {
     default_route_native().map(|(gw, _idx)| gw.to_string())
 }
 
-/// Lowest-metric IPv4 default route: returns `(gateway, physical_interface_index)`
-/// via `GetIpForwardTable2`. The interface index is needed to pin the endpoint
-/// host route to the physical NIC natively. `None` on any failure.
+/// The IPv4 default route Windows prefers: returns `(gateway,
+/// physical_interface_index)` via `GetIpForwardTable2`, ranked by
+/// `network_events::preferred_default_route` (route metric + interface
+/// metric, then a stable tie-break — REVIEW-WIN-005). The interface index is
+/// needed to pin the endpoint host route to the physical NIC natively, and the
+/// same pick decides whether a route change is a move (`needs_rebind`).
+/// `None` on any failure.
 #[cfg(windows)]
-fn default_route_native() -> Option<(Ipv4Addr, u32)> {
+pub(crate) fn default_route_native() -> Option<(Ipv4Addr, u32)> {
+    use crate::vpn::network_events::{preferred_default_route, DefaultRouteCandidate};
     use windows::Win32::NetworkManagement::IpHelper::{
         FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
     };
@@ -50,12 +54,12 @@ fn default_route_native() -> Option<(Ipv4Addr, u32)> {
         return None;
     }
 
-    let result = {
+    let mut candidates = Vec::new();
+    {
         // SAFETY: `table` is non-null and points to a valid table allocated by
         // the OS; `NumEntries` describes the length of the trailing `Table` array.
         let t = unsafe { &*table };
         let rows = unsafe { std::slice::from_raw_parts(t.Table.as_ptr(), t.NumEntries as usize) };
-        let mut best: Option<(u32, Ipv4Addr, u32)> = None; // (metric, gateway, if_index)
         for row in rows {
             if row.DestinationPrefix.PrefixLength != 0 {
                 continue; // not a default route (0.0.0.0/0)
@@ -70,25 +74,40 @@ fn default_route_native() -> Option<(Ipv4Addr, u32)> {
             if ip.is_unspecified() {
                 continue;
             }
-            // is_none_or (1.82) — surfaced by clippy::unnecessary_map_or the moment
-            // rust-version rose past 1.82; the lint is MSRV-gated.
-            if best.is_none_or(|(m, _, _)| row.Metric < m) {
-                best = Some((row.Metric, ip, row.InterfaceIndex));
-            }
+            candidates.push(DefaultRouteCandidate {
+                gateway: ip,
+                interface: row.InterfaceIndex,
+                route_metric: row.Metric,
+                interface_metric: None,
+            });
         }
-        best.map(|(_, ip, idx)| (ip, idx))
-    };
-
+    }
     // SAFETY: `table` was allocated by `GetIpForwardTable2` and is non-null.
     unsafe { FreeMibTable(table as *const core::ffi::c_void) };
-    result
+
+    for candidate in &mut candidates {
+        candidate.interface_metric = ipv4_interface_metric(candidate.interface);
+    }
+    preferred_default_route(&candidates).map(|r| (r.gateway, r.interface))
 }
 
-/// Add an IPv4 route natively via `CreateIpForwardEntry2`. `next_hop` 0.0.0.0
-/// means on-link (point-to-point, e.g. the Wintun adapter). Returns Err on
-/// failure so the caller can fall back to `route.exe`. ERROR_OBJECT_ALREADY_EXISTS
-/// is treated as success.
+/// The IPv4 metric of interface `if_index` (`GetIpInterfaceEntry`), `None`
+/// when it cannot be read.
+// Clippy: MIB_* FFI rows must be default-initialised and then populated.
+#[allow(clippy::field_reassign_with_default)]
 #[cfg(windows)]
+fn ipv4_interface_metric(if_index: u32) -> Option<u32> {
+    use windows::Win32::NetworkManagement::IpHelper::{GetIpInterfaceEntry, MIB_IPINTERFACE_ROW};
+    use windows::Win32::Networking::WinSock::AF_INET;
+
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    row.Family = AF_INET;
+    row.InterfaceIndex = if_index;
+    // SAFETY: Family + InterfaceIndex are set; the call fills the remaining fields.
+    let err = unsafe { GetIpInterfaceEntry(&mut row) };
+    (err.0 == 0).then_some(row.Metric)
+}
+
 /// Install the endpoint host route: native first, `route.exe` as the fallback,
 /// and failing BOTH is fatal.
 ///
@@ -197,7 +216,11 @@ fn add_endpoint_host_route(
     }
 }
 
-fn add_route_native(
+/// Add an IPv4 route natively via `CreateIpForwardEntry2`. `next_hop` 0.0.0.0
+/// means on-link (point-to-point, e.g. the Wintun adapter). Returns Err on
+/// failure so the caller can fall back to `route.exe`. ERROR_OBJECT_ALREADY_EXISTS
+/// is treated as success.
+pub(super) fn add_route_native(
     dest: Ipv4Addr,
     prefix_len: u8,
     next_hop: Ipv4Addr,
@@ -513,6 +536,11 @@ mod dual_stack_order_tests {
 pub(super) const ADAPTER_NAME: &str = "Birdo VPN";
 const TUNNEL_TYPE: &str = "Birdo";
 
+/// Upper bound for a subprocess the tunnel runs from async code (W1-017). The
+/// module documents netsh taking 10-25 s per call on AV-heavy machines; past
+/// this the child is killed instead of holding the connect or the disconnect.
+const SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Fixed GUID for the Birdo VPN adapter, so we can reliably reopen/delete
 /// stale adapters across restarts and crashes.
 /// Generated once — do not change after release.
@@ -656,29 +684,28 @@ pub struct WintunTunnel {
     packets_received: Arc<AtomicU64>,
     adapter: Arc<RwLock<Option<Arc<Adapter>>>>,
     session: Arc<RwLock<Option<Arc<Session>>>>,
-    wg_session: Arc<RwLock<Option<WireGuardSession>>>,
-    shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
-    /// Handle to the packet-processing task. stop() joins this so the task's
+    wg_session: Arc<RwLock<Option<Arc<WireGuardSession>>>>,
+    /// The running packet path (W1-006). stop() stops and joins it so its
     /// Arc<Session> (which keeps the Wintun adapter alive) is dropped BEFORE we
     /// release the adapter — otherwise a server switch fails to recreate the
     /// adapter ("Could not start the VPN network adapter").
-    packet_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    data_plane: TokioMutex<Option<DataPlane>>,
     /// Default gateway saved during route setup, used for the LAN-sharing routes
     saved_default_gateway: Arc<RwLock<Option<String>>>,
     /// Whether local network sharing is enabled (route RFC1918 via real gateway)
     local_network_sharing: bool,
     /// This tunnel's ownership token for the machine state (I1).
     ///
-    /// The parked physical-adapter DNS and the installed routes used to live in
-    /// this struct, which made every question about them a question about tunnel
+    /// The physical-adapter DNS changes (since retired, W1-007) and the
+    /// installed routes used to live in this struct, which made every question about them a question about tunnel
     /// lifetime — and tunnel lifetime is what was broken. `Adapter::open`
     /// deliberately reuses one OS adapter, so two tunnels can legitimately exist
     /// over it, and `VpnManager::tunnel` was written by paths that did not
     /// dispose of what they displaced. The orphan's `Drop` then un-parked every
     /// physical NIC and deleted the live tunnel's routes (issue #98).
     ///
-    /// So the state lives in `win_machine_state` and this is the only claim on
-    /// it. A tunnel whose token is not the current owner mutates NOTHING —
+    /// So the state — now the DNS guard and the routes — lives in
+    /// `win_machine_state` and this is the only claim on it. A tunnel whose token is not the current owner mutates NOTHING —
     /// which also replaces the old `dns_modified` / `routes_installed` /
     /// `local_network_routes_added` flags: "did we change anything" is now
     /// answered by the owner, which cannot disagree with itself.
@@ -704,8 +731,7 @@ impl WintunTunnel {
             adapter: Arc::new(RwLock::new(None)),
             session: Arc::new(RwLock::new(None)),
             wg_session: Arc::new(RwLock::new(None)),
-            shutdown_tx: Arc::new(RwLock::new(None)),
-            packet_task: Arc::new(RwLock::new(None)),
+            data_plane: TokioMutex::new(None),
             saved_default_gateway: Arc::new(RwLock::new(None)),
             local_network_sharing,
             state_gen: crate::vpn::win_machine_state::next_generation(),
@@ -743,9 +769,9 @@ impl WintunTunnel {
 
         // I1: claim the machine state BEFORE the first mutation, so everything
         // installed from here on is attributable to this generation and nothing
-        // else may un-park or delete it. This ADOPTS whatever a previous
-        // generation left in force — on a reconnect the manager holds the park
-        // and the routes across the gap rather than releasing them into it.
+        // else may lift or delete it. This ADOPTS whatever a previous
+        // generation left in force — on a reconnect the manager holds the DNS
+        // guard and the routes across the gap rather than releasing them into it.
         crate::vpn::win_machine_state::take_ownership(self.state_gen);
 
         self.block_ipv6_leaks().await?;
@@ -892,88 +918,33 @@ impl WintunTunnel {
                             win_desc
                         );
 
-                        // Retry strategy: clean up any stale state and try again
-
-                        // 1. Try opening stale adapter and dropping it
+                        // W1-039: recover OUR adapter only, then retry once.
+                        // Wintun 0.14 removes an adapter when the handle that
+                        // created it closes (a crashed process included), so
+                        // the realistic stale state is a handle this process
+                        // still holds: open ours by name and let it go. The
+                        // old steps are gone on purpose — the PowerShell PnP
+                        // removal of every 'Wintun*' device took other
+                        // products' adapters (WireGuard's included), netsh
+                        // disabled an adapter
+                        // by a name anyone can take, and the last-resort
+                        // random GUID defeated the fixed-GUID identity the
+                        // rest of the client relies on.
                         if let Ok(stale) = Adapter::open(&wintun, ADAPTER_NAME) {
-                            tracing::info!("Found stale adapter, dropping it for cleanup");
+                            tracing::info!("Releasing a stale handle on the Birdo adapter");
                             drop(stale);
-                            std::thread::sleep(std::time::Duration::from_millis(500));
                         }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                        // 2. Try disabling the network interface via netsh
-                        let netsh_result = cmd("netsh")
-                            .args([
-                                "interface",
-                                "set",
-                                "interface",
-                                ADAPTER_NAME,
-                                "admin=disable",
-                            ])
-                            .output();
-                        match &netsh_result {
-                            Ok(out) if out.status.success() => {
-                                tracing::info!("Disabled stale network interface via netsh");
-                            }
-                            Ok(out) => {
-                                tracing::debug!(
-                                    "netsh disable returned: {}",
-                                    String::from_utf8_lossy(&out.stderr)
-                                );
-                            }
-                            Err(e) => tracing::debug!("netsh disable failed: {}", e),
-                        }
-
-                        // 3. Also try removing via devcon-like PowerShell if it's a stuck device
-                        let ps_remove = cmd("powershell")
-                            .args([
-                                "-NoProfile", "-NonInteractive", "-Command",
-                                "Get-PnpDevice -FriendlyName 'Wintun*' -ErrorAction SilentlyContinue | Remove-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue"
-                            ])
-                            .output();
-                        if let Ok(out) = &ps_remove {
-                            if out.status.success() {
-                                tracing::info!("Removed stale Wintun PnP device");
-                            }
-                        }
-
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-
-                        // Retry with fixed GUID
                         tracing::info!("Retrying adapter creation...");
-                        match Adapter::create(
-                            &wintun,
-                            ADAPTER_NAME,
-                            TUNNEL_TYPE,
-                            Some(ADAPTER_GUID),
-                        ) {
-                            Ok(adapter) => {
-                                tracing::info!("Adapter created successfully on retry");
-                                adapter
-                            }
-                            Err(e2) => {
+                        Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, Some(ADAPTER_GUID))
+                            .map_err(|e2| {
                                 let (win_err2, win_desc2) = get_last_error_info();
-                                tracing::error!(
-                                    "Adapter creation failed on retry: {} (Win32: {} — {})",
-                                    e2,
-                                    win_err2,
-                                    win_desc2
-                                );
-
-                                // Last resort: try WITHOUT fixed GUID (let Windows assign one)
-                                tracing::info!("Last resort: creating adapter without fixed GUID");
-                                Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, None)
-                                    .map_err(|e3| {
-                                        let (win_err3, win_desc3) = get_last_error_info();
-                                        format!(
-                                            "Failed to create Wintun adapter: {} (Win32: {} — {}). \
-                                             Ensure the app is running as administrator, no other VPN \
-                                             is active, and your antivirus is not blocking Wintun.",
-                                            e3, win_err3, win_desc3
-                                        )
-                                    })?
-                            }
-                        }
+                                format!(
+                                    "Failed to create Wintun adapter: {} (Win32: {} — {}).                                      Ensure the app is running as administrator, no other VPN                                      is active, and your antivirus is not blocking Wintun.",
+                                    e2, win_err2, win_desc2
+                                )
+                            })?
                     }
                 }
             }
@@ -1030,6 +1001,10 @@ impl WintunTunnel {
         // Configure the adapter's IP address
         self.configure_adapter().await?;
 
+        // W1-007: the DNS guard goes in BEFORE any route, so from the first
+        // tunnel route on, DNS can only leave through the tunnel.
+        self.guard_dns().await?;
+
         // Configure routing (pass the actual endpoint IP to avoid double-resolution)
         self.configure_routes(&endpoint_ip.to_string()).await?;
 
@@ -1038,48 +1013,8 @@ impl WintunTunnel {
             self.configure_local_network_routes().await?;
         }
 
-        // Configure DNS
+        // The tunnel interface's own resolvers.
         self.configure_dns().await?;
-
-        // #99: `configure_dns` runs exactly once per tunnel, so an adapter that
-        // is DOWN at connect — a dock still negotiating after resume, Wi-Fi
-        // re-associating, a phone tether appearing — is never parked, and
-        // Windows SMHNR races its ISP resolvers against the tunnel's for the
-        // rest of the session with the UI showing Connected. Re-derive the park
-        // on a ticker for as long as this generation owns it.
-        //
-        // A plain OS thread rather than a task: every machine-state operation is
-        // synchronous by design (it has to be callable from Drop and from the
-        // panic hook), and the pass is idempotent — adapters already in the
-        // record are skipped, never re-snapshotted, which is #99's own stated
-        // objection to the naive "re-run configure_dns" fix.
-        //
-        // The thread carries NO liveness state of its own — deliberately. It used
-        // to hold an `Arc<AtomicBool>` this struct cleared in `stop()` and in
-        // `Drop`, and that shape lasted exactly one review: the updater relaunch
-        // un-parks through `win_machine_state::release_dns_at_exit`, which never
-        // touches a tunnel, so the flag stayed set and the ticker re-parked every
-        // physical adapter on a process that was about to be replaced. Same
-        // blackhole, second door — a flag cleared at N call sites always has an
-        // N+1th.
-        //
-        // The gate is now I13, and it lives entirely inside the machine state:
-        // `refresh_live_session` parks only while the generation both OWNS the
-        // park and has a live data plane, and the one function that can un-park
-        // closes the data plane in the same critical section, before any netsh
-        // runs. See `win_machine_state::refresh_live_session` for why that gives
-        // the same answer for `stop()`, `Drop`, the relaunch, the exit teardown,
-        // an abort and a SIGKILL alike.
-        {
-            let state_gen = self.state_gen;
-            std::thread::spawn(move || {
-                while {
-                    std::thread::sleep(crate::vpn::win_machine_state::REFRESH_INTERVAL);
-                    crate::vpn::win_machine_state::refresh_live_session(state_gen)
-                } {}
-                tracing::debug!("DNS park refresh ended for generation {}", state_gen);
-            });
-        }
 
         // IPv6: if the node is dual-stacked (backend sent a client_ipv6), ROUTE
         // IPv6 through the tunnel. W15: the address + ::/1 + 8000::/1 routes go
@@ -1099,37 +1034,21 @@ impl WintunTunnel {
         }
 
         // Store remaining state (adapter was already stored above, pre-config).
-        *self.session.write().await = Some(session.clone());
+        let wg_session = Arc::new(wg_session);
+        let data_plane = DataPlane::start(
+            Arc::clone(&session),
+            Arc::clone(&wg_session),
+            Counters {
+                bytes_sent: self.bytes_sent.clone(),
+                bytes_received: self.bytes_received.clone(),
+                packets_sent: self.packets_sent.clone(),
+                packets_received: self.packets_received.clone(),
+            },
+        )?;
+        *self.session.write().await = Some(session);
         *self.wg_session.write().await = Some(wg_session);
+        *self.data_plane.lock().await = Some(data_plane);
         self.running.store(true, Ordering::SeqCst);
-
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-        *self.shutdown_tx.write().await = Some(shutdown_tx);
-
-        // Start packet processing in a background task
-        let running = self.running.clone();
-        let bytes_sent = self.bytes_sent.clone();
-        let bytes_received = self.bytes_received.clone();
-        let packets_sent = self.packets_sent.clone();
-        let packets_received = self.packets_received.clone();
-        let wg_session = self.wg_session.clone();
-        let session_clone = session.clone();
-
-        let packet_handle = tokio::spawn(async move {
-            Self::packet_loop(
-                session_clone,
-                wg_session,
-                running,
-                bytes_sent,
-                bytes_received,
-                packets_sent,
-                packets_received,
-                shutdown_rx,
-            )
-            .await;
-        });
-        *self.packet_task.write().await = Some(packet_handle);
 
         tracing::info!("Tunnel started successfully");
         Ok(())
@@ -1290,7 +1209,11 @@ impl WintunTunnel {
 
         let native_ok = match if_index {
             Some(idx) => {
-                match set_adapter_ip_mtu_native(idx, client_ip, 24, self.config.mtu.into()) {
+                // /32, like Linux and Android (W1-040). The /24 this used
+                // to be is what kept the fleet resolver inside the tunnel under
+                // LAN sharing, by accident; the resolvers now get their own
+                // /32 routes in configure_routes.
+                match set_adapter_ip_mtu_native(idx, client_ip, 32, self.config.mtu.into()) {
                     Ok(()) => {
                         tracing::debug!("Adapter IP + MTU set natively (MTU {})", self.config.mtu);
                         true
@@ -1305,9 +1228,9 @@ impl WintunTunnel {
         };
 
         if !native_ok {
-            // Fallback: netsh set address + MTU.
-            let output = cmd("netsh")
-                .args([
+            // Fallback: netsh set address + MTU (bounded and cancellable, W1-017).
+            let output = crate::utils::run_bounded(
+                crate::utils::hidden_async_cmd("netsh").args([
                     "interface",
                     "ip",
                     "set",
@@ -1315,10 +1238,12 @@ impl WintunTunnel {
                     &format!("name={}", ADAPTER_NAME),
                     "static",
                     client_ip,
-                    "255.255.255.0",
-                ])
-                .output()
-                .map_err(|e| format!("Failed to run netsh: {}", e))?;
+                    "255.255.255.255",
+                ]),
+                SUBPROCESS_TIMEOUT,
+            )
+            .await
+            .map_err(|e| format!("Failed to run netsh: {}", e))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.contains("already") && !stderr.is_empty() {
@@ -1327,8 +1252,8 @@ impl WintunTunnel {
             }
 
             let mtu_value = format!("mtu={}", self.config.mtu);
-            let mtu_output = cmd("netsh")
-                .args([
+            let mtu_output = crate::utils::run_bounded(
+                crate::utils::hidden_async_cmd("netsh").args([
                     "interface",
                     "ipv4",
                     "set",
@@ -1336,8 +1261,10 @@ impl WintunTunnel {
                     ADAPTER_NAME,
                     &mtu_value,
                     "store=active",
-                ])
-                .output();
+                ]),
+                SUBPROCESS_TIMEOUT,
+            )
+            .await;
             if let Ok(output) = mtu_output {
                 if !output.status.success() {
                     tracing::warn!(
@@ -1377,16 +1304,18 @@ impl WintunTunnel {
         // combined route metric (route_metric + interface_metric) beats the
         // physical adapter.  Without this, even metric-5 routes can lose to the
         // system default because the interface metric alone is higher.
-        let _ = cmd("netsh")
-            .args([
+        let _ = crate::utils::run_bounded(
+            crate::utils::hidden_async_cmd("netsh").args([
                 "interface",
                 "ip",
                 "set",
                 "interface",
                 ADAPTER_NAME,
                 "metric=5",
-            ])
-            .output();
+            ]),
+            SUBPROCESS_TIMEOUT,
+        )
+        .await;
 
         // Get default gateway BEFORE adding any routes (so we parse the real one)
         let default_gateway = self.get_default_gateway().await?;
@@ -1408,8 +1337,14 @@ impl WintunTunnel {
         //
         // Native first (CreateIpForwardEntry2 pinned to the physical interface),
         // then route.exe fallback; failing BOTH is fatal.
+        //
+        // A route that goes in must also be RECORDED (I10), so this runs to
+        // completion — `block_in_place` rather than a cancellable subprocess —
+        // but off the worker the rest of the runtime needs (W1-017).
         let phys_idx = default_route_native().map(|(_, idx)| idx);
-        add_endpoint_host_route(endpoint_ip, &default_gateway, phys_idx)?;
+        tokio::task::block_in_place(|| {
+            add_endpoint_host_route(endpoint_ip, &default_gateway, phys_idx)
+        })?;
 
         // I10 (#100): remember EXACTLY what went in — destination prefix,
         // interface index AND next hop — so the teardown can delete this row and
@@ -1512,20 +1447,22 @@ impl WintunTunnel {
             }
 
             // Use interface index for Wintun adapter - gateway 0.0.0.0 with IF parameter
-            match cmd("route")
-                .args([
-                    "add",
-                    network,
-                    "mask",
-                    mask,
-                    "0.0.0.0", // Gateway - use 0.0.0.0 for point-to-point interfaces
-                    "metric",
-                    "5",
-                    "IF",
-                    &if_index.to_string(),
-                ])
-                .output()
-            {
+            // (block_in_place: an added route must be recorded, see above).
+            match tokio::task::block_in_place(|| {
+                cmd("route")
+                    .args([
+                        "add",
+                        network,
+                        "mask",
+                        mask,
+                        "0.0.0.0", // Gateway - use 0.0.0.0 for point-to-point interfaces
+                        "metric",
+                        "5",
+                        "IF",
+                        &if_index.to_string(),
+                    ])
+                    .output()
+            }) {
                 Ok(output) if output.status.success() => {
                     tracing::debug!("Route added successfully: {} mask {}", network, mask);
                     record_tunnel_route(network, mask);
@@ -1555,6 +1492,21 @@ impl WintunTunnel {
                         failed_default_split.push(format!("{network} mask {mask}"));
                     }
                 }
+            }
+        }
+
+        // W1-040: every tunnel resolver gets an on-link /32 on the tunnel, the
+        // desktop twin of Android's `pinnedResolverRoutes`. More specific than
+        // anything LAN sharing routes via the physical gateway (10/8 would
+        // otherwise capture the fleet resolver), so DNS never depends on
+        // which /24 the tunnel address happens to share. The DNS guard only
+        // lets DNS out over the tunnel interface, so a missing pin fails
+        // closed (no DNS), never open. The user's own LAN resolver is not
+        // pinned (REVIEW-WIN2-006): LAN sharing's route takes it to the LAN.
+        for resolver in self.tunnel_resolvers().0 {
+            match add_route_native(resolver, 32, Ipv4Addr::UNSPECIFIED, if_index, 5) {
+                Ok(()) => record_tunnel_route(&resolver.to_string(), "255.255.255.255"),
+                Err(e) => tracing::warn!("Resolver route not added ({})", e),
             }
         }
 
@@ -1634,18 +1586,20 @@ impl WintunTunnel {
 
         let mut added = 0u32;
         for (network, mask) in &local_routes {
-            match cmd("route")
-                .args([
-                    "add",
-                    network,
-                    "mask",
-                    mask,
-                    &default_gateway,
-                    "metric",
-                    "1", // Low metric to ensure these win over VPN routes for local traffic
-                ])
-                .output()
-            {
+            // block_in_place: an added route must be recorded (I10, W1-017).
+            match tokio::task::block_in_place(|| {
+                cmd("route")
+                    .args([
+                        "add",
+                        network,
+                        "mask",
+                        mask,
+                        &default_gateway,
+                        "metric",
+                        "1", // Low metric to ensure these win over VPN routes for local traffic
+                    ])
+                    .output()
+            }) {
                 Ok(output) if output.status.success() => {
                     tracing::debug!(
                         "Local network route added: {} mask {} via {}",
@@ -1683,18 +1637,19 @@ impl WintunTunnel {
         // status check and the attribution. Same treatment as its three
         // neighbours now, so only a route that actually went in is recorded and
         // only a recorded route is deleted.
-        match cmd("route")
-            .args([
-                "add",
-                "169.254.0.0",
-                "mask",
-                "255.255.0.0",
-                &default_gateway,
-                "metric",
-                "1",
-            ])
-            .output()
-        {
+        match tokio::task::block_in_place(|| {
+            cmd("route")
+                .args([
+                    "add",
+                    "169.254.0.0",
+                    "mask",
+                    "255.255.0.0",
+                    &default_gateway,
+                    "metric",
+                    "1",
+                ])
+                .output()
+        }) {
             Ok(output) if output.status.success() => {
                 record_lan_route("169.254.0.0", "255.255.0.0");
             }
@@ -1710,35 +1665,75 @@ impl WintunTunnel {
     }
 
     // ===================================================================
-    // SECTION: DNS — configure_dns, restore_dns
-    // The park itself (enumeration, snapshot, suppression, the durable record
-    // and who may undo it) lives in win_machine_state; the netsh reads it drives
-    // live in tunnel_dns.rs.
+    // SECTION: DNS — guard_dns, configure_dns, restore_dns
+    // Nothing here touches the physical adapters' DNS any more (W1-007): the
+    // DNS guard (WFP, dynamic session) keeps DNS inside the tunnel, and it is
+    // owned by the machine-state owner like the routes.
     // ===================================================================
 
-    /// Configure DNS servers
-    /// SECURITY FIX (Vuln-DNS-1): Disable DNS on all non-VPN adapters to prevent
-    /// Windows "Smart Multi-Homed Name Resolution" (SMHNR) from querying ISP DNS
-    /// in parallel with the VPN's DNS servers, leaking queries.
-    ///
-    /// Suppressing SMHNR is a change to the MACHINE, not to this tunnel, so
-    /// `win_machine_state` owns it: the enumeration, the durable record, the
-    /// per-adapter ordering (read -> record -> park -> verify) and the ownership
-    /// token that decides who may undo it. Claiming while a park is already in
-    /// force ADOPTS it and re-snapshots nothing — re-reading a parked adapter is
-    /// what recorded `static`-with-no-servers as the user's own configuration and
-    /// made the loss permanent (issues #98, #102, #105 I5b).
+    /// The config's resolvers as addresses (validate_config has already
+    /// refused anything that is not IPv4): those reached through the tunnel,
+    /// and the user's own LAN resolver, reached outside it
+    /// (`wfp_policy::split_resolvers`, REVIEW-WIN2-006).
+    fn tunnel_resolvers(&self) -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
+        let all: Vec<Ipv4Addr> = self
+            .config
+            .dns
+            .iter()
+            .filter_map(|d| d.parse().ok())
+            .collect();
+        crate::vpn::wfp_policy::split_resolvers(
+            &all,
+            self.config.custom_dns,
+            self.local_network_sharing,
+        )
+    }
+
+    /// Install the DNS guard: DNS only to the tunnel's resolvers, only over the
+    /// tunnel interface (see `wfp_policy::dns_guard_specs`). Fails the connect
+    /// when it cannot be installed — a session must never be up with DNS free
+    /// to leave outside it.
+    async fn guard_dns(&self) -> Result<(), String> {
+        let luid = {
+            let guard = self.adapter.read().await;
+            let adapter = guard.as_ref().ok_or("Wintun adapter not created yet")?;
+            // SAFETY: the union's `Value` is the whole 64-bit LUID.
+            unsafe { adapter.get_luid().Value }
+        };
+        let (resolvers, lan_resolvers) = self.tunnel_resolvers();
+        // The tunnel's own relay flow, for a relay on a DNS port. A stealth
+        // session's endpoint is the local xray (loopback DNS is permitted);
+        // its relay connection is xray's, named by the kill switch's block.
+        let relay = crate::vpn::wfp_policy::parse_relay(
+            &self.config.endpoint,
+            crate::vpn::wfp_policy::RelayTransport::WireGuardUdp,
+        )
+        .filter(|relay| !relay.ip.is_loopback());
+        let dns_guard = crate::vpn::wfp_policy::DnsGuard {
+            resolvers,
+            lan_resolvers,
+            tunnel_luid: luid,
+            lan_sharing: self.local_network_sharing,
+            relay,
+            self_exe: std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from)),
+        };
+        let state_gen = self.state_gen;
+        tokio::task::block_in_place(|| {
+            crate::vpn::win_machine_state::guard_dns(state_gen, dns_guard)
+        })
+        .map_err(|e| format!("Could not keep DNS inside the tunnel: {}", e))
+    }
+
+    /// Give the tunnel interface its resolvers. Native fast path first
+    /// (`SetInterfaceDnsSettings` via the adapter GUID — instant, no
+    /// subprocess), netsh if that errors. If both fail the session is still
+    /// protected (the guard), but names will not resolve, so it is reported.
     async fn configure_dns(&self) -> Result<(), String> {
         tracing::debug!("Configuring DNS servers");
-
         let adapter_name = format!("name={}", ADAPTER_NAME);
 
-        crate::vpn::win_machine_state::claim(self.state_gen);
-
-        // STEP 2: Set DNS on the VPN adapter. Native fast path first
-        // (SetInterfaceDnsSettings via the adapter GUID — instant, no
-        // subprocess), then fall back to netsh if the native call errors so DNS
-        // is never left unset.
         let adapter_guid = {
             let guard = self.adapter.read().await;
             guard.as_ref().map(|a| a.get_guid())
@@ -1754,7 +1749,9 @@ impl WintunTunnel {
             None => false,
         };
 
+        let mut applied = native_ok;
         if !native_ok {
+            applied = true;
             for (i, dns) in self.config.dns.iter().enumerate() {
                 let args: Vec<&str> = if i == 0 {
                     vec![
@@ -1779,11 +1776,10 @@ impl WintunTunnel {
                         "validate=no",
                     ]
                 };
-                let output = cmd("netsh")
-                    .args(&args)
-                    .output()
+                let output = tokio::task::block_in_place(|| cmd("netsh").args(&args).output())
                     .map_err(|e| format!("Failed to set DNS: {}", e))?;
                 if !output.status.success() {
+                    applied = false;
                     tracing::warn!(
                         "DNS configuration warning: {}",
                         String::from_utf8_lossy(&output.stderr)
@@ -1791,6 +1787,7 @@ impl WintunTunnel {
                 }
             }
         }
+        crate::vpn::win_machine_state::note_tunnel_dns(self.state_gen, applied);
 
         tracing::debug!(
             "DNS configured (VPN-only, {}): {:?}",
@@ -1895,55 +1892,26 @@ impl WintunTunnel {
     }
 
     /// Remove the IPv6 block when disconnecting (native WFP — instant).
+    ///
+    /// W1-036: the heal of the netsh firewall rules versions <= 1.3.19 left
+    /// behind no longer runs here (six netsh processes on EVERY disconnect, for
+    /// machines healed long ago); it runs once per install at start-up, see
+    /// `legacy_firewall`. D-24: nothing here touches adapter bindings either —
+    /// IPv6 is blocked with a WFP filter, so there is no binding of ours to
+    /// restore; `ipv6_binding_tests` keeps it that way.
     async fn unblock_ipv6(&self) -> Result<(), String> {
         tracing::debug!("Removing IPv6 block (native WFP)");
-        crate::vpn::wfp::unblock_ipv6().await?;
-
-        // Best-effort legacy heal, fully non-blocking so disconnect stays
-        // instant: versions <= 1.3.19 may have left stale netsh firewall rules.
-        // Those rules carry our own names, so deleting them can only ever
-        // remove something we created. No-ops once a machine is healed.
-        //
-        // D-24 (audit 2026-09-29): this heal ALSO piped every ms_tcpip6 binding
-        // into PowerShell's binding-enable cmdlet on every disconnect,
-        // re-enabling IPv6 on EVERY adapter, including
-        // ones the user had switched IPv6 off on themselves. This build never
-        // touches adapter bindings (IPv6 is blocked with a WFP filter, see
-        // block_ipv6_leaks), so there is no binding of ours to restore, and the
-        // only bindings that line could still change were the user's. It is
-        // gone; `ipv6_binding_tests` keeps it gone.
-        tokio::task::spawn_blocking(|| {
-            for rule in [
-                "Birdo VPN Block IPv6 Out",
-                "Birdo VPN Block IPv6 Out UDP",
-                "Birdo VPN Block IPv6 In",
-                "Birdo VPN Block IPv6 In UDP",
-                "Birdo VPN Block ICMPv6",
-                "Birdo VPN Block 6in4",
-            ] {
-                let _ = cmd("netsh")
-                    .args([
-                        "advfirewall",
-                        "firewall",
-                        "delete",
-                        "rule",
-                        &format!("name={}", rule),
-                    ])
-                    .output();
-            }
-        });
-
-        Ok(())
+        crate::vpn::wfp::unblock_ipv6().await
     }
 
-    /// Hand the physical adapters back the resolvers they had before this
-    /// session parked them, and put the VPN adapter's own DNS back on DHCP.
+    /// Lift the DNS guard (and retry any adapter an older build left parked),
+    /// and put the VPN adapter's own DNS back on DHCP.
     ///
     /// Owner-gated. A tunnel that no longer owns the machine state must not
-    /// un-park anything: on a reconnect the park is held across the gap and the
-    /// INCOMING tunnel owns it, so un-parking here would be issue #98 — the
-    /// physical NICs get their ISP resolvers back while a live tunnel carries
-    /// traffic and the UI reads Connected.
+    /// lift anything: on a reconnect the guard is held across the gap and the
+    /// INCOMING tunnel owns it, so lifting it here would be issue #98 — DNS
+    /// free to leave on the physical NICs while a live tunnel carries traffic
+    /// and the UI reads Connected.
     async fn restore_dns(&self) -> Result<(), String> {
         if !crate::vpn::win_machine_state::is_owner(self.state_gen) {
             tracing::debug!("DNS restore skipped — this tunnel no longer owns the machine state");
@@ -1951,21 +1919,25 @@ impl WintunTunnel {
         }
         tracing::debug!("Restoring DNS");
 
-        // Restore DNS on VPN adapter (both families — configure_dns disabled both)
-        for family in ["ip", "ipv6"] {
-            let _ = cmd("netsh")
-                .args([
-                    "interface",
-                    family,
-                    "set",
-                    "dns",
-                    &format!("name={}", ADAPTER_NAME),
-                    "dhcp",
-                ])
-                .output();
-        }
+        // A restore abandoned halfway strands an adapter, so this runs to
+        // completion — off the runtime worker (W1-017).
+        tokio::task::block_in_place(|| {
+            // The VPN adapter's own DNS, both families.
+            for family in ["ip", "ipv6"] {
+                let _ = cmd("netsh")
+                    .args([
+                        "interface",
+                        family,
+                        "set",
+                        "dns",
+                        &format!("name={}", ADAPTER_NAME),
+                        "dhcp",
+                    ])
+                    .output();
+            }
 
-        crate::vpn::win_machine_state::release_dns(self.state_gen);
+            crate::vpn::win_machine_state::release_dns(self.state_gen);
+        });
 
         tracing::debug!("DNS restoration complete");
         Ok(())
@@ -1981,10 +1953,12 @@ impl WintunTunnel {
             return Ok(gw);
         }
 
-        let output = cmd("route")
-            .args(["print", "0.0.0.0"])
-            .output()
-            .map_err(|e| format!("Failed to get routes: {}", e))?;
+        let output = crate::utils::run_bounded(
+            crate::utils::hidden_async_cmd("route").args(["print", "0.0.0.0"]),
+            SUBPROCESS_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("Failed to get routes: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -2047,192 +2021,6 @@ impl WintunTunnel {
         Ok((network, mask))
     }
 
-    /// Packet processing loop - reads from Wintun, encrypts, sends to WireGuard server
-    ///
-    /// PERF-001: Uses batch processing to amortize lock + timer overhead.
-    /// PERF-002: Acquires RwLock once per batch (not per packet) to reduce contention.
-    /// PERF-003: Uses adaptive polling with interval timers instead of per-iteration sleep.
-    ///
-    /// Under high throughput (50k+ pps during speed tests), the previous design
-    /// acquired the RwLock twice per packet (TX + RX), creating 100k lock acquisitions/sec.
-    /// This version acquires once per batch of up to MAX_BATCH_SIZE packets.
-    #[allow(clippy::too_many_arguments)] // spawned-task plumbing: each Arc is moved in individually
-    async fn packet_loop(
-        session: Arc<Session>,
-        wg_session: Arc<RwLock<Option<WireGuardSession>>>,
-        running: Arc<AtomicBool>,
-        bytes_sent: Arc<AtomicU64>,
-        bytes_received: Arc<AtomicU64>,
-        packets_sent: Arc<AtomicU64>,
-        packets_received: Arc<AtomicU64>,
-        mut shutdown_rx: mpsc::Receiver<()>,
-    ) {
-        tracing::debug!("Starting packet processing loop (batch mode)");
-
-        // Adaptive polling: start fast, slow down when idle, then back off HARD
-        // when idle is sustained. A connected-but-idle tunnel (screen off, no
-        // traffic) previously busy-polled at 500us = 2000 wakeups/s forever; the
-        // deep-idle tier drops that to 5ms = 200 wakeups/s after ~1s of silence,
-        // a 10x cut in steady-state CPU wakeups. Any packet resets idle_cycles to
-        // 0 (below), so only the FIRST packet after >1s idle sees the extra
-        // latency; the timer task (update_timers, every 250ms) is unaffected.
-        let mut idle_cycles: u32 = 0;
-        const IDLE_THRESHOLD: u32 = 100; // brief idle -> slow tier
-        const DEEP_IDLE_THRESHOLD: u32 = 2_000; // ~1s sustained idle -> deep-idle tier
-        const FAST_POLL_US: u64 = 10; // 10 microseconds when active
-        const SLOW_POLL_US: u64 = 500; // 500 microseconds when briefly idle
-        const DEEP_POLL_US: u64 = 5_000; // 5ms when idle >1s (200 wakeups/s)
-
-        // FIX-DL: Timer task — boringtun requires periodic update_timers() calls
-        // to send keepalives, manage rekeys, and handle cookie responses.
-        // Without this the server's session expires and stops sending data.
-        let mut last_timer_update = Instant::now();
-        const TIMER_INTERVAL: Duration = Duration::from_millis(250);
-
-        // Diagnostic: periodic stats log to verify bidirectional traffic.
-        // POWER: at info/5s this was a guaranteed disk write every 5 seconds for
-        // the whole session (the file logger appends), which alone keeps the drive
-        // from idling. Debug + 60s means release builds (info default) write
-        // nothing while connected, and a debug session still gets the diagnostic.
-        let mut last_stats_log = Instant::now();
-        const STATS_LOG_INTERVAL: Duration = Duration::from_secs(60);
-
-        // PERF-001: Batch size — process up to this many packets per wakeup
-        // to amortize timer and lock overhead across multiple packets
-        const MAX_BATCH_SIZE: usize = 64;
-
-        loop {
-            tokio::select! {
-                biased;  // Prioritize shutdown over packet processing
-
-                _ = shutdown_rx.recv() => {
-                    tracing::debug!("Received shutdown signal");
-                    break;
-                }
-                _ = tokio::time::sleep(Duration::from_micros(
-                    if idle_cycles > DEEP_IDLE_THRESHOLD {
-                        DEEP_POLL_US
-                    } else if idle_cycles > IDLE_THRESHOLD {
-                        SLOW_POLL_US
-                    } else {
-                        FAST_POLL_US
-                    }
-                )) => {
-                    // Use lock-free check for running state (major performance improvement)
-                    if !running.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let mut had_activity = false;
-
-                    // PERF-002: Acquire the WireGuard session lock ONCE for the entire batch
-                    // instead of once per packet. The session only changes on disconnect
-                    // (which triggers shutdown_rx) or rekey (which is handled internally
-                    // by boringtun).
-                    //
-                    // FIX-R4: Use try_read() instead of read().await to avoid starving a
-                    // pending write lock during disconnect.  If disconnect is acquiring the
-                    // write lock we simply skip this iteration (10-500 µs later we retry).
-                    let guard = wg_session.try_read();
-                    if let Ok(ref session_guard) = guard {
-                      if let Some(ref wg) = **session_guard {
-                        // ---- TX batch: Read from Wintun, encrypt, send to WireGuard ----
-                        for _ in 0..MAX_BATCH_SIZE {
-                            match session.try_receive() {
-                                Ok(Some(packet)) => {
-                                    had_activity = true;
-                                    let data = packet.bytes();
-                                    // Lock-free atomic increment for stats
-                                    bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
-                                    packets_sent.fetch_add(1, Ordering::Relaxed);
-
-                                    // Encrypt and send via WireGuard
-                                    if let Err(e) = wg.send_packet(data).await {
-                                        tracing::warn!("Failed to send packet: {}", e);
-                                    }
-                                }
-                                Ok(None) => break, // No more packets in this batch
-                                Err(e) => {
-                                    tracing::error!("Error receiving packet from adapter: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // ---- RX batch: Receive from WireGuard, decrypt, write to Wintun ----
-                        for _ in 0..MAX_BATCH_SIZE {
-                            match wg.receive_packet().await {
-                                Ok(Some(data)) => {
-                                    had_activity = true;
-                                    // Lock-free atomic increment for stats
-                                    bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
-                                    packets_received.fetch_add(1, Ordering::Relaxed);
-
-                                    // Write to Wintun adapter
-                                    match session.allocate_send_packet(data.len() as u16) {
-                                        Ok(mut write_packet) => {
-                                            write_packet.bytes_mut().copy_from_slice(&data);
-                                            session.send_packet(write_packet);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Failed to allocate send packet: {}", e);
-                                        }
-                                    }
-                                }
-                                Ok(None) => break, // No more packets in this batch
-                                Err(e) => {
-                                    // Don't log transient decryption errors at warn level
-                                    // (they're expected during rekey transitions)
-                                    tracing::trace!("WireGuard recv error: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // ---- FIX-DL: Periodic timer update for boringtun ----
-                        // boringtun needs update_timers() called regularly so it can:
-                        //   1. Send persistent keepalives (every 25s by default)
-                        //   2. Initiate rekeys before the session expires (after 120s)
-                        //   3. Detect dead peers via handshake timeout
-                        // Without this, the server's crypto session goes stale and it
-                        // stops sending data — upload works but download doesn't.
-                        if last_timer_update.elapsed() >= TIMER_INTERVAL {
-                            last_timer_update = Instant::now();
-                            if let Err(e) = wg.update_timers().await {
-                                tracing::trace!("Timer update error: {}", e);
-                            }
-                        }
-
-                        // Diagnostic: periodic stats log
-                        if last_stats_log.elapsed() >= STATS_LOG_INTERVAL {
-                            last_stats_log = Instant::now();
-                            let s = bytes_sent.load(Ordering::Relaxed);
-                            let r = bytes_received.load(Ordering::Relaxed);
-                            let ps = packets_sent.load(Ordering::Relaxed);
-                            let pr = packets_received.load(Ordering::Relaxed);
-                            tracing::debug!(
-                                "VPN traffic stats — TX: {} pkts / {} bytes, RX: {} pkts / {} bytes",
-                                ps, s, pr, r
-                            );
-                        }
-                      }
-                    }
-                    // FIX-R4: Drop the read guard here; if try_read failed we simply do nothing
-                    drop(guard);
-
-                    // Update idle counter for adaptive polling
-                    if had_activity {
-                        idle_cycles = 0; // Reset on any activity
-                    } else {
-                        idle_cycles = idle_cycles.saturating_add(1);
-                    }
-                }
-            }
-        }
-
-        tracing::debug!("Packet processing loop ended");
-    }
-
     /// Stop the tunnel
     /// SECURITY: Order of operations is critical to prevent traffic leaks
     /// Kill switch must remain active until after all cleanup is complete
@@ -2240,7 +2028,7 @@ impl WintunTunnel {
         // I3 LIVENESS, NOT CLAIM. Keying this on `running` alone made a tunnel
         // that the manager's CONNECT_TIMEOUT cancelled before `running` was ever
         // set impossible to stop — even for someone holding it — while it still
-        // owned the parked adapters and the installed routes. Ownership is the
+        // owned the DNS guard and the installed routes. Ownership is the
         // predicate: if this generation owns machine state there is work to do,
         // whatever the flag says.
         if !self.running.load(Ordering::SeqCst)
@@ -2251,9 +2039,12 @@ impl WintunTunnel {
 
         tracing::info!("Stopping Wintun tunnel");
 
-        // STEP 1: Signal shutdown to packet loop
-        if let Some(tx) = self.shutdown_tx.write().await.take() {
-            let _ = tx.send(()).await;
+        // STEP 1: Stop the packet path and wait for it. Both halves exit
+        // promptly (the send thread on the session's shutdown event, the
+        // receive task on its signal), and neither may still hold the Wintun
+        // session when the adapter is released below.
+        if let Some(data_plane) = self.data_plane.lock().await.take() {
+            data_plane.stop().await;
         }
         self.running.store(false, Ordering::SeqCst);
 
@@ -2271,8 +2062,12 @@ impl WintunTunnel {
 
         // STEP 3: Network cleanup — run all three in parallel since they
         // are independent and each spawns external processes.
-        // Also flush DNS inline (ipconfig /flushdns is ~10ms).
-        let _ = cmd("ipconfig").args(["/flushdns"]).output();
+        // Also flush DNS (bounded: it must never hold a disconnect).
+        let _ = crate::utils::run_bounded(
+            crate::utils::hidden_async_cmd("ipconfig").args(["/flushdns"]),
+            SUBPROCESS_TIMEOUT,
+        )
+        .await;
         let (dns_r, ipv6_r, route_r) = tokio::join!(
             self.restore_dns(),
             self.unblock_ipv6(),
@@ -2286,27 +2081,6 @@ impl WintunTunnel {
         }
         if let Err(e) = route_r {
             tracing::warn!("Route cleanup error: {}", e);
-        }
-
-        // STEP 3.5: Join the packet loop BEFORE releasing the adapter. The loop
-        // holds an Arc<Session> that keeps the Wintun adapter alive; the loop is
-        // biased on the shutdown signal so it exits within ~1 poll cycle. If we
-        // dropped the adapter while the task were still alive, the OS adapter
-        // wouldn't be released and the NEXT tunnel (a server switch) would fail
-        // to recreate it. 3s cap + abort is a safety net for a wedged task.
-        if let Some(handle) = self.packet_task.write().await.take() {
-            let abort = handle.abort_handle();
-            if tokio::time::timeout(Duration::from_secs(3), handle)
-                .await
-                .is_err()
-            {
-                tracing::warn!("Packet loop did not exit within 3s — aborting it");
-                abort.abort();
-                // Give the abort a moment to unwind + drop the Arc<Session>.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            } else {
-                tracing::debug!("Packet loop joined cleanly");
-            }
         }
 
         // STEP 4: Close Wintun adapter (now the only remaining Arc<Session>/Adapter)
@@ -2323,9 +2097,10 @@ impl WintunTunnel {
         Ok(())
     }
 
-    /// Clean up routes when disconnecting.
+    /// Clean up routes when disconnecting — to completion, off the runtime
+    /// worker (W1-017).
     async fn cleanup_routes(&self) -> Result<(), String> {
-        self.cleanup_routes_blocking();
+        tokio::task::block_in_place(|| self.cleanup_routes_blocking());
         Ok(())
     }
 
@@ -2354,11 +2129,6 @@ impl WintunTunnel {
         crate::vpn::win_machine_state::release_routes(self.state_gen);
     }
 
-    /// Check if tunnel is running
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
     /// Get bandwidth statistics (lock-free)
     /// Returns (bytes_sent, bytes_received, packets_sent, packets_received)
     pub fn get_stats(&self) -> (u64, u64, u64, u64) {
@@ -2369,7 +2139,7 @@ impl WintunTunnel {
         (sent, received, pkts_sent, pkts_received)
     }
 
-    /// Get the last measured latency in milliseconds
+    /// The last handshake's round-trip time in milliseconds
     pub async fn get_latency_ms(&self) -> Option<u32> {
         if let Some(wg) = self.wg_session.read().await.as_ref() {
             wg.get_latency_ms().await
@@ -2378,23 +2148,82 @@ impl WintunTunnel {
         }
     }
 
-    /// Measure latency to the VPN server
-    pub async fn measure_latency(&self) -> Option<u32> {
+    /// Time since the last completed WireGuard handshake (W1-002). `None` once
+    /// the WireGuard session is gone (the tunnel is being stopped).
+    pub async fn handshake_age(&self) -> Option<Duration> {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .map(|wg| wg.handshake_age())
+    }
+
+    /// Start a handshake now unless one is in flight (see
+    /// `WireGuardSession::force_handshake`).
+    pub async fn force_handshake(&self) {
         if let Some(wg) = self.wg_session.read().await.as_ref() {
-            wg.measure_latency().await
-        } else {
-            None
+            wg.force_handshake().await;
         }
     }
 
-    /// Get assigned client IP
-    pub fn get_client_ip(&self) -> &str {
-        &self.config.client_ip
+    /// W1-003: follow the default route onto a new gateway or interface
+    /// WITHOUT a new session: move our gateway routes (the endpoint host route
+    /// first among them, and the LAN-sharing routes) to the new path, rebind
+    /// the WireGuard socket so it takes the new interface's source address,
+    /// and force a handshake. The boringtun session, the key and the tunnel
+    /// address all stay; the relay follows the peer's new source address.
+    ///
+    /// `Err` means "re-dial instead" — the caller falls back to the fast full
+    /// reconnect. That includes a stealth session: its relay connection
+    /// belongs to xray, which is restarted by the re-dial.
+    pub async fn roam(&self, from: (Ipv4Addr, u32), to: (Ipv4Addr, u32)) -> Result<(), String> {
+        let wg = self
+            .wg_session
+            .read()
+            .await
+            .clone()
+            .ok_or("the tunnel has no WireGuard session")?;
+        if wg.endpoint_ip().is_loopback() {
+            return Err("a stealth session is re-dialled instead".to_string());
+        }
+        let state_gen = self.state_gen;
+        let moved = tokio::task::block_in_place(|| {
+            crate::vpn::win_machine_state::move_gateway_routes(state_gen, from, to)
+        })?;
+        if moved == 0 {
+            return Err("no endpoint route of ours on the old path".to_string());
+        }
+        *self.saved_default_gateway.write().await = Some(to.0.to_string());
+        wg.rebind().await?;
+        tracing::info!("Tunnel moved to the new network path ({} route(s))", moved);
+        Ok(())
     }
 
-    /// Get server endpoint
-    pub fn get_endpoint(&self) -> &str {
-        &self.config.endpoint
+    /// Has the relay stopped answering while there is traffic to carry?
+    /// (see `wireguard_new::peer_unresponsive`). False with no session.
+    pub async fn peer_unresponsive(&self) -> bool {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|wg| wg.peer_unresponsive())
+    }
+
+    /// When the packet path last showed progress (see
+    /// `wireguard_new::packet_path_progress`). `None` with no session.
+    pub async fn packet_path_progress(&self) -> Option<std::time::Instant> {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .and_then(|wg| wg.last_progress())
+    }
+
+    /// Forget the unanswered-handshake run (after a resume).
+    pub async fn restart_response_watch(&self) {
+        if let Some(wg) = self.wg_session.read().await.as_ref() {
+            wg.restart_response_watch();
+        }
     }
 }
 
@@ -2461,56 +2290,18 @@ impl Drop for WintunTunnel {
                 .output();
         }
 
-        // Best-effort: un-park the physical adapters (both families) and remove
-        // exactly the routes this generation installed. The same owner-gated,
-        // verified code path the clean teardown uses, so the two cannot drift:
-        // a cancelled or failed connect and a panic both land here having parked
-        // every physical NIC on `static none`, and without this the machine is
-        // left with no resolvers on its real interfaces.
+        // Best-effort: lift the DNS guard and remove exactly the routes this
+        // generation installed — the same owner-gated path the clean teardown
+        // uses, so the two cannot drift.
         crate::vpn::win_machine_state::release_all(self.state_gen);
 
-        // Best-effort: remove IPv6 blocking firewall rules
-        let _ = cmd("powershell")
-            .args([
-                "-NoProfile", "-NonInteractive", "-Command",
-                "Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 Out' -ErrorAction SilentlyContinue; \
-                 Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 Out UDP' -ErrorAction SilentlyContinue; \
-                 Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 In' -ErrorAction SilentlyContinue; \
-                 Remove-NetFirewallRule -DisplayName 'Birdo VPN Block IPv6 In UDP' -ErrorAction SilentlyContinue",
-            ])
-            .output();
-        let _ = cmd("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=Birdo VPN Block ICMPv6",
-            ])
-            .output();
-        let _ = cmd("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=Birdo VPN Block 6in4",
-            ])
-            .output();
-        // Also try legacy rule names
-        let _ = cmd("netsh")
-            .args([
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
-                "name=Birdo Block IPv6",
-            ])
-            .output();
-        // No adapter-binding "re-enable" here (D-24): this build never disables
-        // an ms_tcpip6 binding, so the only bindings a blanket re-enable could
-        // change are ones the USER turned off. The WFP IPv6 block lives in the
-        // dynamic session and is removed with it.
+        // Nothing to remove for IPv6: the WFP IPv6 block lives in the dynamic
+        // session and goes with it. (W1-036: the PowerShell + netsh deletion of
+        // the <= 1.3.19 firewall rules ran here on every unwind, seconds of
+        // AV-scanned process spawns on the crash path; it runs once per install
+        // now, see `legacy_firewall`.) No adapter-binding "re-enable" either
+        // (D-24): this build never disables an ms_tcpip6 binding, so the only
+        // bindings a blanket re-enable could change are ones the USER turned off.
 
         tracing::warn!("Emergency cleanup complete — DNS/route state may need manual verification");
     }
@@ -2521,6 +2312,57 @@ impl Drop for WintunTunnel {
 /// user's own IPv6 disablement. The client never disables a binding any more
 /// (WFP filters do the blocking), so it has nothing to restore. This pins that
 /// no source file under `src/vpn` brings the blanket re-enable back.
+/// W1-039: the stale-adapter recovery touches our adapter and nothing else.
+#[cfg(test)]
+mod adapter_recovery_tests {
+    #[test]
+    fn recovery_never_reaches_for_other_products_adapters() {
+        let text = include_str!("tunnel.rs");
+        // Built at run time so this file does not match its own needles.
+        for needle in [
+            ["Remove-", "PnpDevice"].concat(),
+            ["admin=", "disable"].concat(),
+            ["TUNNEL_TYPE, ", "None)"].concat(),
+        ] {
+            assert!(
+                !text.contains(&needle),
+                "tunnel.rs contains `{needle}` again"
+            );
+        }
+    }
+}
+
+/// REVIEW-WIN2-030: the DNS guard is the whole SMHNR protection now that
+/// adapter parking is gone, and nothing proved a connect installs it. The
+/// `wfp_policy` model tests prove what the guard holds, `win_machine_state`
+/// who may lift it; this pins that `start_inner` installs it, failing the
+/// connect when it cannot, after the adapter has its LUID and BEFORE the first
+/// tunnel route and the tunnel's resolvers.
+#[cfg(test)]
+mod dns_guard_wiring_tests {
+    #[test]
+    fn every_connect_installs_the_dns_guard_before_any_route() {
+        let source = include_str!("tunnel.rs");
+        let start = source
+            .find("async fn start_inner(&self)")
+            .expect("start_inner");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }").expect("end of start_inner")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("start_inner no longer calls `{needle}`"))
+        };
+        let adapter = at("self.configure_adapter().await?;");
+        let guard = at("self.guard_dns().await?;");
+        let routes = at("self.configure_routes(");
+        let dns = at("self.configure_dns().await?;");
+        assert!(adapter < guard, "the guard needs the adapter's LUID");
+        assert!(guard < routes, "a route before the guard lets DNS out");
+        assert!(guard < dns, "the tunnel's resolvers before the guard");
+        assert_eq!(body.matches("guard_dns()").count(), 1);
+    }
+}
+
 #[cfg(test)]
 mod ipv6_binding_tests {
     #[test]

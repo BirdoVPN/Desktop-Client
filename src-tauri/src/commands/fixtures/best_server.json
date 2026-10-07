@@ -1,0 +1,63 @@
+{
+  "about": "REVIEW-WIN-008: the ONE best-server rule, read by both commands/vpn.rs (pick_quick_connect_server) and src/lib/ipc.ts (pickBestServer). Usable = online and accessible, each true when the field is absent. Then lowest load, then name compared by UTF-16 code unit (JavaScript's < on strings; NOT localeCompare), then id the same way. Servers are in the /vpn/servers wire shape. expect is the id picked, or null.",
+  "cases": [
+    {
+      "name": "the lowest load wins",
+      "servers": [
+        { "id": "a", "name": "Amsterdam", "country": "NL", "load": 60 },
+        { "id": "b", "name": "Berlin", "country": "DE", "load": 10 }
+      ],
+      "expect": "b"
+    },
+    {
+      "name": "equal load goes by name, not by list order",
+      "servers": [
+        { "id": "zed", "name": "Zed", "country": "XX", "load": 0 },
+        { "id": "ams", "name": "Amsterdam", "country": "NL", "load": 0 },
+        { "id": "ber", "name": "Berlin", "country": "DE", "load": 0 }
+      ],
+      "expect": "ams"
+    },
+    {
+      "name": "names compare by code unit, so an upper-case name sorts before a lower-case one",
+      "servers": [
+        { "id": "lower", "name": "amsterdam", "country": "NL", "load": 5 },
+        { "id": "upper", "name": "Zurich", "country": "CH", "load": 5 }
+      ],
+      "expect": "upper"
+    },
+    {
+      "name": "equal load and name go by id",
+      "servers": [
+        { "id": "node-2", "name": "Frankfurt", "country": "DE", "load": 3 },
+        { "id": "node-10", "name": "Frankfurt", "country": "DE", "load": 3 }
+      ],
+      "expect": "node-10"
+    },
+    {
+      "name": "offline and plan-locked nodes never win, however empty",
+      "servers": [
+        { "id": "off", "name": "Athens", "country": "GR", "isOnline": false, "load": 0 },
+        { "id": "locked", "name": "Bergen", "country": "NO", "accessible": false, "load": 0 },
+        { "id": "ok", "name": "Cork", "country": "IE", "load": 90 }
+      ],
+      "expect": "ok"
+    },
+    {
+      "name": "absent isOnline and accessible count as true",
+      "servers": [
+        { "id": "bare", "name": "Dublin", "country": "IE", "load": 1 },
+        { "id": "flagged", "name": "Edinburgh", "country": "GB", "isOnline": true, "accessible": true, "load": 2 }
+      ],
+      "expect": "bare"
+    },
+    {
+      "name": "nothing usable",
+      "servers": [
+        { "id": "off", "name": "Athens", "country": "GR", "isOnline": false, "load": 0 },
+        { "id": "locked", "name": "Bergen", "country": "NO", "accessible": false, "load": 0 }
+      ],
+      "expect": null
+    }
+  ]
+}

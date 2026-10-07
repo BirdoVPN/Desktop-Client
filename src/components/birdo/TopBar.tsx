@@ -61,7 +61,7 @@ export function BirdoTopBar({
             {title}
           </div>
           {subtitle && (
-            <div className="truncate text-xs" style={{ color: white.w40 }}>
+            <div className="truncate text-xs" style={{ color: white.w60 }}>
               {subtitle}
             </div>
           )}

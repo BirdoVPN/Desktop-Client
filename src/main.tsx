@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { TitleBar } from '@/components/TitleBar';
 import './styles/globals.css';
 
 const rootElement = document.getElementById('root');
@@ -11,7 +12,7 @@ if (!rootElement) {
 
 ReactDOM.createRoot(rootElement).render(
   <React.StrictMode>
-    <ErrorBoundary>
+    <ErrorBoundary chrome={<TitleBar />}>
       <App />
     </ErrorBoundary>
   </React.StrictMode>

@@ -431,8 +431,10 @@ def rust_api(text):
     return None if s is None else {"birdo.app": set(re.findall(B64, s))}
 
 def rust_doh(text):
+    # rustfmt writes a one-provider list as `&[DoHProvider { ... }];` (D5 left
+    # Cloudflare as the only provider), so the closing line may be `}];`.
     s = section(strip_line_comments(text),
-                r'DOH_PROVIDERS\s*:\s*&\[DoHProvider\]\s*=\s*&\[', r'^\];')
+                r'DOH_PROVIDERS\s*:\s*&\[DoHProvider\]\s*=\s*&\[', r'^\}?\];')
     if s is None:
         return None
     out = {}

@@ -5,35 +5,32 @@
 //!
 //! SEC-002: This is critical for preventing DNS leaks during VPN connection.
 //!
-//! PROD-HARDENING: certificate pinning is enforced for all DoH providers as
-//! **CA-chain SPKI** pinning inside the TLS handshake — the same model and
-//! machinery as `api/cert_pin.rs` (a custom rustls `ServerCertVerifier`
-//! wrapping the standard WebPKI verifier). The previous implementation hashed
-//! the LEAF certificate DER via reqwest's `TlsInfo` — which exposes only the
-//! leaf — so every ~90-day provider cert rotation silently expired the pins
-//! and the hardening self-disabled. SPKI pins on the stable intermediate/root
-//! survive leaf rotation. If a provider fails pinning, it is skipped and the
-//! next provider is tried; this is safe because only 1-of-N must succeed.
-//! Unlike the API pinning, an unparseable chain fails CLOSED here — DoH has
-//! independent fallback providers, the API host does not.
+//! ONE PROVIDER: Cloudflare (owner decision D5, 2026-10-01). dns.google and
+//! dns.quad9.net were removed with their pins; Android has always been
+//! Cloudflare-only (DohResolver.kt).
 //!
-//! WHAT THE PIN SETS DO **NOT** GUARANTEE. This paragraph used to claim that
-//! "each provider carries >= 2 overlapping pins (intermediate + its root) so
-//! even an intermediate re-issue under the same root keeps working". That was
-//! false, and believing it is what took dns.google dark:
+//! PROD-HARDENING: certificate pinning is enforced as **CA-chain SPKI**
+//! pinning inside the TLS handshake — the same model and machinery as
+//! `api/cert_pin.rs` (a custom rustls `ServerCertVerifier` wrapping the
+//! standard WebPKI verifier). The previous implementation hashed the LEAF
+//! certificate DER via reqwest's `TlsInfo` — which exposes only the leaf — so
+//! every ~90-day provider cert rotation silently expired the pins and the
+//! hardening self-disabled. SPKI pins on the stable intermediate/root survive
+//! leaf rotation. Unlike the API pinning, an unparseable chain fails CLOSED
+//! here: the control-plane resolver (`api::doh_resolver`) then falls back to
+//! the system resolver, whose answer the API's own pinning still checks.
 //!
-//!   * An intermediate and the root that signed it are ONE lineage. When the CA
-//!     serves the host out of a different hierarchy, BOTH pins are absent from
-//!     the same handshake. Two pins, zero overlap.
-//!   * A pin is only worth anything if the server actually SENDS the
-//!     certificate it hashes. `cloudflare-dns.com` and `dns.quad9.net` both
-//!     send a shortened chain — leaf + intermediate, no root (measured
-//!     2026-09-06 and again 2026-09-08 from a UK consumer ISP and from the
-//!     production hub, over every published IPv4 address and, from the hub,
-//!     IPv6) — so of their 3 and 2 pins respectively, exactly ONE can ever
-//!     match. Each is one CA-side re-issue away from the dns.google failure,
-//!     and that is stated here because it is true, not fixed: no second
-//!     matchable certificate exists to pin.
+//! WHAT THE PIN SET DOES **NOT** GUARANTEE. An intermediate and the root that
+//! signed it are ONE lineage: when the CA serves the host out of a different
+//! hierarchy, BOTH pins are absent from the same handshake (how dns.google's
+//! two-pin set went dark in 2026-09, while this client still used it). And a
+//! pin is only worth anything if the server actually SENDS the certificate it
+//! hashes: `cloudflare-dns.com` sends a shortened chain — leaf + intermediate,
+//! no root (measured 2026-09-06 and again 2026-09-08 from a UK consumer ISP
+//! and from the production hub, over every published IPv4 address and, from
+//! the hub, IPv6) — so of its 3 pins exactly ONE can ever match. It is one
+//! CA-side re-issue away from going dark, and that is stated here because it
+//! is true, not fixed: no second matchable certificate exists to pin.
 //!
 //! The real per-host position is machine-checked, not asserted in prose:
 //! `scripts/check-cert-pins.sh` check 2b counts the LINEAGES each host is
@@ -91,11 +88,10 @@ const _DNS_TYPE_AAAA: i32 = 28; // IPv6 (reserved for future use)
 /// Because the pinned keys are the intermediate + root — not the volatile
 /// leaf — routine provider cert renewal does NOT invalidate them. A release
 /// IS needed whenever a provider presents a chain none of these pins match,
-/// and that happens with no CA change and no announcement: on 2026-09-06
-/// dns.google was serving a second Google Trust Services hierarchy from some
-/// anycast edges while the pins covered only the first. The daily liveness
-/// check (`scripts/check-cert-pins.sh` check 3) can detect that from the edges
-/// a runner happens to reach; nothing here prevents it.
+/// and that can happen with no announcement (a CA serving a second hierarchy
+/// from some anycast edges). The daily liveness check
+/// (`scripts/check-cert-pins.sh` check 3) can detect that from the edges a
+/// runner happens to reach; nothing here prevents it.
 struct DoHProvider {
     url: &'static str,
     /// Hostname in `url` — the key for the bootstrap resolver override below.
@@ -127,15 +123,10 @@ struct DoHProvider {
     /// Measured 2026-09-06 and again 2026-09-08 from two networks (a UK
     /// consumer ISP and the production hub in Hetzner DE):
     ///
-    ///   dns.google           2 live lineages — WR2 + GTS Root R1 (RSA edges)
-    ///                        and WE2 + GTS Root R4 (ECDSA edges); 4 of 4
-    ///                        pins presented
     ///   cloudflare-dns.com   1 live lineage, 1 of 3 pins presented — SINGLE
     ///                        POINT OF FAILURE, waived in the SSOT with a date
-    ///   dns.quad9.net        1 live lineage, 1 of 2 pins presented — SINGLE
-    ///                        POINT OF FAILURE, waived in the SSOT with a date
     ///
-    /// Those counts are enforced by `scripts/check-cert-pins.sh` check 2b
+    /// That count is enforced by `scripts/check-cert-pins.sh` check 2b
     /// against `third_party/cert-pins.json`, and by
     /// `test_live_lineages_per_provider` below against real measured chains.
     /// Changing a pin set changes one of them.
@@ -154,15 +145,15 @@ struct DoHProvider {
 ///   handshake is refused and that provider is skipped.
 /// - An intermediate and the root that signed it are ONE lineage: a CA move
 ///   kills both in the same handshake, so they are not overlap. A provider
-///   may also serve SEVERAL lineages at once, chosen per anycast edge —
-///   dns.google does, see below — and measuring from one machine only ever
-///   shows you one of them.
-/// - Availability guaranteed as long as 1 provider passes pinning.
-/// - If all 3 providers fail pinning simultaneously, resolution fails CLOSED.
+///   may also serve SEVERAL lineages at once, chosen per anycast edge, and
+///   measuring from one machine only ever shows you one of them.
+/// - If the provider fails pinning, resolution fails CLOSED here (and the
+///   control-plane resolver falls back to the system resolver — see
+///   `api::doh_resolver`).
 ///
 /// PIN ROTATION PROCEDURE (needed for a CA-chain change, not cert renewal —
-/// and a CA-chain change is NOT announced: Google did not announce the second
-/// dns.google hierarchy, a scheduled liveness run found it):
+/// and a CA-chain change is NOT announced; a scheduled liveness run is what
+/// finds one):
 /// 1. When a provider is MEASURED serving a new lineage, add its
 ///    intermediate+root pins alongside the old ones — in birdo-shared first.
 /// 2. After the migration is confirmed fleet-wide, remove the old pins in a
@@ -171,168 +162,55 @@ struct DoHProvider {
 /// 4. Never remove a pin merely because your own machine no longer sees it
 ///    in the chain: another user's edge may still be serving exactly that
 ///    chain, and a bricked pin cannot be fixed remotely.
-const DOH_PROVIDERS: &[DoHProvider] = &[
-    DoHProvider {
-        url: "https://cloudflare-dns.com/dns-query",
-        host: "cloudflare-dns.com",
-        // 104.16.248.249/104.16.249.249 are the published A records; 1.1.1.1 and
-        // 1.0.0.1 serve the same DoH endpoint and present the cloudflare-dns.com
-        // certificate for that SNI.
-        bootstrap: &[
-            Ipv4Addr::new(104, 16, 248, 249),
-            Ipv4Addr::new(104, 16, 249, 249),
-            Ipv4Addr::new(1, 1, 1, 1),
-            Ipv4Addr::new(1, 0, 0, 1),
-        ],
-        // Chain: cloudflare-dns.com → SSL.com SSL Intermediate CA ECC R2 — and
-        // nothing else: Cloudflare sends a SHORTENED chain, leaf + intermediate,
-        // NO root. The SSOT records it measured 2026-09-06 from a UK consumer
-        // ISP, the production hub and a GitHub runner in Azure westus2 under
-        // default, RSA-only and ECDSA-only offers (chain_shape.vantages). It
-        // was re-measured 2026-09-08 from the UK ISP and the production hub
-        // over 1.1.1.1, 1.0.0.1, 104.16.248.249 and 104.16.249.249 (plus
-        // 2606:4700:4700::1111 from the hub), under the default offer, an
-        // RSA-only signature-algorithm offer and a TLS 1.2-only offer: the
-        // same single intermediate every time, and an RSA-cipher-only TLS 1.2
-        // offer is refused outright (alert 40) — there is no RSA certificate
-        // behind this name. The hostname itself is what a hostile resolver
-        // hijacks, hence dialling by address.
-        //
-        // SINGLE POINT OF FAILURE — ONE of these three pins can ever match. The
-        // SSL.com root and the legacy DigiCert anchor are dormant: they protect
-        // a future migration, but cannot satisfy today's handshake. An SSL.com
-        // re-issue of the intermediate takes this provider dark with no
-        // warning: the exact shape that took dns.google dark, and the reason
-        // `>= 2 pins` was never the right test. There is NO genuine second
-        // matchable certificate to pin today — no sibling SSL.com issuing CA
-        // was observed serving this host from either vantage — and a
-        // speculative pin is permanent under the SSOT's _rotation_rule. So
-        // this is carried as an explicit, dated `_overlap_risk` waiver in
-        // birdo-shared, which scripts/check-cert-pins.sh check 2b fails on the
-        // day it lapses, is dropped, or stops matching reality.
-        pins: &[
-            // SSL.com SSL Intermediate CA ECC R2 (presented intermediate)
-            "zGgA4OU4DjJdvpRYUqbi5Vh2g9W5Oc/PgKihy9mkLsE=",
-            // SSL.com Root Certification Authority ECC (trust anchor, not sent)
-            "oyD01TTXvpfBro3QSZc1vIlcMjrdLTiL/M9mLCPX+Zo=",
-            // DigiCert High Assurance EV Root CA — Cloudflare's legacy anchor,
-            // kept as migration overlap and to match the Android pin set.
-            // Dormant: Cloudflare serves SSL.com today.
-            "WoiWRyIOVNa9ihaBciRSC7XHjliYS9VwUGOIud4PB18=",
-        ],
-    },
-    DoHProvider {
-        url: "https://dns.google/resolve",
-        host: "dns.google",
-        bootstrap: &[Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
-        // TWO LINEAGES, NOT ONE — and an intermediate plus the root that
-        // signed it does not count as two.
-        //
-        // 8.8.8.8/8.8.4.4 are anycast, so which Google edge answers depends on
-        // the caller's network path, and on 2026-09-06 dns.google was serving
-        // two different Google Trust Services lineages at the same time over
-        // those same addresses:
-        //
-        //   RSA   : leaf → WR2 → GTS Root R1   (UK consumer ISP, both
-        //                                       addresses; Azure northcentralus,
-        //                                       Mobile-Client run 34028683100)
-        //   ECDSA : leaf → WE2 → GTS Root R4   (production hub in Hetzner DE,
-        //                                       both addresses; Azure
-        //                                       centralus, Desktop-Client run
-        //                                       34028720220 — the run that
-        //                                       failed and exposed this)
-        //
-        // Until this change only the first was pinned. WE2 and GTS Root R4 are
-        // a DIFFERENT lineage, so neither of the two pins was in that chain
-        // and the handshake was refused outright: every user routed to a
-        // migrated edge lost this provider, with the log saying "possible MITM
-        // attack" about a stale pin set. WR2 + GTS Root R1 looked like two
-        // overlapping pins but was one lineage — when the CA moved, both went
-        // dark in the same handshake.
-        //
-        // That matters precisely on the networks DoH exists for: with 1.1.1.1
-        // hijacked by a captive portal and 9.9.9.9 blocked by a corporate
-        // filter, dns.google is the last provider standing, and under an
-        // engaged kill switch the system-resolver fallback is blocked too.
-        //
-        // INVARIANT: pin every lineage the provider is MEASURED serving, not
-        // the one chain your own vantage point returned. A liveness probe runs
-        // from a single vantage point and goes green as soon as ANY one chain
-        // matches, so it cannot tell you this list is half-empty. Do NOT drop
-        // the WR2/R1 pair because your machine only ever sees WE2/R4 (or the
-        // reverse) — that is the edit that caused this outage, and there is
-        // no remote kill switch for a bricked pin. Retire a lineage only once
-        // it is unmeasurable from several independent networks.
-        //
-        // EXACTLY THE FOUR MEASURED PINS, BY DECISION. An earlier revision of
-        // this change also pinned Google's six other published issuing
-        // intermediates (WR1/WR3/WR4, WE1/WE3/WE4) "in case an edge ever sends
-        // a shortened chain". They came out: not one of them has been observed
-        // in any dns.google chain from any vantage; a pin is effectively
-        // PERMANENT under the SSOT's _rotation_rule and must be transcribed
-        // identically into every enforcing client under an exact-set-equality
-        // gate; and the two ROOT pins already absorb a sibling rotation for as
-        // long as Google presents the root — which both measured chains do.
-        // The residual risk is real and named: an edge that sends leaf + a
-        // sibling intermediate and NO root would match nothing. Check 3 of
-        // scripts/check-cert-pins.sh is the detector for that (it fails when a
-        // root the SSOT says is presented goes missing); nothing here prevents
-        // it.
-        //
-        // This set is the SSOT's, not a local judgement call: it is
-        // third_party/cert-pins.json, which is vendored verbatim from
-        // birdo-shared and stamped (scripts/check-cert-pins.sh checks 1, 1b
-        // and 2). Do not add, drop or reorder a pin here alone — change
-        // birdo-shared/cert-pins.json, re-vendor, re-stamp.
-        //
-        // All four values verified 2026-09-06 by fetching Google's published
-        // CA certificates from https://i.pki.goog/{wr2,r1,we2,r4}.crt and
-        // hashing the SPKI locally; subjects confirmed CN=WR2, CN=GTS Root R1,
-        // CN=WE2, CN=GTS Root R4. (The published we2.crt is the GlobalSign ECC
-        // Root CA - R4 cross-sign of the same key; the WE2 actually served is
-        // issued by GTS Root R4. Same SPKI, so one pin covers both.)
-        pins: &[
-            // --- RSA hierarchy (GTS Root R1) ---
-            // WR2 — presented from un-migrated edges (UK ISP; Azure northcentralus)
-            "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=",
-            // GTS Root R1 — anchor of that hierarchy, presented in that chain
-            "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",
-            // --- ECDSA hierarchy (GTS Root R4) ---
-            // WE2 — presented from migrated edges (production hub; Azure centralus)
-            "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=",
-            // GTS Root R4 — anchor of that hierarchy, presented in that chain;
-            // the same anchor api/cert_pin.rs already pins for birdo.app
-            "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
-        ],
-    },
-    DoHProvider {
-        url: "https://dns.quad9.net/dns-query",
-        host: "dns.quad9.net",
-        bootstrap: &[Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(149, 112, 112, 112)],
-        // Chain: dns.quad9.net → DigiCert Global G3 TLS ECC SHA384 2020 CA1 —
-        // and nothing else: Quad9 sends a SHORTENED chain, leaf + intermediate,
-        // NO root. Measured 2026-09-06 via 9.9.9.9 from a UK consumer ISP, the
-        // production hub and a GitHub runner in Azure westus2 (SSOT
-        // chain_shape.vantages), and re-measured 2026-09-08 via 9.9.9.9 and
-        // 149.112.112.112 from the UK ISP and the hub: the same single
-        // intermediate every time.
-        //
-        // SINGLE POINT OF FAILURE — ONE of these two pins can ever match: the
-        // DigiCert Global Root G3 pin is dormant, and the two pins are one
-        // lineage anyway (an intermediate and the root that signed it). No
-        // second lineage has been observed serving this host, so nothing is
-        // added on a guess; the SSOT carries it as a dated `_overlap_risk`
-        // waiver ("quad9-single-lineage") that scripts/check-cert-pins.sh
-        // check 2b fails on the day it lapses, is dropped, or stops matching
-        // reality.
-        pins: &[
-            // DigiCert Global G3 TLS ECC SHA384 2020 CA1 (presented intermediate)
-            "qBRjZmOmkSNJL0p70zek7odSIzqs/muR4Jk9xYyCP+E=",
-            // DigiCert Global Root G3 (trust anchor)
-            "uUwZgwDOxcBXrQcntwu+kYFpkiVkOaezL0WYEZ3anJc=",
-        ],
-    },
-];
+const DOH_PROVIDERS: &[DoHProvider] = &[DoHProvider {
+    url: "https://cloudflare-dns.com/dns-query",
+    host: "cloudflare-dns.com",
+    // 104.16.248.249/104.16.249.249 are the published A records; 1.1.1.1 and
+    // 1.0.0.1 serve the same DoH endpoint and present the cloudflare-dns.com
+    // certificate for that SNI.
+    bootstrap: &[
+        Ipv4Addr::new(104, 16, 248, 249),
+        Ipv4Addr::new(104, 16, 249, 249),
+        Ipv4Addr::new(1, 1, 1, 1),
+        Ipv4Addr::new(1, 0, 0, 1),
+    ],
+    // Chain: cloudflare-dns.com → SSL.com SSL Intermediate CA ECC R2 — and
+    // nothing else: Cloudflare sends a SHORTENED chain, leaf + intermediate,
+    // NO root. The SSOT records it measured 2026-09-06 from a UK consumer
+    // ISP, the production hub and a GitHub runner in Azure westus2 under
+    // default, RSA-only and ECDSA-only offers (chain_shape.vantages). It
+    // was re-measured 2026-09-08 from the UK ISP and the production hub
+    // over 1.1.1.1, 1.0.0.1, 104.16.248.249 and 104.16.249.249 (plus
+    // 2606:4700:4700::1111 from the hub), under the default offer, an
+    // RSA-only signature-algorithm offer and a TLS 1.2-only offer: the
+    // same single intermediate every time, and an RSA-cipher-only TLS 1.2
+    // offer is refused outright (alert 40) — there is no RSA certificate
+    // behind this name. The hostname itself is what a hostile resolver
+    // hijacks, hence dialling by address.
+    //
+    // SINGLE POINT OF FAILURE — ONE of these three pins can ever match. The
+    // SSL.com root and the legacy DigiCert anchor are dormant: they protect
+    // a future migration, but cannot satisfy today's handshake. An SSL.com
+    // re-issue of the intermediate takes this provider dark with no
+    // warning: the exact shape that took dns.google dark in 2026-09, and the reason
+    // `>= 2 pins` was never the right test. There is NO genuine second
+    // matchable certificate to pin today — no sibling SSL.com issuing CA
+    // was observed serving this host from either vantage — and a
+    // speculative pin is permanent under the SSOT's _rotation_rule. So
+    // this is carried as an explicit, dated `_overlap_risk` waiver in
+    // birdo-shared, which scripts/check-cert-pins.sh check 2b fails on the
+    // day it lapses, is dropped, or stops matching reality.
+    pins: &[
+        // SSL.com SSL Intermediate CA ECC R2 (presented intermediate)
+        "zGgA4OU4DjJdvpRYUqbi5Vh2g9W5Oc/PgKihy9mkLsE=",
+        // SSL.com Root Certification Authority ECC (trust anchor, not sent)
+        "oyD01TTXvpfBro3QSZc1vIlcMjrdLTiL/M9mLCPX+Zo=",
+        // DigiCert High Assurance EV Root CA — Cloudflare's legacy anchor,
+        // kept as migration overlap and to match the Android pin set.
+        // Dormant: Cloudflare serves SSL.com today.
+        "WoiWRyIOVNa9ihaBciRSC7XHjliYS9VwUGOIud4PB18=",
+    ],
+}];
 
 /// Substring `api::doh_resolver` matches on to tell "every provider failed
 /// PINNING" apart from "the network was unreachable".
@@ -430,9 +308,10 @@ fn is_pin_rejection(e: &reqwest::Error) -> bool {
 /// certificate whose SPKI hash is pinned for the SNI hostname's provider.
 ///
 /// Unlike the API verifier, this one fails CLOSED when the chain cannot be
-/// parsed: the API has a single host and availability wins there, while DoH
-/// has two more independent fallback providers, so refusing one unparseable
-/// chain costs nothing and keeps the pinning guarantee honest.
+/// parsed: the API has a single host and availability wins there, while a
+/// refused DoH handshake costs only a fall back to the system resolver (whose
+/// answer the API's own pinning still checks), so refusing an unparseable
+/// chain keeps the pinning guarantee honest.
 #[derive(Debug)]
 struct DohSpkiPinningVerifier {
     inner: Arc<WebPkiServerVerifier>,
@@ -559,8 +438,8 @@ fn doh_rustls_config() -> ClientConfig {
         .with_no_client_auth();
     // Advertise ALPN http/1.1 — exactly what reqwest's own rustls setup sends
     // for this crate (our reqwest has no `http2` feature). A preconfigured
-    // config otherwise sends NO ALPN at all, which dns.quad9.net answers with
-    // HTTP 505 (verified live 2026-08-12): the provider would silently degrade.
+    // config otherwise sends NO ALPN at all, which some DoH servers answer
+    // with HTTP 505 (seen live 2026-08-12): the provider would silently degrade.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     config
 }
@@ -568,9 +447,8 @@ fn doh_rustls_config() -> ClientConfig {
 /// Resolve a hostname to IPv4 address using DNS-over-HTTPS
 ///
 /// This prevents the ISP from observing the VPN server hostname in DNS queries.
-/// Falls back to multiple DoH providers for reliability.
-/// Certificate pinning is enforced — if a provider's cert doesn't match any
-/// known pin, the provider is skipped and the next one is tried.
+/// Certificate pinning is enforced — a provider whose chain matches no pin is
+/// refused, and with every provider refused the resolution fails closed.
 ///
 /// # Arguments
 /// * `hostname` - The hostname to resolve (e.g., "vpn.example.com")
@@ -617,9 +495,9 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
                 // and nothing else, and nothing bridges tracing to Sentry in
                 // this app (see utils::crash_report::report_security_event), so
                 // a provider going dark in the field was invisible until
-                // somebody asked a user for a log file. dns.google was dark on
-                // every ECDSA Google edge and the only reason anyone found out
-                // was a scheduled CI job.
+                // somebody asked a user for a log file. When dns.google (then a
+                // provider here) went dark on every ECDSA Google edge, the only
+                // reason anyone found out was a scheduled CI job.
                 //
                 // NO PII: the message carries the provider's hardcoded URL and
                 // nothing about what was being resolved.
@@ -674,9 +552,9 @@ pub async fn resolve_via_doh(hostname: &str) -> Result<Ipv4Addr, String> {
 /// lets the bootstrap overrides be installed exactly once.
 static DOH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-/// Build (once) the DoH client with hardcoded bootstrap addresses for every
-/// provider, so resolving a provider's own hostname never falls back to the
-/// system resolver (see `DoHProvider::bootstrap`).
+/// Build (once) the DoH client with hardcoded bootstrap addresses for the
+/// provider, so resolving its own hostname never falls back to the system
+/// resolver (see `DoHProvider::bootstrap`).
 fn doh_client() -> Result<&'static reqwest::Client, String> {
     if let Some(client) = DOH_CLIENT.get() {
         return Ok(client);
@@ -845,64 +723,25 @@ mod tests {
     /// A presented chain is ONE lineage by definition, so the number of
     /// distinct lineage slugs a pin set accepts here is the number of
     /// independently-failing paths it actually covers — the count that
-    /// `pins.len()` was standing in for when dns.google went dark.
+    /// `pins.len()` was standing in for when dns.google (a former provider)
+    /// went dark.
     ///
     /// This table is the input to the tests below, and it is the thing that
     /// makes them mechanical rather than decorative. Adding a chain here means
     /// having measured it.
-    const MEASURED_CHAINS: &[(&str, &str, &str, &[&str])] = &[
-        (
-            "dns.google",
-            "gts-r1",
-            "2026-09-06 and again 2026-09-08, 8.8.8.8 and 8.8.4.4 from a UK \
-             consumer ISP under default, RSA-only and ECDSA-only offers, and from \
-             the production hub under an RSA-only offer; also what Azure \
-             northcentralus saw in Mobile-Client run 34028683100. The root \
-             arrives CROSS-SIGNED (issuer GlobalSign Root CA), same SPKI",
-            &[
-                "qW3FYuXf0SK210sV5lcUYE1NGTmBA398Ee6LXLqneUY=", // leaf (rotates)
-                "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=", // WR2
-                "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=", // GTS Root R1
-            ],
-        ),
-        (
-            "dns.google",
-            "gts-r4",
-            "2026-09-06 and again 2026-09-08 (6 of 6 samples), 8.8.8.8 and \
-             8.8.4.4 from the production hub (Hetzner, DE) under default and \
-             ECDSA-only offers — byte-identical to the chain Azure centralus saw \
-             in the Desktop-Client liveness run 34028720220 that failed",
-            &[
-                "wyib/Zb8QzNvhqZ9QF7LzXCMzYApj7PsLe/ZjlfJzuI=", // leaf (rotates)
-                "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=", // WE2
-                "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=", // GTS Root R4
-            ],
-        ),
-        (
-            "cloudflare-dns.com",
-            "sslcom-ecc",
-            "2026-09-06 (SSOT chain_shape.vantages) and again 2026-09-08: \
+    const MEASURED_CHAINS: &[(&str, &str, &str, &[&str])] = &[(
+        "cloudflare-dns.com",
+        "sslcom-ecc",
+        "2026-09-06 (SSOT chain_shape.vantages) and again 2026-09-08: \
              1.1.1.1 / 1.0.0.1 / 104.16.248.249 / 104.16.249.249 from a UK \
              consumer ISP and from the production hub (plus 2606:4700:4700::1111 \
              from the hub), default, RSA-only and TLS 1.2-only offers — TWO \
              certificates, NO root, every time",
-            &[
-                "ltQ6aXy3tqpNZKJdnevMD7oR+IsI5rNWbOssFDrl+Ew=", // leaf (rotates)
-                "zGgA4OU4DjJdvpRYUqbi5Vh2g9W5Oc/PgKihy9mkLsE=", // SSL.com ECC R2
-            ],
-        ),
-        (
-            "dns.quad9.net",
-            "digicert-global-g3",
-            "2026-09-06 and again 2026-09-08, 9.9.9.9 and 149.112.112.112 from a \
-             UK consumer ISP and from the production hub — TWO certificates, NO \
-             root",
-            &[
-                "i2kObfz0qIKCGNWt7MjBUeSrh0Dyjb0/zWINImZES+I=", // leaf (rotates)
-                "qBRjZmOmkSNJL0p70zek7odSIzqs/muR4Jk9xYyCP+E=", // DigiCert G3 ECC
-            ],
-        ),
-    ];
+        &[
+            "ltQ6aXy3tqpNZKJdnevMD7oR+IsI5rNWbOssFDrl+Ew=", // leaf (rotates)
+            "zGgA4OU4DjJdvpRYUqbi5Vh2g9W5Oc/PgKihy9mkLsE=", // SSL.com ECC R2
+        ],
+    )];
 
     /// Which distinct lineages, among the chains measured for `host`, does
     /// `pins` accept? Sorted, deduplicated.
@@ -925,7 +764,7 @@ mod tests {
     fn test_doh_provider_pin_format() {
         // Format only. This test used to ALSO assert `pins.len() >= 2` under the
         // heading "every provider MUST carry >= 2 OVERLAPPING pins (intermediate
-        // + its root)". It was green throughout the dns.google outage, because
+        // + its root)". It was green throughout the 2026-09 dns.google outage, because
         // counting entries in a slice cannot see that both of them belong to the
         // same CA lineage — or that the server never sends one of them. The
         // question it was pretending to answer is answered for real by
@@ -970,14 +809,11 @@ mod tests {
     /// that the pin set accepts.
     ///
     /// Those lineages are asserted EXACTLY, against the measured chains above,
-    /// with the known single-lineage providers named rather than waived away.
-    /// Any edit to a pin set moves one of these:
-    ///   * trimming dns.google back to "the chain I just measured" drops it to
-    ///     one lineage and fails here;
-    ///   * a second lineage measured for cloudflare-dns.com or dns.quad9.net
-    ///     raises theirs to two and fails here too, which is the prompt to add
-    ///     the chain to MEASURED_CHAINS, update EXPECTED, and delete the
-    ///     `_overlap_risk` waiver in birdo-shared/cert-pins.json.
+    /// with the known single-lineage provider named rather than waived away.
+    /// A second lineage measured for cloudflare-dns.com raises its count to two
+    /// and fails here, which is the prompt to add the chain to MEASURED_CHAINS,
+    /// update EXPECTED, and delete the `_overlap_risk` waiver in
+    /// birdo-shared/cert-pins.json.
     ///
     /// The same invariant is enforced offline over the SSOT by check 2b of
     /// scripts/check-cert-pins.sh, from the SSOT's own `lineage` flags; this is
@@ -986,29 +822,17 @@ mod tests {
     fn test_live_lineages_per_provider() {
         // host -> (lineages the pin set must accept, why that is not >= 2;
         // None means it is)
-        const EXPECTED: &[(&str, &[&str], Option<&str>)] = &[
-            ("dns.google", &["gts-r1", "gts-r4"], None),
-            (
-                "cloudflare-dns.com",
-                &["sslcom-ecc"],
-                Some(
-                    "Cloudflare sends leaf + SSL.com intermediate and NO root from \
-                     every address and vantage measured, so the SSL.com root pin \
-                     and the legacy DigiCert anchor are both dormant and there is \
-                     no second lineage to pin. One SSL.com re-issue takes this \
-                     provider dark. Waived, dated, in birdo-shared/cert-pins.json.",
-                ),
+        const EXPECTED: &[(&str, &[&str], Option<&str>)] = &[(
+            "cloudflare-dns.com",
+            &["sslcom-ecc"],
+            Some(
+                "Cloudflare sends leaf + SSL.com intermediate and NO root from \
+                 every address and vantage measured, so the SSL.com root pin \
+                 and the legacy DigiCert anchor are both dormant and there is \
+                 no second lineage to pin. One SSL.com re-issue takes this \
+                 provider dark. Waived, dated, in birdo-shared/cert-pins.json.",
             ),
-            (
-                "dns.quad9.net",
-                &["digicert-global-g3"],
-                Some(
-                    "Quad9 sends leaf + DigiCert G3 ECC intermediate and NO root, \
-                     and the two pins are one lineage regardless. Waived, dated, \
-                     in birdo-shared/cert-pins.json.",
-                ),
-            ),
-        ];
+        )];
 
         for provider in DOH_PROVIDERS {
             let (_, expected_lineages, debt) = EXPECTED
@@ -1018,7 +842,7 @@ mod tests {
                     panic!(
                         "provider {} has no entry in EXPECTED — a new DoH provider \
                          must declare which measured lineages its pins cover, or it \
-                         ships with the dns.google hole",
+                         ships with the one-lineage hole that took dns.google dark",
                         provider.host
                     )
                 });
@@ -1083,68 +907,6 @@ mod tests {
                     provider.host
                 );
             }
-        }
-    }
-
-    /// The two dns.google pin sets this repo has SHIPPED, and what counting
-    /// PINS said about each versus what counting MEASURED LINEAGES says.
-    ///
-    /// A third set was proposed on this branch and rejected by the owner on
-    /// 2026-09-06: ten pins, adding the six sibling issuing intermediates
-    /// Google publishes but has never been seen serving this host. Its six
-    /// hashes are deliberately NOT written down here. They live in exactly one
-    /// place in this repo — the SSOT's `_removed[]`, each `never_shipped: true`
-    /// with the reason — and `scripts/cert_pins_retired.py` (check 2c of
-    /// scripts/check-cert-pins.sh) fails the build if any of them reappears in
-    /// a file that pins the host they were removed from, comments and test
-    /// fixtures included. Copying a retired hash into a test to prove it is
-    /// retired is how a ten-pin set survives a `git grep`.
-    ///
-    /// What replaces that arm is the invariant the ten-pin set violated, stated
-    /// forwards instead of backwards: every dns.google pin must be one this
-    /// repo has MEASURED on the wire. A speculative sibling fails that the day
-    /// it is added, whether or not anyone remembers to retire it upstream.
-    #[test]
-    fn test_dns_google_lineage_count_is_what_the_pin_count_hid() {
-        const WR2: &str = "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=";
-        const R1: &str = "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=";
-
-        // Shipped until 2026-09-06: two pins, ONE lineage. `pins.len() >= 2`
-        // was green; every ECDSA edge was dark.
-        let pre_outage = [WR2, R1];
-        assert_eq!(accepted_lineages("dns.google", &pre_outage), ["gts-r1"]);
-
-        // Shipped now: four pins, TWO lineages — and nothing unmeasured in it.
-        let shipped = pins_for_host("dns.google").expect("dns.google must be pinned");
-        assert_eq!(
-            shipped.len(),
-            4,
-            "dns.google pins exactly the four measured hashes (owner decision, \
-             2026-09-06); a different count means the SSOT changed — re-vendor"
-        );
-        assert_eq!(
-            accepted_lineages("dns.google", shipped),
-            ["gts-r1", "gts-r4"]
-        );
-
-        // MEASURE-BEFORE-PIN, mechanically. Every shipped dns.google pin must
-        // appear in a chain this repo actually received (MEASURED_CHAINS).
-        // dns.google is the one host here with no dormant pin, and it must stay
-        // that way: a dormant pin on this host is the ten-pin shape returning.
-        for pin in shipped {
-            let seen = MEASURED_CHAINS
-                .iter()
-                .any(|(h, _, _, chain)| *h == "dns.google" && chain.contains(pin));
-            assert!(
-                seen,
-                "dns.google pin {pin} appears in no chain this repo has \
-                 measured. Pinning what a CA publishes rather than what it \
-                 serves is what the rejected ten-pin revision did, and under \
-                 the SSOT's _rotation_rule the pin would be permanent in every \
-                 installed client. Measure the chain, add it to MEASURED_CHAINS \
-                 with its vantage, and record the measurement in \
-                 birdo-shared/cert-pins.json — or do not pin it."
-            );
         }
     }
 
@@ -1286,9 +1048,29 @@ mod tests {
             assert_eq!(pins, provider.pins);
         }
         // Case-insensitive (SNI hostnames are case-insensitive per RFC 4343).
-        assert!(pins_for_host("DNS.GOOGLE").is_some());
+        assert!(pins_for_host("CLOUDFLARE-DNS.COM").is_some());
         assert!(pins_for_host("evil.example").is_none());
         assert!(pins_for_host("").is_none());
+        // D5: the removed providers are unknown now, which the verifier fails
+        // CLOSED.
+        assert!(pins_for_host("dns.google").is_none());
+        assert!(pins_for_host("dns.quad9.net").is_none());
+    }
+
+    /// D5 (owner decision 2026-10-01): the control plane resolves through
+    /// Cloudflare only — the same single provider as Android's DohResolver.kt
+    /// — dialled by Cloudflare's own addresses.
+    #[test]
+    fn the_control_plane_doh_is_cloudflare_only() {
+        let hosts: Vec<&str> = DOH_PROVIDERS.iter().map(|p| p.host).collect();
+        assert_eq!(hosts, ["cloudflare-dns.com"]);
+        for ip in DOH_PROVIDERS[0].bootstrap {
+            let o = ip.octets();
+            assert!(
+                matches!(o, [1, 1, 1, 1] | [1, 0, 0, 1] | [104, 16, 248..=249, 249]),
+                "{ip} is not a Cloudflare DoH address"
+            );
+        }
     }
 
     /// The pinned rustls config must build (panics here would make every DoH
@@ -1318,82 +1100,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// REGRESSION — dns.google was pinned to ONE of the two CA lineages it
-    /// serves.
-    ///
-    /// Google Trust Services was serving dns.google out of two lineages on the
-    /// same anycast addresses on 2026-09-06, the edge deciding which one you
-    /// get. The shipped pin set held only WR2 → GTS Root R1 — one lineage, so
-    /// when an edge answered with WE2 → GTS Root R4 BOTH pins were absent, the
-    /// handshake was refused, the provider was skipped, and the leak-proof
-    /// resolver pool quietly shrank from three providers to two — on exactly
-    /// the hostile networks DoH is there for, with the kill switch blocking the
-    /// system-resolver fallback as designed.
-    ///
-    /// Both chains below are REAL, measured on 2026-09-06 with SNI dns.google.
-    #[test]
-    fn test_dns_google_pins_cover_both_gts_lineages() {
-        let pins = pins_for_host("dns.google").expect("dns.google must be a pinned provider");
-
-        // Observed via 8.8.8.8 and 8.8.4.4 from a consumer-ISP path.
-        let rsa_chain = [
-            "qW3FYuXf0SK210sV5lcUYE1NGTmBA398Ee6LXLqneUY=".to_string(), // leaf (rotates)
-            "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=".to_string(), // WR2
-            "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=".to_string(), // GTS Root R1
-        ];
-        // Observed the same day via 8.8.8.8 from a US cloud edge — the daily
-        // cert-pins liveness job, which is where this failure surfaced.
-        let ecdsa_chain = [
-            "wyib/Zb8QzNvhqZ9QF7LzXCMzYApj7PsLe/ZjlfJzuI=".to_string(), // leaf (rotates)
-            "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=".to_string(), // WE2
-            "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=".to_string(), // GTS Root R4
-        ];
-
-        assert!(
-            chain_satisfies_pins(&rsa_chain, pins),
-            "dns.google GTS Root R1 lineage (WR2) is no longer pinned — users on \
-             an un-migrated Google edge lose this DoH provider entirely"
-        );
-        assert!(
-            chain_satisfies_pins(&ecdsa_chain, pins),
-            "dns.google GTS Root R4 lineage (WE2) is not pinned — users on a \
-             migrated Google edge lose this DoH provider entirely"
-        );
-
-        // Name both anchors explicitly: a future tidy-up that drops either
-        // lineage re-creates the outage, and the message has to say so.
-        for (label, anchor) in [
-            (
-                "GTS Root R1 (legacy lineage)",
-                "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",
-            ),
-            (
-                "GTS Root R4 (new lineage)",
-                "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
-            ),
-        ] {
-            assert!(
-                pins.contains(&anchor),
-                "dns.google no longer pins {label}; both lineages were live on the \
-                 same anycast IPs on 2026-09-06, so dropping one bricks the \
-                 provider for whoever is routed to that edge"
-            );
-        }
-
-        // Pins are on the CA chain: a leaf alone must satisfy nothing, or a
-        // ~90-day leaf rotation would brick the client (the old leaf-DER scheme).
-        assert!(!chain_satisfies_pins(&[rsa_chain[0].clone()], pins));
-        assert!(!chain_satisfies_pins(&[ecdsa_chain[0].clone()], pins));
-
-        // Pin sets are per-host, not a shared pool: Quad9's chain must never
-        // authenticate dns.google.
-        let quad9_chain = [
-            "qBRjZmOmkSNJL0p70zek7odSIzqs/muR4Jk9xYyCP+E=".to_string(),
-            "uUwZgwDOxcBXrQcntwu+kYFpkiVkOaezL0WYEZ3anJc=".to_string(),
-        ];
-        assert!(!chain_satisfies_pins(&quad9_chain, pins));
     }
 
     /// An empty chain — or one whose every certificate failed to parse — must

@@ -7,7 +7,8 @@
 //! IS needed the moment the presented chain stops matching these pins, and a
 //! CA can do that without notice: on 2026-09-06 Google Trust Services was
 //! serving `dns.google` from a second hierarchy on some anycast edges and the
-//! DoH pin set in `vpn/doh.rs` went dark there. Do not read "years" into it.
+//! DoH pin set `vpn/doh.rs` then carried for it went dark there. Do not read
+//! "years" into it.
 //!
 //! What the backups below do and do not buy: the live `birdo.app` chain is ONE
 //! lineage (WE1 and the GTS Root R4 that signed it vanish from the same

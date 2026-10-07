@@ -209,35 +209,93 @@ pub struct BirdoApi {
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// The ONE builder every control-plane client starts from, so a second client
+/// can never be built without the hardening.
+///
+/// SEC-C1 FIX: TLS hardening — enforce HTTPS and install the CA-chain SPKI
+/// pinning rustls config (see super::cert_pin). The custom rustls
+/// ServerCertVerifier does full standard validation (chain/hostname/expiry)
+/// AND pins the intermediate/root public keys during the handshake — matching
+/// the Android client and surviving leaf rotations. TLS 1.2 minimum + versions
+/// are set by the rustls config itself.
+fn hardened_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        // Bound the TCP handshake separately from the overall request budget.
+        // Without this, ONE unreachable address (e.g. an IPv6 candidate that
+        // our own leak block rejects, or a black-holing middlebox) could eat
+        // the entire 30 s timeout before reqwest ever tried the next address,
+        // which is what made a server switch look frozen instead of simply
+        // retrying over IPv4.
+        .connect_timeout(Duration::from_secs(8))
+        .user_agent(USER_AGENT)
+        .pool_max_idle_per_host(5)
+        .https_only(true)
+        // F5 FIX: resolve the control plane via the cert-pinned DoH resolver
+        // (system-resolver fallback) so a censoring ISP / captive portal that
+        // hijacks or blocks DNS for api.birdo.app can no longer block desktop
+        // login — matching the Android client. See super::doh_resolver.
+        .dns_resolver(std::sync::Arc::new(
+            super::doh_resolver::DohApiResolver::new(),
+        ))
+        .use_preconfigured_tls(super::cert_pin::rustls_config())
+}
+
+/// A one-off hardened client whose connections are bound to `local`, the
+/// PHYSICAL interface's address, so a request leaves AROUND a live tunnel
+/// (REVIEW-WIN2-007). Windows' strong-host model sends from a bound address
+/// only through the interface that owns it, so the tunnel's /1 routes do not
+/// apply; the kill switch's control-plane permit lets this executable's HTTPS
+/// through a block. `Err` when it cannot be built, which never weakens the
+/// hardening: the caller keeps the ordinary client.
+fn client_around_the_tunnel(local: std::net::IpAddr) -> Result<Client, ApiError> {
+    hardened_client_builder()
+        .local_address(local)
+        .build()
+        .map_err(|e| ApiError::Unknown(e.to_string()))
+}
+
+/// Whether a request that failed on the path around the tunnel never reached
+/// the server, so the tunnel may carry it instead: the connection itself (TCP
+/// or TLS) failed — a network that blocks the API outside the tunnel, or a
+/// host setting under which the bound address does not hold. A request that
+/// was SENT is never re-sent: the deletion may have happened.
+pub(crate) fn never_left(error: &reqwest::Error) -> bool {
+    error.is_connect()
+}
+
+/// `work` to its end on a task of its own, holding `lock` until it is done.
+/// Dropping the caller drops neither (see `BirdoApi::refresh_detached`).
+async fn run_holding<T: Send + 'static>(
+    lock: tokio::sync::OwnedMutexGuard<()>,
+    work: impl std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::spawn(async move {
+        let done = work.await;
+        drop(lock);
+        done
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(ApiError::Unknown(format!(
+            "the token refresh did not finish: {e}"
+        )))
+    })
+}
+
+/// The body of a POST that carries nothing: `{}`. Never `&()` — serde writes
+/// the unit as `null`, which the backend's strict JSON parser answers with 400
+/// before any handler runs. Every heartbeat since v1.0.0 died that way, so the
+/// server never saw one and reaped each desktop session 5 minutes after it
+/// connected; sign-out never reached the server either (live retest
+/// 2026-10-02).
+#[derive(Serialize)]
+struct EmptyBody {}
+
 impl BirdoApi {
     /// Create a new API client instance
     pub fn new() -> Self {
-        // SEC-C1 FIX: TLS hardening — enforce HTTPS and install the CA-chain
-        // SPKI pinning rustls config (see super::cert_pin). The custom rustls
-        // ServerCertVerifier does full standard validation (chain/hostname/
-        // expiry) AND pins the intermediate/root public keys during the
-        // handshake — matching the Android client and surviving leaf rotations.
-        // TLS 1.2 minimum + versions are set by the rustls config itself.
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            // Bound the TCP handshake separately from the overall request budget.
-            // Without this, ONE unreachable address (e.g. an IPv6 candidate that
-            // our own leak block rejects, or a black-holing middlebox) could eat
-            // the entire 30 s timeout before reqwest ever tried the next address,
-            // which is what made a server switch look frozen instead of simply
-            // retrying over IPv4.
-            .connect_timeout(Duration::from_secs(8))
-            .user_agent(USER_AGENT)
-            .pool_max_idle_per_host(5)
-            .https_only(true)
-            // F5 FIX: resolve the control plane via the cert-pinned DoH resolver
-            // (system-resolver fallback) so a censoring ISP / captive portal that
-            // hijacks or blocks DNS for api.birdo.app can no longer block desktop
-            // login — matching the Android client. See super::doh_resolver.
-            .dns_resolver(std::sync::Arc::new(
-                super::doh_resolver::DohApiResolver::new(),
-            ))
-            .use_preconfigured_tls(super::cert_pin::rustls_config())
+        let client = hardened_client_builder()
             .build()
             // SEC-C1 FIX: Do NOT fall back to Client::new() — that would
             // silently downgrade to an unpinned, un-hardened client.
@@ -251,16 +309,79 @@ impl BirdoApi {
         }
     }
 
+    /// This API on a client that keeps no idle connection, so every request
+    /// it sends opens a fresh one — bound to `local` when given, like
+    /// [`client_around_the_tunnel`]. The tokens and the refresh lock are
+    /// shared: a 401 is refreshed exactly as on the main client.
+    ///
+    /// WIN3-001: for a request sent right after a tunnel teardown. The main
+    /// client's pool keeps the keep-alive connections the heartbeats opened
+    /// THROUGH the tunnel, from an address the teardown has just removed, and
+    /// hands one out until it notices; a request written into it fails at
+    /// once.
+    pub(crate) fn on_fresh_connections(
+        &self,
+        local: Option<std::net::IpAddr>,
+    ) -> Result<Self, ApiError> {
+        let client = hardened_client_builder()
+            .pool_max_idle_per_host(0)
+            .local_address(local)
+            .build()
+            .map_err(|e| ApiError::Unknown(e.to_string()))?;
+        Ok(Self {
+            client,
+            access_token: Arc::clone(&self.access_token),
+            refresh_token: Arc::clone(&self.refresh_token),
+            refresh_lock: Arc::clone(&self.refresh_lock),
+        })
+    }
+
     /// Set authentication tokens
     pub async fn set_tokens(&self, access: String, refresh: String) {
         *self.access_token.write().await = Some(Zeroizing::new(access));
         *self.refresh_token.write().await = Some(Zeroizing::new(refresh));
     }
 
+    /// Fill the in-memory session from the keystore — ONLY if there is none.
+    ///
+    /// W1-028: `get_auth_state` (and every command's token restore) used to
+    /// overwrite memory unconditionally and without the refresh lock. The
+    /// refresh writes the ROTATED pair to memory first and to the keystore
+    /// after, so a keystore read landing between the two put the consumed
+    /// refresh token back in memory; the server treats reusing it as theft and
+    /// revokes the session. Memory is authoritative once set, and the check
+    /// runs under the same lock the refresh holds for its whole write.
+    /// Returns whether the tokens were taken.
+    pub async fn restore_tokens_if_absent(&self, access: String, refresh: String) -> bool {
+        let _guard = self.refresh_lock.lock().await;
+        if self.access_token.read().await.is_some() {
+            return false;
+        }
+        self.set_tokens(access, refresh).await;
+        true
+    }
+
     /// Clear authentication tokens
     pub async fn clear_tokens(&self) {
         *self.access_token.write().await = None;
         *self.refresh_token.write().await = None;
+    }
+
+    /// Clear the tokens only while the session in memory is still the one
+    /// holding `expected` (REVIEW-WIN2-021). Ending an expired session takes
+    /// seconds (the tunnel comes down first) while the UI is already on Login,
+    /// and a user who signs straight back in must not have the NEW session's
+    /// tokens wiped by the old one's teardown. Compared and cleared under the
+    /// access-token lock, so a sign-in cannot land in between. Returns whether
+    /// it cleared.
+    pub async fn clear_tokens_if(&self, expected: Option<&str>) -> bool {
+        let mut access = self.access_token.write().await;
+        if access.as_ref().map(|t| t.as_str()) != expected {
+            return false;
+        }
+        *access = None;
+        *self.refresh_token.write().await = None;
+        true
     }
 
     /// Check if user is authenticated
@@ -395,8 +516,10 @@ impl BirdoApi {
             refresh_token: (*refresh).clone(),
         };
 
-        let response: RefreshResponse =
-            self.post(endpoints::auth::REFRESH, &payload, false).await?;
+        let response: RefreshResponse = self
+            .post(endpoints::auth::REFRESH, &payload, false)
+            .await
+            .inspect_err(super::session_gate::report_refresh_failure)?;
 
         // Update access token
         *self.access_token.write().await = Some(Zeroizing::new(response.access_token.clone()));
@@ -412,7 +535,7 @@ impl BirdoApi {
     /// Logout (invalidate tokens on server)
     pub async fn logout(&self) -> Result<(), ApiError> {
         let _ = self
-            .post::<_, serde_json::Value>(endpoints::auth::LOGOUT, &(), true)
+            .post::<_, serde_json::Value>(endpoints::auth::LOGOUT, &EmptyBody {}, true)
             .await;
         self.clear_tokens().await;
         Ok(())
@@ -433,22 +556,37 @@ impl BirdoApi {
     ///
     /// Tokens are cleared ONLY on a 2xx: a refused deletion leaves the user
     /// signed in to an account that still exists.
-    pub async fn delete_account(&self, password: &str) -> Result<DeleteAccountResponse, ApiError> {
-        let body = DeleteAccountBody { password };
+    ///
+    /// `around_the_tunnel`: the physical interface's address while a tunnel is
+    /// up (REVIEW-WIN2-007). The server removes the account's WireGuard peers
+    /// BEFORE it answers, so an answer through the tunnel was dropped at the
+    /// relay, and a deletion that succeeded read as failed. Sent around it,
+    /// the answer arrives; see [`never_left`] for when the tunnel is used
+    /// instead.
+    pub async fn delete_account(
+        &self,
+        password: &str,
+        two_factor_code: Option<&str>,
+        around_the_tunnel: Option<std::net::IpAddr>,
+    ) -> Result<DeleteAccountResponse, ApiError> {
+        let body = DeleteAccountBody {
+            password,
+            two_factor_code,
+        };
         let token_before = self.access_token_value().await;
-        let outcome = match self.send_gdpr_delete(&body).await? {
+        let outcome = match self.send_gdpr_delete(&body, around_the_tunnel).await? {
             GdprDeleteOutcome::SessionExpired => {
                 {
                     // Same serialisation as request_with_retry: only refresh if
                     // nobody else already did while we waited for the lock.
-                    let _guard = self.refresh_lock.lock().await;
+                    let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
                     if self.access_token_value().await == token_before {
-                        self.refresh_token_internal()
+                        self.refresh_detached(lock)
                             .await
-                            .map_err(|_| ApiError::Unauthorized)?;
+                            .map_err(super::session_gate::error_after_failed_refresh)?;
                     }
                 }
-                self.send_gdpr_delete(&body).await?
+                self.send_gdpr_delete(&body, around_the_tunnel).await?
             }
             other => other,
         };
@@ -470,7 +608,15 @@ impl BirdoApi {
         access_token: &str,
         body: &DeleteAccountBody<'_>,
     ) -> reqwest::RequestBuilder {
-        self.client
+        Self::gdpr_delete_request_on(&self.client, access_token, body)
+    }
+
+    fn gdpr_delete_request_on(
+        client: &Client,
+        access_token: &str,
+        body: &DeleteAccountBody<'_>,
+    ) -> reqwest::RequestBuilder {
+        client
             .request(
                 reqwest::Method::DELETE,
                 format!("{}{}", API_BASE_URL, endpoints::auth::GDPR_DELETE),
@@ -489,6 +635,7 @@ impl BirdoApi {
     async fn send_gdpr_delete(
         &self,
         body: &DeleteAccountBody<'_>,
+        around_the_tunnel: Option<std::net::IpAddr>,
     ) -> Result<GdprDeleteOutcome, ApiError> {
         let token = self
             .access_token
@@ -496,11 +643,34 @@ impl BirdoApi {
             .await
             .clone()
             .ok_or(ApiError::NotAuthenticated)?;
-        let response = self
-            .gdpr_delete_request(token.as_str(), body)
-            .send()
-            .await
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let around = around_the_tunnel.and_then(|local| match client_around_the_tunnel(local) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not build the client around the tunnel ({e}); using the tunnel"
+                );
+                None
+            }
+        });
+        let sent = match around {
+            Some(around) => {
+                match Self::gdpr_delete_request_on(&around, token.as_str(), body)
+                    .send()
+                    .await
+                {
+                    Err(e) if never_left(&e) => {
+                        tracing::info!(
+                            "The path around the tunnel refused the connection — sending the \
+                             deletion through the tunnel"
+                        );
+                        self.gdpr_delete_request(token.as_str(), body).send().await
+                    }
+                    other => other,
+                }
+            }
+            None => self.gdpr_delete_request(token.as_str(), body).send().await,
+        };
+        let response = sent.map_err(|e| ApiError::Network(e.to_string()))?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         let outcome = Self::classify_gdpr_delete_response(status, &text);
@@ -539,7 +709,10 @@ impl BirdoApi {
                 .filter(|m| !m.is_empty());
             return match message {
                 Some(m) if !m.eq_ignore_ascii_case("unauthorized") => {
-                    GdprDeleteOutcome::Refused(ApiError::Unknown(m))
+                    GdprDeleteOutcome::Refused(ApiError::Rejected {
+                        status: StatusCode::UNAUTHORIZED.as_u16(),
+                        message: m,
+                    })
                 }
                 _ => GdprDeleteOutcome::SessionExpired,
             };
@@ -680,7 +853,7 @@ impl BirdoApi {
     /// FIX-2-13: Called periodically by auto_reconnect health check loop
     /// P1-9: Now returns HeartbeatResponse so callers can act on valid/serverOnline
     pub async fn heartbeat(&self, key_id: &str) -> Result<HeartbeatResponse, ApiError> {
-        self.post::<_, HeartbeatResponse>(&endpoints::vpn::heartbeat(key_id), &(), true)
+        self.post::<_, HeartbeatResponse>(&endpoints::vpn::heartbeat(key_id), &EmptyBody {}, true)
             .await
     }
 
@@ -937,7 +1110,7 @@ impl BirdoApi {
             if has_refresh {
                 // H-1 FIX: Serialize token refresh attempts to prevent concurrent
                 // refreshes from racing and overwriting each other's tokens.
-                let _guard = self.refresh_lock.lock().await;
+                let lock = Arc::clone(&self.refresh_lock).lock_owned().await;
                 // Re-check: another task may have already refreshed while we
                 // waited on the lock. Only if the token actually CHANGED is a
                 // pre-refresh retry worth a round-trip; otherwise go straight to
@@ -949,7 +1122,7 @@ impl BirdoApi {
                     }
                 }
                 tracing::info!("Got 401 — attempting transparent token refresh");
-                match self.refresh_token_internal().await {
+                match self.refresh_detached(lock).await {
                     Ok(_) => {
                         tracing::info!("Token refreshed successfully, retrying request");
                         // Retry the original request with the new token
@@ -957,8 +1130,10 @@ impl BirdoApi {
                     }
                     Err(e) => {
                         tracing::warn!("Token refresh failed: {}", e);
-                        // Return the original 401 error
-                        return Err(ApiError::Unauthorized);
+                        // Only the server's refusal is `Unauthorized`
+                        // (session expired); a transient failure answers as
+                        // itself and the session survives it (REVIEW-WIN2-003).
+                        return Err(super::session_gate::error_after_failed_refresh(e));
                     }
                 }
             }
@@ -1003,7 +1178,28 @@ impl BirdoApi {
         self.handle_response(response).await
     }
 
-    /// Internal: refresh access token (used by retry interceptor)
+    /// The refresh, run to its end whatever happens to the caller: on a task
+    /// of its own that holds `lock` — the refresh lock, taken by the caller —
+    /// until the rotated pair is stored (WIN3-004).
+    ///
+    /// The refresh used to run inside the request that met the 401, and the
+    /// heartbeat (10 s) and the re-dial (45 s) cap theirs. A cap that fired
+    /// after `/auth/refresh` reached the server dropped the rotated pair, and
+    /// the client kept the refresh token the server had just CONSUMED: the
+    /// next refresh signed the user out, or, past the server's 30 s rotation
+    /// grace, read as token theft and revoked every session and WireGuard
+    /// peer on the account. Holding the lock to the end also stops a second
+    /// refresh from presenting that consumed token while the first is out.
+    async fn refresh_detached(
+        &self,
+        lock: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), ApiError> {
+        let api = self.clone();
+        run_holding(lock, async move { api.refresh_token_internal().await }).await
+    }
+
+    /// Internal: refresh the access token. Only ever run through
+    /// [`refresh_detached`](Self::refresh_detached).
     async fn refresh_token_internal(&self) -> Result<(), ApiError> {
         let refresh = self
             .refresh_token
@@ -1016,7 +1212,9 @@ impl BirdoApi {
             refresh_token: (*refresh).clone(),
         };
 
-        // Use do_request directly to avoid infinite retry loop
+        // Use do_request directly to avoid infinite retry loop. A 401 here is
+        // the server rejecting the refresh token: contract §3.3 ends the
+        // session everywhere (see `session_gate`).
         let response: RefreshResponse = self
             .do_request(
                 &reqwest::Method::POST,
@@ -1024,15 +1222,17 @@ impl BirdoApi {
                 Some(&payload),
                 false,
             )
-            .await?;
+            .await
+            .inspect_err(super::session_gate::report_refresh_failure)?;
 
-        *self.access_token.write().await = Some(Zeroizing::new(response.access_token.clone()));
-        // FIX C-1: Also update refresh token if rotated
-        if let Some(new_refresh) = response.refresh_token.clone() {
-            *self.refresh_token.write().await = Some(Zeroizing::new(new_refresh));
-        }
-
-        // Persist the rotated pair to the OS keystore.
+        // REVIEW-WIN4-002: adopted only by the session that asked. A refresh
+        // runs detached (WIN3-004), so it can outlive a Sign Out, or a sign-in
+        // to another account, that cleared or replaced the tokens; writing
+        // them back would sign the user in again at the next launch, or put
+        // one account's tokens over another's.
+        //
+        // Persisted to the OS keystore under the same hold, so a Sign Out that
+        // waits for it clears the keystore after it, never before.
         //
         // The server ROTATES refresh tokens and treats a second use of a consumed
         // one as token THEFT — which revokes the whole session server-side. This
@@ -1041,31 +1241,60 @@ impl BirdoApi {
         // one and the next app launch replays it: the user is force-signed-out and
         // the backend records a theft event against a legitimate client.
         //
-        // Latent until now only because the keystore was a mock that persisted
-        // nothing; making persistence work makes this reachable, so the two must
-        // ship together. Best-effort: a keystore failure must not fail the request
-        // that triggered the refresh — the in-memory tokens are still valid for
-        // this session — but it is logged loudly because it costs the next one.
-        {
-            use crate::storage::credentials::{CredentialKey, CredentialStore};
-            // `None` means the server did not rotate, so the stored refresh
-            // token is still current and must be left alone.
-            let refresh_to_store = response.refresh_token.clone();
-            if let Err(e) =
-                CredentialStore::store(CredentialKey::AccessToken, &response.access_token)
-            {
-                tracing::error!("Could not persist refreshed access token ({e})");
-            }
-            if let Some(rotated) = refresh_to_store {
-                if let Err(e) = CredentialStore::store(CredentialKey::RefreshToken, &rotated) {
-                    tracing::error!(
-                        "Could not persist ROTATED refresh token ({e}) — the next launch will \
-                         replay a consumed token and the session will be revoked"
-                    );
-                }
-            }
+        // Best-effort: a keystore failure must not fail the request that
+        // triggered the refresh — the in-memory tokens are still valid for this
+        // session — but it is logged loudly because it costs the next one.
+        let adopted = self
+            .adopt_refreshed(
+                refresh.as_str(),
+                response.access_token,
+                response.refresh_token,
+                |access, rotated| {
+                    use crate::storage::credentials::{CredentialKey, CredentialStore};
+                    if let Err(e) = CredentialStore::store(CredentialKey::AccessToken, access) {
+                        tracing::error!("Could not persist refreshed access token ({e})");
+                    }
+                    // `None` means the server did not rotate, so the stored
+                    // refresh token is still current and must be left alone.
+                    if let Some(rotated) = rotated {
+                        if let Err(e) = CredentialStore::store(CredentialKey::RefreshToken, rotated)
+                        {
+                            tracing::error!(
+                                "Could not persist ROTATED refresh token ({e}) — the next launch                                  will replay a consumed token and the session will be revoked"
+                            );
+                        }
+                    }
+                },
+            )
+            .await;
+        if !adopted {
+            tracing::info!("The session ended while a token refresh ran — its tokens are dropped");
+            return Err(ApiError::NotAuthenticated);
         }
         Ok(())
+    }
+
+    /// Store a refresh's result only if the refresh token it presented is
+    /// still this client's, in the lock order of `clear_tokens_if` (access,
+    /// then refresh). `persist` runs under both locks.
+    async fn adopt_refreshed(
+        &self,
+        presented: &str,
+        access: String,
+        rotated: Option<String>,
+        persist: impl FnOnce(&str, Option<&str>),
+    ) -> bool {
+        let mut access_slot = self.access_token.write().await;
+        let mut refresh_slot = self.refresh_token.write().await;
+        if refresh_slot.as_ref().map(|t| t.as_str()) != Some(presented) {
+            return false;
+        }
+        persist(&access, rotated.as_deref());
+        *access_slot = Some(Zeroizing::new(access));
+        if let Some(rotated) = rotated {
+            *refresh_slot = Some(Zeroizing::new(rotated));
+        }
+        true
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str, auth: bool) -> Result<T, ApiError> {
@@ -1119,7 +1348,9 @@ impl BirdoApi {
     ///     access token expired, Connect / server list / heartbeat all failed
     ///     with "Unknown error: Unauthorized" while a valid 30-day refresh token
     ///     sat unused in the OS keystore, and only a full restart recovered.
-    ///  3. Any other status keeps the backend's message. Deliberate: those
+    ///  3. Any other status keeps the backend's message, WITH its status
+    ///     (`ApiError::Rejected`), so the IPC layer can classify by status and
+    ///     still show the specific sentence. Deliberate: those
     ///     `ApiError` variants carry no payload, so mapping 403 to
     ///     `ApiError::Forbidden` would replace a specific, actionable explanation
     ///     ("Stealth mode requires an Operative or Sovereign subscription") with
@@ -1146,10 +1377,37 @@ impl BirdoApi {
             return ApiError::Unauthorized;
         }
 
+        // A machine-readable reason the client acts on (Account API contract
+        // item 85), mapped by `error`, never by the wording of `message`.
+        let message = || {
+            body.as_ref()
+                .and_then(|b| b.message.clone())
+                .unwrap_or_default()
+        };
+        match body.as_ref().and_then(|b| b.error.as_deref()) {
+            Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
+            Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            // birdo-web #590: a Free connect while the allowance check is
+            // down. Without this it read as a 503 "server unavailable", whose
+            // advice (try another location) cannot help.
+            Some("quota_check_unavailable") => {
+                let retry_after_secs = body
+                    .as_ref()
+                    .and_then(|b| b.details.as_ref())
+                    .and_then(|d| d.get("retryAfterSeconds"))
+                    .and_then(serde_json::Value::as_u64);
+                return ApiError::QuotaCheckUnavailable { retry_after_secs };
+            }
+            _ => {}
+        }
+
         if let Some(message) = body.as_ref().and_then(|b| b.message.as_deref()) {
             let message = message.trim();
             if !message.is_empty() {
-                return ApiError::Unknown(message.to_string());
+                return ApiError::Rejected {
+                    status: status.as_u16(),
+                    message: message.to_string(),
+                };
             }
         }
 
@@ -1244,5 +1502,361 @@ impl Clone for BirdoApi {
             refresh_token: Arc::clone(&self.refresh_token),
             refresh_lock: Arc::clone(&self.refresh_lock),
         }
+    }
+}
+
+/// REVIEW-WIN2-007, the client half. Local sockets only: nothing here reaches
+/// beyond 127.0.0.1.
+#[cfg(test)]
+mod empty_body_tests {
+    #[test]
+    fn a_bodiless_post_sends_an_empty_object_never_null() {
+        assert_eq!(serde_json::to_string(&super::EmptyBody {}).unwrap(), "{}");
+        let source = include_str!("client.rs");
+        let unit_body = ["&()", ", true)"].concat();
+        assert!(!source.contains(&unit_body), "a POST sends `null`");
+    }
+}
+
+#[cfg(test)]
+mod around_the_tunnel_tests {
+    use super::{client_around_the_tunnel, never_left};
+
+    /// The deletion falls back to the tunnel only when the request around it
+    /// never reached the server (the connection was refused) — never when it
+    /// was sent and its answer was lost, because the account may already be
+    /// gone and a second delete would answer 401 and read as an expired
+    /// session.
+    #[tokio::test]
+    async fn only_a_request_that_never_left_falls_back_to_the_tunnel() {
+        let plain = reqwest::Client::new();
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let refused = plain
+            .post(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(never_left(&refused), "{refused:?}");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            // The request arrived; the answer never does.
+        });
+        let lost = plain
+            .post(format!("http://{addr}/"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!never_left(&lost), "{lost:?}");
+        server.await.unwrap();
+    }
+
+    /// WIN3-001: the old-key probe's client is the hardened one with nothing
+    /// kept idle, so no request on it can be handed a connection the tunnel
+    /// teardown left dead; and it is the same session, so a refresh on one is
+    /// seen by the other.
+    #[tokio::test]
+    async fn fresh_connections_share_the_session_and_keep_nothing_idle() {
+        let api = super::BirdoApi::new();
+        let fresh = api
+            .on_fresh_connections(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+            .expect("bound");
+        assert!(api.on_fresh_connections(None).is_ok());
+        api.set_tokens("access".into(), "refresh".into()).await;
+        assert_eq!(fresh.access_token_value().await.as_deref(), Some("access"));
+        assert!(std::sync::Arc::ptr_eq(
+            &api.refresh_lock,
+            &fresh.refresh_lock
+        ));
+
+        let source = include_str!("client.rs");
+        let fresh = &source[source.find("fn on_fresh_connections(").unwrap()..];
+        let fresh = &fresh[..fresh.find("\n    }").unwrap()];
+        assert!(fresh.contains("hardened_client_builder()"), "{fresh}");
+        assert!(fresh.contains(".pool_max_idle_per_host(0)"), "{fresh}");
+    }
+
+    /// The client around the tunnel is the hardened one, only bound.
+    #[test]
+    fn the_client_around_the_tunnel_builds_from_the_hardened_builder() {
+        assert!(
+            client_around_the_tunnel(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).is_ok()
+        );
+        let source = include_str!("client.rs");
+        let around = &source[source.find("fn client_around_the_tunnel(").unwrap()..];
+        let around = &around[..around.find("\n}").unwrap()];
+        assert!(around.contains("hardened_client_builder()"), "{around}");
+        assert!(around.contains(".local_address(local)"), "{around}");
+    }
+}
+
+#[cfg(test)]
+mod token_restore_tests {
+    use super::BirdoApi;
+
+    async fn refresh_in_memory(api: &BirdoApi) -> Option<String> {
+        api.refresh_token
+            .read()
+            .await
+            .as_ref()
+            .map(|t| t.as_str().to_string())
+    }
+
+    /// W1-028: a session already in memory is authoritative — it may hold a
+    /// rotated refresh token the keystore does not have yet.
+    #[tokio::test]
+    async fn restore_never_overwrites_a_session_in_memory() {
+        let api = BirdoApi::new();
+        api.set_tokens("rotated-access".into(), "rotated-refresh".into())
+            .await;
+        assert!(
+            !api.restore_tokens_if_absent("stale-access".into(), "consumed-refresh".into())
+                .await
+        );
+        assert_eq!(
+            refresh_in_memory(&api).await.as_deref(),
+            Some("rotated-refresh")
+        );
+    }
+
+    /// W1-028's interleaving: a restore that starts while a refresh holds the
+    /// lock waits for it, then finds the rotated pair and leaves it alone.
+    #[tokio::test]
+    async fn restore_waits_for_an_in_flight_refresh() {
+        let api = BirdoApi::new();
+        let refreshing = api.refresh_lock.lock().await;
+        let restorer = api.clone();
+        let restore = tokio::spawn(async move {
+            restorer
+                .restore_tokens_if_absent("stale-access".into(), "consumed-refresh".into())
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!restore.is_finished(), "restore ran inside a refresh");
+        // The refresh writes the rotated pair to memory, then releases.
+        api.set_tokens("rotated-access".into(), "rotated-refresh".into())
+            .await;
+        drop(refreshing);
+        assert!(!restore.await.unwrap());
+        assert_eq!(
+            refresh_in_memory(&api).await.as_deref(),
+            Some("rotated-refresh")
+        );
+    }
+
+    /// WIN3-004: the refresh outlives a caller whose cap fired (the
+    /// heartbeat's 10 s, the re-dial's 45 s) while `/auth/refresh` was out:
+    /// the server's answer, which carries the rotated pair, is still stored.
+    /// And it keeps the refresh lock until then, so no second refresh
+    /// presents the token the first one is consuming.
+    #[tokio::test]
+    async fn a_refresh_outlives_a_caller_that_gave_up_on_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let stored = Arc::new(AtomicBool::new(false));
+        let (server, answer) = tokio::sync::oneshot::channel::<()>();
+        let refresh = {
+            let stored = Arc::clone(&stored);
+            async move {
+                let _ = answer.await;
+                stored.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let caller = super::run_holding(Arc::clone(&lock).lock_owned().await, refresh);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), caller)
+                .await
+                .is_err(),
+            "the cap fires first"
+        );
+        assert!(lock.try_lock().is_err(), "the lock went with the caller");
+
+        let _ = server.send(());
+        let _next = tokio::time::timeout(Duration::from_secs(5), lock.lock())
+            .await
+            .expect("the refresh never finished");
+        assert!(
+            stored.load(Ordering::SeqCst),
+            "the rotated pair was dropped"
+        );
+    }
+
+    /// WIN3-004, the wiring: every refresh after a 401 goes through the
+    /// detached runner, with the lock handed to it.
+    #[test]
+    fn every_refresh_after_a_401_is_detached() {
+        const SOURCE: &str = include_str!("client.rs");
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        for signature in [
+            "async fn request_with_retry<",
+            "pub async fn delete_account(",
+        ] {
+            let body = fn_body(signature);
+            assert!(
+                body.contains("Arc::clone(&self.refresh_lock).lock_owned().await"),
+                "{signature}"
+            );
+            assert!(body.contains("self.refresh_detached(lock)"), "{signature}");
+        }
+        assert!(fn_body("async fn refresh_detached(")
+            .contains("run_holding(lock, async move { api.refresh_token_internal().await })"));
+        let code = &SOURCE[..SOURCE.find("mod empty_body_tests").unwrap()];
+        assert_eq!(
+            code.matches(".refresh_token_internal()").count(),
+            1,
+            "a refresh run inline"
+        );
+    }
+
+    /// REVIEW-WIN4-002: a refresh that outlived its session never puts the
+    /// tokens back: not after a Sign Out cleared them, not over another
+    /// account's. The one that still matches is stored, and persisted.
+    #[tokio::test]
+    async fn a_refresh_is_adopted_only_by_the_session_that_asked() {
+        let api = BirdoApi::new();
+        let mut persisted = Vec::new();
+
+        // Signed out while the refresh ran.
+        assert!(
+            !api.adopt_refreshed("r1", "a2".into(), Some("r2".into()), |a, r| {
+                persisted.push((a.to_owned(), r.map(str::to_owned)))
+            })
+            .await
+        );
+        assert!(!api.is_authenticated().await);
+
+        // Another account signed in meanwhile.
+        api.set_tokens("b-access".into(), "b-refresh".into()).await;
+        assert!(
+            !api.adopt_refreshed("r1", "a2".into(), Some("r2".into()), |a, r| {
+                persisted.push((a.to_owned(), r.map(str::to_owned)))
+            })
+            .await
+        );
+        assert_eq!(api.access_token_value().await.as_deref(), Some("b-access"));
+        assert!(
+            persisted.is_empty(),
+            "a dropped refresh reached the keystore"
+        );
+
+        // Still the session that asked.
+        api.set_tokens("a1".into(), "r1".into()).await;
+        assert!(
+            api.adopt_refreshed("r1", "a2".into(), Some("r2".into()), |a, r| {
+                persisted.push((a.to_owned(), r.map(str::to_owned)))
+            })
+            .await
+        );
+        assert_eq!(api.access_token_value().await.as_deref(), Some("a2"));
+        assert_eq!(persisted, vec![("a2".to_owned(), Some("r2".to_owned()))]);
+    }
+
+    #[tokio::test]
+    async fn restore_fills_an_empty_session() {
+        let api = BirdoApi::new();
+        assert!(
+            api.restore_tokens_if_absent("access".into(), "refresh".into())
+                .await
+        );
+        assert!(api.is_authenticated().await);
+    }
+
+    /// WIN-FIX-3: every control-plane request has a hard cap, because the
+    /// refresh (and the deletion's refresh) runs under `refresh_lock`, which
+    /// every other request's refresh waits for. One builder makes every
+    /// client, the deletion's around-the-tunnel one included, and it sets
+    /// both the total timeout and the connect timeout.
+    #[test]
+    fn every_control_plane_request_is_capped() {
+        const SOURCE: &str = include_str!("client.rs");
+        let builder = &SOURCE[SOURCE
+            .find("fn hardened_client_builder() -> reqwest::ClientBuilder {")
+            .unwrap()..];
+        let builder = &builder[..builder.find("\n}").unwrap()];
+        assert!(
+            builder.contains(".timeout(Duration::from_secs(30))"),
+            "{builder}"
+        );
+        assert!(
+            builder.contains(".connect_timeout(Duration::from_secs(8))"),
+            "{builder}"
+        );
+        assert_eq!(
+            // Split, or this line would be the second match.
+            SOURCE.matches(concat!("Client::", "builder()")).count(),
+            1,
+            "a second builder"
+        );
+    }
+
+    /// REVIEW-WIN2-003: both refresh-and-retry paths answer a failed refresh
+    /// through the gate's classification (tested in `session_gate`), never a
+    /// blanket `Unauthorized` — which the UI reads as "session expired" and
+    /// signs the user out over.
+    #[test]
+    fn a_failed_refresh_is_classified_not_collapsed() {
+        const SOURCE: &str = include_str!("client.rs");
+        let fn_body = |signature: &str| {
+            let start = SOURCE.find(signature).expect(signature);
+            let rest = &SOURCE[start..];
+            // The fn's own closing brace: the only line in it indented 4.
+            &rest[..rest.find("\n    }").expect("end of fn")]
+        };
+        for signature in [
+            "async fn request_with_retry<",
+            "pub async fn delete_account(",
+        ] {
+            let body = fn_body(signature);
+            assert!(
+                body.contains("session_gate::error_after_failed_refresh"),
+                "{signature}"
+            );
+            assert!(!body.contains("|_| ApiError::Unauthorized"), "{signature}");
+            assert!(
+                !body.contains("Err(ApiError::Unauthorized);"),
+                "{signature}"
+            );
+        }
+    }
+
+    /// REVIEW-WIN2-021: the expired session's teardown clears ITS tokens, and
+    /// leaves a session signed in while it ran.
+    #[tokio::test]
+    async fn an_expiry_clears_only_the_session_that_expired() {
+        let api = BirdoApi::new();
+        api.set_tokens("expired-access".into(), "expired-refresh".into())
+            .await;
+        let expired = api.access_token_value().await;
+
+        // The user signs straight back in while the old session ends.
+        api.set_tokens("new-access".into(), "new-refresh".into())
+            .await;
+        assert!(!api.clear_tokens_if(expired.as_deref()).await);
+        assert_eq!(
+            refresh_in_memory(&api).await.as_deref(),
+            Some("new-refresh")
+        );
+
+        // Nobody signed in: the expired session's tokens go.
+        let current = api.access_token_value().await;
+        assert!(api.clear_tokens_if(current.as_deref()).await);
+        assert!(!api.is_authenticated().await);
+        assert_eq!(refresh_in_memory(&api).await, None);
     }
 }

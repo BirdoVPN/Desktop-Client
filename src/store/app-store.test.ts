@@ -1,5 +1,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { useAppStore } from './app-store'
+import { migratePersistedState, useAppStore } from './app-store'
+import { selectDisplayState, selectTunnelActive } from './selectors'
+import { parseVpnStatus, type VpnStatus } from '@/lib/ipc'
+import { CONSENT_VERSION, hasCurrentConsent } from '@/lib/consent'
+
+/** A v2 status payload (snake_case), parsed exactly as the controller parses one. */
+function status(fields: Record<string, unknown>): VpnStatus {
+  const st = parseVpnStatus({ state: 'disconnected', kill_switch_blocking: false, error: null, ...fields })
+  if (!st) throw new Error('fixture did not parse')
+  return st
+}
 
 describe('useAppStore', () => {
   beforeEach(() => {
@@ -9,13 +19,14 @@ describe('useAppStore', () => {
       isLoading: false,
       userEmail: null,
       connectionState: 'disconnected',
+      pendingAction: null,
+      killSwitchBlocking: false,
+      vpnError: null,
+      commandError: null,
+      giveUp: null,
+      statusSeq: -1,
+      dnsDegraded: [],
       currentServer: null,
-      stats: {
-        bytesSent: 0,
-        bytesReceived: 0,
-        connectedAt: null,
-        serverName: null,
-      },
       servers: [],
       favoriteServers: [],
       settings: {
@@ -30,6 +41,7 @@ describe('useAppStore', () => {
         splitTunnelingEnabled: false,
         splitTunnelApps: [],
         customDns: null,
+        customDnsEnabled: false,
         protocol: 'wireguard',
         localNetworkSharing: false,
         wireGuardPort: 'auto',
@@ -43,7 +55,7 @@ describe('useAppStore', () => {
         lockdownMode: true,
         crashReportsEnabled: false,
       },
-      hasAcceptedConsent: false,
+      acceptedConsentVersion: 0,
       isOnline: true,
     })
   })
@@ -76,12 +88,18 @@ describe('useAppStore', () => {
         userEmail: 'test@birdo.app',
         connectionState: 'connected',
         currentServer: makeMockServer('us-1'),
-        stats: {
-          bytesSent: 1024,
-          bytesReceived: 2048,
-          connectedAt: '2026-01-01T00:00:00Z',
-          serverName: 'US Server',
-        },
+        lastServerId: 'us-1',
+        servers: [makeMockServer('us-1')],
+        liveStats: { bytesIn: 2048, bytesOut: 1024, uptimeSeconds: 60, latencyMs: 20 },
+        killSwitchBlocking: true,
+        pendingAction: 'disconnecting',
+        settingsHydrated: true,
+      })
+      useAppStore.getState().updateSettings({
+        preferredServerId: 'us-1',
+        multiHopEnabled: true,
+        multiHopEntryNodeId: 'ch-1',
+        multiHopExitNodeId: 'is-1',
       })
 
       useAppStore.getState().logout()
@@ -91,9 +109,20 @@ describe('useAppStore', () => {
       expect(state.userEmail).toBeNull()
       expect(state.connectionState).toBe('disconnected')
       expect(state.currentServer).toBeNull()
-      expect(state.stats.bytesSent).toBe(0)
-      expect(state.stats.bytesReceived).toBe(0)
-      expect(state.stats.connectedAt).toBeNull()
+      // The next account must not inherit this one's servers, choice or counters.
+      expect(state.lastServerId).toBeNull()
+      expect(state.servers).toEqual([])
+      expect(state.liveStats).toBeNull()
+      expect(state.killSwitchBlocking).toBe(false)
+      expect(state.pendingAction).toBeNull()
+      // REVIEW-WIN-007: nor its mirrored server, and the next session waits
+      // for its own settings load before anything writes them.
+      expect(state.settings.preferredServerId).toBeNull()
+      // REVIEW-WIN2-023: nor its Multi-Hop route, which tray Quick Connect dials.
+      expect(state.settings.multiHopEnabled).toBe(false)
+      expect(state.settings.multiHopEntryNodeId).toBeNull()
+      expect(state.settings.multiHopExitNodeId).toBeNull()
+      expect(state.settingsHydrated).toBe(false)
     })
   })
 
@@ -223,12 +252,14 @@ describe('useAppStore', () => {
 
   describe('consent', () => {
     it('should start without consent', () => {
-      expect(useAppStore.getState().hasAcceptedConsent).toBe(false)
+      expect(useAppStore.getState().acceptedConsentVersion).toBe(0)
+      expect(hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)).toBe(false)
     })
 
-    it('should accept consent', () => {
-      useAppStore.getState().setConsent(true)
-      expect(useAppStore.getState().hasAcceptedConsent).toBe(true)
+    it('accepting records the CURRENT text version (D7)', () => {
+      useAppStore.getState().acceptConsent()
+      expect(useAppStore.getState().acceptedConsentVersion).toBe(CONSENT_VERSION)
+      expect(hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)).toBe(true)
     })
   })
 
@@ -272,8 +303,8 @@ describe('useAppStore', () => {
     })
 
     it('should update wireguard port', () => {
-      useAppStore.getState().updateSettings({ wireGuardPort: '53' })
-      expect(useAppStore.getState().settings.wireGuardPort).toBe('53')
+      useAppStore.getState().updateSettings({ wireGuardPort: '51820' })
+      expect(useAppStore.getState().settings.wireGuardPort).toBe('51820')
     })
 
     it('should have auto MTU by default', () => {
@@ -325,31 +356,193 @@ describe('useAppStore', () => {
   })
 
   // ==========================================
-  // Stats
+  // Rust status (contract v2 §1): seq ordering and error ownership
   // ==========================================
 
-  describe('connection stats', () => {
-    it('should start with zeroed stats', () => {
-      const stats = useAppStore.getState().stats
-      expect(stats.bytesSent).toBe(0)
-      expect(stats.bytesReceived).toBe(0)
-      expect(stats.connectedAt).toBeNull()
-      expect(stats.serverName).toBeNull()
+  describe('applyVpnStatus', () => {
+    it('applies a newer status and records its seq', () => {
+      expect(useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 3 }))).toBe(true)
+      expect(useAppStore.getState().connectionState).toBe('connected')
+      expect(useAppStore.getState().statusSeq).toBe(3)
     })
 
-    it('should update stats', () => {
-      useAppStore.getState().setStats({
-        bytesSent: 1024,
-        bytesReceived: 2048,
-        connectedAt: '2026-01-01T00:00:00Z',
-        serverName: 'US West',
-      })
+    it('drops a status older than the one applied — the stale-poll flip-back (W2-009)', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'disconnected', seq: 5 }))
+      // A resync that read `connected` before the user's Disconnect, arriving late.
+      expect(useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 4 }))).toBe(false)
+      expect(useAppStore.getState().connectionState).toBe('disconnected')
+    })
 
-      const stats = useAppStore.getState().stats
-      expect(stats.bytesSent).toBe(1024)
-      expect(stats.bytesReceived).toBe(2048)
-      expect(stats.connectedAt).toBe('2026-01-01T00:00:00Z')
-      expect(stats.serverName).toBe('US West')
+    it('applies an EQUAL seq (a resync of the same state) without moving backwards', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 7, dns_degraded: [] }))
+      expect(
+        useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 7, dns_degraded: ['Wi-Fi'] })),
+      ).toBe(true)
+      expect(useAppStore.getState().dnsDegraded).toEqual(['Wi-Fi'])
+    })
+
+    it('an identical reading writes nothing, so subscribers do not re-render (W2-037)', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 1, dns_degraded: [] }))
+      const listener = vi.fn()
+      const unsubscribe = useAppStore.subscribe(listener)
+      useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 1, dns_degraded: [] }))
+      unsubscribe()
+      expect(listener).not.toHaveBeenCalled()
+    })
+
+    it('a pre-v2 status without `seq` or `error` is applied and leaves a command error alone', () => {
+      useAppStore.setState({ commandError: { code: 'device_limit', message: '', retryable: false, retry_after_secs: null } })
+      const legacy = parseVpnStatus({ state: 'disconnected' })!
+      expect(legacy.seq).toBeNull()
+      expect(legacy.error).toBeUndefined()
+      expect(useAppStore.getState().applyVpnStatus(legacy)).toBe(true)
+      expect(useAppStore.getState().commandError?.code).toBe('device_limit')
+    })
+
+    it('records a reconnect give-up with its kind and attempts (P1-parity-020)', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'reconnecting', seq: 1, reconnect_attempt: 9, reconnect_max: 10 }))
+      useAppStore.getState().applyVpnStatus(
+        status({
+          state: 'error',
+          seq: 2,
+          gave_up: { attempts: 10 },
+          error: { code: 'server_unreachable', message: 'x', retryable: true, retry_after_secs: null },
+        }),
+      )
+      expect(useAppStore.getState().giveUp).toEqual({ kind: 'never_established', attempts: 10 })
+      useAppStore.getState().applyVpnStatus(status({ state: 'connecting', seq: 3 }))
+      expect(useAppStore.getState().giveUp).toBeNull()
+    })
+
+    it('sees a give-up whose reconnecting status was coalesced away (REVIEW-WIN-009)', () => {
+      // A breaker trip: TearDown (connected → reconnecting) and GiveUp
+      // (→ error) back to back. The emitter sends the latest snapshot only, so
+      // the UI can go straight from connected to error.
+      useAppStore.getState().applyVpnStatus(status({ state: 'connected', seq: 1 }))
+      useAppStore.getState().applyVpnStatus(
+        status({
+          state: 'error',
+          seq: 3,
+          gaveUp: { attempts: 0 },
+          error: { code: 'server_unreachable', message: 'x', retryable: true, retry_after_secs: null },
+        }),
+      )
+      expect(useAppStore.getState().giveUp).toEqual({ kind: 'never_established', attempts: 0 })
+    })
+
+    it('an error that ends no recovery is not a give-up, whatever came before it', () => {
+      useAppStore.getState().applyVpnStatus(status({ state: 'reconnecting', seq: 1 }))
+      useAppStore.getState().applyVpnStatus(
+        status({
+          state: 'error',
+          seq: 2,
+          gaveUp: null,
+          error: { code: 'revoked', message: 'x', retryable: false, retry_after_secs: null },
+        }),
+      )
+      expect(useAppStore.getState().giveUp).toBeNull()
+    })
+  })
+
+  describe('display state (the pending command over the Rust state)', () => {
+    it('shows the pending command until Rust gets there', () => {
+      expect(selectDisplayState({ connectionState: 'disconnected', pendingAction: 'connecting' })).toBe('connecting')
+      expect(selectDisplayState({ connectionState: 'connected', pendingAction: 'connecting' })).toBe('connected')
+      expect(selectDisplayState({ connectionState: 'connected', pendingAction: 'disconnecting' })).toBe('disconnecting')
+      expect(selectDisplayState({ connectionState: 'disconnected', pendingAction: 'disconnecting' })).toBe('disconnected')
+      expect(selectDisplayState({ connectionState: 'connected', pendingAction: 'switching' })).toBe('switching')
+      expect(selectDisplayState({ connectionState: 'reconnecting', pendingAction: null })).toBe('reconnecting')
+    })
+
+    it('counts a held kill-switch block as an active tunnel, even when disconnected', () => {
+      expect(selectTunnelActive({ connectionState: 'disconnected', pendingAction: null, killSwitchBlocking: false })).toBe(false)
+      expect(selectTunnelActive({ connectionState: 'disconnected', pendingAction: null, killSwitchBlocking: true })).toBe(true)
+      expect(selectTunnelActive({ connectionState: 'error', pendingAction: null, killSwitchBlocking: false })).toBe(true)
+    })
+  })
+
+  describe('persisted settings migration', () => {
+    it('merges an older saved settings object over the defaults and carries a Custom DNS list over as ON', async () => {
+      localStorage.setItem(
+        'birdo-vpn-storage',
+        JSON.stringify({ state: { settings: { customDns: ['1.1.1.1'], killSwitchEnabled: false } }, version: 0 }),
+      )
+      await useAppStore.persist.rehydrate()
+      const s = useAppStore.getState().settings
+      expect(s.customDnsEnabled).toBe(true)
+      expect(s.killSwitchEnabled).toBe(false)
+      // A field the old object never had comes from the defaults, not undefined.
+      expect(s.lockdownMode).toBe(true)
+      localStorage.removeItem('birdo-vpn-storage')
+    })
+
+    // D7: the consent boolean became the version of the text accepted.
+    it('an old consent TRUE becomes version 1, so an existing user sees the current text once', async () => {
+      localStorage.setItem(
+        'birdo-vpn-storage',
+        JSON.stringify({ state: { hasAcceptedConsent: true, settings: { killSwitchEnabled: false } }, version: 0 }),
+      )
+      await useAppStore.persist.rehydrate()
+      expect(useAppStore.getState().acceptedConsentVersion).toBe(1)
+      expect(hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)).toBe(false)
+      expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false)
+
+      useAppStore.getState().acceptConsent()
+      const blob = localStorage.getItem('birdo-vpn-storage') ?? '{}'
+      const stored = JSON.parse(blob)
+      // The blob is rewritten under the current version (2 since WIN-FIX-3).
+      expect(stored.version).toBe(2)
+      expect(stored.state.acceptedConsentVersion).toBe(CONSENT_VERSION)
+      expect(stored.state).not.toHaveProperty('hasAcceptedConsent')
+
+      // The next start reads the current version: not asked again. (The
+      // reset below is persisted too, so the saved blob is put back first.)
+      useAppStore.setState({ acceptedConsentVersion: 0 })
+      localStorage.setItem('birdo-vpn-storage', blob)
+      await useAppStore.persist.rehydrate()
+      expect(hasCurrentConsent(useAppStore.getState().acceptedConsentVersion)).toBe(true)
+      localStorage.removeItem('birdo-vpn-storage')
+    })
+
+    it('an old FALSE, or no answer at all, is never-accepted', () => {
+      expect(migratePersistedState({ hasAcceptedConsent: false }, 0)).toEqual({ acceptedConsentVersion: 0 })
+      expect(migratePersistedState({ lastServerId: 'x' }, 0)).toEqual({ lastServerId: 'x', acceptedConsentVersion: 0 })
+      expect(migratePersistedState(undefined, 0)).toEqual({ acceptedConsentVersion: 0 })
+      // A blob already on version 1 is left alone.
+      expect(migratePersistedState({ acceptedConsentVersion: 2 }, 1)).toEqual({ acceptedConsentVersion: 2 })
+    })
+
+    // WIN-FIX-3: no relay answers WireGuard on 53 or a custom port, so a
+    // saved one becomes "auto" once; the two real choices are kept.
+    it('a dead WireGuard port is migrated to auto (1 → 2)', () => {
+      for (const [stored, migrated] of [
+        ['53', 'auto'],
+        ['1194', 'auto'],
+        ['', 'auto'],
+        ['auto', 'auto'],
+        ['51820', '51820'],
+      ]) {
+        const out = migratePersistedState({ settings: { wireGuardPort: stored, autoConnect: true } }, 1) as {
+          settings: Record<string, unknown>
+        }
+        expect(out.settings).toEqual({ wireGuardPort: migrated, autoConnect: true })
+      }
+      // Already on version 2: untouched.
+      expect(migratePersistedState({ settings: { wireGuardPort: '53' } }, 2)).toEqual({
+        settings: { wireGuardPort: '53' },
+      })
+      // No settings in the blob: nothing is added.
+      expect(migratePersistedState({ acceptedConsentVersion: 1 }, 1)).toEqual({ acceptedConsentVersion: 1 })
+    })
+
+    it('a stored port 53 rehydrates as auto', async () => {
+      localStorage.setItem(
+        'birdo-vpn-storage',
+        JSON.stringify({ state: { settings: { wireGuardPort: '53' }, acceptedConsentVersion: 1 }, version: 1 }),
+      )
+      await useAppStore.persist.rehydrate()
+      expect(useAppStore.getState().settings.wireGuardPort).toBe('auto')
+      localStorage.removeItem('birdo-vpn-storage')
     })
   })
 })

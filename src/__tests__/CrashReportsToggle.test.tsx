@@ -73,6 +73,9 @@ const mockStoreState = {
   windowCorner: 'bottom-left',
   setWindowCorner: vi.fn(),
   pushRoute: vi.fn(),
+  // What the Custom DNS row reads (the server's per-plan flag, item 40).
+  account: { plan: null },
+  customDnsByPlan: {},
 };
 
 vi.mock('@/store/app-store', () => {

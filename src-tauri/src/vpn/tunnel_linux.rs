@@ -506,12 +506,21 @@ impl LinuxTunnel {
         }
     }
 
-    /// Measure latency to the VPN endpoint.
-    pub async fn measure_latency(&self) -> Option<u32> {
+    /// Time since the last completed WireGuard handshake (W1-002). `None` once
+    /// the WireGuard session is gone (the tunnel is being stopped).
+    pub async fn handshake_age(&self) -> Option<std::time::Duration> {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .map(|session| session.handshake_age())
+    }
+
+    /// Start a handshake now unless one is in flight (see
+    /// `WireGuardSession::force_handshake`).
+    pub async fn force_handshake(&self) {
         if let Some(session) = self.wg_session.read().await.as_ref() {
-            session.measure_latency().await
-        } else {
-            None
+            session.force_handshake().await;
         }
     }
 
@@ -2231,6 +2240,7 @@ mod configure_ipv6_tests {
             endpoint: "192.0.2.1:51820".into(),
             allowed_ips: vec!["0.0.0.0/0".into()],
             dns: vec![],
+            custom_dns: false,
             client_ip: "10.0.0.2".into(),
             client_ipv6: Some(format!("{V6}/128")),
             // The backend always sends ::/0 (vpn.service.ts). Using the real

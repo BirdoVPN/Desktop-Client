@@ -1,5 +1,10 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import type { IpcError, LiveMultiHop, VpnPhase, VpnState, VpnStats, VpnStatus } from '@/lib/ipc';
+import { giveUpKind, type GiveUpKind } from '@/lib/errors';
+import type { PlanId } from '@/lib/plan';
+import { CONSENT_VERSION } from '@/lib/consent';
+import { normalizeWireGuardPort } from '@/utils/helpers';
 
 export interface Server {
   id: string;
@@ -11,7 +16,6 @@ export interface Server {
   ipAddress?: string;
   port?: number;
   load: number;
-  ping?: number;
   isPremium: boolean;
   /** Minimum plan required to connect: 'RECON' | 'OPERATIVE' | 'SOVEREIGN'. */
   minPlan?: string;
@@ -23,27 +27,34 @@ export interface Server {
   isAccessible: boolean;
 }
 
-export interface ConnectionStats {
-  bytesSent: number;
-  bytesReceived: number;
-  connectedAt: string | null;
-  serverName: string | null;
-}
+/**
+ * The connection state RUST reports (contract v2 §1). The old union also had
+ * `authenticating` / `stealth_connecting` (now `connecting` + `phase`) and
+ * `rekeying` / `kill_switch_active`, which no Rust path ever produced (W2-004,
+ * W2-039) — the "Kill switch is blocking" banner they gated was unreachable.
+ * Blocking is the separate `killSwitchBlocking` bit now, because it is true
+ * across several states (reconnecting, switching, error, always-on idle).
+ */
+export type ConnectionState = VpnState;
 
-export type ConnectionState =
-  | 'disconnected'
-  | 'connecting'
-  | 'authenticating'
-  | 'stealth_connecting'
-  | 'connected'
-  | 'disconnecting'
-  | 'reconnecting'
-  | 'rekeying'
-  | 'kill_switch_active'
-  | 'error';
+/**
+ * A command the USER started that has not settled yet. Kept apart from
+ * `connectionState` so an optimistic "Disconnecting…" is never mistaken for a
+ * Rust reading, and a Rust reading can never be overwritten by an optimistic
+ * guess (the stale-poll flip-back, W2-009). See `selectDisplayState`.
+ */
+export type PendingAction = 'connecting' | 'disconnecting' | 'switching';
+
+export type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 
 export interface AccountInfo {
   email: string | null;
+  /**
+   * `null` = NOT KNOWN YET (W2-011). `get_auth_state` never carries a plan, so
+   * this stays null until `get_subscription_status` answers, and a null read
+   * as Recon showed paying users locks, upsells and "Free plan". Consumers go
+   * through `lib/plan.ts`, whose rank is `null` for unknown.
+   */
   plan: string | null;
   accountId: string | null;
   maxDevices: number;
@@ -58,10 +69,17 @@ export interface AccountInfo {
    * the confirmation prompt rather than silently dropping it.
    */
   hasPassword: boolean;
+  /**
+   * `isAnonymous` / `accountType` from `/auth/me` (Account API contract item
+   * 86). `null` = the server did not say (a backend that predates the field);
+   * `resolveAnonymousAccount` then reads the email's shape.
+   */
+  isAnonymous: boolean | null;
+  /** Item 86: the anonymous account number. A credential: never logged. */
+  accountNumber: string | null;
 }
 
 export type Protocol = 'wireguard';
-
 
 /**
  * Where the (frameless) window sits. The four corners pin it to that corner of
@@ -75,8 +93,8 @@ export type WindowCorner =
   | 'bottom-right'
   | 'free';
 
-// ── Navigation (mobile-parity 3-tab bottom nav + push sub-screens) ──────────
-export type TabId = 'profile' | 'home' | 'settings';
+// ── Navigation (the canonical four tabs + push sub-screens) ───────────────
+export type TabId = 'profile' | 'home' | 'limit' | 'settings';
 export type RouteId =
   | 'vpnSettings'
   | 'splitTunnel'
@@ -98,11 +116,20 @@ export interface AppSettings {
   preferredServerId: string | null;
   splitTunnelingEnabled: boolean;
   splitTunnelApps: string[];
+  /**
+   * The user's Custom DNS addresses, kept while the feature is switched OFF
+   * (P1-parity-042): Rust has one `custom_dns` field and no on/off flag, so
+   * `settingsToRust` sends these only while `customDnsEnabled` is on and
+   * `null` otherwise. Turning the switch off therefore no longer throws the
+   * addresses away — they stay here (localStorage) until it is turned back on.
+   */
   customDns: string[] | null;
+  /** Frontend-only, like the notification sub-toggles. See `customDns`. */
+  customDnsEnabled: boolean;
   protocol: Protocol;
   // VPN settings (matching Android VpnSettingsScreen)
   localNetworkSharing: boolean;
-  wireGuardPort: string; // 'auto' | '51820' | '53' | custom port
+  wireGuardPort: WireGuardPort;
   wireGuardMtu: number;  // 0 = automatic, 1280-1500 custom
   // Multi-Hop (Double VPN)
   multiHopEnabled: boolean;
@@ -117,21 +144,14 @@ export interface AppSettings {
   dnsFiltering: boolean;
   // LOCKDOWN (always-on kill switch, Windows WFP). ON by default on Windows
   // (Rust `AppSettings::default()`, desktop #34); switchable in Settings ›
-  // Security › "Always-on kill switch" (Windows only, applies from the next
-  // connection). Carried in the store so settings saves round-trip it instead
-  // of silently resetting the persisted flag to the Rust serde default.
+  // Privacy & Security › "Always-on Kill Switch" (Windows only, applies from
+  // the next connection). Carried in the store so settings saves round-trip it
+  // instead of silently resetting the persisted flag to the Rust serde default.
   lockdownMode: boolean;
   // Crash reports to Sentry. OPT-IN, OFF by default (audit 2026-09-29, C-3).
   // Written through the dedicated `set_crash_reports_enabled` command (consent
-  // screen, Settings › Privacy) and round-tripped by every full save.
+  // screen, Settings › Privacy & Security) and round-tripped by every full save.
   crashReportsEnabled: boolean;
-}
-
-export interface MultiHopRoute {
-  entryNodeId: string;
-  exitNodeId: string;
-  entryCountry: string;
-  exitCountry: string;
 }
 
 export interface PortForward {
@@ -144,20 +164,96 @@ export interface PortForward {
   createdAt?: string;
 }
 
-interface AppState {
+/** `get_usage_stats` (/vpn/stats), camelCase on the wire. */
+export interface UsageStats {
+  plan: string | null;
+  bandwidthLimitGb: number | null;
+  bandwidthUsedGb: number | null;
+  bandwidthPeriodEnd: string | null;
+  bandwidthLastSyncAt: string | null;
+  bandwidthIsFresh: boolean | null;
+}
+
+/** Why auto-reconnect stopped (P1-parity-020); rendered by `giveUpMessage`. */
+export interface GiveUp {
+  kind: GiveUpKind;
+  attempts: number | null;
+}
+
+/**
+ * The one transient message surface (W2-013): settings that failed to save, a
+ * live reapply that failed, upsells, deep-link refusals. Rendered once, by
+ * `NoticeHost`, as a polite live region — instead of each screen hand-rolling
+ * its own toast or dropping the failure on the floor.
+ */
+export interface Notice {
+  id: number;
+  text: string;
+  tone: 'info' | 'danger';
+  actionLabel?: string;
+  onAction?: () => void;
+}
+
+export interface AppState {
   // Auth
   isAuthenticated: boolean;
   isLoading: boolean;
   userEmail: string | null;
+  /** Set when Rust (or a command) ended the session; Login shows why (W2-006). */
+  sessionEndedReason: 'expired' | 'revoked' | null;
 
   // Consent
-  hasAcceptedConsent: boolean;
+  /**
+   * The consent text version the user accepted, 0 for none (D7). The screen
+   * shows while it is older than `CONSENT_VERSION` (`hasCurrentConsent`).
+   */
+  acceptedConsentVersion: number;
 
   // Account
   account: AccountInfo;
+  planStatus: LoadStatus;
 
-  // Connection
+  // Connection — what Rust last reported (see applyVpnStatus)
   connectionState: ConnectionState;
+  vpnPhase: VpnPhase | null;
+  reconnectAttempt: number | null;
+  reconnectMax: number | null;
+  killSwitchBlocking: boolean;
+  /** The error Rust attached to the status (contract §1: non-null iff `error`). */
+  vpnError: IpcError | null;
+  /**
+   * The error the user's own last command rejected with. Separate from
+   * `vpnError` so a status reading that says nothing about errors (a pre-v2
+   * backend, or a refusal that left Rust in `disconnected`) cannot erase the
+   * answer to what the user just clicked. Cleared by the next command, or once
+   * a tunnel is up.
+   */
+  commandError: IpcError | null;
+  giveUp: GiveUp | null;
+  liveServerId: string | null;
+  /** Fallback for resolving the live server on a backend without `server_id`. */
+  liveServerName: string | null;
+  liveMultiHop: LiveMultiHop | null;
+  stealthActive: boolean;
+  connectedAt: string | null;
+  /**
+   * Byte counters, uptime and latency from `get_vpn_stats`, polled only while
+   * the window is visible and a tunnel is up. Its own field so a 2 s counter
+   * tick re-renders the stats row and nothing else.
+   */
+  liveStats: VpnStats | null;
+  /**
+   * Physical adapters whose DNS this session could not verifiably park or put
+   * back. Held across every connection state on purpose: the failure that
+   * matters most is an adapter left un-restored AFTER a disconnect, and clearing
+   * it on disconnect would hide exactly the case it exists for.
+   */
+  dnsDegraded: string[];
+  /** Last applied status `seq`; statuses older than this are dropped (W2-009). */
+  statusSeq: number;
+  pendingAction: PendingAction | null;
+
+  /** The user's server choice (not necessarily the one the tunnel is on). */
   currentServer: Server | null;
   /**
    * The server the user last actually connected to. Persisted (currentServer is
@@ -166,16 +262,28 @@ interface AppState {
    * happens to sort first in the list.
    */
   lastServerId: string | null;
-  stats: ConnectionStats;
-  vpnIp: string | null;
 
   // Servers
   servers: Server[];
+  serversStatus: LoadStatus;
+  /**
+   * Latency per server id, kept apart from `servers` so a ping result touches
+   * one map instead of re-creating every server object (and re-rendering every
+   * subscriber) per probe, and so a list refresh keeps the last measurements
+   * instead of blanking them (W2-023).
+   */
+  serverPings: Record<string, number>;
   favoriteServers: string[];
+
+  // Usage (Limit tab)
+  usage: UsageStats | null;
+  usageStatus: LoadStatus;
 
   // Settings
   settings: AppSettings;
   settingsHydrated: boolean;
+  /** A live `reapply_vpn_settings` is in flight (VPN Settings says so). */
+  reapplying: boolean;
 
   /**
    * BirdoShield (D18) FLEET GATE, from `GET /api/client-config`
@@ -203,69 +311,84 @@ interface AppState {
   dnsFilteringAvailable: boolean | undefined;
   setDnsFilteringAvailable: (available: boolean) => void;
 
-  // Multi-Hop & Port Forwarding
-  multiHopRoutes: MultiHopRoute[];
+  /**
+   * `features.<PLAN>.customDns` from `GET /api/client-config` (Account API
+   * contract item 40), only the plans the server gave an explicit boolean for.
+   * Custom DNS is on every plan (owner decision D6), so the server sends `true`
+   * for each; a plan missing here is ENABLED (`customDnsAvailable`). Like the
+   * fleet gate above: a property of the service, not of the account, so it is
+   * neither persisted nor cleared on logout.
+   */
+  customDnsByPlan: Partial<Record<PlanId, boolean>>;
+  setCustomDnsByPlan: (byPlan: Partial<Record<PlanId, boolean>>) => void;
+
   portForwards: PortForward[];
 
-  // Actions — Auth
-  setAuthenticated: (auth: boolean) => void;
-  setLoading: (loading: boolean) => void;
-  setUserEmail: (email: string | null) => void;
+  /** `null` until `get_admin_status` answers, so the warning cannot flash at startup. */
+  isAdmin: boolean | null;
 
-  // Actions — Consent
-  setConsent: (accepted: boolean) => void;
-
-  // Actions — Account
-  setAccount: (account: Partial<AccountInfo>) => void;
-
-  // Admin status
-  isAdmin: boolean;
-  setIsAdmin: (admin: boolean) => void;
-
-  // Error
-  errorMessage: string | null;
-  setErrorMessage: (msg: string | null) => void;
-
-  // Actions — Connection
-  setConnectionState: (state: ConnectionState) => void;
-  setCurrentServer: (server: Server | null) => void;
-  setStats: (stats: ConnectionStats) => void;
-  setVpnIp: (ip: string | null) => void;
-
-  // Actions — Servers
-  setServers: (servers: Server[]) => void;
-  toggleFavorite: (serverId: string) => void;
-  setServerPing: (serverId: string, ping: number) => void;
-
-  // Actions — Settings
-  updateSettings: (settings: Partial<AppSettings>) => void;
-  hydrateSettings: (settings: AppSettings) => void;
-
-  // Actions — Multi-Hop & Port Forwarding
-  setPortForwards: (forwards: PortForward[]) => void;
+  notice: Notice | null;
 
   // Network
   isOnline: boolean;
-  setOnline: (online: boolean) => void;
-
 
   // Window position (frameless corner anchor / draggable). Persisted.
   windowCorner: WindowCorner;
-  setWindowCorner: (corner: WindowCorner) => void;
 
   // Deep link
   deepLinkAction: { action: string; serverId?: string } | null;
-  setDeepLinkAction: (action: { action: string; serverId?: string } | null) => void;
+  /**
+   * A birdo://connect target staged for an explicit Accept (W2 "must not be
+   * broken": a link is third-party input and never moves the egress on its
+   * own). Rendered by AppShell so it shows on whatever tab is open.
+   */
+  deepLinkConfirm: Server | null;
 
-  // ── Navigation (mobile-parity router; NOT persisted) ──────────────────
-  // Bottom-nav tabs + a per-session push stack for slide-in sub-screens.
+  // ── Navigation (NOT persisted) ─────────────────────────────────────────
   tab: TabId;
   navStack: RouteId[];
+
+  // Actions
+  setAuthenticated: (auth: boolean) => void;
+  setLoading: (loading: boolean) => void;
+  setUserEmail: (email: string | null) => void;
+  setSessionEndedReason: (reason: 'expired' | 'revoked' | null) => void;
+  /** Accept the CURRENT consent text. */
+  acceptConsent: () => void;
+  setAccount: (account: Partial<AccountInfo>) => void;
+  setPlanStatus: (status: LoadStatus) => void;
+  setIsAdmin: (admin: boolean) => void;
+  /**
+   * Apply a Rust status reading. Returns false when it was dropped for being
+   * older than what is already on screen. Writes only the fields that changed,
+   * so an idle resync re-renders nothing (W2-037).
+   */
+  applyVpnStatus: (status: VpnStatus) => boolean;
+  /** A local mirror of a state Rust is known to have reached (no seq). */
+  setConnectionState: (state: ConnectionState) => void;
+  setPendingAction: (action: PendingAction | null) => void;
+  setCommandError: (error: IpcError | null) => void;
+  setLiveStats: (stats: VpnStats | null) => void;
+  setCurrentServer: (server: Server | null) => void;
+  setLastServerId: (id: string | null) => void;
+  setServers: (servers: Server[]) => void;
+  setServersStatus: (status: LoadStatus) => void;
+  mergeServerPings: (pings: Record<string, number>) => void;
+  toggleFavorite: (serverId: string) => void;
+  setUsage: (usage: UsageStats | null, status: LoadStatus) => void;
+  updateSettings: (settings: Partial<AppSettings>) => void;
+  hydrateSettings: (settings: AppSettings) => void;
+  setReapplying: (reapplying: boolean) => void;
+  setPortForwards: (forwards: PortForward[]) => void;
+  showNotice: (notice: Omit<Notice, 'id'>) => number;
+  dismissNotice: (id: number) => void;
+  setOnline: (online: boolean) => void;
+  setWindowCorner: (corner: WindowCorner) => void;
+  setDeepLinkAction: (action: { action: string; serverId?: string } | null) => void;
+  setDeepLinkConfirm: (server: Server | null) => void;
   setTab: (tab: TabId) => void;
   pushRoute: (route: RouteId) => void;
   popRoute: () => void;
-
-  // Actions — Logout
   logout: () => void;
 }
 
@@ -280,9 +403,48 @@ const defaultAccount: AccountInfo = {
   bandwidthLimit: 0,
   status: 'unknown',
   hasPassword: true,
+  isAnonymous: null,
+  accountNumber: null,
 };
 
-const defaultSettings: AppSettings = {
+/**
+ * The WireGuard ports a setting can hold. The relays accept WireGuard on UDP
+ * 51820 only (all ten measured: no DNAT, nothing on a public 53), so "53" and
+ * a custom port are gone; "Automatic" dials the server's endpoint, which is
+ * 51820 too. Same rule in Rust (`dialable_wireguard_port`) and on Android;
+ * `normalizeWireGuardPort` maps anything else to "auto".
+ */
+export type WireGuardPort = 'auto' | '51820';
+
+/**
+ * Persisted-state migrations, from the version the blob was written under.
+ *
+ * 0 → 1 (D7): `hasAcceptedConsent: boolean` becomes `acceptedConsentVersion`.
+ * A `true` was given to the text that preceded versioning, version 1, so an
+ * existing user sees the current text once; anything else is 0 (never
+ * accepted). The rest of the blob is untouched: `merge` lays the settings over
+ * the defaults as before.
+ *
+ * 1 → 2 (WIN-FIX-3): a WireGuard port of "53" or a custom number, which no
+ * relay answers, becomes "auto".
+ */
+export function migratePersistedState(persisted: unknown, fromVersion: number): unknown {
+  const p: Record<string, unknown> =
+    typeof persisted === 'object' && persisted !== null ? { ...(persisted as Record<string, unknown>) } : {};
+  if (fromVersion < 1) {
+    p.acceptedConsentVersion = p.hasAcceptedConsent === true ? 1 : 0;
+    delete p.hasAcceptedConsent;
+  }
+  if (fromVersion < 2 && typeof p.settings === 'object' && p.settings !== null) {
+    const settings = p.settings as Record<string, unknown>;
+    if ('wireGuardPort' in settings) {
+      p.settings = { ...settings, wireGuardPort: normalizeWireGuardPort(settings.wireGuardPort) };
+    }
+  }
+  return p;
+}
+
+export const defaultSettings: AppSettings = {
   killSwitchEnabled: true,
   autoConnect: false,
   autostart: false,
@@ -294,6 +456,7 @@ const defaultSettings: AppSettings = {
   splitTunnelingEnabled: false,
   splitTunnelApps: [],
   customDns: null,
+  customDnsEnabled: false,
   protocol: 'wireguard',
   localNetworkSharing: false,
   wireGuardPort: 'auto',
@@ -314,115 +477,168 @@ const defaultSettings: AppSettings = {
   crashReportsEnabled: false,
 };
 
+/** The session's connection fields, as they are with no tunnel and no reading. */
+const idleConnection = {
+  connectionState: 'disconnected' as ConnectionState,
+  vpnPhase: null,
+  reconnectAttempt: null,
+  reconnectMax: null,
+  killSwitchBlocking: false,
+  vpnError: null,
+  commandError: null,
+  giveUp: null,
+  liveServerId: null,
+  liveServerName: null,
+  liveMultiHop: null,
+  stealthActive: false,
+  connectedAt: null,
+  liveStats: null,
+  pendingAction: null,
+};
+
+const sameStrings = (a: readonly string[], b: readonly string[]) =>
+  a.length === b.length && a.every((v, i) => v === b[i]);
+
+const sameError = (a: IpcError | null, b: IpcError | null) =>
+  a === b || (!!a && !!b && a.code === b.code && a.message === b.message);
+
+const sameRoute = (a: LiveMultiHop | null, b: LiveMultiHop | null) =>
+  a === b || (!!a && !!b && a.entryId === b.entryId && a.exitId === b.exitId);
+
+let noticeSeq = 0;
+
+/** The store's state, for helpers that take a snapshot (selectors, tests). */
+export type AppStateSnapshot = AppState;
+
 export const useAppStore = create<AppState>()(
   persist(
     (set, get) => ({
-      // Initial state
       isAuthenticated: false,
       isLoading: false,
       userEmail: null,
-      hasAcceptedConsent: false,
+      sessionEndedReason: null,
+      acceptedConsentVersion: 0,
       isOnline: true,
       account: { ...defaultAccount },
+      planStatus: 'idle',
 
+      ...idleConnection,
+      dnsDegraded: [],
+      statusSeq: -1,
 
-      windowCorner: 'bottom-left' as WindowCorner,
-      setWindowCorner: (windowCorner) => set({ windowCorner }),
-
-      // Deep link
-      deepLinkAction: null,
-      setDeepLinkAction: (action) => set({ deepLinkAction: action }),
-
-      // Navigation (not persisted — see partialize)
-      tab: 'home' as TabId,
-      navStack: [],
-      setTab: (tab) => set({ tab, navStack: [] }),
-      pushRoute: (route) =>
-        set((state) => ({ navStack: [...state.navStack, route] })),
-      popRoute: () =>
-        set((state) => ({ navStack: state.navStack.slice(0, -1) })),
-
-      connectionState: 'disconnected' as ConnectionState,
       currentServer: null,
       lastServerId: null,
-      isAdmin: false,
-      errorMessage: null,
-      stats: {
-        bytesSent: 0,
-        bytesReceived: 0,
-        connectedAt: null,
-        serverName: null,
-      },
-      vpnIp: null,
-
       servers: [],
+      serversStatus: 'idle',
+      serverPings: {},
       favoriteServers: [],
+      usage: null,
+      usageStatus: 'idle',
 
       settings: { ...defaultSettings },
       settingsHydrated: false,
+      reapplying: false,
 
       // See the AppState doc comment: true until the server says otherwise.
       dnsFilteringAvailable: true,
       setDnsFilteringAvailable: (dnsFilteringAvailable) => set({ dnsFilteringAvailable }),
+      customDnsByPlan: {},
+      setCustomDnsByPlan: (customDnsByPlan) => set({ customDnsByPlan }),
 
-      multiHopRoutes: [],
       portForwards: [],
+      isAdmin: null,
+      notice: null,
+      windowCorner: 'bottom-left' as WindowCorner,
+      deepLinkAction: null,
+      deepLinkConfirm: null,
+      tab: 'home' as TabId,
+      navStack: [],
 
-      // Auth actions
       setAuthenticated: (auth) => set({ isAuthenticated: auth }),
       setLoading: (loading) => set({ isLoading: loading }),
       setUserEmail: (email) => set({ userEmail: email }),
-
-      // Consent actions
-      setConsent: (accepted) => set({ hasAcceptedConsent: accepted }),
-
-      // Network actions
-      setOnline: (online) => set({ isOnline: online }),
-
-      // Account actions
-      setAccount: (partial) =>
-        set((state) => ({
-          account: { ...state.account, ...partial },
-        })),
-
-      // Error actions
-      setErrorMessage: (msg) => set({ errorMessage: msg }),
+      setSessionEndedReason: (sessionEndedReason) => set({ sessionEndedReason }),
+      acceptConsent: () => set({ acceptedConsentVersion: CONSENT_VERSION }),
+      setAccount: (partial) => set((state) => ({ account: { ...state.account, ...partial } })),
+      setPlanStatus: (planStatus) => set({ planStatus }),
       setIsAdmin: (admin) => set({ isAdmin: admin }),
 
-      // Connection actions
-      setConnectionState: (connectionState) => set({ connectionState, ...(connectionState !== 'error' ? { errorMessage: null } : {}) }),
-      setCurrentServer: (server) =>
-        set(server ? { currentServer: server, lastServerId: server.id } : { currentServer: null }),
-      setStats: (stats) => set({ stats }),
-      setVpnIp: (ip) => set({ vpnIp: ip }),
+      applyVpnStatus: (st) => {
+        const s = get();
+        // Contract §1: drop anything older than what is already applied. An
+        // EQUAL seq is the same state re-read (a resync), so it is applied —
+        // it can only refresh fields, never move the state backwards.
+        if (st.seq !== null && st.seq < s.statusSeq) return false;
 
-      // Server actions
+        const patch: Partial<AppState> = {};
+        if (st.seq !== null && st.seq !== s.statusSeq) patch.statusSeq = st.seq;
+        if (st.state !== s.connectionState) patch.connectionState = st.state;
+        if (st.phase !== s.vpnPhase) patch.vpnPhase = st.phase;
+        if (st.reconnectAttempt !== s.reconnectAttempt) patch.reconnectAttempt = st.reconnectAttempt;
+        if (st.reconnectMax !== s.reconnectMax) patch.reconnectMax = st.reconnectMax;
+        if (st.killSwitchBlocking !== s.killSwitchBlocking) patch.killSwitchBlocking = st.killSwitchBlocking;
+        if (st.serverId !== s.liveServerId) patch.liveServerId = st.serverId;
+        if (st.serverName !== s.liveServerName) patch.liveServerName = st.serverName;
+        if (!sameRoute(st.multiHop, s.liveMultiHop)) patch.liveMultiHop = st.multiHop;
+        if (st.stealthActive !== s.stealthActive) patch.stealthActive = st.stealthActive;
+        if (st.connectedAt !== s.connectedAt) patch.connectedAt = st.connectedAt;
+        if (st.dnsDegraded !== undefined && !sameStrings(st.dnsDegraded, s.dnsDegraded)) {
+          patch.dnsDegraded = st.dnsDegraded;
+        }
+
+        // `undefined` = a pre-v2 backend that does not send the field: it
+        // says nothing about errors, so it changes nothing.
+        if (st.error !== undefined && !sameError(st.error, s.vpnError)) patch.vpnError = st.error;
+        if (st.state === 'connected' && s.commandError) patch.commandError = null;
+
+        // Auto-reconnect gave up: Rust marks the final status itself
+        // (REVIEW-WIN-009). Inferring it from a `reconnecting → error`
+        // transition missed every give-up whose intermediate status was
+        // coalesced away (a breaker trip arrives as `connected → error`).
+        const giveUp: GiveUp | null =
+          st.state === 'error' && st.gaveUp
+            ? { kind: giveUpKind(st.error ?? null), attempts: st.gaveUp.attempts }
+            : null;
+        if (giveUp?.kind !== s.giveUp?.kind || giveUp?.attempts !== s.giveUp?.attempts) {
+          patch.giveUp = giveUp;
+        }
+
+        if (Object.keys(patch).length > 0) set(patch);
+        return true;
+      },
+      setConnectionState: (connectionState) =>
+        set({
+          connectionState,
+          ...(connectionState !== 'error' ? { vpnError: null, commandError: null, giveUp: null } : {}),
+          ...(connectionState === 'disconnected' ? { killSwitchBlocking: false } : {}),
+        }),
+      setPendingAction: (pendingAction) => set({ pendingAction }),
+      setCommandError: (commandError) => set({ commandError }),
+      setLiveStats: (liveStats) => set({ liveStats }),
+      setCurrentServer: (currentServer) => set({ currentServer }),
+      setLastServerId: (lastServerId) => set({ lastServerId }),
+
       setServers: (servers) => set({ servers }),
+      setServersStatus: (serversStatus) => set({ serversStatus }),
+      mergeServerPings: (pings) =>
+        set((state) => ({ serverPings: { ...state.serverPings, ...pings } })),
       toggleFavorite: (serverId) => {
         const favorites = get().favoriteServers;
-        if (favorites.includes(serverId)) {
-          set({ favoriteServers: favorites.filter((id) => id !== serverId) });
-        } else {
-          set({ favoriteServers: [...favorites, serverId] });
-        }
+        set({
+          favoriteServers: favorites.includes(serverId)
+            ? favorites.filter((id) => id !== serverId)
+            : [...favorites, serverId],
+        });
       },
-      setServerPing: (serverId, ping) => {
-        const servers = get().servers.map((s) =>
-          s.id === serverId ? { ...s, ping } : s
-        );
-        set({ servers });
-      },
+      setUsage: (usage, usageStatus) => set({ usage, usageStatus }),
 
-      // Settings actions
       updateSettings: (partial) =>
-        set((state) => ({
-          settings: { ...state.settings, ...partial },
-        })),
+        set((state) => ({ settings: { ...state.settings, ...partial } })),
       hydrateSettings: (s) =>
         set((state) => ({
-          // Keep frontend-only preferences (notification detail sub-toggles)
-          // that the Rust backend doesn't round-trip; merge the Rust-owned
-          // fields on top of defaults + the current (localStorage) state.
+          // Keep frontend-only preferences that the Rust backend doesn't
+          // round-trip; merge the Rust-owned fields on top of defaults + the
+          // current (localStorage) state.
           settings: {
             ...defaultSettings,
             ...s,
@@ -431,37 +647,71 @@ export const useAppStore = create<AppState>()(
             // value so the user's choice survives a get_settings hydrate.
             showIpInNotification: state.settings.showIpInNotification,
             showLocationInNotification: state.settings.showLocationInNotification,
+            // Rust sends `custom_dns: null` while Custom DNS is switched off;
+            // the addresses the user entered live here (see AppSettings).
+            customDns: s.customDns ?? state.settings.customDns,
           },
           settingsHydrated: true,
         })),
-
-      // Multi-Hop & Port Forwarding actions
+      setReapplying: (reapplying) => set({ reapplying }),
       setPortForwards: (forwards) => set({ portForwards: forwards }),
 
-      // Logout
+      showNotice: (notice) => {
+        const id = ++noticeSeq;
+        set({ notice: { ...notice, id } });
+        return id;
+      },
+      dismissNotice: (id) => {
+        if (get().notice?.id === id) set({ notice: null });
+      },
+
+      setOnline: (online) => set({ isOnline: online }),
+      setWindowCorner: (windowCorner) => set({ windowCorner }),
+      setDeepLinkAction: (action) => set({ deepLinkAction: action }),
+      setDeepLinkConfirm: (deepLinkConfirm) => set({ deepLinkConfirm }),
+
+      setTab: (tab) => set({ tab, navStack: [] }),
+      pushRoute: (route) => set((state) => ({ navStack: [...state.navStack, route] })),
+      popRoute: () => set((state) => ({ navStack: state.navStack.slice(0, -1) })),
+
       logout: () =>
-        set({
+        set((state) => ({
           isAuthenticated: false,
           userEmail: null,
           account: { ...defaultAccount },
-          connectionState: 'disconnected' as ConnectionState,
+          planStatus: 'idle',
+          ...idleConnection,
           currentServer: null,
           // Cleared on logout: the next account to sign in on this machine must
-          // not inherit the previous user's server choice.
+          // not inherit the previous user's server choice, Multi-Hop route,
+          // server access or usage. Rust forgets the same at its own account
+          // boundaries (sign-out, deletion, an expired session — REVIEW-WIN-007,
+          // REVIEW-WIN2-023).
           lastServerId: null,
-          vpnIp: null,
-          errorMessage: null,
-          stats: {
-            bytesSent: 0,
-            bytesReceived: 0,
-            connectedAt: null,
-            serverName: null,
+          settings: {
+            ...state.settings,
+            preferredServerId: null,
+            multiHopEnabled: false,
+            multiHopEntryNodeId: null,
+            multiHopExitNodeId: null,
           },
+          // The next session waits for ITS settings load: writers gated on
+          // hydration (the preferred-server mirror) would otherwise save this
+          // session's copy over Rust's before the next one has read it.
+          settingsHydrated: false,
+          servers: [],
+          serversStatus: 'idle',
+          serverPings: {},
+          usage: null,
+          usageStatus: 'idle',
+          portForwards: [],
+          notice: null,
+          deepLinkConfirm: null,
           // Reset navigation so a logged-out user doesn't return to a stale
           // deep screen (settings/server list) on next login.
           tab: 'home' as TabId,
           navStack: [],
-        }),
+        })),
     }),
     {
       name: 'birdo-vpn-storage',
@@ -471,9 +721,29 @@ export const useAppStore = create<AppState>()(
         favoriteServers: state.favoriteServers,
         lastServerId: state.lastServerId,
         settings: state.settings,
-        hasAcceptedConsent: state.hasAcceptedConsent,
+        acceptedConsentVersion: state.acceptedConsentVersion,
         windowCorner: state.windowCorner,
       }),
-    }
-  )
+      // 1: the consent boolean became a version (D7); 2: the dead WireGuard
+      // ports became "auto" (WIN-FIX-3). See migratePersistedState.
+      version: 2,
+      migrate: migratePersistedState,
+      // The default merge is shallow, so a settings object saved by an older
+      // build would REPLACE the defaults wholesale and leave any field added
+      // since (customDnsEnabled) undefined. Merge it over the defaults instead,
+      // and carry an existing Custom DNS list over as "on" — before the switch
+      // existed, a non-empty list was the only way the feature could be on.
+      merge: (persisted, current) => {
+        const p = (persisted ?? {}) as Partial<AppState>;
+        const saved = (p.settings ?? {}) as Partial<AppSettings>;
+        const settings: AppSettings = {
+          ...current.settings,
+          ...saved,
+          customDnsEnabled:
+            saved.customDnsEnabled ?? (Array.isArray(saved.customDns) && saved.customDns.length > 0),
+        };
+        return { ...current, ...p, settings };
+      },
+    },
+  ),
 );

@@ -81,7 +81,7 @@ beforeEach(() => {
   dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
   setHidden(false);
   // The shipped default. Every "unknown" case below asserts this survives.
-  useAppStore.setState({ dnsFilteringAvailable: true });
+  useAppStore.setState({ dnsFilteringAvailable: true, customDnsByPlan: {} });
 });
 
 afterEach(() => {
@@ -465,5 +465,23 @@ describe('useClientConfig -> dnsFilteringAvailable', () => {
 
       expect(mockedInvoke).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+/** Account API contract item 40: `features.<PLAN>.customDns`, through the same fetch. */
+describe('useClientConfig -> customDnsByPlan', () => {
+  it("the server's per-plan flags reach the store, keyed by plan", async () => {
+    mockedInvoke.mockResolvedValue({
+      dnsFilteringAvailable: true,
+      features: { RECON: { customDns: true }, OPERATIVE: { customDns: true }, SOVEREIGN: { customDns: false } },
+    });
+    await runHook();
+    expect(useAppStore.getState().customDnsByPlan).toEqual({ RECON: true, OPERATIVE: true, SOVEREIGN: false });
+  });
+
+  it('a payload without the map, or a failed fetch, leaves every plan enabled', async () => {
+    mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: true });
+    await runHook();
+    expect(useAppStore.getState().customDnsByPlan).toEqual({});
   });
 });

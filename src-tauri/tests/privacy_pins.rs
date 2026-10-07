@@ -124,6 +124,34 @@ fn xray_config_source_has_no_access_log_and_sniffing_disabled() {
     );
 }
 
+/// W1-020: every xray stderr line goes through `xray_stderr_line`, which
+/// runs it through `sanitize_always`, before it is logged. xray's warnings name
+/// the relay it was dialling, and they are logged at WARN — persisted in
+/// release builds.
+#[test]
+fn xray_stderr_is_redacted_before_it_is_logged() {
+    let xray = src("vpn/xray.rs");
+    let helper = fn_body(&xray, "xray_stderr_line");
+    assert!(
+        helper.contains("sanitize_always(line)"),
+        "W1-020 broken: xray_stderr_line no longer redacts the line"
+    );
+    let forwarder = xray
+        .find(r#"target: "xray::stderr""#)
+        .expect("the xray stderr forwarder moved — re-pin it");
+    let window = &xray[forwarder.saturating_sub(600)..forwarder];
+    assert!(
+        window.contains("xray_stderr_line(&line)"),
+        "W1-020 broken: xray stderr is logged without going through xray_stderr_line"
+    );
+    let logged = &xray[forwarder..];
+    let logged = &logged[..logged.find('}').unwrap_or(logged.len())];
+    assert!(
+        !logged.contains(", line)"),
+        "W1-020 broken: the raw stderr line is logged"
+    );
+}
+
 // ── P6-CLI-D-11 ───────────────────────────────────────────────────────────
 
 /// The attestation payload format string is the whole wire promise: prefix +
