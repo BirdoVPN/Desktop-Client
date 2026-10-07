@@ -556,8 +556,9 @@ jobs:
       - name: Production bundle builds
         run: npm run build
 
-      # PR builds run `tauri build --no-bundle`, so no job here compiles the
-      # NSIS installer. tauri-bundler 2.10.0 changed CheckIfAppIsRunning's
+      # No job in THIS workflow compiles the NSIS installer (nsis-installer.yml
+      # does, on the PRs that touch its paths; this check runs on every PR, in
+      # a second). tauri-bundler 2.10.0 changed CheckIfAppIsRunning's
       # first parameter from a name to a path, and the uninstall hook's bare
       # name then silently matched nothing (REVIEW-WIN2-008). This reads the
       # macro out of the templates compiled into the locked @tauri-apps/cli

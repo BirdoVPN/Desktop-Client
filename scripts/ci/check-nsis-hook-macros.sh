@@ -4,8 +4,9 @@
 # the uninstall reconcile). tauri-bundler 2.10.0 (@tauri-apps/cli 2.12)
 # changed that macro's first parameter from an executable NAME to a full PATH
 # handed to Restart Manager. A hook still passing the bare name compiled
-# cleanly and silently matched nothing, and PR builds run `tauri build
-# --no-bundle`, so no other job would ever see it.
+# cleanly and silently matched nothing, and no PR job built the installer
+# then. (.github/workflows/nsis-installer.yml now does, on the PRs that touch
+# its paths, and checks the generated script with check-generated-nsis.sh.)
 #
 # The NSIS templates are compiled into the installed @tauri-apps/cli native
 # binary. This requires the hook to call the macro exactly the way that
