@@ -391,7 +391,7 @@ dependencies = [
  "base64 0.22.1",
  "boringtun",
  "chrono",
- "dirs 6.0.0",
+ "dirs 7.0.0",
  "erased-serde",
  "hex",
  "hkdf 0.13.0",
@@ -1305,15 +1305,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca3aa72a6f96ea37bbc5aa912f6788242832f75369bdfdadcb0e38423f100059"
 dependencies = [
  "dirs-sys 0.3.7",
-]
-
-[[package]]
-name = "dirs"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
-dependencies = [
- "dirs-sys 0.5.0",
 ]
 
 [[package]]
