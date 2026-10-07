@@ -62,7 +62,11 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], defa
 # Pinned to the same rustls (0.23, ring provider) reqwest's rustls-tls uses so the
 # custom ClientConfig type matches `use_preconfigured_tls`.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "0.26"
+# 1.0 (2026-10): 0.26.11 was a semver-trick shim whose entire API was
+# `pub use parent::TLS_SERVER_ROOTS` with `parent` = webpki-roots "1", which
+# this lockfile already resolved to 1.0.5. The direct dep stays on that same
+# 1.0.5, so cert_pin.rs and doh.rs build from the identical root store.
+webpki-roots = "1.0"
 x509-parser = "0.18"
 
 # Socket configuration (for buffer sizes)
