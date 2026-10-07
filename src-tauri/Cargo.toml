@@ -308,4 +308,6 @@ tempfile = "3.13"
 # patch releases, cargo-deny advisories/licenses/bans pass, and they cannot be
 # pinned back without dropping this dep. Whoever signs the next release should
 # know the production dependency set changed here, not just the test set.
-jsonschema = { version = "=0.56.0", default-features = false }
+# 0.56.0 -> 0.58.3 (#241): the same zmij and fraction requirements as 0.56.0,
+# so that bump moved no crate in the shipped binary.
+jsonschema ={ version = "=0.58.3", default-features = false }
