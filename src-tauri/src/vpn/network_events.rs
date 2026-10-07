@@ -222,7 +222,7 @@ mod windows_events {
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
-    use windows::Win32::Foundation::{BOOLEAN, HANDLE, WIN32_ERROR};
+    use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
     use windows::Win32::NetworkManagement::IpHelper::{
         NotifyRouteChange2, MIB_IPFORWARD_ROW2, MIB_NOTIFICATION_TYPE,
     };
@@ -317,7 +317,7 @@ mod windows_events {
                 AF_INET,
                 Some(on_route_change),
                 std::ptr::null(),
-                BOOLEAN(0),
+                false, // InitialNotification: BOOLEAN FALSE (windows 0.62 binds it as bool)
                 &mut route_handle,
             )
         };
