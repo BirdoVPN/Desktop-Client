@@ -229,18 +229,23 @@ fn looks_like_a_host(name: &str, tld: &str, after_separator: bool) -> bool {
 /// printed twice doubles them again) with a path component before it. Not
 /// the `//` of a URL's `scheme://` (round 4 of the review of #222), and not
 /// the leading `\\` of a UNC path (`\\nas.example.zip\share`, round 5):
-/// what follows those is a host.
+/// what follows those is a host. A single `\` is a separator wherever it
+/// stands (` \notes.md`, a path from the drive's root; round 6): only a
+/// run of two or more can open a UNC path.
 #[cfg_attr(debug_assertions, allow(dead_code))]
 fn follows_a_path_separator(before: &str) -> bool {
     if let Some(rest) = before.strip_suffix('/') {
         return !rest.ends_with('/');
     }
     let rest = before.trim_end_matches('\\');
-    rest.len() < before.len()
-        && rest
+    match before.len() - rest.len() {
+        0 => false,
+        1 => true,
+        _ => rest
             .chars()
             .next_back()
-            .is_some_and(|c| !c.is_whitespace() && !"\"'`([<{=,".contains(c))
+            .is_some_and(|c| !c.is_whitespace() && !"\"'`([<{=,".contains(c)),
+    }
 }
 
 /// The redaction itself, with NO `debug_assertions` escape hatch.
@@ -636,6 +641,15 @@ mod tests {
         for path in [r"src\vpn\tunnel.rs", r"src\\vpn\\tunnel.rs", r"C:\notes.md"] {
             let msg = format!("panicked at {path}:12");
             assert_eq!(sanitize_always(&msg), msg, "{path}");
+        }
+    }
+
+    /// Round 6 of the review (nit): a file at a drive's root, after a single
+    /// backslash that follows a space or a bracket, is a file, not a host.
+    #[test]
+    fn a_file_after_a_lone_backslash_is_a_file() {
+        for msg in [r"open \notes.md failed", r"read (\notes.md) failed"] {
+            assert_eq!(sanitize_always(msg), msg);
         }
     }
 
