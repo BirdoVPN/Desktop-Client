@@ -166,7 +166,7 @@ FunctionEnd
   ; stops protecting the live session. tests.yml's frontend job runs
   ; scripts/ci/check-nsis-hook-macros.sh, which fails the PR if this call
   ; ever differs from the template compiled into the locked @tauri-apps/cli.
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; W1-008: put back what a BirdoVPN that was killed rather than quit left
   ; behind — DNS an OLDER version parked on the physical adapters, routes a
