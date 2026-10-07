@@ -556,6 +556,15 @@ jobs:
       - name: Production bundle builds
         run: npm run build
 
+      # PR builds run `tauri build --no-bundle`, so no job here compiles the
+      # NSIS installer. tauri-bundler 2.10.0 changed CheckIfAppIsRunning's
+      # first parameter from a name to a path, and the uninstall hook's bare
+      # name then silently matched nothing (REVIEW-WIN2-008). This reads the
+      # macro out of the templates compiled into the locked @tauri-apps/cli
+      # and requires the hook to call it exactly as the template does.
+      - name: NSIS hook calls CheckIfAppIsRunning as the bundled template does
+        run: bash scripts/ci/check-nsis-hook-macros.sh
+
       # The release's tauri build commands, read FROM release.yml so this
       # contract cannot drift from it: every one must end in `-- --locked`,
       # and the Linux/macOS form, run verbatim with an `echo` runner standing
