@@ -369,6 +369,75 @@ mod tests {
         }
     }
 
+    /// Every OTHER host the app's rustls clients dial (all of them validate
+    /// against webpki-roots) must still chain to a root in the store. Chains
+    /// measured 2026-10-07 and verified with `openssl s_client -CAfile`
+    /// against ONLY the 1.0.9 roots. api.birdo.app / birdo.app and
+    /// cloudflare-dns.com (DoH, also over 1.1.1.1, 1.0.0.1, 104.16.248.249,
+    /// 104.16.249.249) are asserted above and in vpn/doh.rs. A host passes if
+    /// ANY root its chain can end at is present (cross-signed roots give
+    /// more than one valid path).
+    #[test]
+    fn every_other_host_the_app_dials_still_chains_to_a_webpki_root() {
+        let roots = webpki_root_spki_pins();
+        let hosts: &[(&str, &[(&str, &str)])] = &[
+            // Update download: the manifest's github.com URL redirects here.
+            // ECDSA: github.com <- Sectigo ... CA DV E36 <- Sectigo ... Root E46
+            // (cross-signed by USERTrust ECC); RSA: ... DV R36 <- Root R46
+            // (cross-signed by USERTrust RSA).
+            (
+                "github.com (ECDSA)",
+                &[
+                    (
+                        "sLVjNUaFYfW7n6EtgBeEpjOlcnBdNPMrZDRF36iwBdE=",
+                        "Sectigo Public Server Authentication Root E46",
+                    ),
+                    (
+                        "ICGRfpgmOUXIWcQ/HXPLQTkFPEFPoDyjvH7ohhQpjzs=",
+                        "USERTrust ECC Certification Authority",
+                    ),
+                ],
+            ),
+            (
+                "github.com (RSA)",
+                &[
+                    (
+                        "Douxi77vs4G+Ib/BogbTFymEYq0QSFXwSgVCaZcI09Q=",
+                        "Sectigo Public Server Authentication Root R46",
+                    ),
+                    (
+                        "x4QzPSC810K5/cMjb05Qm4k3Bw5zBn4lTdO/nEW/Td4=",
+                        "USERTrust RSA Certification Authority",
+                    ),
+                ],
+            ),
+            // release-assets / objects.githubusercontent.com: <- YR1 <- Root YR
+            // (cross-signed by ISRG Root X1; Root YR itself is not in the store).
+            (
+                "release-assets.githubusercontent.com",
+                &[(ISRG_X1_SPKI, "ISRG Root X1")],
+            ),
+            // Sentry ingest (sentry.io, us. and de. regions alike):
+            // <- DigiCert Global G2 TLS RSA SHA256 2020 CA1 <- DigiCert Global Root G2.
+            (
+                "*.ingest.sentry.io",
+                &[(
+                    "i7WTqTvh0OioIruIfFR4kMPnBqrS2rdiVPl/s2uC/CY=",
+                    "DigiCert Global Root G2",
+                )],
+            ),
+        ];
+        for (host, anchors) in hosts {
+            assert!(
+                anchors
+                    .iter()
+                    .any(|(pin, _)| roots.iter().any(|r| r == pin)),
+                "{host}: none of {:?} is a webpki-roots trust anchor any more",
+                anchors.iter().map(|(_, name)| *name).collect::<Vec<_>>()
+            );
+        }
+    }
+
     // ISRG Root X1 (Let's Encrypt) DER — a stable public root cert. Its SPKI
     // SHA-256 is the well-known pin asserted below, proving our extraction
     // matches OkHttp / openssl byte-for-byte.
