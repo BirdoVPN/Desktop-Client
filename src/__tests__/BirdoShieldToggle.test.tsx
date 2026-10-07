@@ -66,6 +66,8 @@ const mockStoreState = {
   pushRoute: vi.fn(),
   setReapplying: vi.fn(),
   showNotice: vi.fn(),
+  // Loaded from Rust, so a landed save has nothing to mark (round 6, P3-4).
+  settingsHydrated: true,
   reapplying: false,
   account: {
     email: 'test@birdo.app',

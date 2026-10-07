@@ -240,6 +240,21 @@ describe('a settings file that cannot be verified (review of #222)', () => {
     expect(useAppStore.getState().notice?.text).toBe('Your settings were reset to their defaults.');
   });
 
+  it('the first save that lands after an unverifiable start-up marks the settings as loaded (round 6, P3-4)', async () => {
+    useAppStore.setState({ settingsHydrated: false });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'save_settings') throw unverified;
+      return undefined;
+    });
+    await persistSettings({ autoConnect: true }, { quiet: true });
+    expect(useAppStore.getState().settingsHydrated).toBe(false);
+    // The file can be verified again: this save lands, and the store is
+    // what the file holds.
+    mockedInvoke.mockImplementation(async () => undefined);
+    expect(await persistSettings({ autoConnect: true })).toBe(true);
+    expect(useAppStore.getState().settingsHydrated).toBe(true);
+  });
+
   it('the reset is not run when the confirmation is cancelled', async () => {
     render(<ResetSettingsDialog />);
     act(() => askToResetSettings());
@@ -321,19 +336,24 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
   };
   /** Rust's intent, as `set_killswitch_live` and the dial's own arm leave it. */
   let intent = false;
+  /** The intent's sequence: every live push moves it. */
+  let seq = 0;
   let saveRefused = false;
   let stopWatching: () => void = () => {};
   beforeEach(() => {
     intent = false;
+    seq = 0;
     saveRefused = false;
     stopWatching = watchKillSwitchAcrossDials();
     mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === 'save_settings' && saveRefused) throw UNVERIFIED;
       if (cmd === 'set_killswitch_live') {
         intent = (args as { enabled: boolean }).enabled;
+        seq += 1;
         return true;
       }
       if (cmd === 'get_killswitch_status') return { enabled: intent, active: false, blocking_connections: 0 };
+      if (cmd === 'reset_settings') return true;
       // What get_settings served for an unverifiable file before this round:
       // the stand-in defaults.
       if (cmd === 'get_settings') return settingsToRust(defaultSettings);
@@ -357,6 +377,26 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
   });
 
+  // Round 6 (P3-1): Rust publishes Connected BEFORE the dial's arm, so the
+  // check above usually runs first and finds the OFF in force. The dial's arm
+  // then takes the sequence read when the dial began and stands aside, since
+  // the OFF moved it (killswitch `an_off_during_the_dial_makes_its_arm_stand_aside`,
+  // session `the_dials_arm_takes_the_intent_sequence_from_the_dials_start`).
+  it('a refused OFF during a dial holds when the dial\'s arm lands after `connected` (round 6, P3-1)', async () => {
+    useAppStore.setState({ connectionState: 'connecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    const dialBegan = seq; // Rust: connect_session_for reads intent_seq()
+    saveRefused = true;
+    await setKillSwitch(false);
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await waitFor(() => expect(statusChecks()).toHaveLength(1));
+    // The dial's arm lands now: arm_since(dialBegan) stores ON only if
+    // nothing wrote the intent since the dial began.
+    if (seq === dialBegan) intent = true;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(intent).toBe(false);
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+  });
+
   it('an ON saved during connecting is pushed once the dial is up without it, and never on a failed dial', async () => {
     useAppStore.setState({ connectionState: 'connecting', settings: { ...defaultSettings, killSwitchEnabled: false } });
     await setKillSwitch(true);
@@ -374,6 +414,39 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(intent).toBe(false);
   });
 
+  it('a refused OFF that a later save wrote to the file is not put back at the next dial (round 6, P2-2)', async () => {
+    useAppStore.setState({ connectionState: 'reconnecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    // The file can be verified again; another setting's save writes the whole
+    // store, the kill switch as it shows (OFF) included.
+    saveRefused = false;
+    expect(await persistSettings({ autoConnect: true })).toBe(true);
+    expect(saves()[saves().length - 1]?.killswitch_enabled).toBe(false);
+    // The next dial arms from that file: OFF. The toggle says so.
+    act(() => useAppStore.setState({ connectionState: 'connecting' }));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    expect(intent).toBe(false);
+  });
+
+  it('a reset drops the standing choice, so the next dial is not pushed back to it (round 6, P3-2)', async () => {
+    useAppStore.setState({ connectionState: 'connected', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    await setKillSwitch(false);
+    expect(intent).toBe(false);
+    await resetSettings();
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    // The session is rebuilt on the defaults, and that dial arms ON.
+    act(() => useAppStore.setState({ connectionState: 'switching' }));
+    intent = true;
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(intent).toBe(true);
+  });
+
   it('the next dial puts back the kill switch alone, never an unverifiable file\'s stand-in defaults (N2)', async () => {
     const real = { ...defaultSettings, killSwitchEnabled: true, autoConnect: true, localNetworkSharing: true };
     useAppStore.setState({ connectionState: 'reconnecting', settings: real });
@@ -386,27 +459,22 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(useAppStore.getState().settings).toEqual(real);
   });
 
-  it('with settings that did not come from Rust, the toggle shows what the dial armed', async () => {
-    useAppStore.setState({
-      connectionState: 'connecting',
-      settingsHydrated: false,
-      settings: { ...defaultSettings, killSwitchEnabled: false },
-    });
-    intent = true;
-    act(() => useAppStore.setState({ connectionState: 'connected' }));
-    await waitFor(() => expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true));
-
-    // Settings that did come from Rust are what is saved: left alone, and
-    // with no choice to honour there is nothing to ask Rust.
-    useAppStore.setState({
-      connectionState: 'connecting',
-      settingsHydrated: true,
-      settings: { ...defaultSettings, killSwitchEnabled: false },
-    });
-    act(() => useAppStore.setState({ connectionState: 'connected' }));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
-    expect(statusChecks()).toHaveLength(1);
+  // Round 6 (P3-3): round 5 copied Rust's intent into settings that had not
+  // come from Rust. That read can precede the dial's arm, and a later save
+  // then wrote it over the file. With no choice made, nothing is touched.
+  it('with no choice made, the dial end leaves the settings alone, hydrated or not (round 6, P3-3)', async () => {
+    for (const settingsHydrated of [false, true]) {
+      useAppStore.setState({
+        connectionState: 'connecting',
+        settingsHydrated,
+        settings: { ...defaultSettings, killSwitchEnabled: false },
+      });
+      intent = true;
+      act(() => useAppStore.setState({ connectionState: 'connected' }));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    }
+    expect(statusChecks()).toHaveLength(0);
   });
 });
 

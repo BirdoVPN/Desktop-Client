@@ -90,6 +90,8 @@ const mockStoreState = {
   hydrateSettings: vi.fn(),
   showNotice: vi.fn(),
   killSwitchBlocking: false,
+  // Loaded from Rust, so a landed save has nothing to mark (round 6, P3-4).
+  settingsHydrated: true,
   account: {
     email: 'test@birdo.app',
     plan: 'operative',

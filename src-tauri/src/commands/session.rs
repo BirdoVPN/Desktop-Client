@@ -116,6 +116,10 @@ struct AttemptContext {
     /// that keeps the old session must point the permit back at.
     #[cfg(target_os = "windows")]
     old_relay: Option<crate::vpn::wfp_policy::Relay>,
+    /// The kill switch intent's sequence when the dial began, for its arm
+    /// (round 6 of the review of #222): an OFF the user made during the dial
+    /// makes that arm stand aside (`killswitch::arm_since`).
+    intent_seen: u64,
 }
 
 impl AttemptContext {
@@ -227,6 +231,8 @@ pub(crate) async fn connect_session_for(
     };
 
     let was_live = session_was_live(&vm.get_state().await, vm.holds_tunnel().await);
+    // Before the state says Connecting/Switching, which is what the UI acts on.
+    let intent_seen = killswitch::intent_seq();
     let _ = vm
         .set_state(if was_live {
             ConnectionState::Switching
@@ -253,6 +259,7 @@ pub(crate) async fn connect_session_for(
         },
         #[cfg(target_os = "windows")]
         old_relay: crate::vpn::wfp::current_relay(),
+        intent_seen,
     };
     let (first_transport, adaptive) = match purpose {
         ConnectPurpose::User => (None, true),
@@ -336,7 +343,7 @@ async fn fallback_reason_for(
     let reason = transport_fallback_reason(error)?;
     // Respect an explicit transport choice: with Stealth Mode forced ON the
     // failed attempt WAS the stealth transport, and it is the last we have.
-    let forced_stealth = crate::commands::settings::get_settings(app.clone())
+    let forced_stealth = crate::commands::settings::load_settings_off_runtime(app)
         .await
         .map(|s| s.stealth_mode)
         .unwrap_or(false);
@@ -511,7 +518,7 @@ async fn attempt(
     // AUDIT-2026-06-19 FIX (CRITICAL): arm the kill switch now that the tunnel
     // is up, so an unexpected drop fails CLOSED. Best-effort: a failure to arm
     // must not tear down a working tunnel.
-    if let Err(e) = killswitch::arm(app).await {
+    if let Err(e) = killswitch::arm_since(app, ctx.intent_seen).await {
         tracing::warn!("Failed to arm kill switch after connect: {}", e);
     }
     release_rebuild_block(ctx.block_engaged).await;
@@ -1214,11 +1221,32 @@ mod lifecycle_tests {
         order(
             body("async fn attempt("),
             &[
-                "killswitch::arm(app)",
+                "killswitch::arm_since(app, ctx.intent_seen)",
                 "ar.store_connected_settings(settings.snapshot)",
                 "ar.store_last_config(",
             ],
         );
+    }
+
+    /// Round 6 of the review of #222 (P3-1): the dial reads the kill switch
+    /// intent's sequence before its state says Connecting/Switching, and its
+    /// arm stores only if nothing wrote the intent since (killswitch tests
+    /// `an_off_during_the_dial_makes_its_arm_stand_aside`).
+    #[test]
+    fn the_dials_arm_takes_the_intent_sequence_from_the_dials_start() {
+        order(
+            body("pub(crate) async fn connect_session_for("),
+            &[
+                "let Some(epoch) = began else {",
+                "let intent_seen = killswitch::intent_seq();",
+                ".set_state(if was_live {",
+                "intent_seen,",
+                "attempt(app, &target, first_transport",
+            ],
+        );
+        let attempt = body("async fn attempt(");
+        assert!(attempt.contains("killswitch::arm_since(app, ctx.intent_seen)"));
+        assert!(!attempt.contains("killswitch::arm(app)"));
     }
 
     /// W1-022: every target stops auto-reconnect before anything is dialled,
@@ -1258,7 +1286,7 @@ mod lifecycle_tests {
                 "vm.connect(",
                 "vm.lock_commit()",
                 "vm.is_current(ctx.epoch)",
-                "killswitch::arm(app)",
+                "killswitch::arm_since(app, ctx.intent_seen)",
                 "ar.store_last_config(",
                 "ar.start()",
             ],
@@ -1422,6 +1450,7 @@ mod lifecycle_tests {
             block_engaged: false,
             old_stealth_mark: Some(xray.ended_count()),
             old_relay: None,
+            intent_seen: 0,
         };
 
         // Refused before XrayManager::start: the old transport is untouched.

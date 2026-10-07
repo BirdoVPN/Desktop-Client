@@ -210,7 +210,7 @@ async fn recover_from_failed_install(
 ) -> UpdateFailure {
     set_tray_visible(app, true);
     restore_and_focus(app);
-    let always_on = crate::commands::settings::get_settings(app.clone())
+    let always_on = crate::commands::settings::load_settings_off_runtime(app)
         .await
         .map(|s| s.killswitch_enabled && s.lockdown_mode)
         .unwrap_or(false);

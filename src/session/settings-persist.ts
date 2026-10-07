@@ -196,6 +196,13 @@ async function trySave(
     useAppStore.getState().updateSettings(revert);
     return { error: e };
   }
+  savedKillSwitch(next.killSwitchEnabled);
+  // The file holds this store's settings now (round 6 of the review of #222,
+  // P3-4): after a start-up that could not verify the file (get_settings
+  // answered settings_unverified), the store is what is saved from here on,
+  // and what waits for that (the preferred-server mirror, the Custom DNS
+  // gate, Auto-Connect) may go. It stayed false for the rest of the run.
+  if (!useAppStore.getState().settingsHydrated) useAppStore.setState({ settingsHydrated: true });
   if (opts.reapply) scheduleReapply();
   return null;
 }
@@ -242,7 +249,13 @@ export async function resetSettings(): Promise<void> {
   try {
     const reset = await invoke<boolean>('reset_settings');
     await loadSettings();
-    if (reset) scheduleReapply();
+    if (reset) {
+      // The defaults are the choice now (round 6 of the review of #222): a
+      // kill switch choice made before the reset must not be pushed back
+      // over them after the next dial.
+      forgetKillSwitchChoices();
+      scheduleReapply();
+    }
     useAppStore.getState().showNotice({
       text: reset
         ? 'Your settings were reset to their defaults.'
@@ -309,7 +322,20 @@ interface StandingChoice {
 }
 let standingChoice: StandingChoice | null = null;
 
-/** For tests: forget the choices made so far. */
+/**
+ * A save landed, and it wrote the whole store — the kill switch as the toggle
+ * showed it included (round 6 of the review of #222, P2-2). A refused OFF
+ * the toggle showed is saved now: it no longer gives way at the next dial,
+ * which would have put the toggle back to ON while the dial armed OFF from
+ * the file.
+ */
+function savedKillSwitch(enabled: boolean): void {
+  if (standingChoice?.thisConnectionOnly && standingChoice.enabled === enabled) {
+    standingChoice.thisConnectionOnly = undefined;
+  }
+}
+
+/** Forget the kill switch choices made so far: after a reset, and for tests. */
 export function forgetKillSwitchChoices(): void {
   standingChoice = null;
 }
@@ -428,9 +454,10 @@ const dialing = (s: AppStateSnapshot) =>
  *   armed ON from the file (N1); an ON saved during `connecting`, where it is
  *   not pushed, after the dial had read the file (it ran with the intent
  *   OFF beside a toggle reading ON).
- * - With no choice made, and settings that did not come from Rust (an
- *   unverifiable or unreadable file: the screen holds what it last had), the
- *   toggle shows what the dial armed.
+ * - With no choice made there is nothing to check. Round 5 copied Rust's
+ *   intent into the toggle when the settings had not come from Rust; that
+ *   read could precede the dial's arm, and a later save wrote it over the
+ *   file (round 6).
  *
  * The auto-reconnect is not a dial here: it keeps the session's intent and
  * does not read the file.
@@ -455,8 +482,7 @@ function dialStarted(): void {
 
 async function dialEnded(): Promise<void> {
   const standing = standingChoice;
-  // Nothing to check: no choice to honour, and the toggle is what is saved.
-  if (!standing && useAppStore.getState().settingsHydrated) return;
+  if (!standing) return;
   let enabled: boolean;
   try {
     ({ enabled } = await invoke<{ enabled: boolean }>('get_killswitch_status'));
@@ -466,23 +492,17 @@ async function dialEnded(): Promise<void> {
   const s = useAppStore.getState();
   // Another dial started meanwhile: its end checks again.
   if (dialing(s)) return;
-  if (standing) {
-    if (standing !== standingChoice || enabled === standing.enabled) return;
-    // An OFF wherever it can lift a block; an ON only on a dial that came up
-    // (it is the dial's own arm that missed it), never on one that failed.
-    const applies = standing.enabled
-      ? s.connectionState === 'connected'
-      : killSwitchLiveApplies(s.connectionState, false, s.killSwitchBlocking);
-    if (!applies) return;
-    try {
-      await invoke('set_killswitch_live', { enabled: standing.enabled });
-    } catch {
-      if (!standing.enabled) s.showNotice({ text: KILL_SWITCH_OFF_FAILED_COPY, tone: 'danger' });
-    }
-    return;
-  }
-  if (!s.settingsHydrated && s.connectionState === 'connected' && s.settings.killSwitchEnabled !== enabled) {
-    s.updateSettings({ killSwitchEnabled: enabled });
+  if (standing !== standingChoice || enabled === standing.enabled) return;
+  // An OFF wherever it can lift a block; an ON only on a dial that came up
+  // (it is the dial's own arm that missed it), never on one that failed.
+  const applies = standing.enabled
+    ? s.connectionState === 'connected'
+    : killSwitchLiveApplies(s.connectionState, false, s.killSwitchBlocking);
+  if (!applies) return;
+  try {
+    await invoke('set_killswitch_live', { enabled: standing.enabled });
+  } catch {
+    if (!standing.enabled) s.showNotice({ text: KILL_SWITCH_OFF_FAILED_COPY, tone: 'danger' });
   }
 }
 
