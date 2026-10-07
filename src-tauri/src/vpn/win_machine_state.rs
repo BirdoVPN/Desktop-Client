@@ -1016,6 +1016,43 @@ fn move_gateway_routes_locked(
     Ok(on_old_path.len())
 }
 
+/// Interface loss: put every gateway route this owner holds on `path` — the
+/// endpoint host route and the LAN-sharing routes — back in place.
+///
+/// Windows deletes an interface's routes with it: disabling the Wi-Fi adapter
+/// for 15 s took the endpoint host route along, and an interface that comes
+/// back on the SAME gateway is no move for [`move_gateway_routes`]. Without
+/// the host route a socket connected to the relay would leave through the
+/// tunnel's own /1 routes. Re-adding a route that is still there is a no-op
+/// (`add_route_native` takes ERROR_OBJECT_ALREADY_EXISTS as success), and the
+/// records are unchanged: these are the same rows. Returns how many are back.
+pub(super) fn reinstall_gateway_routes(gen: Gen, path: (Ipv4Addr, u32)) -> Result<usize, String> {
+    let io = SystemIo;
+    let mut st = state();
+    reinstall_gateway_routes_locked(&mut st, &io, gen, path)
+}
+
+fn reinstall_gateway_routes_locked(
+    st: &mut MachineState,
+    io: &dyn MachineIo,
+    gen: Gen,
+    path: (Ipv4Addr, u32),
+) -> Result<usize, String> {
+    if st.owner != Some(gen) {
+        return Err("this tunnel no longer owns the machine state".to_string());
+    }
+    let on_path: Vec<OwnedRoute> = st
+        .routes
+        .iter()
+        .copied()
+        .filter(|r| r.next_hop == IpAddr::V4(path.0) && r.if_index == path.1)
+        .collect();
+    for route in &on_path {
+        io.add_route(route)?;
+    }
+    Ok(on_path.len())
+}
+
 /// Every DNS problem the user should know about right now, one short sentence
 /// each (see the `dns_degraded` field of `VpnStatus`).
 ///
@@ -1947,6 +1984,57 @@ mod tests {
         assert!(st.routes.contains(&split));
         assert!(st.routes.contains(&foreign_path));
         assert!(!st.routes.contains(&endpoint) && !st.routes.contains(&lan));
+    }
+
+    /// Interface loss (2026-10-07): the Wi-Fi adapter came back on the same
+    /// gateway with our routes deleted along with it. Every gateway route of
+    /// ours on that path is put back, nothing else is touched, and nothing is
+    /// deleted or re-recorded: they are the same rows.
+    #[test]
+    fn an_interface_that_came_back_gets_our_routes_on_it_back() {
+        let io = FakeIo::new(Machine::default());
+        let mut st = state_owned_by(7);
+        let endpoint = route("203.0.113.7", 32, "192.168.1.1", 12);
+        let lan = route("10.0.0.0", 8, "192.168.1.1", 12);
+        let split = route("0.0.0.0", 1, "0.0.0.0", 27);
+        let foreign_path = route("172.16.0.0", 12, "192.168.9.1", 30);
+        for r in [endpoint, lan, split, foreign_path] {
+            record_route_locked(&mut st, &io, 7, r);
+        }
+        let before = st.routes.clone();
+
+        let pinned =
+            reinstall_gateway_routes_locked(&mut st, &io, 7, ("192.168.1.1".parse().unwrap(), 12))
+                .expect("reinstalled");
+
+        assert_eq!(pinned, 2);
+        assert_eq!(io.with(|m| m.added_routes.clone()), vec![endpoint, lan]);
+        assert!(io.with(|m| m.deleted_routes.is_empty()));
+        assert_eq!(st.routes, before);
+    }
+
+    #[test]
+    fn a_reinstall_needs_the_owner_and_reports_a_failed_add() {
+        let io = FakeIo::new(Machine::default());
+        let mut st = state_owned_by(8);
+        st.routes.push(route("203.0.113.7", 32, "192.168.1.1", 12));
+        let path = ("192.168.1.1".parse().unwrap(), 12);
+        assert!(reinstall_gateway_routes_locked(&mut st, &io, 7, path).is_err());
+        assert!(io.with(|m| m.added_routes.is_empty()));
+
+        let io = FakeIo::new(Machine {
+            add_route_fails: true,
+            ..Default::default()
+        });
+        assert!(reinstall_gateway_routes_locked(&mut st, &io, 8, path).is_err());
+
+        // Nothing of ours on that path: zero, which the caller turns into a
+        // re-dial rather than a socket with no host route under it.
+        let io = FakeIo::new(Machine::default());
+        assert_eq!(
+            reinstall_gateway_routes_locked(&mut st, &io, 8, ("10.0.0.1".parse().unwrap(), 15)),
+            Ok(0)
+        );
     }
 
     #[test]

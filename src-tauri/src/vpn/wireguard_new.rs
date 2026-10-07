@@ -63,15 +63,118 @@ pub(crate) const PACKET_PATH_STALL: Duration = Duration::from_secs(10);
 const NO_RTT: u32 = u32::MAX;
 
 /// Send one control datagram within [`CONTROL_SEND_CAP`].
-pub(crate) async fn send_capped(socket: &UdpSocket, datagram: &[u8]) -> Result<(), String> {
+pub(crate) async fn send_capped(socket: &UdpSocket, datagram: &[u8]) -> Result<(), SendError> {
     match tokio::time::timeout(CONTROL_SEND_CAP, socket.send(datagram)).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err(format!(
-            "the socket did not take the datagram within {:?}",
-            CONTROL_SEND_CAP
-        )),
+        Ok(Err(e)) => Err(SendError::Io(e)),
+        Err(_) => Err(SendError::TimedOut(CONTROL_SEND_CAP)),
     }
+}
+
+/// A datagram to the relay that did not leave.
+#[derive(Debug)]
+pub(crate) enum SendError {
+    /// The OS refused it.
+    Io(std::io::Error),
+    /// The socket did not take it within the cap (a full socket).
+    TimedOut(Duration),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::Io(e) => write!(f, "{}", e),
+            SendError::TimedOut(cap) => {
+                write!(f, "the socket did not take the datagram within {:?}", cap)
+            }
+        }
+    }
+}
+
+impl SendError {
+    /// The OS error code, when it says the socket's path is gone
+    /// ([`is_path_error`]).
+    pub(crate) fn path_error(&self) -> Option<i32> {
+        match self {
+            SendError::Io(e) => e.raw_os_error().filter(|&code| is_path_error(code)),
+            SendError::TimedOut(_) => None,
+        }
+    }
+}
+
+/// Windows Sockets errors that say the socket's PATH is gone, not that one
+/// datagram was lost.
+///
+/// Interface loss (device test, 2026-10-07): with the Wi-Fi adapter disabled
+/// for 15 s and enabled again, every send failed — WSAENOBUFS while it was
+/// down, then WSAEINVAL for as long as the session lived. Windows deletes an
+/// interface's routes with it, the endpoint host route among them, and the
+/// socket had been connected over that interface; nothing ever made a new
+/// one, so the tunnel carried nothing until the user pressed Disconnect.
+pub(crate) const PATH_SEND_ERRORS: [i32; 6] = [
+    10022, // WSAEINVAL: the socket's source address or route is no longer valid
+    10049, // WSAEADDRNOTAVAIL
+    10050, // WSAENETDOWN
+    10051, // WSAENETUNREACH
+    10055, // WSAENOBUFS: the adapter is down
+    10065, // WSAEHOSTUNREACH
+];
+
+/// Whether `code` is one of [`PATH_SEND_ERRORS`].
+pub(crate) fn is_path_error(code: i32) -> bool {
+    PATH_SEND_ERRORS.contains(&code)
+}
+
+/// A run of sends refused for a path reason with none succeeding since
+/// ([`PATH_SEND_ERRORS`]): what the reconnect loop's send-path rule reads.
+///
+/// The liveness rules all read the relay's side: the handshake age and the
+/// answers seen. On a path that still DELIVERS but can no longer SEND, the
+/// relay keeps initiating handshakes of its own while it has traffic for us,
+/// and boringtun stamps a session it answered as established before the
+/// answer has left — so the age read "fresh" and the fast rule saw a relay
+/// that answers, for as long as the relay kept trying. What the OS says about
+/// our own sends is the signal that cannot be fooled that way.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SendHealth {
+    /// The first refusal of the run.
+    pub failing_since: Option<Instant>,
+    /// Refusals in the run.
+    pub failures: u32,
+    /// The last refusal's OS error code.
+    pub last_code: Option<i32>,
+}
+
+impl SendHealth {
+    /// One send's outcome. A datagram that left ends the run, a refusal for a
+    /// path reason extends it, and any other failure (a full socket) says
+    /// nothing either way.
+    pub(crate) fn record(&mut self, now: Instant, outcome: &Result<(), SendError>) {
+        match outcome {
+            Ok(()) => *self = Self::default(),
+            Err(e) => {
+                if let Some(code) = e.path_error() {
+                    self.failing_since.get_or_insert(now);
+                    self.failures = self.failures.saturating_add(1);
+                    self.last_code = Some(code);
+                }
+            }
+        }
+    }
+}
+
+/// A run of refusals this long, with nothing sent since it began...
+pub(crate) const SEND_PATH_BROKEN_AFTER: Duration = Duration::from_secs(5);
+/// ...and at least this many of them, is a broken path, not a blip.
+pub(crate) const SEND_PATH_MIN_FAILURES: u32 = 3;
+
+/// Has the socket's path broken (see [`SendHealth`])?
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn send_path_broken(health: &SendHealth, now: Instant) -> bool {
+    health.failures >= SEND_PATH_MIN_FAILURES
+        && health
+            .failing_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= SEND_PATH_BROKEN_AFTER)
 }
 
 /// Whether a packet path last seen ticking at `last_tick` has stopped. One that
@@ -187,9 +290,16 @@ pub(crate) struct ResponseWatch {
     /// The last outbound packet or keepalive (sent, or queued behind a
     /// handshake) — not the initiations themselves.
     pub last_tx: Option<Instant>,
+    /// The last time the relay answered an initiation of OURS
+    /// ([`answers_our_initiation`]): the one proof that our sends arrive.
+    pub last_proof: Option<Instant>,
 }
 
 impl ResponseWatch {
+    fn proven(&mut self, now: Instant) {
+        self.last_proof = Some(now);
+    }
+
     fn initiation_sent(&mut self, now: Instant) {
         self.first_unanswered.get_or_insert(now);
         self.unanswered = self.unanswered.saturating_add(1);
@@ -238,6 +348,13 @@ pub(crate) fn peer_unresponsive(watch: &ResponseWatch, now: Instant) -> bool {
 /// A WireGuard handshake initiation: message type 1, 148 bytes.
 fn is_initiation(datagram: &[u8]) -> bool {
     datagram.len() == 148 && datagram[0] == 1
+}
+
+/// A handshake response (type 2) or a cookie reply (type 3): the relay
+/// received an initiation of ours. Anything else it sends — its OWN
+/// initiation, data — proves only that its packets reach us.
+fn answers_our_initiation(datagram: &[u8]) -> bool {
+    matches!(datagram.first(), Some(2 | 3))
 }
 
 /// ADAPTIVE TRANSPORT markers — LOAD-BEARING error strings.
@@ -464,6 +581,11 @@ pub struct WireGuardSession {
     outbound_since: FastMutex<Option<Instant>>,
     /// Answers seen from the relay, for the fast dead-path rule.
     responses: FastMutex<ResponseWatch>,
+    /// Sends the OS refused for a path reason ([`SendHealth`]).
+    send_health: FastMutex<SendHealth>,
+    /// A refusal run is open: a send that succeeds reads this one atomic, and
+    /// takes the lock only to end a run.
+    send_failing: AtomicBool,
 }
 
 impl WireGuardSession {
@@ -661,6 +783,8 @@ impl WireGuardSession {
             last_tick: FastMutex::new(None),
             outbound_since: FastMutex::new(None),
             responses: FastMutex::new(ResponseWatch::default()),
+            send_health: FastMutex::new(SendHealth::default()),
+            send_failing: AtomicBool::new(false),
         };
 
         // Perform initial handshake with retry logic (NEW-001 fix)
@@ -804,6 +928,7 @@ impl WireGuardSession {
                             .map_err(|e| format!("Failed to send response: {}", e))?;
                     }
                     self.drain_queued_packets(&socket).await;
+                    self.responses.lock().proven(Instant::now());
                     tracing::info!("WireGuard handshake complete");
                     return Ok(());
                 }
@@ -878,7 +1003,12 @@ impl WireGuardSession {
         }
         let result = self.tunnel.lock().decapsulate(None, datagram, dst);
         if !matches!(result, TunnResult::Err(_)) {
-            self.responses.lock().answered(Instant::now());
+            let now = Instant::now();
+            let mut watch = self.responses.lock();
+            watch.answered(now);
+            if answers_our_initiation(datagram) {
+                watch.proven(now);
+            }
         }
         opened(result)
     }
@@ -960,10 +1090,15 @@ impl WireGuardSession {
     /// source address. The boringtun session is kept: WireGuard roams by
     /// design, and the relay follows the peer's newest authenticated source
     /// address. A forced handshake then proves the path.
+    ///
+    /// Also what rebuilds the socket on the SAME path after an interface loss
+    /// (`WintunTunnel::repath`): the new socket starts with a clean send
+    /// record, so what the old one was refused says nothing about it.
     #[cfg(target_os = "windows")]
     pub(crate) async fn rebind(&self) -> Result<(), String> {
         let socket = connected_socket(self.endpoint).await?;
         self.socket.send_replace(Arc::new(socket));
+        self.reset_send_health();
         self.restart_response_watch();
         let mut dst = [0u8; WIREGUARD_OVERHEAD];
         let initiation = {
@@ -978,11 +1113,40 @@ impl WireGuardSession {
         };
         if let Some(len) = initiation {
             self.responses.lock().initiation_sent(Instant::now());
-            send_capped(&self.socket(), &dst[..len])
-                .await
-                .map_err(|e| format!("Failed to send handshake on the new path: {}", e))?;
+            let sent = send_capped(&self.socket(), &dst[..len]).await;
+            self.note_send(Instant::now(), &sent);
+            sent.map_err(|e| format!("Failed to send handshake on the new path: {}", e))?;
         }
         Ok(())
+    }
+
+    /// Record one send's outcome ([`SendHealth`]). Called for every datagram
+    /// the Windows packet path and the control sends put on the socket.
+    pub(crate) fn note_send(&self, now: Instant, outcome: &Result<(), SendError>) {
+        match outcome {
+            // The common case: nothing open, nothing to end.
+            Ok(()) if !self.send_failing.load(Ordering::Acquire) => {}
+            // A full socket says nothing about the path.
+            Err(e) if e.path_error().is_none() => {}
+            _ => {
+                let mut health = self.send_health.lock();
+                health.record(now, outcome);
+                self.send_failing
+                    .store(health.failing_since.is_some(), Ordering::Release);
+            }
+        }
+    }
+
+    /// The current run of refused sends, if any (see [`SendHealth`]).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn send_health(&self) -> SendHealth {
+        *self.send_health.lock()
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn reset_send_health(&self) {
+        *self.send_health.lock() = SendHealth::default();
+        self.send_failing.store(false, Ordering::Release);
     }
 
     // ── The async packet API (macOS / Linux packet loops) ───────────────
@@ -1131,10 +1295,30 @@ impl WireGuardSession {
         };
         if let Some(len) = initiation {
             self.responses.lock().initiation_sent(Instant::now());
-            if let Err(e) = send_capped(&self.socket(), &dst[..len]).await {
+            let sent = send_capped(&self.socket(), &dst[..len]).await;
+            self.note_send(Instant::now(), &sent);
+            if let Err(e) = sent {
                 tracing::debug!("Forced handshake could not be sent: {}", e);
             }
         }
+    }
+
+    /// Time since the relay last answered an initiation of ours
+    /// ([`answers_our_initiation`]; before the first, the session's age):
+    /// what a re-prove window waits for.
+    ///
+    /// Not `handshake_age`: a relay that has traffic for us and hears nothing
+    /// back initiates handshakes of its own, and boringtun stamps a session
+    /// it RESPONDED to as established before its answer has left. On a path
+    /// that still delivers but no longer sends (the interface-loss outage),
+    /// the age kept reading fresh and closed every re-prove window.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn proof_age(&self) -> Duration {
+        self.responses
+            .lock()
+            .last_proof
+            .unwrap_or(self.created_at)
+            .elapsed()
     }
 
     /// Has the relay stopped answering while there is traffic to carry? See
@@ -1371,6 +1555,101 @@ mod response_watch_tests {
     }
 }
 
+/// Interface loss (device test, 2026-10-07): which send errors mean the
+/// socket's path is gone, and when a run of them is a broken path.
+#[cfg(test)]
+mod send_health_tests {
+    use super::*;
+
+    fn s(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn refused(code: i32) -> Result<(), SendError> {
+        Err(SendError::Io(std::io::Error::from_raw_os_error(code)))
+    }
+
+    #[test]
+    fn which_send_errors_mean_the_path_is_gone() {
+        for code in [10022, 10049, 10050, 10051, 10055, 10065] {
+            assert_eq!(
+                refused(code).unwrap_err().path_error(),
+                Some(code),
+                "{code}"
+            );
+        }
+        // A reset after an ICMP port-unreachable (the relay's problem, the
+        // fast rule's to judge), an oversized datagram, a full buffer, a
+        // firewall refusal: not the socket's path.
+        for code in [10054, 10040, 10035, 10013] {
+            assert_eq!(refused(code).unwrap_err().path_error(), None, "{code}");
+        }
+        assert_eq!(SendError::TimedOut(CONTROL_SEND_CAP).path_error(), None);
+    }
+
+    /// The log line keeps the OS's own sentence: `Tunnel send failures:
+    /// Failed to send: <it>`, exactly as before.
+    #[test]
+    fn a_send_error_reads_as_the_os_said_it() {
+        let io = std::io::Error::from_raw_os_error(10022);
+        let expected = io.to_string();
+        assert_eq!(SendError::Io(io).to_string(), expected);
+        assert!(SendError::TimedOut(CONTROL_SEND_CAP)
+            .to_string()
+            .contains("did not take the datagram"));
+    }
+
+    /// The live run: WSAENOBUFS as the adapter goes down, then WSAEINVAL on
+    /// every send. Broken once refused for the window with enough refusals;
+    /// one datagram that leaves ends the run.
+    #[test]
+    fn a_run_of_refusals_breaks_the_path_and_one_send_ends_it() {
+        let t0 = Instant::now();
+        let mut h = SendHealth::default();
+        h.record(t0, &refused(10055));
+        h.record(t0 + s(1), &refused(10022));
+        assert!(!send_path_broken(&h, t0 + s(9)), "two refusals: a blip");
+        h.record(t0 + s(2), &refused(10022));
+        assert!(!send_path_broken(&h, t0 + s(4)), "not for the window yet");
+        assert!(send_path_broken(&h, t0 + SEND_PATH_BROKEN_AFTER));
+        assert_eq!(h.failing_since, Some(t0));
+        assert_eq!(h.failures, 3);
+        assert_eq!(h.last_code, Some(10022));
+
+        h.record(t0 + s(6), &Ok(()));
+        assert_eq!(h, SendHealth::default());
+        assert!(!send_path_broken(&h, t0 + s(60)));
+    }
+
+    /// A full socket, or a failure that is not the path's, neither starts,
+    /// extends nor ends a run.
+    #[test]
+    fn other_failures_say_nothing_about_the_path() {
+        let t0 = Instant::now();
+        let mut h = SendHealth::default();
+        h.record(t0, &Err(SendError::TimedOut(CONTROL_SEND_CAP)));
+        h.record(t0, &refused(10054));
+        assert_eq!(h, SendHealth::default());
+        for k in 0..3 {
+            h.record(t0 + s(k), &refused(10022));
+        }
+        h.record(t0 + s(4), &Err(SendError::TimedOut(CONTROL_SEND_CAP)));
+        h.record(t0 + s(5), &refused(10054));
+        assert_eq!(h.failures, 3);
+        assert!(send_path_broken(&h, t0 + s(5)));
+    }
+
+    #[test]
+    fn only_a_response_or_a_cookie_answers_our_initiation() {
+        for (kind, answers) in [(1u8, false), (2, true), (3, true), (4, false)] {
+            let mut datagram = [0u8; 92];
+            datagram[0] = kind;
+            assert_eq!(answers_our_initiation(&datagram), answers, "type {kind}");
+        }
+        assert!(!answers_our_initiation(&[]));
+    }
+}
+
 /// The establish-time handshake against a real in-process responder on
 /// loopback — boringtun on both ends, no mocks.
 #[cfg(test)]
@@ -1525,6 +1804,160 @@ mod handshake_tests {
             "one initiation for the connect, one for the new path"
         );
         assert!(!session.peer_unresponsive());
+    }
+
+    fn refused(code: i32) -> Result<(), SendError> {
+        Err(SendError::Io(std::io::Error::from_raw_os_error(code)))
+    }
+
+    /// Interface loss (device test, 2026-10-07), on loopback: the OS refuses
+    /// the socket's sends with WSAEINVAL — recorded exactly as the packet path
+    /// records them — until the send-path rule reads the path broken. The
+    /// rebuild gives a fresh socket with a clean record; its forced initiation
+    /// reaches the relay and is answered, which is the proof a re-prove window
+    /// waits for; and sends go out again.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_socket_the_os_refuses_is_rebuilt_and_sends_resume() {
+        let r = responder(false, 0).await;
+        let session = connect(&r).await.expect("handshake");
+        let old = session.socket().local_addr().unwrap();
+        let t0 = Instant::now();
+        for k in 0..4u64 {
+            session.note_send(t0 + Duration::from_secs(2 * k), &refused(10022));
+        }
+        let health = session.send_health();
+        assert_eq!((health.failures, health.last_code), (4, Some(10022)));
+        assert!(send_path_broken(&health, t0 + Duration::from_secs(6)));
+        let proven_before = session.responses.lock().last_proof;
+
+        session.rebind().await.expect("rebuilt");
+
+        assert_ne!(session.socket().local_addr().unwrap().port(), old.port());
+        assert_eq!(
+            session.send_health(),
+            SendHealth::default(),
+            "the new socket starts with a clean record"
+        );
+        let mut buf = [0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(2), session.socket().recv(&mut buf))
+            .await
+            .expect("the relay answers the rebuilt socket")
+            .unwrap();
+        let mut out = [0u8; 2048];
+        assert!(matches!(
+            session.open(&buf[..n], &mut out),
+            Opened::Reply(_)
+        ));
+        assert!(
+            session.responses.lock().last_proof > proven_before,
+            "the answer to our initiation is proof"
+        );
+        assert_eq!(r.initiations_seen.load(Ordering::SeqCst), 2);
+
+        let sent = send_capped(&session.socket(), &[0u8; 32]).await;
+        assert!(sent.is_ok(), "sends go out again");
+        session.note_send(Instant::now(), &sent);
+        assert_eq!(session.send_health(), SendHealth::default());
+    }
+
+    /// The send record on a live session: a send that leaves with nothing
+    /// open touches nothing, refusals open a run, a full socket is ignored,
+    /// and the next datagram that leaves ends the run.
+    #[tokio::test]
+    async fn a_send_that_leaves_ends_a_run_of_refusals() {
+        let r = responder(false, 0).await;
+        let session = connect(&r).await.expect("handshake");
+        let t0 = Instant::now();
+        session.note_send(t0, &Ok(()));
+        assert_eq!(session.send_health(), SendHealth::default());
+        for k in 0..3 {
+            session.note_send(t0 + Duration::from_secs(k), &refused(10051));
+        }
+        session.note_send(
+            t0 + Duration::from_secs(4),
+            &Err(SendError::TimedOut(CONTROL_SEND_CAP)),
+        );
+        assert_eq!(session.send_health().failures, 3);
+        session.note_send(t0 + Duration::from_secs(5), &Ok(()));
+        assert_eq!(session.send_health(), SendHealth::default());
+    }
+
+    /// Interface loss, the trap itself: a relay with traffic for us and no
+    /// answer from us initiates handshakes of its own, and boringtun answers
+    /// them and reads the session as freshly handshaked — whether or not the
+    /// answer ever leaves. That reset the age every re-prove window and the
+    /// 180 s backstop read. Only the relay's answer to an initiation of OURS
+    /// is proof.
+    #[tokio::test]
+    async fn only_an_answer_to_our_initiation_proves_the_path() {
+        let server_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let server_public = PublicKey::from(&server_secret);
+        let client_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let mut relay = Tunn::new(
+            server_secret,
+            PublicKey::from(&client_secret),
+            None,
+            None,
+            1,
+            None,
+        );
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = relay_socket.local_addr().unwrap().to_string();
+        let private_b64 = BASE64.encode(client_secret.to_bytes());
+        let public_b64 = BASE64.encode(server_public.as_bytes());
+        let connecting = tokio::spawn(async move {
+            WireGuardSession::new(&private_b64, &public_b64, &endpoint, None, 0).await
+        });
+        let mut buf = [0u8; 2048];
+        let mut out = [0u8; 2048];
+        let (n, from) = relay_socket.recv_from(&mut buf).await.unwrap();
+        if let TunnResult::WriteToNetwork(reply) =
+            relay.decapsulate(Some(from.ip()), &buf[..n], &mut out)
+        {
+            relay_socket.send_to(reply, from).await.unwrap();
+        }
+        let session = connecting.await.unwrap().expect("handshake");
+        let proven_at_connect = session.responses.lock().last_proof;
+        assert!(
+            proven_at_connect.is_some(),
+            "the connect's handshake is proof"
+        );
+
+        // The relay initiates; we answer (and the answer may never leave).
+        // boringtun's `handle_handshake_init` stamps the session it answered
+        // as established right here — what reset the age.
+        let init = match relay.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(init) => init.to_vec(),
+            _ => panic!("the relay could not initiate"),
+        };
+        let mut plain = [0u8; 2048];
+        assert!(matches!(session.open(&init, &mut plain), Opened::Reply(_)));
+        let watch = *session.responses.lock();
+        assert_eq!(watch.last_proof, proven_at_connect, "that is no proof");
+        assert!(watch.last_rx.is_some(), "though the relay is heard");
+
+        // An initiation of ours, answered by the relay: proof.
+        let mut dst = [0u8; WIREGUARD_OVERHEAD];
+        let len = match session
+            .tunnel
+            .lock()
+            .format_handshake_initiation(&mut dst, true)
+        {
+            TunnResult::WriteToNetwork(ours) => ours.len(),
+            _ => panic!("no initiation"),
+        };
+        let answer = match relay.decapsulate(None, &dst[..len], &mut out) {
+            TunnResult::WriteToNetwork(answer) => answer.to_vec(),
+            _ => panic!("the relay did not answer"),
+        };
+        assert!(answers_our_initiation(&answer));
+        assert!(matches!(
+            session.open(&answer, &mut plain),
+            Opened::Reply(_)
+        ));
+        assert!(session.responses.lock().last_proof > proven_at_connect);
+        assert!(session.proof_age() < Duration::from_secs(1));
     }
 
     /// WIN-FIX-3 P0, reproduced. boringtun stalls inside its own lock — it

@@ -39,7 +39,9 @@ use wintun::Session;
 use zeroize::Zeroizing;
 
 use super::buffer_pool::{MAX_PACKET_SIZE, WIREGUARD_OVERHEAD};
-use super::wireguard_new::{send_capped, Opened, Outbound, WireGuardSession, CONTROL_SEND_CAP};
+use super::wireguard_new::{
+    send_capped, Opened, Outbound, SendError, WireGuardSession, CONTROL_SEND_CAP,
+};
 
 /// boringtun's timer cadence (its own device implementation uses the same).
 const TIMER_INTERVAL: Duration = Duration::from_millis(250);
@@ -257,22 +259,17 @@ fn send_blocking(
     socket: &UdpSocket,
     data: &[u8],
     runtime: &tokio::runtime::Handle,
-) -> Result<(), String> {
+) -> Result<(), SendError> {
     loop {
         match socket.try_send(data) {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 match runtime.block_on(timeout(CONTROL_SEND_CAP, socket.writable())) {
-                    Ok(ready) => ready.map_err(|e| format!("Failed to send: {}", e))?,
-                    Err(_) => {
-                        return Err(format!(
-                            "Failed to send: the socket stayed full for {:?}",
-                            CONTROL_SEND_CAP
-                        ))
-                    }
+                    Ok(ready) => ready.map_err(SendError::Io)?,
+                    Err(_) => return Err(SendError::TimedOut(CONTROL_SEND_CAP)),
                 }
             }
-            Err(e) => return Err(format!("Failed to send: {}", e)),
+            Err(e) => return Err(SendError::Io(e)),
         }
     }
 }
@@ -318,7 +315,13 @@ fn send_loop(
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             counters.packets_sent.fetch_add(1, Ordering::Relaxed);
             match wg.seal(data, &mut sealed) {
-                Outbound::Send(out) => send_blocking(&socket, out, runtime),
+                Outbound::Send(out) => {
+                    // What the OS says about the send is what the
+                    // reconnect loop's send-path rule reads.
+                    let sent = send_blocking(&socket, out, runtime);
+                    wg.note_send(Instant::now(), &sent);
+                    sent.map_err(|e| format!("Failed to send: {}", e))
+                }
                 Outbound::Queued => Ok(()),
                 Outbound::Failed(e) => Err(e),
             }
@@ -378,7 +381,8 @@ async fn receive_loop(
             _ = timers.tick() => {
                 let now = Instant::now();
                 if let Ok(Some(message)) = wg.tick_timers(&mut timer_buf) {
-                    let _ = send_capped(&socket, message).await;
+                    let sent = send_capped(&socket, message).await;
+                    wg.note_send(Instant::now(), &sent);
                 }
                 for summary in [&mut receive_failures, &mut adapter_failures] {
                     if let Some(line) = summary.flush(now) {
@@ -426,7 +430,8 @@ async fn receive_loop(
                         false
                     }
                     Opened::Reply(message) => {
-                        let _ = send_capped(&socket, message).await;
+                        let sent = send_capped(&socket, message).await;
+                        wg.note_send(Instant::now(), &sent);
                         true
                     }
                     Opened::Nothing => false,
@@ -435,7 +440,8 @@ async fn receive_loop(
                     // boringtun's contract after any WriteToNetwork: send what
                     // it queued behind the handshake.
                     while let Some(queued) = wg.next_queued(&mut plain) {
-                        let _ = send_capped(&socket, queued).await;
+                        let sent = send_capped(&socket, queued).await;
+                        wg.note_send(Instant::now(), &sent);
                     }
                 }
             }
@@ -529,6 +535,36 @@ mod tests {
             .and_then(|rest| rest.split("/// Adapter → relay.").next())
             .expect("send_blocking");
         assert!(blocking.contains("timeout(CONTROL_SEND_CAP, socket.writable())"));
+    }
+
+    /// Interface loss (2026-10-07): every send's outcome reaches the
+    /// session's send record — the data packets, the timer messages, the
+    /// handshake answers and what boringtun queued behind them. A send the
+    /// OS refuses was only ever logged, so a socket that had lost its path
+    /// failed every packet for minutes and nothing acted on it.
+    #[test]
+    fn every_send_outcome_reaches_the_send_record() {
+        let src = include_str!("data_plane.rs");
+        let receive = src
+            .split("async fn receive_loop(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Copy one decrypted packet").next())
+            .expect("receive_loop");
+        assert_eq!(
+            receive.matches("send_capped(&socket, ").count(),
+            receive
+                .matches("wg.note_send(Instant::now(), &sent);")
+                .count()
+        );
+        let send = src
+            .split("fn send_loop(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Relay → adapter").next())
+            .expect("send_loop");
+        let at = send
+            .find("let sent = send_blocking(&socket, out, runtime);")
+            .expect("the send");
+        assert!(send[at..].contains("wg.note_send(Instant::now(), &sent);"));
     }
 
     /// WIN3-012: the send thread holds a packet in view of the stall rule

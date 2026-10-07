@@ -701,6 +701,11 @@ struct SessionWatch {
     /// The packet path's tick across looks (WIN3-003).
     #[cfg(target_os = "windows")]
     stall: super::wireguard_new::StallWatch,
+    /// Heartbeats that failed on the network in a row (interface loss).
+    heartbeat_misses: u32,
+    /// The send-path rule's one rebuild per episode (interface loss).
+    #[cfg(target_os = "windows")]
+    send_repair: reconnect_policy::SendPathRepair,
 }
 
 enum Wake {
@@ -738,6 +743,22 @@ struct ReconnectLoop {
     generation: u64,
     /// How long one ordinary step may take (`WATCHDOG_TICKS` intervals).
     step_allowance: Duration,
+}
+
+/// Interface loss: rebuild the live tunnel's path to the relay on `path`
+/// (`VpnManager::repath`: our routes back, a fresh socket, a forced
+/// handshake) and open a re-prove window for it. It is the send-path rule's
+/// one rebuild for this episode. `Err` means re-dial.
+#[cfg(target_os = "windows")]
+async fn rebuild_path(
+    vm: &VpnManager,
+    session: &mut SessionWatch,
+    path: PhysicalRoute,
+    now: Instant,
+) -> Result<(), String> {
+    session.send_repair.rebuilt(now);
+    session.verify_since = Some(now);
+    vm.repath(path).await.map(|_| ())
 }
 
 async fn transport_exit(exits: &mut Option<watch::Receiver<u64>>) {
@@ -839,6 +860,9 @@ impl ReconnectLoop {
         if matches!(wake, Wake::TransportDied) {
             return Liveness::Dead(DropCause::TransportDied);
         }
+        // At most one rebuild of the relay socket per look.
+        #[cfg(target_os = "windows")]
+        let mut rebuilt = false;
         // W1-003: the socket and the endpoint host route are pinned to the
         // interface the session was built over; if the default route moved,
         // nothing of ours leaves the machine any more. Windows follows the new
@@ -855,6 +879,8 @@ impl ReconnectLoop {
                         );
                         session.pinned_route = Some(to);
                         session.verify_since = Some(now);
+                        session.send_repair.rebuilt(now);
+                        rebuilt = true;
                     }
                     Err(e) => {
                         tracing::warn!("In-place roam not possible ({}) — re-dialling", e);
@@ -878,6 +904,22 @@ impl ReconnectLoop {
             // path the machine woke on.
             #[cfg(target_os = "windows")]
             vm.restart_response_watch().await;
+            // Interface loss: the adapter may have been powered down with the
+            // machine, taking our routes and the socket's path with it.
+            // Rebuild on the route it woke on; with none yet, the link's
+            // return does it.
+            #[cfg(target_os = "windows")]
+            if let (Some(path), false) = (route, rebuilt) {
+                tracing::info!("Resumed — rebuilding the tunnel's path to the relay");
+                rebuilt = true;
+                if let Err(e) = rebuild_path(&vm, session, path, now).await {
+                    tracing::warn!(
+                        "Rebuilding the path to the relay failed ({}) — re-dialling",
+                        e
+                    );
+                    return Liveness::Dead(DropCause::PathChanged);
+                }
+            }
             vm.force_handshake().await;
         }
         // Wi-Fi re-associates for several seconds after a resume. The window
@@ -897,6 +939,41 @@ impl ReconnectLoop {
             session.verify_since = Some(now);
             #[cfg(target_os = "windows")]
             vm.restart_response_watch().await;
+            // Interface loss (2026-10-07): an adapter that went away took our
+            // routes with it — the endpoint host route among them — and the
+            // socket connected over it is refused every send from then on
+            // (WSAEINVAL). A nudge on that socket proved nothing and fixed
+            // nothing; rebuild the path on the route that came back.
+            #[cfg(target_os = "windows")]
+            if let (Some(path), false) = (route, rebuilt) {
+                tracing::info!("The network is back — rebuilding the tunnel's path to the relay");
+                rebuilt = true;
+                if let Err(e) = rebuild_path(&vm, session, path, now).await {
+                    tracing::warn!(
+                        "Rebuilding the path to the relay failed ({}) — re-dialling",
+                        e
+                    );
+                    return Liveness::Dead(DropCause::PathChanged);
+                }
+            }
+            vm.force_handshake().await;
+        }
+        // Interface loss: a heartbeat that keeps failing on the network
+        // while there is a route off the machine says the tunnel may carry
+        // nothing. It tears nothing down — the API can be down while the
+        // tunnel is fine — it asks the tunnel to prove itself with a
+        // handshake the relay must answer inside PATH_VERIFY_WINDOW.
+        if reconnect_policy::heartbeat_reprove(
+            session.heartbeat_misses,
+            link,
+            session.verify_since.is_some(),
+        ) {
+            tracing::info!(
+                "The heartbeat failed {} times in a row — re-proving the tunnel with a handshake",
+                session.heartbeat_misses
+            );
+            session.heartbeat_misses = 0;
+            session.verify_since = Some(now);
             vm.force_handshake().await;
         }
 
@@ -915,6 +992,51 @@ impl ReconnectLoop {
             return Liveness::Dead(DropCause::PacketPathStalled);
         }
 
+        // Interface loss (2026-10-07): the OS refuses our sends for a path
+        // reason (WSAEINVAL, WSAENETUNREACH, …) and keeps refusing them. The
+        // rules around this one read the relay's side, and a relay with
+        // traffic for us keeps initiating handshakes that reach us, so they
+        // all read healthy while nothing left. Rebuild the socket on the
+        // current path once; refused again, re-dial.
+        #[cfg(target_os = "windows")]
+        if !rebuilt {
+            let health = vm.send_health().await.unwrap_or_default();
+            let broken = super::wireguard_new::send_path_broken(&health, now);
+            match session
+                .send_repair
+                .observe(broken, link == LinkState::Offline, now)
+            {
+                reconnect_policy::SendPathVerdict::Fine => {}
+                reconnect_policy::SendPathVerdict::Rebuild => {
+                    tracing::warn!(
+                        "Sends to the relay have been refused for {} s (os error {}) — \
+                         rebuilding the socket on the current path",
+                        health
+                            .failing_since
+                            .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
+                        health.last_code.unwrap_or_default()
+                    );
+                    let Some(path) = route else {
+                        return Liveness::Dead(DropCause::PathChanged);
+                    };
+                    if let Err(e) = rebuild_path(&vm, session, path, now).await {
+                        tracing::warn!(
+                            "Rebuilding the path to the relay failed ({}) — re-dialling",
+                            e
+                        );
+                        return Liveness::Dead(DropCause::PathChanged);
+                    }
+                }
+                reconnect_policy::SendPathVerdict::Escalate => {
+                    tracing::warn!(
+                        "Sends to the relay are still refused on the rebuilt socket — declaring \
+                         the tunnel dead"
+                    );
+                    return Liveness::Dead(DropCause::PathChanged);
+                }
+            }
+        }
+
         // The fast dead-path rule: with the relay unreachable the tunnel
         // stops carrying traffic at once, and waiting for the 180 s
         // handshake-age backstop left the app saying Protected for minutes.
@@ -931,11 +1053,19 @@ impl ReconnectLoop {
             // The tunnel went away under us; the next tick sees the new state.
             return Liveness::Healthy;
         };
+        // A re-prove window closes only on the relay's answer to an
+        // initiation of OURS (`reconnect_policy::judged_age`).
+        #[cfg(target_os = "windows")]
+        let proof_age = vm.proof_age().await.unwrap_or(age);
+        #[cfg(not(target_os = "windows"))]
+        let proof_age = age;
         let mut verify_elapsed = session.verify_since.map(|t| now.duration_since(t));
-        if verify_elapsed.is_some_and(|elapsed| age < elapsed) {
+        if verify_elapsed.is_some_and(|elapsed| proof_age < elapsed) {
+            tracing::info!("Tunnel re-proven — the relay answered a handshake on this path");
             session.verify_since = None;
             verify_elapsed = None;
         }
+        let age = reconnect_policy::judged_age(age, proof_age, verify_elapsed.is_some());
         reconnect_policy::liveness(now.duration_since(connected_since), age, verify_elapsed)
     }
 
@@ -1222,15 +1352,26 @@ impl ReconnectLoop {
             // outage, and the log must say why (live retest 2026-10-02).
             Ok(Err(e)) => {
                 tracing::warn!("Heartbeat failed: {}", heartbeat_failure(&e));
+                // An HTTP status crossed the tunnel to arrive; only a failure
+                // on the network itself says the tunnel may carry nothing.
+                self.session.heartbeat_misses = if heartbeat_missed_the_network(&e) {
+                    self.session.heartbeat_misses.saturating_add(1)
+                } else {
+                    0
+                };
                 return Flow::Continue;
             }
             Err(_) => {
                 // A heartbeat that rides a dead tunnel never answers; the
-                // liveness rules, not this, decide that the tunnel is dead.
+                // liveness rules, not this, decide that the tunnel is dead —
+                // a run of these only asks the tunnel to prove itself
+                // (`reconnect_policy::heartbeat_reprove`).
                 tracing::warn!("Heartbeat unanswered after {:?}", HEARTBEAT_TIMEOUT);
+                self.session.heartbeat_misses = self.session.heartbeat_misses.saturating_add(1);
                 return Flow::Continue;
             }
         };
+        self.session.heartbeat_misses = 0;
         if resp.valid {
             self.alive = Some((now, network_events::resume_count()));
         }
@@ -1475,6 +1616,13 @@ async fn flush_dns_cache() {
         Duration::from_secs(5),
     )
     .await;
+}
+
+/// Whether a failed heartbeat failed on the NETWORK — no connection, no
+/// answer — rather than with an answer (a status, an unreadable body), which
+/// had to cross the tunnel to arrive.
+fn heartbeat_missed_the_network(e: &crate::api::ApiError) -> bool {
+    matches!(e, crate::api::ApiError::Network(_))
 }
 
 /// What a failed heartbeat met, for the log: a status or a kind, never the
@@ -1782,6 +1930,8 @@ mod tests {
             "if link == LinkState::Returned {",
             "session.verify_since = Some(now);",
             "vm.restart_response_watch().await;",
+            // Interface loss: the path is rebuilt, not just nudged.
+            "rebuild_path(&vm, session, path, now).await",
             "vm.force_handshake().await;",
             "if link != LinkState::Offline && vm.peer_unresponsive().await {",
         ] {
@@ -1791,6 +1941,93 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
             last += at + needle.len();
         }
+    }
+
+    /// Interface loss (2026-10-07), the wiring of the pieces tested in
+    /// `reconnect_policy` and `wireguard_new`: a resume rebuilds the path
+    /// like the link's return does; the send-path rule sits between the stall
+    /// rule and the fast rule, rebuilds once and re-dials when that did not
+    /// help; and a re-prove window is judged by the relay's answer to OUR
+    /// initiation, not by boringtun's age.
+    #[test]
+    fn a_path_the_os_refuses_is_rebuilt_then_redialled() {
+        let source = include_str!("auto_reconnect.rs").replace('\r', "");
+        let start = source.find("async fn check_liveness(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+
+        let resume = &body[body.find("if resumes != session.resumes_seen {").unwrap()..];
+        let resume = &resume[..resume.find("vm.force_handshake().await;").unwrap()];
+        assert!(resume.contains("rebuild_path(&vm, session, path, now).await"));
+
+        let mut last = 0;
+        for needle in [
+            "Liveness::Dead(DropCause::PacketPathStalled)",
+            "vm.send_health().await",
+            "super::wireguard_new::send_path_broken(&health, now)",
+            ".observe(broken, link == LinkState::Offline, now)",
+            "reconnect_policy::SendPathVerdict::Rebuild => {",
+            "rebuild_path(&vm, session, path, now).await",
+            "reconnect_policy::SendPathVerdict::Escalate => {",
+            "return Liveness::Dead(DropCause::PathChanged);",
+            "vm.peer_unresponsive().await",
+            "let proof_age = vm.proof_age().await.unwrap_or(age);",
+            "proof_age < elapsed",
+            "reconnect_policy::judged_age(age, proof_age, verify_elapsed.is_some())",
+            "reconnect_policy::liveness(",
+        ] {
+            let at = body[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+            last += at + needle.len();
+        }
+
+        let helper = &source[source.find("async fn rebuild_path(").unwrap()..];
+        let helper = &helper[..helper.find("\n}\n").unwrap()];
+        for step in [
+            "session.send_repair.rebuilt(now);",
+            "session.verify_since = Some(now);",
+            "vm.repath(path).await",
+        ] {
+            assert!(helper.contains(step), "rebuild_path lost `{step}`");
+        }
+    }
+
+    /// Interface loss: only a heartbeat that failed on the network counts
+    /// toward a re-prove; any answer — a status included — crossed the
+    /// tunnel and resets the run.
+    #[test]
+    fn only_a_heartbeat_lost_on_the_network_counts_toward_a_reprove() {
+        use crate::api::ApiError;
+        assert!(heartbeat_missed_the_network(&ApiError::Network(
+            "connection reset".into()
+        )));
+        for answered in [
+            ApiError::ServerError(503),
+            ApiError::Unauthorized,
+            ApiError::Parse("x".into()),
+            ApiError::Rejected {
+                status: 409,
+                message: "x".into(),
+            },
+        ] {
+            assert!(!heartbeat_missed_the_network(&answered), "{answered:?}");
+        }
+        let source: String = include_str!("auto_reconnect.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let heartbeat = &source[source
+            .find("asyncfnheartbeat(&mutself,now:Instant)->Flow{")
+            .unwrap()..];
+        let heartbeat = &heartbeat[..heartbeat
+            .find("matchreconnect_policy::heartbeat_verdict")
+            .unwrap()];
+        assert!(heartbeat.contains("ifheartbeat_missed_the_network(&e){"));
+        assert!(heartbeat.contains(
+            "self.session.heartbeat_misses=self.session.heartbeat_misses.saturating_add(1);"
+        ));
+        assert!(heartbeat.contains("self.session.heartbeat_misses=0;ifresp.valid{"));
     }
 
     /// REVIEW-WIN-009: every give-up the POLICY decides is marked on the final

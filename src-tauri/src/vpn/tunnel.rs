@@ -2202,6 +2202,67 @@ impl WintunTunnel {
         Ok(())
     }
 
+    /// Interface loss: rebuild the path to the relay on the default route
+    /// `path` it is still pinned to — after the interface went away and came
+    /// back, after a resume, or when the OS keeps refusing our sends.
+    ///
+    /// Windows deleted the interface's routes with it (the endpoint host
+    /// route among them), and the socket connected over it fails every send
+    /// (WSAEINVAL) for good. So: put our gateway routes on `path` back FIRST
+    /// — a socket connected without the host route would leave through the
+    /// tunnel's own /1 routes — then a fresh socket (bound to 0.0.0.0, so the
+    /// OS picks the source address from the route) and a forced handshake.
+    /// The session, the key, the tunnel address and the kill switch's block
+    /// are all left as they are.
+    ///
+    /// `Ok(false)`: a stealth session, whose relay connection is xray's and
+    /// whose own socket is on loopback — nothing of ours to rebuild. `Err`
+    /// means "re-dial instead".
+    pub(crate) async fn repath(&self, path: (Ipv4Addr, u32)) -> Result<bool, String> {
+        let wg = self
+            .wg_session
+            .read()
+            .await
+            .clone()
+            .ok_or("the tunnel has no WireGuard session")?;
+        if wg.endpoint_ip().is_loopback() {
+            return Ok(false);
+        }
+        let state_gen = self.state_gen;
+        let pinned = tokio::task::block_in_place(|| {
+            crate::vpn::win_machine_state::reinstall_gateway_routes(state_gen, path)
+        })?;
+        if pinned == 0 {
+            return Err("no endpoint route of ours on the current path".to_string());
+        }
+        wg.rebind().await?;
+        tracing::info!(
+            "Relay socket rebuilt on the current network path ({} route(s) re-pinned)",
+            pinned
+        );
+        Ok(true)
+    }
+
+    /// The live session's run of refused sends (see
+    /// `wireguard_new::SendHealth`). `None` with no session.
+    pub(crate) async fn send_health(&self) -> Option<super::wireguard_new::SendHealth> {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .map(|wg| wg.send_health())
+    }
+
+    /// Time since the relay last answered an initiation of ours (see
+    /// `WireGuardSession::proof_age`). `None` with no session.
+    pub async fn proof_age(&self) -> Option<Duration> {
+        self.wg_session
+            .read()
+            .await
+            .as_ref()
+            .map(|wg| wg.proof_age())
+    }
+
     /// Has the relay stopped answering while there is traffic to carry?
     /// (see `wireguard_new::peer_unresponsive`). False with no session.
     pub async fn peer_unresponsive(&self) -> bool {

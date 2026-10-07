@@ -188,6 +188,88 @@ pub fn liveness(
     }
 }
 
+/// The handshake age the liveness rules judge (interface loss, 2026-10-07).
+///
+/// While a re-prove window is open (`verifying`), only an answer to an
+/// initiation of OURS closes it: `proof_age` is the time since the relay last
+/// gave one. boringtun's own age is reset by a handshake the RELAY initiated
+/// and we answered, before that answer has left — and a relay with traffic
+/// for us initiates every 5 s while it hears nothing back. On a path that
+/// still delivers but can no longer send, that kept every window closed and
+/// the 180 s backstop from ever coming due. Outside a window the age is
+/// boringtun's, as before.
+pub fn judged_age(handshake_age: Duration, proof_age: Duration, verifying: bool) -> Duration {
+    if verifying {
+        handshake_age.max(proof_age)
+    } else {
+        handshake_age
+    }
+}
+
+/// Heartbeats that failed on the network in a row (no answer, or no
+/// connection — not an HTTP status, which crossed the tunnel to arrive)
+/// before the tunnel is asked to prove itself.
+pub const HEARTBEAT_MISSES_TO_REPROVE: u32 = 2;
+
+/// Whether `misses` such heartbeats open a re-prove window: a forced
+/// handshake the relay must answer inside [`PATH_VERIFY_WINDOW`], or the path
+/// is declared broken and re-dialled. Never a teardown by itself — the API
+/// can be down while the tunnel is fine, and then the relay simply answers.
+/// Not while there is no route off the machine (the offline pause covers
+/// that), and not while a window is already open.
+pub fn heartbeat_reprove(misses: u32, link: LinkState, verifying: bool) -> bool {
+    misses >= HEARTBEAT_MISSES_TO_REPROVE && link != LinkState::Offline && !verifying
+}
+
+/// A rebuilt socket that is refused again within this long was not the
+/// problem: the next refusal re-dials instead of rebuilding again.
+pub const REBUILD_SETTLE: Duration = Duration::from_secs(30);
+
+/// What to do about the socket's send path this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendPathVerdict {
+    Fine,
+    /// Rebuild the socket on the current path (routes, socket, handshake).
+    Rebuild,
+    /// The rebuild did not help: the tunnel is dead, re-dial.
+    Escalate,
+}
+
+/// The send-path rule across ticks (interface loss, 2026-10-07): a socket
+/// whose sends the OS keeps refusing is rebuilt ONCE; refused again inside
+/// [`REBUILD_SETTLE`], the tunnel is declared dead and re-dialled — never a
+/// rebuild per tick. A rebuild the loop did for another reason (the link came
+/// back, a resume, a roam) counts as that one.
+#[derive(Debug, Default)]
+pub struct SendPathRepair {
+    rebuilt_at: Option<Instant>,
+}
+
+impl SendPathRepair {
+    /// The socket was rebuilt at `now`.
+    pub fn rebuilt(&mut self, now: Instant) {
+        self.rebuilt_at = Some(now);
+    }
+
+    /// One tick. `broken`: the OS has refused our sends for the rule's
+    /// window (`wireguard_new::send_path_broken`). With no route off the
+    /// machine there is no path to rebuild onto: wait.
+    pub fn observe(&mut self, broken: bool, offline: bool, now: Instant) -> SendPathVerdict {
+        if offline || !broken {
+            return SendPathVerdict::Fine;
+        }
+        match self.rebuilt_at {
+            Some(at) if now.saturating_duration_since(at) < REBUILD_SETTLE => {
+                SendPathVerdict::Escalate
+            }
+            _ => {
+                self.rebuilt_at = Some(now);
+                SendPathVerdict::Rebuild
+            }
+        }
+    }
+}
+
 /// The session was built over one physical default route; the WireGuard socket
 /// and the endpoint host route are pinned to it. A DIFFERENT route (another
 /// gateway or interface: Wi-Fi to Ethernet, a dock) means the tunnel's packets
@@ -1066,6 +1148,116 @@ mod tests {
         // A handshake 2 s ago, after the resume 4 s ago: proven, and the normal
         // rules apply again (even inside the grace period).
         assert_eq!(liveness(s(10), s(2), Some(s(4))), Liveness::Healthy);
+    }
+
+    /// Interface loss (2026-10-07): the relay keeps initiating handshakes of
+    /// its own while our sends all fail, and boringtun's age reads 1 s. Inside
+    /// a re-prove window that must not count: only the relay's answer to an
+    /// initiation of ours (40 s ago here) does, and the window ends in a dead
+    /// path. Outside a window nothing changes.
+    #[test]
+    fn a_reprove_window_is_closed_only_by_an_answer_to_our_initiation() {
+        let s = Duration::from_secs;
+        let (age, proof) = (s(1), s(40));
+        let judged = judged_age(age, proof, true);
+        assert_eq!(judged, s(40));
+        assert_eq!(liveness(s(900), judged, Some(s(4))), Liveness::Nudge);
+        assert_eq!(
+            liveness(s(900), judged, Some(s(10))),
+            Liveness::Dead(DropCause::PathChanged)
+        );
+        // The relay answered ours 2 s into a 4 s window: proven.
+        assert_eq!(judged_age(age, s(2), true), s(2));
+        assert_eq!(
+            liveness(s(900), judged_age(age, s(2), true), Some(s(4))),
+            Liveness::Healthy
+        );
+        // No window open: boringtun's age, as before.
+        assert_eq!(judged_age(age, proof, false), age);
+        assert_eq!(judged_age(s(181), s(5), false), s(181));
+    }
+
+    /// Interface loss: heartbeats failing on the network ask the tunnel to
+    /// prove itself — from the second in a row, with a route, and once per
+    /// window. They never tear anything down by themselves.
+    #[test]
+    fn heartbeat_misses_open_one_reprove_window() {
+        assert!(!heartbeat_reprove(0, LinkState::Online, false));
+        assert!(!heartbeat_reprove(1, LinkState::Online, false));
+        assert!(heartbeat_reprove(2, LinkState::Online, false));
+        assert!(heartbeat_reprove(5, LinkState::Returned, false));
+        assert!(
+            !heartbeat_reprove(2, LinkState::Offline, false),
+            "no route off the machine: the offline pause covers it"
+        );
+        assert!(
+            !heartbeat_reprove(2, LinkState::Online, true),
+            "a window is already open"
+        );
+        assert_eq!(HEARTBEAT_MISSES_TO_REPROVE, 2);
+    }
+
+    /// Interface loss: a socket the OS keeps refusing is rebuilt exactly once
+    /// however many ticks see it broken; refused again inside the settle
+    /// window, the tunnel is declared dead — one re-dial, not a rebuild
+    /// storm.
+    #[test]
+    fn a_broken_send_path_is_rebuilt_once_then_escalated() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut repair = SendPathRepair::default();
+        assert_eq!(repair.observe(false, false, t0), SendPathVerdict::Fine);
+
+        // Every 5 s tick inside the settle window sees the path broken.
+        let ticks = REBUILD_SETTLE.as_secs() / 5;
+        let verdicts: Vec<SendPathVerdict> = (0..ticks)
+            .map(|tick| repair.observe(true, false, t0 + s(5 * tick)))
+            .collect();
+        assert_eq!(verdicts[0], SendPathVerdict::Rebuild);
+        assert!(
+            verdicts[1..]
+                .iter()
+                .all(|v| *v == SendPathVerdict::Escalate),
+            "{verdicts:?}"
+        );
+        // (An escalation tears the tunnel down, and the next tunnel starts
+        // with a fresh repair record.) A later episode, past the settle
+        // window — another Wi-Fi drop an hour on — is rebuilt once again.
+        assert_eq!(
+            repair.observe(true, false, t0 + s(3600)),
+            SendPathVerdict::Rebuild
+        );
+        assert_eq!(
+            repair.observe(true, false, t0 + s(3605)),
+            SendPathVerdict::Escalate
+        );
+    }
+
+    /// No route off the machine: nothing to rebuild onto, whatever the
+    /// sends say — the link's return rebuilds instead. A rebuild the loop did
+    /// for that return (or a resume, or a roam) is the one rebuild.
+    #[test]
+    fn the_send_path_rule_waits_offline_and_counts_other_rebuilds() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut repair = SendPathRepair::default();
+        for tick in 0..10u64 {
+            assert_eq!(
+                repair.observe(true, true, t0 + s(5 * tick)),
+                SendPathVerdict::Fine
+            );
+        }
+        let back = t0 + s(60);
+        repair.rebuilt(back);
+        assert_eq!(
+            repair.observe(false, false, back + s(5)),
+            SendPathVerdict::Fine
+        );
+        assert_eq!(
+            repair.observe(true, false, back + s(10)),
+            SendPathVerdict::Escalate,
+            "refused again on the rebuilt socket: re-dial"
+        );
     }
 
     #[test]
