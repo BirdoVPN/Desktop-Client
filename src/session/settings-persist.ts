@@ -307,6 +307,9 @@ export const KILL_SWITCH_OFF_FAILED_COPY =
 export const KILL_SWITCH_OFF_THIS_CONNECTION_COPY =
   "The kill switch is off for this connection only. It couldn't be saved, so it comes back on at your next connection.";
 
+export const KILL_SWITCH_ON_FAILED_COPY =
+  "The kill switch couldn't be turned on for this connection. Disconnect and connect again to turn it on.";
+
 /** Bumped by every kill-switch choice, so an older one's late steps stand down. */
 let killSwitchChoice = 0;
 
@@ -473,7 +476,12 @@ export function watchKillSwitchAcrossDials(): () => void {
 function dialStarted(): void {
   const standing = standingChoice;
   if (!standing?.thisConnectionOnly) return;
-  standingChoice = null;
+  // What the file says stands now, and is checked when this dial ends (round
+  // 7 of the review of #222, N2): a dial Rust started itself (the tray's
+  // Quick Connect) can take this OFF's push before the UI sees it begin. Its
+  // arm then stands aside, as for any OFF during a dial, and the check puts
+  // the intent back to what the toggle shows again.
+  standingChoice = { enabled: standing.thisConnectionOnly.saved };
   const s = useAppStore.getState();
   if (s.settings.killSwitchEnabled === standing.enabled) {
     s.updateSettings({ killSwitchEnabled: standing.thisConnectionOnly.saved });
@@ -502,7 +510,12 @@ async function dialEnded(): Promise<void> {
   try {
     await invoke('set_killswitch_live', { enabled: standing.enabled });
   } catch {
-    if (!standing.enabled) s.showNotice({ text: KILL_SWITCH_OFF_FAILED_COPY, tone: 'danger' });
+    // Either way the connection now runs other than the toggle shows, so it
+    // is said (round 7: a failed ON was silent).
+    s.showNotice({
+      text: standing.enabled ? KILL_SWITCH_ON_FAILED_COPY : KILL_SWITCH_OFF_FAILED_COPY,
+      tone: 'danger',
+    });
   }
 }
 
