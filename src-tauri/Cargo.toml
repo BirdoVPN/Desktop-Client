@@ -6,14 +6,17 @@ authors = ["Birdo VPN"]
 license = "CC-BY-NC-4.0" # SPDX id of ../LICENSE (source-available, not open source)
 publish = false # Tauri app — never published to crates.io (also lets cargo-deny skip it)
 edition = "2021"
-# 1.88: the highest `rust-version` any crate in the locked graph declares
-# (time 0.3.53, sentry 0.49, plist 1.10, darling 0.23, serde_with 3.22 - from
-# `cargo metadata --locked`, 2026-10-06). The "1.85" this replaced (the
-# RustCrypto 0.11 / ml-kem 0.3 floor) had been fiction since those landed:
-# cargo +1.85 refuses the graph. tests.yml's `msrv` job builds at this value
-# on Linux, Windows and macOS, so it cannot drift again. It is also a clippy
-# input (MSRV-gated lints). rust-toolchain.toml pins 1.96 for real builds.
-rust-version = "1.88"
+# 1.90: the highest `rust-version` any crate in the locked graph declares
+# (tauri 2.12, tauri-build/-codegen/-macros/-plugin 2.7, tauri-runtime(-wry)
+# 2.12, tauri-utils 2.10, every tauri-plugin-* this app uses, muda 0.20 and
+# tray-icon 0.25 - from `cargo metadata --locked`, 2026-10-07). It was 1.88
+# (time 0.3.53, sentry 0.49, plist 1.10, darling 0.23, serde_with 3.22) until
+# the tauri 2.12 group raised the floor; cargo +1.88 refuses that graph. The
+# "1.85" before that (the RustCrypto 0.11 / ml-kem 0.3 floor) had been fiction
+# since those landed. tests.yml's `msrv` job builds at this value on Linux,
+# Windows and macOS, so it cannot drift again. It is also a clippy input
+# (MSRV-gated lints). rust-toolchain.toml pins 1.96 for real builds.
+rust-version = "1.90"
 
 [lib]
 name = "birdo_vpn_desktop_lib"

@@ -8,7 +8,8 @@
 # build captured XRAY_BINARY_SHA256 from the freshly downloaded xray.exe, and
 # tauri-bundler then Authenticode-signed that same file IN PLACE during
 # `tauri build` (tauri-bundler 2.9.4 - the crate pinned by tauri-cli-v2.11.4,
-# which the locked @tauri-apps/cli 2.11.4 is built from; nsis/mod.rs
+# which @tauri-apps/cli 2.11.4 is built from; still the same code in the
+# tauri-bundler 2.10.0 that tauri-cli-v2.12.0 pins; nsis/mod.rs
 # generate_resource_data(): `if can_sign() && should_sign(&resource_path)
 # { try_sign(...) }` for every .exe/.dll resource). Signing appends a PKCS#7
 # blob, so the shipped bytes
