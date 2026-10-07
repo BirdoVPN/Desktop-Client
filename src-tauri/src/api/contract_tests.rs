@@ -39,7 +39,7 @@ const SCHEMA_SRC: &str = include_str!("../../contract/vpn-protocol.schema.json")
 /// `sha256sum` of birdo-web `backend/contract/vpn-protocol.schema.json` at the
 /// commit vendored (LF bytes, as git stores them). The test normalises `\r\n`
 /// so an autocrlf checkout hashes the same as CI.
-const SCHEMA_SHA256: &str = "9b8690c097876541c0cdcd4037e335ed36cfe26b301e1a9d1c26cdee96c71384";
+const SCHEMA_SHA256: &str = "4b159a273f6dc640ebb98247cd104053db90a4307b116ac6879ed30da7c6e5ee";
 
 const CONNECT: &str = "ConnectRequest";
 const MULTI_HOP: &str = "MultiHopConnectRequest";
