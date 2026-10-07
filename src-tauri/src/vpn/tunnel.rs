@@ -1174,9 +1174,12 @@ impl WintunTunnel {
                     // active (lockdown holds it on continuously), rebuild it NOW with
                     // this NEW interface LUID + the new server IP, so the active block
                     // never permits a stale/freed LUID. On a fresh connect the block
-                    // is not active yet — arm() does the first activation.
+                    // is not active yet — arm() does the first activation. Through
+                    // the kill switch, which reads the user's intent before and after
+                    // the load: with the kill switch turned off, the block that is up
+                    // is lifted rather than re-baked.
                     if crate::vpn::wfp::is_lockdown_mode() && crate::vpn::wfp::is_blocking() {
-                        if let Err(e) = crate::vpn::wfp::activate_blocking().await {
+                        if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
                             tracing::error!(
                                 "Lockdown: failed to re-activate kill switch with new tunnel LUID: {}",
                                 e

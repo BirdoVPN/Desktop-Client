@@ -40,12 +40,19 @@ export function resetSessionData(): void {
   usageInFlight = null;
 }
 
-export async function loadSettings(): Promise<void> {
+/** Hydrate the settings from Rust. Whether it did (round 8: `reloadSettings`). */
+export async function loadSettings(): Promise<boolean> {
   try {
     const rs = await invoke<RustSettings>('get_settings');
     useAppStore.getState().hydrateSettings(settingsFromRust(rs));
+    return true;
   } catch {
-    /* keep the persisted preferences; Rust logs the failure */
+    // Keep what the store holds. That includes `settings_unverified` (round 5
+    // of the review of #222): the defaults Rust runs on while it cannot
+    // verify the file are not the user's settings, and hydrating them let
+    // the next whole-object save write them over the file. Rust logs the
+    // failure.
+    return false;
   }
 }
 

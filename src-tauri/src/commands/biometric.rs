@@ -14,6 +14,8 @@ use tracing::info;
 #[cfg(any(windows, target_os = "macos"))]
 use tracing::{error, warn};
 
+use crate::utils::redact::for_ipc;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BiometricStatus {
     pub available: bool,
@@ -24,6 +26,10 @@ pub struct BiometricStatus {
 /// Check if biometric authentication is available on this device.
 #[tauri::command]
 pub async fn check_biometric_available() -> Result<BiometricStatus, String> {
+    biometric_status().await.map_err(for_ipc)
+}
+
+async fn biometric_status() -> Result<BiometricStatus, String> {
     // P1-dk-blocking-io-on-async-runtime: the availability probe (subprocess /
     // WinRT bridge) and the keystore read both block; run them on the blocking
     // pool as authenticate_biometric already does. On Linux a locked Secret
@@ -87,6 +93,10 @@ pub async fn check_biometric_available() -> Result<BiometricStatus, String> {
 /// Enable or disable biometric lock.
 #[tauri::command]
 pub async fn set_biometric_enabled(enabled: bool) -> Result<(), String> {
+    store_biometric_enabled(enabled).await.map_err(for_ipc)
+}
+
+async fn store_biometric_enabled(enabled: bool) -> Result<(), String> {
     // P1-dk-blocking-io-on-async-runtime: keystore write is blocking I/O.
     tokio::task::spawn_blocking(move || {
         let entry = keyring::Entry::new("BirdoVPN", "biometric_lock_enabled")
@@ -110,6 +120,10 @@ pub async fn set_biometric_enabled(enabled: bool) -> Result<(), String> {
 /// Returns Ok(true) if authenticated, Ok(false) if cancelled.
 #[tauri::command]
 pub async fn authenticate_biometric(_reason: String) -> Result<bool, String> {
+    authenticate().await.map_err(for_ipc)
+}
+
+async fn authenticate() -> Result<bool, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

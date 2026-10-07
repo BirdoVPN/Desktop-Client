@@ -15,7 +15,7 @@ use crate::commands::session::{
     connect_session, connect_session_for, end_session, ensure_signed_in, ConnectPurpose,
     ConnectTarget, EndReason,
 };
-use crate::commands::settings::{get_settings, AppSettings};
+use crate::commands::settings::{load_settings_off_runtime, AppSettings};
 use crate::storage::CredentialStore;
 use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
 use crate::vpn::xray::XrayManager;
@@ -319,7 +319,10 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
     // Settings failing to load means security-relevant flags (stealth_mode,
     // quantum_protection) fall back to their defaults. We keep the resilient
     // fallback behaviour, but surface the cause instead of silently swallowing it.
-    let settings = match get_settings(app.clone()).await {
+    // Rust's own read (round 6 of the review of #222): an unverifiable file
+    // gives the defaults this session runs on — post-quantum and, on Windows,
+    // lockdown ON — where `get_settings`, the UI's read, refuses it.
+    let settings = match load_settings_off_runtime(app).await {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::warn!(
@@ -870,7 +873,9 @@ async fn quick_connect_target(
     // The branch lives in Rust rather than in each caller because the tray and
     // the launch path have no UI to gate on, and duplicating it per call site is
     // how it went missing in the first place.
-    let settings = get_settings(app.clone()).await.map_err(IpcError::unknown)?;
+    let settings = load_settings_off_runtime(app)
+        .await
+        .map_err(IpcError::unknown)?;
     if settings.multi_hop_enabled {
         return match (
             settings.multi_hop_entry_node_id.as_deref(),
@@ -1041,7 +1046,7 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
         "The settings change could not be applied ({:?}) — restoring the previous settings",
         error.code
     );
-    if let Err(e) = crate::commands::settings::restore_tunnel_settings(&app, &previous) {
+    if let Err(e) = crate::commands::settings::restore_tunnel_settings(&app, &previous).await {
         tracing::error!("Could not save the previous settings back: {}", e);
         return Err(error);
     }

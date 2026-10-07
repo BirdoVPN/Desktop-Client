@@ -11,7 +11,9 @@
  *     snake_case as today" while today's `VpnStatus` is camelCase.
  *  2. UI → Rust: the argument objects our real action functions send, and the
  *     `save_settings` payload checked field-by-field against the Rust
- *     `AppSettings` struct read out of src-tauri.
+ *     `AppSettings` struct read out of src-tauri. Port Forwarding's add is
+ *     driven through the real screen and checked against the Rust command's
+ *     parameter names.
  *  3. The command registry: every command the UI invokes (scanned from the
  *     source, so the list cannot drift) is registered in main.rs.
  *
@@ -19,6 +21,9 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
+import { createElement } from 'react';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { parseServers, parseSessionExpired, parseVpnStats, parseVpnStatus, toIpcError } from '@/lib/ipc';
@@ -26,6 +31,7 @@ import { connectMultiHop, connectToServer, disconnectVpn } from '@/session/vpn-a
 import { persistSettings } from '@/session/settings-persist';
 import { useAppStore, type Server } from '@/store/app-store';
 import { settingsToRust } from '@/utils/helpers';
+import { PortForward } from '@/screens/PortForward';
 
 vi.mock('@tauri-apps/api/core');
 const mockedInvoke = vi.mocked(invoke);
@@ -241,7 +247,44 @@ describe('what the real actions send', () => {
     expect(Object.keys(args.settings).sort()).toEqual(Object.keys(settingsToRust(useAppStore.getState().settings)).sort());
     expect(args.settings.auto_connect).toBe(true);
   });
+
+  // P1-dk-ipc-contract-test-tautology: the add is driven through the real
+  // screen, and its argument names are held against the Rust command's own
+  // parameters (Tauri matches them by name). The old assertion called the
+  // mock with `{ request: { internalPort, protocol } }` and checked that the
+  // mock had been called with it, while the screen sent `{ port, protocol }`.
+  it('create_port_forward { port, protocol }, as PortForward sends it and Rust names it', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) =>
+      cmd === 'get_port_forwards' ? [] : cmd === 'create_port_forward' ? { success: false } : undefined,
+    );
+    render(createElement(PortForward));
+    await userEvent.type(await screen.findByPlaceholderText('e.g. 8080'), '25565');
+    await userEvent.click(screen.getByRole('button', { name: 'udp' }));
+    await userEvent.click(screen.getByRole('button', { name: /Add rule/ }));
+    await waitFor(() => expect(callsTo('create_port_forward')).toHaveLength(1));
+
+    const [[, args]] = callsTo('create_port_forward') as [[string, Record<string, unknown>]];
+    expect(args).toEqual({ port: 25565, protocol: 'udp' });
+    expect(Object.keys(args).sort()).toEqual(rustCommandArgs('vpn_port_forward.rs', 'create_port_forward'));
+  });
 });
+
+/**
+ * The renderer-supplied parameters of a Rust `#[tauri::command]`, as the
+ * camelCase keys Tauri expects: everything but the injected `State<…>` and
+ * `AppHandle`.
+ */
+function rustCommandArgs(file: string, command: string): string[] {
+  const src = readFileSync(findUp(`src-tauri/src/commands/${file}`), 'utf8');
+  const head = `pub async fn ${command}(`;
+  const start = src.indexOf(head);
+  if (start === -1) throw new Error(`${head} not found in commands/${file}`);
+  const params = src.slice(start + head.length, src.indexOf(')', start));
+  return [...params.matchAll(/(\w+)\s*:\s*(State<[^>]*>|[\w:<>']+)/g)]
+    .filter(([, , type]) => !type.startsWith('State<') && type !== 'AppHandle')
+    .map(([, name]) => name.replace(/_(\w)/g, (_, c: string) => c.toUpperCase()))
+    .sort();
+}
 
 function findUp(rel: string): string {
   let dir = process.cwd();
@@ -340,9 +383,12 @@ const FRONTEND_COMMANDS = [
   'get_settings',
   'save_settings',
   'set_autostart',
+  'reset_settings',
   'set_crash_reports_enabled',
   // Kill switch
   'set_killswitch_live',
+  // Rust's intent, checked after every dial (round 5 of the review of #222)
+  'get_killswitch_status',
   // Kill Switch Exceptions
   'list_installed_apps',
   // Updater (pinned Rust client — commands/updater.rs)

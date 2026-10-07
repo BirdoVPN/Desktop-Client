@@ -271,6 +271,63 @@ pub fn enforce(log_path: &Path, now: DateTime<Utc>) {
     }
 }
 
+/// How many crash reports the crash directory keeps at most.
+pub const KEEP_CRASH_REPORTS: usize = 5;
+
+/// When a crash report was written, from its name (`crash_YYYYMMDD_HHMMSS.txt`,
+/// UTC — what `write_crash_report` mints). `None` for any other name.
+fn crash_report_time(name: &str) -> Option<DateTime<Utc>> {
+    let stamp = name.strip_prefix("crash_")?.strip_suffix(".txt")?;
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d_%H%M%S")
+        .ok()
+        .map(|t| t.and_utc())
+}
+
+/// Prune the crash-report directory: every report older than the log's
+/// retention window goes, and of the rest only the newest `keep` stay.
+///
+/// P6-CLI-D-05. A crash report is a timestamped record that this VPN client
+/// was running at that minute, plus a backtrace. The count cap alone ran only
+/// when the NEXT crash was written, so on a machine that stopped crashing the
+/// last five stayed on disk for good. They now leave with the same window as
+/// `birdo.log` (see the module docs before widening it), at every launch as
+/// well as before each new report. A report dated by neither its name nor its
+/// mtime is left alone, like an undated log. Best-effort: never worth failing
+/// startup or a crash path over.
+pub fn prune_crash_reports(dir: &Path, now: DateTime<Utc>, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // no crash yet
+    };
+    let cutoff = cutoff(now);
+    let mut recent: Vec<(DateTime<Utc>, PathBuf)> = Vec::new();
+    for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with("crash_") && name.ends_with(".txt")) {
+            continue;
+        }
+        let written = crash_report_time(name).or_else(|| {
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(DateTime::<Utc>::from)
+        });
+        match written {
+            Some(at) if at < cutoff => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Some(at) => recent.push((at, path)),
+            None => {}
+        }
+    }
+    recent.sort();
+    let excess = recent.len().saturating_sub(keep);
+    for (_, path) in &recent[..excess] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// If `path` already exists and has grown past [`MAX_LOG_BYTES`], move it to
 /// [`rotated_path`] (clobbering any previous generation) so the caller can open
 /// a fresh, empty file at `path`. Best-effort: any failure here just means we
@@ -742,5 +799,86 @@ mod tests {
             src.contains("log_retention::rotate_if_large("),
             "main.rs no longer rotates birdo.log at the size cap."
         );
+    }
+
+    // ── crash reports (P6-CLI-D-05) ───────────────────────────────────────
+
+    fn crash_name(day: u32, hhmmss: &str) -> String {
+        format!("crash_202606{day:02}_{hhmmss}.txt")
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// THE FINDING. The count cap ran only when the next crash was written,
+    /// and never touched a directory under the cap, so the last reports
+    /// stayed on disk for good. Anything older than the log's window now
+    /// goes at launch, with no new crash needed — however few there are.
+    #[test]
+    fn crash_reports_older_than_the_window_go_without_a_new_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [crash_name(1, "120000"), crash_name(12, "235959")] {
+            write(dir.path(), &name, "BirdoVPN Crash Report\n");
+        }
+        let recent: Vec<String> = (0..3).map(|i| crash_name(14 + i, "080000")).collect();
+        for name in &recent {
+            write(dir.path(), name, "BirdoVPN Crash Report\n");
+        }
+        write(dir.path(), "notes.txt", "not ours");
+
+        prune_crash_reports(dir.path(), at(20), KEEP_CRASH_REPORTS);
+
+        let mut want = recent.clone();
+        want.push("notes.txt".into());
+        assert_eq!(files_in(dir.path()), want, "only what is inside the window");
+    }
+
+    /// The cap still holds inside the window: the newest few stay.
+    #[test]
+    fn inside_the_window_only_the_newest_reports_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let recent: Vec<String> = (0..7).map(|i| crash_name(14 + i, "080000")).collect();
+        for name in &recent {
+            write(dir.path(), name, "BirdoVPN Crash Report\n");
+        }
+        prune_crash_reports(dir.path(), at(20), KEEP_CRASH_REPORTS);
+        assert_eq!(files_in(dir.path()), recent[2..].to_vec());
+    }
+
+    #[test]
+    fn a_report_inside_the_window_is_kept_and_a_missing_directory_is_no_crash_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = crash_name(19, "101010");
+        write(dir.path(), &name, "x");
+        prune_crash_reports(dir.path(), at(20), KEEP_CRASH_REPORTS);
+        assert!(dir.path().join(&name).exists());
+        prune_crash_reports(&dir.path().join("absent"), at(20), KEEP_CRASH_REPORTS);
+    }
+
+    #[test]
+    fn a_crash_report_is_dated_by_its_name() {
+        assert_eq!(crash_report_time(&crash_name(5, "120000")), Some(at(5)));
+        assert_eq!(crash_report_time("crash_garbage.txt"), None);
+        assert_eq!(crash_report_time("birdo.log"), None);
+    }
+
+    /// Both halves are wired: the launch sweep, and the cap before a write.
+    #[test]
+    fn the_crash_sweep_runs_at_launch_and_before_each_report() {
+        let src = include_str!("../main.rs").replace('\r', "");
+        let main_fn = &src[src.find("fn main() {").unwrap()..];
+        let main_fn = &main_fn[..main_fn.find("\n}\n").unwrap()];
+        assert!(
+            main_fn.contains("log_retention::prune_crash_reports("),
+            "main() no longer sweeps the crash directory at launch"
+        );
+        let writer = &src[src.find("fn write_crash_report(").unwrap()..];
+        assert!(writer[..writer.find("\n}\n").unwrap()].contains("prune_crash_reports("));
     }
 }

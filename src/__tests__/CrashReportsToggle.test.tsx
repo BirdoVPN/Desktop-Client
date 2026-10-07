@@ -14,6 +14,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { Settings } from '@/components/Settings';
+import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
 
 vi.mock('@tauri-apps/api/core');
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
@@ -70,6 +71,9 @@ const mockStoreState = {
   },
   updateSettings,
   hydrateSettings: vi.fn(),
+  showNotice: vi.fn(),
+  // Loaded from Rust, so a landed save has nothing to mark (round 6, P3-4).
+  settingsHydrated: true,
   windowCorner: 'bottom-left',
   setWindowCorner: vi.fn(),
   pushRoute: vi.fn(),
@@ -148,6 +152,36 @@ describe('Crash reports toggle', () => {
     await userEvent.click(await screen.findByRole('switch', { name: /crash reports/i }));
     await waitFor(() => {
       expect(updateSettings).toHaveBeenLastCalledWith({ crashReportsEnabled: false });
+    });
+  });
+});
+
+describe('a settings file that cannot be verified (review of #222, round 3)', () => {
+  const unverified = {
+    code: 'settings_unverified',
+    message: 'the settings file could not be verified, so it was left as it is',
+    retryable: true,
+    retry_after_secs: null,
+  };
+
+  it.each([
+    ['crash reports', /crash reports/i, 'set_crash_reports_enabled'],
+    ['Launch at Login', /launch at login/i, 'set_autostart'],
+  ])('%s say so and offer the reset, like every other setting', async (_label, name, command) => {
+    mockStoreState.showNotice.mockClear();
+    mockedInvoke.mockImplementation((cmd: string) =>
+      cmd === command
+        ? Promise.reject(unverified)
+        : cmd === 'check_biometric_available'
+          ? Promise.resolve({ available: false, enabled: false, method: 'none' })
+          : Promise.resolve(undefined),
+    );
+    render(<Settings />);
+    await userEvent.click(await screen.findByRole('switch', { name }));
+    await waitFor(() => {
+      expect(mockStoreState.showNotice).toHaveBeenCalledWith(
+        expect.objectContaining({ text: SETTINGS_UNVERIFIED_COPY, actionLabel: 'Reset settings' }),
+      );
     });
   });
 });

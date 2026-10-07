@@ -27,12 +27,15 @@ import { endSession } from '@/session/session';
 import {
   loadAdminStatus,
   loadServers,
-  loadSettings,
   loadSubscription,
   resetSessionData,
 } from '@/session/session-data';
 import { connectPreferred, findLiveServer } from '@/session/vpn-actions';
-import { persistSettings } from '@/session/settings-persist';
+import {
+  persistSettings,
+  reloadSettings,
+  watchKillSwitchAcrossDials,
+} from '@/session/settings-persist';
 import { useCustomDnsGate } from '@/session/custom-dns-gate';
 import {
   connectionNotification,
@@ -176,7 +179,7 @@ function useSessionExpiry(): void {
 
 function useSessionData(): void {
   useEffect(() => {
-    void loadSettings();
+    void reloadSettings();
     void loadAdminStatus();
     void loadSubscription();
     void loadServers();
@@ -206,6 +209,18 @@ function useAutoConnectOnce(): void {
   const hydrated = useAppStore((s) => s.settingsHydrated);
   const serversSettled = useAppStore(
     (s) => s.serversStatus === 'ready' || s.serversStatus === 'error',
+  );
+  // Once this run has connected or disconnected, Auto-Connect's moment has
+  // passed (round 7 of the review of #222, N3): settings that count as loaded
+  // only later — a save landing after a start-up that could not verify the
+  // file (24dc7f2) — must not dial on their own, after a Disconnect the user
+  // chose.
+  useEffect(
+    () =>
+      useAppStore.subscribe((next, prev) => {
+        if (next.connectionState !== prev.connectionState) done.current = true;
+      }),
+    [],
   );
   useEffect(() => {
     if (done.current || !hydrated || !serversSettled) return;
@@ -427,6 +442,14 @@ function useQuotaWarning(): void {
   );
 }
 
+/**
+ * The kill switch toggle across dials (round 5 of the review of #222;
+ * `watchKillSwitchAcrossDials`).
+ */
+function useKillSwitchAcrossDials(): void {
+  useEffect(() => watchKillSwitchAcrossDials(), []);
+}
+
 /** Renderless. Mounted by App for the whole signed-in session. */
 export function VpnSessionController(): null {
   useStatusSync();
@@ -442,5 +465,6 @@ export function VpnSessionController(): null {
   useMultiHopPrune();
   useStealthFallbackNotice();
   useQuotaWarning();
+  useKillSwitchAcrossDials();
   return null;
 }

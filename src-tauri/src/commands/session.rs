@@ -116,6 +116,10 @@ struct AttemptContext {
     /// that keeps the old session must point the permit back at.
     #[cfg(target_os = "windows")]
     old_relay: Option<crate::vpn::wfp_policy::Relay>,
+    /// The kill switch intent's sequence when the dial began, for its arm
+    /// (round 6 of the review of #222): an OFF the user made during the dial
+    /// makes that arm stand aside (`killswitch::arm_since`).
+    intent_seen: u64,
 }
 
 impl AttemptContext {
@@ -227,6 +231,8 @@ pub(crate) async fn connect_session_for(
     };
 
     let was_live = session_was_live(&vm.get_state().await, vm.holds_tunnel().await);
+    // Before the state says Connecting/Switching, which is what the UI acts on.
+    let intent_seen = killswitch::intent_seq();
     let _ = vm
         .set_state(if was_live {
             ConnectionState::Switching
@@ -253,6 +259,7 @@ pub(crate) async fn connect_session_for(
         },
         #[cfg(target_os = "windows")]
         old_relay: crate::vpn::wfp::current_relay(),
+        intent_seen,
     };
     let (first_transport, adaptive) = match purpose {
         ConnectPurpose::User => (None, true),
@@ -336,7 +343,7 @@ async fn fallback_reason_for(
     let reason = transport_fallback_reason(error)?;
     // Respect an explicit transport choice: with Stealth Mode forced ON the
     // failed attempt WAS the stealth transport, and it is the last we have.
-    let forced_stealth = crate::commands::settings::get_settings(app.clone())
+    let forced_stealth = crate::commands::settings::load_settings_off_runtime(app)
         .await
         .map(|s| s.stealth_mode)
         .unwrap_or(false);
@@ -511,7 +518,7 @@ async fn attempt(
     // AUDIT-2026-06-19 FIX (CRITICAL): arm the kill switch now that the tunnel
     // is up, so an unexpected drop fails CLOSED. Best-effort: a failure to arm
     // must not tear down a working tunnel.
-    if let Err(e) = killswitch::arm(app).await {
+    if let Err(e) = killswitch::arm_since(app, ctx.intent_seen).await {
         tracing::warn!("Failed to arm kill switch after connect: {}", e);
     }
     release_rebuild_block(ctx.block_engaged).await;
@@ -898,9 +905,19 @@ pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bo
         // Linux twin: the relay is permitted by ADDRESS and the self-permit is
         // scoped to tcp/443, so a connect onto a different server needs the
         // live block re-armed or its handshake is dropped.
+        //
+        // Through the kill switch, like macOS below (review of #222): it reads
+        // the intent before and after the load, and lifts what an OFF no
+        // longer wants — a partial load included. iptables reads the relay
+        // from VPN_SERVER_IP, recorded above.
         #[cfg(target_os = "linux")]
-        if let Err(e) = crate::vpn::firewall_linux::update_vpn_server(ip).await {
-            tracing::warn!("Failed to update iptables VPN server: {}", e);
+        {
+            let _ = ip;
+            if killswitch::platform_is_blocking() {
+                if let Err(e) = killswitch::activate_killswitch().await {
+                    tracing::warn!("Failed to update iptables VPN server permit: {}", e);
+                }
+            }
         }
         // macOS twin: pf bakes the relay permit into the loaded ruleset, so an
         // engaged block must be re-loaded with the NEW relay IP (block drop
@@ -944,27 +961,33 @@ const RELEASE_DEADLINE: Duration = Duration::from_secs(40);
 /// block — an explicit end ALWAYS releases, always-on included — ending at
 /// `disconnected` with `kill_switch_blocking=false`.
 ///
-/// The block is released last, once the teardown is done — or at
-/// [`RELEASE_DEADLINE`], whichever comes first: a wedged engine must never
-/// hold the block with Disconnect pressed (WIN-FIX-3). A teardown past the
-/// deadline carries on behind the release; it cannot re-engage the block
-/// (`disarm` clears the kill switch's intent), and a new connect waits for it
-/// on the commit lock it holds.
+/// The block is released last: at the end of the teardown, under its commit
+/// lock — or at [`RELEASE_DEADLINE`], whichever comes first: a wedged engine
+/// must never hold the block with Disconnect pressed (WIN-FIX-3). A teardown
+/// past the deadline carries on behind the release; it cannot re-engage the
+/// block (`disarm` clears the kill switch's intent), and a new connect waits
+/// for it on the commit lock it holds.
 pub async fn end_session(app: &AppHandle, reason: EndReason) {
     tracing::info!("Ending the VPN session ({reason:?})");
     let teardown = tauri::async_runtime::spawn(tear_down(app.clone(), reason));
-    if timeout(RELEASE_DEADLINE, teardown).await.is_err() {
-        tracing::error!(
+    match timeout(RELEASE_DEADLINE, teardown).await {
+        // It released the block and wrote Disconnected under the commit lock.
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => tracing::error!(
+            "The session teardown failed ({e}) — releasing the kill switch's block anyway"
+        ),
+        Err(_) => tracing::error!(
             "The session teardown has not finished after {} s — releasing the kill switch's \
              block anyway; the teardown carries on",
             RELEASE_DEADLINE.as_secs()
-        );
+        ),
     }
 
-    // The 3e6f1e2 escape hatch, unconditionally: ending the session is the
-    // user releasing the block, and is_lockdown_mode() is hard false
-    // off-Windows, so any gate here would leave macOS/Linux behind a kernel
-    // firewall with no session to own it. A no-op if never armed.
+    // The 3e6f1e2 escape hatch, whenever the teardown did not get there:
+    // ending the session is the user releasing the block, and
+    // is_lockdown_mode() is hard false off-Windows, so any gate here would
+    // leave macOS/Linux behind a kernel firewall with no session to own it.
+    // A no-op if never armed.
     let _ = killswitch::disarm().await;
     // `disconnect()` returns early when no tunnel is held (an Error after a
     // give-up), so the end state is written here, whatever came before.
@@ -976,7 +999,6 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
 
 /// Everything [`end_session`] does before it releases the block, in order.
 async fn tear_down(app: AppHandle, reason: EndReason) {
-    let app = &app;
     let vm = app.state::<VpnManager>();
 
     // Cancel FIRST: an in-flight connect or re-dial stops at its next await,
@@ -988,6 +1010,26 @@ async fn tear_down(app: AppHandle, reason: EndReason) {
     // operation-lock timeout (`vpn::manager` docs, REVIEW-WIN-013).
     let _commit = vm.lock_commit_for_teardown().await;
 
+    end_the_tunnel(&app, reason).await;
+
+    // Release the block and end Disconnected while the commit lock is still
+    // held (round 7 of the review of #222, N1). A connect queued on the lock
+    // reads the kill switch intent's sequence when it begins: a disarm after
+    // the release moved it under that connect, whose arm then stood aside —
+    // a new session with the intent OFF while the file and the toggle said
+    // ON. A Disconnected written after the release overwrote the new dial's
+    // Connecting the same way. Past RELEASE_DEADLINE, end_session does both.
+    // After the steps, however they end (round 8): end_session trusts a
+    // finished teardown to have done this, so no early return in the steps
+    // may skip it.
+    let _ = killswitch::disarm().await;
+    let _ = vm.set_state(ConnectionState::Disconnected).await;
+}
+
+/// The steps of [`tear_down`], under its commit lock, before it releases the
+/// block.
+async fn end_the_tunnel(app: &AppHandle, reason: EndReason) {
+    let vm = app.state::<VpnManager>();
     let ar = app.state::<AutoReconnectService>();
     ar.stop().await;
     ar.clear_last_config().await;
@@ -1057,7 +1099,7 @@ pub async fn handle_session_expired(app: &AppHandle, stored: StoredSession) {
         }
         // REVIEW-WIN-007 / REVIEW-WIN2-023: the next account to sign in on
         // this machine must not inherit this one's server or route.
-        crate::commands::settings::clear_account_choices(app);
+        crate::commands::settings::clear_account_choices(app).await;
     } else {
         tracing::info!("A new sign-in arrived while the expired session ended — keeping it");
     }
@@ -1119,14 +1161,28 @@ mod lifecycle_tests {
 
     /// W1-009 / W1-021 / contract §3.1: cancel before anything else, stop the
     /// loop before touching the tunnel, disarm last, end Disconnected.
-    /// WIN-FIX-3: "last" is after the teardown or at the release deadline,
-    /// whichever comes first.
+    /// WIN-FIX-3: "last" is at the end of the teardown or at the release
+    /// deadline, whichever comes first. Round 7 of the review of #222 (N1):
+    /// the end of the teardown, under its commit lock, so a connect queued on
+    /// that lock reads the intent's sequence after the disarm (its arm stood
+    /// aside before) and its Connecting is not overwritten by Disconnected.
+    /// end_session disarms and writes Disconnected only when the teardown did
+    /// not finish: past the deadline, or failed.
     #[test]
     fn end_session_cancels_first_and_disarms_last() {
+        let teardown = body("async fn tear_down(");
         order(
-            body("async fn tear_down("),
+            teardown,
             &[
                 "vm.lock_commit_for_teardown()",
+                "end_the_tunnel(&app, reason).await",
+                "killswitch::disarm()",
+                "ConnectionState::Disconnected",
+            ],
+        );
+        order(
+            body("async fn end_the_tunnel("),
+            &[
                 "ar.stop()",
                 "ar.clear_last_config()",
                 "api.disconnect_vpn(&key_id)",
@@ -1134,16 +1190,28 @@ mod lifecycle_tests {
                 "XrayManager>().stop()",
             ],
         );
+        // The guard lives to the end of the function, and nothing in it can
+        // leave before the disarm (round 8): the steps run in their own
+        // function, so an early return there still reaches it.
+        assert!(teardown.contains("let _commit = vm.lock_commit_for_teardown().await;"));
+        assert!(!teardown.contains("drop(_commit)"));
+        let code: String = teardown
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("return"), "an early return in tear_down");
+        assert!(!code.contains('?'), "a `?` in tear_down");
         order(
             body("pub async fn end_session("),
             &[
                 "spawn(tear_down(app.clone(), reason))",
                 "timeout(RELEASE_DEADLINE, teardown)",
+                "Ok(Ok(())) => return,",
                 "killswitch::disarm()",
                 "ConnectionState::Disconnected",
             ],
         );
-        assert!(!body("async fn tear_down(").contains("killswitch::disarm()"));
         assert_eq!(super::RELEASE_DEADLINE, std::time::Duration::from_secs(40));
     }
 
@@ -1204,11 +1272,32 @@ mod lifecycle_tests {
         order(
             body("async fn attempt("),
             &[
-                "killswitch::arm(app)",
+                "killswitch::arm_since(app, ctx.intent_seen)",
                 "ar.store_connected_settings(settings.snapshot)",
                 "ar.store_last_config(",
             ],
         );
+    }
+
+    /// Round 6 of the review of #222 (P3-1): the dial reads the kill switch
+    /// intent's sequence before its state says Connecting/Switching, and its
+    /// arm stores only if nothing wrote the intent since (killswitch tests
+    /// `an_off_during_the_dial_makes_its_arm_stand_aside`).
+    #[test]
+    fn the_dials_arm_takes_the_intent_sequence_from_the_dials_start() {
+        order(
+            body("pub(crate) async fn connect_session_for("),
+            &[
+                "let Some(epoch) = began else {",
+                "let intent_seen = killswitch::intent_seq();",
+                ".set_state(if was_live {",
+                "intent_seen,",
+                "attempt(app, &target, first_transport",
+            ],
+        );
+        let attempt = body("async fn attempt(");
+        assert!(attempt.contains("killswitch::arm_since(app, ctx.intent_seen)"));
+        assert!(!attempt.contains("killswitch::arm(app)"));
     }
 
     /// W1-022: every target stops auto-reconnect before anything is dialled,
@@ -1248,7 +1337,7 @@ mod lifecycle_tests {
                 "vm.connect(",
                 "vm.lock_commit()",
                 "vm.is_current(ctx.epoch)",
-                "killswitch::arm(app)",
+                "killswitch::arm_since(app, ctx.intent_seen)",
                 "ar.store_last_config(",
                 "ar.start()",
             ],
@@ -1412,6 +1501,7 @@ mod lifecycle_tests {
             block_engaged: false,
             old_stealth_mark: Some(xray.ended_count()),
             old_relay: None,
+            intent_seen: 0,
         };
 
         // Refused before XrayManager::start: the old transport is untouched.

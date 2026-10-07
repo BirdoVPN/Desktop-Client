@@ -219,8 +219,8 @@ fn build_chains(gen: i8, server_ip: Option<Ipv4Addr>) -> Result<(), String> {
     // narrow this to our own process and is the obvious follow-up.
     //
     // Note this permit deliberately does NOT cover the WireGuard handshake: the
-    // relay is permitted by address above, and `update_vpn_server` re-arms with
-    // the new relay before a reconnect uses it.
+    // relay is permitted by address above, and the kill switch re-arms with the
+    // new relay before a reconnect uses it (`session::apply_relay_permit`).
     let euid = unsafe { libc::geteuid() };
     let uid_str = euid.to_string();
     match iptables(&[
@@ -487,19 +487,6 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
     IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
     tracing::info!("Linux iptables kill switch activated");
     Ok(())
-}
-
-/// Re-arm the live block around a NEW relay address.
-///
-/// The relay is permitted by address, and the self-permit is scoped to tcp/443,
-/// so a reconnect that lands on a different server would have its WireGuard
-/// handshake dropped until the next re-arm. Windows has `wfp::update_vpn_server`
-/// for exactly this; this is the iptables equivalent. No-op when not blocking.
-pub async fn update_vpn_server(ip: Ipv4Addr) -> Result<(), String> {
-    if !IPTABLES_BLOCKING.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    activate_blocking(Some(ip)).await
 }
 
 /// Deactivate blocking: remove our chains from both filter tables.
