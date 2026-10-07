@@ -196,6 +196,7 @@ async function trySave(
     useAppStore.getState().updateSettings(revert);
     return { error: e };
   }
+  savedKillSwitch(next.killSwitchEnabled);
   if (opts.reapply) scheduleReapply();
   return null;
 }
@@ -308,6 +309,19 @@ interface StandingChoice {
   thisConnectionOnly?: { saved: boolean };
 }
 let standingChoice: StandingChoice | null = null;
+
+/**
+ * A save landed, and it wrote the whole store — the kill switch as the toggle
+ * showed it included (round 6 of the review of #222, P2-2). A refused OFF
+ * the toggle showed is saved now: it no longer gives way at the next dial,
+ * which would have put the toggle back to ON while the dial armed OFF from
+ * the file.
+ */
+function savedKillSwitch(enabled: boolean): void {
+  if (standingChoice?.thisConnectionOnly && standingChoice.enabled === enabled) {
+    standingChoice.thisConnectionOnly = undefined;
+  }
+}
 
 /** For tests: forget the choices made so far. */
 export function forgetKillSwitchChoices(): void {

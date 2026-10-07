@@ -374,6 +374,25 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(intent).toBe(false);
   });
 
+  it('a refused OFF that a later save wrote to the file is not put back at the next dial (round 6, P2-2)', async () => {
+    useAppStore.setState({ connectionState: 'reconnecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    // The file can be verified again; another setting's save writes the whole
+    // store, the kill switch as it shows (OFF) included.
+    saveRefused = false;
+    expect(await persistSettings({ autoConnect: true })).toBe(true);
+    expect(saves()[saves().length - 1]?.killswitch_enabled).toBe(false);
+    // The next dial arms from that file: OFF. The toggle says so.
+    act(() => useAppStore.setState({ connectionState: 'connecting' }));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    expect(intent).toBe(false);
+  });
+
   it('the next dial puts back the kill switch alone, never an unverifiable file\'s stand-in defaults (N2)', async () => {
     const real = { ...defaultSettings, killSwitchEnabled: true, autoConnect: true, localNetworkSharing: true };
     useAppStore.setState({ connectionState: 'reconnecting', settings: real });
