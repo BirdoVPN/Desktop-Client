@@ -35,6 +35,16 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    ignore:
+      # eslint 10 (2026-10-07, #229): eslint-plugin-react 7.37.x and
+      # eslint-plugin-jsx-a11y 6.10.x accept eslint <= 9 only, so the bump fails
+      # `npm ci` with ERESOLVE. Remove these two entries once both plugins
+      # declare eslint 10 support; dropping the a11y lint to take 10 is not an
+      # option (owner decision 2026-10-07).
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@eslint/js"
+        update-types: ["version-update:semver-major"]
     groups:
       # vitest and its coverage provider are version-locked to each other.
       vitest:
