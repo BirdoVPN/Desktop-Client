@@ -314,6 +314,35 @@ describe('Auto-Connect (W2-002)', () => {
     await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'b' }]]));
   });
 
+  // Round 7 (N3): a start-up that could not verify the file leaves the
+  // settings unloaded; a save that lands later marks them loaded (24dc7f2).
+  // By then the user may have connected and disconnected on purpose.
+  it('a mid-run load of the settings never auto-connects after a connect or a disconnect (round 7, N3)', async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case 'get_vpn_status':
+          return status;
+        case 'get_settings':
+          throw { code: 'settings_unverified', message: 'unverified', retryable: true, retry_after_secs: null };
+        case 'get_servers':
+          return servers;
+        default:
+          return undefined;
+      }
+    });
+    useAppStore.setState({ settings: { ...defaultSettings, autoConnect: true } });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    expect(useAppStore.getState().settingsHydrated).toBe(false);
+    emit('vpn-status-changed', { state: 'connected', seq: 10, error: null });
+    emit('vpn-status-changed', { state: 'disconnected', seq: 11, error: null });
+    await act(async () => {});
+    act(() => useAppStore.setState({ settingsHydrated: true }));
+    await act(async () => {});
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
   it('stays off when the setting is off', async () => {
     render(<VpnSessionController />);
     await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));

@@ -183,6 +183,13 @@ async function trySave(
     useAppStore.getState().updateSettings(patch);
   }
   const next = { ...before, ...patch };
+  // While a refused OFF holds for this connection only, a save of anything
+  // else writes the kill switch the OFF was refused over (round 7 of the
+  // review of #222, N4): the toggle shows the live OFF, but the notice said
+  // the saved ON comes back at the next connection, and the next unrelated
+  // save — the quiet preferred-server mirror included — wrote the OFF.
+  const held = heldKillSwitch();
+  if (held !== undefined && !('killSwitchEnabled' in patch)) next.killSwitchEnabled = held;
   try {
     await invoke('save_settings', { settings: settingsToRust(next) });
   } catch (e) {
@@ -307,6 +314,9 @@ export const KILL_SWITCH_OFF_FAILED_COPY =
 export const KILL_SWITCH_OFF_THIS_CONNECTION_COPY =
   "The kill switch is off for this connection only. It couldn't be saved, so it comes back on at your next connection.";
 
+export const KILL_SWITCH_ON_FAILED_COPY =
+  "The kill switch couldn't be turned on for this connection. Disconnect and connect again to turn it on.";
+
 /** Bumped by every kill-switch choice, so an older one's late steps stand down. */
 let killSwitchChoice = 0;
 
@@ -323,11 +333,20 @@ interface StandingChoice {
 let standingChoice: StandingChoice | null = null;
 
 /**
+ * The kill switch a save writes while a refused OFF holds for this
+ * connection only: the value it was refused over (round 7, N4).
+ */
+function heldKillSwitch(): boolean | undefined {
+  return standingChoice?.thisConnectionOnly?.saved;
+}
+
+/**
  * A save landed, and it wrote the whole store — the kill switch as the toggle
  * showed it included (round 6 of the review of #222, P2-2). A refused OFF
  * the toggle showed is saved now: it no longer gives way at the next dial,
  * which would have put the toggle back to ON while the dial armed OFF from
- * the file.
+ * the file. (Since round 7 a held OFF is written only by a save of the kill
+ * switch itself: other saves write the value it was refused over.)
  */
 function savedKillSwitch(enabled: boolean): void {
   if (standingChoice?.thisConnectionOnly && standingChoice.enabled === enabled) {
@@ -473,7 +492,12 @@ export function watchKillSwitchAcrossDials(): () => void {
 function dialStarted(): void {
   const standing = standingChoice;
   if (!standing?.thisConnectionOnly) return;
-  standingChoice = null;
+  // What the file says stands now, and is checked when this dial ends (round
+  // 7 of the review of #222, N2): a dial Rust started itself (the tray's
+  // Quick Connect) can take this OFF's push before the UI sees it begin. Its
+  // arm then stands aside, as for any OFF during a dial, and the check puts
+  // the intent back to what the toggle shows again.
+  standingChoice = { enabled: standing.thisConnectionOnly.saved };
   const s = useAppStore.getState();
   if (s.settings.killSwitchEnabled === standing.enabled) {
     s.updateSettings({ killSwitchEnabled: standing.thisConnectionOnly.saved });
@@ -502,7 +526,12 @@ async function dialEnded(): Promise<void> {
   try {
     await invoke('set_killswitch_live', { enabled: standing.enabled });
   } catch {
-    if (!standing.enabled) s.showNotice({ text: KILL_SWITCH_OFF_FAILED_COPY, tone: 'danger' });
+    // Either way the connection now runs other than the toggle shows, so it
+    // is said (round 7: a failed ON was silent).
+    s.showNotice({
+      text: standing.enabled ? KILL_SWITCH_ON_FAILED_COPY : KILL_SWITCH_OFF_FAILED_COPY,
+      tone: 'danger',
+    });
   }
 }
 
