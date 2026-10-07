@@ -516,9 +516,15 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, IpcError> {
 /// every preference the screen held, and once the file could be verified
 /// again the next whole-object save (the preferred-server mirror makes one
 /// with no user action) wrote them over the user's file. The UI keeps what it
-/// has instead. Rust's own callers ([`load_settings_sync`]) still get the
-/// defaults, and a quarantined file's defaults are what is saved now, so
-/// they are answered.
+/// has instead. A quarantined file's defaults are what is saved now, so they
+/// are answered.
+///
+/// `get_settings` is the UI's read ONLY. Rust code reads through
+/// [`load_settings_sync`] / [`load_settings_off_runtime`]
+/// ([`settings_for_rust`]), which give those defaults. Round 5 wrote "Rust's
+/// own callers still get the defaults" here while four of them called
+/// `get_settings`: every connect then ran with post-quantum and Windows
+/// lockdown OFF, and the tray's Quick Connect failed (round 6).
 fn settings_for_the_ui(loaded: Result<Loaded, LoadError>) -> Result<AppSettings, IpcError> {
     verified(loaded?)
 }
@@ -548,9 +554,14 @@ async fn off_the_runtime<T: Send + 'static>(
 /// callers that need settings before the frontend is up (e.g. main.rs setup
 /// honoring `start_minimized`).
 pub fn load_settings_sync(app: &AppHandle) -> Result<AppSettings, String> {
-    load_settings(app)
-        .map(Loaded::settings)
-        .map_err(String::from)
+    settings_for_rust(load_settings(app))
+}
+
+/// What Rust code reads for a load: the settings in force, which for a file
+/// that cannot be verified right now are the defaults this session runs on;
+/// an error only when there are none (an unreadable file).
+fn settings_for_rust(loaded: Result<Loaded, LoadError>) -> Result<AppSettings, String> {
+    loaded.map(Loaded::settings).map_err(String::from)
 }
 
 /// [`load_settings_sync`] on the blocking pool, for async Rust callers such as
@@ -2136,6 +2147,45 @@ mod tests {
         let command = &source[source.find("pub async fn get_settings(").unwrap()..];
         let command = &command[..command.find("\n}\n").unwrap()];
         assert!(command.contains("settings_for_the_ui(load_settings(&app))"));
+    }
+
+    /// Round 6 of the review (P2-1): the UI's read refuses an unverifiable
+    /// file, Rust's read gives the defaults the session runs on — post-quantum
+    /// and Windows lockdown ON — and no Rust code reads through the UI's.
+    #[test]
+    fn rust_reads_an_unverifiable_files_defaults_and_never_through_get_settings() {
+        let unverifiable = || Ok(Loaded::Unverified(AppSettings::default()));
+        assert!(settings_for_the_ui(unverifiable()).is_err());
+        let rust = settings_for_rust(unverifiable()).unwrap();
+        assert!(rust.quantum_protection, "post-quantum stays on");
+        assert_eq!(
+            rust.lockdown_mode,
+            cfg!(target_os = "windows"),
+            "lockdown as default"
+        );
+        assert!(settings_for_rust(Err(LoadError::Unreadable("busy".into()))).is_err());
+
+        // Every .rs file but this one: no call of the UI's read.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        let mut callers = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && !path.ends_with("commands/settings.rs")
+                    && fs::read_to_string(&path).unwrap().contains("get_settings(")
+                {
+                    callers.push(path);
+                }
+            }
+        }
+        assert!(
+            callers.is_empty(),
+            "Rust code calls get_settings: {callers:?}"
+        );
     }
 
     /// Round 5 of the review (N5): when the re-check's own load quarantined

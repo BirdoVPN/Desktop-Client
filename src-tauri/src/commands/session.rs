@@ -336,7 +336,7 @@ async fn fallback_reason_for(
     let reason = transport_fallback_reason(error)?;
     // Respect an explicit transport choice: with Stealth Mode forced ON the
     // failed attempt WAS the stealth transport, and it is the last we have.
-    let forced_stealth = crate::commands::settings::get_settings(app.clone())
+    let forced_stealth = crate::commands::settings::load_settings_off_runtime(app)
         .await
         .map(|s| s.stealth_mode)
         .unwrap_or(false);
