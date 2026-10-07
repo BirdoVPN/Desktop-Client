@@ -384,7 +384,9 @@ jobs:
             exit 1
           }
           echo "$out"
-          if ! echo "$out" | grep -qE 'test result: ok\. 4 passed'; then
+          # A here-string, not `echo | grep -q`: under pipefail grep -q's early
+          # exit can SIGPIPE the writer and turn a pass into a failure.
+          if ! grep -qE 'test result: ok\. 4 passed' <<<"$out"; then
             echo "::error::pfctl_parse_tests did not run all four tests"
             exit 1
           fi
