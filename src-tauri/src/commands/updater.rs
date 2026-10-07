@@ -100,11 +100,12 @@ fn pinned_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Stri
         // retries DNS an older build left parked, if a teardown timed out.
         //
         // REVIEW-WIN-002: the hook runs BEFORE `ShellExecuteW` launches the
-        // installer (tauri-plugin-updater 2.11.0, updater.rs `install_inner`:
-        // extract → hook → ShellExecuteW → Err if it failed, else exit(0)), so
-        // it must do nothing a failed launch cannot undo. Setting the hook
-        // replaces the plugin's own, which was `cleanup_before_exit()`: it
-        // DROPS every tray icon and hides every window (tauri 2.11.5 app.rs),
+        // installer (tauri-plugin-updater 2.13.1, unchanged since 2.11.0,
+        // updater.rs `install_inner`: extract → hook → ShellExecuteW → Err if
+        // it failed, else exit(0)), so it must do nothing a failed launch
+        // cannot undo. Setting the hook replaces the plugin's own, which is
+        // `cleanup_before_exit()` (lib.rs): it DROPS every tray icon and hides
+        // every window (tauri 2.12.0 app.rs, as in 2.11.5),
         // and when an antivirus quarantined the installer the process lived
         // on invisible, with the VPN already off. The tray is hidden instead
         // (no ghost icon after a real exit) and `install_update` shows it

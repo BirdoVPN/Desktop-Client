@@ -31,7 +31,7 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 # Tauri
-tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri = { version = "2.12.0", features = ["tray-icon"] }
 # Decode the embedded tray PNGs into raw RGBA ourselves (Image::new_owned).
 # NOT tauri's "image-png" feature — that pulls the moxcms/pxfm colour chain
 # (edition2024 Cargo feature / Rust 1.85+). That WOULD build now under our 1.96
