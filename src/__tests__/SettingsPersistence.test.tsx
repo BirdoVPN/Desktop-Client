@@ -338,6 +338,7 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
         return true;
       }
       if (cmd === 'get_killswitch_status') return { enabled: intent, active: false, blocking_connections: 0 };
+      if (cmd === 'reset_settings') return true;
       // What get_settings served for an unverifiable file before this round:
       // the stand-in defaults.
       if (cmd === 'get_settings') return settingsToRust(defaultSettings);
@@ -415,6 +416,20 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
     expect(intent).toBe(false);
+  });
+
+  it('a reset drops the standing choice, so the next dial is not pushed back to it (round 6, P3-2)', async () => {
+    useAppStore.setState({ connectionState: 'connected', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    await setKillSwitch(false);
+    expect(intent).toBe(false);
+    await resetSettings();
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    // The session is rebuilt on the defaults, and that dial arms ON.
+    act(() => useAppStore.setState({ connectionState: 'switching' }));
+    intent = true;
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(intent).toBe(true);
   });
 
   it('the next dial puts back the kill switch alone, never an unverifiable file\'s stand-in defaults (N2)', async () => {

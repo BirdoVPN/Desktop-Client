@@ -243,7 +243,13 @@ export async function resetSettings(): Promise<void> {
   try {
     const reset = await invoke<boolean>('reset_settings');
     await loadSettings();
-    if (reset) scheduleReapply();
+    if (reset) {
+      // The defaults are the choice now (round 6 of the review of #222): a
+      // kill switch choice made before the reset must not be pushed back
+      // over them after the next dial.
+      forgetKillSwitchChoices();
+      scheduleReapply();
+    }
     useAppStore.getState().showNotice({
       text: reset
         ? 'Your settings were reset to their defaults.'
@@ -323,7 +329,7 @@ function savedKillSwitch(enabled: boolean): void {
   }
 }
 
-/** For tests: forget the choices made so far. */
+/** Forget the kill switch choices made so far: after a reset, and for tests. */
 export function forgetKillSwitchChoices(): void {
   standingChoice = null;
 }
