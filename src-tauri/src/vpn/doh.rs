@@ -1074,6 +1074,26 @@ mod tests {
         }
     }
 
+    /// cloudflare-dns.com sends leaf + SSL.com SSL Intermediate CA ECC R2 and
+    /// no root, so the WebPKI step (which runs before the pin check) can only
+    /// pass if SSL.com Root Certification Authority ECC is a webpki-roots
+    /// trust anchor. A webpki-roots bump that drops it would take the
+    /// control-plane DoH dark, so it fails here instead. (The dormant DigiCert
+    /// High Assurance EV pin is deliberately NOT asserted: webpki-roots 1.0.9
+    /// dropped that root, so that pin can no longer be satisfied at all.)
+    #[test]
+    fn the_live_cloudflare_anchor_is_in_the_webpki_root_store() {
+        const SSL_COM_ROOT_ECC: &str = "oyD01TTXvpfBro3QSZc1vIlcMjrdLTiL/M9mLCPX+Zo=";
+        let cloudflare = pins_for_host("cloudflare-dns.com").expect("cloudflare pins");
+        assert!(cloudflare.contains(&SSL_COM_ROOT_ECC));
+        assert!(
+            crate::api::cert_pin::webpki_root_spki_pins()
+                .iter()
+                .any(|r| r == SSL_COM_ROOT_ECC),
+            "SSL.com Root Certification Authority ECC is no longer a webpki-roots trust anchor"
+        );
+    }
+
     /// The verifier dispatches pin sets by SNI hostname; every provider host
     /// must resolve to its own pins, and anything else must resolve to None
     /// (which the verifier fails CLOSED).
