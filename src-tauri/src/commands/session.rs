@@ -961,27 +961,33 @@ const RELEASE_DEADLINE: Duration = Duration::from_secs(40);
 /// block — an explicit end ALWAYS releases, always-on included — ending at
 /// `disconnected` with `kill_switch_blocking=false`.
 ///
-/// The block is released last, once the teardown is done — or at
-/// [`RELEASE_DEADLINE`], whichever comes first: a wedged engine must never
-/// hold the block with Disconnect pressed (WIN-FIX-3). A teardown past the
-/// deadline carries on behind the release; it cannot re-engage the block
-/// (`disarm` clears the kill switch's intent), and a new connect waits for it
-/// on the commit lock it holds.
+/// The block is released last: at the end of the teardown, under its commit
+/// lock — or at [`RELEASE_DEADLINE`], whichever comes first: a wedged engine
+/// must never hold the block with Disconnect pressed (WIN-FIX-3). A teardown
+/// past the deadline carries on behind the release; it cannot re-engage the
+/// block (`disarm` clears the kill switch's intent), and a new connect waits
+/// for it on the commit lock it holds.
 pub async fn end_session(app: &AppHandle, reason: EndReason) {
     tracing::info!("Ending the VPN session ({reason:?})");
     let teardown = tauri::async_runtime::spawn(tear_down(app.clone(), reason));
-    if timeout(RELEASE_DEADLINE, teardown).await.is_err() {
-        tracing::error!(
+    match timeout(RELEASE_DEADLINE, teardown).await {
+        // It released the block and wrote Disconnected under the commit lock.
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => tracing::error!(
+            "The session teardown failed ({e}) — releasing the kill switch's block anyway"
+        ),
+        Err(_) => tracing::error!(
             "The session teardown has not finished after {} s — releasing the kill switch's \
              block anyway; the teardown carries on",
             RELEASE_DEADLINE.as_secs()
-        );
+        ),
     }
 
-    // The 3e6f1e2 escape hatch, unconditionally: ending the session is the
-    // user releasing the block, and is_lockdown_mode() is hard false
-    // off-Windows, so any gate here would leave macOS/Linux behind a kernel
-    // firewall with no session to own it. A no-op if never armed.
+    // The 3e6f1e2 escape hatch, whenever the teardown did not get there:
+    // ending the session is the user releasing the block, and
+    // is_lockdown_mode() is hard false off-Windows, so any gate here would
+    // leave macOS/Linux behind a kernel firewall with no session to own it.
+    // A no-op if never armed.
     let _ = killswitch::disarm().await;
     // `disconnect()` returns early when no tunnel is held (an Error after a
     // give-up), so the end state is written here, whatever came before.
@@ -1043,6 +1049,16 @@ async fn tear_down(app: AppHandle, reason: EndReason) {
         tracing::error!("Tunnel disconnect failed: {}", e);
     }
     app.state::<XrayManager>().stop().await;
+
+    // Release the block and end Disconnected while the commit lock is still
+    // held (round 7 of the review of #222, N1). A connect queued on the lock
+    // reads the kill switch intent's sequence when it begins: a disarm after
+    // the release moved it under that connect, whose arm then stood aside —
+    // a new session with the intent OFF while the file and the toggle said
+    // ON. A Disconnected written after the release overwrote the new dial's
+    // Connecting the same way. Past RELEASE_DEADLINE, end_session does both.
+    let _ = killswitch::disarm().await;
+    let _ = vm.set_state(ConnectionState::Disconnected).await;
 }
 
 static EXPIRY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -1136,12 +1152,18 @@ mod lifecycle_tests {
 
     /// W1-009 / W1-021 / contract §3.1: cancel before anything else, stop the
     /// loop before touching the tunnel, disarm last, end Disconnected.
-    /// WIN-FIX-3: "last" is after the teardown or at the release deadline,
-    /// whichever comes first.
+    /// WIN-FIX-3: "last" is at the end of the teardown or at the release
+    /// deadline, whichever comes first. Round 7 of the review of #222 (N1):
+    /// the end of the teardown, under its commit lock, so a connect queued on
+    /// that lock reads the intent's sequence after the disarm (its arm stood
+    /// aside before) and its Connecting is not overwritten by Disconnected.
+    /// end_session disarms and writes Disconnected only when the teardown did
+    /// not finish: past the deadline, or failed.
     #[test]
     fn end_session_cancels_first_and_disarms_last() {
+        let teardown = body("async fn tear_down(");
         order(
-            body("async fn tear_down("),
+            teardown,
             &[
                 "vm.lock_commit_for_teardown()",
                 "ar.stop()",
@@ -1149,18 +1171,24 @@ mod lifecycle_tests {
                 "api.disconnect_vpn(&key_id)",
                 "vm.disconnect()",
                 "XrayManager>().stop()",
+                "killswitch::disarm()",
+                "ConnectionState::Disconnected",
             ],
         );
+        // The guard lives to the end of the function: nothing above runs
+        // after the lock is released.
+        assert!(teardown.contains("let _commit = vm.lock_commit_for_teardown().await;"));
+        assert!(!teardown.contains("drop(_commit)"));
         order(
             body("pub async fn end_session("),
             &[
                 "spawn(tear_down(app.clone(), reason))",
                 "timeout(RELEASE_DEADLINE, teardown)",
+                "Ok(Ok(())) => return,",
                 "killswitch::disarm()",
                 "ConnectionState::Disconnected",
             ],
         );
-        assert!(!body("async fn tear_down(").contains("killswitch::disarm()"));
         assert_eq!(super::RELEASE_DEADLINE, std::time::Duration::from_secs(40));
     }
 
