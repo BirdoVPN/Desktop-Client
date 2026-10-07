@@ -321,16 +321,20 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
   };
   /** Rust's intent, as `set_killswitch_live` and the dial's own arm leave it. */
   let intent = false;
+  /** The intent's sequence: every live push moves it. */
+  let seq = 0;
   let saveRefused = false;
   let stopWatching: () => void = () => {};
   beforeEach(() => {
     intent = false;
+    seq = 0;
     saveRefused = false;
     stopWatching = watchKillSwitchAcrossDials();
     mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === 'save_settings' && saveRefused) throw UNVERIFIED;
       if (cmd === 'set_killswitch_live') {
         intent = (args as { enabled: boolean }).enabled;
+        seq += 1;
         return true;
       }
       if (cmd === 'get_killswitch_status') return { enabled: intent, active: false, blocking_connections: 0 };
@@ -354,6 +358,26 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     intent = true;
     act(() => useAppStore.setState({ connectionState: 'connected' }));
     await waitFor(() => expect(intent).toBe(false));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+  });
+
+  // Round 6 (P3-1): Rust publishes Connected BEFORE the dial's arm, so the
+  // check above usually runs first and finds the OFF in force. The dial's arm
+  // then takes the sequence read when the dial began and stands aside, since
+  // the OFF moved it (killswitch `an_off_during_the_dial_makes_its_arm_stand_aside`,
+  // session `the_dials_arm_takes_the_intent_sequence_from_the_dials_start`).
+  it('a refused OFF during a dial holds when the dial\'s arm lands after `connected` (round 6, P3-1)', async () => {
+    useAppStore.setState({ connectionState: 'connecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    const dialBegan = seq; // Rust: connect_session_for reads intent_seq()
+    saveRefused = true;
+    await setKillSwitch(false);
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await waitFor(() => expect(statusChecks()).toHaveLength(1));
+    // The dial's arm lands now: arm_since(dialBegan) stores ON only if
+    // nothing wrote the intent since the dial began.
+    if (seq === dialBegan) intent = true;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(intent).toBe(false);
     expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
   });
 

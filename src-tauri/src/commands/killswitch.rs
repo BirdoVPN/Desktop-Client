@@ -47,8 +47,9 @@ static KILLSWITCH_ENABLED: AtomicBool = AtomicBool::new(false);
 static INTENT: parking_lot::Mutex<u64> = parking_lot::const_mutex(0);
 
 /// The intent's current sequence number, for [`intent_on_since`] and
-/// [`intent_off_since`].
-fn intent_seq() -> u64 {
+/// [`intent_off_since`] — and for a dial, which reads it when it begins and
+/// hands it to its arm ([`arm_since`]).
+pub(crate) fn intent_seq() -> u64 {
     *INTENT.lock()
 }
 
@@ -574,13 +575,15 @@ pub fn holds_block_while_connected() -> bool {
 /// Best-effort: a non-elevated host (should not happen — the app manifest
 /// requires administrator) logs and returns `Ok(false)` rather than failing the
 /// whole connection.
-pub async fn arm(app: &AppHandle) -> Result<bool, String> {
-    arm_since(app, intent_seq()).await
-}
-
-/// [`arm`], `seen` the intent's sequence read before anything this arm
-/// depends on (the live ON reads it before its session check).
-async fn arm_since(app: &AppHandle, seen: u64) -> Result<bool, String> {
+///
+/// `seen` is the intent's sequence, read by the caller before anything this
+/// arm depends on: the live ON reads it before its session check, and a dial
+/// when it begins (`session::connect_session_for`; round 6 of the review of
+/// #222, which folded the old `arm(app)` into this). Rust publishes Connected
+/// before the dial's arm, so the UI's check at the end of a dial could run
+/// before it; an OFF the user made during the dial makes the dial's own arm
+/// stand aside instead.
+pub(crate) async fn arm_since(app: &AppHandle, seen: u64) -> Result<bool, String> {
     // Respect the user's kill-switch preference (default ON). Reading it here —
     // the single choke-point every connect path funnels through — keeps all call
     // sites consistent. Fail SAFE: if settings can't be read, treat as enabled.
@@ -594,7 +597,7 @@ async fn arm_since(app: &AppHandle, seen: u64) -> Result<bool, String> {
     .await
 }
 
-/// [`arm`] around a `preference` read that may take any time.
+/// [`arm_since`] around a `preference` read that may take any time.
 ///
 /// Review of #222: an OFF that lands during the read (the toggle during
 /// `connecting`) must win. The intent's sequence is read BEFORE the
@@ -609,7 +612,7 @@ async fn arm_reading_since(
     arm_with_preference(enabled, seen).await
 }
 
-/// [`arm`] after the preference has been read, `seen` the intent's sequence
+/// [`arm_since`] after the preference has been read, `seen` the intent's sequence
 /// from before that read — split out so the preference-OFF branch is
 /// unit-testable without an `AppHandle`.
 async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
@@ -1540,16 +1543,35 @@ mod tests {
         assert!(is_enabled());
         intent_off();
 
-        // And `arm` takes the sequence before the preference, and stores
-        // through intent_on_since. (Its ON store needs an elevated host, so
-        // this half is a source check.)
+        // And `arm_since` stores through intent_on_since, with a sequence its
+        // callers read before the preference (the dial at its start, the
+        // live ON before its session check: source checks in `session` and
+        // below). Its ON store needs an elevated host, so this half is a
+        // source check.
         let source = include_str!("killswitch.rs").replace('\r', "");
-        assert!(source.contains("arm_since(app, intent_seq()).await"));
         let read = &source[source.find("async fn arm_reading_since(").unwrap()..];
         let read = &read[..read.find("\n}\n").unwrap()];
         assert!(read.contains("arm_with_preference(enabled, seen)"));
         let arm = &source[source.find("async fn arm_with_preference(").unwrap()..];
         assert!(arm.contains("if !intent_on_since(seen) {"));
+    }
+
+    /// Round 6 of the review (P3-1): with the sequence from the dial's start,
+    /// an OFF the user made during the dial makes the dial's arm stand aside.
+    /// (That the dial passes it is checked in `session`.)
+    #[tokio::test]
+    async fn an_off_during_the_dial_makes_its_arm_stand_aside() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+        let dial_began = intent_seq();
+        turn_off(|| std::future::ready(Ok(true)), || false)
+            .await
+            .unwrap();
+        assert_eq!(
+            arm_reading_since(dial_began, std::future::ready(true)).await,
+            Ok(false)
+        );
+        assert!(!is_enabled(), "the dial's arm stood aside");
     }
 
     /// Round 4 of the review (P3-6): an `arm` that read the preference OFF
