@@ -444,27 +444,22 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(useAppStore.getState().settings).toEqual(real);
   });
 
-  it('with settings that did not come from Rust, the toggle shows what the dial armed', async () => {
-    useAppStore.setState({
-      connectionState: 'connecting',
-      settingsHydrated: false,
-      settings: { ...defaultSettings, killSwitchEnabled: false },
-    });
-    intent = true;
-    act(() => useAppStore.setState({ connectionState: 'connected' }));
-    await waitFor(() => expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true));
-
-    // Settings that did come from Rust are what is saved: left alone, and
-    // with no choice to honour there is nothing to ask Rust.
-    useAppStore.setState({
-      connectionState: 'connecting',
-      settingsHydrated: true,
-      settings: { ...defaultSettings, killSwitchEnabled: false },
-    });
-    act(() => useAppStore.setState({ connectionState: 'connected' }));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
-    expect(statusChecks()).toHaveLength(1);
+  // Round 6 (P3-3): round 5 copied Rust's intent into settings that had not
+  // come from Rust. That read can precede the dial's arm, and a later save
+  // then wrote it over the file. With no choice made, nothing is touched.
+  it('with no choice made, the dial end leaves the settings alone, hydrated or not (round 6, P3-3)', async () => {
+    for (const settingsHydrated of [false, true]) {
+      useAppStore.setState({
+        connectionState: 'connecting',
+        settingsHydrated,
+        settings: { ...defaultSettings, killSwitchEnabled: false },
+      });
+      intent = true;
+      act(() => useAppStore.setState({ connectionState: 'connected' }));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    }
+    expect(statusChecks()).toHaveLength(0);
   });
 });
 
