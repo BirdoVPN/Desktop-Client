@@ -1286,6 +1286,38 @@ impl VpnManager {
             .await
     }
 
+    /// Interface loss: rebuild the live tunnel's path to the relay on the
+    /// default route it is pinned to (see `WintunTunnel::repath`). `Ok(false)`
+    /// when there is nothing of ours to rebuild (stealth); `Err` means the
+    /// caller should re-dial.
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn repath(
+        &self,
+        path: crate::vpn::network_events::PhysicalRoute,
+    ) -> Result<bool, String> {
+        let guard = timeout(STATE_LOCK_TIMEOUT, self.tunnel.read())
+            .await
+            .map_err(|_| "tunnel lock timeout".to_string())?;
+        let tunnel = guard.as_ref().ok_or_else(|| "no tunnel".to_string())?;
+        tunnel.repath((path.gateway, path.interface)).await
+    }
+
+    /// The live tunnel's run of sends the OS refused (see
+    /// `wireguard_new::SendHealth`). `None` with no tunnel.
+    #[cfg(target_os = "windows")]
+    pub(crate) async fn send_health(&self) -> Option<super::wireguard_new::SendHealth> {
+        let guard = timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await.ok()?;
+        guard.as_ref()?.send_health().await
+    }
+
+    /// Time since the relay last answered an initiation of ours (see
+    /// `WireGuardSession::proof_age`). `None` with no tunnel.
+    #[cfg(target_os = "windows")]
+    pub async fn proof_age(&self) -> Option<Duration> {
+        let guard = timeout(STATE_LOCK_TIMEOUT, self.tunnel.read()).await.ok()?;
+        guard.as_ref()?.proof_age().await
+    }
+
     /// The fast dead-path signal: the relay has stopped answering handshakes
     /// while traffic is waiting (see `wireguard_new::peer_unresponsive`).
     #[cfg(target_os = "windows")]
