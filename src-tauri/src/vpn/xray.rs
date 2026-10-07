@@ -1043,18 +1043,41 @@ mod tests {
         );
         // a TCP listener on the same port is NOT the proxy: UDP stays free.
         // The port must be usable by BOTH protocols, which one bind cannot
-        // promise: Hyper-V reserves separate TCP and UDP blocks inside the
-        // dynamic range, and landing in one failed the setup — not the probe
-        // under test. So look for a port both accept.
-        let (tcp, port) = (0..50)
-            .find_map(|_| {
-                let udp = UdpSocket::bind(("127.0.0.1", 0)).ok()?;
-                let port = udp.local_addr().ok()?.port();
-                drop(udp);
+        // promise: Hyper-V reserves separate TCP and UDP blocks (~100 ports
+        // each) inside the dynamic range, and landing in one failed the setup
+        // — not the probe under test. Ephemeral ports are handed out nearly
+        // sequentially, so 50 UDP-first tries could all fall inside ONE
+        // reserved TCP block (release dry run 37652906051 did). Mix three
+        // sources so no single block can swallow every try: an ephemeral UDP
+        // port, an ephemeral TCP port, and a random port across 20000-59999.
+        let random_port = |i: usize| -> u16 {
+            use std::hash::{BuildHasher, Hasher};
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_usize(i);
+            20_000 + (h.finish() % 40_000) as u16
+        };
+        let (tcp, port) = (0..300)
+            .find_map(|i| {
+                let port = match i % 3 {
+                    0 => UdpSocket::bind(("127.0.0.1", 0))
+                        .ok()?
+                        .local_addr()
+                        .ok()?
+                        .port(),
+                    1 => TcpListener::bind(("127.0.0.1", 0))
+                        .ok()?
+                        .local_addr()
+                        .ok()?
+                        .port(),
+                    _ => random_port(i),
+                };
+                // UDP must really be bindable here, or the probe's "free"
+                // below would be measuring a reservation, not our listener.
+                drop(UdpSocket::bind(("127.0.0.1", port)).ok()?);
                 let tcp = TcpListener::bind(("127.0.0.1", port)).ok()?;
                 Some((tcp, port))
             })
-            .expect("a loopback port free for both TCP and UDP");
+            .expect("a loopback port free for both TCP and UDP (300 tries, 3 sources)");
         assert!(!udp_port_held(port));
         drop(tcp);
     }
