@@ -999,7 +999,6 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
 
 /// Everything [`end_session`] does before it releases the block, in order.
 async fn tear_down(app: AppHandle, reason: EndReason) {
-    let app = &app;
     let vm = app.state::<VpnManager>();
 
     // Cancel FIRST: an in-flight connect or re-dial stops at its next await,
@@ -1011,6 +1010,26 @@ async fn tear_down(app: AppHandle, reason: EndReason) {
     // operation-lock timeout (`vpn::manager` docs, REVIEW-WIN-013).
     let _commit = vm.lock_commit_for_teardown().await;
 
+    end_the_tunnel(&app, reason).await;
+
+    // Release the block and end Disconnected while the commit lock is still
+    // held (round 7 of the review of #222, N1). A connect queued on the lock
+    // reads the kill switch intent's sequence when it begins: a disarm after
+    // the release moved it under that connect, whose arm then stood aside —
+    // a new session with the intent OFF while the file and the toggle said
+    // ON. A Disconnected written after the release overwrote the new dial's
+    // Connecting the same way. Past RELEASE_DEADLINE, end_session does both.
+    // After the steps, however they end (round 8): end_session trusts a
+    // finished teardown to have done this, so no early return in the steps
+    // may skip it.
+    let _ = killswitch::disarm().await;
+    let _ = vm.set_state(ConnectionState::Disconnected).await;
+}
+
+/// The steps of [`tear_down`], under its commit lock, before it releases the
+/// block.
+async fn end_the_tunnel(app: &AppHandle, reason: EndReason) {
+    let vm = app.state::<VpnManager>();
     let ar = app.state::<AutoReconnectService>();
     ar.stop().await;
     ar.clear_last_config().await;
@@ -1049,16 +1068,6 @@ async fn tear_down(app: AppHandle, reason: EndReason) {
         tracing::error!("Tunnel disconnect failed: {}", e);
     }
     app.state::<XrayManager>().stop().await;
-
-    // Release the block and end Disconnected while the commit lock is still
-    // held (round 7 of the review of #222, N1). A connect queued on the lock
-    // reads the kill switch intent's sequence when it begins: a disarm after
-    // the release moved it under that connect, whose arm then stood aside —
-    // a new session with the intent OFF while the file and the toggle said
-    // ON. A Disconnected written after the release overwrote the new dial's
-    // Connecting the same way. Past RELEASE_DEADLINE, end_session does both.
-    let _ = killswitch::disarm().await;
-    let _ = vm.set_state(ConnectionState::Disconnected).await;
 }
 
 static EXPIRY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -1166,19 +1175,33 @@ mod lifecycle_tests {
             teardown,
             &[
                 "vm.lock_commit_for_teardown()",
+                "end_the_tunnel(&app, reason).await",
+                "killswitch::disarm()",
+                "ConnectionState::Disconnected",
+            ],
+        );
+        order(
+            body("async fn end_the_tunnel("),
+            &[
                 "ar.stop()",
                 "ar.clear_last_config()",
                 "api.disconnect_vpn(&key_id)",
                 "vm.disconnect()",
                 "XrayManager>().stop()",
-                "killswitch::disarm()",
-                "ConnectionState::Disconnected",
             ],
         );
-        // The guard lives to the end of the function: nothing above runs
-        // after the lock is released.
+        // The guard lives to the end of the function, and nothing in it can
+        // leave before the disarm (round 8): the steps run in their own
+        // function, so an early return there still reaches it.
         assert!(teardown.contains("let _commit = vm.lock_commit_for_teardown().await;"));
         assert!(!teardown.contains("drop(_commit)"));
+        let code: String = teardown
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("return"), "an early return in tear_down");
+        assert!(!code.contains('?'), "a `?` in tear_down");
         order(
             body("pub async fn end_session("),
             &[
