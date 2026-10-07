@@ -1115,7 +1115,19 @@ impl WireGuardSession {
             self.responses.lock().initiation_sent(Instant::now());
             let sent = send_capped(&self.socket(), &dst[..len]).await;
             self.note_send(Instant::now(), &sent);
-            sent.map_err(|e| format!("Failed to send handshake on the new path: {}", e))?;
+            // The new socket is kept even so. Just after an interface comes
+            // back its first send can be refused while the address settles
+            // (WSAEADDRNOTAVAIL), and failing the rebuild on that one
+            // datagram re-dialled a path that was about to work. The caller's
+            // re-prove window (no answer in 10 s) and the send-path rule
+            // (still refused) judge the new socket instead.
+            if let Err(e) = sent {
+                tracing::warn!(
+                    "The handshake on the rebuilt socket could not be sent yet ({}) — the \
+                     re-prove window decides",
+                    e
+                );
+            }
         }
         Ok(())
     }
@@ -2055,6 +2067,29 @@ mod handshake_tests {
             assert!(body.contains("send_capped(&self.socket(), "), "{signature}");
             assert!(!body.contains(".send("), "{signature}");
         }
+    }
+
+    /// Review of #254: one refused handshake send on the rebuilt socket — an
+    /// address still settling just after the Wi-Fi returns — does not fail
+    /// the rebuild into a full re-dial. It is recorded, and the socket kept
+    /// for the re-prove window and the send-path rule to judge.
+    #[test]
+    fn a_refused_first_send_does_not_fail_the_rebuild() {
+        let source = include_str!("wireguard_new.rs").replace('\r', "");
+        let body = &source[source
+            .find("pub(crate) async fn rebind(&self)")
+            .expect("rebind")..];
+        let body = &body[..body.find("\n    }").expect("end of fn")];
+        let send = body
+            .find("let sent = send_capped(&self.socket(), &dst[..len]).await;")
+            .expect("the forced initiation");
+        let after = &body[send..];
+        assert!(after.contains("self.note_send(Instant::now(), &sent);"));
+        assert!(after.contains("if let Err(e) = sent {"));
+        assert!(
+            !after.contains('?'),
+            "a failed send must not end the rebuild: {after}"
+        );
     }
 
     /// WIN3-012: a send thread stuck with a packet in hand is a stalled

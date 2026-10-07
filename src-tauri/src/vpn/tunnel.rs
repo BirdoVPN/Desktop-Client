@@ -2215,8 +2215,9 @@ impl WintunTunnel {
     /// The session, the key, the tunnel address and the kill switch's block
     /// are all left as they are.
     ///
-    /// `Ok(false)`: a stealth session, whose relay connection is xray's and
-    /// whose own socket is on loopback — nothing of ours to rebuild. `Err`
+    /// `Ok(false)`: a stealth session. Its gateway routes (the LAN-sharing
+    /// ones) are put back too, but its relay connection is xray's and its own
+    /// socket is on loopback — there is no socket of ours to rebuild. `Err`
     /// means "re-dial instead".
     pub(crate) async fn repath(&self, path: (Ipv4Addr, u32)) -> Result<bool, String> {
         let wg = self
@@ -2225,13 +2226,13 @@ impl WintunTunnel {
             .await
             .clone()
             .ok_or("the tunnel has no WireGuard session")?;
-        if wg.endpoint_ip().is_loopback() {
-            return Ok(false);
-        }
         let state_gen = self.state_gen;
         let pinned = tokio::task::block_in_place(|| {
             crate::vpn::win_machine_state::reinstall_gateway_routes(state_gen, path)
         })?;
+        if wg.endpoint_ip().is_loopback() {
+            return Ok(false);
+        }
         if pinned == 0 {
             return Err("no endpoint route of ours on the current path".to_string());
         }
@@ -2368,6 +2369,36 @@ impl Drop for WintunTunnel {
         // bindings a blanket re-enable could change are ones the USER turned off.
 
         tracing::warn!("Emergency cleanup complete — DNS/route state may need manual verification");
+    }
+}
+
+/// Review of #254: an in-place rebuild puts our gateway routes back BEFORE it
+/// decides there is no socket of its own to rebuild (stealth), so a stealth
+/// session gets its LAN-sharing routes back too; and finding none of ours on
+/// the path is a re-dial only when there is a socket the missing host route
+/// would send into the tunnel. Then, and only then, the socket.
+#[cfg(test)]
+mod repath_tests {
+    #[test]
+    fn routes_first_then_the_stealth_check_then_the_socket() {
+        let source = include_str!("tunnel.rs").replace('\r', "");
+        let body = &source[source
+            .find("pub(crate) async fn repath(&self")
+            .expect("repath")..];
+        let body = &body[..body.find("\n    }\n").expect("end of fn")];
+        let mut last = 0;
+        for needle in [
+            "reinstall_gateway_routes(state_gen, path)",
+            "if wg.endpoint_ip().is_loopback() {",
+            "return Ok(false);",
+            "if pinned == 0 {",
+            "wg.rebind().await?;",
+        ] {
+            let at = body[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+            last += at + needle.len();
+        }
     }
 }
 

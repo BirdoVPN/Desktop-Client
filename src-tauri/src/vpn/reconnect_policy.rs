@@ -217,15 +217,32 @@ pub const HEARTBEAT_MISSES_TO_REPROVE: u32 = 2;
 /// can be down while the tunnel is fine, and then the relay simply answers.
 /// Not while there is no route off the machine (the offline pause covers
 /// that), and not while a window is already open.
-pub fn heartbeat_reprove(misses: u32, link: LinkState, verifying: bool) -> bool {
-    misses >= HEARTBEAT_MISSES_TO_REPROVE && link != LinkState::Offline && !verifying
+///
+/// Never on a platform with no route signal (`Connectivity::Unknown`, macOS
+/// today): there a local outage cannot be told from a dead tunnel, so missed
+/// heartbeats during a Wi-Fi drop would re-prove, fail and re-dial mid-outage
+/// as `PathChanged` — no backoff, no breaker, the retry budget spent before
+/// the network is back. (The wiring is Windows-only as well.)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn heartbeat_reprove(
+    misses: u32,
+    connectivity: Connectivity,
+    link: LinkState,
+    verifying: bool,
+) -> bool {
+    misses >= HEARTBEAT_MISSES_TO_REPROVE
+        && connectivity != Connectivity::Unknown
+        && link != LinkState::Offline
+        && !verifying
 }
 
 /// A rebuilt socket that is refused again within this long was not the
 /// problem: the next refusal re-dials instead of rebuilding again.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub const REBUILD_SETTLE: Duration = Duration::from_secs(30);
 
 /// What to do about the socket's send path this tick.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPathVerdict {
     Fine,
@@ -239,12 +256,15 @@ pub enum SendPathVerdict {
 /// whose sends the OS keeps refusing is rebuilt ONCE; refused again inside
 /// [`REBUILD_SETTLE`], the tunnel is declared dead and re-dialled — never a
 /// rebuild per tick. A rebuild the loop did for another reason (the link came
-/// back, a resume, a roam) counts as that one.
+/// back, a resume, a roam) counts as that one. Windows only: the other
+/// platforms have no in-place rebuild.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Default)]
 pub struct SendPathRepair {
     rebuilt_at: Option<Instant>,
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl SendPathRepair {
     /// The socket was rebuilt at `now`.
     pub fn rebuilt(&mut self, now: Instant) {
@@ -1182,19 +1202,38 @@ mod tests {
     /// window. They never tear anything down by themselves.
     #[test]
     fn heartbeat_misses_open_one_reprove_window() {
-        assert!(!heartbeat_reprove(0, LinkState::Online, false));
-        assert!(!heartbeat_reprove(1, LinkState::Online, false));
-        assert!(heartbeat_reprove(2, LinkState::Online, false));
-        assert!(heartbeat_reprove(5, LinkState::Returned, false));
+        let online = Connectivity::Online;
+        assert!(!heartbeat_reprove(0, online, LinkState::Online, false));
+        assert!(!heartbeat_reprove(1, online, LinkState::Online, false));
+        assert!(heartbeat_reprove(2, online, LinkState::Online, false));
+        assert!(heartbeat_reprove(5, online, LinkState::Returned, false));
         assert!(
-            !heartbeat_reprove(2, LinkState::Offline, false),
+            !heartbeat_reprove(2, Connectivity::Offline, LinkState::Offline, false),
             "no route off the machine: the offline pause covers it"
         );
         assert!(
-            !heartbeat_reprove(2, LinkState::Online, true),
+            !heartbeat_reprove(2, online, LinkState::Online, true),
             "a window is already open"
         );
         assert_eq!(HEARTBEAT_MISSES_TO_REPROVE, 2);
+    }
+
+    /// Review of #254: with no route signal (macOS reports `Unknown`, which
+    /// `LocalLink` reads as online) a Wi-Fi drop could not be told from a dead
+    /// tunnel. Missed heartbeats there must never open a re-prove window — it
+    /// would fail mid-outage and re-dial as `PathChanged`, with no backoff and
+    /// no breaker, spending the retry budget before the network is back.
+    #[test]
+    fn no_route_signal_never_reproves_on_missed_heartbeats() {
+        let mut link = LocalLink::default();
+        let state = link.observe(Connectivity::Unknown);
+        assert_eq!(state, LinkState::Online, "Unknown reads as online...");
+        for misses in [2, 3, 10, u32::MAX] {
+            assert!(
+                !heartbeat_reprove(misses, Connectivity::Unknown, state, false),
+                "...so the re-prove needs the signal itself ({misses} misses)"
+            );
+        }
     }
 
     /// Interface loss: a socket the OS keeps refusing is rebuilt exactly once

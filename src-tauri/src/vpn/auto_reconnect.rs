@@ -702,6 +702,9 @@ struct SessionWatch {
     #[cfg(target_os = "windows")]
     stall: super::wireguard_new::StallWatch,
     /// Heartbeats that failed on the network in a row (interface loss).
+    /// Windows only: elsewhere there is no rebuild-and-re-prove path, and
+    /// macOS has no route signal to tell a local outage from a dead tunnel.
+    #[cfg(target_os = "windows")]
     heartbeat_misses: u32,
     /// The send-path rule's one rebuild per episode (interface loss).
     #[cfg(target_os = "windows")]
@@ -749,6 +752,11 @@ struct ReconnectLoop {
 /// (`VpnManager::repath`: our routes back, a fresh socket, a forced
 /// handshake) and open a re-prove window for it. It is the send-path rule's
 /// one rebuild for this episode. `Err` means re-dial.
+///
+/// Heartbeats missed during the outage say nothing about the rebuilt path:
+/// the window opened here judges it, so they are forgotten — or, once it
+/// closes, they would open a second, redundant window that re-dials a
+/// healthy tunnel if its answer happens to be lost.
 #[cfg(target_os = "windows")]
 async fn rebuild_path(
     vm: &VpnManager,
@@ -758,6 +766,7 @@ async fn rebuild_path(
 ) -> Result<(), String> {
     session.send_repair.rebuilt(now);
     session.verify_since = Some(now);
+    session.heartbeat_misses = 0;
     vm.repath(path).await.map(|_| ())
 }
 
@@ -963,8 +972,12 @@ impl ReconnectLoop {
         // nothing. It tears nothing down — the API can be down while the
         // tunnel is fine — it asks the tunnel to prove itself with a
         // handshake the relay must answer inside PATH_VERIFY_WINDOW.
+        // Windows only, and never without a route signal (see
+        // `reconnect_policy::heartbeat_reprove`).
+        #[cfg(target_os = "windows")]
         if reconnect_policy::heartbeat_reprove(
             session.heartbeat_misses,
+            network_events::connectivity_of(route.as_ref()),
             link,
             session.verify_since.is_some(),
         ) {
@@ -1064,6 +1077,12 @@ impl ReconnectLoop {
             tracing::info!("Tunnel re-proven — the relay answered a handshake on this path");
             session.verify_since = None;
             verify_elapsed = None;
+            // The path is proven: heartbeats missed before it was (during an
+            // outage) must not open a second window.
+            #[cfg(target_os = "windows")]
+            {
+                session.heartbeat_misses = 0;
+            }
         }
         let age = reconnect_policy::judged_age(age, proof_age, verify_elapsed.is_some());
         reconnect_policy::liveness(now.duration_since(connected_since), age, verify_elapsed)
@@ -1354,24 +1373,33 @@ impl ReconnectLoop {
                 tracing::warn!("Heartbeat failed: {}", heartbeat_failure(&e));
                 // An HTTP status crossed the tunnel to arrive; only a failure
                 // on the network itself says the tunnel may carry nothing.
-                self.session.heartbeat_misses = if heartbeat_missed_the_network(&e) {
-                    self.session.heartbeat_misses.saturating_add(1)
-                } else {
-                    0
-                };
+                #[cfg(target_os = "windows")]
+                {
+                    self.session.heartbeat_misses = if heartbeat_missed_the_network(&e) {
+                        self.session.heartbeat_misses.saturating_add(1)
+                    } else {
+                        0
+                    };
+                }
                 return Flow::Continue;
             }
             Err(_) => {
                 // A heartbeat that rides a dead tunnel never answers; the
                 // liveness rules, not this, decide that the tunnel is dead —
-                // a run of these only asks the tunnel to prove itself
-                // (`reconnect_policy::heartbeat_reprove`).
+                // on Windows a run of these only asks the tunnel to prove
+                // itself (`reconnect_policy::heartbeat_reprove`).
                 tracing::warn!("Heartbeat unanswered after {:?}", HEARTBEAT_TIMEOUT);
-                self.session.heartbeat_misses = self.session.heartbeat_misses.saturating_add(1);
+                #[cfg(target_os = "windows")]
+                {
+                    self.session.heartbeat_misses = self.session.heartbeat_misses.saturating_add(1);
+                }
                 return Flow::Continue;
             }
         };
-        self.session.heartbeat_misses = 0;
+        #[cfg(target_os = "windows")]
+        {
+            self.session.heartbeat_misses = 0;
+        }
         if resp.valid {
             self.alive = Some((now, network_events::resume_count()));
         }
@@ -1620,7 +1648,8 @@ async fn flush_dns_cache() {
 
 /// Whether a failed heartbeat failed on the NETWORK — no connection, no
 /// answer — rather than with an answer (a status, an unreadable body), which
-/// had to cross the tunnel to arrive.
+/// had to cross the tunnel to arrive. (Windows only; see `SessionWatch`.)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn heartbeat_missed_the_network(e: &crate::api::ApiError) -> bool {
     matches!(e, crate::api::ApiError::Network(_))
 }
@@ -1973,6 +2002,8 @@ mod tests {
             "vm.peer_unresponsive().await",
             "let proof_age = vm.proof_age().await.unwrap_or(age);",
             "proof_age < elapsed",
+            // A window closed on proof forgets the outage's missed heartbeats.
+            "session.heartbeat_misses = 0;",
             "reconnect_policy::judged_age(age, proof_age, verify_elapsed.is_some())",
             "reconnect_policy::liveness(",
         ] {
@@ -1987,9 +2018,52 @@ mod tests {
         for step in [
             "session.send_repair.rebuilt(now);",
             "session.verify_since = Some(now);",
+            "session.heartbeat_misses = 0;",
             "vm.repath(path).await",
         ] {
             assert!(helper.contains(step), "rebuild_path lost `{step}`");
+        }
+    }
+
+    /// Review of #254: the heartbeat re-prove is Windows-only and asks the
+    /// route signal, so macOS (no signal: `Unknown`, read as online) never
+    /// re-dials mid-outage as `PathChanged` over missed heartbeats. The pure
+    /// half is `reconnect_policy::no_route_signal_never_reproves_on_missed_heartbeats`.
+    #[test]
+    fn the_heartbeat_reprove_is_windows_only_and_asks_the_route_signal() {
+        let source = include_str!("auto_reconnect.rs").replace('\r', "");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let at = code
+            .find("if reconnect_policy::heartbeat_reprove(")
+            .expect("the re-prove");
+        assert!(
+            code[..at]
+                .trim_end()
+                .ends_with("#[cfg(target_os = \"windows\")]"),
+            "the heartbeat re-prove lost its Windows gate"
+        );
+        assert!(code[at..].starts_with(
+            "if reconnect_policy::heartbeat_reprove(\n            session.heartbeat_misses,\n            \
+             network_events::connectivity_of(route.as_ref()),"
+        ));
+        // Every write of the miss count sits in a Windows-only block, and the
+        // field itself is Windows-only.
+        let field = code.find("    heartbeat_misses: u32,").expect("the field");
+        assert!(code[..field]
+            .trim_end()
+            .ends_with("#[cfg(target_os = \"windows\")]"));
+        let heartbeat = &code[code.find("async fn heartbeat(&mut self").unwrap()..];
+        let heartbeat = &heartbeat[..heartbeat
+            .find("match reconnect_policy::heartbeat_verdict")
+            .unwrap()];
+        for (i, _) in heartbeat.match_indices("self.session.heartbeat_misses =") {
+            let before = heartbeat[..i].trim_end();
+            assert!(
+                before.ends_with("#[cfg(target_os = \"windows\")]\n                {")
+                    || before.ends_with("#[cfg(target_os = \"windows\")]\n        {"),
+                "a miss-count write outside a Windows block: {}",
+                &heartbeat[i.saturating_sub(120)..i]
+            );
         }
     }
 
@@ -2027,7 +2101,7 @@ mod tests {
         assert!(heartbeat.contains(
             "self.session.heartbeat_misses=self.session.heartbeat_misses.saturating_add(1);"
         ));
-        assert!(heartbeat.contains("self.session.heartbeat_misses=0;ifresp.valid{"));
+        assert!(heartbeat.contains("self.session.heartbeat_misses=0;}ifresp.valid{"));
     }
 
     /// REVIEW-WIN-009: every give-up the POLICY decides is marked on the final
