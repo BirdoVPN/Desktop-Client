@@ -22,9 +22,9 @@ name: NSIS installer
 # installed on this runner and thrown away with it.
 #
 # Not a required check: path-filtered, so it cannot be one without blocking
-# every PR that does not touch these paths. No caches: a cold release build is
-# ~15 min, fine for a path-filtered job, and nothing release-shaped should
-# restore what a PR wrote.
+# every PR that does not touch these paths. No caches: the whole job takes
+# ~9 min cold (cargo's release build ~7.5 of it, #253), fine for a
+# path-filtered job, and nothing release-shaped should restore what a PR wrote.
 
 # The two path lists are the same; keep them so. (Not a YAML anchor: zizmor
 # warns that anchors can make its results wrong.)
@@ -80,7 +80,7 @@ jobs:
     # The schedule runs in this repository only, not in forks.
     if: github.event_name != 'schedule' || github.repository == 'BirdoVPN/Desktop-Client'
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 25 # ~2.5x the ~9 min first runs (#253)
     permissions:
       contents: read
     defaults:
@@ -152,7 +152,7 @@ jobs:
           Write-Host "Bundling wintun.dll and Xray $xrayVersion xray.exe ($binarySha)"
 
       - name: Build the NSIS installer (unsigned)
-        timeout-minutes: 35
+        timeout-minutes: 20 # cargo + makensis took ~8 min
         env:
           # A PR has no SENTRY_DSN, and this artifact is never shipped.
           BIRDO_ALLOW_MISSING_SENTRY_DSN: "1"
@@ -187,7 +187,7 @@ jobs:
       # Safe on a GitHub-hosted runner: no VPN, no WFP/route/DNS change (the
       # script says why, and checks it). Refuses to run anywhere else.
       - name: Silent install + uninstall on this runner (the hooks run)
-        timeout-minutes: 15
+        timeout-minutes: 10 # took 5 s; the script bounds each wait itself
         run: |
           $nsis = @(Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe")
           if ($nsis.Count -ne 1) { throw "expected one NSIS installer, found $($nsis.Count)" }

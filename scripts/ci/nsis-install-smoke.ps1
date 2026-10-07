@@ -35,7 +35,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
     [string]$MainBinaryName = 'birdo-vpn-desktop',
-    [int]$TimeoutSec = 300
+    [int]$TimeoutSec = 120 # per wait; three waits stay inside the step's 10 min
 )
 
 $ErrorActionPreference = 'Stop'
