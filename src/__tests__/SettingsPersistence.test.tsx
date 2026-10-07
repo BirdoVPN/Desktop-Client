@@ -27,6 +27,7 @@ import {
   KILL_SWITCH_ON_FAILED_COPY,
   KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
   persistSettings,
+  reloadSettings,
   resetSettings,
   saveConsentCrashChoice,
   setKillSwitch,
@@ -477,6 +478,87 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     act(() => useAppStore.setState({ connectionState: 'connected' }));
     await new Promise((r) => setTimeout(r, 0));
     expect(intent).toBe(true);
+  });
+
+  // Round 8 (E2): the reapply after a reset runs only while connected, and
+  // the auto-reconnect never arms, so a reset while reconnecting or in error
+  // left a this-connection OFF in force under a toggle reading ON.
+  it('a reset while reconnecting gives the session the defaults\' kill switch at once (round 8, E2)', async () => {
+    useAppStore.setState({ connectionState: 'reconnecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    expect(intent).toBe(false);
+    await resetSettings();
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    expect(intent).toBe(true);
+  });
+
+  it('a reset whose kill switch cannot be pushed says so (round 8, E2)', async () => {
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'set_killswitch_live' && (args as { enabled: boolean }).enabled) throw 'arm failed';
+      return base(cmd, args as never);
+    });
+    useAppStore.setState({ connectionState: 'error', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    await resetSettings();
+    expect(useAppStore.getState().notice?.text).toBe(KILL_SWITCH_ON_FAILED_COPY);
+    expect(intent).toBe(false);
+  });
+
+  // Round 8 (E1), reproduced: OFF for this connection (the file could not
+  // be verified), the key comes back, Reset finds nothing to reset and the
+  // screen re-reads the file. The toggle read ON while the intent was OFF.
+  it('a re-read over a this-connection OFF keeps it on screen: Reset that finds nothing to reset (round 8, E1)', async () => {
+    useAppStore.setState({ connectionState: 'connected', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    expect(intent).toBe(false);
+    // The key is back: nothing to reset, and the file (ON) is re-read.
+    saveRefused = false;
+    mockedInvoke.mockImplementation(
+      ((base) => async (cmd: string, args?: unknown) =>
+        cmd === 'reset_settings' ? false : base(cmd, args as never))(mockedInvoke.getMockImplementation()!),
+    );
+    await resetSettings();
+    expect(useAppStore.getState().notice?.text).toBe(
+      'Your saved settings can be read again, so nothing was reset.',
+    );
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    expect(intent).toBe(false);
+    // The file's ON is what comes back at the next dial, and what a save of
+    // anything else writes meanwhile.
+    expect(await persistSettings({ autoConnect: true })).toBe(true);
+    expect(saves()[saves().length - 1]?.killswitch_enabled).toBe(true);
+    act(() => useAppStore.setState({ connectionState: 'switching' }));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+  });
+
+  it('every re-read keeps a this-connection OFF on screen, and only the file\'s value changes (round 8, E1)', async () => {
+    useAppStore.setState({ connectionState: 'reconnecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    saveRefused = false;
+    // The file now says OFF (saved elsewhere); the re-read takes that as the
+    // value to give way to, and the toggle still shows the live OFF.
+    mockedInvoke.mockImplementation(
+      ((base) => async (cmd: string, args?: unknown) =>
+        cmd === 'get_settings'
+          ? settingsToRust({ ...defaultSettings, killSwitchEnabled: false, autoConnect: true })
+          : base(cmd, args as never))(mockedInvoke.getMockImplementation()!),
+    );
+    await reloadSettings();
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    expect(useAppStore.getState().settings.autoConnect).toBe(true);
+    act(() => useAppStore.setState({ connectionState: 'connecting' }));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+
+    // And no path re-reads around it.
+    const source = readFileSync(resolve(__dirname, '../session/settings-persist.ts'), 'utf8');
+    expect(source.match(/(await|void) loadSettings\(\)/g)).toEqual(['await loadSettings()']);
+    const controller = readFileSync(resolve(__dirname, '../session/controller.tsx'), 'utf8');
+    expect(controller).not.toMatch(/(await|void) loadSettings\(\)/);
   });
 
   it('the next dial puts back the kill switch alone, never an unverifiable file\'s stand-in defaults (N2)', async () => {

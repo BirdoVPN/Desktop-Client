@@ -80,7 +80,7 @@ async function reapply(): Promise<void> {
     if (outcome === 'reverted') {
       // Rust could not apply the change, saved the previous settings back
       // and reconnected on them: show what is really in force, and say so.
-      await loadSettings();
+      await reloadSettings();
       useAppStore.getState().showNotice({ text: REAPPLY_REVERTED_COPY, tone: 'danger' });
     }
   } catch (e) {
@@ -89,7 +89,7 @@ async function reapply(): Promise<void> {
     // saved, or the next save writes the failed value back. Only then: a
     // restore Rust refused saved nothing, and re-reading an unverifiable file
     // hydrates the defaults the next save would write over it (REVIEW-WIN4-004).
-    if (settingsRestored(e)) await loadSettings();
+    if (settingsRestored(e)) await reloadSettings();
     // The user's own Disconnect (or a newer connect) superseded the rebuild:
     // nothing went wrong that they did not ask for (WIN3-002).
     if (isSilentError(toIpcError(e))) return;
@@ -171,7 +171,7 @@ async function trySave(
   useAppStore.getState().updateSettings(patch);
   if (reapplyInFlight) {
     const original = before;
-    if (!(await settledWithin(reapplyInFlight, REAPPLY_WAIT_MS))) await loadSettings();
+    if (!(await settledWithin(reapplyInFlight, REAPPLY_WAIT_MS))) await reloadSettings();
     // What a failed save puts back: what the reapply re-read from disk, or,
     // for a key it did not touch, what the key was.
     const settled = useAppStore.getState().settings;
@@ -253,27 +253,53 @@ export function askToResetSettings(): void {
  * saved, and a live session is rebuilt on it.
  */
 export async function resetSettings(): Promise<void> {
+  let reset: boolean;
   try {
-    const reset = await invoke<boolean>('reset_settings');
-    await loadSettings();
-    if (reset) {
-      // The defaults are the choice now (round 6 of the review of #222): a
-      // kill switch choice made before the reset must not be pushed back
-      // over them after the next dial.
-      forgetKillSwitchChoices();
-      scheduleReapply();
-    }
-    useAppStore.getState().showNotice({
-      text: reset
-        ? 'Your settings were reset to their defaults.'
-        : 'Your saved settings can be read again, so nothing was reset.',
-      tone: 'info',
-    });
+    reset = await invoke<boolean>('reset_settings');
   } catch {
     useAppStore.getState().showNotice({
       text: "Couldn't reset your settings. Please try again.",
       tone: 'danger',
     });
+    return;
+  }
+  // The defaults are the choice now (round 6 of the review of #222): a kill
+  // switch choice made before the reset must not be pushed back over them
+  // after the next dial — so it goes at once, before anything below reads
+  // it (round 8).
+  if (reset) forgetKillSwitchChoices();
+  await reloadSettings();
+  if (!reset) {
+    useAppStore.getState().showNotice({
+      text: 'Your saved settings can be read again, so nothing was reset.',
+      tone: 'info',
+    });
+    return;
+  }
+  scheduleReapply();
+  useAppStore.getState().showNotice({
+    text: 'Your settings were reset to their defaults.',
+    tone: 'info',
+  });
+  await armTheResetDefaults();
+}
+
+/**
+ * After a reset, a live session gets the defaults' kill switch now (round 8
+ * of the review of #222, E2): connected, reconnecting or in error. The
+ * reapply that rebuilds on the defaults runs only while connected, and the
+ * auto-reconnect never arms, so a kill switch turned off for this connection
+ * stayed off under a toggle reading ON until the user's next dial. A push
+ * that fails says so.
+ */
+async function armTheResetDefaults(): Promise<void> {
+  const s = useAppStore.getState();
+  if (!s.settings.killSwitchEnabled) return;
+  if (!killSwitchLiveApplies(s.connectionState, true, s.killSwitchBlocking)) return;
+  try {
+    await invoke('set_killswitch_live', { enabled: true });
+  } catch {
+    useAppStore.getState().showNotice({ text: KILL_SWITCH_ON_FAILED_COPY, tone: 'danger' });
   }
 }
 
@@ -331,6 +357,24 @@ interface StandingChoice {
   thisConnectionOnly?: { saved: boolean };
 }
 let standingChoice: StandingChoice | null = null;
+
+/**
+ * Re-read the settings from Rust: every re-read goes through here (round 8
+ * of the review of #222, E1). While a refused OFF holds for this connection
+ * only, the toggle keeps showing that OFF — it is what is live — and the
+ * file's kill switch becomes the value it gives way to at the next dial.
+ * Hydrated over it, the toggle (and the status chip) read ON while the
+ * intent was OFF: reproduced through Reset when the file verified again
+ * (`reset_settings` answering false).
+ */
+export async function reloadSettings(): Promise<void> {
+  if (!(await loadSettings())) return;
+  const held = standingChoice?.thisConnectionOnly;
+  if (!held) return;
+  const s = useAppStore.getState();
+  held.saved = s.settings.killSwitchEnabled;
+  s.updateSettings({ killSwitchEnabled: false });
+}
 
 /**
  * The kill switch a save writes while a refused OFF holds for this

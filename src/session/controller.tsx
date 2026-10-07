@@ -27,12 +27,15 @@ import { endSession } from '@/session/session';
 import {
   loadAdminStatus,
   loadServers,
-  loadSettings,
   loadSubscription,
   resetSessionData,
 } from '@/session/session-data';
 import { connectPreferred, findLiveServer } from '@/session/vpn-actions';
-import { persistSettings, watchKillSwitchAcrossDials } from '@/session/settings-persist';
+import {
+  persistSettings,
+  reloadSettings,
+  watchKillSwitchAcrossDials,
+} from '@/session/settings-persist';
 import { useCustomDnsGate } from '@/session/custom-dns-gate';
 import {
   connectionNotification,
@@ -176,7 +179,7 @@ function useSessionExpiry(): void {
 
 function useSessionData(): void {
   useEffect(() => {
-    void loadSettings();
+    void reloadSettings();
     void loadAdminStatus();
     void loadSubscription();
     void loadServers();
