@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { open as openExternal } from '@tauri-apps/plugin-shell';
-import { Shield, Eye, BarChart3, ShieldOff } from 'lucide-react';
+import { Shield, Eye, ChartColumn, ShieldOff } from 'lucide-react';
 import { AppIconMark, BirdoButton, BirdoCard, BirdoToggleRow } from './birdo';
 import { brand, motion as motionTokens } from '@/lib/birdo-theme';
 
@@ -124,7 +124,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
                   description={CONSENT_COPY.accountHolds}
                 />
                 <DataItem
-                  icon={BarChart3}
+                  icon={ChartColumn}
                   title="Crash Reports (optional)"
                   description={CONSENT_COPY.crashReports}
                 />
@@ -148,7 +148,7 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
               <BirdoToggleRow
                 title="Send crash reports"
                 subtitle="Optional. Off unless you turn it on."
-                leadingIcon={BarChart3}
+                leadingIcon={ChartColumn}
                 checked={crashReports}
                 onCheckedChange={setCrashReports}
               />

@@ -12,7 +12,7 @@
  */
 import { useEffect } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { AlertCircle, Gauge, RefreshCw, Zap } from 'lucide-react';
+import { CircleAlert, Gauge, RefreshCw, Zap } from 'lucide-react';
 import { BirdoButton, BirdoCard } from '@/components/birdo';
 import { accentA, brand, hairline, status, surface, white } from '@/lib/birdo-theme';
 import { planName } from '@/lib/plan';
@@ -104,7 +104,7 @@ export function Limit() {
             className="flex items-center gap-2.5 rounded-2xl px-3.5 py-3"
             style={{ backgroundColor: status.redBg, border: `1px solid ${status.redBorder}` }}
           >
-            <AlertCircle size={18} color={status.red} aria-hidden className="shrink-0" />
+            <CircleAlert size={18} color={status.red} aria-hidden className="shrink-0" />
             <p className="flex-1 text-xs" style={{ color: status.red }}>
               {usage ? "Couldn't refresh your usage. Showing the last reading." : "Couldn't load your usage."}
             </p>
