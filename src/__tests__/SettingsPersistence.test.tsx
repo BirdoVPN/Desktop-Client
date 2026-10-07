@@ -479,6 +479,33 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(intent).toBe(true);
   });
 
+  // Round 8 (E2): the reapply after a reset runs only while connected, and
+  // the auto-reconnect never arms, so a reset while reconnecting or in error
+  // left a this-connection OFF in force under a toggle reading ON.
+  it('a reset while reconnecting gives the session the defaults\' kill switch at once (round 8, E2)', async () => {
+    useAppStore.setState({ connectionState: 'reconnecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    expect(intent).toBe(false);
+    await resetSettings();
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    expect(intent).toBe(true);
+  });
+
+  it('a reset whose kill switch cannot be pushed says so (round 8, E2)', async () => {
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'set_killswitch_live' && (args as { enabled: boolean }).enabled) throw 'arm failed';
+      return base(cmd, args as never);
+    });
+    useAppStore.setState({ connectionState: 'error', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    saveRefused = true;
+    await setKillSwitch(false);
+    await resetSettings();
+    expect(useAppStore.getState().notice?.text).toBe(KILL_SWITCH_ON_FAILED_COPY);
+    expect(intent).toBe(false);
+  });
+
   it('the next dial puts back the kill switch alone, never an unverifiable file\'s stand-in defaults (N2)', async () => {
     const real = { ...defaultSettings, killSwitchEnabled: true, autoConnect: true, localNetworkSharing: true };
     useAppStore.setState({ connectionState: 'reconnecting', settings: real });

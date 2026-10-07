@@ -253,27 +253,53 @@ export function askToResetSettings(): void {
  * saved, and a live session is rebuilt on it.
  */
 export async function resetSettings(): Promise<void> {
+  let reset: boolean;
   try {
-    const reset = await invoke<boolean>('reset_settings');
-    await loadSettings();
-    if (reset) {
-      // The defaults are the choice now (round 6 of the review of #222): a
-      // kill switch choice made before the reset must not be pushed back
-      // over them after the next dial.
-      forgetKillSwitchChoices();
-      scheduleReapply();
-    }
-    useAppStore.getState().showNotice({
-      text: reset
-        ? 'Your settings were reset to their defaults.'
-        : 'Your saved settings can be read again, so nothing was reset.',
-      tone: 'info',
-    });
+    reset = await invoke<boolean>('reset_settings');
   } catch {
     useAppStore.getState().showNotice({
       text: "Couldn't reset your settings. Please try again.",
       tone: 'danger',
     });
+    return;
+  }
+  // The defaults are the choice now (round 6 of the review of #222): a kill
+  // switch choice made before the reset must not be pushed back over them
+  // after the next dial — so it goes at once, before anything below reads
+  // it (round 8).
+  if (reset) forgetKillSwitchChoices();
+  await loadSettings();
+  if (!reset) {
+    useAppStore.getState().showNotice({
+      text: 'Your saved settings can be read again, so nothing was reset.',
+      tone: 'info',
+    });
+    return;
+  }
+  scheduleReapply();
+  useAppStore.getState().showNotice({
+    text: 'Your settings were reset to their defaults.',
+    tone: 'info',
+  });
+  await armTheResetDefaults();
+}
+
+/**
+ * After a reset, a live session gets the defaults' kill switch now (round 8
+ * of the review of #222, E2): connected, reconnecting or in error. The
+ * reapply that rebuilds on the defaults runs only while connected, and the
+ * auto-reconnect never arms, so a kill switch turned off for this connection
+ * stayed off under a toggle reading ON until the user's next dial. A push
+ * that fails says so.
+ */
+async function armTheResetDefaults(): Promise<void> {
+  const s = useAppStore.getState();
+  if (!s.settings.killSwitchEnabled) return;
+  if (!killSwitchLiveApplies(s.connectionState, true, s.killSwitchBlocking)) return;
+  try {
+    await invoke('set_killswitch_live', { enabled: true });
+  } catch {
+    useAppStore.getState().showNotice({ text: KILL_SWITCH_ON_FAILED_COPY, tone: 'danger' });
   }
 }
 
