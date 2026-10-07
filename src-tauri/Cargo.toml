@@ -1,6 +1,6 @@
 [package]
 name = "birdo-vpn-desktop"
-version = "1.4.45"
+version = "1.4.46-1"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
 license = "CC-BY-NC-4.0" # SPDX id of ../LICENSE (source-available, not open source)
