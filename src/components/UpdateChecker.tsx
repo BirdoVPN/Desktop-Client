@@ -8,7 +8,7 @@
  */
 import { useEffect, useState } from 'react';
 import { relaunch } from '@tauri-apps/plugin-process';
-import { Download, Check, Loader2, RefreshCw } from 'lucide-react';
+import { Download, Check, LoaderCircle, RefreshCw } from 'lucide-react';
 import { BirdoButton, BirdoCard, BirdoDialog } from '@/components/birdo';
 import { brand, status, surface, white } from '@/lib/birdo-theme';
 import { useAppStore } from '@/store/app-store';
@@ -58,7 +58,7 @@ export function UpdateChecker() {
           style={{ backgroundColor: phase === 'available' || phase === 'ready' ? brand.accentBg : white.w05 }}
         >
           {phase === 'checking' || phase === 'installing' ? (
-            <Loader2 size={18} className="animate-spin motion-reduce:animate-none" color={white.w80} aria-hidden />
+            <LoaderCircle size={18} className="animate-spin motion-reduce:animate-none" color={white.w80} aria-hidden />
           ) : phase === 'available' ? (
             <Download size={18} color={brand.accentLight} aria-hidden />
           ) : phase === 'ready' || phase === 'up-to-date' ? (

@@ -5,7 +5,7 @@
  */
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { CheckCircle2, Gift } from 'lucide-react';
+import { CircleCheck, Gift } from 'lucide-react';
 import { BirdoButton, BirdoDialog, BirdoTextField } from '@/components/birdo';
 import { brand, white } from '@/lib/birdo-theme';
 import { errorCopy } from '@/lib/errors';
@@ -68,7 +68,7 @@ export function VoucherRedeemDialog({
       onClose={close}
       busy={redeeming}
       title={success ? 'Voucher redeemed' : 'Redeem voucher'}
-      icon={success ? CheckCircle2 : Gift}
+      icon={success ? CircleCheck : Gift}
       iconColor={success ? brand.accentLight : brand.accent}
     >
       {success ? (

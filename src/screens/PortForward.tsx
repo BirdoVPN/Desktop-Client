@@ -19,7 +19,7 @@
  */
 import { useState, useEffect, useCallback } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { Plus, Trash2, ArrowRightLeft, Network, AlertCircle } from 'lucide-react';
+import { Plus, Trash, ArrowRightLeft, Network, CircleAlert } from 'lucide-react';
 import {
   BirdoTopBar,
   BirdoSubCard,
@@ -263,7 +263,7 @@ export function PortForward() {
         {loadError ? (
           <BirdoSubCard padding="0">
             <BirdoEmptyState
-              icon={AlertCircle}
+              icon={CircleAlert}
               title="Couldn't load your rules"
               description="Your rules are unchanged. Check your connection and try again."
               action={
@@ -307,7 +307,7 @@ export function PortForward() {
         open={pendingDelete !== null}
         onClose={() => setPendingDelete(null)}
         title="Delete rule?"
-        icon={Trash2}
+        icon={Trash}
         iconColor={status.red}
       >
         {pendingDelete && (
@@ -387,7 +387,7 @@ function PortForwardRow({ rule, onRequestDelete, deleting }: PortForwardRowProps
             aria-hidden
           />
         ) : (
-          <Trash2 size={18} color={status.red} aria-hidden />
+          <Trash size={18} color={status.red} aria-hidden />
         )}
       </button>
     </div>
