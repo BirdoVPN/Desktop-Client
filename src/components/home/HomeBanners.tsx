@@ -9,7 +9,7 @@
  * status, or the one the user's own command returned, mapped by code.
  */
 import { useId, useState } from 'react';
-import { AlertCircle, AlertTriangle, ShieldAlert, type LucideIcon } from 'lucide-react';
+import { CircleAlert, TriangleAlert, ShieldAlert, type LucideIcon } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { errorCopy, giveUpMessage, type ErrorAction } from '@/lib/errors';
 import { status } from '@/lib/birdo-theme';
@@ -79,12 +79,12 @@ export function HomeBanners({ onAction }: HomeBannersProps) {
           back). Invisible everywhere else, so it renders on every connection
           state. One human sentence; Rust's own lines behind Details. */}
       {dnsDegraded.length > 0 && (
-        <BannerRow icon={AlertTriangle} tone="warning" text={DNS_DEGRADED_COPY} details={dnsDegraded} />
+        <BannerRow icon={TriangleAlert} tone="warning" text={DNS_DEGRADED_COPY} details={dnsDegraded} />
       )}
 
       {errorText && (
         <BannerRow
-          icon={AlertCircle}
+          icon={CircleAlert}
           tone="danger"
           text={errorText}
           actionLabel={actionLabel ?? undefined}

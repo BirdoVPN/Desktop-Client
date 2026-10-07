@@ -65,7 +65,15 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], defa
 # Pinned to the same rustls (0.23, ring provider) reqwest's rustls-tls uses so the
 # custom ClientConfig type matches `use_preconfigured_tls`.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "0.26"
+# 1.0 (2026-10): 0.26.11 was a semver-trick shim whose entire API was
+# `pub use parent::TLS_SERVER_ROOTS` with `parent` = webpki-roots "1".
+# This is the Mozilla root store the WebPKI verifier in cert_pin.rs and
+# doh.rs validates against BEFORE the SPKI pins are checked, so a root
+# removed here fails every chain that ends at it, pinned or not. On any bump,
+# confirm the live anchors still exist: GTS Root R4 (api.birdo.app, via WE1)
+# and SSL.com Root Certification Authority ECC (cloudflare-dns.com). See the
+# 1.0.5 -> 1.0.9 commit for the last such check.
+webpki-roots = "1.0"
 x509-parser = "0.18"
 
 # Socket configuration (for buffer sizes)

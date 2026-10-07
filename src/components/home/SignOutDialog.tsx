@@ -3,7 +3,7 @@
  * confirm, reworded from "Log Out?" to the account vocabulary).
  */
 import { useState } from 'react';
-import { AlertTriangle } from 'lucide-react';
+import { TriangleAlert } from 'lucide-react';
 import { BirdoButton, BirdoDialog } from '@/components/birdo';
 import { status, white } from '@/lib/birdo-theme';
 import { signOut } from '@/session/session';
@@ -24,7 +24,7 @@ export function SignOutDialog({
       onClose={onClose}
       busy={busy}
       title="Sign out?"
-      icon={AlertTriangle}
+      icon={TriangleAlert}
       iconColor={status.yellowLight}
     >
       <p className="text-[13px]" style={{ color: white.w60 }}>

@@ -3,7 +3,7 @@
  * anonymous account number, and the subscription summary.
  */
 import { useState } from 'react';
-import { AlertCircle, Check, Copy, Eye, EyeOff, KeyRound, Shield, ShieldAlert, Star } from 'lucide-react';
+import { CircleAlert, Check, Copy, Eye, EyeOff, KeyRound, Shield, ShieldAlert, Star } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { BirdoCard } from '@/components/birdo';
 import { brand, hairline, status as statusTokens, surface, white } from '@/lib/birdo-theme';
@@ -225,7 +225,7 @@ export function SubscriptionCard({
       <BirdoCard cornerRadius={20} padding="18px">
         {planStatus === 'error' ? (
           <div className="flex items-center gap-3">
-            <AlertCircle size={20} color={statusTokens.red} aria-hidden className="shrink-0" />
+            <CircleAlert size={20} color={statusTokens.red} aria-hidden className="shrink-0" />
             <p className="flex-1 text-[13px]" style={{ color: white.w80 }}>
               Couldn't load your plan.
             </p>

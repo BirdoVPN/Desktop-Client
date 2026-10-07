@@ -3,7 +3,7 @@
  * Mirrors mobile's `BirdoBadge.kt` (BadgeTone enum + PulsingDot).
  */
 import type { LucideIcon } from 'lucide-react';
-import { RefreshCw, AlertCircle, WifiOff } from 'lucide-react';
+import { RefreshCw, CircleAlert, WifiOff } from 'lucide-react';
 import { accentA, brand, status, white, hairline } from '@/lib/birdo-theme';
 import type { ConnectionState } from '@/store/app-store';
 import { statusPill, type PillIcon } from '@/lib/vpn-display';
@@ -108,7 +108,7 @@ export interface StatusPillProps {
 const PILL_ICON: Record<Exclude<PillIcon, null>, LucideIcon> = {
   'wifi-off': WifiOff,
   sync: RefreshCw,
-  alert: AlertCircle,
+  alert: CircleAlert,
 };
 
 /**

@@ -311,9 +311,132 @@ fn build_config(scope: PinScope) -> ClientConfig {
         .with_no_client_auth()
 }
 
+/// SPKI SHA-256 pins (base64, same form as [`PINNED_SPKI_SHA256`]) of every
+/// trust anchor in the compiled-in webpki-roots store.
+///
+/// A `TrustAnchor` carries the SubjectPublicKeyInfo with its outer SEQUENCE
+/// stripped; re-wrapping it gives exactly the bytes [`spki_sha256_b64`]
+/// hashes (proved by ISRG Root X1 matching below).
+#[cfg(test)]
+pub(crate) fn webpki_root_spki_pins() -> Vec<String> {
+    webpki_roots::TLS_SERVER_ROOTS
+        .iter()
+        .map(|anchor| {
+            let body: &[u8] = anchor.subject_public_key_info.as_ref();
+            let len = body.len();
+            let mut der = vec![0x30];
+            if len < 0x80 {
+                der.push(len as u8);
+            } else if len <= 0xff {
+                der.extend([0x81, len as u8]);
+            } else {
+                der.extend([0x82, (len >> 8) as u8, len as u8]);
+            }
+            der.extend_from_slice(body);
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&der))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The WebPKI verifier runs BEFORE the pin check, against the
+    /// webpki-roots store. A root missing from that store fails every chain
+    /// that ends at it, pinned or not. So a webpki-roots bump that drops the
+    /// anchor the live api.birdo.app chain ends at (birdo.app <- WE1 <- GTS
+    /// Root R4, measured 2026-10-07) would brick every installed client, and
+    /// nothing else in CI would notice. 1.0.9 dropped 19 roots, among them
+    /// GTS Root R2 and three DigiCert roots, so this is not hypothetical.
+    #[test]
+    fn the_live_birdo_app_anchors_are_in_the_webpki_root_store() {
+        let roots = webpki_root_spki_pins();
+        // Self-check of the re-wrapping: the ISRG Root X1 anchor hashes to
+        // the pin spki_sha256_b64() extracts from the real certificate.
+        assert!(roots.iter().any(|r| r == ISRG_X1_SPKI));
+        // GTS Root R4 (the live anchor) and GlobalSign ECC Root CA - R4 (the
+        // pinned cross-sign backup).
+        for pin in [
+            "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
+            "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",
+        ] {
+            assert!(PINNED_SPKI_SHA256.contains(&pin));
+            assert!(
+                roots.iter().any(|r| r == pin),
+                "pinned root {pin} is no longer a webpki-roots trust anchor"
+            );
+        }
+    }
+
+    /// Every OTHER host the app's rustls clients dial (all of them validate
+    /// against webpki-roots) must still chain to a root in the store. Chains
+    /// measured 2026-10-07 and verified with `openssl s_client -CAfile`
+    /// against ONLY the 1.0.9 roots. api.birdo.app / birdo.app and
+    /// cloudflare-dns.com (DoH, also over 1.1.1.1, 1.0.0.1, 104.16.248.249,
+    /// 104.16.249.249) are asserted above and in vpn/doh.rs. A host passes if
+    /// ANY root its chain can end at is present (cross-signed roots give
+    /// more than one valid path).
+    #[test]
+    fn every_other_host_the_app_dials_still_chains_to_a_webpki_root() {
+        let roots = webpki_root_spki_pins();
+        let hosts: &[(&str, &[(&str, &str)])] = &[
+            // Update download: the manifest's github.com URL redirects here.
+            // ECDSA: github.com <- Sectigo ... CA DV E36 <- Sectigo ... Root E46
+            // (cross-signed by USERTrust ECC); RSA: ... DV R36 <- Root R46
+            // (cross-signed by USERTrust RSA).
+            (
+                "github.com (ECDSA)",
+                &[
+                    (
+                        "sLVjNUaFYfW7n6EtgBeEpjOlcnBdNPMrZDRF36iwBdE=",
+                        "Sectigo Public Server Authentication Root E46",
+                    ),
+                    (
+                        "ICGRfpgmOUXIWcQ/HXPLQTkFPEFPoDyjvH7ohhQpjzs=",
+                        "USERTrust ECC Certification Authority",
+                    ),
+                ],
+            ),
+            (
+                "github.com (RSA)",
+                &[
+                    (
+                        "Douxi77vs4G+Ib/BogbTFymEYq0QSFXwSgVCaZcI09Q=",
+                        "Sectigo Public Server Authentication Root R46",
+                    ),
+                    (
+                        "x4QzPSC810K5/cMjb05Qm4k3Bw5zBn4lTdO/nEW/Td4=",
+                        "USERTrust RSA Certification Authority",
+                    ),
+                ],
+            ),
+            // release-assets / objects.githubusercontent.com: <- YR1 <- Root YR
+            // (cross-signed by ISRG Root X1; Root YR itself is not in the store).
+            (
+                "release-assets.githubusercontent.com",
+                &[(ISRG_X1_SPKI, "ISRG Root X1")],
+            ),
+            // Sentry ingest (sentry.io, us. and de. regions alike):
+            // <- DigiCert Global G2 TLS RSA SHA256 2020 CA1 <- DigiCert Global Root G2.
+            (
+                "*.ingest.sentry.io",
+                &[(
+                    "i7WTqTvh0OioIruIfFR4kMPnBqrS2rdiVPl/s2uC/CY=",
+                    "DigiCert Global Root G2",
+                )],
+            ),
+        ];
+        for (host, anchors) in hosts {
+            assert!(
+                anchors
+                    .iter()
+                    .any(|(pin, _)| roots.iter().any(|r| r == pin)),
+                "{host}: none of {:?} is a webpki-roots trust anchor any more",
+                anchors.iter().map(|(_, name)| *name).collect::<Vec<_>>()
+            );
+        }
+    }
 
     // ISRG Root X1 (Let's Encrypt) DER — a stable public root cert. Its SPKI
     // SHA-256 is the well-known pin asserted below, proving our extraction

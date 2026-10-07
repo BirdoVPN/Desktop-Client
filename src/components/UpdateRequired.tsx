@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { relaunch, exit } from '@tauri-apps/plugin-process';
 import { open as openExternal } from '@tauri-apps/plugin-shell';
-import { AlertTriangle, Download, Loader2, RefreshCw, ShieldOff } from 'lucide-react';
+import { TriangleAlert, Download, LoaderCircle, RefreshCw, ShieldOff } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { UPDATE_REQUIRED_COPY } from '@/lib/errors';
 import { statusPill } from '@/lib/vpn-display';
@@ -67,7 +67,7 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-6 overflow-y-auto px-8 py-6 text-center">
       <div className="flex h-12 w-12 items-center justify-center rounded-lg" style={{ backgroundColor: status.yellowBg }}>
-        <AlertTriangle size={24} color={status.yellowLight} aria-hidden />
+        <TriangleAlert size={24} color={status.yellowLight} aria-hidden />
       </div>
 
       <div className="flex flex-col gap-2">
@@ -156,7 +156,7 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
             className="flex items-center gap-2 rounded-lg bg-white px-6 py-2.5 text-sm font-semibold text-black transition hover:bg-white/90 disabled:opacity-50"
           >
             {installing ? (
-              <Loader2 size={16} className="animate-spin motion-reduce:animate-none" aria-hidden />
+              <LoaderCircle size={16} className="animate-spin motion-reduce:animate-none" aria-hidden />
             ) : (
               <Download size={16} aria-hidden />
             )}

@@ -11,7 +11,7 @@ import { useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { useShallow } from 'zustand/react/shallow';
-import { Gift, LogOut, Trash2, Download, CreditCard } from 'lucide-react';
+import { Gift, LogOut, Trash, Download, CreditCard } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import { BirdoCard, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
 import { brand, status as statusTokens } from '@/lib/birdo-theme';
@@ -145,7 +145,7 @@ export function Profile() {
             />
             <BirdoNavRow
               title="Delete Account"
-              leadingIcon={Trash2}
+              leadingIcon={Trash}
               leadingTint={statusTokens.red}
               onClick={() => setShowDeleteDialog(true)}
             />
