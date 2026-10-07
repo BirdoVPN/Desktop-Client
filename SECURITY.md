@@ -80,8 +80,9 @@ This client is built with defence-in-depth:
   WireGuard key material is zeroized after session creation and never
   persisted.
 - **Signed releases** — Windows binaries are Authenticode-signed via Azure
-  Trusted Signing (OIDC, no stored keys), every artifact gets a Sigstore
-  keyless attestation, and auto-updates are verified with the Tauri
+  Trusted Signing (OIDC, no stored keys), every artifact is covered by the
+  release's Sigstore-signed (keyless) `SHA256SUMS.txt`, and auto-updates are
+  verified with the Tauri
   (minisign) updater signature. See [docs/VERIFICATION.md](docs/VERIFICATION.md)
   to verify downloads yourself.
 - **Supply-chain pinning** — bundled binaries (Wintun, Xray) are fetched at

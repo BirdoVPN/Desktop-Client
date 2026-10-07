@@ -2,12 +2,15 @@
 
 > **What is actually signed today (checked 2026-09-29 against `release.yml`):**
 > - **Windows:** tag builds are Authenticode-signed through Azure Trusted Signing
->   (see `azure-trusted-signing-setup.md`), plus a Sigstore bundle.
+>   (see `azure-trusted-signing-setup.md`).
+> - **Every release:** one `SHA256SUMS.txt` over all installers and packages, plus
+>   one Sigstore bundle (`SHA256SUMS.txt.sigstore`) signing it. There are no
+>   per-file `.sigstore` bundles any more. Verify: [VERIFICATION.md](./VERIFICATION.md).
 > - **macOS (Tauri DMG/app):** **unsigned and un-notarised.** There is no Apple
 >   Developer account, so the job always takes the unsigned path. Gatekeeper
 >   will warn. Signing and notarising it, or no longer shipping it, is an open
 >   owner decision (audit D-22).
-> - **Linux:** checksums + Sigstore only.
+> - **Linux:** covered by the checksums file and its Sigstore bundle only.
 > - **PGP:** no release artefact is PGP-signed.
 >
 > Parts of this document below predate the Azure signing work and describe a
@@ -76,11 +79,13 @@ Users can verify any release artifact with:
 
 ```bash
 # Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/
+# Pin the signer to THIS repo's release workflow at THIS tag (vX.Y.Z).
 cosign verify-blob \
-  --bundle BirdoVPN-Setup-1.0.0.exe.sigstore \
+  --bundle SHA256SUMS.txt.sigstore \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp "github.com/BirdoVPN/" \
-  BirdoVPN-Setup-1.0.0.exe
+  --certificate-identity "https://github.com/BirdoVPN/Desktop-Client/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+  SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt --ignore-missing
 ```
 
 See [VERIFICATION.md](./VERIFICATION.md) for detailed instructions.
@@ -92,9 +97,8 @@ The `release.yml` workflow (the single release pipeline; the per-platform
 
 | Trigger | Action |
 |---------|--------|
-| Push tag `win-v*` | Build Windows + Sigstore sign + draft GitHub Release |
-| Push tag `mac-v*` | Build macOS (arm64 + x64) + Sigstore sign + upload artifacts |
-| Manual dispatch | Build + Sigstore sign + upload artifacts |
+| Push tag `v*` (e.g. `v1.4.45`) | Test gate, then Windows + Linux + macOS builds, then ONE published GitHub Release with `SHA256SUMS.txt` + its Sigstore bundle |
+| Manual dispatch | Same builds, uploaded as workflow artifacts only: no release, no Sigstore signature |
 
 ### Required GitHub Settings
 
@@ -117,12 +121,12 @@ Each release includes:
 
 | File | Purpose |
 |------|---------|
-| `BirdoVPN-Setup-X.Y.Z.exe` | NSIS installer (Windows) |
-| `BirdoVPN-Setup-X.Y.Z.exe.sigstore` | Sigstore signature bundle |
-| `BirdoVPN-X.Y.Z.dmg` | DMG installer (macOS, unsigned and un-notarised) |
-| `BirdoVPN-X.Y.Z.dmg.sigstore` | Sigstore signature bundle |
-| `SHA256SUMS.txt` | Checksums for all artifacts |
-| `SHA256SUMS.txt.sigstore` | Signed checksums |
+| `BirdoVPN_X.Y.Z_Windows_x64-setup.exe` (+ `.sig`) | NSIS installer, Authenticode-signed (+ updater signature) |
+| `BirdoVPN_X.Y.Z_Linux_amd64.AppImage` (+ `.sig`), `..._Linux_amd64.deb` | Linux packages (+ updater signature) |
+| `BirdoVPN_X.Y.Z_macOS_{aarch64,x64}.dmg` | DMG installers (macOS, unsigned and un-notarised) |
+| `BirdoVPN-macos-{arm64,x64}.app.tar.gz` (+ `.sig`) | macOS updater bundles (+ updater signature) |
+| `SHA256SUMS.txt` | Checksums for every asset above except the `.sig` files |
+| `SHA256SUMS.txt.sigstore` | Sigstore bundle signing `SHA256SUMS.txt` |
 
 ## References
 
