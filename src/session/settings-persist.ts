@@ -183,6 +183,13 @@ async function trySave(
     useAppStore.getState().updateSettings(patch);
   }
   const next = { ...before, ...patch };
+  // While a refused OFF holds for this connection only, a save of anything
+  // else writes the kill switch the OFF was refused over (round 7 of the
+  // review of #222, N4): the toggle shows the live OFF, but the notice said
+  // the saved ON comes back at the next connection, and the next unrelated
+  // save — the quiet preferred-server mirror included — wrote the OFF.
+  const held = heldKillSwitch();
+  if (held !== undefined && !('killSwitchEnabled' in patch)) next.killSwitchEnabled = held;
   try {
     await invoke('save_settings', { settings: settingsToRust(next) });
   } catch (e) {
@@ -326,11 +333,20 @@ interface StandingChoice {
 let standingChoice: StandingChoice | null = null;
 
 /**
+ * The kill switch a save writes while a refused OFF holds for this
+ * connection only: the value it was refused over (round 7, N4).
+ */
+function heldKillSwitch(): boolean | undefined {
+  return standingChoice?.thisConnectionOnly?.saved;
+}
+
+/**
  * A save landed, and it wrote the whole store — the kill switch as the toggle
  * showed it included (round 6 of the review of #222, P2-2). A refused OFF
  * the toggle showed is saved now: it no longer gives way at the next dial,
  * which would have put the toggle back to ON while the dial armed OFF from
- * the file.
+ * the file. (Since round 7 a held OFF is written only by a save of the kill
+ * switch itself: other saves write the value it was refused over.)
  */
 function savedKillSwitch(enabled: boolean): void {
   if (standingChoice?.thisConnectionOnly && standingChoice.enabled === enabled) {

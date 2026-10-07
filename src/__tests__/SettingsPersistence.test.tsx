@@ -445,23 +445,24 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(intent).toBe(false);
   });
 
-  it('a refused OFF that a later save wrote to the file is not put back at the next dial (round 6, P2-2)', async () => {
+  // Round 6 (P2-2) kept the toggle OFF when a later save had written the OFF
+  // to the file. Round 7 (N4): no unrelated save writes it any more — the
+  // notice promised the saved ON back at the next connection — so the file
+  // keeps ON, the toggle shows the live OFF, and the next dial brings ON back.
+  it('a refused OFF is not written to the file by a later save of another setting (round 7, N4)', async () => {
     useAppStore.setState({ connectionState: 'reconnecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
     saveRefused = true;
     await setKillSwitch(false);
     expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
-    // The file can be verified again; another setting's save writes the whole
-    // store, the kill switch as it shows (OFF) included.
+    // The file can be verified again; another setting's save lands.
     saveRefused = false;
     expect(await persistSettings({ autoConnect: true })).toBe(true);
-    expect(saves()[saves().length - 1]?.killswitch_enabled).toBe(false);
-    // The next dial arms from that file: OFF. The toggle says so.
+    expect(saves()[saves().length - 1]?.killswitch_enabled).toBe(true);
+    expect(saves()[saves().length - 1]?.auto_connect).toBe(true);
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    // The next dial arms from that file, ON, and the toggle says so.
     act(() => useAppStore.setState({ connectionState: 'connecting' }));
-    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
-    act(() => useAppStore.setState({ connectionState: 'connected' }));
-    await new Promise((r) => setTimeout(r, 0));
-    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
-    expect(intent).toBe(false);
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
   });
 
   it('a reset drops the standing choice, so the next dial is not pushed back to it (round 6, P3-2)', async () => {
