@@ -6,14 +6,17 @@ authors = ["Birdo VPN"]
 license = "CC-BY-NC-4.0" # SPDX id of ../LICENSE (source-available, not open source)
 publish = false # Tauri app — never published to crates.io (also lets cargo-deny skip it)
 edition = "2021"
-# 1.88: the highest `rust-version` any crate in the locked graph declares
-# (time 0.3.53, sentry 0.49, plist 1.10, darling 0.23, serde_with 3.22 - from
-# `cargo metadata --locked`, 2026-10-06). The "1.85" this replaced (the
-# RustCrypto 0.11 / ml-kem 0.3 floor) had been fiction since those landed:
-# cargo +1.85 refuses the graph. tests.yml's `msrv` job builds at this value
-# on Linux, Windows and macOS, so it cannot drift again. It is also a clippy
-# input (MSRV-gated lints). rust-toolchain.toml pins 1.96 for real builds.
-rust-version = "1.88"
+# 1.90: the highest `rust-version` any crate in the locked graph declares
+# (tauri 2.12, tauri-build/-codegen/-macros/-plugin 2.7, tauri-runtime(-wry)
+# 2.12, tauri-utils 2.10, every tauri-plugin-* this app uses, muda 0.20 and
+# tray-icon 0.25 - from `cargo metadata --locked`, 2026-10-07). It was 1.88
+# (time 0.3.53, sentry 0.49, plist 1.10, darling 0.23, serde_with 3.22) until
+# the tauri 2.12 group raised the floor; cargo +1.88 refuses that graph. The
+# "1.85" before that (the RustCrypto 0.11 / ml-kem 0.3 floor) had been fiction
+# since those landed. tests.yml's `msrv` job builds at this value on Linux,
+# Windows and macOS, so it cannot drift again. It is also a clippy input
+# (MSRV-gated lints). rust-toolchain.toml pins 1.96 for real builds.
+rust-version = "1.90"
 
 [lib]
 name = "birdo_vpn_desktop_lib"
@@ -28,7 +31,7 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 # Tauri
-tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri = { version = "2.12.0", features = ["tray-icon"] }
 # Decode the embedded tray PNGs into raw RGBA ourselves (Image::new_owned).
 # NOT tauri's "image-png" feature — that pulls the moxcms/pxfm colour chain
 # (edition2024 Cargo feature / Rust 1.85+). That WOULD build now under our 1.96
@@ -193,8 +196,18 @@ boringtun = "0.7.1"
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 
-# System directories for crash reports
-dirs = "6.0"
+# Per-user state locations: the log file, crash reports, device id, BirdoPQ
+# keypair, the DNS and pf-reference journals and the legacy-firewall marker
+# (data_dir / data_local_dir / config_local_dir). settings.json and its HMAC
+# key file resolve through tauri's app_config_dir() (dirs::config_dir()).
+# 7.0 (2026-10), taken with tauri 2.12, which itself requires dirs ^7: its ONLY
+# change from 6.0 is that preference_dir() on Windows moves from LocalAppData
+# to RoamingAppData. Nothing in this crate or in tauri / tauri-build / wry /
+# tray-icon / tauri-plugin-updater calls preference_dir(), and every function
+# that is called is byte-identical (same dirs-sys 0.5.0). Before ANY dirs
+# major, diff the crate: a moved directory orphans keys and state with nothing
+# failing.
+dirs = "7.0"
 
 # Logging. (`log` was a direct dependency with no `log::` call anywhere in
 # src/ — the app logs through `tracing`. Dropped 2026-09; it stays in the graph

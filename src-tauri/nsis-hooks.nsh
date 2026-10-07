@@ -6,8 +6,8 @@
 ; key. The uninstaller must remove that task, or it lingers pointing at a
 ; missing exe and fires a silent failure at every logon.
 ;
-; This file is !included near the top of Tauri's installer.nsi (tauri-bundler,
-; @tauri-apps/cli 2.11.4), BEFORE the template defines MANUFACTURER,
+; This file is !included near the top of Tauri's installer.nsi (tauri-bundler
+; 2.10.0, from @tauri-apps/cli 2.12.0), BEFORE the template defines MANUFACTURER,
 ; PRODUCTNAME and MANUPRODUCTKEY. Code outside the NSIS_HOOK_* macros is
 ; parsed right here, so it uses its own literals; NSIS_HOOK_PREINSTALL, which
 ; expands later, checks at compile time that they match the template's.
@@ -157,7 +157,16 @@ FunctionEnd
   ; Stopping the app first leaves only what a stopped app left behind, which
   ; is what the reconcile is for. (The template's own check, after this
   ; hook, then finds nothing.)
-  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  ;
+  ; Called EXACTLY as the template calls it. tauri-bundler 2.10.0 (CLI 2.12)
+  ; changed the macro's first parameter from an executable NAME to an
+  ; executable PATH that it hands to Restart Manager (RmRegisterResources ->
+  ; RmGetList -> RmShutdown). Given the old bare "${MAINBINARYNAME}.exe", the
+  ; new macro matches nothing, reports "not running", and this hook silently
+  ; stops protecting the live session. tests.yml's frontend job runs
+  ; scripts/ci/check-nsis-hook-macros.sh, which fails the PR if this call
+  ; ever differs from the template compiled into the locked @tauri-apps/cli.
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; W1-008: put back what a BirdoVPN that was killed rather than quit left
   ; behind — DNS an OLDER version parked on the physical adapters, routes a

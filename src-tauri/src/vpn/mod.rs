@@ -1204,11 +1204,15 @@ pub mod dns_journal {
             // does it only after this hook, and the reconcile beside a live
             // session deleted its routes and rewrote its journal. Then the
             // reconcile, which must finish (nsExec waits; REVIEW-WIN2-019: it
-            // is bounded) before anything is deleted.
+            // is bounded) before anything is deleted. The macro takes a full
+            // PATH since tauri-bundler 2.10 (cli 2.12): a bare exe name
+            // matches nothing and reports "not running"
+            // (scripts/ci/check-nsis-hook-macros.sh checks this form against
+            // the template compiled into the locked CLI).
             in_order(
                 pre,
                 &[
-                    r#"!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}""#,
+                    r#"!insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}""#,
                     "nsExec::Exec /TIMEOUT=",
                     "--reconcile-and-exit",
                 ],
