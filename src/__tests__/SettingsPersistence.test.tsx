@@ -240,6 +240,21 @@ describe('a settings file that cannot be verified (review of #222)', () => {
     expect(useAppStore.getState().notice?.text).toBe('Your settings were reset to their defaults.');
   });
 
+  it('the first save that lands after an unverifiable start-up marks the settings as loaded (round 6, P3-4)', async () => {
+    useAppStore.setState({ settingsHydrated: false });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'save_settings') throw unverified;
+      return undefined;
+    });
+    await persistSettings({ autoConnect: true }, { quiet: true });
+    expect(useAppStore.getState().settingsHydrated).toBe(false);
+    // The file can be verified again: this save lands, and the store is
+    // what the file holds.
+    mockedInvoke.mockImplementation(async () => undefined);
+    expect(await persistSettings({ autoConnect: true })).toBe(true);
+    expect(useAppStore.getState().settingsHydrated).toBe(true);
+  });
+
   it('the reset is not run when the confirmation is cancelled', async () => {
     render(<ResetSettingsDialog />);
     act(() => askToResetSettings());

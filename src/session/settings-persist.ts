@@ -197,6 +197,12 @@ async function trySave(
     return { error: e };
   }
   savedKillSwitch(next.killSwitchEnabled);
+  // The file holds this store's settings now (round 6 of the review of #222,
+  // P3-4): after a start-up that could not verify the file (get_settings
+  // answered settings_unverified), the store is what is saved from here on,
+  // and what waits for that (the preferred-server mirror, the Custom DNS
+  // gate, Auto-Connect) may go. It stayed false for the rest of the run.
+  if (!useAppStore.getState().settingsHydrated) useAppStore.setState({ settingsHydrated: true });
   if (opts.reapply) scheduleReapply();
   return null;
 }
