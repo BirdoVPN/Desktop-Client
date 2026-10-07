@@ -77,7 +77,7 @@ webpki-roots = "1.0"
 x509-parser = "0.18"
 
 # Socket configuration (for buffer sizes)
-socket2 = "0.5"
+socket2 = "0.6"
 
 # Secure storage — see the per-target `keyring` entries below.
 #
@@ -109,7 +109,7 @@ rand = "0.8"
 # rustls uses its ring provider and boringtun 0.7.1 links ring 0.17 — so this
 # is a re-export of an existing dependency, not new compiled code.
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). The KAT fixture in
 # src/vpn/fixtures/, not crate identity, is what keeps the four clients
@@ -308,4 +308,6 @@ tempfile = "3.13"
 # patch releases, cargo-deny advisories/licenses/bans pass, and they cannot be
 # pinned back without dropping this dep. Whoever signs the next release should
 # know the production dependency set changed here, not just the test set.
-jsonschema = { version = "=0.56.0", default-features = false }
+# 0.56.0 -> 0.58.3 (#241): the same zmij and fraction requirements as 0.56.0,
+# so that bump moved no crate in the shipped binary.
+jsonschema ={ version = "=0.58.3", default-features = false }
