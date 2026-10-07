@@ -109,7 +109,7 @@ rand = "0.8"
 # rustls uses its ring provider and boringtun 0.7.1 links ring 0.17 — so this
 # is a re-export of an existing dependency, not new compiled code.
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 zeroize = { version = "1.7", features = ["derive"] }  # Secure memory wiping
 # AUDIT-C1: BirdoPQ v1 — ML-KEM-1024 KEM (FIPS 203). The KAT fixture in
 # src/vpn/fixtures/, not crate identity, is what keeps the four clients
