@@ -1,0 +1,195 @@
+name: NSIS installer
+
+# Builds the real Windows installer on the PRs that can change it, checks what
+# the bundler generated, and installs + uninstalls it on the runner.
+#
+# WHY THIS EXISTS: no other PR job runs the bundler. tests.yml compiles, tests
+# and lints, and its release-cli-contract job runs `tauri build --no-bundle`
+# with cargo stubbed out, so until this workflow the NSIS installer was first
+# built by a release. tauri-bundler 2.10.0 (@tauri-apps/cli 2.12) changed the
+# CheckIfAppIsRunning macro's first parameter from an executable name to a
+# full path, and src-tauri/nsis-hooks.nsh's uninstall hook kept passing the
+# bare name: it compiled, and silently stopped protecting a live session
+# (REVIEW-WIN2-008, fixed in #233). check-nsis-hook-macros.sh (tests.yml)
+# compares the call with the template strings in the CLI binary on every PR;
+# this workflow checks the script the bundler actually rendered, and that the
+# hooks it compiled in actually run.
+#
+# UNSIGNED, and no secrets: no Authenticode/Azure, no updater signing key
+# (createUpdaterArtifacts is switched off for this build), no Sentry DSN
+# (build.rs's release gate is waived with BIRDO_ALLOW_MISSING_SENTRY_DSN) and
+# no attestation key. The installer is never uploaded: it is inspected and
+# installed on this runner and thrown away with it.
+#
+# Not a required check: path-filtered, so it cannot be one without blocking
+# every PR that does not touch these paths. No caches: the whole job takes
+# 9-12.5 min cold (cargo's release build 7.5-11 of it, #253), fine for a
+# path-filtered job, and nothing release-shaped should restore what a PR wrote.
+
+# The two path lists are the same; keep them so. (Not a YAML anchor: zizmor
+# warns that anchors can make its results wrong.)
+on:
+  pull_request:
+    paths:
+      - "src-tauri/**" # the app, Cargo.lock, tauri.conf.json, nsis-hooks.nsh, icons, resources
+      - "package.json"
+      - "package-lock.json" # pins @tauri-apps/cli, i.e. the bundler and its NSIS templates
+      - "rust-toolchain.toml"
+      - ".github/actions/setup-rust/**"
+      - ".github/workflows/nsis-installer.yml"
+      - ".github/workflows/release.yml" # the Wintun and Xray pins are read from it
+      - "scripts/ci/check-generated-nsis*.sh"
+      - "scripts/ci/nsis-install-smoke.ps1"
+      - "scripts/ci/verify-bundled-xray-hash.ps1"
+  push:
+    branches: [main]
+    paths:
+      - "src-tauri/**"
+      - "package.json"
+      - "package-lock.json"
+      - "rust-toolchain.toml"
+      - ".github/actions/setup-rust/**"
+      - ".github/workflows/nsis-installer.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/ci/check-generated-nsis*.sh"
+      - "scripts/ci/nsis-install-smoke.ps1"
+      - "scripts/ci/verify-bundled-xray-hash.ps1"
+  # Weekly on main: the runner image, WebView2 and Windows itself change
+  # without a commit here, and a release should not be the first to notice.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  nsis-installer:
+    name: NSIS installer (Windows) - build, inspect, install + uninstall
+    # The schedule runs in this repository only, not in forks.
+    if: github.event_name != 'schedule' || github.repository == 'BirdoVPN/Desktop-Client'
+    runs-on: windows-2025
+    timeout-minutes: 30 # ~2.4x the slowest of the first runs, 12m27s (#253)
+    permissions:
+      contents: read
+    defaults:
+      run:
+        # pwsh like release.yml's build-windows, whose steps these mirror.
+        # Every native command's exit code is checked explicitly.
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          # No caches in this workflow (see the header). Explicit, because
+          # setup-node v7 turns caching on by itself once package.json
+          # declares a packageManager.
+          package-manager-cache: false
+
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      - name: Install frontend dependencies (the locked @tauri-apps/cli)
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci exited $LASTEXITCODE" }
+
+      # The installer bundles src-tauri/resources/*, and a release puts
+      # wintun.dll and xray.exe there first. Same files, same pins: read from
+      # release.yml (its workflow env and its Download Wintun step), so a bump
+      # there cannot leave this build bundling something else.
+      - name: Fetch wintun.dll and xray.exe at release.yml's pins
+        run: |
+          $rel = (Get-Content -Raw -LiteralPath .github/workflows/release.yml) -replace "`r", ''
+          function Pin([string]$pattern, [string]$what) {
+            $m = [regex]::Matches($rel, $pattern, 'Multiline')
+            if ($m.Count -ne 1) { throw "release.yml: expected one $what, found $($m.Count)" }
+            return $m[0].Groups[1].Value
+          }
+          function Fetch([string]$url, [string]$sha, [string]$out) {
+            Invoke-WebRequest -Uri $url -OutFile $out -MaximumRetryCount 4 -RetryIntervalSec 10
+            $actual = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $sha) { throw "SHA-256 mismatch for ${url}: expected $sha, got $actual" }
+            Write-Host "verified $url ($actual)"
+          }
+          $wintunUrl = Pin '^\s*\$wintunUrl = "(https://[^"]+\.zip)"$' 'Wintun URL ($wintunUrl = "...")'
+          $wintunSha = Pin '^\s*\$expectedSha = "([0-9a-f]{64})"$' 'Wintun SHA-256 ($expectedSha = "...")'
+          $xrayVersion = Pin '^\s*XRAY_VERSION: (v[0-9][0-9.]*)$' 'XRAY_VERSION'
+          $xraySha = Pin '^\s*XRAY_WINDOWS_SHA256: ([0-9a-f]{64})$' 'XRAY_WINDOWS_SHA256'
+
+          $tmp = $env:RUNNER_TEMP
+          Fetch $wintunUrl $wintunSha "$tmp\wintun.zip"
+          Expand-Archive -LiteralPath "$tmp\wintun.zip" -DestinationPath "$tmp\wintun"
+          New-Item -ItemType Directory -Force -Path src-tauri/resources, src-tauri/wintun-extract/wintun/bin/amd64 | Out-Null
+          Copy-Item "$tmp\wintun\wintun\bin\amd64\wintun.dll" src-tauri/resources/wintun.dll
+          Copy-Item "$tmp\wintun\wintun\bin\amd64\wintun.dll" src-tauri/wintun-extract/wintun/bin/amd64/wintun.dll
+
+          Fetch "https://github.com/XTLS/Xray-core/releases/download/$xrayVersion/Xray-windows-64.zip" $xraySha "$tmp\xray.zip"
+          Expand-Archive -LiteralPath "$tmp\xray.zip" -DestinationPath "$tmp\xray"
+          $xray = @(Get-ChildItem -LiteralPath "$tmp\xray" -Recurse -Filter xray.exe)
+          if ($xray.Count -ne 1) { throw "expected one xray.exe in the Xray $xrayVersion archive, found $($xray.Count)" }
+          Copy-Item $xray[0].FullName src-tauri/resources/xray.exe
+          # Unsigned build: the bundled bytes are exactly these, so this is
+          # the value the app compiles in and the gate below expects.
+          $binarySha = (Get-FileHash -LiteralPath src-tauri/resources/xray.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "XRAY_BINARY_SHA256=$binarySha" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Bundling wintun.dll and Xray $xrayVersion xray.exe ($binarySha)"
+
+      - name: Build the NSIS installer (unsigned)
+        timeout-minutes: 25 # cargo + makensis took 8-11 min
+        env:
+          # A PR has no SENTRY_DSN, and this artifact is never shipped.
+          BIRDO_ALLOW_MISSING_SENTRY_DSN: "1"
+        run: |
+          # No TAURI_SIGNING_PRIVATE_KEY on a PR: with the updater artifacts
+          # on, tauri fails after bundling for want of it. Nothing else changes.
+          $cfg = Join-Path $env:RUNNER_TEMP 'pr-installer.json'
+          Set-Content -LiteralPath $cfg -Value '{"bundle":{"createUpdaterArtifacts":false}}'
+          # release.yml's command (`npx tauri build -- --locked`), restricted to NSIS.
+          npx tauri build --bundles nsis --config $cfg -- --locked
+          if ($LASTEXITCODE -ne 0) { throw "tauri build exited $LASTEXITCODE" }
+          Get-ChildItem src-tauri/target/release/bundle/nsis, src-tauri/target/release/nsis/x64 |
+            ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.FullName }
+
+      - name: The generated NSIS script includes the hooks, with the full-path CheckIfAppIsRunning
+        shell: bash
+        run: bash scripts/ci/check-generated-nsis.sh
+
+      - name: Self-test - the check above fails each regression it exists for
+        shell: bash
+        run: bash scripts/ci/check-generated-nsis.tests.sh
+
+      # release.yml's own post-bundle gate, on an unsigned installer as its
+      # unsigned dispatch builds run it.
+      - name: Bundled resources\xray.exe hashes to the compiled-in XRAY_BINARY_SHA256
+        run: |
+          $nsis = @(Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe")
+          if ($nsis.Count -ne 1) { throw "expected one NSIS installer, found $($nsis.Count)" }
+          & ./scripts/ci/verify-bundled-xray-hash.ps1 -Installer $nsis[0].FullName -ExpectedSha256 "$env:XRAY_BINARY_SHA256"
+          if ($LASTEXITCODE -ne 0) { throw "bundled xray.exe gate failed (exit $LASTEXITCODE)" }
+
+      # Safe on a GitHub-hosted runner: no VPN, no WFP/route/DNS change (the
+      # script says why, and checks it). Refuses to run anywhere else.
+      - name: Silent install + uninstall on this runner (the hooks run)
+        timeout-minutes: 10 # took 5 s; the script bounds each wait itself
+        run: |
+          $nsis = @(Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe")
+          if ($nsis.Count -ne 1) { throw "expected one NSIS installer, found $($nsis.Count)" }
+          & ./scripts/ci/nsis-install-smoke.ps1 -Installer $nsis[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw "install/uninstall smoke test failed (exit $LASTEXITCODE)" }
