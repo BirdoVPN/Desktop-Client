@@ -1,0 +1,24 @@
+name: Install the Linux build dependencies
+description: >-
+  The GTK/WebKit system packages Tauri's -sys crates need to compile (and the
+  bundler needs to package). ONE list for every Linux job - tests, MSRV and the
+  release build - so they cannot drift apart.
+
+runs:
+  using: composite
+  steps:
+    - name: apt-get install (WebKitGTK 4.1, GTK 3, rsvg, appindicator, patchelf)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Mirror hiccups are the one flaky part of this step: let apt retry
+        # each download (bounded) instead of failing the job.
+        sudo apt-get -o Acquire::Retries=3 update
+        # Same package set (recommends included) as before this was factored
+        # out: the release AppImage bundles from what is installed here.
+        sudo apt-get -o Acquire::Retries=3 install -y \
+          libwebkit2gtk-4.1-dev \
+          librsvg2-dev \
+          patchelf \
+          libgtk-3-dev \
+          libayatana-appindicator3-dev
