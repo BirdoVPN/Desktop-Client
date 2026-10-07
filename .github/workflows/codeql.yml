@@ -2,36 +2,57 @@ name: "CodeQL Security Scan"
 
 # Static analysis for the desktop client. Covers the TypeScript/React frontend
 # (the webview + IPC attack surface) and the Rust backend (Tauri commands, VPN
-# core). Results show up under the repo's Security → Code scanning tab.
+# core). Results show up under the repo's Security -> Code scanning tab.
 #
-# build-mode: none — CodeQL extracts source without a full compile, so the Rust
-# scan does NOT need the GTK/WebKit system libraries or the pinned 1.96 toolchain
-# (those would make the analysis job slow + flaky). This trades a little depth
-# for a reliable, dependency-free scan.
+# This is the ONLY security analysis per language: code-scanning "default
+# setup" is not configured. The GitHub-managed "CodeQL - Code Quality" runs
+# (dynamic/github-code-quality, javascript-typescript + python) are a separate
+# product - maintainability/reliability queries feeding the Code Quality tab,
+# not code-scanning alerts - enabled in Settings -> Code quality, not here.
+#
+# build-mode: none - CodeQL extracts source without a full compile, so the Rust
+# scan does NOT need the GTK/WebKit system libraries (those would make the
+# analysis job slow + flaky). This trades a little depth for a reliable,
+# dependency-free scan.
 
 on:
   push:
-    branches: ["main"]
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
+  # Every base branch: stacked PRs (e.g. #221/#222 on overhaul/windows) are
+  # scanned too. Docs-only changes cannot change a finding.
   pull_request:
-    branches: ["main"]
+    paths-ignore: ["docs/**", "**/*.md"]
   schedule:
     # Weekly catch-all so new CodeQL queries run even without a push.
     - cron: "27 3 * * 1"
+  workflow_dispatch:
 
 # Least privilege by default; the analyze job grants only what it needs.
 permissions: {}
 
+# Superseded PR runs are cancelled. A main scan that has started always
+# finishes: the old `cancel-in-progress: true` killed 26 main scans part-way
+# in 30 days (of 33 cancellations). In a burst of pushes GitHub still keeps
+# only the newest WAITING run per group, so the latest commit is scanned.
 concurrency:
-  group: codeql-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    # Forks get no scheduled scans.
+    if: github.event_name != 'schedule' || github.repository == 'BirdoVPN/Desktop-Client'
+    runs-on: ubuntu-24.04
+    # p90 13.4 min (Rust, security-extended); about 2x.
     timeout-minutes: 30
     permissions:
-      security-events: write   # upload SARIF results to the Security tab
+      security-events: write # upload SARIF results to the Security tab
       contents: read
     strategy:
       fail-fast: false
@@ -43,15 +64,19 @@ jobs:
             build-mode: none
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          # Run the security-extended suite for a deeper set of queries than the
-          # default. Drop to "security" if scan time becomes a problem.
+          # The security-extended suite: a deeper set of queries than the
+          # default. Its evaluation is ~4 of the Rust job's ~9.5 minutes, which
+          # is accepted (public repo: minutes are free, and no check waits on
+          # it).
           queries: security-extended
 
       - name: Perform CodeQL Analysis
