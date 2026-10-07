@@ -371,13 +371,13 @@ impl FilterKernel for Kernel<'_> {
 
         // SAFETY: `self.handle` is a valid WFP engine handle.  `sublayer` is a
         // stack-allocated struct whose `name`/`description` borrow `wide_nul` locals
-        // that outlive this call.  The default `PSECURITY_DESCRIPTOR` is a null sentinel
-        // requesting inherited security.
+        // that outlive this call.  `None` makes windows-rs pass a null
+        // `PSECURITY_DESCRIPTOR`, requesting inherited security.
         let err = unsafe {
             FwpmSubLayerAdd0(
                 self.handle,
                 &sublayer,
-                windows::Win32::Security::PSECURITY_DESCRIPTOR::default(),
+                None, // a null PSECURITY_DESCRIPTOR, as before
             )
         };
         // 0x80320009 = FWP_E_ALREADY_EXISTS — benign during re-init
@@ -518,7 +518,7 @@ impl FilterKernel for Kernel<'_> {
             FwpmFilterAdd0(
                 self.handle,
                 &filter,
-                windows::Win32::Security::PSECURITY_DESCRIPTOR::default(),
+                None, // a null PSECURITY_DESCRIPTOR, as before
                 Some(&mut id),
             )
         };
