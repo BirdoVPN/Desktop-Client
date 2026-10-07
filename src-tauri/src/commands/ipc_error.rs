@@ -271,6 +271,19 @@ impl IpcError {
     /// two markers are load-bearing constants in `wireguard_new.rs`; every
     /// other failure at this stage is adapter, route or DNS setup.
     pub fn from_tunnel_failure(error: &str) -> Self {
+        // P3-5: pf refusing to enforce our rules is the kill switch failing,
+        // and says so — it used to read as "couldn't start the VPN network
+        // adapter … reinstall BirdoVPN", which sends the user the wrong way.
+        // N11: this also covers the IPv6 leak block, which is enforced with
+        // the kill switch OFF, so the kill-switch copy then shows to a user who
+        // turned it off. It is still the nearest true message (the same pf);
+        // copy of its own needs a new IPC code, i.e. a contract change.
+        if error.contains(crate::vpn::ERR_FIREWALL_NOT_ENFORCED) {
+            return Self::new(
+                IpcErrorCode::KillswitchFailed,
+                "The firewall could not be enforced, so BirdoVPN did not connect.",
+            );
+        }
         let transport = if error.contains(crate::vpn::ERR_HANDSHAKE_NO_RESPONSE) {
             Some(TransportFailure::NoResponse)
         } else if error.contains(crate::vpn::ERR_HANDSHAKE_RECV) {
@@ -491,6 +504,28 @@ mod tests {
         ));
         assert_eq!(refused.code, IpcErrorCode::ServerUnreachable);
         assert_eq!(refused.transport, Some(TransportFailure::Refused));
+    }
+
+    /// P3-5: macOS connects now fail when pf cannot be enforced (the IPv6
+    /// leak block, or the kill switch letting the new tunnel through). That
+    /// is the kill switch, not the adapter, and the user must be told so.
+    #[test]
+    fn a_firewall_that_cannot_be_enforced_reads_as_the_kill_switch() {
+        for cause in [
+            "Failed to block IPv6 leaks: IPv6 leak block is not enforced: pf is not enabled",
+            "The kill switch could not let the new tunnel through: the live block-all does \
+             not permit the tunnel's interface utun17",
+        ] {
+            let err = IpcError::from_tunnel_failure(&format!(
+                "{}: {cause}",
+                crate::vpn::ERR_FIREWALL_NOT_ENFORCED
+            ));
+            assert_eq!(err.code, IpcErrorCode::KillswitchFailed, "{cause}");
+            assert_eq!(err.transport, None);
+        }
+        // Everything else keeps its stage.
+        let adapter = IpcError::from_tunnel_failure("Failed to create utun device: errno 1");
+        assert_eq!(adapter.code, IpcErrorCode::AdapterFailed);
     }
 
     #[test]

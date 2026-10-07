@@ -366,6 +366,31 @@ jobs:
             exit 1
           fi
 
+          # The kill switch's block-all is NOT a file: it is generated in Rust
+          # (vpn/pf_policy.rs) from the live inputs — the tunnel's utun, the
+          # control-plane addresses, the relay, LAN sharing — so the loop above
+          # cannot see it. pf_policy's root-only tests build every shape, have
+          # pfctl parse each (`-nv`: parse and print, never load), and run pf's
+          # own printout through the read-back detector the kill switch uses
+          # to decide whether it is blocking; two more take and drop real pf
+          # references (`pfctl -E` / `-X`, no rules loaded): one proves the
+          # token parse, the other a SECOND reference on a running pf, its
+          # `pfctl -s References` listing and a dead token's `-X`. Four tests,
+          # all required: an --ignored filter that matches nothing still exits 0.
+          echo "── pfctl -nv: the generated kill-switch block-all"
+          out=$(sudo -E "$(command -v cargo)" test --lib pfctl_parse_tests -- --ignored --nocapture --test-threads=1) || {
+            echo "$out"
+            echo "::error::the generated pf block-all failed its parse-check"
+            exit 1
+          }
+          echo "$out"
+          # A here-string, not `echo | grep -q`: under pipefail grep -q's early
+          # exit can SIGPIPE the writer and turn a pass into a failure.
+          if ! grep -qE 'test result: ok\. 4 passed' <<<"$out"; then
+            echo "::error::pfctl_parse_tests did not run all four tests"
+            exit 1
+          fi
+
       # Linux: run the real install/remove functions against real ip6tables as
       # root, asserting the chain, the OUTPUT jump, the default-deny, that NDP
       # stays permitted, that repeat installs don't stack, and that teardown

@@ -210,13 +210,27 @@ impl Drop for UtunTunnel {
                 // Drop cannot join the packet loop (no await), so this close
                 // carries the small fd-recycle race stop() eliminates.
                 // Accepted: this is the last-resort path for a DROPPED
-                // half-built tunnel, and leaving the device alive (the
-                // alternative) is a guaranteed IPv4 blackhole.
-                let _ = unsafe { libc::close(fd) };
-                tracing::warn!(
-                    "UtunTunnel dropped with the utun fd still open — closed it to \
-                     destroy the interface and release its routes"
-                );
+                // half-built tunnel, and leaving the device alive for good
+                // (the alternative) is a guaranteed IPv4 blackhole.
+                let close = move || {
+                    let _ = unsafe { libc::close(fd) };
+                    tracing::warn!(
+                        "UtunTunnel dropped with the utun fd still open — closed it to \
+                         destroy the interface and release its routes"
+                    );
+                };
+                // MR-1125 / P3-4: the kill-switch permit leaves a held block
+                // BEFORE the fd closes and frees the unit for someone else —
+                // in place when the lock is free, else on the runtime, which
+                // then closes the fd itself, after the re-load. The device
+                // outlives this Drop by that wait; it is never closed first.
+                let name = self.utun_name.try_read().ok().and_then(|n| n.clone());
+                match name {
+                    Some(name) => {
+                        crate::commands::killswitch::tunnel_interface_gone_then(&name, close)
+                    }
+                    None => close(),
+                }
             }
         }
     }
@@ -271,9 +285,25 @@ impl UtunTunnel {
         *self.utun_name.write().await = Some(utun_name.clone());
         *self.utun_fd.write().await = Some(utun_fd);
 
+        // MR-1125: the kill switch permits the tunnel by interface NAME — this
+        // one, whichever free unit it landed on, and no other — so record it
+        // now. A reconnect or a settings reapply engaged the block before this
+        // device existed; that block is re-loaded here and read back permitting
+        // it. P2-1: if that cannot be confirmed, the tunnel's traffic would meet
+        // `block drop all`, so the start FAILS — it used to log and carry on,
+        // and an automatic reconnect reached Connected with nothing getting
+        // through.
+        if let Err(e) = crate::commands::killswitch::tunnel_interface_up(&utun_name).await {
+            self.abandon_utun(&utun_name).await;
+            return Err(format!(
+                "{}: the kill switch could not let the new tunnel through: {e}",
+                crate::vpn::ERR_FIREWALL_NOT_ENFORCED
+            ));
+        }
+
         // Create WireGuard session BEFORE configuring routes
         // (needs direct network access for DNS resolution of endpoint)
-        let wg_session = WireGuardSession::new(
+        let wg_session = match WireGuardSession::new(
             &self.config.private_key,
             &self.config.server_public_key,
             &self.config.endpoint,
@@ -281,7 +311,13 @@ impl UtunTunnel {
             self.config.persistent_keepalive,
         )
         .await
-        .map_err(|e| format!("Failed to create WireGuard session: {}", e))?;
+        {
+            Ok(session) => session,
+            Err(e) => {
+                self.abandon_utun(&utun_name).await;
+                return Err(format!("Failed to create WireGuard session: {}", e));
+            }
+        };
         tracing::info!("WireGuard session created");
 
         let endpoint_ip = wg_session.endpoint_ip();
@@ -291,19 +327,10 @@ impl UtunTunnel {
         );
         *self.endpoint_ip.write().await = Some(endpoint_ip.to_string());
 
-        // Helper: on a startup configuration failure after the utun fd has been
-        // created, close the fd so it does not leak until the next stop()/drop.
-        // This only runs on the error path; the success path is unchanged.
-        let close_fd_on_err = |fd: i32| {
-            let _ = unsafe { libc::close(fd) };
-            tracing::warn!("Closed utun file descriptor after startup failure");
-        };
-
         // Configure the utun interface IP
         if let Err(e) = configure_utun_address(&utun_name, &self.config.client_ip, &self.config.mtu)
         {
-            close_fd_on_err(utun_fd);
-            *self.utun_fd.write().await = None;
+            self.abandon_utun(&utun_name).await;
             return Err(e);
         }
 
@@ -316,8 +343,7 @@ impl UtunTunnel {
         )
         .await
         {
-            close_fd_on_err(utun_fd);
-            *self.utun_fd.write().await = None;
+            self.abandon_utun(&utun_name).await;
             return Err(e);
         }
 
@@ -349,10 +375,25 @@ impl UtunTunnel {
         // only leak-safe option on this platform. A macOS user on a dual-stack
         // node therefore gets working IPv4 and no IPv6 — degraded, but never
         // leaking their real address.
+        //
+        // DISCLOSURE (MR-1124): that degradation is user-visible, and nothing
+        // in the app says so. While connected on macOS, every IPv6-only site
+        // and service is unreachable — kill switch on or off, since this block
+        // is not the kill switch's — and the user is told neither that IPv6 is
+        // off nor why. No existing copy fits it: the only protection copy in
+        // Settings is the Kill Switch row's, and this does not depend on that
+        // toggle. Proposed wording for a macOS-only line where the app
+        // describes the connection: "On macOS, IPv6 is blocked while you're
+        // connected, so your real address can't leak over it. Sites that only
+        // work over IPv6 won't load until you disconnect." It goes when this
+        // block does, once macOS routes IPv6.
         if let Err(e) = crate::commands::killswitch::ipv6_block_activate().await {
-            close_fd_on_err(utun_fd);
-            *self.utun_fd.write().await = None;
-            return Err(format!("Failed to block IPv6 leaks: {}", e));
+            self.abandon_utun(&utun_name).await;
+            return Err(format!(
+                "{}: failed to block IPv6 leaks: {}",
+                crate::vpn::ERR_FIREWALL_NOT_ENFORCED,
+                e
+            ));
         }
 
         // Configure DNS.
@@ -378,8 +419,7 @@ impl UtunTunnel {
         }
         if let Err(e) = configure_dns(&self.config.dns).await {
             crate::commands::killswitch::ipv6_block_deactivate().await;
-            close_fd_on_err(utun_fd);
-            *self.utun_fd.write().await = None;
+            self.abandon_utun(&utun_name).await;
             return Err(e);
         }
 
@@ -419,6 +459,22 @@ impl UtunTunnel {
 
         tracing::info!("macOS tunnel started successfully");
         Ok(())
+    }
+
+    /// A start that failed after the utun device existed. Its kill-switch
+    /// permit leaves a held block FIRST, while this process still owns the
+    /// unit (P3-4) — not just forgotten until the next load — and only then is
+    /// the fd closed, which destroys the device and its routes. The fd stays
+    /// in `utun_fd` across the await, so a cancelled start still leaves it
+    /// to `Drop`; it is taken and closed with no await in between (N7), so it
+    /// can never be closed twice either.
+    async fn abandon_utun(&self, name: &str) {
+        crate::commands::killswitch::tunnel_interface_down(name).await;
+        let mut slot = self.utun_fd.write().await;
+        if let Some(fd) = slot.take() {
+            let _ = unsafe { libc::close(fd) };
+            tracing::warn!("Closed utun file descriptor after startup failure");
+        }
     }
 
     /// Stop the tunnel and restore network configuration.
@@ -471,13 +527,32 @@ impl UtunTunnel {
             remove_routes(ep_ip, &self.config.allowed_ips, self.local_network_sharing).await;
         }
 
-        // Close the utun file descriptor
-        if let Some(fd) = self.utun_fd.write().await.take() {
-            let _ = unsafe { libc::close(fd) };
-            tracing::info!("Closed utun file descriptor");
+        // Close the utun file descriptor — destroying the interface — but take
+        // its permit out of a held kill-switch block FIRST (MR-1125 / P3-4):
+        // once the fd is closed the unit is free, and another VPN that takes it
+        // before the re-load would pass straight through. Only when THIS stop
+        // closes the device: after a failed start it is already gone, and a
+        // newer tunnel may hold the same unit by now.
+        //
+        // N7: the fd is READ, not taken, across that await. The manager puts a
+        // 10 s cap on a teardown and drops this future when it fires; an fd
+        // taken out of `utun_fd` before the await was then closed by nobody,
+        // and the device lived on. It is taken and closed with no await in
+        // between, so a cancel leaves it where `Drop` finds it.
+        let open = self.utun_fd.read().await.is_some();
+        let utun_name = self.utun_name.read().await.clone();
+        if open {
+            if let Some(name) = utun_name.as_deref() {
+                crate::commands::killswitch::tunnel_interface_down(name).await;
+            }
         }
-
-        // Destroy the utun interface (happens automatically when fd is closed)
+        {
+            let mut slot = self.utun_fd.write().await;
+            if let Some(fd) = slot.take() {
+                let _ = unsafe { libc::close(fd) };
+                tracing::info!("Closed utun file descriptor");
+            }
+        }
         *self.utun_name.write().await = None;
 
         // Clear WireGuard session

@@ -10,14 +10,14 @@
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tauri::{AppHandle, State};
-use tokio::sync::RwLock;
 
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::utils::elevation::is_elevated;
 #[cfg(target_os = "linux")]
 use crate::vpn::firewall_linux;
+#[cfg(target_os = "macos")]
+use crate::vpn::pf_policy::{self, Pf, PfState};
 #[cfg(target_os = "windows")]
 use crate::vpn::wfp;
 
@@ -91,9 +91,18 @@ fn intent_off_since(seen: u64) -> Option<bool> {
     Some(KILLSWITCH_ENABLED.swap(false, Ordering::SeqCst))
 }
 
-/// Global state for kill switch - stores allowed VPN server IP
-static VPN_SERVER_IP: once_cell::sync::Lazy<Arc<RwLock<Option<Ipv4Addr>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
+/// Global state for kill switch - stores allowed VPN server IP. A plain
+/// mutex, so the pf backend reads it under its own lock, synchronously, in the
+/// same step that loads it (P3-3).
+static VPN_SERVER_IP: std::sync::Mutex<Option<Ipv4Addr>> = std::sync::Mutex::new(None);
+
+/// The relay the block permits.
+#[cfg(not(target_os = "windows"))]
+fn vpn_server_ip() -> Option<Ipv4Addr> {
+    *VPN_SERVER_IP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KillSwitchStatus {
@@ -255,10 +264,14 @@ async fn activate_platform_block() -> Result<bool, String> {
         }
     }
 
+    // macOS reads the relay AND re-checks the intent under its own lock
+    // (P3-3): a set_killswitch_live(false) that landed while this waited for
+    // the lock must not be undone by a block built from the earlier intent.
     #[cfg(target_os = "macos")]
-    {
-        let server_ip = VPN_SERVER_IP.read().await.clone();
-        if let Err(e) = pf_activate_blocking(server_ip).await {
+    match pf_activate_blocking().await {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(e) => {
             tracing::error!("Failed to activate pf blocking: {}", e);
             return Err(format!("Failed to activate blocking: {}", e));
         }
@@ -266,7 +279,7 @@ async fn activate_platform_block() -> Result<bool, String> {
 
     #[cfg(target_os = "linux")]
     {
-        let server_ip = VPN_SERVER_IP.read().await.clone();
+        let server_ip = vpn_server_ip();
         if let Err(e) = firewall_linux::activate_blocking(server_ip).await {
             tracing::error!("Failed to activate iptables blocking: {}", e);
             return Err(format!("Failed to activate blocking: {}", e));
@@ -390,14 +403,31 @@ pub async fn set_killswitch_live(
         // Review of #222: a lift that failed used to be dropped here and the
         // OFF reported as applied, with the machine still blocked. It is an
         // error now, so the UI says the change could not be applied.
-        turn_off(deactivate_killswitch, platform_is_blocking)
-            .await
-            .map_err(|e| {
-                IpcError::new(
-                    IpcErrorCode::KillswitchFailed,
-                    format!("The kill switch could not be turned off: {e}"),
-                )
-            })
+        //
+        // macOS lifts through its own pf backend, decided under the PF lock
+        // from `loaded` (N2 on #221): the lock-free status read missed a
+        // block-all held by a disabled pf, and an activation in flight (that
+        // one completes first, then is lifted). So `blocking` is always true
+        // there and `pf_lift_if_loaded` decides — and its failure, which #221
+        // used to log while reporting OK, is now the OFF's error too.
+        #[cfg(target_os = "macos")]
+        let turned_off = turn_off(
+            || async {
+                let lifted = pf_lift_if_loaded().await;
+                blocking_may_have_changed();
+                lifted
+            },
+            || true,
+        )
+        .await;
+        #[cfg(not(target_os = "macos"))]
+        let turned_off = turn_off(deactivate_killswitch, platform_is_blocking).await;
+        turned_off.map_err(|e| {
+            IpcError::new(
+                IpcErrorCode::KillswitchFailed,
+                format!("The kill switch could not be turned off: {e}"),
+            )
+        })
     }
 }
 
@@ -486,7 +516,9 @@ pub fn lan_sharing_enabled() -> bool {
     LAN_SHARING_ENABLED.load(Ordering::SeqCst)
 }
 pub async fn set_vpn_server_ip(ip: Option<Ipv4Addr>) {
-    *VPN_SERVER_IP.write().await = ip;
+    *VPN_SERVER_IP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = ip;
     // This is the real exit-node address (set from vpn.rs and vpn_multi_hop.rs),
     // not a local proxy. Log only whether one is set -- the value itself is the
     // record of which server a customer chose.
@@ -714,11 +746,12 @@ async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
     // activate the block-all NOW and keep it engaged for the whole Connected
     // session. The tunnel is already up when arm() runs on the connect path,
     // and all the firewall backends permit tunneled traffic through an engaged
-    // block (pf utun0-15 pass rules, iptables `-o birdo0 ACCEPT`), which the
-    // switch-guard/reapply paths already rely on mid-session. Reactive-only
-    // protection left every SILENT tunnel death (dead peer, expired NAT
-    // mapping, sleep/resume, Wi-Fi→LTE handover) leaking real-IP traffic —
-    // DNS included — for the up-to-~60s the liveness watchdog needs to trip.
+    // block (pf's pass rule on the tunnel's own utun, iptables `-o birdo0
+    // ACCEPT`), which the switch-guard/reapply paths already rely on
+    // mid-session. Reactive-only protection left every SILENT tunnel death
+    // (dead peer, expired NAT mapping, sleep/resume, Wi-Fi→LTE handover)
+    // leaking real-IP traffic — DNS included — for the up-to-~60s the
+    // liveness watchdog needs to trip.
     // With the block held, a dead tunnel fails CLOSED instantly and the
     // watchdog/auto-reconnect still own recovery.
     //
@@ -802,44 +835,217 @@ async fn disarm_platform() -> Result<(), String> {
 
 // ──────────────────────────────────────────────────────────────
 // macOS pf (packet filter) kill switch implementation
+//
+// WHAT the block-all permits, when pf's answer counts as "blocking", and how a
+// lift is verified are decided in `vpn::pf_policy` (`PfState`): plain code,
+// unit-tested on every OS against a scripted pf. This section runs `pfctl`,
+// holds the one lock, and mirrors the state for the lock-free status probe.
 // ──────────────────────────────────────────────────────────────
 
-/// Tracks whether pf blocking rules are active on macOS
+/// Everything the kill switch knows about pf, behind the one lock every writer
+/// of pf's main ruleset takes while the app runs: the block-all, the IPv6
+/// baseline, a tunnel interface change, the startup cleanup (which takes it
+/// before anything else can). One writer does NOT take it: the panic hook in
+/// main.rs restores `/etc/pf.conf` as the process dies, and another thread may
+/// be mid-load right then, so the two can interleave (N11). The process is
+/// going down either way; what is left is the next start's cleanup to remove,
+/// and our pf reference is released there from the journal if the hook could
+/// not take the lock to release it.
+#[cfg(target_os = "macos")]
+static PF: tokio::sync::Mutex<PfState> = tokio::sync::Mutex::const_new(PfState::new());
+
+/// `PfState::enforcing` for the lock-free status probe: pf is running our
+/// block-all, or cannot be read (which counts as still blocking).
 #[cfg(target_os = "macos")]
 static PF_BLOCKING: AtomicBool = AtomicBool::new(false);
 
-/// macOS: is the pf block-all ruleset currently loaded? Twin of
-/// `wfp::is_blocking()` / `firewall_linux::is_blocking()`, needed by the
-/// connect paths' update-the-relay-permit step: pf bakes the permitted server
-/// IP into the loaded ruleset and has no incremental update, so a switch onto
-/// a different relay while a block is engaged must re-load the ruleset.
+/// `PfState::loaded`: a block-all of ours is (or may be) loaded — a lift is owed.
 #[cfg(target_os = "macos")]
-pub fn pf_blocking_active() -> bool {
-    PF_BLOCKING.load(Ordering::SeqCst)
+static PF_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// The control-plane generation a connection gets through with (N5):
+/// `u64::MAX` while no block-all is loaded.
+#[cfg(target_os = "macos")]
+static PF_PERMITTED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+#[cfg(target_os = "macos")]
+fn mirror(state: &PfState) {
+    PF_BLOCKING.store(state.enforcing, Ordering::SeqCst);
+    PF_LOADED.store(state.loaded, Ordering::SeqCst);
+    PF_PERMITTED_GEN.store(
+        if state.loaded {
+            state.table_gen
+        } else {
+            u64::MAX
+        },
+        Ordering::SeqCst,
+    );
 }
 
-/// True when WE enabled pf (it was disabled before us). Governs whether
-/// deactivation should `pfctl -d` — we must never disable pf if the user or
-/// another tool had it running.
+/// macOS: whether control-plane addresses of `generation` already get
+/// through — the resolver's lock-free fast path (N5).
 #[cfg(target_os = "macos")]
-static PF_WE_ENABLED: AtomicBool = AtomicBool::new(false);
+pub fn control_plane_permits(generation: u64) -> bool {
+    PF_PERMITTED_GEN.load(Ordering::SeqCst) >= generation
+}
 
-/// F-001: true while a tunnel session wants the steady-state IPv6 leak block as
-/// pf's BASELINE ruleset. This is what makes the leak block survive a kill-switch
-/// cycle: `pf_deactivate_blocking()` consults it and restores the leak block
-/// instead of bare `/etc/pf.conf`.
+/// macOS: is a block-all of ours loaded? Twin of `wfp::is_blocking()` /
+/// `firewall_linux::is_blocking()`, needed by the connect paths'
+/// update-the-relay-permit step: pf bakes the permitted server IP into the
+/// loaded ruleset and has no incremental update, so a switch onto a different
+/// relay while a block is loaded must re-load the ruleset.
 #[cfg(target_os = "macos")]
-static PF_IPV6_BLOCK_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub fn pf_blocking_active() -> bool {
+    PF_LOADED.load(Ordering::SeqCst)
+}
 
-/// Is pf currently enabled? Parses `pfctl -s info` ("Status: Enabled").
+/// Run `pfctl` with `args`: its stdout, or why it failed — a non-zero exit
+/// included. A read that fails is an error, never an empty answer (P2-2).
 #[cfg(target_os = "macos")]
-fn pf_is_enabled() -> bool {
-    crate::utils::hidden_cmd("pfctl")
-        .args(["-s", "info"])
+fn pfctl(args: &[&str]) -> Result<String, String> {
+    let out = crate::utils::hidden_cmd("pfctl")
+        .args(args)
         .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("Status: Enabled"))
-        .unwrap_or(false)
+        .map_err(|e| format!("pfctl {} could not run: {e}", args.join(" ")))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(format!(
+            "pfctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// `pfctl`, as the [`Pf`] that `PfState` drives.
+#[cfg(target_os = "macos")]
+struct Pfctl;
+
+#[cfg(target_os = "macos")]
+impl Pf for Pfctl {
+    fn info(&self) -> Result<String, String> {
+        pfctl(&["-s", "info"])
+    }
+    fn rules(&self) -> Result<String, String> {
+        pfctl(&["-s", "rules"])
+    }
+    fn load(&self, rules: &str) -> Result<(), String> {
+        pf_load_ruleset(rules)
+    }
+    fn load_default(&self) -> Result<(), String> {
+        pfctl(&["-f", "/etc/pf.conf"]).map(drop)
+    }
+    fn flush_rules(&self) -> Result<(), String> {
+        pfctl(&["-F", "rules"]).map(drop)
+    }
+    fn take_ref(&self) -> Result<pf_policy::Taken, String> {
+        let child = crate::utils::hidden_cmd("pfctl")
+            .args(["-E"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("pfctl -E could not run: {e}"))?;
+        // The pid `pfctl -s References` lists the reference under (N4).
+        let pid = child.id();
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("pfctl -E: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "pfctl -E failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        // The token is printed (on stderr, measured) after "pf enabled";
+        // read both streams.
+        let printed = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(pf_policy::Taken {
+            token: pf_policy::parse_token(&printed),
+            pid,
+        })
+    }
+    fn references(&self) -> Result<String, String> {
+        pfctl(&["-s", "References"])
+    }
+    fn release_ref(&self, token: u64) -> Result<(), String> {
+        pfctl(&["-X", &token.to_string()]).map(drop)
+    }
+    fn record_reference(&self, held: Option<pf_policy::PfRef>) {
+        pf_reference_journal::write(held);
+    }
+}
+
+/// N3: the pf reference we hold, on disk. XNU frees a token only on `pfctl -X`
+/// or `pfctl -d` — never when the process that took it exits — so a crash
+/// mid-session (every session holds one for the IPv6 block) kept pf enabled
+/// for good. The next start releases what this names. Root-only: the app runs
+/// as root, so this lives in root's own Application Support, mode 0600.
+#[cfg(target_os = "macos")]
+mod pf_reference_journal {
+    use crate::vpn::pf_policy::{self, PfRef};
+
+    fn path() -> Option<std::path::PathBuf> {
+        let mut dir = dirs::data_dir()?;
+        dir.push("BirdoVPN");
+        std::fs::create_dir_all(&dir).ok()?;
+        dir.push("pf-reference");
+        Some(dir)
+    }
+
+    /// Replace the record with `held` (or remove it), staged and renamed so a
+    /// crash leaves the old record or the new one, never half of one.
+    pub(super) fn write(held: Option<PfRef>) {
+        let Some(path) = path() else {
+            tracing::warn!("pf reference journal: no data directory");
+            return;
+        };
+        let written = match held {
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+            Some(held) => write_atomically(&path, pf_policy::encode_reference(held).as_bytes()),
+        };
+        if let Err(e) = written {
+            tracing::warn!("pf reference journal not updated: {e}");
+        }
+    }
+
+    fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let staging = path.with_extension("tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staging)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&staging, path)
+    }
+
+    /// What a previous run left, if anything.
+    pub(super) fn read() -> Option<PfRef> {
+        pf_policy::decode_reference(&std::fs::read_to_string(path()?).ok()?)
+    }
+}
+
+/// N3: the panic hook's share — drop our pf reference now, if the lock is
+/// free. A panic while it is held leaves the reference to the journal, which
+/// the next start releases.
+#[cfg(target_os = "macos")]
+pub fn release_pf_reference_now() {
+    if let Ok(mut pf) = PF.try_lock() {
+        pf.release_reference(&Pfctl);
+        mirror(&pf);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -858,37 +1064,12 @@ fn pf_is_enabled() -> bool {
 // the main ruleset. Two independent writers would clobber each other: the leak
 // block would be silently wiped the first time `pf_deactivate_blocking()` ran
 // after a reconnect, restoring the leak mid-session. So there is ONE owner and
-// a two-level baseline:
+// a two-level baseline (`PfState::disengage` picks it):
 //
 //   kill switch blocking   → block-all ruleset (denies IPv6 as a side effect)
 //   tunnel up, no block    → IPv6 leak-block ruleset   ← the baseline
 //   no tunnel              → /etc/pf.conf
 // ──────────────────────────────────────────────────────────────
-
-/// Marker anchor embedded in every ruleset WE load, so a stale ruleset left by a
-/// crash can be positively identified as ours before we replace it. Declaring an
-/// empty anchor is a no-op for packet processing but shows up in `pfctl -s rules`.
-#[cfg(target_os = "macos")]
-const PF_MARKER_ANCHOR: &str = "com.birdo.vpn";
-
-/// The leak-block rulesets live in `resources/pf/` rather than in this source
-/// file, so that CI can parse-check the EXACT bytes we ship with `pfctl -n -f` on
-/// a real macOS runner (see .github/workflows/tests.yml). A pf syntax error here
-/// would fail every macOS connect, and it is not otherwise reachable from a
-/// Windows dev box — this is the one thing about F-001 that can be verified
-/// without a dual-stack network.
-///
-/// Preferred ruleset: re-declares the stock `/etc/pf.conf` anchors so Apple's own
-/// pf rules (application firewall / Internet Sharing) keep working for the
-/// session, then appends our IPv6 block.
-#[cfg(target_os = "macos")]
-const PF_IPV6_RULESET_FULL: &str = include_str!("../../resources/pf/ipv6-block.conf");
-
-/// Fallback for hosts where the stock Apple anchor file is missing or unreadable
-/// (the `load anchor` line would fail the whole load). Same protection, minus the
-/// Apple anchors for the session.
-#[cfg(target_os = "macos")]
-const PF_IPV6_RULESET_MINIMAL: &str = include_str!("../../resources/pf/ipv6-block-minimal.conf");
 
 /// Load `rules` as pf's main ruleset via `pfctl -f -`.
 ///
@@ -936,103 +1117,28 @@ fn pf_load_ruleset(rules: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Read back pf's live ruleset. Used to verify a block is genuinely in force
-/// rather than trusting `pfctl`'s exit status alone.
-#[cfg(target_os = "macos")]
-fn pf_live_rules() -> String {
-    crate::utils::hidden_cmd("pfctl")
-        .args(["-s", "rules"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default()
-}
-
-/// Install the IPv6 leak-block ruleset as pf's main ruleset and enable pf.
-///
-/// Tries the anchor-preserving ruleset first, falls back to the minimal one, then
-/// VERIFIES the result — a leak fix that silently failed to load is worse than no
-/// fix, because the UI would report protection that isn't there.
-#[cfg(target_os = "macos")]
-fn pf_apply_ipv6_baseline() -> Result<(), String> {
-    let was_enabled = pf_is_enabled();
-
-    if let Err(primary) = pf_load_ruleset(PF_IPV6_RULESET_FULL) {
-        tracing::warn!(
-            "F-001: anchor-preserving IPv6 ruleset failed to load ({}); trying the minimal ruleset",
-            primary
-        );
-        pf_load_ruleset(PF_IPV6_RULESET_MINIMAL).map_err(|e| {
-            format!("IPv6 leak block failed to load ({primary}); fallback also failed: {e}")
-        })?;
-    }
-
-    // pf must actually be running or the loaded ruleset is inert.
-    if !was_enabled {
-        crate::utils::hidden_cmd("pfctl")
-            .args(["-e"])
-            .output()
-            .map_err(|e| format!("pfctl enable failed: {}", e))?;
-        PF_WE_ENABLED.store(true, Ordering::SeqCst);
-    }
-
-    // Read back: our ruleset always contains inet6 rules. If pf reports none, the
-    // load did not take effect and we must NOT claim the leak is blocked.
-    if !pf_live_rules().contains("inet6") {
-        return Err("IPv6 leak block did not take effect (pf reports no inet6 rules)".to_string());
-    }
-
-    tracing::info!("F-001: IPv6 egress blocked for the connect window (pf main ruleset)");
-    Ok(())
-}
-
-/// Restore pf to the system default ruleset and, if we were the ones who turned
-/// pf on, turn it back off.
-#[cfg(target_os = "macos")]
-fn pf_restore_default_ruleset() {
-    let output = crate::utils::hidden_cmd("pfctl")
-        .args(["-f", "/etc/pf.conf"])
-        .output();
-    match output {
-        Ok(o) if !o.status.success() => {
-            tracing::warn!(
-                "pfctl restore /etc/pf.conf: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        Err(e) => tracing::warn!("pfctl restore failed: {}", e),
-        _ => {}
-    }
-
-    // Only disable pf if we enabled it (never disable pf out from under the user
-    // or another tool that had it running).
-    if PF_WE_ENABLED.swap(false, Ordering::SeqCst) {
-        let _ = crate::utils::hidden_cmd("pfctl").args(["-d"]).output();
-    }
-}
-
 /// F-001: engage the steady-state IPv6 leak block for a tunnel session.
 ///
 /// Called from `tunnel_macos.rs::start()`, INDEPENDENT of the kill-switch
 /// enabled/lockdown setting — exactly as Windows blocks IPv6 at tunnel start.
 #[cfg(target_os = "macos")]
 pub async fn ipv6_block_activate() -> Result<(), String> {
-    // Record the intent FIRST so that, if the kill switch is mid-block, its
-    // deactivation lands on our baseline instead of bare /etc/pf.conf.
-    PF_IPV6_BLOCK_ACTIVE.store(true, Ordering::SeqCst);
-
-    if PF_BLOCKING.load(Ordering::SeqCst) {
-        tracing::info!(
-            "F-001: kill-switch block-all is active and already denies IPv6; \
-             leak block recorded as the pf baseline"
-        );
-        return Ok(());
+    // N6: the leak block is watched too, kill switch on or off.
+    ensure_pf_watchdog();
+    let mut pf = PF.lock().await;
+    let result = pf.ipv6_on(&Pfctl);
+    mirror(&pf);
+    if result.is_ok() {
+        if pf.loaded {
+            tracing::info!(
+                "F-001: kill-switch block-all is active and already denies IPv6; \
+                 leak block recorded as the pf baseline"
+            );
+        } else {
+            tracing::info!("F-001: IPv6 egress blocked for the connect window (pf main ruleset)");
+        }
     }
-
-    pf_apply_ipv6_baseline().inspect_err(|_| {
-        // Do not leave a claim we could not honour.
-        PF_IPV6_BLOCK_ACTIVE.store(false, Ordering::SeqCst);
-    })
+    result
 }
 
 /// F-001: lift the steady-state IPv6 leak block at teardown.
@@ -1041,19 +1147,17 @@ pub async fn ipv6_block_activate() -> Result<(), String> {
 /// fail a disconnect — a stuck block would leave the host without IPv6.
 #[cfg(target_os = "macos")]
 pub async fn ipv6_block_deactivate() {
-    if !PF_IPV6_BLOCK_ACTIVE.swap(false, Ordering::SeqCst) {
-        return;
+    let mut pf = PF.lock().await;
+    let (wanted, kill_switch_owns) = (pf.ipv6_baseline, pf.loaded);
+    pf.ipv6_off(&Pfctl);
+    mirror(&pf);
+    if wanted {
+        if kill_switch_owns {
+            tracing::info!("F-001: leak block released; kill switch still owns the pf ruleset");
+        } else {
+            tracing::info!("F-001: IPv6 egress block removed");
+        }
     }
-
-    if PF_BLOCKING.load(Ordering::SeqCst) {
-        // The kill switch owns the ruleset right now. The baseline flag is now
-        // clear, so its own deactivation will restore /etc/pf.conf.
-        tracing::info!("F-001: leak block released; kill switch still owns the pf ruleset");
-        return;
-    }
-
-    pf_restore_default_ruleset();
-    tracing::info!("F-001: IPv6 egress block removed");
 }
 
 /// F-001: remove a leak-block / kill-switch ruleset left behind by a crash.
@@ -1062,47 +1166,50 @@ pub async fn ipv6_block_deactivate() {
 /// unlike Windows WFP dynamic sessions, which self-clean. Without this, a panic
 /// or SIGKILL while blocking leaves the machine either without IPv6 or (worse,
 /// if the kill switch was mid-block) fully firewalled off, with no recovery short
-/// of a reboot. Only reverts rulesets carrying OUR marker anchor, so a third
-/// party's pf configuration is never clobbered.
+/// of a reboot. `PfState::reconcile` decides what to do and records only what pf
+/// reads back afterwards (N8); only rulesets carrying OUR marker are touched, so
+/// a third party's pf configuration is never clobbered. Runs at startup, before
+/// anything else can take the lock.
 #[cfg(target_os = "macos")]
 pub fn reconcile_stale_pf_state() {
-    if !pf_is_enabled() {
+    let Ok(mut pf) = PF.try_lock() else {
+        tracing::error!("Kill switch state is locked at startup; stale pf state not reconciled");
         return;
+    };
+    let reconciled = pf.reconcile(&Pfctl);
+    // N3: the pf reference a crashed earlier run left behind. Released only if
+    // pf still lists it as that run's — token AND pid.
+    if let Some(leftover) = pf_reference_journal::read() {
+        match pf.release_leftover(&Pfctl, leftover) {
+            Ok(()) => tracing::warn!("Released the pf reference a previous run left behind"),
+            Err(e) => tracing::warn!(
+                "The pf reference a previous run left behind was not released ({}); \
+                 retried at the next start",
+                e
+            ),
+        }
     }
-    if !pf_live_rules().contains(PF_MARKER_ANCHOR) {
-        return; // not ours — leave it alone
+    match reconciled {
+        None => {}
+        Some(Ok(())) => {
+            tracing::warn!("Found a stale Birdo pf ruleset from a previous run — removed")
+        }
+        Some(Err(e)) => {
+            tracing::error!(
+                "Stale Birdo pf ruleset NOT removed: {}. Retried every {}s; \
+                 `sudo pfctl -f /etc/pf.conf` clears it manually.",
+                e,
+                PF_WATCHDOG_INTERVAL.as_secs()
+            );
+            ensure_pf_watchdog();
+        }
     }
-    tracing::warn!("Found a stale Birdo pf ruleset from a previous run — restoring /etc/pf.conf");
-    let _ = crate::utils::hidden_cmd("pfctl")
-        .args(["-f", "/etc/pf.conf"])
-        .output();
-
-    // OBSERVE the result — do not infer it from having asked.
-    //
-    // This used to store `false` unconditionally. If the restore failed (an
-    // unreadable /etc/pf.conf, pfctl missing, not root) the kernel kept OUR
-    // block-all ruleset loaded while the app recorded "not blocking" — so the
-    // user had no network at all, the UI said the kill switch was off, and
-    // nothing ever retried, because every recovery path is gated on
-    // PF_BLOCKING. A reboot was the only way out, which is the exact failure
-    // this function exists to prevent.
-    //
-    // The marker anchor is the ground truth: still present means still blocking.
-    if pf_live_rules().contains(PF_MARKER_ANCHOR) {
-        tracing::error!(
-            "Failed to restore /etc/pf.conf — the stale Birdo ruleset is STILL LOADED and this \
-             machine's traffic remains blocked. Leaving the kill switch marked active so the \
-             normal teardown path can retry; `sudo pfctl -f /etc/pf.conf` clears it manually."
-        );
-        PF_BLOCKING.store(true, Ordering::SeqCst);
-        return;
-    }
-
-    PF_BLOCKING.store(false, Ordering::SeqCst);
-    PF_IPV6_BLOCK_ACTIVE.store(false, Ordering::SeqCst);
+    mirror(&pf);
 }
 
-/// Activate pf blocking: block all traffic except to the VPN server and localhost.
+/// Activate pf blocking: block everything except what
+/// `pf_policy::block_all_ruleset` permits (loopback, the tunnel's own utun,
+/// DHCP, the LAN with Local Network Sharing, the control plane, the relay).
 ///
 /// CRITICAL FIX: the rules are loaded as pf's **main ruleset** (`pfctl -f -`),
 /// not into a named anchor. A named anchor is only evaluated when the main
@@ -1111,143 +1218,207 @@ pub fn reconcile_stale_pf_state() {
 /// rules pf never evaluated, and the kill switch silently failed OPEN (all
 /// traffic leaked while the UI reported it active). The main ruleset is always
 /// evaluated. `pf_deactivate_blocking` restores `/etc/pf.conf`.
+///
+/// `Ok(false)`: the kill switch was disarmed while this waited for the lock
+/// (P3-3), and pf was left alone.
 #[cfg(target_os = "macos")]
-async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
-    // Let the tunnel re-establish while blocked by permitting the VPN server.
-    // WireGuard is UDP; allow the server on both transports so a stealth/TCP
-    // fallback can also reconnect through the block.
-    // RELAY PERMIT — must be STATEFUL, and must also permit the INBOUND reply.
-    //
-    // This rule used to be `... to <ip> no state`. `no state` suppresses pf's
-    // implicit state creation, and the ruleset below has no `pass in` rule for
-    // the relay, so the relay's reply packets matched only the non-quick
-    // `block drop all` (pf is last-match) and were silently dropped. The
-    // WireGuard handshake is a REQUEST/RESPONSE exchange, so with the block
-    // engaged no tunnel could EVER be established — the kill switch became a
-    // permanent "cannot connect" rather than a fail-closed gap. `keep state`
-    // plus the explicit inbound permit fixes that; both are scoped to the one
-    // relay IP, so this does not widen the block for anything else.
-    let server_rule = if let Some(ip) = server_ip {
-        format!(
-            "pass out quick inet proto {{ udp tcp }} to {ip} keep state\n\
-             pass in quick inet proto {{ udp tcp }} from {ip} keep state\n"
-        )
-    } else {
-        String::new()
-    };
+async fn pf_activate_blocking() -> Result<bool, String> {
+    ensure_pf_watchdog();
+    let mut pf = PF.lock().await;
+    let inputs = pf_inputs();
+    let result = pf.activate(&Pfctl, &inputs, KILLSWITCH_ENABLED.load(Ordering::SeqCst));
+    mirror(&pf);
+    match &result {
+        Ok(true) => tracing::info!(
+            "macOS pf kill switch activated (read back: pf enabled, block-all loaded)"
+        ),
+        Ok(false) => tracing::info!("Kill switch disarmed meanwhile; pf left alone"),
+        Err(e) => tracing::error!(
+            "macOS pf kill switch NOT confirmed: {} (enforcing={}, lift owed={})",
+            e,
+            pf.enforcing,
+            pf.loaded
+        ),
+    }
+    result
+}
 
-    // SELF-PERMIT: let OUR OWN process reach the control plane.
-    //
-    // Without this the kill switch makes reconnection impossible, which is the
-    // opposite of what it is for. auto_reconnect arms the block and then calls
-    // https://api.birdo.app for a fresh config — a DIFFERENT host from the
-    // permitted relay, over the physical NIC — and DNS is blocked too. macOS is
-    // worse than Linux here: `block drop all` with no state-passing rule kills
-    // even an already-established socket. So every reconnect attempt fails for a
-    // reason that is not the network, and the loop eventually gives up and drops
-    // the block, leaving the machine fully open.
-    //
-    // Windows uses a per-app WFP permit (ALE_APP_ID). pf has no app condition, so
-    // match the euid we run as and scope it to TCP/443 — narrow enough to be
-    // meaningful, broad enough to survive the control plane changing address.
-    // `keep state` so replies come back.
-    let euid = unsafe { libc::geteuid() };
-    // LAN permit: honour Local Network Sharing while the block is engaged, so a
-    // dropped tunnel does not also take out the printer and the NAS. Includes
-    // 169.254/16 for mDNS/Bonjour, which is what actually makes AirPlay and
-    // printer discovery work.
-    let lan_permit = if lan_sharing_enabled() {
-        "pass quick to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } no state\n"
-    } else {
-        ""
+/// The block-all's inputs as they are NOW — read while the `PF` lock is held
+/// (P3-3), so a load can never be built from a relay or an intent that changed
+/// while it waited.
+#[cfg(target_os = "macos")]
+fn pf_inputs() -> pf_policy::Inputs {
+    let (control_plane, control_plane_gen) = pf_policy::control_plane();
+    let inputs = pf_policy::Inputs {
+        relay: vpn_server_ip(),
+        control_plane,
+        control_plane_gen,
+        // pf has no application condition, so the control-plane permit
+        // matches the euid we run as (root: arm() refuses otherwise) and
+        // pf_policy scopes its DESTINATION to the control-plane table.
+        euid: unsafe { libc::geteuid() },
+        lan_sharing: lan_sharing_enabled(),
     };
-    let self_permit = format!("pass out quick proto tcp to any port 443 user {euid} keep state\n");
-    tracing::info!("Kill switch: self-permit for uid {} on tcp/443", euid);
-
-    // Default-deny with `quick` passes short-circuiting for the allow-list.
-    // Permit utun0..utun15. create_utun_device() probes `for unit in 0..256` and
-    // takes the FIRST FREE unit, so on a Mac where system services already hold
-    // utun0-3 (VPNs, Continuity, Handoff — common) our tunnel lands on utun4+
-    // and `block drop all` ate its traffic. The worst path is not the reconnect
-    // gap: reapply_vpn_settings arms the block and never deactivates, so
-    // CHANGING ANY VPN SETTING WHILE CONNECTED killed all internet for the rest
-    // of the session.
-    //
-    // pfctl tolerates naming absent interfaces (which is how utun2/utun3 already
-    // loaded), so listing 16 is safe. The live device name cannot be used
-    // instead: reapply_vpn_settings arms the block BEFORE the new tunnel exists,
-    // so there is no name to bind at rule-load time.
-    // back up before deactivation lands, traffic already inside the VPN is not
-    // dropped by this main ruleset.
-    //
-    // DHCP: both directions are stated explicitly because these rules are
-    // `no state` — pf will not infer the reply from the request, so each
-    // direction has to match on its own.
-    //     request: client :68 -> server :67
-    //     reply:   server :67 -> client :68
-    // The inbound rule used to read `from any port 68`, which is the CLIENT's
-    // port. A DHCP reply arrives FROM :67, so that rule matched nothing and
-    // every reply fell through to `block drop all` while the kill switch was
-    // armed. The lease could then never be renewed, so a long VPN session ended
-    // with the LAN connection dying underneath it — and, because the tunnel
-    // itself kept working until the lease actually lapsed, the cause looked
-    // nothing like the kill switch.
-    let rules = format!(
-        "# Birdo VPN Kill Switch (main ruleset — pf evaluates this directly)\n\
-         set block-policy drop\n\
-         anchor \"{PF_MARKER_ANCHOR}\"\n\
-         block drop all\n\
-         pass quick on lo0 all\n\
-         pass quick on utun0 all\n\
-         pass quick on utun1 all\n\
-         pass quick on utun2 all\n\
-         pass quick on utun3 all\n\
-         pass quick on utun4 all\n\
-         pass quick on utun5 all\n\
-         pass quick on utun6 all\n\
-         pass quick on utun7 all\n\
-         pass quick on utun8 all\n\
-         pass quick on utun9 all\n\
-         pass quick on utun10 all\n\
-         pass quick on utun11 all\n\
-         pass quick on utun12 all\n\
-         pass quick on utun13 all\n\
-         pass quick on utun14 all\n\
-         pass quick on utun15 all\n\
-         pass out quick proto udp from any port 68 to any port 67 no state\n\
-         pass in quick proto udp from any port 67 to any port 68 no state\n\
-         {lan_permit}\
-         {self_permit}\
-         {server_rule}"
+    tracing::debug!(
+        "Kill switch inputs: control-plane permit for uid {} on tcp/443 to {} addresses",
+        inputs.euid,
+        inputs.control_plane.len()
     );
+    inputs
+}
 
-    // Record pf's pre-existing state BEFORE we change it, so deactivation only
-    // disables pf if we were the ones who enabled it.
-    let was_enabled = pf_is_enabled();
+/// How often a held block is re-verified (P2-3): the auto-reconnect
+/// heartbeat's period.
+#[cfg(target_os = "macos")]
+const PF_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-    // Pipe rules directly to pfctl via stdin — avoids TOCTOU race and world-readable temp file
-    pf_load_ruleset(&rules)?;
+/// Start the pf watchdog, once per process. Cheap while nothing is held: a
+/// lock and a flag every 30 s. Its own task rather than a hook in the
+/// auto-reconnect loop, so it also covers a block held outside a session (a
+/// lift that failed after a give-up, a stale block found at startup).
+#[cfg(target_os = "macos")]
+fn ensure_pf_watchdog() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        tauri::async_runtime::spawn(async {
+            loop {
+                tokio::time::sleep(PF_WATCHDOG_INTERVAL).await;
+                pf_watchdog_tick().await;
+            }
+        });
+    });
+}
 
-    // Enable pf if it wasn't already, and remember that we did so.
-    if !was_enabled {
-        let en = crate::utils::hidden_cmd("pfctl").args(["-e"]).output();
-        // `pfctl -e` returns non-zero if pf was already enabled; we already
-        // guarded on was_enabled, so treat a spawn failure as fatal — an
-        // un-enabled pf means the loaded block ruleset is not enforced.
-        match en {
-            Ok(_) => PF_WE_ENABLED.store(true, Ordering::SeqCst),
-            Err(e) => return Err(format!("pfctl enable failed: {}", e)),
+/// One watchdog pass: see `PfState::watchdog`.
+#[cfg(target_os = "macos")]
+async fn pf_watchdog_tick() {
+    let mut pf = PF.lock().await;
+    let (loaded, wanted) = (pf.loaded, pf.wanted);
+    let outcome = pf.watchdog(
+        &Pfctl,
+        pf_inputs,
+        crate::api::doh_resolver::control_plane_generation(),
+    );
+    mirror(&pf);
+    drop(pf);
+    let Some(result) = outcome else {
+        return;
+    };
+    match result {
+        Ok(()) if !loaded => tracing::warn!(
+            "Kill switch watchdog: something else had disabled or replaced the IPv6 leak block; restored"
+        ),
+        Ok(()) if wanted => tracing::warn!(
+            "Kill switch watchdog: something else had disabled or replaced the pf block; restored"
+        ),
+        Ok(()) => {
+            tracing::info!("Kill switch watchdog: retried an owed lift of the pf block; lifted")
+        }
+        Err(e) => tracing::error!("Kill switch watchdog: {}", e),
+    }
+    blocking_may_have_changed();
+}
+
+/// macOS: the tunnel now runs on `name` (MR-1125, P2-1).
+///
+/// The block-all permits the tunnel by interface NAME, and that one only. A
+/// reconnect or a settings reapply engages the block BEFORE the new device
+/// exists, so the name is recorded here, the moment `create_utun_device`
+/// returns it, and a held block is re-loaded at once and READ BACK permitting
+/// it. `Err` — the tunnel's traffic would meet `block drop all` — must fail
+/// the start: this used to be only logged, and an automatic reconnect could
+/// reach Connected behind a block that dropped everything in the tunnel.
+#[cfg(target_os = "macos")]
+pub async fn tunnel_interface_up(name: &str) -> Result<(), String> {
+    let mut pf = PF.lock().await;
+    let held = pf.loaded;
+    let inputs = pf_inputs();
+    let result = pf.tunnel_up(&Pfctl, &inputs, name);
+    mirror(&pf);
+    drop(pf);
+    if held {
+        blocking_may_have_changed();
+    }
+    result
+}
+
+/// macOS: the tunnel on `name` is going away. Its permit leaves a held block
+/// BEFORE the device's fd is closed (P3-4): once closed, the unit is free, and
+/// another VPN that took it before the re-load would pass straight through the
+/// kill switch. Best-effort: a teardown must not fail on it.
+#[cfg(target_os = "macos")]
+pub async fn tunnel_interface_down(name: &str) {
+    let mut pf = PF.lock().await;
+    let inputs = pf_inputs();
+    let result = pf.tunnel_down(&Pfctl, &inputs, name);
+    mirror(&pf);
+    drop(pf);
+    if let Err(e) = result {
+        tracing::warn!("Kill switch: re-loading the block without {}: {}", name, e);
+    }
+    blocking_may_have_changed();
+}
+
+/// [`tunnel_interface_down`] for `Drop`, which cannot await, followed by
+/// `close` — always in that order (P3-4). In place when the lock is free;
+/// otherwise the re-load AND the close are handed to the runtime, so the device
+/// stays open until its permit has left the block, never the other way round.
+#[cfg(target_os = "macos")]
+pub fn tunnel_interface_gone_then(name: &str, close: impl FnOnce() + Send + 'static) {
+    match PF.try_lock() {
+        Ok(mut pf) => {
+            let inputs = pf_inputs();
+            if let Err(e) = pf.tunnel_down(&Pfctl, &inputs, name) {
+                tracing::warn!("Kill switch: re-loading the block without {}: {}", name, e);
+            }
+            mirror(&pf);
+            drop(pf);
+            close();
+        }
+        Err(_) => {
+            let name = name.to_string();
+            tauri::async_runtime::spawn(async move {
+                tunnel_interface_down(&name).await;
+                close();
+            });
         }
     }
+}
 
-    PF_BLOCKING.store(true, Ordering::SeqCst);
-    tracing::info!("macOS pf kill switch activated (main ruleset enforced)");
-    Ok(())
+/// macOS: the kill switch turned off (N2) — see `PfState::lift_if_loaded`.
+#[cfg(target_os = "macos")]
+async fn pf_lift_if_loaded() -> Result<bool, String> {
+    let mut pf = PF.lock().await;
+    let result = pf.lift_if_loaded(&Pfctl);
+    mirror(&pf);
+    result
+}
+
+/// macOS: a DoH answer brought control-plane addresses of `generation` that
+/// the held block's table does not cover (P2-4, N5). The block is re-loaded
+/// NOW, before the resolver caches or hands them out; `Err` makes it cache
+/// nothing, and the watchdog retries by generation.
+#[cfg(target_os = "macos")]
+pub async fn control_plane_learned(generation: u64) -> Result<(), String> {
+    let mut pf = PF.lock().await;
+    let result = pf.control_plane_learned(&Pfctl, pf_inputs, generation);
+    mirror(&pf);
+    drop(pf);
+    match &result {
+        Ok(()) => tracing::info!("Kill switch: control-plane table covers the new address"),
+        Err(e) => tracing::warn!(
+            "Kill switch: re-loading the control-plane table failed: {}",
+            e
+        ),
+    }
+    blocking_may_have_changed();
+    result
 }
 
 /// Deactivate pf blocking: drop the block-all main ruleset and fall back to the
 /// correct baseline — the IPv6 leak block if a tunnel session is still live,
-/// otherwise the system default ruleset (disabling pf only if we enabled it).
+/// otherwise the system default ruleset (dropping our pf reference).
+/// `PfState::disengage` verifies the lift by reading pf back.
 ///
 /// F-001: the fallback is not optional. This runs on every reconnect (the
 /// auto-reconnect loop deactivates once the tunnel is healthy again). Restoring
@@ -1255,24 +1426,26 @@ async fn pf_activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String>
 /// reopen the leak for the rest of the session.
 #[cfg(target_os = "macos")]
 async fn pf_deactivate_blocking() -> Result<(), String> {
-    PF_BLOCKING.store(false, Ordering::SeqCst);
-
-    if PF_IPV6_BLOCK_ACTIVE.load(Ordering::SeqCst) {
-        // Propagating the error deliberately leaves the block-all ruleset loaded.
-        // That is both fail-safe and still usable: block-all permits lo0 and utun*,
-        // so a healthy tunnel keeps carrying the user's traffic. Falling back to
-        // /etc/pf.conf here would restore the IPv6 leak instead.
-        pf_apply_ipv6_baseline()?;
-        tracing::info!("macOS pf kill switch deactivated (IPv6 leak block retained)");
-        return Ok(());
+    let mut pf = PF.lock().await;
+    let onto_baseline = pf.ipv6_baseline;
+    let result = pf.disengage(&Pfctl);
+    mirror(&pf);
+    match &result {
+        Ok(()) if onto_baseline => {
+            tracing::info!("macOS pf kill switch deactivated (IPv6 leak block retained)")
+        }
+        Ok(()) => tracing::info!("macOS pf kill switch deactivated"),
+        Err(e) if pf.loaded => tracing::error!(
+            "macOS pf kill switch is STILL BLOCKING: {}. Left marked active so the next \
+             lift retries; `sudo pfctl -f /etc/pf.conf` clears it manually.",
+            e
+        ),
+        Err(e) => tracing::warn!(
+            "macOS pf kill switch lifted, but its fallback ruleset did not apply cleanly: {}",
+            e
+        ),
     }
-
-    // Reload the default ruleset, dropping our block-all rules. This is the
-    // correct inverse of loading a main ruleset (a per-anchor flush would leave
-    // our main-ruleset block rules in place and keep blocking).
-    pf_restore_default_ruleset();
-    tracing::info!("macOS pf kill switch deactivated");
-    Ok(())
+    result
 }
 
 #[cfg(test)]
