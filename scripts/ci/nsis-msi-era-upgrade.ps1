@@ -107,6 +107,9 @@ $uninstaller = Join-Path $instDir 'uninstall.exe'
 $nsisKey = "$uninstRoot\$product"
 $msiUninstallLnk = Join-Path $instDir "Uninstall $product.lnk"
 $hkcuRecord = "HKCU:\Software\$msiEraPublisher\$product" # the MSI's InstallDir value
+# NSIS_HOOK_POSTINSTALL's pre-D8 mirror lives under this key. POSTUNINSTALL
+# drops the mirror and then this parent (if it is empty), as its last act.
+$mirrorKey = "HKLM:\SOFTWARE\$msiEraPublisher"
 $desktopLnk = Join-Path $env:PUBLIC "Desktop\$product.lnk"
 $programs = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
 $msiStartFolder = Join-Path $programs $product
@@ -285,14 +288,19 @@ function Invoke-OurUninstall {
     Step "our silent uninstall: $uninstaller /S"
     $rc = Invoke-Bounded $uninstaller @('/S') 'the uninstaller'
     if ($rc -ne 0) { Fail "the uninstaller exited $rc" }
-    # It re-runs itself from %TEMP% (Un_A.exe): wait for that copy and the entry.
+    # It re-runs itself from %TEMP% (Un_A.exe). Wait for that copy, the entry,
+    # the folder, and the uninstall's LAST act: NSIS_HOOK_POSTUNINSTALL drops
+    # the mirror key after the template has removed the entry and the folder
+    # (as nsis-install-smoke.ps1 waits for it too).
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
     do {
         $copies = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(Un_[A-Z]|Au_)$' })
-        if ($copies.Count -eq 0 -and -not (Test-Path -LiteralPath $nsisKey) -and -not (Test-Path -LiteralPath $instDir)) { break }
+        if ($copies.Count -eq 0 -and -not (Test-Path -LiteralPath $nsisKey) -and -not (Test-Path -LiteralPath $instDir) -and
+            -not (Test-Path -LiteralPath $mirrorKey)) { break }
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $deadline)
     if (Test-Path -LiteralPath $nsisKey) { Fail "$nsisKey is still there after our uninstall" }
+    if (Test-Path -LiteralPath $mirrorKey) { Fail "$mirrorKey is still there: NSIS_HOOK_POSTUNINSTALL did not finish" }
     if (Test-Path -LiteralPath $instDir) {
         Get-ChildItem -LiteralPath $instDir -Recurse -Force | ForEach-Object { Write-Host "   left: $($_.FullName)" }
         Fail "$instDir is still there after our uninstall"
@@ -356,14 +364,16 @@ if ($ran.Count -ne 0) { Fail "an entry's UninstallString ran: $($ran.Name -join 
 Write-Host "   leftover $($planted.leftover.Key) deleted; other and 1.0.0 entries unchanged; stub never ran"
 
 # A key that has a {GUID}'s length and braces but is no GUID, with every
-# other MSI-era mark: the key name used to reach `msiexec /x` unquoted
-# (Windows Installer answers -2, INVALIDARG, which is not -1), so it could
-# pass arguments or leave a silent install on msiexec's usage dialog. Now
-# IIDFromString rejects it, so msiexec never runs: the hook's msiexec log must
-# not appear. ("Entry unchanged" alone proves nothing: it survives either
-# way.) Planted with the .NET API, because the provider would split the "/"
-# into a sub-key, and checked on their own with the MSI already gone, by
-# running this build over itself.
+# other MSI-era mark. Before IIDFromString, it passed the shape check:
+#   - where MsiQueryProductStateW answers -2 (INVALIDARG), it reached
+#     `msiexec /x` unquoted, able to pass arguments or leave a silent install
+#     on msiexec's usage dialog;
+#   - where it answers -1, as it does on the runner (printed below), it was
+#     deleted as a "leftover".
+# Now nothing matches it, so both checks hold: the hook's msiexec log never
+# appears, and the entry is byte-for-byte unchanged. Planted with the .NET
+# API, because the provider would split the "/" into a sub-key. Checked on
+# their own, with the MSI already gone, by running this build over itself.
 Step 'a 38-character key that is not a GUID never reaches msiexec'
 $hklm64 = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
 $uninstPath = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
