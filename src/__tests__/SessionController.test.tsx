@@ -28,6 +28,7 @@ import { signOut } from '@/session/session';
 import {
   forgetKillSwitchChoices,
   KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
+  persistSettings,
   setKillSwitch,
 } from '@/session/settings-persist';
 import { CONSENT_VERSION } from '@/lib/consent';
@@ -397,6 +398,65 @@ describe("sign-out ends the session's kill switch choices (follow-up 3 to the re
     act(() => useAppStore.setState({ isAuthenticated: true }));
     await waitFor(() => expect(callsTo('get_settings')).toHaveLength(2));
     await waitFor(() => expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true));
+  });
+
+  // Review of #255, L2: an OFF still in flight at sign-out, whose save is
+  // refused only after the next session has re-read the settings. It was
+  // still the latest choice, so it put that session's toggle OFF over the
+  // saved ON, and the next save of anything wrote the OFF into the file.
+  it('an OFF still in flight at sign-out writes nothing into the next session when its refusal lands', async () => {
+    forgetKillSwitchChoices();
+    let refuseSave: () => void = () => {};
+    let held = true;
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd, args) => {
+      if (cmd === 'save_settings' && held) {
+        held = false;
+        return new Promise((_, reject) => {
+          refuseSave = () =>
+            reject({
+              code: 'settings_unverified',
+              message: 'the settings file could not be verified, so it was left as it is',
+              retryable: true,
+              retry_after_secs: null,
+            });
+        });
+      }
+      return base(cmd, args);
+    });
+    function SignedIn() {
+      return useAppStore((s) => s.isAuthenticated) ? <VpnSessionController /> : null;
+    }
+    render(<SignedIn />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    await waitFor(() => expect(useAppStore.getState().settingsHydrated).toBe(true));
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    let off: Promise<void> = Promise.resolve();
+    await act(async () => {
+      off = setKillSwitch(false);
+    });
+    expect(callsTo('save_settings')).toHaveLength(1);
+
+    await act(async () => {
+      await signOut();
+    });
+    act(() => useAppStore.setState({ isAuthenticated: true }));
+    await waitFor(() => expect(callsTo('get_settings')).toHaveLength(2));
+    await waitFor(() => expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true));
+
+    await act(async () => {
+      refuseSave();
+      await off;
+    });
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    expect(useAppStore.getState().notice?.text).not.toBe(KILL_SWITCH_OFF_THIS_CONNECTION_COPY);
+    // The next save of anything writes the file's ON, not the last session's OFF.
+    await act(async () => {
+      expect(await persistSettings({ autoConnect: true })).toBe(true);
+    });
+    const saved = callsTo('save_settings').map(([, a]) => (a as { settings: Record<string, unknown> }).settings);
+    expect(saved).toHaveLength(2);
+    expect(saved[1]).toMatchObject({ killswitch_enabled: true, auto_connect: true });
   });
 });
 

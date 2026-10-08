@@ -709,6 +709,49 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(intent).toBe(false);
   });
 
+  // Review of #255, L1: the reset left the kill switch to an ON still being
+  // made, whose save was then refused. The toggle went back to OFF and the
+  // intent stayed OFF while the file held the defaults' ON: honest on screen,
+  // but the reset's kill switch was lost. It now finishes once the ON ends.
+  it('a reset left to an ON that is then refused finishes: the defaults\' kill switch, on screen and live (L1)', async () => {
+    let refuseSave: () => void = () => {};
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'save_settings') return new Promise((_, reject) => (refuseSave = () => reject(UNVERIFIED)));
+      return base(cmd, args as never);
+    });
+    useAppStore.setState({ connectionState: 'connected', settings: { ...defaultSettings, killSwitchEnabled: false } });
+    const on = setKillSwitch(true);
+    await resetSettings(); // the defaults are saved; the toggle is left to the ON
+    expect(intent).toBe(false);
+    refuseSave();
+    await on;
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    expect(intent).toBe(true);
+    expect(pushesOn()).toHaveLength(1);
+  });
+
+  it('a reset left to a choice that takes stays left to it: nothing re-read, no ON pushed (L1)', async () => {
+    let landSave: () => void = () => {};
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'save_settings') return new Promise<void>((r) => (landSave = r));
+      return base(cmd, args as never);
+    });
+    intent = true;
+    useAppStore.setState({ connectionState: 'reconnecting', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    // Made before the reset, saved after it.
+    const off = setKillSwitch(false);
+    await waitFor(() => expect(intent).toBe(false));
+    await resetSettings();
+    landSave();
+    await off;
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    expect(intent).toBe(false);
+    expect(pushesOn()).toHaveLength(0);
+    expect(mockedInvoke.mock.calls.filter(([c]) => c === 'get_settings')).toHaveLength(1);
+  });
+
   // Follow-up 4: a re-read in flight while the toggle moved hydrated the file
   // as it was before the save, so the toggle read ON beside an OFF that had
   // been pushed and saved — and the next save of anything wrote that ON.

@@ -274,7 +274,13 @@ export async function resetSettings(): Promise<void> {
   // switch choice made before the reset must not be pushed back over them
   // after the next dial — so it goes at once, before anything below reads
   // it (round 8).
-  if (reset && !chosen) forgetKillSwitchChoices();
+  if (reset && !chosen) {
+    forgetKillSwitchChoices();
+  } else if (reset && choicesInFlight.size > 0) {
+    // Left to a choice still in flight, which may yet not take: the reset
+    // then finishes once it has ended (`finishWaitingReset`, review of #255, L1).
+    resetWaiting = { since };
+  }
   await reloadSettings();
   if (!reset) {
     useAppStore.getState().showNotice({
@@ -395,6 +401,13 @@ let standingChoice: StandingChoice | null = null;
 const choicesInFlight = new Set<number>();
 
 /**
+ * A reset that left the kill switch to a choice still in flight (follow-up 2),
+ * kept so it can finish if that choice does not take (review of #255, L1):
+ * `since` as the reset took it.
+ */
+let resetWaiting: { since: number } | null = null;
+
+/**
  * Whether the kill switch is a choice's to settle rather than the caller's:
  * one is still being made, or one made after choice number `since` stands
  * (follow-ups 2 and 4 to the review of #222). A re-read or a reset that
@@ -464,10 +477,41 @@ function savedKillSwitch(enabled: boolean): void {
  * (follow-up 3 to the review of #222: the session controller's teardown, so
  * a same-run sign-in does not show the last session's this-connection OFF),
  * and for tests. One still in flight no longer holds up the next re-read.
+ *
+ * Nor is it the latest choice any more (review of #255, L2): a refused OFF
+ * still in flight at sign-out answered in the next session, and put its
+ * toggle OFF over that session's saved ON. A reset forgets only when no
+ * choice is in flight, so there this changes nothing.
  */
 export function forgetKillSwitchChoices(): void {
   standingChoice = null;
   choicesInFlight.clear();
+  killSwitchChoice++;
+  resetWaiting = null;
+}
+
+/**
+ * A kill switch choice ended. If a reset left the kill switch to it and it did
+ * not take, the reset's kill switch would be lost: an ON refused while the
+ * reset ran went back to OFF, the intent stayed OFF, and the file held the
+ * defaults' ON. Once the last choice in flight has ended without one taking,
+ * the reset finishes what it left: forget, re-read, and arm the defaults.
+ * A choice that took settles the kill switch, as before. One forgotten at
+ * sign-out never gets here (`setKillSwitch`).
+ */
+async function finishWaitingReset(took: boolean): Promise<void> {
+  const waiting = resetWaiting;
+  if (!waiting) return;
+  if (took) {
+    resetWaiting = null;
+    return;
+  }
+  if (choicesInFlight.size > 0) return;
+  resetWaiting = null;
+  if (choiceOwnsKillSwitch(waiting.since)) return;
+  forgetKillSwitchChoices();
+  await reloadSettings();
+  await armTheResetDefaults(waiting.since);
 }
 
 /**
@@ -502,13 +546,15 @@ export async function setKillSwitch(enabled: boolean): Promise<void> {
   const mine: StandingChoice = { enabled, made: choice };
   standingChoice = mine;
   choicesInFlight.add(choice);
+  let stands = false;
   try {
-    const stands = enabled ? await turnKillSwitchOn() : await turnKillSwitchOff(choice, mine);
+    stands = enabled ? await turnKillSwitchOn() : await turnKillSwitchOff(choice, mine);
     // A choice that did not take leaves the one before it standing, as the
     // toggle went back to it.
     if (!stands && standingChoice === mine) standingChoice = previous;
   } finally {
-    choicesInFlight.delete(choice);
+    // Not there: forgotten meanwhile (sign-out), so its end settles nothing.
+    if (choicesInFlight.delete(choice)) await finishWaitingReset(stands);
   }
 }
 
