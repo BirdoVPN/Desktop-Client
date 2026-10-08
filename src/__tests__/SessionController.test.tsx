@@ -449,7 +449,8 @@ describe("sign-out ends the session's kill switch choices (follow-up 3 to the re
       await off;
     });
     expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
-    expect(useAppStore.getState().notice?.text).not.toBe(KILL_SWITCH_OFF_THIS_CONNECTION_COPY);
+    // Nor is the next session told about it (review of #261).
+    expect(useAppStore.getState().notice).toBeNull();
     // The next save of anything writes the file's ON, not the last session's OFF.
     await act(async () => {
       expect(await persistSettings({ autoConnect: true })).toBe(true);
@@ -457,6 +458,56 @@ describe("sign-out ends the session's kill switch choices (follow-up 3 to the re
     const saved = callsTo('save_settings').map(([, a]) => (a as { settings: Record<string, unknown> }).settings);
     expect(saved).toHaveLength(2);
     expect(saved[1]).toMatchObject({ killswitch_enabled: true, auto_connect: true });
+  });
+
+  // Review of #261: an ON in flight at sign-out, refused in the next session
+  // (perhaps another account's), said "couldn't save" there, with a reset to
+  // offer for a file that could not be verified.
+  it('an ON still in flight at sign-out says nothing in the next session when its refusal lands', async () => {
+    forgetKillSwitchChoices();
+    rustSettings = { ...rustSettings, killswitch_enabled: false };
+    let refuseSave: () => void = () => {};
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd, args) => {
+      if (cmd === 'save_settings') {
+        return new Promise((_, reject) => {
+          refuseSave = () =>
+            reject({
+              code: 'settings_unverified',
+              message: 'the settings file could not be verified, so it was left as it is',
+              retryable: true,
+              retry_after_secs: null,
+            });
+        });
+      }
+      return base(cmd, args);
+    });
+    function SignedIn() {
+      return useAppStore((s) => s.isAuthenticated) ? <VpnSessionController /> : null;
+    }
+    render(<SignedIn />);
+    await waitFor(() => expect(useAppStore.getState().settingsHydrated).toBe(true));
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    let on: Promise<void> = Promise.resolve();
+    await act(async () => {
+      on = setKillSwitch(true);
+    });
+    expect(callsTo('save_settings')).toHaveLength(1);
+
+    await act(async () => {
+      await signOut();
+    });
+    act(() => useAppStore.setState({ isAuthenticated: true }));
+    await waitFor(() => expect(callsTo('get_settings')).toHaveLength(2));
+    await waitFor(() => expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false));
+
+    await act(async () => {
+      refuseSave();
+      await on;
+    });
+    expect(useAppStore.getState().notice).toBeNull();
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    expect(callsTo('set_killswitch_live')).toHaveLength(0);
   });
 });
 

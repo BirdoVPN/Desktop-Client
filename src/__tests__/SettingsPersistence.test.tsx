@@ -752,6 +752,151 @@ describe('the kill switch across dials (round 5 of the review of #222)', () => {
     expect(mockedInvoke.mock.calls.filter(([c]) => c === 'get_settings')).toHaveLength(1);
   });
 
+  // Review of #261.
+  it('two choices in flight at the reset, both refused: it finishes once, after the last (REVIEW-E)', async () => {
+    const refusals: Array<() => void> = [];
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'save_settings') return new Promise((_, reject) => refusals.push(() => reject(UNVERIFIED)));
+      return base(cmd, args as never);
+    });
+    useAppStore.setState({ connectionState: 'connected', settings: { ...defaultSettings, killSwitchEnabled: false } });
+    const a = setKillSwitch(true);
+    const b = setKillSwitch(true);
+    await waitFor(() => expect(refusals).toHaveLength(2));
+    await resetSettings();
+    refusals[0]();
+    await a;
+    expect(pushesOn()).toHaveLength(0);
+    refusals[1]();
+    await b;
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    expect(intent).toBe(true);
+    expect(pushesOn()).toHaveLength(1);
+  });
+
+  it('a this-connection OFF made during the reset stands when an older ON in flight is refused (REVIEW-F)', async () => {
+    let answerReset: (r: boolean) => void = () => {};
+    const refusals: Array<() => void> = [];
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'reset_settings') return new Promise((r) => (answerReset = r));
+      if (cmd === 'save_settings') return new Promise((_, reject) => refusals.push(() => reject(UNVERIFIED)));
+      return base(cmd, args as never);
+    });
+    useAppStore.setState({ connectionState: 'connected', settings: { ...defaultSettings, killSwitchEnabled: false } });
+    const on = setKillSwitch(true);
+    await waitFor(() => expect(refusals).toHaveLength(1));
+    const reset = resetSettings();
+    const off = setKillSwitch(false);
+    await waitFor(() => expect(refusals).toHaveLength(2));
+    refusals[1]();
+    await off;
+    answerReset(true);
+    await reset;
+    refusals[0]();
+    await on;
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+    expect(intent).toBe(false);
+    expect(pushesOn()).toHaveLength(0);
+  });
+
+  it('a reset that finishes for a refused ON says so last, over the refusal (REVIEW-N)', async () => {
+    let refuseSave: () => void = () => {};
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'save_settings') return new Promise((_, reject) => (refuseSave = () => reject(UNVERIFIED)));
+      return base(cmd, args as never);
+    });
+    useAppStore.setState({ connectionState: 'connected', settings: { ...defaultSettings, killSwitchEnabled: false } });
+    const on = setKillSwitch(true);
+    await resetSettings();
+    refuseSave();
+    await on;
+    // Not the refusal's "could not be verified ... Reset settings".
+    expect(useAppStore.getState().notice?.text).toBe('Your settings were reset to their defaults.');
+    expect(useAppStore.getState().notice?.actionLabel).toBeUndefined();
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    expect(intent).toBe(true);
+  });
+
+  // REVIEW-P/Q: ON is not pushed during a dial; the dial's own arm brings it.
+  // But that arm stands aside when the intent moved after the dial began (an
+  // OFF pushed during it: arm_since), and the reset has just forgotten the
+  // choice the dial-end check would compare, so the dial came up OFF under a
+  // toggle reading ON.
+  it('a reset during a switch that an OFF already moved: the dial comes up ON (REVIEW-P)', async () => {
+    useAppStore.setState({ connectionState: 'switching', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    const dialBegan = seq;
+    saveRefused = true;
+    await setKillSwitch(false); // pushed: the dial's arm will stand aside
+    expect(intent).toBe(false);
+    saveRefused = false;
+    await resetSettings();
+    expect(pushesOn()).toHaveLength(0); // not during the dial
+    if (seq === dialBegan) intent = true; // the dial's arm_since
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await waitFor(() => expect(intent).toBe(true));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    expect(pushesOn()).toHaveLength(1);
+  });
+
+  it('a waiting reset finished during a switch that an OFF already moved: the dial comes up ON (REVIEW-Q)', async () => {
+    useAppStore.setState({ connectionState: 'switching', settings: { ...defaultSettings, killSwitchEnabled: true } });
+    const dialBegan = seq;
+    saveRefused = true;
+    await setKillSwitch(false); // this-connection OFF, pushed: the dial's arm will stand aside
+    expect(intent).toBe(false);
+    saveRefused = false;
+    let refuseSave: () => void = () => {};
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'save_settings') return new Promise((_, reject) => (refuseSave = () => reject(UNVERIFIED)));
+      return base(cmd, args as never);
+    });
+    const on = setKillSwitch(true); // persisted-only while switching; its save is refused
+    await resetSettings();
+    refuseSave();
+    await on;
+    expect(pushesOn()).toHaveLength(0); // not during the dial
+    if (seq === dialBegan) intent = true; // the dial's arm_since
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await waitFor(() => expect(intent).toBe(true));
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true);
+    expect(pushesOn()).toHaveLength(1);
+  });
+
+  it('a sign-out while a reset waits ends it: a refused choice in the next session re-runs nothing', async () => {
+    const refusals: Array<() => void> = [];
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === 'save_settings') return new Promise((_, reject) => refusals.push(() => reject(UNVERIFIED)));
+      return base(cmd, args as never);
+    });
+    useAppStore.setState({ connectionState: 'connected', settings: { ...defaultSettings, killSwitchEnabled: false } });
+    const old = setKillSwitch(true);
+    await resetSettings(); // left to the ON
+    // Sign-out (the session controller's teardown), then the next session.
+    forgetKillSwitchChoices();
+    useAppStore.getState().logout();
+    useAppStore.setState({
+      isAuthenticated: true,
+      connectionState: 'connected',
+      settings: { ...defaultSettings, killSwitchEnabled: false },
+    });
+    const reads = mockedInvoke.mock.calls.filter(([c]) => c === 'get_settings').length;
+    const next = setKillSwitch(true);
+    await waitFor(() => expect(refusals).toHaveLength(2));
+    refusals[0]();
+    await old;
+    refusals[1]();
+    await next;
+    expect(mockedInvoke.mock.calls.filter(([c]) => c === 'get_settings')).toHaveLength(reads);
+    expect(pushesOn()).toHaveLength(0);
+    expect(intent).toBe(false);
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+  });
+
   // Follow-up 4: a re-read in flight while the toggle moved hydrated the file
   // as it was before the save, so the toggle read ON beside an OFF that had
   // been pushed and saved — and the next save of anything wrote that ON.
