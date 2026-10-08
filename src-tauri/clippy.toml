@@ -1,0 +1,20 @@
+# Clippy configuration, read from the crate root by `cargo clippy` (the
+# required "Rust lint (Windows)" job runs it with `-D warnings`).
+
+disallowed-methods = [
+    # `get_settings` is the UI's read ONLY (commands/settings.rs,
+    # `settings_for_the_ui`): it refuses a settings file that cannot be
+    # verified, where Rust's own reads (`load_settings_sync`,
+    # `load_settings_off_runtime`) give the defaults the session runs on.
+    # Round 6 of the review of #222: four Rust callers read through it, and
+    # every connect then ran with post-quantum and Windows lockdown OFF.
+    #
+    # One path per crate the module tree is compiled into: the library, and
+    # main.rs, which declares its own `mod commands`. Clippy skips a path
+    # whose crate does not resolve without a word (`crate::` among them), so
+    # two `#[expect(clippy::disallowed_methods)]` keep these live: the
+    # registration in main.rs (`ipc_handler`, the one allowed use) and the
+    # canary test `clippy_disallows_get_settings` in commands/settings.rs.
+    { path = "birdo_vpn_desktop_lib::commands::settings::get_settings", reason = "the UI's read only: Rust code reads through load_settings_sync / load_settings_off_runtime" },
+    { path = "birdo_vpn_desktop::commands::settings::get_settings", reason = "the UI's read only: Rust code reads through load_settings_sync / load_settings_off_runtime" },
+]
