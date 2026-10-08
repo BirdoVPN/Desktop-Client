@@ -116,8 +116,15 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 Add-Type -Namespace BirdoCi -Name Msi -MemberDefinition @'
 [DllImport("msi.dll", CharSet = CharSet.Unicode)]
 public static extern int MsiQueryProductStateW(string product);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
 '@
 function Get-ProductState([string]$code) { return [BirdoCi.Msi]::MsiQueryProductStateW($code) } # 5 installed, -1 unknown
+function Get-LongPath([string]$path) {
+    $sb = New-Object System.Text.StringBuilder 1024
+    if ([BirdoCi.Msi]::GetLongPathNameW($path, $sb, 1024) -gt 0) { return $sb.ToString() }
+    return $path
+}
 
 # One value from the MSI's Property table, read without installing anything.
 function Get-MsiProperty([string]$path, [string]$name) {
@@ -197,18 +204,21 @@ function Install-MsiEra([string]$code) {
     $want = [ordered]@{ DisplayName = $product; Publisher = $msiEraPublisher; WindowsInstaller = '1' }
     foreach ($k in $want.Keys) { if ($e.$k -cne $want[$k]) { Fail "the MSI's entry has $k '$($e.$k)', expected '$($want[$k])'" } }
     if ($e.UninstallString -notmatch '(?i)^msiexec\.exe /x\{') { Fail "the MSI's UninstallString is '$($e.UninstallString)'" }
-    if ($e.InstallLocation.TrimEnd('\') -ne $instDir) { Fail "the MSI installed into '$($e.InstallLocation)', not $instDir" }
+    if ((Get-LongPath $e.InstallLocation.TrimEnd('\')) -ne $instDir) { Fail "the MSI installed into '$($e.InstallLocation)', not $instDir" }
     # What it shares with this installer: the exe's path, birdo://, the
     # desktop shortcut. Plus what only it has.
     foreach ($f in @($exe, $msiUninstallLnk, $desktopLnk, (Join-Path $msiStartFolder "$product.lnk"))) {
         if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { Fail "the MSI did not install $f" }
     }
+    # The MSI writes the exe's SHORT path (Tauri's WiX template uses [!Path]):
+    # the same file, the same key.
     foreach ($s in $schemes) {
         $cmd = Get-DefaultValue "HKLM:\SOFTWARE\Classes\$s\shell\open\command"
-        if ($cmd -ne "`"$exe`" `"%1`"") { Fail "after the MSI, ${s}:// opens '$cmd'" }
+        if ($cmd -notmatch '^"([^"]+)" "%1"$' -or (Get-LongPath $Matches[1]) -ne $exe) { Fail "after the MSI, ${s}:// opens '$cmd'" }
+        Write-Host "   ${s}:// -> $cmd (the MSI's short path for $exe)"
     }
     $rec = (Get-ItemProperty -LiteralPath $hkcuRecord -ErrorAction SilentlyContinue).InstallDir
-    if ($rec -ne "$instDir\") { Fail "$hkcuRecord InstallDir is '$rec'" }
+    if (-not $rec -or (Get-LongPath $rec.TrimEnd('\')) -ne $instDir) { Fail "$hkcuRecord InstallDir is '$rec'" }
     Write-Host "   $code  ""$($e.DisplayName)"" / ""$($e.Publisher)"" $($e.DisplayVersion) WindowsInstaller=$($e.WindowsInstaller)"
     Write-Host "   UninstallString: $($e.UninstallString); InstallLocation: $($e.InstallLocation)"
     Write-Host "   shares with this installer: $exe, birdo://, $desktopLnk; only its own: $msiUninstallLnk, $msiStartFolder\, $hkcuRecord InstallDir"
