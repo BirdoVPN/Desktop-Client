@@ -4,11 +4,23 @@ still fail the shapes they exist to fail.
 
 A checker nobody has watched fail is a comment with a shell script around it.
 Every case below mutates a copy of the vendored SSOT (third_party/cert-pins.json)
-or feeds a real measured chain to the check, and asserts BOTH the verdict and
-the words it is reported in. The first case in each group is the committed
-file itself. No hash is written down here: every pin is looked up in the SSOT
-by lineage and role, so check 2's sweep for unregistered pin-bearing files has
-nothing to find, and a pin change upstream cannot silently un-test a fixture.
+plus the retired dns.google fixture (third_party/retired-dns-google.json, see
+below), or feeds a real measured chain to the check, and asserts BOTH the
+verdict and the words it is reported in. The first case in each group is the
+committed file itself. No hash is written down here: every pin is looked up in
+the SSOT or the fixture by lineage and role, so check 2's sweep for
+unregistered pin-bearing files has nothing to find, and a pin change upstream
+cannot silently un-test a fixture.
+
+dns.google and dns.quad9.net left the SSOT on 2026-10-01 (birdo-shared #20:
+the control-plane DoH is Cloudflare-only, D5). dns.google was the one real
+two-hierarchy host these checks were built against, so rather than lose
+PRE_OUTAGE and the cases around it, its last shape is kept as a frozen
+fixture: a byte-identical copy of birdo-shared's
+scripts/fixtures/retired-dns-google.json, in third_party/ because check 2's
+sweep and check 2c both skip that directory (it holds GTS Root R4 and WE1,
+which are live birdo.app pins, and the six never-shipped siblings). BASE =
+the committed SSOT + that fixture; the committed SSOT is also checked alone.
 
 The case that matters most is PRE_OUTAGE: dns.google exactly as it shipped
 before 2026-09-06 - WR2 + GTS Root R1, both live, ONE lineage. An earlier
@@ -48,6 +60,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SSOT = os.path.join(ROOT, "third_party", "cert-pins.json")
+RETIRED_DNS_GOOGLE = os.path.join(ROOT, "third_party", "retired-dns-google.json")
 
 
 def load_module(name):
@@ -63,7 +76,14 @@ live_chain = load_module("cert_pins_live_chain")
 retired = load_module("cert_pins_retired")
 
 with open(SSOT, encoding="utf-8") as fh:
-    BASE = json.load(fh)
+    COMMITTED = json.load(fh)
+with open(RETIRED_DNS_GOOGLE, encoding="utf-8") as fh:
+    _FIXTURE = json.load(fh)
+assert "dns.google" not in COMMITTED["hosts"], (
+    "dns.google is back in the vendored SSOT - retire third_party/retired-dns-google.json")
+BASE = copy.deepcopy(COMMITTED)
+BASE["hosts"]["dns.google"] = copy.deepcopy(_FIXTURE["host"])
+BASE["_removed"] = BASE["_removed"] + copy.deepcopy(_FIXTURE["_removed"])
 
 # A fixed "today" so a waiver fixture with review_by 2099 never expires and one
 # with review_by 2025 is always in the past, whatever the runner's clock says.
@@ -95,7 +115,6 @@ WE2 = pin("dns.google", lineage="gts-r4", role="active-intermediate")
 R4 = pin("dns.google", lineage="gts-r4", role="active-root")
 CF_ECC_R2 = pin("cloudflare-dns.com", lineage="sslcom-ecc", role="active-intermediate")
 CF_ROOT = pin("cloudflare-dns.com", lineage="sslcom-ecc", role="dormant-backup")
-Q9_CA1 = pin("dns.quad9.net", lineage="digicert-global-g3", role="active-intermediate")
 WE1 = pin("birdo.app", lineage="gts-r4", role="active-intermediate")
 BIRDO_R4 = pin("birdo.app", lineage="gts-r4", role="active-root")
 ISRG_X1 = pin("birdo.app", lineage="isrg-x1", role="dormant-backup", live=False) \
@@ -108,7 +127,6 @@ ISRG_X1 = pin("birdo.app", lineage="isrg-x1", role="dormant-backup", live=False)
 LEAF_GOOGLE_R1 = "qW3FYuXf0SK210sV5lcUYE1NGTmBA398Ee6LXLqneUY="
 LEAF_GOOGLE_R4 = "wyib/Zb8QzNvhqZ9QF7LzXCMzYApj7PsLe/ZjlfJzuI="
 LEAF_CLOUDFLARE = "ltQ6aXy3tqpNZKJdnevMD7oR+IsI5rNWbOssFDrl+Ew="
-LEAF_QUAD9 = "i2kObfz0qIKCGNWt7MjBUeSrh0Dyjb0/zWINImZES+I="
 LEAF_BIRDO = "nyzbCYB1+JcItoSGtxXfjT7t2Cm023p3pk0NmqGnyYo="
 UNPINNED = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
@@ -127,6 +145,11 @@ def waiver(review_by="2099-01-01", matchable_pins=2, live_lineages=1, accepted=T
 
 
 # ----------------------------------------------------- check 2b: mutators
+def committed(doc):
+    """The vendored SSOT exactly as committed, without the retired fixture."""
+    return copy.deepcopy(COMMITTED)
+
+
 def unchanged(doc):
     return doc
 
@@ -236,12 +259,16 @@ def new_host_single_lineage(doc):
 
 # (name, mutator, expected failed?, substrings that MUST appear, substrings that must NOT)
 LINEAGE_CASES = [
-    ("committed file passes: dns.google two live lineages, waived hosts named",
+    ("committed file passes: waived hosts named, no retired host left",
+     committed, False,
+     ["ok    birdo.app: 1 live lineage gts-r4", "KNOWN, ACCEPTED, DATED",
+      "ok    cloudflare-dns.com: 1 live lineage sslcom-ecc"],
+     ["FAIL", "ok    dns.google", "dns.quad9.net"]),
+    ("committed file + the retired dns.google fixture passes (the base every case below mutates)",
      unchanged, False,
      ["ok    dns.google: 2 live lineages", "gts-r1", "gts-r4",
-      "ok    birdo.app: 1 live lineage gts-r4", "KNOWN, ACCEPTED, DATED",
-      "ok    cloudflare-dns.com: 1 live lineage sslcom-ecc",
-      "ok    dns.quad9.net: 1 live lineage digicert-global-g3"],
+      "ok    birdo.app: 1 live lineage gts-r4",
+      "ok    cloudflare-dns.com: 1 live lineage sslcom-ecc"],
      ["FAIL"]),
     ("PRE_OUTAGE: WR2 + R1 live in one lineage + dormant foreign pin, no waiver -> FAIL",
      pre_outage, True,
@@ -316,10 +343,6 @@ CLOUDFLARE_CHAIN = [
     row(CF_ECC_R2, "CN=SSL.com SSL Intermediate CA ECC R2",
         "CN=SSL.com Root Certification Authority ECC"),
 ]
-QUAD9_CHAIN = [
-    row(LEAF_QUAD9, "CN=dns.quad9.net", "CN=DigiCert Global G3 TLS ECC SHA384 2020 CA1"),
-    row(Q9_CA1, "CN=DigiCert Global G3 TLS ECC SHA384 2020 CA1", "CN=DigiCert Global Root G3"),
-]
 BIRDO_CHAIN = [
     row(LEAF_BIRDO, "CN=birdo.app", "CN=WE1"),
     row(WE1, "CN=WE1", "CN=GTS Root R4"),
@@ -342,9 +365,6 @@ LIVE_CASES = [
      "cloudflare-dns.com", entry("cloudflare-dns.com"), CLOUDFLARE_CHAIN, False,
      ["ok    cloudflare-dns.com: live chain satisfies pin", "(lineage sslcom-ecc)"],
      ["FAIL", "NOT OBSERVED", "SHORTENED"]),
-    ("dns.quad9.net two-certificate chain -> ok",
-     "dns.quad9.net", entry("dns.quad9.net"), QUAD9_CHAIN, False,
-     ["ok    dns.quad9.net: live chain satisfies pin"], ["FAIL", "NOT OBSERVED"]),
     ("birdo.app WE1 chain, root cross-signed -> ok (the other shape the self-signed test failed)",
      "birdo.app", entry("birdo.app"), BIRDO_CHAIN, False,
      ["ok    birdo.app: live chain satisfies pin", "(lineage gts-r4)"], ["FAIL", "SHORTENED"]),
