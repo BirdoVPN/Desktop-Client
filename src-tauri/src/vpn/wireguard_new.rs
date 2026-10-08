@@ -1363,6 +1363,10 @@ impl WireGuardSession {
     }
 
     /// Close the WireGuard session
+    ///
+    /// Called by the Windows teardown (tunnel.rs). The Linux and macOS
+    /// teardowns drop the session instead (`*wg_session = None`).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub async fn close(&self) {
         tracing::debug!("Closing WireGuard session");
         self.closed.store(true, Ordering::SeqCst);

@@ -16,6 +16,9 @@ set -euo pipefail
 
 hook=src-tauri/nsis-hooks.nsh
 call='!insertmacro CheckIfAppIsRunning "[^"]*" "[^"]*"'
+# Any call at all, whatever its arguments: $call only sees the quoted form, so
+# a second call with unquoted arguments would otherwise ship unchecked.
+any_call='^[[:space:]]*!insertmacro[[:space:]]+CheckIfAppIsRunning([[:space:]]|$)'
 
 shopt -s nullglob
 bins=(node_modules/@tauri-apps/cli-*/*.node)
@@ -27,10 +30,11 @@ fi
 sig=$(grep -a -o -h '!macro CheckIfAppIsRunning [A-Za-z_]* [A-Za-z_]*' "${bins[@]}" | sort -u || true)
 template=$(grep -a -o -h "$call" "${bins[@]}" | sort -u || true)
 ours=$(tr -d '\r' < "$hook" | grep -o "$call" | sort -u || true)
+call_lines=$(tr -d '\r' < "$hook" | grep -cE "$any_call" || true)
 
 echo "bundler macro:  ${sig:-<not found>}"
 echo "template calls: ${template:-<not found>}"
-echo "hook calls:     ${ours:-<not found>}"
+echo "hook calls:     ${ours:-<not found>} (on $call_lines line(s))"
 
 if [ -z "$sig" ] || [ -z "$template" ]; then
   echo "::error::CheckIfAppIsRunning is gone from the @tauri-apps/cli templates - re-check $hook's NSIS_HOOK_PREUNINSTALL by hand"
@@ -42,6 +46,10 @@ if [ "$(printf '%s\n' "$template" | wc -l)" -ne 1 ]; then
 fi
 if [ -z "$ours" ]; then
   echo "::error::$hook no longer calls CheckIfAppIsRunning (REVIEW-WIN2-008 depends on it)"
+  exit 1
+fi
+if [ "$call_lines" -ne 1 ]; then
+  echo "::error::$hook calls CheckIfAppIsRunning on $call_lines lines (want exactly 1): only a call with quoted arguments is compared with the template below"
   exit 1
 fi
 if [ "$ours" != "$template" ]; then

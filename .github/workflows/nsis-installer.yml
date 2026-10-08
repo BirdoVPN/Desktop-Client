@@ -151,6 +151,15 @@ jobs:
           "XRAY_BINARY_SHA256=$binarySha" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Bundling wintun.dll and Xray $xrayVersion xray.exe ($binarySha)"
 
+          # The tracked src-tauri/resources/.gitkeep is there for the builds
+          # that stage nothing (tests, clippy, MSRV, CodeQL): tauri-build fails
+          # when the "resources/*" glob matches no file. That glob matches
+          # dotfiles too, so a bundling build drops it once the real files are
+          # in, or the installer puts it in Program Files (release.yml does the
+          # same; the smoke test below fails on any installed dotfile).
+          if (Test-Path -LiteralPath src-tauri/resources/.gitkeep) { Remove-Item -LiteralPath src-tauri/resources/.gitkeep }
+          Get-ChildItem -LiteralPath src-tauri/resources -File -Force | ForEach-Object { Write-Host "resources/$($_.Name)" }
+
       - name: Build the NSIS installer (unsigned)
         timeout-minutes: 25 # cargo + makensis took 8-11 min
         env:

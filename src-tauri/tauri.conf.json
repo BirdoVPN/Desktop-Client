@@ -90,7 +90,8 @@
       "endpoints": [
         "https://api.birdo.app/updates/{{target}}/{{arch}}/{{current_version}}"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MjREQjkxNjE0Nzk1MUUKUldRZWxVZGhrZHNrUjVmLzE5NUwvd0s1Zi9QVHhnK1NsT200MS9zSkJnZFZiZFhIdjFGWWZsTDgK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MjREQjkxNjE0Nzk1MUUKUldRZWxVZGhrZHNrUjVmLzE5NUwvd0s1Zi9QVHhnK1NsT200MS9zSkJnZFZiZFhIdjFGWWZsTDgK",
+      "requireSignedVersion": true
     },
     "deep-link": {
       "desktop": {

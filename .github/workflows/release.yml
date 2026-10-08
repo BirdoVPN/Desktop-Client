@@ -346,6 +346,12 @@ jobs:
           # Unsigned (PR/dispatch) builds ship exactly these bytes.
           "XRAY_BINARY_SHA256=$binarySha" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Xray ready: src-tauri/resources/xray.exe ($binarySha)"
+          # The tracked resources/.gitkeep only keeps tauri-build's
+          # "resources/*" glob matching in builds that stage nothing. The glob
+          # matches dotfiles, so with the real files in place it goes, or the
+          # installer puts it in Program Files (nsis-installer.yml's smoke test
+          # fails on that).
+          if (Test-Path -LiteralPath src-tauri/resources/.gitkeep) { Remove-Item -LiteralPath src-tauri/resources/.gitkeep }
 
       # ── Client attestation key (release builds only) ─────────────────
       # A tagged release MUST be able to attest itself: without the secret,
@@ -716,10 +722,15 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # The tracked resources/.gitkeep only keeps tauri-build's "resources/*"
+      # glob matching in builds that stage nothing; the next step stages xray,
+      # and a glob matches dotfiles, so the placeholder would ship in the
+      # package. (It was `touch`ed here before: v1.4.46's .deb carries
+      # usr/lib/BirdoVPN/resources/.gitkeep.)
       - name: Prepare resources directory
         run: |
           mkdir -p src-tauri/resources
-          touch src-tauri/resources/.gitkeep
+          rm -f src-tauri/resources/.gitkeep
 
       # Download + SHA-verify + bundle the pinned Xray Reality engine, mirroring
       # the Windows pipeline. Without this the release fails closed: xray.rs
@@ -930,10 +941,11 @@ jobs:
           sips -z 1024 1024 src-tauri/icons/icon.png --out icon.iconset/icon_512x512@2x.png
           iconutil -c icns icon.iconset -o src-tauri/icons/icon.icns
 
+      # As in build-linux: the placeholder goes, the next step stages xray.
       - name: Prepare resources directory
         run: |
           mkdir -p src-tauri/resources
-          touch src-tauri/resources/.gitkeep
+          rm -f src-tauri/resources/.gitkeep
 
       # Download + SHA-verify + bundle the pinned Xray Reality engine, mirroring
       # the Windows pipeline. Picks the asset for the matrix arch. Without this

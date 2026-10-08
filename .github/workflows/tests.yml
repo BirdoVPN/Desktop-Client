@@ -227,46 +227,15 @@ jobs:
       # superset of `cargo check`, so this is still this job's compile guard:
       # a compile error fails the step.
       #
-      # WARN-ONLY for now, deliberately: its first run (PR #223) found 12
-      # (Linux) / 11 (macOS) pre-existing warnings - cfg-gated dead code and
-      # unused variables in shared code, too_many_arguments, and small lints in
-      # the tunnel files that the open stacked PRs #220-#222 are rewriting.
-      # They are listed in #223 as a follow-up; once fixed, add
-      # `-- -D warnings` here to match the Windows job. Until then the count
-      # and every warning are surfaced as an annotation + step summary.
-      - name: cargo clippy (all targets; warn-only, see comment) - also the compile check
+      # -D warnings, as the Windows job. It was warn-only from PR #223, whose
+      # first run found 12 (Linux) / 11 (macOS) pre-existing warnings in code
+      # the Windows job never compiles: cfg-gated dead code, an unused `mut`,
+      # too_many_arguments in both packet loops and small lints in the tunnel
+      # files. Those are fixed; a new one now fails the PR on the platform
+      # that has it.
+      - name: cargo clippy (all targets, deny warnings) - also the compile check
         working-directory: src-tauri
-        env:
-          OS: ${{ matrix.os }}
-          # Plain text: the workflow-level `always` colours `warning:` with ANSI
-          # codes, which the counter below cannot match (it silently reported 0
-          # on its first run).
-          CARGO_TERM_COLOR: never
-        run: |
-          set -euo pipefail
-          cargo clippy --locked --all-targets --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.log"
-          # One line per distinct `file:line:col: warning: ...` (the lib and
-          # lib-test builds report the same sites; cargo's own "generated N
-          # warnings" summary lines have no file prefix and are not counted).
-          grep -E '^[^ ]+:[0-9]+:[0-9]+: warning: ' "$RUNNER_TEMP/clippy.log" | sort -u > "$RUNNER_TEMP/clippy-warnings.txt" || true
-          n=$(wc -l < "$RUNNER_TEMP/clippy-warnings.txt" | tr -d ' ')
-          # Self-check: cargo's own "generated N warnings" summary must agree
-          # that there is something to count, or the counter is broken and
-          # would report a false zero.
-          generated=$(grep -oE 'generated [0-9]+ warnings?' "$RUNNER_TEMP/clippy.log" | grep -oE '[0-9]+' | sort -n | tail -n 1 || true)
-          if [ "${generated:-0}" -gt 0 ] && [ "$n" -eq 0 ]; then
-            echo "::error::cargo reported $generated clippy warnings but the counter matched none - the warning parser is broken"
-            exit 1
-          fi
-          {
-            echo "### clippy on $OS: $n distinct warning(s) (warn-only; follow-up in PR #223)"
-            echo '```'
-            cat "$RUNNER_TEMP/clippy-warnings.txt"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$n" -gt 0 ]; then
-            echo "::warning::clippy on $OS: $n distinct warning(s) in the $OS cfg code (warn-only until the PR #223 follow-up; listed in the job summary)"
-          fi
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       # The DNS crash-recovery journal is the only record of the user's
       # pre-connect resolvers, so it must survive a restore that did not land.

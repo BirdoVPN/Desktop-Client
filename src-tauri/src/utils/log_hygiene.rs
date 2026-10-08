@@ -297,6 +297,12 @@ fn scan_args(file: &str, line: usize, args: &str) -> Vec<Finding> {
             i = end;
             continue;
         }
+        // The redactor itself passed as a function, `.map(redact_ip)`: the form
+        // clippy's redundant_closure asks for instead of `.map(|s| redact_ip(s))`.
+        if ident.starts_with("redact_") || ident.starts_with("sanitize_") {
+            i = end;
+            continue;
+        }
         // A presence test discloses nothing.
         if after.starts_with(".is_some()") || after.starts_with(".is_none()") {
             i = end;
@@ -467,6 +473,19 @@ mod tests {
         let src = r#"fn f() { tracing::info!("{:?}",
             snapshot.default_gateway.as_deref().map(|s| redact_ip(s))); }"#;
         assert!(scan_source("t.rs", src).is_empty());
+    }
+
+    #[test]
+    fn accepts_a_redactor_passed_as_a_function() {
+        let src = r#"fn f() { tracing::info!("{:?}",
+            snapshot.default_gateway.as_deref().map(redact_ip)); }"#;
+        assert!(scan_source("t.rs", src).is_empty());
+        // ...but the address it is mapped over still has to be redacted.
+        let src = r#"fn f() { tracing::info!("{:?} {}",
+            snapshot.default_gateway.as_deref().map(redact_ip), gateway_ip); }"#;
+        let hits = scan_source("t.rs", src);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].ident, "gateway_ip");
     }
 
     /// The on-disk log level clamp must stay WIRED, not merely exist.

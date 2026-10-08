@@ -503,4 +503,29 @@ mod tests {
             "the probing monitor is back"
         );
     }
+
+    /// Google and Quad9 are retired, so no resolv.conf we write may name
+    /// them either: the Linux restore's last resort (tunnel_linux.rs
+    /// `FALLBACK_NAMESERVERS`) wrote 1.1.1.1 + 8.8.8.8 until it became
+    /// Cloudflare's 1.1.1.1 + 1.0.0.1. Read as text because tunnel_linux.rs
+    /// compiles only on Linux, and this test runs in the Windows job too
+    /// (tunnel_linux.rs's own test of the content runs on the Linux leg).
+    #[test]
+    fn no_retired_public_resolver_in_the_resolv_conf_we_write() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vpn");
+        let linux = std::fs::read_to_string(dir.join("tunnel_linux.rs")).expect("read source");
+        let fallback = linux
+            .lines()
+            .find(|line| line.starts_with("const FALLBACK_NAMESERVERS"))
+            .expect("tunnel_linux.rs declares FALLBACK_NAMESERVERS");
+        assert!(fallback.contains("\"1.1.1.1\", \"1.0.0.1\""), "{fallback}");
+        for host in ["8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112"] {
+            assert!(!fallback.contains(host), "{fallback}");
+            let line = ["nameserver ", host].concat();
+            assert!(
+                !linux.contains(&line),
+                "tunnel_linux.rs writes `{line}` into resolv.conf"
+            );
+        }
+    }
 }

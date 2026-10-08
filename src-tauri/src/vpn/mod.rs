@@ -588,6 +588,10 @@ pub mod dns_journal {
         /// It KEEPS the record (the service may come back and still needs its
         /// resolvers put back), but it raises no banner. Mirrors Windows'
         /// `Degradation::dormant`, which is explicitly distinct from a fault.
+        ///
+        /// Only the macOS restore has such entries (a detached network
+        /// service); the Linux record is one file, which is there or is not.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         pub(super) fn note_dormant(&mut self) {
             self.unverified += 1;
         }
@@ -705,8 +709,9 @@ pub mod dns_journal {
     /// capture that reads back the PREVIOUS session's tunnel resolvers is not a
     /// baseline, so the older one is kept.
     ///
-    /// Pure and free of `cfg` so the Windows job actually runs its tests.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    /// Pure and free of `cfg` so the Windows job actually runs its tests; only
+    /// `record_macos` calls it outside them.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(super) fn merge_macos_capture(
         fresh: &[(String, Vec<String>)],
         old_services: &[(String, Vec<String>)],
@@ -751,10 +756,12 @@ pub mod dns_journal {
     /// carried our marker - and "already ours" IS the retained-record case, so
     /// this is not a corner. Writing that `None` over a retained backup drops
     /// the real bytes and arms `restore_dns`'s fallback, which writes
-    /// `nameserver 1.1.1.1` / `nameserver 8.8.8.8`, then verifies (our marker is
+    /// `nameserver 1.1.1.1` / `nameserver 1.0.0.1`, then verifies (our marker is
     /// legitimately gone) and clears the journal: the user's own resolvers
     /// replaced by two public ones, permanently, by the recovery path.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    ///
+    /// Pure for the same reason; only `record_linux` calls it outside tests.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) fn merge_linux_capture(
         fresh: Option<&str>,
         retained: Option<&str>,
@@ -1156,7 +1163,7 @@ pub mod dns_journal {
         /// `record_linux` filters out a resolv.conf carrying our own marker, so
         /// a capture taken while a previous session is still unrestored is
         /// ALWAYS `None`. Writing that over the retained bytes armed
-        /// `restore_dns`'s fallback, which writes 1.1.1.1/8.8.8.8, verifies
+        /// `restore_dns`'s fallback, which writes 1.1.1.1/1.0.0.1, verifies
         /// (our marker is legitimately gone) and clears the journal.
         #[test]
         fn a_none_capture_never_overwrites_retained_resolv_conf_bytes() {

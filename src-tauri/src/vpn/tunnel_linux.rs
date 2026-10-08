@@ -213,7 +213,7 @@ impl LinuxTunnel {
         let snapshot = capture_network_snapshot().await?;
         tracing::info!(
             "Captured network snapshot: gw={:?}, iface={:?}",
-            snapshot.default_gateway.as_deref().map(|s| redact_ip(s)),
+            snapshot.default_gateway.as_deref().map(redact_ip),
             snapshot.default_interface
         );
         *self.network_snapshot.write().await = Some(snapshot);
@@ -323,7 +323,7 @@ impl LinuxTunnel {
 
         // Configure DNS
         let snapshot = self.network_snapshot.read().await;
-        let uses_resolved = snapshot.as_ref().map_or(false, |s| s.uses_systemd_resolved);
+        let uses_resolved = snapshot.as_ref().is_some_and(|s| s.uses_systemd_resolved);
         drop(snapshot);
         let pinned = match configure_dns(&self.config.dns, &tun_name, uses_resolved).await {
             Ok(pinned) => pinned,
@@ -550,6 +550,7 @@ impl LinuxTunnel {
     /// on every non-idle iteration a page fault or memset for the pages the
     /// kernel actually filled) per packet, on the hot path, for the whole
     /// session. See [`tun_read_owned`].
+    #[allow(clippy::too_many_arguments)] // shared session handles, moved into the task once
     async fn packet_loop(
         tun_fd: i32,
         wg_session: Arc<RwLock<Option<WireGuardSession>>>,
@@ -911,22 +912,21 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
         .split(':')
         .next()
         .ok_or_else(|| "Invalid endpoint format: missing host".to_string())?;
-    if endpoint_host.parse::<Ipv4Addr>().is_err() {
-        if endpoint_host.is_empty()
+    if endpoint_host.parse::<Ipv4Addr>().is_err()
+        && (endpoint_host.is_empty()
             || endpoint_host.len() > 253
             || !endpoint_host
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
             || endpoint_host.starts_with('-')
-            || endpoint_host.starts_with('.')
-        {
-            // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
-            // in manager.rs / auto_reconnect.rs at levels release builds write.
-            return Err(format!(
-                "Invalid endpoint hostname: '{}'",
-                crate::utils::redact::redact_hostname(endpoint_host)
-            ));
-        }
+            || endpoint_host.starts_with('.'))
+    {
+        // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
+        // in manager.rs / auto_reconnect.rs at levels release builds write.
+        return Err(format!(
+            "Invalid endpoint hostname: '{}'",
+            crate::utils::redact::redact_hostname(endpoint_host)
+        ));
     }
 
     for dns in &config.dns {
@@ -1596,6 +1596,27 @@ fn resolv_conf_read_back_verified(intended: &str, after: Option<&str>) -> bool {
     }
 }
 
+/// The resolvers `restore_dns` writes when the original /etc/resolv.conf was
+/// unreadable at snapshot time AND no DNS server was recorded either.
+///
+/// Cloudflare's two addresses only: BirdoVPN uses Cloudflare (DoH) and no
+/// other public resolver, Google's 8.8.8.8 and Quad9's 9.9.9.9 included.
+const FALLBACK_NAMESERVERS: [&str; 2] = ["1.1.1.1", "1.0.0.1"];
+
+/// The resolv.conf to write back when the original bytes are gone: the
+/// recorded servers, or [`FALLBACK_NAMESERVERS`] when none were recorded.
+fn resolv_conf_from_servers(dns_servers: &[String]) -> String {
+    let servers: Vec<&str> = if dns_servers.is_empty() {
+        FALLBACK_NAMESERVERS.to_vec()
+    } else {
+        dns_servers.iter().map(String::as_str).collect()
+    };
+    servers
+        .iter()
+        .map(|dns| format!("nameserver {dns}\n"))
+        .collect()
+}
+
 /// Restore original DNS configuration.
 ///
 /// Deliberately synchronous (it never awaited anything): it must be callable
@@ -1666,16 +1687,7 @@ fn restore_dns(snapshot: &NetworkSnapshot) -> DnsRestoreOutcome {
     } else {
         // We overwrote the file but its original bytes were unreadable at
         // snapshot time. Best effort: write back the original DNS servers.
-        let mut contents = String::new();
-        if snapshot.dns_servers.is_empty() {
-            // No original DNS — write a reasonable default
-            contents.push_str("nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
-        } else {
-            for dns in &snapshot.dns_servers {
-                contents.push_str(&format!("nameserver {}\n", dns));
-            }
-        }
-        (contents, "snapshot")
+        (resolv_conf_from_servers(&snapshot.dns_servers), "snapshot")
     };
 
     // Verified, not attempted. The journal is deleted off this answer, and it
@@ -2034,7 +2046,36 @@ mod ipv6_leak_block_tests {
 /// alongside the root-only ipv6 tests without needing sudo.
 #[cfg(test)]
 mod resolv_conf_restore_tests {
-    use super::{resolv_conf_read_back_verified, write_resolv_conf_verified, RESOLV_CONF_MARKER};
+    use super::{
+        resolv_conf_from_servers, resolv_conf_read_back_verified, write_resolv_conf_verified,
+        RESOLV_CONF_MARKER,
+    };
+
+    /// With neither the original bytes nor a recorded server, the restore
+    /// falls back to Cloudflare's two resolvers and nothing else. BirdoVPN
+    /// retired Google and Quad9: the fallback used to be 1.1.1.1 + 8.8.8.8.
+    #[test]
+    fn the_last_resort_resolvers_are_cloudflare_only() {
+        let fallback = resolv_conf_from_servers(&[]);
+        assert_eq!(fallback, "nameserver 1.1.1.1\nnameserver 1.0.0.1\n");
+        for retired in ["8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112"] {
+            assert!(
+                !fallback.contains(retired),
+                "the resolv.conf fallback names {retired}"
+            );
+        }
+    }
+
+    /// Recorded servers are written back as they were, in order; the fallback
+    /// is only for when there are none.
+    #[test]
+    fn recorded_servers_are_written_back_unchanged() {
+        let recorded = vec!["192.168.1.1".to_string(), "10.0.0.53".to_string()];
+        assert_eq!(
+            resolv_conf_from_servers(&recorded),
+            "nameserver 192.168.1.1\nnameserver 10.0.0.53\n"
+        );
+    }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -2110,7 +2151,7 @@ mod resolv_conf_restore_tests {
     fn a_file_replaced_by_something_else_is_not_a_verified_restore() {
         let backup = "nameserver 192.168.1.1\n";
         assert!(
-            !resolv_conf_read_back_verified(backup, Some("nameserver 9.9.9.9\n")),
+            !resolv_conf_read_back_verified(backup, Some("nameserver 192.168.1.254\n")),
             "our marker being absent is not proof that OUR bytes landed"
         );
         assert!(resolv_conf_read_back_verified(backup, Some(backup)));

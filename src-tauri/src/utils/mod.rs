@@ -26,6 +26,7 @@ pub use redact::redact_ip;
 ///
 /// On non-Windows platforms, this returns a plain `Command`.
 pub fn hidden_cmd(program: &str) -> std::process::Command {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut cmd = std::process::Command::new(program);
     #[cfg(target_os = "windows")]
     {

@@ -400,9 +400,10 @@ mod tests {
         );
     }
 
-    /// W1-038: the updater plugin (v2) reads only endpoints, pubkey, windows
-    /// and the dangerous_* switches. The v1 `active` / `dialog` keys did
-    /// nothing, while suggesting an update dialog that does not exist.
+    /// W1-038: the updater plugin (v2) reads only endpoints, pubkey, windows,
+    /// the dangerous_* switches and, in 2.13.1, allowDowngrades and
+    /// requireSignedVersion. The v1 `active` / `dialog` keys did nothing,
+    /// while suggesting an update dialog that does not exist.
     #[test]
     fn the_updater_config_carries_only_keys_the_plugin_reads() {
         let conf: serde_json::Value =
@@ -412,6 +413,62 @@ mod tests {
             .expect("plugins.updater");
         let mut keys: Vec<&str> = updater.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["endpoints", "pubkey"]);
+        assert_eq!(keys, vec!["endpoints", "pubkey", "requireSignedVersion"]);
+    }
+
+    /// The update endpoint's response is not signed, only the artifact is. With
+    /// `requireSignedVersion` the plugin also requires the signature's trusted
+    /// comment, which the signature covers, to name the version the endpoint
+    /// announced, so a forged response cannot pair a higher version number
+    /// with an older, genuinely signed release. Without the flag a signature
+    /// that names no version (every release up to 1.4.45) skips that check.
+    ///
+    /// The flag is enforced by the RUNNING app on the update it downloads
+    /// (tauri-plugin-updater 2.13.1: `Update::download` -> `verify_signature`
+    /// with the announced version), and this app takes only a strictly newer
+    /// release: no custom version comparator, allowDowngrades off. So every
+    /// update a build with the flag can take is a release signed by
+    /// @tauri-apps/cli 2.12 or later, which writes `version:<x.y.z>` (the
+    /// v1.4.46 signatures carry `version:1.4.46`; the v1.4.45 ones, CLI
+    /// 2.11.4, carry none).
+    ///
+    /// Read through the plugin's own Config, so a misspelt key, which the
+    /// plugin ignores without a word, fails here; and the CLI that signs the
+    /// releases must be one that writes the version, or every update would be
+    /// signed in a form this flag rejects.
+    #[test]
+    fn updates_must_carry_a_signature_bound_to_their_version() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).expect("tauri.conf.json");
+        let updater: tauri_plugin_updater::Config =
+            serde_json::from_value(conf["plugins"]["updater"].clone())
+                .expect("plugins.updater is a valid updater config");
+        assert!(
+            updater.require_signed_version,
+            "plugins.updater.requireSignedVersion must be true"
+        );
+        assert!(
+            !updater.allow_downgrades,
+            "allowDowngrades lets an older release be installed, which is what the signed version guards against"
+        );
+        let comparator = ["version", "_comparator"].concat();
+        assert!(!include_str!("../main.rs").contains(&comparator));
+        assert!(!include_str!("updater.rs").contains(&comparator));
+
+        let lock: serde_json::Value =
+            serde_json::from_str(include_str!("../../../package-lock.json"))
+                .expect("package-lock.json");
+        let cli = lock["packages"]["node_modules/@tauri-apps/cli"]["version"]
+            .as_str()
+            .expect("@tauri-apps/cli in package-lock.json");
+        let cli_version: Vec<u64> = cli
+            .split(['.', '-', '+'])
+            .take(3)
+            .map(|part| part.parse().expect("numeric @tauri-apps/cli version"))
+            .collect();
+        assert!(
+            cli_version >= vec![2, 12, 0],
+            "@tauri-apps/cli {cli} signs updates without `version:`; requireSignedVersion would reject every one"
+        );
     }
 }

@@ -13,13 +13,17 @@
 #      the installer still builds;
 #   3. every NSIS_HOOK_* macro the hook file defines is one the generated
 #      template invokes. The template wraps each call in !ifmacrodef, so a
-#      renamed or misspelt hook is skipped without a word;
-#   4. the hook calls CheckIfAppIsRunning exactly as the generated template
-#      does, in the full-path form "$INSTDIR\${MAINBINARYNAME}.exe".
-#      tauri-bundler 2.10.0 (@tauri-apps/cli 2.12) turned the macro's first
-#      parameter from an executable name into a path for Restart Manager; the
-#      hook's bare name still compiled and silently matched nothing
-#      (REVIEW-WIN2-008).
+#      renamed or misspelt hook is skipped without a word. A definition is
+#      read whatever the whitespace after !macro, and with its whole name
+#      (NSIS_HOOK_PREINSTALL2 is not NSIS_HOOK_PREINSTALL);
+#   4. the hook calls CheckIfAppIsRunning on exactly one line, exactly as the
+#      generated template does, in the full-path form
+#      "$INSTDIR\${MAINBINARYNAME}.exe". tauri-bundler 2.10.0 (@tauri-apps/cli
+#      2.12) turned the macro's first parameter from an executable name into a
+#      path for Restart Manager; the hook's bare name still compiled and
+#      silently matched nothing (REVIEW-WIN2-008). The line count is what
+#      catches a second call the form comparison cannot see, such as one with
+#      unquoted arguments.
 #
 # Usage, from the repo root after the build:
 #   check-generated-nsis.sh [nsis-dir] [hook] [bundle-dir]
@@ -37,6 +41,8 @@ bundle_dir=${3:-src-tauri/target/release/bundle/nsis}
 # shellcheck disable=SC2016
 want_call='!insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"'
 call_re='!insertmacro CheckIfAppIsRunning "[^"]*" "[^"]*"'
+# Any call at all, whatever its arguments: call_re only sees the quoted form.
+any_call_re='^[[:space:]]*!insertmacro[[:space:]]+CheckIfAppIsRunning([[:space:]]|$)'
 
 fail() {
   echo "::error::check-generated-nsis: $*"
@@ -86,8 +92,8 @@ done < <(plain "$nsi" | sed -n 's/^[[:space:]]*!include "\([^"]*\)"[[:space:]]*$
 echo "OK 2/4 installer.nsi includes ${included[0]} (the same bytes as $hook)"
 
 # -- 3. every hook the file defines is one the template invokes --------------
-defined=$(plain "$hook" | sed -n 's/^[[:space:]]*!macro \(NSIS_HOOK_[A-Z_]*\).*$/\1/p' | sort -u)
-invoked=$(plain "$nsi" | sed -n 's/^[[:space:]]*!insertmacro \(NSIS_HOOK_[A-Z_]*\)[[:space:]]*$/\1/p' | sort -u)
+defined=$(plain "$hook" | sed -n 's/^[[:space:]]*!macro[[:space:]]\{1,\}\(NSIS_HOOK_[A-Za-z0-9_]*\).*$/\1/p' | sort -u)
+invoked=$(plain "$nsi" | sed -n 's/^[[:space:]]*!insertmacro[[:space:]]\{1,\}\(NSIS_HOOK_[A-Za-z0-9_]*\)[[:space:]]*$/\1/p' | sort -u)
 [ -n "$defined" ] || fail "$hook defines no NSIS_HOOK_* macro"
 [ -n "$invoked" ] || fail "installer.nsi invokes no NSIS_HOOK_* macro: the bundler's hook points changed - re-check $hook by hand"
 dead=$(comm -23 <(printf '%s\n' "$defined") <(printf '%s\n' "$invoked") | tr '\n' ' ')
@@ -99,10 +105,13 @@ echo "OK 3/4 hooks defined and invoked: $(tr '\n' ' ' <<<"$defined")"
 sig=$(cat "$nsis_dir"/*.nsh | tr -d '\r' | grep -oE '!macro CheckIfAppIsRunning [A-Za-z_]+ [A-Za-z_]+' | sort -u || true)
 template=$(plain "$nsi" | grep -oE "$call_re" | sort -u || true)
 ours=$(plain "$hook" | grep -oE "$call_re" | sort -u || true)
+call_lines=$(plain "$hook" | grep -cE "$any_call_re" || true)
 echo "   generated macro:  ${sig:-<not found>}"
 echo "   template calls:   ${template:-<not found>}"
-echo "   hook calls:       ${ours:-<not found>}"
+echo "   hook calls:       ${ours:-<not found>} (on $call_lines line(s))"
 [ -n "$sig" ] || fail "no CheckIfAppIsRunning macro in the generated $nsis_dir/*.nsh - the hook's call cannot compile against it; re-check by hand"
+[ "$call_lines" -eq 1 ] ||
+  fail "$hook calls CheckIfAppIsRunning on $call_lines lines (want exactly 1): the form checks below see only calls with quoted arguments, so any other call would ship unchecked"
 [ "$(lines "$template")" -eq 1 ] ||
   fail "the generated template calls CheckIfAppIsRunning in $(lines "$template") forms (want 1) - decide by hand which one the hook must use"
 [ "$(lines "$ours")" -eq 1 ] || fail "$hook calls CheckIfAppIsRunning in $(lines "$ours") forms (want 1; REVIEW-WIN2-008 depends on it)"
