@@ -503,7 +503,8 @@ fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
     true
 }
 
-/// The saved settings, for the UI ([`settings_for_the_ui`]).
+/// The saved settings, for the UI ([`settings_for_the_ui`]). Rust code may
+/// not call it: clippy.toml lists it in `disallowed-methods`.
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<AppSettings, IpcError> {
     off_the_runtime(move || settings_for_the_ui(load_settings(&app))).await
@@ -524,7 +525,8 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, IpcError> {
 /// ([`settings_for_rust`]), which give those defaults. Round 5 wrote "Rust's
 /// own callers still get the defaults" here while four of them called
 /// `get_settings`: every connect then ran with post-quantum and Windows
-/// lockdown OFF, and the tray's Quick Connect failed (round 6).
+/// lockdown OFF, and the tray's Quick Connect failed (round 6). Clippy now
+/// refuses any such call (clippy.toml).
 fn settings_for_the_ui(loaded: Result<Loaded, LoadError>) -> Result<AppSettings, IpcError> {
     verified(loaded?)
 }
@@ -2151,9 +2153,11 @@ mod tests {
 
     /// Round 6 of the review (P2-1): the UI's read refuses an unverifiable
     /// file, Rust's read gives the defaults the session runs on — post-quantum
-    /// and Windows lockdown ON — and no Rust code reads through the UI's.
+    /// and Windows lockdown ON. That no Rust code reads through the UI's is
+    /// clippy's to enforce (clippy.toml `disallowed-methods`; see
+    /// [`clippy_disallows_get_settings`]).
     #[test]
-    fn rust_reads_an_unverifiable_files_defaults_and_never_through_get_settings() {
+    fn rust_reads_an_unverifiable_files_defaults() {
         let unverifiable = || Ok(Loaded::Unverified(AppSettings::default()));
         assert!(settings_for_the_ui(unverifiable()).is_err());
         let rust = settings_for_rust(unverifiable()).unwrap();
@@ -2164,28 +2168,26 @@ mod tests {
             "lockdown as default"
         );
         assert!(settings_for_rust(Err(LoadError::Unreadable("busy".into()))).is_err());
+    }
 
-        // Every .rs file but this one: no call of the UI's read.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut stack = vec![root];
-        let mut callers = Vec::new();
-        while let Some(dir) = stack.pop() {
-            for entry in fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs")
-                    && !path.ends_with("commands/settings.rs")
-                    && fs::read_to_string(&path).unwrap().contains("get_settings(")
-                {
-                    callers.push(path);
-                }
-            }
-        }
-        assert!(
-            callers.is_empty(),
-            "Rust code calls get_settings: {callers:?}"
-        );
+    /// Follow-up 5 to the review of #222: no Rust code reads through the UI's
+    /// read. A source scan for `get_settings(` stood here, and missed an
+    /// alias, a fn value, a macro's call and any caller in this file; clippy
+    /// resolves the path (clippy.toml `disallowed-methods`) and the required
+    /// lint job denies its warning.
+    ///
+    /// This reference is the canary: clippy skips a configured path that does
+    /// not resolve without a word, and the expectation then goes unfulfilled,
+    /// which fails the lint job. The test target is compiled into both crates
+    /// the module tree is part of (the library and main.rs), so it checks both
+    /// entries; `ipc_handler` in main.rs checks the binary's again.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the canary that keeps the clippy.toml entry live"
+    )]
+    fn clippy_disallows_get_settings() {
+        let _ui_read = get_settings;
     }
 
     /// Round 5 of the review (N5): when the re-check's own load quarantined

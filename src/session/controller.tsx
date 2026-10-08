@@ -32,6 +32,7 @@ import {
 } from '@/session/session-data';
 import { connectPreferred, findLiveServer } from '@/session/vpn-actions';
 import {
+  forgetKillSwitchChoices,
   persistSettings,
   reloadSettings,
   watchKillSwitchAcrossDials,
@@ -193,6 +194,11 @@ function useSessionData(): void {
     return () => {
       offShown();
       resetSessionData();
+      // Sign-out (follow-up 3 to the review of #222): this session's kill
+      // switch choices end with it. Kept, a same-run sign-in re-read the
+      // settings under the last session's this-connection OFF, and the
+      // toggle showed OFF over a saved ON with no connection to be off for.
+      forgetKillSwitchChoices();
     };
   }, []);
 }

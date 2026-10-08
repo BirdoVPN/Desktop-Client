@@ -114,6 +114,84 @@ fn reconcile_and_exit() -> ! {
     std::process::exit(0)
 }
 
+/// The IPC command table.
+///
+/// Registering `get_settings` here is its one allowed use in Rust code: it is
+/// the UI's read, and clippy.toml disallows it everywhere else (follow-up 5
+/// to the review of #222). The expectation keeps that entry honest too: a
+/// path that stopped resolving is skipped silently by clippy, and would
+/// leave this unfulfilled, which fails the lint job.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "registers get_settings, the UI's read, as an IPC command"
+)]
+fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        // Authentication
+        commands::auth::login,
+        commands::auth::login_anonymous,
+        commands::auth::register_anonymous,
+        commands::oauth::native_oauth_login, // native Google/GitHub SSO
+        commands::auth::logout,
+        commands::auth::get_auth_state,
+        commands::auth::verify_2fa,     // FIX C-2: 2FA TOTP verification
+        commands::auth::delete_account, // GDPR account deletion
+        commands::auth::deletion_preflight, // what a deletion leaves billing
+        commands::auth::export_user_data, // GDPR data export
+        commands::session::end_expired_session, // a command answered session_expired
+        // VPN operations
+        commands::vpn::connect_vpn,
+        commands::vpn::disconnect_vpn,
+        commands::vpn::get_vpn_status,
+        commands::vpn::get_vpn_stats,
+        commands::vpn::quick_connect,
+        commands::vpn::reapply_vpn_settings,
+        commands::vpn::get_admin_status,
+        // Server management
+        commands::servers::get_servers,
+        commands::servers::ping_server,
+        // Settings
+        commands::settings::get_settings,
+        commands::settings::save_settings,
+        commands::settings::set_autostart,
+        commands::settings::reset_settings,
+        commands::settings::set_crash_reports_enabled,
+        // Kill switch
+        commands::killswitch::get_killswitch_status,
+        commands::killswitch::set_killswitch_live,
+        // Split Tunneling
+        commands::split_tunnel::list_installed_apps,
+        // Auto-updater (pinned client — see commands/updater.rs)
+        commands::updater::get_app_version,
+        commands::updater::check_for_updates,
+        commands::updater::install_update,
+        commands::updater::get_required_update,
+        // Extended VPN info
+        commands::vpn::get_subscription_status,
+        commands::vpn::get_usage_stats,
+        commands::vpn::get_client_config,
+        // Multi-Hop (Double VPN)
+        commands::vpn_multi_hop::get_multi_hop_routes,
+        commands::vpn_multi_hop::connect_multi_hop,
+        // Port Forwarding
+        commands::vpn_port_forward::get_port_forwards,
+        commands::vpn_port_forward::create_port_forward,
+        commands::vpn_port_forward::delete_port_forward,
+        // Vouchers
+        commands::vouchers::redeem_voucher,
+        // Speed Test
+        commands::speed_test::run_speed_test_command,
+        // Biometric (Windows Hello)
+        commands::biometric::check_biometric_available,
+        commands::biometric::set_biometric_enabled,
+        commands::biometric::authenticate_biometric,
+        // Deep link captured at cold start
+        take_pending_deep_link,
+        // The window up from the tray (re-consent behind Start Minimized)
+        commands::tray::show_main_window,
+    ]
+}
+
 fn main() {
     // Set custom panic hook for crash recovery
     setup_panic_hook();
@@ -599,70 +677,7 @@ fn main() {
                 api.prevent_close();
             }
         })
-        .invoke_handler(tauri::generate_handler![
-            // Authentication
-            commands::auth::login,
-            commands::auth::login_anonymous,
-            commands::auth::register_anonymous,
-            commands::oauth::native_oauth_login, // native Google/GitHub SSO
-            commands::auth::logout,
-            commands::auth::get_auth_state,
-            commands::auth::verify_2fa, // FIX C-2: 2FA TOTP verification
-            commands::auth::delete_account, // GDPR account deletion
-            commands::auth::deletion_preflight, // what a deletion leaves billing
-            commands::auth::export_user_data, // GDPR data export
-            commands::session::end_expired_session, // a command answered session_expired
-            // VPN operations
-            commands::vpn::connect_vpn,
-            commands::vpn::disconnect_vpn,
-            commands::vpn::get_vpn_status,
-            commands::vpn::get_vpn_stats,
-            commands::vpn::quick_connect,
-            commands::vpn::reapply_vpn_settings,
-            commands::vpn::get_admin_status,
-            // Server management
-            commands::servers::get_servers,
-            commands::servers::ping_server,
-            // Settings
-            commands::settings::get_settings,
-            commands::settings::save_settings,
-            commands::settings::set_autostart,
-            commands::settings::reset_settings,
-            commands::settings::set_crash_reports_enabled,
-            // Kill switch
-            commands::killswitch::get_killswitch_status,
-            commands::killswitch::set_killswitch_live,
-            // Split Tunneling
-            commands::split_tunnel::list_installed_apps,
-            // Auto-updater (pinned client — see commands/updater.rs)
-            commands::updater::get_app_version,
-            commands::updater::check_for_updates,
-            commands::updater::install_update,
-            commands::updater::get_required_update,
-            // Extended VPN info
-            commands::vpn::get_subscription_status,
-            commands::vpn::get_usage_stats,
-            commands::vpn::get_client_config,
-            // Multi-Hop (Double VPN)
-            commands::vpn_multi_hop::get_multi_hop_routes,
-            commands::vpn_multi_hop::connect_multi_hop,
-            // Port Forwarding
-            commands::vpn_port_forward::get_port_forwards,
-            commands::vpn_port_forward::create_port_forward,
-            commands::vpn_port_forward::delete_port_forward,
-            // Vouchers
-            commands::vouchers::redeem_voucher,
-            // Speed Test
-            commands::speed_test::run_speed_test_command,
-            // Biometric (Windows Hello)
-            commands::biometric::check_biometric_available,
-            commands::biometric::set_biometric_enabled,
-            commands::biometric::authenticate_biometric,
-            // Deep link captured at cold start
-            take_pending_deep_link,
-            // The window up from the tray (re-consent behind Start Minimized)
-            commands::tray::show_main_window,
-        ])
+        .invoke_handler(ipc_handler())
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {

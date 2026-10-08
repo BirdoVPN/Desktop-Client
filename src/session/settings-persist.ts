@@ -253,6 +253,7 @@ export function askToResetSettings(): void {
  * saved, and a live session is rebuilt on it.
  */
 export async function resetSettings(): Promise<void> {
+  const since = killSwitchChoice;
   let reset: boolean;
   try {
     reset = await invoke<boolean>('reset_settings');
@@ -263,11 +264,17 @@ export async function resetSettings(): Promise<void> {
     });
     return;
   }
+  // A kill switch choice made while the reset ran, or one still being made,
+  // is newer than the defaults (follow-up 2 to the review of #222): the
+  // reset neither forgets it nor pushes ON over it. Forgotten, an OFF whose
+  // refused save answered after the reset put the toggle back to OFF, and
+  // the push below had turned the intent ON under it.
+  const chosen = choiceOwnsKillSwitch(since);
   // The defaults are the choice now (round 6 of the review of #222): a kill
   // switch choice made before the reset must not be pushed back over them
   // after the next dial — so it goes at once, before anything below reads
   // it (round 8).
-  if (reset) forgetKillSwitchChoices();
+  if (reset && !chosen) forgetKillSwitchChoices();
   await reloadSettings();
   if (!reset) {
     useAppStore.getState().showNotice({
@@ -281,7 +288,7 @@ export async function resetSettings(): Promise<void> {
     text: 'Your settings were reset to their defaults.',
     tone: 'info',
   });
-  await armTheResetDefaults();
+  if (!chosen) await armTheResetDefaults(since);
 }
 
 /**
@@ -291,11 +298,32 @@ export async function resetSettings(): Promise<void> {
  * auto-reconnect never arms, so a kill switch turned off for this connection
  * stayed off under a toggle reading ON until the user's next dial. A push
  * that fails says so.
+ *
+ * Only an intent that is OFF is pushed (follow-up 1 to the review of #222).
+ * The push re-arms, and an intent already ON loses by it: while reconnecting
+ * in Windows lockdown no tunnel LUID is published, `activate_blocking`
+ * refuses, and `arm` falls back to the reactive kill switch for the rest of
+ * the session. An intent that cannot be read is pushed, as before: OFF under
+ * a toggle reading ON is the worse of the two. A choice made since the reset
+ * began decides instead (follow-up 2), up to the push itself.
  */
-async function armTheResetDefaults(): Promise<void> {
-  const s = useAppStore.getState();
-  if (!s.settings.killSwitchEnabled) return;
-  if (!killSwitchLiveApplies(s.connectionState, true, s.killSwitchBlocking)) return;
+async function armTheResetDefaults(since: number): Promise<void> {
+  const applies = () => {
+    const s = useAppStore.getState();
+    return (
+      s.settings.killSwitchEnabled &&
+      killSwitchLiveApplies(s.connectionState, true, s.killSwitchBlocking) &&
+      !choiceOwnsKillSwitch(since)
+    );
+  };
+  if (!applies()) return;
+  try {
+    const { enabled } = await invoke<{ enabled: boolean }>('get_killswitch_status');
+    if (enabled === true) return;
+  } catch {
+    /* not known: pushed */
+  }
+  if (!applies()) return;
   try {
     await invoke('set_killswitch_live', { enabled: true });
   } catch {
@@ -355,8 +383,27 @@ let killSwitchChoice = 0;
 interface StandingChoice {
   enabled: boolean;
   thisConnectionOnly?: { saved: boolean };
+  /**
+   * The choice (`killSwitchChoice`) that made it. None for the file's value
+   * that a dial puts back over a this-connection OFF (`dialStarted`).
+   */
+  made?: number;
 }
 let standingChoice: StandingChoice | null = null;
+
+/** The kill-switch choices whose steps have not all run yet. */
+const choicesInFlight = new Set<number>();
+
+/**
+ * Whether the kill switch is a choice's to settle rather than the caller's:
+ * one is still being made, or one made after choice number `since` stands
+ * (follow-ups 2 and 4 to the review of #222). A re-read or a reset that
+ * began before it is older than it. A choice that did not take hands the
+ * kill switch back: the toggle went back to what was there before it.
+ */
+function choiceOwnsKillSwitch(since: number): boolean {
+  return choicesInFlight.size > 0 || (standingChoice?.made ?? 0) > since;
+}
 
 /**
  * Re-read the settings from Rust: every re-read goes through here (round 8
@@ -366,9 +413,23 @@ let standingChoice: StandingChoice | null = null;
  * Hydrated over it, the toggle (and the status chip) read ON while the
  * intent was OFF: reproduced through Reset when the file verified again
  * (`reset_settings` answering false).
+ *
+ * A kill switch choice made while the read was in flight, or still being
+ * made when it lands, keeps the toggle (follow-up 4): the file may predate
+ * its save, and hydrated over it the toggle read ON beside an OFF that was
+ * pushed and then saved. The choice's own steps settle it — and the value a
+ * this-connection OFF gives way to — and every other field is hydrated.
  */
 export async function reloadSettings(): Promise<void> {
-  if (!(await loadSettings())) return;
+  const since = killSwitchChoice;
+  let kept = false;
+  const loaded = await loadSettings((read) => {
+    kept = choiceOwnsKillSwitch(since);
+    return kept
+      ? { ...read, killSwitchEnabled: useAppStore.getState().settings.killSwitchEnabled }
+      : read;
+  });
+  if (!loaded || kept) return;
   const held = standingChoice?.thisConnectionOnly;
   if (!held) return;
   const s = useAppStore.getState();
@@ -398,9 +459,15 @@ function savedKillSwitch(enabled: boolean): void {
   }
 }
 
-/** Forget the kill switch choices made so far: after a reset, and for tests. */
+/**
+ * Forget the kill switch choices made so far: after a reset, at sign-out
+ * (follow-up 3 to the review of #222: the session controller's teardown, so
+ * a same-run sign-in does not show the last session's this-connection OFF),
+ * and for tests. One still in flight no longer holds up the next re-read.
+ */
 export function forgetKillSwitchChoices(): void {
   standingChoice = null;
+  choicesInFlight.clear();
 }
 
 /**
@@ -432,12 +499,17 @@ export function forgetKillSwitchChoices(): void {
 export async function setKillSwitch(enabled: boolean): Promise<void> {
   const choice = ++killSwitchChoice;
   const previous = standingChoice;
-  const mine: StandingChoice = { enabled };
+  const mine: StandingChoice = { enabled, made: choice };
   standingChoice = mine;
-  const stands = enabled ? await turnKillSwitchOn() : await turnKillSwitchOff(choice, mine);
-  // A choice that did not take leaves the one before it standing, as the
-  // toggle went back to it.
-  if (!stands && standingChoice === mine) standingChoice = previous;
+  choicesInFlight.add(choice);
+  try {
+    const stands = enabled ? await turnKillSwitchOn() : await turnKillSwitchOff(choice, mine);
+    // A choice that did not take leaves the one before it standing, as the
+    // toggle went back to it.
+    if (!stands && standingChoice === mine) standingChoice = previous;
+  } finally {
+    choicesInFlight.delete(choice);
+  }
 }
 
 /** Whether the ON was saved. */
