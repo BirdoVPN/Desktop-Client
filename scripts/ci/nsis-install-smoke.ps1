@@ -9,8 +9,9 @@
 # of BirdoVPN is already on the machine.
 #
 # What it proves, beyond "the installer runs":
-#   - the installer lays down the app and its resources, the Apps & features
-#     entry (version and publisher as tauri.conf.json says) and birdo://;
+#   - the installer lays down the app and its resources (and no dotfile such
+#     as resources\.gitkeep), the Apps & features entry (version and
+#     publisher as tauri.conf.json says) and birdo://;
 #   - the hooks in src-tauri/nsis-hooks.nsh are compiled in AND run:
 #       NSIS_HOOK_POSTINSTALL    writes the pre-D8 mirror HKLM\Software\Birdo VPN\BirdoVPN
 #       NSIS_HOOK_PREUNINSTALL   runs "$INSTDIR\<exe>" --reconcile-and-exit, whose
@@ -108,6 +109,13 @@ foreach ($t in $traces) {
 $wv = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue
 Write-Host ('   WebView2 runtime: {0}' -f $(if ($wv -and $wv.pv) { $wv.pv } else { 'absent (the installer downloads the bootstrapper)' }))
 $netBefore = Get-NetSnapshot
+# Both cmdlets swallow their errors (-ErrorAction SilentlyContinue), so a
+# snapshot that came back (nearly) empty would make "unchanged" below prove
+# nothing. A runner has loopback and default routes and DNS servers: require
+# at least two entries besides the '--' separator.
+if ($netBefore.Count -lt 3) {
+    Fail "the network snapshot before the install has $($netBefore.Count - 1) route/DNS entries: Get-NetRoute or Get-DnsClientServerAddress returned nothing usable, so the no-network-change check would be vacuous"
+}
 
 # -- install ------------------------------------------------------------------
 Step "silent install: $Installer /S"
@@ -118,8 +126,17 @@ Step "installed files under $instDir"
 foreach ($f in @($exe, $uninstaller, (Join-Path $instDir 'resources\xray.exe'), (Join-Path $instDir 'resources\wintun.dll'))) {
     if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { Fail "missing after install: $f" }
 }
-Get-ChildItem -LiteralPath $instDir -Recurse -File |
+Get-ChildItem -LiteralPath $instDir -Recurse -File -Force |
     ForEach-Object { Write-Host ('   {0,10}  {1}' -f $_.Length, $_.FullName.Substring($instDir.Length + 1)) }
+# bundle.resources is the glob "resources/*", which matches dotfiles too: the
+# tracked src-tauri/resources/.gitkeep (there so builds that stage nothing
+# still match it) was installed as resources\.gitkeep until the bundling
+# builds started dropping it after staging the real files.
+$dotfiles = @(Get-ChildItem -LiteralPath $instDir -Recurse -File -Force | Where-Object { $_.Name.StartsWith('.') })
+if ($dotfiles.Count -ne 0) {
+    Fail "the installer put repository placeholder files in ${instDir}: $(($dotfiles | ForEach-Object { $_.FullName.Substring($instDir.Length + 1) }) -join ', ')"
+}
+Write-Host '   no dotfiles (resources\.gitkeep is not installed)'
 
 Step "Apps & features entry $uninstKey"
 if (-not (Test-Path -LiteralPath $uninstKey)) { Fail "no Apps & features entry at $uninstKey" }
