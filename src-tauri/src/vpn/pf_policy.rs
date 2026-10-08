@@ -205,24 +205,15 @@ pub(crate) fn block_all_ruleset(b: &BlockAll<'_>) -> String {
     r
 }
 
-/// The addresses the control-plane permit names: the DoH provider's (how the
-/// app finds the API at all once port-53 DNS is blocked) and every address a
-/// DoH answer gave our own hosts in the last day — all A records, the union
-/// across answers (P2-4), and never a system-resolver answer (P3-1).
+/// The addresses the control-plane permit names, with the generation that
+/// covers them (N5): `api::doh_resolver::control_plane`, the set the Linux
+/// kill switch's self-permits name too.
 ///
 /// Read whenever the ruleset is (re-)loaded, and a held block is re-loaded
 /// the moment a DoH answer brings an address it does not hold yet
 /// (`killswitch::control_plane_learned`), before that address is dialled.
-///
-/// With the generation that covers every remembered address (N5): a loaded
-/// block records it, and a newer one means its table is out of date.
 pub(crate) fn control_plane() -> (Vec<Ipv4Addr>, u64) {
-    let mut addrs = crate::vpn::doh::bootstrap_addrs();
-    let (learned, generation) = crate::api::doh_resolver::control_plane_v4();
-    addrs.extend(learned);
-    addrs.sort_unstable();
-    addrs.dedup();
-    (addrs, generation)
+    crate::api::doh_resolver::control_plane()
 }
 
 /// The IPv6 leak block (F-001), as the bytes we ship: `resources/pf/` rather

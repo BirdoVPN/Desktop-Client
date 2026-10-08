@@ -834,6 +834,61 @@ async fn disarm_platform() -> Result<(), String> {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Linux: the control-plane self-permit follows what DoH learns
+//
+// Root's tcp/443 self-permit names each control-plane address
+// (`vpn::iptables_policy`), so an address a DoH answer brings while a block
+// is up must be added before it is dialled — the twin of macOS's table
+// re-load below (P2-4, N5).
+// ──────────────────────────────────────────────────────────────
+
+/// Linux: whether control-plane addresses of `generation` already get
+/// through — the resolver's lock-free fast path (N5).
+#[cfg(target_os = "linux")]
+pub fn control_plane_permits(generation: u64) -> bool {
+    firewall_linux::permits(generation)
+}
+
+/// Linux: a DoH answer brought control-plane addresses of `generation` that
+/// the live block's self-permits do not cover. The block is re-armed around
+/// them NOW, before the resolver caches or hands them out; `Err` makes it
+/// cache nothing, so the next request asks again.
+///
+/// Under the one rule for the intent ([`unless_turned_off`]): a block the
+/// user has turned off is lifted rather than re-armed, and a block that is
+/// not up is never put up from here.
+#[cfg(target_os = "linux")]
+pub async fn control_plane_learned(generation: u64) -> Result<(), String> {
+    let result = unless_turned_off(
+        async {
+            if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            firewall_linux::refresh_control_plane(vpn_server_ip(), generation).await
+        },
+        deactivate_platform_block,
+        activate_platform_block,
+        platform_is_blocking,
+    )
+    .await;
+    blocking_may_have_changed();
+    match result {
+        Ok(_) if firewall_linux::permits(generation) => {
+            tracing::info!("Kill switch: the control-plane self-permits cover the new address");
+            Ok(())
+        }
+        Ok(_) => Err("the kill switch's control-plane self-permit could not be installed".into()),
+        Err(e) => {
+            tracing::warn!(
+                "Kill switch: re-arming for a new control-plane address failed: {}",
+                e
+            );
+            Err(e)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
 // macOS pf (packet filter) kill switch implementation
 //
 // WHAT the block-all permits, when pf's answer counts as "blocking", and how a
@@ -1912,6 +1967,7 @@ mod tests {
                 for call in [
                     "wfp::activate_blocking(",
                     "firewall_linux::activate_blocking(",
+                    "firewall_linux::refresh_control_plane(",
                     "update_vpn_server(",
                 ] {
                     if text.contains(call) {

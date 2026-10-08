@@ -21,11 +21,21 @@
 //!    pre-existing plaintext flows keep running straight through the block) and
 //!    an `-m owner` rule in a chain hooked into INPUT/FORWARD, where xt_owner is
 //!    not valid at all.
+//!
+//! WHAT the chains permit is decided in `vpn::iptables_policy`, as plain data
+//! unit-tested on every OS; this module only loads it. In particular root's
+//! tcp/443 self-permit goes to the control-plane addresses alone (the DoH
+//! provider and every address a DoH answer gave our own hosts — macOS's
+//! `<birdo_control>` table), and a held block is re-armed the moment a DoH
+//! answer brings an address it does not cover yet, before that address is
+//! cached or dialled ([`refresh_control_plane`]).
 
 #![allow(dead_code)]
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
+
+use crate::vpn::iptables_policy;
 
 /// Tracks whether iptables blocking rules are active
 pub(crate) static IPTABLES_BLOCKING: AtomicBool = AtomicBool::new(false);
@@ -34,6 +44,19 @@ pub(crate) static IPTABLES_BLOCKING: AtomicBool = AtomicBool::new(false);
 /// `-1` = none, `0`/`1` = the live generation. Activation always builds the
 /// OTHER generation and swaps the jumps onto it.
 static LIVE_GEN: AtomicI8 = AtomicI8::new(-1);
+
+/// The control-plane generation the live chains' self-permits cover
+/// (`doh_resolver`'s generation, N5 on macOS): `u64::MAX` while no chain of
+/// ours is live, so every address gets through as far as we are concerned.
+static PERMITTED_GEN: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Serialises every change to our chains: an activation, a lift, and the
+/// re-arm a newly learned control-plane address asks for (which comes from
+/// the API resolver, concurrently with the reconnect loop's own re-arms). Two
+/// activations at once would both build — and flush — the same staging
+/// generation. Never held across anything but our own iptables runs; the
+/// panic path ([`emergency_cleanup`]) does not take it.
+static CHAINS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Chain carrying the OUTPUT policy for generation `gen`.
 fn chain_out(gen: i8) -> String {
@@ -166,163 +189,74 @@ fn reset_chain_v6(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the fully-populated rule set for `gen` in both address families.
+/// Load `rules` into `chain` (IPv4 or IPv6, by `run`), in order.
+///
+/// A self-permit that will not load is logged and skipped: the block still
+/// goes up, only narrower (no control plane). Any other rule failing abandons
+/// the generation. Returns whether every self-permit loaded.
+fn load_chain(
+    run: fn(&[&str]) -> Result<(), String>,
+    chain: &str,
+    rules: &[iptables_policy::Rule],
+) -> Result<bool, String> {
+    let mut self_permits_loaded = true;
+    for rule in rules {
+        let mut args = vec!["-A", chain];
+        args.extend(rule.iter().map(String::as_str));
+        match run(&args) {
+            Ok(()) => {}
+            Err(e) if iptables_policy::is_self_permit(rule) => {
+                // Loudly, like Windows does — a kill switch the client cannot
+                // escape is a support incident, not a silent degradation.
+                tracing::error!(
+                    "Kill switch: could NOT install a control-plane self-permit ({}). \
+                     Auto-reconnect may not be able to reach the control plane while \
+                     the block is armed.",
+                    e
+                );
+                self_permits_loaded = false;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(self_permits_loaded)
+}
+
+/// Build the fully-populated rule set for `gen` in both address families, as
+/// `iptables_policy::block_all` decides it. `Ok`: whether every control-plane
+/// self-permit loaded.
 ///
 /// Nothing here is reachable from a built-in chain yet, so a failure part-way
 /// through cannot leave a half-armed policy in the packet path: the caller
 /// deletes the staging chains and the previous generation (if any) is untouched.
-fn build_chains(gen: i8, server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+fn build_chains(gen: i8, inputs: &iptables_policy::BlockAll<'_>) -> Result<bool, String> {
     let out = chain_out(gen);
     let inn = chain_in(gen);
-    let lan = crate::commands::killswitch::lan_sharing_enabled();
+    let chains = iptables_policy::block_all(inputs);
 
-    // ---------------------------------------------------------------- IPv4 OUT
     reset_chain(&out)?;
-    iptables(&["-A", &out, "-o", "lo", "-j", "ACCEPT"])?;
-    // DHCP client → server, so the machine can keep its lease.
-    iptables(&["-A", &out, "-p", "udp", "--dport", "67", "-j", "ACCEPT"])?;
-    // Traffic to the VPN relay (WireGuard handshake + stealth fallback).
-    if let Some(ip) = server_ip {
-        iptables(&["-A", &out, "-d", &ip.to_string(), "-j", "ACCEPT"])?;
-    }
-    // Traffic on the TUN interface.
-    iptables(&["-A", &out, "-o", "birdo0", "-j", "ACCEPT"])?;
+    let self_permits_loaded = load_chain(iptables, &out, &chains.out_v4)?;
+    reset_chain(&inn)?;
+    load_chain(iptables, &inn, &chains.in_v4)?;
 
-    // LAN PERMIT: honour Local Network Sharing while the block is engaged, so a
-    // dropped tunnel does not also take out the printer, the NAS and SSH.
-    // 169.254/16 is included for mDNS/Bonjour discovery.
-    if lan {
-        for cidr in [
-            "10.0.0.0/8",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "169.254.0.0/16",
-        ] {
-            iptables(&["-A", &out, "-d", cidr, "-j", "ACCEPT"])?;
-        }
+    // AUDIT-N5: IPv6 parity — dual-stack hosts must not leak IPv6 around the
+    // IPv4-only tunnel (Windows closes the same gap with block_all_v6).
+    reset_chain_v6(&out)?;
+    load_chain(ip6tables, &out, &chains.out_v6)?;
+    reset_chain_v6(&inn)?;
+    load_chain(ip6tables, &inn, &chains.in_v6)?;
+
+    if inputs.lan_sharing {
         tracing::info!("Kill switch: LAN sharing permitted (RFC1918 + link-local)");
     }
-
-    // SELF-PERMIT: let OUR OWN process reach the control plane.
-    //
-    // Without this the kill switch makes reconnection impossible, which is the
-    // opposite of what it is for: auto_reconnect arms the block and then calls
-    // https://api.birdo.app for a fresh config — a DIFFERENT host from the
-    // permitted relay — with DoH (tcp/443) for name resolution.
-    //
-    // Windows keys the equivalent permit on ALE_APP_ID. iptables has no app
-    // identity, so we match the euid we run as; but the client runs as root, so
-    // `--uid-owner 0` on its own exempts EVERY root-owned process on every port
-    // and protocol — plaintext DNS, http, any daemon that phones home. It is
-    // scoped to tcp/443 to match what the control plane actually needs (and what
-    // the macOS pf rule already did). A cgroup2 match (`-m cgroup --path`) would
-    // narrow this to our own process and is the obvious follow-up.
-    //
-    // Note this permit deliberately does NOT cover the WireGuard handshake: the
-    // relay is permitted by address above, and the kill switch re-arms with the
-    // new relay before a reconnect uses it (`session::apply_relay_permit`).
-    let euid = unsafe { libc::geteuid() };
-    let uid_str = euid.to_string();
-    match iptables(&[
-        "-A",
-        &out,
-        "-p",
-        "tcp",
-        "--dport",
-        "443",
-        "-m",
-        "owner",
-        "--uid-owner",
-        &uid_str,
-        "-j",
-        "ACCEPT",
-    ]) {
-        Ok(()) => tracing::info!(
-            "Kill switch: self-permit installed for uid {} (tcp/443 only)",
-            euid
-        ),
-        Err(e) => {
-            // Loudly, like Windows does — a kill switch the client cannot escape
-            // is a support incident, not a silent degradation.
-            tracing::error!(
-                "Kill switch: could NOT install the self-permit for uid {} ({}). \
-                 Auto-reconnect will not be able to reach the control plane while \
-                 the block is armed.",
-                euid,
-                e
-            );
-        }
+    if self_permits_loaded {
+        tracing::info!(
+            "Kill switch: self-permit for uid {} on tcp/443 to {} control-plane addresses",
+            inputs.euid,
+            inputs.control_plane.len()
+        );
     }
-
-    iptables(&["-A", &out, "-j", "DROP"])?;
-
-    // ----------------------------------------------------------- IPv4 IN/FWD
-    reset_chain(&inn)?;
-    iptables(&["-A", &inn, "-i", "lo", "-j", "ACCEPT"])?;
-    // DHCP server → client.
-    iptables(&["-A", &inn, "-p", "udp", "--dport", "68", "-j", "ACCEPT"])?;
-    if let Some(ip) = server_ip {
-        iptables(&["-A", &inn, "-s", &ip.to_string(), "-j", "ACCEPT"])?;
-    }
-    iptables(&["-A", &inn, "-i", "birdo0", "-j", "ACCEPT"])?;
-    if lan {
-        for cidr in [
-            "10.0.0.0/8",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "169.254.0.0/16",
-        ] {
-            iptables(&["-A", &inn, "-s", cidr, "-j", "ACCEPT"])?;
-        }
-    }
-    // Replies to traffic we permitted outbound (control plane, relay, LAN).
-    //
-    // This used to be an unscoped `ESTABLISHED,RELATED` accept in the single
-    // shared chain, i.e. it also applied to OUTPUT — so any plaintext flow
-    // opened over the physical NIC before the block kept running through it for
-    // the whole outage. Accepting established traffic INBOUND only is enough for
-    // replies while still killing those flows, because their outbound direction
-    // (including the TCP ACKs) now hits the DROP.
-    iptables(&[
-        "-A",
-        &inn,
-        "-m",
-        "conntrack",
-        "--ctstate",
-        "ESTABLISHED",
-        "-j",
-        "ACCEPT",
-    ])?;
-    iptables(&["-A", &inn, "-j", "DROP"])?;
-
-    // ---------------------------------------------------------------- IPv6
-    // AUDIT-N5: parity rules for IPv6. Without these, dual-stack Linux hosts
-    // leak IPv6 traffic outside the tunnel — a real-IP leak the WFP code on
-    // Windows explicitly closes via block_all_v6. The WireGuard tunnel itself is
-    // IPv4-only on this client, so nothing but link-local housekeeping survives.
-    reset_chain_v6(&out)?;
-    ip6tables(&["-A", &out, "-o", "lo", "-j", "ACCEPT"])?;
-    ip6tables(&["-A", &out, "-p", "udp", "--dport", "547", "-j", "ACCEPT"])?;
-    // ICMPv6 NDP / RA / RS — required for IPv6 to function at all on the LAN,
-    // but scoped to link-local and multicast destinations. A blanket
-    // `-p ipv6-icmp -j ACCEPT` here would sit in front of the tunnel's
-    // BIRDO_IPV6_LEAK_BLOCK chain (see tunnel_linux.rs) and re-permit ICMPv6 to
-    // GLOBAL destinations, disclosing the host's real IPv6 address at exactly
-    // the moment protection matters most.
-    for dst in ["fe80::/10", "ff02::/16"] {
-        ip6tables(&["-A", &out, "-p", "ipv6-icmp", "-d", dst, "-j", "ACCEPT"])?;
-    }
-    ip6tables(&["-A", &out, "-j", "DROP"])?;
-
-    reset_chain_v6(&inn)?;
-    ip6tables(&["-A", &inn, "-i", "lo", "-j", "ACCEPT"])?;
-    ip6tables(&["-A", &inn, "-p", "udp", "--dport", "546", "-j", "ACCEPT"])?;
-    for src in ["fe80::/10", "ff02::/16"] {
-        ip6tables(&["-A", &inn, "-p", "ipv6-icmp", "-s", src, "-j", "ACCEPT"])?;
-    }
-    ip6tables(&["-A", &inn, "-j", "DROP"])?;
-
-    Ok(())
+    Ok(self_permits_loaded)
 }
 
 /// Hook generation `gen` into OUTPUT/INPUT/FORWARD in both families.
@@ -407,13 +341,31 @@ fn leftover_chains() -> Vec<String> {
         .collect()
 }
 
-/// Activate blocking: block all traffic except loopback, DHCP, and VPN server.
+/// Activate blocking: block all traffic except what `iptables_policy`
+/// permits (loopback, DHCP, the relay, the tunnel, the LAN with sharing on,
+/// and our uid's tcp/443 to the control plane).
 ///
 /// Builds a fresh generation of chains, swaps the built-in jumps onto it, and
 /// only then tears down the previous generation — so re-arming (which happens on
 /// every reconnect tick) never opens a window where traffic is unfiltered.
 pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    let _chains = CHAINS.lock().await;
+    activate_locked(server_ip)
+}
+
+/// [`activate_blocking`] with [`CHAINS`] held.
+fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
     tracing::info!("Activating Linux iptables kill switch");
+
+    // Read under the lock: a re-arm for a newly learned control-plane address
+    // must be built from a set that includes it.
+    let (control_plane, control_plane_gen) = crate::api::doh_resolver::control_plane();
+    let inputs = iptables_policy::BlockAll {
+        relay: server_ip,
+        control_plane: &control_plane,
+        euid: unsafe { libc::geteuid() },
+        lan_sharing: crate::commands::killswitch::lan_sharing_enabled(),
+    };
 
     let live = LIVE_GEN.load(Ordering::SeqCst);
     if live < 0 {
@@ -432,13 +384,17 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
     }
     let next: i8 = if live == 0 { 1 } else { 0 };
 
-    if let Err(e) = build_chains(next, server_ip) {
-        // Nothing was hooked, so this cannot leak: drop the staging chains and
-        // leave the previous generation (if any) exactly as it was.
-        retire_chains(next);
-        tracing::error!("Kill switch: rule build failed, block NOT changed: {}", e);
-        return Err(e);
-    }
+    let self_permits_loaded = match build_chains(next, &inputs) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            // Nothing was hooked, so this cannot leak: drop the staging chains
+            // and leave the previous generation (if any) exactly as it was.
+            retire_chains(next);
+            tracing::error!("Kill switch: rule build failed, block NOT changed: {}", e);
+            return Err(e);
+        }
+    };
+    let covered = iptables_policy::covered_generation(control_plane_gen, self_permits_loaded);
 
     if let Err(e) = hook_chains(next) {
         // INVARIANT: the generation LIVE_GEN does NOT name is never referenced
@@ -452,7 +408,7 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
             // The old generation is still fully hooked underneath, every chain
             // DROP-terminated — so unhooking whatever next-gen jumps landed is
             // fail-closed. Retire the staging generation and keep LIVE_GEN on
-            // the old one.
+            // the old one (and PERMITTED_GEN on what the old one covers).
             retire_chains(next);
             IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
             tracing::error!(
@@ -470,6 +426,7 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
             // whether we finished.
             let blocking = jump_present("OUTPUT", &chain_out(next));
             LIVE_GEN.store(next, Ordering::SeqCst);
+            PERMITTED_GEN.store(covered, Ordering::SeqCst);
             IPTABLES_BLOCKING.store(blocking, Ordering::SeqCst);
             tracing::error!(
                 "Kill switch: only part of the rule set could be hooked ({}); blocking={}",
@@ -484,9 +441,37 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
     retire_chains(live);
 
     LIVE_GEN.store(next, Ordering::SeqCst);
+    PERMITTED_GEN.store(covered, Ordering::SeqCst);
     IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
     tracing::info!("Linux iptables kill switch activated");
     Ok(())
+}
+
+/// Whether control-plane addresses of `generation` get through our chains:
+/// none of ours is live, or the live one's self-permits cover them (N5).
+pub fn permits(generation: u64) -> bool {
+    PERMITTED_GEN.load(Ordering::SeqCst) >= generation
+}
+
+/// A DoH answer brought control-plane addresses of `generation`. If a block of
+/// ours is live and its self-permits do not cover them, re-arm it NOW around
+/// the current control-plane set — the same generation swap as any re-arm, so
+/// it never opens a window — before the resolver caches or dials them.
+///
+/// `Ok(true)`: re-armed. `Ok(false)`: nothing to do — no block of ours is live
+/// (the next activation reads the set), or the live one covers `generation`
+/// already. Whether a block is WANTED is the caller's to decide
+/// (`killswitch::control_plane_learned`, under the one rule for the intent);
+/// this never puts up a block that is not already up.
+pub async fn refresh_control_plane(
+    server_ip: Option<Ipv4Addr>,
+    generation: u64,
+) -> Result<bool, String> {
+    let _chains = CHAINS.lock().await;
+    if permits(generation) || LIVE_GEN.load(Ordering::SeqCst) < 0 {
+        return Ok(false);
+    }
+    activate_locked(server_ip).map(|()| true)
 }
 
 /// Deactivate blocking: remove our chains from both filter tables.
@@ -496,6 +481,7 @@ pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String
 /// the app believes it is not blocking: every later lift is gated on that flag,
 /// so nothing ever retries.
 pub async fn deactivate_blocking() -> Result<(), String> {
+    let _chains = CHAINS.lock().await;
     tracing::info!("Deactivating Linux iptables kill switch");
 
     remove_all_chains();
@@ -516,6 +502,7 @@ pub async fn deactivate_blocking() -> Result<(), String> {
     }
 
     LIVE_GEN.store(-1, Ordering::SeqCst);
+    PERMITTED_GEN.store(u64::MAX, Ordering::SeqCst);
     IPTABLES_BLOCKING.store(false, Ordering::SeqCst);
     tracing::info!("Linux iptables kill switch deactivated");
     Ok(())
@@ -531,5 +518,117 @@ pub fn is_blocking() -> bool {
 pub fn emergency_cleanup() {
     remove_all_chains();
     LIVE_GEN.store(-1, Ordering::SeqCst);
+    PERMITTED_GEN.store(u64::MAX, Ordering::SeqCst);
     IPTABLES_BLOCKING.store(false, Ordering::SeqCst);
+}
+
+/// The chains as the KERNEL holds them. `iptables_policy`'s unit tests prove
+/// what we ask for; this proves what iptables actually loaded from it.
+#[cfg(test)]
+mod iptables_chain_tests {
+    use super::*;
+    use crate::vpn::iptables_policy::check::{self, Packet};
+    use std::net::{IpAddr, Ipv6Addr};
+
+    /// `<cmd> -S <chain>`: the kernel's own listing.
+    fn listing(cmd: &str, chain: &str) -> Result<String, String> {
+        let out = crate::utils::hidden_cmd(cmd)
+            .args(["-w", "-S", chain])
+            .output()
+            .map_err(|e| format!("{cmd}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{cmd} -S {chain}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Builds one generation for real and reads it back, then removes it. It
+    /// is NEVER hooked into OUTPUT/INPUT/FORWARD, so it filters none of the
+    /// runner's own traffic. Root only: tests.yml's Linux root step runs it.
+    #[test]
+    #[ignore = "needs root and iptables: run by tests.yml's kill-switch chain step"]
+    fn the_kernel_holds_only_scoped_tcp_443_permits() {
+        let control = [
+            Ipv4Addr::new(1, 0, 0, 1),
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(104, 16, 0, 1),
+        ];
+        let euid = unsafe { libc::geteuid() };
+        let inputs = iptables_policy::BlockAll {
+            relay: Some(Ipv4Addr::new(203, 0, 113, 7)),
+            control_plane: &control,
+            euid,
+            lan_sharing: true,
+        };
+        let want = iptables_policy::block_all(&inputs);
+        let gen = 1;
+        let (out, inn) = (chain_out(gen), chain_in(gen));
+
+        retire_chains(gen); // a previous run that died part-way
+        let built = build_chains(gen, &inputs);
+        let v4 = listing("iptables", &out);
+        let v6 = listing("ip6tables", &out);
+        let hooked: Vec<&str> = HOOKS
+            .into_iter()
+            .filter(|h| jump_present(h, &out) || jump_present(h, &inn))
+            .collect();
+        retire_chains(gen);
+        let left: Vec<&String> = [&out, &inn]
+            .into_iter()
+            .filter(|c| chain_exists(c) || chain_exists_v6(c))
+            .collect();
+
+        assert!(hooked.is_empty(), "the test hooked {hooked:?}");
+        assert!(left.is_empty(), "the test left {left:?} behind");
+        assert_eq!(built, Ok(true), "every rule, every self-permit, loaded");
+
+        let v4 = v4.expect("iptables -S");
+        println!("{v4}");
+        let rules = check::parse_listing(&v4, &out);
+        assert_eq!(rules.len(), want.out_v4.len(), "{v4}");
+        assert!(check::port_443_is_scoped(&rules, &control, euid), "{v4}");
+        assert_eq!(
+            rules.last().map(|r| r.join(" ")),
+            Some("-j DROP".to_string()),
+            "{v4}"
+        );
+        let tcp443 = |dst: IpAddr, uid: u32| Packet {
+            proto: "tcp",
+            dst,
+            dport: 443,
+            oif: "eth0",
+            uid,
+        };
+        for ip in control {
+            let to = IpAddr::V4(ip);
+            assert_eq!(check::verdict(&rules, &tcp443(to, euid)), Some("ACCEPT"));
+            assert_eq!(check::verdict(&rules, &tcp443(to, euid + 1)), Some("DROP"));
+        }
+        for to in [
+            Ipv4Addr::new(140, 82, 112, 3),    // github.com
+            Ipv4Addr::new(185, 199, 108, 133), // release-assets.githubusercontent.com
+            Ipv4Addr::new(93, 184, 216, 34),
+        ] {
+            assert_eq!(
+                check::verdict(&rules, &tcp443(IpAddr::V4(to), euid)),
+                Some("DROP"),
+                "{to}\n{v4}"
+            );
+        }
+
+        let v6 = v6.expect("ip6tables -S");
+        println!("{v6}");
+        let rules6 = check::parse_listing(&v6, &out);
+        assert_eq!(rules6.len(), want.out_v6.len(), "{v6}");
+        assert!(check::port_443_is_scoped(&rules6, &[], euid), "{v6}");
+        let cloudflare_v6 = IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111));
+        assert_eq!(
+            check::verdict(&rules6, &tcp443(cloudflare_v6, euid)),
+            Some("DROP"),
+            "{v6}"
+        );
+    }
 }

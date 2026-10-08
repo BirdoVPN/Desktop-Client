@@ -214,10 +214,10 @@ const DOH_PROVIDERS: &[DoHProvider] = &[DoHProvider {
 
 /// Every address the DoH client dials (see `DoHProvider::bootstrap`).
 ///
-/// The macOS kill switch's control-plane permit names these
-/// (`vpn::pf_policy::control_plane_addresses`): once port-53 DNS is blocked,
-/// they are how the app finds the API at all.
-#[cfg(any(target_os = "macos", test))]
+/// The Unix kill switches' control-plane permit names these
+/// (`api::doh_resolver::control_plane`): once port-53 DNS is blocked, they
+/// are how the app finds the API at all.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn bootstrap_addrs() -> Vec<Ipv4Addr> {
     DOH_PROVIDERS
         .iter()

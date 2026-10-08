@@ -52,6 +52,10 @@ pub mod legacy_firewall;
 // Linux iptables firewall for kill switch
 #[cfg(target_os = "linux")]
 pub mod firewall_linux;
+// What the Linux iptables kill switch loads, as testable data. Compiled into
+// every test build too, so the Windows job runs its tests.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod iptables_policy;
 
 // What the macOS pf kill switch loads and reads back, as testable functions.
 // Compiled into every test build too, so the Windows job runs its tests.

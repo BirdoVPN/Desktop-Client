@@ -173,16 +173,39 @@ fn remember_in(
 }
 
 /// Every IPv4 address a DoH answer gave our own hosts within the memory
-/// window, and the generation that covers them all: what the macOS kill
-/// switch's control-plane table holds besides the DoH provider itself
-/// (`vpn::pf_policy::control_plane`). IPv4 only: the macOS block admits no
-/// IPv6 at all.
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn control_plane_v4() -> (Vec<std::net::Ipv4Addr>, u64) {
+/// window, and the generation that covers them all: what the kill switch's
+/// control-plane permit names besides the DoH provider itself
+/// ([`control_plane`]). IPv4 only: neither Unix block admits IPv6 to the
+/// control plane.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn control_plane_v4() -> (Vec<std::net::Ipv4Addr>, u64) {
     match control_plane_memory().lock() {
         Ok(memory) => remembered(&memory, Instant::now()),
         Err(_) => (Vec::new(), 0),
     }
+}
+
+/// The addresses the Unix kill switches let our own HTTPS reach through a
+/// block — macOS's `<birdo_control>` pf table (`vpn::pf_policy`), Linux's
+/// per-address tcp/443 self-permits (`vpn::iptables_policy`): the DoH
+/// provider's (how the app finds the API at all once port-53 DNS is blocked)
+/// and every address a DoH answer gave our own hosts in the last day — all A
+/// records, the union across answers (P2-4), and never a system-resolver
+/// answer (P3-1). Sorted and de-duplicated.
+///
+/// Read whenever a block is (re-)armed, and a held block is re-armed the
+/// moment a DoH answer brings an address it does not cover yet
+/// ([`permit_control_plane`]), before that address is dialled. With the
+/// generation that covers every remembered address (N5): a block records it,
+/// and a newer one means its permit is out of date.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) fn control_plane() -> (Vec<std::net::Ipv4Addr>, u64) {
+    let mut addrs = crate::vpn::doh::bootstrap_addrs();
+    let (learned, generation) = control_plane_v4();
+    addrs.extend(learned);
+    addrs.sort_unstable();
+    addrs.dedup();
+    (addrs, generation)
 }
 
 /// The current control-plane generation: a held block whose table is older
@@ -195,7 +218,7 @@ pub(crate) fn control_plane_generation() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn remembered(memory: &ControlPlaneMemory, now: Instant) -> (Vec<std::net::Ipv4Addr>, u64) {
     let addrs = memory
         .hosts
@@ -239,10 +262,11 @@ where
     Ok(addrs)
 }
 
-/// Whether the macOS kill switch already lets `generation` through, and if
-/// not, have it re-load its block now. Elsewhere there is nothing to permit.
+/// Whether the Unix kill switch already lets `generation` through, and if
+/// not, have it re-load (macOS) or re-arm (Linux) its block now. Windows
+/// permits the executable itself, so there is nothing to permit there.
 async fn permit_control_plane(generation: u64) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         if !crate::commands::killswitch::control_plane_permits(generation) {
             return crate::commands::killswitch::control_plane_learned(generation).await;
@@ -277,7 +301,7 @@ impl Resolve for DohApiResolver {
                         .into_iter()
                         .map(|ip| SocketAddr::new(IpAddr::V4(ip), HTTPS_PORT))
                         .collect();
-                    // P2-4 / N5: an address the macOS block does not permit yet
+                    // P2-4 / N5: an address the Unix block does not permit yet
                     // is let through BEFORE it is cached or dialled.
                     let addrs = admit_doh_answer(
                         &cache,
@@ -627,6 +651,21 @@ mod tests {
         .await;
         assert!(result.is_ok());
         assert!(cache_get(&cache, "example.com").is_some());
+    }
+
+    /// The control-plane set both Unix kill switches permit always holds
+    /// the DoH provider's bootstrap addresses (or no API lookup can work
+    /// behind a block), sorted and de-duplicated.
+    #[test]
+    fn the_control_plane_set_holds_every_doh_bootstrap_address() {
+        let (set, _) = control_plane();
+        for ip in crate::vpn::doh::bootstrap_addrs() {
+            assert!(set.contains(&ip), "{ip} missing from {set:?}");
+        }
+        let mut sorted = set.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(set, sorted, "sorted and de-duplicated");
     }
 
     #[test]
