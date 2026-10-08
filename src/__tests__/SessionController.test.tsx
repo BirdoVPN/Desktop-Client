@@ -24,6 +24,12 @@ import { invoke } from '@tauri-apps/api/core';
 import { VpnSessionController, RESYNC_INTERVAL_MS } from '@/session/controller';
 import { useAppStore, defaultSettings, type Server } from '@/store/app-store';
 import { resetSessionData } from '@/session/session-data';
+import { signOut } from '@/session/session';
+import {
+  forgetKillSwitchChoices,
+  KILL_SWITCH_OFF_THIS_CONNECTION_COPY,
+  setKillSwitch,
+} from '@/session/settings-persist';
 import { CONSENT_VERSION } from '@/lib/consent';
 
 vi.mock('@tauri-apps/api/core');
@@ -349,6 +355,48 @@ describe('Auto-Connect (W2-002)', () => {
     await act(async () => {});
     expect(callsTo('connect_vpn')).toHaveLength(0);
     expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+});
+
+describe("sign-out ends the session's kill switch choices (follow-up 3 to the review of #222)", () => {
+  it("a same-run sign-in shows the saved kill switch, not the last session's this-connection OFF", async () => {
+    forgetKillSwitchChoices();
+    const base = mockedInvoke.getMockImplementation()!;
+    mockedInvoke.mockImplementation(async (cmd, args) => {
+      // The file cannot be verified: an OFF holds for this connection only.
+      if (cmd === 'save_settings') {
+        throw {
+          code: 'settings_unverified',
+          message: 'the settings file could not be verified, so it was left as it is',
+          retryable: true,
+          retry_after_secs: null,
+        };
+      }
+      return base(cmd, args);
+    });
+    // Mounted the way App mounts it: for as long as someone is signed in.
+    function SignedIn() {
+      return useAppStore((s) => s.isAuthenticated) ? <VpnSessionController /> : null;
+    }
+    render(<SignedIn />);
+    await waitFor(() => expect(useAppStore.getState().statusSeq).toBe(1));
+    await waitFor(() => expect(useAppStore.getState().settingsHydrated).toBe(true));
+    act(() => useAppStore.setState({ connectionState: 'connected' }));
+    await act(async () => {
+      await setKillSwitch(false);
+    });
+    expect(useAppStore.getState().notice?.text).toBe(KILL_SWITCH_OFF_THIS_CONNECTION_COPY);
+    expect(useAppStore.getState().settings.killSwitchEnabled).toBe(false);
+
+    await act(async () => {
+      await signOut();
+    });
+    expect(useAppStore.getState().isAuthenticated).toBe(false);
+    // Signed in again in the same run: the settings are re-read, and the
+    // file says ON. There is no connection for an OFF to be off for.
+    act(() => useAppStore.setState({ isAuthenticated: true }));
+    await waitFor(() => expect(callsTo('get_settings')).toHaveLength(2));
+    await waitFor(() => expect(useAppStore.getState().settings.killSwitchEnabled).toBe(true));
   });
 });
 

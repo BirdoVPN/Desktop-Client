@@ -14,7 +14,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { parseServers } from '@/lib/ipc';
 import { command } from '@/session/command';
-import { useAppStore, type UsageStats } from '@/store/app-store';
+import { useAppStore, type AppSettings, type UsageStats } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 import { settingsFromRust, type RustSettings } from '@/utils/helpers';
 
@@ -40,11 +40,17 @@ export function resetSessionData(): void {
   usageInFlight = null;
 }
 
-/** Hydrate the settings from Rust. Whether it did (round 8: `reloadSettings`). */
-export async function loadSettings(): Promise<boolean> {
+/**
+ * Hydrate the settings from Rust. Whether it did (round 8: `reloadSettings`).
+ * `adjust` gets what was read just before it is hydrated (follow-up 4 to the
+ * review of #222: a kill switch toggle moved during the read is kept).
+ */
+export async function loadSettings(
+  adjust: (read: AppSettings) => AppSettings = (read) => read,
+): Promise<boolean> {
   try {
     const rs = await invoke<RustSettings>('get_settings');
-    useAppStore.getState().hydrateSettings(settingsFromRust(rs));
+    useAppStore.getState().hydrateSettings(adjust(settingsFromRust(rs)));
     return true;
   } catch {
     // Keep what the store holds. That includes `settings_unverified` (round 5
