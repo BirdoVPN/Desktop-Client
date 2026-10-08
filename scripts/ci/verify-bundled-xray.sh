@@ -32,7 +32,12 @@
 #   4. its SHA-256 equals <expected-sha256>;
 #   5. a file in the app's binary dir (Contents/MacOS, usr/bin) contains the
 #      exact <expected-sha256> string - i.e. the value really was compiled in
-#      via option_env!, not just exported to a later step.
+#      via option_env!, not just exported to a later step;
+#   6. no dotfile anywhere under resources/. bundle.resources is the glob
+#      "resources/*", which matches dotfiles: v1.4.46's .deb carried
+#      usr/lib/BirdoVPN/resources/.gitkeep (#256). The build jobs now delete
+#      the tracked src-tauri/resources/.gitkeep before bundling; this proves
+#      they did. (The Windows twin: nsis-install-smoke.ps1.)
 #
 # Self-test: scripts/ci/verify-bundled-xray.tests.sh (tests.yml runs it on
 # Linux and macOS on every PR), with fixtures for each failure path.
@@ -90,20 +95,29 @@ collect() {
 }
 
 # check_tree <label> <root> <macos|linux>
-# Applies checks 2-5 to an unpacked artifact tree.
+# Applies checks 2-6 to an unpacked artifact tree.
 check_tree() {
   local label="$1" root="$2" kind="$3"
-  local xray_pattern bin_pattern
+  local xray_pattern bin_pattern resources_pattern
   case "$kind" in
     macos)
       xray_pattern='*/Contents/Resources/resources/xray'
       bin_pattern='*/Contents/MacOS/*'
+      resources_pattern='*/Contents/Resources/resources/*'
       ;;
     linux)
       xray_pattern='*/usr/lib/*/resources/xray'
       bin_pattern='*/usr/bin/*'
+      resources_pattern='*/usr/lib/*/resources/*'
       ;;
   esac
+
+  # Check 6 first: the checks below return early on a missing xray.
+  collect "$root" -path "$resources_pattern" -name '.*'
+  local dot
+  for dot in "${found[@]+"${found[@]}"}"; do
+    err "$label: ${dot#"$root"/} - a dotfile under resources/ ships in the package (bundle.resources' \"resources/*\" glob matches dotfiles; delete it before bundling, as the build jobs do src-tauri/resources/.gitkeep)"
+  done
 
   collect "$root" -path "$xray_pattern" ! -type d
   if [ "${#found[@]}" -eq 0 ]; then
@@ -226,4 +240,4 @@ if [ "$fail_count" -gt 0 ]; then
   echo "verify-bundled-xray: $fail_count failure(s) across $n artifact(s)"
   exit 1
 fi
-echo "OK: every artifact ($n) ships an executable resources/xray matching the compiled-in XRAY_BINARY_SHA256 ($expected_lc)"
+echo "OK: every artifact ($n) ships an executable resources/xray matching the compiled-in XRAY_BINARY_SHA256 ($expected_lc), and no dotfile under resources/"

@@ -15,6 +15,7 @@
 #          xray not executable
 #          two xrays (ambiguous)
 #          hash not compiled into the app binary (stale option_env!)
+#          a dotfile under resources/ (.app, AppImage, .deb; #256's .gitkeep)
 #          empty / non-hex expected hash (GITHUB_ENV never set)
 #          missing artifact, unknown artifact kind, tarball with two .app dirs
 #          one bad artifact among good ones still fails the whole call
@@ -138,6 +139,22 @@ expect 1 'non-executable xray fails' 'not executable' -- "$good_sha" "$work/noex
 make_app "$work/stale/BirdoVPN.app" Contents/Resources/resources/xray "$other_sha"
 expect 1 'hash not compiled into the app fails' 'was not compiled into the app' -- "$good_sha" "$work/stale/BirdoVPN.app"
 
+# #256: bundle.resources' "resources/*" glob shipped resources/.gitkeep. Any
+# dotfile under resources/ fails, however deep; one elsewhere is not its
+# business.
+make_app "$work/gitkeep/BirdoVPN.app"
+: >"$work/gitkeep/BirdoVPN.app/Contents/Resources/resources/.gitkeep"
+make_tar "$work/gitkeep.app.tar.gz" "$work/gitkeep"
+expect 1 '.app.tar.gz with resources/.gitkeep fails' 'Contents/Resources/resources/.gitkeep - a dotfile under resources/' -- "$good_sha" "$work/gitkeep.app.tar.gz"
+make_app "$work/dsstore/BirdoVPN.app"
+mkdir -p "$work/dsstore/BirdoVPN.app/Contents/Resources/resources/pf"
+: >"$work/dsstore/BirdoVPN.app/Contents/Resources/resources/pf/.DS_Store"
+: >"$work/dsstore/BirdoVPN.app/Contents/.hidden-elsewhere"
+expect 1 '.app with a nested dotfile under resources/ fails' 'resources/pf/.DS_Store - a dotfile under resources/' -- "$good_sha" "$work/dsstore/BirdoVPN.app"
+make_app "$work/elsewhere/BirdoVPN.app"
+: >"$work/elsewhere/BirdoVPN.app/Contents/.hidden-elsewhere"
+expect 0 'a dotfile outside resources/ passes' 'OK: every artifact' -- "$good_sha" "$work/elsewhere/BirdoVPN.app"
+
 make_app "$work/two/A.app"
 make_app "$work/two/B.app"
 make_tar "$work/two.app.tar.gz" "$work/two"
@@ -155,6 +172,11 @@ make_linux_root "$work/lroot-good"
 make_appimage "$work/good.AppImage" "$work/lroot-good"
 expect 0 'AppImage passes' 'OK: every artifact' -- "$good_sha" "$work/good.AppImage"
 
+make_linux_root "$work/lroot-gitkeep"
+: >"$work/lroot-gitkeep/usr/lib/BirdoVPN/resources/.gitkeep"
+make_appimage "$work/gitkeep.AppImage" "$work/lroot-gitkeep"
+expect 1 'AppImage with resources/.gitkeep fails' 'usr/lib/BirdoVPN/resources/.gitkeep - a dotfile under resources/' -- "$good_sha" "$work/gitkeep.AppImage"
+
 make_linux_root "$work/lroot-two"
 make_linux_root "$work/lroot-two" usr/lib/birdo-vpn-desktop/resources/xray
 make_appimage "$work/two.AppImage" "$work/lroot-two"
@@ -165,15 +187,23 @@ make_appimage "$work/bad.AppImage" "$work/lroot-bad"
 expect 1 'AppImage with rewritten xray fails' 'v1.4.40/v1.4.41' -- "$good_sha" "$work/bad.AppImage"
 
 if command -v dpkg-deb >/dev/null 2>&1; then
-  for v in good bad; do
+  for v in good bad gitkeep; do
     d="$work/deb-$v"
-    if [ "$v" = good ]; then make_linux_root "$d"; else make_linux_root "$d" usr/lib/BirdoVPN/resources/xray "$good_sha" 755 "$tampered"; fi
+    case "$v" in
+      good) make_linux_root "$d" ;;
+      bad) make_linux_root "$d" usr/lib/BirdoVPN/resources/xray "$good_sha" 755 "$tampered" ;;
+      gitkeep)
+        make_linux_root "$d"
+        : >"$d/usr/lib/BirdoVPN/resources/.gitkeep" # v1.4.46's .deb
+        ;;
+    esac
     mkdir -p "$d/DEBIAN"
     printf 'Package: birdo-selftest\nVersion: 1.0\nArchitecture: amd64\nMaintainer: ci\nDescription: gate fixture\n' >"$d/DEBIAN/control"
     dpkg-deb --root-owner-group --build "$d" "$work/$v.deb" >/dev/null
   done
   expect 0 '.deb passes' 'OK: every artifact' -- "$good_sha" "$work/good.deb"
   expect 1 '.deb with rewritten xray fails' 'v1.4.40/v1.4.41' -- "$good_sha" "$work/bad.deb"
+  expect 1 '.deb with resources/.gitkeep fails' 'usr/lib/BirdoVPN/resources/.gitkeep - a dotfile under resources/' -- "$good_sha" "$work/gitkeep.deb"
 else
   echo "SKIP  .deb scenarios (no dpkg-deb on this OS; the Linux leg runs them)"
 fi
