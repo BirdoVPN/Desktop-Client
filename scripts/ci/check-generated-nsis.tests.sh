@@ -9,7 +9,13 @@
 #   fail  the hook calls CheckIfAppIsRunning with the bare "${MAINBINARYNAME}.exe"
 #         (REVIEW-WIN2-008: what tauri-bundler 2.10.0 silently broke)
 #   fail  the template calls it in a form the hook does not (the next bundler change)
-#   fail  a hook macro is renamed (the template's !ifmacrodef skips it silently)
+#   fail  the template AND the hook both use the bare name: they agree, and
+#         the hook still does not pass the full path
+#   fail  the hook adds a second, unquoted call, which the form comparison
+#         cannot see
+#   fail  a hook macro is renamed (the template's !ifmacrodef skips it silently),
+#         also behind two spaces or a tab after !macro, and by a suffix
+#         (NSIS_HOOK_PREUNINSTALL2 must not read as NSIS_HOOK_PREUNINSTALL)
 #   fail  the script no longer includes the hook (installerHooks not applied)
 #
 # Usage, from the repo root after the build:
@@ -96,11 +102,48 @@ expect() {
     'CheckIfAppIsRunning "${MAINBINARYNAME}"'
   expect fail template-changed 'call form mismatch'
 
+  # The two agree, so only the full-path assertion (want_call) can fail it.
+  fixture bare-name-both
+  mutate "$work/bare-name-both/nsis-hooks.nsh" \
+    's/CheckIfAppIsRunning "\$INSTDIR\\\${MAINBINARYNAME}\.exe"/CheckIfAppIsRunning "${MAINBINARYNAME}.exe"/' \
+    'CheckIfAppIsRunning "${MAINBINARYNAME}.exe"'
+  mutate "$work/bare-name-both/x64/installer.nsi" \
+    's/CheckIfAppIsRunning "\$INSTDIR\\\${MAINBINARYNAME}\.exe"/CheckIfAppIsRunning "${MAINBINARYNAME}.exe"/' \
+    'CheckIfAppIsRunning "${MAINBINARYNAME}.exe"'
+  expect fail bare-name-both 'must pass the full path'
+
+  # Unquoted arguments: invisible to the quoted-form comparison.
+  fixture second-unquoted-call
+  mutate "$work/second-unquoted-call/nsis-hooks.nsh" \
+    '/^[[:space:]]*!insertmacro CheckIfAppIsRunning "/a\  !insertmacro CheckIfAppIsRunning ${MAINBINARYNAME}.exe "${PRODUCTNAME}"' \
+    '!insertmacro CheckIfAppIsRunning ${MAINBINARYNAME}.exe "${PRODUCTNAME}"'
+  expect fail second-unquoted-call 'calls CheckIfAppIsRunning on 2 lines'
+
   fixture renamed-hook
   mutate "$work/renamed-hook/nsis-hooks.nsh" \
     's/!macro NSIS_HOOK_PREUNINSTALL/!macro NSIS_HOOK_PRE_UNINSTALL/' \
     '!macro NSIS_HOOK_PRE_UNINSTALL'
   expect fail renamed-hook 'hook never invoked'
+
+  # NSIS takes any whitespace after !macro; the check must read it too.
+  fixture renamed-hook-two-spaces
+  mutate "$work/renamed-hook-two-spaces/nsis-hooks.nsh" \
+    's/!macro NSIS_HOOK_PREUNINSTALL/!macro  NSIS_HOOK_PRE_UNINSTALL/' \
+    '!macro  NSIS_HOOK_PRE_UNINSTALL'
+  expect fail renamed-hook-two-spaces 'hook never invoked'
+
+  fixture renamed-hook-tab
+  mutate "$work/renamed-hook-tab/nsis-hooks.nsh" \
+    's/!macro NSIS_HOOK_PREUNINSTALL/!macro\tNSIS_HOOK_PRE_UNINSTALL/' \
+    $'!macro\tNSIS_HOOK_PRE_UNINSTALL'
+  expect fail renamed-hook-tab 'hook never invoked'
+
+  # A name that merely STARTS with a real hook's name is another macro.
+  fixture renamed-hook-suffix
+  mutate "$work/renamed-hook-suffix/nsis-hooks.nsh" \
+    's/!macro NSIS_HOOK_PREUNINSTALL/!macro NSIS_HOOK_PREUNINSTALL2/' \
+    '!macro NSIS_HOOK_PREUNINSTALL2'
+  expect fail renamed-hook-suffix 'hook never invoked'
 
   fixture not-included
   sed -i '/^[[:space:]]*!include ".*nsis-hooks\.nsh"/d' "$work/not-included/x64/installer.nsi"
