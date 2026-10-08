@@ -339,6 +339,12 @@ FunctionEnd
   ; as long as a rollback to a pre-D8 build is supported.
   WriteRegStr HKLM "${BIRDO_LEGACY_MANUPRODUCTKEY}" "" $INSTDIR
   !insertmacro BIRDO_DROP_LEGACY_LANGUAGE
+  ; 1.4.46 and older installed resources\.gitkeep, which bundle.resources'
+  ; "resources/*" glob matched; #256 stopped shipping it. The uninstaller
+  ; deletes only the files it ships, so after an upgrade that file used to
+  ; keep resources\ and the install folder behind for good. CI caught it:
+  ; nsis-msi-era-upgrade.ps1, phase B, upgrades over v1.4.46.
+  Delete "$INSTDIR\resources\.gitkeep"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
