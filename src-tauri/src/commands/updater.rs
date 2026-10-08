@@ -197,8 +197,9 @@ impl UpdateFailure {
 }
 
 /// `install_update`'s code for a download a kill-switch block holds back
-/// (MR-1824). The UI says why it waits and starts it again by itself once the
-/// status says the download can get out (`session/updater.ts`).
+/// (MR-1824). The UI says why it waits; it starts again by itself only once
+/// nothing is active (the install ends the session and lifts the block), and
+/// once the tunnel is up it is offered again (`session/updater.ts`).
 pub const HELD_BY_KILL_SWITCH: &str = "held_by_kill_switch";
 
 /// How the installer download would leave the machine right now.

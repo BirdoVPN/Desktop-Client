@@ -158,7 +158,7 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
           <button
             type="button"
             onClick={() => void installUpdate()}
-            disabled={installing || waiting}
+            disabled={installing}
             className="flex items-center gap-2 rounded-lg bg-white px-6 py-2.5 text-sm font-semibold text-black transition hover:bg-white/90 disabled:opacity-50"
           >
             {installing ? (

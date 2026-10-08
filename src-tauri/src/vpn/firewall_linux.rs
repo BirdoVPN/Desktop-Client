@@ -50,6 +50,11 @@ static LIVE_GEN: AtomicI8 = AtomicI8::new(-1);
 /// ours is live, so every address gets through as far as we are concerned.
 static PERMITTED_GEN: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// The live chains are missing a control-plane self-permit that would not
+/// load (no `-m owner` on this host, say). See
+/// `killswitch::learn_control_plane`.
+static SELF_PERMITS_MISSING: AtomicBool = AtomicBool::new(false);
+
 /// Serialises every change to our chains: an activation, a lift, and the
 /// re-arm a newly learned control-plane address asks for (which comes from
 /// the API resolver, concurrently with the reconnect loop's own re-arms). Two
@@ -366,6 +371,12 @@ fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
         euid: unsafe { libc::geteuid() },
         lan_sharing: crate::commands::killswitch::lan_sharing_enabled(),
     };
+    // Review of #259 (L3): `permits` is lock-free, and PERMITTED_GEN is
+    // u64::MAX while nothing is live — so on a FIRST activation an address
+    // DoH learns while this runs would read as permitted, and be cached
+    // without a self-permit. From here on it reads as what this generation
+    // will cover (a no-op on a re-arm: the live one covers no more).
+    PERMITTED_GEN.fetch_min(control_plane_gen, Ordering::SeqCst);
 
     let live = LIVE_GEN.load(Ordering::SeqCst);
     if live < 0 {
@@ -390,6 +401,10 @@ fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
             // Nothing was hooked, so this cannot leak: drop the staging chains
             // and leave the previous generation (if any) exactly as it was.
             retire_chains(next);
+            if live < 0 {
+                // Nothing of ours is live, so nothing restricts any address.
+                PERMITTED_GEN.store(u64::MAX, Ordering::SeqCst);
+            }
             tracing::error!("Kill switch: rule build failed, block NOT changed: {}", e);
             return Err(e);
         }
@@ -427,6 +442,7 @@ fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
             let blocking = jump_present("OUTPUT", &chain_out(next));
             LIVE_GEN.store(next, Ordering::SeqCst);
             PERMITTED_GEN.store(covered, Ordering::SeqCst);
+            SELF_PERMITS_MISSING.store(!self_permits_loaded, Ordering::SeqCst);
             IPTABLES_BLOCKING.store(blocking, Ordering::SeqCst);
             tracing::error!(
                 "Kill switch: only part of the rule set could be hooked ({}); blocking={}",
@@ -442,6 +458,7 @@ fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
 
     LIVE_GEN.store(next, Ordering::SeqCst);
     PERMITTED_GEN.store(covered, Ordering::SeqCst);
+    SELF_PERMITS_MISSING.store(!self_permits_loaded, Ordering::SeqCst);
     IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
     tracing::info!("Linux iptables kill switch activated");
     Ok(())
@@ -451,6 +468,12 @@ fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
 /// none of ours is live, or the live one's self-permits cover them (N5).
 pub fn permits(generation: u64) -> bool {
     PERMITTED_GEN.load(Ordering::SeqCst) >= generation
+}
+
+/// Whether the live chains lack a control-plane self-permit that would not
+/// load. False while nothing of ours is live.
+pub fn self_permits_missing() -> bool {
+    SELF_PERMITS_MISSING.load(Ordering::SeqCst)
 }
 
 /// A DoH answer brought control-plane addresses of `generation`. If a block of
@@ -503,6 +526,7 @@ pub async fn deactivate_blocking() -> Result<(), String> {
 
     LIVE_GEN.store(-1, Ordering::SeqCst);
     PERMITTED_GEN.store(u64::MAX, Ordering::SeqCst);
+    SELF_PERMITS_MISSING.store(false, Ordering::SeqCst);
     IPTABLES_BLOCKING.store(false, Ordering::SeqCst);
     tracing::info!("Linux iptables kill switch deactivated");
     Ok(())
@@ -519,6 +543,7 @@ pub fn emergency_cleanup() {
     remove_all_chains();
     LIVE_GEN.store(-1, Ordering::SeqCst);
     PERMITTED_GEN.store(u64::MAX, Ordering::SeqCst);
+    SELF_PERMITS_MISSING.store(false, Ordering::SeqCst);
     IPTABLES_BLOCKING.store(false, Ordering::SeqCst);
 }
 
@@ -529,6 +554,15 @@ mod iptables_chain_tests {
     use super::*;
     use crate::vpn::iptables_policy::check::{self, Packet};
     use std::net::{IpAddr, Ipv6Addr};
+
+    /// Whether a jump from `hook` to `name` is installed in the IPv6 table.
+    fn jump_present_v6(hook: &str, name: &str) -> bool {
+        crate::utils::hidden_cmd("ip6tables")
+            .args(["-w", "-C", hook, "-j", name])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 
     /// `<cmd> -S <chain>`: the kernel's own listing.
     fn listing(cmd: &str, chain: &str) -> Result<String, String> {
@@ -564,7 +598,9 @@ mod iptables_chain_tests {
             lan_sharing: true,
         };
         let want = iptables_policy::block_all(&inputs);
-        let gen = 1;
+        // Not 0 or 1, the generations the kill switch itself swaps between,
+        // so this can never flush chains a live block is using.
+        let gen = 7;
         let (out, inn) = (chain_out(gen), chain_in(gen));
 
         retire_chains(gen); // a previous run that died part-way
@@ -573,7 +609,12 @@ mod iptables_chain_tests {
         let v6 = listing("ip6tables", &out);
         let hooked: Vec<&str> = HOOKS
             .into_iter()
-            .filter(|h| jump_present(h, &out) || jump_present(h, &inn))
+            .filter(|h| {
+                jump_present(h, &out)
+                    || jump_present(h, &inn)
+                    || jump_present_v6(h, &out)
+                    || jump_present_v6(h, &inn)
+            })
             .collect();
         retire_chains(gen);
         let left: Vec<&String> = [&out, &inn]

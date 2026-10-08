@@ -20,14 +20,17 @@
  * On macOS and Linux a kill-switch block lets the app reach only the BirdoVPN
  * control plane, deliberately, so while a block is up and no tunnel carries
  * the download Rust refuses it up front (`held_by_kill_switch`). The update
- * then waits (`waiting`), says why, and starts again by itself once the
- * status says the download can get out. Windows permits the app through its
- * block and never waits.
+ * then waits (`waiting`) and says why. It starts by itself only once nothing
+ * is active — the install ends the session and lifts the block, which must
+ * never happen to a session nobody is watching — and once the tunnel is up it
+ * is offered again, so the next click goes through the confirm. Windows
+ * permits the app through its block and never waits.
  */
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore, type AppStateSnapshot } from '@/store/app-store';
+import { selectTunnelActive } from '@/store/selectors';
 import { isWindowsPlatform } from '@/utils/helpers';
 
 /** Mirrors `commands::updater::UpdateInfo` (serde camelCase). */
@@ -78,7 +81,7 @@ const UPDATE_INSTALL_FAILED_RECONNECTING_COPY =
   'The update was downloaded but could not be installed. BirdoVPN is reconnecting.';
 /** MR-1824. Wording flagged for review in the PR. */
 export const UPDATE_WAITING_COPY =
-  'The kill switch is blocking the download. It starts once the VPN connects or you disconnect.';
+  'The kill switch is blocking the download. You can download it once the VPN connects, or it starts by itself if you disconnect.';
 
 /** `install_update`'s code for a download a kill-switch block holds back. */
 const HELD_BY_KILL_SWITCH = 'held_by_kill_switch';
@@ -88,11 +91,25 @@ function heldByKillSwitch(e: unknown): boolean {
 }
 
 /**
- * Rust's `download_route`, read from the published status: the tunnel
- * carries the download, or no block is up. (Windows never gets here.)
+ * What a held download does with the published status (MR-1824):
+ *  - `resume`: nothing is active — no tunnel, no block, no command in
+ *    flight. The install has no session to end, so it starts by itself.
+ *  - `ask`: the tunnel is up. The download could go through it, but the
+ *    install would end the session and lift the block, and an auto-reconnect
+ *    can bring the tunnel back hours after the click with nobody watching
+ *    (macOS/Linux do not restart into a new session). So the update is
+ *    offered again, and the next click goes through the confirm.
+ *  - `wait`: still blocked, or a session without a block (a give-up's error)
+ *    that the install would end.
  */
-export function downloadCanStart(s: Pick<AppStateSnapshot, 'connectionState' | 'killSwitchBlocking'>): boolean {
-  return s.connectionState === 'connected' || !s.killSwitchBlocking;
+export type HeldUpdateStep = 'resume' | 'ask' | 'wait';
+
+export function heldUpdateStep(
+  s: Pick<AppStateSnapshot, 'connectionState' | 'pendingAction' | 'killSwitchBlocking'>,
+): HeldUpdateStep {
+  if (s.connectionState === 'connected') return 'ask';
+  if (!selectTunnelActive(s)) return 'resume';
+  return 'wait';
 }
 
 let stopWaiting: (() => void) | null = null;
@@ -102,23 +119,29 @@ function stopWaitingForDownload(): void {
   stopWaiting = null;
 }
 
+function settleHeld(step: 'resume' | 'ask', retryNowIfHeld: boolean): void {
+  stopWaitingForDownload();
+  if (step === 'ask') useUpdater.setState({ phase: 'available' });
+  else void runInstall(retryNowIfHeld);
+}
+
 /**
- * Held: start again once the status says the download can get out. On a
- * CHANGE of that answer, so a status that disagrees with Rust's cannot spin
- * it; plus one immediate retry (`retryNow`) if the status already moved on
- * while Rust was answering.
+ * Held: act once the status reaches `resume` or `ask`. On a CHANGE of that
+ * answer, so a status that disagrees with Rust's cannot spin it; plus, if it
+ * is already there while Rust was answering, `ask` at once, or one immediate
+ * retry (`retryNow`) for `resume`.
  */
 function waitForDownloadPath(retryNow: boolean): void {
   stopWaitingForDownload();
-  if (retryNow && downloadCanStart(useAppStore.getState())) {
-    void runInstall(false);
+  const now = heldUpdateStep(useAppStore.getState());
+  if (now === 'ask' || (now === 'resume' && retryNow)) {
+    settleHeld(now, false);
     return;
   }
   stopWaiting = useAppStore.subscribe((next, prev) => {
-    if (downloadCanStart(next) && !downloadCanStart(prev)) {
-      stopWaitingForDownload();
-      void runInstall(true);
-    }
+    const step = heldUpdateStep(next);
+    if (step === 'wait' || step === heldUpdateStep(prev)) return;
+    settleHeld(step, true);
   });
 }
 

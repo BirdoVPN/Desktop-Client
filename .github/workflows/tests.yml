@@ -382,7 +382,13 @@ jobs:
         working-directory: src-tauri
         run: |
           set -euo pipefail
-          out=$(sudo -E "$(command -v cargo)" test --locked --lib iptables_chain_tests -- --ignored --nocapture --test-threads=1)
+          # `|| {…}`: under `set -e` a failing `out=$(…)` would exit before
+          # the output it captured is printed.
+          out=$(sudo -E "$(command -v cargo)" test --locked --lib iptables_chain_tests -- --ignored --nocapture --test-threads=1) || {
+            echo "$out"
+            echo "::error::iptables_chain_tests failed"
+            exit 1
+          }
           echo "$out"
           # One test, required: an --ignored filter that matches nothing
           # still exits 0.

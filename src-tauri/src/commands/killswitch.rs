@@ -852,32 +852,75 @@ pub fn control_plane_permits(generation: u64) -> bool {
 /// Linux: a DoH answer brought control-plane addresses of `generation` that
 /// the live block's self-permits do not cover. The block is re-armed around
 /// them NOW, before the resolver caches or hands them out; `Err` makes it
-/// cache nothing, so the next request asks again.
-///
-/// Under the one rule for the intent ([`unless_turned_off`]): a block the
-/// user has turned off is lifted rather than re-armed, and a block that is
-/// not up is never put up from here.
+/// cache nothing, so the next request asks again. See [`learn_control_plane`].
 #[cfg(target_os = "linux")]
 pub async fn control_plane_learned(generation: u64) -> Result<(), String> {
-    let result = unless_turned_off(
-        async {
-            if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
-                return Ok(false);
-            }
-            firewall_linux::refresh_control_plane(vpn_server_ip(), generation).await
-        },
+    let result = learn_control_plane(
+        || firewall_linux::refresh_control_plane(vpn_server_ip(), generation),
         deactivate_platform_block,
         activate_platform_block,
         platform_is_blocking,
+        || firewall_linux::permits(generation),
+        firewall_linux::self_permits_missing,
     )
     .await;
     blocking_may_have_changed();
-    match result {
-        Ok(_) if firewall_linux::permits(generation) => {
+    result
+}
+
+/// What [`control_plane_learned`] does, over its parts, so the decision is
+/// unit-tested on every OS.
+///
+/// `refresh` re-arms the live block around the current control-plane set; it
+/// runs only while the intent is on, and under the one rule for the intent
+/// ([`unless_turned_off`]): a block the user has turned off is lifted rather
+/// than re-armed, and a block that is not up is never put up from here. Then:
+///
+/// - the block covers the new addresses (`covered`), or none is up: `Ok`;
+/// - the re-arm landed but a self-permit would not load on this host
+///   (`self_permits_missing`: no `-m owner`, say) — review of #259, L2: `Ok`.
+///   The address is not permitted either way, so caching it makes nothing
+///   less safe, and refusing would keep api.birdo.app from resolving even
+///   while connected, when its traffic goes through the tunnel;
+/// - otherwise `Err`: nothing is cached, and the next request asks again.
+#[cfg(any(target_os = "linux", test))]
+async fn learn_control_plane<F, FF, L, LF, R, RF>(
+    refresh: F,
+    lift: L,
+    reengage: R,
+    blocking: impl Fn() -> bool,
+    covered: impl Fn() -> bool,
+    self_permits_missing: impl Fn() -> bool,
+) -> Result<(), String>
+where
+    F: FnOnce() -> FF,
+    FF: std::future::Future<Output = Result<bool, String>>,
+    L: Fn() -> LF,
+    LF: std::future::Future<Output = Result<bool, String>>,
+    R: Fn() -> RF,
+    RF: std::future::Future<Output = Result<bool, String>>,
+{
+    let engage = async move {
+        if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        refresh().await
+    };
+    match unless_turned_off(engage, lift, reengage, blocking).await {
+        Ok(_) if covered() => {
             tracing::info!("Kill switch: the control-plane self-permits cover the new address");
             Ok(())
         }
-        Ok(_) => Err("the kill switch's control-plane self-permit could not be installed".into()),
+        Ok(_) if self_permits_missing() => {
+            tracing::warn!(
+                "Kill switch: a control-plane self-permit would not load on this host; \
+                 the new address is cached, and reaches the API only through the tunnel"
+            );
+            Ok(())
+        }
+        Ok(_) => {
+            Err("the kill switch's control-plane self-permit does not cover the new address".into())
+        }
         Err(e) => {
             tracing::warn!(
                 "Kill switch: re-arming for a new control-plane address failed: {}",
@@ -1544,6 +1587,127 @@ mod tests {
         // Idempotent from the cleared state too.
         assert_eq!(arm_with_preference(false, intent_seq()).await, Ok(false));
         assert!(!is_enabled());
+    }
+
+    /// Review of #259: a control-plane address DoH learns while a Linux block
+    /// is up is let through by a re-arm BEFORE the resolver may cache it.
+    #[tokio::test]
+    async fn a_learned_address_is_re_armed_in_before_it_is_cached() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+        let rearmed = AtomicBool::new(false);
+        let lifted = AtomicBool::new(false);
+
+        let result = learn_control_plane(
+            || async {
+                rearmed.store(true, Ordering::SeqCst);
+                Ok(true)
+            },
+            || async {
+                lifted.store(true, Ordering::SeqCst);
+                Ok(true)
+            },
+            || std::future::ready(Ok(true)),
+            || true,
+            || rearmed.load(Ordering::SeqCst),
+            || false,
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            rearmed.load(Ordering::SeqCst),
+            "the live block was re-armed"
+        );
+        assert!(
+            !lifted.load(Ordering::SeqCst),
+            "a wanted block is not lifted"
+        );
+    }
+
+    /// A re-arm that failed, or one that left the address uncovered, keeps
+    /// the resolver from caching it: the next request asks again.
+    #[tokio::test]
+    async fn an_address_the_block_does_not_cover_is_not_cached() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+
+        let failed = learn_control_plane(
+            || std::future::ready(Err("iptables failed".to_string())),
+            || std::future::ready(Ok(true)),
+            || std::future::ready(Ok(true)),
+            || true,
+            || false,
+            || false,
+        )
+        .await;
+        assert_eq!(failed, Err("iptables failed".to_string()));
+
+        let uncovered = learn_control_plane(
+            || std::future::ready(Ok(true)),
+            || std::future::ready(Ok(true)),
+            || std::future::ready(Ok(true)),
+            || true,
+            || false,
+            || false,
+        )
+        .await;
+        assert!(uncovered.is_err(), "{uncovered:?}");
+    }
+
+    /// Review of #259 (L2): on a host where no self-permit loads (no
+    /// `-m owner`), the address is not permitted either way, so the resolver
+    /// may cache it — or api.birdo.app would never resolve, even connected.
+    #[tokio::test]
+    async fn a_host_without_self_permits_still_caches_the_address() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(true, Ordering::SeqCst);
+        let result = learn_control_plane(
+            || std::future::ready(Ok(true)),
+            || std::future::ready(Ok(true)),
+            || std::future::ready(Ok(true)),
+            || true,
+            || false,
+            || true,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+    }
+
+    /// The intent rules here too: a block the user turned off is lifted, not
+    /// re-armed around the new address.
+    #[tokio::test]
+    async fn a_learned_address_lifts_a_block_the_user_turned_off() {
+        let _tests = FLAG_TESTS.lock().await;
+        KILLSWITCH_ENABLED.store(false, Ordering::SeqCst);
+        let rearmed = AtomicBool::new(false);
+        let lifted = AtomicBool::new(false);
+
+        let result = learn_control_plane(
+            || async {
+                rearmed.store(true, Ordering::SeqCst);
+                Ok(true)
+            },
+            || async {
+                lifted.store(true, Ordering::SeqCst);
+                Ok(true)
+            },
+            || std::future::ready(Ok(true)),
+            || !lifted.load(Ordering::SeqCst),
+            || lifted.load(Ordering::SeqCst),
+            || false,
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            !rearmed.load(Ordering::SeqCst),
+            "no re-arm against the intent"
+        );
+        assert!(
+            lifted.load(Ordering::SeqCst),
+            "the unwanted block is lifted"
+        );
     }
 
     /// Proposed row 1 (MR-734): Kill Switch OFF lands while a reconnect
