@@ -17,8 +17,10 @@
 //! ends in `_ip`/`ip`, `_addr`/`addr`, `_address`, `_endpoint`/`endpoint`,
 //! `_gateway`, `_host`/`host` or `_hostname` may appear as a VALUE unless it is
 //! inside a `redact_*`/`sanitize_*` call, or is only tested for presence
-//! (`.is_some()`/`.is_none()`). String literals and comments are stripped first,
-//! so prose and format strings never trip it.
+//! (`.is_some()`/`.is_none()`). A redactor's own name passes only where it is
+//! handed to a combinator as a function (`.map(redact_ip)`): a variable merely
+//! named `redact_ip` is a value like any other. String literals and comments
+//! are stripped first, so prose and format strings never trip it.
 //!
 //! The check deliberately covers `debug!` too. "Debug never ships" was the
 //! stated reason several raw values were left in place, and `RUST_LOG` made that
@@ -299,7 +301,11 @@ fn scan_args(file: &str, line: usize, args: &str) -> Vec<Finding> {
         }
         // The redactor itself passed as a function, `.map(redact_ip)`: the form
         // clippy's redundant_closure asks for instead of `.map(|s| redact_ip(s))`.
-        if ident.starts_with("redact_") || ident.starts_with("sanitize_") {
+        // Only in that shape: the name is no proof, since a plain variable can
+        // be called `redact_ip` too (`let redact_ip = peer_ip;`).
+        if (ident.starts_with("redact_") || ident.starts_with("sanitize_"))
+            && passed_as_a_function(args, i, end)
+        {
             i = end;
             continue;
         }
@@ -332,6 +338,62 @@ fn scan_args(file: &str, line: usize, args: &str) -> Vec<Finding> {
     }
 
     findings
+}
+
+/// The combinators a redactor is handed to as a function. In each the function
+/// is the last argument: `.map(redact_ip)`, `.and_then(sanitize_host)`,
+/// `.map_or(default, redact_ip)`.
+const REDACTOR_COMBINATORS: &[&str] = &[
+    "map",
+    "and_then",
+    "map_or",
+    "map_or_else",
+    "filter_map",
+    "flat_map",
+];
+
+/// Is the `redact_*`/`sanitize_*` identifier at `args[start..end]` handed to a
+/// combinator as a function (`.map(redact_ip)`) rather than used as a value?
+///
+/// It must be a whole argument (`(` or `,` before it), the LAST one (`)` after
+/// it, or a trailing `,` and then `)`), of a method call named in
+/// `REDACTOR_COMBINATORS`. So none of these pass: the macro's own arguments
+/// (`info!("{}", redact_ip)`), a nested macro (`format!("{}", redact_ip)`), a
+/// constructor (`Some(redact_ip)`), a method that takes a value
+/// (`.unwrap_or(redact_ip)`), or a combinator's default (`.map_or(redact_ip, f)`).
+fn passed_as_a_function(args: &str, start: usize, end: usize) -> bool {
+    let after = args[end..].trim_start();
+    let last_argument = after.starts_with(')')
+        || after
+            .strip_prefix(',')
+            .is_some_and(|rest| rest.trim_start().starts_with(')'));
+    let before = args[..start].trim_end();
+    if !last_argument || !(before.ends_with('(') || before.ends_with(',')) {
+        return false;
+    }
+    // The bracket that opens the argument list it is in.
+    let b = args.as_bytes();
+    let mut depth = 0usize;
+    let mut k = start;
+    let open = loop {
+        if k == 0 {
+            return false; // the macro's own argument list
+        }
+        k -= 1;
+        match b[k] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' if depth == 0 => break k,
+            b'(' | b'[' | b'{' => depth -= 1,
+            _ => {}
+        }
+    };
+    if b[open] != b'(' {
+        return false;
+    }
+    let callee = args[..open].trim_end();
+    let name_start = callee.trim_end_matches(is_ident_char).len();
+    REDACTOR_COMBINATORS.contains(&&callee[name_start..])
+        && callee[..name_start].trim_end().ends_with('.')
 }
 
 /// Is the identifier starting at `idx` the argument of a `redact_*`/`sanitize_*`
@@ -486,6 +548,61 @@ mod tests {
         let hits = scan_source("t.rs", src);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].ident, "gateway_ip");
+    }
+
+    #[test]
+    fn accepts_a_redactor_handed_to_any_combinator_as_its_last_argument() {
+        for src in [
+            r#"fn f() { tracing::info!("{:?}", host.and_then(sanitize_host)); }"#,
+            r#"fn f() { tracing::info!("{}", gw.map_or(String::new(), redact_ip)); }"#,
+            // rustfmt's vertical form, with its trailing comma
+            "fn f() { tracing::info!(\"{}\", gw.map_or_else(\n    || \"none\".into(),\n    redact_endpoint,\n)); }",
+            r#"fn f() { tracing::info!("{:?}", ips.iter().filter_map(redact_ip).count()); }"#,
+        ] {
+            let hits = scan_source("t.rs", src);
+            assert!(hits.is_empty(), "{src}: {hits:?}");
+        }
+    }
+
+    /// From the review of #256: any identifier starting `redact_`/`sanitize_`
+    /// was skipped, so a plain variable given a redactor's name reached the log
+    /// raw (`let redact_ip = peer_ip; info!("{}", redact_ip)`).
+    #[test]
+    fn flags_a_value_that_is_only_named_like_a_redactor() {
+        for (src, ident) in [
+            (
+                r#"fn f() { let redact_ip = peer_ip; tracing::info!("{}", redact_ip); }"#,
+                "redact_ip",
+            ),
+            (
+                r#"fn f() { tracing::info!("{} {}", redact_ip, port); }"#,
+                "redact_ip",
+            ),
+            (
+                r#"fn f() { tracing::info!("{:?}", Some(sanitize_host)); }"#,
+                "sanitize_host",
+            ),
+            (
+                r#"fn f() { tracing::info!("{}", format!("{}", redact_endpoint)); }"#,
+                "redact_endpoint",
+            ),
+            (
+                r#"fn f() { tracing::info!("{}", redact_ip.to_string()); }"#,
+                "redact_ip",
+            ),
+            (
+                r#"fn f() { tracing::info!("{}", opt.unwrap_or(redact_ip)); }"#,
+                "redact_ip",
+            ),
+            (
+                r#"fn f() { tracing::info!("{}", opt.map_or(redact_ip, |g| g.len())); }"#,
+                "redact_ip",
+            ),
+        ] {
+            let hits = scan_source("t.rs", src);
+            assert_eq!(hits.len(), 1, "{src}: {hits:?}");
+            assert_eq!(hits[0].ident, ident, "{src}");
+        }
     }
 
     /// The on-disk log level clamp must stay WIRED, not merely exist.
