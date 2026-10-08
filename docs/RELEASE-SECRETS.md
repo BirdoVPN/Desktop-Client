@@ -25,6 +25,28 @@ The matching public key is hard-coded into
 `plugins.updater.pubkey` and **must not** be rotated without also bumping
 all installed clients.
 
+### Re-signing an updater artifact by hand
+
+`release.yml` signs every updater artifact inside `tauri build`, which binds
+the signature to the release's version. An artifact re-signed by hand (a
+repaired or re-uploaded asset) **must** be bound the same way, to the version
+it is published as:
+
+```bash
+npx tauri signer sign --app-version <version> <artifact>
+```
+
+with `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in
+the environment, never on the command line. `--app-version` needs
+`@tauri-apps/cli` 2.12 or later (the locked one).
+
+From 1.4.47 the app runs with `plugins.updater.requireSignedVersion`: the
+signature's trusted comment must say `version:<version>`, the version the
+update endpoint announces. A signature made without `--app-version` names no
+version, and every updated client rejects it, as it does one bound to another
+version. Before uploading, check that the trusted comment carries the right
+version (`base64 -d < <artifact>.sig | grep '^trusted comment:'`).
+
 ---
 
 ## 2. Windows — Azure Trusted Signing
