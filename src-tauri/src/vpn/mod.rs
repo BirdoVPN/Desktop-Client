@@ -1219,11 +1219,16 @@ pub mod dns_journal {
             // PATH since tauri-bundler 2.10 (cli 2.12): a bare exe name
             // matches nothing and reports "not running"
             // (scripts/ci/check-nsis-hook-macros.sh checks this form against
-            // the template compiled into the locked CLI).
+            // the template compiled into the locked CLI). The one call lives
+            // in BIRDO_STOP_APP_IF_RUNNING, which the MSI-era removal in
+            // NSIS_HOOK_PREINSTALL uses too (WIN2-012).
+            assert!(hook_macro("BIRDO_STOP_APP_IF_RUNNING").contains(
+                r#"!insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}""#
+            ));
             in_order(
                 pre,
                 &[
-                    r#"!insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}""#,
+                    "!insertmacro BIRDO_STOP_APP_IF_RUNNING",
                     "nsExec::Exec /TIMEOUT=",
                     "--reconcile-and-exit",
                 ],
@@ -1419,6 +1424,82 @@ pub mod dns_journal {
             // product) keeps its own record under it.
             assert!(drop.contains(r#"DeleteRegKey /ifempty HKLM "${BIRDO_LEGACY_MANUKEY}""#));
             assert!(!drop.contains(r#"DeleteRegKey HKLM "${BIRDO_LEGACY_MANUKEY}""#));
+        }
+
+        /// WIN2-012: an upgrade over the MSI that builds b15aece..79fd4ae also
+        /// shipped (same folder, publisher "Birdo VPN") removes that MSI
+        /// BEFORE any file of ours is laid down, after stopping a running app,
+        /// and matches nothing but its exact entry. Behaviour, with a real MSI
+        /// of that shape: scripts/ci/nsis-msi-era-upgrade.ps1.
+        #[test]
+        fn an_upgrade_removes_the_msi_era_install_first() {
+            in_order(
+                hook_macro("NSIS_HOOK_PREINSTALL"),
+                &[
+                    "Call BirdoAdoptLegacyRecord",
+                    "Push 0",
+                    "Call BirdoMsiEraEntries",
+                    "!insertmacro BIRDO_STOP_APP_IF_RUNNING",
+                    "SetOutPath $TEMP",
+                    "Push 1",
+                    "Call BirdoMsiEraEntries",
+                    "SetOutPath $INSTDIR",
+                    "StrCpy $WixMode 1",
+                ],
+            );
+            assert!(HOOKS.contains(r#"!define BIRDO_MSI_ERA_PUBLISHER "Birdo VPN""#));
+            in_order(
+                hook_function("BirdoIsMsiEraEntry"),
+                &[
+                    "${If} $1 = 38",
+                    // Only a real GUID reaches msiexec (the round trip).
+                    "IIDFromString",
+                    "${If} $3 == 0",
+                    "${AndIf} $1 == $0",
+                    r#"${If} $1 S== "BirdoVPN""#,
+                    r#"${If} $1 S== "${BIRDO_MSI_ERA_PUBLISHER}""#,
+                    r#""WindowsInstaller""#,
+                ],
+            );
+            let remove = hook_function("BirdoRemoveMsiEraEntry");
+            in_order(
+                remove,
+                &[
+                    "MsiQueryProductStateW",
+                    "${If} $1 = -1",
+                    r#"DeleteRegKey HKLM "${BIRDO_UNINSTALL_ROOT}\$0""#,
+                    // Only an installed product is uninstalled, its code quoted.
+                    "${ElseIf} $1 = 5",
+                    r#"msiexec.exe" /x "$0" /qn /norestart"#,
+                    "${ElseIf} $1 == 3010",
+                    "SetRebootFlag true",
+                    // -2 INVALIDARG, 1, 2, a failed call: left alone.
+                    "${Else}",
+                    "Leaving $0 alone",
+                ],
+            );
+            assert!(
+                !HOOKS.contains(r#""UninstallString""#),
+                "the entry's own command is never run"
+            );
+        }
+
+        /// MR-1606 / REVIEW-WIN2-018: the confirm page's "Delete the
+        /// application data" says that the DNS-restore journal survives it.
+        /// The custom English.nsh replaces the bundler's; every language the
+        /// installer offers has to carry the sentence.
+        /// scripts/ci/check-nsis-language.sh checks the generated installer
+        /// and the CLI's own strings.
+        #[test]
+        fn the_confirm_page_says_the_journal_is_kept() {
+            let conf: serde_json::Value =
+                serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+            let nsis = &conf["bundle"]["windows"]["nsis"];
+            assert_eq!(nsis["languages"], serde_json::json!(["English"]));
+            assert_eq!(nsis["customLanguageFiles"]["English"], "nsis/English.nsh");
+            assert!(include_str!("../../nsis/English.nsh").contains(
+                r#"LangString deleteAppData ${LANG_ENGLISH} "Delete the application data (keeps the DNS-restore journal)""#
+            ));
         }
     }
 
