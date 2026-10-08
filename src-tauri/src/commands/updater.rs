@@ -32,6 +32,9 @@
 //! The webview's direct access to the plugin's own (unpinned) IPC commands is
 //! revoked in `capabilities/default.json` — `updater:default` is gone — so the
 //! unpinned path cannot be reached from the frontend at all.
+//!
+//! MR-1824: that GitHub download is also why a kill-switch block holds it on
+//! macOS and Linux — see [`download_route`].
 
 use std::time::Duration;
 
@@ -176,7 +179,8 @@ pub enum Reconnect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateFailure {
-    /// `check_failed`, `download_failed` or `install_failed`.
+    /// `check_failed`, `download_failed`, `install_failed`, or
+    /// [`HELD_BY_KILL_SWITCH`]: nothing was attempted, the download waits.
     pub code: &'static str,
     pub message: String,
     pub reconnect: Reconnect,
@@ -189,6 +193,49 @@ impl UpdateFailure {
             message: for_ipc(message),
             reconnect: Reconnect::None,
         }
+    }
+}
+
+/// `install_update`'s code for a download a kill-switch block holds back
+/// (MR-1824). The UI says why it waits; it starts again by itself only once
+/// nothing is active (the install ends the session and lifts the block), and
+/// once the tunnel is up it is offered again (`session/updater.ts`).
+pub const HELD_BY_KILL_SWITCH: &str = "held_by_kill_switch";
+
+/// How the installer download would leave the machine right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadRoute {
+    /// No block is up, or the block lets this app's HTTPS through (Windows).
+    Open,
+    /// A block is up and the tunnel carries the download through it: every
+    /// block permits the tunnel's own interface, and the tunnel holds the
+    /// default route.
+    Tunnel,
+    /// A block is up and nothing carries the download: it would be dropped.
+    HeldByKillSwitch,
+}
+
+/// MR-1824: may the installer download start now?
+///
+/// The manifest's `url` is a GitHub release asset (github.com, redirected to
+/// release-assets.githubusercontent.com — measured 2026-10-08 for
+/// darwin-aarch64 and linux-x86_64 1.4.46). The Windows block permits this
+/// executable's tcp/443 to any host (`app_permitted`), so it never holds
+/// the download. The macOS and Linux blocks let root's tcp/443 reach ONLY
+/// the control plane — the API and DoH addresses (`pf_policy`,
+/// `iptables_policy`) — and they stay that narrow on purpose: permitting
+/// GitHub's front and its CDN would let every root process on the machine
+/// reach them from the real address, through exactly the window the kill
+/// switch seals. So there the download waits for a tunnel to carry it, or
+/// for the block to lift, instead of timing out as "could not be
+/// downloaded".
+fn download_route(app_permitted: bool, blocking: bool, tunnel_connected: bool) -> DownloadRoute {
+    if !blocking || app_permitted {
+        DownloadRoute::Open
+    } else if tunnel_connected {
+        DownloadRoute::Tunnel
+    } else {
+        DownloadRoute::HeldByKillSwitch
     }
 }
 
@@ -252,10 +299,32 @@ async fn recover_from_failed_install(
 /// install that failed, and offers to reconnect — or, under always-on,
 /// reconnects. The process only exits once the installer is running.
 ///
+/// MR-1824: off Windows, while a kill-switch block is up and no tunnel
+/// carries the download, nothing is attempted: the error is
+/// [`HELD_BY_KILL_SWITCH`] ([`download_route`]).
+///
 /// Emits [`DOWNLOAD_PROGRESS_EVENT`] as bytes arrive. Returns `Ok(false)` if the
 /// re-check found nothing to install.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
+    let tunnel_connected = app
+        .state::<crate::vpn::VpnManager>()
+        .get_state()
+        .await
+        .is_tunnel_active();
+    let route = download_route(
+        cfg!(target_os = "windows"),
+        crate::commands::killswitch::platform_is_blocking(),
+        tunnel_connected,
+    );
+    if route == DownloadRoute::HeldByKillSwitch {
+        tracing::info!("Update download held: a kill-switch block is up and no tunnel carries it");
+        return Err(UpdateFailure::before_install(
+            HELD_BY_KILL_SWITCH,
+            "The kill switch is blocking the update download".to_string(),
+        ));
+    }
+
     let updater =
         pinned_updater(&app).map_err(|e| UpdateFailure::before_install("check_failed", e))?;
     let update = match updater.check().await {
@@ -361,6 +430,41 @@ mod tests {
 
         let install = &source[source.find("pub async fn install_update(").unwrap()..];
         assert!(install.contains("recover_from_failed_install(&app, resume"));
+    }
+
+    /// MR-1824: off Windows a block holds the download unless the tunnel
+    /// carries it; Windows (which permits the app) and no block never hold it.
+    #[test]
+    fn a_kill_switch_block_holds_the_download_until_a_tunnel_carries_it() {
+        use super::{download_route, DownloadRoute::*};
+        // (app permitted through the block, blocking, tunnel connected)
+        let unix = false;
+        assert_eq!(download_route(unix, true, false), HeldByKillSwitch);
+        assert_eq!(download_route(unix, true, true), Tunnel);
+        assert_eq!(download_route(unix, false, false), Open);
+        assert_eq!(download_route(unix, false, true), Open);
+        let windows = true;
+        for (blocking, tunnel) in [(true, false), (true, true), (false, false), (false, true)] {
+            assert_eq!(download_route(windows, blocking, tunnel), Open);
+        }
+    }
+
+    /// MR-1824: the hold is decided before anything goes on the wire, from
+    /// the platform's block and the tunnel, and reported as its own stage.
+    #[test]
+    fn the_hold_comes_before_the_re_check_and_the_download() {
+        let source = include_str!("updater.rs");
+        let body = &source[source.find("pub async fn install_update(").unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let route = body.find("download_route(").expect("route");
+        let held = body.find("HELD_BY_KILL_SWITCH").expect("held");
+        let check = body.find("updater.check()").expect("re-check");
+        let download = body.find(".download(").expect("download");
+        assert!(route < held && held < check && check < download);
+        assert!(body.contains("cfg!(target_os = \"windows\")"));
+        assert!(body.contains("platform_is_blocking()"));
+        assert!(body.contains(".is_tunnel_active()"));
+        assert_eq!(super::HELD_BY_KILL_SWITCH, "held_by_kill_switch");
     }
 
     /// REVIEW-WIN-002: what a failed install does about the session it ended.

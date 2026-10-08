@@ -369,6 +369,34 @@ jobs:
         working-directory: src-tauri
         run: sudo -E "$(command -v cargo)" test --locked --lib ipv6_leak_block_tests -- --ignored --nocapture
 
+      # Linux: the kill switch's block-all as the KERNEL holds it. The root
+      # test builds one generation of chains for real from a fixed control
+      # set, reads `iptables -S` / `ip6tables -S` back through the same
+      # checker vpn/iptables_policy.rs's unit tests use, and removes it. Every
+      # tcp/443 permit must name a control-plane /32 and our uid, nothing else
+      # on 443 may get out (github.com and its CDN included), and IPv6 permits
+      # no 443 at all. The chains are NEVER hooked into OUTPUT/INPUT/FORWARD,
+      # so the runner's own traffic is untouched (the test asserts that too).
+      - name: Kill-switch chain build test (Linux, root)
+        if: matrix.os == 'linux'
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          # `|| {…}`: under `set -e` a failing `out=$(…)` would exit before
+          # the output it captured is printed.
+          out=$(sudo -E "$(command -v cargo)" test --locked --lib iptables_chain_tests -- --ignored --nocapture --test-threads=1) || {
+            echo "$out"
+            echo "::error::iptables_chain_tests failed"
+            exit 1
+          }
+          echo "$out"
+          # One test, required: an --ignored filter that matches nothing
+          # still exits 0.
+          if ! grep -qE 'test result: ok\. 1 passed' <<<"$out"; then
+            echo "::error::iptables_chain_tests did not run"
+            exit 1
+          fi
+
       # F-008 macOS: the ONE tolerated route failure, proven rather than
       # asserted in a comment. The owner has no Mac, so this runner is the only
       # place it can run. It installs a route to TEST-NET-1 and removes it.

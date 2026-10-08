@@ -13,7 +13,14 @@ import { BirdoButton, BirdoCard, BirdoDialog } from '@/components/birdo';
 import { brand, status, surface, white } from '@/lib/birdo-theme';
 import { useAppStore } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
-import { checkForUpdates, installExitsApp, installUpdate, useUpdater } from '@/session/updater';
+import {
+  cancelUpdateWait,
+  checkForUpdates,
+  installExitsApp,
+  installUpdate,
+  UPDATE_WAITING_COPY,
+  useUpdater,
+} from '@/session/updater';
 import { connectPreferred } from '@/session/vpn-actions';
 
 export function UpdateChecker() {
@@ -38,7 +45,7 @@ export function UpdateChecker() {
 
   const title =
     phase === 'checking' ? 'Checking for updates…'
-    : phase === 'available' ? `Update available: v${info?.version ?? ''}`
+    : phase === 'available' || phase === 'waiting' ? `Update available: v${info?.version ?? ''}`
     : phase === 'installing' ? (exitsApp ? `Installing… ${progress}%` : `Downloading… ${progress}%`)
     : phase === 'ready' ? 'Update ready to install'
     : phase === 'up-to-date' ? "You're up to date"
@@ -46,6 +53,7 @@ export function UpdateChecker() {
   const subtitle =
     phase === 'available' ? `Current: v${info?.currentVersion ?? ''}`
     : phase === 'installing' ? (exitsApp ? 'BirdoVPN will close and restart to finish.' : 'Please wait…')
+    : phase === 'waiting' ? UPDATE_WAITING_COPY
     : phase === 'ready' ? 'Restart to apply the update'
     : phase === 'error' ? error ?? ''
     : restartError ?? 'Check for new versions';
@@ -55,11 +63,13 @@ export function UpdateChecker() {
       <div className="flex items-center gap-3.5">
         <div
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
-          style={{ backgroundColor: phase === 'available' || phase === 'ready' ? brand.accentBg : white.w05 }}
+          style={{
+            backgroundColor: phase === 'available' || phase === 'waiting' || phase === 'ready' ? brand.accentBg : white.w05,
+          }}
         >
           {phase === 'checking' || phase === 'installing' ? (
             <LoaderCircle size={18} className="animate-spin motion-reduce:animate-none" color={white.w80} aria-hidden />
-          ) : phase === 'available' ? (
+          ) : phase === 'available' || phase === 'waiting' ? (
             <Download size={18} color={brand.accentLight} aria-hidden />
           ) : phase === 'ready' || phase === 'up-to-date' ? (
             <Check size={18} color={brand.accentLight} aria-hidden />
@@ -90,6 +100,7 @@ export function UpdateChecker() {
         {phase === 'available' && (
           <UpdateAction label={exitsApp ? 'Install and restart' : 'Download'} onClick={startInstall} />
         )}
+        {phase === 'waiting' && <UpdateAction label="Cancel" onClick={cancelUpdateWait} />}
         {phase === 'ready' && !exitsApp && (
           <UpdateAction
             label="Restart"

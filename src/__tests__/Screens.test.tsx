@@ -10,6 +10,9 @@
  *    are active while the feature is off.
  *  - Offline banner (P1-parity-029), the update wall's Disconnect (W2-025),
  *    the updater surviving a remount (W2-024), Pricing (W2-042).
+ *  - An update download held by the kill switch (MR-1824): it waits, says
+ *    why, starts by itself only once nothing is active, and is offered again
+ *    (never installed unattended) once the tunnel is up.
  *
  * Run: npx vitest run src/__tests__/Screens.test.tsx
  */
@@ -27,10 +30,13 @@ import { UpdateRequired } from '@/components/UpdateRequired';
 import { UpdateChecker } from '@/components/UpdateChecker';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import {
+  cancelUpdateWait,
+  heldUpdateStep,
   installUpdate,
   resetUpdater,
   UPDATE_DOWNLOAD_FAILED_COPY,
   UPDATE_INSTALL_FAILED_COPY,
+  UPDATE_WAITING_COPY,
   useUpdater,
 } from '@/session/updater';
 import { resetSessionData } from '@/session/session-data';
@@ -339,6 +345,170 @@ describe('Update wall (W2-025) and updater (W2-024)', () => {
     await installUpdate();
     expect(useUpdater.getState().error).toBe(UPDATE_DOWNLOAD_FAILED_COPY);
     expect(useUpdater.getState().reconnectOffered).toBe(false);
+  });
+});
+
+describe('Update held by the kill switch (MR-1824)', () => {
+  const HELD = { code: 'held_by_kill_switch', message: 'The kill switch is blocking the update download', reconnect: 'none' };
+
+  /** Rust holds the first `held` installs, then installs. */
+  const rustHolds = (held: number) => {
+    let calls = 0;
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'install_update') {
+        calls += 1;
+        if (calls <= held) throw HELD;
+        return true;
+      }
+      return cmd === 'check_for_updates' ? { version: '9.9.9', currentVersion: '1.0.0' } : undefined;
+    });
+  };
+
+  const blockedNoTunnel = () =>
+    useAppStore.setState({ connectionState: 'reconnecting', killSwitchBlocking: true, pendingAction: null });
+
+  /** Let any resume the store change kicked off settle. */
+  const settle = () => act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  it('decides from the status: resume only with nothing active, ask once the tunnel is up', () => {
+    const at = (connectionState: string, killSwitchBlocking: boolean, pendingAction: string | null = null) =>
+      heldUpdateStep({ connectionState, killSwitchBlocking, pendingAction } as Parameters<typeof heldUpdateStep>[0]);
+    expect(at('reconnecting', true)).toBe('wait');
+    expect(at('error', true)).toBe('wait');
+    // The block is gone but a session the install would end is not.
+    expect(at('error', false)).toBe('wait');
+    expect(at('reconnecting', false)).toBe('wait');
+    expect(at('disconnected', false, 'disconnecting')).toBe('wait');
+    // Nothing active: no session to end.
+    expect(at('disconnected', false)).toBe('resume');
+    // The tunnel is up (the Unix block is held while connected): ask again.
+    expect(at('connected', true)).toBe('ask');
+    expect(at('connected', false)).toBe('ask');
+  });
+
+  it('waits and says why, instead of failing the download', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    useUpdater.setState({ phase: 'available', info: { version: '9.9.9', currentVersion: '1.0.0' } });
+    await installUpdate();
+    expect(useUpdater.getState().phase).toBe('waiting');
+    expect(useUpdater.getState().error).toBeNull();
+
+    render(<UpdateChecker />);
+    expect(screen.getByText(UPDATE_WAITING_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(UPDATE_DOWNLOAD_FAILED_COPY)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Download|Install|Retry/ })).not.toBeInTheDocument();
+    // A revisit (or the daily check) does not clobber the wait.
+    expect(callsTo('check_for_updates')).toHaveLength(0);
+  });
+
+  // Review of #259 (M1): an auto-reconnect hours later must not end the
+  // session it just restored, and lift the block, with nobody watching.
+  it('once the tunnel is up it offers the update again, and installs nothing by itself', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    useUpdater.setState({ info: { version: '9.9.9', currentVersion: '1.0.0' } });
+    await installUpdate();
+
+    useAppStore.setState({ connectionState: 'connected' });
+    await settle();
+    expect(useUpdater.getState().phase).toBe('available');
+    expect(callsTo('install_update')).toHaveLength(1);
+
+    // The next click goes through the confirm: installing ends the session.
+    render(<UpdateChecker />);
+    await userEvent.click(await screen.findByRole('button', { name: /Download|Install and restart/ }));
+    expect(screen.getByText('Installing will disconnect the VPN and restart BirdoVPN.')).toBeInTheDocument();
+    expect(callsTo('install_update')).toHaveLength(1);
+
+    // And a later drop and recovery does not pick the old wait back up.
+    blockedNoTunnel();
+    useAppStore.setState({ connectionState: 'disconnected', killSwitchBlocking: false });
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(1);
+  });
+
+  it('starts by itself once a disconnect leaves nothing active', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    await installUpdate();
+
+    // Disconnect lands in steps: the command, the block lifting, then the state.
+    useAppStore.setState({ pendingAction: 'disconnecting' });
+    useAppStore.setState({ killSwitchBlocking: false });
+    useAppStore.setState({ connectionState: 'disconnecting' });
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(1);
+    useAppStore.setState({ connectionState: 'disconnected', pendingAction: null });
+    await waitFor(() => expect(useUpdater.getState().phase).toBe('ready'));
+    expect(callsTo('install_update')).toHaveLength(2);
+  });
+
+  it('a block lifted under a session it would end (a give-up error) keeps waiting', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    await installUpdate();
+
+    useAppStore.setState({ connectionState: 'error', killSwitchBlocking: false });
+    useAppStore.setState({ connectionState: 'reconnecting' });
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(1);
+    expect(useUpdater.getState().phase).toBe('waiting');
+  });
+
+  it('a status that disagrees with Rust cannot spin it', async () => {
+    // The status says nothing is active; Rust keeps holding the download.
+    useAppStore.setState({ connectionState: 'disconnected', killSwitchBlocking: false, pendingAction: null });
+    rustHolds(Number.MAX_SAFE_INTEGER);
+    await installUpdate();
+    await settle();
+    // The click, and ONE immediate retry for a status that moved on.
+    expect(callsTo('install_update')).toHaveLength(2);
+    useAppStore.setState({ connectionState: 'disconnected' });
+    useAppStore.setState({ settings: { ...useAppStore.getState().settings } });
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(2);
+    expect(useUpdater.getState().phase).toBe('waiting');
+  });
+
+  it('a hold answered while the tunnel is already up asks at once', async () => {
+    useAppStore.setState({ connectionState: 'connected', killSwitchBlocking: true });
+    rustHolds(Number.MAX_SAFE_INTEGER);
+    await installUpdate();
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(1);
+    expect(useUpdater.getState().phase).toBe('available');
+  });
+
+  it('Cancel stops the wait and offers the update again', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    useUpdater.setState({ info: { version: '9.9.9', currentVersion: '1.0.0' } });
+    await installUpdate();
+    render(<UpdateChecker />);
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(useUpdater.getState().phase).toBe('available');
+
+    useAppStore.setState({ connectionState: 'disconnected', killSwitchBlocking: false });
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(1);
+    cancelUpdateWait(); // idempotent once nothing waits
+    expect(useUpdater.getState().phase).toBe('available');
+  });
+
+  // Review of #259 (L4): a stuck wait still has a way out on the wall.
+  it('the update wall says why it waits and keeps its button', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    await installUpdate();
+    render(<UpdateRequired info={{}} />);
+    expect(screen.getByText(UPDATE_WAITING_COPY)).toBeInTheDocument();
+    const button = screen.getByRole('button', { name: /Update now|Install and restart/ });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    await waitFor(() => expect(callsTo('install_update')).toHaveLength(2));
   });
 });
 

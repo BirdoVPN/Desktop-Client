@@ -15,10 +15,22 @@
  * restart" on Windows and warns first when a tunnel is up. Rust performs the
  * exit teardown (disconnect, release the kill switch) before it installs
  * (contract §3.5).
+ *
+ * HELD BY THE KILL SWITCH (MR-1824). The installer is downloaded from GitHub.
+ * On macOS and Linux a kill-switch block lets the app reach only the BirdoVPN
+ * control plane, deliberately, so while a block is up and no tunnel carries
+ * the download Rust refuses it up front (`held_by_kill_switch`). The update
+ * then waits (`waiting`) and says why. It starts by itself only once nothing
+ * is active — the install ends the session and lifts the block, which must
+ * never happen to a session nobody is watching — and once the tunnel is up it
+ * is offered again, so the next click goes through the confirm. Windows
+ * permits the app through its block and never waits.
  */
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { useAppStore, type AppStateSnapshot } from '@/store/app-store';
+import { selectTunnelActive } from '@/store/selectors';
 import { isWindowsPlatform } from '@/utils/helpers';
 
 /** Mirrors `commands::updater::UpdateInfo` (serde camelCase). */
@@ -34,6 +46,8 @@ export type UpdatePhase =
   | 'available'
   | 'up-to-date'
   | 'installing'
+  /** Held by the kill switch (MR-1824): starts again by itself. */
+  | 'waiting'
   | 'ready'
   | 'error';
 
@@ -65,6 +79,77 @@ export const UPDATE_INSTALL_FAILED_COPY =
   'The update was downloaded but could not be installed. Please try again.';
 const UPDATE_INSTALL_FAILED_RECONNECTING_COPY =
   'The update was downloaded but could not be installed. BirdoVPN is reconnecting.';
+/** MR-1824. Wording flagged for review in the PR. */
+export const UPDATE_WAITING_COPY =
+  'The kill switch is blocking the download. You can download it once the VPN connects, or it starts by itself if you disconnect.';
+
+/** `install_update`'s code for a download a kill-switch block holds back. */
+const HELD_BY_KILL_SWITCH = 'held_by_kill_switch';
+
+function heldByKillSwitch(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && (e as Record<string, unknown>).code === HELD_BY_KILL_SWITCH;
+}
+
+/**
+ * What a held download does with the published status (MR-1824):
+ *  - `resume`: nothing is active — no tunnel, no block, no command in
+ *    flight. The install has no session to end, so it starts by itself.
+ *  - `ask`: the tunnel is up. The download could go through it, but the
+ *    install would end the session and lift the block, and an auto-reconnect
+ *    can bring the tunnel back hours after the click with nobody watching
+ *    (macOS/Linux do not restart into a new session). So the update is
+ *    offered again, and the next click goes through the confirm.
+ *  - `wait`: still blocked, or a session without a block (a give-up's error)
+ *    that the install would end.
+ */
+export type HeldUpdateStep = 'resume' | 'ask' | 'wait';
+
+export function heldUpdateStep(
+  s: Pick<AppStateSnapshot, 'connectionState' | 'pendingAction' | 'killSwitchBlocking'>,
+): HeldUpdateStep {
+  if (s.connectionState === 'connected') return 'ask';
+  if (!selectTunnelActive(s)) return 'resume';
+  return 'wait';
+}
+
+let stopWaiting: (() => void) | null = null;
+
+function stopWaitingForDownload(): void {
+  stopWaiting?.();
+  stopWaiting = null;
+}
+
+function settleHeld(step: 'resume' | 'ask', retryNowIfHeld: boolean): void {
+  stopWaitingForDownload();
+  if (step === 'ask') useUpdater.setState({ phase: 'available' });
+  else void runInstall(retryNowIfHeld);
+}
+
+/**
+ * Held: act once the status reaches `resume` or `ask`. On a CHANGE of that
+ * answer, so a status that disagrees with Rust's cannot spin it; plus, if it
+ * is already there while Rust was answering, `ask` at once, or one immediate
+ * retry (`retryNow`) for `resume`.
+ */
+function waitForDownloadPath(retryNow: boolean): void {
+  stopWaitingForDownload();
+  const now = heldUpdateStep(useAppStore.getState());
+  if (now === 'ask' || (now === 'resume' && retryNow)) {
+    settleHeld(now, false);
+    return;
+  }
+  stopWaiting = useAppStore.subscribe((next, prev) => {
+    const step = heldUpdateStep(next);
+    if (step === 'wait' || step === heldUpdateStep(prev)) return;
+    settleHeld(step, true);
+  });
+}
+
+/** Stop waiting for the kill switch; the update is offered again. */
+export function cancelUpdateWait(): void {
+  stopWaitingForDownload();
+  if (useUpdater.getState().phase === 'waiting') useUpdater.setState({ phase: 'available' });
+}
 
 /**
  * `install_update`'s error (commands/updater.rs `UpdateFailure`): which stage
@@ -88,6 +173,7 @@ let checkedThisRun = false;
 /** For tests. */
 export function resetUpdater(): void {
   checkedThisRun = false;
+  stopWaitingForDownload();
   useUpdater.setState({
     phase: 'idle',
     info: null,
@@ -116,7 +202,7 @@ export async function loadAppVersion(): Promise<void> {
  */
 export async function checkForUpdates(force = false): Promise<UpdateInfo | null> {
   const s = useUpdater.getState();
-  if (s.phase === 'installing' || s.phase === 'checking') return s.info;
+  if (s.phase === 'installing' || s.phase === 'checking' || s.phase === 'waiting') return s.info;
   if (!force && checkedThisRun) return s.info;
   checkedThisRun = true;
   useUpdater.setState({ phase: 'checking', error: null, reconnectOffered: false });
@@ -138,7 +224,12 @@ export async function checkForUpdates(force = false): Promise<UpdateInfo | null>
 }
 
 export async function installUpdate(): Promise<void> {
+  return runInstall(true);
+}
+
+async function runInstall(retryNowIfHeld: boolean): Promise<void> {
   if (useUpdater.getState().phase === 'installing') return;
+  stopWaitingForDownload();
   useUpdater.setState({ phase: 'installing', progress: 0, error: null, reconnectOffered: false });
   const unlisten = listen<{ downloaded: number; contentLength?: number | null }>(
     'updater-download-progress',
@@ -155,6 +246,11 @@ export async function installUpdate(): Promise<void> {
       installed ? { phase: 'ready', progress: 100 } : { phase: 'up-to-date', progress: 0 },
     );
   } catch (e) {
+    if (heldByKillSwitch(e)) {
+      useUpdater.setState({ phase: 'waiting', progress: 0 });
+      waitForDownloadPath(retryNowIfHeld);
+      return;
+    }
     useUpdater.setState({ phase: 'error', ...failureCopy(e) });
   } finally {
     unlisten.then((off) => off()).catch(() => {});
