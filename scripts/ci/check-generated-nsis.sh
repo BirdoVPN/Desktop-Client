@@ -25,6 +25,11 @@
 #      catches a second call the form comparison cannot see, such as one with
 #      unquoted arguments.
 #
+# NSIS keywords are case-insensitive: `!Macro`, `!INSERTMACRO` and `!Include`
+# compile like the lower-case forms. Every keyword is therefore matched in any
+# case, and a call written in another case is compared in the template's
+# lower-case form. Macro names and arguments still have to match exactly.
+#
 # Usage, from the repo root after the build:
 #   check-generated-nsis.sh [nsis-dir] [hook] [bundle-dir]
 # Defaults: src-tauri/target/release/nsis/x64, src-tauri/nsis-hooks.nsh,
@@ -40,9 +45,14 @@ bundle_dir=${3:-src-tauri/target/release/bundle/nsis}
 # Literal NSIS text, not shell expansions.
 # shellcheck disable=SC2016
 want_call='!insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"'
-call_re='!insertmacro CheckIfAppIsRunning "[^"]*" "[^"]*"'
+# The keywords in any case. Bracket expressions behave the same in every grep
+# and sed (GNU on the runners, BSD on a Mac), unlike grep -i or sed's I flag.
+kw_include='![Ii][Nn][Cc][Ll][Uu][Dd][Ee]'
+kw_macro='![Mm][Aa][Cc][Rr][Oo]'
+kw_insertmacro='![Ii][Nn][Ss][Ee][Rr][Tt][Mm][Aa][Cc][Rr][Oo]'
+call_re="$kw_insertmacro"' CheckIfAppIsRunning "[^"]*" "[^"]*"'
 # Any call at all, whatever its arguments: call_re only sees the quoted form.
-any_call_re='^[[:space:]]*!insertmacro[[:space:]]+CheckIfAppIsRunning([[:space:]]|$)'
+any_call_re="^[[:space:]]*$kw_insertmacro"'[[:space:]]+CheckIfAppIsRunning([[:space:]]|$)'
 
 fail() {
   echo "::error::check-generated-nsis: $*"
@@ -62,6 +72,8 @@ resolve() {
   esac
 }
 lines() { if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | wc -l | tr -d ' '; fi; }
+# A call as the template spells it: the keyword in lower case.
+lower_kw() { sed "s/^$kw_insertmacro /!insertmacro /"; }
 
 nsi="$nsis_dir/installer.nsi"
 [ -f "$nsi" ] || fail "no generated script at $nsi - did tauri build the nsis bundle?"
@@ -86,14 +98,14 @@ included=()
 while IFS= read -r inc; do
   path=$(resolve "$inc")
   if [ -f "$path" ] && cmp -s "$path" "$hook"; then included+=("$inc"); fi
-done < <(plain "$nsi" | sed -n 's/^[[:space:]]*!include "\([^"]*\)"[[:space:]]*$/\1/p')
+done < <(plain "$nsi" | sed -n 's/^[[:space:]]*'"$kw_include"' "\([^"]*\)"[[:space:]]*$/\1/p')
 [ "${#included[@]}" -eq 1 ] ||
   fail "installer.nsi includes $hook ${#included[@]} times (want 1): bundle.windows.nsis.installerHooks is not reaching the bundler, so no hook is in the installer"
 echo "OK 2/4 installer.nsi includes ${included[0]} (the same bytes as $hook)"
 
 # -- 3. every hook the file defines is one the template invokes --------------
-defined=$(plain "$hook" | sed -n 's/^[[:space:]]*!macro[[:space:]]\{1,\}\(NSIS_HOOK_[A-Za-z0-9_]*\).*$/\1/p' | sort -u)
-invoked=$(plain "$nsi" | sed -n 's/^[[:space:]]*!insertmacro[[:space:]]\{1,\}\(NSIS_HOOK_[A-Za-z0-9_]*\)[[:space:]]*$/\1/p' | sort -u)
+defined=$(plain "$hook" | sed -n 's/^[[:space:]]*'"$kw_macro"'[[:space:]]\{1,\}\(NSIS_HOOK_[A-Za-z0-9_]*\).*$/\1/p' | sort -u)
+invoked=$(plain "$nsi" | sed -n 's/^[[:space:]]*'"$kw_insertmacro"'[[:space:]]\{1,\}\(NSIS_HOOK_[A-Za-z0-9_]*\)[[:space:]]*$/\1/p' | sort -u)
 [ -n "$defined" ] || fail "$hook defines no NSIS_HOOK_* macro"
 [ -n "$invoked" ] || fail "installer.nsi invokes no NSIS_HOOK_* macro: the bundler's hook points changed - re-check $hook by hand"
 dead=$(comm -23 <(printf '%s\n' "$defined") <(printf '%s\n' "$invoked") | tr '\n' ' ')
@@ -102,9 +114,9 @@ dead=$(comm -23 <(printf '%s\n' "$defined") <(printf '%s\n' "$invoked") | tr '\n
 echo "OK 3/4 hooks defined and invoked: $(tr '\n' ' ' <<<"$defined")"
 
 # -- 4. CheckIfAppIsRunning: the template's form, and the full path ----------
-sig=$(cat "$nsis_dir"/*.nsh | tr -d '\r' | grep -oE '!macro CheckIfAppIsRunning [A-Za-z_]+ [A-Za-z_]+' | sort -u || true)
-template=$(plain "$nsi" | grep -oE "$call_re" | sort -u || true)
-ours=$(plain "$hook" | grep -oE "$call_re" | sort -u || true)
+sig=$(cat "$nsis_dir"/*.nsh | tr -d '\r' | grep -oE "$kw_macro"' CheckIfAppIsRunning [A-Za-z_]+ [A-Za-z_]+' | sort -u || true)
+template=$(plain "$nsi" | grep -oE "$call_re" | lower_kw | sort -u || true)
+ours=$(plain "$hook" | grep -oE "$call_re" | lower_kw | sort -u || true)
 call_lines=$(plain "$hook" | grep -cE "$any_call_re" || true)
 echo "   generated macro:  ${sig:-<not found>}"
 echo "   template calls:   ${template:-<not found>}"

@@ -11,26 +11,45 @@
 # The NSIS templates are compiled into the installed @tauri-apps/cli native
 # binary. This requires the hook to call the macro exactly the way that
 # template calls it, so the next bundler change to the macro fails the PR
-# instead of shipping. Run from the repo root after `npm ci`.
+# instead of shipping. NSIS keywords are case-insensitive (`!INSERTMACRO` is
+# `!insertmacro`), so the keyword is matched in any case and compared in the
+# template's lower-case form; the macro name and arguments must match exactly.
+#
+# Usage, from the repo root after `npm ci`:
+#   check-nsis-hook-macros.sh [hook] [cli-dir]
+# Defaults: src-tauri/nsis-hooks.nsh, node_modules/@tauri-apps (whose
+# cli-*/*.node is the native binary). Self-test (tests.yml runs it next):
+# scripts/ci/check-nsis-hook-macros.tests.sh.
 set -euo pipefail
 
-hook=src-tauri/nsis-hooks.nsh
-call='!insertmacro CheckIfAppIsRunning "[^"]*" "[^"]*"'
+hook=${1:-src-tauri/nsis-hooks.nsh}
+cli_dir=${2:-node_modules/@tauri-apps}
+# The keywords in any case. Bracket expressions behave the same in every grep
+# and sed (GNU on the runners, BSD on a Mac), unlike grep -i or sed's I flag.
+kw_macro='![Mm][Aa][Cc][Rr][Oo]'
+kw_insertmacro='![Ii][Nn][Ss][Ee][Rr][Tt][Mm][Aa][Cc][Rr][Oo]'
+call="$kw_insertmacro"' CheckIfAppIsRunning "[^"]*" "[^"]*"'
 # Any call at all, whatever its arguments: $call only sees the quoted form, so
 # a second call with unquoted arguments would otherwise ship unchecked.
-any_call='^[[:space:]]*!insertmacro[[:space:]]+CheckIfAppIsRunning([[:space:]]|$)'
+any_call="^[[:space:]]*$kw_insertmacro"'[[:space:]]+CheckIfAppIsRunning([[:space:]]|$)'
+# A call as the template spells it: the keyword in lower case.
+lower_kw() { sed "s/^$kw_insertmacro /!insertmacro /"; }
 
+[ -f "$hook" ] || {
+  echo "::error::hook file missing: $hook"
+  exit 1
+}
 shopt -s nullglob
-bins=(node_modules/@tauri-apps/cli-*/*.node)
+bins=("$cli_dir"/cli-*/*.node)
 if [ "${#bins[@]}" -eq 0 ]; then
-  echo "::error::no @tauri-apps/cli native binary under node_modules - run npm ci first"
+  echo "::error::no @tauri-apps/cli native binary under $cli_dir - run npm ci first"
   exit 1
 fi
 
-sig=$(grep -a -o -h '!macro CheckIfAppIsRunning [A-Za-z_]* [A-Za-z_]*' "${bins[@]}" | sort -u || true)
-template=$(grep -a -o -h "$call" "${bins[@]}" | sort -u || true)
-ours=$(tr -d '\r' < "$hook" | grep -o "$call" | sort -u || true)
-call_lines=$(tr -d '\r' < "$hook" | grep -cE "$any_call" || true)
+sig=$(grep -a -o -h "$kw_macro"' CheckIfAppIsRunning [A-Za-z_]* [A-Za-z_]*' "${bins[@]}" | sort -u || true)
+template=$(grep -a -o -h "$call" "${bins[@]}" | lower_kw | sort -u || true)
+ours=$(tr -d '\r' <"$hook" | grep -o "$call" | lower_kw | sort -u || true)
+call_lines=$(tr -d '\r' <"$hook" | grep -cE "$any_call" || true)
 
 echo "bundler macro:  ${sig:-<not found>}"
 echo "template calls: ${template:-<not found>}"

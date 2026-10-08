@@ -56,7 +56,10 @@
         "installMode": "perMachine",
         "displayLanguageSelector": false,
         "installerHooks": "nsis-hooks.nsh",
-        "languages": ["English"]
+        "languages": ["English"],
+        "customLanguageFiles": {
+          "English": "nsis/English.nsh"
+        }
       },
       "wix": null
     },

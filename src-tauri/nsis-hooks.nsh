@@ -106,6 +106,177 @@ FunctionEnd
   !insertmacro BIRDO_DROP_LEGACY_LANGUAGE
 !macroend
 
+; REVIEW-WIN2-008: stop a running BirdoVPN with the template's OWN macro,
+; called EXACTLY as the template calls it, on this one line only. Both hooks
+; that need a stopped app use this macro (NSIS_HOOK_PREUNINSTALL always;
+; NSIS_HOOK_PREINSTALL only before it uninstalls an MSI-era install).
+;
+; tauri-bundler 2.10.0 (CLI 2.12) changed the macro's first parameter from an
+; executable NAME to an executable PATH that it hands to Restart Manager
+; (RmRegisterResources -> RmGetList -> RmShutdown). Given the old bare
+; "${MAINBINARYNAME}.exe", the new macro matches nothing, reports "not
+; running", and the hooks silently stop protecting the live session.
+; tests.yml's frontend job runs scripts/ci/check-nsis-hook-macros.sh, which
+; fails the PR if this call ever differs from the template compiled into the
+; locked @tauri-apps/cli, or if the call appears on more than this one line.
+!macro BIRDO_STOP_APP_IF_RUNNING
+  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+!macroend
+
+; ── WIN2-012: the MSI-era install ──────────────────────────────────────────
+;
+; From b15aece (2026-04-16, productName "BirdoVPN") to 79fd4ae (2026-07-29),
+; every release also built an MSI from Tauri's default WiX template
+; (tauri.conf.json "wix": null; CLI 2.9.6 to 2.11.4), with publisher
+; "Birdo VPN". That MSI:
+;   - installed per-machine into [ProgramFiles64Folder]BirdoVPN, which is THIS
+;     installer's default folder. It installed the same birdo-vpn-desktop.exe
+;     and resources, the same birdo:// key (HKLM\Software\Classes\birdo) and
+;     the same Public Desktop BirdoVPN.lnk;
+;   - registered its own Apps & features entry, Uninstall\{ProductCode}: a
+;     new GUID per build, DisplayName "BirdoVPN", Publisher "Birdo VPN",
+;     WindowsInstaller = 1, UninstallString "MsiExec.exe /X{ProductCode}".
+;     Every build shares the UpgradeCode {A5391D09-4F7F-5D63-841B-D35670681DB4},
+;     a UUID v5 of "BirdoVPN.exe.app.x64";
+;   - put "Uninstall BirdoVPN.lnk" (msiexec /x [ProductCode]) into that same
+;     folder, and BirdoVPN.lnk into a Start-menu folder of its own.
+; (Read from the tables of a 1.3.2 MSI of that era. Root 2, HKLM, holds
+; Classes\birdo; Root 1, HKCU, holds Software\Birdo VPN\BirdoVPN\InstallDir.)
+;
+; The template's WiX migration (PageReinstall) matches DisplayName plus
+; ${MANUFACTURER}, which has been "Birdo Networks Ltd" since D8, so it no
+; longer finds that entry (REVIEW-WIN2-012). It never ran for a silent
+; install at all. Left alone, the MSI keeps a second Apps & features entry.
+; Uninstalling it later, from there or from its shortcut, deletes the exe,
+; the resources, birdo:// and the desktop shortcut that this install now
+; owns. Deleting only its entry would not help either: Windows Installer
+; would still own those files, and the shortcut would still uninstall it.
+;
+; So each such entry goes before any file is laid down:
+;   - Windows Installer knows the product: `msiexec /x {ProductCode} /qn`.
+;     The files it deletes are the old version's; ours are written right
+;     after. A running BirdoVPN is stopped first (BIRDO_STOP_APP_IF_RUNNING),
+;     so none of its files is in use.
+;   - Windows Installer does not know it: the entry is a leftover that can
+;     only fail to uninstall, so only the entry is deleted.
+; The entry's UninstallString is never run. Nothing else matches: the key
+; must be a {GUID} (a ProductCode), with DisplayName exactly "BirdoVPN",
+; Publisher exactly "Birdo VPN" and WindowsInstaller = 1. A 1.0.0 MSI
+; (product "Birdo VPN", its own folder) is a different product and is not
+; touched. With no such entry (the usual case), nothing happens.
+!define BIRDO_UNINSTALL_ROOT "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+!define BIRDO_MSI_ERA_PUBLISHER "Birdo VPN"
+
+Var BirdoMsiEraRemoved
+
+; Stack in: the name of an Uninstall subkey. Stack out: 1 if it is an MSI-era
+; BirdoVPN entry, else 0. Reads the 64-bit view, where the x64 MSI registered
+; (the template's SetContext has set SetRegView 64 by now).
+Function BirdoIsMsiEraEntry
+  Exch $0
+  Push $1
+  Push $2
+  StrCpy $2 0
+  StrLen $1 $0
+  ${If} $1 = 38
+    StrCpy $1 $0 1
+    ${If} $1 == "{"
+      StrCpy $1 $0 1 -1
+      ${If} $1 == "}"
+        ReadRegStr $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "DisplayName"
+        ${If} $1 S== "BirdoVPN"
+          ReadRegStr $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "Publisher"
+          ${If} $1 S== "${BIRDO_MSI_ERA_PUBLISHER}"
+            ReadRegDWORD $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "WindowsInstaller"
+            ${If} $1 == 1
+              StrCpy $2 1
+            ${EndIf}
+          ${EndIf}
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  StrCpy $0 $2
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
+; Stack in: the {ProductCode} key of an MSI-era entry. Stack out: 1 if the
+; entry is gone afterwards, else 0.
+Function BirdoRemoveMsiEraEntry
+  Exch $0
+  Push $1
+  ; INSTALLSTATE_UNKNOWN (-1): Windows Installer has no such product.
+  System::Call 'msi::MsiQueryProductStateW(w r0) i .r1'
+  ${If} $1 == -1
+    DetailPrint "Removing the leftover Apps & features entry $0 of the old BirdoVPN MSI"
+    DeleteRegKey HKLM "${BIRDO_UNINSTALL_ROOT}\$0"
+  ${Else}
+    DetailPrint "Uninstalling the old BirdoVPN MSI $0 (Windows Installer state $1)"
+    ClearErrors
+    ExecWait '"$SYSDIR\msiexec.exe" /x $0 /qn /norestart /l*v "$TEMP\BirdoVPN-msi-era-uninstall.log"' $1
+    ${If} ${Errors}
+      StrCpy $1 "not started"
+    ${EndIf}
+    DetailPrint "msiexec /x $0: $1 (log: $TEMP\BirdoVPN-msi-era-uninstall.log)"
+    ; 3010: done, a reboot completes it (ERROR_SUCCESS_REBOOT_REQUIRED).
+    ${If} $1 == 0
+    ${OrIf} $1 == 3010
+      StrCpy $BirdoMsiEraRemoved 1
+    ${EndIf}
+  ${EndIf}
+  ClearErrors
+  ReadRegStr $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "DisplayName"
+  ${If} ${Errors}
+    StrCpy $0 1
+  ${Else}
+    StrCpy $0 0
+  ${EndIf}
+  Pop $1
+  Exch $0
+FunctionEnd
+
+; Stack in: 0 to count the MSI-era entries, 1 to remove them. Stack out: how
+; many there were.
+Function BirdoMsiEraEntries
+  Exch $R0
+  Push $R1
+  Push $R2
+  Push $R3
+  Push $R4
+  StrCpy $R1 0
+  StrCpy $R3 0
+  ${Do}
+    EnumRegKey $R2 HKLM "${BIRDO_UNINSTALL_ROOT}" $R1
+    ${If} $R2 == ""
+      ${ExitDo}
+    ${EndIf}
+    Push $R2
+    Call BirdoIsMsiEraEntry
+    Pop $R4
+    ${If} $R4 = 1
+      IntOp $R3 $R3 + 1
+      ${If} $R0 = 1
+        Push $R2
+        Call BirdoRemoveMsiEraEntry
+        Pop $R4
+        ; Gone: the next key has moved up to this index.
+        ${If} $R4 = 1
+          ${Continue}
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    IntOp $R1 $R1 + 1
+  ${Loop}
+  StrCpy $R0 $R3
+  Pop $R4
+  Pop $R3
+  Pop $R2
+  Pop $R1
+  Exch $R0
+FunctionEnd
+
 !macro NSIS_HOOK_PREINSTALL
   ; The literals above must be the template's, or the adoption writes a key
   ; nothing reads: fail the build instead (REVIEW-WIN2-017: the parent key
@@ -133,6 +304,29 @@ FunctionEnd
   ${If} $INSTDIR != $BirdoOutPathBeforeAdoption
     RMDir $BirdoOutPathBeforeAdoption
   ${EndIf}
+
+  ; WIN2-012 (above): an MSI-era install goes before any file of ours is
+  ; laid down. When there is none (the usual case), this is a no-op.
+  Push 0
+  Call BirdoMsiEraEntries
+  Pop $0
+  ${If} $0 > 0
+    ; Its exe sits at our exe's path. Stop it the way the template does right
+    ; after this hook, so that msiexec finds nothing in use.
+    !insertmacro BIRDO_STOP_APP_IF_RUNNING
+    ; Not from inside the folder that the MSI's uninstall may remove.
+    SetOutPath $TEMP
+    Push 1
+    Call BirdoMsiEraEntries
+    Pop $0
+    SetOutPath $INSTDIR
+    ; The MSI took its Start-menu and desktop shortcuts with it. Let the
+    ; template re-create them, even on an in-app update (/UPDATE): that is
+    ; the template's own rule after a WiX migration.
+    ${If} $BirdoMsiEraRemoved = 1
+      StrCpy $WixMode 1
+    ${EndIf}
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -156,17 +350,9 @@ FunctionEnd
   ; running" prompt then left that session broken, its routes forgotten.
   ; Stopping the app first leaves only what a stopped app left behind, which
   ; is what the reconcile is for. (The template's own check, after this
-  ; hook, then finds nothing.)
-  ;
-  ; Called EXACTLY as the template calls it. tauri-bundler 2.10.0 (CLI 2.12)
-  ; changed the macro's first parameter from an executable NAME to an
-  ; executable PATH that it hands to Restart Manager (RmRegisterResources ->
-  ; RmGetList -> RmShutdown). Given the old bare "${MAINBINARYNAME}.exe", the
-  ; new macro matches nothing, reports "not running", and this hook silently
-  ; stops protecting the live session. tests.yml's frontend job runs
-  ; scripts/ci/check-nsis-hook-macros.sh, which fails the PR if this call
-  ; ever differs from the template compiled into the locked @tauri-apps/cli.
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  ; hook, then finds nothing.) The template's macro, called exactly as the
+  ; template calls it: see BIRDO_STOP_APP_IF_RUNNING.
+  !insertmacro BIRDO_STOP_APP_IF_RUNNING
 
   ; W1-008: put back what a BirdoVPN that was killed rather than quit left
   ; behind — DNS an OLDER version parked on the physical adapters, routes a
