@@ -220,7 +220,9 @@ impl CredentialStore {
     }
 }
 
-#[cfg(test)]
+// Its only test is Windows/macOS (see there), so the module is too: on Linux
+// it would be an empty module with an unused `use super::*`.
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -239,7 +241,6 @@ mod tests {
     /// headless Linux CI runner has no D-Bus session for Secret Service, and a
     /// skipped test is better than a flaky one that trains people to ignore it.
     #[test]
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn credentials_survive_a_new_entry_handle() {
         const PROBE_SERVICE: &str = "BirdoVPN-backend-probe";
         const PROBE_USER: &str = "keystore-roundtrip";

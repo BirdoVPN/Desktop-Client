@@ -190,8 +190,9 @@ impl XrayManager {
         self.ended.load(Ordering::SeqCst)
     }
 
-    /// Put `child` in the slot as if `start()` had spawned it.
-    #[cfg(test)]
+    /// Put `child` in the slot as if `start()` had spawned it. Its tests spawn
+    /// `cmd.exe`, so they and it are Windows-only.
+    #[cfg(all(test, target_os = "windows"))]
     pub(crate) async fn adopt_for_test(&self, child: Child) {
         *self.process.lock().await = Some(child);
     }

@@ -213,7 +213,7 @@ impl LinuxTunnel {
         let snapshot = capture_network_snapshot().await?;
         tracing::info!(
             "Captured network snapshot: gw={:?}, iface={:?}",
-            snapshot.default_gateway.as_deref().map(|s| redact_ip(s)),
+            snapshot.default_gateway.as_deref().map(redact_ip),
             snapshot.default_interface
         );
         *self.network_snapshot.write().await = Some(snapshot);
@@ -323,7 +323,7 @@ impl LinuxTunnel {
 
         // Configure DNS
         let snapshot = self.network_snapshot.read().await;
-        let uses_resolved = snapshot.as_ref().map_or(false, |s| s.uses_systemd_resolved);
+        let uses_resolved = snapshot.as_ref().is_some_and(|s| s.uses_systemd_resolved);
         drop(snapshot);
         let pinned = match configure_dns(&self.config.dns, &tun_name, uses_resolved).await {
             Ok(pinned) => pinned,
@@ -550,6 +550,7 @@ impl LinuxTunnel {
     /// on every non-idle iteration a page fault or memset for the pages the
     /// kernel actually filled) per packet, on the hot path, for the whole
     /// session. See [`tun_read_owned`].
+    #[allow(clippy::too_many_arguments)] // shared session handles, moved into the task once
     async fn packet_loop(
         tun_fd: i32,
         wg_session: Arc<RwLock<Option<WireGuardSession>>>,
@@ -911,22 +912,21 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
         .split(':')
         .next()
         .ok_or_else(|| "Invalid endpoint format: missing host".to_string())?;
-    if endpoint_host.parse::<Ipv4Addr>().is_err() {
-        if endpoint_host.is_empty()
+    if endpoint_host.parse::<Ipv4Addr>().is_err()
+        && (endpoint_host.is_empty()
             || endpoint_host.len() > 253
             || !endpoint_host
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
             || endpoint_host.starts_with('-')
-            || endpoint_host.starts_with('.')
-        {
-            // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
-            // in manager.rs / auto_reconnect.rs at levels release builds write.
-            return Err(format!(
-                "Invalid endpoint hostname: '{}'",
-                crate::utils::redact::redact_hostname(endpoint_host)
-            ));
-        }
+            || endpoint_host.starts_with('.'))
+    {
+        // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
+        // in manager.rs / auto_reconnect.rs at levels release builds write.
+        return Err(format!(
+            "Invalid endpoint hostname: '{}'",
+            crate::utils::redact::redact_hostname(endpoint_host)
+        ));
     }
 
     for dns in &config.dns {

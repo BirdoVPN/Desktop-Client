@@ -107,9 +107,9 @@ fn query_dns_servers(service: &str) -> Option<Vec<String>> {
 /// Interpret a `networksetup -getdnsservers` result, `None` meaning the command
 /// itself could not be run or exited non-zero.
 ///
-/// Split out from the process spawn purely so the distinction this file turns on
-/// - an unanswerable question (`None`) versus an answer of "none" (`Some([])`) -
-/// is asserted by a test rather than only by prose. Nothing on macOS can be
+/// Split out from the process spawn purely so the distinction this file turns
+/// on, an unanswerable question (`None`) versus an answer of "none"
+/// (`Some([])`), is asserted by a test rather than only by prose. Nothing on macOS can be
 /// exercised by the one CI job that runs `cargo test`, so anything that is not
 /// pulled out into a pure function here is verified by nothing.
 fn interpret_dns_query(raw: Option<&str>) -> Option<Vec<String>> {
@@ -615,6 +615,7 @@ impl UtunTunnel {
     }
 
     /// Packet processing loop: read from utun, encrypt via WireGuard, send to server.
+    #[allow(clippy::too_many_arguments)] // shared session handles, moved into the task once
     async fn packet_loop(
         utun_fd: i32,
         wg_session: Arc<RwLock<Option<WireGuardSession>>>,
@@ -816,22 +817,21 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
         .split(':')
         .next()
         .ok_or_else(|| "Invalid endpoint format: missing host".to_string())?;
-    if endpoint_host.parse::<Ipv4Addr>().is_err() {
-        if endpoint_host.is_empty()
+    if endpoint_host.parse::<Ipv4Addr>().is_err()
+        && (endpoint_host.is_empty()
             || endpoint_host.len() > 253
             || !endpoint_host
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
             || endpoint_host.starts_with('-')
-            || endpoint_host.starts_with('.')
-        {
-            // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
-            // in manager.rs / auto_reconnect.rs at levels release builds write.
-            return Err(format!(
-                "Invalid endpoint hostname: '{}'",
-                crate::utils::redact::redact_hostname(endpoint_host)
-            ));
-        }
+            || endpoint_host.starts_with('.'))
+    {
+        // P6-CLI-D-03: this Err string is logged verbatim by the catch-all handlers
+        // in manager.rs / auto_reconnect.rs at levels release builds write.
+        return Err(format!(
+            "Invalid endpoint hostname: '{}'",
+            crate::utils::redact::redact_hostname(endpoint_host)
+        ));
     }
 
     for dns in &config.dns {
