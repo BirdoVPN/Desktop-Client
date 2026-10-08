@@ -756,7 +756,7 @@ pub mod dns_journal {
     /// carried our marker - and "already ours" IS the retained-record case, so
     /// this is not a corner. Writing that `None` over a retained backup drops
     /// the real bytes and arms `restore_dns`'s fallback, which writes
-    /// `nameserver 1.1.1.1` / `nameserver 8.8.8.8`, then verifies (our marker is
+    /// `nameserver 1.1.1.1` / `nameserver 1.0.0.1`, then verifies (our marker is
     /// legitimately gone) and clears the journal: the user's own resolvers
     /// replaced by two public ones, permanently, by the recovery path.
     ///
@@ -1163,7 +1163,7 @@ pub mod dns_journal {
         /// `record_linux` filters out a resolv.conf carrying our own marker, so
         /// a capture taken while a previous session is still unrestored is
         /// ALWAYS `None`. Writing that over the retained bytes armed
-        /// `restore_dns`'s fallback, which writes 1.1.1.1/8.8.8.8, verifies
+        /// `restore_dns`'s fallback, which writes 1.1.1.1/1.0.0.1, verifies
         /// (our marker is legitimately gone) and clears the journal.
         #[test]
         fn a_none_capture_never_overwrites_retained_resolv_conf_bytes() {
