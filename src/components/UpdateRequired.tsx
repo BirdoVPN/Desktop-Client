@@ -7,7 +7,7 @@ import { UPDATE_REQUIRED_COPY } from '@/lib/errors';
 import { statusPill } from '@/lib/vpn-display';
 import { status, white } from '@/lib/birdo-theme';
 import { disconnectVpn } from '@/session/vpn-actions';
-import { installExitsApp, installUpdate, useUpdater } from '@/session/updater';
+import { installExitsApp, installUpdate, UPDATE_WAITING_COPY, useUpdater } from '@/session/updater';
 import { useAppStore } from '@/store/app-store';
 import { selectDisplayState, selectTunnelActive } from '@/store/selectors';
 
@@ -53,6 +53,7 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
   const version = info.requiredVersion?.trim() || null;
   const downloadUrl = info.downloadUrl?.trim() || null;
   const installing = phase === 'installing';
+  const waiting = phase === 'waiting';
 
   const openDownloadPage = useCallback(() => {
     if (!downloadUrl) return;
@@ -127,6 +128,11 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
         </div>
       )}
 
+      {waiting && (
+        <p role="status" className="max-w-xs text-xs" style={{ color: status.yellowLight }}>
+          {UPDATE_WAITING_COPY}
+        </p>
+      )}
       {phase === 'error' && error && (
         <p role="alert" className="max-w-xs text-xs" style={{ color: status.yellowLight }}>
           {error}
@@ -152,7 +158,7 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
           <button
             type="button"
             onClick={() => void installUpdate()}
-            disabled={installing}
+            disabled={installing || waiting}
             className="flex items-center gap-2 rounded-lg bg-white px-6 py-2.5 text-sm font-semibold text-black transition hover:bg-white/90 disabled:opacity-50"
           >
             {installing ? (

@@ -15,10 +15,19 @@
  * restart" on Windows and warns first when a tunnel is up. Rust performs the
  * exit teardown (disconnect, release the kill switch) before it installs
  * (contract §3.5).
+ *
+ * HELD BY THE KILL SWITCH (MR-1824). The installer is downloaded from GitHub.
+ * On macOS and Linux a kill-switch block lets the app reach only the BirdoVPN
+ * control plane, deliberately, so while a block is up and no tunnel carries
+ * the download Rust refuses it up front (`held_by_kill_switch`). The update
+ * then waits (`waiting`), says why, and starts again by itself once the
+ * status says the download can get out. Windows permits the app through its
+ * block and never waits.
  */
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { useAppStore, type AppStateSnapshot } from '@/store/app-store';
 import { isWindowsPlatform } from '@/utils/helpers';
 
 /** Mirrors `commands::updater::UpdateInfo` (serde camelCase). */
@@ -34,6 +43,8 @@ export type UpdatePhase =
   | 'available'
   | 'up-to-date'
   | 'installing'
+  /** Held by the kill switch (MR-1824): starts again by itself. */
+  | 'waiting'
   | 'ready'
   | 'error';
 
@@ -65,6 +76,57 @@ export const UPDATE_INSTALL_FAILED_COPY =
   'The update was downloaded but could not be installed. Please try again.';
 const UPDATE_INSTALL_FAILED_RECONNECTING_COPY =
   'The update was downloaded but could not be installed. BirdoVPN is reconnecting.';
+/** MR-1824. Wording flagged for review in the PR. */
+export const UPDATE_WAITING_COPY =
+  'The kill switch is blocking the download. It starts once the VPN connects or you disconnect.';
+
+/** `install_update`'s code for a download a kill-switch block holds back. */
+const HELD_BY_KILL_SWITCH = 'held_by_kill_switch';
+
+function heldByKillSwitch(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && (e as Record<string, unknown>).code === HELD_BY_KILL_SWITCH;
+}
+
+/**
+ * Rust's `download_route`, read from the published status: the tunnel
+ * carries the download, or no block is up. (Windows never gets here.)
+ */
+export function downloadCanStart(s: Pick<AppStateSnapshot, 'connectionState' | 'killSwitchBlocking'>): boolean {
+  return s.connectionState === 'connected' || !s.killSwitchBlocking;
+}
+
+let stopWaiting: (() => void) | null = null;
+
+function stopWaitingForDownload(): void {
+  stopWaiting?.();
+  stopWaiting = null;
+}
+
+/**
+ * Held: start again once the status says the download can get out. On a
+ * CHANGE of that answer, so a status that disagrees with Rust's cannot spin
+ * it; plus one immediate retry (`retryNow`) if the status already moved on
+ * while Rust was answering.
+ */
+function waitForDownloadPath(retryNow: boolean): void {
+  stopWaitingForDownload();
+  if (retryNow && downloadCanStart(useAppStore.getState())) {
+    void runInstall(false);
+    return;
+  }
+  stopWaiting = useAppStore.subscribe((next, prev) => {
+    if (downloadCanStart(next) && !downloadCanStart(prev)) {
+      stopWaitingForDownload();
+      void runInstall(true);
+    }
+  });
+}
+
+/** Stop waiting for the kill switch; the update is offered again. */
+export function cancelUpdateWait(): void {
+  stopWaitingForDownload();
+  if (useUpdater.getState().phase === 'waiting') useUpdater.setState({ phase: 'available' });
+}
 
 /**
  * `install_update`'s error (commands/updater.rs `UpdateFailure`): which stage
@@ -88,6 +150,7 @@ let checkedThisRun = false;
 /** For tests. */
 export function resetUpdater(): void {
   checkedThisRun = false;
+  stopWaitingForDownload();
   useUpdater.setState({
     phase: 'idle',
     info: null,
@@ -116,7 +179,7 @@ export async function loadAppVersion(): Promise<void> {
  */
 export async function checkForUpdates(force = false): Promise<UpdateInfo | null> {
   const s = useUpdater.getState();
-  if (s.phase === 'installing' || s.phase === 'checking') return s.info;
+  if (s.phase === 'installing' || s.phase === 'checking' || s.phase === 'waiting') return s.info;
   if (!force && checkedThisRun) return s.info;
   checkedThisRun = true;
   useUpdater.setState({ phase: 'checking', error: null, reconnectOffered: false });
@@ -138,7 +201,12 @@ export async function checkForUpdates(force = false): Promise<UpdateInfo | null>
 }
 
 export async function installUpdate(): Promise<void> {
+  return runInstall(true);
+}
+
+async function runInstall(retryNowIfHeld: boolean): Promise<void> {
   if (useUpdater.getState().phase === 'installing') return;
+  stopWaitingForDownload();
   useUpdater.setState({ phase: 'installing', progress: 0, error: null, reconnectOffered: false });
   const unlisten = listen<{ downloaded: number; contentLength?: number | null }>(
     'updater-download-progress',
@@ -155,6 +223,11 @@ export async function installUpdate(): Promise<void> {
       installed ? { phase: 'ready', progress: 100 } : { phase: 'up-to-date', progress: 0 },
     );
   } catch (e) {
+    if (heldByKillSwitch(e)) {
+      useUpdater.setState({ phase: 'waiting', progress: 0 });
+      waitForDownloadPath(retryNowIfHeld);
+      return;
+    }
     useUpdater.setState({ phase: 'error', ...failureCopy(e) });
   } finally {
     unlisten.then((off) => off()).catch(() => {});

@@ -10,6 +10,8 @@
  *    are active while the feature is off.
  *  - Offline banner (P1-parity-029), the update wall's Disconnect (W2-025),
  *    the updater surviving a remount (W2-024), Pricing (W2-042).
+ *  - An update download held by the kill switch (MR-1824): it waits, says
+ *    why, and starts by itself once the tunnel is up or the block is gone.
  *
  * Run: npx vitest run src/__tests__/Screens.test.tsx
  */
@@ -27,10 +29,13 @@ import { UpdateRequired } from '@/components/UpdateRequired';
 import { UpdateChecker } from '@/components/UpdateChecker';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import {
+  cancelUpdateWait,
+  downloadCanStart,
   installUpdate,
   resetUpdater,
   UPDATE_DOWNLOAD_FAILED_COPY,
   UPDATE_INSTALL_FAILED_COPY,
+  UPDATE_WAITING_COPY,
   useUpdater,
 } from '@/session/updater';
 import { resetSessionData } from '@/session/session-data';
@@ -339,6 +344,125 @@ describe('Update wall (W2-025) and updater (W2-024)', () => {
     await installUpdate();
     expect(useUpdater.getState().error).toBe(UPDATE_DOWNLOAD_FAILED_COPY);
     expect(useUpdater.getState().reconnectOffered).toBe(false);
+  });
+});
+
+describe('Update held by the kill switch (MR-1824)', () => {
+  const HELD = { code: 'held_by_kill_switch', message: 'The kill switch is blocking the update download', reconnect: 'none' };
+
+  /** Rust holds the first `held` installs, then installs. */
+  const rustHolds = (held: number) => {
+    let calls = 0;
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'install_update') {
+        calls += 1;
+        if (calls <= held) throw HELD;
+        return true;
+      }
+      return cmd === 'check_for_updates' ? { version: '9.9.9', currentVersion: '1.0.0' } : undefined;
+    });
+  };
+
+  const blockedNoTunnel = () => useAppStore.setState({ connectionState: 'reconnecting', killSwitchBlocking: true });
+
+  /** Let any resume the store change kicked off settle. */
+  const settle = () => act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  it('reads the same signals as Rust: a tunnel or no block', () => {
+    expect(downloadCanStart({ connectionState: 'reconnecting', killSwitchBlocking: true })).toBe(false);
+    expect(downloadCanStart({ connectionState: 'error', killSwitchBlocking: true })).toBe(false);
+    expect(downloadCanStart({ connectionState: 'connected', killSwitchBlocking: true })).toBe(true);
+    expect(downloadCanStart({ connectionState: 'disconnected', killSwitchBlocking: false })).toBe(true);
+  });
+
+  it('waits and says why, instead of failing the download', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    useUpdater.setState({ phase: 'available', info: { version: '9.9.9', currentVersion: '1.0.0' } });
+    await installUpdate();
+    expect(useUpdater.getState().phase).toBe('waiting');
+    expect(useUpdater.getState().error).toBeNull();
+
+    render(<UpdateChecker />);
+    expect(screen.getByText(UPDATE_WAITING_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(UPDATE_DOWNLOAD_FAILED_COPY)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Download|Install|Retry/ })).not.toBeInTheDocument();
+    // A revisit (or the daily check) does not clobber the wait.
+    expect(callsTo('check_for_updates')).toHaveLength(0);
+  });
+
+  it('starts by itself once the tunnel is up', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    await installUpdate();
+    expect(callsTo('install_update')).toHaveLength(1);
+
+    useAppStore.setState({ connectionState: 'connected' });
+    await waitFor(() => expect(useUpdater.getState().phase).toBe('ready'));
+    expect(callsTo('install_update')).toHaveLength(2);
+  });
+
+  it('starts by itself once the block is lifted', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    await installUpdate();
+
+    useAppStore.setState({ connectionState: 'disconnected', killSwitchBlocking: false });
+    await waitFor(() => expect(useUpdater.getState().phase).toBe('ready'));
+    expect(callsTo('install_update')).toHaveLength(2);
+  });
+
+  it('a status change that still leaves the block up with no tunnel does not retry', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    await installUpdate();
+
+    useAppStore.setState({ connectionState: 'connecting' });
+    useAppStore.setState({ connectionState: 'error' });
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(1);
+    expect(useUpdater.getState().phase).toBe('waiting');
+  });
+
+  it('a status that disagrees with Rust cannot spin it', async () => {
+    // The status says the tunnel is up; Rust keeps holding the download.
+    useAppStore.setState({ connectionState: 'connected', killSwitchBlocking: true });
+    rustHolds(Number.MAX_SAFE_INTEGER);
+    await installUpdate();
+    await settle();
+    // The click, and ONE immediate retry for a status that moved on.
+    expect(callsTo('install_update')).toHaveLength(2);
+    useAppStore.setState({ connectionState: 'connected' });
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(2);
+    expect(useUpdater.getState().phase).toBe('waiting');
+  });
+
+  it('Cancel stops the wait and offers the update again', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    useUpdater.setState({ info: { version: '9.9.9', currentVersion: '1.0.0' } });
+    await installUpdate();
+    render(<UpdateChecker />);
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(useUpdater.getState().phase).toBe('available');
+
+    useAppStore.setState({ connectionState: 'connected' });
+    await settle();
+    expect(callsTo('install_update')).toHaveLength(1);
+    cancelUpdateWait(); // idempotent once nothing waits
+    expect(useUpdater.getState().phase).toBe('available');
+  });
+
+  it('the update wall says why it waits and does not offer the button meanwhile', async () => {
+    blockedNoTunnel();
+    rustHolds(1);
+    await installUpdate();
+    render(<UpdateRequired info={{}} />);
+    expect(screen.getByText(UPDATE_WAITING_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Update now|Install and restart/ })).toBeDisabled();
   });
 });
 
