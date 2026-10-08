@@ -1452,6 +1452,10 @@ pub mod dns_journal {
                 hook_function("BirdoIsMsiEraEntry"),
                 &[
                     "${If} $1 = 38",
+                    // Only a real GUID reaches msiexec (the round trip).
+                    "IIDFromString",
+                    "${If} $3 == 0",
+                    "${AndIf} $1 == $0",
                     r#"${If} $1 S== "BirdoVPN""#,
                     r#"${If} $1 S== "${BIRDO_MSI_ERA_PUBLISHER}""#,
                     r#""WindowsInstaller""#,
@@ -1462,9 +1466,16 @@ pub mod dns_journal {
                 remove,
                 &[
                     "MsiQueryProductStateW",
-                    "${If} $1 == -1",
+                    "${If} $1 = -1",
                     r#"DeleteRegKey HKLM "${BIRDO_UNINSTALL_ROOT}\$0""#,
-                    r#"msiexec.exe" /x $0 /qn /norestart"#,
+                    // Only an installed product is uninstalled, its code quoted.
+                    "${ElseIf} $1 = 5",
+                    r#"msiexec.exe" /x "$0" /qn /norestart"#,
+                    "${ElseIf} $1 == 3010",
+                    "SetRebootFlag true",
+                    // -2 INVALIDARG, 1, 2, a failed call: left alone.
+                    "${Else}",
+                    "Leaving $0 alone",
                 ],
             );
             assert!(

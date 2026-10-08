@@ -22,7 +22,9 @@
 #     - an entry with DisplayName "BirdoVPN" from another publisher;
 #     - an entry for the 1.0.0 product ("Birdo VPN", publisher "Birdo VPN").
 #   The MSI is uninstalled and the leftover deleted, with the stub never run;
-#   the other two are byte-for-byte untouched.
+#   the other two are byte-for-byte untouched. Then two keys with a GUID's
+#   length and braces but not a GUID (one carries " /qb"), with every other
+#   MSI-era mark: running this build over itself must never start msiexec.
 # Phase B - MSI-era install plus v1.4.46 over it: the TWO entries that the
 #   shipped release leaves (the bug, reproduced). Then this build as the in-app
 #   updater runs it (/P /UPDATE): one entry, and the shortcuts the MSI took
@@ -352,6 +354,51 @@ foreach ($name in $untouched.Keys) {
 $ran = @(Get-ChildItem -LiteralPath $work -Filter 'stub-ran-*.txt')
 if ($ran.Count -ne 0) { Fail "an entry's UninstallString ran: $($ran.Name -join ', ')" }
 Write-Host "   leftover $($planted.leftover.Key) deleted; other and 1.0.0 entries unchanged; stub never ran"
+
+# A key that has a {GUID}'s length and braces but is no GUID, with every
+# other MSI-era mark: the key name used to reach `msiexec /x` unquoted
+# (Windows Installer answers -2, INVALIDARG, which is not -1), so it could
+# pass arguments or leave a silent install on msiexec's usage dialog. Now
+# IIDFromString rejects it, so msiexec never runs: the hook's msiexec log must
+# not appear. ("Entry unchanged" alone proves nothing: it survives either
+# way.) Planted with the .NET API, because the provider would split the "/"
+# into a sub-key, and checked on their own with the MSI already gone, by
+# running this build over itself.
+Step 'a 38-character key that is not a GUID never reaches msiexec'
+$hklm64 = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+$uninstPath = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+function Get-RawSnapshot([string]$name) {
+    $k = $hklm64.OpenSubKey("$uninstPath\$name")
+    if ($null -eq $k) { return $null }
+    try { return (@($k.GetValueNames() | Sort-Object | ForEach-Object { "$_=$($k.GetValue($_))" }) -join '; ') } finally { $k.Close() }
+}
+$malformed = @('{BIRDOVPN-NOTA-GUID-0000-000000000000}', '{00000000-0000-0000-0000-00000000 /qb}')
+$rawBefore = @{}
+foreach ($m in $malformed) {
+    if ($m.Length -ne 38) { Fail "test bug: '$m' has $($m.Length) characters, not 38" }
+    $k = $hklm64.CreateSubKey("$uninstPath\$m")
+    $k.SetValue('DisplayName', $product)
+    $k.SetValue('Publisher', $msiEraPublisher)
+    $k.SetValue('DisplayVersion', '1.4.20')
+    $k.SetValue('WindowsInstaller', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+    $k.SetValue('UninstallString', "`"$stub`" malformed")
+    $k.Close()
+    $rawBefore[$m] = Get-RawSnapshot $m
+    Write-Host "   planted $m (Windows Installer state $(Get-ProductState $m))"
+}
+Invoke-Upgrade @('/S')
+if (Test-Path -LiteralPath $hookLog) {
+    Get-Content -LiteralPath $hookLog -Tail 20 | ForEach-Object { Write-Host "   | $_" }
+    Fail "msiexec ran for a key that is not a GUID ($hookLog exists)"
+}
+foreach ($m in $malformed) {
+    if ((Get-RawSnapshot $m) -ne $rawBefore[$m]) { Fail "the entry '$m' was changed or deleted" }
+    $hklm64.DeleteSubKeyTree("$uninstPath\$m")
+}
+$ran = @(Get-ChildItem -LiteralPath $work -Filter 'stub-ran-*.txt')
+if ($ran.Count -ne 0) { Fail "an entry's UninstallString ran: $($ran.Name -join ', ')" }
+if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { Fail "$exe is missing after the re-run" }
+Write-Host "   no msiexec log, both entries untouched, stub never ran"
 
 Invoke-OurUninstall
 foreach ($name in $untouched.Keys) { Remove-Item -LiteralPath "$uninstRoot\$($planted[$name].Key)" -Recurse -Force }

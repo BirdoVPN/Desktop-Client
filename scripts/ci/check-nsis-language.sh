@@ -96,4 +96,5 @@ extra=$(comm -13 <(names "$builtin" | sort) <(names "$ours" | sort) | tr '\n' ' 
 differs=$(comm -13 <(grep -v '^LangString deleteAppData ' <<<"$builtin") <(grep -v '^LangString deleteAppData ' <<<"$ours") || true)
 [ -z "$differs" ] ||
   fail "[ $(names "$differs" | tr '\n' ' ')] in $lang differ from the locked CLI's built-in English: take the CLI's wording (only deleteAppData is ours)"
-echo "OK 3/3 $(wc -l <<<"$ours" | tr -d ' ') strings, the locked CLI's wording except deleteAppData"
+others=$(grep -vc '^LangString deleteAppData ' <<<"$ours" || true)
+echo "OK 3/3 $others others in the locked CLI's wording, plus deleteAppData"

@@ -153,19 +153,30 @@ FunctionEnd
 ; would still own those files, and the shortcut would still uninstall it.
 ;
 ; So each such entry goes before any file is laid down:
-;   - Windows Installer knows the product: `msiexec /x {ProductCode} /qn`.
-;     The files it deletes are the old version's; ours are written right
-;     after. A running BirdoVPN is stopped first (BIRDO_STOP_APP_IF_RUNNING),
-;     so none of its files is in use.
-;   - Windows Installer does not know it: the entry is a leftover that can
-;     only fail to uninstall, so only the entry is deleted.
+;   - Windows Installer reports the product installed (state 5): run
+;     `msiexec /x "{ProductCode}" /qn`. The files it deletes are the old
+;     version's; ours are written right after. A running BirdoVPN is stopped
+;     first (BIRDO_STOP_APP_IF_RUNNING), so none of its files is in use. That
+;     check only covers $INSTDIR: an MSI installed into a custom folder is not
+;     stopped first, which is the template's own blind spot, and msiexec then
+;     likely answers 3010.
+;   - Windows Installer does not know it (-1): the entry is a leftover that
+;     can only fail to uninstall, so only the entry is deleted.
+;   - Any other state: left alone.
 ; The entry's UninstallString is never run. Nothing else matches: the key
-; must be a {GUID} (a ProductCode), with DisplayName exactly "BirdoVPN",
-; Publisher exactly "Birdo VPN" and WindowsInstaller = 1. A 1.0.0 MSI
-; (product "Birdo VPN", its own folder) is a different product and is not
-; touched. With no such entry (the usual case), nothing happens.
+; must be a real {GUID} (a ProductCode; IIDFromString checks it), with
+; DisplayName exactly "BirdoVPN", Publisher exactly "Birdo VPN" and
+; WindowsInstaller = 1. A 1.0.0 MSI (product "Birdo VPN", its own folder) is
+; a different product and is not touched. With no such entry (the usual
+; case), nothing happens.
 !define BIRDO_UNINSTALL_ROOT "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
 !define BIRDO_MSI_ERA_PUBLISHER "Birdo VPN"
+
+; If msiexec answered 3010, the finish page offers a restart, as Modern UI
+; does whenever the reboot flag is set. "Later" is its default, so that a
+; reflexive Finish does not restart a machine the user is working on. (Read
+; by the template's MUI_PAGE_FINISH, which comes after this file.)
+!define MUI_FINISHPAGE_REBOOTLATER_DEFAULT
 
 Var BirdoMsiEraRemoved
 
@@ -176,27 +187,35 @@ Function BirdoIsMsiEraEntry
   Exch $0
   Push $1
   Push $2
+  Push $3
   StrCpy $2 0
   StrLen $1 $0
   ${If} $1 = 38
-    StrCpy $1 $0 1
-    ${If} $1 == "{"
-      StrCpy $1 $0 1 -1
-      ${If} $1 == "}"
-        ReadRegStr $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "DisplayName"
-        ${If} $1 S== "BirdoVPN"
-          ReadRegStr $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "Publisher"
-          ${If} $1 S== "${BIRDO_MSI_ERA_PUBLISHER}"
-            ReadRegDWORD $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "WindowsInstaller"
-            ${If} $1 == 1
-              StrCpy $2 1
-            ${EndIf}
+    ; Only a real {GUID} may reach msiexec: the key name becomes its
+    ; ProductCode argument. IIDFromString parses nothing but the braced
+    ; 8-4-4-4-12 hex form, and the System plugin prints the GUID back in that
+    ; form (upper case), so the round trip must give the key's own text. `==`
+    ; ignores case, so a lower-case key still matches. Since IIDFromString
+    ; accepted the key, it holds only hex digits, and ignoring case cannot
+    ; let anything else through. ($3 is compared as text: a failed System
+    ; call leaves "error" there, which a numeric compare would read as 0.)
+    System::Call 'ole32::IIDFromString(w r0, g .r1) i .r3'
+    ${If} $3 == 0
+    ${AndIf} $1 == $0
+      ReadRegStr $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "DisplayName"
+      ${If} $1 S== "BirdoVPN"
+        ReadRegStr $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "Publisher"
+        ${If} $1 S== "${BIRDO_MSI_ERA_PUBLISHER}"
+          ReadRegDWORD $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "WindowsInstaller"
+          ${If} $1 == 1
+            StrCpy $2 1
           ${EndIf}
         ${EndIf}
       ${EndIf}
     ${EndIf}
   ${EndIf}
   StrCpy $0 $2
+  Pop $3
   Pop $2
   Pop $1
   Exch $0
@@ -207,24 +226,38 @@ FunctionEnd
 Function BirdoRemoveMsiEraEntry
   Exch $0
   Push $1
-  ; INSTALLSTATE_UNKNOWN (-1): Windows Installer has no such product.
+  ; Each state on its own. Anything but these two is left alone: -2
+  ; INVALIDARG, 1 ADVERTISED, 2 ABSENT (another user's), or a failed call
+  ; ("error", which reads as 0 here).
   System::Call 'msi::MsiQueryProductStateW(w r0) i .r1'
-  ${If} $1 == -1
+  ${If} $1 = -1
+    ; INSTALLSTATE_UNKNOWN: Windows Installer has no such product.
     DetailPrint "Removing the leftover Apps & features entry $0 of the old BirdoVPN MSI"
     DeleteRegKey HKLM "${BIRDO_UNINSTALL_ROOT}\$0"
-  ${Else}
-    DetailPrint "Uninstalling the old BirdoVPN MSI $0 (Windows Installer state $1)"
+  ${ElseIf} $1 = 5
+    ; INSTALLSTATE_DEFAULT: installed (per machine, as the MSI era was).
+    DetailPrint "Uninstalling the old BirdoVPN MSI $0"
     ClearErrors
-    ExecWait '"$SYSDIR\msiexec.exe" /x $0 /qn /norestart /l*v "$TEMP\BirdoVPN-msi-era-uninstall.log"' $1
+    ExecWait '"$SYSDIR\msiexec.exe" /x "$0" /qn /norestart /l*v "$TEMP\BirdoVPN-msi-era-uninstall.log"' $1
     ${If} ${Errors}
       StrCpy $1 "not started"
     ${EndIf}
     DetailPrint "msiexec /x $0: $1 (log: $TEMP\BirdoVPN-msi-era-uninstall.log)"
-    ; 3010: done, a reboot completes it (ERROR_SUCCESS_REBOOT_REQUIRED).
     ${If} $1 == 0
-    ${OrIf} $1 == 3010
       StrCpy $BirdoMsiEraRemoved 1
+    ${ElseIf} $1 == 3010
+      ; ERROR_SUCCESS_REBOOT_REQUIRED: removed, but a file that was in use
+      ; goes only at the next restart. The GUI finish page then offers that
+      ; restart, defaulting to "later" (MUI_FINISHPAGE_REBOOTLATER_DEFAULT,
+      ; below); silent and passive installs, which skip that page, only
+      ; record it.
+      StrCpy $BirdoMsiEraRemoved 1
+      SetRebootFlag true
     ${EndIf}
+    ; Any other code: msiexec failed, and the MSI and its entry stay. The
+    ; install carries on, with the code in the details and in the log above.
+  ${Else}
+    DetailPrint "Leaving $0 alone (Windows Installer state $1)"
   ${EndIf}
   ClearErrors
   ReadRegStr $1 HKLM "${BIRDO_UNINSTALL_ROOT}\$0" "DisplayName"
