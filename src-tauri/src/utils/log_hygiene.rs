@@ -355,19 +355,29 @@ const REDACTOR_COMBINATORS: &[&str] = &[
 /// Is the `redact_*`/`sanitize_*` identifier at `args[start..end]` handed to a
 /// combinator as a function (`.map(redact_ip)`) rather than used as a value?
 ///
-/// It must be a whole argument (`(` or `,` before it), the LAST one (`)` after
-/// it, or a trailing `,` and then `)`), of a method call named in
-/// `REDACTOR_COMBINATORS`. So none of these pass: the macro's own arguments
-/// (`info!("{}", redact_ip)`), a nested macro (`format!("{}", redact_ip)`), a
-/// constructor (`Some(redact_ip)`), a method that takes a value
-/// (`.unwrap_or(redact_ip)`), or a combinator's default (`.map_or(redact_ip, f)`).
+/// It must be a whole argument (`(` or `,` before it, or before the path that
+/// leads to it), the LAST one (`)` after it, or a trailing `,` and then `)`),
+/// of a method call named in `REDACTOR_COMBINATORS`, turbofish or not. So
+/// none of these pass: the macro's own arguments (`info!("{}", redact_ip)`), a
+/// nested macro (`format!("{}", redact_ip)`), a constructor
+/// (`Some(redact_ip)`), a method that takes a value (`.unwrap_or(redact_ip)`),
+/// or a combinator's default (`.map_or(redact_ip, f)`).
 fn passed_as_a_function(args: &str, start: usize, end: usize) -> bool {
     let after = args[end..].trim_start();
     let last_argument = after.starts_with(')')
         || after
             .strip_prefix(',')
             .is_some_and(|rest| rest.trim_start().starts_with(')'));
-    let before = args[..start].trim_end();
+    // A path to it names the same function: `.map(log_hygiene::redact_ip)`,
+    // `.map(Self::redact_ip)`, `.map(::crate_name::redact_ip)`.
+    let mut path_start = start;
+    while let Some(head) = args[..path_start].strip_suffix("::") {
+        path_start = head.trim_end_matches(is_ident_char).len();
+        if path_start == head.len() {
+            break; // a leading `::`
+        }
+    }
+    let before = args[..path_start].trim_end();
     if !last_argument || !(before.ends_with('(') || before.ends_with(',')) {
         return false;
     }
@@ -390,7 +400,33 @@ fn passed_as_a_function(args: &str, start: usize, end: usize) -> bool {
     if b[open] != b'(' {
         return false;
     }
-    let callee = args[..open].trim_end();
+    let mut callee = args[..open].trim_end();
+    // A turbofish between the name and its arguments: `.map::<String, _>(..)`.
+    if callee.ends_with('>') {
+        let cb = callee.as_bytes();
+        let mut depth = 0usize;
+        let mut k = cb.len();
+        let lt = loop {
+            if k == 0 {
+                return false;
+            }
+            k -= 1;
+            match cb[k] {
+                b'>' => depth += 1,
+                b'<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break k;
+                    }
+                }
+                _ => {}
+            }
+        };
+        match callee[..lt].trim_end().strip_suffix("::") {
+            Some(name) => callee = name.trim_end(),
+            None => return false,
+        }
+    }
     let name_start = callee.trim_end_matches(is_ident_char).len();
     REDACTOR_COMBINATORS.contains(&&callee[name_start..])
         && callee[..name_start].trim_end().ends_with('.')
@@ -423,14 +459,18 @@ fn opened_by_redactor(args: &str, idx: usize) -> bool {
 }
 
 /// The remainder of the current top-level macro argument (up to the next comma
-/// at bracket depth zero).
+/// at bracket depth zero). A turbofish's commas (`.map::<String, _>(..)`) are
+/// inside it too; only `::<` opens one, as a bare `<` may be a comparison.
 fn rest_of_argument(after: &str) -> &str {
     let mut depth = 0i32;
+    let mut turbofish = 0i32;
     for (idx, c) in after.char_indices() {
         match c {
+            '<' if turbofish > 0 || after[..idx].ends_with("::") => turbofish += 1,
+            '>' if turbofish > 0 => turbofish -= 1,
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
-            ',' if depth == 0 => return &after[..idx],
+            ',' if depth == 0 && turbofish == 0 => return &after[..idx],
             _ => {}
         }
     }
@@ -562,6 +602,42 @@ mod tests {
             let hits = scan_source("t.rs", src);
             assert!(hits.is_empty(), "{src}: {hits:?}");
         }
+    }
+
+    /// Review of #261: a path to the redactor, or a turbofish on the
+    /// combinator, is the same shape, not a value.
+    #[test]
+    fn accepts_a_redactor_reached_by_a_path_or_through_a_turbofish() {
+        for src in [
+            r#"fn f() { tracing::info!("{:?}", gw.map(log_hygiene::redact_ip)); }"#,
+            r#"fn f() { tracing::info!("{:?}", gw.map(crate::utils::redact_ip)); }"#,
+            r#"fn f() { tracing::info!("{:?}", host.and_then(Self::sanitize_host)); }"#,
+            r#"fn f() { tracing::info!("{:?}", gw.map(::utils::redact_endpoint)); }"#,
+            r#"fn f() { tracing::info!("{:?}", gw.map::<String, _>(redact_ip)); }"#,
+            r#"fn f() { tracing::info!("{:?}", gw.map::<String, _>(utils::redact_ip)); }"#,
+        ] {
+            let hits = scan_source("t.rs", src);
+            assert!(hits.is_empty(), "{src}: {hits:?}");
+        }
+        // ...while a path is still a value wherever a bare name is one.
+        for src in [
+            r#"fn f() { tracing::info!("{}", utils::redact_ip); }"#,
+            r#"fn f() { tracing::info!("{:?}", Some(utils::redact_ip)); }"#,
+            r#"fn f() { tracing::info!("{}", opt.unwrap_or(Self::redact_ip)); }"#,
+            r#"fn f() { tracing::info!("{:?}", gw.map::<String>(redact_ip, x)); }"#,
+            r#"fn f() { tracing::info!("{:?}", Vec::<u8>::from(redact_ip)); }"#,
+        ] {
+            let hits = scan_source("t.rs", src);
+            assert_eq!(hits.len(), 1, "{src}: {hits:?}");
+            assert_eq!(hits[0].ident, "redact_ip", "{src}");
+        }
+        // Only `::<` opens a turbofish: a bare `<` is a comparison, and the
+        // argument still ends at its comma (the next one's redactor is not
+        // this one's).
+        let src = r#"fn f() { tracing::info!("{} {}", peer_ip < limit, redact_ip(x)); }"#;
+        let hits = scan_source("t.rs", src);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].ident, "peer_ip");
     }
 
     /// From the review of #256: any identifier starting `redact_`/`sanitize_`
