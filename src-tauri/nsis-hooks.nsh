@@ -249,7 +249,7 @@ Function BirdoRemoveMsiEraEntry
       ; ERROR_SUCCESS_REBOOT_REQUIRED: removed, but a file that was in use
       ; goes only at the next restart. The GUI finish page then offers that
       ; restart, defaulting to "later" (MUI_FINISHPAGE_REBOOTLATER_DEFAULT,
-      ; below); silent and passive installs, which skip that page, only
+      ; above); silent and passive installs, which skip that page, only
       ; record it.
       StrCpy $BirdoMsiEraRemoved 1
       SetRebootFlag true
@@ -378,6 +378,18 @@ FunctionEnd
   ; keep resources\ and the install folder behind for good. CI caught it:
   ; nsis-msi-era-upgrade.ps1, phase B, upgrades over v1.4.46.
   Delete "$INSTDIR\resources\.gitkeep"
+  ; WIN2-012: when msiexec answered 3010, Modern UI's finish page shows the
+  ; restart choice INSTEAD of the template's "Create desktop shortcut"
+  ; checkbox (MUI_FINISHPAGE_SHOWREADME, its only GUI path to that
+  ; shortcut), and the MSI took its own desktop shortcut with it: a GUI
+  ; install ended with none. Silent and passive installs skip that page, and
+  ; the template has already made theirs, just before this hook.
+  ${If} ${RebootFlag}
+  ${AndIf} $BirdoMsiEraRemoved = 1
+  ${AndIf} $PassiveMode <> 1
+  ${AndIfNot} ${Silent}
+    Call CreateOrUpdateDesktopShortcut
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

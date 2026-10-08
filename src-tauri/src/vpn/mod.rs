@@ -1472,10 +1472,28 @@ pub mod dns_journal {
                     "${ElseIf} $1 = 5",
                     r#"msiexec.exe" /x "$0" /qn /norestart"#,
                     "${ElseIf} $1 == 3010",
+                    "StrCpy $BirdoMsiEraRemoved 1",
                     "SetRebootFlag true",
                     // -2 INVALIDARG, 1, 2, a failed call: left alone.
                     "${Else}",
                     "Leaving $0 alone",
+                ],
+            );
+            // After a 3010, a GUI install's finish page offers the restart in
+            // place of the template's "Create desktop shortcut" checkbox, and
+            // the MSI took its own shortcut with it: the hook makes it, with
+            // the template's own function (the NSIS build in
+            // nsis-installer.yml fails if that name ever goes). Silent and
+            // passive installs got theirs from the template already.
+            in_order(
+                hook_macro("NSIS_HOOK_POSTINSTALL"),
+                &[
+                    "${If} ${RebootFlag}",
+                    "${AndIf} $BirdoMsiEraRemoved = 1",
+                    "${AndIf} $PassiveMode <> 1",
+                    "${AndIfNot} ${Silent}",
+                    "Call CreateOrUpdateDesktopShortcut",
+                    "${EndIf}",
                 ],
             );
             assert!(
