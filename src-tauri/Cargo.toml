@@ -230,6 +230,7 @@ tauri-plugin-process = "2.2"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Globalization",       # the WebView2 environment's language, as wry sets it (MR-1946)
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
@@ -248,6 +249,14 @@ windows = { version = "0.62", features = [
 
 # Wintun driver bindings
 wintun = "0.5"
+
+# The WebView2 environment for the main window, built by the app so that
+# WebView2's crash reports stay on the device (MR-1946, utils/webview2.rs):
+# neither tauri nor wry exposes IsCustomCrashReportingEnabled, but both take
+# a ready-made environment. Already in the graph at this version (tauri 2.12
+# and wry 0.57 depend on it, and `with_environment` takes its type), so this
+# adds no crate; it must move with tauri's, or the types will not match.
+webview2-com = "0.39"
 
 # Registry read for enumerating installed apps (split-tunnel picker). Simple,
 # pure-Rust wrapper over windows-sys; builds on the pinned 1.96 toolchain.

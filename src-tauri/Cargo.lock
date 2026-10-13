@@ -432,6 +432,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
+ "webview2-com",
  "windows 0.62.2",
  "winreg",
  "wintun",

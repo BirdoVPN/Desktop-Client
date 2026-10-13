@@ -9,6 +9,7 @@ pub mod log_policy;
 pub mod log_retention;
 pub mod os_rng;
 pub mod redact;
+pub mod webview2;
 
 /// Source-level guard that no address-shaped value reaches a logging macro
 /// unredacted. Test-only: it reads the tree rather than running in the app.

@@ -311,6 +311,10 @@ fn main() {
         chrono::Utc::now(),
         crate::utils::log_retention::KEEP_CRASH_REPORTS,
     );
+    // MR-1946: WebView2's own crash dumps, by the same rule. Here, before
+    // Tauri starts, so before this session's WebView2 is running.
+    #[cfg(windows)]
+    crate::utils::webview2::prune_dumps(chrono::Utc::now());
 
     if std::env::args().any(|arg| arg == RECONCILE_AND_EXIT) {
         reconcile_and_exit();
@@ -426,6 +430,25 @@ fn main() {
                     .map(|s| s.crash_reports_enabled)
                     .unwrap_or(false),
             );
+
+            // MR-1946: the main window is built here, not by Tauri from
+            // tauri.conf.json ("create": false), so that on Windows it runs on
+            // a WebView2 environment that keeps WebView2's crash reports on
+            // this device. Before everything below, which finds it as it did
+            // when Tauri built it before `setup` ran; after the two choices
+            // above, so a window that cannot be built is logged and reported
+            // the way the user chose.
+            {
+                let config = app
+                    .config()
+                    .app
+                    .windows
+                    .iter()
+                    .find(|w| w.label == "main")
+                    .cloned()
+                    .ok_or("tauri.conf.json has no \"main\" window")?;
+                crate::utils::webview2::build_main_window(app.handle(), &config)?;
+            }
 
             // REVIEW-WIN2-011: a GUI upgrade runs the old uninstaller, which
             // deletes the launch-at-login task; put it back if it is missing.
