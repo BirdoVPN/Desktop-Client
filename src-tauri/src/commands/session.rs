@@ -362,10 +362,6 @@ async fn attempt(
     tracing::debug!(?target, ?fallback_reason, "connect attempt");
 
     let device_name = get_device_name();
-    // FIX-1-1: the X25519 keypair is generated here — the private key never
-    // leaves this device. Zeroizing until it moves into the config.
-    let (private_key, client_public_key) = generate_wireguard_keypair();
-    let mut private_key = Zeroizing::new(private_key);
     let settings = apply_vpn_settings(app).await;
 
     // AUDIT-C1: with PQ requested, attach our ML-KEM-1024 public key so the
@@ -385,49 +381,88 @@ async fn attempt(
     };
 
     vm.set_phase(ConnectPhase::Authenticating);
-    let (response, multi_hop, dialled_id) = match target {
-        ConnectTarget::SingleHop { server_id } => {
-            let response = vm
-                .run_cancellable(
-                    ctx.epoch,
-                    api.connect_vpn(
-                        server_id,
-                        &device_name,
-                        Some(client_public_key),
-                        settings.stealth_mode.then_some(true),
-                        fallback_reason,
-                        settings.quantum_protection.then_some(true),
-                        pq_pk,
-                        settings.dns_filtering,
-                    ),
-                )
-                .await?
-                .map_err(|e| {
-                    tracing::error!("API call failed: {}", e);
-                    IpcError::from(e)
-                })?;
-            tracing::info!("API response received: success={}", response.success);
-            (response, None, server_id.as_str())
+    // MR-1639: a refusal the server marks retryable with a wait
+    // (`psk_delivery_unavailable`, `quota_check_unavailable`) is asked ONCE
+    // more, after that wait (clamped at parse), with the SAME `settings` and
+    // the SAME post-quantum key. Nothing is re-read between the two, so the
+    // second request cannot go out without the Quantum Protection (or
+    // Stealth) the first one asked for: a PQ connect is retried as a PQ
+    // connect or fails, closed, with the server's error. A Disconnect during
+    // the wait cancels it like any other step.
+    let mut retried = false;
+    let (response, multi_hop, dialled_id, mut private_key) = loop {
+        // FIX-1-1: the X25519 keypair is generated here — the private key
+        // never leaves this device. A fresh one per request, so a refused
+        // request's key is never sent again. Zeroizing until it moves into
+        // the config.
+        let (private_key, client_public_key) = generate_wireguard_keypair();
+        let private_key = Zeroizing::new(private_key);
+        let asked: Result<(ConnectResponse, Option<MultiHopStatus>, &str), IpcError> = async {
+            match target {
+                ConnectTarget::SingleHop { server_id } => {
+                    let response = vm
+                        .run_cancellable(
+                            ctx.epoch,
+                            api.connect_vpn(
+                                server_id,
+                                &device_name,
+                                Some(client_public_key),
+                                settings.stealth_mode.then_some(true),
+                                fallback_reason,
+                                settings.quantum_protection.then_some(true),
+                                pq_pk.clone(),
+                                settings.dns_filtering,
+                            ),
+                        )
+                        .await?
+                        .map_err(|e| {
+                            tracing::error!("API call failed: {}", e);
+                            IpcError::from(e)
+                        })?;
+                    tracing::info!("API response received: success={}", response.success);
+                    Ok((response, None, server_id.as_str()))
+                }
+                ConnectTarget::MultiHop { entry_id, exit_id } => {
+                    let response = vm
+                        .run_cancellable(
+                            ctx.epoch,
+                            api.connect_multi_hop(
+                                entry_id,
+                                exit_id,
+                                &device_name,
+                                &client_public_key,
+                                settings.stealth_mode,
+                                settings.quantum_protection,
+                                pq_pk.clone(),
+                                settings.dns_filtering,
+                            ),
+                        )
+                        .await?
+                        .map_err(IpcError::from)?;
+                    let (response, route) =
+                        verified_multi_hop_response(response, entry_id, exit_id)?;
+                    Ok((response, Some(route), entry_id.as_str()))
+                }
+            }
         }
-        ConnectTarget::MultiHop { entry_id, exit_id } => {
-            let response = vm
-                .run_cancellable(
-                    ctx.epoch,
-                    api.connect_multi_hop(
-                        entry_id,
-                        exit_id,
-                        &device_name,
-                        &client_public_key,
-                        settings.stealth_mode,
-                        settings.quantum_protection,
-                        pq_pk,
-                        settings.dns_filtering,
-                    ),
-                )
-                .await?
-                .map_err(IpcError::from)?;
-            let (response, route) = verified_multi_hop_response(response, entry_id, exit_id)?;
-            (response, Some(route), entry_id.as_str())
+        .await;
+        match asked {
+            Ok((response, multi_hop, dialled_id)) => {
+                break (response, multi_hop, dialled_id, private_key)
+            }
+            Err(error) => match error.server_asked_to_wait().filter(|_| !retried) {
+                Some(wait) => {
+                    retried = true;
+                    tracing::warn!(
+                        "Connect refused as retryable ({}) — asking once more in {}s",
+                        error,
+                        wait.as_secs()
+                    );
+                    vm.run_cancellable(ctx.epoch, tokio::time::sleep(wait))
+                        .await?;
+                }
+                None => return Err(error),
+            },
         }
     };
     if !response.success {
@@ -1342,6 +1377,43 @@ mod lifecycle_tests {
                 "ar.start()",
             ],
         );
+    }
+
+    /// MR-1639: a retryable refusal (`psk_delivery_unavailable`,
+    /// `quota_check_unavailable`) is asked once more, after the server's
+    /// wait, cancellably. Settings and the post-quantum key are read ONCE,
+    /// before the loop, and both requests are built from them — so the retry
+    /// cannot go out without the Quantum Protection the first one asked for.
+    /// Each request gets a fresh keypair (FIX-1-1).
+    #[test]
+    fn a_retryable_refusal_is_asked_once_more_with_the_same_protection() {
+        let attempt = body("async fn attempt(");
+        order(
+            attempt,
+            &[
+                "let settings = apply_vpn_settings(app).await;",
+                "let pq_pk = if settings.quantum_protection {",
+                "let mut retried = false;",
+                "loop {",
+                "generate_wireguard_keypair()",
+                "settings.quantum_protection.then_some(true),",
+                "pq_pk.clone(),",
+                "settings.quantum_protection,",
+                "pq_pk.clone(),",
+                "error.server_asked_to_wait().filter(|_| !retried)",
+                "retried = true;",
+                "vm.run_cancellable(ctx.epoch, tokio::time::sleep(wait))",
+                "None => return Err(error),",
+                "prepare_tunnel(",
+            ],
+        );
+        for once in [
+            "apply_vpn_settings(",
+            "get_client_public_key_b64()",
+            "generate_wireguard_keypair()",
+        ] {
+            assert_eq!(attempt.matches(once).count(), 1, "{once}");
+        }
     }
 
     /// REVIEW-WIN-012: a command-level `session_expired` ends the session in

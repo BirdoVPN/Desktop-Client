@@ -1391,6 +1391,8 @@ impl BirdoApi {
                 .and_then(|b| b.message.clone())
                 .unwrap_or_default()
         };
+        let retry_after_secs =
+            || super::error::retry_after_secs(body.as_ref().and_then(|b| b.details.as_ref()));
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
@@ -1398,13 +1400,21 @@ impl BirdoApi {
             // down. Without this it read as a 503 "server unavailable", whose
             // advice (try another location) cannot help.
             Some("quota_check_unavailable") => {
-                let retry_after_secs = body
-                    .as_ref()
-                    .and_then(|b| b.details.as_ref())
-                    .and_then(|d| d.get("retryAfterSeconds"))
-                    .and_then(serde_json::Value::as_u64);
-                return ApiError::QuotaCheckUnavailable { retry_after_secs };
+                return ApiError::QuotaCheckUnavailable {
+                    retry_after_secs: retry_after_secs(),
+                };
             }
+            // MR-1639: the peer was rolled back because its pre-shared key
+            // could only have travelled over the SSH fallback. Same shape and
+            // semantics as the allowance check: retry the same request.
+            Some("psk_delivery_unavailable") => {
+                return ApiError::PskDeliveryUnavailable {
+                    retry_after_secs: retry_after_secs(),
+                };
+            }
+            // Any other code, known or not, falls through to the status
+            // mapping below: `Rejected` with the server's sentence, or the
+            // bare status. An unknown code never fails the decode.
             _ => {}
         }
 

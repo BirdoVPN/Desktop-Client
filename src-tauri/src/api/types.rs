@@ -47,8 +47,9 @@ pub struct ApiErrorBody {
     pub message: Option<String>,
     /// The backend's machine-readable reason, where it sends one
     /// (`two_factor_required`, `two_factor_invalid` — Account API contract
-    /// 2026-10-01, item 85; `quota_check_unavailable`, birdo-web #590).
-    /// Clients map by THIS, never by `message`.
+    /// 2026-10-01, item 85; `quota_check_unavailable`, birdo-web #590;
+    /// `psk_delivery_unavailable`, MR-1639). Clients map by THIS, never by
+    /// `message`; a code this build does not know is not an error.
     #[serde(default)]
     pub error: Option<String>,
     /// Structured extras (`retryAfterSeconds`), read leniently where used.

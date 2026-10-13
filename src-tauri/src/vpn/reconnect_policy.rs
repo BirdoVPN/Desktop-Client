@@ -19,7 +19,8 @@
 //!      keeps dying after reconnecting stops being re-dialled.
 //!   5. With no route off the machine, wait without spending budget — for at
 //!      most `OFFLINE_PAUSE_CAP`, so a wrong signal cannot hold anyone forever.
-//!   6. Otherwise dial with exponential backoff until the budget is spent.
+//!   6. Otherwise dial with exponential backoff until the budget is spent —
+//!      never sooner than a retryable refusal's own `retryAfterSeconds`.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -718,7 +719,14 @@ impl ReconnectPolicy {
                 let delay = if std::mem::take(&mut self.immediate) {
                     Duration::ZERO
                 } else {
-                    backoff_delay(self.attempts, &self.budget)
+                    // MR-1639: a refusal that names its own wait
+                    // (`quota_check_unavailable`, `psk_delivery_unavailable`)
+                    // is never re-dialled sooner than the server asked.
+                    let backoff = backoff_delay(self.attempts, &self.budget);
+                    self.last_error
+                        .as_ref()
+                        .and_then(IpcError::server_asked_to_wait)
+                        .map_or(backoff, |wait| backoff.max(wait))
                 };
                 self.attempts += 1;
                 Action::Dial {
@@ -891,6 +899,79 @@ mod tests {
                 other => panic!("{code:?}: expected give-up, got {other:?}"),
             }
         }
+    }
+
+    /// MR-1639: the two retryable 503s (`psk_delivery_unavailable`,
+    /// `quota_check_unavailable`) are re-dialled, never given up on at once,
+    /// and never sooner than the server's `retryAfterSeconds`. A longer
+    /// backoff still wins; the budget still ends it; without a wait the plain
+    /// backoff applies.
+    #[test]
+    fn a_retryable_refusal_is_redialled_no_sooner_than_the_server_asked() {
+        use crate::api::ApiError;
+        let refusals: [fn(Option<u64>) -> ApiError; 2] = [
+            |retry_after_secs| ApiError::PskDeliveryUnavailable { retry_after_secs },
+            |retry_after_secs| ApiError::QuotaCheckUnavailable { retry_after_secs },
+        ];
+        for refusal in refusals {
+            let mut p = ReconnectPolicy::new(Budget {
+                max_attempts: 8,
+                ..budget()
+            });
+            let now = Instant::now();
+            let mut delays = Vec::new();
+            for _ in 0..8 {
+                match p.decide(&not_connected(now)) {
+                    Action::Dial { delay, .. } => delays.push(delay.as_secs()),
+                    other => panic!("{other:?}"),
+                }
+                let error = IpcError::from_api(&refusal(Some(30)));
+                assert!(!error.code.is_hard_refusal());
+                p.on_dial_failed(error);
+            }
+            // The first dial follows the drop (no refusal yet); then
+            // max(backoff 2, 4, 8, 16, 32, 64→60, 60; the server's 30).
+            assert_eq!(delays, vec![1, 30, 30, 30, 30, 32, 60, 60]);
+            match p.decide(&not_connected(now)) {
+                Action::GiveUp(err) => {
+                    assert_eq!(err.code, IpcErrorCode::ServerError);
+                    assert!(err.message.contains("after 8 attempts"), "{}", err.message);
+                    assert!(
+                        marks_give_up(err.code),
+                        "a failed recovery, not a server ending"
+                    );
+                }
+                other => panic!("expected give-up, got {other:?}"),
+            }
+
+            // No wait in the body: the plain backoff.
+            let mut p = ReconnectPolicy::new(budget());
+            let mut delays = Vec::new();
+            for _ in 0..3 {
+                match p.decide(&not_connected(now)) {
+                    Action::Dial { delay, .. } => delays.push(delay.as_secs()),
+                    other => panic!("{other:?}"),
+                }
+                p.on_dial_failed(IpcError::from_api(&refusal(None)));
+            }
+            assert_eq!(delays, vec![1, 2, 4]);
+        }
+    }
+
+    /// Only a retryable `server_error` names a wait the policy honours: a
+    /// `retry_after_secs` on any other code (the sign-in rate limit) is not a
+    /// dial-path answer, and changes nothing here.
+    #[test]
+    fn only_a_retryable_server_error_carries_a_dial_wait() {
+        let rate_limited =
+            IpcError::new(IpcErrorCode::RateLimited, "slow down").with_retry_after(30);
+        assert_eq!(rate_limited.server_asked_to_wait(), None);
+        let server = IpcError::new(IpcErrorCode::ServerError, "x").with_retry_after(30);
+        assert_eq!(server.server_asked_to_wait(), Some(Duration::from_secs(30)));
+        assert_eq!(
+            IpcError::new(IpcErrorCode::ServerError, "x").server_asked_to_wait(),
+            None
+        );
     }
 
     /// The 426 latch (W1 section (b)): recovery stops; a live tunnel is left
