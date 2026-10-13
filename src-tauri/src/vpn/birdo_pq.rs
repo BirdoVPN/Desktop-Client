@@ -87,9 +87,12 @@
 //!
 //! * **Protection once the secret key is stolen.** The ML-KEM secret key is the
 //!   LONG-LIVED client identity for BirdoPQ: one keypair per install, replaced
-//!   only on sign-out (`commands::auth::logout`) or when the stored file is
-//!   unusable. An attacker who steals it recovers the PSK of EVERY session
-//!   they hold the connect response for — the ciphertext and the nonce —
+//!   only on an explicit sign-out (`commands::auth::logout`), on account
+//!   deletion (`commands::auth::delete_account`), or when the stored file is
+//!   unusable (`KeypairReadError::Unusable`); the auto sign-out after an
+//!   expired session keeps it. An attacker who steals it recovers the PSK
+//!   of EVERY session they hold the connect response for — the ciphertext
+//!   and the nonce —
 //!   whether that session came before the theft or after it, for as long as
 //!   this key is in use. ML-KEM decapsulation is deterministic in `(sk, ct)`:
 //!   the server's fresh randomness in each encapsulation stops nothing once
