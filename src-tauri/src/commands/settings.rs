@@ -110,6 +110,30 @@ pub struct AppSettings {
     /// tampering and reset.
     #[serde(default, skip_serializing_if = "is_false")]
     pub crash_reports_enabled: bool,
+    /// Keep a diagnostic log on this device (MR-808): `birdo.log` and the
+    /// local crash files, described in `utils::file_log`. Off means nothing
+    /// more is written; files already there stay until "Delete Logs Now" or
+    /// the 7-day retention sweep. Applied live by `utils::file_log::apply`, at
+    /// startup and on every save.
+    ///
+    /// ON by default, which is how every build before this one behaved. The
+    /// log never leaves the device unless the user sends it; a release build
+    /// keeps only INFO and above with addresses redacted, for at most
+    /// `log_retention::MAX_LOG_AGE_DAYS` days; and it is the only diagnostic a
+    /// release GUI build has (no console, and Sentry is opt-in and off by
+    /// default), so with it off by default the first failure a user reports
+    /// would have left no trace anywhere. The privacy policy's "no connection
+    /// logs" is about Birdo's servers and account system, which this file
+    /// never reaches. A session whose settings cannot be verified runs with it
+    /// OFF, not on this default ([`file_logging_for_session`]): a default
+    /// must never override a user's "off".
+    ///
+    /// `skip_serializing_if = is_true` is the `dns_filtering` HMAC rule
+    /// mirrored for a default-ON field: every existing settings.json (no such
+    /// key) must re-serialize byte-identically, or the upgrade would be
+    /// quarantined as tampering and reset. Only an "off" is written.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub file_logging_enabled: bool,
     /// LOCKDOWN: always-on kill switch (Mullvad-style). When true the WFP
     /// block-all stays active the entire time the tunnel is up, permitting
     /// tunneled traffic by interface so there is ZERO leak window — including
@@ -200,6 +224,7 @@ impl From<LegacyAppSettingsV1> for AppSettings {
             quantum_protection: l.quantum_protection,
             dns_filtering: false,
             crash_reports_enabled: false,
+            file_logging_enabled: true,
             lockdown_mode: l.lockdown_mode,
             multi_hop_enabled: false,
             multi_hop_entry_node_id: None,
@@ -228,6 +253,7 @@ impl Default for AppSettings {
             quantum_protection: true,     // post-quantum on by default
             dns_filtering: false,         // BirdoShield — opt-in (D18)
             crash_reports_enabled: false, // crash reports — opt-in (C-3)
+            file_logging_enabled: true,   // on-device log — see the field (MR-808)
             // LOCKDOWN mode. ON by default where it is REAL (Windows), OFF
             // elsewhere — on macOS and Linux `is_lockdown_mode()` returns a
             // hard-coded `false` (killswitch.rs), so this flag does nothing
@@ -265,6 +291,11 @@ fn default_true() -> bool {
 /// must stay OUT of the signed JSON while unset (see `dns_filtering`).
 fn is_false(v: &bool) -> bool {
     !*v
+}
+
+/// The same, for a default-true preference (`file_logging_enabled`).
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -573,6 +604,30 @@ pub(crate) async fn load_settings_off_runtime(app: &AppHandle) -> Result<AppSett
     tokio::task::spawn_blocking(move || load_settings_sync(&app))
         .await
         .map_err(|e| format!("Settings task failed: {e}"))?
+}
+
+/// [`load_settings_sync`] for `setup()` in `main.rs`, saying whether the
+/// settings are the user's own (MR-808): `false` for the defaults served while
+/// the file cannot be verified, and for no settings at all. Most choices are
+/// fine on those defaults for a session; the on-device log is not, because
+/// its default is ON ([`file_logging_for_session`]).
+pub fn load_startup_settings(app: &AppHandle) -> (Option<AppSettings>, bool) {
+    match load_settings(app) {
+        Ok(Loaded::Unverified(settings)) => (Some(settings), false),
+        Ok(loaded) => (Some(loaded.settings()), true),
+        Err(e) => {
+            tracing::warn!("Settings could not be loaded at start-up: {}", e);
+            (None, false)
+        }
+    }
+}
+
+/// Whether this session keeps the on-device log (MR-808): the saved choice
+/// when there is one that could be verified, and OFF otherwise. A user who
+/// switched the log off must never have it switched back on for a session
+/// because their signing key was briefly unreadable.
+pub fn file_logging_for_session(settings: Option<&AppSettings>, verified: bool) -> bool {
+    verified && settings.is_some_and(|s| s.file_logging_enabled)
 }
 
 /// Why a load produced no settings at all.
@@ -893,6 +948,9 @@ fn save_settings_blocking(app: &AppHandle, settings: &AppSettings) -> Result<boo
     // Keep the live crash-reporting gate equal to what is on disk, whichever
     // screen saved.
     crate::utils::crash_report::set_opted_in(settings.crash_reports_enabled);
+    // The same for the on-device log (MR-808): the Settings switch saves
+    // through here, and takes effect at once.
+    crate::utils::file_log::apply(settings.file_logging_enabled);
     tracing::info!("Settings saved successfully");
     Ok(true)
 }
@@ -1091,6 +1149,7 @@ pub async fn reset_settings(app: AppHandle) -> Result<bool, IpcError> {
         let defaults = AppSettings::default();
         reset_over(&path, quarantined, || save_settings_inner(&app, &defaults))?;
         crate::utils::crash_report::set_opted_in(defaults.crash_reports_enabled);
+        crate::utils::file_log::apply(defaults.file_logging_enabled);
         if let Err(e) = apply_autostart(&app, defaults.autostart) {
             tracing::warn!("Settings reset, but launch-at-login was not updated: {}", e);
         }
@@ -1733,6 +1792,90 @@ mod tests {
                 .unwrap()
                 .crash_reports_enabled
         );
+    }
+
+    /// MR-808: the on-device log is ON for a fresh install and for every
+    /// file that predates the key (the behaviour every earlier build had), ON
+    /// stays out of the signed JSON so those files keep verifying, and OFF —
+    /// the user's choice — is written and round-trips.
+    #[test]
+    fn file_logging_defaults_on_absent_loads_on_and_off_round_trips() {
+        assert!(AppSettings::default().file_logging_enabled);
+
+        let before: AppSettings = serde_json::from_str(
+            r#"{"autostart":false,"start_minimized":false,"killswitch_enabled":true,
+               "notifications_enabled":true,"auto_connect":false,"preferred_server_id":null,
+               "split_tunneling_enabled":false,"split_tunnel_apps":[],"custom_dns":null,
+               "protocol":"wireguard","local_network_sharing":false,"wireguard_port":"auto",
+               "wireguard_mtu":0,"stealth_mode":false,"quantum_protection":true,
+               "crash_reports_enabled":true,"lockdown_mode":true,"multi_hop_enabled":false,
+               "multi_hop_entry_node_id":null,"multi_hop_exit_node_id":null}"#,
+        )
+        .expect("a settings file from before the key still loads");
+        assert!(before.file_logging_enabled, "absent loads as ON");
+        assert!(before.crash_reports_enabled, "other choices pass through");
+
+        let on_json = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(
+            !on_json.contains("file_logging_enabled"),
+            "ON must stay out of the signed JSON so older files keep verifying: {on_json}"
+        );
+
+        let off = AppSettings {
+            file_logging_enabled: false,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(json.contains("\"file_logging_enabled\":false"), "{json}");
+        assert!(
+            !serde_json::from_str::<AppSettings>(&json)
+                .unwrap()
+                .file_logging_enabled,
+            "OFF must survive a save and a load"
+        );
+        let legacy: LegacyAppSettingsV1 = serde_json::from_str(&json).unwrap();
+        assert!(
+            AppSettings::from(legacy).file_logging_enabled,
+            "the pre-multi-hop shape never had the key: ON, like any old file"
+        );
+    }
+
+    /// MR-808: a session keeps the log only on a verified ON. The defaults a
+    /// load serves while it cannot verify the file say ON, and they are not
+    /// the user's: an "off" must not be overridden by them.
+    #[test]
+    fn a_session_keeps_the_log_only_on_a_verified_on() {
+        let on = AppSettings::default();
+        let off = AppSettings {
+            file_logging_enabled: false,
+            ..AppSettings::default()
+        };
+        assert!(file_logging_for_session(Some(&on), true));
+        assert!(!file_logging_for_session(Some(&off), true));
+        assert!(
+            !file_logging_for_session(Some(&on), false),
+            "unverified defaults must not switch the log on"
+        );
+        assert!(!file_logging_for_session(None, false));
+    }
+
+    /// MR-808: the live gate follows every way the setting changes — a save
+    /// (the Settings switch) and a reset — like the crash-report opt-in.
+    #[test]
+    fn every_save_and_reset_applies_the_log_switch() {
+        let source = include_str!("settings.rs").replace('\r', "");
+        let body = |signature: &str| {
+            let start = source.find(signature).expect(signature);
+            let rest = &source[start..];
+            rest[..rest.find("\n}\n").expect("end of fn")].to_string()
+        };
+        let save = body("fn save_settings_blocking(");
+        let applied = save
+            .find("file_log::apply(settings.file_logging_enabled)")
+            .expect("a save no longer applies the log switch");
+        assert!(save.find("save_settings_inner(").unwrap() < applied);
+        assert!(body("pub async fn reset_settings(")
+            .contains("file_log::apply(defaults.file_logging_enabled)"));
     }
 
     /// REGRESSION GUARD for the upgrade path: a settings.json signed by 1.4.42

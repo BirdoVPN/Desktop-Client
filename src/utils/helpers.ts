@@ -262,6 +262,9 @@ export interface RustSettings {
   // Crash reports (opt-in, C-3). Optional on the READ side for the same reason
   // as dns_filtering: Rust omits the key while it is false.
   crash_reports_enabled?: boolean;
+  // The on-device diagnostic log (MR-808). ON by default, so Rust omits the
+  // key while it is TRUE; absent reads as on.
+  file_logging_enabled?: boolean;
 }
 
 import type { AccountInfo, AppSettings, WireGuardPort } from '../store/app-store';
@@ -311,6 +314,8 @@ export function settingsFromRust(rs: RustSettings): AppSettings {
     lockdownMode: rs.lockdown_mode ?? true,
     // Opt-in; absent (not false) while off, and absent on every pre-opt-in file.
     crashReportsEnabled: rs.crash_reports_enabled ?? false,
+    // On by default; absent (not true) while on (MR-808).
+    fileLoggingEnabled: rs.file_logging_enabled ?? true,
   };
 }
 
@@ -339,5 +344,8 @@ export function settingsToRust(s: AppSettings): RustSettings {
     lockdown_mode: s.lockdownMode,
     // Always written, so a full save can never silently drop the user's choice.
     crash_reports_enabled: s.crashReportsEnabled,
+    // Always written too: its serde default is ON, so leaving it out of a
+    // full save would switch a user's "off" back on (MR-808).
+    file_logging_enabled: s.fileLoggingEnabled,
   };
 }

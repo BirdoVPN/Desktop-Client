@@ -152,6 +152,10 @@ export interface AppSettings {
   // Written through the dedicated `set_crash_reports_enabled` command (consent
   // screen, Settings › Privacy & Security) and round-tripped by every full save.
   crashReportsEnabled: boolean;
+  // The diagnostic log kept on this device (birdo.log + crash files, MR-808).
+  // ON by default (Rust `AppSettings::file_logging_enabled`); Settings ›
+  // Privacy & Security saves it like any setting, and Rust applies it live.
+  fileLoggingEnabled: boolean;
 }
 
 export interface PortForward {
@@ -475,6 +479,8 @@ export const defaultSettings: AppSettings = {
   lockdownMode: true,
   // Crash reporting is opt-in — matches the Rust `AppSettings::default()`.
   crashReportsEnabled: false,
+  // The on-device log is on — matches the Rust `AppSettings::default()`.
+  fileLoggingEnabled: true,
 };
 
 /** The session's connection fields, as they are with no tunnel and no reading. */

@@ -156,6 +156,8 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::settings::set_autostart,
         commands::settings::reset_settings,
         commands::settings::set_crash_reports_enabled,
+        // The on-device diagnostic log's "Delete Logs Now" (MR-808)
+        commands::logs::delete_logs,
         // Kill switch
         commands::killswitch::get_killswitch_status,
         commands::killswitch::set_killswitch_live,
@@ -203,11 +205,14 @@ fn main() {
     // second fmt layer that appends to <data_dir>/BirdoVPN/logs/birdo.log so the
     // real error (e.g. the raw /vpn/connect failure) is always recoverable from
     // disk. No new dependency: `dirs` + std::fs + a closure MakeWriter.
-    let file_layer = dirs::data_dir().and_then(|mut p| {
-        p.push("BirdoVPN");
-        p.push("logs");
-        std::fs::create_dir_all(&p).ok()?;
-        p.push("birdo.log");
+    //
+    // MR-808: the user can switch this log off (Settings › Privacy & Security
+    // › "Save Diagnostic Logs"), and that choice is only known in setup().
+    // Until then the writer opens nothing and holds lines in memory; see
+    // utils::file_log. The directory is created when the file is first
+    // opened, so a log that is off is never created at all.
+    let file_layer = crate::utils::file_log::log_dir().map(|dir| {
+        let p = dir.join(crate::utils::file_log::LOG_FILE_NAME);
         // TWO CAPS ON THE SAME FILE, and they run in this order.
         //
         // LOG-002 (age). Everything else that protects birdo.log is
@@ -235,31 +240,26 @@ fn main() {
         // passes the cap too, and once it did, every later line used to be
         // dropped until the next launch. A stat per log event at info level is
         // negligible. Owner-only on multi-user Unix hosts (P6-CLI-D-08).
-        let log = crate::utils::log_retention::RotatingLog::open(
-            &p,
-            crate::utils::log_retention::MAX_LOG_BYTES,
-        )
-        .ok()?;
-        Some(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(move || log.writer())
-                // CLAMP THE PERSISTENT LOG. The redaction strategy leans on
-                // "debug never ships": `redact_ip`/`redact_hostname` are
-                // pass-throughs under `debug_assertions`, and several
-                // connection-history lines are DEMOTED to debug rather than
-                // redacted (the node name in manager.rs, the deep-link URL
-                // above). `RUST_LOG` is read from the environment below and
-                // overrides the default filter for the WHOLE subscriber, so
-                // anything able to set an environment variable for this process
-                // — a shortcut, a scheduled task, a support instruction copied
-                // off a forum — turned birdo.log into a durable record of which
-                // exit node was used and when. A per-layer filter fixes that at
-                // the sink rather than at the call site: the console layer still
-                // honours RUST_LOG in full, the append-only FILE never takes
-                // anything below the level this build is allowed to persist.
-                .with_filter(crate::utils::log_policy::file_log_max_level()),
-        )
+        // Gated on the user's choice (MR-808), which setup() applies.
+        let log = crate::utils::file_log::install(&p);
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || log.writer())
+            // CLAMP THE PERSISTENT LOG. The redaction strategy leans on
+            // "debug never ships": `redact_ip`/`redact_hostname` are
+            // pass-throughs under `debug_assertions`, and several
+            // connection-history lines are DEMOTED to debug rather than
+            // redacted (the node name in manager.rs, the deep-link URL
+            // above). `RUST_LOG` is read from the environment below and
+            // overrides the default filter for the WHOLE subscriber, so
+            // anything able to set an environment variable for this process
+            // — a shortcut, a scheduled task, a support instruction copied
+            // off a forum — turned birdo.log into a durable record of which
+            // exit node was used and when. A per-layer filter fixes that at
+            // the sink rather than at the call site: the console layer still
+            // honours RUST_LOG in full, the append-only FILE never takes
+            // anything below the level this build is allowed to persist.
+            .with_filter(crate::utils::log_policy::file_log_max_level())
     });
 
     tracing_subscriber::registry()
@@ -396,8 +396,17 @@ fn main() {
             // from the same load further down. A synchronous load is right
             // here: `setup` runs on the main thread before the async runtime
             // serves any command, so it parks no worker.
-            let startup_settings =
-                commands::settings::load_settings_sync(&app.handle().clone()).ok();
+            let (startup_settings, startup_verified) =
+                commands::settings::load_startup_settings(&app.handle().clone());
+            // MR-808: decide the on-device log. Until here it has held its
+            // lines in memory and opened nothing; on writes them out, off
+            // drops them. Off, too, when the file cannot be verified this
+            // session: its defaults are not the user's choice, and an "off"
+            // must never be overridden by a default "on".
+            crate::utils::file_log::apply(commands::settings::file_logging_for_session(
+                startup_settings.as_ref(),
+                startup_verified,
+            ));
             crate::utils::crash_report::set_opted_in(
                 startup_settings
                     .as_ref()
@@ -952,15 +961,21 @@ fn cleanup_on_crash() {
 
 /// Where crash reports are written.
 fn crash_dir() -> std::path::PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("Birdo VPN")
-        .join("crashes")
+    crate::utils::file_log::crash_dir_in(
+        &dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
+    )
 }
 
 /// Write crash report to a file for later analysis
 fn write_crash_report(location: &str, message: &str) {
     use std::io::Write;
+
+    // MR-808: a crash file is part of the on-device log, so it is written
+    // only while the user keeps that log on — and not before setup() has read
+    // the choice (a panic that early would otherwise ignore an "off").
+    if !crate::utils::file_log::persists() {
+        return;
+    }
 
     let crash_dir = crash_dir();
 

@@ -338,7 +338,14 @@ describe('save_settings payload ↔ Rust AppSettings (commands/settings.rs)', ()
   });
 
   it('round-trips the flags whose serde default would silently flip a user choice', () => {
-    for (const k of ['lockdown_mode', 'quantum_protection', 'killswitch_enabled', 'dns_filtering', 'crash_reports_enabled']) {
+    for (const k of [
+      'lockdown_mode',
+      'quantum_protection',
+      'killswitch_enabled',
+      'dns_filtering',
+      'crash_reports_enabled',
+      'file_logging_enabled',
+    ]) {
       expect(written).toContain(k);
     }
   });
@@ -385,6 +392,8 @@ const FRONTEND_COMMANDS = [
   'set_autostart',
   'reset_settings',
   'set_crash_reports_enabled',
+  // The on-device diagnostic log's "Delete Logs Now" (MR-808)
+  'delete_logs',
   // Kill switch
   'set_killswitch_live',
   // Rust's intent, checked after every dial (round 5 of the review of #222)

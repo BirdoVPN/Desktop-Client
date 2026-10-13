@@ -356,3 +356,24 @@ function compareBestServer(a: Server, b: Server): number {
   if (a.id !== b.id) return a.id < b.id ? -1 : 1;
   return 0;
 }
+
+// ── On-device logs (MR-808) ────────────────────────────────────────────────
+
+/**
+ * `delete_logs` (commands/logs.rs, `utils::file_log::Deleted`): how many of
+ * the app's log and crash files were removed, and how many were not (in use
+ * by another program, or refused). Counts only; Rust never sends a path.
+ * `null` for anything else, so the UI cannot report a count it was not given.
+ */
+export interface DeleteLogsResult {
+  deleted: number;
+  failed: number;
+}
+
+export function parseDeleteLogsResult(raw: unknown): DeleteLogsResult | null {
+  if (!isObj(raw)) return null;
+  const deleted = num(raw.deleted);
+  const failed = num(raw.failed);
+  if (deleted === null || failed === null || deleted < 0 || failed < 0) return null;
+  return { deleted, failed };
+}

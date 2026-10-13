@@ -41,6 +41,8 @@ use chrono::{DateTime, Duration, Utc};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use super::file_log::{Held, LogGate};
+
 /// How far back `birdo.log` may reach. See the module docs before changing it.
 pub const MAX_LOG_AGE_DAYS: i64 = 7;
 
@@ -274,6 +276,12 @@ pub fn enforce(log_path: &Path, now: DateTime<Utc>) {
 /// How many crash reports the crash directory keeps at most.
 pub const KEEP_CRASH_REPORTS: usize = 5;
 
+/// Whether `name` is a crash report's: the sweep below and the user's
+/// "Delete Logs Now" (`file_log::delete_logs`) match the same files.
+pub fn is_crash_report_name(name: &str) -> bool {
+    name.starts_with("crash_") && name.ends_with(".txt")
+}
+
 /// When a crash report was written, from its name (`crash_YYYYMMDD_HHMMSS.txt`,
 /// UTC — what `write_crash_report` mints). `None` for any other name.
 fn crash_report_time(name: &str) -> Option<DateTime<Utc>> {
@@ -304,7 +312,7 @@ pub fn prune_crash_reports(dir: &Path, now: DateTime<Utc>, keep: usize) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !(name.starts_with("crash_") && name.ends_with(".txt")) {
+        if !is_crash_report_name(name) {
             continue;
         }
         let written = crash_report_time(name).or_else(|| {
@@ -393,14 +401,23 @@ pub fn create_owner_only(path: &Path) -> io::Result<std::fs::File> {
 /// the start-up check performs. The sink survives only as the last resort for
 /// a rotation the OS refuses (a scanner holding the file) on a file already
 /// past twice the cap, so the disk stays bounded.
+///
+/// MR-808: it writes only while its gate (`file_log::LogGate`, the user's
+/// "Save Diagnostic Logs") is on. Undecided, it holds lines in memory and
+/// opens nothing; off, it closes the file and writes nothing. The file is
+/// opened on the first line written while on, so a log that is off is never
+/// created, and one that was deleted comes back only with new lines.
 pub struct RotatingLog {
     path: PathBuf,
     cap: u64,
+    gate: &'static LogGate,
     state: std::sync::Mutex<RotatingState>,
 }
 
 struct RotatingState {
-    file: std::fs::File,
+    /// `None` until the first line written while on, and again whenever the
+    /// gate turns off or the logs are deleted.
+    file: Option<std::fs::File>,
     /// When a rotation last failed; it is not retried on every line.
     failed_at: Option<std::time::Instant>,
 }
@@ -408,34 +425,67 @@ struct RotatingState {
 /// How long a refused rotation waits before it is tried again.
 const ROTATION_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The gate of a log that is not switchable ([`RotatingLog::open`]).
+#[cfg(test)]
+static ALWAYS_ON: LogGate = LogGate::on();
+
 impl RotatingLog {
+    /// A log that is always on, opened now.
+    #[cfg(test)]
     pub fn open(path: &Path, cap: u64) -> io::Result<Self> {
         Ok(Self {
             path: path.to_path_buf(),
             cap,
+            gate: &ALWAYS_ON,
             state: std::sync::Mutex::new(RotatingState {
-                file: open_for_append(path)?,
+                file: Some(open_for_append(path)?),
                 failed_at: None,
             }),
         })
     }
 
+    /// A log behind `gate`. Opens nothing; see the type's docs.
+    pub fn gated(path: &Path, cap: u64, gate: &'static LogGate) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            cap,
+            gate,
+            state: std::sync::Mutex::new(RotatingState {
+                file: None,
+                failed_at: None,
+            }),
+        }
+    }
+
     /// A writer for one log event. Never fails: losing one line beats taking
     /// the process down from inside the logging path.
     pub fn writer(&self) -> Box<dyn Write> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let len = state.file.metadata().map(|m| m.len()).unwrap_or(0);
+        if self.gate.is_undecided() {
+            return Box::new(Held(self.gate));
+        }
+        let mut state = self.lock();
+        if !self.gate.is_on() {
+            state.file = None;
+            return Box::new(io::sink());
+        }
+        self.ensure_open(&mut state);
+        let RotatingState {
+            file: Some(file),
+            failed_at,
+        } = &mut *state
+        else {
+            return Box::new(io::sink());
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
         if len > self.cap {
-            let may_retry = state
-                .failed_at
-                .is_none_or(|at| at.elapsed() >= ROTATION_RETRY);
+            let may_retry = failed_at.is_none_or(|at| at.elapsed() >= ROTATION_RETRY);
             if may_retry {
                 match std::fs::rename(&self.path, rotated_path(&self.path))
                     .and_then(|()| open_for_append(&self.path))
                 {
                     Ok(fresh) => {
-                        state.file = fresh;
-                        state.failed_at = None;
+                        *file = fresh;
+                        *failed_at = None;
                     }
                     Err(e) => {
                         // WIN3-011: noted in the log itself, never on stderr.
@@ -445,23 +495,65 @@ impl RotatingLog {
                         // behind one `eprintln!`. Dated like any line, so the
                         // retention sweep treats it like one.
                         let _ = writeln!(
-                            state.file,
+                            file,
                             "{} WARN birdo.log rotation failed (continuing to append): {}",
                             Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
                             e
                         );
-                        state.failed_at = Some(std::time::Instant::now());
+                        *failed_at = Some(std::time::Instant::now());
                     }
                 }
             }
-            if state.failed_at.is_some() && len > 2 * self.cap {
+            if failed_at.is_some() && len > 2 * self.cap {
                 return Box::new(io::sink());
             }
         }
-        match state.file.try_clone() {
+        match file.try_clone() {
             Ok(f) => Box::new(f),
             Err(_) => Box::new(io::sink()),
         }
+    }
+
+    /// Bring the file in line with the gate now, rather than at the next line:
+    /// on writes out what was held, off closes the file (`file_log::apply`).
+    pub fn sync(&self) {
+        let mut state = self.lock();
+        if self.gate.is_on() {
+            self.ensure_open(&mut state);
+        } else if !self.gate.is_undecided() {
+            state.file = None;
+        }
+    }
+
+    /// Run `f` with this log's file closed and its lock held, so no line from
+    /// this process can reach the disk until `f` returns; the next line opens
+    /// a fresh file (`file_log::delete_logs`).
+    pub fn closed_for<R>(&self, f: impl FnOnce() -> R) -> R {
+        let mut state = self.lock();
+        state.file = None;
+        f()
+    }
+
+    /// Open the file if it is not open (creating its directory: nothing
+    /// creates it at start-up any more), then write out whatever the gate held
+    /// before it was decided.
+    fn ensure_open(&self, state: &mut RotatingState) {
+        if state.file.is_none() {
+            if let Some(dir) = self.path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            state.file = open_for_append(&self.path).ok();
+        }
+        if let Some(file) = state.file.as_mut() {
+            let held = self.gate.take_held();
+            if !held.is_empty() {
+                let _ = file.write_all(&held);
+            }
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RotatingState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
