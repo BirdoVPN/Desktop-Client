@@ -625,6 +625,9 @@ pub fn load_startup_settings(app: &AppHandle) -> (Option<AppSettings>, bool) {
         Ok(Loaded::Unverified(settings)) => (Some(settings), false),
         Ok(Loaded::Quarantined(defaults)) => {
             let (settings, own) = after_quarantine(defaults, crate::utils::file_log::saved());
+            // `quarantine` has saved this already if its own read found the
+            // "off"; this covers the case where that read could not tell and
+            // the choice read at launch did.
             if !settings.file_logging_enabled {
                 if let Err(e) = save_settings_inner(app, &settings) {
                     tracing::warn!("Could not keep the log switched off after the reset: {}", e);
@@ -639,13 +642,15 @@ pub fn load_startup_settings(app: &AppHandle) -> (Option<AppSettings>, bool) {
     }
 }
 
-/// What a quarantine at start-up keeps of the on-device log switch (MR-808).
+/// What a quarantine keeps of the on-device log switch (MR-808), at start-up
+/// and in the middle of a session ([`quarantine`]).
 ///
 /// A quarantine (no key verifies settings.json, for good) resets every setting
 /// to its default, and the log's default is ON: a lost signing key used to
 /// switch a user's log back on. So the set-aside file's own "off", read before
-/// the load set it aside (`file_log::read_saved_choice`), is kept, and the
-/// caller saves it with the defaults. It cannot be verified, but an "off" can
+/// the load set it aside (`file_log::read_saved_choice` at launch, and
+/// [`quarantine`]'s own read), is kept, and the caller saves it with the
+/// defaults. It cannot be verified, but an "off" can
 /// only mean less is written. Every other setting keeps the quarantine's
 /// default. A file whose choice could not be read leaves the session off
 /// (`false`), like an unverified load; one that said on, or had no key, is the
@@ -886,7 +891,7 @@ fn key_may_still_exist(keystore: &Result<Option<Vec<u8>>, String>, key_file: &Ke
 /// every save was refused, with no way out. Both now quarantine the file
 /// (settings.json.tampered-…, [`aside_path`]) instead of leaving it for a save to silently
 /// overwrite — the user's data stays recoverable and the reset is visible on
-/// disk — and the defaults load as what is saved.
+/// disk — and the defaults load as what is saved ([`quarantine`]).
 fn no_verifying_key(path: &Path, key_may_still_exist: bool) -> Loaded {
     if key_may_still_exist {
         tracing::error!(
@@ -897,10 +902,36 @@ fn no_verifying_key(path: &Path, key_may_still_exist: bool) -> Loaded {
     tracing::warn!(
         "Settings HMAC verification failed — tampered, or its key is gone. Resetting to defaults."
     );
+    Loaded::Quarantined(quarantine(path, |json| {
+        compute_hmac(json, &get_hmac_key(path)?)
+    }))
+}
+
+/// Set `path` aside as tampered ([`aside_path`]) and return the defaults that
+/// stand in its place, keeping its "off" on the on-device log (MR-808).
+///
+/// The file's own log choice is read before it is moved
+/// (`file_log::saved_choice`), and [`after_quarantine`] keeps an "off" as it
+/// does at start-up. With the log off, those defaults are saved now, signed
+/// with `sign` (a parameter so a test can sign without the OS credential
+/// store): a quarantine in the middle of a session (the signing key vanished
+/// while the app runs) used to leave no file at all, so the next launch read
+/// the log as on and the user's "off" was lost. With the log on, nothing is
+/// written: no file reads as the default. A file that could not be moved is
+/// not written over either; it still says "off" to the next launch.
+fn quarantine(path: &Path, sign: impl FnOnce(&str) -> Result<String, String>) -> AppSettings {
+    let saved = crate::utils::file_log::saved_choice(fs::read_to_string(path));
+    let (defaults, _) = after_quarantine(AppSettings::default(), saved);
     if let Err(e) = fs::rename(path, aside_path(path, "tampered")) {
         tracing::warn!("Could not preserve the unverified settings file: {}", e);
+        return defaults;
     }
-    Loaded::Quarantined(AppSettings::default())
+    if !defaults.file_logging_enabled {
+        if let Err(e) = write_signed_settings(path, &defaults, sign) {
+            tracing::warn!("Could not keep the log switched off after the reset: {}", e);
+        }
+    }
+    defaults
 }
 
 /// Internal save function used by both save_settings command and migration
@@ -2482,6 +2513,90 @@ mod tests {
             1,
             "kept, not deleted"
         );
+    }
+
+    /// MR-808, mid-session: the signing key vanishes while the app runs, and
+    /// the next load quarantines a file that says the log is off. The "off"
+    /// is saved with the defaults, as the start-up quarantine does; it used
+    /// to leave no file, so the next launch read the log as on.
+    #[test]
+    fn a_mid_session_quarantine_keeps_a_saved_logs_off() {
+        use crate::utils::file_log::{saved_choice, SavedChoice};
+        // The key that is now gone, and the one the defaults are signed by.
+        let gone: [u8; 32] = rand::random();
+        let fresh: [u8; 32] = rand::random();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let users = AppSettings {
+            file_logging_enabled: false,
+            killswitch_enabled: false,
+            stealth_mode: true,
+            autostart: true,
+            wireguard_mtu: 1280,
+            ..AppSettings::default()
+        };
+        write_signed_settings(&path, &users, |json| compute_hmac(json, &gone)).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+
+        let kept = quarantine(&path, |json| compute_hmac(json, &fresh));
+        assert!(!kept.file_logging_enabled, "the saved off is kept");
+
+        // A new settings file, signed, with the log off and the rest at its
+        // defaults; the user's file is kept aside, as it was.
+        let written = fs::read_to_string(&path).expect("the defaults are saved");
+        assert_eq!(
+            saved_choice(Ok(written.clone())),
+            SavedChoice::Off,
+            "the next launch reads the log as off"
+        );
+        let signed: SignedSettings = serde_json::from_str(&written).unwrap();
+        assert!(verify_hmac(
+            &serde_json::to_string(&signed.settings).unwrap(),
+            &signed.hmac,
+            &fresh
+        ));
+        let reset = AppSettings {
+            file_logging_enabled: true,
+            ..signed.settings
+        };
+        assert_eq!(
+            serde_json::to_string(&reset).unwrap(),
+            serde_json::to_string(&AppSettings::default()).unwrap(),
+            "every other setting is the quarantine's default"
+        );
+        let aside = names_in(dir.path(), "settings.json.tampered-");
+        assert_eq!(aside.len(), 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(&aside[0])).unwrap(),
+            original
+        );
+
+        // A file that says on (no key: the default) leaves no file behind,
+        // which reads as the default.
+        write_signed_settings(&path, &AppSettings::default(), |json| {
+            compute_hmac(json, &gone)
+        })
+        .unwrap();
+        let on = quarantine(&path, |_| unreachable!("nothing is saved"));
+        assert!(on.file_logging_enabled);
+        assert!(!path.exists());
+
+        // The load's quarantine is this one, signed like any save, and it
+        // reads the file before moving it.
+        let source = include_str!("settings.rs").replace('\r', "");
+        let body = |signature: &str| {
+            let start = source.find(signature).expect(signature);
+            let rest = &source[start..];
+            rest[..rest.find("\n}\n").expect("end of fn")].to_string()
+        };
+        let load = body("fn no_verifying_key(");
+        let quarantined = load.find("Loaded::Quarantined(quarantine(path,").unwrap();
+        assert!(load[quarantined..].contains("compute_hmac(json, &get_hmac_key(path)?)"));
+        let steps = body("fn quarantine(");
+        let read = steps
+            .find("saved_choice(fs::read_to_string(path))")
+            .expect("the file's own choice");
+        assert!(read < steps.find("fs::rename(path,").unwrap());
     }
 
     /// The other side: while a key source cannot be read right now, the key
