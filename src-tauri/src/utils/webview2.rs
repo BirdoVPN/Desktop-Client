@@ -964,6 +964,18 @@ mod tests {
         unsafe { controller.Close() }.unwrap();
         // SAFETY: the window this test created.
         unsafe { DestroyWindow(window) }.unwrap();
+        // Let the browser process go before the temporary folder is removed:
+        // it holds files there until it exits.
+        drop(controller);
+        drop(environment);
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("Wait-Process -Id {pid} -Timeout 20 -ErrorAction SilentlyContinue"),
+            ])
+            .status();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "True");
     }
 }
