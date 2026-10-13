@@ -165,6 +165,9 @@ pub async fn login(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<LoginResponse, IpcError> {
+    // MR-1861: a sign-in typed in by hand never resumes the session an
+    // update ended — it belonged to whoever was signed in before.
+    crate::commands::update_resume::discard();
     // FIX-2-5: Rate limit login attempts (max 5 per 60s window)
     {
         let mut guard = LOGIN_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -664,6 +667,9 @@ pub async fn verify_2fa(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<LoginResponse, IpcError> {
+    // MR-1861: a sign-in typed in by hand never resumes the session an
+    // update ended — it belonged to whoever was signed in before.
+    crate::commands::update_resume::discard();
     // SEC-2FA: Rate limit TOTP verification attempts (max 5 per 120s window)
     {
         let mut guard = TOTP_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -803,6 +809,9 @@ pub async fn register_anonymous(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<LoginResponse, IpcError> {
+    // MR-1861: a sign-in typed in by hand never resumes the session an
+    // update ended — it belonged to whoever was signed in before.
+    crate::commands::update_resume::discard();
     // Same client-side rate limit as login (compromised-webview guard). The
     // backend also enforces a strict per-IP creation cap.
     {
@@ -883,6 +892,9 @@ pub async fn login_anonymous(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<LoginResponse, IpcError> {
+    // MR-1861: a sign-in typed in by hand never resumes the session an
+    // update ended — it belonged to whoever was signed in before.
+    crate::commands::update_resume::discard();
     // Same client-side rate limit as email login (compromised-webview guard).
     {
         let mut guard = LOGIN_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());

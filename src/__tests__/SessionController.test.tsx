@@ -428,6 +428,50 @@ describe('Resume after an update (MR-1861)', () => {
     expect(callsTo('connect_vpn')).toHaveLength(0);
     expect(useAppStore.getState().notice).toBeNull();
   });
+
+  // Review of #276, L2: asked behind the same gates as Auto-Connect.
+  it('a connect and a disconnect before the server list settles win: the resume is not even taken', async () => {
+    answerResume({ kind: 'singleHop', serverId: 'c' });
+    let releaseServers: (list: unknown) => void = () => {};
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) =>
+      cmd === 'get_servers'
+        ? new Promise((resolve) => {
+            releaseServers = resolve;
+          })
+        : scripted?.(cmd, args, options),
+    );
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().settingsHydrated).toBe(true));
+    expect(useAppStore.getState().serversStatus).toBe('loading');
+    emit('vpn-status-changed', { state: 'connected', seq: 10, error: null });
+    emit('vpn-status-changed', { state: 'disconnected', seq: 11, error: null });
+    await act(async () => releaseServers(servers));
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    await act(async () => {});
+    expect(callsTo('take_update_resume')).toHaveLength(0);
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(useAppStore.getState().notice).toBeNull();
+  });
+
+  it('a connect made while Rust answers wins too', async () => {
+    let answer: (target: unknown) => void = () => {};
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) =>
+      cmd === 'take_update_resume'
+        ? new Promise((resolve) => {
+            answer = resolve;
+          })
+        : scripted?.(cmd, args, options),
+    );
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('take_update_resume')).toHaveLength(1));
+    emit('vpn-status-changed', { state: 'connecting', seq: 10, error: null });
+    await act(async () => answer({ kind: 'singleHop', serverId: 'c' }));
+    await act(async () => {});
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(useAppStore.getState().notice).toBeNull();
+  });
 });
 
 describe("sign-out ends the session's kill switch choices (follow-up 3 to the review of #222)", () => {

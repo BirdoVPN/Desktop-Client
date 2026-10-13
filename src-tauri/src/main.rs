@@ -687,10 +687,11 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // MR-1861: an exit that skipped the teardown below — Restart
-            // Manager's shutdown for an installer (WM_ENDSESSION reaches here
-            // with no ExitRequested), a restart into an installed update —
-            // leaves the live session for the next version to resume.
+            // MR-1861: on Windows, an exit that skipped the teardown below —
+            // Restart Manager's shutdown for an installer (WM_ENDSESSION
+            // reaches here with no ExitRequested) — leaves the live session
+            // for the next version to resume. Not on macOS, where Cmd+Q and
+            // the Dock's Quit come this way too (commands::update_resume).
             if matches!(event, RunEvent::Exit) {
                 commands::update_resume::record_if_exit_kept_the_session(
                     app_handle,

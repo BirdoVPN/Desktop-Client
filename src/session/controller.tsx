@@ -16,16 +16,10 @@
  * `RESYNC_INTERVAL_MS` while it is visible — and both paths go through the
  * store's seq check, so a slow read can never undo a newer event (W2-009).
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import {
-  parseQuotaWarning,
-  parseSessionExpired,
-  parseVpnStats,
-  parseVpnStatus,
-  type ResumeTarget,
-} from '@/lib/ipc';
+import { parseQuotaWarning, parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
 import { errorCopy, giveUpMessage, quotaGraceMessage } from '@/lib/errors';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
@@ -227,13 +221,14 @@ function useSessionData(): void {
  * out once — first start of a new version, connected when the update began,
  * within the hour (`commands::update_resume`) — and it takes Auto-Connect's
  * place for this run. Asked here because this controller only exists signed
- * in and past consent: it never signs anyone in.
+ * in and past consent: it never signs anyone in. Asked behind the same gates
+ * as Auto-Connect (review of #276, L2): a user who connects or disconnects
+ * before the list settles — or while Rust answers — has made the choice.
  */
 function useAutoConnectOnce(): void {
   const done = useRef(false);
-  const askedResume = useRef(false);
-  // undefined until Rust has answered.
-  const [resume, setResume] = useState<ResumeTarget | null | undefined>(undefined);
+  // Any change of state since mount, including one while Rust answers below.
+  const moved = useRef(false);
   const hydrated = useAppStore((s) => s.settingsHydrated);
   const serversSettled = useAppStore(
     (s) => s.serversStatus === 'ready' || s.serversStatus === 'error',
@@ -246,27 +241,27 @@ function useAutoConnectOnce(): void {
   useEffect(
     () =>
       useAppStore.subscribe((next, prev) => {
-        if (next.connectionState !== prev.connectionState) done.current = true;
+        if (next.connectionState !== prev.connectionState) {
+          done.current = true;
+          moved.current = true;
+        }
       }),
     [],
   );
   useEffect(() => {
-    if (askedResume.current) return;
-    askedResume.current = true;
-    void takeUpdateResume().then(setResume);
-  }, []);
-  useEffect(() => {
-    if (done.current || !hydrated || !serversSettled || resume === undefined) return;
+    if (done.current || !hydrated || !serversSettled) return;
     done.current = true;
-    const s = useAppStore.getState();
-    if (selectTunnelActive(s)) return;
-    if (resume) {
-      void resumeAfterUpdate(resume);
-      return;
-    }
-    if (!s.settings.autoConnect) return;
-    void connectPreferred();
-  }, [hydrated, serversSettled, resume]);
+    void (async () => {
+      const resume = await takeUpdateResume();
+      const s = useAppStore.getState();
+      if (moved.current || selectTunnelActive(s)) return;
+      if (resume) {
+        void resumeAfterUpdate(resume);
+        return;
+      }
+      if (s.settings.autoConnect) void connectPreferred();
+    })();
+  }, [hydrated, serversSettled]);
 }
 
 function serverLabel(server: Server | null, fallback: string | null): string {

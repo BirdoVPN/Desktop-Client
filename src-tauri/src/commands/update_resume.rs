@@ -13,24 +13,40 @@
 //! So the session on record is written down as the app is ended for an
 //! update, and the first start of the new version puts it back:
 //!
-//! - The in-app updater records it before it ends the session ([`record`]).
-//! - An exit that skips the teardown records the session still on record
-//!   ([`record_if_exit_kept_the_session`], from `main.rs`): Restart Manager's
-//!   WM_ENDSESSION, which tao turns straight into `RunEvent::Exit` with no
-//!   `ExitRequested` (tao 0.37, event_loop.rs), and the restart into an update
-//!   installed on macOS/Linux. Not while Windows itself is shutting down or
-//!   signing out: that is no update.
+//! - The in-app updater records it before it ends the session ([`record`]),
+//!   on every platform; the macOS/Linux restart into the installed update
+//!   finds that record.
+//! - On WINDOWS ONLY, an exit that skips the teardown records the session
+//!   still on record ([`record_if_exit_kept_the_session`], from `main.rs`):
+//!   Restart Manager's WM_ENDSESSION, which tao turns straight into
+//!   `RunEvent::Exit` with no `ExitRequested` (tao 0.37, event_loop.rs). Not
+//!   while Windows itself is shutting down or signing out: that is no update.
+//!   Not on macOS, where a plain Quit takes the same path (Cmd+Q, the Dock's
+//!   Quit and logout reach `RunEvent::Exit` through applicationWillTerminate,
+//!   with no `ExitRequested`): a user who quits has chosen to end the session.
+//!   So a manual DMG or AppImage upgrade does not resume; only the in-app one
+//!   does.
 //! - Every other end of a session — Disconnect, Quit, sign-out, an expired
 //!   sign-in — and an install that failed throw the record away ([`discard`],
-//!   from `session::end_session` and `install_update`). A user who chose to be
-//!   disconnected is never connected again by it.
+//!   from `session::end_session` and `install_update`), and nothing is
+//!   recorded again until a new session is on record ([`session_started`]):
+//!   a WM_ENDSESSION landing while that teardown runs must not write back the
+//!   session the user just ended. A user who chose to be disconnected is never
+//!   connected again by it. A sign-in typed in by hand discards it too: the
+//!   session belonged to whoever was signed in before.
 //!
 //! At start ([`load_at_start`]) the record is read and DELETED, whatever it
-//! says: it is used once, and one that cannot be deleted is not used. It is
-//! kept for the UI only when a DIFFERENT version wrote it — the app was updated
-//! in between; the version in the record is the "last run" version — and it is
-//! at most [`MAX_AGE_SECS`] old, so a record left by a crash, a shutdown or an
-//! install that never finished cannot connect anyone later.
+//! says: it is used once, and one that cannot be deleted, or is larger than
+//! [`MAX_RECORD_BYTES`], is not used. It is kept for the UI only when a
+//! DIFFERENT version wrote it — the app was updated in between; the version in
+//! the record is the "last run" version — and it is at most [`MAX_AGE_SECS`]
+//! old, so a record left by a crash, a shutdown or an install that never
+//! finished cannot connect anyone later. "Different" is plain inequality: a
+//! downgrade resumes too. The uninstaller stops a running app the same way
+//! (PREUNINSTALL), so an uninstall while connected leaves a record as well:
+//! "Delete the application data" removes it, a reinstall of the same version
+//! or anything after the hour drops it, and a reinstall of another version
+//! within the hour resumes the session, as an update would.
 //!
 //! The UI takes it once ([`take_update_resume`]) from the session controller,
 //! which exists only signed in and past the consent screen: this never signs
@@ -40,11 +56,14 @@
 //!
 //! The record names the server (for Multi-Hop, the entry and the exit), as
 //! `preferred_server_id` in settings.json already does, and lives from one
-//! update to the next start.
+//! update to the next start. It is not signed (an HMAC is a follow-up): what
+//! can write the user's data dir can plant one, and all it can do is make the
+//! signed-in app connect to a server the API accepts for that account.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -62,6 +81,10 @@ const FILE_NAME: &str = "resume-after-update.json";
 /// past an hour the user has been disconnected long enough to have noticed,
 /// and a connect nobody asked for is the bigger surprise.
 pub const MAX_AGE_SECS: i64 = 60 * 60;
+
+/// A record is a few hundred bytes; anything larger is not ours and is
+/// deleted unread.
+pub const MAX_RECORD_BYTES: u64 = 4 * 1024;
 
 /// This build's version, which a record's is compared with.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -115,8 +138,13 @@ impl Record {
 struct ResumeStore {
     /// `None`: no data dir, nothing is recorded.
     path: Option<PathBuf>,
-    /// What the start found, until the UI takes it.
+    /// What the start found, until the UI takes it. Also what `record` and
+    /// `discard` hold, so a discard cannot land between a record's check of
+    /// `ended_by_choice` and its write.
     pending: Mutex<Option<Record>>,
+    /// The last session ended for another reason than an update, and no new
+    /// one is on record yet: nothing may be recorded.
+    ended_by_choice: AtomicBool,
 }
 
 impl ResumeStore {
@@ -124,6 +152,7 @@ impl ResumeStore {
         Self {
             path,
             pending: Mutex::new(None),
+            ended_by_choice: AtomicBool::new(false),
         }
     }
 
@@ -133,6 +162,11 @@ impl ResumeStore {
 
     fn record(&self, target: ResumeTarget, version: &str, now: i64) {
         let Some(path) = &self.path else { return };
+        let _held = self.pending();
+        if self.ended_by_choice.load(Ordering::SeqCst) {
+            tracing::info!("The VPN session was ended by choice — not recording it for an update");
+            return;
+        }
         let record = Record {
             version: version.to_string(),
             written_at: now,
@@ -166,7 +200,9 @@ impl ResumeStore {
     }
 
     fn discard(&self) {
-        *self.pending() = None;
+        let mut pending = self.pending();
+        self.ended_by_choice.store(true, Ordering::SeqCst);
+        *pending = None;
         if let Some(path) = &self.path {
             if fs::remove_file(path).is_ok() {
                 tracing::info!(
@@ -174,6 +210,10 @@ impl ResumeStore {
                 );
             }
         }
+    }
+
+    fn session_started(&self) {
+        self.ended_by_choice.store(false, Ordering::SeqCst);
     }
 }
 
@@ -206,10 +246,21 @@ fn write_record(path: &Path, record: &Record) -> std::io::Result<()> {
 }
 
 /// Read the record and delete it. `None` when there is none, when it cannot be
-/// deleted (it would be used again), or when it is unreadable.
+/// deleted (it would be used again), when it is larger than
+/// [`MAX_RECORD_BYTES`], or when it is unreadable.
 fn read_once(path: &Path) -> Option<Record> {
-    let bytes = fs::read(path).ok()?;
+    let mut bytes = Vec::new();
+    // At most one byte past the cap is read, and the handle is closed before
+    // the delete (Windows refuses to delete an open file).
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
     fs::remove_file(path).ok()?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return None;
+    }
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -248,6 +299,14 @@ fn kept_at_exit(
 /// `ExitRequested` and its teardown, which ends (and discards) the session.
 /// Synchronous and brief: tao exits the process as soon as this returns.
 pub fn record_if_exit_kept_the_session(app: &AppHandle, teardown_started: bool) {
+    // Windows only. On macOS a plain Quit — Cmd+Q, the Dock's Quit (Tauri's
+    // default menu Quit is `terminate:`), logout — also reaches
+    // `RunEvent::Exit` with no `ExitRequested` (tao's applicationWillTerminate),
+    // and must never leave a session to resume. The in-app update records its
+    // own before it ends the session (`install_update`).
+    if !cfg!(target_os = "windows") {
+        return;
+    }
     let on_record = app
         .try_state::<AutoReconnectService>()
         .and_then(|ar| ar.current_info_now())
@@ -279,15 +338,23 @@ pub fn load_at_start() {
     STORE.load(VERSION, now());
 }
 
-/// Every end of a session but an update's (`session::end_session`), and an
-/// install that failed.
+/// Every end of a session but an update's (`session::end_session`), an
+/// install that failed, and a sign-in typed in by hand (`auth`, `oauth`).
+/// Nothing is recorded again until [`session_started`].
 pub fn discard() {
     STORE.discard();
 }
 
+/// A new session is on record (`AutoReconnectService::store_last_config`):
+/// an update may record it again.
+pub fn session_started() {
+    STORE.session_started();
+}
+
 /// The session the update ended, once: on the first start of the new version,
-/// within [`MAX_AGE_SECS`] of the update. The session controller asks when it
-/// mounts (signed in, consent given).
+/// within [`MAX_AGE_SECS`] of the update. The session controller asks once the
+/// settings and the server list are in (signed in, consent given), unless the
+/// user has connected or disconnected first.
 #[tauri::command]
 pub fn take_update_resume() -> Option<ResumeTarget> {
     STORE.take(VERSION, now())
@@ -391,6 +458,56 @@ mod tests {
         found.load("1.4.48", T + 5);
         found.discard();
         assert_eq!(found.take("1.4.48", T + 6), None);
+    }
+
+    /// Review of #276, L1: Disconnect discards first and clears the session on
+    /// record later, after the teardown's lock. A WM_ENDSESSION (or an update)
+    /// in between must not write back the session the user just ended; only
+    /// a new session on record lifts that.
+    #[test]
+    fn nothing_is_recorded_after_a_discard_until_a_new_session_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let s = store(&dir);
+        s.discard();
+        s.record(single("node-7"), "1.4.47", T);
+        assert!(!path.exists(), "recorded a session the user had ended");
+
+        s.session_started();
+        s.record(single("node-8"), "1.4.47", T + 60);
+        assert!(path.exists());
+        let next = store(&dir);
+        next.load("1.4.48", T + 90);
+        assert_eq!(next.take("1.4.48", T + 91), Some(single("node-8")));
+    }
+
+    /// Review of #276, L5: a record is a few hundred bytes. A larger file is
+    /// deleted, never parsed.
+    #[test]
+    fn an_oversized_record_is_deleted_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let valid = serde_json::to_vec(&Record {
+            version: "1.4.47".into(),
+            written_at: T,
+            target: single("node-7"),
+        })
+        .unwrap();
+        // A valid record padded past the cap with JSON whitespace.
+        let mut padded = valid.clone();
+        padded.resize(MAX_RECORD_BYTES as usize + 1, b' ');
+        fs::write(&path, &padded).unwrap();
+        let s = store(&dir);
+        s.load("1.4.48", T + 5);
+        assert!(!path.exists());
+        assert_eq!(s.take("1.4.48", T + 6), None);
+
+        // At the cap it is still read.
+        padded.truncate(MAX_RECORD_BYTES as usize);
+        fs::write(&path, &padded).unwrap();
+        let s = store(&dir);
+        s.load("1.4.48", T + 5);
+        assert_eq!(s.take("1.4.48", T + 6), Some(single("node-7")));
     }
 
     /// An unreadable record is deleted and ignored, never retried.
@@ -532,5 +649,58 @@ mod tests {
             .expect("the teardown flag");
         let requested = run.find("RunEvent::ExitRequested").expect("ExitRequested");
         assert!(exit < recorded && recorded < requested && flag < 200);
+    }
+
+    /// Review of #276, M1: the exit path records on Windows only. On macOS a
+    /// plain Quit (Cmd+Q, the Dock, logout) reaches `RunEvent::Exit` with no
+    /// `ExitRequested` too, and must never leave a session to resume.
+    #[test]
+    fn only_windows_records_at_exit() {
+        let source = include_str!("update_resume.rs");
+        let exit = body(
+            source,
+            "pub fn record_if_exit_kept_the_session(app: &AppHandle, teardown_started: bool) {",
+        );
+        let guard = exit
+            .find("if !cfg!(target_os = \"windows\") {")
+            .expect("the Windows-only guard");
+        assert_eq!(exit[guard..].lines().nth(1).map(str::trim), Some("return;"));
+        let first_statement = exit
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .expect("a statement");
+        assert_eq!(first_statement, "if !cfg!(target_os = \"windows\") {");
+        let state = exit
+            .find("try_state::<AutoReconnectService>()")
+            .expect("state");
+        assert!(guard < state);
+    }
+
+    /// Review of #276, L1/L4: a new session on record lifts the discard, and
+    /// every sign-in typed in by hand discards a pending resume.
+    #[test]
+    fn a_new_session_lifts_the_discard_and_a_manual_sign_in_discards() {
+        let ar = include_str!("../vpn/auto_reconnect.rs");
+        let method = &ar[ar.find("pub async fn store_last_config(").expect("method")..];
+        let method = &method[..method.find("\n    }").expect("end of method")];
+        assert!(method.contains("crate::commands::update_resume::session_started();"));
+
+        let auth = include_str!("auth.rs");
+        for login in [
+            "login",
+            "verify_2fa",
+            "register_anonymous",
+            "login_anonymous",
+        ] {
+            let f = body(auth, &format!("pub async fn {login}("));
+            assert!(
+                f.contains("crate::commands::update_resume::discard();"),
+                "{login} does not discard a pending resume"
+            );
+        }
+        let sso = body(include_str!("oauth.rs"), "pub async fn native_oauth_login(");
+        assert!(sso.contains("crate::commands::update_resume::discard();"));
     }
 }

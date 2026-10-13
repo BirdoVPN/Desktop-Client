@@ -469,6 +469,10 @@ impl AutoReconnectService {
     /// fresh ones.
     pub async fn store_last_config(&self, info: ReconnectInfo) {
         tracing::debug!("Stored reconnect info for: {}", info.server_name);
+        // MR-1861: a new session on record, which an update may resume again
+        // (a Disconnect had stopped `update_resume` from recording). Before
+        // the write, so a Disconnect racing it still wins.
+        crate::commands::update_resume::session_started();
         *self.last_reconnect_info.write().await = Some(info);
     }
 
