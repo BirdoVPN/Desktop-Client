@@ -1042,6 +1042,14 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
         tracing::warn!("reapply_vpn_settings: no stored target — cannot rebuild");
         return Ok(ReapplyOutcome::NotConnected);
     };
+    // MR-1943: a file that cannot be read has no change in it to apply. The
+    // rebuild would run on `settings_in_force`'s defaults and drop this
+    // healthy session's LAN sharing, custom DNS and kill-switch exceptions.
+    // The session stays as it is, and the UI offers Retry.
+    if let Err(e) = load_settings_off_runtime(&app).await {
+        tracing::warn!("reapply_vpn_settings: the settings could not be read — not rebuilding");
+        return Err(IpcError::unknown(e));
+    }
     let previous = ar.connected_settings().await;
 
     // P6-CLI-D-03: the node being rebuilt to is connection history.
@@ -1059,6 +1067,21 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
     };
     let rebuild = connect_session_for(&app, target.clone(), purpose, None).await;
     let error = match rebuild.result {
+        // MR-1943: a rebuild whose own settings read failed ran on
+        // `settings_in_force`'s defaults and the live session's flags, and
+        // stored no snapshot. That is not the change just saved: a Stealth or
+        // BirdoShield turned ON would never be in force, and auto-reconnect
+        // re-dials from the same record. Report it, so the UI offers Retry.
+        // Only while the rebuild is still the session: a Disconnect since
+        // clears the snapshot for its own reason.
+        Ok(())
+            if rebuild.epoch.is_some_and(|epoch| vm.is_current(epoch))
+                && ar.connected_settings().await.is_none() =>
+        {
+            return Err(IpcError::unknown(
+                "Settings could not be read; the connection runs on the default settings",
+            ));
+        }
         Ok(()) => return Ok(ReapplyOutcome::Applied),
         Err(error) => error,
     };
@@ -1207,9 +1230,14 @@ mod tests {
         let body = &body[..body.find("\n}").unwrap()];
         let mut last = 0;
         for needle in [
+            // MR-1943: an unreadable file is not rebuilt onto the defaults.
+            "if let Err(e) = load_settings_off_runtime(&app).await {",
             "ar.connected_settings().await",
             "ConnectPurpose::SettingsReapply {",
             "let rebuild = connect_session_for(&app, target.clone(), purpose, None)",
+            // MR-1943: nor is a rebuild that ran on them reported Applied.
+            "ar.connected_settings().await.is_none()",
+            "Ok(()) => return Ok(ReapplyOutcome::Applied),",
             "failed_reapply(",
             "restore_tunnel_settings(&app, &previous)",
             // WIN3-005: the failed attempt's kill-switch globals go, before
