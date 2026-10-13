@@ -583,7 +583,10 @@ pub(crate) async fn start_stealth_tunnel(
 ///
 /// Order of preference:
 ///   1. BirdoPQ v1 ML-KEM-1024 — decapsulate the server-supplied ciphertext
-///      with our persistent client secret key (HNDL-safe).
+///      with our persistent client secret key. Post-quantum on the app-to-API
+///      leg only, not a complete "record now, decrypt later" defence: the key
+///      is long-lived, the relay leg is classical TLS and multi-hop's middle
+///      leg has no PQ PSK (`vpn::birdo_pq` module docs).
 ///   2. If the server enabled quantum mode but decapsulation fails, abort.
 ///   3. Server-provided classical PSK (TLS-delivered random; not HNDL-safe).
 ///   4. None — connection runs without PSK.
