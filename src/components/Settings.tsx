@@ -99,7 +99,8 @@ export const CUSTOM_DNS_NOT_LAN_COPY =
 /**
  * macOS only (MR-1124): the IPv6 block `tunnel_macos.rs` installs for every
  * session, kill switch on or off, until macOS routes IPv6 (the F-001 block
- * there). The wording is the one drafted there; it goes when the block does.
+ * there). The wording was drafted in tunnel_macos.rs (MR-1124); it goes when
+ * the block does.
  */
 export const MACOS_IPV6_NOTE =
   "On macOS, IPv6 is blocked while you're connected, so your real address can't leak over it. " +

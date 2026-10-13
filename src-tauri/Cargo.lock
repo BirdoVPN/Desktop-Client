@@ -432,7 +432,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
- "which",
  "windows 0.62.2",
  "winreg",
  "wintun",
@@ -6805,15 +6804,6 @@ dependencies = [
  "thiserror 2.0.17",
  "windows 0.62.2",
  "windows-core 0.62.2",
-]
-
-[[package]]
-name = "which"
-version = "8.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
-dependencies = [
- "libc",
 ]
 
 [[package]]

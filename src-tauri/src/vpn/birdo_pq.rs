@@ -66,18 +66,54 @@
 //! psk = HKDF-SHA-256(IKM = ss, salt = "BirdoPQ-v1-PSK", info = nonce)[..32]
 //! ```
 //!
-//! ## Threat model for persisted client secret key
+//! ## Threat model: what BirdoPQ v1 protects, and what it does not
 //!
-//! The ML-KEM secret key is the LONG-LIVED client identity for BirdoPQ. An
-//! attacker who steals it recovers the PSK of EVERY session they hold the
-//! connect response for — the ciphertext and the nonce — whether that
-//! session came before the theft or after it, for as long as this key is in
-//! use. ML-KEM decapsulation is deterministic in `(sk, ct)`: the server's
-//! fresh randomness in each encapsulation stops nothing once `sk` is known,
-//! and the PSK is HKDF of the shared secret and the nonce (above). A stolen
-//! key is therefore not forward-secret in either direction; only rotating it
-//! would bound what it opens (MR-703, not built). An earlier version of this
-//! paragraph said past sessions were safe (MR-1368). They are not.
+//! The full analysis is birdo-web `docs/PQ-THREAT-MODEL.md` (§4 leg by leg,
+//! §6.2 the claims); this is the desktop's share of it (MR-743, MR-1364).
+//!
+//! **What it gives.** This client uploads only its ML-KEM public key and,
+//! since v1.4.42, asks the server to withhold the derived PSK from the
+//! connect response (`pq_client_can_decapsulate`), so the app-to-API leg
+//! carries a KEM ciphertext and a nonce, never the PSK. Every connect derives
+//! its PSK from a fresh server encapsulation, so one session's KEM output says
+//! nothing about another's. A recording of this app's API traffic and its
+//! WireGuard tunnel, made by someone who never obtains the secret key, stays
+//! confidential against a future quantum computer that breaks X25519 alone:
+//! the tunnel keys mix in the PSK, and recovering the PSK from that recording
+//! means breaking ML-KEM-1024. (The WireGuard handshake's metadata is not
+//! covered: the PSK is mixed in only after the first message.)
+//!
+//! **What it does not give:**
+//!
+//! * **Protection once the secret key is stolen.** The ML-KEM secret key is the
+//!   LONG-LIVED client identity for BirdoPQ: one keypair per install, replaced
+//!   only on an explicit sign-out (`commands::auth::logout`), on account
+//!   deletion (`commands::auth::delete_account`), or when the stored file is
+//!   unusable (`KeypairReadError::Unusable`); the auto sign-out after an
+//!   expired session keeps it. An attacker who steals it recovers the PSK
+//!   of EVERY session they hold the connect response for — the ciphertext
+//!   and the nonce —
+//!   whether that session came before the theft or after it, for as long as
+//!   this key is in use. ML-KEM decapsulation is deterministic in `(sk, ct)`:
+//!   the server's fresh randomness in each encapsulation stops nothing once
+//!   `sk` is known, and the PSK is HKDF of the shared secret and the nonce
+//!   (above). Per-session derivation does not change that, so a stolen key is
+//!   not forward-secret in either direction. Only replacing the key bounds
+//!   what it opens; one keypair per connect (the threat model's O0e, MR-703 /
+//!   MR-1742) is not built. An earlier version of this paragraph said past
+//!   sessions were safe (MR-1368). They are not.
+//! * **The relay leg.** The server derives the same PSK and sends it on to
+//!   the VPN relay over TLS that is not yet post-quantum, so a recording of
+//!   that link plus a future quantum computer recovers the PSK without
+//!   touching ML-KEM (MR-1444). One recorder at a relay's hosting provider
+//!   sees both that link and the tunnel, so against "record now, decrypt
+//!   later" the PQ layer is today only as strong as that classical link.
+//! * **Multi-hop's entry-to-exit leg.** The relay-to-relay mesh carries no PQ
+//!   PSK at all: between the entry and the exit relay, traffic is protected
+//!   by classical X25519 only. The PSK derived here covers this client's leg
+//!   to the entry relay and nothing beyond it.
+//!
+//! ## Where the secret key lives
 //!
 //! Storage location: `<config_local_dir>/BirdoVPN/birdo_pq_v1.bin`.
 //! Format: 4-byte magic "BPQ1" + 4-byte version (=1) + 1568 B pk + 3168 B sk.
@@ -128,7 +164,7 @@ const SEED_BYTES: usize = 64;
 const PSK_LEN: usize = 32;
 const HKDF_SALT: &[u8] = b"BirdoPQ-v1-PSK";
 /// Upper bound for the server's per-connect nonce, the same as Android's
-/// `RosenpassManager.MAX_NONCE_BYTES` (the server mints 32 bytes).
+/// `BirdoPqManager.MAX_NONCE_BYTES` (the server mints 32 bytes).
 const MAX_NONCE_BYTES: usize = 64;
 
 /// Which ML-KEM implementation is linked into this binary.
@@ -162,16 +198,24 @@ const _: () = assert!(READ_CAP_BYTES < READ_RESERVE_BYTES);
 
 /// Operating mode reported to the UI.
 ///
-/// Mirrors the Android `RosenpassManager.Mode` enum so the same telemetry
-/// dashboards / strings work on both platforms.
+/// Shares its `disabled` / `bilateral` values with Android's
+/// `BirdoPqManager.Mode` (formerly `RosenpassManager.Mode`) so the same
+/// telemetry dashboards / strings work on both platforms. Android no longer
+/// has `ServerProvided` (A1-039 removed it there as unreachable); the desktop
+/// still latches it when a session the server did not make post-quantum
+/// carries the server's PSK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PqMode {
     /// No PSK at all. Tunnel runs without preshared-key.
     Disabled,
-    /// Server-provided classical PSK (TLS-delivered, NOT HNDL-safe).
+    /// Server-provided classical PSK for a session the server did not make
+    /// post-quantum (TLS-delivered; no post-quantum protection at all).
     ServerProvided,
-    /// Genuine bilateral ML-KEM-1024 — HNDL-safe.
+    /// Bilateral ML-KEM-1024: this client decapsulated the server's ciphertext
+    /// and derived the PSK itself. Post-quantum on the app-to-API leg only; NOT
+    /// a complete "record now, decrypt later" defence (long-lived key, classical
+    /// relay leg, multi-hop's middle leg — see the module docs).
     Bilateral,
 }
 
@@ -614,8 +658,10 @@ fn server_nonce(field: Option<&str>) -> Result<Vec<u8>, String> {
 /// server-provided PSK (`record_server_provided`); with it ON the same `None`
 /// aborts the connection. `None` is therefore never a silent downgrade.
 ///
-/// On success, latches `current_mode() == Bilateral` so the UI can display
-/// the genuine HNDL-safe state.
+/// On success, latches `current_mode() == Bilateral`, which `get_vpn_status`
+/// reports as `quantum_active` / `pq_mode`. That state means "this client
+/// derived the PSK itself", not a complete "record now, decrypt later"
+/// defence: see the module docs for what it does not cover.
 ///
 /// The PSK comes back `Zeroizing`: it is the WireGuard preshared key, base64
 /// for the config file, and it used to be a plain `String` that was dropped

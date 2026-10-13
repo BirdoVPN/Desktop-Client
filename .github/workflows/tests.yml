@@ -256,9 +256,11 @@ jobs:
           # Linux: resolv_conf_restore_tests + tun_read_tests (F6: the packet
           # loop's buffer-reuse helper, run on a pipe fd). macOS:
           # dns_journal_restore_tests (restore_services_pass,
-          # interpret_dns_query, dns_write_verified). Space-separated: libtest
+          # interpret_dns_query, dns_write_verified). Both: log_retention::tests,
+          # whose owner-only (0600) log-file test is #[cfg(unix)], so the
+          # Windows job compiles it out. Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests' || 'resolv_conf_restore_tests tun_read_tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests log_retention::tests' || 'resolv_conf_restore_tests tun_read_tests log_retention::tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
