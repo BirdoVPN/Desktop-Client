@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
-use super::wireguard_new::WireGuardSession;
+use super::wireguard_new::{WgPrivateKey, WireGuardSession};
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
 use crate::vpn::dns_journal::DnsRestoreOutcome;
@@ -180,11 +180,14 @@ pub struct LinuxTunnel {
 
 impl LinuxTunnel {
     /// Create a new TUN tunnel with the given VPN configuration.
-    pub async fn create(config: &VpnConfig, local_network_sharing: bool) -> Result<Self, String> {
-        validate_config(config)?;
+    ///
+    /// MR-822: takes `config` by move (it used to clone it). The config holds
+    /// no private key; that is handed to [`start`](Self::start).
+    pub async fn create(config: VpnConfig, local_network_sharing: bool) -> Result<Self, String> {
+        validate_config(&config)?;
 
         Ok(Self {
-            config: config.clone(),
+            config,
             running: Arc::new(AtomicBool::new(false)),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
@@ -202,7 +205,11 @@ impl LinuxTunnel {
     }
 
     /// Start the tunnel: create TUN device, configure routes/DNS, start packet loop.
-    pub async fn start(&self) -> Result<(), String> {
+    ///
+    /// MR-822: `private_key` moves into the WireGuard session, and the tunnel
+    /// keeps no copy. A start that fails before the session is built drops it,
+    /// which wipes it.
+    pub async fn start(&self, private_key: WgPrivateKey) -> Result<(), String> {
         tracing::info!("Starting Linux TUN tunnel");
 
         if !crate::utils::elevation::is_elevated() {
@@ -236,7 +243,7 @@ impl LinuxTunnel {
         // Mirrors tunnel_macos.rs's close_fd_on_err, but reuses stop() so the
         // unwind cannot drift from the real teardown.
         let wg_session = match WireGuardSession::new(
-            &self.config.private_key,
+            private_key,
             &self.config.server_public_key,
             &self.config.endpoint,
             self.config.preshared_key.as_deref(),
@@ -2277,7 +2284,6 @@ mod configure_ipv6_tests {
         VpnConfig {
             server_id: "f001".into(),
             key_id: "f001".into(),
-            private_key: String::new(),
             public_key: String::new(),
             server_public_key: String::new(),
             preshared_key: None,

@@ -495,6 +495,62 @@ impl SensitiveKey {
     }
 }
 
+/// MR-822: the client's WireGuard private key, from the moment it is
+/// generated to the moment boringtun takes it.
+///
+/// The key used to be a base64 `String` field of `VpnConfig`, which derived
+/// `Clone`, `Serialize` and `Deserialize`. A serializer could write it out (to
+/// an IPC payload, a log, a file), a freed copy was not wiped, it was cloned,
+/// and the tunnel kept an unwiped copy for the whole session. Now:
+///
+/// - One owner at a time. It is not `Clone` or `Copy`. It MOVES from
+///   `generate_wireguard_keypair` through `VpnManager::connect` and the
+///   platform tunnel's `start` into [`WireGuardSession::new`], which hands it
+///   to boringtun's `Tunn`. Nothing that outlives the handshake holds it.
+/// - It is wiped on drop, on every path. It holds x25519-dalek's
+///   `StaticSecret`, which zeroizes itself (asserted below), so a connect
+///   that fails anywhere on the way frees nothing readable. It is never
+///   encoded as base64 or copied into a byte buffer.
+/// - It is not `Serialize` or `Deserialize` (asserted below). Nothing can
+///   write it anywhere, and nothing, a server response included, can be read
+///   into one. The only way to make one is [`WgPrivateKey::generate`], from
+///   the OS CSPRNG (FIX-1-1 / C-24).
+/// - `Debug` prints `[REDACTED]`.
+pub struct WgPrivateKey(StaticSecret);
+
+impl WgPrivateKey {
+    /// A fresh key from the operating system's CSPRNG.
+    pub(crate) fn generate() -> Self {
+        Self(crate::utils::os_rng::x25519_static_secret())
+    }
+
+    /// The public half: what a connect request sends as `clientPublicKey`.
+    pub(crate) fn public_key(&self) -> PublicKey {
+        PublicKey::from(&self.0)
+    }
+}
+
+impl std::fmt::Debug for WgPrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+// MR-822, held at compile time. `StaticSecret` implements `Zeroize` exactly
+// when x25519-dalek's `zeroize` feature is on, and that same feature is what
+// makes it wipe itself on drop (x25519-dalek 2.0.1, `x25519.rs`). A dependency
+// change that turned the wipe off stops the build here instead of shipping.
+const _: fn() = || {
+    fn wipes_itself<T: Zeroize>() {}
+    wipes_itself::<StaticSecret>();
+};
+crate::utils::assert_not_impl_any!(
+    WgPrivateKey: Clone,
+    Copy,
+    serde::Serialize,
+    serde::de::DeserializeOwned
+);
+
 /// A UDP socket `connect()`ed to the relay, with the large buffers a VPN
 /// needs. The kernel picks the source address when it connects, from the
 /// route to `endpoint` at that moment — which is why a roam (W1-003) makes a
@@ -591,36 +647,17 @@ pub struct WireGuardSession {
 impl WireGuardSession {
     /// Create a new WireGuard session with boringtun
     ///
-    /// # Security (MEM-003)
-    /// All key material passed to this function is zeroized after being copied
-    /// into the boringtun Tunn struct. The caller's copies are also cleared.
+    /// # Security (MEM-003, MR-822)
+    /// `private_key` is moved in and moved on into the boringtun `Tunn`, with
+    /// no copy made; an error return drops it, which wipes it. The other key
+    /// material is zeroized after being copied into the `Tunn`.
     pub async fn new(
-        private_key_b64: &str,
+        private_key: WgPrivateKey,
         server_public_key_b64: &str,
         endpoint: &str,
         preshared_key_b64: Option<&str>,
         persistent_keepalive: u16,
     ) -> Result<Self, String> {
-        // MEM-003: Use SensitiveKey wrapper for automatic zeroization
-        let private_key_bytes = BASE64
-            .decode(private_key_b64)
-            .map_err(|e| format!("Invalid private key: {}", e))?;
-
-        if private_key_bytes.len() != 32 {
-            return Err(format!(
-                "Invalid private key length: {}",
-                private_key_bytes.len()
-            ));
-        }
-
-        let mut private_key = SensitiveKey::new();
-        private_key
-            .as_mut_slice()
-            .copy_from_slice(&private_key_bytes);
-        // Zeroize the temporary vector immediately
-        let mut temp_bytes = private_key_bytes;
-        temp_bytes.zeroize();
-
         // Decode server public key with zeroization
         let server_key_bytes = BASE64
             .decode(server_public_key_b64)
@@ -709,13 +746,6 @@ impl WireGuardSession {
 
         // Create boringtun tunnel
         // MEM-003: Extract raw arrays and let SensitiveKey wrappers zeroize
-        let private_key_arr = {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(private_key.as_slice());
-            private_key.zeroize(); // Explicit zeroize before drop
-            arr
-        };
-
         let server_key_arr = {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(server_public_key.as_slice());
@@ -742,8 +772,10 @@ impl WireGuardSession {
         };
 
         // boringtun 0.7: Tunn::new is infallible (0.6 returned Result).
+        // MR-822: the private key moves into the Tunn. This is the only place a
+        // `WgPrivateKey` is unwrapped, and no copy of it is left behind here.
         let tunnel = Tunn::new(
-            StaticSecret::from(private_key_arr),
+            private_key.0,
             PublicKey::from(server_key_arr),
             psk_arr,   // Preshared key for additional security
             keepalive, // Persistent keepalive (seconds); None = disabled
@@ -753,9 +785,7 @@ impl WireGuardSession {
 
         // MEM-003: Zeroize our copies of keys after tunnel creation
         // The keys have been moved into the Tunn struct
-        let mut private_key_arr = private_key_arr;
         let mut server_key_arr = server_key_arr;
-        private_key_arr.zeroize();
         server_key_arr.zeroize();
         // psk SensitiveKey wrapper auto-zeroizes on drop via ZeroizeOnDrop
         drop(psk);
@@ -1677,7 +1707,7 @@ mod handshake_tests {
     struct Responder {
         endpoint: String,
         server_public_b64: String,
-        client_private_b64: String,
+        client_secret: StaticSecret,
         initiations_seen: Arc<AtomicUsize>,
     }
 
@@ -1716,14 +1746,14 @@ mod handshake_tests {
         Responder {
             endpoint,
             server_public_b64: BASE64.encode(server_public.as_bytes()),
-            client_private_b64: BASE64.encode(client_secret.to_bytes()),
+            client_secret,
             initiations_seen: seen,
         }
     }
 
     async fn connect(r: &Responder) -> Result<WireGuardSession, String> {
         WireGuardSession::new(
-            &r.client_private_b64,
+            WgPrivateKey(r.client_secret.clone()),
             &r.server_public_b64,
             &r.endpoint,
             None,
@@ -1833,7 +1863,6 @@ mod handshake_tests {
         let server_secret = crate::utils::os_rng::x25519_static_secret();
         let server_public = PublicKey::from(&server_secret);
         let client_secret = crate::utils::os_rng::x25519_static_secret();
-        let client_key = client_secret.to_bytes();
         let tunn = Tunn::new(
             server_secret,
             PublicKey::from(&client_secret),
@@ -1846,7 +1875,7 @@ mod handshake_tests {
         let endpoint = socket.local_addr().unwrap().to_string();
         let relay = relay(tunn, socket, want);
         let session = WireGuardSession::new(
-            &BASE64.encode(client_key),
+            WgPrivateKey(client_secret.clone()),
             &BASE64.encode(server_public.as_bytes()),
             &endpoint,
             None,
@@ -1854,14 +1883,7 @@ mod handshake_tests {
         )
         .await
         .expect("handshake");
-        *session.tunnel.lock() = Tunn::new(
-            StaticSecret::from(client_key),
-            server_public,
-            None,
-            None,
-            2,
-            None,
-        );
+        *session.tunnel.lock() = Tunn::new(client_secret, server_public, None, None, 2, None);
         (session, relay)
     }
 
@@ -2059,10 +2081,10 @@ mod handshake_tests {
         );
         let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let endpoint = relay_socket.local_addr().unwrap().to_string();
-        let private_b64 = BASE64.encode(client_secret.to_bytes());
+        let private_key = WgPrivateKey(client_secret);
         let public_b64 = BASE64.encode(server_public.as_bytes());
         let connecting = tokio::spawn(async move {
-            WireGuardSession::new(&private_b64, &public_b64, &endpoint, None, 0).await
+            WireGuardSession::new(private_key, &public_b64, &endpoint, None, 0).await
         });
         let mut buf = [0u8; 2048];
         let mut out = [0u8; 2048];
@@ -2298,5 +2320,53 @@ mod handshake_tests {
             handshake_reply(TunnResult::Done, true),
             HandshakeReply::Established { confirm: None }
         ));
+    }
+}
+
+/// MR-822. The type-level half (no `Clone`, `Copy`, `Serialize` or
+/// `Deserialize`; a self-wiping secret) is asserted at compile time beside
+/// [`WgPrivateKey`]; these cover what a type cannot say.
+#[cfg(test)]
+mod private_key_tests {
+    use super::*;
+
+    /// The key's bytes in every spelling a careless log line could use.
+    fn spellings(key: &WgPrivateKey) -> Vec<String> {
+        let bytes = key.0.to_bytes();
+        vec![
+            BASE64.encode(bytes),
+            bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            format!("{bytes:?}"),
+        ]
+    }
+
+    #[test]
+    fn debug_prints_only_redacted() {
+        let key = WgPrivateKey::generate();
+        let printed = format!("{key:?}");
+        assert_eq!(printed, "[REDACTED]");
+        let pretty = format!("{key:#?}");
+        for spelling in spellings(&key) {
+            assert!(!printed.contains(&spelling) && !pretty.contains(&spelling));
+        }
+    }
+
+    /// `generate_wireguard_keypair` sends `public_key()` as `clientPublicKey`;
+    /// it must be the public half of the key the tunnel is then built with.
+    #[test]
+    fn the_public_key_is_the_public_half() {
+        let key = WgPrivateKey::generate();
+        let peer = crate::utils::os_rng::x25519_static_secret();
+        assert_eq!(
+            key.0.diffie_hellman(&PublicKey::from(&peer)).as_bytes(),
+            peer.diffie_hellman(&key.public_key()).as_bytes()
+        );
+    }
+
+    #[test]
+    fn every_key_is_fresh() {
+        let a = WgPrivateKey::generate();
+        let b = WgPrivateKey::generate();
+        assert_ne!(a.public_key().as_bytes(), b.public_key().as_bytes());
     }
 }

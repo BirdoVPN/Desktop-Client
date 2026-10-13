@@ -14,7 +14,7 @@ use tokio::sync::{Mutex as TokioMutex, RwLock};
 use wintun::{Adapter, Session};
 
 use super::data_plane::{Counters, DataPlane};
-use super::wireguard_new::WireGuardSession;
+use super::wireguard_new::{WgPrivateKey, WireGuardSession};
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
 
@@ -718,11 +718,14 @@ impl WintunTunnel {
     /// `local_network_sharing`: when true, RFC1918 private ranges are routed
     /// via the real default gateway instead of through the VPN tunnel, allowing
     /// access to printers, NAS devices, and other LAN resources.
-    pub async fn create(config: &VpnConfig, local_network_sharing: bool) -> Result<Self, String> {
+    ///
+    /// MR-822: takes `config` by move (it used to clone it). The config holds
+    /// no private key; that is handed to [`start`](Self::start).
+    pub async fn create(config: VpnConfig, local_network_sharing: bool) -> Result<Self, String> {
         tracing::debug!("Creating Wintun tunnel for {}", redact_ip(&config.endpoint));
 
         Ok(Self {
-            config: config.clone(),
+            config,
             running: Arc::new(AtomicBool::new(false)),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
@@ -745,7 +748,11 @@ impl WintunTunnel {
     /// IPv6 egressed the physical NIC throughout DLL load, adapter creation, the
     /// WireGuard handshake and the route/DNS netsh calls — which this module
     /// itself documents as taking 10-25s on AV-heavy machines.
-    pub async fn start(&self) -> Result<(), String> {
+    ///
+    /// MR-822: `private_key` moves into the WireGuard session, and the tunnel
+    /// keeps no copy. A start that fails before the session is built drops it,
+    /// which wipes it.
+    pub async fn start(&self, private_key: WgPrivateKey) -> Result<(), String> {
         if self.running.load(Ordering::SeqCst) {
             return Err("Tunnel is already running".to_string());
         }
@@ -775,10 +782,10 @@ impl WintunTunnel {
         crate::vpn::win_machine_state::take_ownership(self.state_gen);
 
         self.block_ipv6_leaks().await?;
-        self.start_inner().await
+        self.start_inner(private_key).await
     }
 
-    async fn start_inner(&self) -> Result<(), String> {
+    async fn start_inner(&self, private_key: WgPrivateKey) -> Result<(), String> {
         tracing::info!(
             "Starting Wintun tunnel to {}",
             redact_ip(&self.config.endpoint)
@@ -979,7 +986,7 @@ impl WintunTunnel {
         // This must happen while we still have direct network access for DNS resolution.
         // After routes are configured, all traffic goes through VPN tunnel.
         let wg_session = WireGuardSession::new(
-            &self.config.private_key,
+            private_key,
             &self.config.server_public_key,
             &self.config.endpoint,
             self.config.preshared_key.as_deref(),
@@ -2439,7 +2446,7 @@ mod dns_guard_wiring_tests {
     fn every_connect_installs_the_dns_guard_before_any_route() {
         let source = include_str!("tunnel.rs");
         let start = source
-            .find("async fn start_inner(&self)")
+            .find("async fn start_inner(&self, private_key: WgPrivateKey)")
             .expect("start_inner");
         let body = &source[start..];
         let body = &body[..body.find("\n    }").expect("end of start_inner")];

@@ -855,15 +855,25 @@ pub struct VpnServer {
     pub accessible: bool,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// The tunnel a connect builds: built by `commands::vpn::build_vpn_config` from
+/// the server's connect response, and MOVED into the platform tunnel, which
+/// keeps it for the session's routes, DNS and teardown.
+///
+/// MR-822: it carries no private key. The client's WireGuard key is a
+/// `vpn::WgPrivateKey`, generated per connect attempt and moved to the tunnel
+/// beside this config (`VpnManager::connect`), never inside it. This used to
+/// hold the key as a plain `String` and derive `Clone`, `Serialize` and
+/// `Deserialize`, so the key could be serialized, was cloned (the tunnel kept
+/// an unwiped copy for the whole session) and was not wiped when a copy was
+/// freed. Nothing serializes or deserializes a `VpnConfig` (the server sends
+/// a `ConnectResponse`; the UI never sees this), so the derives are gone, and
+/// a compile-time assertion below keeps `Clone` and `Serialize` from coming
+/// back: the config still holds the PSK.
 pub struct VpnConfig {
     pub server_id: String,
     pub key_id: String,
-    pub private_key: String,
     pub public_key: String,
     pub server_public_key: String,
-    #[serde(default)]
     pub preshared_key: Option<String>,
     pub endpoint: String,
     pub allowed_ips: Vec<String>,
@@ -871,30 +881,28 @@ pub struct VpnConfig {
     /// `dns` is the user's Custom DNS, not the server's resolvers. A private
     /// Custom DNS server with Local Network Sharing on is the user's own LAN
     /// resolver, reached outside the tunnel (`wfp_policy::split_resolvers`).
-    #[serde(default)]
     pub custom_dns: bool,
     pub client_ip: String,
     /// Optional IPv6 tunnel address (e.g. "fd00::2/128"). When present, enables
     /// dual-stack routing through the tunnel.
-    #[serde(default)]
     pub client_ipv6: Option<String>,
     /// IPv6 CIDRs to route through the tunnel (e.g. ["::/0"]). Empty = IPv4-only.
-    #[serde(default)]
     pub allowed_ips_v6: Vec<String>,
     pub mtu: u16,
     pub persistent_keepalive: u16,
 }
 
+crate::utils::assert_not_impl_any!(VpnConfig: Clone, Serialize);
+
 /// P1-dk-vpnconfig-debug-serialize-privkey: manual Debug so a careless
 /// `tracing::debug!(?config)` or panic-context capture can never print the
-/// WireGuard private key / PSK. Endpoint and addresses are connection history
-/// (LOG-001) — redact those too.
+/// PSK. Endpoint and addresses are connection history (LOG-001) — redact
+/// those too. (The private key is no longer in the config at all: MR-822.)
 impl std::fmt::Debug for VpnConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VpnConfig")
             .field("server_id", &self.server_id)
             .field("key_id", &self.key_id)
-            .field("private_key", &"[redacted]")
             .field("public_key", &self.public_key)
             .field("server_public_key", &self.server_public_key)
             .field(
@@ -918,28 +926,14 @@ impl std::fmt::Debug for VpnConfig {
 }
 
 /// FIX-R3: Zero sensitive key material before deallocation.
-/// Prevents private key recovery from freed heap memory (e.g., via core dump).
-/// Note: Rust String zeroization clears the buffer but V8/JS string copies
-/// may still exist if this struct was serialized. Defense-in-depth only.
+/// Prevents PSK recovery from freed heap memory (e.g., via core dump). The
+/// private key wipes itself (`WgPrivateKey`, MR-822). Defense-in-depth only.
 impl Drop for VpnConfig {
     fn drop(&mut self) {
-        self.private_key.zeroize();
         if let Some(ref mut psk) = self.preshared_key {
             psk.zeroize();
         }
         self.server_public_key.zeroize();
-    }
-}
-
-impl VpnConfig {
-    /// Zero only the private key material while keeping the config usable
-    /// for reconnection metadata (server_id, endpoint, etc.).
-    /// Called after the WireGuard session has consumed the key.
-    pub fn scrub_key_material(&mut self) {
-        self.private_key.zeroize();
-        if let Some(ref mut psk) = self.preshared_key {
-            psk.zeroize();
-        }
     }
 }
 

@@ -66,6 +66,9 @@ pub(crate) mod pf_policy;
 pub use manager::VpnManager;
 #[allow(unused_imports)]
 pub use wireguard_new::WireGuardSession;
+// MR-822: the client's WireGuard private key, moved from its generation to
+// the tunnel and never copied, serialized or printed on the way.
+pub use wireguard_new::WgPrivateKey;
 
 // ADAPTIVE TRANSPORT: the establish-time handshake failure markers, re-exported
 // so commands::vpn::transport_fallback_reason can classify a failed connect
@@ -1667,7 +1670,6 @@ mod scope_tests {
         VpnConfig {
             server_id: "test".into(),
             key_id: "k".into(),
-            private_key: String::new(),
             public_key: String::new(),
             server_public_key: String::new(),
             preshared_key: None,

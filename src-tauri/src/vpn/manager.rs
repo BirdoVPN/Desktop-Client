@@ -59,6 +59,7 @@ use super::tunnel_linux::LinuxTunnel as PlatformTunnel;
 #[cfg(target_os = "macos")]
 use super::tunnel_macos::UtunTunnel as PlatformTunnel;
 
+use super::WgPrivateKey;
 use crate::api::types::VpnConfig;
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 
@@ -356,7 +357,10 @@ pub struct VpnManager {
     state: Arc<RwLock<ConnectionState>>,
     pub(crate) stats: Arc<RwLock<ConnectionStats>>,
     tunnel: Arc<RwLock<Option<PlatformTunnel>>>,
-    current_config: Arc<RwLock<Option<VpnConfig>>>,
+    // MR-822: `current_config` is gone. It held a clone of every session's
+    // config with the key "scrubbed" (overwritten in place), and nothing ever
+    // read it. The tunnel owns its config now, and the key never was its to
+    // keep. Reconnects re-dial from `auto_reconnect::ReconnectInfo`.
     /// SM-002: Operation lock to prevent concurrent connect/disconnect
     /// Only one connect or disconnect operation can run at a time
     operation_lock: Arc<TokioMutex<()>>,
@@ -439,7 +443,6 @@ impl VpnManager {
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             stats: Arc::new(RwLock::new(ConnectionStats::empty())),
             tunnel: Arc::new(RwLock::new(None)),
-            current_config: Arc::new(RwLock::new(None)),
             operation_lock: Arc::new(TokioMutex::new(())),
             status: Arc::new(StatusBus::new(probe)),
             epoch: Arc::new(epoch),
@@ -701,10 +704,15 @@ impl VpnManager {
     /// error at the UI and the tray between attempts. A cancelled attempt
     /// writes nothing: whoever cancelled it owns the state.
     ///
+    /// MR-822: `config` moves into the new tunnel, and `private_key` into its
+    /// WireGuard session as it starts. Neither is copied. A connect that fails
+    /// or is cancelled drops the key, which wipes it.
+    ///
     /// SM-002: Uses operation lock to prevent concurrent connect/disconnect
     pub async fn connect(
         &self,
         config: VpnConfig,
+        private_key: WgPrivateKey,
         label: SessionLabel,
         local_network_sharing: bool,
         epoch: u64,
@@ -894,6 +902,9 @@ impl VpnManager {
             crate::utils::redact_endpoint(&config.endpoint),
             crate::utils::redact_ip(&config.client_ip)
         );
+        // The tunnel takes the config (MR-822); the session's stats keep its ids.
+        let server_id = config.server_id.clone();
+        let key_id = config.key_id.clone();
 
         // CONNECT-FIX: Wrap the entire tunnel creation + start in a timeout.
         // If tunnel creation or start hangs (e.g. netsh deadlocks on Windows
@@ -904,11 +915,11 @@ impl VpnManager {
         // build drops the half-built tunnel at its current await — the SAME
         // unwind the timeout performs, so it needs no new cleanup path.
         let build = timeout(CONNECT_TIMEOUT, async {
-            let tunnel = PlatformTunnel::create(&config, local_network_sharing)
+            let tunnel = PlatformTunnel::create(config, local_network_sharing)
                 .await
                 .map_err(|e| format!("Failed to create tunnel: {}", e))?;
             tunnel
-                .start()
+                .start(private_key)
                 .await
                 .map_err(|e| format!("Failed to start tunnel: {}", e))?;
             Ok::<PlatformTunnel, String>(tunnel)
@@ -960,25 +971,13 @@ impl VpnManager {
                 }
                 self.set_tunnel_present(true);
 
-                match timeout(STATE_LOCK_TIMEOUT, self.current_config.write()).await {
-                    Ok(mut guard) => {
-                        // FIX-R3: Store config for reconnect metadata but scrub key material.
-                        // The WireGuard session now owns copies via SensitiveKey with ZeroizeOnDrop.
-                        // Auto-reconnect must request fresh keys from the backend.
-                        let mut scrubbed_config = config.clone();
-                        scrubbed_config.scrub_key_material();
-                        *guard = Some(scrubbed_config);
-                    }
-                    Err(_) => tracing::error!("Config write lock timeout"),
-                }
-
                 // Stats BEFORE the Connected publication: the status the emitter
                 // builds for it reads the server name from here.
                 match timeout(STATE_LOCK_TIMEOUT, self.stats.write()).await {
                     Ok(mut stats) => {
                         stats.connected_at = Some(chrono::Utc::now());
-                        stats.server_id = Some(config.server_id.clone());
-                        stats.key_id = Some(config.key_id.clone());
+                        stats.server_id = Some(server_id);
+                        stats.key_id = Some(key_id);
                         stats.server_name = Some(label.server_name.clone());
                         stats.bytes_sent = 0;
                         stats.bytes_received = 0;
@@ -1188,11 +1187,6 @@ impl VpnManager {
                 Err("Lock timeout".to_string())
             }
         };
-
-        match timeout(STATE_LOCK_TIMEOUT, self.current_config.write()).await {
-            Ok(mut guard) => *guard = None,
-            Err(_) => tracing::error!("Config write lock timeout during disconnect"),
-        }
 
         // Update stats with timeout
         match timeout(STATE_LOCK_TIMEOUT, self.stats.write()).await {
@@ -1728,7 +1722,6 @@ mod tests {
         let config = VpnConfig {
             server_id: "ams-1".into(),
             key_id: "k".into(),
-            private_key: "p".into(),
             public_key: "q".into(),
             server_public_key: "s".into(),
             preshared_key: None,
@@ -1743,7 +1736,7 @@ mod tests {
             persistent_keepalive: 25,
         };
         let err = mgr
-            .connect(config, label(), false, stale)
+            .connect(config, WgPrivateKey::generate(), label(), false, stale)
             .await
             .unwrap_err();
         assert_eq!(err.code, IpcErrorCode::Cancelled);

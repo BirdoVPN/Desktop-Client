@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
-use super::wireguard_new::WireGuardSession;
+use super::wireguard_new::{WgPrivateKey, WireGuardSession};
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
 use crate::vpn::dns_journal::DnsRestoreOutcome;
@@ -238,12 +238,15 @@ impl Drop for UtunTunnel {
 
 impl UtunTunnel {
     /// Create a new utun tunnel with the given VPN configuration.
-    pub async fn create(config: &VpnConfig, local_network_sharing: bool) -> Result<Self, String> {
+    ///
+    /// MR-822: takes `config` by move (it used to clone it). The config holds
+    /// no private key; that is handed to [`start`](Self::start).
+    pub async fn create(config: VpnConfig, local_network_sharing: bool) -> Result<Self, String> {
         // Validate config before any system changes
-        validate_config(config)?;
+        validate_config(&config)?;
 
         Ok(Self {
-            config: config.clone(),
+            config,
             running: Arc::new(AtomicBool::new(false)),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
@@ -261,7 +264,11 @@ impl UtunTunnel {
     }
 
     /// Start the tunnel: create utun device, configure routes/DNS, start packet loop.
-    pub async fn start(&self) -> Result<(), String> {
+    ///
+    /// MR-822: `private_key` moves into the WireGuard session, and the tunnel
+    /// keeps no copy. A start that fails before the session is built drops it,
+    /// which wipes it.
+    pub async fn start(&self, private_key: WgPrivateKey) -> Result<(), String> {
         tracing::info!("Starting macOS utun tunnel");
 
         // Check for root privileges
@@ -304,7 +311,7 @@ impl UtunTunnel {
         // Create WireGuard session BEFORE configuring routes
         // (needs direct network access for DNS resolution of endpoint)
         let wg_session = match WireGuardSession::new(
-            &self.config.private_key,
+            private_key,
             &self.config.server_public_key,
             &self.config.endpoint,
             self.config.preshared_key.as_deref(),
