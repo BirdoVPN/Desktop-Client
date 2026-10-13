@@ -19,8 +19,13 @@ PRE_OUTAGE and the cases around it, its last shape is kept as a frozen
 fixture: a byte-identical copy of birdo-shared's
 scripts/fixtures/retired-dns-google.json, in third_party/ because check 2's
 sweep and check 2c both skip that directory (it holds GTS Root R4 and WE1,
-which are live birdo.app pins, and the six never-shipped siblings). BASE =
-the committed SSOT + that fixture; the committed SSOT is also checked alone.
+which are live birdo.app pins; WR2, GTS Root R1 and WE2, which the SSOT now
+retires everywhere; and the six never-shipped siblings). BASE = the committed
+SSOT as it was BEFORE that retirement: the fixture's host and its six
+host-scoped records put back, and the unscoped records the retirement added
+for that host's own pins taken out again, exactly as birdo-shared's own tests
+build it. The committed SSOT is also checked alone, and RETIRED_HOST_PIN_IN_A_DOC
+checks it under 2c: WR2 is retired everywhere there, so 2c must refuse it.
 
 The case that matters most is PRE_OUTAGE: dns.google exactly as it shipped
 before 2026-09-06 - WR2 + GTS Root R1, both live, ONE lineage. An earlier
@@ -81,8 +86,11 @@ with open(RETIRED_DNS_GOOGLE, encoding="utf-8") as fh:
     _FIXTURE = json.load(fh)
 assert "dns.google" not in COMMITTED["hosts"], (
     "dns.google is back in the vendored SSOT - retire third_party/retired-dns-google.json")
+_FIXTURE_HASHES = {p["hash"] for p in _FIXTURE["host"]["pins"]}
 BASE = copy.deepcopy(COMMITTED)
 BASE["hosts"]["dns.google"] = copy.deepcopy(_FIXTURE["host"])
+BASE["_removed"] = [r for r in BASE["_removed"]
+                    if r.get("host") is not None or r.get("hash") not in _FIXTURE_HASHES]
 BASE["_removed"] = BASE["_removed"] + copy.deepcopy(_FIXTURE["_removed"])
 
 # A fixed "today" so a waiver fixture with review_by 2099 never expires and one
@@ -475,6 +483,13 @@ RETIRED_CASES = [
     # green line that reads like coverage.
     ("NO_RETIRED_RECORDS", TREE, False,
      ["ok    2c: the SSOT records no retired pins"], ["FAIL"]),
+
+    # Against the COMMITTED SSOT, not BASE: dns.google is gone and its WR2 is
+    # recorded in _removed with no host, so R1 forbids it repo-wide. This is
+    # what recording a retired host's pins buys over simply deleting them.
+    ("RETIRED_HOST_PIN_IN_A_DOC",
+     tree_with("SECURITY.md", NL + "Desktop <=1.4.45 pinned `" + WR2["hash"] + "`." + NL),
+     True, ["FAIL  2c: SECURITY.md", "carries RETIRED pin", "Retired with host dns.google"], []),
 ]
 
 
@@ -523,6 +538,8 @@ def run():
         doc = copy.deepcopy(BASE)
         if name == "NO_RETIRED_RECORDS":
             doc["_removed"] = []
+        elif name == "RETIRED_HOST_PIN_IN_A_DOC":
+            doc = copy.deepcopy(COMMITTED)
         got_failed, lines = retired.scan(doc, files)
         text = chr(10).join(lines)
         problems = []
