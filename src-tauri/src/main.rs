@@ -168,6 +168,7 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::updater::check_for_updates,
         commands::updater::install_update,
         commands::updater::get_required_update,
+        commands::update_resume::take_update_resume, // MR-1861: the session an update ended
         // Extended VPN info
         commands::vpn::get_subscription_status,
         commands::vpn::get_usage_stats,
@@ -420,6 +421,11 @@ fn main() {
             if startup_settings.as_ref().is_some_and(|s| s.autostart) {
                 commands::settings::restore_launch_at_login_task();
             }
+
+            // MR-1861: the VPN session an update ended, if this is the first
+            // start of the new version. Read and deleted here; the session
+            // controller takes it once (commands::update_resume).
+            commands::update_resume::load_at_start();
 
             // Give the forced-version-floor gate a handle so a 426 from ANY
             // request can raise the blocking "update required" screen. Must be
@@ -690,6 +696,17 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // MR-1861: on Windows, an exit that skipped the teardown below —
+            // Restart Manager's shutdown for an installer (WM_ENDSESSION
+            // reaches here with no ExitRequested) — leaves the live session
+            // for the next version to resume. Not on macOS, where Cmd+Q and
+            // the Dock's Quit come this way too (commands::update_resume).
+            if matches!(event, RunEvent::Exit) {
+                commands::update_resume::record_if_exit_kept_the_session(
+                    app_handle,
+                    EXIT_TEARDOWN_STARTED.load(std::sync::atomic::Ordering::SeqCst),
+                );
+            }
             if let RunEvent::ExitRequested { code, api, .. } = &event {
                 // A restart (`plugin-process` relaunch: the frontend's
                 // relaunch() after an install on macOS/Linux) cannot be held

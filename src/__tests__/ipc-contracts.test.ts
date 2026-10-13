@@ -405,6 +405,8 @@ const FRONTEND_COMMANDS = [
   'check_for_updates',
   'install_update',
   'get_required_update',
+  // The session an update ended, resumed once (MR-1861)
+  'take_update_resume',
   // Account data
   'get_subscription_status',
   'get_usage_stats',

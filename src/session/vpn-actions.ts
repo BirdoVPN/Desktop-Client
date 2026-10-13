@@ -14,7 +14,13 @@
  * nothing here writes `connectionState` itself.
  */
 import { invoke } from '@tauri-apps/api/core';
-import { parseVpnStatus, pickBestServer, toIpcError } from '@/lib/ipc';
+import {
+  parseResumeTarget,
+  parseVpnStatus,
+  pickBestServer,
+  toIpcError,
+  type ResumeTarget,
+} from '@/lib/ipc';
 import { isSilentError } from '@/lib/errors';
 import { command } from '@/session/command';
 import { useAppStore, type PendingAction, type Server } from '@/store/app-store';
@@ -160,6 +166,36 @@ export async function connectPreferred(): Promise<boolean> {
   // The list has not loaded (offline start, slow backend): Rust has its own
   // copy and applies the same best-server rule.
   return run('connecting', 'quick_connect');
+}
+
+/** MR-1861: shown while the session an update ended comes back. */
+export const RESUME_AFTER_UPDATE_COPY = 'Reconnecting after the update…';
+
+/**
+ * The session an update ended (Rust's `commands::update_resume`): only on the
+ * first start of the new version, only if the user was connected when the
+ * update began, and only once. Null for nothing, or a failed read.
+ */
+export async function takeUpdateResume(): Promise<ResumeTarget | null> {
+  try {
+    return parseResumeTarget(await invoke('take_update_resume'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Put back the session an update ended (MR-1861): the same server, or the
+ * same Multi-Hop route, through the ordinary connect commands — so with the
+ * saved settings, kill switch included. A server that is gone, offline or no
+ * longer in the plan falls back to the plain Connect rule.
+ */
+export async function resumeAfterUpdate(target: ResumeTarget): Promise<boolean> {
+  const s = useAppStore.getState();
+  s.showNotice({ text: RESUME_AFTER_UPDATE_COPY, tone: 'info' });
+  if (target.kind === 'multiHop') return connectMultiHop(target.entryId, target.exitId);
+  const server = s.servers.find((srv) => srv.id === target.serverId);
+  return usable(server) ? connectToServer(server) : connectPreferred();
 }
 
 /**

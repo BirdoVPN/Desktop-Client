@@ -271,7 +271,9 @@ import type { AccountInfo, AppSettings, WireGuardPort } from '../store/app-store
 
 /** A stored or received port setting as one of the two that exist (see
  * `WireGuardPort`): "51820" stays, anything else — "53", a custom number from
- * an older build, nothing at all — is "auto". */
+ * an older build, nothing at all — is "auto". Since MR-920, Rust also loads a
+ * saved "51820" as "auto" (`migrate_wireguard_port`), and `hydrateSettings`
+ * takes the port from Rust, so in practice the store holds "auto". */
 export function normalizeWireGuardPort(value: unknown): WireGuardPort {
   return value === '51820' ? '51820' : 'auto';
 }

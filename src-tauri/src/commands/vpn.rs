@@ -252,8 +252,9 @@ pub(crate) const RELAY_WIREGUARD_PORT: u16 = 51820;
 /// `None` for the server's own endpoint. "53" and custom numbers, which
 /// earlier builds offered and no relay answers, are never dialled — whatever a
 /// stale settings file or a session's reconnect record still says. The
-/// settings load migrates them to "auto" (`settings::migrate_wireguard_port`);
-/// Android applies the same rule.
+/// settings load migrates them to "auto" (`settings::migrate_wireguard_port`),
+/// and since MR-920 a saved "51820" too, so in practice every connect takes
+/// the server's endpoint. Android applies the same rule.
 pub(crate) fn dialable_wireguard_port(setting: &str) -> Option<u16> {
     (setting.trim() == "51820").then_some(RELAY_WIREGUARD_PORT)
 }
@@ -583,7 +584,10 @@ pub(crate) async fn start_stealth_tunnel(
 ///
 /// Order of preference:
 ///   1. BirdoPQ v1 ML-KEM-1024 — decapsulate the server-supplied ciphertext
-///      with our persistent client secret key (HNDL-safe).
+///      with our persistent client secret key. Post-quantum on the app-to-API
+///      leg only, not a complete "record now, decrypt later" defence: the key
+///      is long-lived, the relay leg is classical TLS and multi-hop's middle
+///      leg has no PQ PSK (`vpn::birdo_pq` module docs).
 ///   2. If the server enabled quantum mode but decapsulation fails, abort.
 ///   3. Server-provided classical PSK (TLS-delivered random; not HNDL-safe).
 ///   4. None — connection runs without PSK.

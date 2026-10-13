@@ -264,6 +264,9 @@ pub async fn native_oauth_login(
     api: State<'_, BirdoApi>,
     credentials: State<'_, CredentialStore>,
 ) -> Result<LoginResponse, IpcError> {
+    // MR-1861: a sign-in typed in by hand never resumes the session an
+    // update ended — it belonged to whoever was signed in before.
+    crate::commands::update_resume::discard();
     if !SSO_PROVIDERS.contains(&provider.as_str()) {
         return Err(IpcError::unknown("Unsupported sign-in provider"));
     }

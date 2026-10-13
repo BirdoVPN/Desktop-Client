@@ -71,10 +71,14 @@ server's address. It is not onion routing: the entry server can see your IP
 address and the destinations you connect to.
 
 **Post-Quantum Key Exchange**
-Each connection adds a WireGuard pre-shared key derived with ML-KEM-1024
-(BirdoPQ) between your app and our API. The key is then delivered to the VPN
-server over TLS that is not yet post-quantum, so protection against "record now,
-decrypt later" is only as strong as that link today.
+With Quantum Protection on (the default), each connection adds a WireGuard
+pre-shared key derived with ML-KEM-1024 (BirdoPQ) between your app and our API.
+Your app works the key out itself, so our API never sends it back to the app.
+Our API sends the key to the VPN server over a connection that is not yet
+post-quantum, and it keeps an encrypted copy while you are connected. So
+protection against "record now, decrypt later" is only as strong as that server
+link today. With multi-hop, the hop between our two servers does not use a
+post-quantum key yet.
 
 **Two-Factor Authentication**
 TOTP-based 2FA to protect your account. Works with any authenticator app.

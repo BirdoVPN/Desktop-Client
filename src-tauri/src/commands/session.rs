@@ -969,6 +969,11 @@ const RELEASE_DEADLINE: Duration = Duration::from_secs(40);
 /// for it on the commit lock it holds.
 pub async fn end_session(app: &AppHandle, reason: EndReason) {
     tracing::info!("Ending the VPN session ({reason:?})");
+    // MR-1861: only the session an update ends is put back by the version it
+    // installs; any other end is the user's (or the server's) choice.
+    if reason != EndReason::Update {
+        crate::commands::update_resume::discard();
+    }
     let teardown = tauri::async_runtime::spawn(tear_down(app.clone(), reason));
     match timeout(RELEASE_DEADLINE, teardown).await {
         // It released the block and wrote Disconnected under the commit lock.

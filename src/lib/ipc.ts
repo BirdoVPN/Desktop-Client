@@ -295,6 +295,29 @@ export function parseSessionExpired(raw: unknown): 'expired' | 'revoked' {
   return isObj(raw) && raw.reason === 'revoked' ? 'revoked' : 'expired';
 }
 
+/**
+ * `take_update_resume` (MR-1861): the session an update ended, as Rust's
+ * `commands::update_resume::ResumeTarget` sends it.
+ */
+export type ResumeTarget =
+  | { kind: 'singleHop'; serverId: string }
+  | { kind: 'multiHop'; entryId: string; exitId: string };
+
+/** Null for nothing to resume, and for anything unrecognisable (never throws). */
+export function parseResumeTarget(raw: unknown): ResumeTarget | null {
+  if (!isObj(raw)) return null;
+  if (raw.kind === 'singleHop') {
+    const serverId = str(pick(raw, 'serverId', 'server_id'));
+    return serverId ? { kind: 'singleHop', serverId } : null;
+  }
+  if (raw.kind === 'multiHop') {
+    const entryId = str(pick(raw, 'entryId', 'entry_id'));
+    const exitId = str(pick(raw, 'exitId', 'exit_id'));
+    return entryId && exitId ? { kind: 'multiHop', entryId, exitId } : null;
+  }
+  return null;
+}
+
 // ── Servers ────────────────────────────────────────────────────────────────
 
 /**
