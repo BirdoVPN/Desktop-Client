@@ -1781,6 +1781,145 @@ mod handshake_tests {
         );
     }
 
+    /// A relay run by hand: it answers handshakes and hands back the IP
+    /// packets it decrypts — `want` of them, or what arrived before it heard
+    /// nothing for two seconds.
+    fn relay(
+        mut tunn: Tunn,
+        socket: UdpSocket,
+        want: usize,
+    ) -> tokio::task::JoinHandle<Vec<Vec<u8>>> {
+        tokio::spawn(async move {
+            let (mut buf, mut out) = ([0u8; 2048], [0u8; 2048]);
+            let mut packets = Vec::new();
+            while packets.len() < want {
+                let Ok(Ok((n, from))) =
+                    tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await
+                else {
+                    break;
+                };
+                match tunn.decapsulate(Some(from.ip()), &buf[..n], &mut out) {
+                    TunnResult::WriteToNetwork(reply) => {
+                        let _ = socket.send_to(reply, from).await;
+                    }
+                    TunnResult::WriteToTunnelV4(packet, _) => packets.push(packet.to_vec()),
+                    _ => {}
+                }
+            }
+            packets
+        })
+    }
+
+    /// An IPv4 packet the relay's boringtun accepts (it reads the version,
+    /// the total length and the source address).
+    fn ipv4_packet(tag: u8) -> Vec<u8> {
+        let mut packet = vec![0u8; 24];
+        packet[0] = 0x45;
+        packet[3] = 24;
+        packet[12..16].copy_from_slice(&[10, 7, 0, 2]);
+        packet[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        packet[20..].copy_from_slice(&[tag; 4]);
+        packet
+    }
+
+    /// A session connected to a hand-run relay, then put back into the state
+    /// in which boringtun QUEUES what it is asked to send: no keys. A fresh
+    /// `Tunn` with the same keys stands in for an expired session (boringtun
+    /// drops its keys 540 s after the last handshake), which a test cannot
+    /// wait for.
+    async fn a_session_without_keys(
+        want: usize,
+    ) -> (WireGuardSession, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let server_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let server_public = PublicKey::from(&server_secret);
+        let client_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let client_key = client_secret.to_bytes();
+        let tunn = Tunn::new(
+            server_secret,
+            PublicKey::from(&client_secret),
+            None,
+            None,
+            1,
+            None,
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = socket.local_addr().unwrap().to_string();
+        let relay = relay(tunn, socket, want);
+        let session = WireGuardSession::new(
+            &BASE64.encode(client_key),
+            &BASE64.encode(server_public.as_bytes()),
+            &endpoint,
+            None,
+            0,
+        )
+        .await
+        .expect("handshake");
+        *session.tunnel.lock() = Tunn::new(
+            StaticSecret::from(client_key),
+            server_public,
+            None,
+            None,
+            2,
+            None,
+        );
+        (session, relay)
+    }
+
+    /// P1-dk-boringtun-queue-never-drained (MR-792), the connect's handshake:
+    /// packets sent while the handshake is still in flight are queued by
+    /// boringtun, and reach the relay once it completes. Without the drain
+    /// they stayed in boringtun's queue and the relay saw only the keepalive.
+    #[tokio::test]
+    async fn packets_queued_behind_the_handshake_reach_the_relay_after_it() {
+        let (session, relay) = a_session_without_keys(2).await;
+        let mut dst = [0u8; 2048];
+        assert!(
+            matches!(session.seal(&ipv4_packet(1), &mut dst), Outbound::Send(_)),
+            "an initiation"
+        );
+        assert!(matches!(
+            session.seal(&ipv4_packet(2), &mut dst),
+            Outbound::Queued
+        ));
+
+        session.handshake().await.expect("the relay answers");
+
+        assert_eq!(relay.await.unwrap(), vec![ipv4_packet(1), ipv4_packet(2)]);
+    }
+
+    /// The same contract on the receive path (`recv_packet`, the unix
+    /// loops), where a rekey's handshake answer arrives: the reply goes out
+    /// and the packets queued behind it follow.
+    #[tokio::test]
+    async fn packets_queued_behind_a_rekey_reach_the_relay_after_its_answer() {
+        let (session, relay) = a_session_without_keys(2).await;
+        let mut dst = [0u8; 2048];
+        let Outbound::Send(initiation) = session.seal(&ipv4_packet(1), &mut dst) else {
+            panic!("no initiation");
+        };
+        session.socket().send(initiation).await.unwrap();
+        assert!(matches!(
+            session.seal(&ipv4_packet(2), &mut dst),
+            Outbound::Queued
+        ));
+
+        // `readable` can report a readiness that is already spent, and
+        // `recv_packet` does not wait, so read until the answer is in.
+        let answered = tokio::time::timeout(Duration::from_secs(2), async {
+            while session.tunnel.lock().time_since_last_handshake().is_none() {
+                session.socket().readable().await.unwrap();
+                assert_eq!(
+                    session.recv_packet().await,
+                    Ok(None),
+                    "a handshake answer, not a packet"
+                );
+            }
+        });
+        answered.await.expect("the relay answers the rekey");
+
+        assert_eq!(relay.await.unwrap(), vec![ipv4_packet(1), ipv4_packet(2)]);
+    }
+
     /// W1-003: a roam swaps the socket in place — the receive loop's
     /// subscription sees the new one — and proves the new path with a forced
     /// initiation on the SAME session, which the relay answers at the new

@@ -69,9 +69,15 @@
 //! ## Threat model for persisted client secret key
 //!
 //! The ML-KEM secret key is the LONG-LIVED client identity for BirdoPQ. An
-//! attacker who steals it can decrypt any future server-encapsulated PSK
-//! they observe but CANNOT derive PSKs from sessions that happened before
-//! the theft (the server uses fresh randomness in every encapsulation).
+//! attacker who steals it recovers the PSK of EVERY session they hold the
+//! connect response for — the ciphertext and the nonce — whether that
+//! session came before the theft or after it, for as long as this key is in
+//! use. ML-KEM decapsulation is deterministic in `(sk, ct)`: the server's
+//! fresh randomness in each encapsulation stops nothing once `sk` is known,
+//! and the PSK is HKDF of the shared secret and the nonce (above). A stolen
+//! key is therefore not forward-secret in either direction; only rotating it
+//! would bound what it opens (MR-703, not built). An earlier version of this
+//! paragraph said past sessions were safe (MR-1368). They are not.
 //!
 //! Storage location: `<config_local_dir>/BirdoVPN/birdo_pq_v1.bin`.
 //! Format: 4-byte magic "BPQ1" + 4-byte version (=1) + 1568 B pk + 3168 B sk.

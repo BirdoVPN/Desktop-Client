@@ -993,7 +993,9 @@ pub struct ConnectRequest {
     /// `commands::vpn::FALLBACK_*` constants, never a literal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
-    /// Request post-quantum protection (Rosenpass PSK)
+    /// Request post-quantum protection: a BirdoPQ PSK (ML-KEM-1024,
+    /// `vpn::birdo_pq`). Not Rosenpass: the `rosenpass*` response fields keep
+    /// that name on the wire only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantum_protection: Option<bool>,
     /// AUDIT-C1: BirdoPQ v1 ML-KEM-1024 client public key (Base64).
@@ -1006,9 +1008,11 @@ pub struct ConnectRequest {
     /// BirdoPQ HNDL opt-in (OPEN-WORK G5): `Some(true)` whenever
     /// `pq_client_public_key` is uploaded. It tells the backend this build
     /// WILL ML-KEM-decapsulate locally (`vpn::birdo_pq::try_decapsulate`), so
-    /// `vpn.service.ts connect()` withholds the derived PSK instead of echoing
-    /// it back over TLS — the harvest-now-decrypt-later hole the whole PQ
-    /// exchange exists to close. Absent, the backend keeps the compat path
+    /// `vpn.service.ts connect()` withholds the derived PSK from the CLIENT
+    /// response instead of echoing it back over TLS — the
+    /// harvest-now-decrypt-later hole the whole PQ exchange exists to close.
+    /// The PSK still crosses a wire elsewhere: the hub pushes it to the relay
+    /// under classical TLS (MR-1444). Absent, the backend keeps the compat path
     /// (quantumEnabled=true AND presharedKey returned), which every desktop
     /// build up to 1.4.41 relied on. `commands::vpn::derive_quantum_psk`
     /// already fails closed when decapsulation fails in quantum mode, so
@@ -1111,7 +1115,8 @@ pub struct ConnectResponse {
     pub xray_sni: Option<String>,
     #[serde(default, rename = "xrayFlow")]
     pub xray_flow: Option<String>,
-    // Post-Quantum (Rosenpass)
+    // Post-quantum (BirdoPQ, ML-KEM-1024). The `rosenpass*` names are the
+    // wire's, kept from before BirdoPQ: the first carries the ciphertext.
     #[serde(default, rename = "quantumEnabled")]
     pub quantum_enabled: Option<bool>,
     #[serde(default, rename = "rosenpassPublicKey")]

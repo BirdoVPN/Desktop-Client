@@ -38,12 +38,15 @@ async function windowIsVisible(): Promise<boolean> {
 }
 
 function App() {
-  const { isAuthenticated, hasAcceptedConsent, setAuthenticated, setLoading, setUserEmail, setAccount, acceptConsent, windowCorner, pushed } =
+  const { isAuthenticated, hasAcceptedConsent, storedCrashChoice, setAuthenticated, setLoading, setUserEmail, setAccount, acceptConsent, windowCorner, pushed } =
     useAppStore(
       useShallow((s) => ({
         isAuthenticated: s.isAuthenticated,
         // The CURRENT text (D7): an older acceptance shows the screen again.
         hasAcceptedConsent: hasCurrentConsent(s.acceptedConsentVersion),
+        // A re-consent's crash-report toggle starts from the stored choice
+        // (owner decision 2026-10-07, MR-1516); a first consent starts OFF.
+        storedCrashChoice: s.acceptedConsentVersion > 0 && s.settings.crashReportsEnabled,
         setAuthenticated: s.setAuthenticated,
         setLoading: s.setLoading,
         setUserEmail: s.setUserEmail,
@@ -380,7 +383,13 @@ function App() {
     screen = <UpdateRequired info={requiredUpdate} />;
   } else if (!hasAcceptedConsent) {
     screenKey = 'consent';
-    screen = <ConsentScreen onAccept={handleAcceptConsent} onDecline={handleDeclineConsent} />;
+    screen = (
+      <ConsentScreen
+        onAccept={handleAcceptConsent}
+        onDecline={handleDeclineConsent}
+        initialCrashReports={storedCrashChoice}
+      />
+    );
   } else if (isAuthenticated) {
     screenKey = 'appshell';
     screen = <AppShell />;

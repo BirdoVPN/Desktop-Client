@@ -15,7 +15,7 @@ import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { exit } from '@tauri-apps/plugin-process';
 import App from '@/App';
-import { useAppStore } from '@/store/app-store';
+import { defaultSettings, useAppStore } from '@/store/app-store';
 import { CONSENT_VERSION } from '@/lib/consent';
 
 // Start Minimized keeps the window hidden at launch (REVIEW-WIN2-010).
@@ -123,5 +123,32 @@ describe('versioned re-consent (D7)', () => {
     render(<App />);
     await waitFor(() => expect(callsTo('get_auth_state')).toHaveLength(1));
     expect(callsTo('show_main_window')).toHaveLength(0);
+  });
+});
+
+// MR-1516 (owner decision 2026-10-07): a re-consent's crash-report toggle
+// starts from the stored choice. It used to start OFF every time, so accepting
+// a newer text quietly turned reports off for a user who had turned them on.
+describe('the crash-report toggle on a re-consent (MR-1516)', () => {
+  const crashToggle = () => screen.findByRole('switch', { name: /send crash reports/i });
+
+  it('starts from the stored choice, and accepting keeps it', async () => {
+    useAppStore.setState({ acceptedConsentVersion: 1, settings: { ...defaultSettings, crashReportsEnabled: true } });
+    render(<App />);
+    expect(await crashToggle()).toHaveAttribute('aria-checked', 'true');
+    await userEvent.click(await agree());
+    await waitFor(() => expect(callsTo('set_crash_reports_enabled')).toEqual([['set_crash_reports_enabled', { enabled: true }]]));
+  });
+
+  it('a first consent still starts OFF, whatever the store holds', async () => {
+    useAppStore.setState({ acceptedConsentVersion: 0, settings: { ...defaultSettings, crashReportsEnabled: true } });
+    render(<App />);
+    expect(await crashToggle()).toHaveAttribute('aria-checked', 'false');
+  });
+
+  it('a stored OFF stays OFF', async () => {
+    useAppStore.setState({ acceptedConsentVersion: 1, settings: { ...defaultSettings, crashReportsEnabled: false } });
+    render(<App />);
+    expect(await crashToggle()).toHaveAttribute('aria-checked', 'false');
   });
 });

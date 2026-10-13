@@ -42,7 +42,7 @@ import {
   Bug,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
-import { isPrivateDnsAddress, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
+import { isMacPlatform, isPrivateDnsAddress, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
 import {
   BirdoCard,
   BirdoSectionHeader,
@@ -90,6 +90,20 @@ export const KILL_SWITCH_DISABLE_BODY =
   'If the VPN drops while the kill switch is off, your apps fall back to your normal, ' +
   'unencrypted connection and can expose your real IP address and DNS queries until it ' +
   'reconnects. For the strongest protection, keep it on.';
+
+/** Under the Custom DNS fields (MR-689). */
+export const CUSTOM_DNS_NOT_LAN_COPY =
+  'A DNS server at a carrier-grade NAT address (100.64.x.x) or a public address is not ' +
+  'treated as on your own network, so Local Network Sharing does not apply to it.';
+
+/**
+ * macOS only (MR-1124): the IPv6 block `tunnel_macos.rs` installs for every
+ * session, kill switch on or off, until macOS routes IPv6 (the F-001 block
+ * there). The wording is the one drafted there; it goes when the block does.
+ */
+export const MACOS_IPV6_NOTE =
+  "On macOS, IPv6 is blocked while you're connected, so your real address can't leak over it. " +
+  "Sites that only work over IPv6 won't load until you disconnect.";
 
 export function Settings() {
   const { settings, windowCorner, setWindowCorner, pushRoute, connected, customDnsOffered } = useAppStore(
@@ -253,11 +267,10 @@ export function Settings() {
                 protects only while the app is running. After 10 failed
                 reconnects auto_reconnect releases the block unless Windows
                 lockdown ("always-on") is on, so say so there.
-                Not disclosed anywhere yet (MR-1124): macOS blocks ALL IPv6 for
-                the whole connection, kill switch on or off, so IPv6-only sites
-                fail there. It is not this toggle's doing, so it does not belong
-                in this subtitle; the proposed wording is in tunnel_macos.rs at
-                the F-001 block. */}
+                macOS blocks ALL IPv6 for the whole connection, kill switch on
+                or off, so IPv6-only sites fail there. It is not this toggle's
+                doing, so it is not in this subtitle: MACOS_IPV6_NOTE says it
+                below, on macOS only (MR-1124). */}
             <BirdoToggleRow
               title="Kill Switch"
               subtitle={
@@ -292,6 +305,11 @@ export function Settings() {
                 checked={settings.lockdownMode}
                 onCheckedChange={(v) => void persistSettings({ lockdownMode: v })}
               />
+            )}
+            {isMacPlatform() && (
+              <p className="px-3.5 pb-2.5 text-xs" style={{ color: white.w60 }}>
+                {MACOS_IPV6_NOTE}
+              </p>
             )}
             <BirdoToggleRow
               title="Quantum Protection"
@@ -623,6 +641,15 @@ function CustomDnsFields() {
       />
       <p className="text-xs" style={{ color: white.w60 }}>
         Popular: 1.1.1.1 (Cloudflare), 8.8.8.8 (Google), 9.9.9.9 (Quad9). Saved when you leave a field.
+      </p>
+      {/* MR-689: "your own network" means the ranges Local Network Sharing
+          opens, on every platform: 10/8, 172.16/12, 192.168/16 and
+          link-local. A LAN numbered from carrier-grade NAT space (100.64/10)
+          or a public range is not one of them, and a public-range LAN
+          resolver cannot be told from an internet one, so this is said up
+          front rather than per address. */}
+      <p className="text-xs" style={{ color: white.w60 }}>
+        {CUSTOM_DNS_NOT_LAN_COPY}
       </p>
       {/* REVIEW-WIN2-006: a resolver on the user's own network is reached
           outside the tunnel, and only with Local Network Sharing on. */}

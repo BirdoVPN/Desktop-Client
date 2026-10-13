@@ -49,9 +49,15 @@ export const CONSENT_COPY = {
 } as const;
 
 interface ConsentScreenProps {
-  /** Called with the user's crash-report choice (default OFF). */
+  /** Called with the user's crash-report choice. */
   onAccept: (crashReportsEnabled: boolean) => void;
   onDecline: () => void;
+  /**
+   * Where the crash-report toggle starts: OFF on a first consent, the stored
+   * choice when an existing user re-consents to a newer text (owner decision
+   * 2026-10-07, MR-1516). Read once, when the screen mounts.
+   */
+  initialCrashReports?: boolean;
 }
 
 /**
@@ -63,10 +69,13 @@ interface ConsentScreenProps {
  * where the Terms are accepted on desktop (audit B-13).
  *
  * Crash reporting is a separate, optional choice made here with a toggle that
- * starts OFF; nothing is sent to Sentry unless it is switched on (C-3).
+ * starts OFF on a first consent; nothing is sent to Sentry unless it is
+ * switched on (C-3). On a re-consent it starts from the user's stored choice
+ * (`initialCrashReports`), so accepting a new text does not quietly turn
+ * reports off for someone who had turned them on.
  */
-export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
-  const [crashReports, setCrashReports] = useState(false);
+export function ConsentScreen({ onAccept, onDecline, initialCrashReports = false }: ConsentScreenProps) {
+  const [crashReports, setCrashReports] = useState(initialCrashReports);
 
   return (
     <div className="flex h-full flex-col">
@@ -140,7 +149,8 @@ export function ConsentScreen({ onAccept, onDecline }: ConsentScreenProps) {
             </BirdoCard>
           </motion.div>
 
-          {/* The crash-report choice: a real control, starting OFF. */}
+          {/* The crash-report choice: a real control, starting OFF unless a
+              re-consent carries the stored choice in. */}
           <motion.div
             className="mb-5 w-full"
             initial={{ opacity: 0, y: 10 }}

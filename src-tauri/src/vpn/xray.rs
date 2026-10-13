@@ -243,7 +243,7 @@ impl XrayManager {
         let config_json = serde_json::to_string_pretty(&xray_config)
             .map_err(|e| format!("Failed to serialize Xray config: {}", e))?;
 
-        // Find xray binary — check resources dir first, then PATH
+        // Find the bundled xray binary (resources dir only; never PATH, MR-1724)
         let xray_binary = find_xray_binary(app_data_dir)?;
 
         // AUDIT-N4: verify SHA-256 BEFORE exec. Without this, an attacker who
@@ -802,7 +802,8 @@ fn udp_port_held(port: u16) -> bool {
     }
 }
 
-/// Find the xray binary — check bundled resources first, then PATH.
+/// Find the bundled xray binary: next to the app executable, in its
+/// resources, or where the macOS / Linux packages stage them. Nowhere else.
 ///
 /// AUDIT-N4: the previous lookup order included `app_data_dir/xray/<bin>`
 /// (typically %APPDATA% on Windows, ~/.local/share on Linux), which is
@@ -811,8 +812,12 @@ fn udp_port_held(port: u16) -> bool {
 /// escalation primitive: any unprivileged code running as the same user
 /// could plant a fake xray binary there and have it auto-executed with
 /// elevated rights. We now refuse user-writable lookup paths entirely.
-/// Bundled binaries must live next to the app exe (admin-installed) or in
-/// the system PATH (administrator-controlled).
+///
+/// MR-1724: PATH went the same way. It was the last fallback, on the theory
+/// that PATH is administrator-controlled, which a user's own PATH entries
+/// make untrue. Every release bundles xray (the #223 packaging gate), so the
+/// fallback only ever ran on a broken install, and then ran whatever the
+/// user's PATH offered first, with only the hash check standing in the way.
 fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     const XRAY_BIN: &str = "xray.exe";
@@ -895,15 +900,12 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
         }
     }
 
-    // Fall back to PATH (administrator-controlled on a properly managed host).
-    if let Ok(path) = which::which("xray") {
-        return Ok(path);
-    }
-
+    // No PATH fallback (MR-1724): a missing bundled binary is a broken
+    // install, and the error says so.
     Err(format!(
-        "Xray binary not found. Place {} next to the application executable \
-         (admin-installed) or in the system PATH. User-writable locations \
-         are no longer accepted (AUDIT-N4).",
+        "Xray binary not found. The app bundles {} in its resources folder; \
+         reinstall BirdoVPN to restore it. PATH and user-writable locations \
+         are never searched (AUDIT-N4, MR-1724).",
         XRAY_BIN
     ))
 }
@@ -946,6 +948,26 @@ mod stderr_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MR-1724: the lookup never consults PATH. It used to fall back to
+    /// `which::which("xray")`, which runs whatever a user's own PATH entry
+    /// offers first. Read from the source, like the repo's other guards: a
+    /// behavioural test would have to rewrite PATH under every other test
+    /// running in this process.
+    #[test]
+    fn the_xray_lookup_never_consults_path() {
+        let source = include_str!("xray.rs");
+        let start = source.find("fn find_xray_binary(").expect("the lookup");
+        let end = start + source[start..].find("\n}").expect("its end");
+        let lookup = &source[start..end];
+        assert!(lookup.contains("current_exe()"), "this is the lookup");
+        for path_search in ["which::", "\"PATH\"", "env::var", "split_paths"] {
+            assert!(
+                !lookup.contains(path_search),
+                "find_xray_binary uses {path_search}"
+            );
+        }
+    }
 
     /// F4: the shipped-file/compiled-hash mismatch is exactly what every
     /// signed Windows release hit. A one-byte rewrite after hashing (what an
