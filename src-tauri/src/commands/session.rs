@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::timeout;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::api::session_gate::StoredSession;
 use crate::api::types::{ConnectResponse, MultiHopConnectResponse, VpnConfig};
@@ -363,9 +363,9 @@ async fn attempt(
 
     let device_name = get_device_name();
     // FIX-1-1: the X25519 keypair is generated here — the private key never
-    // leaves this device. Zeroizing until it moves into the config.
+    // leaves this device. MR-822: it moves from here to `vm.connect` and on
+    // into the tunnel; every early return before that drops it, which wipes it.
     let (private_key, client_public_key) = generate_wireguard_keypair();
-    let mut private_key = Zeroizing::new(private_key);
     let settings = apply_vpn_settings(app).await;
 
     // AUDIT-C1: with PQ requested, attach our ML-KEM-1024 public key so the
@@ -453,7 +453,6 @@ async fn attempt(
             custom_mtu: settings.custom_mtu,
             custom_port: &settings.custom_port,
         },
-        &mut private_key,
     )
     .await?;
 
@@ -500,6 +499,7 @@ async fn attempt(
     vm.set_phase(ConnectPhase::Handshaking);
     vm.connect(
         prepared.config,
+        private_key,
         label.clone(),
         settings.local_network_sharing,
         ctx.epoch,
@@ -736,7 +736,9 @@ pub(crate) struct TunnelRequest<'a> {
     pub custom_port: &'a str,
 }
 
-/// A validated tunnel config, ready for `VpnManager::connect`.
+/// A validated tunnel config, ready for `VpnManager::connect`. It holds no
+/// private key (MR-822): the caller keeps the attempt's `WgPrivateKey` and
+/// moves it to `VpnManager::connect` beside this config.
 pub(crate) struct PreparedTunnel {
     pub config: VpnConfig,
     pub server_name: String,
@@ -750,14 +752,15 @@ pub(crate) struct PreparedTunnel {
 /// shared by the user connect and the unattended re-dial so a security check
 /// can never exist on one path only: protection enforcement (no silent
 /// downgrade), the stealth transport, the BirdoPQ PSK and the
-/// `build_vpn_config` choke point (client key, `validate_tunnel_scope`).
+/// `build_vpn_config` choke point (`validate_tunnel_scope`). The client's
+/// private key does not pass through here (MR-822): it goes from the caller
+/// straight to `VpnManager::connect`.
 pub(crate) async fn prepare_tunnel(
     app: &AppHandle,
     vm: &VpnManager,
     epoch: u64,
     response: ConnectResponse,
     request: TunnelRequest<'_>,
-    private_key: &mut Zeroizing<String>,
 ) -> Result<PreparedTunnel, IpcError> {
     enforce_requested_protection(&response, request.stealth_mode, request.quantum_protection)?;
 
@@ -799,7 +802,6 @@ pub(crate) async fn prepare_tunnel(
         response,
         request.server_id,
         request.custom_dns,
-        std::mem::take(&mut **private_key),
         request.custom_mtu,
         request.custom_port,
     )
