@@ -2,6 +2,10 @@
 # UNIFIED release workflow — Windows + Linux + macOS build TOGETHER and
 # publish into ONE GitHub Release from a SINGLE tag (v*.*.* e.g. v1.4.16).
 # Published directly (draft: false), not as a draft - owner decision 2026-10-01.
+# Opt-in exception (owner ruling 2026-10-13, Desktop 1.4.47): an ANNOTATED tag
+# whose message has a line `release: draft` is created as a DRAFT that does not
+# take Latest, so the exact signed bytes can be smoke-tested and then published
+# from the GitHub UI without a rebuild. Every other tag behaves as before.
 #
 # This superseded the three separate per-platform pipelines
 # (build-windows.yml, build-linux.yml, build-macos.yml). All three are GONE:
@@ -1387,14 +1391,50 @@ jobs:
       # A tag that is not plain vX.Y.Z (e.g. v1.5.0-rc.1) is published as a
       # PRERELEASE and never takes Latest: the website reads /releases/latest,
       # and the in-app updater ignores prereleases.
-      - name: Decide whether this tag becomes GitHub Latest
-        id: latest
+      # Opt-in DRAFT (owner ruling 2026-10-13): only an ANNOTATED tag whose
+      # message has a line that is exactly `release: draft`. A lightweight tag,
+      # or any other message, publishes as before. If the tag cannot be read the
+      # job FAILS rather than guess: publishing a release that was meant to be a
+      # draft cannot be undone for anyone whose updater already fetched it.
+      - name: Decide whether this tag is released as a draft
+        id: draft
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          type=${ref%% *}
+          sha=${ref##* }
+          draft=false
+          if [ "$type" = tag ]; then
+            message=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .message)
+            if printf '%s' "$message" | grep -qxE 'release:[[:space:]]*draft[[:space:]]*'; then
+              draft=true
+            fi
+          fi
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          if [ "$draft" = true ]; then
+            echo "::notice::$TAG asks for a DRAFT release (annotated tag message 'release: draft') - it will not be published or take Latest"
+          fi
+
+      - name: Decide whether this tag becomes GitHub Latest
+        id: latest
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          DRAFT: ${{ steps.draft.outputs.draft }}
+        run: |
+          set -euo pipefail
+          if [ "$DRAFT" = true ]; then
+            # A draft is not a release yet: it never takes Latest here. Whoever
+            # publishes it in the GitHub UI decides Latest there.
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "make_latest=false" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -1429,7 +1469,8 @@ jobs:
           fi
 
       # Only actually publish on a real tag push (workflow_dispatch builds are
-      # for manual/debug runs and cut no release); no hand-flipped drafts. The
+      # for manual/debug runs and cut no release). A draft only via the opt-in
+      # `release: draft` tag message above, never a hand-flipped one. The
       # guard above already refuses to get here unless the test gate and every
       # required platform succeeded.
       - name: Create GitHub Release
@@ -1445,6 +1486,6 @@ jobs:
             release-files/SHA256SUMS.txt
             release-files/SHA256SUMS.txt.sigstore
           generate_release_notes: true
-          draft: false
+          draft: ${{ steps.draft.outputs.draft == 'true' }}
           prerelease: ${{ steps.latest.outputs.prerelease }}
           make_latest: ${{ steps.latest.outputs.make_latest }}
