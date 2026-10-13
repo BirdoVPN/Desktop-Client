@@ -212,19 +212,47 @@ impl IpcError {
                 Self::new(IpcErrorCode::TwoFactorInvalid, message)
             }
             // Retryable by nature: the check is down, the account was not refused.
-            ApiError::QuotaCheckUnavailable { retry_after_secs } => {
-                let err = Self::new(
-                    IpcErrorCode::ServerError,
-                    "BirdoVPN couldn't check your plan's data allowance just now. Please try \
-                     again in a moment.",
-                );
-                match retry_after_secs {
-                    Some(secs) => err.with_retry_after(*secs),
-                    None => err,
-                }
-            }
+            ApiError::QuotaCheckUnavailable { retry_after_secs } => Self::transient(
+                "BirdoVPN couldn't check your plan's data allowance just now. Please try again \
+                 in a moment.",
+                *retry_after_secs,
+            ),
+            // MR-1639: retryable by nature too. The server rolled the peer back
+            // rather than install it without its pre-shared key; the SAME
+            // request (same Quantum Protection) succeeds once that temporary,
+            // server-side condition clears. Not `server_unavailable`: its
+            // advice, "try another location", cannot help — the condition
+            // holds for every relay at once.
+            ApiError::PskDeliveryUnavailable { retry_after_secs } => Self::transient(
+                "BirdoVPN couldn't set up a secure connection to this server just now. Please \
+                 try again in a moment.",
+                *retry_after_secs,
+            ),
             ApiError::Unknown(message) => Self::unknown(message),
         }
+    }
+
+    /// A refusal the server marked retryable, with the wait it asked for
+    /// (already clamped by `api::error::retry_after_secs`).
+    fn transient(message: &str, retry_after_secs: Option<u64>) -> Self {
+        let err = Self::new(IpcErrorCode::ServerError, message);
+        match retry_after_secs {
+            Some(secs) => err.with_retry_after(secs),
+            None => err,
+        }
+    }
+
+    /// How long the server asked this client to wait before sending the SAME
+    /// request again: `Some` only for a retryable `server_error` that carries
+    /// a wait, i.e. `quota_check_unavailable` and `psk_delivery_unavailable`
+    /// (MR-1639). Both dial paths honour it: auto-reconnect never re-dials
+    /// sooner (`ReconnectPolicy::decide`), and a connect retries its request
+    /// once after it (`session::attempt`).
+    pub fn server_asked_to_wait(&self) -> Option<std::time::Duration> {
+        if self.code != IpcErrorCode::ServerError || !self.retryable {
+            return None;
+        }
+        self.retry_after_secs.map(std::time::Duration::from_secs)
     }
 
     /// A non-2xx answer that carried the backend's own sentence. The status
@@ -428,6 +456,12 @@ mod tests {
                 },
                 IpcErrorCode::ServerError,
             ),
+            (
+                ApiError::PskDeliveryUnavailable {
+                    retry_after_secs: Some(30),
+                },
+                IpcErrorCode::ServerError,
+            ),
         ];
         // Cases are named by index, not by `{api:?}`: an ApiError can carry what a
         // user typed, and CodeQL reads formatting it as cleartext logging.
@@ -593,6 +627,164 @@ mod tests {
             IpcError::from_api(&other).code,
             IpcErrorCode::ServerUnavailable
         );
+    }
+
+    fn classify_503(body: &str) -> ApiError {
+        crate::api::BirdoApi::classify_error_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body,
+        )
+    }
+
+    /// MR-1639: birdo-web's `psk_delivery_unavailable`, byte for byte as
+    /// GlobalExceptionFilter writes it (vpn.controller.ts
+    /// `rethrowPskDeliveryRefusal`; PskOverSshRefusedError.RETRY_AFTER_SECONDS
+    /// = 30). It used to fall through to `Rejected { 503 }`, i.e.
+    /// `server_unavailable` — "try another location" — when the server says
+    /// "the same request, in 30 s".
+    #[test]
+    fn a_psk_delivery_refusal_is_retryable_with_its_wait() {
+        let body = r#"{"statusCode":503,"message":"We could not set up a secure connection to this server just now. Please try again in a moment.","error":"psk_delivery_unavailable","timestamp":"2026-10-13T09:00:00.000Z","path":"/api/v1/vpn/connect","requestId":"req-1","details":{"retryable":true,"retryAfterSeconds":30}}"#;
+        let api = classify_503(body);
+        assert!(matches!(
+            api,
+            ApiError::PskDeliveryUnavailable {
+                retry_after_secs: Some(30)
+            }
+        ));
+        let err = IpcError::from_api(&api);
+        assert_eq!(err.code, IpcErrorCode::ServerError);
+        assert!(err.retryable);
+        assert!(!err.code.is_hard_refusal());
+        assert_eq!(err.retry_after_secs, Some(30));
+        assert_eq!(
+            err.server_asked_to_wait(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert!(err.message.contains("secure connection"), "{}", err.message);
+        // Never read as a transport failure: no Adaptive Transport fallback
+        // (a different transport) can follow it.
+        assert_eq!(err.transport, None);
+        assert_eq!(crate::commands::vpn::transport_fallback_reason(&err), None);
+        // The wire shape the UI reads.
+        let wire = serde_json::to_value(&err).unwrap();
+        assert_eq!(wire["code"], "server_error");
+        assert_eq!(wire["retryable"], true);
+        assert_eq!(wire["retry_after_secs"], 30);
+
+        // Without `retryAfterSeconds` (or without `details`): still the same
+        // retryable refusal, just without a wait.
+        for bare in [
+            r#"{"statusCode":503,"message":"m","error":"psk_delivery_unavailable","details":{"retryable":true}}"#,
+            r#"{"statusCode":503,"message":"m","error":"psk_delivery_unavailable"}"#,
+            r#"{"error":"psk_delivery_unavailable","details":"not an object"}"#,
+        ] {
+            let api = classify_503(bare);
+            assert!(
+                matches!(
+                    api,
+                    ApiError::PskDeliveryUnavailable {
+                        retry_after_secs: None
+                    }
+                ),
+                "{bare}"
+            );
+            let err = IpcError::from_api(&api);
+            assert_eq!(err.code, IpcErrorCode::ServerError, "{bare}");
+            assert!(err.retryable, "{bare}");
+            assert_eq!(err.retry_after_secs, None, "{bare}");
+            assert_eq!(err.server_asked_to_wait(), None, "{bare}");
+        }
+    }
+
+    /// MR-1639: `retryAfterSeconds` is clamped to 1..=RETRY_AFTER_MAX_SECS, so
+    /// no single answer can park a connect or a re-dial, nor make one spin.
+    /// Anything that is not a non-negative number is no wait at all.
+    #[test]
+    fn the_server_wait_is_clamped() {
+        use crate::api::error::RETRY_AFTER_MAX_SECS;
+        let wait = |value: &str| {
+            let body = format!(
+                r#"{{"statusCode":503,"message":"m","error":"psk_delivery_unavailable","details":{{"retryable":true,"retryAfterSeconds":{value}}}}}"#
+            );
+            match classify_503(&body) {
+                ApiError::PskDeliveryUnavailable { retry_after_secs } => retry_after_secs,
+                other => panic!("{value}: {other:?}"),
+            }
+        };
+        assert_eq!(wait("30"), Some(30));
+        assert_eq!(wait("3600"), Some(RETRY_AFTER_MAX_SECS));
+        assert_eq!(wait("18446744073709551615"), Some(RETRY_AFTER_MAX_SECS));
+        assert_eq!(wait("1e300"), Some(RETRY_AFTER_MAX_SECS));
+        assert_eq!(wait("0"), Some(1));
+        assert_eq!(wait("12.2"), Some(13));
+        assert_eq!(wait("-5"), None);
+        assert_eq!(wait("\"30\""), None);
+        assert_eq!(wait("null"), None);
+        assert_eq!(wait("true"), None);
+        assert_eq!(RETRY_AFTER_MAX_SECS, 60);
+        // The allowance check is read through the same clamp.
+        assert!(matches!(
+            classify_503(
+                r#"{"error":"quota_check_unavailable","details":{"retryable":true,"retryAfterSeconds":86400}}"#
+            ),
+            ApiError::QuotaCheckUnavailable {
+                retry_after_secs: Some(RETRY_AFTER_MAX_SECS)
+            }
+        ));
+    }
+
+    /// MR-1639: a code this build does not know decodes to the generic
+    /// fallback — by status, keeping the server's sentence — and never fails
+    /// the decode, panics, or borrows a known code's handling (no wait, even
+    /// when its `details` look like one). A body that is not the envelope at
+    /// all falls back to the bare status.
+    #[test]
+    fn an_unknown_error_code_falls_back_by_status() {
+        let unknown = classify_503(
+            r#"{"statusCode":503,"message":"Something new is down.","error":"some_future_code","details":{"retryable":true,"retryAfterSeconds":30}}"#,
+        );
+        match &unknown {
+            ApiError::Rejected { status, message } => {
+                assert_eq!(*status, 503);
+                assert_eq!(message, "Something new is down.");
+            }
+            other => panic!("{other:?}"),
+        }
+        let err = IpcError::from_api(&unknown);
+        assert_eq!(err.code, IpcErrorCode::ServerUnavailable);
+        assert!(err.retryable);
+        assert_eq!(err.retry_after_secs, None);
+        assert_eq!(err.server_asked_to_wait(), None);
+
+        // The envelope's own default `error` (the status name) is not a code.
+        assert!(matches!(
+            classify_503(r#"{"statusCode":503,"message":"Down","error":"Service Unavailable"}"#),
+            ApiError::Rejected { status: 503, .. }
+        ));
+        // Wrong types, no message, not JSON, HTML from a proxy: bare status.
+        for body in [
+            r#"{"statusCode":503,"error":42,"message":"m"}"#,
+            r#"{"statusCode":503,"error":"some_future_code"}"#,
+            "<html>503 Service Temporarily Unavailable</html>",
+            "",
+        ] {
+            let api = classify_503(body);
+            assert!(matches!(api, ApiError::ServerError(503)), "{body}: {api:?}");
+            assert_eq!(
+                IpcError::from_api(&api).code,
+                IpcErrorCode::ServerUnavailable,
+                "{body}"
+            );
+        }
+        // Any other status: the same fallback, by that status.
+        assert!(matches!(
+            crate::api::BirdoApi::classify_error_response(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"statusCode":400,"message":"Bad thing","error":"some_future_code"}"#,
+            ),
+            ApiError::Rejected { status: 400, .. }
+        ));
     }
 
     #[test]
