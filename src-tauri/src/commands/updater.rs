@@ -303,6 +303,9 @@ async fn recover_from_failed_install(
 /// carries the download, nothing is attempted: the error is
 /// [`HELD_BY_KILL_SWITCH`] ([`download_route`]).
 ///
+/// MR-1861: the session it ends is recorded first, and the version it
+/// installs connects it again at its first start (`update_resume`).
+///
 /// Emits [`DOWNLOAD_PROGRESS_EVENT`] as bytes arrive. Returns `Ok(false)` if the
 /// re-check found nothing to install.
 #[tauri::command]
@@ -368,10 +371,17 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
         .current_info()
         .await
         .map(|info| ConnectTarget::of(&info));
+    // MR-1861: the version this installs puts that session back at its first
+    // start (`update_resume`); Windows exits inside `install` below.
+    if let Some(target) = &resume {
+        crate::commands::update_resume::record(target);
+    }
     end_session(&app, EndReason::Update).await;
 
     if let Err(e) = update.install(bundle) {
         tracing::warn!("Update install failed: {e}");
+        // Still this version, still running: nothing for a next start to resume.
+        crate::commands::update_resume::discard();
         return Err(recover_from_failed_install(&app, resume, e.to_string()).await);
     }
 

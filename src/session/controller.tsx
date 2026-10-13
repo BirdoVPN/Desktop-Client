@@ -30,7 +30,12 @@ import {
   loadSubscription,
   resetSessionData,
 } from '@/session/session-data';
-import { connectPreferred, findLiveServer } from '@/session/vpn-actions';
+import {
+  connectPreferred,
+  findLiveServer,
+  resumeAfterUpdate,
+  takeUpdateResume,
+} from '@/session/vpn-actions';
 import {
   forgetKillSwitchChoices,
   persistSettings,
@@ -209,9 +214,21 @@ function useSessionData(): void {
  * can connect to the user's own server rather than whatever sorts first, and a
  * ref — not the mount — is what makes it once: this component outlives tab
  * switches, the lock and the wall, and the ref outlives StrictMode's re-run.
+ *
+ * The first start after an update puts back the session the update ended,
+ * Auto-Connect on or off (MR-1861): the installer closed the app under a
+ * protected user, who used to come back disconnected. Rust hands that session
+ * out once — first start of a new version, connected when the update began,
+ * within the hour (`commands::update_resume`) — and it takes Auto-Connect's
+ * place for this run. Asked here because this controller only exists signed
+ * in and past consent: it never signs anyone in. Asked behind the same gates
+ * as Auto-Connect (review of #276, L2): a user who connects or disconnects
+ * before the list settles — or while Rust answers — has made the choice.
  */
 function useAutoConnectOnce(): void {
   const done = useRef(false);
+  // Any change of state since mount, including one while Rust answers below.
+  const moved = useRef(false);
   const hydrated = useAppStore((s) => s.settingsHydrated);
   const serversSettled = useAppStore(
     (s) => s.serversStatus === 'ready' || s.serversStatus === 'error',
@@ -224,17 +241,26 @@ function useAutoConnectOnce(): void {
   useEffect(
     () =>
       useAppStore.subscribe((next, prev) => {
-        if (next.connectionState !== prev.connectionState) done.current = true;
+        if (next.connectionState !== prev.connectionState) {
+          done.current = true;
+          moved.current = true;
+        }
       }),
     [],
   );
   useEffect(() => {
     if (done.current || !hydrated || !serversSettled) return;
     done.current = true;
-    const s = useAppStore.getState();
-    if (!s.settings.autoConnect) return;
-    if (selectTunnelActive(s)) return;
-    void connectPreferred();
+    void (async () => {
+      const resume = await takeUpdateResume();
+      const s = useAppStore.getState();
+      if (moved.current || selectTunnelActive(s)) return;
+      if (resume) {
+        void resumeAfterUpdate(resume);
+        return;
+      }
+      if (s.settings.autoConnect) void connectPreferred();
+    })();
   }, [hydrated, serversSettled]);
 }
 
