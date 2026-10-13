@@ -4,7 +4,8 @@
  *
  * Sections in the canonical order (P1-parity "Settings names and help text"):
  * Appearance (window position) · Privacy & Security (Kill Switch, Always-on
- * Kill Switch, Quantum Protection, Hide App Contents, Crash Reports) ·
+ * Kill Switch, Quantum Protection, Hide App Contents, Crash Reports, Save
+ * Diagnostic Logs, Delete Logs Now) ·
  * Connection (Auto-Connect, Launch at Login, Start Minimized) · Notifications ·
  * VPN (VPN Settings, Custom DNS Servers, Port Forwarding) · Speed Test · About.
  * Every row says what it does and when it applies (W2-029).
@@ -40,12 +41,15 @@ import {
   ArrowDownRight,
   Move,
   Bug,
+  ScrollText,
+  Trash2,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import { isMacPlatform, isPrivateDnsAddress, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
 import {
   BirdoCard,
   BirdoSectionHeader,
+  BirdoListItem,
   BirdoToggleRow,
   BirdoNavRow,
   BirdoTextField,
@@ -60,7 +64,8 @@ import { persistSettings, setKillSwitch, showSaveFailure } from '@/session/setti
 import { loadAppVersion, useUpdater } from '@/session/updater';
 import { DASHBOARD_URL, PRIVACY_URL, TERMS_URL } from '@/lib/links';
 import { customDnsAvailable } from '@/lib/plan';
-import type { WindowCorner } from '@/store/app-store';
+import { parseDeleteLogsResult, type DeleteLogsResult } from '@/lib/ipc';
+import type { Notice, WindowCorner } from '@/store/app-store';
 
 
 /** Shape returned by the Rust `check_biometric_available` command. */
@@ -106,6 +111,46 @@ export const MACOS_IPV6_NOTE =
   "On macOS, IPv6 is blocked while you're connected, so your real address can't leak over it. " +
   "Sites that only work over IPv6 won't load until you disconnect.";
 
+/**
+ * MR-808: the diagnostic log kept on this device (`birdo.log` and the crash
+ * files, `utils::file_log` in Rust). What it holds, how long, that the app
+ * never sends it, and what "off" does and does not do. Applied live, so no
+ * restart note.
+ */
+export const FILE_LOGGING_COPY =
+  'Keeps a log of connection events, errors and crashes on this device, trimmed to the last ' +
+  '7 days each time the app starts. The app never sends it. Turning this off stops new ' +
+  'entries but does not delete existing logs.';
+
+export const DELETE_LOGS_COPY = 'Deletes the diagnostic log and crash files from this device.';
+
+export const DELETE_LOGS_CONFIRM_BODY =
+  "This deletes the diagnostic log and crash files on this device. It can't be undone.";
+
+/** Added to the confirmation while the log is on: the next entry starts a new file. */
+export const DELETE_LOGS_STILL_ON_NOTE = ' While Save Diagnostic Logs is on, new entries start a new log.';
+
+export const DELETE_LOGS_FAILED_COPY = "Couldn't delete the logs. Please try again.";
+
+const files = (n: number) => `${n} log file${n === 1 ? '' : 's'}`;
+
+/**
+ * What the notice says after `delete_logs` answered (MR-808). A failure
+ * names no cause: Rust counts a file another program holds, one it may not
+ * delete and a link where a folder should be alike.
+ */
+export function deleteLogsNotice(result: DeleteLogsResult): Omit<Notice, 'id'> {
+  if (result.failed > 0) {
+    const done = result.deleted > 0 ? `Deleted ${files(result.deleted)}, but ` : '';
+    return {
+      text: `${done}${files(result.failed)} couldn't be deleted. Please try again.`,
+      tone: 'danger',
+    };
+  }
+  if (result.deleted === 0) return { text: 'There were no logs to delete.', tone: 'info' };
+  return { text: `Deleted ${files(result.deleted)}.`, tone: 'info' };
+}
+
 export function Settings() {
   const { settings, windowCorner, setWindowCorner, pushRoute, connected, customDnsOffered } = useAppStore(
     useShallow((s) => ({
@@ -125,6 +170,24 @@ export function Settings() {
   // Disabling the kill switch removes leak protection — gate it behind an
   // explicit confirmation (mobile parity). Enabling stays immediate.
   const [showKsConfirm, setShowKsConfirm] = useState(false);
+
+  // "Delete Logs Now" asks first: it cannot be undone (MR-808).
+  const [showDeleteLogs, setShowDeleteLogs] = useState(false);
+  const [deletingLogs, setDeletingLogs] = useState(false);
+  const deleteLogs = useCallback(async () => {
+    setDeletingLogs(true);
+    let notice: Omit<Notice, 'id'>;
+    try {
+      const result = parseDeleteLogsResult(await invoke('delete_logs'));
+      notice = result ? deleteLogsNotice(result) : { text: DELETE_LOGS_FAILED_COPY, tone: 'danger' };
+    } catch {
+      notice = { text: DELETE_LOGS_FAILED_COPY, tone: 'danger' };
+    } finally {
+      setDeletingLogs(false);
+      setShowDeleteLogs(false);
+    }
+    useAppStore.getState().showNotice(notice);
+  }, []);
 
   // ── Speed test (on-device, through the tunnel via Rust) ───────────────────
   const [speedTestRunning, setSpeedTestRunning] = useState(false);
@@ -362,6 +425,26 @@ export function Settings() {
               checked={settings.crashReportsEnabled}
               onCheckedChange={handleCrashReports}
             />
+            {/* MR-808: the log kept on this device, which Crash Reports above
+                (network, opt-in) is not. Saved like any setting and applied
+                live by Rust, in both directions. */}
+            <BirdoToggleRow
+              title="Save Diagnostic Logs"
+              subtitle={FILE_LOGGING_COPY}
+              subtitleWrap
+              leadingIcon={ScrollText}
+              leadingTint={white.w60}
+              checked={settings.fileLoggingEnabled}
+              onCheckedChange={(v) => void persistSettings({ fileLoggingEnabled: v })}
+            />
+            <BirdoListItem
+              title="Delete Logs Now"
+              subtitle={DELETE_LOGS_COPY}
+              subtitleWrap
+              leadingIcon={Trash2}
+              leadingTint={white.w60}
+              onClick={() => setShowDeleteLogs(true)}
+            />
           </BirdoCard>
 
           {/* ── CONNECTION ─────────────────────────────────────────────── */}
@@ -569,6 +652,35 @@ export function Settings() {
               setShowKsConfirm(false);
               void setKillSwitch(false);
             }}
+          />
+        </div>
+      </BirdoDialog>
+
+      <BirdoDialog
+        open={showDeleteLogs}
+        onClose={() => setShowDeleteLogs(false)}
+        title="Delete logs?"
+        icon={Trash2}
+        iconColor={statusTokens.red}
+        busy={deletingLogs}
+      >
+        <p className="text-[13px]" style={{ color: white.w60 }}>
+          {DELETE_LOGS_CONFIRM_BODY + (settings.fileLoggingEnabled ? DELETE_LOGS_STILL_ON_NOTE : '')}
+        </p>
+        <div className="flex gap-2.5">
+          <BirdoButton
+            text="Cancel"
+            variant="secondary"
+            fullWidth
+            disabled={deletingLogs}
+            onClick={() => setShowDeleteLogs(false)}
+          />
+          <BirdoButton
+            text="Delete"
+            variant="danger"
+            fullWidth
+            isLoading={deletingLogs}
+            onClick={() => void deleteLogs()}
           />
         </div>
       </BirdoDialog>

@@ -54,6 +54,7 @@ describe('useAppStore', () => {
         dnsFiltering: false,
         lockdownMode: true,
         crashReportsEnabled: false,
+        fileLoggingEnabled: true,
       },
       acceptedConsentVersion: 0,
       isOnline: true,

@@ -124,6 +124,20 @@ describe('crash reports (C-3) crash_reports_enabled ↔ crashReportsEnabled', ()
   });
 });
 
+describe('on-device log (MR-808) file_logging_enabled ↔ fileLoggingEnabled', () => {
+  it('defaults ON when the key is absent — Rust omits it while true, and no earlier file has it', () => {
+    expect('file_logging_enabled' in base).toBe(false);
+    expect(settingsFromRust(base).fileLoggingEnabled).toBe(true);
+  });
+
+  it('maps an explicit false, and settingsToRust always writes the key so a full save cannot switch it back on', () => {
+    const off = settingsFromRust({ ...base, file_logging_enabled: false });
+    expect(off.fileLoggingEnabled).toBe(false);
+    expect(settingsToRust(off).file_logging_enabled).toBe(false);
+    expect(settingsToRust(settingsFromRust(base)).file_logging_enabled).toBe(true);
+  });
+});
+
 // friendlyVpnError (substring-matching free text) is gone: errors are mapped by
 // their v2 code in lib/errors.ts (W2-012), tested in lib/errors.test.ts.
 
