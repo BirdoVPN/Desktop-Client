@@ -621,8 +621,6 @@ connect_addr() {
   case "$1" in
     birdo.app)          echo "api.birdo.app:443" ;;
     cloudflare-dns.com) echo "1.1.1.1:443" ;;
-    dns.google)         echo "8.8.8.8:443" ;;
-    dns.quad9.net)      echo "9.9.9.9:443" ;;
     *)                  echo "$1:443" ;;
   esac
 }

@@ -61,6 +61,7 @@ on:
     paths:
       - 'third_party/cert-pins.json'
       - 'third_party/cert-pins.provenance.json'
+      - 'third_party/retired-dns-google.json'
       - 'scripts/check-cert-pins.sh'
       - 'scripts/cert_pins_lineages.py'
       - 'scripts/cert_pins_live_chain.py'

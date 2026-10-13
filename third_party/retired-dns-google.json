@@ -1,0 +1,127 @@
+{
+  "_comment": "dns.google exactly as cert-pins.json carried it until 2026-10-01, when the desktop control-plane DoH became Cloudflare-only (owner decision) and the host was retired from the SSOT. Kept as a frozen fixture because it is the only real two-hierarchy host the estate ever measured, and test_check_cert_pins.py's E2/E3/E4/S5 cases are built on its shape (PRE_OUTAGE above all). Test data only, never enforced by any client. A consumer that copies it for its own checker's tests (Desktop-Client keeps a byte-identical copy at third_party/retired-dns-google.json) copies a frozen fixture, not a pin set.",
+  "host": {
+    "include_subdomains": false,
+    "note": "DoH resolver, desktop only. Android dropped this provider (P6-CLI-A-06). TWO HIERARCHIES, NOT ONE: Google Trust Services serves dns.google out of both an RSA hierarchy (leaf -> WR2 -> GTS Root R1) and an ECDSA one (leaf -> WE2 -> GTS Root R4), and which one a client gets depends on the anycast edge it reaches and on the signature algorithms it offers (_selection_rule). Measured 2026-09-06 over 8.8.8.8 and 8.8.4.4: a UK consumer ISP got WR2 / R1 on every sample and every offer; the production hub got WE2 / R4 for default and ECDSA-only offers and WR2 / R1 for RSA-only; Azure centralus got WE2 / R4 and FAILED against the old set. Re-measured 2026-09-08 23:26Z from the same two networks: identical - the hub is still an R4 edge for a default or ECDSA-only client (4 of 4) and an R1 edge for an RSA-only one (2 of 2), the UK ISP is still an R1 edge under every offer (6 of 6). Until 2026-09-06 only the RSA lineage was pinned, so every user reaching an R4 edge got a hard pin failure and dns.google silently dropped out of the DoH pool. Both MEASURED lineages are now pinned - four pins, the intermediate and root of each - and nothing else: the sibling issuing CAs Google publishes (WR1/WR3/WR4, WE1/WE3/WE4) have never been seen serving this host and are recorded in _removed as never shipped. Read _security_note before changing this list in either direction.",
+    "_security_note": "WHAT THIS PIN SET BUYS AND WHAT IT COSTS, stated because a posture change in a security file must not be silent. Pinning GTS Root R1 and GTS Root R4 means: any certificate for dns.google issued anywhere under either Google root is accepted. That is close to plain WebPKI for this host, and it is the availability trade the outage forced - a narrower set went dark for a whole population with no remote recovery path. The two ROOTS are what widen acceptance, and both are presented in a measured live chain, so they are not optional. Sibling intermediates under those roots would add NO acceptance surface (a chain through WR3 is accepted by the R1 pin anyway); they would only matter if Google started sending a SHORTENED chain (leaf + intermediate, no root), which it has never been observed to do for this host. The owner decided on 2026-09-06 NOT to pin them: under _rotation_rule a pin is effectively permanent and transcribed into every client, and a pin nobody has measured is a guess. If a shortened chain or a sibling intermediate is ever measured for this host, add THAT pin with its measurement. This is the only host here with two live lineages; do not copy its four-pin shape to a provider you have not measured serving two hierarchies.",
+    "chain_shape": {
+      "presented": [
+        "leaf",
+        "WR2 | WE2",
+        "GTS Root R1 | GTS Root R4"
+      ],
+      "root_presented": true,
+      "measured": "2026-09-08",
+      "vantages": [
+        "UK consumer ISP, 2026-09-06 20:36Z: 8.8.8.8 and 8.8.4.4, 14/14 samples (5 default + RSA-only + ECDSA-only per address) -> WR2 / GTS Root R1",
+        "Production hub, 2026-09-06 20:38Z: 8.8.8.8 and 8.8.4.4, default and ECDSA-only offers 12/12 -> WE2 / GTS Root R4; RSA-only offer 2/2 -> leaf *.google.com, WR2 / GTS Root R1",
+        "GitHub Actions ubuntu-24.04, Azure northcentralus, 10:53Z (Mobile-Client run 34028683100) -> WR2 / GTS Root R1",
+        "GitHub Actions ubuntu-24.04, Azure centralus, 10:54Z (Desktop-Client run 34028720220) -> WE2 / GTS Root R4, chain hashes quoted in the log",
+        "GitHub Actions ubuntu-24.04, Azure westus2, 21:03Z (this repository's live job, run 34059860524): default and RSA-only offers -> WR2 / GTS Root R1, chains printed in the log",
+        "UK consumer ISP, 2026-09-08 23:26Z: 8.8.8.8 and 8.8.4.4, default, RSA-only and ECDSA-only offers, 6/6 -> WR2 / GTS Root R1 (RSA-only: leaf *.google.com)",
+        "Production hub, 2026-09-08 23:26Z: 8.8.8.8 and 8.8.4.4, default and ECDSA-only offers 4/4 -> WE2 / GTS Root R4; RSA-only offer 2/2 -> leaf *.google.com, WR2 / GTS Root R1 - the 2026-09-06 result reproduced two days later",
+        "GitHub Actions ubuntu-24.04, Azure westus, 2026-09-08 23:39Z (this repository's live job on this PR, run 34291599337): default and RSA-only offers -> WR2 / GTS Root R1 (an R1 edge; adds nothing to the R4 story)",
+        "NOT measured: the VPN nodes - their sshd was unreachable from the measuring workstation on 2026-09-06"
+      ]
+    },
+    "enforced_by": [
+      "birdo-client-desktop:src-tauri/src/vpn/doh.rs"
+    ],
+    "pins": [
+      {
+        "hash": "YPtHaftLw6/0vnc2BnNKGF54xiCA28WFcccjkA4ypCM=",
+        "label": "WR2 - Google Trust Services issuing intermediate, GTS Root R1 hierarchy (presented)",
+        "role": "active-intermediate",
+        "lineage": "gts-r1",
+        "lineage_evidence": "measured",
+        "in_live_chain": true,
+        "_verification": "2026-09-06 measured in the live dns.google chain from a UK consumer ISP (8.8.8.8 and 8.8.4.4, 14 of 14 samples across default, RSA-only and ECDSA-only client offers, chain leaf -> WR2 -> GTS Root R1), from the production hub under an RSA-only offer (2 of 2, chain leaf *.google.com -> WR2 -> GTS Root R1) and from GitHub Actions in Azure northcentralus (Mobile-Client run 34028683100), AND independently against https://i.pki.goog/wr2.crt, whose issuer is CN=GTS Root R1. Re-measured 2026-09-08 23:26Z: UK ISP 6 of 6 (both addresses, three offers), production hub RSA-only offer 2 of 2.",
+        "_note": "DO NOT TRIM THIS SET BACK to 'the chain I just measured'. That edit is what caused the outage: a liveness probe from one network sees ONE lineage and goes green as soon as any single pin matches, so it cannot tell you the other lineage is missing, and there is no remote kill switch for a bricked pin (_rotation_rule). Both lineages here were measured live on the same day from different networks; rule E3 fails this file if either is ever dropped without a dated waiver."
+      },
+      {
+        "hash": "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",
+        "label": "GTS Root R1 - trust anchor of the RSA hierarchy (presented)",
+        "role": "active-root",
+        "lineage": "gts-r1",
+        "lineage_evidence": "measured",
+        "in_live_chain": true,
+        "_verification": "2026-09-06 measured in those same live chains (UK consumer ISP 14/14; production hub RSA-only offer 2/2; Azure northcentralus, Mobile-Client run 34028683100) AND independently against https://i.pki.goog/r1.crt. Re-measured 2026-09-08 23:26Z in those same chains (UK ISP 6/6; hub RSA-only 2/2)."
+      },
+      {
+        "hash": "vh78KSg1Ry4NaqGDV10w/cTb9VH3BQUZoCWNa93W/EY=",
+        "label": "WE2 - Google Trust Services issuing intermediate, GTS Root R4 hierarchy (presented)",
+        "role": "active-intermediate",
+        "lineage": "gts-r4",
+        "lineage_evidence": "measured",
+        "in_live_chain": true,
+        "_verification": "2026-09-06 measured in the live dns.google chain from the production hub (8.8.8.8 and 8.8.4.4, 12 of 12 samples across default and ECDSA-only client offers, 20:38Z, chain leaf -> WE2 -> GTS Root R4) and from GitHub Actions ubuntu-24.04 in Azure centralus (Desktop-Client Cert Pins run 34028720220, 10:54Z - the run that failed and exposed this; its log quotes the chain wyib/Zb8Q... vh78KSg1... mEflZT5e...). Also fetched from https://i.pki.goog/we2.crt. Re-measured 2026-09-08 23:26Z from the production hub: 4 of 4 (default and ECDSA-only offers, 8.8.8.8 and 8.8.4.4) -> leaf -> WE2 -> GTS Root R4 - the 2026-09-06 result reproduced two days later.",
+        "_note": "The certificate published at i.pki.goog/we2.crt is the GlobalSign ECC Root CA - R4 CROSS-SIGN (its issuer field says GlobalSign, not GTS); the certificate actually served in the measured chain is issued by GTS Root R4. Same subject public key, so this one hash covers both - but they are different certificates and the published one's issuer must not be recorded as the live hierarchy."
+      },
+      {
+        "hash": "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
+        "label": "GTS Root R4 - trust anchor of the ECDSA hierarchy (presented)",
+        "role": "active-root",
+        "lineage": "gts-r4",
+        "lineage_evidence": "measured",
+        "in_live_chain": true,
+        "_verification": "2026-09-06 measured in those same live chains (production hub 12/12; Azure centralus, Desktop-Client run 34028720220) AND independently against https://i.pki.goog/r4.crt. Same value already pinned for birdo.app, where it is the live anchor too. Re-measured 2026-09-08 23:26Z from the hub in those same chains, 4 of 4."
+      }
+    ]
+  },
+  "_removed": [
+    {
+      "hash": "yDu9og255NN5GEf+Bwa9rTrqFQ0EydZ0r1FCh9TdAW4=",
+      "host": "dns.google",
+      "was_labelled": "WR1 - Google Trust Services sibling issuing intermediate, GTS Root R1 hierarchy",
+      "was_in": "birdo-shared PR #3 branch only (commits c526aed and 5515868, 2026-09-06), and Desktop-Client PR #125's vendored copy of it; never on main and never in a shipped client",
+      "removed": "2026-09-06",
+      "never_shipped": true,
+      "reason": "Never measured serving dns.google. Pinned speculatively for a few hours as 'enumerate the CA's published issuing set'; removed by owner decision - pin only lineages measured live (_selection_rule). Removing it cannot brick anything because no shipped client ever carried it. Re-adding it requires a measured dns.google chain and the vantage that saw it. Scoped to dns.google: rule S5 fails this file if it reappears in that host's set without an explicit un-retirement."
+    },
+    {
+      "hash": "OdSlmQD9NWJh4EbcOHBxkhygPwNSwA9Q91eounfbcoE=",
+      "host": "dns.google",
+      "was_labelled": "WR3 - Google Trust Services sibling issuing intermediate, GTS Root R1 hierarchy",
+      "was_in": "birdo-shared PR #3 branch only (commits c526aed and 5515868, 2026-09-06), and Desktop-Client PR #125's vendored copy of it; never on main and never in a shipped client",
+      "removed": "2026-09-06",
+      "never_shipped": true,
+      "reason": "Never measured serving dns.google. Pinned speculatively for a few hours as 'enumerate the CA's published issuing set'; removed by owner decision - pin only lineages measured live (_selection_rule). Removing it cannot brick anything because no shipped client ever carried it. Re-adding it requires a measured dns.google chain and the vantage that saw it. Scoped to dns.google: rule S5 fails this file if it reappears in that host's set without an explicit un-retirement."
+    },
+    {
+      "hash": "hZe1OerqJ1Pnq6F4N0gVjjpHqm037Ndf4aLLVpZZdAE=",
+      "host": "dns.google",
+      "was_labelled": "WR4 - Google Trust Services sibling issuing intermediate, GTS Root R1 hierarchy",
+      "was_in": "birdo-shared PR #3 branch only (commits c526aed and 5515868, 2026-09-06), and Desktop-Client PR #125's vendored copy of it; never on main and never in a shipped client",
+      "removed": "2026-09-06",
+      "never_shipped": true,
+      "reason": "Never measured serving dns.google. Pinned speculatively for a few hours as 'enumerate the CA's published issuing set'; removed by owner decision - pin only lineages measured live (_selection_rule). Removing it cannot brick anything because no shipped client ever carried it. Re-adding it requires a measured dns.google chain and the vantage that saw it. Scoped to dns.google: rule S5 fails this file if it reappears in that host's set without an explicit un-retirement."
+    },
+    {
+      "hash": "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
+      "host": "dns.google",
+      "was_labelled": "WE1 - Google Trust Services sibling issuing intermediate, GTS Root R4 hierarchy (still live-pinned for birdo.app, where it IS measured)",
+      "was_in": "birdo-shared PR #3 branch only (commits c526aed and 5515868, 2026-09-06), and Desktop-Client PR #125's vendored copy of it; never on main and never in a shipped client",
+      "removed": "2026-09-06",
+      "never_shipped": true,
+      "reason": "Never measured serving dns.google. Pinned speculatively for a few hours as 'enumerate the CA's published issuing set'; removed by owner decision - pin only lineages measured live (_selection_rule). Removing it cannot brick anything because no shipped client ever carried it. Re-adding it requires a measured dns.google chain and the vantage that saw it. Scoped to dns.google: rule S5 fails this file if it reappears in that host's set without an explicit un-retirement."
+    },
+    {
+      "hash": "daBIAnKdRIX3bqM85I6We7wBUh0DPycNFBMvYkXGX2Q=",
+      "host": "dns.google",
+      "was_labelled": "WE3 - Google Trust Services sibling issuing intermediate, GTS Root R4 hierarchy",
+      "was_in": "birdo-shared PR #3 branch only (commits c526aed and 5515868, 2026-09-06), and Desktop-Client PR #125's vendored copy of it; never on main and never in a shipped client",
+      "removed": "2026-09-06",
+      "never_shipped": true,
+      "reason": "Never measured serving dns.google. Pinned speculatively for a few hours as 'enumerate the CA's published issuing set'; removed by owner decision - pin only lineages measured live (_selection_rule). Removing it cannot brick anything because no shipped client ever carried it. Re-adding it requires a measured dns.google chain and the vantage that saw it. Scoped to dns.google: rule S5 fails this file if it reappears in that host's set without an explicit un-retirement."
+    },
+    {
+      "hash": "O5TQDB/wa4SkRjBrQL2Aq9CG317H9MDDgpTVcrpJDa4=",
+      "host": "dns.google",
+      "was_labelled": "WE4 - Google Trust Services sibling issuing intermediate, GTS Root R4 hierarchy",
+      "was_in": "birdo-shared PR #3 branch only (commits c526aed and 5515868, 2026-09-06), and Desktop-Client PR #125's vendored copy of it; never on main and never in a shipped client",
+      "removed": "2026-09-06",
+      "never_shipped": true,
+      "reason": "Never measured serving dns.google. Pinned speculatively for a few hours as 'enumerate the CA's published issuing set'; removed by owner decision - pin only lineages measured live (_selection_rule). Removing it cannot brick anything because no shipped client ever carried it. Re-adding it requires a measured dns.google chain and the vantage that saw it. Scoped to dns.google: rule S5 fails this file if it reappears in that host's set without an explicit un-retirement."
+    }
+  ]
+}
