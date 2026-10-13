@@ -246,7 +246,7 @@ wintun = "0.5"
 
 # Registry read for enumerating installed apps (split-tunnel picker). Simple,
 # pure-Rust wrapper over windows-sys; builds on the pinned 1.96 toolchain.
-winreg = "0.52"
+winreg = "0.55"
 
 # Real Windows Credential Manager (wincred) instead of keyring's mock backend.
 keyring = { version = "3.2", features = ["windows-native"] }
