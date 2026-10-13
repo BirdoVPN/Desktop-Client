@@ -120,6 +120,13 @@ struct AttemptContext {
     /// (round 6 of the review of #222): an OFF the user made during the dial
     /// makes that arm stand aside (`killswitch::arm_since`).
     intent_seen: u64,
+    /// The Stealth Mode the latest attempt asked for: `settings.stealth_mode`
+    /// from the settings in force for it, recorded by `attempt` before it can
+    /// fail. Those are the defaults (stealth OFF) when the file could not be
+    /// read (`vpn::settings_in_force`). The Adaptive Transport retry is
+    /// decided from this, never from a second read of the file
+    /// (`fallback_reason_for`).
+    stealth_mode: bool,
 }
 
 impl AttemptContext {
@@ -260,6 +267,8 @@ pub(crate) async fn connect_session_for(
         #[cfg(target_os = "windows")]
         old_relay: crate::vpn::wfp::current_relay(),
         intent_seen,
+        // `attempt` records what it asks for before anything can fail.
+        stealth_mode: false,
     };
     let (first_transport, adaptive) = match purpose {
         ConnectPurpose::User => (None, true),
@@ -274,7 +283,7 @@ pub(crate) async fn connect_session_for(
     // local Xray proxy, whose failures do not classify as transport-shaped.
     // Not for a settings reapply (see `ConnectPurpose`).
     if let Some(direct) = result.as_ref().err().filter(|_| adaptive) {
-        if let Some(reason) = fallback_reason_for(app, &target, direct).await {
+        if let Some(reason) = fallback_reason_for(&target, direct, ctx.stealth_mode) {
             tracing::warn!(
                 "Adaptive Transport: direct WireGuard failed ({reason}) — rebuilding over the \
                  stealth transport"
@@ -330,10 +339,12 @@ async fn release_rebuild_block(engaged: bool) {
 }
 
 /// `Some(reason)` when a failed direct attempt warrants the stealth retry.
-async fn fallback_reason_for(
-    app: &AppHandle,
+/// `attempted_stealth`: the Stealth Mode the failed attempt asked for
+/// ([`AttemptContext::stealth_mode`]).
+fn fallback_reason_for(
     target: &ConnectTarget,
     error: &IpcError,
+    attempted_stealth: bool,
 ) -> Option<&'static str> {
     // The Multi-Hop connect contract has no `fallbackReason`: Multi-Hop asks
     // for stealth up front through the same grant (mirrors Android).
@@ -343,11 +354,11 @@ async fn fallback_reason_for(
     let reason = transport_fallback_reason(error)?;
     // Respect an explicit transport choice: with Stealth Mode forced ON the
     // failed attempt WAS the stealth transport, and it is the last we have.
-    let forced_stealth = crate::commands::settings::load_settings_off_runtime(app)
-        .await
-        .map(|s| s.stealth_mode)
-        .unwrap_or(false);
-    (!forced_stealth).then_some(reason)
+    // Decided by what that attempt asked for, not by reading settings.json
+    // again: when the attempt's own read failed (an antivirus lock), it went
+    // out direct on the defaults, and a second read that then succeeded with
+    // stealth ON suppressed the one retry that would have used it.
+    (!attempted_stealth).then_some(reason)
 }
 
 /// One full connect attempt: API → stealth/PQ → tunnel → commit.
@@ -363,6 +374,9 @@ async fn attempt(
 
     let device_name = get_device_name();
     let settings = apply_vpn_settings(app).await;
+    // What this attempt asks for, for the Adaptive Transport decision should
+    // it fail (`fallback_reason_for`).
+    ctx.stealth_mode = settings.stealth_mode;
 
     // AUDIT-C1: with PQ requested, attach our ML-KEM-1024 public key so the
     // server can encapsulate against it.
@@ -1309,7 +1323,7 @@ mod lifecycle_tests {
                 "ConnectPurpose::SettingsReapply { fallback_reason } => (fallback_reason, false)",
                 "attempt(app, &target, first_transport, &mut ctx)",
                 ".filter(|_| adaptive)",
-                "fallback_reason_for(app, &target, direct)",
+                "fallback_reason_for(&target, direct, ctx.stealth_mode)",
             ],
         );
         order(
@@ -1319,6 +1333,68 @@ mod lifecycle_tests {
                 "ar.store_connected_settings(settings.snapshot)",
                 "ar.store_last_config(",
             ],
+        );
+    }
+
+    /// The Adaptive Transport retry follows what the failed attempt asked
+    /// for, not a second read of settings.json. An antivirus lock failed the
+    /// attempt's own read, so it went out direct on the defaults (stealth
+    /// OFF, `vpn::settings_in_force`); by the time it failed, the file read
+    /// again with Stealth Mode ON. That second read suppressed the retry and
+    /// the connect failed; the retry over Xray now goes ahead.
+    #[test]
+    fn the_stealth_retry_follows_what_the_failed_attempt_asked_for() {
+        use super::{fallback_reason_for, AttemptContext, ConnectTarget};
+        use crate::commands::ipc_error::IpcError;
+        use crate::commands::settings::AppSettings;
+        use crate::commands::vpn::FALLBACK_HANDSHAKE_TIMEOUT;
+
+        // The settings in force for an attempt whose read failed: the
+        // defaults, which is what `attempt` records.
+        let ctx = AttemptContext {
+            epoch: 1,
+            was_live: false,
+            block_engaged: false,
+            old_stealth_mark: None,
+            #[cfg(target_os = "windows")]
+            old_relay: None,
+            intent_seen: 0,
+            stealth_mode: AppSettings::default().stealth_mode,
+        };
+        assert!(!ctx.stealth_mode, "the attempt went out direct");
+
+        let single_hop = ConnectTarget::SingleHop {
+            server_id: "node-1".into(),
+        };
+        let unanswered = IpcError::from_tunnel_failure(&format!(
+            "Failed to start tunnel: Handshake failed after 3 attempts: {}",
+            crate::vpn::ERR_HANDSHAKE_NO_RESPONSE
+        ));
+        assert_eq!(
+            fallback_reason_for(&single_hop, &unanswered, ctx.stealth_mode),
+            Some(FALLBACK_HANDSHAKE_TIMEOUT),
+            "the retry over Xray goes ahead, whatever the file says now"
+        );
+        // An attempt that asked for stealth WAS the stealth transport.
+        assert_eq!(fallback_reason_for(&single_hop, &unanswered, true), None);
+        let multi_hop = ConnectTarget::MultiHop {
+            entry_id: "a".into(),
+            exit_id: "b".into(),
+        };
+        assert_eq!(fallback_reason_for(&multi_hop, &unanswered, false), None);
+
+        // Nothing reads the file again, and the attempt records what it asks
+        // for before it can fail.
+        assert!(!body("fn fallback_reason_for(").contains("load_settings"));
+        let attempt = body("async fn attempt(");
+        let recorded = attempt
+            .find("ctx.stealth_mode = settings.stealth_mode;")
+            .expect("the attempt records its Stealth Mode");
+        let before = &attempt[..recorded];
+        assert!(before.contains("let settings = apply_vpn_settings(app).await;"));
+        assert!(
+            !before.contains(")?") && !before.contains("return "),
+            "recorded before the attempt can fail"
         );
     }
 
@@ -1582,6 +1658,7 @@ mod lifecycle_tests {
             old_stealth_mark: Some(xray.ended_count()),
             old_relay: None,
             intent_seen: 0,
+            stealth_mode: true,
         };
 
         // Refused before XrayManager::start: the old transport is untouched.
