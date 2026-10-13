@@ -1830,9 +1830,9 @@ mod handshake_tests {
     async fn a_session_without_keys(
         want: usize,
     ) -> (WireGuardSession, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
-        let server_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let server_secret = crate::utils::os_rng::x25519_static_secret();
         let server_public = PublicKey::from(&server_secret);
-        let client_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let client_secret = crate::utils::os_rng::x25519_static_secret();
         let client_key = client_secret.to_bytes();
         let tunn = Tunn::new(
             server_secret,
