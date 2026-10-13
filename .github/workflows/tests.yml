@@ -258,9 +258,11 @@ jobs:
           # dns_journal_restore_tests (restore_services_pass,
           # interpret_dns_query, dns_write_verified). Both: log_retention::tests,
           # whose owner-only (0600) log-file test is #[cfg(unix)], so the
-          # Windows job compiles it out. Space-separated: libtest
+          # Windows job compiles it out; and file_log::tests, whose symlinked
+          # log and symlinked log-directory tests (MR-808) are #[cfg(unix)]
+          # for the same reason. Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests log_retention::tests' || 'resolv_conf_restore_tests tun_read_tests log_retention::tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests log_retention::tests file_log::tests' || 'resolv_conf_restore_tests tun_read_tests log_retention::tests file_log::tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -

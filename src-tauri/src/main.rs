@@ -105,6 +105,11 @@ const RECONCILE_AND_EXIT: &str = "--reconcile-and-exit";
 /// (REVIEW-WIN2-008). The uninstaller therefore stops the app first
 /// (nsis-hooks.nsh, NSIS_HOOK_PREUNINSTALL).
 fn reconcile_and_exit() -> ! {
+    // MR-808: this run never reaches setup(), so the on-device log is decided
+    // here from settings.json: on when it says on, or there is none (the
+    // default). These two lines are how the install smoke test and support see
+    // that the pre-uninstall reconcile ran and finished.
+    crate::utils::file_log::decide_from_saved_choice();
     info!(
         "{}: restoring what a previous session left behind",
         RECONCILE_AND_EXIT
@@ -292,6 +297,12 @@ fn main() {
         .with(file_layer)
         .init();
 
+    // MR-808: settings.json's word on the on-device log, read before setup()
+    // can verify it: a saved "off" switches the log off now, and an "on" is
+    // kept for the runs that end before setup() decides (reconcile_and_exit,
+    // the panic hook). See utils::file_log.
+    crate::utils::file_log::read_saved_choice();
+
     // P6-CLI-D-05 (age): crash reports leave with birdo.log's retention
     // window at every launch, not only when the next crash is written — a
     // machine that stopped crashing kept its last five for good.
@@ -399,11 +410,12 @@ fn main() {
             // serves any command, so it parks no worker.
             let (startup_settings, startup_verified) =
                 commands::settings::load_startup_settings(&app.handle().clone());
-            // MR-808: decide the on-device log. Until here it has held its
-            // lines in memory and opened nothing; on writes them out, off
-            // drops them. Off, too, when the file cannot be verified this
-            // session: its defaults are not the user's choice, and an "off"
-            // must never be overridden by a default "on".
+            // MR-808: decide the on-device log, now on the verified file.
+            // Until here it has held its lines in memory and opened nothing
+            // (or was switched off already by a saved "off"); on writes them
+            // out, off drops them. Off, too, when the file cannot be verified
+            // this session: its defaults are not the user's choice, and an
+            // "off" must never be overridden by a default "on".
             crate::utils::file_log::apply(commands::settings::file_logging_for_session(
                 startup_settings.as_ref(),
                 startup_verified,
@@ -845,6 +857,12 @@ fn setup_panic_hook() {
         // emails, or hostnames. Apply the same PII redaction used for API errors.
         let message = crate::utils::redact::sanitize_error(&message);
 
+        // MR-808: a panic before setup() decided the on-device log (WebView2
+        // that will not start, a plugin that fails to initialise) would leave
+        // nothing on disk. Decide from settings.json now, so the held lines
+        // and the crash file are written when the saved choice is on.
+        crate::utils::file_log::decide_from_saved_choice();
+
         error!("PANIC at {}: {}", location, message);
         error!("Backtrace:\n{:?}", std::backtrace::Backtrace::capture());
 
@@ -988,8 +1006,8 @@ fn write_crash_report(location: &str, message: &str) {
     use std::io::Write;
 
     // MR-808: a crash file is part of the on-device log, so it is written
-    // only while the user keeps that log on — and not before setup() has read
-    // the choice (a panic that early would otherwise ignore an "off").
+    // only while the user keeps that log on, and never while the choice is
+    // unknown (the panic hook decides from settings.json first when it can).
     if !crate::utils::file_log::persists() {
         return;
     }

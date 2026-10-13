@@ -614,18 +614,54 @@ pub(crate) async fn load_settings_off_runtime(app: &AppHandle) -> Result<AppSett
 }
 
 /// [`load_settings_sync`] for `setup()` in `main.rs`, saying whether the
-/// settings are the user's own (MR-808): `false` for the defaults served while
-/// the file cannot be verified, and for no settings at all. Most choices are
-/// fine on those defaults for a session; the on-device log is not, because
-/// its default is ON ([`file_logging_for_session`]).
+/// settings' on-device log switch is the user's own (MR-808): `false` for the
+/// defaults served while the file cannot be verified, and for no settings at
+/// all. Most choices are fine on those defaults for a session; the log is
+/// not, because its default is ON ([`file_logging_for_session`]). A
+/// quarantine is [`after_quarantine`].
 pub fn load_startup_settings(app: &AppHandle) -> (Option<AppSettings>, bool) {
     match load_settings(app) {
+        Ok(Loaded::Saved(settings)) => (Some(settings), true),
         Ok(Loaded::Unverified(settings)) => (Some(settings), false),
-        Ok(loaded) => (Some(loaded.settings()), true),
+        Ok(Loaded::Quarantined(defaults)) => {
+            let (settings, own) = after_quarantine(defaults, crate::utils::file_log::saved());
+            if !settings.file_logging_enabled {
+                if let Err(e) = save_settings_inner(app, &settings) {
+                    tracing::warn!("Could not keep the log switched off after the reset: {}", e);
+                }
+            }
+            (Some(settings), own)
+        }
         Err(e) => {
             tracing::warn!("Settings could not be loaded at start-up: {}", e);
             (None, false)
         }
+    }
+}
+
+/// What a quarantine at start-up keeps of the on-device log switch (MR-808).
+///
+/// A quarantine (no key verifies settings.json, for good) resets every setting
+/// to its default, and the log's default is ON: a lost signing key used to
+/// switch a user's log back on. So the set-aside file's own "off", read before
+/// the load set it aside (`file_log::read_saved_choice`), is kept, and the
+/// caller saves it with the defaults. It cannot be verified, but an "off" can
+/// only mean less is written. Every other setting keeps the quarantine's
+/// default. A file whose choice could not be read leaves the session off
+/// (`false`), like an unverified load; one that said on, or had no key, is the
+/// default anyway.
+fn after_quarantine(
+    mut defaults: AppSettings,
+    saved: crate::utils::file_log::SavedChoice,
+) -> (AppSettings, bool) {
+    use crate::utils::file_log::SavedChoice;
+    match saved {
+        SavedChoice::Off => {
+            defaults.file_logging_enabled = false;
+            (defaults, true)
+        }
+        SavedChoice::On => (defaults, true),
+        SavedChoice::Unknown => (defaults, false),
     }
 }
 
@@ -1869,6 +1905,40 @@ mod tests {
             "unverified defaults must not switch the log on"
         );
         assert!(!file_logging_for_session(None, false));
+    }
+
+    /// MR-808 (review F4): a quarantine resets every setting to its default
+    /// except the log's "off", which the set-aside file keeps. A lost signing
+    /// key must not switch a user's log back on.
+    #[test]
+    fn a_quarantine_keeps_the_logs_off_and_resets_everything_else() {
+        use crate::utils::file_log::SavedChoice;
+        let defaults = AppSettings::default();
+
+        let (kept, own) = after_quarantine(defaults.clone(), SavedChoice::Off);
+        assert!(!kept.file_logging_enabled, "the saved off is kept");
+        assert!(own && !file_logging_for_session(Some(&kept), own));
+        let reset = AppSettings {
+            file_logging_enabled: true,
+            ..kept
+        };
+        assert_eq!(
+            serde_json::to_string(&reset).unwrap(),
+            serde_json::to_string(&defaults).unwrap(),
+            "every other setting is the quarantine's default"
+        );
+
+        let (on, own) = after_quarantine(defaults.clone(), SavedChoice::On);
+        assert!(
+            file_logging_for_session(Some(&on), own),
+            "on, or no key: the default"
+        );
+
+        let (unknown, own) = after_quarantine(defaults, SavedChoice::Unknown);
+        assert!(
+            !file_logging_for_session(Some(&unknown), own),
+            "a choice that could not be read leaves the session off"
+        );
     }
 
     /// MR-808: the live gate follows every way the setting changes — a save

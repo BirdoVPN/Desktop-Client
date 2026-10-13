@@ -27,11 +27,20 @@
 //! would still have had every launch appended to it. Now nothing is opened
 //! until `setup()` has decided ([`apply`]); the lines logged before that (the
 //! elevation check among them) are held in memory, bounded, and written once
-//! the log is on, or dropped when it is off. A panic before `setup()` writes no
-//! crash file for the same reason: the user's choice is not known yet, and
-//! writing one would ignore an "off". A run that never reaches `setup()` (the
-//! uninstaller's `--reconcile-and-exit`, a second instance handing over to the
-//! first) never decides, and persists nothing.
+//! the log is on, or dropped when it is off.
+//!
+//! THE SAVED CHOICE, BEFORE IT CAN BE VERIFIED. Right after the subscriber is
+//! installed, `main()` reads `settings.json` WITHOUT its signature check
+//! ([`read_saved_choice`]). That is safe only in the direction it acts on: a
+//! saved "off" switches the log off at once (an unverified "off" can only mean
+//! less is written), while "on" (or no file yet, the default) is only
+//! remembered. A run that ends before `setup()` decides uses it
+//! ([`decide_from_saved_choice`]): the uninstaller's `--reconcile-and-exit`,
+//! whose two lines are how the install smoke test and support see that the
+//! pre-uninstall reconcile ran, and a panic during start-up (WebView2 that
+//! will not start, a plugin that fails), whose held lines and crash file would
+//! otherwise be lost. Unreadable or unparseable, the file says nothing, and
+//! such a run persists nothing. `setup()` still makes the verified decision.
 //!
 //! NOT A LOG: the DNS journal (`vpn::dns_journal`, `dns-restore.json` in the
 //! directory above `logs`). It is the record of the resolvers to put back, the
@@ -189,9 +198,96 @@ pub fn apply(enabled: bool) {
 }
 
 /// Whether this process may write to disk what the log records (crash
-/// reports included). False until `setup()` has read the user's choice.
+/// reports included). False until the user's choice is known.
 pub fn persists() -> bool {
     FILE_LOGGING.is_on()
+}
+
+/// Tauri's identifier for this app (`tauri.conf.json`): the directory under
+/// the OS config directory that holds `settings.json`. Pinned against
+/// tauri.conf.json by a test.
+const APP_IDENTIFIER: &str = "uk.birdo.vpn.desktop";
+
+/// `settings.json` where `commands::settings::get_settings_path` finds it:
+/// Tauri's `app_config_dir()`, which is `dirs::config_dir()/<identifier>`
+/// (tauri 2, `path/desktop.rs`) because this app sets no
+/// `appDirectoriesOverride`. Both are pinned by a test.
+fn settings_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join(APP_IDENTIFIER).join("settings.json"))
+}
+
+/// What `settings.json` says about the log, read without verifying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedChoice {
+    /// The file says on, does not have the key (the default), or does not
+    /// exist yet (a first run: the default).
+    On,
+    /// The file says off.
+    Off,
+    /// Not read yet, unreadable, or not settings this build can read.
+    Unknown,
+}
+
+/// What [`read_saved_choice`] found, as a `SavedChoice` discriminant.
+static SAVED: AtomicU8 = AtomicU8::new(SavedChoice::Unknown as u8);
+
+/// The log switch in `settings.json`'s text. Signed files keep the settings
+/// under `settings`; an unsigned file from before signing has them at the top.
+pub fn saved_choice(read: io::Result<String>) -> SavedChoice {
+    use serde_json::Value;
+    let text = match read {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return SavedChoice::On,
+        Err(_) => return SavedChoice::Unknown,
+    };
+    let Ok(Value::Object(file)) = serde_json::from_str::<Value>(&text) else {
+        return SavedChoice::Unknown;
+    };
+    let settings = match file.get("settings") {
+        Some(Value::Object(signed)) => signed,
+        Some(_) => return SavedChoice::Unknown,
+        None => &file,
+    };
+    match settings.get("file_logging_enabled") {
+        None | Some(Value::Bool(true)) => SavedChoice::On,
+        Some(Value::Bool(false)) => SavedChoice::Off,
+        Some(_) => SavedChoice::Unknown,
+    }
+}
+
+/// Read the saved choice before Tauri exists (see the module docs). Called by
+/// `main()` right after the subscriber is installed. A saved "off" switches
+/// the log off now; anything else leaves it undecided for `setup()`. Nothing
+/// from the file is logged.
+pub fn read_saved_choice() {
+    let choice = settings_path().map_or(SavedChoice::Unknown, |path| {
+        saved_choice(std::fs::read_to_string(path))
+    });
+    SAVED.store(choice as u8, Ordering::SeqCst);
+    if choice == SavedChoice::Off {
+        apply(false);
+    }
+}
+
+/// What [`read_saved_choice`] found (`Unknown` before it ran).
+pub fn saved() -> SavedChoice {
+    match SAVED.load(Ordering::SeqCst) {
+        x if x == SavedChoice::On as u8 => SavedChoice::On,
+        x if x == SavedChoice::Off as u8 => SavedChoice::Off,
+        _ => SavedChoice::Unknown,
+    }
+}
+
+/// For a run that may end before `setup()` decides: the uninstaller's
+/// `--reconcile-and-exit`, and the panic hook. If the log is still undecided
+/// and the saved choice is on, turn it on now, so the held lines are written
+/// and a crash file may be. Returns whether it did.
+pub fn decide_from_saved_choice() -> bool {
+    if FILE_LOGGING.is_undecided() && saved() == SavedChoice::On {
+        apply(true);
+        return true;
+    }
+    false
 }
 
 /// What [`delete_logs`] did, in counts. Never a path: the UI has no use for
@@ -436,8 +532,9 @@ mod tests {
         assert!(victim.exists());
     }
 
-    /// The same two refusals on Windows, where a symlink needs a privilege
-    /// (or Developer Mode) the test may not have: skipped there, not failed.
+    /// The same on Windows. A symlink there needs a privilege (or Developer
+    /// Mode): a dev account without it skips, saying so; CI (an administrator)
+    /// must not skip, or the test would pass there without testing anything.
     #[cfg(windows)]
     #[test]
     fn a_symlinked_log_is_skipped_and_its_target_survives() {
@@ -445,8 +542,12 @@ mod tests {
         let logs = root.path().join("logs");
         std::fs::create_dir_all(&logs).unwrap();
         let target = write(root.path(), "precious.txt");
-        if std::os::windows::fs::symlink_file(&target, logs.join("birdo.log")).is_err() {
-            eprintln!("skipped: this account cannot create symlinks");
+        if let Err(e) = std::os::windows::fs::symlink_file(&target, logs.join("birdo.log")) {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI cannot create a symlink ({e}), so this test would test nothing"
+            );
+            eprintln!("SKIPPED: this account cannot create symlinks ({e})");
             return;
         }
         write(&logs, "birdo.log.1");
@@ -462,6 +563,46 @@ mod tests {
         );
         assert!(target.exists(), "the link's target was deleted");
         assert!(std::fs::symlink_metadata(logs.join("birdo.log")).is_ok());
+    }
+
+    /// A JUNCTION where the log directory should be is refused outright. A
+    /// junction needs no privilege, so any process running as the user can
+    /// plant one in %APPDATA%, and the app that follows it runs elevated.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_log_directory_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let victim = write(&elsewhere, "birdo.log");
+        let logs = root.path().join("logs");
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&logs)
+            .arg(&elsewhere)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+        assert!(
+            std::fs::symlink_metadata(&logs)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "std must see a junction as a link, or the refusal below is luck"
+        );
+
+        let done = delete_logs_in(Some(&logs), None);
+
+        assert_eq!(
+            done,
+            Deleted {
+                deleted: 0,
+                failed: 1
+            }
+        );
+        assert!(victim.exists(), "the delete followed the junction");
     }
 
     #[test]
@@ -587,6 +728,73 @@ mod tests {
         assert!(gate.take_held().len() <= HELD_CAP);
     }
 
+    // ── the saved choice, before it can be verified ───────────────────────
+
+    fn choice(text: &str) -> SavedChoice {
+        saved_choice(Ok(text.to_string()))
+    }
+
+    #[test]
+    fn a_saved_off_reads_off_and_everything_else_on_or_unknown() {
+        // The signed shape `save_settings` writes, and the unsigned legacy one.
+        assert_eq!(
+            choice(r#"{"settings":{"autostart":false,"file_logging_enabled":false},"hmac":"ab"}"#),
+            SavedChoice::Off
+        );
+        assert_eq!(
+            choice(r#"{"autostart":false,"file_logging_enabled":false}"#),
+            SavedChoice::Off
+        );
+        // ON is never written (skip_serializing_if): no key is the default.
+        assert_eq!(
+            choice(r#"{"settings":{"autostart":false},"hmac":"ab"}"#),
+            SavedChoice::On
+        );
+        assert_eq!(
+            choice(r#"{"settings":{"file_logging_enabled":true},"hmac":"ab"}"#),
+            SavedChoice::On
+        );
+        // A first run has no file: the default.
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        assert_eq!(saved_choice(Err(missing)), SavedChoice::On);
+        // Anything this cannot read says nothing.
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(saved_choice(Err(denied)), SavedChoice::Unknown);
+        for unreadable in [
+            "",
+            "not json",
+            "[]",
+            "3",
+            r#"{"settings":"x","hmac":"ab"}"#,
+            r#"{"settings":{"file_logging_enabled":"no"},"hmac":"ab"}"#,
+        ] {
+            assert_eq!(choice(unreadable), SavedChoice::Unknown, "{unreadable}");
+        }
+    }
+
+    /// The early read must look where `get_settings_path` does: Tauri's
+    /// `app_config_dir()`, which is `<config dir>/<identifier>` unless
+    /// tauri.conf.json overrides the app directories.
+    #[test]
+    fn the_early_read_looks_where_the_settings_really_are() {
+        let conf =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json"))
+                .unwrap();
+        let conf: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        assert_eq!(conf["identifier"], APP_IDENTIFIER);
+        assert!(
+            conf["app"].get("appDirectoriesOverride").is_none(),
+            "tauri.conf.json now overrides the app directories: settings_path() must follow"
+        );
+        let settings = include_str!("../commands/settings.rs").replace('\r', "");
+        let get = &settings[settings.find("fn get_settings_path(").unwrap()..];
+        let get = &get[..get.find("\n}\n").unwrap()];
+        assert!(get.contains(".app_config_dir()") && get.contains("\"settings.json\""));
+        if let Some(path) = settings_path() {
+            assert!(path.ends_with(Path::new(APP_IDENTIFIER).join("settings.json")));
+        }
+    }
+
     /// The switch must stay wired: `setup()` decides the gate, and a crash
     /// file is written only when it is on. The call sites are in `main.rs`,
     /// the BIN target, which `cargo test --lib` never compiles (same technique
@@ -594,6 +802,11 @@ mod tests {
     #[test]
     fn the_switch_is_still_wired_into_main() {
         let src = include_str!("../main.rs").replace('\r', "");
+        let body = |signature: &str| {
+            let start = src.find(signature).expect(signature);
+            let rest = &src[start..];
+            rest[..rest.find("\n}\n").expect("end of fn")].to_string()
+        };
         assert!(
             src.contains("file_log::install("),
             "main() no longer builds birdo.log behind the user's switch"
@@ -602,8 +815,7 @@ mod tests {
             src.contains("file_log::apply("),
             "setup() no longer applies the user's choice, so the log never opens"
         );
-        let writer = &src[src.find("fn write_crash_report(").unwrap()..];
-        let writer = &writer[..writer.find("\n}\n").unwrap()];
+        let writer = body("fn write_crash_report(");
         let gate = writer
             .find("file_log::persists()")
             .expect("write_crash_report no longer checks the switch");
@@ -611,5 +823,25 @@ mod tests {
             gate < writer.find("create_dir_all").unwrap(),
             "write_crash_report touches the disk before checking the switch"
         );
+
+        // The saved choice is read as soon as the subscriber exists...
+        let main_fn = body("fn main() {");
+        let read = main_fn
+            .find("file_log::read_saved_choice()")
+            .expect("main() no longer reads the saved choice early");
+        assert!(main_fn.find(".init();").unwrap() < read);
+        // ...and the runs that may end before setup() decide from it: the
+        // uninstaller's reconcile (whose lines the NSIS smoke test reads from
+        // birdo.log), and a panic, before its PANIC line.
+        let reconcile = body("fn reconcile_and_exit(");
+        let decided = reconcile
+            .find("file_log::decide_from_saved_choice()")
+            .expect("--reconcile-and-exit no longer decides the log, so it persists nothing");
+        assert!(decided < reconcile.find("info!(").unwrap());
+        let hook = body("fn setup_panic_hook(");
+        let decided = hook
+            .find("file_log::decide_from_saved_choice()")
+            .expect("a start-up panic no longer decides the log, so it leaves nothing");
+        assert!(decided < hook.find(r#"error!("PANIC"#).unwrap());
     }
 }

@@ -134,14 +134,16 @@ export const DELETE_LOGS_FAILED_COPY = "Couldn't delete the logs. Please try aga
 
 const files = (n: number) => `${n} log file${n === 1 ? '' : 's'}`;
 
-/** What the notice says after `delete_logs` answered (MR-808). */
+/**
+ * What the notice says after `delete_logs` answered (MR-808). A failure
+ * names no cause: Rust counts a file another program holds, one it may not
+ * delete and a link where a folder should be alike.
+ */
 export function deleteLogsNotice(result: DeleteLogsResult): Omit<Notice, 'id'> {
   if (result.failed > 0) {
     const done = result.deleted > 0 ? `Deleted ${files(result.deleted)}, but ` : '';
     return {
-      text:
-        `${done}${files(result.failed)} couldn't be deleted. ` +
-        'Close any program that has them open and try again.',
+      text: `${done}${files(result.failed)} couldn't be deleted. Please try again.`,
       tone: 'danger',
     };
   }

@@ -179,7 +179,7 @@ describe('Delete Logs Now', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Delete' }));
     await waitFor(() => expect(useAppStore.getState().notice?.tone).toBe('danger'));
     expect(useAppStore.getState().notice?.text).toBe(
-      "Deleted 1 log file, but 2 log files couldn't be deleted. Close any program that has them open and try again.",
+      "Deleted 1 log file, but 2 log files couldn't be deleted. Please try again.",
     );
   });
 
@@ -211,7 +211,7 @@ describe('the delete_logs answer', () => {
     });
     expect(deleteLogsNotice({ deleted: 1, failed: 0 }).text).toBe('Deleted 1 log file.');
     expect(deleteLogsNotice({ deleted: 0, failed: 1 })).toEqual({
-      text: "1 log file couldn't be deleted. Close any program that has them open and try again.",
+      text: "1 log file couldn't be deleted. Please try again.",
       tone: 'danger',
     });
   });
