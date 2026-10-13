@@ -369,6 +369,19 @@ pub fn open_for_append(path: &Path) -> io::Result<std::fs::File> {
     opts.open(path)
 }
 
+/// Create (or empty) `path` for writing, owner-only on multi-user Unix hosts:
+/// the crash report's twin of [`open_for_append`] (P6-CLI-D-08).
+pub fn create_owner_only(path: &Path) -> io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 /// The persistent log's writer: rotates when the file passes its cap instead
 /// of going silent (W1-019).
 ///
@@ -474,6 +487,34 @@ mod tests {
 
     fn read(p: &Path) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    /// P6-CLI-D-08 (MR-843): the log, a rotated log's fresh file and a crash
+    /// report are created owner-only on Unix. The modes were set, and nothing
+    /// asserted them. (Windows relies on the per-user %APPDATA% ACL.)
+    #[cfg(unix)]
+    #[test]
+    fn the_log_and_a_crash_report_are_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("birdo.log");
+        let crash = dir.path().join("crash_20261008_120000.txt");
+        let rotated = dir.path().join("rotating.log");
+        drop(open_for_append(&log).unwrap());
+        drop(create_owner_only(&crash).unwrap());
+        // Past its cap, the next writer moves the file aside and opens a
+        // fresh one in its place.
+        let rotating = RotatingLog::open(&rotated, 4).unwrap();
+        rotating
+            .writer()
+            .write_all(b"more than four bytes")
+            .unwrap();
+        drop(rotating.writer());
+        assert!(rotated_path(&rotated).exists(), "the log was rotated");
+        for p in [&log, &crash, &rotated] {
+            let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} is {:o}", p.display(), mode);
+        }
     }
 
     // ── the failure this module was written for ──────────────────────────

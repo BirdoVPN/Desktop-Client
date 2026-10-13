@@ -13,10 +13,10 @@
  * Run: npx vitest run src/__tests__/SettingsPersistence.test.tsx
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { act, render, screen, waitFor, fireEvent, within } from '@testing-library/react';
+import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings } from '@/components/Settings';
+import { CUSTOM_DNS_NOT_LAN_COPY, MACOS_IPV6_NOTE, Settings } from '@/components/Settings';
 import { VpnSettings } from '@/screens/VpnSettings';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import {
@@ -159,6 +159,18 @@ describe('Custom DNS: draft fields, saved on leave', () => {
     });
     render(<Settings />);
     expect(screen.getByText(outsideNote)).toBeInTheDocument();
+  });
+
+  // MR-689: Local Network Sharing opens the private ranges and link-local, on
+  // every platform. A CGNAT or public-range LAN resolver is none of them, and
+  // only CGNAT space can be recognised, so the fields say it for every address.
+  it('says a carrier-grade NAT or public address is not your own network (MR-689)', () => {
+    useAppStore.setState({
+      settings: { ...defaultSettings, customDnsEnabled: true, customDns: ['100.100.100.100'], localNetworkSharing: true },
+    });
+    render(<Settings />);
+    expect(screen.getByText(CUSTOM_DNS_NOT_LAN_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(/on your own network is reached directly/)).not.toBeInTheDocument();
   });
 });
 
@@ -1183,30 +1195,21 @@ describe('a failed save is rolled back and reported (W2-013)', () => {
 });
 
 describe('VPN Settings: the port, and MTU as a draft', () => {
-  // WIN-FIX-3: the relays accept WireGuard on 51820 only; the "53" preset and
-  // the custom port failed the handshake on every one of them.
-  it('offers Automatic and 51820 only', () => {
+  // MR-920 (Android and iOS parity): the relays accept WireGuard on 51820
+  // only (WIN-FIX-3), so the port is not a choice. "53" and the custom port
+  // failed the handshake on every relay, and "51820" dialled what Automatic
+  // dials. The card says so; nothing on the screen picks a port.
+  it.each(['auto', '51820'] as const)('offers no port choice (saved %s)', (wireGuardPort) => {
+    useAppStore.setState({ settings: { ...defaultSettings, wireGuardPort } });
     render(<VpnSettings />);
-    const group = screen.getByRole('radiogroup', { name: 'WireGuard Port' });
-    expect(within(group).getAllByRole('radio').map((r) => r.textContent)).toEqual(['Automatic', '51820']);
-    expect(screen.queryByRole('radio', { name: '53' })).toBeNull();
-    expect(screen.queryByRole('radio', { name: 'Custom' })).toBeNull();
+    expect(screen.queryByRole('radiogroup', { name: 'WireGuard Port' })).toBeNull();
+    expect(screen.queryAllByRole('radio')).toEqual([]);
     expect(screen.queryByRole('textbox', { name: 'Custom WireGuard port' })).toBeNull();
     expect(screen.queryByText(/port 53/)).toBeNull();
-  });
-
-  it('the port options are a real radio group with arrow keys (W2-035)', async () => {
-    render(<VpnSettings />);
-    const group = screen.getByRole('radiogroup', { name: 'WireGuard Port' });
-    const auto = screen.getByRole('radio', { name: 'Automatic' });
-    expect(auto).toHaveAttribute('aria-checked', 'true');
-    expect(auto).toHaveAttribute('tabindex', '0');
-    expect(screen.getByRole('radio', { name: '51820' })).toHaveAttribute('tabindex', '-1');
-    auto.focus();
-    await userEvent.keyboard('{ArrowDown}');
-    await waitFor(() => expect(saves()).toHaveLength(1));
-    expect(saves()[0].wireguard_port).toBe('51820');
-    expect(group).toBeInTheDocument();
+    expect(screen.getByText('WireGuard Port')).toBeInTheDocument();
+    expect(screen.getByText('Automatic')).toBeInTheDocument();
+    expect(screen.getByText('BirdoVPN servers accept WireGuard on port 51820 only.')).toBeInTheDocument();
+    expect(saves()).toHaveLength(0);
   });
 
   it('MTU validates on leave (1280–1500)', async () => {
@@ -1227,5 +1230,29 @@ describe('VPN Settings: the port, and MTU as a draft', () => {
     expect(screen.getByRole('textbox', { name: 'WireGuard MTU' })).toHaveValue('1280');
     act(() => useAppStore.getState().updateSettings({ wireGuardMtu: 1420 }));
     expect(screen.getByRole('textbox', { name: 'WireGuard MTU' })).toHaveValue('1420');
+  });
+});
+
+// MR-1124: macOS blocks all IPv6 while connected, kill switch on or off, and
+// said so nowhere. The drafted sentence shows on macOS and nowhere else.
+describe('the macOS IPv6 note (MR-1124)', () => {
+  const realUserAgent = navigator.userAgent;
+  const setUserAgent = (ua: string) =>
+    Object.defineProperty(window.navigator, 'userAgent', { value: ua, configurable: true });
+  afterEach(() => setUserAgent(realUserAgent));
+
+  it('shows on macOS', () => {
+    setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)');
+    render(<Settings />);
+    expect(screen.getByText(MACOS_IPV6_NOTE)).toBeInTheDocument();
+  });
+
+  it.each([
+    ['Windows', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/129.0'],
+    ['Linux', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko)'],
+  ])('not on %s', (_os, ua) => {
+    setUserAgent(ua);
+    render(<Settings />);
+    expect(screen.queryByText(MACOS_IPV6_NOTE)).not.toBeInTheDocument();
   });
 });

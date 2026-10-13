@@ -221,6 +221,15 @@ export function isWindowsPlatform(): boolean {
   return typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows');
 }
 
+/**
+ * Platform gate for macOS-only copy. WKWebView's UA carries "Macintosh"
+ * ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) …") on Intel and Apple
+ * Silicon alike.
+ */
+export function isMacPlatform(): boolean {
+  return typeof navigator !== 'undefined' && navigator.userAgent.includes('Macintosh');
+}
+
 /** Shape returned by the Rust `get_settings` command (snake_case). */
 export interface RustSettings {
   killswitch_enabled: boolean;

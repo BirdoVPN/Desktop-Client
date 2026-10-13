@@ -979,15 +979,8 @@ fn write_crash_report(location: &str, message: &str) {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
 
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.write(true).create(true).truncate(true);
     // P6-CLI-D-08: owner-readable only on multi-user Unix hosts.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-    }
-    if let Ok(mut file) = open_opts.open(&crash_file) {
+    if let Ok(mut file) = crate::utils::log_retention::create_owner_only(&crash_file) {
         let _ = writeln!(file, "BirdoVPN Crash Report");
         let _ = writeln!(file, "=====================");
         let _ = writeln!(file, "Time: {}", chrono::Utc::now().to_rfc3339());

@@ -1,4 +1,4 @@
-# Code Signing with Sigstore
+# Code Signing
 
 > **What is actually signed today (checked 2026-09-29 against `release.yml`):**
 > - **Windows:** tag builds are Authenticode-signed through Azure Trusted Signing
@@ -13,46 +13,65 @@
 > - **Linux:** covered by the checksums file and its Sigstore bundle only.
 > - **PGP:** no release artefact is PGP-signed.
 >
-> Parts of this document below predate the Azure signing work and describe a
-> Sigstore-only setup; where they disagree with the list above, the list wins.
+> The body below was rewritten to this list on 2026-10-08 (MR-1369). It used to
+> describe a Sigstore-only setup that signed every artefact with its own
+> `.sigstore` bundle.
 
 ## Overview
 
-Birdo VPN uses [Sigstore](https://www.sigstore.dev/) for keyless code signing.
-Because the client source is public (source-available, CC BY-NC 4.0 — not an
-OSI open-source licence), Sigstore provides **free, transparent, verifiable
-signatures** tied to our GitHub Actions CI — no paid certificates required.
+A tagged release carries three kinds of signature. Each does a different job,
+and none of them stands in for another:
 
-Every release artifact (`.exe`, `.dmg`, Linux packages) is signed with `cosign sign-blob` using
-GitHub's OIDC identity token. This produces a `.sigstore` bundle containing:
+| Signature | Over | Checked by |
+|---|---|---|
+| **Authenticode** (Azure Trusted Signing) | the Windows installer and the binaries it installs (`BirdoVPN.exe`, `xray.exe`) | Windows itself, at download and at the UAC prompt |
+| **Tauri updater signature** (`.sig`, minisign) | each updater bundle: the Windows setup `.exe`, the AppImage, the macOS `.app.tar.gz` | the installed app, against `plugins.updater.pubkey`, before it installs an update |
+| **Sigstore** (cosign keyless) | **one** file, `SHA256SUMS.txt`, which lists every release asset except the `.sig` files | anyone, by hand: [VERIFICATION.md](./VERIFICATION.md) |
 
-- A **Fulcio certificate** proving the artifact was built by GitHub Actions from this repo
+Sigstore signs no installer directly. The release job writes `SHA256SUMS.txt`
+over the final asset names and signs that one file with `cosign sign-blob`,
+using GitHub's OIDC identity token. That produces `SHA256SUMS.txt.sigstore`, a
+bundle containing:
+
+- A **Fulcio certificate** proving the checksums file was signed by this repo's
+  `release.yml`, at the release tag
 - A **Rekor transparency log entry** — a tamper-proof public record of the signing event
+
+So a download is verified in two steps: the bundle against `SHA256SUMS.txt`,
+then the download against its line in `SHA256SUMS.txt`. Because the client
+source is public (source-available, CC BY-NC 4.0 — not an OSI open-source
+licence), anyone can tie a download to the workflow run that built it.
 
 ## How It Works
 
 ```
-GitHub Actions triggers → Tauri builds installers
-  → cosign sign-blob --yes --bundle <file>.sigstore <file>
-    → Fulcio issues short-lived cert (GitHub OIDC identity)
-    → Signature recorded in Rekor transparency log
-    → .sigstore bundle attached to GitHub Release
+Push tag v* → release.yml (test gate first)
+  → Windows: xray.exe signed (Authenticode) → Tauri build signs BirdoVPN.exe
+             and the NSIS installer (Authenticode) → updater .sig (minisign)
+  → Linux:   Tauri build → AppImage + .deb → updater .sig for the AppImage
+  → macOS:   Tauri build, unsigned and un-notarised → DMGs + .app.tar.gz → updater .sig
+  → release job: SHA256SUMS.txt over every asset except the .sig files
+    → cosign sign-blob --yes --bundle SHA256SUMS.txt.sigstore SHA256SUMS.txt
+      → Fulcio issues a short-lived cert (GitHub OIDC identity)
+      → the signature is recorded in the Rekor transparency log
+    → SHA256SUMS.txt + SHA256SUMS.txt.sigstore published with the assets
 ```
 
-No private keys to manage. No certificates to purchase or renew.
+No Sigstore key to manage. The Authenticode certificate is issued per run by
+Azure Trusted Signing (`azure-trusted-signing-setup.md`); the updater key is a
+minisign key held in the repository secrets (below). A manual dispatch builds
+unsigned binaries and no Sigstore bundle: only a tag's release job signs.
 
 ## What Users See
 
 ### Windows SmartScreen
 
-Sigstore does **not** replace Windows Authenticode. Windows users will still see:
-
-1. **SmartScreen:** "Windows protected your PC" -> click "More info" -> "Run anyway"
-2. **UAC prompt:** "Unknown publisher" (yellow shield)
-
-This is normal for software without an established signing reputation. The Sigstore signature lets users
-**cryptographically verify** the download came from our CI — something SmartScreen
-can't tell them.
+Tag builds are Authenticode-signed with a PublicTrust certificate, so
+SmartScreen and the UAC prompt name the verified publisher rather than
+"Unknown publisher". If SmartScreen still warns, see the troubleshooting
+table in `azure-trusted-signing-setup.md`. The Sigstore bundle answers a
+different question, which neither prompt can: whether the download is the
+file this repo's release workflow built at that tag.
 
 ### macOS Gatekeeper
 
@@ -61,17 +80,15 @@ Gatekeeper warning. To bypass:
 1. Right-click -> Open -> "Open" (first launch only)
 2. Or: System Settings -> Privacy & Security -> "Open Anyway"
 
-If macOS code signing (Apple Developer ID) becomes needed, it can be layered
-on top of Sigstore in the `build-macos.yml` workflow.
+If macOS code signing (Apple Developer ID) becomes needed, it goes into the
+macOS job of `release.yml`; the Sigstore step is unchanged by it.
 
-### Why Not Authenticode?
+### Authenticode and Sigstore
 
-Traditional Authenticode OV certificates ($60-500/year) require identity verification
-and annual renewal. Sigstore is free, automated, and provides **stronger provenance
-guarantees** — you can verify exactly which repo, commit, and workflow produced a binary.
-
-If SmartScreen warnings become a user adoption issue, we can layer Authenticode on top
-later (the workflow supports it as an optional step).
+Authenticode is what Windows checks: without it the UAC prompt says "Unknown
+publisher". Sigstore is what a person checks: it ties the published checksums
+to the exact repository, workflow and tag that produced them. Releases carry
+both, and Linux and macOS have only the second.
 
 ## Verifying Signatures
 
@@ -185,3 +202,39 @@ F-001 bench in `release/patches/`:
 ⚠ The runbook's protected-infrastructure list is stale: it calls `89.167.6.86`
 "crypto server, leave alone", and that box has since been **wiped and
 reimaged**.
+
+## macOS and Linux release the block when reconnecting gives up (2026-10-07)
+
+On Windows, the Always-on Kill Switch (lockdown, the default there) keeps
+traffic blocked after auto-reconnect gives up, until the user disconnects or
+turns the kill switch off. macOS and Linux release the block at that point,
+and that is decided, not missing: on 2026-10-07 the owner chose **not** to port
+keep-blocked-after-give-up to them, so that Unix users are never stranded
+behind the firewall (MR-708).
+
+They do hold the block for the whole connected session whenever the kill
+switch is on (`killswitch::holds_block_while_connected`). What they release is
+the block for a session that is over. The rule, as `commands/settings.rs`
+states it at the `lockdown_mode` default:
+
+> What they do NOT have is lockdown's keep-blocked-after-give-up semantics,
+> which is what this flag governs: on Unix the give-up/offline-cap branches
+> still release the block so a dead session cannot strand the machine.
+
+`killswitch::is_lockdown_mode()` is hard `false` off Windows, and
+`reconnect_policy::give_up_keeps_block` keeps the block only under lockdown.
+The Kill Switch row in Settings says so ("If reconnecting keeps failing, the
+app stops blocking."). Do not file the difference as a gap.
+
+## macOS and Linux have no packet-path stall rule (MR-1117)
+
+The auto-reconnect loop's packet-path stall rule (WIN-FIX-3), like its fast
+dead-path and send-path rules, is Windows-only: each sits behind
+`#[cfg(target_os = "windows")]` in `vpn/auto_reconnect.rs`. On macOS and Linux
+a tunnel whose packet path stops is caught by the handshake-age backstop
+instead: 180 s without a completed handshake
+(`reconnect_policy::MAX_HANDSHAKE_AGE`; an idle session is nudged at 150 s, so
+a quiet tunnel does not trip it). Until then the app can show Protected over a
+dead tunnel. With the kill switch on, the session-long block (above) holds
+through it, so nothing leaves outside the tunnel. A stall rule for macOS and
+Linux would be new work, not a fix.

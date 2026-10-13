@@ -284,7 +284,7 @@ pub struct VpnSettings {
     pub custom_port: String,
     /// Enable Xray Reality stealth tunnel
     pub stealth_mode: bool,
-    /// Enable Rosenpass post-quantum protection
+    /// Enable post-quantum protection (BirdoPQ, ML-KEM-1024; not Rosenpass)
     pub quantum_protection: bool,
     /// BirdoShield: request the fleet's filtering DNS resolver for this
     /// device (per-device `dnsFiltering` connect flag, OPEN-WORK D18).
@@ -570,7 +570,7 @@ pub(crate) async fn start_stealth_tunnel(
     }
 }
 
-/// Phase 2 helper: Derive Rosenpass post-quantum hybrid PSK if the server supports it.
+/// Phase 2 helper: derive the BirdoPQ (ML-KEM-1024) post-quantum PSK if the server supports it.
 ///
 /// IMPORTANT: A previous version of this function called `derive_hybrid_psk()` which
 /// mixed in client-only random entropy. That entropy never reaches the server, so the

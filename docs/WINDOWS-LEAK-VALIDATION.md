@@ -552,6 +552,32 @@ its own.
 
 ---
 
+## Accepted residuals — not failures
+
+Three behaviours a run of this checklist can show that were accepted by
+design in the client overhaul (WIN-RUST-B, residuals 8 and 9, and the relay
+port check of 2026-10-01). Record them if seen; do not file them.
+
+- **WireGuard runs on UDP 51820 only.** All ten relays were checked: nothing
+  listens on a public 53 and there is no DNAT to 51820. The app no longer
+  offers a port, and a "53" or custom port saved by an older build is never
+  dialled (`commands/vpn.rs`, `dialable_wireguard_port`). A network that
+  blocks UDP 51820 cannot carry a plain WireGuard session; Stealth Mode is the
+  answer there.
+- **DNS-over-HTTPS on 443 over the physical adapter is not blocked.** The DNS
+  guard filters the DNS ports (53, 853). DoH is HTTPS like any other, and while
+  connected it is routed into the tunnel with everything else (see "What this
+  build does"). Through a kill-switch block, 443 is open only to BirdoVPN.exe
+  (`Birdo: Permit the app's own HTTPS (control plane)`) and to any Kill Switch
+  Exception the user added.
+- **Static DNS that 1.4.45 already erased cannot be recovered.** Its heal
+  judged such an adapter foreign and dropped the journal record, so nothing on
+  the machine still holds the old resolvers. This build never erases them (B3)
+  and heals what older builds parked while the record survives (B9); users who
+  lost theirs under 1.4.45 have to re-enter them.
+
+---
+
 ## Results
 
 | Step | Result | Notes |

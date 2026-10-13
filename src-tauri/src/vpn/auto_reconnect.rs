@@ -10,7 +10,8 @@
 //!   * the physical default route and resume events (W1-003), via
 //!     `network_events`;
 //!   * the stealth transport exiting under the session (W1-005);
-//!   * the tunnel's own packet path still running (WIN-FIX-3).
+//!   * the tunnel's own packet path still running (WIN-FIX-3; Windows only —
+//!     macOS and Linux rely on the 180 s handshake-age backstop, MR-1117).
 //!
 //! # It cannot hang (WIN-FIX-3 P0)
 //! Every network call it makes has a hard cap ([`HEARTBEAT_TIMEOUT`],
@@ -996,6 +997,8 @@ impl ReconnectLoop {
         // T5 hang sat here, Protected, until the 180 s backstop. Judged over
         // two looks, so a sleep the machine just woke from is not one
         // (WIN3-003).
+        // Windows only (MR-1117): macOS and Linux have no stall rule, so a
+        // stalled packet path there is caught by the 180 s backstop.
         #[cfg(target_os = "windows")]
         if session
             .stall

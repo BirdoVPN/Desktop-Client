@@ -121,6 +121,14 @@ describe('ConsentScreen controls', () => {
     expect(onAccept).toHaveBeenCalledWith(false);
   });
 
+  // MR-1516: on a re-consent App passes the stored choice in.
+  it('starts from the choice it is given, and accepting passes it through', async () => {
+    render(<ConsentScreen onAccept={onAccept} onDecline={onDecline} initialCrashReports />);
+    expect(screen.getByRole('switch', { name: /send crash reports/i })).toHaveAttribute('aria-checked', 'true');
+    await userEvent.click(screen.getByRole('button', { name: /i agree & continue/i }));
+    expect(onAccept).toHaveBeenCalledWith(true);
+  });
+
   it('passes an explicit opt-in through', async () => {
     render(<ConsentScreen onAccept={onAccept} onDecline={onDecline} />);
     await userEvent.click(screen.getByRole('switch', { name: /send crash reports/i }));

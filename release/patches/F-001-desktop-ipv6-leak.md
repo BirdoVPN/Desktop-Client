@@ -471,15 +471,17 @@ which platforms were covered, and note that Android/iOS were checked against the
 | 3 connected to v6 node | | | node = |
 | 4 configure_ipv6 ran | | | |
 | 5 route is the tunnel's | | | |
-| 6 no leak | | | observed = |
-| 7 MTU | | | |
+| 6 no leak | **Fleet run, not a client machine:** pass for the relay side | 2026-08-20 | A plain WireGuard peer in an isolated netns on the Frankfurt relay, through London: handshake established, IPv6 egress = London's own global IPv6 (matching the address recorded for London server-side), IPv4 egress = London's IPv4. That proves the relays' in-tunnel v6 egress (NAT66). This client and its `configure_ipv6()` were not involved: still to be run on the bench, observed = |
+| 7 MTU | **Fleet run:** not covered | 2026-08-20 | The netns run made no MTU check. Still to be run on the bench |
 | 8 kill switch after disconnect | | | |
 | 9 clean restore | | | |
 | P1 endpoint host-route pinned | | | |
 | P2 route-add failure is loud | | | |
 | P3 clean teardown | | | |
 
-**Overall: not yet run on a client machine.** Step 1's prerequisite is proven
+**Overall: not yet run on a client machine.** Rows 1, 6 and 7 hold fleet runs
+(the 2026-09-20 read-only sweep and the 2026-08-20 netns peer), labelled as such;
+neither ran this client. Step 1's prerequisite is proven
 across the fleet, and goal 1 — that `configure_ipv6()` executes and installs the
 route shape it claims — is now proven in CI on every push. What remains is the
 part that needs a real dual-stack client: the leak test itself, MTU, and the kill

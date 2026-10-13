@@ -3,8 +3,8 @@
  * iOS VpnSettingsView.
  *
  * Sections: SECURITY (Stealth Mode, BirdoShield), NETWORK (Local Network
- * Sharing), WIREGUARD (Port radio group + MTU), an info note, then FEATURES
- * (Kill Switch Exceptions, Windows-only).
+ * Sharing), WIREGUARD (the port, which is not a choice, + MTU), an info note,
+ * then FEATURES (Kill Switch Exceptions, Windows-only).
  *
  * Every setting here shapes the tunnel, so each save goes through
  * `persistSettings(…, { reapply: true })`: saved, rolled back and reported if
@@ -12,9 +12,12 @@
  * rebuild. The MTU field is a draft saved when the field is left (W2-007):
  * saving per keystroke rebuilt the tunnel on every digit.
  *
- * The port is Automatic or 51820, nothing else (WIN-FIX-3): the relays accept
- * WireGuard on 51820 only, and the "53" preset and custom port this screen
- * used to offer failed the handshake on every one of them.
+ * The port is not a choice (MR-920, Android and iOS parity): the relays accept
+ * WireGuard on 51820 only (WIN-FIX-3). The "53" preset and custom port this
+ * screen used to offer failed the handshake on every one of them, and the
+ * "51820" choice that outlived them dialled what Automatic dials. The card says
+ * so; a saved value is still migrated by Rust (`migrate_wireguard_port`) and
+ * by the store (`normalizeWireGuardPort`).
  */
 import { useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
@@ -26,9 +29,8 @@ import {
   BirdoToggleRow,
   BirdoNavRow,
   BirdoTextField,
-  BirdoRadioGroup,
 } from '@/components/birdo';
-import { useAppStore, type WireGuardPort } from '@/store/app-store';
+import { useAppStore } from '@/store/app-store';
 import { isValidMtu, isWindowsPlatform } from '@/utils/helpers';
 import { white, status, brand } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
@@ -71,10 +73,6 @@ export function VpnSettings() {
   // The saved `settings.dnsFiltering` is NOT cleared by either: clearing
   // Custom DNS, or the fleet gate coming back, restores the user's choice.
   const shieldBlocked = fleetGateOff || customDnsActive;
-
-  const choosePort = (choice: WireGuardPort) => {
-    if (choice !== settings.wireGuardPort) save({ wireGuardPort: choice });
-  };
 
   // ── MTU (a draft while custom) ─────────────────────────────────────────────
   const mtuAuto = settings.wireGuardMtu === 0;
@@ -186,19 +184,15 @@ export function VpnSettings() {
         <BirdoSectionHeader title="WireGuard" className="mt-4" />
 
         <BirdoCard>
-          <div className="mb-3 flex items-center gap-3.5">
+          <div className="flex items-center gap-3.5">
             <Router size={20} color={brand.accent} aria-hidden />
-            <span className="text-[15px] font-medium text-white">WireGuard Port</span>
+            <div>
+              <div className="text-[15px] font-medium text-white">WireGuard Port</div>
+              <div className="text-xs" style={{ color: white.w60 }}>
+                Automatic
+              </div>
+            </div>
           </div>
-          <BirdoRadioGroup<WireGuardPort>
-            label="WireGuard Port"
-            options={[
-              { value: 'auto', label: 'Automatic' },
-              { value: '51820', label: '51820' },
-            ]}
-            value={settings.wireGuardPort}
-            onChange={choosePort}
-          />
           <p className="mt-2 text-xs" style={{ color: white.w60 }}>
             BirdoVPN servers accept WireGuard on port 51820 only.
           </p>
