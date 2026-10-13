@@ -20,11 +20,11 @@ use crate::storage::CredentialStore;
 use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
 use crate::vpn::xray::XrayManager;
 use crate::vpn::AutoReconnectService;
+use crate::vpn::WgPrivateKey;
 
 // FIX-1-1: Client-side WireGuard key generation
 use base64::Engine as _;
-use boringtun::x25519::PublicKey;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Serialize)]
 pub struct ConnectionStats {
@@ -105,11 +105,13 @@ fn connect_failure_message(response: &ConnectResponse) -> String {
 /// F-05 FIX: Accepts optional custom_dns from user settings. When provided,
 /// overrides the server-supplied DNS addresses (after validation).
 ///
-/// FIX-1-1 / C-24 (W1-031): `local_private_key` is REQUIRED and is the only
-/// private key a config can carry. The server-generated fallback is gone —
-/// every caller has generated its key locally since FIX-1-1, and accepting one
-/// from the backend would hand the server the client's secret. The response
-/// types no longer even deserialize a `privateKey` field.
+/// FIX-1-1 / C-24 (W1-031): the config carries no private key at all (MR-822).
+/// The client's key is a [`WgPrivateKey`] the connect attempt generates and
+/// moves to the tunnel beside this config (`VpnManager::connect`). The
+/// server-generated fallback is gone, and accepting a key from the backend
+/// would hand the server the client's secret: the response types no longer
+/// deserialize a `privateKey` field, and nothing can deserialize into a
+/// `WgPrivateKey`.
 /// P3-1: `custom_mtu`: 0 = use server default, 1280-1500 = user override.
 /// `custom_port`: the `wireguard_port` setting, applied only as far as
 /// [`dialable_wireguard_port`] allows.
@@ -117,7 +119,6 @@ pub fn build_vpn_config(
     response: ConnectResponse,
     server_id: &str,
     custom_dns: Option<Vec<String>>,
-    local_private_key: String,
     custom_mtu: u16,
     custom_port: &str,
 ) -> Result<(VpnConfig, String), String> {
@@ -129,7 +130,6 @@ pub fn build_vpn_config(
 
     // Extract required fields from response
     let key_id = response.key_id.ok_or("Missing key_id in response")?;
-    let private_key = local_private_key;
     let public_key = response
         .public_key
         .ok_or("Missing public_key in response")?;
@@ -215,7 +215,6 @@ pub fn build_vpn_config(
     let config = VpnConfig {
         server_id: server_id.to_string(),
         key_id,
-        private_key,
         public_key,
         server_public_key,
         preshared_key,
@@ -259,19 +258,19 @@ pub(crate) fn dialable_wireguard_port(setting: &str) -> Option<u16> {
     (setting.trim() == "51820").then_some(RELAY_WIREGUARD_PORT)
 }
 
-/// Generate a X25519 keypair for WireGuard. Returns (local_private_key_b64, client_public_key_b64).
-/// Private key bytes are zeroized immediately after encoding.
+/// Generate a X25519 keypair for WireGuard. Returns (private_key,
+/// client_public_key_b64).
+/// MR-822: the private key is never encoded: it stays a [`WgPrivateKey`],
+/// which the caller moves to the tunnel and which wipes itself if dropped
+/// first. It used to be returned as a base64 `String`.
 /// pub(crate) (was pub(super)) so api/contract_tests.rs can run the REAL
 /// producer through the schema's `clientPublicKey` pattern instead of a
 /// hand-typed 44-char literal that would pass no matter what this emits.
-pub(crate) fn generate_wireguard_keypair() -> (String, String) {
-    let secret = crate::utils::os_rng::x25519_static_secret();
-    let public = PublicKey::from(&secret);
-    let mut private_key_bytes = secret.to_bytes();
-    let local_private_key = base64::engine::general_purpose::STANDARD.encode(private_key_bytes);
-    let client_public_key = base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
-    private_key_bytes.zeroize();
-    (local_private_key, client_public_key)
+pub(crate) fn generate_wireguard_keypair() -> (WgPrivateKey, String) {
+    let private_key = WgPrivateKey::generate();
+    let client_public_key =
+        base64::engine::general_purpose::STANDARD.encode(private_key.public_key().as_bytes());
+    (private_key, client_public_key)
 }
 
 /// VPN settings extracted from the user's AppSettings.
@@ -584,7 +583,10 @@ pub(crate) async fn start_stealth_tunnel(
 ///
 /// Order of preference:
 ///   1. BirdoPQ v1 ML-KEM-1024 — decapsulate the server-supplied ciphertext
-///      with our persistent client secret key (HNDL-safe).
+///      with our persistent client secret key. Post-quantum on the app-to-API
+///      leg only, not a complete "record now, decrypt later" defence: the key
+///      is long-lived, the relay leg is classical TLS and multi-hop's middle
+///      leg has no PQ PSK (`vpn::birdo_pq` module docs).
 ///   2. If the server enabled quantum mode but decapsulation fails, abort.
 ///   3. Server-provided classical PSK (TLS-delivered random; not HNDL-safe).
 ///   4. None — connection runs without PSK.
@@ -1270,7 +1272,7 @@ mod tests {
                 "endpoint": "203.0.113.1:51820",
             }))
             .unwrap();
-            build_vpn_config(response, "ams-1", None, "a2V5".into(), 0, setting)
+            build_vpn_config(response, "ams-1", None, 0, setting)
                 .map(|(config, _)| config.endpoint.clone())
                 .unwrap()
         };
@@ -1356,12 +1358,10 @@ mod tests {
             "allowedIps": ["0.0.0.0/0"],
         }))
         .unwrap();
-        let (local_private_key, _) = generate_wireguard_keypair();
         let (config, _) = build_vpn_config(
             response,
             "server-1",
             Some(vec!["9.9.9.9".into()]),
-            local_private_key,
             0,
             "auto",
         )
@@ -1421,8 +1421,10 @@ mod tests {
     }
 
     /// W1-031 (C-24): a response that still carries a server-generated private
-    /// key cannot put it in the tunnel config — the field no longer exists on
-    /// the response type, and the config key is always the local one.
+    /// key cannot put it in the tunnel. The field no longer exists on the
+    /// response type, the config has no key field at all (MR-822), and the
+    /// only key a tunnel takes is a `WgPrivateKey`, which nothing can
+    /// deserialize (asserted at compile time beside it).
     #[test]
     fn connect_response_private_key_is_never_used() {
         // Zero entropy on purpose, so no secret scanner reads it as a real key.
@@ -1439,11 +1441,8 @@ mod tests {
             "allowedIps": ["0.0.0.0/0"],
         }))
         .unwrap();
-        let (local, _) = generate_wireguard_keypair();
-        let (config, _) =
-            build_vpn_config(response, "server-1", None, local.clone(), 0, "auto").unwrap();
-        assert_eq!(config.private_key, local);
-        assert_ne!(config.private_key, server_sent_key);
+        let (config, _) = build_vpn_config(response, "server-1", None, 0, "auto").unwrap();
+        assert!(!format!("{config:?}").contains(&server_sent_key));
     }
 
     /// Contract §1: the exact key set of `VpnStatus`, camelCase throughout

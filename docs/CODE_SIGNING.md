@@ -183,10 +183,21 @@ practice means the rotation ships *after* a release everyone has already taken.
 
 ## Deliberately deferred, and the UI says so
 
-Desktop **bilateral PQ** and **macOS/Linux split tunnelling** are deferred.
-One-way PQ is active and Windows split tunnelling works. Both stay marked
-"coming soon" in the UI — that label is the commitment, and removing it is a
-product decision rather than a tidy-up.
+**Kill Switch Exceptions on macOS and Linux** are deferred; Windows has them
+(see above for why they are not split tunnelling). Off Windows the nav row is
+hidden and the screen reads "Windows only (for now)" — that label is the
+commitment, and removing it is a product decision rather than a tidy-up.
+
+Desktop post-quantum is **not** deferred. An earlier version of this section
+said bilateral PQ was deferred and only one-way PQ was active (MR-1869); that
+is stale. The BirdoPQ v1 ML-KEM-1024 PSK ships and Quantum Protection is on by
+default: the client uploads its public key, decapsulates the server's
+ciphertext and derives the PSK itself (`src-tauri/src/vpn/birdo_pq.rs`), and
+since v1.4.42 it asks the server to withhold the PSK from the connect
+response. What remains open is not a deferred feature but the limits of that
+protection: the client key is long-lived, the server-to-relay leg is classical
+TLS, and multi-hop's entry-to-exit leg has no PQ PSK. See that file's module
+docs and birdo-web `docs/PQ-THREAT-MODEL.md`.
 
 ## The IPv6 leak-test procedure
 

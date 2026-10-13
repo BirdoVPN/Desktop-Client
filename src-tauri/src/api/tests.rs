@@ -4,7 +4,7 @@
 //! - API type serialization / deserialization
 //! - Endpoint path construction
 //! - Error display formatting
-//! - VpnConfig key material zeroization
+//! - VpnConfig secrets: no private key, nothing printed (MR-822)
 //! - AppSettings defaults and serialization
 
 #[cfg(test)]
@@ -705,19 +705,10 @@ mod types_serialization_tests {
         assert!(server.accessible);
     }
 
-    #[test]
-    fn vpn_config_optional_fields_default_correctly() {
-        let json = r#"{
-            "serverId": "s1", "keyId": "k1",
-            "privateKey": "pk=", "publicKey": "pub=",
-            "serverPublicKey": "spk=", "endpoint": "1.2.3.4:51820",
-            "allowedIps": ["0.0.0.0/0"], "dns": ["1.1.1.1"],
-            "clientIp": "10.0.0.2", "mtu": 1420, "persistentKeepalive": 25
-        }"#;
-        let config: VpnConfig = serde_json::from_str(json).unwrap();
-        assert!(config.preshared_key.is_none());
-        assert_eq!(config.mtu, 1420);
-    }
+    // MR-822: `vpn_config_optional_fields_default_correctly` decoded a
+    // `VpnConfig` (private key included) from JSON. Nothing does that in the
+    // app: the server sends a `ConnectResponse`, and the config is built from
+    // it. `VpnConfig` is no longer `Deserialize`, so the test went with it.
 
     #[test]
     fn connect_request_skips_none_fields() {
@@ -1122,14 +1113,19 @@ mod types_serialization_tests {
 
 #[cfg(test)]
 mod vpn_config_security_tests {
+    //! MR-822. What a type can say is asserted at compile time beside the
+    //! types: `VpnConfig` has no private-key field and is not `Clone` or
+    //! `Serialize`; `WgPrivateKey` is not `Clone`, `Copy`, `Serialize` or
+    //! `Deserialize`. These tests cover what a type cannot say: what `Debug`
+    //! prints.
     use super::super::types::VpnConfig;
+    use crate::vpn::WgPrivateKey;
     use zeroize::Zeroize;
 
     fn make_test_config() -> VpnConfig {
         VpnConfig {
             server_id: "s1".to_string(),
             key_id: "k1".to_string(),
-            private_key: "SUPER_SECRET_PRIVATE_KEY".to_string(),
             public_key: "pub".to_string(),
             server_public_key: "server_pub".to_string(),
             preshared_key: Some("PRESHARED_SECRET".to_string()),
@@ -1146,29 +1142,28 @@ mod vpn_config_security_tests {
     }
 
     #[test]
-    fn scrub_key_material_zeroes_private_key() {
-        let mut config = make_test_config();
-        config.scrub_key_material();
-
-        // After scrub, private key should be zeroed (all null bytes)
-        assert!(config.private_key.bytes().all(|b| b == 0));
-        // Preshared key should also be zeroed
-        assert!(config
-            .preshared_key
-            .as_ref()
-            .unwrap()
-            .bytes()
-            .all(|b| b == 0));
+    fn debug_prints_no_secret_and_no_connection_history() {
+        let config = make_test_config();
+        for printed in [format!("{config:?}"), format!("{config:#?}")] {
+            for hidden in ["PRESHARED_SECRET", "1.2.3.4", "10.0.0.2", "private_key"] {
+                assert!(!printed.contains(hidden), "`{hidden}` in {printed}");
+            }
+            assert!(printed.contains("\"s1\""), "the ids still print: {printed}");
+        }
     }
 
+    /// The attempt's key travels beside the config, not inside it
+    /// (`VpnManager::connect`). Printed together, as a careless
+    /// `tracing::debug!(?config, ?key)` would print them, neither leaks.
+    /// (`vpn::wireguard_new::private_key_tests` checks the key's own bytes
+    /// against what it prints.)
     #[test]
-    fn scrub_preserves_non_sensitive_fields() {
-        let mut config = make_test_config();
-        config.scrub_key_material();
-
-        assert_eq!(config.server_id, "s1");
-        assert_eq!(config.endpoint, "1.2.3.4:51820");
-        assert_eq!(config.client_ip, "10.0.0.2");
+    fn the_key_beside_the_config_prints_redacted() {
+        let key = WgPrivateKey::generate();
+        assert_eq!(format!("{key:?}"), "[REDACTED]");
+        let pair = format!("{:#?}", (make_test_config(), &key));
+        assert!(pair.contains("[REDACTED]"), "{pair}");
+        assert!(!pair.contains("PRESHARED_SECRET"), "{pair}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod settings;
 pub mod speed_test;
 pub mod split_tunnel;
 pub mod tray;
+pub mod update_resume;
 pub mod updater;
 pub mod vouchers;
 pub mod vpn;

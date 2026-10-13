@@ -18,6 +18,32 @@ pub use redact::redact_email;
 pub use redact::redact_endpoint;
 pub use redact::redact_ip;
 
+/// Fails to compile if `$ty` implements any of the listed traits: a negative
+/// trait bound, which Rust cannot state directly. Two blanket impls of one
+/// generic trait make `<$ty as AmbiguousIfImpl<_>>` ambiguous exactly when
+/// `$ty` implements a listed trait. This is the `static_assertions` crate's
+/// `assert_not_impl_any!`, written out here instead of added as a dependency.
+///
+/// MR-822 uses it to keep the WireGuard private key, and the tunnel config it
+/// used to live in, from becoming `Clone` or serializable again.
+macro_rules! assert_not_impl_any {
+    ($ty:ty: $($trait_:path),+ $(,)?) => {
+        const _: fn() = || {
+            trait AmbiguousIfImpl<A> {
+                fn some_item() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+            $({
+                #[allow(dead_code)]
+                struct Invalid;
+                impl<T: ?Sized + $trait_> AmbiguousIfImpl<Invalid> for T {}
+            })+
+            let _ = <$ty as AmbiguousIfImpl<_>>::some_item;
+        };
+    };
+}
+pub(crate) use assert_not_impl_any;
+
 /// Create a `std::process::Command` that runs hidden on Windows (no console popup).
 ///
 /// On Windows, subprocesses launched from a GUI app inherit the parent's console

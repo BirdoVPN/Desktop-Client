@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::time::timeout;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::api::session_gate::StoredSession;
 use crate::api::types::{ConnectResponse, MultiHopConnectResponse, VpnConfig};
@@ -390,13 +390,14 @@ async fn attempt(
     // connect or fails, closed, with the server's error. A Disconnect during
     // the wait cancels it like any other step.
     let mut retried = false;
-    let (response, multi_hop, dialled_id, mut private_key) = loop {
+    let (response, multi_hop, dialled_id, private_key) = loop {
         // FIX-1-1: the X25519 keypair is generated here — the private key
         // never leaves this device. A fresh one per request, so a refused
-        // request's key is never sent again. Zeroizing until it moves into
-        // the config.
+        // request's key is never sent again. MR-822: it is a `WgPrivateKey`,
+        // moved out of this loop to `vm.connect` and on into the tunnel; a
+        // refused request's key, and every early return before that, drops
+        // it, which wipes it.
         let (private_key, client_public_key) = generate_wireguard_keypair();
-        let private_key = Zeroizing::new(private_key);
         let asked: Result<(ConnectResponse, Option<MultiHopStatus>, &str), IpcError> = async {
             match target {
                 ConnectTarget::SingleHop { server_id } => {
@@ -488,7 +489,6 @@ async fn attempt(
             custom_mtu: settings.custom_mtu,
             custom_port: &settings.custom_port,
         },
-        &mut private_key,
     )
     .await?;
 
@@ -535,6 +535,7 @@ async fn attempt(
     vm.set_phase(ConnectPhase::Handshaking);
     vm.connect(
         prepared.config,
+        private_key,
         label.clone(),
         settings.local_network_sharing,
         ctx.epoch,
@@ -771,7 +772,9 @@ pub(crate) struct TunnelRequest<'a> {
     pub custom_port: &'a str,
 }
 
-/// A validated tunnel config, ready for `VpnManager::connect`.
+/// A validated tunnel config, ready for `VpnManager::connect`. It holds no
+/// private key (MR-822): the caller keeps the attempt's `WgPrivateKey` and
+/// moves it to `VpnManager::connect` beside this config.
 pub(crate) struct PreparedTunnel {
     pub config: VpnConfig,
     pub server_name: String,
@@ -785,14 +788,15 @@ pub(crate) struct PreparedTunnel {
 /// shared by the user connect and the unattended re-dial so a security check
 /// can never exist on one path only: protection enforcement (no silent
 /// downgrade), the stealth transport, the BirdoPQ PSK and the
-/// `build_vpn_config` choke point (client key, `validate_tunnel_scope`).
+/// `build_vpn_config` choke point (`validate_tunnel_scope`). The client's
+/// private key does not pass through here (MR-822): it goes from the caller
+/// straight to `VpnManager::connect`.
 pub(crate) async fn prepare_tunnel(
     app: &AppHandle,
     vm: &VpnManager,
     epoch: u64,
     response: ConnectResponse,
     request: TunnelRequest<'_>,
-    private_key: &mut Zeroizing<String>,
 ) -> Result<PreparedTunnel, IpcError> {
     enforce_requested_protection(&response, request.stealth_mode, request.quantum_protection)?;
 
@@ -834,7 +838,6 @@ pub(crate) async fn prepare_tunnel(
         response,
         request.server_id,
         request.custom_dns,
-        std::mem::take(&mut **private_key),
         request.custom_mtu,
         request.custom_port,
     )
@@ -1004,6 +1007,11 @@ const RELEASE_DEADLINE: Duration = Duration::from_secs(40);
 /// for it on the commit lock it holds.
 pub async fn end_session(app: &AppHandle, reason: EndReason) {
     tracing::info!("Ending the VPN session ({reason:?})");
+    // MR-1861: only the session an update ends is put back by the version it
+    // installs; any other end is the user's (or the server's) choice.
+    if reason != EndReason::Update {
+        crate::commands::update_resume::discard();
+    }
     let teardown = tauri::async_runtime::spawn(tear_down(app.clone(), reason));
     match timeout(RELEASE_DEADLINE, teardown).await {
         // It released the block and wrote Disconnected under the commit lock.

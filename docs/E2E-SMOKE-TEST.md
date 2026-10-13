@@ -35,7 +35,7 @@ installing the signed `v1.4.x` build, **as Administrator**. Tick each box.
 
 ## 4. Post-Quantum — ON by default
 - [ ] Fresh install: Settings shows **Quantum Protection ON** by default.
-- [ ] Connect -> the **"Post-Quantum" chip appears under the status pill** (proves ML-KEM PSK is active, `pq_mode == bilateral`).
+- [ ] Connect -> `birdo.log` has the line **`BirdoPQ v1 BILATERAL`** (`mode=bilateral`), which proves the ML-KEM PSK is active (`get_vpn_status` reports `pq_mode == bilateral`). There is no PQ badge to look for: the "Post-Quantum" chip under the status pill was removed in v1.3.34 (#10).
 
 ## 5. Multi-hop (Sovereign)
 - [ ] Multi-hop arm toggle is gated to Sovereign; entry + exit pickers work; same-server is rejected.

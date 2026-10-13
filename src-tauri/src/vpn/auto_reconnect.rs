@@ -30,7 +30,6 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{watch, Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, MissedTickBehavior};
-use zeroize::Zeroizing;
 
 use super::manager::{
     ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, SessionLabel, VpnManager,
@@ -469,6 +468,10 @@ impl AutoReconnectService {
     /// fresh ones.
     pub async fn store_last_config(&self, info: ReconnectInfo) {
         tracing::debug!("Stored reconnect info for: {}", info.server_name);
+        // MR-1861: a new session on record, which an update may resume again
+        // (a Disconnect had stopped `update_resume` from recording). Before
+        // the write, so a Disconnect racing it still wins.
+        crate::commands::update_resume::session_started();
         *self.last_reconnect_info.write().await = Some(info);
     }
 
@@ -476,6 +479,16 @@ impl AutoReconnectService {
     /// failed switch reverts to. None when there is no session.
     pub async fn current_info(&self) -> Option<ReconnectInfo> {
         self.last_reconnect_info.read().await.clone()
+    }
+
+    /// [`current_info`](Self::current_info) without waiting, for a caller
+    /// that cannot await: the process exit (`commands::update_resume`).
+    /// `None` too while the record is being written.
+    pub fn current_info_now(&self) -> Option<ReconnectInfo> {
+        self.last_reconnect_info
+            .try_read()
+            .ok()
+            .and_then(|info| info.clone())
     }
 
     /// Record the settings the session on record connected with.
@@ -1275,11 +1288,11 @@ impl ReconnectLoop {
         // SEC-PII: same generic label as every other auth/connect payload —
         // never the raw hostname.
         let device_name = crate::utils::get_device_name();
-        // FIX-1-1: a fresh client-side keypair for every re-dial. Zeroizing
-        // until it is moved into the config, so no error path frees it
-        // un-wiped (AR-1).
+        // FIX-1-1: a fresh client-side keypair for every re-dial. MR-822: a
+        // `WgPrivateKey`, moved to `vm.connect` and on into the tunnel, and
+        // wiped on drop, so no error path frees it un-wiped (AR-1). Only
+        // `ReconnectInfo` outlives the attempt, and it holds no key.
         let (private_key, client_public_key) = crate::commands::vpn::generate_wireguard_keypair();
-        let mut private_key = Zeroizing::new(private_key);
         let pq_pk = if info.quantum_protection {
             Some(
                 crate::vpn::birdo_pq::get_client_public_key_b64().ok_or_else(|| {
@@ -1329,7 +1342,6 @@ impl ReconnectLoop {
                 custom_mtu: info.custom_mtu,
                 custom_port: &info.custom_port,
             },
-            &mut private_key,
         )
         .await?;
         // The block `dial` engaged is rebuilt around this relay before the
@@ -1345,6 +1357,7 @@ impl ReconnectLoop {
         vm.set_phase(ConnectPhase::Handshaking);
         vm.connect(
             prepared.config,
+            private_key,
             info.label(),
             info.local_network_sharing,
             epoch,
