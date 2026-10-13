@@ -19,9 +19,12 @@ export const PRIVACY_URL = 'https://birdo.app/privacy';
  * connected), and that crash reports carried "no personal data" while they
  * were sent unconditionally. Do not reintroduce any of those.
  *
- * Nor "never included in backups" (second-pass #2): the nightly dump leaves
- * the live record out, but the daily point-in-time-recovery base backup
- * (kept 7 days) copies every data file, so it can hold it (§1.2a).
+ * "Left out of our nightly backups" is exact: the nightly dump skips the
+ * live record (an UNLOGGED table), and since 2026-10-04 the daily
+ * point-in-time-recovery base backup (4 kept) holds none of its rows either
+ * (a streamed BASE_BACKUP skips unlogged data). /privacy says the same since
+ * 2026-10-07. Until then this comment said the base backup (kept 7 days)
+ * could hold it, which was true at the time.
  */
 export const CONSENT_COPY = {
   noActivityLogs:
