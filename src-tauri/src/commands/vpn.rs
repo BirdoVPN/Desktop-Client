@@ -23,7 +23,7 @@ use crate::vpn::AutoReconnectService;
 
 // FIX-1-1: Client-side WireGuard key generation
 use base64::Engine as _;
-use boringtun::x25519::{PublicKey, StaticSecret};
+use boringtun::x25519::PublicKey;
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Serialize)]
@@ -264,7 +264,7 @@ pub(crate) fn dialable_wireguard_port(setting: &str) -> Option<u16> {
 /// producer through the schema's `clientPublicKey` pattern instead of a
 /// hand-typed 44-char literal that would pass no matter what this emits.
 pub(crate) fn generate_wireguard_keypair() -> (String, String) {
-    let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let secret = crate::utils::os_rng::x25519_static_secret();
     let public = PublicKey::from(&secret);
     let mut private_key_bytes = secret.to_bytes();
     let local_private_key = base64::engine::general_purpose::STANDARD.encode(private_key_bytes);

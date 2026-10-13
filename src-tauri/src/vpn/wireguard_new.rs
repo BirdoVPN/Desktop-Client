@@ -1416,8 +1416,8 @@ mod liveness_tests {
     use super::*;
 
     fn fresh_tunn() -> Tunn {
-        let ours = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let theirs = PublicKey::from(&StaticSecret::random_from_rng(rand::rngs::OsRng));
+        let ours = crate::utils::os_rng::x25519_static_secret();
+        let theirs = PublicKey::from(&crate::utils::os_rng::x25519_static_secret());
         Tunn::new(ours, theirs, None, None, 0, None)
     }
 
@@ -1685,9 +1685,9 @@ mod handshake_tests {
     /// cookie (rate-limit limit 0) — the path W1-033 is about. `ignore_first`
     /// drops that many initiations unanswered — a lossy or filtering network.
     async fn responder(under_load: bool, ignore_first: usize) -> Responder {
-        let server_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let server_secret = crate::utils::os_rng::x25519_static_secret();
         let server_public = PublicKey::from(&server_secret);
-        let client_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let client_secret = crate::utils::os_rng::x25519_static_secret();
         let client_public = PublicKey::from(&client_secret);
         let limiter = under_load.then(|| Arc::new(RateLimiter::new(&server_public, 0)));
         let mut tunn = Tunn::new(server_secret, client_public, None, None, 1, limiter);
@@ -2046,9 +2046,9 @@ mod handshake_tests {
     /// is proof.
     #[tokio::test]
     async fn only_an_answer_to_our_initiation_proves_the_path() {
-        let server_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let server_secret = crate::utils::os_rng::x25519_static_secret();
         let server_public = PublicKey::from(&server_secret);
-        let client_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let client_secret = crate::utils::os_rng::x25519_static_secret();
         let mut relay = Tunn::new(
             server_secret,
             PublicKey::from(&client_secret),

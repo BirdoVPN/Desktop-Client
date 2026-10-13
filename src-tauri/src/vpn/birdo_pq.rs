@@ -273,11 +273,10 @@ fn keypair_from_seed(seed_bytes: &[u8; SEED_BYTES]) -> StaticKeypair {
 }
 
 pub fn generate_keypair() -> StaticKeypair {
-    use rand::RngCore;
     // Straight from the OS CSPRNG: this is a long-lived identity key, so it
     // does not go through a userspace PRNG that could be forked or reseeded.
     let mut seed = Zeroizing::new([0u8; SEED_BYTES]);
-    rand::rngs::OsRng.fill_bytes(seed.as_mut_slice());
+    crate::utils::os_rng::fill(seed.as_mut_slice());
     keypair_from_seed(&seed)
 }
 

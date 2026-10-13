@@ -6,6 +6,7 @@ pub mod device_id;
 pub mod elevation;
 pub mod log_policy;
 pub mod log_retention;
+pub mod os_rng;
 pub mod redact;
 
 /// Source-level guard that no address-shaped value reaches a logging macro

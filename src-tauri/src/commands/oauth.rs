@@ -21,7 +21,6 @@ use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use crate::storage::CredentialStore;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tauri::{Manager, State};
@@ -107,7 +106,7 @@ fn b64url(bytes: &[u8]) -> String {
 /// challenge = base64url(SHA-256(verifier)).
 fn generate_pkce() -> (String, String) {
     let mut verifier_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut verifier_bytes);
+    crate::utils::os_rng::fill(&mut verifier_bytes);
     let verifier = b64url(&verifier_bytes);
     let challenge = b64url(&Sha256::digest(verifier.as_bytes()));
     (verifier, challenge)
@@ -115,7 +114,7 @@ fn generate_pkce() -> (String, String) {
 
 fn random_token(len: usize) -> String {
     let mut b = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut b);
+    crate::utils::os_rng::fill(&mut b);
     b64url(&b)
 }
 
