@@ -65,9 +65,10 @@ pub struct AppSettings {
     /// Allow LAN access while connected (printers, NAS, etc.)
     #[serde(default)]
     pub local_network_sharing: bool,
-    /// WireGuard port: "auto" or "51820" (the relays accept no other). "53"
-    /// and custom numbers from earlier builds are migrated to "auto" on load
-    /// (`migrate_wireguard_port`).
+    /// WireGuard port: "auto", the only value since MR-920 took the choice
+    /// away. The relays accept WireGuard on 51820 only, which is what the
+    /// server's endpoint names. "51820", "53" and custom numbers saved by
+    /// earlier builds are migrated to "auto" on load (`migrate_wireguard_port`).
     #[serde(default = "default_wireguard_port")]
     pub wireguard_port: String,
     /// WireGuard MTU: 0 = automatic (server default), 1280-1500 = custom
@@ -76,8 +77,9 @@ pub struct AppSettings {
     /// Enable Xray Reality stealth tunnel (bypass DPI/censorship)
     #[serde(default)]
     pub stealth_mode: bool,
-    /// Enable Rosenpass post-quantum key exchange. ON by default for all users
-    /// (available on every plan, negligible overhead).
+    /// Enable BirdoPQ (an ML-KEM-1024 post-quantum PSK for WireGuard; see
+    /// `vpn/birdo_pq.rs`). ON by default for all users (available on every
+    /// plan, negligible overhead).
     #[serde(default = "default_true")]
     pub quantum_protection: bool,
     /// BirdoShield (OPEN-WORK D18): ask the server to resolve this device's
@@ -492,10 +494,15 @@ fn normalize_loaded_settings(mut settings: AppSettings) -> AppSettings {
 /// WIN-FIX-3: the relays accept WireGuard on UDP 51820 only (vpn-a3, all
 /// ten: no DNAT, nothing on a public 53). The "53" preset and the custom port
 /// that earlier builds offered failed the handshake on every relay, so a
-/// saved value of either becomes "auto" — the same rule as Android. Returns
-/// whether it changed anything, so a signed file is re-saved once.
+/// saved value of either becomes "auto" — the same rule as Android.
+///
+/// MR-920 removed the port choice, so a saved "51820" becomes "auto" too.
+/// Nothing in the app can clear it any more, and it would keep overriding the
+/// port in the server's endpoint ([`crate::commands::vpn::dialable_wireguard_port`])
+/// on every connect, for good. Returns whether it changed anything, so a
+/// signed file is re-saved once.
 fn migrate_wireguard_port(settings: &mut AppSettings) -> bool {
-    if matches!(settings.wireguard_port.as_str(), "auto" | "51820") {
+    if settings.wireguard_port == "auto" {
         return false;
     }
     settings.wireguard_port = default_wireguard_port();
@@ -1580,12 +1587,12 @@ mod tests {
     }
 
     /// WIN-FIX-3: "53" and custom ports, which no relay answers, load as
-    /// "auto"; the two real choices are kept.
+    /// "auto". MR-920: so does "51820", which no screen can clear any more.
     #[test]
     fn a_dead_wireguard_port_loads_as_auto() {
         for (stored, loaded) in [
             ("auto", "auto"),
-            ("51820", "51820"),
+            ("51820", "auto"),
             ("53", "auto"),
             ("443", "auto"),
             ("5353", "auto"),
@@ -1598,10 +1605,15 @@ mod tests {
             assert_eq!(settings.wireguard_port, loaded, "{stored:?}");
         }
         let mut kept = AppSettings {
-            wireguard_port: "51820".into(),
+            wireguard_port: "auto".into(),
             ..AppSettings::default()
         };
         assert!(!migrate_wireguard_port(&mut kept), "nothing to re-save");
+        let mut fixed = AppSettings {
+            wireguard_port: "51820".into(),
+            ..AppSettings::default()
+        };
+        assert!(migrate_wireguard_port(&mut fixed), "re-saved once");
         let mut dead = AppSettings {
             wireguard_port: "53".into(),
             ..AppSettings::default()
