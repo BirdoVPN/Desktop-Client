@@ -17,6 +17,7 @@ use crate::commands::session::{
 };
 use crate::commands::settings::{load_settings_off_runtime, AppSettings};
 use crate::storage::CredentialStore;
+use crate::vpn::auto_reconnect::ReconnectInfo;
 use crate::vpn::manager::{ConnectPhase, ConnectionState, GaveUp, MultiHopStatus, VpnManager};
 use crate::vpn::xray::XrayManager;
 use crate::vpn::AutoReconnectService;
@@ -314,57 +315,81 @@ pub(crate) fn effective_dns_filtering(dns_filtering: bool, custom_dns: Option<&[
     dns_filtering && !custom_dns_active
 }
 
+/// What [`apply_vpn_settings`] logs when settings.json cannot be read
+/// (MR-1943). The old line said the fallback had switched stealth and
+/// post-quantum off, which was true.
+const UNREADABLE_SETTINGS_FALLBACK: &str = "Failed to load VPN settings; using the default \
+     settings (post-quantum on, lockdown at its platform default) and keeping any \
+     protection the session on record has";
+
+/// The settings a connect runs on for a load of settings.json, and the
+/// snapshot a failed reapply goes back to (`None` unless they are the file's).
+///
+/// MR-1943: a file that cannot be read gives the DEFAULTS. That covers an
+/// antivirus, backup or EDR agent holding it, an ACL change, bytes that are
+/// not UTF-8, JSON in neither the signed nor the legacy format, and a config
+/// path that does not resolve. It is the rule Rust already follows for a file
+/// it cannot verify (`settings::Loaded::Unverified`) or has quarantined:
+/// post-quantum ON and, on Windows, lockdown ON. Such a file used to give
+/// post-quantum, lockdown and stealth all OFF. Nothing objected to that
+/// downgrade, because `enforce_requested_protection` checks only what was
+/// requested. Auto-reconnect kept it for the rest of the session, and any
+/// process of this user could cause it by making the file unparseable, which
+/// gets past the HMAC.
+///
+/// Upgrade-only: the session on record (`live`) keeps its stealth,
+/// post-quantum and BirdoShield. A server switch or a settings reapply that
+/// meets a transient read error must not strip a live session of a protection
+/// the user turned on. No flag ends up below its default. Everything else
+/// takes its default (no custom DNS, no LAN sharing, no kill-switch
+/// exceptions, automatic MTU), the restrictive side of each; the next connect
+/// reads the file again.
+fn settings_in_force(
+    loaded: Result<AppSettings, String>,
+    live: Option<&ReconnectInfo>,
+) -> (AppSettings, Option<AppSettings>) {
+    match loaded {
+        Ok(settings) => (settings.clone(), Some(settings)),
+        Err(e) => {
+            tracing::warn!("{} ({})", UNREADABLE_SETTINGS_FALLBACK, e);
+            let mut settings = AppSettings::default();
+            if let Some(live) = live {
+                settings.stealth_mode |= live.stealth_mode;
+                settings.quantum_protection |= live.quantum_protection;
+                settings.dns_filtering |= live.dns_filtering;
+            }
+            (settings, None)
+        }
+    }
+}
+
 /// Read VPN-related settings and configure WFP split tunneling / local network sharing.
 pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
-    // Settings failing to load means security-relevant flags (stealth_mode,
-    // quantum_protection) fall back to their defaults. We keep the resilient
-    // fallback behaviour, but surface the cause instead of silently swallowing it.
     // Rust's own read (round 6 of the review of #222): an unverifiable file
     // gives the defaults this session runs on — post-quantum and, on Windows,
-    // lockdown ON — where `get_settings`, the UI's read, refuses it.
-    let settings = match load_settings_off_runtime(app).await {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(
-                "Failed to load VPN settings ({}); falling back to defaults \
-                 (stealth/quantum disabled)",
-                e
-            );
-            None
-        }
-    };
-    let custom_dns = settings.as_ref().and_then(|s| s.custom_dns.clone());
-    let local_network_sharing = settings
-        .as_ref()
-        .map(|s| s.local_network_sharing)
-        .unwrap_or(false);
-    let split_tunneling_enabled = settings
-        .as_ref()
-        .map(|s| s.split_tunneling_enabled)
-        .unwrap_or(false);
-    let split_tunnel_apps = settings
-        .as_ref()
-        .map(|s| s.split_tunnel_apps.clone())
-        .unwrap_or_default();
-    let custom_mtu = settings.as_ref().map(|s| s.wireguard_mtu).unwrap_or(0);
-    let custom_port = settings
-        .as_ref()
-        .map(|s| s.wireguard_port.clone())
-        .unwrap_or_else(|| "auto".to_string());
-    let stealth_mode = settings.as_ref().map(|s| s.stealth_mode).unwrap_or(false);
-    let quantum_protection = settings
-        .as_ref()
-        .map(|s| s.quantum_protection)
-        .unwrap_or(false);
-    let dns_filtering = effective_dns_filtering(
-        settings.as_ref().map(|s| s.dns_filtering).unwrap_or(false),
-        custom_dns.as_deref(),
-    );
-    // Lockdown (always-on kill switch). The SETTING defaults ON on Windows
-    // (AppSettings::default, desktop #34) and is user-switchable in Settings;
-    // only an unreadable settings file falls back to reactive (false) here.
-    // See wfp::LOCKDOWN_MODE (D-21).
-    let lockdown_mode = settings.as_ref().map(|s| s.lockdown_mode).unwrap_or(false);
+    // lockdown ON — where `get_settings`, the UI's read, refuses it. A file
+    // that cannot be read at all gives them too ([`settings_in_force`]).
+    let live = app.state::<AutoReconnectService>().current_info().await;
+    let (settings, snapshot) =
+        settings_in_force(load_settings_off_runtime(app).await, live.as_ref());
+    let AppSettings {
+        custom_dns,
+        local_network_sharing,
+        split_tunneling_enabled,
+        split_tunnel_apps,
+        wireguard_mtu: custom_mtu,
+        wireguard_port: custom_port,
+        stealth_mode,
+        quantum_protection,
+        dns_filtering,
+        // Lockdown (always-on kill switch). The SETTING defaults ON on
+        // Windows (AppSettings::default, desktop #34) and is user-switchable
+        // in Settings; an unreadable settings file gives that default too
+        // (MR-1943). See wfp::LOCKDOWN_MODE (D-21).
+        lockdown_mode,
+        ..
+    } = settings;
+    let dns_filtering = effective_dns_filtering(dns_filtering, custom_dns.as_deref());
 
     // Mirror Local Network Sharing to the kill switch on every platform, so an
     // engaged block still permits the LAN when the user asked for that. Lives
@@ -392,7 +417,7 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
         stealth_mode,
         quantum_protection,
         dns_filtering,
-        snapshot: settings,
+        snapshot,
     }
 }
 
@@ -1755,5 +1780,144 @@ mod tests {
                 servers.reverse();
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // MR-1943: a settings file that cannot be read connects on the defaults
+    // (post-quantum ON, Windows lockdown ON), never with every protection off.
+    // ------------------------------------------------------------------
+
+    /// What `load_settings_off_runtime` answers for each way a load fails
+    /// (`settings::LoadError`: unreadable, not UTF-8, unparseable, no config
+    /// directory), as the string it reaches this module as.
+    const LOAD_ERRORS: [&str; 4] = [
+        "Failed to read settings: The process cannot access the file because it is being used by another process. (os error 32)",
+        "Failed to parse settings (not UTF-8): stream did not contain valid UTF-8",
+        "Failed to parse settings: expected value at line 1 column 1",
+        "Failed to get config dir: unknown path",
+    ];
+
+    /// The `ReconnectInfo` of a live session with these protections.
+    fn live_session(
+        stealth_mode: bool,
+        quantum_protection: bool,
+        dns_filtering: bool,
+    ) -> ReconnectInfo {
+        ReconnectInfo {
+            server_id: "ams-1".to_string(),
+            server_name: "Amsterdam".to_string(),
+            local_network_sharing: false,
+            custom_mtu: 0,
+            custom_port: "auto".to_string(),
+            custom_dns: None,
+            stealth_mode,
+            quantum_protection,
+            dns_filtering,
+            fallback_reason: None,
+            multi_hop: None,
+        }
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_connects_on_the_defaults() {
+        let defaults = AppSettings::default();
+        for error in LOAD_ERRORS {
+            let (settings, snapshot) = settings_in_force(Err(error.to_string()), None);
+            assert_eq!(
+                settings.quantum_protection, defaults.quantum_protection,
+                "{error}"
+            );
+            assert!(
+                settings.quantum_protection,
+                "post-quantum stays on: {error}"
+            );
+            assert_eq!(settings.lockdown_mode, defaults.lockdown_mode, "{error}");
+            assert_eq!(
+                settings.lockdown_mode,
+                cfg!(target_os = "windows"),
+                "lockdown as default: {error}"
+            );
+            assert_eq!(settings.stealth_mode, defaults.stealth_mode, "{error}");
+            assert_eq!(settings.dns_filtering, defaults.dns_filtering, "{error}");
+            // The rest on the restrictive side: no custom DNS, no LAN, no
+            // kill-switch exceptions.
+            assert!(settings.custom_dns.is_none(), "{error}");
+            assert!(!settings.local_network_sharing, "{error}");
+            assert!(!settings.split_tunneling_enabled, "{error}");
+            assert!(settings.split_tunnel_apps.is_empty(), "{error}");
+            // Not the file's: a failed reapply must never save these back
+            // over it (`restore_tunnel_settings`).
+            assert!(snapshot.is_none(), "{error}");
+        }
+    }
+
+    /// Upgrade-only: a switch or a reapply that meets a read error keeps the
+    /// live session's stealth, post-quantum and BirdoShield, and a session
+    /// that ran with one off does not take it below its default.
+    #[test]
+    fn an_unreadable_settings_file_keeps_the_live_sessions_protection() {
+        let error = || Err(LOAD_ERRORS[0].to_string());
+        let (kept, _) = settings_in_force(error(), Some(&live_session(true, true, true)));
+        assert!(kept.stealth_mode, "stealth kept");
+        assert!(kept.quantum_protection, "post-quantum kept");
+        assert!(kept.dns_filtering, "BirdoShield kept");
+        assert_eq!(kept.lockdown_mode, AppSettings::default().lockdown_mode);
+
+        let (raised, snapshot) =
+            settings_in_force(error(), Some(&live_session(false, false, false)));
+        assert!(raised.quantum_protection, "never below the default");
+        assert_eq!(raised.lockdown_mode, AppSettings::default().lockdown_mode);
+        assert!(!raised.stealth_mode);
+        assert!(!raised.dns_filtering);
+        assert!(snapshot.is_none());
+    }
+
+    /// A file that was read is honoured as saved, a protection the user
+    /// switched off included, and a live session never overrides it.
+    #[test]
+    fn a_readable_settings_file_is_honoured_as_saved() {
+        let saved = AppSettings {
+            quantum_protection: false,
+            lockdown_mode: false,
+            stealth_mode: true,
+            dns_filtering: false,
+            custom_dns: Some(vec!["9.9.9.9".to_string()]),
+            ..AppSettings::default()
+        };
+        let (settings, snapshot) =
+            settings_in_force(Ok(saved.clone()), Some(&live_session(false, true, true)));
+        assert!(!settings.quantum_protection);
+        assert!(!settings.lockdown_mode);
+        assert!(settings.stealth_mode);
+        assert!(!settings.dns_filtering);
+        assert_eq!(settings.custom_dns, saved.custom_dns);
+        let snapshot = snapshot.expect("the file's settings are the snapshot");
+        assert!(!snapshot.quantum_protection && snapshot.stealth_mode);
+    }
+
+    /// The wiring, and the log line: `apply_vpn_settings` takes every flag
+    /// from [`settings_in_force`] and keeps no fallback of its own (the old
+    /// ones were `false`), and the warning no longer says "disabled".
+    #[test]
+    fn apply_vpn_settings_takes_every_flag_from_settings_in_force() {
+        let source = include_str!("vpn.rs");
+        let apply = &source[source
+            .find("pub(super) async fn apply_vpn_settings(")
+            .unwrap()..];
+        let apply = &apply[..apply.find("\n}").unwrap()];
+        for needle in [
+            "app.state::<AutoReconnectService>().current_info().await",
+            "settings_in_force(load_settings_off_runtime(app).await, live.as_ref())",
+            "} = settings;",
+        ] {
+            assert!(apply.contains(needle), "{needle}");
+        }
+        assert!(!apply.contains("unwrap_or"), "a fallback of its own");
+
+        let in_force = &source[source.find("fn settings_in_force(").unwrap()..];
+        let in_force = &in_force[..in_force.find("\n}").unwrap()];
+        assert!(in_force.contains("tracing::warn!(\"{} ({})\", UNREADABLE_SETTINGS_FALLBACK, e)"));
+        assert!(!UNREADABLE_SETTINGS_FALLBACK.contains("disabled"));
+        assert!(UNREADABLE_SETTINGS_FALLBACK.contains("default settings (post-quantum on"));
     }
 }
