@@ -249,6 +249,16 @@ fn reconnect_after_failed_install(had_session: bool, always_on: bool) -> Reconne
     }
 }
 
+/// Whether the user asked never to be unprotected: kill switch and lockdown
+/// both on. A settings file that cannot be read gives the defaults' answer
+/// (yes, on Windows), as every other Rust read of such a file does (MR-1943).
+/// It used to give no, which left the user unprotected after a failed install
+/// until they accepted the offered reconnect.
+fn is_always_on(loaded: Result<crate::commands::settings::AppSettings, String>) -> bool {
+    let settings = loaded.unwrap_or_default();
+    settings.killswitch_enabled && settings.lockdown_mode
+}
+
 /// The install failed after the session was ended for it. Bring the app back
 /// into view and decide about the session (REVIEW-WIN-002).
 async fn recover_from_failed_install(
@@ -258,10 +268,7 @@ async fn recover_from_failed_install(
 ) -> UpdateFailure {
     set_tray_visible(app, true);
     restore_and_focus(app);
-    let always_on = crate::commands::settings::load_settings_off_runtime(app)
-        .await
-        .map(|s| s.killswitch_enabled && s.lockdown_mode)
-        .unwrap_or(false);
+    let always_on = is_always_on(crate::commands::settings::load_settings_off_runtime(app).await);
     let reconnect = reconnect_after_failed_install(resume.is_some(), always_on);
     if let (Reconnect::Automatic, Some(target)) = (reconnect, resume) {
         tracing::info!("Update install failed under always-on — reconnecting");
@@ -440,6 +447,53 @@ mod tests {
 
         let install = &source[source.find("pub async fn install_update(").unwrap()..];
         assert!(install.contains("recover_from_failed_install(&app, resume"));
+    }
+
+    /// MR-1943: after a failed install, a settings file that cannot be read
+    /// decides the reconnect the way the defaults would (automatic where
+    /// lockdown defaults on, Windows), never as "not always-on".
+    #[test]
+    fn an_unreadable_settings_file_reconnects_as_the_defaults_would() {
+        use super::{is_always_on, reconnect_after_failed_install, Reconnect};
+        use crate::commands::settings::AppSettings;
+        let defaults = AppSettings::default();
+        let unreadable = || Err("Failed to read settings: busy (os error 32)".to_string());
+        assert_eq!(
+            is_always_on(unreadable()),
+            defaults.killswitch_enabled && defaults.lockdown_mode
+        );
+        assert_eq!(is_always_on(unreadable()), cfg!(target_os = "windows"));
+        let expected = if cfg!(target_os = "windows") {
+            Reconnect::Automatic
+        } else {
+            Reconnect::Offered
+        };
+        assert_eq!(
+            reconnect_after_failed_install(true, is_always_on(unreadable())),
+            expected
+        );
+
+        // A file that was read answers for itself.
+        let saved = |killswitch_enabled, lockdown_mode| {
+            Ok(AppSettings {
+                killswitch_enabled,
+                lockdown_mode,
+                ..AppSettings::default()
+            })
+        };
+        assert!(is_always_on(saved(true, true)));
+        assert!(!is_always_on(saved(true, false)));
+        assert!(!is_always_on(saved(false, true)));
+
+        let source = include_str!("updater.rs");
+        let body = &source[source
+            .find("async fn recover_from_failed_install(")
+            .unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        assert!(body.contains(
+            "is_always_on(crate::commands::settings::load_settings_off_runtime(app).await)"
+        ));
+        assert!(!body.contains("unwrap_or(false)"));
     }
 
     /// MR-1824: off Windows a block holds the download unless the tunnel
