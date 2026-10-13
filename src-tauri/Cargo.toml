@@ -104,7 +104,13 @@ socket2 = "0.6"
 sha2 = "0.11"  # DLL integrity verification
 hmac = "0.13"  # FIX-1-7: Settings file HMAC integrity (boringtun still carries hmac 0.12 internally)
 hex = "0.4"    # FIX-1-7: Hex encoding for HMAC key storage
-rand = "0.8"
+# Key material: the WireGuard X25519 secret, the ML-KEM seed and the OAuth
+# PKCE verifier/state come straight from the OS CSPRNG via
+# utils/os_rng.rs (`SysRng`, which rand 0.8 called `OsRng`). The settings HMAC
+# key and the device id use `rand::random` / `rand::fill` (ThreadRng).
+# 0.10 is already in the graph (quinn-proto), so this adds no crate. rand 0.8
+# stays for zbus / secret-service on Linux.
+rand = "0.10"
 # Ed25519 client attestation (src/api/attestation.rs). Already in the graph —
 # rustls uses its ring provider and boringtun 0.7.1 links ring 0.17 — so this
 # is a re-export of an existing dependency, not new compiled code.

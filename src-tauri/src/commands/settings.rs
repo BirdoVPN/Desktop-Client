@@ -339,8 +339,7 @@ fn get_hmac_key(settings_path: &Path) -> Result<Vec<u8>, String> {
     // Neither source holds a key — first run. Mint one and persist it to BOTH
     // sources. The file write is the hard requirement (it is the source that
     // is always reachable); the store mirror is best-effort.
-    use rand::Rng;
-    let key: [u8; 32] = rand::thread_rng().gen();
+    let key: [u8; 32] = rand::random();
     write_key_file(settings_path, &key)?;
     sync_hmac_key_sources(settings_path, &key);
     tracing::info!("Generated new settings HMAC key");

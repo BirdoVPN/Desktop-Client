@@ -57,12 +57,11 @@ fn is_valid(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
-/// A fresh `desktop_<uuid-v4>` from the OS CSPRNG (`rand::thread_rng` is a
+/// A fresh `desktop_<uuid-v4>` from the OS CSPRNG (`rand::rng()` is a
 /// ChaCha stream seeded from it). RFC 4122 layout, version 4, variant 10.
 fn generate() -> String {
-    use rand::RngCore;
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::fill(&mut b[..]);
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h = hex::encode(b);
