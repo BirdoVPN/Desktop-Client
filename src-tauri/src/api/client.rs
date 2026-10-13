@@ -1405,8 +1405,9 @@ impl BirdoApi {
                 };
             }
             // MR-1639: the peer was rolled back because its pre-shared key
-            // could only have travelled over the SSH fallback. Same shape and
-            // semantics as the allowance check: retry the same request.
+            // could only have travelled over the backend's SSH fallback (a
+            // temporary, server-side condition). Same shape and semantics as
+            // the allowance check: retry the same request.
             Some("psk_delivery_unavailable") => {
                 return ApiError::PskDeliveryUnavailable {
                     retry_after_secs: retry_after_secs(),

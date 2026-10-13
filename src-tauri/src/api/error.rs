@@ -44,12 +44,13 @@ pub enum ApiError {
     /// `retry_after_secs` when the server says.
     QuotaCheckUnavailable { retry_after_secs: Option<u64> },
     /// 503 `error: "psk_delivery_unavailable"` (birdo-web
-    /// `VpnController.rethrowPskDeliveryRefusal`, MR-1639): the relay could
-    /// only have been reached over the SSH fallback, which never carries a
-    /// pre-shared key, so the server rolled the peer back instead of
-    /// installing it without one. Nothing was downgraded, and the SAME
-    /// request is worth retrying, after `retry_after_secs` when the server
-    /// says.
+    /// `VpnController.rethrowPskDeliveryRefusal`, MR-1639): the backend could
+    /// only have added the peer over its SSH fallback, which never carries a
+    /// pre-shared key, so it rolled the peer back instead of installing it
+    /// without one. A temporary, server-side condition (the backend running
+    /// without its node agent, for every relay at once), not this device's or
+    /// this relay's. Nothing was downgraded, and the SAME request is worth
+    /// retrying, after `retry_after_secs` when the server says.
     PskDeliveryUnavailable { retry_after_secs: Option<u64> },
     /// Unknown error
     Unknown(String),

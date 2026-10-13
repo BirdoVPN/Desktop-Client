@@ -219,9 +219,10 @@ impl IpcError {
             ),
             // MR-1639: retryable by nature too. The server rolled the peer back
             // rather than install it without its pre-shared key; the SAME
-            // request (same Quantum Protection) succeeds once the relay's
-            // secure channel is back. Not `server_unavailable`: its advice,
-            // "try another location", is not what the server said.
+            // request (same Quantum Protection) succeeds once that temporary,
+            // server-side condition clears. Not `server_unavailable`: its
+            // advice, "try another location", cannot help — the condition
+            // holds for every relay at once.
             ApiError::PskDeliveryUnavailable { retry_after_secs } => Self::transient(
                 "BirdoVPN couldn't set up a secure connection to this server just now. Please \
                  try again in a moment.",
