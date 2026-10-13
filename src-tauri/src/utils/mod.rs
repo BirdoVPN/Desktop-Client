@@ -4,6 +4,7 @@ pub mod console_log;
 pub mod crash_report;
 pub mod device_id;
 pub mod elevation;
+pub mod file_log;
 pub mod log_policy;
 pub mod log_retention;
 pub mod os_rng;

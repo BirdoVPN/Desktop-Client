@@ -16,6 +16,10 @@
 //! protocol-schema.spec.ts). Re-vendoring = copy the file verbatim AND update
 //! `SCHEMA_SHA256` in the same commit; nothing else passes the drift test.
 //!
+//! The same schema pins the connect routes' error vocabulary
+//! (`$defs/ErrorCode`, MR-1639): every code has a decided handling, and a
+//! sample body in the server's envelope decodes to it.
+//!
 //! Fixtures come from the REAL producers wherever one exists
 //! (`utils::get_device_id`, `birdo_pq::generate_keypair`,
 //! `commands::vpn::generate_wireguard_keypair`, `attestation::platform` /
@@ -25,6 +29,8 @@
 use super::attestation::{self, DesktopAttestation};
 use super::client::{build_connect_request, build_multi_hop_request};
 use super::types::{ConnectRequest, LoginRequest, MultiHopConnectRequest};
+use super::{ApiError, BirdoApi};
+use crate::commands::ipc_error::{IpcError, IpcErrorCode};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use jsonschema::error::ValidationErrorKind;
@@ -738,4 +744,223 @@ fn dns_filtering_is_absent_on_both_dial_paths_when_off() {
     // The single mapping rule both builders share.
     assert_eq!(super::client::dns_filtering_flag(true), Some(true));
     assert_eq!(super::client::dns_filtering_flag(false), None);
+}
+
+// ── connect error codes (MR-1639) ───────────────────────────────────────────
+
+/// One machine-readable `error` code the connect routes emit, with a body
+/// exactly as birdo-web's GlobalExceptionFilter writes it
+/// ({statusCode, message, error, timestamp, path, requestId?, details?}) and
+/// what desktop decided to make of it.
+struct ErrorCodeCase {
+    code: &'static str,
+    body: Value,
+    ipc: IpcErrorCode,
+    /// The wait the dial paths honour (`IpcError::server_asked_to_wait`).
+    wait_secs: Option<u64>,
+}
+
+fn envelope(status: u16, code: &str, message: &str, details: Option<Value>) -> Value {
+    let mut body = json!({
+        "statusCode": status,
+        "message": message,
+        "error": code,
+        "timestamp": "2026-10-13T09:00:00.000Z",
+        "path": "/api/v1/vpn/connect",
+        "requestId": "4f1c2a",
+    });
+    if let Some(details) = details {
+        body["details"] = details;
+    }
+    body
+}
+
+/// Every code in `$defs/ErrorCode`, decided. The 503s carry birdo-web's
+/// `RETRY_AFTER_SECONDS` (30, QuotaCheckUnavailableError and
+/// PskOverSshRefusedError alike).
+fn error_code_cases() -> Vec<ErrorCodeCase> {
+    let retry = Some(json!({ "retryable": true, "retryAfterSeconds": 30 }));
+    vec![
+        ErrorCodeCase {
+            code: "update_required",
+            body: envelope(
+                426,
+                "update_required",
+                "This version of BirdoVPN is no longer supported. Please update the app to \
+                 reconnect.",
+                Some(json!({
+                    "minVersion": "1.4.45",
+                    "currentVersion": "1.4.40",
+                    "updateUrl": "https://birdo.app/clients",
+                })),
+            ),
+            ipc: IpcErrorCode::UpgradeRequired,
+            wait_secs: None,
+        },
+        // Mapped by its 403 status only: it has no copy of its own yet, so
+        // it reads as `subscription_required` (see the MR-1639 PR).
+        ErrorCodeCase {
+            code: "client_attestation_required",
+            body: envelope(
+                403,
+                "client_attestation_required",
+                "This VPN requires an official, unmodified BirdoVPN client.",
+                None,
+            ),
+            ipc: IpcErrorCode::SubscriptionRequired,
+            wait_secs: None,
+        },
+        ErrorCodeCase {
+            code: "quota_check_unavailable",
+            body: envelope(
+                503,
+                "quota_check_unavailable",
+                "We could not check your free data allowance just now. Please try again in a \
+                 moment.",
+                retry.clone(),
+            ),
+            ipc: IpcErrorCode::ServerError,
+            wait_secs: Some(30),
+        },
+        ErrorCodeCase {
+            code: "psk_delivery_unavailable",
+            body: envelope(
+                503,
+                "psk_delivery_unavailable",
+                "We could not set up a secure connection to this server just now. Please try \
+                 again in a moment.",
+                retry,
+            ),
+            ipc: IpcErrorCode::ServerError,
+            wait_secs: Some(30),
+        },
+    ]
+}
+
+fn classify(status: u16, body: &Value) -> ApiError {
+    BirdoApi::classify_error_response(
+        reqwest::StatusCode::from_u16(status).expect("a valid status"),
+        &body.to_string(),
+    )
+}
+
+fn contract_error_codes() -> BTreeSet<String> {
+    def("ErrorCode")["enum"]
+        .as_array()
+        .expect("$defs/ErrorCode.enum is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A re-vendored contract with a code desktop has not decided on fails HERE,
+/// naming it — not in production as a generic "server unavailable" (which is
+/// how `psk_delivery_unavailable` arrived).
+#[test]
+fn every_contract_error_code_has_a_decided_handling() {
+    let decided: BTreeSet<String> = error_code_cases()
+        .iter()
+        .map(|c| c.code.to_string())
+        .collect();
+    assert_eq!(
+        contract_error_codes(),
+        decided,
+        "$defs/ErrorCode changed: decide how desktop handles the new code, then add it to \
+         error_code_cases"
+    );
+}
+
+/// Each sample IS the contract's shape (validated against `$defs/<code>`,
+/// under the status the contract pins), and decodes to the decided code and
+/// wait. The two retryable 503s are retryable, never a hard refusal, and
+/// never a transport failure (no Adaptive Transport switch can follow them).
+#[test]
+fn each_error_code_body_is_the_contracts_shape_and_maps_as_decided() {
+    for case in error_code_cases() {
+        let code = case.code;
+        assert_valid(code, &case.body);
+        let status = def(code)["properties"]["statusCode"]["const"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("$defs/{code}.statusCode is a const"));
+        assert_eq!(case.body["statusCode"], json!(status), "{code}");
+
+        let err = IpcError::from_api(&classify(status as u16, &case.body));
+        assert_eq!(err.code, case.ipc, "{code}");
+        assert_eq!(err.retry_after_secs, case.wait_secs, "{code}");
+        assert_eq!(
+            err.server_asked_to_wait(),
+            case.wait_secs.map(std::time::Duration::from_secs),
+            "{code}"
+        );
+        if case.wait_secs.is_some() {
+            assert_eq!(status, 503, "{code}");
+            assert!(err.retryable, "{code}");
+            assert!(!err.code.is_hard_refusal(), "{code}");
+            assert_eq!(
+                crate::commands::vpn::transport_fallback_reason(&err),
+                None,
+                "{code}"
+            );
+            // The key the parser reads is the one the contract requires.
+            let details = &def(code)["properties"]["details"];
+            assert_eq!(
+                details["properties"]["retryAfterSeconds"]["type"], "integer",
+                "{code}"
+            );
+            assert!(
+                details["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("retryAfterSeconds")),
+                "{code}"
+            );
+        }
+    }
+}
+
+/// The gate bites: a `retryAfterSeconds` that is not an integer is refused by
+/// the contract — and still decodes, leniently, to the same retryable
+/// refusal without a wait rather than failing.
+#[test]
+fn a_malformed_retry_after_is_refused_by_the_contract_but_still_decodes() {
+    let mut body = error_code_cases()
+        .into_iter()
+        .find(|c| c.code == "psk_delivery_unavailable")
+        .unwrap()
+        .body;
+    body["details"]["retryAfterSeconds"] = json!("30");
+    assert!(error_kinds("psk_delivery_unavailable", &body)
+        .iter()
+        .any(|k| matches!(k, ValidationErrorKind::Type { .. })));
+    assert!(matches!(
+        classify(503, &body),
+        ApiError::PskDeliveryUnavailable {
+            retry_after_secs: None
+        }
+    ));
+}
+
+/// A code outside `$defs/ErrorCode` — the next one the server adds, before
+/// desktop re-vendors — is not in the enum, and decodes to the generic
+/// fallback by status: never a failed decode, never a borrowed wait.
+#[test]
+fn an_unknown_error_code_decodes_to_the_fallback() {
+    let code = "some_future_code";
+    assert!(!contract_error_codes().contains(code));
+    assert!(!validator_for("ErrorCode").is_valid(&json!(code)));
+    let body = envelope(
+        503,
+        code,
+        "Something new is down.",
+        Some(json!({ "retryable": true, "retryAfterSeconds": 30 })),
+    );
+    let api = classify(503, &body);
+    assert!(
+        matches!(&api, ApiError::Rejected { status: 503, message } if message == "Something new is down."),
+        "{api:?}"
+    );
+    let err = IpcError::from_api(&api);
+    assert_eq!(err.code, IpcErrorCode::ServerUnavailable);
+    assert!(err.retryable);
+    assert_eq!(err.server_asked_to_wait(), None);
 }

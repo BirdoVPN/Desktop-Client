@@ -6,6 +6,7 @@ pub mod auth;
 pub mod biometric;
 pub mod ipc_error;
 pub mod killswitch;
+pub mod logs;
 pub mod oauth;
 pub mod servers;
 pub mod session;

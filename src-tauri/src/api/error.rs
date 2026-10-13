@@ -43,8 +43,40 @@ pub enum ApiError {
     /// could not check a Free plan's allowance just now. Worth retrying, after
     /// `retry_after_secs` when the server says.
     QuotaCheckUnavailable { retry_after_secs: Option<u64> },
+    /// 503 `error: "psk_delivery_unavailable"` (birdo-web
+    /// `VpnController.rethrowPskDeliveryRefusal`, MR-1639): the backend could
+    /// only have added the peer over its SSH fallback, which never carries a
+    /// pre-shared key, so it rolled the peer back instead of installing it
+    /// without one. A temporary, server-side condition (the backend running
+    /// without its node agent, for every relay at once), not this device's or
+    /// this relay's. Nothing was downgraded, and the SAME request is worth
+    /// retrying, after `retry_after_secs` when the server says.
+    PskDeliveryUnavailable { retry_after_secs: Option<u64> },
     /// Unknown error
     Unknown(String),
+}
+
+/// The longest wait a `details.retryAfterSeconds` may impose (MR-1639). The
+/// server sends 30. A larger value (a server bug) is cut to this, so one
+/// answer can never park a connect or a re-dial for longer than the reconnect
+/// backoff's own cap (`AutoReconnectConfig::max_delay_ms`).
+pub const RETRY_AFTER_MAX_SECS: u64 = 60;
+
+/// `details.retryAfterSeconds` of a retryable refusal, in whole seconds,
+/// clamped to `1..=RETRY_AFTER_MAX_SECS`. `None` when it is absent or not a
+/// non-negative number: the refusal stays retryable, just without a wait.
+/// A 0 reads as 1 so a retry can never spin.
+pub fn retry_after_secs(details: Option<&serde_json::Value>) -> Option<u64> {
+    let value = details?.get("retryAfterSeconds")?;
+    let secs = match value.as_u64() {
+        Some(secs) => secs,
+        // The contract says integer; a `30.0` is read, rounded up.
+        None => {
+            let secs = value.as_f64().filter(|s| s.is_finite() && *s >= 0.0)?;
+            secs.ceil().min(RETRY_AFTER_MAX_SECS as f64) as u64
+        }
+    };
+    Some(secs.clamp(1, RETRY_AFTER_MAX_SECS))
 }
 
 impl fmt::Display for ApiError {
@@ -76,6 +108,12 @@ impl fmt::Display for ApiError {
             | ApiError::TwoFactorInvalid(message) => write!(f, "{}", message),
             ApiError::QuotaCheckUnavailable { .. } => {
                 write!(f, "The data allowance check is unavailable right now")
+            }
+            ApiError::PskDeliveryUnavailable { .. } => {
+                write!(
+                    f,
+                    "A secure connection to this server could not be set up right now"
+                )
             }
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
         }
