@@ -507,26 +507,33 @@ impl SensitiveKey {
 ///   `generate_wireguard_keypair` through `VpnManager::connect` and the
 ///   platform tunnel's `start` into [`WireGuardSession::new`], which hands it
 ///   to boringtun's `Tunn`. Nothing that outlives the handshake holds it.
-/// - It is wiped on drop, on every path. It holds x25519-dalek's
+/// - The secret lives in ONE heap allocation (the `Box`), so those moves,
+///   several of them across `.await`s in heap-allocated tasks, copy only a
+///   pointer. Held inline, every move would leave an unwiped 32-byte copy
+///   behind in the frame it left (security review of #279).
+/// - That heap copy is wiped on drop, on every path. It is x25519-dalek's
 ///   `StaticSecret`, which zeroizes itself (asserted below), so a connect
 ///   that fails anywhere on the way frees nothing readable. It is never
-///   encoded as base64 or copied into a byte buffer.
+///   encoded as base64 or copied into a byte buffer. The only other copies
+///   are short synchronous stack temporaries: in `os_rng` as the secret is
+///   made, as `Box::new` moves it to the heap, and the clone handed to
+///   `Tunn::new` (which keeps and wipes its own).
 /// - It is not `Serialize` or `Deserialize` (asserted below). Nothing can
 ///   write it anywhere, and nothing, a server response included, can be read
 ///   into one. The only way to make one is [`WgPrivateKey::generate`], from
 ///   the OS CSPRNG (FIX-1-1 / C-24).
 /// - `Debug` prints `[REDACTED]`.
-pub struct WgPrivateKey(StaticSecret);
+pub struct WgPrivateKey(Box<StaticSecret>);
 
 impl WgPrivateKey {
     /// A fresh key from the operating system's CSPRNG.
     pub(crate) fn generate() -> Self {
-        Self(crate::utils::os_rng::x25519_static_secret())
+        Self(Box::new(crate::utils::os_rng::x25519_static_secret()))
     }
 
     /// The public half: what a connect request sends as `clientPublicKey`.
     pub(crate) fn public_key(&self) -> PublicKey {
-        PublicKey::from(&self.0)
+        PublicKey::from(&*self.0)
     }
 }
 
@@ -648,9 +655,12 @@ impl WireGuardSession {
     /// Create a new WireGuard session with boringtun
     ///
     /// # Security (MEM-003, MR-822)
-    /// `private_key` is moved in and moved on into the boringtun `Tunn`, with
-    /// no copy made; an error return drops it, which wipes it. The other key
-    /// material is zeroized after being copied into the `Tunn`.
+    /// `private_key` is moved in as a `Box`: the one heap copy of the secret,
+    /// wiped on drop. An error return drops it. On success the `Tunn` gets a
+    /// clone (a short synchronous stack temporary on the way in; boringtun
+    /// keeps and wipes its own), and the heap copy is dropped, and so wiped,
+    /// at once. The other key material is zeroized after being copied into
+    /// the `Tunn`.
     pub async fn new(
         private_key: WgPrivateKey,
         server_public_key_b64: &str,
@@ -772,16 +782,20 @@ impl WireGuardSession {
         };
 
         // boringtun 0.7: Tunn::new is infallible (0.6 returned Result).
-        // MR-822: the private key moves into the Tunn. This is the only place a
-        // `WgPrivateKey` is unwrapped, and no copy of it is left behind here.
+        // MR-822: the only place a `WgPrivateKey` is opened. The Tunn takes a
+        // clone (by value: a short synchronous stack temporary; boringtun
+        // keeps and wipes its own), and the Box is dropped at once, which
+        // wipes the one heap copy. NOT `*private_key.0`: moving the secret out
+        // of the Box would free the heap copy without running its wipe.
         let tunnel = Tunn::new(
-            private_key.0,
+            StaticSecret::clone(&private_key.0),
             PublicKey::from(server_key_arr),
             psk_arr,   // Preshared key for additional security
             keepalive, // Persistent keepalive (seconds); None = disabled
             0,         // Tunnel index
             None,      // Rate limiter
         );
+        drop(private_key);
 
         // MEM-003: Zeroize our copies of keys after tunnel creation
         // The keys have been moved into the Tunn struct
@@ -1753,7 +1767,7 @@ mod handshake_tests {
 
     async fn connect(r: &Responder) -> Result<WireGuardSession, String> {
         WireGuardSession::new(
-            WgPrivateKey(r.client_secret.clone()),
+            WgPrivateKey(Box::new(r.client_secret.clone())),
             &r.server_public_b64,
             &r.endpoint,
             None,
@@ -1875,7 +1889,7 @@ mod handshake_tests {
         let endpoint = socket.local_addr().unwrap().to_string();
         let relay = relay(tunn, socket, want);
         let session = WireGuardSession::new(
-            WgPrivateKey(client_secret.clone()),
+            WgPrivateKey(Box::new(client_secret.clone())),
             &BASE64.encode(server_public.as_bytes()),
             &endpoint,
             None,
@@ -2081,7 +2095,7 @@ mod handshake_tests {
         );
         let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let endpoint = relay_socket.local_addr().unwrap().to_string();
-        let private_key = WgPrivateKey(client_secret);
+        let private_key = WgPrivateKey(Box::new(client_secret));
         let public_b64 = BASE64.encode(server_public.as_bytes());
         let connecting = tokio::spawn(async move {
             WireGuardSession::new(private_key, &public_b64, &endpoint, None, 0).await
@@ -2368,5 +2382,24 @@ mod private_key_tests {
         let a = WgPrivateKey::generate();
         let b = WgPrivateKey::generate();
         assert_ne!(a.public_key().as_bytes(), b.public_key().as_bytes());
+    }
+
+    /// The wipe itself, not only the `Zeroize` impl the compile-time check
+    /// stands on: dropping a `StaticSecret` in place leaves zeros where the
+    /// secret was. A `WgPrivateKey`'s one heap copy relies on exactly this
+    /// when its `Box` is dropped.
+    #[test]
+    fn dropping_a_static_secret_wipes_its_bytes() {
+        // One `[u8; 32]` field in 32 bytes: the field is every byte.
+        assert_eq!(std::mem::size_of::<StaticSecret>(), 32);
+        let mut slot = std::mem::MaybeUninit::new(StaticSecret::from([0xA5; 32]));
+        // SAFETY: `slot` holds an initialised `StaticSecret`. It is dropped
+        // exactly once, here, and never used as a `StaticSecret` again.
+        unsafe { std::ptr::drop_in_place(slot.as_mut_ptr()) };
+        // SAFETY: the storage is still live (it is `slot`, on this frame), and
+        // all 32 bytes are initialised: the drop just wrote them. `[u8; 32]`
+        // has alignment 1 and no invalid bit patterns.
+        let left: [u8; 32] = unsafe { std::ptr::read(slot.as_ptr().cast::<[u8; 32]>()) };
+        assert_eq!(left, [0u8; 32]);
     }
 }

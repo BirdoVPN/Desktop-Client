@@ -704,9 +704,12 @@ impl VpnManager {
     /// error at the UI and the tray between attempts. A cancelled attempt
     /// writes nothing: whoever cancelled it owns the state.
     ///
-    /// MR-822: `config` moves into the new tunnel, and `private_key` into its
-    /// WireGuard session as it starts. Neither is copied. A connect that fails
-    /// or is cancelled drops the key, which wipes it.
+    /// MR-822: `config` moves into the new tunnel (it is no longer cloned), and
+    /// `private_key` into its WireGuard session as it starts. The key moves as
+    /// a `Box`, so only a pointer is copied; the one heap copy is wiped on
+    /// drop. A connect that fails or is cancelled drops the key, which wipes
+    /// it. (The short synchronous stack temporaries are listed at
+    /// `WgPrivateKey`.)
     ///
     /// SM-002: Uses operation lock to prevent concurrent connect/disconnect
     pub async fn connect(
