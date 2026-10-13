@@ -252,8 +252,9 @@ pub(crate) const RELAY_WIREGUARD_PORT: u16 = 51820;
 /// `None` for the server's own endpoint. "53" and custom numbers, which
 /// earlier builds offered and no relay answers, are never dialled — whatever a
 /// stale settings file or a session's reconnect record still says. The
-/// settings load migrates them to "auto" (`settings::migrate_wireguard_port`);
-/// Android applies the same rule.
+/// settings load migrates them to "auto" (`settings::migrate_wireguard_port`),
+/// and since MR-920 a saved "51820" too, so in practice every connect takes
+/// the server's endpoint. Android applies the same rule.
 pub(crate) fn dialable_wireguard_port(setting: &str) -> Option<u16> {
     (setting.trim() == "51820").then_some(RELAY_WIREGUARD_PORT)
 }
