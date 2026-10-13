@@ -555,9 +555,44 @@ mod tests {
             !updater.allow_downgrades,
             "allowDowngrades lets an older release be installed, which is what the signed version guards against"
         );
+        // No custom version comparator anywhere in the crate (review of #256:
+        // only main.rs and this file were read, and the updater builder can
+        // be reached from any module).
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("could not list {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        rust_sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        assert!(
+            sources.iter().any(|p| p.ends_with("main.rs"))
+                && sources.iter().any(|p| p.ends_with("updater.rs")),
+            "the source walk missed main.rs or updater.rs: {sources:?}"
+        );
         let comparator = ["version", "_comparator"].concat();
-        assert!(!include_str!("../main.rs").contains(&comparator));
-        assert!(!include_str!("updater.rs").contains(&comparator));
+        let with_comparator: Vec<_> = sources
+            .iter()
+            .filter(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
+                    .contains(&comparator)
+            })
+            .collect();
+        assert!(
+            with_comparator.is_empty(),
+            "a custom version comparator can take a release that is not strictly newer, and the signed version is then no guard: {with_comparator:?}"
+        );
 
         let lock: serde_json::Value =
             serde_json::from_str(include_str!("../../../package-lock.json"))

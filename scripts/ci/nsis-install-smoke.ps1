@@ -112,9 +112,14 @@ $netBefore = Get-NetSnapshot
 # Both cmdlets swallow their errors (-ErrorAction SilentlyContinue), so a
 # snapshot that came back (nearly) empty would make "unchanged" below prove
 # nothing. A runner has loopback and default routes and DNS servers: require
-# at least two entries besides the '--' separator.
-if ($netBefore.Count -lt 3) {
-    Fail "the network snapshot before the install has $($netBefore.Count - 1) route/DNS entries: Get-NetRoute or Get-DnsClientServerAddress returned nothing usable, so the no-network-change check would be vacuous"
+# at least one entry on EACH side of the '--' separator (routes, then DNS).
+# A total count alone let an empty DNS half through.
+$sep = [array]::IndexOf($netBefore, '--')
+$routeCount = $sep
+$dnsCount = $netBefore.Count - $sep - 1
+Write-Host "   network snapshot: $routeCount routes, $dnsCount DNS server entries"
+if (-not ($sep -ge 1 -and $dnsCount -ge 1)) {
+    Fail "the network snapshot before the install has $routeCount routes and $dnsCount DNS server entries (want at least one of each): Get-NetRoute or Get-DnsClientServerAddress returned nothing usable, so the no-network-change check would be vacuous"
 }
 
 # -- install ------------------------------------------------------------------

@@ -233,6 +233,8 @@ export function showSaveFailure(e: unknown, fallback: string): void {
   );
 }
 
+const RESET_DONE_COPY = 'Your settings were reset to their defaults.';
+
 /** Whether the reset confirmation is open (`ResetSettingsDialog`). */
 export const useResetPrompt = create<{ open: boolean }>(() => ({ open: false }));
 
@@ -274,7 +276,13 @@ export async function resetSettings(): Promise<void> {
   // switch choice made before the reset must not be pushed back over them
   // after the next dial — so it goes at once, before anything below reads
   // it (round 8).
-  if (reset && !chosen) forgetKillSwitchChoices();
+  if (reset && !chosen) {
+    forgetKillSwitchChoices();
+  } else if (reset && choicesInFlight.size > 0) {
+    // Left to a choice still in flight, which may yet not take: the reset
+    // then finishes once it has ended (`finishWaitingReset`, review of #255, L1).
+    resetWaiting = { since };
+  }
   await reloadSettings();
   if (!reset) {
     useAppStore.getState().showNotice({
@@ -285,7 +293,7 @@ export async function resetSettings(): Promise<void> {
   }
   scheduleReapply();
   useAppStore.getState().showNotice({
-    text: 'Your settings were reset to their defaults.',
+    text: RESET_DONE_COPY,
     tone: 'info',
   });
   if (!chosen) await armTheResetDefaults(since);
@@ -306,8 +314,20 @@ export async function resetSettings(): Promise<void> {
  * the session. An intent that cannot be read is pushed, as before: OFF under
  * a toggle reading ON is the worse of the two. A choice made since the reset
  * began decides instead (follow-up 2), up to the push itself.
+ *
+ * ON is not pushed while a dial is in progress (`killSwitchLiveApplies`): the
+ * dial arms from the file when it ends. But that arm stands aside if the
+ * intent moved since the dial began (an OFF pushed during it), and the reset
+ * has just forgotten the choice `dialEnded` would have checked, so the dial
+ * came up OFF under a toggle reading ON (review of #261, REVIEW-P/Q). The
+ * defaults' ON is handed to `dialEnded` instead, which checks it against Rust
+ * once the dial is up.
  */
 async function armTheResetDefaults(since: number): Promise<void> {
+  const s0 = useAppStore.getState();
+  if (s0.settings.killSwitchEnabled && dialing(s0) && !choiceOwnsKillSwitch(since)) {
+    standingChoice = { enabled: true };
+  }
   const applies = () => {
     const s = useAppStore.getState();
     return (
@@ -395,6 +415,13 @@ let standingChoice: StandingChoice | null = null;
 const choicesInFlight = new Set<number>();
 
 /**
+ * A reset that left the kill switch to a choice still in flight (follow-up 2),
+ * kept so it can finish if that choice does not take (review of #255, L1):
+ * `since` as the reset took it.
+ */
+let resetWaiting: { since: number } | null = null;
+
+/**
  * Whether the kill switch is a choice's to settle rather than the caller's:
  * one is still being made, or one made after choice number `since` stands
  * (follow-ups 2 and 4 to the review of #222). A re-read or a reset that
@@ -464,10 +491,47 @@ function savedKillSwitch(enabled: boolean): void {
  * (follow-up 3 to the review of #222: the session controller's teardown, so
  * a same-run sign-in does not show the last session's this-connection OFF),
  * and for tests. One still in flight no longer holds up the next re-read.
+ *
+ * Nor is it the latest choice any more (review of #255, L2): a refused OFF
+ * still in flight at sign-out answered in the next session, and put its
+ * toggle OFF over that session's saved ON. A reset forgets only when no
+ * choice is in flight, so there this changes nothing.
  */
 export function forgetKillSwitchChoices(): void {
   standingChoice = null;
   choicesInFlight.clear();
+  killSwitchChoice++;
+  resetWaiting = null;
+}
+
+/**
+ * A kill switch choice ended. If a reset left the kill switch to it and it did
+ * not take, the reset's kill switch would be lost: an ON refused while the
+ * reset ran went back to OFF, the intent stayed OFF, and the file held the
+ * defaults' ON. Once the last choice in flight has ended without one taking,
+ * the reset finishes what it left: forget, re-read, and arm the defaults.
+ * A choice that took settles the kill switch, as before. One forgotten at
+ * sign-out never gets here (`setKillSwitch`).
+ */
+async function finishWaitingReset(took: boolean): Promise<void> {
+  const waiting = resetWaiting;
+  if (!waiting) return;
+  if (took) {
+    resetWaiting = null;
+    return;
+  }
+  if (choicesInFlight.size > 0) return;
+  resetWaiting = null;
+  if (choiceOwnsKillSwitch(waiting.since)) return;
+  forgetKillSwitchChoices();
+  await reloadSettings();
+  // The refused choice said its save failed (with a reset to offer, for a file
+  // that could not be verified); the reset that did happen is what stands.
+  useAppStore.getState().showNotice({
+    text: RESET_DONE_COPY,
+    tone: 'info',
+  });
+  await armTheResetDefaults(waiting.since);
 }
 
 /**
@@ -502,19 +566,33 @@ export async function setKillSwitch(enabled: boolean): Promise<void> {
   const mine: StandingChoice = { enabled, made: choice };
   standingChoice = mine;
   choicesInFlight.add(choice);
+  let stands = false;
   try {
-    const stands = enabled ? await turnKillSwitchOn() : await turnKillSwitchOff(choice, mine);
+    stands = enabled ? await turnKillSwitchOn(choice) : await turnKillSwitchOff(choice, mine);
     // A choice that did not take leaves the one before it standing, as the
     // toggle went back to it.
     if (!stands && standingChoice === mine) standingChoice = previous;
   } finally {
-    choicesInFlight.delete(choice);
+    // Not there: forgotten meanwhile (sign-out), so its end settles nothing.
+    if (choicesInFlight.delete(choice)) await finishWaitingReset(stands);
   }
 }
 
+/**
+ * Whether a choice was forgotten at sign-out while it was being made (review
+ * of #261): its session is over, and what it had to say with it. The next
+ * one, perhaps another account's, is not told about it.
+ */
+const forgotten = (choice: number) => !choicesInFlight.has(choice);
+
 /** Whether the ON was saved. */
-async function turnKillSwitchOn(): Promise<boolean> {
-  if (!(await persistSettings({ killSwitchEnabled: true }))) return false;
+async function turnKillSwitchOn(choice: number): Promise<boolean> {
+  const refused = await trySave({ killSwitchEnabled: true }, {});
+  if (forgotten(choice)) return refused === null;
+  if (refused) {
+    showSaveFailure(refused.error, SAVE_FAILED_COPY);
+    return false;
+  }
   const s = useAppStore.getState();
   if (!killSwitchLiveApplies(s.connectionState, true, s.killSwitchBlocking)) return true;
   try {
@@ -546,6 +624,7 @@ async function turnKillSwitchOff(choice: number, mine: StandingChoice): Promise<
   // Whether the block is lifted: the LAST push says (`null`: none was due).
   let lifted = first === null ? null : await first;
   if (refused === null && latest() && live()) lifted = await pushOff();
+  if (forgotten(choice)) return refused === null;
 
   const { showNotice, updateSettings, settings } = useAppStore.getState();
   if (lifted === false) {

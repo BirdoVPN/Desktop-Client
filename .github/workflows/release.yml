@@ -574,6 +574,15 @@ jobs:
         # against the locked @tauri-apps/cli). Ship exactly Cargo.lock.
         run: npx tauri build -- --locked
 
+      # MR-1606: the uninstall confirm page's DNS-restore sentence comes from a
+      # custom English.nsh (customLanguageFiles), which replaces the bundler's
+      # own file. nsis-installer.yml checks it on PRs but is not a required
+      # check, so a CLI bump could still ship a stale or incomplete file. Check
+      # the script this build generated: read-only, about a second.
+      - name: Gate — the installer's English.nsh is the locked CLI's, plus the DNS-restore sentence
+        shell: bash
+        run: bash scripts/ci/check-nsis-language.sh
+
       # OPEN-WORK F4 — the gate that would have caught v1.4.40 and v1.4.41:
       # extract resources\xray.exe from the NSIS installer we are about to
       # ship and require its SHA-256 to equal the XRAY_BINARY_SHA256 the app

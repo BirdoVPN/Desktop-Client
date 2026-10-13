@@ -12,10 +12,13 @@
 #   fail  the template AND the hook both use the bare name: they agree, and
 #         the hook still does not pass the full path
 #   fail  the hook adds a second, unquoted call, which the form comparison
-#         cannot see
+#         cannot see; also when that call spells the keyword !INSERTMACRO
+#   pass  the hook's one call spells the keyword !INSERTMACRO (NSIS keywords
+#         are case-insensitive: it is the same call)
 #   fail  a hook macro is renamed (the template's !ifmacrodef skips it silently),
-#         also behind two spaces or a tab after !macro, and by a suffix
-#         (NSIS_HOOK_PREUNINSTALL2 must not read as NSIS_HOOK_PREUNINSTALL)
+#         also behind two spaces or a tab after !macro, by a suffix
+#         (NSIS_HOOK_PREUNINSTALL2 must not read as NSIS_HOOK_PREUNINSTALL),
+#         and behind a mixed-case !Macro
 #   fail  the script no longer includes the hook (installerHooks not applied)
 #
 # Usage, from the repo root after the build:
@@ -119,6 +122,20 @@ expect() {
     '!insertmacro CheckIfAppIsRunning ${MAINBINARYNAME}.exe "${PRODUCTNAME}"'
   expect fail second-unquoted-call 'calls CheckIfAppIsRunning on 2 lines'
 
+  # NSIS keywords are case-insensitive: an upper-case second call is a call.
+  fixture second-call-upper-case
+  mutate "$work/second-call-upper-case/nsis-hooks.nsh" \
+    '/^[[:space:]]*!insertmacro CheckIfAppIsRunning "/a\  !INSERTMACRO CheckIfAppIsRunning ${MAINBINARYNAME}.exe "${PRODUCTNAME}"' \
+    '!INSERTMACRO CheckIfAppIsRunning ${MAINBINARYNAME}.exe "${PRODUCTNAME}"'
+  expect fail second-call-upper-case 'calls CheckIfAppIsRunning on 2 lines'
+
+  # ...and the one call, spelt in upper case, is the template's call.
+  fixture upper-case-call
+  mutate "$work/upper-case-call/nsis-hooks.nsh" \
+    's/!insertmacro CheckIfAppIsRunning "/!INSERTMACRO CheckIfAppIsRunning "/' \
+    '!INSERTMACRO CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe"'
+  expect pass upper-case-call
+
   fixture renamed-hook
   mutate "$work/renamed-hook/nsis-hooks.nsh" \
     's/!macro NSIS_HOOK_PREUNINSTALL/!macro NSIS_HOOK_PRE_UNINSTALL/' \
@@ -144,6 +161,13 @@ expect() {
     's/!macro NSIS_HOOK_PREUNINSTALL/!macro NSIS_HOOK_PREUNINSTALL2/' \
     '!macro NSIS_HOOK_PREUNINSTALL2'
   expect fail renamed-hook-suffix 'hook never invoked'
+
+  # `!Macro` defines a macro just as `!macro` does.
+  fixture renamed-hook-mixed-case
+  mutate "$work/renamed-hook-mixed-case/nsis-hooks.nsh" \
+    's/!macro NSIS_HOOK_PREUNINSTALL/!Macro NSIS_HOOK_PRE_UNINSTALL/' \
+    '!Macro NSIS_HOOK_PRE_UNINSTALL'
+  expect fail renamed-hook-mixed-case 'hook never invoked'
 
   fixture not-included
   sed -i '/^[[:space:]]*!include ".*nsis-hooks\.nsh"/d' "$work/not-included/x64/installer.nsi"

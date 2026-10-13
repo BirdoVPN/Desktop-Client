@@ -15,14 +15,20 @@ name: NSIS installer
 # this workflow checks the script the bundler actually rendered, and that the
 # hooks it compiled in actually run.
 #
+# It also checks the uninstaller's custom English strings (MR-1606), and
+# upgrades over an MSI-era install (WIN2-012). That is the MSI that builds
+# b15aece..79fd4ae shipped into the same folder; no release keeps one, so this
+# job builds it from the same binary with `tauri bundle`. It is also checked
+# against v1.4.46, the release that leaves both installed.
+#
 # UNSIGNED, and no secrets: no Authenticode/Azure, no updater signing key
 # (createUpdaterArtifacts is switched off for this build), no Sentry DSN
 # (build.rs's release gate is waived with BIRDO_ALLOW_MISSING_SENTRY_DSN) and
-# no attestation key. The installer is never uploaded: it is inspected and
+# no attestation key. The installers are never uploaded: they are inspected and
 # installed on this runner and thrown away with it.
 #
 # Not a required check: path-filtered, so it cannot be one without blocking
-# every PR that does not touch these paths. No caches: the whole job takes
+# every PR that does not touch these paths. No caches: the NSIS part took
 # 9-12.5 min cold (cargo's release build 7.5-11 of it, #253), fine for a
 # path-filtered job, and nothing release-shaped should restore what a PR wrote.
 
@@ -39,7 +45,9 @@ on:
       - ".github/workflows/nsis-installer.yml"
       - ".github/workflows/release.yml" # the Wintun and Xray pins are read from it
       - "scripts/ci/check-generated-nsis*.sh"
+      - "scripts/ci/check-nsis-language*.sh"
       - "scripts/ci/nsis-install-smoke.ps1"
+      - "scripts/ci/nsis-msi-era-upgrade.ps1"
       - "scripts/ci/verify-bundled-xray-hash.ps1"
   push:
     branches: [main]
@@ -52,7 +60,9 @@ on:
       - ".github/workflows/nsis-installer.yml"
       - ".github/workflows/release.yml"
       - "scripts/ci/check-generated-nsis*.sh"
+      - "scripts/ci/check-nsis-language*.sh"
       - "scripts/ci/nsis-install-smoke.ps1"
+      - "scripts/ci/nsis-msi-era-upgrade.ps1"
       - "scripts/ci/verify-bundled-xray-hash.ps1"
   # Weekly on main: the runner image, WebView2 and Windows itself change
   # without a commit here, and a release should not be the first to notice.
@@ -80,7 +90,9 @@ jobs:
     # The schedule runs in this repository only, not in forks.
     if: github.event_name != 'schedule' || github.repository == 'BirdoVPN/Desktop-Client'
     runs-on: windows-2025
-    timeout-minutes: 30 # ~2.4x the slowest of the first runs, 12m27s (#253)
+    # The NSIS part's slowest run was 12m27s (#253). The MSI-era build and
+    # upgrade add a few minutes on top of that.
+    timeout-minutes: 40
     permissions:
       contents: read
     defaults:
@@ -184,6 +196,18 @@ jobs:
         shell: bash
         run: bash scripts/ci/check-generated-nsis.tests.sh
 
+      # MR-1606 (REVIEW-WIN2-018): "Delete the application data" on the
+      # uninstall confirm page says that the DNS-restore journal survives it.
+      # That text comes from a custom English.nsh, which replaces the bundler's
+      # own file and so has to keep step with the locked CLI's strings.
+      - name: The uninstall confirm page says the DNS-restore journal is kept (custom English.nsh)
+        shell: bash
+        run: bash scripts/ci/check-nsis-language.sh
+
+      - name: Self-test - the language check fails each regression it exists for
+        shell: bash
+        run: bash scripts/ci/check-nsis-language.tests.sh
+
       # release.yml's own post-bundle gate, on an unsigned installer as its
       # unsigned dispatch builds run it.
       - name: Bundled resources\xray.exe hashes to the compiled-in XRAY_BINARY_SHA256
@@ -202,3 +226,45 @@ jobs:
           if ($nsis.Count -ne 1) { throw "expected one NSIS installer, found $($nsis.Count)" }
           & ./scripts/ci/nsis-install-smoke.ps1 -Installer $nsis[0].FullName
           if ($LASTEXITCODE -ne 0) { throw "install/uninstall smoke test failed (exit $LASTEXITCODE)" }
+
+      # WIN2-012: builds b15aece..79fd4ae also shipped an MSI (Tauri's default
+      # WiX template, publisher "Birdo VPN") into the same folder. No release
+      # keeps one, so `tauri bundle` re-bundles the binary built above as that
+      # MSI: the era's publisher, a version of that era, and the UpgradeCode
+      # Tauri derives from productName alone (the test checks it). It is never
+      # uploaded. Runs after the smoke test, which needs a clean runner.
+      - name: Build an MSI-era MSI (Tauri's WiX template, publisher "Birdo VPN", 1.4.30)
+        timeout-minutes: 10
+        run: |
+          $cfg = Join-Path $env:RUNNER_TEMP 'msi-era.json'
+          Set-Content -LiteralPath $cfg -Value '{"version":"1.4.30","bundle":{"publisher":"Birdo VPN","createUpdaterArtifacts":false}}'
+          npx tauri bundle --bundles msi --config $cfg
+          if ($LASTEXITCODE -ne 0) { throw "tauri bundle exited $LASTEXITCODE" }
+          Get-ChildItem src-tauri/target/release/bundle/msi |
+            ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.FullName }
+
+      # The release that installs BESIDE an MSI-era install (two Apps &
+      # features entries): the state that the upgrade has to repair.
+      - name: Fetch the v1.4.46 installer (pinned to its SHA256SUMS.txt)
+        env:
+          PREVIOUS_URL: https://github.com/BirdoVPN/Desktop-Client/releases/download/v1.4.46/BirdoVPN_1.4.46_Windows_x64-setup.exe
+          PREVIOUS_SHA256: 25380d7ffad55717144a784b304ef56be8681b06930ca7fc669ed31b238a24b2
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'BirdoVPN_1.4.46_x64-setup.exe'
+          Invoke-WebRequest -Uri $env:PREVIOUS_URL -OutFile $out -MaximumRetryCount 4 -RetryIntervalSec 10
+          $actual = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:PREVIOUS_SHA256) { throw "SHA-256 mismatch for $env:PREVIOUS_URL`: expected $env:PREVIOUS_SHA256, got $actual" }
+          Write-Host "verified $out ($actual)"
+
+      # Safe on a GitHub-hosted runner for the same reasons as the smoke test
+      # (the script says why); refuses to run anywhere else.
+      - name: Upgrade over an MSI-era install leaves one entry and no MSI (WIN2-012)
+        timeout-minutes: 15
+        run: |
+          $nsis = @(Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe")
+          if ($nsis.Count -ne 1) { throw "expected one NSIS installer, found $($nsis.Count)" }
+          $msi = @(Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi")
+          if ($msi.Count -ne 1) { throw "expected one MSI, found $($msi.Count)" }
+          $previous = Join-Path $env:RUNNER_TEMP 'BirdoVPN_1.4.46_x64-setup.exe'
+          & ./scripts/ci/nsis-msi-era-upgrade.ps1 -Installer $nsis[0].FullName -Msi $msi[0].FullName -Previous $previous
+          if ($LASTEXITCODE -ne 0) { throw "MSI-era upgrade test failed (exit $LASTEXITCODE)" }

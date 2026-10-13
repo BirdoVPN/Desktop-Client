@@ -563,6 +563,9 @@ jobs:
       - name: NSIS hook calls CheckIfAppIsRunning as the bundled template does
         run: bash scripts/ci/check-nsis-hook-macros.sh
 
+      - name: Self-test - the hook-macro check fails each regression it exists for
+        run: bash scripts/ci/check-nsis-hook-macros.tests.sh
+
       # The release's tauri build commands, read FROM release.yml so this
       # contract cannot drift from it: every one must end in `-- --locked`,
       # and the Linux/macOS form, run verbatim with an `echo` runner standing
