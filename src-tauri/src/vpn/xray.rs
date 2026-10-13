@@ -243,7 +243,7 @@ impl XrayManager {
         let config_json = serde_json::to_string_pretty(&xray_config)
             .map_err(|e| format!("Failed to serialize Xray config: {}", e))?;
 
-        // Find xray binary — check resources dir first, then PATH
+        // Find the bundled xray binary (resources dir only; never PATH, MR-1724)
         let xray_binary = find_xray_binary(app_data_dir)?;
 
         // AUDIT-N4: verify SHA-256 BEFORE exec. Without this, an attacker who
@@ -903,7 +903,7 @@ fn find_xray_binary(_app_data_dir: &std::path::Path) -> Result<PathBuf, String> 
     // No PATH fallback (MR-1724): a missing bundled binary is a broken
     // install, and the error says so.
     Err(format!(
-        "Xray binary not found. The app bundles {} next to its executable; \
+        "Xray binary not found. The app bundles {} in its resources folder; \
          reinstall BirdoVPN to restore it. PATH and user-writable locations \
          are never searched (AUDIT-N4, MR-1724).",
         XRAY_BIN

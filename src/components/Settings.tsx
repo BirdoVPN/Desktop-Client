@@ -94,7 +94,7 @@ export const KILL_SWITCH_DISABLE_BODY =
 /** Under the Custom DNS fields (MR-689). */
 export const CUSTOM_DNS_NOT_LAN_COPY =
   'A DNS server at a carrier-grade NAT address (100.64.x.x) or a public address is not ' +
-  'treated as on your own network: it is reached through the VPN tunnel.';
+  'treated as on your own network, so Local Network Sharing does not apply to it.';
 
 /**
  * macOS only (MR-1124): the IPv6 block `tunnel_macos.rs` installs for every
