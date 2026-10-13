@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { parseQuotaWarning, parseServers, pickBestServer, toIpcError } from './ipc';
+import { parseQuotaWarning, parseResumeTarget, parseServers, pickBestServer, toIpcError } from './ipc';
 
 interface Case {
   name: string;
@@ -51,5 +51,30 @@ describe('the Free allowance on the wire', () => {
     expect(parseQuotaWarning({ secondsRemaining: null })).toEqual({ secondsRemaining: null });
     expect(parseQuotaWarning({ secondsRemaining: -3 })).toEqual({ secondsRemaining: null });
     expect(parseQuotaWarning(undefined)).toEqual({ secondsRemaining: null });
+  });
+});
+
+/** MR-1861: `take_update_resume`, in the shape `commands::update_resume::ResumeTarget` serializes. */
+describe('the session an update ended, on the wire', () => {
+  it('reads both targets as Rust sends them', () => {
+    expect(parseResumeTarget({ kind: 'singleHop', serverId: 'node-7' })).toEqual({
+      kind: 'singleHop',
+      serverId: 'node-7',
+    });
+    expect(parseResumeTarget({ kind: 'multiHop', entryId: 'entry-1', exitId: 'exit-2' })).toEqual({
+      kind: 'multiHop',
+      entryId: 'entry-1',
+      exitId: 'exit-2',
+    });
+  });
+
+  it('nothing, or anything incomplete or unknown, resumes nothing', () => {
+    expect(parseResumeTarget(null)).toBeNull();
+    expect(parseResumeTarget(undefined)).toBeNull();
+    expect(parseResumeTarget({ kind: 'singleHop' })).toBeNull();
+    expect(parseResumeTarget({ kind: 'singleHop', serverId: '' })).toBeNull();
+    expect(parseResumeTarget({ kind: 'multiHop', entryId: 'entry-1' })).toBeNull();
+    expect(parseResumeTarget({ kind: 'reconnect', serverId: 'node-7' })).toBeNull();
+    expect(parseResumeTarget('node-7')).toBeNull();
   });
 });

@@ -16,10 +16,16 @@
  * `RESYNC_INTERVAL_MS` while it is visible — and both paths go through the
  * store's seq check, so a slow read can never undo a newer event (W2-009).
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { parseQuotaWarning, parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
+import {
+  parseQuotaWarning,
+  parseSessionExpired,
+  parseVpnStats,
+  parseVpnStatus,
+  type ResumeTarget,
+} from '@/lib/ipc';
 import { errorCopy, giveUpMessage, quotaGraceMessage } from '@/lib/errors';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
@@ -30,7 +36,12 @@ import {
   loadSubscription,
   resetSessionData,
 } from '@/session/session-data';
-import { connectPreferred, findLiveServer } from '@/session/vpn-actions';
+import {
+  connectPreferred,
+  findLiveServer,
+  resumeAfterUpdate,
+  takeUpdateResume,
+} from '@/session/vpn-actions';
 import {
   forgetKillSwitchChoices,
   persistSettings,
@@ -209,9 +220,20 @@ function useSessionData(): void {
  * can connect to the user's own server rather than whatever sorts first, and a
  * ref — not the mount — is what makes it once: this component outlives tab
  * switches, the lock and the wall, and the ref outlives StrictMode's re-run.
+ *
+ * The first start after an update puts back the session the update ended,
+ * Auto-Connect on or off (MR-1861): the installer closed the app under a
+ * protected user, who used to come back disconnected. Rust hands that session
+ * out once — first start of a new version, connected when the update began,
+ * within the hour (`commands::update_resume`) — and it takes Auto-Connect's
+ * place for this run. Asked here because this controller only exists signed
+ * in and past consent: it never signs anyone in.
  */
 function useAutoConnectOnce(): void {
   const done = useRef(false);
+  const askedResume = useRef(false);
+  // undefined until Rust has answered.
+  const [resume, setResume] = useState<ResumeTarget | null | undefined>(undefined);
   const hydrated = useAppStore((s) => s.settingsHydrated);
   const serversSettled = useAppStore(
     (s) => s.serversStatus === 'ready' || s.serversStatus === 'error',
@@ -229,13 +251,22 @@ function useAutoConnectOnce(): void {
     [],
   );
   useEffect(() => {
-    if (done.current || !hydrated || !serversSettled) return;
+    if (askedResume.current) return;
+    askedResume.current = true;
+    void takeUpdateResume().then(setResume);
+  }, []);
+  useEffect(() => {
+    if (done.current || !hydrated || !serversSettled || resume === undefined) return;
     done.current = true;
     const s = useAppStore.getState();
-    if (!s.settings.autoConnect) return;
     if (selectTunnelActive(s)) return;
+    if (resume) {
+      void resumeAfterUpdate(resume);
+      return;
+    }
+    if (!s.settings.autoConnect) return;
     void connectPreferred();
-  }, [hydrated, serversSettled]);
+  }, [hydrated, serversSettled, resume]);
 }
 
 function serverLabel(server: Server | null, fallback: string | null): string {

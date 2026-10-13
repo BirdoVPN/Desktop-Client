@@ -478,6 +478,16 @@ impl AutoReconnectService {
         self.last_reconnect_info.read().await.clone()
     }
 
+    /// [`current_info`](Self::current_info) without waiting, for a caller
+    /// that cannot await: the process exit (`commands::update_resume`).
+    /// `None` too while the record is being written.
+    pub fn current_info_now(&self) -> Option<ReconnectInfo> {
+        self.last_reconnect_info
+            .try_read()
+            .ok()
+            .and_then(|info| info.clone())
+    }
+
     /// Record the settings the session on record connected with.
     pub async fn store_connected_settings(&self, settings: Option<AppSettings>) {
         *self.connected_settings.write().await = settings;

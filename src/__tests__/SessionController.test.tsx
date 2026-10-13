@@ -32,6 +32,7 @@ import {
   setKillSwitch,
 } from '@/session/settings-persist';
 import { CONSENT_VERSION } from '@/lib/consent';
+import { RESUME_AFTER_UPDATE_COPY } from '@/session/vpn-actions';
 
 vi.mock('@tauri-apps/api/core');
 
@@ -356,6 +357,76 @@ describe('Auto-Connect (W2-002)', () => {
     await act(async () => {});
     expect(callsTo('connect_vpn')).toHaveLength(0);
     expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+});
+
+/**
+ * MR-1861 (device test 2026-10-07, 1.4.46 on Windows, row 1b): an update
+ * closed the app under a protected user and the new version came back
+ * disconnected, Auto-Connect being off. Rust now hands out the session the
+ * update ended, once, on the first start of the new version
+ * (`commands::update_resume`); the controller puts it back.
+ */
+describe('Resume after an update (MR-1861)', () => {
+  /** What `take_update_resume` answers this run; everything else as scripted. */
+  function answerResume(target: unknown) {
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) =>
+      cmd === 'take_update_resume' ? target : scripted?.(cmd, args, options),
+    );
+  }
+
+  it('reconnects to the server the update ended, with Auto-Connect off, says so, and only once', async () => {
+    answerResume({ kind: 'singleHop', serverId: 'c' });
+    useAppStore.setState({ lastServerId: 'a' });
+    const { rerender } = render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'c' }]]));
+    expect(useAppStore.getState().notice?.text).toBe(RESUME_AFTER_UPDATE_COPY);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+
+    emit('vpn-status-changed', { state: 'disconnected', seq: 50, error: null });
+    rerender(<VpnSessionController />);
+    await act(async () => {});
+    expect(callsTo('connect_vpn')).toHaveLength(1);
+    expect(callsTo('take_update_resume')).toHaveLength(1);
+  });
+
+  it('a Multi-Hop session comes back on the same route', async () => {
+    answerResume({ kind: 'multiHop', entryId: 'a', exitId: 'b' });
+    render(<VpnSessionController />);
+    await waitFor(() =>
+      expect(callsTo('connect_multi_hop')).toEqual([['connect_multi_hop', { entryNodeId: 'a', exitNodeId: 'b' }]]),
+    );
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+  });
+
+  it("a server that is gone now falls back to the user's own server", async () => {
+    answerResume({ kind: 'singleHop', serverId: 'retired' });
+    useAppStore.setState({ lastServerId: 'a' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'a' }]]));
+  });
+
+  it('nothing to resume (no update, or disconnected when it began): nothing dials', async () => {
+    answerResume(null);
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    await act(async () => {});
+    expect(callsTo('take_update_resume')).toHaveLength(1);
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(callsTo('connect_multi_hop')).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+    expect(useAppStore.getState().notice).toBeNull();
+  });
+
+  it('a tunnel that is already up is left alone', async () => {
+    answerResume({ kind: 'singleHop', serverId: 'c' });
+    status = { state: 'connected', seq: 2, kill_switch_blocking: false, error: null };
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().serversStatus).toBe('ready'));
+    await act(async () => {});
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(useAppStore.getState().notice).toBeNull();
   });
 });
 
