@@ -324,6 +324,26 @@ async fn recover_from_failed_install(
 /// re-check found nothing to install.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
+    // L4: one install at a time. A second call must not run
+    // `fresh_updates_dir` (which would delete the first call's installer) or
+    // redirect/restore TMP/TEMP while the first install is mid-flight. The
+    // guard resets the flag on every return; a successful Windows install
+    // exits the process before it would, which is correct.
+    static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if INSTALLING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(UpdateFailure::before_install(
+            "install_failed",
+            "An update install is already in progress".to_string(),
+        ));
+    }
+    struct InstallGuard;
+    impl Drop for InstallGuard {
+        fn drop(&mut self) {
+            INSTALLING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _install_guard = InstallGuard;
+
     let tunnel_connected = app
         .state::<crate::vpn::VpnManager>()
         .get_state()
@@ -380,36 +400,48 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
 
     // The session the install is about to end, so a failed install can put
     // it back. Present exactly while a session is being kept or recovered.
+    // Captured BEFORE the teardown, which clears the live session.
     let resume = app
         .state::<AutoReconnectService>()
         .current_info()
         .await
         .map(|info| ConnectTarget::of(&info));
-    // MR-1861: the version this installs puts that session back at its first
-    // start (`update_resume`); Windows exits inside `install` below.
-    if let Some(target) = &resume {
-        crate::commands::update_resume::record(target);
-    }
-    // MR-1722: the folder the installer is written to and launched from is
-    // admin-only. Made before the teardown, so a machine where it cannot be
-    // made keeps its session; a launch from the user's %TEMP% is never the
-    // fallback.
-    let admin_only_temp = match installer_temp() {
-        Ok(guard) => guard,
+
+    // MR-1722: the admin-only folder the installer is written to and launched
+    // from, made BEFORE the teardown so a machine where it cannot be made
+    // keeps its session; a launch from the user's %TEMP% is never the fallback.
+    #[cfg(windows)]
+    let updates_dir = match crate::utils::protected_dir::fresh_updates_dir() {
+        Ok(dir) => dir,
         Err(e) => {
-            tracing::warn!("Update not installed: {e}");
+            // L6: nothing has been recorded or torn down yet, so there is no
+            // resume record to leave stale.
+            tracing::warn!("Update not installed: no admin-only folder for the installer ({e})");
             return Err(UpdateFailure::before_install(
                 "install_failed",
                 format!("Update failed: {e}"),
             ));
         }
     };
+
+    // MR-1861 / L6: record the session to resume only once the install is
+    // actually going ahead (the installer folder is ready), so an earlier
+    // failure never leaves a stale record behind. Windows exits inside
+    // `install` below; the new version resumes at its first start.
+    if let Some(target) = &resume {
+        crate::commands::update_resume::record(target);
+    }
     end_session(&app, EndReason::Update).await;
 
     let installed = {
-        // Windows: `install` exits the process once the installer runs, so
-        // only a failed install gets here, and drops the guard first.
-        let _admin_only_temp = admin_only_temp;
+        // L1: redirect TMP/TEMP to the admin-only folder for the duration of
+        // `install` ONLY — not the teardown above or any child it spawned —
+        // and restore them deterministically when it returns. On Windows a
+        // successful `install` exits the process from inside, so the restore
+        // runs only on the failure path (and the single-flight guard above
+        // keeps a second call from restoring them mid-install).
+        #[cfg(windows)]
+        let _env = AdminOnlyTemp::to(&updates_dir);
         update.install(bundle)
     };
     if let Err(e) = installed {
@@ -475,25 +507,6 @@ impl Drop for AdminOnlyTemp {
     }
 }
 
-/// The admin-only temporary directory for the install ([`AdminOnlyTemp`]).
-#[cfg(windows)]
-fn installer_temp() -> Result<AdminOnlyTemp, String> {
-    crate::utils::protected_dir::fresh_updates_dir()
-        .map(|dir| AdminOnlyTemp::to(&dir))
-        .map_err(|e| format!("no admin-only folder for the installer ({e})"))
-}
-
-/// macOS and Linux: the plugin replaces the app in place there, and launches
-/// no installer from a temporary directory (MR-1722 is Windows'). A unit
-/// struct, not `()`, so the guard reads the same on every platform.
-#[cfg(not(windows))]
-struct AdminOnlyTemp;
-
-#[cfg(not(windows))]
-fn installer_temp() -> Result<AdminOnlyTemp, String> {
-    Ok(AdminOnlyTemp)
-}
-
 #[cfg(test)]
 mod tests {
     /// W1-004: the session ends between the verified download and the install
@@ -505,20 +518,46 @@ mod tests {
         let body = &source[source.find("pub async fn install_update(").unwrap()..];
         let body = &body[..body.find("\n}").unwrap()];
         let download = body.find(".download(").expect("download");
+        let record = body
+            .find("update_resume::record(target)")
+            .expect("record the session");
         let teardown = body
             .find("end_session(&app, EndReason::Update)")
             .expect("teardown");
         let install = body.find("update.install(bundle)").expect("install");
         assert!(download < teardown && teardown < install);
-        // MR-1722: the admin-only temp dir is in place before the teardown,
-        // and held across the install.
-        let temp = body.find("installer_temp()").expect("installer_temp");
-        assert!(download < temp && temp < teardown);
-        let held = body
-            .find("let _admin_only_temp = admin_only_temp;")
-            .expect("the guard is held across the install");
-        assert!(teardown < held && held < install);
+        // MR-1722: the admin-only installer folder is made before the
+        // teardown; L6: the resume record is written only after it is ready.
+        let folder = body
+            .find("protected_dir::fresh_updates_dir()")
+            .expect("fresh_updates_dir");
+        assert!(download < folder && folder < record && record < teardown);
+        // L1: TMP/TEMP are redirected ONLY around `install`, inside the block
+        // that holds the guard, after the teardown.
+        let env = body
+            .find("let _env = AdminOnlyTemp::to(&updates_dir);")
+            .expect("the env redirect scoped to install");
+        assert!(teardown < env && env < install);
         assert!(!body.contains(&["download", "_and_install"].concat()));
+    }
+
+    /// L4: a second concurrent `install_update` is refused rather than racing
+    /// `fresh_updates_dir` / the TMP redirect of the first.
+    #[test]
+    fn install_update_is_single_flight() {
+        let source = include_str!("updater.rs");
+        let body = &source[source.find("pub async fn install_update(").unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let swap = body
+            .find("INSTALLING.swap(true,")
+            .expect("the single-flight flag");
+        let folder = body.find("fresh_updates_dir()").expect("fresh_updates_dir");
+        assert!(
+            swap < folder,
+            "the flag is taken before the installer folder"
+        );
+        assert!(body.contains("struct InstallGuard"));
+        assert!(body.contains("INSTALLING.store(false,"));
     }
 
     /// MR-1722: what the plugin calls to place the installer

@@ -32,6 +32,38 @@ extern "system" {
         info: *const c_void,
         size: u32,
     ) -> i32;
+    fn GetFileInformationByHandle(file: *mut c_void, info: *mut ByHandleFileInformation) -> i32;
+}
+
+/// The fields of `BY_HANDLE_FILE_INFORMATION` this crate reads, in layout
+/// order; the tail it does not (`nFileIndex*`) is padded so the struct is the
+/// size the API writes.
+#[repr(C)]
+#[derive(Default)]
+struct ByHandleFileInformation {
+    attributes: u32,
+    creation: [u32; 2],
+    last_access: [u32; 2],
+    last_write: [u32; 2],
+    volume_serial: u32,
+    size_high: u32,
+    size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+/// How many hard links name the file `file` is open on. 1 for an ordinary
+/// file; more means another name shares the data, so a write through this
+/// handle would reach it (MR-1945 L3).
+pub fn hard_link_count(file: &File) -> io::Result<u32> {
+    let mut info = ByHandleFileInformation::default();
+    // SAFETY: `file` is open for as long as the borrow lives; `info` is a
+    // writable BY_HANDLE_FILE_INFORMATION.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.number_of_links)
 }
 
 #[link(name = "advapi32")]

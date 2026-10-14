@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+use crate::utils::safe_fs::OwnedDir;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1163,23 +1164,32 @@ fn verify_signed(signed: SignedSettings, keys: &[Vec<u8>]) -> Result<Option<Veri
 /// MR-1721 (Windows): adopt a file that only a pre-MR-1721 source vouches
 /// for. Those sources are the user's to read and write, so their key is never
 /// carried over: the file is re-signed with a FRESH admin-only key (`sign`
-/// mints it) and only then are they deleted. A re-sign that fails takes the
-/// minted key back, so the next load migrates again rather than quarantine
-/// the user's settings. See `protected_key`.
-fn adopt_legacy(path: &Path, settings: &AppSettings, keys: &dyn SettingsKeys) {
+/// mints it) and only then are they deleted. Returns whether the adoption
+/// landed.
+///
+/// A re-sign that fails (M1: a user process holding settings.json without
+/// FILE_SHARE_DELETE makes the rename fail, among others) takes the minted key
+/// back, so the next load migrates again — and the caller runs the SESSION on
+/// secure defaults meanwhile rather than on settings only a user-writable key
+/// vouches for. See `protected_key`.
+#[must_use]
+fn adopt_legacy(path: &Path, settings: &AppSettings, keys: &dyn SettingsKeys) -> bool {
     match write_signed_settings(path, settings, |json| keys.sign(json)) {
         Ok(()) => {
             tracing::info!(
                 "Settings re-signed with the admin-only key; the old key sources are retired"
             );
             keys.retire_legacy();
+            true
         }
         Err(e) => {
             tracing::warn!(
-                "Could not re-sign the settings with the admin-only key: {} (will retry next load)",
+                "Could not re-sign the settings with the admin-only key: {} (will retry next load, \
+                 running on secure defaults until then)",
                 e
             );
             keys.undo_mint();
+            false
         }
     }
 }
@@ -1199,8 +1209,15 @@ fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {
         let found = keys.verifying();
         return match verify_signed(signed, &found.keys)? {
             Some(verified) if found.legacy => {
-                adopt_legacy(path, &verified.settings, keys);
-                Ok(Loaded::Saved(verified.settings))
+                if adopt_legacy(path, &verified.settings, keys) {
+                    Ok(Loaded::Saved(verified.settings))
+                } else {
+                    // M1: the adoption did not land, so these settings are
+                    // vouched for only by a user-writable key right now. Run
+                    // the session on secure defaults and retry next load,
+                    // never persisting them.
+                    Ok(Loaded::Unverified(AppSettings::default()))
+                }
             }
             Some(verified) => {
                 keys.verified_with(&verified.key);
@@ -1243,7 +1260,12 @@ fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {
             tracing::info!("Migrating unsigned settings to HMAC-protected format");
             let settings = normalize_loaded_settings(settings);
             if found.legacy {
-                adopt_legacy(path, &settings, keys);
+                // M1: on Windows an unsigned file is adopted under a fresh
+                // admin-only key; if that does not land, run on secure
+                // defaults and retry rather than trust an unsigned file.
+                if !adopt_legacy(path, &settings, keys) {
+                    return Ok(Loaded::Unverified(AppSettings::default()));
+                }
             } else if let Err(e) = write_signed_settings(path, &settings, |json| keys.sign(json)) {
                 // Log on failure so a persistent failure to upgrade (disk
                 // full, permissions, credential store down) is observable
@@ -1388,25 +1410,56 @@ fn write_signed_settings(
     write_atomically(path, &content)
 }
 
+/// The config directory `settings.json` sits in, as an [`OwnedDir`] rooted at
+/// the OS config folder: `<config dir>/<identifier>`. The elevated client
+/// writes there in the user's %APPDATA%, so every create/rename goes through
+/// this (MR-1945 H1), and the whole directory is held open for the process
+/// lifetime (`file_log::hold_app_dirs`) so it cannot be swapped for a junction.
+fn config_dir(path: &Path) -> Result<OwnedDir, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "settings path has no directory".to_string())?;
+    let identifier = parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "settings directory has no name".to_string())?;
+    let root = parent
+        .parent()
+        .ok_or_else(|| "config directory has no parent".to_string())?;
+    Ok(OwnedDir::new(root, &[identifier]))
+}
+
 /// FIX-2-6: write to a temp file, then rename over `path`, so a crash or a
-/// power cut mid-write never leaves a torn settings file. The temp name is
-/// unique to this write (process id + a counter): a fixed name is shared by
-/// every writer, which is half of REVIEW-WIN-006.
+/// power cut mid-write never leaves a torn settings file.
+///
+/// MR-1945 H1: the staging file is CREATED NEW under a random name through a
+/// checked handle (never `fs::write` to a predictable path a user could have
+/// turned into a symlink), and both it and the rename act inside the config
+/// directory the app holds open. A failure deletes the staging file through a
+/// checked handle too.
 fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = path.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
-    fs::write(&tmp_path, content).map_err(|e| {
-        // Clean up partial temp file on write failure
-        let _ = fs::remove_file(&tmp_path);
-        format!("Failed to write temp settings: {}", e)
-    })?;
-    fs::rename(&tmp_path, path).map_err(|e| {
-        // Clean up temp file on rename failure
-        let _ = fs::remove_file(&tmp_path);
+    let dir = config_dir(path)?;
+    fs::create_dir_all(dir.path()).map_err(|e| format!("Failed to create config dir: {}", e))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "settings file has no name".to_string())?;
+    let tmp = format!("{name}.{:016x}.tmp", rand::random::<u64>());
+
+    let mut staging = dir
+        .create_new(&tmp)
+        .map_err(|e| format!("Failed to create temp settings: {}", e))?;
+    let written = std::io::Write::write_all(&mut staging, content.as_bytes())
+        .and_then(|()| staging.sync_all());
+    drop(staging);
+    if let Err(e) = written {
+        let _ = dir.remove_file(&tmp);
+        return Err(format!("Failed to write temp settings: {}", e));
+    }
+    dir.rename_within(&tmp, name).map_err(|e| {
+        let _ = dir.remove_file(&tmp);
         format!("Failed to atomically replace settings file: {}", e)
-    })?;
-    Ok(())
+    })
 }
 
 /// Save application settings
@@ -2112,10 +2165,17 @@ mod tests {
         assert!(lock < load.find("load_at(&path, &OsKeys::new(&path))").unwrap());
         let at =
             body("fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {");
-        // The one branch that serves defaults and touches nothing, which
-        // every unverified file reaches: signed, and (MR-1721) unsigned.
+        // The branch that serves defaults and touches nothing, which every
+        // unverified file reaches: signed, and (MR-1721) unsigned.
         assert_eq!(at.matches("no_verifying_key(").count(), 2);
-        assert!(!at.contains("Loaded::Unverified("));
+        // M1: a legacy adoption that does not land runs on secure defaults
+        // (Unverified) rather than on settings a user-writable key vouches
+        // for — one for the signed path, one for the unsigned path.
+        assert_eq!(
+            at.matches("Loaded::Unverified(AppSettings::default())")
+                .count(),
+            2
+        );
         assert_eq!(
             body("fn no_verifying_key(")
                 .matches("Loaded::Unverified(AppSettings::default())")
@@ -3408,28 +3468,41 @@ mod tests {
         assert!(keys.retired.get());
     }
 
-    /// A migration whose re-sign fails takes the minted key back, so the
-    /// next load migrates again instead of quarantining the user's settings
-    /// as signed by a key that no longer counts.
+    /// M1: a migration whose re-sign fails takes the minted key back AND runs
+    /// the session on secure defaults (Unverified), never on settings only a
+    /// user-writable key vouches for. Nothing is saved, and the next load
+    /// migrates again.
     #[test]
-    fn a_failed_migration_save_leaves_the_migration_open() {
+    fn a_failed_migration_runs_on_defaults_and_leaves_the_migration_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let old: [u8; 32] = rand::random();
         let users = AppSettings {
             wireguard_mtu: 1300,
+            killswitch_enabled: false,
             ..AppSettings::default()
         };
         signed_file(&path, &users, &old);
+        let before = fs::read_to_string(&path).unwrap();
         let mut keys = WindowsKeys::new(KeyFile::Missing, &[&old]);
         keys.fail_after_mint = true;
 
+        // Secure defaults for the session: the kill switch is NOT off here.
+        let loaded = load_at(&path, &keys).unwrap();
+        assert!(matches!(loaded, Loaded::Unverified(_)));
         assert!(
-            matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(s) if s.wireguard_mtu == 1300)
+            may_save_over(Ok(loaded)).is_err(),
+            "an unverified load must not be saved over"
         );
         assert_eq!(*keys.protected.borrow(), KeyFile::Missing);
         assert!(!keys.retired.get());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "nothing was written"
+        );
 
+        // The retry adopts and keeps the real settings.
         keys.fail_after_mint = false;
         assert!(
             matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(s) if s.wireguard_mtu == 1300)

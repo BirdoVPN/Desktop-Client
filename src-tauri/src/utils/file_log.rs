@@ -53,7 +53,9 @@
 //! one goes through [`OwnedDir`]: by a checked handle, never by a path.
 
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -180,9 +182,45 @@ static FILE_LOG: OnceLock<RotatingLog> = OnceLock::new();
 /// Build this process's `birdo.log` writer at `path`, gated on the user's
 /// choice. Opens nothing: the file is opened on the first line written after
 /// [`apply`] has said on.
-pub fn install(path: &Path) -> &'static RotatingLog {
-    FILE_LOG.get_or_init(|| RotatingLog::gated(path, MAX_LOG_BYTES, &FILE_LOGGING))
+pub fn install(dir: OwnedDir, name: &str) -> &'static RotatingLog {
+    FILE_LOG.get_or_init(|| RotatingLog::gated(dir, name, MAX_LOG_BYTES, &FILE_LOGGING))
 }
+
+/// Hold the app's user-writable state directories open for the process
+/// lifetime (MR-1945 H1): the config directory (`settings.json` and its
+/// atomic writes), the logs directory and the crash directory. While a handle
+/// is held, an unprivileged process cannot rename the directory or replace it
+/// with a junction, so the elevated client's by-path create/append/rename
+/// operations in those directories cannot be redirected. Each directory's
+/// whole chain is verified (no reparse point, expected final path) at hold
+/// time; one that cannot be verified is left unheld and simply operates as
+/// before. Best-effort: never worth failing startup over, and a no-op where
+/// there is no data directory. The guards are leaked on purpose — they live
+/// as long as the process.
+pub fn hold_app_dirs() {
+    let mut dirs: Vec<OwnedDir> = Vec::new();
+    if let Some(config) = dirs::config_dir() {
+        dirs.push(OwnedDir::new(config, &[APP_IDENTIFIER]));
+    }
+    if let Some(dir) = log_dir() {
+        dirs.push(dir);
+    }
+    if let Some(dir) = crash_dir() {
+        dirs.push(dir);
+    }
+    for dir in dirs {
+        match dir.hold_open() {
+            Ok(guard) => HELD.lock().unwrap_or_else(|e| e.into_inner()).push(guard),
+            Err(e) => tracing::warn!(
+                "Could not hold a state directory open against a junction swap: {}",
+                e
+            ),
+        }
+    }
+}
+
+/// The held directory guards, for the process lifetime.
+static HELD: Mutex<Vec<crate::utils::safe_fs::DirGuard>> = Mutex::new(Vec::new());
 
 /// Apply the user's choice: at start-up (`setup()`), on every settings save
 /// and on a reset, so the live gate always equals what is saved. Takes effect
@@ -681,6 +719,12 @@ mod tests {
         Box::leak(Box::new(LogGate::undecided()))
     }
 
+    /// A gated log at `path`, for tests that still address it by path.
+    fn gated_log(path: &Path, cap: u64, gate: &'static LogGate) -> RotatingLog {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        RotatingLog::gated(OwnedDir::new(path.parent().unwrap(), &[]), name, cap, gate)
+    }
+
     /// THE FINDING (MR-808): with the log off, launching must neither create
     /// nor append to it — not even with the lines logged before `setup()`
     /// read the choice.
@@ -689,7 +733,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("logs").join(LOG_FILE_NAME);
         let gate = leaked_gate();
-        let log = RotatingLog::gated(&path, MAX_LOG_BYTES, gate);
+        let log = gated_log(&path, MAX_LOG_BYTES, gate);
 
         log.writer()
             .write_all(b"NOT running as administrator\n")
@@ -710,7 +754,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("logs").join(LOG_FILE_NAME);
         let gate = leaked_gate();
-        let log = RotatingLog::gated(&path, MAX_LOG_BYTES, gate);
+        let log = gated_log(&path, MAX_LOG_BYTES, gate);
 
         log.writer().write_all(b"one\n").unwrap();
         gate.set(true);
@@ -726,7 +770,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LOG_FILE_NAME);
         let gate = leaked_gate();
-        let log = RotatingLog::gated(&path, MAX_LOG_BYTES, gate);
+        let log = gated_log(&path, MAX_LOG_BYTES, gate);
         gate.set(true);
         log.writer().write_all(b"kept\n").unwrap();
 
@@ -753,7 +797,7 @@ mod tests {
         let path = logs.join(LOG_FILE_NAME);
         let gate = leaked_gate();
         gate.set(true);
-        let log = RotatingLog::gated(&path, MAX_LOG_BYTES, gate);
+        let log = gated_log(&path, MAX_LOG_BYTES, gate);
         log.writer().write_all(b"history\n").unwrap();
         write(&logs, "birdo.log.1");
 

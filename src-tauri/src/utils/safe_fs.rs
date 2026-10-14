@@ -74,11 +74,59 @@ impl OwnedDir {
     }
 
     /// Open `name`, a regular file directly in this directory, for reading
-    /// and writing, under the same checks as [`OwnedDir::remove_file`]. Never
-    /// creates it: `NotFound` when there is none.
+    /// and writing, under the same checks as [`OwnedDir::remove_file`] plus a
+    /// hard-link check (a write must not reach a file that shares this one's
+    /// data under another name). Never creates it: `NotFound` when there is
+    /// none.
     pub fn open_rw(&self, name: &str) -> io::Result<File> {
         imp::open_rw(self, name)
     }
+
+    /// Create `name` as a brand-new regular file (fails if it exists), owner-
+    /// only on Unix, for writing. The handle's final path must be this
+    /// directory's own, so a directory swapped for a junction mid-call is
+    /// caught (MR-1945 H1). Used for the uniquely-named staging files the
+    /// atomic writers rename into place.
+    pub fn create_new(&self, name: &str) -> io::Result<File> {
+        imp::create_new(self, name)
+    }
+
+    /// Open `name` for appending, creating it owner-only if absent, with the
+    /// link and reparse checks of [`OwnedDir::open_rw`]: a planted symlink or
+    /// hard link at the name is refused rather than appended through
+    /// (MR-1945 H1). Used by the log writer and the crash-report writer.
+    pub fn open_append(&self, name: &str) -> io::Result<File> {
+        imp::open_append(self, name)
+    }
+
+    /// Rename `from` to `to`, both plain names directly in this directory
+    /// (a log rotation, or an atomic write's staging file into place). The
+    /// held directory handle keeps the directory itself from being swapped;
+    /// the rename never follows a reparse point at either name.
+    pub fn rename_within(&self, from: &str, to: &str) -> io::Result<()> {
+        check_name(from)?;
+        check_name(to)?;
+        std::fs::rename(self.join(from), self.join(to))
+    }
+
+    /// Hold the directory open for as long as the returned guard lives, so no
+    /// unprivileged process can rename or replace it with a junction while the
+    /// app runs (MR-1945 H1). The whole chain is verified first: every
+    /// component is a real directory, not a reparse point, and the leaf's
+    /// final path is this directory's own. Creates the directory if absent.
+    pub fn hold_open(&self) -> io::Result<DirGuard> {
+        std::fs::create_dir_all(self.path())?;
+        imp::hold_open(self)
+    }
+}
+
+/// An open handle to an [`OwnedDir`], kept for the process lifetime so the
+/// directory cannot be renamed or replaced out from under the elevated app.
+/// On Unix it carries the verified directory handle too; dropping it releases
+/// the hold.
+pub struct DirGuard {
+    #[allow(dead_code)]
+    handle: File,
 }
 
 /// A single path component that names an entry in its directory: no
@@ -116,24 +164,106 @@ mod imp {
     };
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
+    // winnt.h share-mode bits (std's OpenOptions has no setter for them).
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+
     pub(super) fn remove_file(dir: &OwnedDir, name: &str) -> io::Result<()> {
         let file = open_checked(
             dir,
             name,
             OpenOptions::new().access_mode(DELETE | FILE_READ_ATTRIBUTES),
+            false,
         )?;
         win_api::delete_on_handle(&file)
     }
 
     pub(super) fn open_rw(dir: &OwnedDir, name: &str) -> io::Result<File> {
-        open_checked(dir, name, OpenOptions::new().read(true).write(true))
+        open_checked(dir, name, OpenOptions::new().read(true).write(true), true)
     }
 
-    fn open_checked(dir: &OwnedDir, name: &str, opts: &mut OpenOptions) -> io::Result<File> {
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+
+    pub(super) fn create_new(dir: &OwnedDir, name: &str) -> io::Result<File> {
+        check_name(name)?;
+        // DELETE in the access mask so a file that turns out to be in the
+        // wrong place (the directory was a junction) can be removed through
+        // this very handle, before it is ever written to.
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_WRITE | DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir.join(name))?;
+        if let Err(e) = verify(dir, name, &file, true) {
+            // Undo the create: it landed somewhere it should not have.
+            let _ = win_api::delete_on_handle(&file);
+            return Err(e);
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_append(dir: &OwnedDir, name: &str) -> io::Result<File> {
+        // Ensure the file exists in the checked directory WITHOUT writing to
+        // it (create_new cleans up a file that lands behind a junction), then
+        // open it for appending under the full checks: an existing reparse
+        // point or hard link at the name is refused before anything is
+        // appended.
+        match create_new(dir, name) {
+            Ok(_fresh) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        open_checked(dir, name, OpenOptions::new().append(true), true)
+    }
+
+    pub(super) fn hold_open(dir: &OwnedDir) -> io::Result<DirGuard> {
+        // No FILE_SHARE_DELETE: while this handle lives, the directory cannot
+        // be renamed or deleted, so it cannot be swapped for a junction.
+        let handle = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir.path())?;
+        let attributes = handle.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(refused("state directory", "it is a link"));
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(refused("state directory", "it is not a directory"));
+        }
+        let actual = win_api::final_path(&handle)?;
+        if !win_api::same_path(&actual, &final_dir(dir)?) {
+            return Err(refused(
+                "state directory",
+                "it resolves somewhere unexpected",
+            ));
+        }
+        Ok(DirGuard { handle })
+    }
+
+    /// `write`: the handle will be written through, so the name must be a
+    /// single-link ordinary file (a hard link would reach the shared data,
+    /// MR-1945 L3). A delete needs no such check — unlinking one name of a
+    /// hard-linked file leaves the data under its other names.
+    fn open_checked(
+        dir: &OwnedDir,
+        name: &str,
+        opts: &mut OpenOptions,
+        write: bool,
+    ) -> io::Result<File> {
         check_name(name)?;
         let file = opts
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(dir.join(name))?;
+        verify(dir, name, &file, write)?;
+        Ok(file)
+    }
+
+    /// The checks every opened handle must pass: not a reparse point, not a
+    /// directory, resolving to exactly this app directory's own path, and —
+    /// for a handle about to be written — a single hard link.
+    fn verify(dir: &OwnedDir, name: &str, file: &File, write: bool) -> io::Result<()> {
         let attributes = file.metadata()?.file_attributes();
         if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(refused(name, "it is a link"));
@@ -142,11 +272,14 @@ mod imp {
             return Err(refused(name, "it is a directory"));
         }
         let expected = final_dir(dir)?.join(name);
-        let actual = win_api::final_path(&file)?;
+        let actual = win_api::final_path(file)?;
         if !win_api::same_path(&actual, &expected) {
             return Err(refused(name, "it resolves outside the app's directory"));
         }
-        Ok(file)
+        if write && win_api::hard_link_count(file)? != 1 {
+            return Err(refused(name, "it is a hard link to another file"));
+        }
+        Ok(())
     }
 
     /// Where the directory must really be: the root as the OS resolves it,
@@ -194,6 +327,45 @@ mod imp {
             return Err(refused(name, "it is not a regular file"));
         }
         Ok(file)
+    }
+
+    pub(super) fn create_new(dir: &OwnedDir, name: &str) -> io::Result<File> {
+        check_name(name)?;
+        check_dirs(dir)?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        opts.open(dir.join(name))
+    }
+
+    pub(super) fn open_append(dir: &OwnedDir, name: &str) -> io::Result<File> {
+        check_name(name)?;
+        check_dirs(dir)?;
+        let mut opts = OpenOptions::new();
+        opts.append(true).create(true);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // O_NOFOLLOW rejects a symlink at the final component (ELOOP);
+            // owner-only for a file this call creates.
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(dir.join(name))?;
+        if !file.metadata()?.is_file() {
+            return Err(refused(name, "it is not a regular file"));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn hold_open(dir: &OwnedDir) -> io::Result<DirGuard> {
+        check_dirs(dir)?;
+        Ok(DirGuard {
+            handle: File::open(dir.path())?,
+        })
     }
 
     /// Every one of the app's folders below the root is a real directory.
@@ -382,6 +554,116 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(&victim, root.path().join("birdo.log")).unwrap();
         assert!(direct.remove_file("birdo.log").is_err());
         assert!(direct.open_rw("birdo.log").is_err());
+        assert!(direct.open_append("birdo.log").is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not the app's");
+    }
+
+    // ── MR-1945 H1: the create/append/truncate/hold path ──────────────────
+
+    #[test]
+    fn create_new_makes_a_file_and_refuses_an_existing_one() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = OwnedDir::new(root.path(), &[]);
+        let mut f = dir.create_new("settings.json.ab.tmp").unwrap();
+        std::io::Write::write_all(&mut f, b"x").unwrap();
+        assert!(dir.join("settings.json.ab.tmp").exists());
+        assert_eq!(
+            dir.create_new("settings.json.ab.tmp").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        // ..and a plain name only.
+        assert_eq!(
+            dir.create_new("../evil").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn open_append_creates_then_appends() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = OwnedDir::new(root.path(), &[]);
+        std::io::Write::write_all(&mut dir.open_append("birdo.log").unwrap(), b"one\n").unwrap();
+        std::io::Write::write_all(&mut dir.open_append("birdo.log").unwrap(), b"two\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("birdo.log")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn rename_within_takes_plain_names_only() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = OwnedDir::new(root.path(), &[]);
+        write(&dir.join("a.tmp"), "data");
+        dir.rename_within("a.tmp", "birdo.log").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("birdo.log")).unwrap(),
+            "data"
+        );
+        assert!(dir.rename_within("birdo.log", "../evil").is_err());
+    }
+
+    /// L3: a write (truncate or append) must not reach a file that shares the
+    /// leaf's data under another name. `open_rw`/`open_append` reject a hard
+    /// link; `remove_file` does not (unlinking one name is harmless).
+    #[cfg(windows)]
+    #[test]
+    fn a_hard_linked_leaf_is_refused_for_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim.txt");
+        write(&victim, "precious");
+        let dir = OwnedDir::new(root.path(), &[]);
+        if std::fs::hard_link(&victim, dir.join("birdo.log")).is_err() {
+            eprintln!("SKIPPED: this filesystem has no hard links");
+            return;
+        }
+        assert!(
+            dir.open_rw("birdo.log").is_err(),
+            "truncate followed a hard link"
+        );
+        assert!(dir.open_append("birdo.log").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        // Removing one name of a hard link is fine — the data keeps its others.
+        dir.remove_file("birdo.log").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+    }
+
+    /// THE H1 FINDING, on the config dir: a junction swapped in for the app's
+    /// directory makes a create/append/rename act somewhere else. The final-
+    /// path check refuses it, so nothing is created or written through it.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_directory_is_refused_for_creating_and_appending() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        junction(&root.path().join("uk.birdo.vpn.desktop"), &elsewhere);
+
+        let config = OwnedDir::new(root.path(), &["uk.birdo.vpn.desktop"]);
+        assert!(config.create_new("settings.json.ab.tmp").is_err());
+        assert!(config.open_append("birdo.log").is_err());
+        // Nothing of ours landed behind the junction.
+        assert!(!elsewhere.join("settings.json.ab.tmp").exists());
+        assert!(!elsewhere.join("birdo.log").exists());
+    }
+
+    /// `hold_open` refuses a junctioned directory (so the caller never trusts
+    /// it) and accepts a real one.
+    #[cfg(windows)]
+    #[test]
+    fn hold_open_refuses_a_junctioned_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(root.path().join("BirdoVPN")).unwrap();
+        // A real one holds.
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        let _guard = logs.hold_open().unwrap();
+        // A junction on the leaf is refused.
+        std::fs::remove_dir(logs.path()).unwrap();
+        junction(logs.path(), &elsewhere);
+        assert!(OwnedDir::new(root.path(), &["BirdoVPN", "logs"])
+            .hold_open()
+            .is_err());
     }
 }

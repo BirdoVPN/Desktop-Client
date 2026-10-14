@@ -79,13 +79,98 @@ pub fn ensure() -> io::Result<PathBuf> {
             "the admin-only state directory needs an elevated process",
         ));
     }
-    let dir = ensure_in(&win_api::program_data()?)?;
+    let dir = resolve(&win_api::program_data()?)?;
     Ok(VERIFIED.get_or_init(|| dir).clone())
 }
 
-/// [`ensure`] under `base` (ProgramData in the app; a temp dir in tests).
-pub fn ensure_in(base: &Path) -> io::Result<PathBuf> {
-    let dir = base.join(DIR_NAME);
+/// Where the protected directory ends up under `base` (M3).
+///
+/// Normally `BirdoVPN`. But any user may pre-create that name in ProgramData
+/// and hold it open without `FILE_SHARE_DELETE`, so it can be neither secured
+/// nor moved aside, and every start would then fail — no updates, no DNS
+/// journal, no settings saves. So if the fixed name cannot be secured, the app
+/// falls back to a RANDOMLY named protected directory the attacker could not
+/// have pre-created, and records its name in HKLM (writable only by
+/// administrators, so a user cannot poison it). A recorded name is reused on
+/// later starts; if it too has been made unusable, a fresh one is minted.
+fn resolve(base: &Path) -> io::Result<PathBuf> {
+    match secure_named(base, DIR_NAME) {
+        Ok(dir) => return Ok(dir),
+        Err(e) => tracing::warn!(
+            "The fixed state directory could not be secured ({}); using a private name",
+            e
+        ),
+    }
+    if let Some(name) = recorded_dir_name() {
+        // A plain directory name, never a path a crafted value could escape.
+        if !name.is_empty() && !name.contains(['/', '\\', ':']) && name != ".." {
+            match secure_named(base, &name) {
+                Ok(dir) => return Ok(dir),
+                Err(e) => tracing::warn!("The recorded state directory is unusable ({})", e),
+            }
+        }
+    }
+    for _ in 0..ATTEMPTS {
+        let name = random_state_name();
+        match create(&base.join(&name)) {
+            Ok(()) => {
+                record_dir_name(&name);
+                tracing::warn!("Created a privately named admin-only state directory");
+                return Ok(base.join(name));
+            }
+            Err(e) if e.raw_os_error() == Some(ERROR_ALREADY_EXISTS) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other(
+        "could not create a protected state directory",
+    ))
+}
+
+/// A directory name no user could have pre-created to squat on.
+fn random_state_name() -> String {
+    format!("{DIR_NAME}-{:016x}", rand::random::<u64>())
+}
+
+/// The fallback directory name recorded in HKLM, if any (M3). HKLM is writable
+/// only by administrators, so a user cannot point this at a directory of
+/// theirs.
+#[cfg(windows)]
+fn recorded_dir_name() -> Option<String> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SOFTWARE\BirdoVPN", KEY_READ)
+        .ok()?
+        .get_value::<String, _>("ProtectedStateDir")
+        .ok()
+}
+
+/// Record the fallback directory name in HKLM (M3). Best-effort: a start that
+/// cannot record it mints a new private name next time, which still works.
+#[cfg(windows)]
+fn record_dir_name(name: &str) {
+    use winreg::RegKey;
+    match RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).create_subkey(r"SOFTWARE\BirdoVPN") {
+        Ok((key, _)) => {
+            if let Err(e) = key.set_value("ProtectedStateDir", &name.to_string()) {
+                tracing::warn!("Could not record the state directory name: {}", e);
+            }
+        }
+        Err(e) => tracing::warn!("Could not open HKLM to record the state directory: {}", e),
+    }
+}
+
+/// [`ensure`] under `base` for the fixed name (a temp dir in tests).
+#[cfg(test)]
+fn ensure_in(base: &Path) -> io::Result<PathBuf> {
+    secure_named(base, DIR_NAME)
+}
+
+/// Secure (create, or move a squatter aside and create) the directory `name`
+/// under `base`, returning it once it is admin-only.
+fn secure_named(base: &Path, name: &str) -> io::Result<PathBuf> {
+    let dir = base.join(name);
     for _ in 0..ATTEMPTS {
         match inspect(&dir)? {
             State::AdminOnly => return Ok(dir),
@@ -499,6 +584,30 @@ mod tests {
         assert!(!security.is_admin_only());
         let user = current_user_sid().unwrap();
         assert!(security.granted_sids().unwrap().contains(&user));
+    }
+
+    #[test]
+    fn a_random_state_name_is_a_plain_prefixed_name() {
+        let name = random_state_name();
+        assert!(name.starts_with("BirdoVPN-"), "{name}");
+        assert!(!name.contains(['/', '\\', ':']), "{name}");
+        assert_ne!(random_state_name(), random_state_name());
+    }
+
+    /// M3: a fresh, privately named fallback directory is admin-only, the same
+    /// as the fixed one. (The HKLM record is exercised by the real
+    /// `resolve` path on a device; it is global machine state a unit test must
+    /// not write.)
+    #[test]
+    fn a_fallback_named_directory_is_created_admin_only() {
+        if !elevated_or_skip("a_fallback_named_directory_is_created_admin_only") {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let dir = secure_named(base.path(), &random_state_name()).unwrap();
+        assert!(Security::of(&open_for_security(&dir))
+            .unwrap()
+            .is_admin_only());
     }
 
     #[test]

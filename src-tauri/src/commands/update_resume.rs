@@ -76,7 +76,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
@@ -194,6 +194,11 @@ struct ResumeStore {
     dir: Option<OwnedDir>,
     /// The keys it is signed and verified with (MR-1933).
     keys: Keys,
+    /// MR-1933: the one-shot marker that an unsigned 1.4.47 record has already
+    /// been accepted for this account. It lives where a user cannot delete it
+    /// to re-arm the one-time acceptance (the admin-only directory on Windows).
+    /// `None` disables the one-time acceptance.
+    legacy_marker: Option<PathBuf>,
     /// What the start found, until the UI takes it. Also what `record` and
     /// `discard` hold, so a discard cannot land between a record's check of
     /// `ended_by_choice` and its write.
@@ -204,10 +209,11 @@ struct ResumeStore {
 }
 
 impl ResumeStore {
-    fn new(dir: Option<OwnedDir>, keys: Keys) -> Self {
+    fn new(dir: Option<OwnedDir>, keys: Keys, legacy_marker: Option<PathBuf>) -> Self {
         Self {
             dir,
             keys,
+            legacy_marker,
             pending: Mutex::new(None),
             ended_by_choice: AtomicBool::new(false),
         }
@@ -235,17 +241,14 @@ impl ResumeStore {
             );
             return;
         };
-        match write_record(&dir.join(FILE_NAME), &signed) {
+        match write_record(dir, &signed) {
             Ok(()) => tracing::info!("Recorded the VPN session for the update to resume"),
             Err(e) => tracing::warn!("Could not record the VPN session for the update: {e}"),
         }
     }
 
     fn load(&self, version: &str, now: i64) {
-        let found = self
-            .dir
-            .as_ref()
-            .and_then(|dir| read_once(dir, &(self.keys)()));
+        let found = self.dir.as_ref().and_then(|dir| self.read_once(dir));
         let mut pending = self.pending();
         *pending = None;
         match found {
@@ -283,30 +286,25 @@ impl ResumeStore {
     }
 }
 
-/// Write via a sibling staging file and a rename, so a record is whole or
-/// absent. Owner-only on multi-user Unix hosts, like the logs beside it.
-fn write_record(path: &Path, record: &SignedRecord) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
+/// Write via a uniquely-named staging file and a rename, so a record is whole
+/// or absent. Owner-only on multi-user Unix hosts, like the logs beside it.
+///
+/// MR-1945 H1: the staging file is created new through a checked handle and
+/// renamed within `dir`, never written to a predictable path a user could have
+/// turned into a symlink; `dir` is held open for the process lifetime.
+fn write_record(dir: &OwnedDir, record: &SignedRecord) -> std::io::Result<()> {
+    fs::create_dir_all(dir.path())?;
     let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-    let staging = path.with_extension("json.tmp");
-    let mut opts = fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let written = opts
-        .open(&staging)
+    let staging = format!("{FILE_NAME}.{:016x}.tmp", rand::random::<u64>());
+    let written = dir
+        .create_new(&staging)
         .and_then(|mut f| {
             f.write_all(&bytes)?;
             f.sync_all()
         })
-        .and_then(|()| fs::rename(&staging, path));
+        .and_then(|()| dir.rename_within(&staging, FILE_NAME));
     if written.is_err() {
-        let _ = fs::remove_file(&staging);
+        let _ = dir.remove_file(&staging);
     }
     written
 }
@@ -315,38 +313,98 @@ fn write_record(path: &Path, record: &SignedRecord) -> std::io::Result<()> {
 /// deleted (it would be used again), when it is larger than
 /// [`MAX_RECORD_BYTES`], when it is unreadable, or when none of `keys`
 /// signed it (MR-1933).
-fn read_once(dir: &OwnedDir, keys: &[Vec<u8>]) -> Option<Record> {
-    let mut bytes = Vec::new();
-    // At most one byte past the cap is read, and the handle is closed before
-    // the delete. Both through checked handles (MR-1945): a junction planted
-    // on the folder neither feeds this a file from elsewhere nor has the
-    // delete remove one.
-    dir.open_rw(FILE_NAME)
-        .ok()?
-        .take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    dir.remove_file(FILE_NAME).ok()?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return None;
+impl ResumeStore {
+    /// Read the record and delete it. `None` when there is none, when it
+    /// cannot be deleted (it would be used again), when it is larger than
+    /// [`MAX_RECORD_BYTES`], when it is unreadable, or when it is neither
+    /// signed with the settings key nor the one accepted unsigned record
+    /// (MR-1933).
+    fn read_once(&self, dir: &OwnedDir) -> Option<Record> {
+        let mut bytes = Vec::new();
+        // At most one byte past the cap is read, and the handle is closed
+        // before the delete. Both through checked handles (MR-1945): a
+        // junction planted on the folder neither feeds this a file from
+        // elsewhere nor has the delete remove one.
+        dir.open_rw(FILE_NAME)
+            .ok()?
+            .take(MAX_RECORD_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        dir.remove_file(FILE_NAME).ok()?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return None;
+        }
+        if let Ok(signed) = serde_json::from_slice::<SignedRecord>(&bytes) {
+            if verifies(&signed, &(self.keys)()) {
+                return Some(signed.record);
+            }
+            tracing::warn!("Dropped a VPN session record that is not signed with the settings key");
+            return None;
+        }
+        // MR-1933: 1.4.47 wrote this record UNSIGNED. Accept it exactly once,
+        // only if it names that version, so the update FROM 1.4.47 can resume —
+        // every later version signs. The one-shot marker (in a place a user
+        // cannot clear) closes the window after the first boot of the new
+        // version, so a planted unsigned record cannot drive a connect twice.
+        self.accept_unsigned_once(&bytes)
     }
-    let signed: SignedRecord = serde_json::from_slice(&bytes).ok()?;
-    if !verifies(&signed, keys) {
-        tracing::warn!("Dropped a VPN session record that is not signed with the settings key");
-        return None;
+
+    fn accept_unsigned_once(&self, bytes: &[u8]) -> Option<Record> {
+        let marker = self.legacy_marker.as_ref()?;
+        let record: Record = serde_json::from_slice(bytes).ok()?;
+        if record.version != LEGACY_UNSIGNED_VERSION {
+            return None;
+        }
+        if marker.exists() {
+            tracing::warn!("An unsigned VPN session record was ignored (already accepted once)");
+            return None;
+        }
+        // Close the window first, whatever happens next: this one-time
+        // acceptance must not be re-armable even if the record is then too old
+        // to resume.
+        if let Some(parent) = marker.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(marker, b"") {
+            // Could not record the one-shot: refuse rather than risk accepting
+            // it again on the next boot.
+            tracing::warn!("Could not mark the 1.4.47 resume record consumed ({e}); ignoring it");
+            return None;
+        }
+        tracing::info!("Accepted the unsigned 1.4.47 VPN session record once");
+        Some(record)
     }
-    Some(signed.record)
 }
+
+/// The one build that wrote the resume record unsigned (MR-1933).
+const LEGACY_UNSIGNED_VERSION: &str = "1.4.47";
 
 /// `<data_dir>/BirdoVPN`, where the record lives.
 fn default_dir() -> Option<OwnedDir> {
     dirs::data_dir().map(|base| OwnedDir::new(base, &["BirdoVPN"]))
 }
 
+/// The one-shot marker for the 1.4.47 unsigned-record acceptance (MR-1933),
+/// where a user cannot delete it: the admin-only directory on Windows (per
+/// account), root's own `<data_dir>/BirdoVPN` elsewhere.
+fn default_legacy_marker() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let dir = crate::utils::protected_dir::ensure().ok()?;
+        let sid = crate::utils::protected_dir::current_user_sid().ok()?;
+        Some(dir.join(format!("resume-unsigned-consumed-{sid}")))
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::data_dir().map(|base| base.join("BirdoVPN").join("resume-unsigned-consumed"))
+    }
+}
+
 static STORE: LazyLock<ResumeStore> = LazyLock::new(|| {
     ResumeStore::new(
         default_dir(),
         Box::new(crate::commands::settings::existing_signing_keys),
+        default_legacy_marker(),
     )
 });
 
@@ -460,7 +518,11 @@ mod tests {
     }
 
     fn store(dir: &tempfile::TempDir) -> ResumeStore {
-        ResumeStore::new(Some(OwnedDir::new(dir.path(), &[])), keyed(*KEY))
+        ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            keyed(*KEY),
+            Some(dir.path().join("marker").join("consumed")),
+        )
     }
 
     fn signed_bytes(record: Record, key: [u8; 32]) -> Vec<u8> {
@@ -468,11 +530,19 @@ mod tests {
     }
 
     fn record_of(target: ResumeTarget) -> Record {
+        record_ver(target, "1.4.47")
+    }
+
+    fn record_ver(target: ResumeTarget, version: &str) -> Record {
         Record {
-            version: "1.4.47".into(),
+            version: version.into(),
             written_at: T,
             target,
         }
+    }
+
+    fn unsigned_bytes(record: &Record) -> Vec<u8> {
+        serde_json::to_vec(record).unwrap()
     }
 
     /// MR-1861: connected when the update began, so the first start of the
@@ -640,12 +710,13 @@ mod tests {
 
     /// THE FINDING. The record makes the elevated app connect with no click,
     /// and it sits in a folder any process of the user can write. One that
-    /// is not signed with the settings key — 1.4.47's unsigned shape, a
-    /// forgery, another key's — is deleted and never resumed. On main each
-    /// of these connected.
+    /// is not signed with the settings key — an unsigned record of any version
+    /// but 1.4.47, a forgery, another key's — is deleted and never resumed. On
+    /// main each of these connected. (The one-time 1.4.47 exception is its own
+    /// test.)
     #[test]
     fn a_record_not_signed_with_the_settings_key_is_dropped() {
-        let unsigned = serde_json::to_vec(&record_of(single("node-7"))).unwrap();
+        let unsigned = unsigned_bytes(&record_ver(single("node-7"), "1.4.46"));
         let other_key = signed_bytes(record_of(single("node-7")), *OTHER);
         let mut tampered: serde_json::Value =
             serde_json::from_slice(&signed_bytes(record_of(single("node-7")), *KEY)).unwrap();
@@ -657,7 +728,7 @@ mod tests {
         let garbled = serde_json::to_vec(&garbled).unwrap();
 
         for (what, bytes) in [
-            ("unsigned (1.4.47)", unsigned),
+            ("unsigned (not 1.4.47)", unsigned),
             ("another key", other_key),
             ("a tampered target", tampered),
             ("a garbled MAC", garbled),
@@ -670,6 +741,98 @@ mod tests {
             assert!(!path.exists(), "{what}: not deleted");
             assert_eq!(s.take("1.4.48", T + 6), None, "{what}: resumed");
         }
+    }
+
+    /// MR-1933: 1.4.47 wrote the record unsigned, so the update FROM it must
+    /// still resume. The unsigned record is accepted EXACTLY ONCE: a one-shot
+    /// marker (which a user cannot reach) closes the window, so a second
+    /// unsigned record — a plant — is dropped.
+    #[test]
+    fn an_unsigned_1447_record_is_accepted_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker").join("consumed");
+        let s = ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            keyed(*KEY),
+            Some(marker.clone()),
+        );
+        fs::write(
+            dir.path().join(FILE_NAME),
+            unsigned_bytes(&record_of(single("node-7"))),
+        )
+        .unwrap();
+
+        s.load("1.4.48", T + 5);
+        assert_eq!(
+            s.take("1.4.48", T + 6),
+            Some(single("node-7")),
+            "the upgrade resumes"
+        );
+        assert!(marker.exists(), "the one-shot window is closed");
+
+        // A second unsigned 1.4.47 record (a plant) is ignored now.
+        fs::write(
+            dir.path().join(FILE_NAME),
+            unsigned_bytes(&record_of(single("attacker-node"))),
+        )
+        .unwrap();
+        let s2 = ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            keyed(*KEY),
+            Some(marker),
+        );
+        s2.load("1.4.48", T + 5);
+        assert_eq!(
+            s2.take("1.4.48", T + 6),
+            None,
+            "a second unsigned record is a plant"
+        );
+    }
+
+    /// The one-time acceptance still obeys the version and age checks, and
+    /// closes its window even when it does not resume (so it cannot be re-armed
+    /// by an aged record).
+    #[test]
+    fn the_unsigned_acceptance_still_checks_version_and_age() {
+        // Another unsigned version is never the one-time exception.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker").join("consumed");
+        fs::write(
+            dir.path().join(FILE_NAME),
+            unsigned_bytes(&record_ver(single("node-7"), "1.4.40")),
+        )
+        .unwrap();
+        let s = ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            keyed(*KEY),
+            Some(marker.clone()),
+        );
+        s.load("1.4.48", T + 5);
+        assert_eq!(s.take("1.4.48", T + 6), None);
+        assert!(
+            !marker.exists(),
+            "a non-1.4.47 record never consumes the window"
+        );
+
+        // A 1.4.47 record older than the hour consumes the window but does not
+        // resume.
+        fs::write(
+            dir.path().join(FILE_NAME),
+            unsigned_bytes(&record_of(single("node-7"))),
+        )
+        .unwrap();
+        let s = ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            keyed(*KEY),
+            Some(marker.clone()),
+        );
+        s.load("1.4.48", T + MAX_AGE_SECS + 1);
+        assert_eq!(
+            s.take("1.4.48", T + MAX_AGE_SECS + 2),
+            None,
+            "too old to resume"
+        );
+        assert!(marker.exists(), "but the window is closed");
     }
 
     /// What `record` writes is signed, verifies with the key, and with that
@@ -686,7 +849,11 @@ mod tests {
         assert!(!verifies(&signed, &[]));
 
         // A start whose key changed since (a reset settings key) drops it.
-        let rekeyed = ResumeStore::new(Some(OwnedDir::new(dir.path(), &[])), keyed(*OTHER));
+        let rekeyed = ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            keyed(*OTHER),
+            Some(dir.path().join("marker").join("consumed")),
+        );
         rekeyed.load("1.4.48", T + 5);
         assert_eq!(rekeyed.take("1.4.48", T + 6), None);
     }
@@ -695,7 +862,11 @@ mod tests {
     #[test]
     fn without_a_key_nothing_is_recorded() {
         let dir = tempfile::tempdir().unwrap();
-        let s = ResumeStore::new(Some(OwnedDir::new(dir.path(), &[])), Box::new(Vec::new));
+        let s = ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            Box::new(Vec::new),
+            Some(dir.path().join("marker").join("consumed")),
+        );
         s.record(single("node-7"), "1.4.47", T);
         assert!(!dir.path().join(FILE_NAME).exists());
     }

@@ -355,61 +355,39 @@ pub fn prune_crash_reports(dir: &OwnedDir, now: DateTime<Utc>, keep: usize) {
     }
 }
 
-/// If `path` already exists and has grown past [`MAX_LOG_BYTES`], move it to
-/// [`rotated_path`] (clobbering any previous generation) so the caller can open
-/// a fresh, empty file at `path`. Best-effort: any failure here just means we
-/// keep appending to the existing file, which is the pre-existing (unbounded)
-/// behaviour — never worth failing startup over a log file.
+/// The rotated generation's name for `name` (`birdo.log` -> `birdo.log.1`).
+fn rotated_name_of(name: &str) -> String {
+    rotated_path(Path::new(name))
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("birdo.log.1")
+        .to_string()
+}
+
+/// If `name` in `dir` has grown past [`MAX_LOG_BYTES`], move it to its rotated
+/// generation (clobbering any previous one) so the caller can open a fresh,
+/// empty file. Best-effort: any failure here just means we keep appending to
+/// the existing file, the pre-existing (unbounded) behaviour — never worth
+/// failing startup over a log file.
+///
+/// MR-1945 H1: the rename is within `dir` (held open for the process lifetime),
+/// not a raw path, so it cannot be redirected through a planted junction.
 ///
 /// Run this AFTER [`enforce`]: the sweep may well have taken the file back
 /// under the size cap on its own, and rotating first would push expired content
 /// into `.1` only to have to prune it there.
-pub fn rotate_if_large(path: &Path) {
-    let Ok(meta) = std::fs::metadata(path) else {
+pub fn rotate_if_large(dir: &OwnedDir, name: &str) {
+    let Ok(meta) = std::fs::metadata(dir.join(name)) else {
         return; // doesn't exist yet (first run) — nothing to rotate
     };
     if meta.len() <= MAX_LOG_BYTES {
         return;
     }
-    // std::fs::rename replaces an existing destination on both Windows
-    // (MoveFileExW with MOVEFILE_REPLACE_EXISTING) and Unix, so this is a
-    // single atomic step — no separate "delete old .1 first" required.
-    if let Err(e) = std::fs::rename(path, rotated_path(path)) {
+    if let Err(e) = dir.rename_within(name, &rotated_name_of(name)) {
         // Can't log through tracing yet (this runs before the subscriber is
         // installed) — stderr is the best available diagnostic.
         eprintln!("birdo.log rotation failed (continuing to append): {}", e);
     }
-}
-
-/// Open `path` for appending, owner-only on multi-user Unix hosts.
-///
-/// P6-CLI-D-08: the log records which VPN nodes were used and when. On
-/// Windows the file inherits its folder's ACL: the log and crash folders are
-/// in the user's profile (`%APPDATA%`, `%LOCALAPPDATA%`), whose ACL grants the
-/// user, SYSTEM and Administrators and no other local user (MR-843, pinned by
-/// `tests::the_log_and_a_crash_report_are_not_readable_by_other_users_on_windows`).
-pub fn open_for_append(path: &Path) -> io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
-}
-
-/// Create (or empty) `path` for writing, owner-only on multi-user Unix hosts:
-/// the crash report's twin of [`open_for_append`] (P6-CLI-D-08).
-pub fn create_owner_only(path: &Path) -> io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
 }
 
 /// The persistent log's writer: rotates when the file passes its cap instead
@@ -419,18 +397,24 @@ pub fn create_owner_only(path: &Path) -> io::Result<std::fs::File> {
 /// file passed 2 × [`MAX_LOG_BYTES`], so a session that hit it — exactly the
 /// failure storms support needs logs for — recorded nothing more until the
 /// next launch, the reconnect and give-up lines included. Now the file is moved
-/// to [`rotated_path`] and a fresh one opened in its place, the same rotation
-/// the start-up check performs. The sink survives only as the last resort for
-/// a rotation the OS refuses (a scanner holding the file) on a file already
-/// past twice the cap, so the disk stays bounded.
+/// to its rotated generation and a fresh one opened in its place, the same
+/// rotation the start-up check performs. The sink survives only as the last
+/// resort for a rotation the OS refuses (a scanner holding the file) on a file
+/// already past twice the cap, so the disk stays bounded.
 ///
 /// MR-808: it writes only while its gate (`file_log::LogGate`, the user's
 /// "Save Diagnostic Logs") is on. Undecided, it holds lines in memory and
 /// opens nothing; off, it closes the file and writes nothing. The file is
 /// opened on the first line written while on, so a log that is off is never
 /// created, and one that was deleted comes back only with new lines.
+///
+/// MR-1945 H1: every create, append, rename and delete goes through `dir`
+/// ([`OwnedDir`], held open for the process lifetime), never a raw path, so
+/// the elevated writer cannot be redirected by a junction or a planted link
+/// in the user-writable log directory.
 pub struct RotatingLog {
-    path: PathBuf,
+    dir: OwnedDir,
+    name: String,
     cap: u64,
     gate: &'static LogGate,
     state: std::sync::Mutex<RotatingState>,
@@ -454,22 +438,26 @@ static ALWAYS_ON: LogGate = LogGate::on();
 impl RotatingLog {
     /// A log that is always on, opened now.
     #[cfg(test)]
-    pub fn open(path: &Path, cap: u64) -> io::Result<Self> {
+    pub fn open(dir: OwnedDir, name: &str, cap: u64) -> io::Result<Self> {
+        std::fs::create_dir_all(dir.path())?;
+        let file = dir.open_append(name)?;
         Ok(Self {
-            path: path.to_path_buf(),
+            dir,
+            name: name.to_string(),
             cap,
             gate: &ALWAYS_ON,
             state: std::sync::Mutex::new(RotatingState {
-                file: Some(open_for_append(path)?),
+                file: Some(file),
                 failed_at: None,
             }),
         })
     }
 
     /// A log behind `gate`. Opens nothing; see the type's docs.
-    pub fn gated(path: &Path, cap: u64, gate: &'static LogGate) -> Self {
+    pub fn gated(dir: OwnedDir, name: &str, cap: u64, gate: &'static LogGate) -> Self {
         Self {
-            path: path.to_path_buf(),
+            dir,
+            name: name.to_string(),
             cap,
             gate,
             state: std::sync::Mutex::new(RotatingState {
@@ -502,8 +490,10 @@ impl RotatingLog {
         if len > self.cap {
             let may_retry = failed_at.is_none_or(|at| at.elapsed() >= ROTATION_RETRY);
             if may_retry {
-                match std::fs::rename(&self.path, rotated_path(&self.path))
-                    .and_then(|()| open_for_append(&self.path))
+                match self
+                    .dir
+                    .rename_within(&self.name, &rotated_name_of(&self.name))
+                    .and_then(|()| self.dir.open_append(&self.name))
                 {
                     Ok(fresh) => {
                         *file = fresh;
@@ -561,10 +551,8 @@ impl RotatingLog {
     /// before it was decided.
     fn ensure_open(&self, state: &mut RotatingState) {
         if state.file.is_none() {
-            if let Some(dir) = self.path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            state.file = open_for_append(&self.path).ok();
+            let _ = std::fs::create_dir_all(self.dir.path());
+            state.file = self.dir.open_append(&self.name).ok();
         }
         if let Some(file) = state.file.as_mut() {
             let held = self.gate.take_held();
@@ -624,22 +612,22 @@ mod tests {
     fn the_log_and_a_crash_report_are_owner_only_on_unix() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("birdo.log");
-        let crash = dir.path().join("crash_20261008_120000.txt");
-        let rotated = dir.path().join("rotating.log");
-        drop(open_for_append(&log).unwrap());
-        drop(create_owner_only(&crash).unwrap());
+        let owned = here(dir.path());
+        drop(owned.open_append("birdo.log").unwrap());
+        drop(owned.create_new("crash_20261008_120000.txt").unwrap());
         // Past its cap, the next writer moves the file aside and opens a
         // fresh one in its place.
-        let rotating = RotatingLog::open(&rotated, 4).unwrap();
+        let rotating = RotatingLog::open(here(dir.path()), "rotating.log", 4).unwrap();
         rotating
             .writer()
             .write_all(b"more than four bytes")
             .unwrap();
         drop(rotating.writer());
-        assert!(rotated_path(&rotated).exists(), "the log was rotated");
-        for p in [&log, &crash, &rotated] {
-            let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let rotated = dir.path().join(rotated_name_of("rotating.log"));
+        assert!(rotated.exists(), "the log was rotated");
+        for name in ["birdo.log", "crash_20261008_120000.txt", "rotating.log"] {
+            let p = dir.path().join(name);
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{} is {:o}", p.display(), mode);
         }
     }
@@ -887,10 +875,11 @@ mod tests {
         let roots = [dirs::data_dir().unwrap(), dirs::data_local_dir().unwrap()];
         for root in roots {
             let dir = tempfile::tempdir_in(&root).unwrap();
+            let owned = here(dir.path());
             let log = dir.path().join("birdo.log");
             let crash = dir.path().join("crash_20261013_120000.txt");
-            drop(open_for_append(&log).unwrap());
-            drop(create_owner_only(&crash).unwrap());
+            drop(owned.open_append("birdo.log").unwrap());
+            drop(owned.create_new("crash_20261013_120000.txt").unwrap());
             for p in [dir.path(), log.as_path(), crash.as_path()] {
                 let handle = std::fs::OpenOptions::new()
                     .access_mode(READ_CONTROL)
@@ -920,7 +909,7 @@ mod tests {
             "birdo.log",
             &"x".repeat(MAX_LOG_BYTES as usize + 1),
         );
-        rotate_if_large(&p);
+        rotate_if_large(&here(dir.path()), "birdo.log");
         assert!(
             !p.exists(),
             "rotation should have moved the oversized log aside"
@@ -940,7 +929,7 @@ mod tests {
         let p = write(dir.path(), "birdo.log", &line(20, &"x".repeat(64)));
         // A directory where the rotated file goes: the rename is refused.
         std::fs::create_dir(rotated_path(&p)).unwrap();
-        let log = RotatingLog::open(&p, 16).unwrap();
+        let log = RotatingLog::open(here(dir.path()), "birdo.log", 16).unwrap();
         drop(log.writer());
 
         let text = read(&p);
@@ -960,7 +949,7 @@ mod tests {
     fn rotation_leaves_a_log_under_the_size_cap_alone() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "birdo.log", "small\n");
-        rotate_if_large(&p);
+        rotate_if_large(&here(dir.path()), "birdo.log");
         assert_eq!(read(&p), "small\n");
         assert!(!rotated_path(&p).exists());
     }
@@ -1048,7 +1037,7 @@ mod tests {
     fn the_in_session_cap_rotates_instead_of_going_silent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("birdo.log");
-        let log = RotatingLog::open(&path, 100).unwrap();
+        let log = RotatingLog::open(here(dir.path()), "birdo.log", 100).unwrap();
         log.writer().write_all(&[b'a'; 150]).unwrap();
         // The next event finds the file past the cap.
         log.writer()
