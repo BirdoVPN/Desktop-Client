@@ -873,6 +873,37 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// AF_SYSTEM / SYSPROTO_CONTROL: the socket a utun is created from.
+const AF_SYSTEM: i32 = 32;
+const SYSPROTO_CONTROL: i32 = 2;
+
+/// Create the kernel-control socket a utun is connected from, close-on-exec.
+///
+/// Without FD_CLOEXEC, any long-lived child spawned while the tunnel is up
+/// (xray, re-spawned by the stealth path) inherited the descriptor, and its
+/// copy kept the utun — and the half-default routes through it — alive after
+/// stop() closed ours. Darwin's socket(2) has no SOCK_CLOEXEC, so the flag is
+/// set straight after socket() and before connect() creates the interface; a
+/// failure to set it fails the start, as a failure to set O_NONBLOCK does.
+/// Creating the socket needs no privilege (connecting it to the utun control
+/// does), so the test runs this as is.
+fn open_utun_control_socket() -> Result<std::os::fd::RawFd, String> {
+    // SAFETY: socket(2) with constant arguments; no memory is passed.
+    let fd = unsafe { libc::socket(AF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
+    if fd < 0 {
+        return Err(format!(
+            "Failed to create AF_SYSTEM socket: errno {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if let Err(e) = device_fd::set_cloexec(fd) {
+        // SAFETY: `fd` was created above and nothing else owns it.
+        unsafe { libc::close(fd) };
+        return Err(format!("Could not make the utun fd close-on-exec: {e}"));
+    }
+    Ok(fd)
+}
+
 /// Create a macOS utun device via AF_SYSTEM socket.
 ///
 /// Returns (utun_name, fd) on success; the fd is owned from here on (MR-820),
@@ -880,9 +911,7 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
 fn create_utun_device() -> Result<(String, OwnedFd), String> {
     use std::os::unix::io::RawFd;
 
-    // macOS-specific constants for utun
-    const AF_SYSTEM: i32 = 32; // AF_SYSTEM
-    const SYSPROTO_CONTROL: i32 = 2;
+    // macOS-specific constants for utun (AF_SYSTEM / SYSPROTO_CONTROL above)
     const AF_SYS_CONTROL: i32 = 2;
     const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
 
@@ -907,14 +936,9 @@ fn create_utun_device() -> Result<(String, OwnedFd), String> {
     // CTLIOCGINFO ioctl number
     const CTLIOCGINFO: libc::c_ulong = 0xc0644e03;
 
-    // Create AF_SYSTEM socket
-    let fd: RawFd = unsafe { libc::socket(AF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
-    if fd < 0 {
-        return Err(format!(
-            "Failed to create AF_SYSTEM socket: errno {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    // Create the AF_SYSTEM socket, close-on-exec before connect() makes it a
+    // utun.
+    let fd: RawFd = open_utun_control_socket()?;
 
     // Get the control ID for utun
     let mut ctl_info = CtlInfo {
@@ -2055,5 +2079,53 @@ mod endpoint_route_tests {
         let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
 
         second.expect("an already-present endpoint route must be tolerated, not fatal");
+    }
+}
+
+/// The utun descriptor is close-on-exec. Run UNPRIVILEGED on the macOS leg of
+/// tests.yml: creating the kernel-control socket needs no root (connecting it
+/// to the utun control does), so the very function create_utun_device() opens
+/// its device through is what is checked.
+#[cfg(test)]
+mod utun_fd_tests {
+    use super::open_utun_control_socket;
+    use crate::vpn::device_fd::set_cloexec;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    fn is_cloexec(fd: &OwnedFd) -> bool {
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    /// The regression: the socket was created without FD_CLOEXEC, so a child
+    /// spawned while the tunnel was up (a re-spawned xray) kept a copy and the
+    /// utun outlived stop().
+    #[test]
+    fn the_utun_control_socket_is_close_on_exec() {
+        let fd = open_utun_control_socket().expect("an AF_SYSTEM control socket");
+        // SAFETY: just created, and owned by nothing else.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert!(
+            is_cloexec(&fd),
+            "the utun socket is inherited by every child spawned while it is open"
+        );
+    }
+
+    /// The control for the test above (a fresh socket() does NOT start out
+    /// close-on-exec on Darwin, so the flag there is set_cloexec's doing),
+    /// and set_cloexec refuses a bad descriptor rather than passing it.
+    #[test]
+    fn set_cloexec_sets_the_flag_a_plain_socket_lacks_and_refuses_a_bad_fd() {
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+        assert!(raw >= 0, "socket: {}", std::io::Error::last_os_error());
+        // SAFETY: just created, and owned by nothing else.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert!(!is_cloexec(&fd), "a plain socket() starts out inheritable");
+
+        set_cloexec(fd.as_raw_fd()).expect("a valid fd");
+        assert!(is_cloexec(&fd), "FD_CLOEXEC was not set");
+
+        assert!(set_cloexec(-1).is_err(), "a bad fd passed as close-on-exec");
     }
 }

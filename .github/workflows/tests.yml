@@ -254,9 +254,11 @@ jobs:
         env:
           OS: ${{ matrix.os }}
           # Linux: resolv_conf_restore_tests + tun_read_tests (F6: the packet
-          # loop's buffer-reuse helper, run on a pipe fd). macOS:
-          # dns_journal_restore_tests (restore_services_pass,
-          # interpret_dns_query, dns_write_verified). Both: log_retention::tests,
+          # loop's buffer-reuse helper, run on a pipe fd; and the TUN fd's
+          # close-on-exec check). macOS: dns_journal_restore_tests
+          # (restore_services_pass, interpret_dns_query, dns_write_verified)
+          # and utun_fd_tests (the utun socket is close-on-exec, checked
+          # unprivileged). Both: log_retention::tests,
           # whose owner-only (0600) log-file test is #[cfg(unix)], so the
           # Windows job compiles it out; and file_log::tests, whose symlinked
           # log and symlinked log-directory tests (MR-808) are #[cfg(unix)]
@@ -266,13 +268,13 @@ jobs:
           # MR-849 test (Drop kills xray by its recorded PID while the slot is
           # held) is Unix-only. Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests' || 'resolv_conf_restore_tests tun_read_tests log_retention::tests file_log::tests safe_fs::tests xray::tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests' || 'resolv_conf_restore_tests tun_read_tests log_retention::tests file_log::tests safe_fs::tests xray::tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
           # FILTER plus the root-only ipv6 step further down, whose tests are
           # #[ignore]d and so cannot run in the loop above.
-          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests' || 'configure_ipv6_tests ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
+          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests' || 'configure_ipv6_tests ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
         run: |
           set -euo pipefail
           # $FILTER/$COVERED are space-separated lists; split them explicitly
@@ -281,7 +283,14 @@ jobs:
           read -r -a covered_list <<<"$COVERED"
           # Captured, not piped: a name filter that matches NOTHING still exits
           # 0, which is a green light for a test suite that never ran.
-          out=$(cargo test --locked --lib -- "${filters[@]}")
+          # `|| {…}`: under `set -e` a failing `out=$(…)` would exit before
+          # the output it captured is printed - the job red, and the names of
+          # the failing tests nowhere in the log.
+          out=$(cargo test --locked --lib -- "${filters[@]}") || {
+            echo "$out"
+            echo "::error::cargo test failed on $OS (filter '$FILTER') - the failing tests are listed above"
+            exit 1
+          }
           echo "$out"
           if ! echo "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; then
             echo "::error::no tests ran on $OS - the filter '$FILTER' matched nothing"
@@ -413,7 +422,11 @@ jobs:
         working-directory: src-tauri
         run: |
           set -euo pipefail
-          out=$(sudo -E "$(command -v cargo)" test --locked --lib endpoint_route_tests -- --ignored --nocapture --test-threads=1)
+          out=$(sudo -E "$(command -v cargo)" test --locked --lib endpoint_route_tests -- --ignored --nocapture --test-threads=1) || {
+            echo "$out"
+            echo "::error::endpoint_route_tests failed"
+            exit 1
+          }
           echo "$out"
           if ! echo "$out" | grep -qE 'test result: ok\. 1 passed'; then
             echo "::error::the macOS endpoint-route root test did not run"
@@ -440,7 +453,11 @@ jobs:
           # GLOBAL routing state - ::/1 is ::/1 whichever device claims it - so
           # run in parallel they contend over the same prefix and fail for a
           # reason that has nothing to do with the code under test.
-          out=$(sudo -E "$(command -v cargo)" test --locked --lib configure_ipv6_tests -- --ignored --nocapture --test-threads=1)
+          out=$(sudo -E "$(command -v cargo)" test --locked --lib configure_ipv6_tests -- --ignored --nocapture --test-threads=1) || {
+            echo "$out"
+            echo "::error::configure_ipv6_tests failed"
+            exit 1
+          }
           echo "$out"
           # Two tests, both required. An --ignored filter that matches nothing
           # still exits 0, which is the exact failure this repo has been bitten

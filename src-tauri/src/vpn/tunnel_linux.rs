@@ -775,7 +775,8 @@ fn tun_read_owned(fd: i32, mut buf: Vec<u8>) -> (Vec<u8>, Option<usize>) {
 /// F6: the packet loop's read helper must reuse its buffer. Exercised on a
 /// pipe (any fd works for `read(2)`) on the ubuntu leg of tests.yml — no TUN
 /// device or root needed. MR-820's fd-lifetime tests live here too, for the
-/// same reason (`device_fd`'s own tests cover the protocol on every platform).
+/// same reason (`device_fd`'s own tests cover the protocol on every platform),
+/// as does the TUN fd's close-on-exec check (the clone device opens unprivileged).
 #[cfg(test)]
 mod tun_read_tests {
     use super::tun_read_owned;
@@ -979,6 +980,27 @@ mod tun_read_tests {
         );
     }
 
+    /// The TUN fd is close-on-exec, or a child spawned while the tunnel is up
+    /// (a re-spawned xray) keeps a copy and `birdo0` outlives stop(). This
+    /// opens the real /dev/net/tun through the function create_tun_device()
+    /// uses; the clone device is mode 0666, and no TUNSETIFF is issued, so it
+    /// needs no root and creates no interface.
+    #[test]
+    fn the_tun_clone_device_opens_close_on_exec() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let fd = super::open_tun_clone().expect("open /dev/net/tun");
+        // SAFETY: just opened, and owned by nothing else.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the TUN fd is inherited by every child spawned while it is open"
+        );
+    }
+
     /// MR-820: stop()'s close waits for the blocking read the loop detached,
     /// then closes — the read runs against its own, still-open fd.
     #[tokio::test]
@@ -1134,6 +1156,24 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Open the TUN clone device read/write and close-on-exec.
+///
+/// O_CLOEXEC is set by the open itself, so there is no window in which a child
+/// forked elsewhere in the process can inherit the descriptor. Without it, any
+/// long-lived child spawned while the tunnel is up (xray, re-spawned by the
+/// stealth path) held a copy, and that copy kept `birdo0` alive — with the
+/// half-default routes through it — after stop() closed ours; the next start's
+/// TUNSETIFF then failed with EBUSY. Opening the clone device needs no
+/// privilege (it is mode 0666); only TUNSETIFF does, so the test runs it as is.
+fn open_tun_clone() -> std::io::Result<std::os::fd::RawFd> {
+    // SAFETY: a NUL-terminated path literal; open(2) does not retain it.
+    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
 /// Create a Linux TUN device via /dev/net/tun ioctl.
 ///
 /// Uses IFF_TUN | IFF_NO_PI for raw IP packet I/O (no protocol info header).
@@ -1153,17 +1193,9 @@ fn create_tun_device() -> Result<(String, OwnedFd), String> {
     // TUNSETIFF ioctl number: _IOW('T', 202, int)
     const TUNSETIFF: libc::c_ulong = 0x400454CA;
 
-    // Open /dev/net/tun
-    let tun_path = std::ffi::CString::new("/dev/net/tun")
-        .map_err(|_| "Invalid TUN device path".to_string())?;
-
-    let fd = unsafe { libc::open(tun_path.as_ptr(), libc::O_RDWR) };
-    if fd < 0 {
-        return Err(format!(
-            "Failed to open /dev/net/tun: {} (are you root? is the tun module loaded?)",
-            std::io::Error::last_os_error()
-        ));
-    }
+    let fd = open_tun_clone().map_err(|e| {
+        format!("Failed to open /dev/net/tun: {e} (are you root? is the tun module loaded?)")
+    })?;
 
     // Prepare ifreq
     let mut ifr = IfReq {
