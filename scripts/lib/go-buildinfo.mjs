@@ -4,7 +4,7 @@
 // Works on ELF, PE and Mach-O alike: the blob is found by its magic, not by
 // section. Used by scripts/generate-third-party-notices.mjs,
 // scripts/vendor-xray-go-licences.mjs (MR-1685) and
-// scripts/build-xray-source-archive.mjs. Throws on anything it cannot read;
+// scripts/build-corresponding-source.mjs. Throws on anything it cannot read;
 // callers decide how to fail.
 import fs from 'node:fs';
 

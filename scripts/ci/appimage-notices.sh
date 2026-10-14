@@ -10,9 +10,11 @@
 #     --appimage-extract, as the post-bundle gate does);
 #  2. scripts/generate-appimage-notices.mjs writes <out file>: this build's
 #     notices (src-tauri/resources/THIRD-PARTY-NOTICES.txt, which the .deb
-#     keeps) plus the AppImage-only sections: every library in that AppImage,
-#     its Ubuntu package, source package and version, copyright file and
-#     cited licence texts;
+#     keeps) plus the AppImage-only sections: every file in that AppImage
+#     (libraries by their Ubuntu package, source package and version,
+#     copyright file and cited licence texts), and its runtime, which must be
+#     the pinned one (APPIMAGE_RUNTIME_FILE, set by fetch-appimage-tooling.mjs
+#     before the build), with the libraries it links;
 #  3. re-bundles ONLY the AppImage with <out file> as resources/THIRD-PARTY-
 #     NOTICES.txt: `tauri bundle --bundles appimage` (nothing is recompiled:
 #     same app binary, same xray; the updater .sig is made again, so the old
@@ -21,8 +23,10 @@
 # Which libraries linuxdeploy bundles is only known once it has run, hence
 # the second bundle. The post-bundle gate (verify-bundled-xray.sh with
 # APPIMAGE_NOTICES_FILE=<out file>) then checks the FINAL AppImage: its
-# notices must be <out file> byte for byte, and every ELF file in it must be
-# listed there. [tauri bundle args]: what the build passed, e.g. --config.
+# notices must be <out file> byte for byte, every file in it must be listed
+# there, and its runtime must be the one listed. [tauri bundle args]: what the
+# build passed, e.g. --config. LDAI_RUNTIME_FILE stays set, so the re-bundle
+# uses the same pinned runtime.
 # ============================================================================
 set -euo pipefail
 
@@ -37,6 +41,11 @@ generic=src-tauri/resources/THIRD-PARTY-NOTICES.txt
 dir="src-tauri/target/$target/release/bundle/appimage"
 if [ ! -s "$generic" ]; then
   echo "::error::$generic is missing - generate this build's notices before tauri build"
+  exit 1
+fi
+runtime="${APPIMAGE_RUNTIME_FILE:-}"
+if [ -z "$runtime" ] || [ ! -s "$runtime" ] || [ "${LDAI_RUNTIME_FILE:-}" != "$runtime" ]; then
+  echo "::error::APPIMAGE_RUNTIME_FILE and LDAI_RUNTIME_FILE must name the pinned AppImage runtime - run scripts/ci/fetch-appimage-tooling.mjs before tauri build"
   exit 1
 fi
 
@@ -61,7 +70,8 @@ trap restore EXIT
 cp "$appimage" "$work/built.AppImage"
 chmod +x "$work/built.AppImage"
 (cd "$work" && ./built.AppImage --appimage-extract >/dev/null)
-node scripts/generate-appimage-notices.mjs --appdir "$work/squashfs-root" --base "$generic" --out "$out"
+node scripts/generate-appimage-notices.mjs --appdir "$work/squashfs-root" --appimage "$work/built.AppImage" \
+  --runtime-file "$runtime" --base "$generic" --out "$out"
 
 had_sig=false
 if [ -f "$appimage.sig" ]; then had_sig=true; fi

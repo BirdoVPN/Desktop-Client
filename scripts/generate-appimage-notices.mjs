@@ -1,52 +1,71 @@
 #!/usr/bin/env node
 // ============================================================================
-// AppImage-only notices: the system libraries the AppImage bundles (owner
-// decision 2026-10-14, L2: list them in the notices).
+// AppImage-only notices: everything the AppImage carries besides BirdoVPN
+// (owner decision 2026-10-14, L2: list them in the notices; review round 1 of
+// #298: every file, and the runtime).
 //
 // The .deb uses the libraries the user's system provides; the AppImage
 // carries its own, copied by Tauri's bundler (linuxdeploy and its GTK plugin)
-// from the Ubuntu system it is built on: WebKitGTK, GTK, GLib, libsoup and
-// everything they link, about 175 files from about 100 packages. This script
-// lists every one of them in the AppImage's copy of THIRD-PARTY-NOTICES.txt,
-// after the sections every package carries:
+// from the Ubuntu system it is built on (WebKitGTK, GTK, GLib, libsoup and
+// everything they link, with their typelibs, GSettings schemas and copyright
+// files), plus the AppImage runtime at the start of the file and the AppRun
+// launcher. This script lists every one of them in the AppImage's copy of
+// THIRD-PARTY-NOTICES.txt, after the sections every package carries:
 //
 //   node scripts/generate-appimage-notices.mjs --appdir <unpacked AppImage>
+//        --appimage <the .AppImage> --runtime-file <the pinned runtime>
 //        --base <this build's THIRD-PARTY-NOTICES.txt> --out <file>
 //        [--doc-root /usr/share/doc] [--licenses-root /usr/share/common-licenses]
 //        [--os-release /etc/os-release] [--host-root /] [--multiarch <triplet>]
+//        [--runtime-pins third_party/licenses/appimage-runtime.json]
 //
 // Run on the build host, right after `tauri build` made the AppImage, by
 // scripts/ci/appimage-notices.sh (release.yml's build-linux, and the PR
 // workflow linux-packages.yml), which then re-bundles the AppImage with the
-// result. For every ELF file under usr/ in the AppImage (shared libraries,
-// GTK/GIO/gdk-pixbuf modules, WebKitGTK's helper programs), except BirdoVPN's
-// own (usr/bin/<binary>, usr/lib/<productName>/, already in sections 1-4):
-//  * the Ubuntu package it came from: `dpkg -S` on the build host, by its
-//    path below usr/lib (linuxdeploy copies a library into usr/lib/ under the
-//    name it was loaded by, and keeps a module's directory below its
-//    multiarch lib dir), falling back to the host file it resolves to;
-//  * that package's version, and its source package and exact version
-//    (`dpkg-query`), with where to get that source: `apt-get source` or the
-//    Launchpad page of that exact upload;
-//  * the package's copyright file (/usr/share/doc/<package>/copyright) in
-//    full, and the full text of every licence it refers to in
-//    /usr/share/common-licenses (where Debian keeps the GPL and LGPL texts
-//    that copyright files cite rather than repeat).
-// It FAILS when a file maps to no package or to more than one, when a package
-// has no copyright file, or when a cited common licence is missing: the fix
-// is never to leave a library out. scripts/ci/verify-bundled-xray.sh checks
-// the final AppImage: every ELF file under usr/ must be listed here.
+// result. EVERY regular file in the AppImage is accounted for, and listed as
+// a line "    <path>":
+//  * BirdoVPN's own: usr/bin/<binary>, usr/lib/<productName>/, its .desktop
+//    file and icons (sections 1-4 cover them);
+//  * AppRun.wrapped: AppImageKit's AppRun, which must be the pinned bytes
+//    (appimage-runtime.json), with its licence;
+//  * AppRun and apprun-hooks/: the files linuxdeploy and its GTK plugin
+//    write, with their licence;
+//  * the caches the bundler generates from the listed modules and schemas
+//    (loaders.cache, immodules.cache, giomodule.cache, gschemas.compiled);
+//  * everything else - libraries, modules, WebKitGTK's helpers, typelibs,
+//    schemas, copyright files - by the Ubuntu package that owns the host file
+//    it was copied from: each candidate host path (below the multiarch lib
+//    dir for usr/lib/), resolved through symlinks first, so an unversioned
+//    libfoo.so copy is credited to the runtime package that ships the real
+//    file, not the -dev package that ships the link; then `dpkg -S`. With
+//    the package's version, its source package and exact version
+//    (`dpkg-query`: `apt-get source` or the Launchpad page of that upload),
+//    its copyright file in full and every /usr/share/common-licenses text it
+//    cites.
+// And the runtime, which is not a file in the AppImage but its first bytes:
+// the --appimage's leading ELF must be the pinned --runtime-file byte for byte,
+// except the three sections appimagetool fills in (.digest_md5, .upd_info,
+// .sha256_sig). It is listed with its commit, licence and the libraries it
+// links statically (libfuse, LGPL-2.1, in full), and the corresponding-source
+// asset that mirrors their source.
+// It FAILS on any file it cannot account for: the fix is never to leave one
+// out. scripts/ci/verify-bundled-xray.sh checks the final AppImage the same
+// way (every file listed, the runtime's commit, these notices starting with
+// the generic ones).
 //
 // dpkg and dpkg-query are taken from PATH (a fixture can stand in for them:
 // scripts/ci/appimage-notices.tests.sh). Output is deterministic for a given
 // AppImage and build host. Node built-ins only.
 // ============================================================================
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runtimeMember, runtimeSourceFile, sourceAssetUrl } from './lib/corresponding-source.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const licensesDir = path.join(repo, 'third_party', 'licenses');
 
 function fail(message) {
   console.error(`::error::AppImage notices: ${message}`);
@@ -61,6 +80,7 @@ const args = {
   osRelease: '/etc/os-release',
   hostRoot: '/',
   multiarch: MULTIARCH[process.arch] || `${process.arch}-linux-gnu`,
+  runtimePins: path.join(licensesDir, 'appimage-runtime.json'),
 };
 {
   const argv = process.argv.slice(2);
@@ -72,6 +92,8 @@ const args = {
     };
     switch (flag) {
       case '--appdir': args.appdir = path.resolve(value()); break;
+      case '--appimage': args.appimage = path.resolve(value()); break;
+      case '--runtime-file': args.runtimeFile = path.resolve(value()); break;
       case '--base': args.base = path.resolve(value()); break;
       case '--out': args.out = path.resolve(value()); break;
       case '--doc-root': args.docRoot = value(); break;
@@ -79,17 +101,19 @@ const args = {
       case '--os-release': args.osRelease = value(); break;
       case '--host-root': args.hostRoot = value(); break;
       case '--multiarch': args.multiarch = value(); break;
+      case '--runtime-pins': args.runtimePins = path.resolve(value()); break;
       default: fail(`unknown argument ${flag}`);
     }
   }
 }
-for (const required of ['appdir', 'base', 'out']) if (!args[required]) fail(`--${required} is required`);
+for (const required of ['appdir', 'appimage', 'runtimeFile', 'base', 'out']) {
+  if (!args[required]) fail(`--${required.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)} is required`);
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 /** LF line ends, no BOM, no trailing spaces, no blank lines at either end (as the main generator). */
 function normalize(text) {
-  return text
-    .replace(/^\uFEFF/, '')
+  return (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
     .replace(/\r\n?/g, '\n')
     .split('\n')
     .map((line) => line.replace(/\s+$/, ''))
@@ -97,6 +121,7 @@ function normalize(text) {
     .replace(/^\n+|\n+$/g, '');
 }
 const byKey = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 
 function run(cmd, cmdArgs, okStatuses = [0]) {
   const r = spawnSync(cmd, cmdArgs, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
@@ -106,6 +131,81 @@ function run(cmd, cmdArgs, okStatuses = [0]) {
 }
 
 const host = (p) => path.join(args.hostRoot, p);
+const pins = JSON.parse(fs.readFileSync(args.runtimePins, 'utf8'));
+const appVersion = JSON.parse(fs.readFileSync(path.join(repo, 'src-tauri', 'tauri.conf.json'), 'utf8')).version;
+const asset = sourceAssetUrl(appVersion);
+
+// ── Licence texts: each printed once, numbered by first use ────────────────
+const texts = [];
+const textIndex = new Map();
+function addText(body, origin) {
+  const key = body.replace(/\s+/g, ' ').trim();
+  let entry = textIndex.get(key);
+  if (!entry) {
+    entry = { id: `A${texts.length + 1}`, body, origin, more: 0 };
+    texts.push(entry);
+    textIndex.set(key, entry);
+  } else entry.more += 1;
+  return entry.id;
+}
+/** Committed texts (paths under third_party/licenses/), registered; returns their ids. */
+function committedTexts(paths, label) {
+  return [
+    ...new Set(
+      paths.map((t) => {
+        const file = path.join(licensesDir, t);
+        if (!fs.existsSync(file)) fail(`missing committed licence text third_party/licenses/${t}`);
+        return addText(normalize(fs.readFileSync(file, 'utf8')), `${path.basename(t)} of ${label}`);
+      }),
+    ),
+  ];
+}
+
+// ── The runtime: the AppImage's first bytes ────────────────────────────────
+/** An ELF64 little-endian file's size (end of its section headers) and named sections. */
+function elf64(buf, what) {
+  if (buf.length < 64 || buf.readUInt32BE(0) !== 0x7f454c46 || buf[4] !== 2 || buf[5] !== 1) fail(`${what} is not a little-endian ELF64 file`);
+  const shoff = Number(buf.readBigUInt64LE(0x28));
+  const shentsize = buf.readUInt16LE(0x3a);
+  const shnum = buf.readUInt16LE(0x3c);
+  const shstrndx = buf.readUInt16LE(0x3e);
+  const size = shoff + shentsize * shnum;
+  if (size > buf.length || shstrndx >= shnum) fail(`${what}: its section headers are not where its ELF header says`);
+  const header = (i) => {
+    const o = shoff + i * shentsize;
+    return { nameAt: buf.readUInt32LE(o), offset: Number(buf.readBigUInt64LE(o + 0x18)), size: Number(buf.readBigUInt64LE(o + 0x20)) };
+  };
+  const strtab = header(shstrndx);
+  const sections = [];
+  for (let i = 0; i < shnum; i++) {
+    const s = header(i);
+    const start = strtab.offset + s.nameAt;
+    sections.push({ name: buf.toString('latin1', start, buf.indexOf(0, start)), offset: s.offset, size: s.size });
+  }
+  return { size, sections };
+}
+const FILLED = new Set(['.digest_md5', '.upd_info', '.sha256_sig']); // what appimagetool writes into the runtime
+{
+  const runtime = fs.readFileSync(args.runtimeFile);
+  if (sha256(runtime) !== pins.runtime.sha256) fail(`${args.runtimeFile} is not the pinned runtime (${pins.runtime.sha256})`);
+  const fd = fs.openSync(args.appimage, 'r');
+  const head = Buffer.alloc(runtime.length);
+  const read = fs.readSync(fd, head, 0, runtime.length, 0);
+  fs.closeSync(fd);
+  const want = elf64(runtime, 'the pinned runtime');
+  const got = elf64(head.subarray(0, read), `the start of ${args.appimage}`);
+  if (want.size !== runtime.length || got.size !== want.size) {
+    fail(`${args.appimage}'s runtime is ${got.size} bytes, the pinned ${pins.runtime.release} runtime ${want.size}: not the pinned runtime (LDAI_RUNTIME_FILE not used?)`);
+  }
+  const a = Buffer.from(runtime);
+  const b = Buffer.from(head);
+  for (const s of want.sections.filter((x) => FILLED.has(x.name))) {
+    a.fill(0, s.offset, s.offset + s.size);
+    b.fill(0, s.offset, s.offset + s.size);
+  }
+  if (!a.equals(b)) fail(`${args.appimage} does not start with the pinned type2-runtime ${pins.runtime.release} (${pins.runtime.commit}) - the bundler used another runtime`);
+  console.log(`runtime: ${args.appimage} starts with type2-runtime ${pins.runtime.release} (${pins.runtime.commit}), as pinned`);
+}
 
 // ── What the AppImage carries ───────────────────────────────────────────────
 const productName = JSON.parse(fs.readFileSync(path.join(repo, 'src-tauri', 'tauri.conf.json'), 'utf8')).productName;
@@ -116,42 +216,70 @@ const binaryName = (() => {
   if (!m) fail('src-tauri/Cargo.toml: no [package] name');
   return m[1];
 })();
-const isOwn = (rel) => rel === `usr/bin/${binaryName}` || rel.startsWith(`usr/lib/${productName}/`);
+const isOwn = (rel) =>
+  rel === `usr/bin/${binaryName}` ||
+  rel.startsWith(`usr/lib/${productName}/`) ||
+  rel === `usr/share/applications/${productName}.desktop` ||
+  new RegExp(`^usr/share/icons/hicolor/[^/]+/apps/${binaryName.replace(/[.-]/g, '\\$&')}\\.png$`).test(rel) ||
+  rel === `${productName}.png`;
+const GENERATED_CACHES = new Set(['loaders.cache', 'immodules.cache', 'giomodule.cache', 'gschemas.compiled']);
 
 if (!fs.existsSync(path.join(args.appdir, 'usr'))) fail(`${args.appdir} has no usr/ - not an unpacked AppImage`);
-const ELF = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
-const elfFiles = [];
+const allFiles = [];
 (function walk(dir) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => byKey(a.name, b.name))) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const file = path.join(dir, entry.name);
     if (entry.isDirectory()) walk(file);
-    else if (entry.isFile()) {
-      const head = Buffer.alloc(4);
-      const fd = fs.openSync(file, 'r');
-      const read = fs.readSync(fd, head, 0, 4, 0);
-      fs.closeSync(fd);
-      if (read === 4 && head.equals(ELF)) elfFiles.push(path.relative(args.appdir, file).split(path.sep).join('/'));
-    }
+    else if (entry.isFile()) allFiles.push(path.relative(args.appdir, file).split(path.sep).join('/'));
     // Symlinks are not followed: linuxdeploy's links point at files inside
     // the AppDir, which are listed under their own paths.
   }
-})(path.join(args.appdir, 'usr'));
-elfFiles.sort(byKey);
-const own = elfFiles.filter(isOwn);
-const bundled = elfFiles.filter((rel) => !isOwn(rel));
-if (bundled.length === 0) fail(`no bundled library under ${args.appdir}/usr - is this the AppImage?`);
+})(args.appdir);
+allFiles.sort(byKey);
+
+const own = [];
+const caches = [];
+const tooling = new Map(); // rel -> pin entry (AppRun.wrapped, AppRun, hooks)
+const toMap = [];
+const toolingPins = [pins.apprun, ...pins.generated];
+for (const rel of allFiles) {
+  const pin = toolingPins.find((t) => t.file === rel);
+  if (isOwn(rel)) own.push(rel);
+  else if (pin) tooling.set(rel, pin);
+  else if (GENERATED_CACHES.has(path.posix.basename(rel))) caches.push(rel);
+  else toMap.push(rel);
+}
+for (const t of toolingPins) if (!tooling.has(t.file)) fail(`the AppImage has no ${t.file} - the bundler changed; review appimage-runtime.json`);
+{
+  const actual = sha256(fs.readFileSync(path.join(args.appdir, pins.apprun.file)));
+  if (actual !== pins.apprun.sha256) fail(`${pins.apprun.file} is ${actual}, not the pinned AppRun ${pins.apprun.sha256} (Tauri's AppRun download, appimage-runtime.json)`);
+}
+if (!toMap.some((rel) => rel.startsWith('usr/lib/'))) fail(`no bundled library under ${args.appdir}/usr/lib - is this the AppImage?`);
 
 // ── Which package each came from ────────────────────────────────────────────
-// Where a file below usr/lib/ in the AppImage was on the build host.
+// Where a file in the AppImage was on the build host: below usr/lib/, under
+// the multiarch lib dirs (linuxdeploy flattens libraries into usr/lib/ and
+// keeps a module's directory below its lib dir); anything else at its path.
 const libBases = [`/usr/lib/${args.multiarch}`, `/lib/${args.multiarch}`, '/usr/lib', '/lib'];
-const hostCandidates = (rel) =>
-  rel.startsWith('usr/lib/') ? libBases.map((b) => `${b}/${rel.slice('usr/lib/'.length)}`) : [`/${rel}`, `/${rel.slice('usr/'.length)}`];
+const hostCandidates = (rel) => (rel.startsWith('usr/lib/') ? libBases.map((b) => `${b}/${rel.slice('usr/lib/'.length)}`) : [`/${rel}`]);
+const hostRoot = fs.realpathSync(args.hostRoot);
+/** The real files a bundled file can have come from, in both usrmerge spellings dpkg may know. */
+function realCandidates(rel) {
+  const out = new Set();
+  for (const c of hostCandidates(rel)) {
+    if (!fs.existsSync(host(c))) continue;
+    const real = `/${path.relative(hostRoot, fs.realpathSync(host(c))).split(path.sep).join('/')}`;
+    out.add(real);
+    out.add(real.startsWith('/usr/') ? real.slice(4) : `/usr${real}`);
+  }
+  return [...out];
+}
 
-/** `dpkg -S` over many patterns at once: path -> [packages]. Unmatched patterns are not an error here. */
-function dpkgSearch(patterns) {
+/** `dpkg -S` over many literal paths at once: path -> [packages]. Unowned paths are not an error here. */
+function dpkgSearch(paths) {
   const owners = new Map();
-  if (patterns.length === 0) return owners;
-  const out = run('dpkg', ['-S', ...patterns], [0, 1]);
+  if (paths.length === 0) return owners;
+  const out = run('dpkg', ['-S', ...paths], [0, 1]);
   for (const line of out.split('\n')) {
     if (!line || line.startsWith('diversion by') || line.startsWith('local diversion')) continue;
     const m = /^(.+?): (\/.*)$/.exec(line);
@@ -162,45 +290,20 @@ function dpkgSearch(patterns) {
   return owners;
 }
 
-const owners = dpkgSearch([...new Set(bundled.map((rel) => `*/${path.posix.basename(rel)}`))].sort(byKey));
+const reals = new Map(toMap.map((rel) => [rel, realCandidates(rel)]));
+const owners = dpkgSearch([...new Set([...reals.values()].flat())].sort(byKey));
 const packageOf = new Map(); // rel -> { pkg, hostPath }
 const problems = [];
-const unresolved = [];
-const pick = (rel, candidates, lookup) => {
+for (const rel of toMap) {
   const found = new Map();
-  for (const c of candidates) for (const pkg of lookup.get(c) || []) found.set(pkg, found.get(pkg) || c);
-  return found;
-};
-for (const rel of bundled) {
-  const found = pick(rel, hostCandidates(rel), owners);
+  for (const c of reals.get(rel)) for (const pkg of owners.get(c) || []) if (!found.has(pkg)) found.set(pkg, c);
   if (found.size === 1) {
     const [[pkg, hostPath]] = [...found];
     packageOf.set(rel, { pkg, hostPath });
   } else if (found.size > 1) problems.push(`${rel}: more than one package owns it (${[...found].map(([p, h]) => `${p} ${h}`).join(', ')})`);
-  else unresolved.push(rel);
-}
-// A name no package ships (e.g. a soname link ldconfig made): the file it
-// resolves to on the build host, and that file's package.
-if (unresolved.length) {
-  const real = new Map(); // rel -> [host real paths]
-  const hostRoot = fs.realpathSync(args.hostRoot);
-  for (const rel of unresolved) {
-    const paths = [];
-    for (const c of hostCandidates(rel)) {
-      if (!fs.existsSync(host(c))) continue;
-      const r = `/${path.relative(hostRoot, fs.realpathSync(host(c))).split(path.sep).join('/')}`;
-      paths.push(r, r.startsWith('/usr/') ? r.slice(4) : `/usr${r}`); // usrmerge: dpkg knows one spelling
-    }
-    real.set(rel, [...new Set(paths)]);
-  }
-  const owners2 = dpkgSearch([...new Set([...real.values()].flat())].sort(byKey));
-  for (const rel of unresolved) {
-    const found = pick(rel, real.get(rel), owners2);
-    if (found.size === 1) {
-      const [[pkg, hostPath]] = [...found];
-      packageOf.set(rel, { pkg, hostPath });
-    } else if (found.size > 1) problems.push(`${rel}: more than one package owns it (${[...found].map(([p, h]) => `${p} ${h}`).join(', ')})`);
-    else problems.push(`${rel}: no installed package owns it (dpkg -S, at ${hostCandidates(rel).join(', ')}) - a library from outside the package manager cannot be listed with its source`);
+  else {
+    const where = reals.get(rel).length ? reals.get(rel).join(', ') : `none of ${hostCandidates(rel).join(', ')} exists on this host`;
+    problems.push(`${rel}: no installed package owns it (${where}) - a file from outside the package manager cannot be listed with its source`);
   }
 }
 if (problems.length) fail(`bundled files the notices cannot account for:\n  ${problems.join('\n  ')}`);
@@ -221,28 +324,17 @@ for (const [rel, { pkg, hostPath }] of packageOf) {
   const p = packages.get(pkg) || packages.get(pkg.replace(/:[^:]+$/, ''));
   if (!p) fail(`dpkg-query does not know ${pkg} (owner of ${rel})`);
   p.files.push(rel);
-  // The mapping, for the build log.
-  console.log(`  ${rel} <- ${hostPath} (${p.name} ${p.version})`);
+  console.log(`  ${rel} <- ${hostPath} (${p.name} ${p.version})`); // the mapping, for the build log
 }
 
-// ── Licence texts: each printed once, numbered by first use ────────────────
-const texts = [];
-const textIndex = new Map();
-function addText(body, origin) {
-  const key = body.replace(/\s+/g, ' ').trim();
-  let entry = textIndex.get(key);
-  if (!entry) {
-    entry = { id: `A${texts.length + 1}`, body, origin, more: 0 };
-    texts.push(entry);
-    textIndex.set(key, entry);
-  } else entry.more += 1;
-  return entry.id;
-}
 const CITED = /\/usr\/share\/common-licenses\/([A-Za-z0-9][A-Za-z0-9.+_-]*)/g;
-
 const listed = [...new Map([...packages.values()].map((p) => [`${p.name}:${p.arch}`, p])).values()].sort(
   (a, b) => byKey(a.name, b.name) || byKey(a.arch, b.arch),
 );
+// Numbered after the runtime's and the launcher's texts, which come first.
+const runtimeIds = committedTexts(pins.runtime.texts, `type2-runtime ${pins.runtime.release}`);
+for (const l of pins.linked) l.ids = committedTexts(l.texts, `${l.name} ${l.version}`);
+for (const t of toolingPins) t.ids = committedTexts(t.texts, t.name || t.file);
 for (const p of listed) {
   const copyrightFile = path.posix.join(args.docRoot, p.name, 'copyright');
   if (!fs.existsSync(copyrightFile)) {
@@ -262,8 +354,7 @@ for (const p of listed) {
       problems.push(`${p.name}: its copyright file cites /usr/share/common-licenses/${cited}, which this host does not have`);
       continue;
     }
-    const file = path.posix.join(args.licensesRoot, name);
-    const id = addText(normalize(fs.readFileSync(file, 'utf8')), `/usr/share/common-licenses/${name}`);
+    const id = addText(normalize(fs.readFileSync(path.posix.join(args.licensesRoot, name), 'utf8')), `/usr/share/common-licenses/${name}`);
     if (!p.texts.includes(id)) p.texts.push(id);
   }
   // DEP-5 copyright files name their licences in License: fields.
@@ -290,24 +381,68 @@ const osName = (() => {
 const rule = '='.repeat(78);
 const out = [];
 const fileCount = listed.reduce((n, p) => n + p.files.length, 0);
+const rt = pins.runtime;
 out.push(
   '',
   rule,
-  `6. AppImage only: bundled system libraries (${listed.length} packages, ${fileCount} files)`,
+  `6. AppImage only: what the AppImage carries besides BirdoVPN (${allFiles.length} files)`,
   rule,
   '',
   'This section is in the AppImage\'s copy of this file only. The .deb uses the',
   'libraries your system provides; the AppImage carries its own: WebKitGTK, GTK,',
   'GLib, libsoup and what they link, copied from the system it was built on',
-  `(${osName}). Every one is listed below under the Ubuntu package it came from,`,
-  'with that package\'s copyright file and every licence text the copyright file',
-  'cites ([A1], [A2], ... in section 7). The complete source of each package is',
-  'its Ubuntu source package at the exact version given: run',
-  '`apt-get source <source package>=<version>` on Ubuntu (with deb-src enabled),',
-  'or download it from the Launchpad page shown.',
+  `(${osName}).`,
+  'It also starts with the AppImage runtime. Every file in it is listed below:',
+  'BirdoVPN\'s own, the runtime and launcher, the caches the bundler generates,',
+  'and each Ubuntu package the rest came from, with that package\'s copyright',
+  'file and every licence text the copyright file cites ([A1], [A2], ... in',
+  'section 7). The complete source of each package is its Ubuntu source package',
+  'at the exact version given: run `apt-get source <source package>=<version>`',
+  'on Ubuntu (with deb-src enabled), or download it from the Launchpad page',
+  'shown.',
   '',
-  `BirdoVPN's own programs in the AppImage (sections 1 to 4 above):`,
+  `BirdoVPN's own files in the AppImage (sections 1 to 4 above):`,
   ...own.map((rel) => `    ${rel}`),
+  '',
+  'The AppImage runtime: the program at the start of the .AppImage file, before',
+  'the files below, which mounts them and starts BirdoVPN.',
+  `  AppImage type2-runtime ${rt.release} - commit ${rt.commit} - ${rt.license} [${runtimeIds.join(', ')}]`,
+  `    source: ${runtimeMember(runtimeSourceFile(rt.commit))} in ${asset}`,
+  `    upstream: ${rt.repository} at ${rt.commit}`,
+  `    the unmodified ${rt.url}`,
+  `      (SHA-256 ${rt.sha256}), ${rt.build}`,
+  '  Linked statically into it:',
+);
+for (const l of pins.linked) {
+  out.push(`    ${l.name} ${l.version} - ${l.license} [${l.ids.join(', ')}]${l.note ? ` - ${l.note}` : ''}`);
+  if (l.mirror) out.push(`      source: ${runtimeMember(l.mirror.file)} in ${asset}`);
+  out.push(`      upstream: ${l.upstream}`);
+}
+out.push(
+  '  libfuse\'s library is under the LGPL-2.1: the asset above holds the runtime\'s',
+  '  source and build scripts with libfuse\'s and squashfuse\'s source, and its',
+  '  README says how to rebuild the runtime against a modified libfuse and put it',
+  '  in front of these files.',
+  '',
+  'The launcher, and the files linuxdeploy writes:',
+);
+for (const t of toolingPins) {
+  out.push(
+    `  ${t.name || t.file} - ${t.license} [${t.ids.join(', ')}]`,
+    `    ${t.note || t.what}`,
+    `    upstream: ${t.upstream}`,
+    '  files:',
+    `    ${t.file}`,
+  );
+}
+out.push(
+  '',
+  'Generated when the AppImage is built, from the modules and schemas listed below',
+  '(gdk-pixbuf-query-loaders, gtk-query-immodules-3.0, gio-querymodules,',
+  'glib-compile-schemas); index data with no licence of their own:',
+  ...caches.map((rel) => `    ${rel}`),
+  '',
+  `From Ubuntu packages (${listed.length} packages, ${fileCount} files):`,
 );
 for (const p of listed) {
   out.push(
@@ -328,9 +463,14 @@ for (const t of texts) {
 }
 const body = `${base}${out.join('\n')}\n`;
 
+// Every file is listed exactly as the gate looks for it.
+for (const rel of allFiles) if (!body.includes(`\n    ${rel}\n`)) fail(`internal: ${rel} is not listed`);
+
 fs.mkdirSync(path.dirname(args.out), { recursive: true });
 fs.writeFileSync(args.out, body, 'utf8');
 console.log(
-  `Wrote ${args.out}: ${fileCount} bundled files from ${listed.length} packages, ${own.length} of BirdoVPN's own, ` +
-    `${texts.length} licence texts, ${Buffer.byteLength(body)} bytes (${Buffer.byteLength(body) - Buffer.byteLength(base)} for the AppImage section)`,
+  `Wrote ${args.out}: ${allFiles.length} files (${own.length} BirdoVPN's own, ${tooling.size} launcher/linuxdeploy, ` +
+    `${caches.length} generated caches, ${fileCount} from ${listed.length} Ubuntu packages), the type2-runtime ` +
+    `${rt.release} runtime with ${pins.linked.length} static libraries, ${texts.length} licence texts, ` +
+    `${Buffer.byteLength(body)} bytes (${Buffer.byteLength(body) - Buffer.byteLength(base)} for the AppImage section)`,
 );

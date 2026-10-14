@@ -768,11 +768,12 @@ jobs:
   # package whose licence it cannot ship the text of, so run it here for all
   # four release targets: a dependency bump that adds such a package fails the
   # PR, not the next release. With --xray, as the release runs it (below).
-  # And (owner decision 2026-10-14, L1) the Xray corresponding-source asset
+  # And (owner decisions 2026-10-14, L1/L2) the corresponding-source asset
   # those notices point at: built from every pin it has, as release.yml's
-  # xray-source job builds it, so a stale pin fails the PR, not release day.
+  # corresponding-source job builds it, so a stale pin fails the PR, not
+  # release day.
   third-party-notices:
-    name: Third-party notices + Xray source asset for every release target
+    name: Third-party notices + corresponding-source asset for every release target
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -841,14 +842,14 @@ jobs:
           gen aarch64-apple-darwin "$RUNNER_TEMP/xray-macos-arm64" xray
           gen x86_64-apple-darwin "$RUNNER_TEMP/xray-macos-x64" xray
           app_version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          asset="https://github.com/BirdoVPN/Desktop-Client/releases/download/v$app_version/BirdoVPN-$app_version-xray-corresponding-source.tar.gz"
+          asset="https://github.com/BirdoVPN/Desktop-Client/releases/download/v$app_version/BirdoVPN-$app_version-corresponding-source.tar.gz"
           for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
             out="$RUNNER_TEMP/notices-$target.txt"
             # What MR-1685 requires of every package's file, checked by name.
             # The source: this release's own asset first (L1), then upstream.
             grep -qxF "  source: $asset" "$out"
             grep -qxF "  upstream: https://github.com/XTLS/Xray-core at $xray_version" "$out"
-            grep -qE "^      source: go-modules/github\.com/sagernet/sing@v[0-9][^ ]*\.zip in https://" "$out"
+            grep -qE "^      source: xray/go-modules/github\.com/sagernet/sing@v[0-9][^ ]*\.zip in https://" "$out"
             grep -qF 'Mozilla Public License Version 2.0' "$out"
             grep -qF 'GNU GENERAL PUBLIC LICENSE' "$out"
             grep -qF 'SIL OPEN FONT LICENSE Version 1.1' "$out"
@@ -859,38 +860,40 @@ jobs:
             esac
           done
 
-      # L1 (owner decision 2026-10-14): the asset the notices above point at,
-      # built as release.yml's xray-source job builds it, from every pin it
-      # has: the four Xray release zips (XRAY_*_SHA256) and the Go modules
-      # their binaries link (xray-go-modules.json), the tag archive
-      # (XRAY_SOURCE_SHA256) and the commit the binaries carry, and each
-      # GPL/LGPL/MPL module zip (zipSha256, and its line in Xray's go.sum).
-      # Built twice (it must be byte-identical), and every module zip the
-      # notices name must be in it under the path they give.
-      - name: Build the Xray corresponding-source asset, as the release does (pins, determinism, agreement with the notices)
+      # L1/L2 (owner decisions 2026-10-14; review round 1 of #298): the asset
+      # the notices above point at, built as release.yml's corresponding-source
+      # job builds it, from every pin it has: the four Xray release zips
+      # (XRAY_*_SHA256) and the Go modules their binaries link
+      # (xray-go-modules.json), the Xray-core source by commit and tree
+      # (XRAY_SOURCE_COMMIT/TREE, `git archive`) and the commit the binaries
+      # carry, every module zip (zipSha256, and its line in Xray's go.sum), and
+      # the AppImage runtime's sources (appimage-runtime.json). Built twice from
+      # the same downloads (it must be byte-identical), and every module each
+      # target's notices list must be in it under the path they give.
+      - name: Build the corresponding-source asset, as the release does (pins, determinism, agreement with the notices)
         run: |
           set -euo pipefail
-          node scripts/build-xray-source-archive.mjs --out-dir "$RUNNER_TEMP/source-a"
-          node scripts/build-xray-source-archive.mjs --out-dir "$RUNNER_TEMP/source-b"
+          node scripts/build-corresponding-source.mjs --out-dir "$RUNNER_TEMP/source-a" --download-dir "$RUNNER_TEMP/source-downloads"
+          node scripts/build-corresponding-source.mjs --out-dir "$RUNNER_TEMP/source-b" --download-dir "$RUNNER_TEMP/source-downloads"
           built=("$RUNNER_TEMP"/source-a/*.tar.gz)
           name=$(basename "${built[0]}")
           cmp "${built[0]}" "$RUNNER_TEMP/source-b/$name"
-          echo "deterministic: $name ($(sha256sum "${built[0]}" | cut -d' ' -f1))"
+          echo "deterministic: $name ($(wc -c <"${built[0]}") bytes, SHA-256 $(sha256sum "${built[0]}" | cut -d' ' -f1))"
           tar -tzvf "${built[0]}"
           members=$(tar -tzf "${built[0]}")
           root="${name%.tar.gz}"
           for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
             out="$RUNNER_TEMP/notices-$target.txt"
             grep -qF "/$name" "$out"
-            mapfile -t zips < <(sed -nE 's/^      source: (go-modules\/[^ ]+\.zip) in https:.*$/\1/p' "$out")
-            if [ "${#zips[@]}" -eq 0 ]; then echo "::error::the $target notices name no module zip"; exit 1; fi
-            for z in "${zips[@]}"; do
-              if ! grep -qxF "$root/$z" <<<"$members"; then
-                echo "::error::the $target notices point at $z, which $name does not contain"
+            mapfile -t mods < <(sed -nE 's/^    ([a-z0-9][A-Za-z0-9._~\/-]*) (v[0-9][^ ]*) - .*$/\1@\2/p' "$out" | sort -u)
+            if [ "${#mods[@]}" -lt 10 ]; then echo "::error::the $target notices list ${#mods[@]} Go modules - not understood"; exit 1; fi
+            for m in "${mods[@]}"; do
+              if ! grep -qxF "$root/xray/go-modules/$m.zip" <<<"$members"; then
+                echo "::error::the $target notices list $m, whose zip $name does not contain"
                 exit 1
               fi
             done
-            echo "$target: the ${#zips[@]} module zips its notices name are all in $name"
+            echo "$target: all ${#mods[@]} Go modules its notices list are in $name"
           done
 
   # Version-consistency gate. The app version is declared in THREE places:

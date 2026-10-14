@@ -51,11 +51,17 @@
 #      the same notices plus the sections listing the system libraries that
 #      only the AppImage bundles (scripts/ci/appimage-notices.sh; owner
 #      decision 2026-10-14, L2). Unset, empty or missing fails that AppImage.
-#   8. (AppImage only) every ELF file under usr/ - each bundled shared
-#      library and module, WebKitGTK's helper programs, BirdoVPN's own
-#      binary and xray - is listed, as a line "    <path>", in those
-#      notices: a library the bundler added after the notices were generated
-#      fails the release instead of shipping unlisted.
+#   8. (AppImage only) EVERY regular file in it - libraries, modules,
+#      WebKitGTK's helpers, typelibs, schemas, AppRun, AppRun.wrapped, the
+#      hooks, BirdoVPN's own - is listed, as a line "    <path>", in those
+#      notices: a file the bundler added after the notices were generated
+#      fails the release instead of shipping unlisted (review round 1 of #298).
+#   9. (AppImage only) its runtime is the one those notices name: the commit
+#      in their "AppImage type2-runtime ... - commit <sha> -" line is the one
+#      the runtime reports (--appimage-version).
+#  10. (AppImage only) those notices begin with the generic notices
+#      (NOTICES_FILE), byte for byte: the AppImage adds sections, it does not
+#      ship different ones.
 #
 # Self-test: scripts/ci/verify-bundled-xray.tests.sh (tests.yml runs it on
 # Linux and macOS on every PR), with fixtures for each failure path.
@@ -206,23 +212,40 @@ check_tree() {
   fi
 }
 
-# check_appimage_libraries <label> <root> <notices file>
-# Check 8: every ELF file under usr/ in the unpacked AppImage is listed.
-check_appimage_libraries() {
-  local label="$1" root="$2" list="$3"
+# check_appimage_contents <label> <AppImage> <root> <notices file>
+# Checks 8-10 on an AppImage unpacked at <root>.
+check_appimage_contents() {
+  local label="$1" appimage="$2" root="$3" list="$4"
   local f rel total=0 missing=0
-  collect "$root/usr" -type f
+  # Check 8: every regular file, wherever it is.
+  collect "$root" -type f
   for f in "${found[@]+"${found[@]}"}"; do
-    if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" != 7f454c46 ]; then continue; fi
     total=$((total + 1))
     rel="${f#"$root"/}"
     if ! grep -qxF -- "    $rel" "$list"; then
       missing=$((missing + 1))
-      err "$label: $rel is bundled but not listed in the AppImage's notices ($list) - every library the AppImage carries must be listed with its package, source and licence (owner decision 2026-10-14, L2)"
+      err "$label: $rel is in the AppImage but not listed in its notices ($list) - every file the AppImage carries must be listed with its source and licence (owner decision 2026-10-14, L2)"
     fi
   done
   if [ "$missing" -eq 0 ]; then
-    echo "  libraries: all $total ELF files under usr/ are listed in its notices"
+    echo "  files    : all $total files in it are listed in its notices"
+  fi
+  # Check 9: the runtime.
+  local commit reported
+  commit="$(sed -nE 's/^  AppImage type2-runtime .* - commit ([0-9a-f]{40}) - .*$/\1/p' "$list")"
+  if [ "$(printf '%s\n' "$commit" | grep -c .)" -ne 1 ]; then
+    err "$label: its notices name no AppImage runtime (one '  AppImage type2-runtime ... - commit <sha> -' line) - the runtime at the start of the file would ship unlisted"
+  else
+    reported="$("$appimage" --appimage-version 2>&1 || true)"
+    if printf '%s' "$reported" | grep -qF "/commit/${commit:0:7}"; then
+      echo "  runtime  : type2-runtime ${commit:0:7}, as its notices say"
+    else
+      err "$label: its runtime reports '$reported', its notices name type2-runtime $commit - the bundler used another runtime (LDAI_RUNTIME_FILE, scripts/ci/fetch-appimage-tooling.mjs)"
+    fi
+  fi
+  # Check 10: the generic notices first, then the AppImage's sections.
+  if ! head -c "$(wc -c <"$notices" | tr -d ' ')" "$list" | cmp -s - "$notices"; then
+    err "$label: its notices ($list) do not begin with the generic notices ($notices) byte for byte"
   fi
 }
 
@@ -294,7 +317,7 @@ for artifact in "$@"; do
       # its own squashfs into ./squashfs-root.
       if ! (cd "$dest" && "$abs" --appimage-extract >/dev/null); then err "$label: --appimage-extract failed"; continue; fi
       check_tree "$label" "$dest/squashfs-root" linux "$appimage_notices"
-      check_appimage_libraries "$label" "$dest/squashfs-root" "$appimage_notices"
+      check_appimage_contents "$label" "$abs" "$dest/squashfs-root" "$appimage_notices"
       ;;
     *)
       err "$label: unknown artifact kind (expected .app, .app.tar.gz, .dmg, .deb or .AppImage)"

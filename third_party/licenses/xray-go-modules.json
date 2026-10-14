@@ -10,10 +10,10 @@
     "and `source` are a person's job: a new module arrives as UNREVIEWED, which the generator refuses. GPL,",
     "LGPL and MPL modules need `source`; extra texts such as GPL-3.0.txt (paths under third_party/licenses/)",
     "are kept across refreshes.",
-    "GPL, LGPL and MPL modules also need `zipSha256`: the SHA-256 of <module>@<version>.zip from proxy.golang.org,",
-    "which every release mirrors in its Xray corresponding-source asset (scripts/build-xray-source-archive.mjs,",
-    "owner decision 2026-10-14) and refuses to publish if the downloaded zip differs. The vendor script records",
-    "it for every module whose `license` is already copyleft."
+    "Every module also needs `zipSha256`: the SHA-256 of <module>@<version>.zip from proxy.golang.org, which",
+    "every release mirrors in its corresponding-source asset (scripts/build-corresponding-source.mjs; owner decision",
+    "2026-10-14 and review round 1: the GPL-3.0 binary's corresponding source covers every linked module) and",
+    "refuses to publish if the downloaded zip differs. The vendor script records it for every module."
   ],
   "toolchain": {
     "version": "go1.26.1",
@@ -29,42 +29,48 @@
       "texts": [
         "xray/github.com/andybalholm/brotli@v1.0.6/LICENSE"
       ],
-      "version": "v1.0.6"
+      "version": "v1.0.6",
+      "zipSha256": "7406a3da42b69d91795fa3cbdbda47b4609352e1a292d5cf890ed6e7a05ab690"
     },
     "github.com/apernet/quic-go": {
       "license": "MIT",
       "texts": [
         "xray/github.com/apernet/quic-go@v0.59.1-0.20260217092621-db4786c77a22/LICENSE"
       ],
-      "version": "v0.59.1-0.20260217092621-db4786c77a22"
+      "version": "v0.59.1-0.20260217092621-db4786c77a22",
+      "zipSha256": "194d28f5f67a5a656283df94883a18833f86d650b1382d73f85293f543aff966"
     },
     "github.com/cloudflare/circl": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/github.com/cloudflare/circl@v1.6.3/LICENSE"
       ],
-      "version": "v1.6.3"
+      "version": "v1.6.3",
+      "zipSha256": "9aed6385d52ccd66e0a3b8cc093b5f0e7744640485405dd08c8ef89ef6bbeb06"
     },
     "github.com/ghodss/yaml": {
       "license": "MIT AND BSD-3-Clause",
       "texts": [
         "xray/github.com/ghodss/yaml@v1.0.1-0.20220118164431-d8423dcdf344/LICENSE"
       ],
-      "version": "v1.0.1-0.20220118164431-d8423dcdf344"
+      "version": "v1.0.1-0.20220118164431-d8423dcdf344",
+      "zipSha256": "bf6c7a9ec0ec0d8a304ed21255824fda80debf351f28185e8997c587932d6689"
     },
     "github.com/google/btree": {
       "license": "Apache-2.0",
       "texts": [
         "xray/github.com/google/btree@v1.1.2/LICENSE"
       ],
-      "version": "v1.1.2"
+      "version": "v1.1.2",
+      "zipSha256": "faee8550c5fffb4ae1dadde5ccaccb13298726f9fad226bb4eed0c03c90a481d"
     },
     "github.com/gorilla/websocket": {
       "license": "BSD-2-Clause",
       "texts": [
         "xray/github.com/gorilla/websocket@v1.5.3/LICENSE"
       ],
-      "version": "v1.5.3"
+      "version": "v1.5.3",
+      "zipSha256": "dbbd31dd0f08548c5dc43e4c2f12bbba66abff5252b224b1cd06afbb72783a76"
     },
     "github.com/juju/ratelimit": {
       "license": "LGPL-3.0-only WITH LGPL-3.0-linking-exception",
@@ -81,14 +87,16 @@
       "texts": [
         "xray/github.com/klauspost/compress@v1.17.4/LICENSE"
       ],
-      "version": "v1.17.4"
+      "version": "v1.17.4",
+      "zipSha256": "dd1acc63c40bf36ccfb2a7a7dd46579ea67585e37f1d2dbb06026b56ef625903"
     },
     "github.com/klauspost/cpuid/v2": {
       "license": "MIT",
       "texts": [
         "xray/github.com/klauspost/cpuid/v2@v2.3.0/LICENSE"
       ],
-      "version": "v2.3.0"
+      "version": "v2.3.0",
+      "zipSha256": "e6766f75ecfadf12fd045e4bdd9383f2a5bd3f9bd4c88a6db72861c84cf41486"
     },
     "github.com/miekg/dns": {
       "license": "BSD-3-Clause",
@@ -96,35 +104,40 @@
         "xray/github.com/miekg/dns@v1.1.72/COPYRIGHT",
         "xray/github.com/miekg/dns@v1.1.72/LICENSE"
       ],
-      "version": "v1.1.72"
+      "version": "v1.1.72",
+      "zipSha256": "092608d919335ff22154862c59abe8b4d651be3ef0b75d22001a07c03106a3b6"
     },
     "github.com/pelletier/go-toml": {
       "license": "MIT AND Apache-2.0",
       "texts": [
         "xray/github.com/pelletier/go-toml@v1.9.5/LICENSE"
       ],
-      "version": "v1.9.5"
+      "version": "v1.9.5",
+      "zipSha256": "de3dcda660cc800cd86d03273a25956d67f416e8fcbe4d2001a2cb4a01e6ac60"
     },
     "github.com/pires/go-proxyproto": {
       "license": "Apache-2.0",
       "texts": [
         "xray/github.com/pires/go-proxyproto@v0.11.0/LICENSE"
       ],
-      "version": "v0.11.0"
+      "version": "v0.11.0",
+      "zipSha256": "7cda3fa2b99a33afaef02011776a75bf2a197872b87cf886bdb2e10cf61e3fae"
     },
     "github.com/quic-go/qpack": {
       "license": "MIT",
       "texts": [
         "xray/github.com/quic-go/qpack@v0.6.0/LICENSE.md"
       ],
-      "version": "v0.6.0"
+      "version": "v0.6.0",
+      "zipSha256": "3ac037cd1747420bc00bd6a793b4b197a2359fc354de12dc2187477417564914"
     },
     "github.com/refraction-networking/utls": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/github.com/refraction-networking/utls@v1.8.3-0.20260301010127-aa6edf4b11af/LICENSE"
       ],
-      "version": "v1.8.3-0.20260301010127-aa6edf4b11af"
+      "version": "v1.8.3-0.20260301010127-aa6edf4b11af",
+      "zipSha256": "e63da2f09ca0cd280e8b6a5cfe06cb790076df757efbc58f047d28847f50901e"
     },
     "github.com/sagernet/sing": {
       "license": "GPL-3.0-or-later",
@@ -151,14 +164,16 @@
       "texts": [
         "xray/github.com/vishvananda/netlink@v1.3.1/LICENSE"
       ],
-      "version": "v1.3.1"
+      "version": "v1.3.1",
+      "zipSha256": "213c83dcc66cbeca2b83eca59d08649fa5ea96f463a8c014e8d6b6d5e601887e"
     },
     "github.com/vishvananda/netns": {
       "license": "Apache-2.0",
       "texts": [
         "xray/github.com/vishvananda/netns@v0.0.5/LICENSE"
       ],
-      "version": "v0.0.5"
+      "version": "v0.0.5",
+      "zipSha256": "07804b88c922c2a6780efe392ffef9d126eac584384eb3eb17bcadd34cfa9422"
     },
     "github.com/xtls/reality": {
       "license": "MPL-2.0 AND BSD-3-Clause",
@@ -175,77 +190,88 @@
       "texts": [
         "xray/go4.org/netipx@v0.0.0-20231129151722-fdeea329fbba/LICENSE"
       ],
-      "version": "v0.0.0-20231129151722-fdeea329fbba"
+      "version": "v0.0.0-20231129151722-fdeea329fbba",
+      "zipSha256": "e15f57de368c92b826010181906f26112ba3a0d7fde7d94c8a8c60c525dc4044"
     },
     "golang.org/x/crypto": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/golang.org/x/crypto@v0.49.0/LICENSE"
       ],
-      "version": "v0.49.0"
+      "version": "v0.49.0",
+      "zipSha256": "cbca45d1fcb0fa359cd232b884ba86cfa1a32644ff7efdeb79807db3eb0f005d"
     },
     "golang.org/x/exp": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/golang.org/x/exp@v0.0.0-20240506185415-9bf2ced13842/LICENSE"
       ],
-      "version": "v0.0.0-20240506185415-9bf2ced13842"
+      "version": "v0.0.0-20240506185415-9bf2ced13842",
+      "zipSha256": "6b4a2c206c65da1945186e59b9fdf8da26f13db40ee18a37f963c6ea053a665c"
     },
     "golang.org/x/net": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/golang.org/x/net@v0.52.0/LICENSE"
       ],
-      "version": "v0.52.0"
+      "version": "v0.52.0",
+      "zipSha256": "5b8bf13a81552cd4ffc06dae2b78fb1e72ece57e54446e396ff9c19251e917ed"
     },
     "golang.org/x/sync": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/golang.org/x/sync@v0.20.0/LICENSE"
       ],
-      "version": "v0.20.0"
+      "version": "v0.20.0",
+      "zipSha256": "7179d4d68800f6fdcadb9d4bbf11cbb5df9b40360c89305c203fe20723cbd375"
     },
     "golang.org/x/sys": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/golang.org/x/sys@v0.42.0/LICENSE"
       ],
-      "version": "v0.42.0"
+      "version": "v0.42.0",
+      "zipSha256": "99df0ad90183debc80aee0b7489648574c6baa0c1cf5da37aaf591cf2e2d426a"
     },
     "golang.org/x/text": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/golang.org/x/text@v0.35.0/LICENSE"
       ],
-      "version": "v0.35.0"
+      "version": "v0.35.0",
+      "zipSha256": "2df36ee135211552d1e729d2a2a4b5bbff2bd3a0cc53064151a6e6495e947b32"
     },
     "golang.org/x/time": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/golang.org/x/time@v0.12.0/LICENSE"
       ],
-      "version": "v0.12.0"
+      "version": "v0.12.0",
+      "zipSha256": "cdcb04c43b112919c5e0d0fa1d90769124ad56918a44e6cb0747876ed7e5015c"
     },
     "golang.zx2c4.com/wintun": {
       "license": "MIT",
       "texts": [
         "xray/golang.zx2c4.com/wintun@v0.0.0-20230126152724-0fa3db229ce2/LICENSE"
       ],
-      "version": "v0.0.0-20230126152724-0fa3db229ce2"
+      "version": "v0.0.0-20230126152724-0fa3db229ce2",
+      "zipSha256": "06599222daa6af8547045c446cefa9a2bab19d57bde1fc6436114308d79a2b4b"
     },
     "golang.zx2c4.com/wireguard": {
       "license": "MIT",
       "texts": [
         "xray/golang.zx2c4.com/wireguard@v0.0.0-20250521234502-f333402bd9cb/LICENSE"
       ],
-      "version": "v0.0.0-20250521234502-f333402bd9cb"
+      "version": "v0.0.0-20250521234502-f333402bd9cb",
+      "zipSha256": "e40fbd4b585b8097e8d2577c2100c092f9844b44b09a6d6d640740e42e86f649"
     },
     "google.golang.org/genproto/googleapis/rpc": {
       "license": "Apache-2.0",
       "texts": [
         "xray/google.golang.org/genproto/googleapis/rpc@v0.0.0-20251202230838-ff82c1b0f217/LICENSE"
       ],
-      "version": "v0.0.0-20251202230838-ff82c1b0f217"
+      "version": "v0.0.0-20251202230838-ff82c1b0f217",
+      "zipSha256": "29f02d8e0e2f6e9cc0ee24abc29989e5e44d168eec35c12046efee3fea201aef"
     },
     "google.golang.org/grpc": {
       "license": "Apache-2.0",
@@ -253,14 +279,16 @@
         "xray/google.golang.org/grpc@v1.79.3/LICENSE",
         "xray/google.golang.org/grpc@v1.79.3/NOTICE.txt"
       ],
-      "version": "v1.79.3"
+      "version": "v1.79.3",
+      "zipSha256": "91e4c27a4c29ed867049d1eadbb29fb7cc6cd58c364ca2004d22bbaaafcafb9f"
     },
     "google.golang.org/protobuf": {
       "license": "BSD-3-Clause",
       "texts": [
         "xray/google.golang.org/protobuf@v1.36.11/LICENSE"
       ],
-      "version": "v1.36.11"
+      "version": "v1.36.11",
+      "zipSha256": "14983d36c56a814ed91b6d652f2b8f895baba1b84eb43b28a0b132c8637cd274"
     },
     "gopkg.in/yaml.v2": {
       "license": "Apache-2.0 AND MIT",
@@ -269,21 +297,24 @@
         "xray/gopkg.in/yaml.v2@v2.4.0/LICENSE.libyaml",
         "xray/gopkg.in/yaml.v2@v2.4.0/NOTICE"
       ],
-      "version": "v2.4.0"
+      "version": "v2.4.0",
+      "zipSha256": "ede49e27c4cca6cdd2ec719aed8ea4d363710cceb3d411e7a786fbdec0d391fd"
     },
     "gvisor.dev/gvisor": {
       "license": "Apache-2.0",
       "texts": [
         "xray/gvisor.dev/gvisor@v0.0.0-20260122175437-89a5d21be8f0/LICENSE"
       ],
-      "version": "v0.0.0-20260122175437-89a5d21be8f0"
+      "version": "v0.0.0-20260122175437-89a5d21be8f0",
+      "zipSha256": "3fea26ada816f3acd72d15ab8d10331faf87fff60292979329609d6287529f73"
     },
     "lukechampine.com/blake3": {
       "license": "MIT",
       "texts": [
         "xray/lukechampine.com/blake3@v1.4.1/LICENSE"
       ],
-      "version": "v1.4.1"
+      "version": "v1.4.1",
+      "zipSha256": "b3a3338a6e830b79fb2ff1d263f07f3fe0adcfbafd04b65e5fe14415613e2e4d"
     }
   }
 }

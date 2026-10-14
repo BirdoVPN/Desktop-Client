@@ -83,10 +83,13 @@ env:
   XRAY_LINUX_SHA256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
   XRAY_MACOS_ARM64_SHA256: 2e93a67e8aa1936ecefb307e120830fcbd4c643ab9b1c46a2d0838d5f8409eaf
   XRAY_MACOS_AMD64_SHA256: f5b0471d3459eff1b82e48af0aeac186abcc3298210070afbbbd8437a4e8b203
-  # The Xray-core tag archive at XRAY_VERSION (github.com/XTLS/Xray-core/archive/refs/tags/<version>.tar.gz),
-  # mirrored with every release as its corresponding source (the xray-source job). Bump with XRAY_VERSION;
-  # the module zips it is published with are pinned in third_party/licenses/xray-go-modules.json (zipSha256).
-  XRAY_SOURCE_SHA256: 992a4997e6bb846d11469435d687f99ef812fcde1e0a009bb8e95189ea20331d
+  # The Xray-core source the binaries are built from: the commit the XRAY_VERSION tag names, and its tree.
+  # Mirrored with every release as its corresponding source (`git archive`, the corresponding-source job):
+  # content-addressed, so GitHub regenerating its tag tarballs cannot change or block it. Bump with
+  # XRAY_VERSION; the module zips published with it are pinned in third_party/licenses/xray-go-modules.json
+  # (zipSha256).
+  XRAY_SOURCE_COMMIT: d2758a023cd7f4174a5a5fa4ff66e487d4342ba0
+  XRAY_SOURCE_TREE: dbcb1d31713edfcf5860cf35feee0632e9117893
 
 jobs:
   # ══════════════════════════════════════════════════════════════════════
@@ -815,6 +818,16 @@ jobs:
           fi
           echo "Attestation key present (kid: ${BIRDO_DESKTOP_ATTEST_KID})"
 
+      # L2 (review round 1 of #298): the AppImage starts with the AppImage
+      # runtime, which links libfuse (LGPL-2.1) statically. Left alone, the
+      # bundler fetches type2-runtime's moving `continuous` build; this pins it
+      # (LDAI_RUNTIME_FILE, read by linuxdeploy-plugin-appimage) and the AppRun
+      # Tauri copies in, to the bytes third_party/licenses/appimage-runtime.json
+      # names - the ones the notices list and the corresponding-source asset
+      # mirrors the source of. The notices step checks the AppImage has them.
+      - name: Pin the AppImage runtime and AppRun (third_party/licenses/appimage-runtime.json)
+        run: node scripts/ci/fetch-appimage-tooling.mjs --out-dir "$RUNNER_TEMP/appimage-tooling"
+
       - name: Build Tauri application
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -831,16 +844,19 @@ jobs:
       # Owner decision 2026-10-14 (L2): the AppImage carries system libraries
       # from this ubuntu-22.04 image (WebKitGTK, GTK, GLib, libsoup and what
       # they link) that the .deb leaves to the user's system, so its own
-      # THIRD-PARTY-NOTICES.txt also lists every one: its Ubuntu package (dpkg
-      # -S on this runner), source package at the exact version, copyright
-      # file and the licence texts that cites. Which libraries linuxdeploy
-      # bundled is only known now, so the script maps them, writes the
-      # AppImage's notices and re-bundles ONLY the AppImage with them (`tauri
-      # bundle`: nothing recompiles; the updater .sig is made again). The .deb
-      # keeps the generic file. Fails on a library it cannot account for.
-      # Self-test (fake dpkg): scripts/ci/appimage-notices.tests.sh, in
-      # tests.yml; the real path runs on PRs in linux-packages.yml.
-      - name: AppImage — list its bundled system libraries in its own notices, then re-bundle it
+      # THIRD-PARTY-NOTICES.txt also lists EVERY file in it: libraries,
+      # typelibs, schemas and copyright files by their Ubuntu package (dpkg -S
+      # on this runner, after resolving symlinks), source package at the exact
+      # version, copyright file and the licence texts that cites; the runtime
+      # (checked to be the pinned one) and the libraries it links; AppRun and
+      # what linuxdeploy writes. Which files linuxdeploy bundled is only known
+      # now, so the script maps them, writes the AppImage's notices and
+      # re-bundles ONLY the AppImage with them (`tauri bundle`: nothing
+      # recompiles; the updater .sig is made again). The .deb keeps the
+      # generic file. Fails on a file it cannot account for. Self-test (fake
+      # dpkg): scripts/ci/appimage-notices.tests.sh, in tests.yml; the real
+      # path runs on PRs in linux-packages.yml, with a throwaway signing key.
+      - name: AppImage — list everything it carries in its own notices, then re-bundle it
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -855,7 +871,8 @@ jobs:
       # the published v1.4.45 packages.
       # MR-1685: and each must carry this build's THIRD-PARTY-NOTICES.txt -
       # the .deb the generic file, the AppImage its own (L2: APPIMAGE_NOTICES_
-      # FILE), in which every ELF file the AppImage carries must be listed.
+      # FILE), which must begin with the generic one, list every file the
+      # AppImage carries, and name the runtime it starts with.
       - name: Gate — bundled xray (.deb, .AppImage) must hash to the compiled-in XRAY_BINARY_SHA256; THIRD-PARTY-NOTICES.txt must be this build's
         env:
           ARCH: ${{ matrix.arch }}
@@ -1235,25 +1252,30 @@ jobs:
           compression-level: 0 # .dmg / .app.tar.gz are already compressed
 
   # ══════════════════════════════════════════════════════════════════════
-  # XRAY CORRESPONDING SOURCE — owner decision 2026-10-14 (L1: mirror the
-  # source per release). The bundled xray links GPL-3.0-or-later and LGPL-3.0
-  # Go modules, so every release publishes, next to its installers, the exact
-  # Xray-core tag archive at XRAY_VERSION and the module zip of each GPL,
-  # LGPL and MPL module the four bundled binaries link, at the linked
-  # version: BirdoVPN-<version>-xray-corresponding-source.tar.gz, the URL
-  # every package's THIRD-PARTY-NOTICES.txt names first. The script checks
-  # every input before writing anything (the binary zips against the
-  # XRAY_*_SHA256 pins and their Go modules against xray-go-modules.json,
-  # the tag archive against XRAY_SOURCE_SHA256 and the commit the binaries
-  # carry, each module zip against its zipSha256 pin and Xray's own go.sum)
-  # and fails on any mismatch. tests.yml runs the same script on every PR.
-  # Nothing secret, read-only; the release job publishes it, puts it in
-  # SHA256SUMS.txt and so under the Sigstore signature.
+  # CORRESPONDING SOURCE — owner decisions 2026-10-14 (L1: mirror the source
+  # per release; L2), review round 1 of #298. The bundled xray links
+  # GPL-3.0-or-later and LGPL-3.0 Go modules, so as a whole it is under the
+  # GPL-3.0, whose corresponding source covers EVERY module linked in; and
+  # the AppImage's runtime links libfuse (LGPL-2.1) statically. So every
+  # release publishes, next to its installers,
+  # BirdoVPN-<version>-corresponding-source.tar.gz (the URL every package's
+  # THIRD-PARTY-NOTICES.txt names first): the Xray-core source at
+  # XRAY_SOURCE_COMMIT (`git archive`, tree XRAY_SOURCE_TREE), the module zip
+  # of every module the four bundled binaries link, and the AppImage
+  # runtime's source with libfuse's and squashfuse's. The script checks every
+  # input before writing anything (the binary zips against XRAY_*_SHA256 and
+  # their Go modules against xray-go-modules.json, the tag against the
+  # pinned commit and tree and the commit the binaries carry, each module zip
+  # against its zipSha256 pin and Xray's own go.sum, the runtime's source and
+  # library tarballs against appimage-runtime.json) and fails on any
+  # mismatch. tests.yml runs the same script on every PR. Nothing secret,
+  # read-only; the release job publishes it, puts it in SHA256SUMS.txt and so
+  # under the Sigstore signature. About 120 MB.
   # ══════════════════════════════════════════════════════════════════════
-  xray-source:
-    name: Xray corresponding source (release asset)
+  corresponding-source:
+    name: Corresponding source (release asset)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -1268,14 +1290,14 @@ jobs:
           # No npm cache (the workflow header says why); nothing is installed.
           package-manager-cache: false
 
-      - name: Build + verify BirdoVPN-<version>-xray-corresponding-source.tar.gz
-        run: node scripts/build-xray-source-archive.mjs --out-dir xray-source
+      - name: Build + verify BirdoVPN-<version>-corresponding-source.tar.gz
+        run: node scripts/build-corresponding-source.mjs --out-dir corresponding-source
 
       - name: Upload the source asset
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: birdo-vpn-xray-source
-          path: xray-source/*.tar.gz
+          name: birdo-vpn-corresponding-source
+          path: corresponding-source/*.tar.gz
           retention-days: 30
           if-no-files-found: error
           compression-level: 0 # already gzip
@@ -1285,11 +1307,11 @@ jobs:
   # Windows, Linux AND macOS are REQUIRED: the guard below refuses to publish
   # unless each succeeded. The only exception is macOS once the Mac App Store
   # app is live (then build-macos is skipped by design and no DMG ships).
-  # The Xray corresponding source (xray-source) is required too: every
+  # The corresponding source (corresponding-source) is required too: every
   # package's notices point at it.
   # ══════════════════════════════════════════════════════════════════════
   release:
-    needs: [test, build-windows, build-linux, mac-app-store, build-macos, xray-source]
+    needs: [test, build-windows, build-linux, mac-app-store, build-macos, corresponding-source]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1305,12 +1327,12 @@ jobs:
           MAS_RESULT: ${{ needs.mac-app-store.result }}
           MAS_LIVE: ${{ needs.mac-app-store.outputs.live }}
           MACOS_RESULT: ${{ needs.build-macos.result }}
-          XRAY_SOURCE_RESULT: ${{ needs.xray-source.result }}
+          SOURCE_RESULT: ${{ needs.corresponding-source.result }}
         run: |
           set -euo pipefail
           fail=0
-          if [ "$XRAY_SOURCE_RESULT" != "success" ]; then
-            echo "::error::xray-source result=$XRAY_SOURCE_RESULT — every package's notices point at this release's Xray corresponding-source asset (GPL-3.0 §6, owner decision 2026-10-14), refusing to publish a release without it"
+          if [ "$SOURCE_RESULT" != "success" ]; then
+            echo "::error::corresponding-source result=$SOURCE_RESULT — every package's notices point at this release's corresponding-source asset (GPL-3.0 §6, LGPL-2.1 §6; owner decision 2026-10-14), refusing to publish a release without it"
             fail=1
           fi
           if [ "$TEST_RESULT" != "success" ]; then
@@ -1335,7 +1357,7 @@ jobs:
             fail=1
           fi
           [ "$fail" -eq 0 ] || exit 1
-          echo "Test gate, Windows, Linux, macOS and the Xray source OK."
+          echo "Test gate, Windows, Linux, macOS and the corresponding source OK."
 
       - name: Download Windows artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1374,24 +1396,34 @@ jobs:
           name: birdo-vpn-macos-x64
           path: release-files/macos-x64/
 
-      - name: Download the Xray corresponding source
+      - name: Download the corresponding source
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: birdo-vpn-xray-source
+          name: birdo-vpn-corresponding-source
           path: release-files/source/
 
       # Every package's THIRD-PARTY-NOTICES.txt names this asset by URL
-      # (releases/download/v<version>/BirdoVPN-<version>-xray-corresponding-
-      # source.tar.gz, scripts/lib/xray-source.mjs). The test gate has tied the
-      # tag to the source version, so the asset must carry exactly that name,
-      # or the notices would point at nothing.
-      - name: Require the Xray source asset under the name the notices give
-        if: startsWith(github.ref, 'refs/tags/')
+      # (releases/download/v<version>/BirdoVPN-<version>-corresponding-
+      # source.tar.gz, scripts/lib/corresponding-source.mjs). The test gate has
+      # tied the tag (or the dispatch `version` input) to the source version,
+      # so the asset must carry exactly that name, or the notices would point
+      # at nothing. Runs on dispatch too, so a dry run exercises it.
+      - name: Require the corresponding-source asset under the name the notices give
         env:
+          REF: ${{ github.ref }}
           TAG: ${{ github.ref_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          want="BirdoVPN-${TAG#v}-xray-corresponding-source.tar.gz"
+          case "$REF" in
+            refs/tags/v*) version="${TAG#v}" ;;
+            *) version="$DISPATCH_VERSION" ;;
+          esac
+          if [ -z "$version" ]; then
+            echo "::error::no release version (not a v* tag, and no dispatch version input)"
+            exit 1
+          fi
+          want="BirdoVPN-${version}-corresponding-source.tar.gz"
           ls -la release-files/source/
           got=$(find release-files/source -type f | wc -l)
           if [ "$got" -ne 1 ] || [ ! -f "release-files/source/$want" ]; then
@@ -1400,10 +1432,10 @@ jobs:
           fi
           members=$(tar -tzf "release-files/source/$want")
           if ! grep -qxF "${want%.tar.gz}/README.txt" <<<"$members"; then
-            echo "::error::$want has no ${want%.tar.gz}/README.txt - not the archive scripts/build-xray-source-archive.mjs builds"
+            echo "::error::$want has no ${want%.tar.gz}/README.txt - not the archive scripts/build-corresponding-source.mjs builds"
             exit 1
           fi
-          echo "OK: $want"
+          echo "OK: $want ($(printf '%s\n' "$members" | wc -l) members)"
 
       # Name every asset for the platform it runs on, and disambiguate the
       # basenames that would otherwise collide.

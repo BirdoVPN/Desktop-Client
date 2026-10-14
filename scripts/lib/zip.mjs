@@ -2,7 +2,7 @@
 // their bytes. Built-in zlib only. Enough for the archives the licence and
 // source scripts read: Go module zips from proxy.golang.org and Xray-core's
 // release zips (stored or deflated members, no ZIP64, no encryption). Used by
-// scripts/vendor-xray-go-licences.mjs and scripts/build-xray-source-archive.mjs.
+// scripts/vendor-xray-go-licences.mjs and scripts/build-corresponding-source.mjs.
 // Throws on anything it cannot read; callers decide how to fail.
 import zlib from 'node:zlib';
 

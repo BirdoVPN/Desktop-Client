@@ -24,11 +24,10 @@
 // module seen for the first time - the generator refuses that until a person
 // has read the module's licence and filled in its SPDX id (and `source`, for
 // GPL, LGPL or MPL). Older vendored versions of a module are removed.
-// For a GPL, LGPL or MPL module it also records `zipSha256`, the SHA-256 of
-// the module zip it downloaded: each release mirrors that zip as part of its
-// Xray corresponding-source asset (scripts/build-xray-source-archive.mjs),
-// which refuses a zip that does not match. A module that becomes copyleft at
-// review needs one more run of this script to get its `zipSha256`.
+// For every module it also records `zipSha256`, the SHA-256 of the module
+// zip it downloaded: each release mirrors every linked module's zip in its
+// corresponding-source asset (scripts/build-corresponding-source.mjs), which
+// refuses a zip that does not match (and checks it against Xray's go.sum).
 //
 // Built-in fetch, crypto and zlib only (Node 18+): no new dependency.
 // ============================================================================
@@ -37,7 +36,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readGoBuildInfo } from './lib/go-buildinfo.mjs';
-import { COPYLEFT } from './lib/xray-source.mjs';
 import { zipEntries } from './lib/zip.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -145,8 +143,8 @@ for (const [modPath, version] of [...linked].sort(([a], [b]) => (a < b ? -1 : 1)
   const entry = { ...(modules[modPath] || { license: 'UNREVIEWED' }) };
   delete entry.zipSha256; // the hash of this run's zip, below, or none
   const texts = vendor(modPath, version, files);
-  const copyleft = COPYLEFT.test(entry.license) ? { zipSha256: createHash('sha256').update(zip).digest('hex') } : {};
-  modules[modPath] = { ...entry, version, texts: [...texts, ...keepOthers(entry, modPath)], ...copyleft };
+  const zipSha256 = createHash('sha256').update(zip).digest('hex');
+  modules[modPath] = { ...entry, version, texts: [...texts, ...keepOthers(entry, modPath)], zipSha256 };
   console.log(`${modPath} ${version}: ${Object.keys(files).join(', ')}${entry.license === 'UNREVIEWED' ? '  <- NEW: review its licence' : ''}`);
 }
 for (const modPath of Object.keys(modules)) {

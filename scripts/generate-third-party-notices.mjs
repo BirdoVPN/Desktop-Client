@@ -30,18 +30,18 @@
 //    code the build copies in (Tailwind's Preflight, Vite's modulepreload
 //    polyfill, rolldown's runtime helpers).
 //  * Xray-core: its licence (MPL-2.0) and its source: first the release
-//    asset BirdoVPN-<version>-xray-corresponding-source.tar.gz of THIS
-//    version (scripts/lib/xray-source.mjs; owner decision 2026-10-14, L1),
-//    which carries the Xray-core tag archive at XRAY_VERSION (the version
-//    release.yml downloads) and the zip of every GPL/LGPL/MPL Go module it
+//    asset BirdoVPN-<version>-corresponding-source.tar.gz of THIS version
+//    (scripts/lib/corresponding-source.mjs; owner decision 2026-10-14, L1),
+//    which carries the Xray-core source at the commit XRAY_VERSION names
+//    (the version release.yml downloads) and the zip of every Go module it
 //    links, then the upstream repository at that tag. With --xray, the Go
 //    toolchain and every Go module linked into the binary, read from the
 //    binary's own Go build information. Each must be in
 //    third_party/licenses/xray-go-modules.json with exactly the linked
 //    version and its vendored licence files (scripts/vendor-xray-go-
-//    licences.mjs); GPL/LGPL/MPL ones also need `source` and `zipSha256`,
-//    get the path of their zip in that asset plus their upstream at their
-//    version, and the GPL-3.0 text.
+//    licences.mjs) and the `zipSha256` of the zip the asset mirrors;
+//    GPL/LGPL/MPL ones also need `source`, and get the path of their zip in
+//    that asset plus their upstream at their version, and the GPL-3.0 text.
 //  * Wintun (Windows targets): its Prebuilt Binaries License.
 //
 // Every licence text is printed in full, once, and each component names the
@@ -67,7 +67,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readGoBuildInfo } from './lib/go-buildinfo.mjs';
-import { COPYLEFT, moduleZipMember, sourceAssetUrl, xrayModuleProblems, xrayTagArchiveMember } from './lib/xray-source.mjs';
+import { COPYLEFT, moduleZipMember, sourceAssetUrl, xrayModuleProblems, xrayTagArchiveMember } from './lib/corresponding-source.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tauriDir = path.join(repo, 'src-tauri');
@@ -260,8 +260,8 @@ const sourceAsset = sourceAssetUrl(appVersion);
     lines: [
       `source: ${sourceAsset}`,
       `  (published with BirdoVPN ${appVersion}: ${xrayTagArchiveMember(xrayVersion)} in it is the Xray-core`,
-      `  ${xrayVersion} tag archive, and go-modules/ the source of each GPL, LGPL and MPL Go module`,
-      '  listed below, at the version linked)',
+      `  source at the commit the ${xrayVersion} tag names, and xray/go-modules/ the source of every Go`,
+      '  module listed below, at the version linked)',
       `upstream: https://github.com/XTLS/Xray-core at ${xrayVersion}`,
     ],
   };
@@ -291,7 +291,8 @@ const sourceAsset = sourceAssetUrl(appVersion);
       `  Go ${info.goVersion.replace(/^go/, '')} - ${toolchain.license} [${goIds.join(', ')}]`,
       `    source: ${toolchain.source} at ${info.goVersion}`,
       '',
-      'Go modules linked into it (from its embedded build information):',
+      'Go modules linked into it (from its embedded build information); the source of each is',
+      `xray/go-modules/<module>@<version>.zip in ${sourceAsset}:`,
     );
     const copyleft = [];
     for (const m of info.modules) {
@@ -316,9 +317,10 @@ const sourceAsset = sourceAssetUrl(appVersion);
         'Because GPL-3.0 modules are linked into it, this xray binary as a whole is distributed under',
         'the terms of the GNU General Public License version 3; the MPL-2.0 files in it stay available',
         'under MPL-2.0 too. Its complete corresponding source is the release asset named above, on the',
-        `same release page as this version of BirdoVPN: the Xray-core ${xrayVersion} tag archive, whose`,
-        'go.mod and go.sum pin every module listed here, and the module source of each GPL, LGPL and',
-        'MPL module at the version linked. BirdoVPN runs xray as a separate program.',
+        `same release page as this version of BirdoVPN: the Xray-core ${xrayVersion} source, whose go.mod`,
+        'and go.sum pin every module listed here, and the source of every one of those modules at the',
+        'version linked. (The Go standard library and runtime are part of the Go toolchain, a System',
+        "Library in the GPL-3.0's terms; their source is above.) BirdoVPN runs xray as a separate program.",
       );
     }
   } else {
