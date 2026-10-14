@@ -295,6 +295,13 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3.13"
+# Paused time for the tests (`#[tokio::test(start_paused = true)]`,
+# `tokio::time::advance`): the Disconnect release deadline is driven through
+# its 40 s without waiting them (MR-1408). A feature of the tokio already
+# above, not a new crate: `test-util` is `rt` + `sync` + `time`, so Cargo.lock
+# does not change, and a dev-dependency's features never reach the release
+# build (resolver 2).
+tokio = { version = "1.41", features = ["test-util"] }
 # K5 connect contract: validates the SERIALIZED ConnectRequest /
 # MultiHopConnectRequest bodies against the vendored
 # contract/vpn-protocol.schema.json (src/api/contract_tests.rs). Exact pin so a
