@@ -985,13 +985,6 @@ mod tun_read_tests {
     /// opens the real /dev/net/tun through the function create_tun_device()
     /// uses; the clone device is mode 0666, and no TUNSETIFF is issued, so it
     /// needs no root and creates no interface.
-    /// TEMPORARY (reverted before review): proves a failing test's name
-    /// now reaches the CI log.
-    #[test]
-    fn r8_proof_deliberately_failing_linux_test() {
-        panic!("deliberate failure: R8 proof");
-    }
-
     #[test]
     fn the_tun_clone_device_opens_close_on_exec() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
