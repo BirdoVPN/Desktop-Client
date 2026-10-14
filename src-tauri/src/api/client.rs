@@ -214,6 +214,9 @@ pub struct BirdoApi {
     refresh_token: Arc<RwLock<Option<Zeroizing<String>>>>,
     /// Guard to prevent concurrent token refresh attempts (H-1 race fix)
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// MR-1808: the requests the server asked to hold (`Retry-After`), shared
+    /// by every client built from this one so none of them sends early.
+    retry_gate: Arc<super::retry_gate::RetryGate>,
 }
 
 /// The ONE builder every control-plane client starts from, so a second client
@@ -313,6 +316,7 @@ impl BirdoApi {
             access_token: Arc::new(RwLock::new(None)),
             refresh_token: Arc::new(RwLock::new(None)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            retry_gate: Arc::default(),
         }
     }
 
@@ -340,6 +344,7 @@ impl BirdoApi {
             access_token: Arc::clone(&self.access_token),
             refresh_token: Arc::clone(&self.refresh_token),
             refresh_lock: Arc::clone(&self.refresh_lock),
+            retry_gate: Arc::clone(&self.retry_gate),
         })
     }
 
@@ -1158,6 +1163,11 @@ impl BirdoApi {
         auth: bool,
     ) -> Result<T, ApiError> {
         let url = format!("{}{}", API_BASE_URL, path);
+        // MR-1808: a request the server asked to hold is answered here, with
+        // the wait that is left, until that wait is over. Never logged: a
+        // heartbeat's path carries the session's key id.
+        let held = format!("{method} {path}");
+        self.retry_gate.check(&held, std::time::Instant::now())?;
         let mut request = self.client.request(method.clone(), &url);
 
         if method == reqwest::Method::POST {
@@ -1182,7 +1192,12 @@ impl BirdoApi {
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
-        self.handle_response(response).await
+        let result = self.handle_response(response).await;
+        if let Err(error) = &result {
+            self.retry_gate
+                .note(&held, error, std::time::Instant::now());
+        }
+        result
     }
 
     /// The refresh, run to its end whatever happens to the caller: on a task
@@ -1361,8 +1376,29 @@ impl BirdoApi {
     ///     `ApiError` variants carry no payload, so mapping 403 to
     ///     `ApiError::Forbidden` would replace a specific, actionable explanation
     ///     ("Stealth mode requires an Operative or Sovereign subscription") with
-    ///     a bare "Access denied".
+    ///     a bare "Access denied". Two exceptions, both for the wait they carry
+    ///     (MR-1808): a 429, and a 5xx that names a wait — see
+    ///     [`Self::classify_error_response_after`].
     pub(crate) fn classify_error_response(status: StatusCode, error_text: &str) -> ApiError {
+        Self::classify_error_response_after(status, error_text, None)
+    }
+
+    /// [`Self::classify_error_response`], told the response's `Retry-After`
+    /// (already parsed and clamped by `error::retry_after_header`; MR-1808).
+    ///
+    ///  * Every **429** is `RateLimited` carrying that wait, after the 401
+    ///    rule and the typed codes but BEFORE the backend-message shortcut:
+    ///    the UI words a 429 by its code, and the wait has to travel with it.
+    ///  * A **5xx that names a wait** is `ServerBusy`: busy or in maintenance,
+    ///    worth the SAME request again after the wait. A 5xx without one
+    ///    keeps today's mapping.
+    ///  * A typed retryable refusal (`quota_check_unavailable`, …) prefers its
+    ///    `details.retryAfterSeconds` and falls back to the header.
+    pub(crate) fn classify_error_response_after(
+        status: StatusCode,
+        error_text: &str,
+        retry_after: Option<u64>,
+    ) -> ApiError {
         if status == StatusCode::UPGRADE_REQUIRED {
             // A body we cannot parse yields the default (all-None) struct rather
             // than skipping the branch: the 426 must still block.
@@ -1391,11 +1427,19 @@ impl BirdoApi {
                 .and_then(|b| b.message.clone())
                 .unwrap_or_default()
         };
-        let retry_after_secs =
-            || super::error::retry_after_secs(body.as_ref().and_then(|b| b.details.as_ref()));
+        let retry_after_secs = || {
+            super::error::retry_after_secs(body.as_ref().and_then(|b| b.details.as_ref()))
+                .or(retry_after)
+        };
         match body.as_ref().and_then(|b| b.error.as_deref()) {
             Some("two_factor_required") => return ApiError::TwoFactorRequired(message()),
             Some("two_factor_invalid") => return ApiError::TwoFactorInvalid(message()),
+            // MR-1944: the attestation policy refused this build. A bare 403
+            // reads as `subscription_required`, whose "upgrade your plan" is
+            // wrong advice here.
+            Some("client_attestation_required") => {
+                return ApiError::ClientAttestationRequired(message());
+            }
             // birdo-web #590: a Free connect while the allowance check is
             // down. Without this it read as a 503 "server unavailable", whose
             // advice (try another location) cannot help.
@@ -1419,6 +1463,19 @@ impl BirdoApi {
             _ => {}
         }
 
+        // MR-1808: the waits the server names, by status — see the doc above.
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return ApiError::RateLimited {
+                retry_after_secs: retry_after,
+            };
+        }
+        if let (true, Some(secs)) = (status.is_server_error(), retry_after) {
+            return ApiError::ServerBusy {
+                status: status.as_u16(),
+                retry_after_secs: secs,
+            };
+        }
+
         if let Some(message) = body.as_ref().and_then(|b| b.message.as_deref()) {
             let message = message.trim();
             if !message.is_empty() {
@@ -1432,7 +1489,6 @@ impl BirdoApi {
         match status {
             StatusCode::FORBIDDEN => ApiError::Forbidden,
             StatusCode::NOT_FOUND => ApiError::NotFound,
-            StatusCode::TOO_MANY_REQUESTS => ApiError::RateLimited,
             StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE => ApiError::ServerError(status.as_u16()),
@@ -1482,6 +1538,14 @@ impl BirdoApi {
             return serde_json::from_slice(payload).map_err(|e| ApiError::Parse(e.to_string()));
         }
 
+        // MR-1808: read before the body consumes the response.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                super::error::retry_after_header(value, std::time::SystemTime::now())
+            });
         // Parse the body once for typed protocol errors and backend-provided messages.
         let error_text = response.text().await.unwrap_or_else(|e| {
             // The body read itself failed (broken stream/timeout). We still fall
@@ -1494,7 +1558,7 @@ impl BirdoApi {
             );
             String::new()
         });
-        let error = Self::classify_error_response(status, &error_text);
+        let error = Self::classify_error_response_after(status, &error_text, retry_after);
         // Latch the forced-version floor process-wide the FIRST time any request
         // is refused. Done here rather than in `classify_error_response` so that
         // function stays pure and unit-testable; the latch is what stops
@@ -1519,6 +1583,7 @@ impl Clone for BirdoApi {
             access_token: Arc::clone(&self.access_token),
             refresh_token: Arc::clone(&self.refresh_token),
             refresh_lock: Arc::clone(&self.refresh_lock),
+            retry_gate: Arc::clone(&self.retry_gate),
         }
     }
 }
@@ -1898,5 +1963,131 @@ mod token_restore_tests {
         assert!(api.clear_tokens_if(current.as_deref()).await);
         assert!(!api.is_authenticated().await);
         assert_eq!(refresh_in_memory(&api).await, None);
+    }
+}
+
+/// MR-1808: `Retry-After` is read off the response, and a request the server
+/// asked to hold is not sent again until its wait is over.
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+
+    /// A response as reqwest hands it to `handle_response`.
+    fn answer(status: u16, retry_after: Option<&str>) -> reqwest::Response {
+        let mut response = tauri::http::Response::builder().status(status);
+        if let Some(value) = retry_after {
+            response = response.header("Retry-After", value);
+        }
+        reqwest::Response::from(
+            response
+                .body(r#"{"statusCode":0,"message":"Slow down"}"#.to_string())
+                .unwrap(),
+        )
+    }
+
+    async fn error_for(status: u16, retry_after: Option<&str>) -> ApiError {
+        BirdoApi::new()
+            .handle_response::<serde_json::Value>(answer(status, retry_after))
+            .await
+            .unwrap_err()
+    }
+
+    /// Through `handle_response` itself: seconds or an HTTP-date, clamped
+    /// like every server-named wait; anything unreadable is no wait (the
+    /// status still decides the error).
+    #[tokio::test]
+    async fn the_retry_after_header_is_read_off_the_response() {
+        let in_90s = chrono::Utc::now() + chrono::TimeDelta::seconds(90);
+        let http_date = in_90s.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+        assert!(matches!(
+            error_for(429, Some("30")).await,
+            ApiError::RateLimited {
+                retry_after_secs: Some(30)
+            }
+        ));
+        assert!(matches!(
+            error_for(429, Some(&http_date)).await,
+            ApiError::RateLimited {
+                retry_after_secs: Some(super::super::error::RETRY_AFTER_MAX_SECS)
+            }
+        ));
+        for unreadable in [Some("soon"), Some(""), None] {
+            assert!(
+                matches!(
+                    error_for(429, unreadable).await,
+                    ApiError::RateLimited {
+                        retry_after_secs: None
+                    }
+                ),
+                "{unreadable:?}"
+            );
+        }
+        assert!(matches!(
+            error_for(503, Some("20")).await,
+            ApiError::ServerBusy {
+                status: 503,
+                retry_after_secs: 20
+            }
+        ));
+        assert!(matches!(
+            error_for(500, Some("5")).await,
+            ApiError::ServerBusy {
+                status: 500,
+                retry_after_secs: 5
+            }
+        ));
+        // Without one, a 5xx maps exactly as before.
+        assert!(matches!(
+            error_for(503, None).await,
+            ApiError::Rejected { status: 503, .. }
+        ));
+        // A 401 is the token's business whatever else it carries.
+        assert!(matches!(
+            error_for(401, Some("30")).await,
+            ApiError::Unauthorized
+        ));
+    }
+
+    /// Every client made from this one shares the holds: the re-dial's and
+    /// the old-key probe's clients (`on_fresh_connections`) must not send
+    /// what the main one was told to hold, and vice versa.
+    #[test]
+    fn every_client_made_from_one_shares_its_holds() {
+        let api = BirdoApi::new();
+        let fresh = api.on_fresh_connections(None).expect("built");
+        let cloned = api.clone();
+        assert!(Arc::ptr_eq(&api.retry_gate, &fresh.retry_gate));
+        assert!(Arc::ptr_eq(&api.retry_gate, &cloned.retry_gate));
+        let now = std::time::Instant::now();
+        api.retry_gate.note(
+            "POST /auth/refresh",
+            &ApiError::RateLimited {
+                retry_after_secs: Some(60),
+            },
+            now,
+        );
+        assert!(fresh.retry_gate.check("POST /auth/refresh", now).is_err());
+    }
+
+    /// The wiring: every control-plane request (the refresh a 401 runs
+    /// included — it goes through `do_request` too) asks the gate before it
+    /// is sent and tells it what came back.
+    #[test]
+    fn every_control_plane_request_honours_the_holds() {
+        const SOURCE: &str = include_str!("client.rs");
+        let start = SOURCE.find("async fn do_request<").unwrap();
+        let body = &SOURCE[start..];
+        let body = &body[..body.find("\n    }").unwrap()];
+        let check = body
+            .find("self.retry_gate.check(&held, std::time::Instant::now())?;")
+            .expect("the check");
+        let send = body.find(".send()").expect("the send");
+        let note = body
+            .find(".note(&held, error, std::time::Instant::now())")
+            .expect("the note");
+        assert!(check < send && send < note);
+        let refresh = &SOURCE[SOURCE.find("async fn refresh_token_internal(").unwrap()..];
+        assert!(refresh[..refresh.find("\n    }").unwrap()].contains(".do_request("));
     }
 }

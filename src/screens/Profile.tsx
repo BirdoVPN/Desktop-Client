@@ -49,10 +49,9 @@ export function Profile() {
   // The email is mirrored in both `account.email` and `userEmail` (set at
   // sign-in); fall back so the card never reads "Anonymous" for a real user.
   const resolvedEmail = account.email ?? userEmail ?? null;
-  // Never render the synthetic `anon_…@anonymous.local`; show the number
-  // (item 86: the server's own fields first, the email's shape on an older
-  // backend).
-  const { isAnon, accountNumber } = resolveAnonymousAccount(account, resolvedEmail);
+  // An anonymous account's email is never rendered; its number is shown
+  // instead — both from `/auth/me`'s own fields (item 86, MR-918).
+  const { isAnon, accountNumber } = resolveAnonymousAccount(account);
 
   const [showVoucherDialog, setShowVoucherDialog] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);

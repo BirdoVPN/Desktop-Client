@@ -23,7 +23,7 @@ use crate::storage::CredentialStore;
 fn friendly_redeem_error(err: &ApiError) -> String {
     match err {
         ApiError::NotFound => "We couldn't find that voucher code. Double-check it and try again.".to_string(),
-        ApiError::RateLimited => "Too many attempts. Please wait a minute and try again.".to_string(),
+        ApiError::RateLimited { .. } => "Too many attempts. Please wait a minute and try again.".to_string(),
         ApiError::Unauthorized | ApiError::NotAuthenticated => {
             "Your session has expired. Please sign in again to redeem a voucher.".to_string()
         }
@@ -79,7 +79,10 @@ mod tests {
     #[test]
     fn maps_known_failures_to_friendly_copy() {
         assert!(friendly_redeem_error(&ApiError::NotFound).contains("couldn't find"));
-        assert!(friendly_redeem_error(&ApiError::RateLimited).contains("Too many attempts"));
+        assert!(friendly_redeem_error(&ApiError::RateLimited {
+            retry_after_secs: None
+        })
+        .contains("Too many attempts"));
         assert!(friendly_redeem_error(&ApiError::Unauthorized).contains("session has expired"));
         assert!(friendly_redeem_error(&ApiError::NotAuthenticated).contains("session has expired"));
 

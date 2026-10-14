@@ -204,6 +204,26 @@ impl AutoReconnectConfig {
 /// `valid:false` answer is how a revocation arrives.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Whether a heartbeat is due for the session the loop watches (MR-946).
+///
+/// The FIRST one goes out as soon as the session is seen Connected — a new
+/// connect, a re-dial or a server switch alike, since each of them starts a
+/// fresh `SessionWatch` — and then one every [`HEARTBEAT_INTERVAL`]. It used
+/// to count the first interval from the connect, so a key's first check-in
+/// came 30 s late.
+///
+/// `last` is stamped BEFORE each request goes out (`ReconnectLoop::heartbeat`),
+/// so a heartbeat that fails or never answers still waits a full interval for
+/// the next: a failing heartbeat cannot become a burst. A new session beats
+/// at once only after a connect the server has just accepted, which is
+/// itself paced by the reconnect backoff and its breaker.
+fn heartbeat_due(connected_since: Option<Instant>, last: Option<Instant>, now: Instant) -> bool {
+    if connected_since.is_none() {
+        return false;
+    }
+    last.is_none_or(|last| now.saturating_duration_since(last) >= HEARTBEAT_INTERVAL)
+}
+
 /// The one heartbeat for a dead session's key, after its tunnel came down: a
 /// network that is down must not hold the recovery up for longer than this.
 const OLD_KEY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1125,7 +1145,9 @@ impl ReconnectLoop {
                 if !killswitch::holds_block_while_connected() {
                     let _ = killswitch::deactivate_killswitch().await;
                 }
-                Flow::Continue
+                // MR-946: the re-dialled key checks in now, not one tick (or
+                // one heartbeat interval) later.
+                self.heartbeat(now).await
             }
             Action::TearDown { cause } => {
                 tracing::warn!(
@@ -1366,10 +1388,11 @@ impl ReconnectLoop {
     }
 
     async fn heartbeat(&mut self, now: Instant) -> Flow {
-        let Some(since) = self.session.last_heartbeat.or(self.session.connected_since) else {
-            return Flow::Continue;
-        };
-        if now.duration_since(since) < HEARTBEAT_INTERVAL {
+        if !heartbeat_due(
+            self.session.connected_since,
+            self.session.last_heartbeat,
+            now,
+        ) {
             return Flow::Continue;
         }
         self.session.last_heartbeat = Some(now);
@@ -1681,9 +1704,11 @@ fn heartbeat_failure(e: &crate::api::ApiError) -> String {
         E::Unauthorized => "HTTP 401".into(),
         E::Forbidden => "HTTP 403".into(),
         E::NotFound => "HTTP 404".into(),
-        E::RateLimited => "HTTP 429".into(),
+        E::RateLimited { .. } => "HTTP 429".into(),
         E::UpgradeRequired(_) => "HTTP 426".into(),
-        E::ServerError(status) | E::Rejected { status, .. } => format!("HTTP {status}"),
+        E::ServerError(status) | E::ServerBusy { status, .. } | E::Rejected { status, .. } => {
+            format!("HTTP {status}")
+        }
         E::Parse(_) => "unreadable reply".into(),
         E::CertificatePinningFailed(_) => "certificate pin mismatch".into(),
         _ => "other error".into(),
@@ -1714,6 +1739,90 @@ mod tests {
             );
         }
         assert_eq!(heartbeat_failure(&ApiError::ServerError(503)), "HTTP 503");
+        assert_eq!(
+            heartbeat_failure(&ApiError::RateLimited {
+                retry_after_secs: Some(30)
+            }),
+            "HTTP 429"
+        );
+        assert_eq!(
+            heartbeat_failure(&ApiError::ServerBusy {
+                status: 503,
+                retry_after_secs: 30
+            }),
+            "HTTP 503"
+        );
+    }
+
+    /// MR-946: the first heartbeat goes out as soon as the session is seen
+    /// Connected, then one per interval. It used to wait a whole interval
+    /// first, so a new key's first check-in came 30 s after the connect.
+    #[test]
+    fn the_first_heartbeat_goes_out_at_once_then_every_interval() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        // No session: nothing to beat for.
+        assert!(!heartbeat_due(None, None, t0));
+        // Just connected, never beaten: due now, not 30 s from now.
+        assert!(heartbeat_due(Some(t0), None, t0));
+        // Beaten at t0: the next one waits the interval.
+        for later in [s(0), s(1), s(5), s(29)] {
+            assert!(!heartbeat_due(Some(t0), Some(t0), t0 + later), "{later:?}");
+        }
+        assert!(heartbeat_due(Some(t0), Some(t0), t0 + HEARTBEAT_INTERVAL));
+
+        // A heartbeat failing on every 5 s tick for two minutes is still one
+        // request per interval (it is stamped before it goes out), never a
+        // burst: t = 0, 30, 60, 90, 120.
+        let mut last = None;
+        let mut sent = Vec::new();
+        for tick in 0..=24u64 {
+            let now = t0 + s(5 * tick);
+            if heartbeat_due(Some(t0), last, now) {
+                last = Some(now);
+                sent.push(5 * tick);
+            }
+        }
+        assert_eq!(sent, vec![0, 30, 60, 90, 120]);
+
+        // A re-dial or a server switch starts a fresh watch: its key checks
+        // in at once too.
+        let fresh = SessionWatch::default();
+        let redialled = t0 + s(42);
+        assert!(heartbeat_due(
+            Some(redialled),
+            fresh.last_heartbeat,
+            redialled
+        ));
+    }
+
+    /// MR-946, the wiring: the stamp is written before the request goes out
+    /// (so a failure cannot repeat at once), and a recovered session beats
+    /// on the step that sees it back, not on the next tick.
+    #[test]
+    fn a_heartbeat_is_stamped_before_it_goes_out_and_a_recovery_beats() {
+        let source: String = include_str!("auto_reconnect.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let beat = &source[source
+            .find("asyncfnheartbeat(&mutself,now:Instant)->Flow{")
+            .expect("the heartbeat")..];
+        let due = beat.find("heartbeat_due(").expect("the due check");
+        let stamp = beat
+            .find("self.session.last_heartbeat=Some(now);")
+            .expect("the stamp");
+        let request = beat
+            .find("self.api.heartbeat(&key_id)")
+            .expect("the request");
+        assert!(due < stamp && stamp < request);
+
+        let recovered = &source[source.find("Action::Recovered=>{").expect("Recovered")..];
+        let recovered = &recovered[..recovered.find("Action::TearDown").expect("next arm")];
+        assert!(
+            recovered.contains("self.heartbeat(now).await"),
+            "{recovered}"
+        );
     }
 
     fn service() -> AutoReconnectService {

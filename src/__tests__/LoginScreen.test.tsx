@@ -155,6 +155,27 @@ describe('After a sign-in', () => {
     expect(useAppStore.getState().account.isAnonymous).toBe(true);
   });
 
+  // MR-1723: the new account's number is copied through Rust's
+  // copy_sensitive (kept out of Win+V history, cleared after a minute), never
+  // the webview's ordinary clipboard.
+  it("copies a new account's number through copy_sensitive, not the web clipboard", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'register_anonymous') return { success: true, user: { account_id: '123456789012345678901234' } };
+      if (cmd === 'copy_sensitive') return true;
+      return undefined;
+    });
+    render(<Login />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Anonymous' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Create a new anonymous account' }));
+    await userEvent.click(await screen.findByRole('button', { name: /^Copy account number/ }));
+    await waitFor(() =>
+      expect(mockedInvoke).toHaveBeenCalledWith('copy_sensitive', { text: '123456789012345678901234' }),
+    );
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
   it('an SSO account is known to have no password', async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'native_oauth_login') return { success: true };
