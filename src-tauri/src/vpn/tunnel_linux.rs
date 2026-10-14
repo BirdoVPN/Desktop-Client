@@ -3,8 +3,6 @@
 //! Creates and manages a TUN virtual network interface for WireGuard VPN on Linux.
 //! Uses /dev/net/tun with IFF_TUN | IFF_NO_PI for raw IP packet I/O.
 
-#![allow(dead_code)]
-
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;

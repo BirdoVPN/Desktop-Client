@@ -3,8 +3,6 @@
 //! Creates and manages a utun virtual network interface for WireGuard VPN on macOS.
 //! Uses the kernel utun interface via AF_SYSTEM sockets.
 
-#![allow(dead_code)]
-
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
@@ -25,23 +23,13 @@ fn cmd(program: &str) -> Command {
     crate::utils::hidden_cmd(program)
 }
 
-/// utun adapter name (assigned by macOS kernel, typically utun0, utun1, etc.)
-const ADAPTER_PREFIX: &str = "utun";
-
-/// DNS resolver config path
-const RESOLVER_DIR: &str = "/etc/resolver";
-
-/// Stores original DNS and default route info for restoration on disconnect
+/// Stores original DNS info for restoration on disconnect
 #[derive(Debug, Clone)]
 struct NetworkSnapshot {
     /// The primary network service name (e.g. "Wi-Fi", "Ethernet")
     service_name: String,
     /// Original DNS servers
     dns_servers: Vec<String>,
-    /// Original default gateway
-    default_gateway: Option<String>,
-    /// Original default interface
-    default_interface: Option<String>,
     /// EVERY enabled network service and its original resolvers, so each can be
     /// restored exactly. Repointing only the primary service leaks: with Wi-Fi
     /// and Ethernet both active, unscoped queries can still go to the other
@@ -1677,9 +1665,6 @@ async fn capture_network_snapshot(tunnel_dns: &[String]) -> Result<NetworkSnapsh
         dns_text.lines().map(|l| l.trim().to_string()).collect()
     };
 
-    let default_gateway = get_default_gateway().ok();
-    let default_interface = get_default_interface().ok();
-
     // Snapshot every enabled service BEFORE anything is changed, so each can be
     // put back exactly. Captured even for services that already use DHCP — an
     // empty vec is meaningful here and restores as "empty".
@@ -1717,8 +1702,6 @@ async fn capture_network_snapshot(tunnel_dns: &[String]) -> Result<NetworkSnapsh
     Ok(NetworkSnapshot {
         service_name: service,
         dns_servers,
-        default_gateway,
-        default_interface,
         all_dns,
     })
 }
@@ -1777,22 +1760,6 @@ fn get_default_gateway() -> Result<String, String> {
         .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().to_string())
         .ok_or_else(|| "Could not determine default gateway".to_string())
-}
-
-/// Get the default network interface name.
-fn get_default_interface() -> Result<String, String> {
-    let output = cmd("route")
-        .args(["-n", "get", "default"])
-        .output()
-        .map_err(|e| format!("Failed to get default interface: {}", e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .find(|l| l.trim().starts_with("interface:"))
-        .and_then(|l| l.split(':').nth(1))
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| "Could not determine default interface".to_string())
 }
 
 /// Convert a CIDR prefix length to a dotted-decimal netmask.
