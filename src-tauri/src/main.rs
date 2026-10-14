@@ -197,6 +197,8 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         take_pending_deep_link,
         // The window up from the tray (re-consent behind Start Minimized)
         commands::tray::show_main_window,
+        // The anonymous account number, kept out of clipboard history (MR-1723)
+        commands::clipboard::copy_sensitive,
     ]
 }
 

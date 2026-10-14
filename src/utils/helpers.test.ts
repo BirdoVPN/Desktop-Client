@@ -5,7 +5,6 @@ import {
   formatBytes,
   formatUptime,
   formatDate,
-  anonAccountNumber,
   anonymityPatch,
   formatAccountNumber,
   identityPatch,
@@ -202,14 +201,6 @@ describe('formatting (iOS / Android FormatUtils parity, W2-031)', () => {
 });
 
 describe('anonymous identity (P1-parity-007)', () => {
-  const synthetic = 'anon_123456789012345678901234@anonymous.local';
-
-  it('recognises the synthetic address and extracts the account number', () => {
-    expect(anonAccountNumber(synthetic)).toBe('123456789012345678901234');
-    expect(anonAccountNumber('someone@example.com')).toBeNull();
-    expect(anonAccountNumber(null)).toBeNull();
-  });
-
   it('formats the account number in six space-separated groups of four', () => {
     expect(formatAccountNumber('123456789012345678901234')).toBe('1234 5678 9012 3456 7890 1234');
     expect(formatAccountNumber('1234|5678')).toBe('1234 5678');
@@ -220,45 +211,46 @@ describe('anonymous identity (P1-parity-007)', () => {
   });
 });
 
-/** Account API contract 2026-10-01, item 86: `/auth/me` on an old and a new server. */
+/**
+ * Account API contract 2026-10-01, item 86: `/auth/me` sends `accountType`,
+ * `isAnonymous` and `accountNumber` for every account (MR-918), and they are
+ * the only thing read — never the synthetic email.
+ */
 describe('anonymous account resolution (item 86)', () => {
-  const synthetic = 'anon_123456789012345678901234@anonymous.local';
-  const unknown = { isAnonymous: null, accountNumber: null };
-
-  it('an old server (no new fields) is read from the email, as before', () => {
-    expect(anonymityPatch({})).toEqual({});
-    expect(resolveAnonymousAccount(unknown, synthetic)).toEqual({
-      isAnon: true,
-      accountNumber: '123456789012345678901234',
-    });
-    expect(resolveAnonymousAccount(unknown, 'me@example.com')).toEqual({ isAnon: false, accountNumber: null });
-  });
-
-  it("a new server's fields win, and the number comes from accountNumber", () => {
+  it("the server's fields decide, and the number comes from accountNumber", () => {
     const patch = anonymityPatch({ is_anonymous: true, account_number: '999988887777666655554444' });
     expect(patch).toEqual({ isAnonymous: true, accountNumber: '999988887777666655554444' });
-    // Phase 2: the email no longer carries the number at all.
-    expect(resolveAnonymousAccount({ isAnonymous: true, accountNumber: '999988887777666655554444' }, null)).toEqual({
+    expect(resolveAnonymousAccount({ isAnonymous: true, accountNumber: '999988887777666655554444' })).toEqual({
       isAnon: true,
       accountNumber: '999988887777666655554444',
     });
-    expect(resolveAnonymousAccount({ isAnonymous: false, accountNumber: null }, 'me@example.com')).toEqual({
+    expect(resolveAnonymousAccount({ isAnonymous: false, accountNumber: null })).toEqual({
       isAnon: false,
       accountNumber: null,
     });
   });
 
-  it('a server that sends no number (null, the email carrying none) still reads as anonymous', () => {
+  it('a server that sends no number still reads as anonymous', () => {
     const patch = anonymityPatch({ is_anonymous: true, account_number: null });
     expect(patch).toEqual({ isAnonymous: true });
-    expect(resolveAnonymousAccount({ isAnonymous: true, accountNumber: null }, 'member@anonymous.local')).toEqual({
+    expect(resolveAnonymousAccount({ isAnonymous: true, accountNumber: null })).toEqual({
       isAnon: true,
       accountNumber: null,
     });
   });
 
-  it('a synthetic email is never treated as a real one, whatever the server says', () => {
-    expect(resolveAnonymousAccount({ isAnonymous: false, accountNumber: null }, synthetic).isAnon).toBe(true);
+  it('MR-918: nothing is read from an email — the resolver does not even take one', () => {
+    // Not known yet (no profile this session): not anonymous, no number.
+    expect(resolveAnonymousAccount({ isAnonymous: null, accountNumber: null })).toEqual({
+      isAnon: false,
+      accountNumber: null,
+    });
+    // A standard account never carries a number, whatever arrives.
+    expect(resolveAnonymousAccount({ isAnonymous: false, accountNumber: '999988887777666655554444' })).toEqual({
+      isAnon: false,
+      accountNumber: null,
+    });
+    expect(resolveAnonymousAccount.length).toBe(1);
   });
 
   it('only the documented 24 digits are taken as an account number', () => {

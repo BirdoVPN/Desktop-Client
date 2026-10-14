@@ -203,7 +203,9 @@ mod gdpr_request_tests {
         ));
         assert!(matches!(
             BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, ""),
-            GdprDeleteOutcome::Refused(ApiError::RateLimited)
+            GdprDeleteOutcome::Refused(ApiError::RateLimited {
+                retry_after_secs: None
+            })
         ));
     }
 
@@ -255,14 +257,21 @@ mod gdpr_request_tests {
 
     #[test]
     fn other_refusals_keep_the_backend_message() {
-        let body = r#"{"statusCode":429,"message":"Slow down"}"#;
-        match BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, body) {
+        let body = r#"{"statusCode":409,"message":"A deletion is already in progress"}"#;
+        match BirdoApi::classify_gdpr_delete_response(StatusCode::CONFLICT, body) {
             GdprDeleteOutcome::Refused(ApiError::Rejected { status, message }) => {
-                assert_eq!(status, 429);
-                assert_eq!(message, "Slow down");
+                assert_eq!(status, 409);
+                assert_eq!(message, "A deletion is already in progress");
             }
             other => panic!("{other:?}"),
         }
+        // MR-1808: a 429 is a rate limit whatever its body says — the dialog
+        // words it by its code, and its wait has to travel with it.
+        let body = r#"{"statusCode":429,"message":"Slow down"}"#;
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response(StatusCode::TOO_MANY_REQUESTS, body),
+            GdprDeleteOutcome::Refused(ApiError::RateLimited { .. })
+        ));
         assert!(matches!(
             BirdoApi::classify_gdpr_delete_response(StatusCode::NOT_FOUND, ""),
             GdprDeleteOutcome::Refused(ApiError::NotFound)
@@ -351,7 +360,9 @@ mod error_display_tests {
 
     #[test]
     fn rate_limited_displays_message() {
-        let err = ApiError::RateLimited;
+        let err = ApiError::RateLimited {
+            retry_after_secs: Some(30),
+        };
         assert_eq!(err.to_string(), "Too many requests, please slow down");
     }
 
@@ -1287,7 +1298,9 @@ mod error_classification_tests {
         ));
         assert!(matches!(
             BirdoApi::classify_error_response(StatusCode::TOO_MANY_REQUESTS, ""),
-            ApiError::RateLimited
+            ApiError::RateLimited {
+                retry_after_secs: None
+            }
         ));
         assert!(matches!(
             BirdoApi::classify_error_response(StatusCode::BAD_GATEWAY, ""),
