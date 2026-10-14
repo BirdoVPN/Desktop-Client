@@ -953,6 +953,34 @@ pub(crate) mod tests {
         std::fs::rename(logs.path(), &moved).unwrap();
     }
 
+    /// D6c BLOCKER (the mechanism behind the CI failure): while a directory is
+    /// held open without `FILE_SHARE_DELETE` — as `hold_app_dirs` holds the
+    /// per-user dirs — neither it nor the open files inside it can be deleted.
+    /// So the uninstaller's `--with-app-data` sweep MUST run before those holds
+    /// are taken (see `main.rs`), or it deletes nothing. This reproduces the
+    /// "…\BirdoVPN\logs survived" failure and confirms dropping the hold frees
+    /// the delete.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_directory_and_its_open_file_cannot_be_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        let guard = logs.hold_open().unwrap();
+        // An open log file inside the held directory, as the file logger keeps.
+        let mut f = logs.open_append("birdo.log").unwrap();
+        std::io::Write::write_all(&mut f, b"x").unwrap();
+        // While held, the directory cannot be removed (SHARING_VIOLATION).
+        assert!(
+            std::fs::remove_dir_all(logs.path()).is_err(),
+            "a held directory was deleted"
+        );
+        // Release the hold and the open file: now it deletes.
+        drop(f);
+        drop(guard);
+        std::fs::remove_dir_all(logs.path()).unwrap();
+        assert!(!logs.path().exists());
+    }
+
     /// D6c: the MS-FSA rule the design relies on — while a directory is held
     /// open, its PARENT (and any ancestor) cannot be renamed either, so the
     /// path to the held directory cannot be swapped out from under it between a

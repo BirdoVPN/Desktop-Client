@@ -388,7 +388,12 @@ pub mod dns_journal {
         };
         let legacy = crate::utils::safe_fs::OwnedDir::new(base, &["BirdoVPN"]);
         let marker = protected.with_file_name(format!("dns-journal-migrated-{sid}"));
-        migrate_legacy(&legacy, protected, &marker);
+        migrate_legacy(
+            &legacy,
+            protected,
+            &marker,
+            crate::utils::protected_dir::legacy_upgrade_window(),
+        );
     }
 
     /// What became of a journal a pre-MR-1721 build left in %APPDATA%.
@@ -416,18 +421,49 @@ pub mod dns_journal {
     /// this account's was looked at, and from then on that folder is never
     /// read for a journal again.
     ///
-    /// D6c LOW (W1-008): unlike the settings key and the resume record, this is
-    /// NOT gated on the legacy-upgrade window. The journal describes MACHINE
-    /// state — adapter DNS a killed session parked, routes a crash stranded —
-    /// and the restore must run on every account's first start, or on a
-    /// multi-account PC the account that did not consume the machine-wide
-    /// window would have its journal marked migrated UNREAD and the machine
-    /// left without DNS. The planted-journal risk the window was meant to blunt
-    /// is already bounded here: only a well-formed journal of THIS OS is taken
-    /// over, and the reconcile that then reads it (`win_machine_state`) restores
-    /// an adapter only while its live DNS is still in the parked shape (a
-    /// foreign or user configuration is read back and left alone), and deletes
-    /// only a route recorded for the current boot.
+    /// Rewrite an unverified %APPDATA% journal for a takeover OUTSIDE the
+    /// legacy-upgrade window (D6c): drop every route (nothing is deleted on an
+    /// unverified record) and heal every recorded adapter to DHCP / automatic
+    /// DNS rather than to its journal-supplied resolver values. `None` when the
+    /// bytes do not parse (the caller keeps them as-is; the OS check already
+    /// refused a non-journal). Windows only; a no-op elsewhere.
+    #[cfg(windows)]
+    fn sanitize_unverified_journal(bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut journal: DnsJournal = serde_json::from_slice(bytes).ok()?;
+        journal.routes.clear();
+        for adapter in &mut journal.adapters {
+            adapter.dns_servers.clear();
+            adapter.dns_servers_v6.clear();
+            adapter.v4_was_dhcp = true;
+            adapter.v6_was_dhcp = true;
+        }
+        serde_json::to_vec(&journal).ok()
+    }
+
+    #[cfg(not(windows))]
+    fn sanitize_unverified_journal(_bytes: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// D6c (W1-008 vs #293 R1): the journal describes MACHINE state — adapter
+    /// DNS a killed session parked, routes a crash stranded — so it is taken
+    /// over on every account's first start, not only inside the legacy-upgrade
+    /// window; otherwise on a multi-account PC the account that did not consume
+    /// the machine-wide window would have its journal marked migrated UNREAD and
+    /// the machine left without DNS.
+    ///
+    /// But the %APPDATA% journal is UNSIGNED and only checked to parse with
+    /// `os == "windows"`, and the same-boot test is freshness, not authorship.
+    /// So OUTSIDE the window a same-user process could plant one to make the
+    /// elevated app delete the gateway routes it names and set journal-supplied
+    /// resolvers on parked adapters, machine-wide. Outside the window the
+    /// takeover is therefore SANITISED ([`sanitize_unverified_journal`]): the
+    /// `routes` are dropped (no route is deleted on an unverified record) and
+    /// every adapter is healed to DHCP/automatic DNS instead of to
+    /// journal-supplied resolver values — still enough to lift a park and give
+    /// the machine working DNS back, but it cannot be steered to attacker
+    /// values. INSIDE the window (a genuine pre-#287 upgrade) the record is
+    /// trusted as before, routes and resolvers included.
     ///
     /// The old file is read and deleted through checked handles (MR-1945).
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -435,6 +471,7 @@ pub mod dns_journal {
         legacy: &crate::utils::safe_fs::OwnedDir,
         protected: &std::path::Path,
         marker: &std::path::Path,
+        upgrade_window: bool,
     ) -> Migration {
         use std::io::Read;
         if marker.exists() {
@@ -462,6 +499,13 @@ pub mod dns_journal {
                     );
                     Migration::LeftInPlace
                 } else {
+                    // Outside the upgrade window the record is unverified: drop
+                    // routes and heal to DHCP, never to journal-supplied values.
+                    let bytes = if upgrade_window {
+                        bytes
+                    } else {
+                        sanitize_unverified_journal(&bytes).unwrap_or(bytes)
+                    };
                     match write_bytes_atomically(protected, &bytes) {
                         Ok(()) => {
                             if let Err(e) = legacy.remove_file(JOURNAL_FILE) {
@@ -1339,6 +1383,8 @@ pub mod dns_journal {
     /// that folder is never read for a journal again.
     #[cfg(test)]
     mod legacy_journal_tests {
+        #[cfg(windows)]
+        use super::DnsJournal;
         use super::{migrate_legacy, Migration, JOURNAL_FILE};
         use crate::utils::safe_fs::OwnedDir;
         use std::path::PathBuf;
@@ -1378,7 +1424,7 @@ pub mod dns_journal {
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
 
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::Moved
             );
             assert_eq!(read(&d.protected), journal(""));
@@ -1389,7 +1435,7 @@ pub mod dns_journal {
             // never read — it named routes for the elevated client to delete.
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal(r#","routes":[]"#)).unwrap();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::AlreadyDone
             );
             assert_eq!(read(&d.protected), journal(""));
@@ -1400,36 +1446,110 @@ pub mod dns_journal {
         fn a_journal_planted_after_the_first_look_is_never_read() {
             let d = dirs();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::NoneThere
             );
             assert!(d.marker.exists());
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::AlreadyDone
             );
             assert!(!d.protected.exists());
         }
 
-        /// D6c LOW (W1-008): the DNS journal is MACHINE state, so its takeover
-        /// does not depend on the legacy-upgrade window — unlike the settings
-        /// key and the resume record. A new account whose crashed session
-        /// parked DNS still has its journal read and moved into the admin-only
-        /// directory (where the reconcile restores it), rather than marked
-        /// migrated unread, which would leave the machine without DNS.
+        /// D6c (W1-008): the DNS journal is MACHINE state, so its takeover does
+        /// not depend on the legacy-upgrade window — unlike the settings key and
+        /// the resume record. A new account whose crashed session parked DNS
+        /// still has its journal read and moved into the admin-only directory
+        /// (where the reconcile restores it), rather than marked migrated unread,
+        /// which would leave the machine without DNS.
         #[test]
         fn the_journal_is_taken_over_regardless_of_the_upgrade_window() {
             let d = dirs();
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, false),
                 Migration::Moved,
                 "a new account's journal must still be restored (machine state)"
             );
-            assert_eq!(read(&d.protected), journal(""));
+            // Taken over (sanitised outside the window — see the sanitise tests);
+            // still a journal of this OS that the reconcile can read.
+            assert!(d.protected.exists());
+            assert!(read(&d.protected).contains(&format!("\"os\":\"{}\"", std::env::consts::OS)));
             assert!(!d.legacy.join(JOURNAL_FILE).exists());
             assert!(d.marker.exists());
+        }
+
+        /// D6c MEDIUM: OUTSIDE the upgrade window the journal is unverified, so
+        /// its takeover drops the routes (the elevated app deletes none) and
+        /// heals adapters to DHCP, never to journal-supplied resolver values —
+        /// a planted journal cannot steer DNS or delete gateway routes. INSIDE
+        /// the window (a genuine upgrade) routes and resolvers are preserved.
+        #[cfg(windows)]
+        #[test]
+        fn an_unverified_journal_is_sanitised_outside_the_window() {
+            use super::super::tunnel::AdapterDnsSnapshot;
+            use super::super::win_machine_state::OwnedRoute;
+            use std::net::{IpAddr, Ipv4Addr};
+
+            let make = || DnsJournal {
+                os: std::env::consts::OS.to_string(),
+                adapters: vec![AdapterDnsSnapshot {
+                    adapter_name: "Wi-Fi".into(),
+                    adapter_guid: "{GUID}".into(),
+                    v4_was_dhcp: false,
+                    v6_was_dhcp: false,
+                    dns_servers: vec!["203.0.113.53".into()],
+                    dns_servers_v6: vec!["2001:db8::53".into()],
+                }],
+                routes: vec![OwnedRoute {
+                    dest: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+                    prefix_len: 32,
+                    next_hop: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                    if_index: 7,
+                }],
+                boot: Some(123),
+            };
+            let bytes = serde_json::to_vec(&make()).unwrap();
+
+            // Outside the window: sanitised.
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), &bytes).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, false),
+                Migration::Moved
+            );
+            let got: DnsJournal =
+                serde_json::from_slice(&std::fs::read(&d.protected).unwrap()).unwrap();
+            assert!(
+                got.routes.is_empty(),
+                "routes must be dropped outside the window"
+            );
+            assert_eq!(got.adapters.len(), 1);
+            let a = &got.adapters[0];
+            assert!(a.dns_servers.is_empty() && a.dns_servers_v6.is_empty());
+            assert!(
+                a.v4_was_dhcp && a.v6_was_dhcp,
+                "adapter must be healed to DHCP"
+            );
+            assert_eq!(a.adapter_guid, "{GUID}", "the adapter identity is kept");
+
+            // Inside the window: trusted verbatim.
+            let d2 = dirs();
+            std::fs::write(d2.legacy.join(JOURNAL_FILE), &bytes).unwrap();
+            assert_eq!(
+                migrate_legacy(&d2.legacy, &d2.protected, &d2.marker, true),
+                Migration::Moved
+            );
+            let kept: DnsJournal =
+                serde_json::from_slice(&std::fs::read(&d2.protected).unwrap()).unwrap();
+            assert_eq!(kept.routes.len(), 1, "routes kept inside the window");
+            assert_eq!(
+                kept.adapters[0].dns_servers,
+                vec!["203.0.113.53".to_string()]
+            );
+            assert!(!kept.adapters[0].v4_was_dhcp);
         }
 
         /// The machine-wide record already in the admin-only directory is
@@ -1440,7 +1560,7 @@ pub mod dns_journal {
             std::fs::write(&d.protected, journal(r#","boot":1"#)).unwrap();
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::LeftInPlace
             );
             assert_eq!(read(&d.protected), journal(r#","boot":1"#));
@@ -1454,7 +1574,7 @@ pub mod dns_journal {
                 let d = dirs();
                 std::fs::write(d.legacy.join(JOURNAL_FILE), bytes).unwrap();
                 assert_eq!(
-                    migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                    migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                     Migration::LeftInPlace,
                     "{bytes}"
                 );
@@ -1627,6 +1747,18 @@ pub mod dns_journal {
             let flag = MAIN
                 .find("arg == REMOVE_LEFTOVERS_AND_EXIT")
                 .expect("main() handles it");
+            // D6c BLOCKER: the cleanup sweep is dispatched BEFORE the process
+            // holds the per-user directories (hold_app_dirs) and before the file
+            // logger opens birdo.log inside one of them — otherwise this process
+            // would hold what the sweep must delete.
+            let hold = MAIN
+                .find("file_log::hold_app_dirs();")
+                .expect("main() holds the app dirs");
+            let init = MAIN.find(".init();").expect("main() starts the subscriber");
+            assert!(
+                flag < hold && flag < init,
+                "the cleanup sweep must run before hold_app_dirs() and the file logger"
+            );
             // D6c LOW: main() only LATCHES the window (read-only) before the
             // reconcile short-circuit; it never consumes it.
             let latch = MAIN

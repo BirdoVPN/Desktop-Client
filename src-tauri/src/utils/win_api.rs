@@ -33,6 +33,28 @@ extern "system" {
         size: u32,
     ) -> i32;
     fn GetFileInformationByHandle(file: *mut c_void, info: *mut ByHandleFileInformation) -> i32;
+    fn ExpandEnvironmentStringsW(src: *const u16, dst: *mut u16, len: u32) -> u32;
+}
+
+/// Expand `%VAR%` references in `s` (e.g. a REG_EXPAND_SZ `ProfileImagePath`),
+/// which `winreg` returns unexpanded. Returns `s` unchanged if the expansion
+/// fails or does not fit a generous buffer.
+pub fn expand_env(s: &str) -> OsString {
+    let src = wide(OsStr::new(s));
+    // Length probe (chars incl. NUL).
+    // SAFETY: `src` is NUL-terminated; a null/zero dst is the documented probe.
+    let needed = unsafe { ExpandEnvironmentStringsW(src.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 || needed as usize > 1 << 15 {
+        return OsString::from(s);
+    }
+    let mut buf = vec![0u16; needed as usize];
+    // SAFETY: `src` is NUL-terminated; `buf` holds `needed` units.
+    let n = unsafe { ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), needed) };
+    if n == 0 || n > needed {
+        return OsString::from(s);
+    }
+    // `n` includes the terminator.
+    OsString::from_wide(&buf[..n as usize - 1])
 }
 
 /// The fields of `BY_HANDLE_FILE_INFORMATION` this crate reads, in layout

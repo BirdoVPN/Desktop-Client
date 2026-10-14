@@ -128,18 +128,26 @@ const WITH_APP_DATA: &str = "--with-app-data";
 
 /// R2 (#287 follow-up L2): remove the updater's `updates\` and the squatted
 /// folders moved aside as `%ProgramData%\BirdoVPN.untrusted-*` (and, with
-/// [`WITH_APP_DATA`], the accounts' ML-KEM keypairs there, R4/D-23), never the
-/// settings keys or the migration markers (a reinstall needs the keys to
-/// verify the user's settings). Done here, not by NSIS: the set-aside folders
-/// are a user's, and NSIS's `RMDir /r` follows the junctions a user can plant
-/// in them (`protected_dir::remove_uninstall_leftovers_in`). Creates nothing,
-/// touches no other state, and exits before any window, tray or plugin.
+/// [`WITH_APP_DATA`], the accounts' ML-KEM keypairs there, R4/D-23, and the
+/// per-user app-data folders, D6c HIGH), never the settings keys or the
+/// migration markers (a reinstall needs the keys to verify the user's
+/// settings). Done here, not by NSIS: the folders are a user's, and NSIS's
+/// `RMDir /r` follows the junctions a user can plant in them
+/// (`protected_dir::remove_uninstall_leftovers`). Creates nothing, touches no
+/// other state, and exits before any window, tray or plugin.
+///
+/// D6c BLOCKER: dispatched from `main()` BEFORE `file_log::hold_app_dirs()` and
+/// before the file logger opens — otherwise THIS process would hold the very
+/// per-user directories (no `FILE_SHARE_DELETE`) and the open `birdo.log` it
+/// then tries to delete, and the sweep would fail
+/// ("…\Roaming\BirdoVPN\logs survived"). So it logs to stderr only (no
+/// subscriber is installed yet); the uninstaller's nsExec captures that.
 fn remove_leftovers_and_exit() -> ! {
     #[cfg(windows)]
     {
         let with_app_data = std::env::args().any(|arg| arg == WITH_APP_DATA);
         let done = crate::utils::protected_dir::remove_uninstall_leftovers(with_app_data);
-        info!(
+        eprintln!(
             "{}: removed {} updates folder(s), {} set-aside folder(s), {} ML-KEM key(s), \
              {} app-data entr(ies); {} failed",
             REMOVE_LEFTOVERS_AND_EXIT,
@@ -241,6 +249,17 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
 fn main() {
     // Set custom panic hook for crash recovery
     setup_panic_hook();
+
+    // R2 / D6c BLOCKER: the uninstaller's cleanup sweep runs FIRST — before
+    // hold_app_dirs() holds the per-user directories (without FILE_SHARE_DELETE)
+    // and before the file logger opens birdo.log inside one of them. Otherwise
+    // this very process would hold what the sweep must delete, and
+    // `--with-app-data` would leave `…\Roaming\BirdoVPN\logs` behind. It logs to
+    // stderr only (no subscriber yet) and exits; it never consumes the
+    // legacy-upgrade marker (item 4).
+    if std::env::args().any(|arg| arg == REMOVE_LEFTOVERS_AND_EXIT) {
+        remove_leftovers_and_exit();
+    }
 
     // MR-1945 H1: hold the user-writable state directories (config, logs,
     // crashes) open for the whole run, BEFORE anything writes to them, so an
@@ -363,12 +382,6 @@ fn main() {
         chrono::Utc::now(),
         crate::utils::log_retention::KEEP_CRASH_REPORTS,
     );
-
-    // R2: the uninstaller's cleanup. Before the upgrade window below: this run
-    // must not consume the installer's marker.
-    if std::env::args().any(|arg| arg == REMOVE_LEFTOVERS_AND_EXIT) {
-        remove_leftovers_and_exit();
-    }
 
     // R1 / D6c LOW: latch (read-only) whether this is the first start after the
     // installer upgraded a pre-MR-1721 install — the one run that may migrate

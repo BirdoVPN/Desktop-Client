@@ -471,51 +471,138 @@ fn remove_tree_no_follow(path: &Path) -> io::Result<()> {
 /// so it cannot be swapped for a junction between the check and the delete; its
 /// children are each removed with [`remove_tree_no_follow`]. A junction planted
 /// in its place is unlinked, never entered.
+///
+/// D6c LOW-MEDIUM: the roots come from `SHGetKnownFolderPath`, which a same-user
+/// process can REDIRECT via HKCU "User Shell Folders" — pointed at
+/// `%ProgramData%`, a fixed-name target would resolve onto the admin-only
+/// `BirdoVPN` and the sweep would delete the settings keys and markers,
+/// re-arming the migration. Two guards: a root is swept only when its final
+/// path resolves UNDER the token user's HKLM `ProfileList` profile directory
+/// (which HKCU cannot move); and no target that `inspect` reports `AdminOnly`
+/// is ever touched.
 fn remove_app_data_folders_in(appdata: &Path, localappdata: &Path) -> Leftovers {
+    remove_app_data_folders_under(appdata, localappdata, user_profile_dir().as_deref())
+}
+
+/// [`remove_app_data_folders_in`] with the profile directory injected, so a
+/// test can place its fake roots under a profile it controls.
+fn remove_app_data_folders_under(
+    appdata: &Path,
+    localappdata: &Path,
+    profile: Option<&Path>,
+) -> Leftovers {
     let mut done = Leftovers::default();
-    let mut sweep = |path: &Path| match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        _ => match remove_tree_no_follow(path) {
-            Ok(()) => done.app_data += 1,
-            Err(_) => done.failed += 1,
-        },
+    let under_profile = |root: &Path| match profile {
+        Some(p) => path_is_under(root, p),
+        None => false,
     };
-    sweep(&localappdata.join("BirdoVPN")); // device id, pre-R4 ML-KEM key
-    sweep(&localappdata.join("Birdo VPN")); // crash reports
-    sweep(&appdata.join(APP_IDENTIFIER)); // the template's own %APPDATA% folder
-    sweep(&localappdata.join(APP_IDENTIFIER)); // the template's own %LOCALAPPDATA% folder
+    let roam_ok = under_profile(appdata);
+    let local_ok = under_profile(localappdata);
+    if !roam_ok || !local_ok {
+        tracing::warn!("A per-user data root is not under the user profile — refusing to sweep it");
+        done.failed += 1;
+    }
+    let mut sweep = |path: &Path| {
+        // Never an admin-only directory: a redirected root could resolve a
+        // target onto %ProgramData%\BirdoVPN, whose keys and markers must stay.
+        if matches!(inspect(path), Ok(State::AdminOnly)) {
+            return;
+        }
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => match remove_tree_no_follow(path) {
+                Ok(()) => done.app_data += 1,
+                Err(_) => done.failed += 1,
+            },
+        }
+    };
+    if local_ok {
+        sweep(&localappdata.join("BirdoVPN")); // device id, pre-R4 ML-KEM key
+        sweep(&localappdata.join("Birdo VPN")); // crash reports
+        sweep(&localappdata.join(APP_IDENTIFIER)); // the template's local folder
+    }
+    if roam_ok {
+        sweep(&appdata.join(APP_IDENTIFIER)); // the template's roaming folder
+    }
 
     // %APPDATA%\BirdoVPN: logs and the rest, but keep the DNS journal.
     let birdo = super::safe_fs::OwnedDir::new(appdata, &["BirdoVPN"]);
-    match birdo.hold_open_if_present() {
-        Ok(None) => {}
-        Err(_) => {
-            // A junction (or an unverifiable folder) in its place: unlink it
-            // without entering. Nothing of ours is really behind a junction.
-            match remove_tree_no_follow(birdo.path()) {
-                Ok(()) => done.app_data += 1,
-                Err(_) => done.failed += 1,
-            }
-        }
-        Ok(Some(_guard)) => {
-            let Ok(entries) = std::fs::read_dir(birdo.path()) else {
-                done.failed += 1;
-                return done;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if is_dns_journal_name(name) {
-                    continue;
-                }
-                match remove_tree_no_follow(&birdo.join(name)) {
+    if roam_ok && !matches!(inspect(birdo.path()), Ok(State::AdminOnly)) {
+        match birdo.hold_open_if_present() {
+            Ok(None) => {}
+            Err(_) => {
+                // A junction (or an unverifiable folder) in its place: unlink it
+                // without entering. Nothing of ours is really behind a junction.
+                match remove_tree_no_follow(birdo.path()) {
                     Ok(()) => done.app_data += 1,
                     Err(_) => done.failed += 1,
+                }
+            }
+            Ok(Some(_guard)) => {
+                let Ok(entries) = std::fs::read_dir(birdo.path()) else {
+                    done.failed += 1;
+                    return done;
+                };
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    if is_dns_journal_name(name) {
+                        continue;
+                    }
+                    match remove_tree_no_follow(&birdo.join(name)) {
+                        Ok(()) => done.app_data += 1,
+                        Err(_) => done.failed += 1,
+                    }
                 }
             }
         }
     }
     done
+}
+
+/// The token user's profile directory from HKLM `ProfileList` (which only an
+/// administrator can write), so a redirected `%APPDATA%`/`%LOCALAPPDATA%` can
+/// be refused. `ProfileImagePath` is `REG_EXPAND_SZ`, which `winreg` returns
+/// unexpanded, so it is expanded here.
+fn user_profile_dir() -> Option<PathBuf> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    let sid = current_user_sid().ok()?;
+    let raw: String = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(
+            format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}"),
+            KEY_READ,
+        )
+        .ok()?
+        .get_value("ProfileImagePath")
+        .ok()?;
+    Some(PathBuf::from(win_api::expand_env(&raw)))
+}
+
+/// The final path of `p` (opened without following a reparse point), or `None`.
+fn final_path_of(p: &Path) -> Option<PathBuf> {
+    let handle = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(p)
+        .ok()?;
+    win_api::final_path(&handle).ok()
+}
+
+/// Whether `child` resolves to `ancestor` or a path beneath it, comparing
+/// resolved final paths component-by-component, case-insensitively (NTFS folds
+/// case). A root that does not resolve is not under anything.
+fn path_is_under(child: &Path, ancestor: &Path) -> bool {
+    let (Some(c), Some(a)) = (final_path_of(child), final_path_of(ancestor)) else {
+        return false;
+    };
+    let a_comps: Vec<_> = a.components().collect();
+    let c_comps: Vec<_> = c.components().collect();
+    c_comps.len() >= a_comps.len()
+        && a_comps
+            .iter()
+            .zip(&c_comps)
+            .all(|(x, y)| x.as_os_str().eq_ignore_ascii_case(y.as_os_str()))
 }
 
 /// An account's ML-KEM keypair file in the admin-only directory
@@ -1223,7 +1310,7 @@ mod tests {
         std::fs::write(appdata.join(APP_IDENTIFIER).join("settings.json"), "{}").unwrap();
         std::fs::create_dir_all(local.join(APP_IDENTIFIER)).unwrap();
 
-        let done = remove_app_data_folders_in(&appdata, &local);
+        let done = remove_app_data_folders_under(&appdata, &local, Some(base.path()));
 
         assert_eq!(done.failed, 0, "{done:?}");
         // The journal survives; everything else in %APPDATA%\BirdoVPN goes.
@@ -1257,7 +1344,7 @@ mod tests {
         std::fs::write(victim.join("precious.txt"), "keep").unwrap();
         junction(&appdata.join("BirdoVPN"), &victim);
 
-        let done = remove_app_data_folders_in(&appdata, &local);
+        let done = remove_app_data_folders_under(&appdata, &local, Some(base.path()));
 
         assert_eq!(done.failed, 0, "{done:?}");
         assert!(std::fs::symlink_metadata(appdata.join("BirdoVPN")).is_err());
@@ -1265,6 +1352,57 @@ mod tests {
             std::fs::read_to_string(victim.join("precious.txt")).unwrap() == "keep",
             "the sweep entered a junctioned folder"
         );
+    }
+
+    /// D6c LOW-MEDIUM: a root that does not resolve under the user profile (a
+    /// redirected %APPDATA%/%LOCALAPPDATA%) is refused — nothing is swept.
+    #[test]
+    fn a_root_outside_the_profile_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let appdata = base.path().join("Roaming");
+        let local = base.path().join("Local");
+        std::fs::create_dir_all(appdata.join("BirdoVPN")).unwrap();
+        std::fs::create_dir_all(local.join("BirdoVPN")).unwrap();
+        // A profile elsewhere: neither root is under it.
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        let done = remove_app_data_folders_under(&appdata, &local, Some(elsewhere.path()));
+
+        assert_eq!(done.app_data, 0);
+        assert!(done.failed >= 1, "{done:?}");
+        assert!(appdata.join("BirdoVPN").exists() && local.join("BirdoVPN").exists());
+        // And with no profile at all, the same refusal.
+        let done = remove_app_data_folders_under(&appdata, &local, None);
+        assert_eq!(done.app_data, 0);
+        assert!(appdata.join("BirdoVPN").exists());
+    }
+
+    /// D6c LOW-MEDIUM (elevated): a target that resolves onto an admin-only
+    /// directory — e.g. a root redirected onto %ProgramData% so the fixed name
+    /// hits the protected dir — is never swept, so the settings keys and markers
+    /// survive.
+    #[test]
+    fn an_admin_only_target_is_never_swept() {
+        if !elevated_or_skip("an_admin_only_target_is_never_swept") {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let appdata = base.path().join("Roaming");
+        let local = base.path().join("Local");
+        std::fs::create_dir_all(&appdata).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        // Make %LOCALAPPDATA%\BirdoVPN an admin-only directory holding a key.
+        let admin = secure_named(&local, "BirdoVPN").unwrap();
+        std::fs::write(admin.join("settings-hmac-S-1-5-21-1.key"), "k").unwrap();
+
+        let done = remove_app_data_folders_under(&appdata, &local, Some(base.path()));
+
+        assert_eq!(done.failed, 0, "{done:?}");
+        assert!(
+            admin.join("settings-hmac-S-1-5-21-1.key").exists(),
+            "an admin-only target was swept"
+        );
+        assert_eq!(inspect(&admin).unwrap(), State::AdminOnly);
     }
 
     /// Only the DNS-restore journal and its variants are kept.
