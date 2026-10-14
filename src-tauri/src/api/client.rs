@@ -1313,7 +1313,8 @@ impl BirdoApi {
                         if let Err(e) = CredentialStore::store(CredentialKey::RefreshToken, rotated)
                         {
                             tracing::error!(
-                                "Could not persist ROTATED refresh token ({e}) — the next launch                                  will replay a consumed token and the session will be revoked"
+                                "Could not persist ROTATED refresh token ({e}) — the next launch \
+                                 will replay a consumed token and the session will be revoked"
                             );
                         }
                     }
