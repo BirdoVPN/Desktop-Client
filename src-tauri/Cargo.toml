@@ -38,7 +38,15 @@ tauri = { version = "2.12.0", features = ["tray-icon"] }
 # pin, but png 0.18 stays a leaner, known-good decode path we keep to avoid
 # dragging that graph in. png 0.18 (rust-version 1.73) builds cleanly on 1.96.
 png = "0.18"
-tauri-plugin-shell = "2.0"
+# Opens birdo.app pages in the system browser. MR-713 (2026-10-14) replaced
+# the Tauri shell plugin with this one: the shell plugin's `open` is deprecated
+# in favour of the opener, and it also shipped a process-spawning `Command`
+# API this app never used. The webview's URL allowlist is the scoped
+# `opener:allow-open-url` entry in capabilities/default.json, pinned by
+# src/commands/capability_scope_tests.rs. EXACT pin: 2.7.1 was inside the
+# 7-day release cooldown when this landed, and the npm twin
+# @tauri-apps/plugin-opener is pinned to the same 2.7.0.
+tauri-plugin-opener = "=2.7.0"
 tauri-plugin-notification = "2.0"
 tauri-plugin-autostart = "2.0"
 tauri-plugin-updater = "2.0"
@@ -295,6 +303,13 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3.13"
+# Paused time for the tests (`#[tokio::test(start_paused = true)]`,
+# `tokio::time::advance`): the Disconnect release deadline is driven through
+# its 40 s without waiting them (MR-1408). A feature of the tokio already
+# above, not a new crate: `test-util` is `rt` + `sync` + `time`, so Cargo.lock
+# does not change, and a dev-dependency's features never reach the release
+# build (resolver 2).
+tokio = { version = "1.41", features = ["test-util"] }
 # K5 connect contract: validates the SERIALIZED ConnectRequest /
 # MultiHopConnectRequest bodies against the vendored
 # contract/vpn-protocol.schema.json (src/api/contract_tests.rs). Exact pin so a
@@ -316,3 +331,8 @@ tempfile = "3.13"
 # 0.56.0 -> 0.58.3 (#241): the same zmij and fraction requirements as 0.56.0,
 # so that bump moved no crate in the shipped binary.
 jsonschema ={ version = "=0.58.3", default-features = false }
+# MR-713: src/commands/capability_scope_tests.rs matches the opener URL scope
+# with the matcher tauri-plugin-opener itself uses (`glob::Pattern`). "0.3"
+# unifies with the plugin's own `glob = "^0.3"`, so the test and the app share
+# one glob crate and this adds nothing to the graph.
+glob = "0.3"

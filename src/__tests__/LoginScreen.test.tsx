@@ -12,7 +12,7 @@ import { useAppStore } from '@/store/app-store';
 import { SESSION_EXPIRED_COPY } from '@/lib/errors';
 
 vi.mock('@tauri-apps/api/core');
-vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
 
 const mockedInvoke = vi.mocked(invoke);
 

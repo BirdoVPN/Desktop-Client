@@ -17,7 +17,7 @@
  */
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
 import { useShallow } from 'zustand/react/shallow';
 import {
   Wifi,

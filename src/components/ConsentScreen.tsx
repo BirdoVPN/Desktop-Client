@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
 import { Shield, Eye, ChartColumn, ShieldOff } from 'lucide-react';
 import { AppIconMark, BirdoButton, BirdoCard, BirdoToggleRow } from './birdo';
 import { brand, motion as motionTokens } from '@/lib/birdo-theme';

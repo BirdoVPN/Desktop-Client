@@ -17,7 +17,7 @@ import { Settings } from '@/components/Settings';
 import { SETTINGS_UNVERIFIED_COPY } from '@/lib/errors';
 
 vi.mock('@tauri-apps/api/core');
-vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
 
 function stripMotion(props: Record<string, unknown>) {
   const {

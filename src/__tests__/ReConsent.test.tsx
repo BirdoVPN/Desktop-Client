@@ -37,7 +37,7 @@ vi.mock('@tauri-apps/api/window', () => ({
   primaryMonitor: async () => null,
 }));
 vi.mock('@tauri-apps/plugin-process', () => ({ exit: vi.fn().mockResolvedValue(undefined), relaunch: vi.fn() }));
-vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn() }));
+vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn() }));
 vi.mock('@tauri-apps/plugin-notification', () => ({
   isPermissionGranted: vi.fn().mockResolvedValue(false),
   requestPermission: vi.fn().mockResolvedValue('denied'),
