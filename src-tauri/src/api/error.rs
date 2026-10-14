@@ -31,6 +31,12 @@ pub enum ApiError {
     /// after the wait — not "try another location". The wait is clamped by
     /// [`retry_after_header`].
     ServerBusy { status: u16, retry_after_secs: u64 },
+    /// NOT SENT: the API client's retry gate answered a request the server had
+    /// asked to hold — a 429 (`status` 429) or a busy 5xx — with the wait
+    /// that is left (MR-1808). It reads to the user exactly as the server's
+    /// own answer did; it is its own variant because nothing crossed the
+    /// network, so it says nothing about the network or the tunnel.
+    Held { status: u16, retry_after_secs: u64 },
     /// Failed to parse response
     Parse(String),
     /// SEC-C1: TLS certificate pinning verification failed (possible MITM)
@@ -166,6 +172,14 @@ impl fmt::Display for ApiError {
             } => write!(
                 f,
                 "The service is busy (HTTP {}); try again in {} s",
+                status, retry_after_secs
+            ),
+            ApiError::Held {
+                status,
+                retry_after_secs,
+            } => write!(
+                f,
+                "Not sent: the server asked to wait (HTTP {}); try again in {} s",
                 status, retry_after_secs
             ),
             ApiError::Parse(msg) => write!(f, "Failed to parse response: {}", msg),

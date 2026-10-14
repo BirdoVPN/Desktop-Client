@@ -1411,14 +1411,12 @@ impl ReconnectLoop {
             Ok(Err(e)) => {
                 tracing::warn!("Heartbeat failed: {}", heartbeat_failure(&e));
                 // An HTTP status crossed the tunnel to arrive; only a failure
-                // on the network itself says the tunnel may carry nothing.
+                // on the network itself says the tunnel may carry nothing,
+                // and one never sent says nothing either way.
                 #[cfg(target_os = "windows")]
                 {
-                    self.session.heartbeat_misses = if heartbeat_missed_the_network(&e) {
-                        self.session.heartbeat_misses.saturating_add(1)
-                    } else {
-                        0
-                    };
+                    self.session.heartbeat_misses =
+                        misses_after_failure(self.session.heartbeat_misses, &e);
                 }
                 return Flow::Continue;
             }
@@ -1693,6 +1691,21 @@ fn heartbeat_missed_the_network(e: &crate::api::ApiError) -> bool {
     matches!(e, crate::api::ApiError::Network(_))
 }
 
+/// The run of network misses after a heartbeat that failed with `e`
+/// (Windows only; see `SessionWatch`): one more when it failed on the
+/// network; reset by an answer, which had to cross the tunnel to arrive; and
+/// UNCHANGED when it was never sent — the API client's retry gate answered it
+/// (`ApiError::Held`, MR-1808), so it says nothing about the tunnel either way
+/// (review of #289).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn misses_after_failure(misses: u32, e: &crate::api::ApiError) -> u32 {
+    match e {
+        crate::api::ApiError::Held { .. } => misses,
+        e if heartbeat_missed_the_network(e) => misses.saturating_add(1),
+        _ => 0,
+    }
+}
+
 /// What a failed heartbeat met, for the log: a status or a kind, never the
 /// error's text — a transport error names the URL, and the heartbeat's URL
 /// carries the session's key id (the node-agent privacy convention).
@@ -1705,6 +1718,7 @@ fn heartbeat_failure(e: &crate::api::ApiError) -> String {
         E::Forbidden => "HTTP 403".into(),
         E::NotFound => "HTTP 404".into(),
         E::RateLimited { .. } => "HTTP 429".into(),
+        E::Held { status, .. } => format!("not sent (waiting out HTTP {status}'s Retry-After)"),
         E::UpgradeRequired(_) => "HTTP 426".into(),
         E::ServerError(status) | E::ServerBusy { status, .. } | E::Rejected { status, .. } => {
             format!("HTTP {status}")
@@ -1751,6 +1765,46 @@ mod tests {
                 retry_after_secs: 30
             }),
             "HTTP 503"
+        );
+    }
+
+    /// Review of #289: a heartbeat the retry gate answered was never sent, so
+    /// it neither counts as a network miss nor clears the run of them (that
+    /// would hide a dead tunnel from the re-prove rule); a real answer, which
+    /// crossed the tunnel, clears it; a network failure adds one.
+    #[test]
+    fn a_heartbeat_that_was_never_sent_leaves_the_misses_alone() {
+        use crate::api::ApiError;
+        let held = ApiError::Held {
+            status: 429,
+            retry_after_secs: 30,
+        };
+        assert_eq!(misses_after_failure(2, &held), 2);
+        assert_eq!(misses_after_failure(0, &held), 0);
+        assert_eq!(
+            misses_after_failure(2, &ApiError::Network("reset".into())),
+            3
+        );
+        assert_eq!(
+            misses_after_failure(u32::MAX, &ApiError::Network("reset".into())),
+            u32::MAX
+        );
+        for answered in [
+            ApiError::RateLimited {
+                retry_after_secs: Some(30),
+            },
+            ApiError::ServerBusy {
+                status: 503,
+                retry_after_secs: 30,
+            },
+            ApiError::ServerError(502),
+            ApiError::Unauthorized,
+        ] {
+            assert_eq!(misses_after_failure(2, &answered), 0, "{answered:?}");
+        }
+        assert_eq!(
+            heartbeat_failure(&held),
+            "not sent (waiting out HTTP 429's Retry-After)"
         );
     }
 
@@ -2222,7 +2276,11 @@ mod tests {
         let heartbeat = &heartbeat[..heartbeat
             .find("matchreconnect_policy::heartbeat_verdict")
             .unwrap()];
-        assert!(heartbeat.contains("ifheartbeat_missed_the_network(&e){"));
+        // The failure rule itself, with a gated (never sent) heartbeat, is
+        // `misses_after_failure` (a_heartbeat_that_was_never_sent_…).
+        assert!(heartbeat.contains(
+            "self.session.heartbeat_misses=misses_after_failure(self.session.heartbeat_misses,&e);"
+        ));
         assert!(heartbeat.contains(
             "self.session.heartbeat_misses=self.session.heartbeat_misses.saturating_add(1);"
         ));

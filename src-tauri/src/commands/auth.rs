@@ -376,7 +376,13 @@ fn delete_failure_message(error: &ApiError) -> IpcError {
         ),
         other => (IpcError::from_api(other).code, other.to_string()),
     };
-    IpcError::new(code, format!("Account deletion failed: {}", reason))
+    let failed = IpcError::new(code, format!("Account deletion failed: {}", reason));
+    // MR-1808: a rate limit keeps the server's `Retry-After`, so the dialog
+    // can say how long to wait.
+    match IpcError::from_api(error).retry_after_secs {
+        Some(secs) => failed.with_retry_after(secs),
+        None => failed,
+    }
 }
 
 /// The physical interface's address while a tunnel is up, for a request that
@@ -542,7 +548,8 @@ pub async fn get_auth_state(
                 // later", and says nothing about the token either.
                 Err(
                     e @ (crate::api::error::ApiError::RateLimited { .. }
-                    | crate::api::error::ApiError::ServerBusy { .. }),
+                    | crate::api::error::ApiError::ServerBusy { .. }
+                    | crate::api::error::ApiError::Held { .. }),
                 ) => {
                     tracing::warn!(
                         "Profile fetch refused for now ({e}) — NOT refreshing; session kept, \
@@ -1206,6 +1213,12 @@ mod account_boundary_tests {
             .code,
             IpcErrorCode::RateLimited
         );
+        // MR-1808: the server's wait reaches the dialog.
+        let limited = delete_failure_message(&ApiError::RateLimited {
+            retry_after_secs: Some(30),
+        });
+        assert_eq!(limited.code, IpcErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_secs, Some(30));
     }
 
     /// The UI sends `two_factor_code` only on the retry; today's dialog sends

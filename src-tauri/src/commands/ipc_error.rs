@@ -226,6 +226,21 @@ impl IpcError {
                 "BirdoVPN is busy right now. Please try again in a moment.",
                 Some(*retry_after_secs),
             ),
+            // Answered by the API client's retry gate without being sent: the
+            // user is told exactly what the server's own answer said.
+            ApiError::Held {
+                status: 429,
+                retry_after_secs,
+            } => Self::from_api(&ApiError::RateLimited {
+                retry_after_secs: Some(*retry_after_secs),
+            }),
+            ApiError::Held {
+                status,
+                retry_after_secs,
+            } => Self::from_api(&ApiError::ServerBusy {
+                status: *status,
+                retry_after_secs: *retry_after_secs,
+            }),
             // MR-1944: its own words, not the plan copy a bare 403 gets.
             // Attestation is log-only on the server today, so this is rare;
             // the sentence says what helps without alarming anyone.
@@ -491,6 +506,20 @@ mod tests {
             (
                 ApiError::ClientAttestationRequired("x".into()),
                 IpcErrorCode::ClientAttestationRequired,
+            ),
+            (
+                ApiError::Held {
+                    status: 429,
+                    retry_after_secs: 30,
+                },
+                IpcErrorCode::RateLimited,
+            ),
+            (
+                ApiError::Held {
+                    status: 503,
+                    retry_after_secs: 30,
+                },
+                IpcErrorCode::ServerError,
             ),
             (ApiError::ServerError(502), IpcErrorCode::ServerError),
             (ApiError::ServerError(503), IpcErrorCode::ServerUnavailable),
@@ -972,6 +1001,25 @@ mod tests {
                 );
                 assert_eq!(serde_json::to_value(&err).unwrap()["retry_after_secs"], 42);
             }
+        }
+
+        // The retry gate's local answer (nothing sent) reads exactly like the
+        // server's own, wait included, and is never `session_expired` either.
+        for (status, code) in [
+            (429, IpcErrorCode::RateLimited),
+            (503, IpcErrorCode::ServerError),
+        ] {
+            let err = IpcError::from_api(&ApiError::Held {
+                status,
+                retry_after_secs: 42,
+            });
+            assert_eq!(err.code, code, "{status}");
+            assert_eq!(err.retry_after_secs, Some(42), "{status}");
+            assert_eq!(
+                err.retry_wait(),
+                Some(std::time::Duration::from_secs(42)),
+                "{status}"
+            );
         }
 
         // Without `Retry-After` nothing changes for a 5xx: a 503 is still

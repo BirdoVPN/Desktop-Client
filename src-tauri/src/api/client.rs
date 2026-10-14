@@ -274,6 +274,17 @@ pub(crate) fn never_left(error: &reqwest::Error) -> bool {
     error.is_connect()
 }
 
+/// The response's `Retry-After`, parsed and clamped
+/// (`error::retry_after_header`, MR-1808). Read before the body consumes the
+/// response.
+fn retry_after_of(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| super::error::retry_after_header(value, std::time::SystemTime::now()))
+}
+
 /// `work` to its end on a task of its own, holding `lock` until it is done.
 /// Dropping the caller drops neither (see `BirdoApi::refresh_detached`).
 async fn run_holding<T: Send + 'static>(
@@ -684,8 +695,12 @@ impl BirdoApi {
         };
         let response = sent.map_err(|e| ApiError::Network(e.to_string()))?;
         let status = response.status();
+        // MR-1808: a refused deletion reports the server's wait. Not through
+        // the retry gate: the deletion is the user's own deliberate action, so
+        // a retry is never held back here, only told how long to wait.
+        let retry_after = retry_after_of(&response);
         let text = response.text().await.unwrap_or_default();
-        let outcome = Self::classify_gdpr_delete_response(status, &text);
+        let outcome = Self::classify_gdpr_delete_response_after(status, &text, retry_after);
         // Same one-way latch every control-plane response gets (handle_response_from).
         if let GdprDeleteOutcome::Refused(ApiError::UpgradeRequired(info)) = &outcome {
             super::upgrade_gate::latch_from(
@@ -705,9 +720,20 @@ impl BirdoApi {
     /// - 401 with any other message: the password check refused; that message
     ///   is the answer.
     /// - anything else: the normal mapping, which keeps the backend's message.
+    #[cfg(test)]
     pub(crate) fn classify_gdpr_delete_response(
         status: StatusCode,
         body: &str,
+    ) -> GdprDeleteOutcome {
+        Self::classify_gdpr_delete_response_after(status, body, None)
+    }
+
+    /// [`Self::classify_gdpr_delete_response`], told the response's
+    /// `Retry-After` (MR-1808), which a refusal carries like any other.
+    pub(crate) fn classify_gdpr_delete_response_after(
+        status: StatusCode,
+        body: &str,
+        retry_after: Option<u64>,
     ) -> GdprDeleteOutcome {
         if status.is_success() {
             let parsed = serde_json::from_str::<DeleteAccountResponse>(body).unwrap_or_default();
@@ -729,7 +755,11 @@ impl BirdoApi {
                 _ => GdprDeleteOutcome::SessionExpired,
             };
         }
-        GdprDeleteOutcome::Refused(Self::classify_error_response(status, body))
+        GdprDeleteOutcome::Refused(Self::classify_error_response_after(
+            status,
+            body,
+            retry_after,
+        ))
     }
 
     /// GDPR: Export all user data (Right to Data Portability, Art. 20)
@@ -1163,9 +1193,10 @@ impl BirdoApi {
         auth: bool,
     ) -> Result<T, ApiError> {
         let url = format!("{}{}", API_BASE_URL, path);
-        // MR-1808: a request the server asked to hold is answered here, with
-        // the wait that is left, until that wait is over. Never logged: a
-        // heartbeat's path carries the session's key id.
+        // MR-1808: a request the server asked to hold is answered here
+        // (`ApiError::Held`, nothing sent), with the wait that is left, until
+        // that wait is over. Never logged: a heartbeat's path carries the
+        // session's key id.
         let held = format!("{method} {path}");
         self.retry_gate.check(&held, std::time::Instant::now())?;
         let mut request = self.client.request(method.clone(), &url);
@@ -1379,6 +1410,10 @@ impl BirdoApi {
     ///     a bare "Access denied". Two exceptions, both for the wait they carry
     ///     (MR-1808): a 429, and a 5xx that names a wait — see
     ///     [`Self::classify_error_response_after`].
+    ///
+    /// The tests' entry point: every response is classified through
+    /// [`Self::classify_error_response_after`], which also knows its `Retry-After`.
+    #[cfg(test)]
     pub(crate) fn classify_error_response(status: StatusCode, error_text: &str) -> ApiError {
         Self::classify_error_response_after(status, error_text, None)
     }
@@ -1539,13 +1574,7 @@ impl BirdoApi {
         }
 
         // MR-1808: read before the body consumes the response.
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| {
-                super::error::retry_after_header(value, std::time::SystemTime::now())
-            });
+        let retry_after = retry_after_of(&response);
         // Parse the body once for typed protocol errors and backend-provided messages.
         let error_text = response.text().await.unwrap_or_else(|e| {
             // The body read itself failed (broken stream/timeout). We still fall
@@ -2047,6 +2076,39 @@ mod retry_after_tests {
             error_for(401, Some("30")).await,
             ApiError::Unauthorized
         ));
+    }
+
+    /// The account deletion reports the server's wait like every other
+    /// refusal, but is never held back locally: it is the user's own
+    /// deliberate action (review of #289).
+    #[test]
+    fn a_refused_deletion_reports_its_wait_and_is_never_held() {
+        assert!(matches!(
+            BirdoApi::classify_gdpr_delete_response_after(
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"statusCode":429,"message":"Slow down"}"#,
+                Some(30),
+            ),
+            GdprDeleteOutcome::Refused(ApiError::RateLimited {
+                retry_after_secs: Some(30)
+            })
+        ));
+        const SOURCE: &str = include_str!("client.rs");
+        let start = SOURCE.find("async fn send_gdpr_delete(").unwrap();
+        let body = &SOURCE[start..];
+        let body = &body[..body
+            .find(
+                "
+    }",
+            )
+            .unwrap()];
+        let read = body
+            .find("let retry_after = retry_after_of(&response);")
+            .expect("the header is read");
+        let text = body.find("response.text()").expect("the body is read");
+        assert!(read < text, "read before the body consumes the response");
+        assert!(body.contains("classify_gdpr_delete_response_after(status, &text, retry_after)"));
+        assert!(!body.contains("retry_gate"), "a deletion is never held");
     }
 
     /// Every client made from this one shares the holds: the re-dial's and

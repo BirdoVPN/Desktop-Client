@@ -23,7 +23,7 @@ use crate::storage::CredentialStore;
 fn friendly_redeem_error(err: &ApiError) -> String {
     match err {
         ApiError::NotFound => "We couldn't find that voucher code. Double-check it and try again.".to_string(),
-        ApiError::RateLimited { .. } => "Too many attempts. Please wait a minute and try again.".to_string(),
+        ApiError::RateLimited { .. } | ApiError::Held { status: 429, .. } => "Too many attempts. Please wait a minute and try again.".to_string(),
         ApiError::Unauthorized | ApiError::NotAuthenticated => {
             "Your session has expired. Please sign in again to redeem a voucher.".to_string()
         }

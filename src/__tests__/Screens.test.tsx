@@ -176,14 +176,27 @@ describe('Profile', () => {
     expect(document.body.textContent).not.toContain('1234 5678');
     await userEvent.click(screen.getByRole('button', { name: 'Show account number' }));
     expect(screen.getByTestId('account-number')).toHaveTextContent('1234 5678 9012 3456 7890 1234');
-    // MR-1723: through Rust's copy_sensitive (kept out of clipboard history,
-    // cleared after a minute), not the webview's ordinary clipboard.
-    mockedInvoke.mockImplementation(async (cmd: string) => (cmd === 'copy_sensitive' ? true : undefined));
-    await userEvent.click(screen.getByRole('button', { name: 'Copy account number' }));
-    await waitFor(() =>
-      expect(callsTo('copy_sensitive')).toEqual([['copy_sensitive', { text: '123456789012345678901234' }]]),
-    );
-    expect(writeText).not.toHaveBeenCalled();
+    const realUserAgent = navigator.userAgent;
+    const setUserAgent = (ua: string) =>
+      Object.defineProperty(window.navigator, 'userAgent', { value: ua, configurable: true });
+    try {
+      // MR-1723, Windows: through Rust's copy_sensitive (kept out of clipboard
+      // history, cleared after a minute), not the webview's ordinary clipboard.
+      setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/141.0');
+      mockedInvoke.mockImplementation(async (cmd: string) => (cmd === 'copy_sensitive' ? true : undefined));
+      await userEvent.click(screen.getByRole('button', { name: 'Copy account number' }));
+      await waitFor(() =>
+        expect(callsTo('copy_sensitive')).toEqual([['copy_sensitive', { text: '123456789012345678901234' }]]),
+      );
+      expect(writeText).not.toHaveBeenCalled();
+      // macOS / Linux: the ordinary copy, at once (inside the click), no IPC.
+      setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15');
+      await userEvent.click(screen.getByRole('button', { name: 'Copy account number' }));
+      expect(writeText).toHaveBeenCalledWith('123456789012345678901234');
+      expect(callsTo('copy_sensitive')).toHaveLength(1);
+    } finally {
+      setUserAgent(realUserAgent);
+    }
   });
 
   it('a server that sends no number: still "Anonymous account", no number, and says why', () => {

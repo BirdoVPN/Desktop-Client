@@ -93,9 +93,16 @@ fn acceptable(text: &str) -> bool {
 
 /// `text` as the clipboard stores it: UTF-16 with a terminating NUL. Wiped
 /// on drop, like every copy of the credential this module makes.
+///
+/// Built in a buffer allocated once, at its final size: UTF-16 never takes
+/// more units than UTF-8 takes bytes, so `len + 1` holds it all. A growing
+/// `collect()` would reallocate and free the earlier, un-wiped buffers.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn to_wide_nul(text: &str) -> Zeroizing<Vec<u16>> {
-    Zeroizing::new(text.encode_utf16().chain(std::iter::once(0)).collect())
+    let mut wide = Zeroizing::new(Vec::with_capacity(text.len() + 1));
+    wide.extend(text.encode_utf16());
+    wide.push(0);
+    wide
 }
 
 /// Whether the clipboard's text `held` (as stored: possibly NUL-terminated,
@@ -264,6 +271,121 @@ mod win {
         unsafe { EmptyClipboard()? };
         Ok(true)
     }
+
+    /// What the Windows round-trip test reads and writes besides the real
+    /// path (review of #289): the clipboard as it is, an ordinary copy (what
+    /// another app's copy looks like), and putting the developer's own
+    /// clipboard text back afterwards.
+    #[cfg(test)]
+    pub(super) mod probe {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// The clipboard, opened patiently: another process (a monitor
+        /// reading the last copy) may hold it for a while. `None` only when
+        /// it cannot be opened at all, e.g. a session with no interactive
+        /// window station.
+        fn open_patiently(within: Duration) -> Option<Opened> {
+            let start = Instant::now();
+            loop {
+                if let Ok(open) = Opened::open() {
+                    return Some(open);
+                }
+                if start.elapsed() >= within {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        pub(crate) fn can_open() -> bool {
+            open_patiently(Duration::from_secs(10)).is_some()
+        }
+
+        /// The raw bytes of `format` on the open clipboard, whole block.
+        fn read(_open: &Opened, format: u32) -> Option<Vec<u8>> {
+            // SAFETY: open clipboard; the block is only read, while locked,
+            // within its size.
+            unsafe {
+                let handle = GetClipboardData(format).ok()?;
+                let mem = HGLOBAL(handle.0);
+                let ptr = GlobalLock(mem).cast::<u8>();
+                if ptr.is_null() {
+                    return None;
+                }
+                let bytes = std::slice::from_raw_parts(ptr, GlobalSize(mem)).to_vec();
+                let _ = GlobalUnlock(mem);
+                Some(bytes)
+            }
+        }
+
+        fn wide(bytes: Vec<u8>) -> Vec<u16> {
+            bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect()
+        }
+
+        /// What is on the clipboard now: its text, and each privacy format
+        /// as (registered id, data).
+        pub(crate) struct Snapshot {
+            pub(crate) text: Option<Vec<u16>>,
+            pub(crate) marks: Vec<(u32, Option<Vec<u8>>)>,
+        }
+
+        pub(crate) fn snapshot() -> Snapshot {
+            let ids = privacy_formats().expect("the privacy formats register");
+            let open = open_patiently(Duration::from_secs(10)).expect("the clipboard opens");
+            Snapshot {
+                text: read(&open, CF_UNICODETEXT).map(wide),
+                marks: ids.iter().map(|&id| (id, read(&open, id))).collect(),
+            }
+        }
+
+        /// Another app's copy of `text` (UTF-16, NUL-terminated): a new
+        /// clipboard content, so the sequence number moves. It opts out of
+        /// clipboard history too, only so the test leaves nothing in a
+        /// developer's Win+V history.
+        pub(crate) fn set_plain(text: &[u16]) -> Result<()> {
+            let [exclude, ..] = privacy_formats()?;
+            let open = Opened::open()?;
+            // SAFETY: open clipboard; `text` viewed as bytes, as in `set`.
+            unsafe {
+                EmptyClipboard()?;
+                put(&open, exclude, &super::super::DWORD_ZERO)?;
+                let bytes = std::slice::from_raw_parts(
+                    text.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(text),
+                );
+                put(&open, CF_UNICODETEXT, bytes)
+            }
+        }
+
+        /// Puts back, on drop, the text that was on the clipboard when it
+        /// was made, so running the tests on a workstation does not eat the
+        /// developer's clipboard (text only; anything else is lost).
+        pub(crate) struct Restore(Option<Vec<u16>>);
+
+        impl Restore {
+            pub(crate) fn save() -> Self {
+                let open = open_patiently(Duration::from_secs(10));
+                Self(open.and_then(|open| read(&open, CF_UNICODETEXT)).map(wide))
+            }
+        }
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(text) = &self.0 {
+                    for _ in 0..50 {
+                        if set_plain(text).is_ok() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +452,110 @@ mod tests {
         assert!(!acceptable("12\u{0}34"));
         assert!(!acceptable(&"1".repeat(MAX_LEN + 1)));
         assert!(acceptable(&"1".repeat(MAX_LEN)));
+    }
+
+    /// `to_wide_nul` allocates once, at its final size, so no un-wiped
+    /// intermediate buffer is left behind (review of #289).
+    #[test]
+    fn the_wide_buffer_is_allocated_once() {
+        for text in ["123456789012345678901234", "é", "日本", "🦆"] {
+            let wide = to_wide_nul(text);
+            assert_eq!(wide.capacity(), text.len() + 1, "{text}");
+            assert_eq!(wide.len(), text.encode_utf16().count() + 1, "{text}");
+            assert_eq!(wide.last(), Some(&0));
+        }
+    }
+
+    /// Review of #289: the real round trip, on the real clipboard. A copy is
+    /// read back with its text and the three privacy formats (registered,
+    /// each a 4-byte zero); the delayed clear empties an untouched clipboard,
+    /// and leaves it alone after another copy: of different text and, where
+    /// Windows numbers clipboard changes, of the very same digits.
+    ///
+    /// Busy is retried. It is skipped only when the clipboard cannot be opened
+    /// at all in this session, and says so on stderr either way (written past
+    /// the test harness's capture, so a CI log shows whether it ran). A
+    /// developer's own clipboard text is put back afterwards.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_windows_copy_is_marked_and_cleared_only_if_unchanged() {
+        use std::io::Write;
+        let say = |line: &str| {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        };
+        if !win::probe::can_open() {
+            say(
+                "copy_sensitive clipboard round-trip: SKIPPED - OpenClipboard is impossible in \
+                 this session (no interactive window station)",
+            );
+            return;
+        }
+        let _restore = win::probe::Restore::save();
+        // Busy clipboards (a monitor reading the last copy) are retried.
+        fn retry<T>(what: &str, mut f: impl FnMut() -> windows::core::Result<T>) -> T {
+            let mut last = None;
+            for _ in 0..50 {
+                match f() {
+                    Ok(value) => return value,
+                    Err(e) => last = Some(e),
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            panic!("{what}: {last:?}");
+        }
+        let holds = |text: &[u16]| {
+            win::probe::snapshot()
+                .text
+                .is_some_and(|held| same_text(&held, text))
+        };
+        let ours = to_wide_nul(&format!("birdo-copy-sensitive-test-{}", std::process::id()));
+
+        // The copy, read back: the text and the three marks.
+        let armed = retry("copy", || win::set(&ours));
+        let snapshot = win::probe::snapshot();
+        assert!(
+            snapshot
+                .text
+                .as_deref()
+                .is_some_and(|held| same_text(held, &ours)),
+            "the text is on the clipboard"
+        );
+        assert_eq!(snapshot.marks.len(), PRIVACY_FORMATS.len());
+        for ((id, data), name) in snapshot.marks.iter().zip(PRIVACY_FORMATS) {
+            assert_ne!(*id, 0, "{name} is registered");
+            let data = data
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} is on the clipboard"));
+            assert!(data.len() >= 4, "{name}: {} bytes", data.len());
+            assert_eq!(data[..4], DWORD_ZERO, "{name} is a DWORD 0");
+        }
+
+        // Untouched since the copy: cleared.
+        assert!(retry("clear", || win::clear_if_unchanged(armed, &ours)));
+        assert!(
+            win::probe::snapshot().text.is_none(),
+            "the copy was cleared"
+        );
+
+        // The same digits copied again elsewhere: the sequence number moved,
+        // so it is the user's copy now and is left alone.
+        let armed = retry("copy", || win::set(&ours));
+        retry("another copy", || win::probe::set_plain(&ours));
+        if armed != 0 {
+            assert!(!retry("clear", || win::clear_if_unchanged(armed, &ours)));
+            assert!(holds(&ours), "the user's copy was wiped");
+        }
+
+        // Something else copied since: left alone.
+        let theirs = to_wide_nul("something the user copied");
+        retry("another copy", || win::probe::set_plain(&theirs));
+        assert!(!retry("clear", || win::clear_if_unchanged(armed, &ours)));
+        assert!(holds(&theirs), "the user's copy was wiped");
+
+        say(&format!(
+            "copy_sensitive clipboard round-trip: RAN (sequence numbers: {})",
+            if armed != 0 { "yes" } else { "no, text only" }
+        ));
     }
 
     /// Off Windows nothing is done natively: the UI copies the ordinary way.
