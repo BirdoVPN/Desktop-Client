@@ -46,6 +46,9 @@ export const DEVICE_LIMIT_COPY =
   'Disconnect another device or upgrade your plan.';
 export const SERVER_UNREACHABLE_COPY =
   "Couldn't establish a secure tunnel to this server. Try another location.";
+export const CLIENT_ATTESTATION_COPY =
+  "BirdoVPN couldn't verify this copy of the app. Install the latest version from birdo.app, " +
+  'then try again.';
 export const SETTINGS_UNVERIFIED_COPY =
   "Your saved settings couldn't be verified right now, so this change wasn't saved. " +
   'Try again in a moment, or reset your settings to their defaults.';
@@ -115,6 +118,11 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   // The settings file's signing key is unreadable, so Rust refused to write
   // over the file. The save notice offers the reset itself.
   settings_unverified: { message: SETTINGS_UNVERIFIED_COPY, action: null },
+  // The server's attestation policy refused this build (MR-1944). It used to
+  // read as `subscription_required`, whose "upgrade" cannot help. Plain on
+  // purpose: attestation is log-only on the server today, so this is rare,
+  // and it is no accusation.
+  client_attestation_required: { message: CLIENT_ATTESTATION_COPY, action: null },
   unknown: { message: 'Something went wrong. Please try again.', action: 'retry' },
 };
 

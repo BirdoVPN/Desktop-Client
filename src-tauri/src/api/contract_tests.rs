@@ -797,8 +797,9 @@ fn error_code_cases() -> Vec<ErrorCodeCase> {
             ipc: IpcErrorCode::UpgradeRequired,
             wait_secs: None,
         },
-        // Mapped by its 403 status only: it has no copy of its own yet, so
-        // it reads as `subscription_required` (see the MR-1639 PR).
+        // MR-1944: its own code and copy. It used to be mapped by its 403
+        // status alone and read as `subscription_required` ("upgrade your
+        // plan"), which cannot help a build the attestation policy refused.
         ErrorCodeCase {
             code: "client_attestation_required",
             body: envelope(
@@ -807,7 +808,7 @@ fn error_code_cases() -> Vec<ErrorCodeCase> {
                 "This VPN requires an official, unmodified BirdoVPN client.",
                 None,
             ),
-            ipc: IpcErrorCode::SubscriptionRequired,
+            ipc: IpcErrorCode::ClientAttestationRequired,
             wait_secs: None,
         },
         ErrorCodeCase {

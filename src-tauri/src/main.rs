@@ -199,12 +199,23 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         take_pending_deep_link,
         // The window up from the tray (re-consent behind Start Minimized)
         commands::tray::show_main_window,
+        // The anonymous account number, kept out of clipboard history (MR-1723)
+        commands::clipboard::copy_sensitive,
     ]
 }
 
 fn main() {
     // Set custom panic hook for crash recovery
     setup_panic_hook();
+
+    // MR-1945 H1: hold the user-writable state directories (config, logs,
+    // crashes) open for the whole run, BEFORE anything writes to them, so an
+    // unprivileged process cannot swap one for a junction while this elevated
+    // process creates, appends to, renames or deletes files in it. Each
+    // directory's chain is verified at hold time; one that cannot be is left
+    // unheld (the per-operation checks still apply). Any diagnostic is held by
+    // the log gate until the subscriber below decides it.
+    crate::utils::file_log::hold_app_dirs();
 
     // Initialize logging.
     //
@@ -220,7 +231,6 @@ fn main() {
     // utils::file_log. The directory is created when the file is first
     // opened, so a log that is off is never created at all.
     let file_layer = crate::utils::file_log::log_dir().map(|dir| {
-        let p = dir.join(crate::utils::file_log::LOG_FILE_NAME);
         // TWO CAPS ON THE SAME FILE, and they run in this order.
         //
         // LOG-002 (age). Everything else that protects birdo.log is
@@ -233,7 +243,13 @@ fn main() {
         // log (and the rotated birdo.log.1 beside it) back to the retention
         // window on every launch, so the file can only ever describe recent
         // activity. See utils::log_retention before widening the window.
-        crate::utils::log_retention::enforce(&p, chrono::Utc::now());
+        // MR-1945: through the directory's checked handles, never a path:
+        // this runs elevated in a folder the user can write.
+        crate::utils::log_retention::enforce(
+            &dir,
+            crate::utils::file_log::LOG_FILE_NAME,
+            chrono::Utc::now(),
+        );
         //
         // PWR-5 (size). birdo.log is open in append mode for the life of the
         // process, so a long-running session (this is a VPN client — it can
@@ -243,13 +259,13 @@ fn main() {
         // AFTER the sweep — the sweep may already have brought it back under
         // the cap, and rotating first would only push expired content into
         // .1 to be pruned there.
-        crate::utils::log_retention::rotate_if_large(&p);
+        crate::utils::log_retention::rotate_if_large(&dir, crate::utils::file_log::LOG_FILE_NAME);
         // The in-session twin of that rotation (W1-019): a weeks-long session
         // passes the cap too, and once it did, every later line used to be
         // dropped until the next launch. A stat per log event at info level is
         // negligible. Owner-only on multi-user Unix hosts (P6-CLI-D-08).
         // Gated on the user's choice (MR-808), which setup() applies.
-        let log = crate::utils::file_log::install(&p);
+        let log = crate::utils::file_log::install(dir, crate::utils::file_log::LOG_FILE_NAME);
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(move || log.writer())
@@ -997,9 +1013,9 @@ fn cleanup_on_crash() {
 }
 
 /// Where crash reports are written.
-fn crash_dir() -> std::path::PathBuf {
+fn crash_dir() -> crate::utils::safe_fs::OwnedDir {
     crate::utils::file_log::crash_dir_in(
-        &dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
+        dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
     )
 }
 
@@ -1016,7 +1032,7 @@ fn write_crash_report(location: &str, message: &str) {
 
     let crash_dir = crash_dir();
 
-    let _ = std::fs::create_dir_all(&crash_dir);
+    let _ = std::fs::create_dir_all(crash_dir.path());
 
     // P6-CLI-D-05: crash files used to accumulate forever (a permanent,
     // timestamped on-disk history on a product that claims to retain
@@ -1029,10 +1045,13 @@ fn write_crash_report(location: &str, message: &str) {
     );
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
+    let crash_name = format!("crash_{}.txt", timestamp);
+    let crash_file = crash_dir.join(&crash_name);
 
-    // P6-CLI-D-08: owner-readable only on multi-user Unix hosts.
-    if let Ok(mut file) = crate::utils::log_retention::create_owner_only(&crash_file) {
+    // MR-1945 H1 / P6-CLI-D-08: created new through a checked handle (never a
+    // raw path a planted link could redirect), owner-only on multi-user Unix
+    // hosts, in the crash directory held open for the process lifetime.
+    if let Ok(mut file) = crash_dir.create_new(&crash_name) {
         let _ = writeln!(file, "BirdoVPN Crash Report");
         let _ = writeln!(file, "=====================");
         let _ = writeln!(file, "Time: {}", chrono::Utc::now().to_rfc3339());

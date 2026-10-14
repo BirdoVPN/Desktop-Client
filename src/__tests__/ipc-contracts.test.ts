@@ -429,6 +429,8 @@ const FRONTEND_COMMANDS = [
   'take_pending_deep_link',
   // The window up from the tray: re-consent behind Start Minimized (REVIEW-WIN2-010)
   'show_main_window',
+  // The anonymous account number, kept out of clipboard history (MR-1723)
+  'copy_sensitive',
 ] as const;
 
 function sourceFiles(dir: string): string[] {
