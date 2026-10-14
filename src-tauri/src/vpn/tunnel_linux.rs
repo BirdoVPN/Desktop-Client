@@ -780,17 +780,26 @@ fn tun_read_owned(fd: i32, mut buf: Vec<u8>) -> (Vec<u8>, Option<usize>) {
 mod tun_read_tests {
     use super::tun_read_owned;
 
+    /// (read_fd, write_fd), both O_CLOEXEC. The xray tests in the same run
+    /// spawn child processes, and a child forked while a plain pipe() end is
+    /// open inherits it and keeps it open — the closed-read-end checks below
+    /// would then see a live reader that is not the test's.
+    fn cloexec_pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        (fds[0], fds[1])
+    }
+
     /// (read_fd, write_fd), read end O_NONBLOCK like the real TUN fd.
     fn nonblocking_pipe() -> (i32, i32) {
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+        let (r, w) = cloexec_pipe();
+        let flags = unsafe { libc::fcntl(r, libc::F_GETFL) };
         assert!(flags >= 0);
         assert_eq!(
-            unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            unsafe { libc::fcntl(r, libc::F_SETFL, flags | libc::O_NONBLOCK) },
             0
         );
-        (fds[0], fds[1])
+        (r, w)
     }
 
     fn write_all(fd: i32, bytes: &[u8]) {
@@ -869,10 +878,19 @@ mod tun_read_tests {
 
     /// Writing to a pipe whose read end is gone fails with EPIPE (Rust
     /// ignores SIGPIPE), which is how these tests see that the read end — the
-    /// stand-in for the TUN fd — was really closed.
+    /// stand-in for the TUN fd — was really closed. Retried for a moment: even
+    /// with O_CLOEXEC, a child mid-spawn elsewhere in the run holds a copy of
+    /// the fd table between its fork and its exec.
     fn read_end_is_closed(w: i32) -> bool {
-        let n = unsafe { libc::write(w, b"?".as_ptr() as *const libc::c_void, 1) };
-        n == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
+        (0..200).any(|_| {
+            let n = unsafe { libc::write(w, b"?".as_ptr() as *const libc::c_void, 1) };
+            let closed =
+                n == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE);
+            if !closed {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            closed
+        })
     }
 
     /// MR-820: when stop()'s close runs out of patience with a read the loop
@@ -931,9 +949,7 @@ mod tun_read_tests {
     fn set_nonblocking_makes_an_idle_read_return_and_refuses_a_bad_fd() {
         use crate::vpn::device_fd::set_nonblocking;
 
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (r, w) = (fds[0], fds[1]);
+        let (r, w) = cloexec_pipe();
         assert_eq!(
             unsafe { libc::fcntl(r, libc::F_GETFL) } & libc::O_NONBLOCK,
             0,
