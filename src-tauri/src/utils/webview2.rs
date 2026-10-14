@@ -59,17 +59,27 @@
 //! open for the call once every level has been opened without following a
 //! reparse point and found at its expected final path, and each dump is
 //! deleted through a handle checked to be exactly that file
-//! ([`OwnedDir::remove_file`]), never by path. On Windows the root itself
-//! must resolve under the user's own profile directory, the uninstaller
-//! sweep's guard (D6c, `protected_dir::is_under_user_profile`): a
-//! `%LOCALAPPDATA%` redirected onto another account's profile is refused.
+//! ([`OwnedDir::remove_file`]), never by path. On Windows the root itself is
+//! checked first, with the uninstaller sweep's guard (D6c,
+//! `protected_dir::hold_user_root`): opened by handle, refused if it is a
+//! link, its final path under the user's own profile directory, then held
+//! for the call, and the work goes on at that final path. A `%LOCALAPPDATA%`
+//! redirected (or junctioned) onto another account's profile is refused.
+//!
+//! THE USER DATA FOLDER is made the same way (`OwnedDir::hold_open`, inside
+//! its verified parent). If it cannot be verified (a junction in its place),
+//! that is logged, and WebView2 still gets this environment, crash reports
+//! kept on this device: refusing would only open the window on WebView2's
+//! defaults, through the same folder, with crash upload left to Windows.
 
 // Off Windows only the tests reach the dump helpers: WebKit keeps no such
 // folder (see the MR-1946 PR), so nothing calls them there.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
@@ -195,28 +205,22 @@ pub fn delete_dumps_in(local_data: &Path, tally: &mut Deleted) {
     }
 }
 
-/// The local data directory, the root the dump folder is found under, if it
-/// resolves under the signed-in user's own profile directory (see the module
-/// docs): `Some(Err(()))` when it does not, `None` when the OS has none.
+/// The local data directory, the root the dump folder is found under, held
+/// for the caller's work if it is the user's own (see the module docs and
+/// `protected_dir::hold_user_root`): `Some(Err)` when it is not, `None` when
+/// the OS has none. The work goes on at the held root's final path.
 #[cfg(windows)]
-fn local_data_root() -> Option<Result<PathBuf, ()>> {
-    let local_data = dirs::data_local_dir()?;
-    Some(
-        if super::protected_dir::is_under_user_profile(&local_data) {
-            Ok(local_data)
-        } else {
-            Err(())
-        },
-    )
+fn local_data_root() -> Option<std::io::Result<super::protected_dir::UserRoot>> {
+    dirs::data_local_dir().map(|local_data| super::protected_dir::hold_user_root(&local_data))
 }
 
 /// "Delete Logs Now", WebView2's part: Windows only, where the dumps are. A
-/// local data directory outside the user's profile is refused, and counted.
+/// local data directory that is not the user's own is refused, and counted.
 #[cfg(windows)]
 pub fn delete_dumps(tally: &mut Deleted) {
     match local_data_root() {
-        Some(Ok(local_data)) => delete_dumps_in(&local_data, tally),
-        Some(Err(())) => tally.failed += 1,
+        Some(Ok(root)) => delete_dumps_in(root.path(), tally),
+        Some(Err(_)) => tally.failed += 1,
         None => {}
     }
 }
@@ -269,11 +273,11 @@ pub fn prune_dumps_in(local_data: &Path, now: DateTime<Utc>, keep: usize) {
 
 /// The launch sweep, run by `main()` before Tauri starts, so before this
 /// session's WebView2 (and its Crashpad handler) is running. Windows only; a
-/// local data directory outside the user's profile is left alone.
+/// local data directory that is not the user's own is left alone.
 #[cfg(windows)]
 pub fn prune_dumps(now: DateTime<Utc>) {
-    if let Some(Ok(local_data)) = local_data_root() {
-        prune_dumps_in(&local_data, now, log_retention::KEEP_CRASH_REPORTS);
+    if let Some(Ok(root)) = local_data_root() {
+        prune_dumps_in(root.path(), now, log_retention::KEEP_CRASH_REPORTS);
     }
 }
 
@@ -343,12 +347,17 @@ pub fn create_environment(
     // runs first, so it does the same, the way the elevated app makes any
     // folder in the user's profile (R5, `safe_fs`): never `create_dir_all` by
     // path, but inside its verified parent, and refused if a link or a
-    // junction is in its place. The error names no path.
+    // junction is in its place. A refusal does NOT stop the environment:
+    // without it the window would open on WebView2's defaults, through the
+    // very same folder (Tauri and wry use this path too), with crash upload
+    // left to Windows. So it is logged (no path in it), and WebView2's crash
+    // reports stay on this device regardless.
     let user_data = user_data_owned_dir(local_data);
-    user_data
-        .hold_open()
-        .map(drop)
-        .map_err(|e| webview2_com::Error::CallbackError(e.to_string()))?;
+    if let Err(e) = user_data.hold_open() {
+        tracing::warn!(
+            "WebView2: the user data folder could not be verified ({e}); its crash reports stay on this device all the same"
+        );
+    }
 
     // What wry's `new_in_hwnd` does first, result ignored the same way.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -701,22 +710,68 @@ mod tests {
         }
     }
 
-    /// The root check behind [`delete_dumps`] and [`prune_dumps`] (D6c): this
-    /// account's own local data directory passes; a folder outside the
-    /// profile does not.
+    /// The root behind [`delete_dumps`] and [`prune_dumps`] (D6c,
+    /// `protected_dir::hold_user_root`, whose tests cover a junction as the
+    /// root and a root outside the profile): this account's own local data
+    /// directory passes, and the work goes on at its final path, the same
+    /// folder.
     #[cfg(windows)]
     #[test]
-    fn the_local_data_root_must_be_under_the_users_profile() {
-        assert!(
-            matches!(local_data_root(), Some(Ok(_))),
-            "this account's %LOCALAPPDATA% is not under its profile"
-        );
-        let windows_dir = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .expect("SystemRoot");
-        assert!(!crate::utils::protected_dir::is_under_user_profile(
-            &windows_dir
+    fn the_local_data_root_is_held_at_its_final_path() {
+        use crate::utils::win_api::{self, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES};
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let Some(Ok(root)) = local_data_root() else {
+            panic!("this account's %LOCALAPPDATA% is not under its profile");
+        };
+        let local = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dirs::data_local_dir().unwrap())
+            .unwrap();
+        assert!(win_api::same_path(
+            root.path(),
+            &win_api::final_path(&local).unwrap()
         ));
+    }
+
+    /// MR-1946 review: a user data folder that cannot be verified (here a
+    /// junction in its place) must not cost the crash option. Refusing it used
+    /// to open the window on WebView2's defaults, through the same junction,
+    /// with crash upload left to Windows; now the environment is still made,
+    /// with crash reports kept on this device. (That the option is set
+    /// unconditionally is pinned by
+    /// `the_environment_is_the_one_wry_would_have_made`; the by-hand test
+    /// checks the browser process of this case too.) A dev machine without
+    /// the runtime skips, saying so; CI must not skip.
+    #[cfg(windows)]
+    #[test]
+    fn an_unverified_user_data_folder_still_gets_the_environment() {
+        let local = tempfile::tempdir().unwrap();
+        let elsewhere = local.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        crate::utils::safe_fs::tests::junction(&user_data_dir_in(local.path()), &elsewhere);
+        assert!(
+            user_data_owned_dir(local.path()).hold_open().is_err(),
+            "the junction was not refused, so this tests nothing"
+        );
+
+        match create_environment(local.path()) {
+            Ok(_environment) => {}
+            Err(e) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "no WebView2 environment on CI ({e}), so this test would test nothing"
+                );
+                // Only a missing runtime may skip: the environment for a
+                // plain folder must work here, or the junction is the cause.
+                assert!(
+                    create_environment(tempfile::tempdir().unwrap().path()).is_err(),
+                    "the environment fails only for the unverified folder: {e}"
+                );
+                eprintln!("SKIPPED: no WebView2 environment here ({e})");
+            }
+        }
     }
 
     /// Every delete and create in this file goes through `safe_fs` (MR-1945,
@@ -740,7 +795,9 @@ mod tests {
         assert!(code.contains("file_log::delete_in(&dir, is_dump_name, tally)"));
         assert!(code.contains("let _ = dir.remove_file(&name);"));
         assert!(code.contains("let _ = dir.remove_file(name);"));
-        assert!(code.contains("user_data\n        .hold_open()"));
+        // The folder is made verified, and a refusal is logged, not returned:
+        // it must not cost the crash option (see the test above).
+        assert!(code.contains("if let Err(e) = user_data.hold_open() {"));
     }
 
     /// A link named like a dump is skipped, and what it points at survives.
@@ -1067,23 +1124,18 @@ mod tests {
         assert_eq!(folder, ours);
     }
 
-    /// End to end, by hand (`cargo test --lib webview2 -- --ignored`), on a
-    /// Windows machine with WebView2: a webview on [`create_environment`]
-    /// starts a browser process carrying the switch the runtime turns the
-    /// crash option into. Ignored: the switch is the runtime's internal
-    /// spelling, not an API, so it is a check to run, not one to gate on.
+    /// Run `during` with a webview on [`create_environment`] for `local`
+    /// started, passing it the browser process's id; then close it all and
+    /// wait for that process to go (it holds files in `local` until it exits).
     #[cfg(windows)]
-    #[test]
-    #[ignore = "starts a WebView2 browser process; run by hand"]
-    fn a_webview_on_the_environment_starts_with_crash_reporting_off() {
+    fn with_a_live_webview<R>(local: &Path, during: impl FnOnce(u32) -> R) -> R {
         use webview2_com::CreateCoreWebView2ControllerCompletedHandler;
         use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED};
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW,
         };
 
-        let local = tempfile::tempdir().unwrap();
-        let environment = create_environment(local.path()).unwrap();
+        let environment = create_environment(local).unwrap();
         // SAFETY: a hidden window of a system class, destroyed below.
         let window = unsafe {
             CreateWindowExW(
@@ -1130,36 +1182,12 @@ mod tests {
         }
         .unwrap();
 
-        // Only whether the switch is there: never the command line itself.
-        let query = format!(
-            "(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine \
-             -match '--edge-webview-disable-crash-reporting=1'"
-        );
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &query])
-            .output()
-            .unwrap();
-
-        // "Delete Logs Now" and the launch sweep with this webview's browser
-        // process (and its Crashpad handler) running: holding the folders
-        // open and checking them by handle must not collide with WebView2.
-        let reports = DUMP_DIR
-            .iter()
-            .fold(local.path().to_path_buf(), |dir, part| dir.join(part));
-        std::fs::create_dir_all(&reports).unwrap();
-        write(&reports, DUMP_A);
-        let deleted_live = deleted(local.path());
-        let old = write(&reports, DUMP_B);
-        written_days_ago(&old, Utc::now(), 30);
-        prune_dumps_in(local.path(), Utc::now(), log_retention::KEEP_CRASH_REPORTS);
-        let swept_live = !old.exists();
+        let result = during(pid);
 
         // SAFETY: closing what this test created.
         unsafe { controller.Close() }.unwrap();
         // SAFETY: the window this test created.
         unsafe { DestroyWindow(window) }.unwrap();
-        // Let the browser process go before the temporary folder is removed:
-        // it holds files there until it exits.
         drop(controller);
         drop(environment);
         let _ = std::process::Command::new("powershell")
@@ -1170,7 +1198,55 @@ mod tests {
                 &format!("Wait-Process -Id {pid} -Timeout 20 -ErrorAction SilentlyContinue"),
             ])
             .status();
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "True");
+        result
+    }
+
+    /// Whether browser process `pid` carries the switch the runtime turns the
+    /// crash option into. Only that: never the command line itself.
+    #[cfg(windows)]
+    fn carries_the_crash_switch(pid: u32) -> bool {
+        let query = format!(
+            "(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine \
+             -match '--edge-webview-disable-crash-reporting=1'"
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim() == "True"
+    }
+
+    /// End to end, by hand (`cargo test --lib webview2 -- --ignored`), on a
+    /// Windows machine with WebView2: a webview on [`create_environment`]
+    /// starts a browser process carrying the switch the runtime turns the
+    /// crash option into. Ignored: the switch is the runtime's internal
+    /// spelling, not an API, so it is a check to run, not one to gate on.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "starts a WebView2 browser process; run by hand"]
+    fn a_webview_on_the_environment_starts_with_crash_reporting_off() {
+        let local = tempfile::tempdir().unwrap();
+        let (switch, deleted_live, swept_live) = with_a_live_webview(local.path(), |pid| {
+            let switch = carries_the_crash_switch(pid);
+            // "Delete Logs Now" and the launch sweep with this webview's
+            // browser process (and its Crashpad handler) running: holding the
+            // folders open and checking them by handle must not collide with
+            // WebView2.
+            let reports = DUMP_DIR
+                .iter()
+                .fold(local.path().to_path_buf(), |dir, part| dir.join(part));
+            std::fs::create_dir_all(&reports).unwrap();
+            write(&reports, DUMP_A);
+            let deleted_live = deleted(local.path());
+            let old = write(&reports, DUMP_B);
+            written_days_ago(&old, Utc::now(), 30);
+            prune_dumps_in(local.path(), Utc::now(), log_retention::KEEP_CRASH_REPORTS);
+            (switch, deleted_live, !old.exists())
+        });
+        assert!(
+            switch,
+            "the browser process does not carry the crash switch"
+        );
         assert_eq!(
             deleted_live,
             Deleted {
@@ -1180,5 +1256,24 @@ mod tests {
             "Delete Logs Now beside a running WebView2"
         );
         assert!(swept_live, "the sweep beside a running WebView2");
+    }
+
+    /// By hand, as above: with a junction in place of the user data folder
+    /// (which the app refuses to verify), the browser process still carries
+    /// the crash switch: the refusal no longer opens the window on WebView2's
+    /// defaults (MR-1946 review).
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "starts a WebView2 browser process; run by hand"]
+    fn a_webview_on_an_unverified_folder_still_starts_with_crash_reporting_off() {
+        let local = tempfile::tempdir().unwrap();
+        let elsewhere = local.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        crate::utils::safe_fs::tests::junction(&user_data_dir_in(local.path()), &elsewhere);
+        assert!(user_data_owned_dir(local.path()).hold_open().is_err());
+        assert!(
+            with_a_live_webview(local.path(), carries_the_crash_switch),
+            "the browser process does not carry the crash switch"
+        );
     }
 }
