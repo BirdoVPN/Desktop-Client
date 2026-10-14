@@ -1076,6 +1076,171 @@ mod types_serialization_tests {
         );
     }
 
+    /// birdo-web #708 serialises `plans` like this (lib/plans.ts through
+    /// app/api/client-config/route.ts): one entry per plan, the yearly price
+    /// an ANNUAL total, a `null` cap for unlimited.
+    const PLANS_708: &str = r#"{
+        "dnsFilteringAvailable": true,
+        "plans": {
+            "RECON": { "monthlyPrice": 0, "yearlyPrice": 0, "currency": "GBP", "bandwidthLimitGb": 50 },
+            "OPERATIVE": { "monthlyPrice": 3.99, "yearlyPrice": 38, "currency": "GBP", "bandwidthLimitGb": null },
+            "SOVEREIGN": { "monthlyPrice": 9.99, "yearlyPrice": 99, "currency": "GBP", "bandwidthLimitGb": null }
+        }
+    }"#;
+
+    /// MR-132 / MR-630 / MR-1767 / MR-1979: the server's prices reach the UI
+    /// as sent, in the camelCase shape the Pricing screen reads, with a
+    /// `null` cap kept as `null` (unlimited), never dropped or zeroed.
+    #[test]
+    fn client_config_plans_present_parse_and_reach_the_ui_unchanged() {
+        let cfg: ClientConfigResponse = serde_json::from_str(PLANS_708).unwrap();
+        let plans = cfg.plans.as_ref().unwrap();
+        assert_eq!(plans.len(), 3);
+        assert_eq!(
+            plans["RECON"],
+            PlanPrice {
+                monthly_price: 0.0,
+                yearly_price: 0.0,
+                currency: "GBP".into(),
+                bandwidth_limit_gb: Some(50),
+            }
+        );
+        assert_eq!(plans["OPERATIVE"].monthly_price, 3.99);
+        assert_eq!(plans["OPERATIVE"].yearly_price, 38.0);
+        assert_eq!(plans["SOVEREIGN"].bandwidth_limit_gb, None);
+        assert_eq!(cfg.dns_filtering_available, Some(true));
+
+        let ui = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            ui["plans"]["RECON"],
+            serde_json::json!({ "monthlyPrice": 0.0, "yearlyPrice": 0.0, "currency": "GBP", "bandwidthLimitGb": 50 })
+        );
+        assert_eq!(
+            ui["plans"]["SOVEREIGN"],
+            serde_json::json!({ "monthlyPrice": 9.99, "yearlyPrice": 99.0, "currency": "GBP", "bandwidthLimitGb": null })
+        );
+    }
+
+    /// An older web deploy has no `plans`: that is "not said" (the UI falls
+    /// back to its built-in prices), and the rest of the config still parses.
+    #[test]
+    fn client_config_plans_absent_or_not_an_object_reads_as_not_said() {
+        let absent: ClientConfigResponse =
+            serde_json::from_str(r#"{"dnsFilteringAvailable":false}"#).unwrap();
+        assert!(absent.plans.is_none());
+        assert_eq!(absent.dns_filtering_available, Some(false));
+        assert!(serde_json::to_value(&absent).unwrap()["plans"].is_null());
+
+        for odd in [r#"null"#, r#"[1,2]"#, r#""GBP""#, r#"7"#] {
+            let json = format!(r#"{{"dnsFilteringAvailable":true,"plans":{odd}}}"#);
+            let cfg: ClientConfigResponse = serde_json::from_str(&json).unwrap();
+            assert!(cfg.plans.is_none(), "plans = {odd}");
+            assert_eq!(cfg.dns_filtering_available, Some(true), "plans = {odd}");
+        }
+    }
+
+    /// A malformed entry is dropped on its own: the other plans, and the rest
+    /// of the config, survive it. Each case breaks exactly one rule.
+    #[test]
+    fn client_config_plans_malformed_entries_are_dropped_not_fatal() {
+        let ok = r#"{ "monthlyPrice": 3.99, "yearlyPrice": 38, "currency": "GBP", "bandwidthLimitGb": null }"#;
+        let bad = [
+            // prices: missing, negative, not a number
+            r#"{ "yearlyPrice": 38, "currency": "GBP", "bandwidthLimitGb": null }"#,
+            r#"{ "monthlyPrice": -1, "yearlyPrice": 38, "currency": "GBP", "bandwidthLimitGb": null }"#,
+            r#"{ "monthlyPrice": 3.99, "yearlyPrice": "38", "currency": "GBP", "bandwidthLimitGb": null }"#,
+            r#"{ "monthlyPrice": 3.99, "yearlyPrice": null, "currency": "GBP", "bandwidthLimitGb": null }"#,
+            // the cap: missing, zero, negative, fractional, absurd, not a number
+            r#"{ "monthlyPrice": 0, "yearlyPrice": 0, "currency": "GBP" }"#,
+            r#"{ "monthlyPrice": 0, "yearlyPrice": 0, "currency": "GBP", "bandwidthLimitGb": 0 }"#,
+            r#"{ "monthlyPrice": 0, "yearlyPrice": 0, "currency": "GBP", "bandwidthLimitGb": -50 }"#,
+            r#"{ "monthlyPrice": 0, "yearlyPrice": 0, "currency": "GBP", "bandwidthLimitGb": 50.5 }"#,
+            r#"{ "monthlyPrice": 0, "yearlyPrice": 0, "currency": "GBP", "bandwidthLimitGb": 100001 }"#,
+            r#"{ "monthlyPrice": 0, "yearlyPrice": 0, "currency": "GBP", "bandwidthLimitGb": "50" }"#,
+            // not an object at all
+            r#"null"#,
+            r#"[3.99, 38]"#,
+        ];
+        for entry in bad {
+            let json = format!(
+                r#"{{"dnsFilteringAvailable":false,"plans":{{"RECON":{entry},"OPERATIVE":{ok}}}}}"#
+            );
+            let cfg: ClientConfigResponse = serde_json::from_str(&json).unwrap();
+            let plans = cfg.plans.unwrap();
+            assert!(
+                !plans.contains_key("RECON"),
+                "kept a malformed entry: {entry}"
+            );
+            assert_eq!(
+                plans["OPERATIVE"].yearly_price, 38.0,
+                "lost a good entry beside {entry}"
+            );
+            assert_eq!(cfg.dns_filtering_available, Some(false));
+        }
+
+        // The edges that ARE valid: a cap at the limit, a whole-number cap
+        // written as a float, and a zero price.
+        let json = format!(
+            r#"{{"plans":{{"RECON":{{"monthlyPrice":0,"yearlyPrice":0.0,"currency":"GBP","bandwidthLimitGb":{MAX_PLAN_BANDWIDTH_GB}}},"SOVEREIGN":{{"monthlyPrice":9.99,"yearlyPrice":99,"currency":"GBP","bandwidthLimitGb":50.0}}}}}}"#
+        );
+        let plans = serde_json::from_str::<ClientConfigResponse>(&json)
+            .unwrap()
+            .plans
+            .unwrap();
+        assert_eq!(
+            plans["RECON"].bandwidth_limit_gb,
+            Some(MAX_PLAN_BANDWIDTH_GB)
+        );
+        assert_eq!(plans["SOVEREIGN"].bandwidth_limit_gb, Some(50));
+    }
+
+    /// Only RECON, OPERATIVE and SOVEREIGN are read; any other key is
+    /// ignored, including a known plan in the wrong case.
+    #[test]
+    fn client_config_plans_unknown_keys_are_ignored() {
+        let entry = r#"{ "monthlyPrice": 1, "yearlyPrice": 10, "currency": "GBP", "bandwidthLimitGb": null }"#;
+        let json = format!(
+            r#"{{"plans":{{"OPERATIVE":{entry},"ENTERPRISE":{entry},"operative":{entry},"":{entry}}}}}"#
+        );
+        let plans = serde_json::from_str::<ClientConfigResponse>(&json)
+            .unwrap()
+            .plans
+            .unwrap();
+        assert_eq!(plans.keys().collect::<Vec<_>>(), ["OPERATIVE"]);
+    }
+
+    /// The currency is ISO 4217's shape, three letters, upper-cased on the
+    /// way through; anything else drops the entry (the UI hands it to
+    /// `Intl.NumberFormat`, which throws on a malformed code).
+    #[test]
+    fn client_config_plans_currency_is_three_letters() {
+        let with = |currency: &str| {
+            let json = format!(
+                r#"{{"plans":{{"OPERATIVE":{{"monthlyPrice":4.5,"yearlyPrice":45,"currency":{currency},"bandwidthLimitGb":null}}}}}}"#
+            );
+            serde_json::from_str::<ClientConfigResponse>(&json)
+                .unwrap()
+                .plans
+                .unwrap()
+                .get("OPERATIVE")
+                .map(|p| p.currency.clone())
+        };
+        assert_eq!(with(r#""EUR""#).as_deref(), Some("EUR"));
+        assert_eq!(with(r#""usd""#).as_deref(), Some("USD"));
+        for bad in [
+            r#""""#,
+            r#""GB""#,
+            r#""GBPX""#,
+            r#""£££""#,
+            r#""G1P""#,
+            r#""€""#,
+            r#"null"#,
+            r#"826"#,
+        ] {
+            assert_eq!(with(bad), None, "currency {bad}");
+        }
+    }
+
     /// The in-app anonymous-registration body must serialize with the exact
     /// camelCase keys the backend's DeviceInfoSchema expects.
     #[test]
