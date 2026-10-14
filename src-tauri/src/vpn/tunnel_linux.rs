@@ -2937,7 +2937,8 @@ mod configure_ipv6_tests {
 // These create birdo0, add and delete routes and rewrite /etc/resolv.conf, so
 // they run ONLY inside a private network + mount namespace that
 // scripts/ci/linux-netns-tests.sh builds: an overlay over /etc, a tmpfs /run,
-// a dummy uplink with a default route (nothing answers on it), and stand-ins
+// a dummy uplink with a default route (nothing answers on it), the relay's
+// address on lo (the tests answer start()'s handshake there), and stand-ins
 // for systemctl/resolvectl so the host's systemd-resolved is never touched.
 // Every test refuses to run anywhere else. CI runs them as root in the Linux
 // job; locally:
@@ -2951,9 +2952,10 @@ mod netns_teardown_tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    /// The relay. Routed via the dummy uplink, so start() can connect its UDP
-    /// socket and install every route; nothing ever answers.
-    const ENDPOINT: &str = "10.99.0.7:51820";
+    /// The relay's address. The script puts it on `lo`, so the [`Relay`]
+    /// below answers start()'s handshake whatever routes are in. start() still
+    /// pins its endpoint route to it via the uplink, in the main table, which
+    /// is where the probes read it.
     const RELAY: &str = "10.99.0.7";
     const FIXTURE: &str = "# netns test fixture\nnameserver 10.99.0.1\noptions edns0\n";
     /// Where NetworkManager keeps the file it links /etc/resolv.conf to.
@@ -3025,16 +3027,64 @@ mod netns_teardown_tests {
         }
     }
 
-    fn config() -> VpnConfig {
+    /// A WireGuard relay that answers one client's handshake. start() builds
+    /// its WireGuard session, a real handshake, BEFORE it creates a route or
+    /// touches DNS: against a relay that never answers, every start() here
+    /// failed with "Handshake timeout" and no test reached the teardown it is
+    /// about. Same responder as wireguard_new's handshake_tests, bound on
+    /// RELAY. Aborted on drop.
+    struct Relay {
+        endpoint: String,
+        server_public_b64: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn relay(client: boringtun::x25519::PublicKey) -> Relay {
         use base64::Engine as _;
+        use boringtun::noise::{Tunn, TunnResult};
+        let server_secret = crate::utils::os_rng::x25519_static_secret();
+        let server_public = boringtun::x25519::PublicKey::from(&server_secret);
+        let mut tunn = Tunn::new(server_secret, client, None, None, 1, None);
+        let socket = tokio::net::UdpSocket::bind(format!("{RELAY}:0"))
+            .await
+            .expect("bind the relay on RELAY: the script puts it on lo");
+        let endpoint = socket.local_addr().expect("the relay's port").to_string();
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let mut out = [0u8; 2048];
+            loop {
+                let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                if let TunnResult::WriteToNetwork(reply) =
+                    tunn.decapsulate(Some(from.ip()), &buf[..n], &mut out)
+                {
+                    let _ = socket.send_to(reply, from).await;
+                }
+            }
+        });
+        Relay {
+            endpoint,
+            server_public_b64: base64::engine::general_purpose::STANDARD
+                .encode(server_public.as_bytes()),
+            task,
+        }
+    }
+
+    fn config(relay: &Relay) -> VpnConfig {
         VpnConfig {
             server_id: "netns".into(),
             key_id: "netns".into(),
             public_key: String::new(),
-            server_public_key: base64::engine::general_purpose::STANDARD
-                .encode(WgPrivateKey::generate().public_key().as_bytes()),
+            server_public_key: relay.server_public_b64.clone(),
             preshared_key: None,
-            endpoint: ENDPOINT.into(),
+            endpoint: relay.endpoint.clone(),
             allowed_ips: vec!["0.0.0.0/0".into()],
             dns: vec!["10.66.0.53".into()],
             custom_dns: false,
@@ -3046,10 +3096,15 @@ mod netns_teardown_tests {
         }
     }
 
-    async fn tunnel() -> LinuxTunnel {
-        LinuxTunnel::create(config(), false)
+    /// A tunnel, the key to start it with, and the relay that answers that
+    /// key. Keep the relay bound (`_relay`, not `_`) until the test ends.
+    async fn tunnel() -> (LinuxTunnel, WgPrivateKey, Relay) {
+        let key = WgPrivateKey::generate();
+        let relay = relay(key.public_key()).await;
+        let tunnel = LinuxTunnel::create(config(&relay), false)
             .await
-            .expect("create the tunnel")
+            .expect("create the tunnel");
+        (tunnel, key, relay)
     }
 
     /// /etc/resolv.conf as a plain file (the overlay keeps this private).
@@ -3144,10 +3199,10 @@ mod netns_teardown_tests {
         assert_isolated();
         plain_resolv_conf();
         let before = resolv_conf();
-        let tunnel = tunnel().await;
+        let (tunnel, key, _relay) = tunnel().await;
         let snapshot = Arc::clone(&tunnel.network_snapshot);
         let (task, guard) = spawn_parked_after_dns_pin(snapshot, async move {
-            let result = tunnel.start(WgPrivateKey::generate()).await;
+            let result = tunnel.start(key).await;
             // Reached only if start() was never parked; the caller asserts it was.
             eprintln!("start() was meant to be cancelled, but returned {result:?}");
         })
@@ -3185,11 +3240,12 @@ mod netns_teardown_tests {
         let before = resolv_conf();
         // ManuallyDrop: even the last handle going away must not run Drop
         // here; the control is the state without it.
-        let tunnel = Arc::new(std::mem::ManuallyDrop::new(tunnel().await));
+        let (tunnel, key, _relay) = tunnel().await;
+        let tunnel = Arc::new(std::mem::ManuallyDrop::new(tunnel));
         let snapshot = Arc::clone(&tunnel.network_snapshot);
         let in_task = Arc::clone(&tunnel);
         let (task, guard) = spawn_parked_after_dns_pin(snapshot, async move {
-            let result = in_task.start(WgPrivateKey::generate()).await;
+            let result = in_task.start(key).await;
             // Reached only if start() was never parked; the caller asserts it was.
             eprintln!("start() was meant to be cancelled, but returned {result:?}");
         })
@@ -3244,8 +3300,8 @@ mod netns_teardown_tests {
             assert!(ok, "ip {args:?}: {out}");
         }
 
-        let tunnel = tunnel().await;
-        let result = tunnel.start(WgPrivateKey::generate()).await;
+        let (tunnel, key, _relay) = tunnel().await;
+        let result = tunnel.start(key).await;
         let err = result.expect_err("start() must fail: another VPN owns the half-defaults");
         assert!(
             err.contains("0.0.0.0/1"),
@@ -3276,9 +3332,9 @@ mod netns_teardown_tests {
         let target = symlinked_resolv_conf();
         let before = resolv_conf();
 
-        let tunnel = tunnel().await;
+        let (tunnel, key, _relay) = tunnel().await;
         tunnel
-            .start(WgPrivateKey::generate())
+            .start(key)
             .await
             .expect("start() against the namespace's dummy uplink");
         assert!(
@@ -3309,9 +3365,9 @@ mod netns_teardown_tests {
         let target = symlinked_resolv_conf();
         let before = resolv_conf();
 
-        let tunnel = tunnel().await;
+        let (tunnel, key, _relay) = tunnel().await;
         tunnel
-            .start(WgPrivateKey::generate())
+            .start(key)
             .await
             .expect("start() against the namespace's dummy uplink");
         assert!(

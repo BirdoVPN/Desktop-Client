@@ -10,7 +10,9 @@
 # /etc/resolv.conf, so they run only in the private namespace built here, and
 # refuse to run anywhere else. Nothing below touches the host:
 #   - a private NETWORK namespace: a dummy uplink with a default route that
-#     goes nowhere (start() needs a route to the relay; nothing answers);
+#     goes nowhere (start() pins its endpoint route via that gateway), and the
+#     relay's address 10.99.0.7 on lo, where the tests run a WireGuard
+#     responder: start() handshakes before it adds a route or touches DNS;
 #   - a private MOUNT namespace: an overlay over /etc (upper dir on a tmpfs),
 #     and a tmpfs over /run, which also hides the host's D-Bus socket;
 #   - systemctl / resolvectl stand-ins first on PATH, so the code takes its
@@ -51,8 +53,9 @@ chmod 755 "$scratch/bin/systemctl" "$scratch/bin/resolvectl"
 export PATH="$scratch/bin:$PATH"
 [ "$(command -v resolvectl)" = "$scratch/bin/resolvectl" ] || die "the resolvectl stand-in is not first on PATH"
 
-# ---- the network: an uplink that goes nowhere ----
+# ---- the network: an uplink that goes nowhere, the relay on lo ----
 ip link set lo up
+ip addr add 10.99.0.7/32 dev lo
 ip link add uplink0 type dummy
 ip link set uplink0 up
 ip addr add 10.99.0.2/24 dev uplink0
