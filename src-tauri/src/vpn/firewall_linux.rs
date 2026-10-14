@@ -30,8 +30,6 @@
 //! answer brings an address it does not cover yet, before that address is
 //! cached or dialled ([`refresh_control_plane`]).
 
-#![allow(dead_code)]
-
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
