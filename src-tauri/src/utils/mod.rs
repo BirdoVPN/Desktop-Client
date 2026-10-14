@@ -8,7 +8,12 @@ pub mod file_log;
 pub mod log_policy;
 pub mod log_retention;
 pub mod os_rng;
+#[cfg(windows)]
+pub mod protected_dir;
 pub mod redact;
+pub mod safe_fs;
+#[cfg(windows)]
+pub mod win_api;
 
 /// Source-level guard that no address-shaped value reaches a logging macro
 /// unredacted. Test-only: it reads the tree rather than running in the app.
