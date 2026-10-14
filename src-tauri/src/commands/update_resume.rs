@@ -249,6 +249,12 @@ impl ResumeStore {
 
     fn load(&self, version: &str, now: i64) {
         let found = self.dir.as_ref().and_then(|dir| self.read_once(dir));
+        // LOW 3 (#287 review): close the one-time unsigned-record window on the
+        // FIRST start whether or not a 1.4.47 record was found (the genuine one
+        // was already read just above). Otherwise the window would stay open
+        // forever and an attacker could plant an unsigned record with a fresh
+        // `written_at` at any later date and have it resumed.
+        self.close_legacy_window();
         let mut pending = self.pending();
         *pending = None;
         match found {
@@ -260,6 +266,22 @@ impl ResumeStore {
                 "Dropped a VPN session record that is not from an update, or is too old"
             ),
             None => {}
+        }
+    }
+
+    /// Mark the unsigned-record window closed if it is not already (LOW 3).
+    fn close_legacy_window(&self) {
+        let Some(marker) = self.legacy_marker.as_ref() else {
+            return;
+        };
+        if marker.exists() {
+            return;
+        }
+        if let Some(parent) = marker.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = fs::write(marker, b"") {
+            tracing::warn!("Could not close the unsigned-record window ({e})");
         }
     }
 
@@ -794,7 +816,9 @@ mod tests {
     /// by an aged record).
     #[test]
     fn the_unsigned_acceptance_still_checks_version_and_age() {
-        // Another unsigned version is never the one-time exception.
+        // An unsigned record of another version is never the one-time
+        // exception: it is not resumed (its own dir, so the window-close of one
+        // case does not mask the other).
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("marker").join("consumed");
         fs::write(
@@ -808,14 +832,16 @@ mod tests {
             Some(marker.clone()),
         );
         s.load("1.4.48", T + 5);
-        assert_eq!(s.take("1.4.48", T + 6), None);
-        assert!(
-            !marker.exists(),
-            "a non-1.4.47 record never consumes the window"
+        assert_eq!(
+            s.take("1.4.48", T + 6),
+            None,
+            "a non-1.4.47 record is not resumed"
         );
 
         // A 1.4.47 record older than the hour consumes the window but does not
         // resume.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker").join("consumed");
         fs::write(
             dir.path().join(FILE_NAME),
             unsigned_bytes(&record_of(single("node-7"))),
@@ -833,6 +859,38 @@ mod tests {
             "too old to resume"
         );
         assert!(marker.exists(), "but the window is closed");
+    }
+
+    /// LOW 3 (#287 review): the one-time window is closed on the FIRST
+    /// `load_at_start` even when no unsigned record is present, so an attacker
+    /// cannot plant one with a fresh `written_at` later.
+    #[test]
+    fn the_unsigned_window_closes_on_the_first_load_even_with_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker").join("consumed");
+        let s = ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            keyed(*KEY),
+            Some(marker.clone()),
+        );
+        // No record on disk at the first start.
+        s.load("1.4.48", T + 5);
+        assert!(marker.exists(), "the window is closed on first load");
+
+        // A record planted afterwards, even a genuine-looking 1.4.47 one, is
+        // not resumed.
+        fs::write(
+            dir.path().join(FILE_NAME),
+            unsigned_bytes(&record_of(single("attacker-node"))),
+        )
+        .unwrap();
+        let s2 = ResumeStore::new(
+            Some(OwnedDir::new(dir.path(), &[])),
+            keyed(*KEY),
+            Some(marker),
+        );
+        s2.load("1.4.48", T + 6);
+        assert_eq!(s2.take("1.4.48", T + 7), None, "the window stays closed");
     }
 
     /// What `record` writes is signed, verifies with the key, and with that

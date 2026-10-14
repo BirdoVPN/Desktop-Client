@@ -39,7 +39,8 @@
 //! The first launch of this version is exactly such a rotation for every
 //! existing install: the old hash is never read again, never migrated.
 
-use std::fs;
+use crate::utils::safe_fs::OwnedDir;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -75,22 +76,30 @@ fn generate() -> String {
     )
 }
 
-/// Write `id` to `path` via a temp file + rename, so a crash mid-write can
-/// never leave a truncated ID that would then read as invalid and rotate.
-fn persist(path: &Path, id: &str) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, id).map_err(|e| format!("write {tmp:?}: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("rename to {path:?}: {e}")
+/// Write `id` to `name` in `dir` via a uniquely-named staging file + rename,
+/// so a crash mid-write can never leave a truncated ID that would then read as
+/// invalid and rotate.
+///
+/// MR-1945 H1 (#287 review): through `dir` ([`OwnedDir`], held open for the
+/// process lifetime), never a raw path. The elevated client rewrites this file
+/// whenever the user deletes it, so a by-path create could otherwise be
+/// redirected by a junction to overwrite an arbitrary file; here the staging
+/// file is created new through a checked handle and renamed within the held
+/// directory, owner-only on Unix.
+fn persist(dir: &OwnedDir, name: &str, id: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir.path()).map_err(|e| format!("create dir: {e}"))?;
+    let tmp = format!("{name}.{:016x}.tmp", rand::random::<u64>());
+    let written = dir
+        .create_new(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(id.as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|()| dir.rename_within(&tmp, name));
+    written.map_err(|e| {
+        let _ = dir.remove_file(&tmp);
+        format!("persist device id: {e}")
     })
 }
 
@@ -99,14 +108,37 @@ fn persist(path: &Path, id: &str) -> Result<(), String> {
 /// process-wide one every other test reads.
 struct DeviceIdStore {
     /// `None` = memory only (unit tests, or a platform without a config dir).
-    path: Option<PathBuf>,
+    loc: Option<(OwnedDir, String)>,
     cache: Mutex<Option<String>>,
 }
 
 impl DeviceIdStore {
+    /// The store at `path` (tests, and a generic location). The directory the
+    /// file sits in is the held/checked unit; the file's own name is the leaf.
+    #[cfg(test)]
     fn new(path: Option<PathBuf>) -> Self {
+        let loc = path.map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(FILE_NAME)
+                .to_string();
+            let root = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            (OwnedDir::new(root, &[]), name)
+        });
         Self {
-            path,
+            loc,
+            cache: Mutex::new(None),
+        }
+    }
+
+    /// The store at `name` inside the app directory `dir` (production).
+    fn new_in(dir: Option<OwnedDir>, name: &str) -> Self {
+        Self {
+            loc: dir.map(|dir| (dir, name.to_string())),
             cache: Mutex::new(None),
         }
     }
@@ -122,18 +154,17 @@ impl DeviceIdStore {
     }
 
     fn load_or_create(&self) -> String {
-        let Some(path) = self.path.as_deref() else {
+        let Some((dir, name)) = self.loc.as_ref() else {
             return generate();
         };
-        if let Ok(stored) = fs::read_to_string(path) {
-            let stored = stored.trim();
-            if is_valid(stored) {
-                return stored.to_string();
+        if let Some(stored) = read_trimmed(dir, name) {
+            if is_valid(&stored) {
+                return stored;
             }
             tracing::warn!("Stored device identifier is malformed; generating a new one");
         }
         let id = generate();
-        if let Err(e) = persist(path, &id) {
+        if let Err(e) = persist(dir, name, &id) {
             // Keep working with the in-memory value; the next launch will
             // generate again, which is a new device row, not a failure.
             tracing::warn!("Could not persist the device identifier: {}", e);
@@ -147,10 +178,12 @@ impl DeviceIdStore {
     fn rotate(&self) -> String {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let id = generate();
-        if let Some(path) = self.path.as_deref() {
-            if let Err(e) = persist(path, &id) {
+        if let Some((dir, name)) = self.loc.as_ref() {
+            if let Err(e) = persist(dir, name, &id) {
                 tracing::warn!("Could not persist the rotated device identifier: {}", e);
-                if let Err(e) = fs::remove_file(path) {
+                // Remove the stale file through the checked handle so the next
+                // launch cannot resurrect the old identity.
+                if let Err(e) = dir.remove_file(name) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         tracing::error!(
                             "Could not remove the previous device identifier either: {}",
@@ -165,17 +198,36 @@ impl DeviceIdStore {
     }
 }
 
-/// Beside `birdo_pq_v1.bin` (see `vpn::birdo_pq::keypair_path`). Memory-only
-/// under `cfg(test)`, so `cargo test` never writes into the developer's
-/// profile and never rotates their real install's identity.
-fn default_path() -> Option<PathBuf> {
+/// Read `name` in `dir` through the checked handle and trim it; `None` if it is
+/// missing, unreadable, or not this app's file (a planted link is refused).
+fn read_trimmed(dir: &OwnedDir, name: &str) -> Option<String> {
+    use std::io::Read;
+    let mut file = dir.open_rw(name).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text.trim().to_string())
+}
+
+/// The app directory holding the device id, beside `birdo_pq_v1.bin`
+/// (`<config_local_dir>/BirdoVPN`). Memory-only under `cfg(test)`, so
+/// `cargo test` never writes into the developer's profile and never rotates
+/// their real install's identity.
+///
+/// Deliberately PER-USER, not the machine-wide `%ProgramData%`: the device id
+/// is what the audit (C-8) made random precisely so it does NOT link the
+/// Windows accounts on one machine, and a shared location would re-link them.
+/// The MR-1945 risk is the elevated REWRITE by a crafted path, not the value's
+/// location, so the directory is held open and every write goes through
+/// [`OwnedDir`] (`file_log::hold_app_dirs` holds this same directory).
+fn default_dir() -> Option<OwnedDir> {
     if cfg!(test) {
         return None;
     }
-    dirs::config_local_dir().map(|d| d.join("BirdoVPN").join(FILE_NAME))
+    dirs::config_local_dir().map(|base| OwnedDir::new(base, &["BirdoVPN"]))
 }
 
-static STORE: LazyLock<DeviceIdStore> = LazyLock::new(|| DeviceIdStore::new(default_path()));
+static STORE: LazyLock<DeviceIdStore> =
+    LazyLock::new(|| DeviceIdStore::new_in(default_dir(), FILE_NAME));
 
 /// This install's device identifier (see the module docs).
 pub fn get() -> String {
@@ -192,6 +244,7 @@ pub fn rotate() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn generated_ids_are_random_prefixed_uuid_v4_within_the_contract() {
@@ -288,7 +341,48 @@ mod tests {
 
     #[test]
     fn the_process_wide_store_never_touches_disk_under_test() {
-        assert!(default_path().is_none());
+        assert!(default_dir().is_none());
         assert!(is_valid(&get()));
+    }
+
+    /// MR-1945 H1 (#287 review): a user can delete `device_id` to force the
+    /// elevated client to rewrite it. If the directory is a junction, the
+    /// create is refused and nothing lands behind it — the by-path rewrite can
+    /// no longer be redirected into an arbitrary file.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_directory_refuses_the_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        crate::utils::safe_fs::tests::junction(&root.path().join("BirdoVPN"), &elsewhere);
+
+        let dir = OwnedDir::new(root.path(), &["BirdoVPN"]);
+        assert!(persist(&dir, FILE_NAME, "desktop_x").is_err());
+        assert!(
+            !elsewhere.join(FILE_NAME).exists(),
+            "the id landed behind the junction"
+        );
+        // No stray staging file behind it either.
+        let strays: Vec<_> = std::fs::read_dir(&elsewhere)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(strays.is_empty(), "{strays:?}");
+    }
+
+    /// A planted symlink at the id's name is not followed on the rewrite, and
+    /// the id round-trips through the checked read.
+    #[test]
+    fn the_id_round_trips_through_the_checked_handle() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("BirdoVPN")).unwrap();
+        let store =
+            DeviceIdStore::new_in(Some(OwnedDir::new(root.path(), &["BirdoVPN"])), FILE_NAME);
+        let id = store.get();
+        assert!(is_valid(&id));
+        let back =
+            DeviceIdStore::new_in(Some(OwnedDir::new(root.path(), &["BirdoVPN"])), FILE_NAME);
+        assert_eq!(back.get(), id, "stable across launches through OwnedDir");
     }
 }

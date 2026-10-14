@@ -86,6 +86,27 @@ extern "system" {
     ) -> i32;
 }
 
+#[link(name = "ntdll")]
+extern "system" {
+    // Unlike the Win32 `SetFileInformationByHandle(FileRenameInfo)` wrapper,
+    // which does not honour `RootDirectory`, the native call renames relative
+    // to the directory handle, so the destination path is never re-walked.
+    fn NtSetInformationFile(
+        file: *mut c_void,
+        io_status: *mut IoStatusBlock,
+        info: *const c_void,
+        length: u32,
+        class: i32,
+    ) -> i32;
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct IoStatusBlock {
+    status_or_pointer: usize,
+    information: usize,
+}
+
 // winnt.h / winbase.h values, for `std::os::windows::fs::OpenOptionsExt`.
 pub const DELETE: u32 = 0x0001_0000;
 pub const READ_CONTROL: u32 = 0x0002_0000;
@@ -251,6 +272,73 @@ pub fn delete_on_handle(file: &File) -> io::Result<()> {
         }
         _ => Err(err),
     }
+}
+
+/// Rename the open file `file` to `new_name` **relative to the directory handle
+/// `dir`** (`FileRenameInfo` with `RootDirectory`), replacing an existing
+/// target (MR-1945 MEDIUM 1).
+///
+/// The kernel resolves `new_name` against the directory object `dir` names, not
+/// by re-walking a path, so a junction swapped onto the path between a check and
+/// this call cannot redirect the rename. `file` must be open with `DELETE`
+/// access and `new_name` must be a single relative component (NUL-terminated
+/// UTF-16, no separators).
+pub fn rename_by_handle(file: &File, dir: &File, new_name: &[u16]) -> io::Result<()> {
+    // FileRenameInformation (NtSetInformationFile class 10): the native call
+    // honours RootDirectory, so the target is resolved against `dir` itself,
+    // never by re-walking a path a junction could redirect.
+    const FILE_RENAME_INFORMATION: i32 = 10;
+    // The trailing WCHAR[] is NOT NUL-terminated for this API; its length is
+    // given in bytes. Strip a trailing NUL if present.
+    let name: &[u16] = match new_name.split_last() {
+        Some((0, head)) => head,
+        _ => new_name,
+    };
+    // FILE_RENAME_INFORMATION on x64:
+    //   [0..4]   ReplaceIfExists (union, as a DWORD)
+    //   [4..8]   padding (HANDLE is 8-aligned)
+    //   [8..16]  RootDirectory (HANDLE)
+    //   [16..20] FileNameLength (bytes)
+    //   [20..]   FileName (WCHARs, no terminator)
+    const HEADER: usize = 20;
+    let name_bytes = name.len() * 2;
+    // Allocate as u64 so the struct is 8-byte aligned for the HANDLE field.
+    let mut buf = vec![0u64; (HEADER + name_bytes).div_ceil(8).max(1)];
+    let bytes: &mut [u8] = bytemuck_cast(&mut buf);
+    bytes[0..4].copy_from_slice(&1u32.to_le_bytes()); // ReplaceIfExists = TRUE
+    let root = dir.as_raw_handle() as usize as u64;
+    bytes[8..16].copy_from_slice(&root.to_le_bytes());
+    bytes[16..20].copy_from_slice(&(name_bytes as u32).to_le_bytes());
+    for (i, unit) in name.iter().enumerate() {
+        let at = HEADER + i * 2;
+        bytes[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    let mut io_status = IoStatusBlock::default();
+    // SAFETY: `file` and `dir` are open for the borrow; `bytes` is a
+    // FILE_RENAME_INFORMATION of `HEADER + name_bytes` bytes that outlives the
+    // call; `io_status` is a writable IO_STATUS_BLOCK.
+    let status = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut io_status,
+            bytes.as_ptr().cast(),
+            (HEADER + name_bytes) as u32,
+            FILE_RENAME_INFORMATION,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "NtSetInformationFile(rename) failed: {status:#010x}"
+        )));
+    }
+    Ok(())
+}
+
+/// A plain reinterpretation of a `u64` slice as bytes (no external crate).
+fn bytemuck_cast(buf: &mut [u64]) -> &mut [u8] {
+    // SAFETY: every bit pattern is a valid u8; the length is 8x the u64 count
+    // and the alignment of u64 exceeds u8.
+    unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len() * 8) }
 }
 
 /// `%ProgramData%` (normally `C:\ProgramData`), from the known-folder API: a

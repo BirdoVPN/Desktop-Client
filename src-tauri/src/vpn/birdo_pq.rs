@@ -149,10 +149,10 @@ use parking_lot::Mutex;
 use sha2::Sha256;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::api::types::ConnectResponse;
+use crate::utils::safe_fs::OwnedDir;
 
 /// FIPS 203 ML-KEM-1024 sizes — must match server + Android constants.
 pub const PUBLIC_KEY_BYTES: usize = 1568;
@@ -394,15 +394,47 @@ fn hkdf_to_psk(shared_secret: &[u8], nonce: &[u8]) -> Result<Zeroizing<[u8; PSK_
 
 // ── Persistence ───────────────────────────────────────────────────────────
 
-fn keypair_path() -> Result<PathBuf, String> {
-    let base = dirs::config_local_dir()
-        .ok_or_else(|| "no config_local_dir on this platform".to_string())?;
-    let dir = base.join("BirdoVPN");
-    fs::create_dir_all(&dir).map_err(|e| format!("create dir {dir:?}: {e}"))?;
-    Ok(dir.join(KEYPAIR_FILENAME))
+/// Where the ML-KEM keypair lives: `name` in the app directory `dir`.
+///
+/// MR-1945 H1 (#287 review): the keypair is PER-USER security material, so its
+/// home stays `<config_local_dir>/BirdoVPN` (never the machine-wide
+/// `%ProgramData%`, which would share one device's key across the Windows
+/// accounts on a machine). What the review asked for is that the elevated
+/// client's writes to it cannot be redirected: that directory is held open for
+/// the process lifetime (`file_log::hold_app_dirs`) and every create/rename/
+/// delete goes through `dir` ([`OwnedDir`]).
+struct KeypairLoc {
+    dir: OwnedDir,
+    name: String,
 }
 
-fn write_keypair(path: &PathBuf, kp: &StaticKeypair) -> Result<(), String> {
+impl KeypairLoc {
+    #[cfg(test)]
+    fn at(path: &std::path::Path) -> Self {
+        Self {
+            dir: OwnedDir::new(
+                path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                &[],
+            ),
+            name: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(KEYPAIR_FILENAME)
+                .to_string(),
+        }
+    }
+}
+
+fn keypair_loc() -> Result<KeypairLoc, String> {
+    let base = dirs::config_local_dir()
+        .ok_or_else(|| "no config_local_dir on this platform".to_string())?;
+    Ok(KeypairLoc {
+        dir: OwnedDir::new(base, &["BirdoVPN"]),
+        name: KEYPAIR_FILENAME.to_string(),
+    })
+}
+
+fn write_keypair(loc: &KeypairLoc, kp: &StaticKeypair) -> Result<(), String> {
     // The length check IS the guard against `ml_kem::KeyExport::to_bytes()`,
     // which hands back a 64-byte seed rather than the 3168-byte expanded key.
     if kp.public_key.len() != PUBLIC_KEY_BYTES || kp.secret_key.len() != SECRET_KEY_BYTES {
@@ -421,50 +453,45 @@ fn write_keypair(path: &PathBuf, kp: &StaticKeypair) -> Result<(), String> {
     buf.extend_from_slice(&kp.public_key);
     buf.extend_from_slice(kp.secret_key.as_slice());
 
-    // Write atomically via tmp + rename so a crash mid-write can't leave a
-    // half-truncated file that bricks the client.
-    let tmp = path.with_extension("bin.tmp");
-    {
-        let mut f = open_owner_only(&tmp)?;
-        f.write_all(&buf)
-            .map_err(|e| format!("write {tmp:?}: {e}"))?;
-        f.sync_all().map_err(|e| format!("fsync {tmp:?}: {e}"))?;
+    // Write atomically via a uniquely-named staging file + rename so a crash
+    // mid-write can't leave a half-truncated file that bricks the client.
+    // MR-1945 H1: created new through a checked handle and renamed within the
+    // held directory (owner-only on Unix), never a raw path a planted link
+    // could redirect.
+    fs::create_dir_all(loc.dir.path()).map_err(|e| format!("create dir: {e}"))?;
+    let tmp = format!("{}.{:016x}.tmp", loc.name, rand::random::<u64>());
+    let result = (|| {
+        let mut f = loc
+            .dir
+            .create_new(&tmp)
+            .map_err(|e| format!("create {tmp}: {e}"))?;
+        f.write_all(&buf).map_err(|e| format!("write {tmp}: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync {tmp}: {e}"))?;
+        drop(f);
+        loc.dir
+            .rename_within(&tmp, &loc.name)
+            .map_err(|e| format!("rename {tmp} -> {}: {e}", loc.name))
+    })();
+    if result.is_err() {
+        let _ = loc.dir.remove_file(&tmp);
     }
-    fs::rename(&tmp, path).map_err(|e| format!("rename {tmp:?} -> {path:?}: {e}"))?;
     buf.fill(0);
-    Ok(())
+    result
 }
 
-#[cfg(unix)]
-fn open_owner_only(path: &PathBuf) -> Result<fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("open {path:?}: {e}"))
-}
-
-#[cfg(not(unix))]
-fn open_owner_only(path: &PathBuf) -> Result<fs::File, String> {
-    // Windows: relies on the user-profile ACL inherited via config_local_dir.
-    // Same posture as the existing settings file; full DACL hardening lives
-    // in a separate audit follow-up if/when needed.
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|e| format!("open {path:?}: {e}"))
-}
-
-fn read_keypair(path: &PathBuf) -> Result<Option<StaticKeypair>, KeypairReadError> {
-    let mut f = match fs::File::open(path) {
+fn read_keypair(loc: &KeypairLoc) -> Result<Option<StaticKeypair>, KeypairReadError> {
+    // MR-1945: opened through the checked handle. A planted link or hard link
+    // at the name is refused (PermissionDenied) and treated as an unusable key
+    // (re-keyed), never followed.
+    let mut f = match loc.dir.open_rw(&loc.name) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(KeypairReadError::Io(format!("open {path:?}: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(KeypairReadError::Unusable(format!(
+                "keypair file is not the app's own: {e}"
+            )));
+        }
+        Err(e) => return Err(KeypairReadError::Io(format!("open {}: {e}", loc.name))),
     };
     // Zeroizing + pre-sized: the buffer holds the ML-KEM SECRET key, so (a) it
     // must be scrubbed on EVERY exit path, not only the manual `buf.fill(0)`
@@ -481,7 +508,7 @@ fn read_keypair(path: &PathBuf) -> Result<Option<StaticKeypair>, KeypairReadErro
     (&mut f)
         .take(READ_CAP_BYTES as u64)
         .read_to_end(&mut buf)
-        .map_err(|e| KeypairReadError::Io(format!("read {path:?}: {e}")))?;
+        .map_err(|e| KeypairReadError::Io(format!("read {}: {e}", loc.name)))?;
     if buf.len() != KEYPAIR_FILE_BYTES {
         let n = buf.len();
         buf.fill(0);
@@ -543,8 +570,8 @@ fn read_keypair(path: &PathBuf) -> Result<Option<StaticKeypair>, KeypairReadErro
 /// per-device PQ key — so the fresh key is simply used from the next connect.
 /// A file that merely failed to read (I/O) is left alone: discarding a
 /// long-lived identity key on a transient error is the worse trade.
-fn load_or_generate_at(path: &PathBuf) -> Result<StaticKeypair, String> {
-    match read_keypair(path) {
+fn load_or_generate_at(loc: &KeypairLoc) -> Result<StaticKeypair, String> {
+    match read_keypair(loc) {
         Ok(Some(kp)) => return Ok(kp),
         Ok(None) => {
             tracing::info!("BirdoPQ: no persisted ML-KEM keypair — generating fresh (~10–50 ms)");
@@ -560,9 +587,9 @@ fn load_or_generate_at(path: &PathBuf) -> Result<StaticKeypair, String> {
         }
     }
     let fresh = generate_keypair();
-    if let Err(e) = write_keypair(path, &fresh) {
+    if let Err(e) = write_keypair(loc, &fresh) {
         tracing::warn!(
-            "BirdoPQ: failed to persist keypair to {path:?}: {e} — \
+            "BirdoPQ: failed to persist keypair: {e} — \
              continuing in-memory; will regenerate next launch"
         );
     }
@@ -585,8 +612,8 @@ fn load_or_generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), String> {
             ));
         }
     }
-    let path = keypair_path()?;
-    let kp = load_or_generate_at(&path)?;
+    let loc = keypair_loc()?;
+    let kp = load_or_generate_at(&loc)?;
     let pk = kp.public_key.clone();
     let sk = Zeroizing::new(kp.secret_key.to_vec());
     *cell.lock() = Some(kp);
@@ -597,11 +624,12 @@ fn load_or_generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), String> {
 pub fn reset_persisted_keypair() -> Result<(), String> {
     *cache().lock() = None;
     set_mode(PqMode::Disabled);
-    let path = keypair_path()?;
-    match fs::remove_file(&path) {
+    // MR-1945: delete through the checked handle in the held directory.
+    let loc = keypair_loc()?;
+    match loc.dir.remove_file(&loc.name) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("delete {path:?}: {e}")),
+        Err(e) => Err(format!("delete {}: {e}", loc.name)),
     }
 }
 
@@ -745,6 +773,12 @@ pub fn record_disabled() {
 mod tests {
     use super::*;
     use ml_kem::array::sizes::U32;
+    use std::path::Path;
+
+    /// A keypair location at a temp `path`, for tests.
+    fn kloc(path: &Path) -> KeypairLoc {
+        KeypairLoc::at(path)
+    }
     use ml_kem::{EncapsulationKey, Key, TryKeyInit, B32};
 
     // No suite-wide file lock: every file-touching test below owns a
@@ -882,7 +916,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(KEYPAIR_FILENAME);
-        write_keypair(&path, &kp).unwrap();
+        write_keypair(&kloc(&path), &kp).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().len() as usize,
             KEYPAIR_FILE_BYTES,
@@ -894,7 +928,7 @@ mod tests {
             public_key: kp.public_key.clone(),
             secret_key: Zeroizing::new(vec![0u8; 64]),
         };
-        assert!(write_keypair(&path, &short).is_err());
+        assert!(write_keypair(&kloc(&path), &short).is_err());
     }
 
     /// ml-kem enforces FIPS 203 §7.3 where `pqcrypto-mlkem`'s `from_bytes` was
@@ -917,23 +951,23 @@ mod tests {
             public_key: field(PQCLEAN_JSON, "publicKeyB64"),
             secret_key: Zeroizing::new(sk.clone()),
         };
-        write_keypair(&path, &corrupt).unwrap();
+        write_keypair(&kloc(&path), &corrupt).unwrap();
 
         assert!(
             load_decapsulation_key(&sk).is_err(),
             "a dk whose H(ek) does not match must be rejected"
         );
-        match read_keypair(&path) {
+        match read_keypair(&kloc(&path)) {
             Err(KeypairReadError::Unusable(_)) => {}
             Err(e) => panic!("expected Unusable, got {e:?}"),
             Ok(_) => panic!("corrupt H(ek) must not be accepted"),
         }
 
         // The recovery: a fresh, valid, persisted keypair.
-        let fresh = load_or_generate_at(&path).expect("must re-key rather than fail");
+        let fresh = load_or_generate_at(&kloc(&path)).expect("must re-key rather than fail");
         assert_eq!(fresh.secret_key.len(), SECRET_KEY_BYTES);
         assert_ne!(fresh.secret_key.as_slice(), sk.as_slice());
-        let reread = read_keypair(&path)
+        let reread = read_keypair(&kloc(&path))
             .expect("the re-keyed file must be readable")
             .expect("the re-keyed file must exist");
         assert_eq!(reread.secret_key.as_slice(), fresh.secret_key.as_slice());
@@ -960,7 +994,7 @@ mod tests {
         let mut wrong_pk = kp.public_key.clone();
         wrong_pk[0] ^= 0x01; // one byte off; magic, version and both sizes stay perfect
         write_keypair(
-            &path,
+            &kloc(&path),
             &StaticKeypair {
                 public_key: wrong_pk.clone(),
                 secret_key: Zeroizing::new(kp.secret_key.to_vec()),
@@ -973,7 +1007,7 @@ mod tests {
         load_decapsulation_key(kp.secret_key.as_slice())
             .expect("the secret-key half is valid; only the stored pk is wrong");
 
-        match read_keypair(&path) {
+        match read_keypair(&kloc(&path)) {
             Err(KeypairReadError::Unusable(m)) => assert!(
                 m.contains("stored public key"),
                 "wrong Unusable reason: {m}"
@@ -984,9 +1018,9 @@ mod tests {
 
         // Unusable means re-key, not fail-forever: the replacement file must
         // be readable and its halves must agree.
-        let fresh = load_or_generate_at(&path).expect("must re-key rather than fail");
+        let fresh = load_or_generate_at(&kloc(&path)).expect("must re-key rather than fail");
         assert_ne!(fresh.public_key, wrong_pk);
-        let reread = read_keypair(&path)
+        let reread = read_keypair(&kloc(&path))
             .expect("the re-keyed file must be readable")
             .expect("the re-keyed file must exist");
         assert_eq!(reread.public_key, fresh.public_key);
@@ -1004,13 +1038,13 @@ mod tests {
         let path = dir.path().join(KEYPAIR_FILENAME);
 
         let kp = generate_keypair();
-        write_keypair(&path, &kp).unwrap();
+        write_keypair(&kloc(&path), &kp).unwrap();
         // Append a megabyte of junk to an otherwise valid file.
         let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(&vec![0xAAu8; 1 << 20]).unwrap();
         drop(f);
 
-        match read_keypair(&path) {
+        match read_keypair(&kloc(&path)) {
             // The reported size is the CAP (4745), not the file's real size:
             // proof the read stopped inside the reservation.
             Err(KeypairReadError::Unusable(m)) => assert!(
@@ -1139,8 +1173,8 @@ mod tests {
         let kp = generate_keypair();
         let pk_clone = kp.public_key.clone();
         let sk_clone = kp.secret_key.to_vec();
-        write_keypair(&path, &kp).unwrap();
-        let loaded = read_keypair(&path).unwrap().unwrap();
+        write_keypair(&kloc(&path), &kp).unwrap();
+        let loaded = read_keypair(&kloc(&path)).unwrap().unwrap();
         assert_eq!(loaded.public_key, pk_clone);
         assert_eq!(loaded.secret_key.as_slice(), sk_clone.as_slice());
     }
@@ -1151,7 +1185,7 @@ mod tests {
         let path = dir.path().join(KEYPAIR_FILENAME);
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(&[0u8; KEYPAIR_FILE_BYTES]).unwrap();
-        let r = read_keypair(&path);
+        let r = read_keypair(&kloc(&path));
         assert!(r.is_err());
     }
 
@@ -1161,7 +1195,7 @@ mod tests {
         let path = dir.path().join(KEYPAIR_FILENAME);
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(b"BPQ1\x01\x00\x00\x00").unwrap();
-        let r = read_keypair(&path);
+        let r = read_keypair(&kloc(&path));
         assert!(r.is_err());
     }
 

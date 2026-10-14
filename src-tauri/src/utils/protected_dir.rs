@@ -91,9 +91,43 @@ pub fn ensure() -> io::Result<PathBuf> {
 /// journal, no settings saves. So if the fixed name cannot be secured, the app
 /// falls back to a RANDOMLY named protected directory the attacker could not
 /// have pre-created, and records its name in HKLM (writable only by
-/// administrators, so a user cannot poison it). A recorded name is reused on
-/// later starts; if it too has been made unusable, a fresh one is minted.
+/// administrators, so a user cannot poison it).
+///
+/// MEDIUM 2 (#287 review): once a fallback is recorded, it is used FIRST, before
+/// the fixed name, on every later start. Otherwise a squatter who held the
+/// fixed name at first run (so the key landed in the random dir) could release
+/// it later; the next start would secure the now-free fixed name, find no key
+/// there, and re-open the whole migration (unsigned settings adopted, journal
+/// and resume markers re-armed). With the recorded folder preferred, the app
+/// keeps using the directory that actually holds its key.
 fn resolve(base: &Path) -> io::Result<PathBuf> {
+    resolve_with(base, &recorded_dir_name, &record_dir_name)
+}
+
+/// [`resolve`] with the HKLM record read/write injected, so the preference
+/// order is testable without touching the machine's registry (MEDIUM 2 seam).
+fn resolve_with(
+    base: &Path,
+    recorded: &dyn Fn() -> Option<String>,
+    record: &dyn Fn(&str),
+) -> io::Result<PathBuf> {
+    // A recorded fallback is authoritative: the key/markers live there.
+    if let Some(name) = recorded() {
+        // A plain directory name, never a path a crafted value could escape.
+        if !name.is_empty() && !name.contains(['/', '\\', ':']) && name != ".." {
+            match secure_named(base, &name) {
+                Ok(dir) => return Ok(dir),
+                Err(e) => tracing::warn!(
+                    "The recorded state directory is unusable ({}); minting a new private one",
+                    e
+                ),
+            }
+        }
+        // The recorded folder could not be secured: mint a fresh private one
+        // (and re-record it) rather than fall back to the fixed name, which a
+        // squatter could have freed to re-open the migration.
+        return mint_private(base, record);
+    }
     match secure_named(base, DIR_NAME) {
         Ok(dir) => return Ok(dir),
         Err(e) => tracing::warn!(
@@ -101,20 +135,16 @@ fn resolve(base: &Path) -> io::Result<PathBuf> {
             e
         ),
     }
-    if let Some(name) = recorded_dir_name() {
-        // A plain directory name, never a path a crafted value could escape.
-        if !name.is_empty() && !name.contains(['/', '\\', ':']) && name != ".." {
-            match secure_named(base, &name) {
-                Ok(dir) => return Ok(dir),
-                Err(e) => tracing::warn!("The recorded state directory is unusable ({})", e),
-            }
-        }
-    }
+    mint_private(base, record)
+}
+
+/// Create a fresh randomly named admin-only directory and record it.
+fn mint_private(base: &Path, record: &dyn Fn(&str)) -> io::Result<PathBuf> {
     for _ in 0..ATTEMPTS {
         let name = random_state_name();
         match create(&base.join(&name)) {
             Ok(()) => {
-                record_dir_name(&name);
+                record(&name);
                 tracing::warn!("Created a privately named admin-only state directory");
                 return Ok(base.join(name));
             }
@@ -608,6 +638,68 @@ mod tests {
         assert!(Security::of(&open_for_security(&dir))
             .unwrap()
             .is_admin_only());
+    }
+
+    /// MEDIUM 2 (#287 review): once a fallback directory is recorded, `resolve`
+    /// uses it FIRST and never touches the fixed `BirdoVPN` name — so a
+    /// squatter who freed the fixed name later cannot make the app adopt it and
+    /// re-open the migration. The HKLM read/write is injected here.
+    #[test]
+    fn resolve_prefers_the_recorded_fallback_over_the_fixed_name() {
+        if !elevated_or_skip("resolve_prefers_the_recorded_fallback_over_the_fixed_name") {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        // Pre-create the recorded fallback as a real admin-only directory.
+        let recorded = secure_named(base.path(), &random_state_name()).unwrap();
+        let name = recorded.file_name().unwrap().to_str().unwrap().to_string();
+
+        let got = resolve_with(base.path(), &|| Some(name.clone()), &|_| {
+            panic!("a new name must not be recorded when one already resolves")
+        })
+        .unwrap();
+        assert_eq!(got, recorded, "the recorded fallback is used");
+        assert!(
+            !base.path().join(DIR_NAME).exists(),
+            "the fixed name must not be secured or created"
+        );
+    }
+
+    /// With nothing recorded, `resolve` uses the fixed name.
+    #[test]
+    fn resolve_uses_the_fixed_name_when_nothing_is_recorded() {
+        if !elevated_or_skip("resolve_uses_the_fixed_name_when_nothing_is_recorded") {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let got = resolve_with(base.path(), &|| None, &|_| {
+            panic!("the fixed name must not record a fallback")
+        })
+        .unwrap();
+        assert_eq!(got, base.path().join(DIR_NAME));
+    }
+
+    /// A recorded value that is not a plain name (a crafted HKLM value) is not
+    /// used as a path; a fresh private one is minted and recorded instead, and
+    /// the fixed name is still never used.
+    #[test]
+    fn a_crafted_recorded_value_mints_a_fresh_private_name() {
+        if !elevated_or_skip("a_crafted_recorded_value_mints_a_fresh_private_name") {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let minted = std::cell::RefCell::new(None);
+        let got = resolve_with(base.path(), &|| Some(r"..\..\Windows".to_string()), &|n| {
+            *minted.borrow_mut() = Some(n.to_string())
+        })
+        .unwrap();
+        let minted = minted.borrow().clone().expect("a fresh name was recorded");
+        assert!(minted.starts_with("BirdoVPN-"), "{minted}");
+        assert_eq!(got, base.path().join(&minted));
+        assert!(
+            !base.path().join(DIR_NAME).exists(),
+            "the fixed name is untouched"
+        );
     }
 
     #[test]

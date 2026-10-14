@@ -100,13 +100,18 @@ impl OwnedDir {
     }
 
     /// Rename `from` to `to`, both plain names directly in this directory
-    /// (a log rotation, or an atomic write's staging file into place). The
-    /// held directory handle keeps the directory itself from being swapped;
-    /// the rename never follows a reparse point at either name.
+    /// (a log rotation, or an atomic write's staging file into place).
+    ///
+    /// MR-1945 MEDIUM 1: on Windows the rename is performed relative to a
+    /// freshly opened, verified handle to this directory (`FileRenameInfo` with
+    /// `RootDirectory`), so a junction swapped onto the path between a check and
+    /// the rename cannot redirect it to move the file elsewhere (e.g. through
+    /// `\RPC Control`). `from` is opened without following a reparse point, and
+    /// the directory handle's final path must be this directory's own.
     pub fn rename_within(&self, from: &str, to: &str) -> io::Result<()> {
         check_name(from)?;
         check_name(to)?;
-        std::fs::rename(self.join(from), self.join(to))
+        imp::rename_within(self, from, to)
     }
 
     /// Hold the directory open for as long as the returned guard lives, so no
@@ -117,6 +122,18 @@ impl OwnedDir {
     pub fn hold_open(&self) -> io::Result<DirGuard> {
         std::fs::create_dir_all(self.path())?;
         imp::hold_open(self)
+    }
+
+    /// [`OwnedDir::hold_open`], but only if the directory already exists; `None`
+    /// when it does not. Unlike `hold_open` it never CREATES the directory —
+    /// used for the logs and crash folders, which must not be brought into
+    /// being while the on-device log is switched off (MR-808).
+    pub fn hold_open_if_present(&self) -> io::Result<Option<DirGuard>> {
+        match std::fs::symlink_metadata(self.path()) {
+            Ok(_) => imp::hold_open(self).map(Some),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -167,6 +184,7 @@ mod imp {
     // winnt.h share-mode bits (std's OpenOptions has no setter for them).
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
 
     pub(super) fn remove_file(dir: &OwnedDir, name: &str) -> io::Result<()> {
         let file = open_checked(
@@ -217,12 +235,29 @@ mod imp {
         open_checked(dir, name, OpenOptions::new().append(true), true)
     }
 
+    // FILE_LIST_DIRECTORY (0x1): required on the `RootDirectory` handle for
+    // `FileRenameInfo` to resolve a relative target name.
+    const FILE_LIST_DIRECTORY: u32 = 0x1;
+
     pub(super) fn hold_open(dir: &OwnedDir) -> io::Result<DirGuard> {
         // No FILE_SHARE_DELETE: while this handle lives, the directory cannot
         // be renamed or deleted, so it cannot be swapped for a junction.
+        let handle = open_verified_dir(
+            dir,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )?;
+        Ok(DirGuard { handle })
+    }
+
+    /// A handle to this directory, verified to be exactly it: not a reparse
+    /// point, a real directory, and resolving to its expected final path. Used
+    /// both for the process-lifetime hold and, freshly each time, as the
+    /// `RootDirectory` a rename is performed relative to.
+    fn open_verified_dir(dir: &OwnedDir, access: u32, share: u32) -> io::Result<File> {
         let handle = OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .access_mode(access)
+            .share_mode(share)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(dir.path())?;
         let attributes = handle.metadata()?.file_attributes();
@@ -239,7 +274,29 @@ mod imp {
                 "it resolves somewhere unexpected",
             ));
         }
-        Ok(DirGuard { handle })
+        Ok(handle)
+    }
+
+    pub(super) fn rename_within(dir: &OwnedDir, from: &str, to: &str) -> io::Result<()> {
+        // The source, opened with DELETE (FileRenameInfo needs it) and the
+        // usual reparse/final-path checks; not the single-link check — renaming
+        // our own staging or rotated file is fine either way.
+        let source = open_checked(
+            dir,
+            from,
+            OpenOptions::new().access_mode(DELETE | FILE_READ_ATTRIBUTES),
+            false,
+        )?;
+        // A fresh, verified handle to the directory; the rename is relative to
+        // it, so the path is never re-walked (no junction can redirect it).
+        // SHARE_DELETE here so a rename is not blocked by a held dir handle.
+        let dir_handle = open_verified_dir(
+            dir,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        let wide = win_api::wide(std::ffi::OsStr::new(to));
+        win_api::rename_by_handle(&source, &dir_handle, &wide)
     }
 
     /// `write`: the handle will be written through, so the name must be a
@@ -366,6 +423,14 @@ mod imp {
         Ok(DirGuard {
             handle: File::open(dir.path())?,
         })
+    }
+
+    pub(super) fn rename_within(dir: &OwnedDir, from: &str, to: &str) -> io::Result<()> {
+        // On Unix the client runs as root with its state in root's own home;
+        // the chain is checked and the rename's last components are plain names
+        // (rename never follows a symlink at the final component).
+        check_dirs(dir)?;
+        std::fs::rename(dir.join(from), dir.join(to))
     }
 
     /// Every one of the app's folders below the root is a real directory.
@@ -645,6 +710,52 @@ pub(crate) mod tests {
         // Nothing of ours landed behind the junction.
         assert!(!elsewhere.join("settings.json.ab.tmp").exists());
         assert!(!elsewhere.join("birdo.log").exists());
+    }
+
+    /// MR-1945 MEDIUM 1: a rename whose directory is a junction is refused —
+    /// the directory handle it would rename relative to does not resolve to the
+    /// expected path — so a planted junction (the "unheld dir, swap it in"
+    /// attack) cannot move the file through, say, `\RPC Control`.
+    #[cfg(windows)]
+    #[test]
+    fn rename_within_is_refused_when_the_directory_is_a_junction() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // A real staging file reachable through the junction, to prove the
+        // refusal is the directory check, not a missing source.
+        write(&elsewhere.join("settings.json.ab.tmp"), "staged");
+        junction(&root.path().join("uk.birdo.vpn.desktop"), &elsewhere);
+
+        let config = OwnedDir::new(root.path(), &["uk.birdo.vpn.desktop"]);
+        assert!(config
+            .rename_within("settings.json.ab.tmp", "settings.json")
+            .is_err());
+        assert!(
+            !elsewhere.join("settings.json").exists(),
+            "renamed through the junction"
+        );
+    }
+
+    /// The whole atomic replace (create new + rename within) round-trips in a
+    /// real directory.
+    #[test]
+    fn create_then_rename_replaces_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = OwnedDir::new(root.path(), &[]);
+        write(&dir.join("settings.json"), "old");
+        {
+            use std::io::Write;
+            let mut f = dir.create_new("settings.json.tmp").unwrap();
+            f.write_all(b"new").unwrap();
+        }
+        dir.rename_within("settings.json.tmp", "settings.json")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.json")).unwrap(),
+            "new"
+        );
+        assert!(!dir.join("settings.json.tmp").exists());
     }
 
     /// `hold_open` refuses a junctioned directory (so the caller never trusts

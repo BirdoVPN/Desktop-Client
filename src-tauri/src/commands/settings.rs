@@ -1348,8 +1348,15 @@ fn quarantine(
     sign: impl FnOnce(&str) -> Result<String, String>,
 ) -> AppSettings {
     let (defaults, _) = after_quarantine(AppSettings::default(), saved);
-    if let Err(e) = fs::rename(path, aside_path(path, "tampered")) {
-        tracing::warn!("Could not preserve the unverified settings file: {}", e);
+    let moved = aside_path(path, "tampered");
+    let renamed = (|| {
+        let from = file_name_of(path).map_err(|_| ())?;
+        let to = moved.file_name().and_then(|n| n.to_str()).ok_or(())?;
+        rename_in_config(path, from, to).map_err(|e| {
+            tracing::warn!("Could not preserve the unverified settings file: {}", e);
+        })
+    })();
+    if renamed.is_err() {
         return defaults;
     }
     if !defaults.file_logging_enabled {
@@ -1727,25 +1734,46 @@ fn reset_over(
     let Err(e) = save() else {
         return Ok(());
     };
-    Err(IpcError::unknown(
-        match aside.map(|aside| fs::rename(aside, path)) {
-            Some(Err(back)) => format!(
-                "The defaults could not be saved ({e}), and the settings file stays set aside \
+    let put_back = aside.as_ref().map(|aside| {
+        let from = aside
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| std::io::Error::other("aside path has no file name"))?;
+        let to = file_name_of(path).map_err(|_| std::io::Error::other("no settings name"))?;
+        rename_in_config(path, from, to)
+    });
+    Err(IpcError::unknown(match put_back {
+        Some(Err(back)) => format!(
+            "The defaults could not be saved ({e}), and the settings file stays set aside \
                  (settings.json.unverified-…): {back}"
-            ),
-            None if quarantined => format!(
-                "The settings file was set aside (settings.json.tampered-…), but the defaults \
+        ),
+        None if quarantined => format!(
+            "The settings file was set aside (settings.json.tampered-…), but the defaults \
                  could not be saved: {e}"
-            ),
-            _ => format!("The defaults could not be saved, so the settings were not reset: {e}"),
-        },
-    ))
+        ),
+        _ => format!("The defaults could not be saved, so the settings were not reset: {e}"),
+    }))
 }
 
 /// Where to move settings.json aside to: `settings.json.<tag>-<UTC time>`,
 /// with a counter when that name is taken. A fixed name was replaced by the
 /// next quarantine or reset (a rename onto an existing file replaces it on
 /// Windows), destroying the copy an earlier one had kept.
+/// The leaf file name of `path`, for the checked renames below.
+fn file_name_of(path: &Path) -> Result<&str, IpcError> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| IpcError::unknown("settings path has no file name"))
+}
+
+/// Rename `from` to `to` (both leaf names) inside the config directory, through
+/// the checked, directory-handle-relative rename (MR-1945 MEDIUM 1): never a
+/// by-path `fs::rename` a junction swap could redirect.
+fn rename_in_config(path: &Path, from: &str, to: &str) -> std::io::Result<()> {
+    let dir = config_dir(path).map_err(std::io::Error::other)?;
+    dir.rename_within(from, to)
+}
+
 fn aside_path(path: &Path, tag: &str) -> PathBuf {
     let base = format!(
         "settings.json.{tag}-{}",
@@ -1764,7 +1792,12 @@ fn aside_path(path: &Path, tag: &str) -> PathBuf {
 /// (`None`) when there is none.
 fn set_aside(path: &Path, tag: &str) -> Result<Option<PathBuf>, IpcError> {
     let aside = aside_path(path, tag);
-    match fs::rename(path, &aside) {
+    let from = file_name_of(path)?;
+    let to = aside
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| IpcError::unknown("aside path has no file name"))?;
+    match rename_in_config(path, from, to) {
         Ok(()) => Ok(Some(aside)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(IpcError::unknown(format!(

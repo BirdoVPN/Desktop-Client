@@ -198,24 +198,43 @@ pub fn install(dir: OwnedDir, name: &str) -> &'static RotatingLog {
 /// there is no data directory. The guards are leaked on purpose — they live
 /// as long as the process.
 pub fn hold_app_dirs() {
-    let mut dirs: Vec<OwnedDir> = Vec::new();
-    if let Some(config) = dirs::config_dir() {
-        dirs.push(OwnedDir::new(config, &[APP_IDENTIFIER]));
-    }
-    if let Some(dir) = log_dir() {
-        dirs.push(dir);
-    }
-    if let Some(dir) = crash_dir() {
-        dirs.push(dir);
-    }
-    for dir in dirs {
-        match dir.hold_open() {
-            Ok(guard) => HELD.lock().unwrap_or_else(|e| e.into_inner()).push(guard),
+    fn keep(guard: io::Result<Option<crate::utils::safe_fs::DirGuard>>) {
+        match guard {
+            Ok(Some(g)) => HELD.lock().unwrap_or_else(|e| e.into_inner()).push(g),
+            Ok(None) => {}
             Err(e) => tracing::warn!(
                 "Could not hold a state directory open against a junction swap: {}",
                 e
             ),
         }
+    }
+
+    // Created and held: these hold state written regardless of the on-device
+    // log switch — settings (config dir), the update-resume record and the DNS
+    // journal's %APPDATA% ancestor (`%APPDATA%\BirdoVPN`), and the device id and
+    // ML-KEM key (`%LOCALAPPDATA%\BirdoVPN`).
+    if let Some(config) = dirs::config_dir() {
+        keep(
+            OwnedDir::new(config, &[APP_IDENTIFIER])
+                .hold_open()
+                .map(Some),
+        );
+    }
+    if let Some(base) = dirs::data_dir() {
+        keep(OwnedDir::new(base, &["BirdoVPN"]).hold_open().map(Some));
+    }
+    if let Some(base) = dirs::config_local_dir() {
+        keep(OwnedDir::new(base, &["BirdoVPN"]).hold_open().map(Some));
+    }
+    // Held only if they already exist: creating them here would bring the
+    // logs / crash folders into being even when the on-device log is off
+    // (MR-808). When logging is later switched on, the writer creates and the
+    // per-operation checks still apply.
+    if let Some(dir) = log_dir() {
+        keep(dir.hold_open_if_present());
+    }
+    if let Some(dir) = crash_dir() {
+        keep(dir.hold_open_if_present());
     }
 }
 
