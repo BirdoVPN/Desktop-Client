@@ -34,7 +34,6 @@
 //! takes DELETE on it or FILE_DELETE_CHILD on ProgramData, which users do not
 //! have.
 
-use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -44,10 +43,8 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::{
-    GetKernelObjectSecurity, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsWellKnownSid,
-    WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
-    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    PSID, WELL_KNOWN_SID_TYPE,
+    GetKernelObjectSecurity, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR,
 };
 
 use super::win_api::{
@@ -193,8 +190,16 @@ fn set_aside(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// An object's owner and DACL, read through an open handle.
-pub struct Security(Vec<u64>);
+/// SYSTEM, BUILTIN\Administrators, OWNER RIGHTS.
+const SYSTEM: &str = "S-1-5-18";
+const ADMINISTRATORS: &str = "S-1-5-32-544";
+const OWNER_RIGHTS: &str = "S-1-3-4";
+
+/// An object's owner and DACL, read through an open handle as the
+/// self-relative security descriptor `GetKernelObjectSecurity` returns, and
+/// parsed from those bytes with every offset bounds-checked: no pointer into
+/// the descriptor is ever dereferenced.
+pub struct Security(Vec<u8>);
 
 impl Security {
     /// `file` must be open with READ_CONTROL.
@@ -207,7 +212,7 @@ impl Security {
         if needed == 0 {
             return Err(io::Error::last_os_error());
         }
-        // u64s, so the self-relative descriptor is suitably aligned.
+        // u64s, so the buffer is suitably aligned for a descriptor.
         let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
         // SAFETY: `buf` is writable for `buf.len() * 8` bytes, at least
         // `needed`; `handle` is open for as long as `file` lives.
@@ -221,115 +226,101 @@ impl Security {
             )
         }
         .map_err(|_| io::Error::last_os_error())?;
-        Ok(Self(buf))
-    }
-
-    fn descriptor(&self) -> PSECURITY_DESCRIPTOR {
-        PSECURITY_DESCRIPTOR(self.0.as_ptr() as *mut c_void)
+        let bytes = buf
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .take(needed as usize)
+            .collect();
+        Ok(Self(bytes))
     }
 
     /// Owned by SYSTEM or Administrators, and a DACL with no grant to anyone
     /// else (OWNER RIGHTS limited to READ_CONTROL). An absent or NULL DACL —
-    /// full access for everyone — is not admin-only.
+    /// full access for everyone — or a descriptor that does not parse is not
+    /// admin-only.
     pub fn is_admin_only(&self) -> bool {
-        self.owner_is_admin()
+        self.owner()
+            .is_some_and(|owner| owner == SYSTEM || owner == ADMINISTRATORS)
             && self
                 .allowed_aces()
-                .is_some_and(|aces| aces.iter().all(|&(sid, mask)| is_admin_grant(sid, mask)))
+                .is_some_and(|aces| aces.iter().all(|(sid, mask)| is_admin_grant(sid, *mask)))
     }
 
-    /// Every SID the DACL grants any access to, in string form (`S-1-5-18`);
-    /// an ACE of a type this does not read is listed as `"?"`. `None` for an
-    /// absent or NULL DACL, which grants everyone everything. (For tests:
-    /// the app decides with [`Security::is_admin_only`].)
+    /// Every SID the DACL grants any access to (`S-1-5-18`); an ACE of a
+    /// type this does not read is listed as `"?"`. `None` for an absent or
+    /// NULL DACL, which grants everyone everything. (For tests: the app
+    /// decides with [`Security::is_admin_only`].)
     #[cfg(test)]
     pub fn granted_sids(&self) -> Option<Vec<String>> {
-        self.allowed_aces().map(|aces| {
-            aces.iter()
-                .map(|&(sid, _)| {
-                    if sid.0.is_null() {
-                        "?".to_string()
-                    } else {
-                        // SAFETY: a SID inside this descriptor's DACL.
-                        unsafe { sid_string(sid) }
-                    }
-                })
-                .collect()
-        })
+        self.allowed_aces()
+            .map(|aces| aces.into_iter().map(|(sid, _)| sid).collect())
     }
 
-    fn owner_is_admin(&self) -> bool {
-        let mut owner = PSID::default();
-        let mut defaulted = windows::core::BOOL::default();
-        // SAFETY: the descriptor is the self-relative one in `self.0`; `owner`
-        // points into it and is only read while `self` lives.
-        let read =
-            unsafe { GetSecurityDescriptorOwner(self.descriptor(), &mut owner, &mut defaulted) };
-        read.is_ok()
-            && !owner.0.is_null()
-            && (is_sid(owner, WinBuiltinAdministratorsSid) || is_sid(owner, WinLocalSystemSid))
+    // SECURITY_DESCRIPTOR_RELATIVE: Revision u8, Sbz1 u8, Control u16,
+    // then the offsets of Owner, Group, Sacl and Dacl (u32 each; 0 = none).
+
+    fn owner(&self) -> Option<String> {
+        let at = u32_at(&self.0, 4)? as usize;
+        (at != 0).then(|| sid_at(&self.0, at)).flatten()
     }
 
     /// Every ACE of the DACL as `(sid, mask)`, with a deny ACE left out (it
     /// grants nothing) and an ACE of any other type reported as a grant to
-    /// nobody we know, so it fails the checks. `None` for an absent or NULL
-    /// DACL.
-    fn allowed_aces(&self) -> Option<Vec<(PSID, u32)>> {
+    /// `"?"` with every right, so it fails the checks. `None` for an absent
+    /// or NULL DACL, or one that does not parse.
+    fn allowed_aces(&self) -> Option<Vec<(String, u32)>> {
+        const SE_DACL_PRESENT: u16 = 0x0004;
         const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
         const ACCESS_DENIED_ACE_TYPE: u8 = 1;
-        let mut present = windows::core::BOOL::default();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut defaulted = windows::core::BOOL::default();
-        // SAFETY: as in `owner_is_admin`; `dacl` points into `self.0`.
-        let read = unsafe {
-            GetSecurityDescriptorDacl(self.descriptor(), &mut present, &mut dacl, &mut defaulted)
-        };
-        if read.is_err() || !present.as_bool() || dacl.is_null() {
+        let b = &self.0;
+        if u16_at(b, 2)? & SE_DACL_PRESENT == 0 {
             return None;
         }
-        // SAFETY: a present, non-NULL DACL inside the descriptor.
-        let count = unsafe { (*dacl).AceCount };
-        let mut aces = Vec::with_capacity(count as usize);
-        for index in 0..u32::from(count) {
-            let mut ace: *mut c_void = std::ptr::null_mut();
-            // SAFETY: `index` < AceCount; `ace` points into the DACL.
-            if unsafe { windows::Win32::Security::GetAce(dacl, index, &mut ace) }.is_err() {
+        let acl = u32_at(b, 16)? as usize;
+        if acl == 0 {
+            return None; // a NULL DACL
+        }
+        // ACL: AclRevision u8, Sbz1 u8, AclSize u16, AceCount u16, Sbz2 u16.
+        let count = u16_at(b, acl + 4)?;
+        let mut at = acl + 8;
+        let mut aces = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            // ACE_HEADER: AceType u8, AceFlags u8, AceSize u16.
+            let kind = *b.get(at)?;
+            let size = usize::from(u16_at(b, at + 2)?);
+            if size < 8 {
                 return None;
             }
-            // SAFETY: every ACE starts with an ACE_HEADER.
-            let header = unsafe { *(ace as *const ACE_HEADER) };
-            match header.AceType {
-                ACCESS_ALLOWED_ACE_TYPE => {
-                    // SAFETY: the header says this is an ACCESS_ALLOWED_ACE,
-                    // whose SID starts at SidStart.
-                    let allowed = ace as *const ACCESS_ALLOWED_ACE;
-                    let (mask, sid) = unsafe {
-                        (
-                            (*allowed).Mask,
-                            PSID(std::ptr::addr_of!((*allowed).SidStart) as *mut c_void),
-                        )
-                    };
-                    aces.push((sid, mask));
-                }
+            match kind {
+                // ACCESS_ALLOWED_ACE: the header, Mask u32, then the SID.
+                ACCESS_ALLOWED_ACE_TYPE => aces.push((sid_at(b, at + 8)?, u32_at(b, at + 4)?)),
                 ACCESS_DENIED_ACE_TYPE => {}
-                _ => aces.push((PSID::default(), u32::MAX)),
+                _ => aces.push(("?".to_string(), u32::MAX)),
             }
+            at += size;
         }
         Some(aces)
     }
 }
 
-fn is_sid(sid: PSID, kind: WELL_KNOWN_SID_TYPE) -> bool {
-    // SAFETY: a valid SID pointer (or null, which the caller rules out).
-    !sid.0.is_null() && unsafe { IsWellKnownSid(sid, kind) }.as_bool()
+fn u16_at(b: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
+}
+
+fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// The string form of the binary SID at `at` in `b`, if it fits there.
+fn sid_at(b: &[u8], at: usize) -> Option<String> {
+    let count = usize::from(*b.get(at + 1)?);
+    b.get(at..at + 8 + 4 * count).map(format_sid)
 }
 
 /// SYSTEM and Administrators with any rights; OWNER RIGHTS with at most
 /// READ_CONTROL. Nothing else.
-fn is_admin_grant(sid: PSID, mask: u32) -> bool {
-    is_sid(sid, WinLocalSystemSid)
-        || is_sid(sid, WinBuiltinAdministratorsSid)
-        || (is_sid(sid, WinCreatorOwnerRightsSid) && mask & !READ_CONTROL == 0)
+fn is_admin_grant(sid: &str, mask: u32) -> bool {
+    sid == SYSTEM || sid == ADMINISTRATORS || (sid == OWNER_RIGHTS && mask & !READ_CONTROL == 0)
 }
 
 fn read_user_sid() -> io::Result<String> {
@@ -359,22 +350,21 @@ fn read_user_sid() -> io::Result<String> {
     // SAFETY: opened above, closed once.
     let _ = unsafe { windows::Win32::Foundation::CloseHandle(token) };
     read.map_err(|_| io::Error::other("could not read the process token's user"))?;
-    // SAFETY: GetTokenInformation(TokenUser) filled a TOKEN_USER whose SID
-    // points into `buf`, which is still alive.
-    Ok(unsafe { sid_string((*(buf.as_ptr() as *const TOKEN_USER)).User.Sid) })
-}
-
-/// The string form of the binary SID at `sid`.
-///
-/// # Safety
-/// `sid` must point at a valid SID: a revision, a sub-authority count, a
-/// 6-byte authority, then that many little-endian u32 sub-authorities.
-unsafe fn sid_string(sid: PSID) -> String {
-    let count = *(sid.0 as *const u8).add(1) as usize;
-    format_sid(std::slice::from_raw_parts(
-        sid.0 as *const u8,
-        8 + 4 * count,
-    ))
+    // TOKEN_USER is a pointer to the SID, which the API placed in `buf`
+    // after the struct: read the pointer, turn it into an offset into `buf`,
+    // and parse the SID from those bytes.
+    // SAFETY: GetTokenInformation(TokenUser) filled a TOKEN_USER at the
+    // start of `buf`, which is aligned for it.
+    let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let bytes: Vec<u8> = buf
+        .iter()
+        .flat_map(|word| word.to_ne_bytes())
+        .take(needed as usize)
+        .collect();
+    (sid.0 as usize)
+        .checked_sub(buf.as_ptr() as usize)
+        .and_then(|at| sid_at(&bytes, at))
+        .ok_or_else(|| io::Error::other("the token's user SID is not where it should be"))
 }
 
 /// A binary SID in its string form, `S-<revision>-<authority>-<sub>…`.
@@ -428,6 +418,89 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    const SY: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    const BA: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0];
+    const BU: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x21, 2, 0, 0];
+    const OW: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+    const WD: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+    const FA: u32 = 0x001F_01FF;
+
+    /// A self-relative security descriptor: `owner`, and a DACL of
+    /// `(type, mask, sid)` ACEs — `None` for a NULL DACL.
+    fn descriptor(owner: &[u8], aces: Option<&[(u8, u32, &[u8])]>) -> Security {
+        let mut acl = Vec::new();
+        for &(kind, mask, sid) in aces.unwrap_or(&[]) {
+            acl.push(kind);
+            acl.push(0x03); // OBJECT_INHERIT | CONTAINER_INHERIT
+            acl.extend_from_slice(&((8 + sid.len()) as u16).to_le_bytes());
+            acl.extend_from_slice(&mask.to_le_bytes());
+            acl.extend_from_slice(sid);
+        }
+        let count = aces.map_or(0, <[_]>::len) as u16;
+        let mut b = vec![1u8, 0];
+        b.extend_from_slice(&(0x8004u16).to_le_bytes()); // SELF_RELATIVE | DACL_PRESENT
+        b.extend_from_slice(&20u32.to_le_bytes()); // owner
+        b.extend_from_slice(&[0; 8]); // no group, no SACL
+        let dacl = if aces.is_some() {
+            20 + owner.len() as u32
+        } else {
+            0
+        };
+        b.extend_from_slice(&dacl.to_le_bytes());
+        b.extend_from_slice(owner);
+        if aces.is_some() {
+            b.extend_from_slice(&[2, 0]);
+            b.extend_from_slice(&((8 + acl.len()) as u16).to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&[0, 0]);
+            b.extend_from_slice(&acl);
+        }
+        Security(b)
+    }
+
+    /// The check every start applies, on descriptors of each shape: only
+    /// the one `create` makes (and an explicit deny on top) passes.
+    #[test]
+    fn only_an_administrators_owned_system_and_admins_dacl_is_admin_only() {
+        let ours: &[(u8, u32, &[u8])] = &[(0, FA, SY), (0, FA, BA), (0, READ_CONTROL, OW)];
+        assert!(descriptor(BA, Some(ours)).is_admin_only());
+        assert!(descriptor(SY, Some(ours)).is_admin_only());
+        assert_eq!(
+            descriptor(BA, Some(ours)).granted_sids().unwrap(),
+            [SYSTEM, ADMINISTRATORS, OWNER_RIGHTS]
+        );
+        // A deny grants nothing.
+        assert!(descriptor(BA, Some(&[(1, FA, WD), (0, FA, SY)])).is_admin_only());
+
+        // Owned by Users (a squatter's own folder).
+        assert!(!descriptor(BU, Some(ours)).is_admin_only());
+        // Users (or Everyone) granted anything.
+        assert!(!descriptor(BA, Some(&[(0, FA, SY), (0, 0x0012_0089, BU)])).is_admin_only());
+        assert!(!descriptor(BA, Some(&[(0, FA, SY), (0, 0x1, WD)])).is_admin_only());
+        // Owner rights worth more than reading the permissions.
+        assert!(!descriptor(BA, Some(&[(0, FA, SY), (0, FA, OW)])).is_admin_only());
+        // An ACE type this does not read (an object ACE).
+        assert!(!descriptor(BA, Some(&[(0, FA, SY), (5, FA, SY)])).is_admin_only());
+        // A NULL DACL: everyone, everything.
+        assert!(!descriptor(BA, None).is_admin_only());
+        assert_eq!(descriptor(BA, None).granted_sids(), None);
+        // Truncated: nothing parses, nothing passes.
+        let Security(mut cut) = descriptor(BA, Some(ours));
+        cut.truncate(cut.len() - 3);
+        assert!(!Security(cut).is_admin_only());
+    }
+
+    /// The parser on a descriptor the OS wrote: a folder this process made
+    /// with an inherited ACL grants this account, so it is not admin-only.
+    #[test]
+    fn a_folder_with_an_inherited_acl_is_not_admin_only() {
+        let base = tempfile::tempdir().unwrap();
+        let security = Security::of(&open_for_security(base.path())).unwrap();
+        assert!(!security.is_admin_only());
+        let user = current_user_sid().unwrap();
+        assert!(security.granted_sids().unwrap().contains(&user));
+    }
+
     #[test]
     fn a_sid_is_formatted_like_windows_does() {
         // S-1-5-32-544, BUILTIN\Administrators.
@@ -453,7 +526,8 @@ mod tests {
         // inherited from the parent (a user-writable temp dir here, and
         // ProgramData's Users ACEs in the app).
         let listing = icacls(&dir);
-        for nobody in ["Users", "Authenticated Users", "Everyone", "(I)"] {
+        // (Names, not "Users" alone: icacls prints the path, C:\Users\….)
+        for nobody in [r"BUILTIN\Users", "Authenticated Users", "Everyone", "(I)"] {
             assert!(!listing.contains(nobody), "{nobody}: {listing}");
         }
         // A file created inside inherits it: SYSTEM, Administrators, and

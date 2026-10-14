@@ -450,14 +450,17 @@ mod tests {
     }
 
     /// The settings key, in these tests.
-    const KEY: [u8; 32] = [7; 32];
+    /// A key minted per test run, as the app mints the real one.
+    static KEY: LazyLock<[u8; 32]> = LazyLock::new(rand::random);
+    /// Some other key.
+    static OTHER: LazyLock<[u8; 32]> = LazyLock::new(rand::random);
 
     fn keyed(key: [u8; 32]) -> Keys {
         Box::new(move || vec![key.to_vec()])
     }
 
     fn store(dir: &tempfile::TempDir) -> ResumeStore {
-        ResumeStore::new(Some(OwnedDir::new(dir.path(), &[])), keyed(KEY))
+        ResumeStore::new(Some(OwnedDir::new(dir.path(), &[])), keyed(*KEY))
     }
 
     fn signed_bytes(record: Record, key: [u8; 32]) -> Vec<u8> {
@@ -583,7 +586,7 @@ mod tests {
     fn an_oversized_record_is_deleted_unread() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
-        let valid = signed_bytes(record_of(single("node-7")), KEY);
+        let valid = signed_bytes(record_of(single("node-7")), *KEY);
         // A valid record padded past the cap with JSON whitespace.
         let mut padded = valid.clone();
         padded.resize(MAX_RECORD_BYTES as usize + 1, b' ');
@@ -643,13 +646,13 @@ mod tests {
     #[test]
     fn a_record_not_signed_with_the_settings_key_is_dropped() {
         let unsigned = serde_json::to_vec(&record_of(single("node-7"))).unwrap();
-        let other_key = signed_bytes(record_of(single("node-7")), [9; 32]);
+        let other_key = signed_bytes(record_of(single("node-7")), *OTHER);
         let mut tampered: serde_json::Value =
-            serde_json::from_slice(&signed_bytes(record_of(single("node-7")), KEY)).unwrap();
+            serde_json::from_slice(&signed_bytes(record_of(single("node-7")), *KEY)).unwrap();
         tampered["record"]["target"]["serverId"] = "attacker-node".into();
         let tampered = serde_json::to_vec(&tampered).unwrap();
         let mut garbled: serde_json::Value =
-            serde_json::from_slice(&signed_bytes(record_of(single("node-7")), KEY)).unwrap();
+            serde_json::from_slice(&signed_bytes(record_of(single("node-7")), *KEY)).unwrap();
         garbled["hmac"] = "zz".into();
         let garbled = serde_json::to_vec(&garbled).unwrap();
 
@@ -679,11 +682,11 @@ mod tests {
             serde_json::from_slice(&fs::read(dir.path().join(FILE_NAME)).unwrap()).unwrap();
         assert_eq!(signed.record, record_of(single("node-7")));
         assert!(verifies(&signed, &[KEY.to_vec()]));
-        assert!(!verifies(&signed, &[[9; 32].to_vec()]));
+        assert!(!verifies(&signed, &[OTHER.to_vec()]));
         assert!(!verifies(&signed, &[]));
 
         // A start whose key changed since (a reset settings key) drops it.
-        let rekeyed = ResumeStore::new(Some(OwnedDir::new(dir.path(), &[])), keyed([9; 32]));
+        let rekeyed = ResumeStore::new(Some(OwnedDir::new(dir.path(), &[])), keyed(*OTHER));
         rekeyed.load("1.4.48", T + 5);
         assert_eq!(rekeyed.take("1.4.48", T + 6), None);
     }
@@ -703,7 +706,7 @@ mod tests {
     #[test]
     fn the_mac_is_bound_to_the_record_label() {
         let record = record_of(single("node-7"));
-        let mut mac = Hmac::<Sha256>::new_from_slice(&KEY).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&*KEY).unwrap();
         mac.update(&serde_json::to_vec(&record).unwrap());
         let bare = hex::encode(mac.finalize().into_bytes());
         let signed = SignedRecord { record, hmac: bare };
