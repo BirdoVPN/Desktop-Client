@@ -845,23 +845,20 @@ fn main() {
                         .name("birdo-exit-fallback".into())
                         .spawn(|| {
                             std::thread::sleep(EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN);
-                            if !EXIT_TEARDOWN_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-                                utils::run_on_helper_for(
-                                    "birdo-exit-cleanup",
-                                    EXIT_FALLBACK_CLEANUP,
-                                    || {
-                                        error!(
-                                            "Exit teardown never ran to its end — exiting \
-                                             without it"
-                                        );
-                                        #[cfg(target_os = "windows")]
-                                        {
-                                            let _ = vpn::win_machine_state::release_dns_at_exit();
-                                        }
-                                    },
-                                );
-                                std::process::exit(0);
-                            }
+                            utils::exit_unless_torn_down(
+                                &EXIT_TEARDOWN_DONE,
+                                EXIT_FALLBACK_CLEANUP,
+                                || {
+                                    error!(
+                                        "Exit teardown never ran to its end — exiting without it"
+                                    );
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        let _ = vpn::win_machine_state::release_dns_at_exit();
+                                    }
+                                },
+                                || std::process::exit(0),
+                            );
                         });
                     let app = app_handle.clone();
                     tauri::async_runtime::spawn(async move {

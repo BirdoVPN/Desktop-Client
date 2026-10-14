@@ -377,11 +377,11 @@ impl Pulse {
     /// while its beat is still the one on record. A loop that ended has
     /// cleared it, and a cleared pulse stays clear: re-beating it is what had
     /// the watchdog restart a loop that had already finished (WIN3-008).
-    fn renew(&self, generation: u64, allowance: Duration) -> bool {
+    fn renew(&self, generation: u64, allowance: Duration, now: Instant) -> bool {
         let mut beat = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match beat.as_mut() {
             Some(b) if b.generation == generation => {
-                b.at = Instant::now();
+                b.at = now;
                 b.allowance = allowance;
                 true
             }
@@ -439,6 +439,25 @@ impl WatchdogClock {
     fn silent_for(&self, beat: Instant, now: Instant) -> Duration {
         now.saturating_duration_since(beat.max(self.awake_since))
     }
+}
+
+/// One look of the watchdog at `now`: the loop to restart, if one is overdue,
+/// with how long it has been silent (for the log). A verdict renews that
+/// loop's allowance from `now`, so the restart gets a whole allowance before
+/// the next one — and a loop that ended (its pulse cleared) gets none
+/// (WIN3-008). Apart from the thread so a test can drive it across a freeze
+/// (REVIEW-WIN3-013).
+fn watchdog_look(
+    clock: &mut WatchdogClock,
+    pulse: &Pulse,
+    now: Instant,
+    period: Duration,
+) -> Option<(Beat, Duration)> {
+    clock.look(now, period);
+    let beat = pulse.read()?;
+    let silent_for = clock.silent_for(beat.at, now);
+    (overdue(silent_for, beat.allowance) && pulse.renew(beat.generation, beat.allowance, now))
+        .then_some((beat, silent_for))
 }
 
 /// Held by a loop task for as long as it lives — an aborted one included,
@@ -626,20 +645,11 @@ impl AutoReconnectService {
                 let mut clock = WatchdogClock::new(Instant::now());
                 loop {
                     std::thread::sleep(period);
-                    let now = Instant::now();
-                    clock.look(now, period);
-                    let Some(beat) = svc.pulse.read() else {
+                    let Some((beat, silent_for)) =
+                        watchdog_look(&mut clock, &svc.pulse, Instant::now(), period)
+                    else {
                         continue;
                     };
-                    let silent_for = clock.silent_for(beat.at, now);
-                    if !overdue(silent_for, beat.allowance) {
-                        continue;
-                    }
-                    // The restart gets a whole allowance before the next
-                    // verdict — unless the loop has ended meanwhile.
-                    if !svc.pulse.renew(beat.generation, beat.allowance) {
-                        continue;
-                    }
                     tracing::error!(
                         "Auto-reconnect has not checked in for {} s (allowed {} s) — restarting \
                          it; the kill switch's block is left as it is (blocking: {})",
@@ -1594,15 +1604,7 @@ impl ReconnectLoop {
             self.alive
                 .is_some_and(|(_, resumes)| resumes != network_events::resume_count()),
         );
-        let ending = reconnect_policy::after_teardown(reply.as_ref().ok(), alive);
-        // One line either way, with no identifiers (the node-agent privacy
-        // convention), so a re-dial after a takeover can be told apart from
-        // a probe that never got its answer (Android logs the same).
-        let answer = match &reply {
-            Ok(r) if r.valid => "valid",
-            Ok(r) => r.reason.as_deref().unwrap_or("invalid, no reason"),
-            Err(why) => why,
-        };
+        let (ending, answer) = probe_verdict(&reply, alive);
         let outcome = if ending.is_some() {
             "end the session"
         } else {
@@ -1703,6 +1705,26 @@ async fn request_fresh_response(
         ));
     }
     Ok(response)
+}
+
+/// What the old-key probe's `reply` decides, and how it reads in the log
+/// (WIN3-001): an answer that says the session is over ends it
+/// (`reconnect_policy::after_teardown`); no answer — both requests failed,
+/// the budget ran out, the loop is shutting down — re-dials. The log line has
+/// no identifiers (the node-agent privacy convention), so a re-dial after a
+/// takeover can be told apart from a probe that never got its answer
+/// (Android logs the same).
+fn probe_verdict<'r>(
+    reply: &'r Result<crate::api::types::HeartbeatResponse, &'static str>,
+    recently_alive: bool,
+) -> (Option<IpcError>, &'r str) {
+    let ending = reconnect_policy::after_teardown(reply.as_ref().ok(), recently_alive);
+    let answer = match reply {
+        Ok(r) if r.valid => "valid",
+        Ok(r) => r.reason.as_deref().unwrap_or("invalid, no reason"),
+        Err(why) => why,
+    };
+    (ending, answer)
 }
 
 /// Ask, and ask once more if the request FAILED, all inside `budget`
@@ -1991,9 +2013,21 @@ mod tests {
         svc.start().await.unwrap();
         wait_until("the first check-in", || svc.pulse.read().is_some()).await;
 
+        let stalled = running(&svc).await.expect("a loop");
         let record = svc.last_reconnect_info.write().await;
         wait_until("a restart", || svc.restarts.load(Ordering::SeqCst) >= 1).await;
-        assert!(svc.live_loops() <= 1, "the stalled loop was not stopped");
+        // REVIEW-WIN3-013: this read `live_loops() <= 1` once, right here.
+        // But the restart waits only a second for the aborted loop to be
+        // dropped before it starts the next one, and a loaded runner can take
+        // longer, so the count could read 2 for a moment and fail a correct
+        // restart. What must hold is that the stalled loop goes and its
+        // successor is a different one: waited for, not sampled.
+        wait_until("the stalled loop to be gone", || svc.live_loops() <= 1).await;
+        assert_ne!(
+            running(&svc).await,
+            Some(stalled),
+            "the stalled loop runs on"
+        );
         drop(record);
 
         wait_until("one live loop checking in again", || {
@@ -2063,15 +2097,81 @@ mod tests {
         svc.stop().await;
 
         let pulse = Pulse::default();
+        let now = Instant::now();
         pulse.beat(7, Duration::from_secs(30));
-        assert!(pulse.renew(7, Duration::from_secs(30)));
+        assert!(pulse.renew(7, Duration::from_secs(30), now));
         assert!(
-            !pulse.renew(8, Duration::from_secs(30)),
+            !pulse.renew(8, Duration::from_secs(30), now),
             "another loop's beat"
         );
         pulse.clear(7);
-        assert!(!pulse.renew(7, Duration::from_secs(30)));
+        assert!(!pulse.renew(7, Duration::from_secs(30), now));
         assert!(pulse.read().is_none(), "a cleared pulse was re-beaten");
+    }
+
+    /// The watchdog's own looks across a standby (WIN3-003; REVIEW-WIN3-013
+    /// found no freeze or resume test). A healthy loop is not restarted for
+    /// the hour the machine slept; one that stays silent after the wake is,
+    /// one allowance later, and once — the restart gets a whole allowance
+    /// before the next verdict. A loop that checks in after the wake, or one
+    /// that ended, is never restarted.
+    #[test]
+    fn the_watchdog_judges_a_loop_across_a_standby() {
+        let s = Duration::from_secs;
+        let (period, allowance) = (s(5), s(30));
+        let t0 = Instant::now();
+        let beat_at = |pulse: &Pulse, generation: u64, at: Instant| {
+            *pulse.0.lock().unwrap() = Some(Beat {
+                generation,
+                at,
+                allowance,
+            });
+        };
+        let looks = |clock: &mut WatchdogClock, pulse: &Pulse, from: Instant, to: Instant| {
+            let mut verdicts = Vec::new();
+            let mut now = from;
+            while now <= to {
+                if let Some((beat, silent)) = watchdog_look(clock, pulse, now, period) {
+                    verdicts.push((now, beat.generation, silent));
+                }
+                now += period;
+            }
+            verdicts
+        };
+
+        // A loop that checked in just before the machine slept for an hour,
+        // and is silent after the wake.
+        let pulse = Pulse::default();
+        let mut clock = WatchdogClock::new(t0);
+        beat_at(&pulse, 1, t0);
+        assert!(looks(&mut clock, &pulse, t0 + period, t0 + s(25)).is_empty());
+        let woke = t0 + s(25) + s(3600);
+        let verdicts = looks(&mut clock, &pulse, woke, woke + s(60));
+        assert_eq!(
+            verdicts.iter().map(|v| (v.0, v.1)).collect::<Vec<_>>(),
+            [(woke + s(35), 1)],
+            "restarted for the sleep, or more than once per allowance: {verdicts:?}"
+        );
+        assert_eq!(verdicts[0].2, s(35), "the sleep counted as silence");
+
+        // A loop that checks in after the wake is left alone.
+        let pulse = Pulse::default();
+        let mut clock = WatchdogClock::new(t0);
+        beat_at(&pulse, 2, t0);
+        assert!(looks(&mut clock, &pulse, t0 + period, t0 + s(25)).is_empty());
+        let mut now = woke;
+        for _ in 0..24 {
+            assert!(watchdog_look(&mut clock, &pulse, now, period).is_none());
+            beat_at(&pulse, 2, now);
+            now += period;
+        }
+
+        // A loop that ended (a give-up) is not restarted, slept on or not.
+        let pulse = Pulse::default();
+        let mut clock = WatchdogClock::new(t0);
+        beat_at(&pulse, 3, t0);
+        pulse.clear(3);
+        assert!(looks(&mut clock, &pulse, t0 + period, woke + s(60)).is_empty());
     }
 
     #[test]
@@ -2421,7 +2521,9 @@ mod tests {
         // heartbeats left behind.
         assert!(probe.contains("let api = self.api_after_teardown();"));
         assert!(probe.contains("ask_twice(OLD_KEY_PROBE_TIMEOUT, || api.heartbeat(key_id))"));
-        assert!(probe.contains("reconnect_policy::after_teardown("));
+        // What the reply decides is driven in
+        // `a_failed_probe_re_dials_and_never_ends_the_session`.
+        assert!(probe.contains("let (ending, answer) = probe_verdict(&reply, alive);"));
         assert_eq!(OLD_KEY_PROBE_TIMEOUT, Duration::from_secs(5));
         let fresh = &source[source.find("fn api_after_teardown(&self)").unwrap()..];
         assert!(fresh[..fresh.find("\n    }").unwrap()]
@@ -2498,6 +2600,54 @@ mod tests {
             1,
             "a spent budget was asked again"
         );
+    }
+
+    /// WIN3-001 (REVIEW-WIN3-013: "a failed probe request" was untested
+    /// end to end): a probe whose requests fail gives no answer, and no
+    /// answer re-dials — even for a session that was alive a moment ago,
+    /// where a "session over" answer would end it. A first request that
+    /// fails and a second that answers is decided by that answer.
+    #[tokio::test]
+    async fn a_failed_probe_re_dials_and_never_ends_the_session() {
+        use crate::api::types::HeartbeatResponse;
+        use crate::api::ApiError;
+        let budget = Duration::from_secs(5);
+        let answer =
+            |json: &'static str| -> HeartbeatResponse { serde_json::from_str(json).unwrap() };
+
+        let reply: Result<HeartbeatResponse, _> = ask_twice(budget, || async {
+            Err(ApiError::Network("connection aborted".into()))
+        })
+        .await;
+        for recently_alive in [true, false] {
+            let (ending, said) = probe_verdict(&reply, recently_alive);
+            assert!(ending.is_none(), "a failed probe ended the session");
+            assert_eq!(said, "request failed twice");
+        }
+
+        let reply: Result<HeartbeatResponse, _> = ask_twice(Duration::from_millis(50), || {
+            std::future::pending::<Result<HeartbeatResponse, ApiError>>()
+        })
+        .await;
+        let (ending, said) = probe_verdict(&reply, true);
+        assert!(ending.is_none());
+        assert_eq!(said, "no answer in time");
+
+        let calls = AtomicUsize::new(0);
+        let reply = ask_twice(budget, || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    Err(ApiError::Network("connection aborted".into()))
+                } else {
+                    Ok(answer(r#"{"valid":false,"reason":"evicted"}"#))
+                }
+            }
+        })
+        .await;
+        let (ending, said) = probe_verdict(&reply, false);
+        assert_eq!(said, "evicted");
+        assert_eq!(ending.map(|e| e.code), Some(IpcErrorCode::Revoked));
     }
 
     /// The grace warning goes out once per session, not on every 30 s

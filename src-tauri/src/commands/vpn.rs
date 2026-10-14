@@ -441,19 +441,41 @@ pub(super) async fn apply_vpn_settings(app: &AppHandle) -> VpnSettings {
 /// are set either way: they only describe the file.
 async fn reapply_kill_switch_settings(app: &AppHandle, epoch: Option<u64>) {
     apply_vpn_settings(app).await;
-    let vm = app.state::<VpnManager>();
+    rebuild_block_for(
+        &app.state::<VpnManager>(),
+        epoch,
+        crate::commands::killswitch::platform_is_blocking,
+        crate::commands::killswitch::activate_killswitch,
+    )
+    .await;
+}
+
+/// The second half of [`reapply_kill_switch_settings`], apart from the
+/// `AppHandle` so a test can drive it (REVIEW-WIN3-013): under the commit
+/// lock, and only while `epoch` is current, rebuild the block in force
+/// (`is_blocking`) with `rebuild`. Returns whether it did.
+async fn rebuild_block_for<B, F, Fut, T>(
+    vm: &VpnManager,
+    epoch: Option<u64>,
+    is_blocking: B,
+    rebuild: F,
+) -> bool
+where
+    B: FnOnce() -> bool,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
     let _commit = vm.lock_commit().await;
-    if !epoch.is_some_and(|epoch| vm.is_current(epoch)) {
-        return;
+    if !epoch.is_some_and(|epoch| vm.is_current(epoch)) || !is_blocking() {
+        return false;
     }
-    if crate::commands::killswitch::platform_is_blocking() {
-        if let Err(e) = crate::commands::killswitch::activate_killswitch().await {
-            tracing::warn!(
-                "Could not rebuild the kill switch's block with the restored settings: {}",
-                e
-            );
-        }
+    if let Err(e) = rebuild().await {
+        tracing::warn!(
+            "Could not rebuild the kill switch's block with the restored settings: {}",
+            e
+        );
     }
+    true
 }
 
 fn stealth_failed(detail: impl AsRef<str>) -> IpcError {
@@ -1050,10 +1072,17 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
     // rebuild would run on `settings_in_force`'s defaults and drop this
     // healthy session's LAN sharing, custom DNS and kill-switch exceptions.
     // The session stays as it is, and the UI offers Retry.
-    if let Err(e) = load_settings_off_runtime(&app).await {
-        tracing::warn!("reapply_vpn_settings: the settings could not be read — not rebuilding");
-        return Err(IpcError::unknown(e));
-    }
+    //
+    // What it reads is the change being attempted: the rebuild reads the same
+    // file, and the UI holds its saves while a reapply runs. A revert puts
+    // back only what this moved (WIN3-009 item 3).
+    let attempted = match load_settings_off_runtime(&app).await {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!("reapply_vpn_settings: the settings could not be read — not rebuilding");
+            return Err(IpcError::unknown(e));
+        }
+    };
     let previous = ar.connected_settings().await;
 
     // P6-CLI-D-03: the node being rebuilt to is connection history.
@@ -1089,43 +1118,124 @@ pub async fn reapply_vpn_settings(app: AppHandle) -> Result<ReapplyOutcome, IpcE
         Ok(()) => return Ok(ReapplyOutcome::Applied),
         Err(error) => error,
     };
+    revert_failed_reapply(
+        &AppRevert {
+            app: &app,
+            previous,
+            attempted,
+            target,
+            purpose,
+        },
+        error,
+        rebuild.epoch,
+    )
+    .await
+}
+
+/// What the revert of a failed reapply does to the world, apart from the
+/// `AppHandle` so a test can drive [`revert_failed_reapply`] with the real
+/// epoch rules (REVIEW-WIN3-013).
+trait RevertSteps {
+    /// The settings the session connected with are on record.
+    fn have_previous(&self) -> bool;
+    async fn session_alive(&self) -> bool;
+    /// Save the previous settings back over what the change moved.
+    async fn restore(&self) -> Result<(), String>;
+    /// The kill switch's process-wide settings from the restored file, and a
+    /// block in force rebuilt with them for the attempt of `epoch` (WIN3-005).
+    async fn reapply_kill_switch(&self, epoch: Option<u64>);
+    /// Rebuild the session on the restored settings as a follow-up of the
+    /// attempt of `epoch` (`VpnManager::begin_follow_up`).
+    async fn reconnect_following(&self, epoch: u64) -> Result<(), IpcError>;
+}
+
+/// The app's [`RevertSteps`].
+struct AppRevert<'a> {
+    app: &'a AppHandle,
+    previous: Option<AppSettings>,
+    attempted: AppSettings,
+    target: ConnectTarget,
+    purpose: ConnectPurpose,
+}
+
+impl RevertSteps for AppRevert<'_> {
+    fn have_previous(&self) -> bool {
+        self.previous.is_some()
+    }
+
+    async fn session_alive(&self) -> bool {
+        self.app
+            .state::<VpnManager>()
+            .get_state()
+            .await
+            .is_tunnel_active()
+    }
+
+    async fn restore(&self) -> Result<(), String> {
+        let previous = self
+            .previous
+            .as_ref()
+            .ok_or_else(|| "no previous settings on record".to_string())?;
+        crate::commands::settings::restore_tunnel_settings(self.app, previous, &self.attempted)
+            .await
+            .map(drop)
+    }
+
+    async fn reapply_kill_switch(&self, epoch: Option<u64>) {
+        reapply_kill_switch_settings(self.app, epoch).await;
+    }
+
+    async fn reconnect_following(&self, epoch: u64) -> Result<(), IpcError> {
+        connect_session_for(self.app, self.target.clone(), self.purpose, Some(epoch))
+            .await
+            .result
+    }
+}
+
+/// A reapply's rebuild failed with `error`: go back to the settings the
+/// session ran on ([`failed_reapply`]).
+///
+/// WIN3-002: the rebuild's failure is on screen by now, and the user may
+/// have pressed Disconnect or picked another server since. Either one moved
+/// the epoch, and then the reconnect begins nothing (`cancelled`): it must
+/// never bring back a session the user ended, or a server the user left. A
+/// rebuild that never began has nothing to follow up. Past the restore every
+/// error says so: the UI re-reads the settings only then (REVIEW-WIN4-004).
+async fn revert_failed_reapply<S: RevertSteps>(
+    steps: &S,
+    error: IpcError,
+    rebuild_epoch: Option<u64>,
+) -> Result<ReapplyOutcome, IpcError> {
     let plan = failed_reapply(
         error.code == IpcErrorCode::Cancelled,
-        previous.is_some(),
-        vm.get_state().await.is_tunnel_active(),
+        steps.have_previous(),
+        steps.session_alive().await,
     );
-    let Some(previous) = previous.filter(|_| plan != FailedReapply::Report) else {
+    if plan == FailedReapply::Report {
         return Err(error);
-    };
+    }
     tracing::warn!(
         "The settings change could not be applied ({:?}) — restoring the previous settings",
         error.code
     );
-    if let Err(e) = crate::commands::settings::restore_tunnel_settings(&app, &previous).await {
+    if let Err(e) = steps.restore().await {
         tracing::error!("Could not save the previous settings back: {}", e);
         return Err(error);
     }
-    reapply_kill_switch_settings(&app, rebuild.epoch).await;
+    steps.reapply_kill_switch(rebuild_epoch).await;
     if plan == FailedReapply::RestoreSettings {
         return Ok(ReapplyOutcome::Reverted);
     }
-    // WIN3-002: the rebuild's failure is on screen by now, and the user may
-    // have pressed Disconnect or picked another server since. Either one
-    // moved the epoch, and then this reconnect begins nothing (`cancelled`):
-    // it must never bring back a session the user ended, or a server the
-    // user left. A rebuild that never began has nothing to follow up.
-    // Past the restore every error says so: the UI re-reads the settings only
-    // then (REVIEW-WIN4-004).
     let restored = |mut error: IpcError| {
         error.settings_restored = true;
         error
     };
-    let Some(rebuild_epoch) = rebuild.epoch else {
+    let Some(rebuild_epoch) = rebuild_epoch else {
         return Err(restored(error));
     };
-    connect_session_for(&app, target, purpose, Some(rebuild_epoch))
+    steps
+        .reconnect_following(rebuild_epoch)
         .await
-        .result
         .map(|()| ReapplyOutcome::Reverted)
         .map_err(restored)
 }
@@ -1208,6 +1318,270 @@ pub async fn get_usage_stats(
 
 // Multi-hop and port forwarding commands extracted to vpn_multi_hop.rs and vpn_port_forward.rs
 
+/// REVIEW-WIN3-013: the revert of a failed reapply, driven against the real
+/// epoch rules (`VpnManager`), where it used to be a source-order pin.
+#[cfg(test)]
+mod revert_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// The revert's world: a real manager for the epochs, and a log of what
+    /// was asked of it, in order.
+    struct World {
+        vm: VpnManager,
+        previous: bool,
+        alive: bool,
+        restore_ok: bool,
+        /// The user presses Disconnect while the settings are being saved
+        /// back: the window REVIEW-WIN3-002 found.
+        disconnect_during_restore: bool,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl World {
+        fn new() -> Self {
+            Self {
+                vm: VpnManager::new(),
+                previous: true,
+                alive: false,
+                restore_ok: true,
+                disconnect_during_restore: false,
+                log: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn note(&self, what: impl Into<String>) {
+            self.log.lock().unwrap().push(what.into());
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl RevertSteps for World {
+        fn have_previous(&self) -> bool {
+            self.previous
+        }
+
+        async fn session_alive(&self) -> bool {
+            self.alive
+        }
+
+        async fn restore(&self) -> Result<(), String> {
+            self.note("restore");
+            if self.disconnect_during_restore {
+                self.vm.cancel_in_flight();
+            }
+            if self.restore_ok {
+                Ok(())
+            } else {
+                Err("the settings file could not be verified".into())
+            }
+        }
+
+        async fn reapply_kill_switch(&self, epoch: Option<u64>) {
+            self.note(format!("kill switch for {epoch:?}"));
+        }
+
+        async fn reconnect_following(&self, epoch: u64) -> Result<(), IpcError> {
+            match self.vm.begin_follow_up(epoch) {
+                Some(_) => {
+                    self.note(format!("reconnect after {epoch}"));
+                    Ok(())
+                }
+                None => Err(IpcError::cancelled()),
+            }
+        }
+    }
+
+    fn handshake_failed() -> IpcError {
+        IpcError::new(IpcErrorCode::ServerUnreachable, "no handshake")
+    }
+
+    /// The old tunnel is gone: the previous settings go back, the kill
+    /// switch's side with them, and the session is rebuilt on them as a
+    /// follow-up of the rebuild that failed.
+    #[tokio::test]
+    async fn a_failed_rebuild_is_restored_then_reconnected_as_its_follow_up() {
+        let world = World::new();
+        let epoch = world.vm.begin_attempt();
+        let outcome = revert_failed_reapply(&world, handshake_failed(), Some(epoch)).await;
+        assert_eq!(outcome.unwrap(), ReapplyOutcome::Reverted);
+        assert_eq!(
+            world.log(),
+            [
+                "restore".to_string(),
+                format!("kill switch for Some({epoch})"),
+                format!("reconnect after {epoch}"),
+            ]
+        );
+    }
+
+    /// WIN3-002: a Disconnect that lands after the failure is on screen —
+    /// here while the settings are saved back — wins. Nothing is reconnected,
+    /// the error says the settings were restored (the UI re-reads them), and
+    /// it reads as the user's own cancel, not a failure.
+    #[tokio::test]
+    async fn a_disconnect_after_the_failure_is_never_undone() {
+        let world = World {
+            disconnect_during_restore: true,
+            ..World::new()
+        };
+        let epoch = world.vm.begin_attempt();
+        let error = revert_failed_reapply(&world, handshake_failed(), Some(epoch))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, IpcErrorCode::Cancelled);
+        assert!(error.settings_restored);
+        assert!(!world.vm.is_current(epoch));
+        assert!(
+            !world.log().iter().any(|l| l.starts_with("reconnect")),
+            "{:?}",
+            world.log()
+        );
+    }
+
+    /// WIN3-002: the same for a newer connect (the user picked another
+    /// server): the revert does not drag the session back.
+    #[tokio::test]
+    async fn a_newer_connect_after_the_failure_wins() {
+        let world = World::new();
+        let epoch = world.vm.begin_attempt();
+        let newer = world.vm.begin_attempt();
+        let error = revert_failed_reapply(&world, handshake_failed(), Some(epoch))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, IpcErrorCode::Cancelled);
+        assert!(
+            world.vm.is_current(newer),
+            "the newer connect lost its epoch"
+        );
+    }
+
+    /// The old session never went down (W1-010): the settings and the kill
+    /// switch's side go back, and nothing is rebuilt.
+    #[tokio::test]
+    async fn a_session_that_survived_is_only_restored() {
+        let world = World {
+            alive: true,
+            ..World::new()
+        };
+        let epoch = world.vm.begin_attempt();
+        let outcome = revert_failed_reapply(&world, handshake_failed(), Some(epoch)).await;
+        assert_eq!(outcome.unwrap(), ReapplyOutcome::Reverted);
+        assert_eq!(
+            world.log(),
+            [
+                "restore".to_string(),
+                format!("kill switch for Some({epoch})")
+            ]
+        );
+    }
+
+    /// A rebuild the user cancelled, or one with nothing to go back to,
+    /// reports its error and touches nothing; a restore that is refused (an
+    /// unverifiable file) reports the rebuild's error, unmarked, and goes no
+    /// further; a rebuild that never began has nothing to follow up.
+    #[tokio::test]
+    async fn nothing_is_restored_or_rebuilt_without_cause() {
+        let world = World::new();
+        let epoch = world.vm.begin_attempt();
+        let error = revert_failed_reapply(&world, IpcError::cancelled(), Some(epoch))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, IpcErrorCode::Cancelled);
+        assert!(!error.settings_restored);
+        assert!(world.log().is_empty());
+
+        let world = World {
+            previous: false,
+            ..World::new()
+        };
+        let error = revert_failed_reapply(&world, handshake_failed(), Some(epoch))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, IpcErrorCode::ServerUnreachable);
+        assert!(world.log().is_empty());
+
+        let world = World {
+            restore_ok: false,
+            ..World::new()
+        };
+        let epoch = world.vm.begin_attempt();
+        let error = revert_failed_reapply(&world, handshake_failed(), Some(epoch))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, IpcErrorCode::ServerUnreachable);
+        assert!(!error.settings_restored);
+        assert_eq!(world.log(), ["restore"]);
+
+        let world = World::new();
+        let error = revert_failed_reapply(&world, handshake_failed(), None)
+            .await
+            .unwrap_err();
+        assert!(error.settings_restored);
+        assert_eq!(world.log(), ["restore", "kill switch for None"]);
+    }
+
+    /// WIN3-005 / REVIEW-WIN4-001: the block in force is rebuilt with the
+    /// restored settings only for the session it was asked for, and under the
+    /// commit lock, so a Disconnect's teardown either lands first (and the
+    /// rebuild is skipped) or waits for it.
+    #[tokio::test]
+    async fn the_block_is_rebuilt_only_for_the_current_attempt_under_the_commit_lock() {
+        let vm = std::sync::Arc::new(VpnManager::new());
+        let epoch = vm.begin_attempt();
+        let ok = || async { Ok::<(), String>(()) };
+
+        assert!(rebuild_block_for(&vm, Some(epoch), || true, ok).await);
+        assert!(
+            !rebuild_block_for(&vm, Some(epoch), || false, ok).await,
+            "no block"
+        );
+        assert!(
+            !rebuild_block_for(&vm, None, || true, ok).await,
+            "never began"
+        );
+        vm.cancel_in_flight();
+        assert!(
+            !rebuild_block_for(&vm, Some(epoch), || true, ok).await,
+            "after a Disconnect"
+        );
+
+        // A rebuild in progress holds the commit lock: a teardown waits.
+        let epoch = vm.begin_attempt();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let rebuilding = {
+            let vm = vm.clone();
+            tokio::spawn(async move {
+                rebuild_block_for(
+                    &vm,
+                    Some(epoch),
+                    || true,
+                    move || async move {
+                        let _ = started.send(());
+                        let _ = held.await;
+                        Ok::<(), String>(())
+                    },
+                )
+                .await
+            })
+        };
+        running.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), vm.lock_commit())
+                .await
+                .is_err(),
+            "a teardown ran beside the rebuild"
+        );
+        release.send(()).unwrap();
+        assert!(rebuilding.await.unwrap());
+        drop(vm.lock_commit().await);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1224,39 +1598,50 @@ mod tests {
         assert_eq!(failed_reapply(true, true, true), Report);
         assert_eq!(failed_reapply(false, false, false), Report);
 
-        // The wiring: the rebuild, then the restore, then the second rebuild
-        // on the same purpose (the session's own transport, no stealth retry)
-        // — as a follow-up of the first, so a Disconnect or a newer connect
-        // in between wins (WIN3-002; `begin_follow_up` is tested in
-        // `vpn::manager`).
+        // The wiring only: what the revert does is driven in
+        // `revert_tests` (WIN3-002, WIN3-005).
         let source = include_str!("vpn.rs");
         let body = &source[source.find("pub async fn reapply_vpn_settings(").unwrap()..];
         let body = &body[..body.find("\n}").unwrap()];
         let mut last = 0;
         for needle in [
             // MR-1943: an unreadable file is not rebuilt onto the defaults.
-            "if let Err(e) = load_settings_off_runtime(&app).await {",
+            // What it reads is the change attempted (WIN3-009 item 3).
+            "let attempted = match load_settings_off_runtime(&app).await {",
             "ar.connected_settings().await",
             "ConnectPurpose::SettingsReapply {",
             "let rebuild = connect_session_for(&app, target.clone(), purpose, None)",
             // MR-1943: nor is a rebuild that ran on them reported Applied.
             "ar.connected_settings().await.is_none()",
             "Ok(()) => return Ok(ReapplyOutcome::Applied),",
-            "failed_reapply(",
-            "restore_tunnel_settings(&app, &previous)",
-            // WIN3-005: the failed attempt's kill-switch globals go, before
-            // either outcome — the session kept, or rebuilt on the old ones.
-            "reapply_kill_switch_settings(&app, rebuild.epoch).await;",
-            "FailedReapply::RestoreSettings",
-            "let Some(rebuild_epoch) = rebuild.epoch else {",
-            "connect_session_for(&app, target, purpose, Some(rebuild_epoch))",
-            "ReapplyOutcome::Reverted",
-            ".map_err(restored)",
+            "revert_failed_reapply(",
+            "previous,",
+            "attempted,",
+            "target,",
+            "purpose,",
+            "rebuild.epoch,",
         ] {
             let at = body[last..]
                 .find(needle)
                 .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
             last += at + needle.len();
+        }
+        // The app's steps: the reconnect is a FOLLOW-UP of the rebuild's
+        // epoch, on the reapply's own purpose (its transport, no stealth
+        // retry), and the restore is told what was attempted.
+        let steps = &source[source.find("impl RevertSteps for AppRevert<'_> {").unwrap()..];
+        let steps = &steps[..steps
+            .find(
+                "
+}",
+            )
+            .unwrap()];
+        for needle in [
+            "restore_tunnel_settings(self.app, previous, &self.attempted)",
+            "reapply_kill_switch_settings(self.app, epoch).await;",
+            "connect_session_for(self.app, self.target.clone(), self.purpose, Some(epoch))",
+        ] {
+            assert!(steps.contains(needle), "{needle}");
         }
         assert_eq!(
             serde_json::to_value(ReapplyOutcome::Reverted).unwrap(),
@@ -1269,9 +1654,10 @@ mod tests {
     }
 
     /// WIN3-005: a reverted reapply puts the kill switch's side back too —
-    /// the globals from the restored file, and a block in force rebuilt with
-    /// them. A source pin: both halves need an `AppHandle` and the real WFP
-    /// engine, which a unit test must not touch.
+    /// the globals from the restored file, then the block in force rebuilt
+    /// with them (`rebuild_block_for`, driven in `revert_tests`). This pins
+    /// the wiring: `apply_vpn_settings` needs an `AppHandle`, and the rebuild
+    /// the real WFP engine, which a unit test must not touch.
     #[test]
     fn a_reverted_reapply_puts_the_kill_switch_settings_back() {
         let source = include_str!("vpn.rs");
@@ -1282,12 +1668,10 @@ mod tests {
         let mut last = 0;
         for needle in [
             "apply_vpn_settings(app).await;",
-            // REVIEW-WIN4-001: the block only for the session it was asked
-            // for, serialised against a Disconnect's teardown.
-            "let _commit = vm.lock_commit().await;",
-            "vm.is_current(epoch)",
-            "killswitch::platform_is_blocking()",
-            "killswitch::activate_killswitch().await",
+            "rebuild_block_for(",
+            "epoch,",
+            "crate::commands::killswitch::platform_is_blocking,",
+            "crate::commands::killswitch::activate_killswitch,",
         ] {
             let at = body[last..]
                 .find(needle)
