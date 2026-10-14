@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "What ends up in the shipped UI bundle without being an npm `dependency` (MR-1685), for",
+    "scripts/generate-third-party-notices.mjs. `assets`: files from this repository that are",
+    "third-party works; `file` must exist, `texts` are paths under third_party/licenses/.",
+    "`devPackages`: devDependencies whose own code the build copies into the bundle; their licence",
+    "files are read from node_modules (`cutAt` drops everything from that line on, e.g. Vite's list",
+    "of the dependencies it bundles into its own build tool, none of which ship in the app).",
+    "Checked against `vite build` output on 2026-10-14: the font file, Tailwind's banner and",
+    "Preflight in the CSS, Vite's modulepreload polyfill in the entry chunk, rolldown-runtime-*.js."
+  ],
+  "assets": [
+    {
+      "name": "Inter",
+      "version": "4.1",
+      "what": "the UI font (Inter Variable, \"Version 4.001\" in its name table)",
+      "file": "src/assets/fonts/Inter-Variable.woff2",
+      "license": "OFL-1.1",
+      "url": "https://github.com/rsms/inter",
+      "texts": ["assets/inter/LICENSE.txt"]
+    }
+  ],
+  "devPackages": [
+    {
+      "package": "tailwindcss",
+      "what": "Preflight, the base styles Tailwind compiles into the UI stylesheet"
+    },
+    {
+      "package": "vite",
+      "what": "the module preload polyfill Vite adds to the UI entry script",
+      "cutAt": "# Licenses of bundled dependencies"
+    },
+    {
+      "package": "rolldown",
+      "what": "the module runtime helpers chunk (rolldown-runtime-*.js)"
+    }
+  ]
+}

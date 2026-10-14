@@ -8,7 +8,12 @@ pub mod file_log;
 pub mod log_policy;
 pub mod log_retention;
 pub mod os_rng;
+#[cfg(windows)]
+pub mod protected_dir;
 pub mod redact;
+pub mod safe_fs;
+#[cfg(windows)]
+pub mod win_api;
 
 /// Source-level guard that no address-shaped value reaches a logging macro
 /// unredacted. Test-only: it reads the tree rather than running in the app.
@@ -148,6 +153,26 @@ pub fn run_on_helper_for(
             let _ = done.send(());
         });
     spawned.is_ok() && finished.recv_timeout(limit).is_ok()
+}
+
+/// The exit fallback's decision (WIN-FIX-3, WIN3-006), apart from `main.rs`
+/// so a test can drive it: unless `done` says the exit teardown ran to its
+/// end, give `cleanup` — the log line and the DNS restore, either of which
+/// can wait on what a wedged teardown holds — at most `limit` on a helper
+/// thread ([`run_on_helper_for`]), then `exit`. Returns whether it exited
+/// (`exit` never returns in the app).
+pub fn exit_unless_torn_down(
+    done: &std::sync::atomic::AtomicBool,
+    limit: std::time::Duration,
+    cleanup: impl FnOnce() + Send + 'static,
+    exit: impl FnOnce(),
+) -> bool {
+    if done.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    run_on_helper_for("birdo-exit-cleanup", limit, cleanup);
+    exit();
+    true
 }
 
 /// This install's device identifier: a random `desktop_<uuid-v4>`, persisted
@@ -297,6 +322,65 @@ mod bounded_process_tests {
             Duration::from_secs(5),
             || {}
         ));
+    }
+
+    /// WIN3-006 (REVIEW-WIN3-013, which found this a source-order pin): the
+    /// exit fallback exits whatever its last steps wait on. A cleanup stuck
+    /// on a lock the wedged teardown holds costs the limit, and the exit
+    /// still happens; a teardown that ran to its end leaves the exit to the
+    /// normal path and runs no cleanup at all.
+    #[test]
+    fn the_exit_fallback_exits_whatever_its_cleanup_waits_on() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let limit = Duration::from_millis(100);
+        let teardown_holds = Arc::new(Mutex::new(()));
+        let held = teardown_holds.lock().unwrap();
+        let exited = AtomicBool::new(false);
+        let started = Instant::now();
+        let wanted = Arc::clone(&teardown_holds);
+        assert!(super::exit_unless_torn_down(
+            &AtomicBool::new(false),
+            limit,
+            move || {
+                let _wedged = wanted.lock();
+            },
+            || exited.store(true, Ordering::SeqCst),
+        ));
+        assert!(exited.load(Ordering::SeqCst), "it did not exit");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it waited on the lock"
+        );
+        drop(held);
+
+        let (cleaned, exited) = (Arc::new(AtomicBool::new(false)), AtomicBool::new(false));
+        let mark = Arc::clone(&cleaned);
+        assert!(!super::exit_unless_torn_down(
+            &AtomicBool::new(true),
+            limit,
+            move || mark.store(true, Ordering::SeqCst),
+            || exited.store(true, Ordering::SeqCst),
+        ));
+        assert!(!exited.load(Ordering::SeqCst));
+        assert!(
+            !cleaned.load(Ordering::SeqCst),
+            "a finished teardown's exit ran the cleanup"
+        );
+
+        let mark = Arc::clone(&cleaned);
+        assert!(super::exit_unless_torn_down(
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+            move || mark.store(true, Ordering::SeqCst),
+            || {},
+        ));
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "a quick cleanup was skipped"
+        );
     }
 }
 

@@ -62,20 +62,6 @@ export function formatDate(raw: string | null | undefined): string | null {
   }).format(parsed);
 }
 
-/**
- * Anonymous accounts carry a synthetic email `anon_<24-digit-id>@anonymous.local`,
- * and the 24 digits are the account's ONLY recovery credential. Every surface
- * that shows an identity must go through this, so the synthetic address (and
- * the credential inside it) is never rendered raw — the Connect screen's top
- * bar used to print the first ~20 characters of it (P1-parity-007).
- */
-const ANON_EMAIL_RE = /^anon_(\d{24})@anonymous\.local$/i;
-export function anonAccountNumber(email: string | null | undefined): string | null {
-  if (!email) return null;
-  const m = ANON_EMAIL_RE.exec(email.trim());
-  return m ? m[1] : null;
-}
-
 /** What `get_auth_state` says about anonymity (Rust `AuthState`, item 86). */
 export interface AuthStateAnonymity {
   is_anonymous?: boolean | null;
@@ -133,19 +119,22 @@ export function anonymityPatch(st: AuthStateAnonymity): { isAnonymous?: boolean;
 }
 
 /**
- * Whether the signed-in account is anonymous, and its number (Account API
- * contract item 86). The server's `isAnonymous` / `accountNumber` are used
- * when it sends them; a backend that predates them is read from the synthetic
- * email, as before. The synthetic email always means anonymous — it exists
- * only on anonymous accounts — so it is never rendered whatever else is said.
+ * Whether the signed-in account is anonymous, and its number — from
+ * `/auth/me`'s `isAnonymous` / `accountNumber` (Account API contract item 86)
+ * and nothing else (MR-918). The backend sends `accountType`, `isAnonymous`
+ * and `accountNumber` on every `/auth/me`, for every kind of account
+ * (birdo-web auth.controller.ts `me()`), so the synthetic
+ * `anon_<number>@anonymous.local` email is no longer parsed: phase 2 of item
+ * 86 drops it (`email: null`). Every surface that shows an identity goes
+ * through this, and an anonymous account's email is never rendered
+ * (P1-parity-007): the screens show "Anonymous account" instead.
  */
-export function resolveAnonymousAccount(
-  account: { isAnonymous: boolean | null; accountNumber: string | null },
-  email: string | null,
-): { isAnon: boolean; accountNumber: string | null } {
-  const fromEmail = anonAccountNumber(email);
-  const isAnon = fromEmail !== null || account.isAnonymous === true;
-  return { isAnon, accountNumber: isAnon ? account.accountNumber ?? fromEmail : null };
+export function resolveAnonymousAccount(account: {
+  isAnonymous: boolean | null;
+  accountNumber: string | null;
+}): { isAnon: boolean; accountNumber: string | null } {
+  const isAnon = account.isAnonymous === true;
+  return { isAnon, accountNumber: isAnon ? account.accountNumber : null };
 }
 
 /** "123456789012…" → "1234 5678 9012 …": six groups of four, space-separated (canonical). */

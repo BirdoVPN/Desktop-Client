@@ -667,9 +667,11 @@ impl std::fmt::Debug for UserProfile {
 }
 
 impl UserProfile {
-    /// Whether this is an anonymous account, from the explicit fields when the
-    /// server sends them. `None` on an older backend: the UI then falls back to
-    /// the synthetic email's shape (`anon_<number>@anonymous.local`).
+    /// Whether this is an anonymous account, from the explicit fields
+    /// (`isAnonymous`, else `accountType`). birdo-web's `/auth/me` sends both
+    /// for every account, so `None` means only that no profile said; nothing
+    /// — here or in the UI — reads the synthetic email's shape
+    /// (`anon_<number>@anonymous.local`) any more (MR-918).
     pub fn is_anonymous_account(&self) -> Option<bool> {
         self.is_anonymous.or_else(|| {
             self.account_type

@@ -33,12 +33,14 @@ import { VpnSettings } from '@/screens/VpnSettings';
 import { SplitTunnel } from '@/screens/SplitTunnel';
 import { PortForward } from '@/screens/PortForward';
 import { Pricing } from '@/screens/Pricing';
+import { Licences } from '@/screens/Licences';
 
 const PUSH_SCREENS: Record<RouteId, React.ComponentType> = {
   vpnSettings: VpnSettings,
   splitTunnel: SplitTunnel,
   portForward: PortForward,
   pricing: Pricing,
+  licences: Licences,
 };
 
 export function AppShell() {

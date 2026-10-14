@@ -5,6 +5,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  CLIENT_ATTESTATION_COPY,
   errorCopy,
   errorText,
   giveUpKind,
@@ -51,6 +52,8 @@ const ALL: IpcErrorCode[] = [
   'cancelled',
   'server_error',
   'settings_unverified',
+  'client_attestation_required',
+  'consent_required',
   'unknown',
 ];
 
@@ -97,6 +100,17 @@ describe('errorCopy', () => {
     expect(errorCopy(err('invalid_credentials'), 'password_confirm').message).toBe(
       'Incorrect password. Please try again.',
     );
+  });
+
+  // MR-1944: its own words, never the plan copy a bare 403 gets.
+  it('an attestation refusal is not a plan refusal, and says what helps without alarm', () => {
+    const copy = errorCopy(err('client_attestation_required'), 'vpn');
+    expect(copy).toEqual({ message: CLIENT_ATTESTATION_COPY, action: null });
+    expect(copy.message).not.toBe(errorCopy(err('subscription_required')).message);
+    expect(copy.message).not.toMatch(/plan|upgrade|subscription|unmodified|tamper/i);
+    expect(copy.message).toMatch(/latest version/);
+    // Rust's wire shape is a known code, not `unknown`.
+    expect(errorText({ code: 'client_attestation_required', message: 'raw' })).toBe(CLIENT_ATTESTATION_COPY);
   });
 
   it('says how long to wait when Rust knows', () => {

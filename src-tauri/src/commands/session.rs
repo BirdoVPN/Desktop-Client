@@ -1027,8 +1027,36 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
         crate::commands::update_resume::discard();
     }
     let teardown = tauri::async_runtime::spawn(tear_down(app.clone(), reason));
+    release_unless_torn_down(teardown, async {
+        // The 3e6f1e2 escape hatch, whenever the teardown did not get there:
+        // ending the session is the user releasing the block, and
+        // is_lockdown_mode() is hard false off-Windows, so any gate here would
+        // leave macOS/Linux behind a kernel firewall with no session to own it.
+        // A no-op if never armed.
+        let _ = killswitch::disarm().await;
+        // `disconnect()` returns early when no tunnel is held (an Error after a
+        // give-up), so the end state is written here, whatever came before.
+        let _ = app
+            .state::<VpnManager>()
+            .set_state(ConnectionState::Disconnected)
+            .await;
+    })
+    .await;
+}
+
+/// [`end_session`]'s wait, apart from the `AppHandle` so a test can drive it
+/// on paused time (MR-1408): wait for `teardown` up to [`RELEASE_DEADLINE`]
+/// and run `release` unless it finished. A teardown that finished released
+/// the block and wrote Disconnected itself, under its commit lock.
+///
+/// A teardown still running at the deadline is not cancelled, only no longer
+/// waited for: `end_session` passes a spawned task's handle, and dropping a
+/// handle leaves its task running.
+async fn release_unless_torn_down<E: std::fmt::Display>(
+    teardown: impl std::future::Future<Output = Result<(), E>>,
+    release: impl std::future::Future<Output = ()>,
+) {
     match timeout(RELEASE_DEADLINE, teardown).await {
-        // It released the block and wrote Disconnected under the commit lock.
         Ok(Ok(())) => return,
         Ok(Err(e)) => tracing::error!(
             "The session teardown failed ({e}) — releasing the kill switch's block anyway"
@@ -1039,19 +1067,7 @@ pub async fn end_session(app: &AppHandle, reason: EndReason) {
             RELEASE_DEADLINE.as_secs()
         ),
     }
-
-    // The 3e6f1e2 escape hatch, whenever the teardown did not get there:
-    // ending the session is the user releasing the block, and
-    // is_lockdown_mode() is hard false off-Windows, so any gate here would
-    // leave macOS/Linux behind a kernel firewall with no session to own it.
-    // A no-op if never armed.
-    let _ = killswitch::disarm().await;
-    // `disconnect()` returns early when no tunnel is held (an Error after a
-    // give-up), so the end state is written here, whatever came before.
-    let _ = app
-        .state::<VpnManager>()
-        .set_state(ConnectionState::Disconnected)
-        .await;
+    release.await;
 }
 
 /// Everything [`end_session`] does before it releases the block, in order.
@@ -1259,17 +1275,17 @@ mod lifecycle_tests {
             .join("\n");
         assert!(!code.contains("return"), "an early return in tear_down");
         assert!(!code.contains('?'), "a `?` in tear_down");
+        // The wiring only: what the wait does with the deadline is driven on
+        // paused time in `release_deadline_tests` (MR-1408).
         order(
             body("pub async fn end_session("),
             &[
-                "spawn(tear_down(app.clone(), reason))",
-                "timeout(RELEASE_DEADLINE, teardown)",
-                "Ok(Ok(())) => return,",
+                "let teardown = tauri::async_runtime::spawn(tear_down(app.clone(), reason));",
+                "release_unless_torn_down(teardown, async {",
                 "killswitch::disarm()",
                 "ConnectionState::Disconnected",
             ],
         );
-        assert_eq!(super::RELEASE_DEADLINE, std::time::Duration::from_secs(40));
     }
 
     /// WIN-FIX-3: quitting never depends on the async runtime. Its teardown
@@ -1290,22 +1306,24 @@ mod lifecycle_tests {
                 "api.prevent_exit();",
                 "std::thread::Builder::new()",
                 "std::thread::sleep(EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN)",
-                "if !EXIT_TEARDOWN_DONE.load(",
-                "utils::run_on_helper_for(",
+                "utils::exit_unless_torn_down(",
+                "&EXIT_TEARDOWN_DONE,",
                 "EXIT_FALLBACK_CLEANUP,",
                 "error!(",
                 "release_dns_at_exit()",
-                "std::process::exit(0)",
+                "|| std::process::exit(0),",
                 "tauri::async_runtime::spawn(async move {",
             ],
         );
-        // WIN3-006: nothing between the decision and the bounded helper can
-        // wait on what the wedged teardown holds (the helper's own wait is
-        // tested in `utils`).
-        let decided = &held[held.find("if !EXIT_TEARDOWN_DONE.load(").unwrap()..];
-        let before_helper = &decided[..decided.find("utils::run_on_helper_for(").unwrap()];
+        // WIN3-006: nothing between the sleep and the bounded decision can
+        // wait on what the wedged teardown holds. What the decision does is
+        // driven in `utils::tests::the_exit_fallback_exits_whatever_its_cleanup_waits_on`.
+        let slept = &held[held
+            .find("EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN")
+            .unwrap()..];
+        let before_decision = &slept[..slept.find("utils::exit_unless_torn_down(").unwrap()];
         for blocking in ["error!(", "release_dns_at_exit", "restore_dns_blocking"] {
-            assert!(!before_helper.contains(blocking), "{blocking}");
+            assert!(!before_decision.contains(blocking), "{blocking}");
         }
     }
 
@@ -1675,6 +1693,112 @@ mod lifecycle_tests {
         assert_eq!(
             failure_outcome(false, ctx.was_live, ctx.old_transport_touched(&xray), true),
             FailureOutcome::Error { hold_block: true }
+        );
+    }
+}
+
+/// WIN-FIX-3 / MR-1408: Disconnect releases the block at the end of the
+/// teardown or 40 s after it began, whichever comes first, driven on paused
+/// time (these used to be a source-order pin and a constant check).
+#[cfg(test)]
+mod release_deadline_tests {
+    use super::release_unless_torn_down;
+    use std::future::{pending, Future};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::time::{advance, sleep, Duration, Instant};
+
+    const DEADLINE: Duration = Duration::from_secs(40);
+
+    /// When the release ran, if it did.
+    #[derive(Clone, Default)]
+    struct Release(Arc<Mutex<Option<Instant>>>);
+
+    impl Release {
+        fn run(&self) -> impl Future<Output = ()> + Send + 'static {
+            let at = self.0.clone();
+            async move {
+                let mut at = at.lock().unwrap();
+                assert!(at.is_none(), "released twice");
+                *at = Some(Instant::now());
+            }
+        }
+
+        fn at(&self) -> Option<Instant> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_teardown_is_released_at_the_deadline_and_not_before() {
+        let start = Instant::now();
+        let release = Release::default();
+        let wait = tokio::spawn(release_unless_torn_down(
+            pending::<Result<(), String>>(),
+            release.run(),
+        ));
+        // Let the wait start its clock now, not after the first advance.
+        tokio::task::yield_now().await;
+
+        advance(DEADLINE - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(release.at(), None, "released before the deadline");
+        assert!(!wait.is_finished());
+
+        advance(Duration::from_millis(1)).await;
+        wait.await.unwrap();
+        assert_eq!(release.at(), Some(start + DEADLINE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_teardown_that_finishes_in_time_is_not_released_again() {
+        let start = Instant::now();
+        let release = Release::default();
+        let teardown = async {
+            sleep(DEADLINE - Duration::from_secs(1)).await;
+            Ok::<(), String>(())
+        };
+        release_unless_torn_down(teardown, release.run()).await;
+        assert_eq!(start.elapsed(), DEADLINE - Duration::from_secs(1));
+        assert_eq!(release.at(), None, "it released the block itself");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_teardown_is_released_at_once() {
+        let start = Instant::now();
+        let release = Release::default();
+        let teardown = async {
+            sleep(Duration::from_secs(5)).await;
+            Err::<(), _>("the teardown task panicked")
+        };
+        release_unless_torn_down(teardown, release.run()).await;
+        assert_eq!(release.at(), Some(start + Duration::from_secs(5)));
+    }
+
+    /// The release does not wait for the teardown, and does not stop it: the
+    /// spawned task finishes on its own, after the block was released.
+    #[tokio::test(start_paused = true)]
+    async fn a_teardown_past_the_deadline_carries_on_behind_the_release() {
+        let start = Instant::now();
+        let release = Release::default();
+        let finished = Arc::new(AtomicBool::new(false));
+        let teardown = tokio::spawn({
+            let finished = finished.clone();
+            async move {
+                sleep(Duration::from_secs(90)).await;
+                finished.store(true, Ordering::SeqCst);
+            }
+        });
+        release_unless_torn_down(teardown, release.run()).await;
+        assert_eq!(release.at(), Some(start + DEADLINE));
+        assert!(!finished.load(Ordering::SeqCst));
+
+        // Past the teardown's own 90 s (not AT it: two timers due at the same
+        // instant wake in no promised order).
+        sleep(Duration::from_secs(51)).await;
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the teardown was cancelled at the deadline"
         );
     }
 }

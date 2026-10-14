@@ -46,6 +46,15 @@ export const DEVICE_LIMIT_COPY =
   'Disconnect another device or upgrade your plan.';
 export const SERVER_UNREACHABLE_COPY =
   "Couldn't establish a secure tunnel to this server. Try another location.";
+export const CLIENT_ATTESTATION_COPY =
+  "BirdoVPN couldn't verify this copy of the app. Install the latest version from birdo.app, " +
+  'then try again.';
+/**
+ * Quick Connect (the tray's, which needs no window) while the consent text the
+ * user accepted is older than this build's (MR-1607). The window comes up on
+ * the consent screen with it.
+ */
+export const CONSENT_REQUIRED_COPY = 'Review and accept the privacy terms to connect.';
 export const SETTINGS_UNVERIFIED_COPY =
   "Your saved settings couldn't be verified right now, so this change wasn't saved. " +
   'Try again in a moment, or reset your settings to their defaults.';
@@ -115,6 +124,12 @@ const COPY: Record<Exclude<IpcErrorCode, 'cancelled'>, ErrorCopy> = {
   // The settings file's signing key is unreadable, so Rust refused to write
   // over the file. The save notice offers the reset itself.
   settings_unverified: { message: SETTINGS_UNVERIFIED_COPY, action: null },
+  // The server's attestation policy refused this build (MR-1944). It used to
+  // read as `subscription_required`, whose "upgrade" cannot help. Plain on
+  // purpose: attestation is log-only on the server today, so this is rare,
+  // and it is no accusation.
+  client_attestation_required: { message: CLIENT_ATTESTATION_COPY, action: null },
+  consent_required: { message: CONSENT_REQUIRED_COPY, action: null },
   unknown: { message: 'Something went wrong. Please try again.', action: 'retry' },
 };
 

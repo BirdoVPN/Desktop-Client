@@ -17,7 +17,7 @@
  * restraint — emerald is an accent only, no colourful gradients / neon glow.
  */
 import { useState } from 'react';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
 import { useShallow } from 'zustand/react/shallow';
 import type { LucideIcon } from 'lucide-react';
 import { Check, Shield, Zap, Crown, ExternalLink } from 'lucide-react';

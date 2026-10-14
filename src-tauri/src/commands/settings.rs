@@ -2,7 +2,10 @@
 //!
 //! Handles user preferences and application settings.
 //! FIX-1-7: Settings files are HMAC-protected to detect tampering.
-//! A random HMAC key is stored in Windows Credential Manager.
+//! The random HMAC key lives where only the elevated client can read it: on
+//! Windows in the admin-only `%ProgramData%\BirdoVPN` (MR-1721,
+//! `protected_key`), on macOS and Linux in the OS credential store and a
+//! 0600 file in root's own config directory (`get_hmac_key`).
 
 // digest 0.11 moved `new_from_slice` off the `Mac` trait and onto `KeyInit`,
 // so the constructor needs its own import now.
@@ -15,6 +18,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+use crate::utils::safe_fs::OwnedDir;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -315,7 +319,8 @@ fn get_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("settings.json"))
 }
 
-/// Get or generate the key used to sign `settings.json`.
+/// Get or generate the key used to sign `settings.json` on macOS and Linux.
+/// (Windows: `protected_key`, MR-1721.)
 ///
 /// The OS credential store is tried FIRST, so existing installs keep the key
 /// (and therefore the signature) they already have.
@@ -331,10 +336,13 @@ fn get_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// over settings.json permanently. It also produced the stream of "HMAC key
 /// unavailable" errors in Console.
 ///
-/// This key only has to make local tampering DETECTABLE. It is not a secret from
-/// root, and settings.json already lives in the same root-owned directory, so a
-/// sibling 0600 file is exactly as strong as the keychain was pretending to be
-/// here.
+/// This key only has to make local tampering DETECTABLE. On macOS and Linux it
+/// is not a secret from root, and settings.json already lives in the same
+/// root-owned directory (every VPN operation runs as root there), so a sibling
+/// 0600 file is exactly as strong as the keychain was pretending to be. That
+/// is NOT true on Windows, where the client runs elevated but settings.json is
+/// in the user's own %APPDATA% (MR-1721): there the key is kept out of the
+/// user's reach altogether, see `protected_key`.
 /// P1-dk-hmac-key-source-drift: the key source used to be keystore-first with
 /// a silent (debug-logged) fallback that MINTED a fresh key file whenever the
 /// store was merely unreachable — a locked GNOME Secret Service at login, or
@@ -346,6 +354,7 @@ fn get_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// - the winning key is mirrored into BOTH sources so they converge and a
 ///   later outage of either source can no longer strand the signature;
 /// - fallbacks log at warn/error, not debug.
+#[cfg(not(windows))]
 fn get_hmac_key(settings_path: &Path) -> Result<Vec<u8>, String> {
     // Deterministic order: credential store first (existing installs keep the
     // key — and therefore the signature — they already have), then the sibling
@@ -398,6 +407,7 @@ fn read_keystore_key() -> Result<Option<Vec<u8>>, String> {
 
 /// Read the sibling 0600 key file, WITHOUT ever creating one. `None` means
 /// absent, empty, unreadable or non-hex.
+#[cfg(not(windows))]
 fn read_file_key(settings_path: &Path) -> Option<Vec<u8>> {
     match read_key_file(settings_path) {
         KeyFile::Key(key) => Some(key),
@@ -405,8 +415,9 @@ fn read_file_key(settings_path: &Path) -> Option<Vec<u8>> {
     }
 }
 
-/// What the key file beside settings.json holds right now.
-#[derive(Debug, PartialEq)]
+/// What a key file holds right now: the one beside settings.json, or on
+/// Windows the admin-only one (`protected_key`).
+#[derive(Debug, Clone, PartialEq)]
 enum KeyFile {
     Key(Vec<u8>),
     /// No file, or one that is not a key (empty, not hex): no key to find.
@@ -416,9 +427,18 @@ enum KeyFile {
     Unreadable,
 }
 
+/// The key file beside settings.json: the key source on macOS and Linux, and
+/// on Windows a pre-MR-1721 one, read only to migrate (`protected_key`).
+fn legacy_key_path(settings_path: &Path) -> PathBuf {
+    settings_path.with_file_name("settings_hmac.key")
+}
+
 fn read_key_file(settings_path: &Path) -> KeyFile {
-    let key_path = settings_path.with_file_name("settings_hmac.key");
-    let existing = match fs::read_to_string(&key_path) {
+    read_key_at(&legacy_key_path(settings_path))
+}
+
+fn read_key_at(key_path: &Path) -> KeyFile {
+    let existing = match fs::read_to_string(key_path) {
         Ok(existing) => existing,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return KeyFile::Missing,
         Err(e) => {
@@ -440,8 +460,9 @@ fn read_key_file(settings_path: &Path) -> KeyFile {
 }
 
 /// Write the 0600 HMAC key file that sits beside settings.json.
+#[cfg(not(windows))]
 fn write_key_file(settings_path: &Path, key: &[u8]) -> Result<(), String> {
-    let key_path = settings_path.with_file_name("settings_hmac.key");
+    let key_path = legacy_key_path(settings_path);
     if let Some(parent) = key_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
     }
@@ -461,7 +482,10 @@ fn write_key_file(settings_path: &Path, key: &[u8]) -> Result<(), String> {
 /// outage of either one can never strand the settings signature again. This
 /// key only makes local tampering DETECTABLE (see `get_hmac_key`'s history) —
 /// duplicating it into the sibling 0600 file does not widen access beyond
-/// what settings.json itself already has.
+/// what settings.json itself already has. macOS and Linux only: on Windows
+/// both sources are readable by the user's unelevated processes, and the
+/// key must never be written to either (MR-1721).
+#[cfg(not(windows))]
 fn sync_hmac_key_sources(settings_path: &Path, key: &[u8]) {
     let key_hex = hex::encode(key);
 
@@ -474,7 +498,7 @@ fn sync_hmac_key_sources(settings_path: &Path, key: &[u8]) {
         }
     }
 
-    let key_path = settings_path.with_file_name("settings_hmac.key");
+    let key_path = legacy_key_path(settings_path);
     let already = fs::read_to_string(&key_path)
         .map(|s| s.trim() == key_hex)
         .unwrap_or(false);
@@ -761,100 +785,512 @@ impl Loaded {
 fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {
     let _write = SETTINGS_WRITE.lock();
     let path = get_settings_path(app).map_err(LoadError::Other)?;
+    load_at(&path, &OsKeys::new(&path))
+}
+
+/// The keys a load may verify settings.json with, and what they allow.
+#[derive(Debug, PartialEq)]
+struct VerifyingKeys {
+    keys: Vec<Vec<u8>>,
+    /// Windows (MR-1721): `keys` come from the pre-MR-1721 sources — the
+    /// credential store and settings_hmac.key beside the file — which any
+    /// process of the user can read and write. A file they verify is adopted
+    /// once ([`adopt_legacy`]) and they are retired.
+    legacy: bool,
+    /// A key that could verify the file may exist and be unreadable right now
+    /// ([`key_may_still_exist`]).
+    key_may_still_exist: bool,
+    /// An unsigned file (from before FIX-1-7) may be adopted and signed.
+    accepts_unsigned: bool,
+}
+
+/// What [`load_at`] verifies with on Windows, given this account's
+/// admin-only key (`protected`) and, only while there is none AND this is the
+/// first start after the installer upgraded a pre-MR-1721 install
+/// (`upgrade_window`, R1: `protected_dir::legacy_upgrade_window`), the
+/// pre-MR-1721 sources (`legacy`: their keys, and whether one may be
+/// unreadable right now). See `protected_key`.
+///
+/// Pure and free of `cfg` so the rule is tested on every host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_verifying_keys(
+    protected: KeyFile,
+    upgrade_window: bool,
+    legacy: impl FnOnce() -> (Vec<Vec<u8>>, bool),
+) -> VerifyingKeys {
+    match protected {
+        // The admin-only key is the only one that counts, for good: what the
+        // old sources sign, and an unsigned file, are tampering now.
+        KeyFile::Key(key) => VerifyingKeys {
+            keys: vec![key],
+            legacy: false,
+            key_may_still_exist: false,
+            accepts_unsigned: false,
+        },
+        // There, and unreadable now: the file is left alone (Unverified).
+        KeyFile::Unreadable => VerifyingKeys {
+            keys: Vec::new(),
+            legacy: false,
+            key_may_still_exist: true,
+            accepts_unsigned: false,
+        },
+        // None yet for this account, on the first start after an upgrade: the
+        // one migration.
+        KeyFile::Missing if upgrade_window => {
+            let (keys, key_may_still_exist) = legacy();
+            VerifyingKeys {
+                keys,
+                legacy: true,
+                key_may_still_exist,
+                accepts_unsigned: true,
+            }
+        }
+        // None yet, and no upgrade: a fresh install, a new Windows account,
+        // or a key that was deleted. Nothing in the user's reach is trusted —
+        // the old sources are not even read, and a settings.json there
+        // (signed or not) is quarantined to the secure defaults.
+        KeyFile::Missing => VerifyingKeys {
+            keys: Vec::new(),
+            legacy: false,
+            key_may_still_exist: false,
+            accepts_unsigned: false,
+        },
+    }
+}
+
+/// The keys the credential store and the key file beside settings.json hold
+/// right now, WITHOUT minting one, and whether one of them may exist and be
+/// unreadable.
+///
+/// P1-dk-hmac-key-source-drift: minting during load is what used to turn a
+/// transient credential-store outage into a permanent signature mismatch. A
+/// signature made by EITHER source's key is accepted, and (macOS, Linux) the
+/// winning key is then mirrored into both sources so they converge.
+fn legacy_sources(settings_path: &Path) -> (Vec<Vec<u8>>, bool) {
+    let keystore = read_keystore_key();
+    let key_file = read_key_file(settings_path);
+    let key_may_still_exist = key_may_still_exist(&keystore, &key_file);
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    match keystore {
+        Ok(Some(key)) => candidates.push(key),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            "Credential store unavailable while verifying settings ({}); trying the key file",
+            e
+        ),
+    }
+    if let KeyFile::Key(key) = key_file {
+        if !candidates.contains(&key) {
+            candidates.push(key);
+        }
+    }
+    (candidates, key_may_still_exist)
+}
+
+/// Where a load gets the keys to verify settings.json with, and a save the
+/// key to sign it with: the OS's in the app ([`OsKeys`]), a test's own in
+/// the tests.
+trait SettingsKeys {
+    /// Every key a load may verify with, never minting one.
+    fn verifying(&self) -> VerifyingKeys;
+    /// The signature a save writes, minting the key if there is none.
+    fn sign(&self, json: &str) -> Result<String, String>;
+    /// A load verified the file with `key`, not a legacy one: keep the
+    /// sources in step (macOS, Linux).
+    fn verified_with(&self, key: &[u8]);
+    /// The file was re-signed with the admin-only key: delete the
+    /// pre-MR-1721 sources (Windows).
+    fn retire_legacy(&self);
+    /// The re-sign that `sign` minted the admin-only key for failed: take
+    /// the key back, so the next load can still migrate (Windows).
+    fn undo_mint(&self);
+}
+
+/// The OS's key sources for the settings file at `settings_path`.
+struct OsKeys<'a> {
+    settings_path: &'a Path,
+}
+
+impl<'a> OsKeys<'a> {
+    fn new(settings_path: &'a Path) -> Self {
+        Self { settings_path }
+    }
+
+    fn signing_key(&self) -> Result<Vec<u8>, String> {
+        #[cfg(windows)]
+        {
+            match protected_key::read() {
+                KeyFile::Key(key) => Ok(key),
+                KeyFile::Missing => protected_key::mint(),
+                KeyFile::Unreadable => {
+                    Err("the settings signing key cannot be read right now".to_string())
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            get_hmac_key(self.settings_path)
+        }
+    }
+}
+
+impl SettingsKeys for OsKeys<'_> {
+    fn verifying(&self) -> VerifyingKeys {
+        #[cfg(windows)]
+        {
+            windows_verifying_keys(
+                protected_key::read(),
+                crate::utils::protected_dir::legacy_upgrade_window(),
+                || legacy_sources(self.settings_path),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            let (keys, key_may_still_exist) = legacy_sources(self.settings_path);
+            VerifyingKeys {
+                keys,
+                legacy: false,
+                key_may_still_exist,
+                accepts_unsigned: true,
+            }
+        }
+    }
+
+    fn sign(&self, json: &str) -> Result<String, String> {
+        compute_hmac(json, &self.signing_key()?)
+    }
+
+    fn verified_with(&self, _key: &[u8]) {
+        #[cfg(not(windows))]
+        sync_hmac_key_sources(self.settings_path, _key);
+    }
+
+    fn retire_legacy(&self) {
+        #[cfg(windows)]
+        protected_key::retire_legacy_sources(self.settings_path);
+    }
+
+    fn undo_mint(&self) {
+        #[cfg(windows)]
+        protected_key::forget();
+    }
+}
+
+/// MR-1721: the settings key on Windows.
+///
+/// THE FINDING. The elevated client applies settings.json — kill switch,
+/// lockdown, DNS, split tunnel — and settings.json is in %APPDATA%, which
+/// every process of the user can write without elevation. The key that
+/// signed it sat beside it (settings_hmac.key) and in the user's Credential
+/// Manager vault, and a medium-integrity process reads both as easily as the
+/// file, so it could re-sign settings.json with the kill switch off. (The
+/// key's doc called that folder "root-owned", which is true on macOS and
+/// Linux only.) An unsigned file was adopted as a pre-FIX-1-7 one, too.
+///
+/// THE KEY now lives in the admin-only `%ProgramData%\BirdoVPN`
+/// (`utils::protected_dir`), one per Windows account
+/// (`settings-hmac-<SID>.key`), and is never written anywhere else.
+///
+/// MIGRATION. While this account has no admin-only key, and only on the first
+/// start after the installer upgraded a pre-MR-1721 install (R1: its HKLM
+/// marker, `protected_dir::legacy_upgrade_window`; a fresh install, a new
+/// account or a deleted key never gets this), the two old sources
+/// are read, once: a file they verify, or an unsigned one, is adopted and
+/// re-signed with a FRESH admin-only key ([`adopt_legacy`]), and only then
+/// are the old sources deleted. The old key is never carried over, so
+/// whoever read it before keeps nothing. Once the admin-only key exists
+/// (which an unelevated process can neither read, delete nor replace), the
+/// old sources are never consulted again: a settings.json they sign, or an
+/// unsigned one, verifies against nothing and is quarantined, and the
+/// session runs on the secure defaults (MR-1943). What the migration adopts
+/// is what the pre-MR-1721 build was already applying; the window is the
+/// time from the upgrade to its first elevated start.
+#[cfg(windows)]
+mod protected_key {
+    use super::{
+        legacy_key_path, read_key_at, KeyFile, SETTINGS_HMAC_KEY_NAME, SETTINGS_HMAC_SERVICE,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn path() -> Result<PathBuf, String> {
+        let dir = crate::utils::protected_dir::ensure()
+            .map_err(|e| format!("admin-only state directory: {e}"))?;
+        let user = crate::utils::protected_dir::current_user_sid()
+            .map_err(|e| format!("account SID: {e}"))?;
+        Ok(dir.join(format!("settings-hmac-{user}.key")))
+    }
+
+    /// This account's key: there, absent (never made), or unreadable now.
+    pub(super) fn read() -> KeyFile {
+        match path() {
+            Ok(path) => read_key_at(&path),
+            Err(e) => {
+                tracing::warn!("The settings signing key is out of reach ({})", e);
+                KeyFile::Unreadable
+            }
+        }
+    }
+
+    /// Make this account's key. One that is already there is used instead;
+    /// one that is there and not a key (a write torn by a crash: nobody else
+    /// can write here) is replaced.
+    pub(super) fn mint() -> Result<Vec<u8>, String> {
+        use std::io::Write;
+        let path = path()?;
+        let key: [u8; 32] = rand::random();
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let KeyFile::Key(existing) = read_key_at(&path) {
+                    return Ok(existing);
+                }
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+            }
+            other => other,
+        };
+        file.and_then(|mut file| {
+            file.write_all(hex::encode(key).as_bytes())?;
+            file.sync_all()
+        })
+        .map_err(|e| format!("Failed to write the settings signing key: {e}"))?;
+        tracing::info!("Generated a new settings signing key (admin-only)");
+        Ok(key.to_vec())
+    }
+
+    /// Take back a key [`mint`] made for a migration whose re-sign failed.
+    pub(super) fn forget() {
+        if let Ok(path) = path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Delete the pre-MR-1721 key sources once the file is re-signed: the
+    /// Credential Manager entry, and the key file beside settings.json —
+    /// through a checked handle (MR-1945), as %APPDATA% is the user's.
+    pub(super) fn retire_legacy_sources(settings_path: &Path) {
+        if let Ok(entry) = keyring::Entry::new(SETTINGS_HMAC_SERVICE, SETTINGS_HMAC_KEY_NAME) {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => tracing::warn!(
+                    "Could not delete the old settings key from the credential store: {}",
+                    e
+                ),
+            }
+        }
+        let key_path = legacy_key_path(settings_path);
+        let (Some(dir), Some(name)) = (
+            key_path.parent(),
+            key_path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            return;
+        };
+        let (Some(root), Some(folder)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+        else {
+            return;
+        };
+        match crate::utils::safe_fs::OwnedDir::new(root, &[folder]).remove_file(name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("Could not delete the old settings key file: {}", e),
+        }
+    }
+
+    /// This account's admin-only key, if it has one.
+    pub(super) fn existing() -> Option<Vec<u8>> {
+        match read() {
+            KeyFile::Key(key) => Some(key),
+            KeyFile::Missing | KeyFile::Unreadable => None,
+        }
+    }
+}
+
+/// The settings key as it is now, for other state the elevated client must
+/// not take from an unelevated process: the update-resume record (MR-1933).
+/// Never mints a key: on Windows a mint would end the settings migration
+/// (`protected_key`) before the settings were migrated. Empty when there is
+/// no key yet, or it cannot be read.
+pub(crate) fn existing_signing_keys() -> Vec<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        protected_key::existing().into_iter().collect()
+    }
+    #[cfg(not(windows))]
+    {
+        crate::utils::file_log::settings_path()
+            .map(|path| legacy_sources(&path).0)
+            .unwrap_or_default()
+    }
+}
+
+/// A signed file one of the keys verified.
+struct Verified {
+    key: Vec<u8>,
+    settings: AppSettings,
+    /// What was loaded is not what is signed (a migration): save it once.
+    resave: bool,
+}
+
+/// Verify `signed` against each of `keys`, in the current shape and then in
+/// the pre-multi-hop one.
+fn verify_signed(signed: SignedSettings, keys: &[Vec<u8>]) -> Result<Option<Verified>, LoadError> {
+    let settings_json = serde_json::to_string(&signed.settings)
+        .map_err(|e| LoadError::Other(format!("Failed to re-serialize settings: {}", e)))?;
+    if let Some(key) = keys
+        .iter()
+        .find(|key| verify_hmac(&settings_json, &signed.hmac, key))
+    {
+        let port_before = signed.settings.wireguard_port.clone();
+        let settings = normalize_loaded_settings(signed.settings);
+        // Persist a migration once rather than redo it on every load.
+        let resave = settings.wireguard_port != port_before;
+        return Ok(Some(Verified {
+            key: key.clone(),
+            settings,
+            resave,
+        }));
+    }
+
+    // Fallback: the file may have been signed by a build whose
+    // AppSettings predates newer fields — the HMAC covers the OLD
+    // shape's serialization, which the primary check (serialized
+    // with the new fields present) can never reproduce. Re-verify
+    // against the legacy shape before declaring tampering, else
+    // every upgrade would silently reset user settings.
+    if let Ok(legacy) = serde_json::to_value(&signed.settings)
+        .and_then(serde_json::from_value::<LegacyAppSettingsV1>)
+    {
+        let legacy_json = serde_json::to_string(&legacy)
+            .map_err(|e| LoadError::Other(format!("Failed to serialize legacy settings: {}", e)))?;
+        if let Some(key) = keys
+            .iter()
+            .find(|key| verify_hmac(&legacy_json, &signed.hmac, key))
+        {
+            tracing::info!("Settings verified against pre-multi-hop shape — migrating signature");
+            return Ok(Some(Verified {
+                key: key.clone(),
+                settings: normalize_loaded_settings(AppSettings::from(legacy)),
+                resave: true,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// MR-1721 (Windows): adopt a file that only a pre-MR-1721 source vouches
+/// for. Those sources are the user's to read and write, so their key is never
+/// carried over: the file is re-signed with a FRESH admin-only key (`sign`
+/// mints it) and only then are they deleted. Returns whether the adoption
+/// landed.
+///
+/// A re-sign that fails (M1: a user process holding settings.json without
+/// FILE_SHARE_DELETE makes the rename fail, among others) takes the minted key
+/// back, so the next load migrates again — and the caller runs the SESSION on
+/// secure defaults meanwhile rather than on settings only a user-writable key
+/// vouches for. See `protected_key`.
+#[must_use]
+fn adopt_legacy(path: &Path, settings: &AppSettings, keys: &dyn SettingsKeys) -> bool {
+    match write_signed_settings(path, settings, |json| keys.sign(json)) {
+        Ok(()) => {
+            tracing::info!(
+                "Settings re-signed with the admin-only key; the old key sources are retired"
+            );
+            keys.retire_legacy();
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not re-sign the settings with the admin-only key: {} (will retry next load, \
+                 running on secure defaults until then)",
+                e
+            );
+            keys.undo_mint();
+            false
+        }
+    }
+}
+
+/// [`load_settings`] for the file at `path`, verified and signed with `keys`.
+fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {
+    let _write = SETTINGS_WRITE.lock();
 
     if !path.exists() {
         return Ok(Loaded::Saved(AppSettings::default()));
     }
 
-    let content = fs::read_to_string(&path).map_err(read_error)?;
+    let content = fs::read_to_string(path).map_err(read_error)?;
 
     // Try to parse as signed settings (new format)
     if let Ok(signed) = serde_json::from_str::<SignedSettings>(&content) {
-        // P1-dk-hmac-key-source-drift: collect every key the two sources hold
-        // right now, WITHOUT minting one — minting during load is what used to
-        // turn a transient credential-store outage into a permanent signature
-        // mismatch. A signature made by EITHER source's key is accepted, and
-        // the winning key is then mirrored into both sources so they converge.
-        let keystore = read_keystore_key();
-        let key_file = read_key_file(&path);
-        let key_may_still_exist = key_may_still_exist(&keystore, &key_file);
-        let mut candidates: Vec<Vec<u8>> = Vec::new();
-        match keystore {
-            Ok(Some(key)) => candidates.push(key),
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                "Credential store unavailable while verifying settings ({}); trying the key file",
-                e
-            ),
-        }
-        if let KeyFile::Key(key) = key_file {
-            if !candidates.contains(&key) {
-                candidates.push(key);
+        let found = keys.verifying();
+        return match verify_signed(signed, &found.keys)? {
+            Some(verified) if found.legacy => {
+                if adopt_legacy(path, &verified.settings, keys) {
+                    Ok(Loaded::Saved(verified.settings))
+                } else {
+                    // M1: the adoption did not land, so these settings are
+                    // vouched for only by a user-writable key right now. Run
+                    // the session on secure defaults and retry next load,
+                    // never persisting them.
+                    Ok(Loaded::Unverified(AppSettings::default()))
+                }
             }
-        }
-
-        let settings_json = serde_json::to_string(&signed.settings)
-            .map_err(|e| LoadError::Other(format!("Failed to re-serialize settings: {}", e)))?;
-        for key in &candidates {
-            if verify_hmac(&settings_json, &signed.hmac, key) {
-                sync_hmac_key_sources(&path, key);
-                let port_before = signed.settings.wireguard_port.clone();
-                let settings = normalize_loaded_settings(signed.settings);
-                // Persist a migration once rather than redo it on every load.
-                if settings.wireguard_port != port_before {
-                    if let Err(e) = save_settings_inner(app, &settings) {
+            Some(verified) => {
+                keys.verified_with(&verified.key);
+                if verified.resave {
+                    if let Err(e) =
+                        write_signed_settings(path, &verified.settings, |json| keys.sign(json))
+                    {
                         tracing::warn!(
                             "Failed to save migrated settings: {} (will retry next load)",
                             e
                         );
                     }
                 }
-                return Ok(Loaded::Saved(settings));
+                Ok(Loaded::Saved(verified.settings))
             }
-        }
-
-        // Fallback: the file may have been signed by a build whose
-        // AppSettings predates newer fields — the HMAC covers the OLD
-        // shape's serialization, which the primary check (serialized
-        // with the new fields present) can never reproduce. Re-verify
-        // against the legacy shape before declaring tampering, else
-        // every upgrade would silently reset user settings.
-        if let Ok(legacy) = serde_json::to_value(&signed.settings)
-            .and_then(serde_json::from_value::<LegacyAppSettingsV1>)
-        {
-            let legacy_json = serde_json::to_string(&legacy).map_err(|e| {
-                LoadError::Other(format!("Failed to serialize legacy settings: {}", e))
-            })?;
-            for key in &candidates {
-                if verify_hmac(&legacy_json, &signed.hmac, key) {
-                    tracing::info!(
-                        "Settings verified against pre-multi-hop shape — migrating signature"
-                    );
-                    sync_hmac_key_sources(&path, key);
-                    let settings = normalize_loaded_settings(AppSettings::from(legacy));
-                    if let Err(e) = save_settings_inner(app, &settings) {
-                        tracing::warn!(
-                            "Failed to re-sign migrated settings: {} (will retry next load)",
-                            e
-                        );
-                    }
-                    return Ok(Loaded::Saved(settings));
-                }
-            }
-        }
-
-        return Ok(no_verifying_key(&path, &content, key_may_still_exist));
+            None => Ok(no_verifying_key(
+                path,
+                &content,
+                found.key_may_still_exist,
+                |json| keys.sign(json),
+            )),
+        };
     }
 
     // Legacy format (unsigned) — migrate by parsing and re-saving with HMAC
     match serde_json::from_str::<AppSettings>(&content) {
         Ok(settings) => {
+            let found = keys.verifying();
+            if !found.accepts_unsigned {
+                // MR-1721: the admin-only key exists, so this file was signed
+                // by nothing the elevated client trusts.
+                tracing::warn!("settings.json is unsigned where a signed file is required");
+                return Ok(no_verifying_key(
+                    path,
+                    &content,
+                    found.key_may_still_exist,
+                    |json| keys.sign(json),
+                ));
+            }
             tracing::info!("Migrating unsigned settings to HMAC-protected format");
             let settings = normalize_loaded_settings(settings);
-            // Re-save with HMAC (best effort). Log on failure so a persistent
-            // failure to upgrade (disk full, permissions, credential store down)
-            // is observable rather than silently leaving settings unprotected.
-            if let Err(e) = save_settings_inner(app, &settings) {
+            if found.legacy {
+                // M1: on Windows an unsigned file is adopted under a fresh
+                // admin-only key; if that does not land, run on secure
+                // defaults and retry rather than trust an unsigned file.
+                if !adopt_legacy(path, &settings, keys) {
+                    return Ok(Loaded::Unverified(AppSettings::default()));
+                }
+            } else if let Err(e) = write_signed_settings(path, &settings, |json| keys.sign(json)) {
+                // Log on failure so a persistent failure to upgrade (disk
+                // full, permissions, credential store down) is observable
+                // rather than silently leaving settings unprotected.
                 tracing::warn!(
                     "Failed to migrate settings to HMAC-protected format: {}. Settings remain unsigned and will be retried on next load.",
                     e
@@ -894,8 +1330,13 @@ fn key_may_still_exist(keystore: &Result<Option<Vec<u8>>, String>, key_file: &Ke
 /// disk — and the defaults load as what is saved ([`quarantine`]). `content`
 /// is the file as this load read it: its log choice is taken from those
 /// bytes, not from a second read that a brief lock (an antivirus scan) could
-/// fail (MR-1956).
-fn no_verifying_key(path: &Path, content: &str, key_may_still_exist: bool) -> Loaded {
+/// fail (MR-1956). `sign` signs those defaults like any save.
+fn no_verifying_key(
+    path: &Path,
+    content: &str,
+    key_may_still_exist: bool,
+    sign: impl FnOnce(&str) -> Result<String, String>,
+) -> Loaded {
     if key_may_still_exist {
         tracing::error!(
             "Settings signature matches no readable key while a key source is unreadable — using defaults for this session without resetting"
@@ -906,9 +1347,7 @@ fn no_verifying_key(path: &Path, content: &str, key_may_still_exist: bool) -> Lo
         "Settings HMAC verification failed — tampered, or its key is gone. Resetting to defaults."
     );
     let saved = crate::utils::file_log::saved_choice(Ok(content.to_owned()));
-    Loaded::Quarantined(quarantine(path, saved, |json| {
-        compute_hmac(json, &get_hmac_key(path)?)
-    }))
+    Loaded::Quarantined(quarantine(path, saved, sign))
 }
 
 /// Set `path` aside as tampered ([`aside_path`]) and return the defaults that
@@ -930,8 +1369,15 @@ fn quarantine(
     sign: impl FnOnce(&str) -> Result<String, String>,
 ) -> AppSettings {
     let (defaults, _) = after_quarantine(AppSettings::default(), saved);
-    if let Err(e) = fs::rename(path, aside_path(path, "tampered")) {
-        tracing::warn!("Could not preserve the unverified settings file: {}", e);
+    let moved = aside_path(path, "tampered");
+    let renamed = (|| {
+        let from = file_name_of(path).map_err(|_| ())?;
+        let to = moved.file_name().and_then(|n| n.to_str()).ok_or(())?;
+        rename_in_config(path, from, to).map_err(|e| {
+            tracing::warn!("Could not preserve the unverified settings file: {}", e);
+        })
+    })();
+    if renamed.is_err() {
         return defaults;
     }
     if !defaults.file_logging_enabled {
@@ -945,9 +1391,8 @@ fn quarantine(
 /// Internal save function used by both save_settings command and migration
 fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = get_settings_path(app)?;
-    write_signed_settings(&path, settings, |json| {
-        compute_hmac(json, &get_hmac_key(&path)?)
-    })
+    let keys = OsKeys::new(&path);
+    write_signed_settings(&path, settings, |json| keys.sign(json))
 }
 
 /// Serialises every settings write in this process (REVIEW-WIN-006).
@@ -978,10 +1423,7 @@ fn write_signed_settings(
 ) -> Result<(), String> {
     let _write = SETTINGS_WRITE.lock();
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
-    }
-
+    // The config folder is created (verified, held) by `write_atomically`.
     let settings_json =
         serde_json::to_string(settings).map_err(|e| format!("Failed to serialize: {}", e))?;
     let signed = SignedSettings {
@@ -993,25 +1435,59 @@ fn write_signed_settings(
     write_atomically(path, &content)
 }
 
+/// The config directory `settings.json` sits in, as an [`OwnedDir`] rooted at
+/// the OS config folder: `<config dir>/<identifier>`. The elevated client
+/// writes there in the user's %APPDATA%, so every create/rename goes through
+/// this (MR-1945 H1), and the whole directory is held open for the process
+/// lifetime (`file_log::hold_app_dirs`) so it cannot be swapped for a junction.
+fn config_dir(path: &Path) -> Result<OwnedDir, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "settings path has no directory".to_string())?;
+    let identifier = parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "settings directory has no name".to_string())?;
+    let root = parent
+        .parent()
+        .ok_or_else(|| "config directory has no parent".to_string())?;
+    Ok(OwnedDir::new(root, &[identifier]))
+}
+
 /// FIX-2-6: write to a temp file, then rename over `path`, so a crash or a
-/// power cut mid-write never leaves a torn settings file. The temp name is
-/// unique to this write (process id + a counter): a fixed name is shared by
-/// every writer, which is half of REVIEW-WIN-006.
-fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = path.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
-    fs::write(&tmp_path, content).map_err(|e| {
-        // Clean up partial temp file on write failure
-        let _ = fs::remove_file(&tmp_path);
-        format!("Failed to write temp settings: {}", e)
-    })?;
-    fs::rename(&tmp_path, path).map_err(|e| {
-        // Clean up temp file on rename failure
-        let _ = fs::remove_file(&tmp_path);
+/// power cut mid-write never leaves a torn settings file.
+///
+/// MR-1945 H1: the staging file is CREATED NEW under a random name through a
+/// checked handle (never `fs::write` to a predictable path a user could have
+/// turned into a symlink), and both it and the rename act inside the config
+/// directory the app holds open. A failure deletes the staging file through a
+/// checked handle too.
+pub(crate) fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
+    let dir = config_dir(path)?;
+    // R5: created inside verified, held parents and held from then on (the
+    // start-up hold usually got there first); never `create_dir_all` by path.
+    dir.ensure_held()
+        .map_err(|e| format!("Failed to create config dir: {}", e))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "settings file has no name".to_string())?;
+    let tmp = format!("{name}.{:016x}.tmp", rand::random::<u64>());
+
+    let mut staging = dir
+        .create_new(&tmp)
+        .map_err(|e| format!("Failed to create temp settings: {}", e))?;
+    let written = std::io::Write::write_all(&mut staging, content.as_bytes())
+        .and_then(|()| staging.sync_all());
+    drop(staging);
+    if let Err(e) = written {
+        let _ = dir.remove_file(&tmp);
+        return Err(format!("Failed to write temp settings: {}", e));
+    }
+    dir.rename_within(&tmp, name).map_err(|e| {
+        let _ = dir.remove_file(&tmp);
         format!("Failed to atomically replace settings file: {}", e)
-    })?;
-    Ok(())
+    })
 }
 
 /// Save application settings
@@ -1087,23 +1563,29 @@ fn forget_saved_account_choices(app: &AppHandle) {
     }
 }
 
-/// Put the tunnel-shaping settings of `good` back over what is saved now, and
-/// save: the revert of a settings change the live session could not apply
-/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved. On the
-/// blocking pool, like the commands (review of #222).
+/// Put the tunnel-shaping settings that the failed change (`attempted`) moved
+/// back to `good` over what is saved now, and save: the revert of a settings
+/// change the live session could not apply (WIN-FIX-3,
+/// `vpn::reapply_vpn_settings`). Returns what was saved. On the blocking
+/// pool, like the commands (review of #222).
 pub(crate) async fn restore_tunnel_settings(
     app: &AppHandle,
     good: &AppSettings,
+    attempted: &AppSettings,
 ) -> Result<AppSettings, String> {
-    let (app, good) = (app.clone(), good.clone());
-    tokio::task::spawn_blocking(move || restore_tunnel_settings_now(&app, &good))
+    let (app, good, attempted) = (app.clone(), good.clone(), attempted.clone());
+    tokio::task::spawn_blocking(move || restore_tunnel_settings_now(&app, &good, &attempted))
         .await
         .map_err(|e| format!("Settings task failed: {e}"))?
 }
 
-fn restore_tunnel_settings_now(app: &AppHandle, good: &AppSettings) -> Result<AppSettings, String> {
+fn restore_tunnel_settings_now(
+    app: &AppHandle,
+    good: &AppSettings,
+    attempted: &AppSettings,
+) -> Result<AppSettings, String> {
     let _write = SETTINGS_WRITE.lock();
-    let restored = restored_over(load_settings(app)?, good)?;
+    let restored = restored_over(load_settings(app)?, good, attempted)?;
     save_settings_inner(app, &restored)?;
     Ok(restored)
 }
@@ -1113,9 +1595,13 @@ fn restore_tunnel_settings_now(app: &AppHandle, good: &AppSettings) -> Result<Ap
 /// replaced the user's kill switch, lockdown, autostart, server and every
 /// other preference with defaults. The revert then fails, and the error the
 /// reapply met stands.
-fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, String> {
+fn restored_over(
+    loaded: Loaded,
+    good: &AppSettings,
+    attempted: &AppSettings,
+) -> Result<AppSettings, String> {
     verified(loaded)
-        .map(|current| with_tunnel_settings_of(current, good))
+        .map(|current| with_tunnel_settings_of(current, good, attempted))
         .map_err(|refusal| refusal.message)
 }
 
@@ -1160,20 +1646,72 @@ fn may_save_over(loaded: Result<Loaded, LoadError>) -> Result<(), IpcError> {
     }
 }
 
-/// `current` with every setting a live reapply rebuilds the tunnel for taken
-/// from `good`. Only those: anything else changed since (a notification
-/// toggle, the server the user picked) is not part of the revert.
-fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSettings {
+/// `current` with the settings a live reapply rebuilds the tunnel for put
+/// back to `good` — each only where the failed change moved it (`attempted`
+/// differs from `good`) and it still holds what was attempted.
+///
+/// WIN3-009 item 3: the revert used to copy every tunnel setting from `good`,
+/// the settings the session connected with. That also threw away changes
+/// that were never attempted: one saved while the rebuild ran (the UI holds
+/// its saves for a while, not for ever, and `scheduleReapply` does nothing
+/// mid-switch), or one saved earlier that no rebuild took up. A setting the
+/// change did not move, or one changed again since, keeps what is saved.
+/// Anything that shapes no tunnel (a notification toggle, the server the user
+/// picked) is not part of the revert at all.
+fn with_tunnel_settings_of(
+    current: AppSettings,
+    good: &AppSettings,
+    attempted: &AppSettings,
+) -> AppSettings {
+    fn back<T: PartialEq + Clone>(current: T, good: &T, attempted: &T) -> T {
+        if attempted != good && current == *attempted {
+            good.clone()
+        } else {
+            current
+        }
+    }
     AppSettings {
-        custom_dns: good.custom_dns.clone(),
-        local_network_sharing: good.local_network_sharing,
-        wireguard_port: good.wireguard_port.clone(),
-        wireguard_mtu: good.wireguard_mtu,
-        stealth_mode: good.stealth_mode,
-        quantum_protection: good.quantum_protection,
-        dns_filtering: good.dns_filtering,
-        split_tunneling_enabled: good.split_tunneling_enabled,
-        split_tunnel_apps: good.split_tunnel_apps.clone(),
+        custom_dns: back(current.custom_dns, &good.custom_dns, &attempted.custom_dns),
+        local_network_sharing: back(
+            current.local_network_sharing,
+            &good.local_network_sharing,
+            &attempted.local_network_sharing,
+        ),
+        wireguard_port: back(
+            current.wireguard_port,
+            &good.wireguard_port,
+            &attempted.wireguard_port,
+        ),
+        wireguard_mtu: back(
+            current.wireguard_mtu,
+            &good.wireguard_mtu,
+            &attempted.wireguard_mtu,
+        ),
+        stealth_mode: back(
+            current.stealth_mode,
+            &good.stealth_mode,
+            &attempted.stealth_mode,
+        ),
+        quantum_protection: back(
+            current.quantum_protection,
+            &good.quantum_protection,
+            &attempted.quantum_protection,
+        ),
+        dns_filtering: back(
+            current.dns_filtering,
+            &good.dns_filtering,
+            &attempted.dns_filtering,
+        ),
+        split_tunneling_enabled: back(
+            current.split_tunneling_enabled,
+            &good.split_tunneling_enabled,
+            &attempted.split_tunneling_enabled,
+        ),
+        split_tunnel_apps: back(
+            current.split_tunnel_apps,
+            &good.split_tunnel_apps,
+            &attempted.split_tunnel_apps,
+        ),
         ..current
     }
 }
@@ -1279,25 +1817,46 @@ fn reset_over(
     let Err(e) = save() else {
         return Ok(());
     };
-    Err(IpcError::unknown(
-        match aside.map(|aside| fs::rename(aside, path)) {
-            Some(Err(back)) => format!(
-                "The defaults could not be saved ({e}), and the settings file stays set aside \
+    let put_back = aside.as_ref().map(|aside| {
+        let from = aside
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| std::io::Error::other("aside path has no file name"))?;
+        let to = file_name_of(path).map_err(|_| std::io::Error::other("no settings name"))?;
+        rename_in_config(path, from, to)
+    });
+    Err(IpcError::unknown(match put_back {
+        Some(Err(back)) => format!(
+            "The defaults could not be saved ({e}), and the settings file stays set aside \
                  (settings.json.unverified-…): {back}"
-            ),
-            None if quarantined => format!(
-                "The settings file was set aside (settings.json.tampered-…), but the defaults \
+        ),
+        None if quarantined => format!(
+            "The settings file was set aside (settings.json.tampered-…), but the defaults \
                  could not be saved: {e}"
-            ),
-            _ => format!("The defaults could not be saved, so the settings were not reset: {e}"),
-        },
-    ))
+        ),
+        _ => format!("The defaults could not be saved, so the settings were not reset: {e}"),
+    }))
 }
 
 /// Where to move settings.json aside to: `settings.json.<tag>-<UTC time>`,
 /// with a counter when that name is taken. A fixed name was replaced by the
 /// next quarantine or reset (a rename onto an existing file replaces it on
 /// Windows), destroying the copy an earlier one had kept.
+/// The leaf file name of `path`, for the checked renames below.
+fn file_name_of(path: &Path) -> Result<&str, IpcError> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| IpcError::unknown("settings path has no file name"))
+}
+
+/// Rename `from` to `to` (both leaf names) inside the config directory, through
+/// the checked, directory-handle-relative rename (MR-1945 MEDIUM 1): never a
+/// by-path `fs::rename` a junction swap could redirect.
+fn rename_in_config(path: &Path, from: &str, to: &str) -> std::io::Result<()> {
+    let dir = config_dir(path).map_err(std::io::Error::other)?;
+    dir.rename_within(from, to)
+}
+
 fn aside_path(path: &Path, tag: &str) -> PathBuf {
     let base = format!(
         "settings.json.{tag}-{}",
@@ -1316,7 +1875,12 @@ fn aside_path(path: &Path, tag: &str) -> PathBuf {
 /// (`None`) when there is none.
 fn set_aside(path: &Path, tag: &str) -> Result<Option<PathBuf>, IpcError> {
     let aside = aside_path(path, tag);
-    match fs::rename(path, &aside) {
+    let from = file_name_of(path)?;
+    let to = aside
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| IpcError::unknown("aside path has no file name"))?;
+    match rename_in_config(path, from, to) {
         Ok(()) => Ok(Some(aside)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(IpcError::unknown(format!(
@@ -1638,7 +2202,8 @@ mod tests {
     }
 
     /// WIN-FIX-3: a reapply that cannot be applied puts back what the live
-    /// session runs on — every tunnel-shaping setting — and nothing else.
+    /// session runs on — every tunnel-shaping setting the change moved — and
+    /// nothing else.
     #[test]
     fn a_revert_restores_the_tunnel_settings_and_keeps_the_rest() {
         let good = AppSettings::default();
@@ -1658,7 +2223,7 @@ mod tests {
             auto_connect: true,
             ..AppSettings::default()
         };
-        let restored = with_tunnel_settings_of(changed, &good);
+        let restored = with_tunnel_settings_of(changed.clone(), &good, &changed);
         assert_eq!(restored.wireguard_port, good.wireguard_port);
         assert_eq!(restored.wireguard_mtu, good.wireguard_mtu);
         assert_eq!(restored.custom_dns, good.custom_dns);
@@ -1676,6 +2241,58 @@ mod tests {
         assert!(restored.auto_connect);
     }
 
+    /// WIN3-009 item 3: a revert puts back only what the failed change moved.
+    /// A setting changed since and never attempted (saved while the rebuild
+    /// ran, or before it and never taken up) keeps what is saved — also when
+    /// it is a setting the change moved and the user moved again.
+    #[test]
+    fn a_revert_keeps_changes_that_were_never_attempted() {
+        let good = AppSettings::default();
+        // The change that failed: Stealth Mode on.
+        let attempted = AppSettings {
+            stealth_mode: true,
+            ..good.clone()
+        };
+        // Saved since, never attempted: an MTU and an excepted app.
+        let current = AppSettings {
+            wireguard_mtu: 1280,
+            split_tunneling_enabled: true,
+            split_tunnel_apps: vec!["C:\\apps\\game.exe".into()],
+            ..attempted.clone()
+        };
+        let restored = with_tunnel_settings_of(current, &good, &attempted);
+        assert!(!restored.stealth_mode, "the failed change is reverted");
+        assert_eq!(restored.wireguard_mtu, 1280, "a later change was undone");
+        assert!(restored.split_tunneling_enabled);
+        assert_eq!(restored.split_tunnel_apps, vec!["C:\\apps\\game.exe"]);
+
+        // The failed change's own setting, moved again since: the newer
+        // choice stands (it was never attempted either).
+        let attempted = AppSettings {
+            wireguard_mtu: 1300,
+            ..good.clone()
+        };
+        let current = AppSettings {
+            wireguard_mtu: 1340,
+            ..good.clone()
+        };
+        let restored = with_tunnel_settings_of(current, &good, &attempted);
+        assert_eq!(restored.wireguard_mtu, 1340);
+
+        // A Custom DNS the change turned off comes back — the gate in the UI
+        // retries its own switch-off (`custom-dns-gate.ts`, item 4).
+        let good = AppSettings {
+            custom_dns: Some(vec!["9.9.9.9".into()]),
+            ..AppSettings::default()
+        };
+        let attempted = AppSettings {
+            custom_dns: None,
+            ..good.clone()
+        };
+        let restored = with_tunnel_settings_of(attempted.clone(), &good, &attempted);
+        assert_eq!(restored.custom_dns, good.custom_dns);
+    }
+
     /// WIN3-010: a revert never saves over the defaults a load serves while
     /// it cannot verify the file (its signing key unreadable): they are not
     /// the user's settings, and saving them replaced every preference. Over
@@ -1688,13 +2305,23 @@ mod tests {
             wireguard_mtu: 1280,
             ..AppSettings::default()
         };
-        assert!(restored_over(Loaded::Unverified(AppSettings::default()), &good).is_err());
+        let attempted = AppSettings {
+            wireguard_mtu: 1420,
+            ..AppSettings::default()
+        };
+        assert!(restored_over(
+            Loaded::Unverified(AppSettings::default()),
+            &good,
+            &attempted
+        )
+        .is_err());
         let saved = AppSettings {
             killswitch_enabled: false,
             wireguard_mtu: 1420,
             ..AppSettings::default()
         };
-        let restored = restored_over(Loaded::Saved(saved), &good).expect("a verified file");
+        let restored =
+            restored_over(Loaded::Saved(saved), &good, &attempted).expect("a verified file");
         assert_eq!(restored.wireguard_mtu, 1280);
         assert!(!restored.killswitch_enabled, "not part of the revert");
 
@@ -1710,21 +2337,33 @@ mod tests {
                 .expect("end of fn")]
         };
         let restore = body("fn restore_tunnel_settings_now(");
-        assert!(restore.contains("restored_over(load_settings(app)?, good)?"));
+        assert!(restore.contains("restored_over(load_settings(app)?, good, attempted)?"));
         let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {");
-        // The one branch that serves defaults and touches nothing, which
-        // every unverified signed file reaches.
-        assert!(load.contains("return Ok(no_verifying_key(&path, &content, key_may_still_exist));"));
-        assert!(!load.contains("Loaded::Unverified("));
+        let lock = load.find("SETTINGS_WRITE.lock()").expect("the lock");
+        assert!(lock < load.find("get_settings_path(app)").unwrap());
+        assert!(lock < load.find("load_at(&path, &OsKeys::new(&path))").unwrap());
+        let at =
+            body("fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {");
+        // The branch that serves defaults and touches nothing, which every
+        // unverified file reaches: signed, and (MR-1721) unsigned.
+        assert_eq!(at.matches("no_verifying_key(").count(), 2);
+        // M1: a legacy adoption that does not land runs on secure defaults
+        // (Unverified) rather than on settings a user-writable key vouches
+        // for — one for the signed path, one for the unsigned path.
+        assert_eq!(
+            at.matches("Loaded::Unverified(AppSettings::default())")
+                .count(),
+            2
+        );
         assert_eq!(
             body("fn no_verifying_key(")
                 .matches("Loaded::Unverified(AppSettings::default())")
                 .count(),
             1
         );
-        let lock = load.find("SETTINGS_WRITE.lock()").expect("the lock");
-        assert!(lock < load.find("get_settings_path(app)").unwrap());
-        assert!(lock < load.find("save_settings_inner(").unwrap());
+        let lock = at.find("SETTINGS_WRITE.lock()").expect("the lock");
+        assert!(lock < at.find("write_signed_settings(").unwrap());
+        assert!(lock < at.find("adopt_legacy(").unwrap());
     }
 
     /// WIN-FIX-3: "53" and custom ports, which no relay answers, load as
@@ -2329,7 +2968,7 @@ mod tests {
 
         for round in ["one", "two"] {
             fs::write(&path, round).unwrap();
-            let _ = no_verifying_key(&path, round, false);
+            let _ = no_verifying_key(&path, round, false, signs_nothing);
         }
         assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 2);
     }
@@ -2545,7 +3184,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         let content = r#"{"settings":{},"hmac":"00"}"#;
         fs::write(&path, content).unwrap();
-        let loaded = no_verifying_key(&path, content, false);
+        let loaded = no_verifying_key(&path, content, false, signs_nothing);
         assert!(
             matches!(loaded, Loaded::Quarantined(_)),
             "quarantined, and so said"
@@ -2648,8 +3287,16 @@ mod tests {
             .find("Loaded::Quarantined(quarantine(path, saved,")
             .unwrap();
         assert!(choice < quarantined);
-        assert!(load[quarantined..].contains("compute_hmac(json, &get_hmac_key(path)?)"));
+        assert!(
+            load[quarantined..].starts_with("Loaded::Quarantined(quarantine(path, saved, sign))")
+        );
         assert!(!body("fn quarantine(").contains("read_to_string"));
+        // ...and the load hands it the signing every save uses.
+        let at = body("fn load_at(");
+        for call in at.split("no_verifying_key(").skip(1) {
+            let args = &call[..call.find("))").expect("end of the call")];
+            assert!(args.contains("|json| keys.sign(json)"), "{args}");
+        }
     }
 
     /// The other side: while a key source cannot be read right now, the key
@@ -2667,7 +3314,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, "{}").unwrap();
         assert!(matches!(
-            no_verifying_key(&path, "{}", true),
+            no_verifying_key(&path, "{}", true, signs_nothing),
             Loaded::Unverified(_)
         ));
         assert!(path.exists());
@@ -2723,7 +3370,7 @@ mod tests {
             ),
             (
                 include_str!("vpn.rs"),
-                "restore_tunnel_settings(&app, &previous).await",
+                "restore_tunnel_settings(self.app, previous, &self.attempted)",
             ),
             (
                 include_str!("killswitch.rs"),
@@ -2776,5 +3423,408 @@ mod tests {
                 "{command} does its work on the async runtime"
             );
         }
+    }
+
+    /// For a quarantine that writes nothing: there is nothing to sign.
+    fn signs_nothing(_: &str) -> Result<String, String> {
+        Err("this test signs nothing".to_string())
+    }
+
+    // ── MR-1721: the key an unelevated process cannot read ─────────────
+
+    /// Windows' key sources, in memory: this account's admin-only key
+    /// (`protected`) and the pre-MR-1721 ones (`legacy`, the credential
+    /// store and settings_hmac.key beside the file, which any process of the
+    /// user can read and write). Decided by the same `windows_verifying_keys`
+    /// the app uses, so `load_at` runs exactly as it does on Windows.
+    struct WindowsKeys {
+        protected: std::cell::RefCell<KeyFile>,
+        legacy: Vec<Vec<u8>>,
+        legacy_may_exist: bool,
+        retired: std::cell::Cell<bool>,
+        /// Mint the admin-only key, then fail the save it was minted for.
+        fail_after_mint: bool,
+        /// R1: the first start after the installer upgraded a pre-MR-1721
+        /// install. On by default: the migration tests are upgrades.
+        upgrade_window: bool,
+    }
+
+    impl WindowsKeys {
+        fn new(protected: KeyFile, legacy: &[&[u8]]) -> Self {
+            Self {
+                protected: std::cell::RefCell::new(protected),
+                legacy: legacy.iter().map(|k| k.to_vec()).collect(),
+                legacy_may_exist: false,
+                retired: std::cell::Cell::new(false),
+                fail_after_mint: false,
+                upgrade_window: true,
+            }
+        }
+
+        /// A fresh install / new account / deleted key: no upgrade marker.
+        fn without_upgrade(protected: KeyFile, legacy: &[&[u8]]) -> Self {
+            Self {
+                upgrade_window: false,
+                ..Self::new(protected, legacy)
+            }
+        }
+
+        fn protected_key(&self) -> Option<Vec<u8>> {
+            match &*self.protected.borrow() {
+                KeyFile::Key(key) => Some(key.clone()),
+                _ => None,
+            }
+        }
+    }
+
+    impl SettingsKeys for WindowsKeys {
+        fn verifying(&self) -> VerifyingKeys {
+            let legacy = || {
+                assert!(
+                    self.upgrade_window,
+                    "R1: the old sources were read outside an upgrade's first start"
+                );
+                (self.legacy.clone(), self.legacy_may_exist)
+            };
+            windows_verifying_keys(self.protected.borrow().clone(), self.upgrade_window, legacy)
+        }
+
+        fn sign(&self, json: &str) -> Result<String, String> {
+            let minted = matches!(*self.protected.borrow(), KeyFile::Missing);
+            let key = match self.protected.borrow().clone() {
+                KeyFile::Key(key) => key,
+                KeyFile::Missing => rand::random::<[u8; 32]>().to_vec(),
+                KeyFile::Unreadable => return Err("unreadable".to_string()),
+            };
+            *self.protected.borrow_mut() = KeyFile::Key(key.clone());
+            if minted && self.fail_after_mint {
+                return Err("disk full".to_string());
+            }
+            compute_hmac(json, &key)
+        }
+
+        fn verified_with(&self, _key: &[u8]) {}
+
+        fn retire_legacy(&self) {
+            self.retired.set(true);
+        }
+
+        fn undo_mint(&self) {
+            *self.protected.borrow_mut() = KeyFile::Missing;
+        }
+    }
+
+    /// What an unelevated process wants applied.
+    fn weakened() -> AppSettings {
+        AppSettings {
+            killswitch_enabled: false,
+            lockdown_mode: false,
+            custom_dns: Some(vec!["203.0.113.53".to_string()]),
+            split_tunneling_enabled: true,
+            split_tunnel_apps: vec![r"C:\Users\x\evil.exe".to_string()],
+            ..AppSettings::default()
+        }
+    }
+
+    fn signed_file(path: &Path, settings: &AppSettings, key: &[u8]) {
+        write_signed_settings(path, settings, |json| compute_hmac(json, key)).unwrap();
+    }
+
+    fn assert_secure_defaults(loaded: &AppSettings) {
+        let defaults = AppSettings::default();
+        assert_eq!(loaded.killswitch_enabled, defaults.killswitch_enabled);
+        assert_eq!(loaded.lockdown_mode, defaults.lockdown_mode);
+        assert_eq!(loaded.custom_dns, None);
+        assert!(!loaded.split_tunneling_enabled && loaded.split_tunnel_apps.is_empty());
+    }
+
+    /// THE FINDING. With the admin-only key in place, an unelevated process
+    /// that writes settings.json signed with a key it can reach (the old
+    /// sources, which it can also simply write) does not get it applied: the
+    /// file verifies against nothing, is set aside, and the session runs on
+    /// the secure defaults (MR-1943). On main the planted key verified it.
+    #[test]
+    fn a_file_signed_with_a_user_writable_key_is_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let planted: [u8; 32] = rand::random();
+        signed_file(&path, &weakened(), &planted);
+        let keys = WindowsKeys::new(
+            KeyFile::Key(rand::random::<[u8; 32]>().to_vec()),
+            &[&planted],
+        );
+
+        let loaded = load_at(&path, &keys).unwrap();
+
+        let Loaded::Quarantined(settings) = loaded else {
+            panic!("the planted file was not quarantined");
+        };
+        assert_secure_defaults(&settings);
+        assert!(!keys.retired.get());
+        assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 1);
+    }
+
+    /// The other door: an unsigned file used to be adopted as one from
+    /// before signing, and signed. Not once the admin-only key exists.
+    #[test]
+    fn an_unsigned_file_is_not_applied_once_the_key_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, serde_json::to_string(&weakened()).unwrap()).unwrap();
+        let keys = WindowsKeys::new(KeyFile::Key(rand::random::<[u8; 32]>().to_vec()), &[]);
+
+        let Loaded::Quarantined(settings) = load_at(&path, &keys).unwrap() else {
+            panic!("the unsigned file was not quarantined");
+        };
+        assert_secure_defaults(&settings);
+    }
+
+    /// A key that is there and cannot be read right now leaves the file
+    /// alone and serves the defaults for the session; nothing old is tried.
+    #[test]
+    fn an_unreadable_admin_only_key_leaves_the_file_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let old: [u8; 32] = rand::random();
+        signed_file(&path, &weakened(), &old);
+        let before = fs::read_to_string(&path).unwrap();
+        let keys = WindowsKeys::new(KeyFile::Unreadable, &[&old]);
+
+        assert!(matches!(
+            load_at(&path, &keys).unwrap(),
+            Loaded::Unverified(_)
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert!(!keys.retired.get());
+    }
+
+    /// MIGRATION. An existing install has no admin-only key yet: its file,
+    /// signed with the old key, is adopted ONCE, re-signed with a FRESH key
+    /// (the old one is never carried over), and the old sources are retired.
+    /// After that the old key verifies nothing.
+    #[test]
+    fn an_existing_install_is_migrated_once_to_a_fresh_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let old: [u8; 32] = rand::random();
+        let users = AppSettings {
+            killswitch_enabled: false,
+            wireguard_mtu: 1380,
+            ..AppSettings::default()
+        };
+        signed_file(&path, &users, &old);
+        let keys = WindowsKeys::new(KeyFile::Missing, &[&old]);
+
+        let Loaded::Saved(loaded) = load_at(&path, &keys).unwrap() else {
+            panic!("the existing install's settings were not kept");
+        };
+        assert!(!loaded.killswitch_enabled);
+        assert_eq!(loaded.wireguard_mtu, 1380);
+        let fresh = keys.protected_key().expect("an admin-only key was minted");
+        assert_ne!(fresh, old.to_vec(), "the old key was carried over");
+        assert!(keys.retired.get(), "the old sources were not retired");
+        let signed: SignedSettings =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(verify_hmac(
+            &serde_json::to_string(&signed.settings).unwrap(),
+            &signed.hmac,
+            &fresh
+        ));
+
+        // The next start verifies with the admin-only key and keeps them.
+        let again = WindowsKeys::new(KeyFile::Key(fresh.clone()), &[&old]);
+        assert!(
+            matches!(load_at(&path, &again).unwrap(), Loaded::Saved(s) if s.wireguard_mtu == 1380)
+        );
+
+        // And the old key, which an unelevated process may well hold, can no
+        // longer get anything applied.
+        signed_file(&path, &weakened(), &old);
+        assert!(matches!(
+            load_at(&path, &again).unwrap(),
+            Loaded::Quarantined(_)
+        ));
+    }
+
+    /// An unsigned file from before FIX-1-7 is migrated the same way, while
+    /// there is no admin-only key.
+    #[test]
+    fn an_unsigned_file_is_migrated_while_there_is_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let users = AppSettings {
+            autostart: true,
+            ..AppSettings::default()
+        };
+        fs::write(&path, serde_json::to_string(&users).unwrap()).unwrap();
+        let keys = WindowsKeys::new(KeyFile::Missing, &[]);
+
+        assert!(matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(s) if s.autostart));
+        assert!(keys.protected_key().is_some());
+        assert!(keys.retired.get());
+    }
+
+    /// M1: a migration whose re-sign fails takes the minted key back AND runs
+    /// the session on secure defaults (Unverified), never on settings only a
+    /// user-writable key vouches for. Nothing is saved, and the next load
+    /// migrates again.
+    #[test]
+    fn a_failed_migration_runs_on_defaults_and_leaves_the_migration_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let old: [u8; 32] = rand::random();
+        let users = AppSettings {
+            wireguard_mtu: 1300,
+            killswitch_enabled: false,
+            ..AppSettings::default()
+        };
+        signed_file(&path, &users, &old);
+        let before = fs::read_to_string(&path).unwrap();
+        let mut keys = WindowsKeys::new(KeyFile::Missing, &[&old]);
+        keys.fail_after_mint = true;
+
+        // Secure defaults for the session: the kill switch is NOT off here.
+        let loaded = load_at(&path, &keys).unwrap();
+        assert!(matches!(loaded, Loaded::Unverified(_)));
+        assert!(
+            may_save_over(Ok(loaded)).is_err(),
+            "an unverified load must not be saved over"
+        );
+        assert_eq!(*keys.protected.borrow(), KeyFile::Missing);
+        assert!(!keys.retired.get());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "nothing was written"
+        );
+
+        // The retry adopts and keeps the real settings.
+        keys.fail_after_mint = false;
+        assert!(
+            matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(s) if s.wireguard_mtu == 1300)
+        );
+        assert!(keys.protected_key().is_some() && keys.retired.get());
+    }
+
+    /// The rule itself: with the admin-only key, the old sources are not
+    /// even read; without it, they are, once, and marked as such.
+    #[test]
+    fn the_old_sources_are_consulted_only_while_there_is_no_admin_only_key() {
+        for window in [true, false] {
+            let found = windows_verifying_keys(KeyFile::Key(vec![1]), window, || {
+                panic!("the old sources were read although the admin-only key exists")
+            });
+            assert_eq!(
+                found,
+                VerifyingKeys {
+                    keys: vec![vec![1]],
+                    legacy: false,
+                    key_may_still_exist: false,
+                    accepts_unsigned: false,
+                }
+            );
+            let found = windows_verifying_keys(KeyFile::Unreadable, window, || panic!("read"));
+            assert!(found.keys.is_empty() && found.key_may_still_exist && !found.accepts_unsigned);
+        }
+        let found = windows_verifying_keys(KeyFile::Missing, true, || (vec![vec![2]], true));
+        assert!(found.legacy && found.accepts_unsigned && found.key_may_still_exist);
+        assert_eq!(found.keys, vec![vec![2]]);
+    }
+
+    /// R1, the rule: with no admin-only key and NO upgrade marker (a fresh
+    /// install, a new Windows account, a deleted key) the old sources are not
+    /// read and nothing unsigned is accepted.
+    #[test]
+    fn without_an_upgrade_the_old_sources_are_never_read() {
+        let found = windows_verifying_keys(KeyFile::Missing, false, || {
+            panic!("the old sources were read on a fresh install")
+        });
+        assert_eq!(
+            found,
+            VerifyingKeys {
+                keys: Vec::new(),
+                legacy: false,
+                key_may_still_exist: false,
+                accepts_unsigned: false,
+            }
+        );
+    }
+
+    /// R1, THE FINDING: on a fresh install (no admin-only key yet), a
+    /// settings.json an unelevated process planted together with a key in an
+    /// old source used to be adopted once. Without the installer's upgrade
+    /// marker it is quarantined to the secure defaults, the old key is not
+    /// read, and the defaults are signed with a fresh admin-only key.
+    #[test]
+    fn a_fresh_install_does_not_adopt_a_file_signed_by_an_old_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let planted: [u8; 32] = rand::random();
+        signed_file(&path, &weakened(), &planted);
+        let keys = WindowsKeys::without_upgrade(KeyFile::Missing, &[&planted]);
+
+        let Loaded::Quarantined(settings) = load_at(&path, &keys).unwrap() else {
+            panic!("a planted file was adopted on a fresh install");
+        };
+        assert_secure_defaults(&settings);
+        assert!(!keys.retired.get());
+        assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 1);
+    }
+
+    /// R1: nor an unsigned one.
+    #[test]
+    fn a_fresh_install_does_not_adopt_an_unsigned_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, serde_json::to_string(&weakened()).unwrap()).unwrap();
+        let keys = WindowsKeys::without_upgrade(KeyFile::Missing, &[]);
+
+        let Loaded::Quarantined(settings) = load_at(&path, &keys).unwrap() else {
+            panic!("an unsigned file was adopted on a fresh install");
+        };
+        assert_secure_defaults(&settings);
+        assert!(!keys.retired.get());
+    }
+
+    /// R1: a fresh install with no settings.json is simply the defaults, and
+    /// its first save mints the admin-only key (which closes the migration
+    /// for this account for good).
+    #[test]
+    fn a_fresh_install_without_a_file_starts_on_defaults_and_mints_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let keys = WindowsKeys::without_upgrade(KeyFile::Missing, &[]);
+        assert!(matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(_)));
+        write_signed_settings(&path, &AppSettings::default(), |json| keys.sign(json)).unwrap();
+        assert!(keys.protected_key().is_some());
+        assert!(matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(_)));
+    }
+
+    /// The Windows key is written nowhere a medium-integrity process can
+    /// read it: the only Windows paths that write a key are the admin-only
+    /// mint, and the macOS/Linux mirroring is compiled out there.
+    #[test]
+    fn the_windows_key_is_never_mirrored_into_the_old_sources() {
+        let source = include_str!("settings.rs").replace('\r', "");
+        for f in [
+            "fn get_hmac_key(",
+            "fn sync_hmac_key_sources(",
+            "fn write_key_file(",
+        ] {
+            let at = source.find(f).expect(f);
+            let before = &source[..at];
+            let attr = before[before.rfind("\n\n").unwrap()..].to_string();
+            assert!(
+                attr.contains("#[cfg(not(windows))]"),
+                "{f} is compiled on Windows"
+            );
+        }
+        let windows = &source[source.find("mod protected_key {").unwrap()..];
+        let windows = &windows[..windows.find("\n}\n").unwrap()];
+        assert!(
+            !windows.contains("set_password"),
+            "the key went to Credential Manager"
+        );
+        assert!(windows.contains("crate::utils::protected_dir::ensure()"));
     }
 }

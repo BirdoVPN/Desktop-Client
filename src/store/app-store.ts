@@ -71,8 +71,8 @@ export interface AccountInfo {
   hasPassword: boolean;
   /**
    * `isAnonymous` / `accountType` from `/auth/me` (Account API contract item
-   * 86). `null` = the server did not say (a backend that predates the field);
-   * `resolveAnonymousAccount` then reads the email's shape.
+   * 86), the only source `resolveAnonymousAccount` reads (MR-918). `null` =
+   * not known yet (no profile fetched this session).
    */
   isAnonymous: boolean | null;
   /** Item 86: the anonymous account number. A credential: never logged. */
@@ -99,7 +99,8 @@ export type RouteId =
   | 'vpnSettings'
   | 'splitTunnel'
   | 'portForward'
-  | 'pricing';
+  | 'pricing'
+  | 'licences';
 
 export interface AppSettings {
   killSwitchEnabled: boolean;

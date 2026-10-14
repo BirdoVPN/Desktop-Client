@@ -7,6 +7,7 @@ import { CircleAlert, Check, Copy, Eye, EyeOff, KeyRound, Shield, ShieldAlert, S
 import { useShallow } from 'zustand/react/shallow';
 import { BirdoCard } from '@/components/birdo';
 import { brand, hairline, status as statusTokens, surface, white } from '@/lib/birdo-theme';
+import { copySensitive } from '@/lib/clipboard';
 import { planGradient, planName, planRank } from '@/lib/plan';
 import { findLiveServer } from '@/session/vpn-actions';
 import { useAppStore, type LoadStatus } from '@/store/app-store';
@@ -139,7 +140,8 @@ function AccountNumberRow({ accountNumber }: { accountNumber: string }) {
 
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(accountNumber.replace(/\D/g, ''));
+      // MR-1723: kept out of clipboard history and cleared after a minute.
+      await copySensitive(accountNumber.replace(/\D/g, ''));
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {

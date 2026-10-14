@@ -52,6 +52,17 @@ pub enum IpcErrorCode {
     /// unreadable), so a save was refused rather than written over it. The UI
     /// offers `reset_settings`.
     SettingsUnverified,
+    /// The server's attestation policy refused this build (403 `error:
+    /// "client_attestation_required"`, MR-1944). It used to read as
+    /// `subscription_required`, whose "upgrade your plan" cannot help. The
+    /// same build is refused the same way every time, so it is a hard
+    /// refusal: no automatic retry.
+    ClientAttestationRequired,
+    /// Quick Connect (the tray's, which needs no window) while the consent
+    /// text the user accepted is older than this build's (MR-1607,
+    /// `commands::consent`). Accepting it is the way out, so asking again
+    /// unchanged cannot succeed.
+    ConsentRequired,
     Unknown,
 }
 
@@ -68,9 +79,11 @@ impl IpcErrorCode {
                 | IpcErrorCode::DeviceLimit
                 | IpcErrorCode::SubscriptionRequired
                 | IpcErrorCode::UpgradeRequired
+                | IpcErrorCode::ClientAttestationRequired
                 | IpcErrorCode::InvalidCredentials
                 | IpcErrorCode::NotElevated
                 | IpcErrorCode::Cancelled
+                | IpcErrorCode::ConsentRequired
         )
     }
 
@@ -86,6 +99,7 @@ impl IpcErrorCode {
                 | IpcErrorCode::DeviceLimit
                 | IpcErrorCode::SubscriptionRequired
                 | IpcErrorCode::UpgradeRequired
+                | IpcErrorCode::ClientAttestationRequired
                 | IpcErrorCode::NotElevated
         )
     }
@@ -186,10 +200,18 @@ impl IpcError {
                 IpcErrorCode::ServerUnavailable,
                 "This server is no longer available.",
             ),
-            ApiError::RateLimited => Self::new(
-                IpcErrorCode::RateLimited,
-                "Too many attempts. Please wait a moment.",
-            ),
+            // MR-1808: with the server's `Retry-After` when it sent one; the UI
+            // then says how long to wait.
+            ApiError::RateLimited { retry_after_secs } => {
+                let err = Self::new(
+                    IpcErrorCode::RateLimited,
+                    "Too many attempts. Please wait a moment.",
+                );
+                match retry_after_secs {
+                    Some(secs) => err.with_retry_after(*secs),
+                    None => err,
+                }
+            }
             ApiError::UpgradeRequired(_) => {
                 Self::new(IpcErrorCode::UpgradeRequired, error.to_string())
             }
@@ -200,6 +222,38 @@ impl IpcError {
             ApiError::ServerError(_) | ApiError::Parse(_) => Self::new(
                 IpcErrorCode::ServerError,
                 "BirdoVPN had a problem answering. Please try again.",
+            ),
+            // MR-1808: a 5xx that named its wait is busy, not gone — the SAME
+            // request after the wait (both dial paths honour it, as for the
+            // two refusals below), never "try another location".
+            ApiError::ServerBusy {
+                retry_after_secs, ..
+            } => Self::transient(
+                "BirdoVPN is busy right now. Please try again in a moment.",
+                Some(*retry_after_secs),
+            ),
+            // Answered by the API client's retry gate without being sent: the
+            // user is told exactly what the server's own answer said.
+            ApiError::Held {
+                status: 429,
+                retry_after_secs,
+            } => Self::from_api(&ApiError::RateLimited {
+                retry_after_secs: Some(*retry_after_secs),
+            }),
+            ApiError::Held {
+                status,
+                retry_after_secs,
+            } => Self::from_api(&ApiError::ServerBusy {
+                status: *status,
+                retry_after_secs: *retry_after_secs,
+            }),
+            // MR-1944: its own words, not the plan copy a bare 403 gets.
+            // Attestation is log-only on the server today, so this is rare;
+            // the sentence says what helps without alarming anyone.
+            ApiError::ClientAttestationRequired(_) => Self::new(
+                IpcErrorCode::ClientAttestationRequired,
+                "BirdoVPN couldn't verify this copy of the app. Install the latest version from \
+                 birdo.app, then try again.",
             ),
             ApiError::CertificatePinningFailed(_) => {
                 Self::new(IpcErrorCode::CertPinFailed, error.to_string())
@@ -244,12 +298,25 @@ impl IpcError {
 
     /// How long the server asked this client to wait before sending the SAME
     /// request again: `Some` only for a retryable `server_error` that carries
-    /// a wait, i.e. `quota_check_unavailable` and `psk_delivery_unavailable`
-    /// (MR-1639). Both dial paths honour it: auto-reconnect never re-dials
-    /// sooner (`ReconnectPolicy::decide`), and a connect retries its request
-    /// once after it (`session::attempt`).
+    /// a wait, i.e. `quota_check_unavailable`, `psk_delivery_unavailable`
+    /// (MR-1639) and a busy 5xx's `Retry-After` (MR-1808). A connect retries
+    /// its request once after it (`session::attempt`); a rate limit is not
+    /// retried there, the user is told how long to wait instead.
     pub fn server_asked_to_wait(&self) -> Option<std::time::Duration> {
-        if self.code != IpcErrorCode::ServerError || !self.retryable {
+        if self.code != IpcErrorCode::ServerError {
+            return None;
+        }
+        self.retry_wait()
+    }
+
+    /// The wait any retryable error names before the SAME request may go out
+    /// again — the ones above and a rate limit's `Retry-After` (MR-1808).
+    /// Auto-reconnect never re-dials sooner (`ReconnectPolicy::decide`): a
+    /// re-dial inside the wait would be refused again (or held by the API
+    /// client's `retry_gate` without being sent) and only spend an attempt.
+    /// The local sign-in limiters' waits never reach a dial path.
+    pub fn retry_wait(&self) -> Option<std::time::Duration> {
+        if !self.retryable {
             return None;
         }
         self.retry_after_secs.map(std::time::Duration::from_secs)
@@ -404,6 +471,11 @@ mod tests {
             (IpcErrorCode::Cancelled, "cancelled"),
             (IpcErrorCode::ServerError, "server_error"),
             (IpcErrorCode::SettingsUnverified, "settings_unverified"),
+            (
+                IpcErrorCode::ClientAttestationRequired,
+                "client_attestation_required",
+            ),
+            (IpcErrorCode::ConsentRequired, "consent_required"),
             (IpcErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in pairs {
@@ -425,7 +497,37 @@ mod tests {
             (ApiError::NotAuthenticated, IpcErrorCode::SessionExpired),
             (ApiError::Forbidden, IpcErrorCode::SubscriptionRequired),
             (ApiError::NotFound, IpcErrorCode::ServerUnavailable),
-            (ApiError::RateLimited, IpcErrorCode::RateLimited),
+            (
+                ApiError::RateLimited {
+                    retry_after_secs: None,
+                },
+                IpcErrorCode::RateLimited,
+            ),
+            (
+                ApiError::ServerBusy {
+                    status: 503,
+                    retry_after_secs: 30,
+                },
+                IpcErrorCode::ServerError,
+            ),
+            (
+                ApiError::ClientAttestationRequired("x".into()),
+                IpcErrorCode::ClientAttestationRequired,
+            ),
+            (
+                ApiError::Held {
+                    status: 429,
+                    retry_after_secs: 30,
+                },
+                IpcErrorCode::RateLimited,
+            ),
+            (
+                ApiError::Held {
+                    status: 503,
+                    retry_after_secs: 30,
+                },
+                IpcErrorCode::ServerError,
+            ),
             (ApiError::ServerError(502), IpcErrorCode::ServerError),
             (ApiError::ServerError(503), IpcErrorCode::ServerUnavailable),
             (ApiError::Parse("x".into()), IpcErrorCode::ServerError),
@@ -571,6 +673,7 @@ mod tests {
             IpcErrorCode::DeviceLimit,
             IpcErrorCode::SubscriptionRequired,
             IpcErrorCode::UpgradeRequired,
+            IpcErrorCode::ClientAttestationRequired,
             IpcErrorCode::NotElevated,
         ] {
             assert!(code.is_hard_refusal(), "{code:?}");
@@ -838,6 +941,177 @@ mod tests {
         assert_eq!(
             IpcError::connect_refused("Full", old.quota_exceeded).code,
             IpcErrorCode::ServerUnavailable
+        );
+    }
+
+    /// MR-1808: a 429 answers `rate_limited` with the server's `Retry-After`
+    /// — whatever its body says, so the UI can say how long to wait — and a
+    /// 5xx that named its wait answers a retryable `server_error` carrying it,
+    /// which both dial paths honour. Neither is ever `session_expired`, the
+    /// one code that signs the user out: not on its own, and not when it was
+    /// the answer to the refresh a 401 ran (REVIEW-WIN2-003, in 1.4.46).
+    #[test]
+    fn a_429_or_a_busy_5xx_carries_its_wait_and_never_ends_the_session() {
+        use crate::api::BirdoApi;
+        use reqwest::StatusCode;
+        let throttled = r#"{"statusCode":429,"message":"ThrottlerException: Too Many Requests","error":"Too Many Requests"}"#;
+        let deploying = r#"{"statusCode":503,"message":"Service Unavailable"}"#;
+        let cases = [
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                throttled,
+                IpcErrorCode::RateLimited,
+            ),
+            (StatusCode::TOO_MANY_REQUESTS, "", IpcErrorCode::RateLimited),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                deploying,
+                IpcErrorCode::ServerError,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "",
+                IpcErrorCode::ServerError,
+            ),
+            (StatusCode::BAD_GATEWAY, "", IpcErrorCode::ServerError),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "",
+                IpcErrorCode::ServerError,
+            ),
+        ];
+        for (status, body, code) in cases {
+            let api = BirdoApi::classify_error_response_after(status, body, Some(42));
+            for err in [
+                IpcError::from_api(&api),
+                // The same answer to the refresh a 401 ran.
+                IpcError::from_api(&crate::api::session_gate::error_after_failed_refresh(
+                    BirdoApi::classify_error_response_after(status, body, Some(42)),
+                )),
+            ] {
+                assert_eq!(err.code, code, "{status} {body}");
+                assert_ne!(err.code, IpcErrorCode::SessionExpired);
+                assert!(err.retryable, "{status}");
+                assert!(!err.code.is_hard_refusal(), "{status}");
+                assert_eq!(err.retry_after_secs, Some(42), "{status} {body}");
+                assert_eq!(
+                    err.retry_wait(),
+                    Some(std::time::Duration::from_secs(42)),
+                    "{status}"
+                );
+                // The connect's one automatic retry is for the busy server;
+                // a rate limit is reported with its wait instead.
+                assert_eq!(
+                    err.server_asked_to_wait().is_some(),
+                    code == IpcErrorCode::ServerError,
+                    "{status}"
+                );
+                assert_eq!(serde_json::to_value(&err).unwrap()["retry_after_secs"], 42);
+            }
+        }
+
+        // The retry gate's local answer (nothing sent) reads exactly like the
+        // server's own, wait included, and is never `session_expired` either.
+        for (status, code) in [
+            (429, IpcErrorCode::RateLimited),
+            (503, IpcErrorCode::ServerError),
+        ] {
+            let err = IpcError::from_api(&ApiError::Held {
+                status,
+                retry_after_secs: 42,
+            });
+            assert_eq!(err.code, code, "{status}");
+            assert_eq!(err.retry_after_secs, Some(42), "{status}");
+            assert_eq!(
+                err.retry_wait(),
+                Some(std::time::Duration::from_secs(42)),
+                "{status}"
+            );
+        }
+
+        // Without `Retry-After` nothing changes for a 5xx: a 503 is still
+        // "this server is unavailable", a 502 a server error, neither with a
+        // wait; a 429 is still a rate limit, just without one.
+        for (status, body, code) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                deploying,
+                IpcErrorCode::ServerUnavailable,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "",
+                IpcErrorCode::ServerUnavailable,
+            ),
+            (StatusCode::BAD_GATEWAY, "", IpcErrorCode::ServerError),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                throttled,
+                IpcErrorCode::RateLimited,
+            ),
+        ] {
+            let err = IpcError::from_api(&BirdoApi::classify_error_response(status, body));
+            assert_eq!(err.code, code, "{status} {body}");
+            assert_eq!(err.retry_after_secs, None, "{status} {body}");
+            assert_eq!(err.retry_wait(), None, "{status}");
+        }
+
+        // A typed refusal keeps the wait its body names, and falls back to
+        // the header when the body names none.
+        let quota = r#"{"statusCode":503,"error":"quota_check_unavailable","message":"m","details":{"retryable":true,"retryAfterSeconds":30}}"#;
+        let quota_bare = r#"{"statusCode":503,"error":"quota_check_unavailable","message":"m"}"#;
+        for (body, wait) in [(quota, 30), (quota_bare, 42)] {
+            let err = IpcError::from_api(&BirdoApi::classify_error_response_after(
+                StatusCode::SERVICE_UNAVAILABLE,
+                body,
+                Some(42),
+            ));
+            assert_eq!(err.code, IpcErrorCode::ServerError);
+            assert_eq!(err.retry_after_secs, Some(wait), "{body}");
+        }
+
+        // A 401 stays the token's business, whatever else it carries.
+        assert!(matches!(
+            BirdoApi::classify_error_response_after(StatusCode::UNAUTHORIZED, "", Some(42)),
+            ApiError::Unauthorized
+        ));
+    }
+
+    /// MR-1944: `client_attestation_required` has its own code and plain
+    /// words. It used to fall to its 403 and read as `subscription_required`
+    /// ("upgrade your plan"). Still a hard refusal: the same build is refused
+    /// the same way, so auto-reconnect must not spend its budget on it.
+    #[test]
+    fn an_attestation_refusal_is_not_a_plan_refusal() {
+        let body = r#"{"statusCode":403,"message":"This VPN requires an official, unmodified BirdoVPN client.","error":"client_attestation_required","timestamp":"2026-10-13T09:00:00.000Z","path":"/api/v1/vpn/connect"}"#;
+        let api =
+            crate::api::BirdoApi::classify_error_response(reqwest::StatusCode::FORBIDDEN, body);
+        assert!(
+            matches!(api, ApiError::ClientAttestationRequired(_)),
+            "{api:?}"
+        );
+        let err = IpcError::from_api(&api);
+        assert_eq!(err.code, IpcErrorCode::ClientAttestationRequired);
+        assert_ne!(err.code, IpcErrorCode::SubscriptionRequired);
+        assert!(!err.retryable);
+        assert!(err.code.is_hard_refusal());
+        assert_eq!(
+            serde_json::to_value(&err).unwrap()["code"],
+            "client_attestation_required"
+        );
+        // Plain, not alarming, and nothing about plans.
+        let words = err.message.to_ascii_lowercase();
+        for alarming in ["unmodified", "tamper", "plan", "subscription", "upgrade"] {
+            assert!(!words.contains(alarming), "{}", err.message);
+        }
+        // Any other 403 is still the plan refusal it was.
+        let plan = crate::api::BirdoApi::classify_error_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"statusCode":403,"message":"Stealth mode requires a plan","error":"Forbidden"}"#,
+        );
+        assert_eq!(
+            IpcError::from_api(&plan).code,
+            IpcErrorCode::SubscriptionRequired
         );
     }
 

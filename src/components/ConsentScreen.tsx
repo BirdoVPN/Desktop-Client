@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
 import { Shield, Eye, ChartColumn, ShieldOff } from 'lucide-react';
 import { AppIconMark, BirdoButton, BirdoCard, BirdoToggleRow } from './birdo';
 import { brand, motion as motionTokens } from '@/lib/birdo-theme';
@@ -168,11 +168,12 @@ export function ConsentScreen({ onAccept, onDecline, initialCrashReports = false
             </BirdoCard>
           </motion.div>
 
-          {/* Terms + Privacy links. Opened in the SYSTEM browser via the scoped
-              shell plugin (like every other external link): a raw
-              <a target="_blank"> is outside the shell allowlist, and a webview
-              that follows it in-place strands this frameless window on a
-              remote page with no way back. */}
+          {/* Terms + Privacy links. Opened in the SYSTEM browser with the
+              opener plugin's openUrl (like every other external link), inside
+              its birdo.app scope (opener:allow-open-url in
+              capabilities/default.json). Never a raw <a target="_blank">: a
+              webview that follows it in-place strands this frameless window
+              on a remote page with no way back. */}
           <motion.div
             className="mb-4 flex items-center justify-center gap-4"
             initial={{ opacity: 0 }}

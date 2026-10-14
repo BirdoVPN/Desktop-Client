@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import { relaunch, exit } from '@tauri-apps/plugin-process';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
 import { TriangleAlert, Download, LoaderCircle, RefreshCw, ShieldOff } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { UPDATE_REQUIRED_COPY } from '@/lib/errors';
