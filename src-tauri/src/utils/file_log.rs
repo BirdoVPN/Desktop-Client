@@ -14,6 +14,13 @@
 //! user's own disk. Nothing here is sent anywhere. Sentry is a separate,
 //! opt-in channel (`crash_report`).
 //!
+//! ON WINDOWS, ALSO WEBVIEW2'S CRASH DUMPS (MR-1946). The engine that draws the
+//! window keeps its own: `<uuid>.dmp` in
+//! `%LOCALAPPDATA%\uk.birdo.vpn.desktop\EBWebView\Crashpad\reports`, kept on
+//! this device (the app turns WebView2's crash upload off) and swept at launch
+//! with the same window and cap as `crash_*.txt`. [`delete_logs`] deletes them
+//! too. See `webview2`. The switch below cannot stop WebView2 writing one.
+//!
 //! THE SWITCH is `AppSettings::file_logging_enabled`, default ON (see there
 //! for why). Off means nothing more is written: no log line, no crash file.
 //! Files already on disk are left alone until the user deletes them
@@ -259,7 +266,7 @@ pub fn persists() -> bool {
 /// Tauri's identifier for this app (`tauri.conf.json`): the directory under
 /// the OS config directory that holds `settings.json`. Pinned against
 /// tauri.conf.json by a test.
-const APP_IDENTIFIER: &str = "uk.birdo.vpn.desktop";
+pub(crate) const APP_IDENTIFIER: &str = "uk.birdo.vpn.desktop";
 
 /// `settings.json` where `commands::settings::get_settings_path` finds it:
 /// Tauri's `app_config_dir()`, which is `dirs::config_dir()/<identifier>`
@@ -366,7 +373,8 @@ fn is_log_file_name(name: &str) -> bool {
 }
 
 /// Delete the diagnostic log and the local crash reports now (Settings ›
-/// Privacy & Security › "Delete Logs Now").
+/// Privacy & Security › "Delete Logs Now"), and on Windows WebView2's crash
+/// dumps (`webview2::delete_dumps`, MR-1946), counted with them.
 ///
 /// THE OPEN FILE. While the log is on, this process holds `birdo.log` open.
 /// It is not truncated in place: the log's handle is CLOSED, with the log's
@@ -381,10 +389,15 @@ fn is_log_file_name(name: &str) -> bool {
 /// the file is counted as `failed`, never reported as deleted.
 pub fn delete_logs() -> Deleted {
     let run = || delete_logs_in(log_dir().as_ref(), crash_dir().as_ref());
-    match FILE_LOG.get() {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut done = match FILE_LOG.get() {
         Some(log) => log.closed_for(run),
         None => run(),
-    }
+    };
+    // Not under the log's lock: nothing of the log's is in that folder.
+    #[cfg(windows)]
+    super::webview2::delete_dumps(&mut done);
+    done
 }
 
 /// [`delete_logs`] over given directories. Only names this app writes are
@@ -402,8 +415,9 @@ pub fn delete_logs_in(log_dir: Option<&OwnedDir>, crash_dir: Option<&OwnedDir>) 
 
 /// Remove every regular file directly in `dir` whose name `ours` accepts.
 ///
-/// No paths from anywhere else: `dir` is one of the app's two known
-/// directories, and each candidate is a name read from it. Never recursive,
+/// No paths from anywhere else: `dir` is one of the app's known directories
+/// (the two above, and WebView2's dump folder, which `webview2` holds open
+/// for the call), and each candidate is a name read from it. Never recursive,
 /// and never through a link: a `dir` that is a symlink or a junction is
 /// refused outright (`symlink_metadata` does not follow it, and a junction is
 /// a link there too), and an entry that is a link or a directory is skipped,
@@ -416,7 +430,7 @@ pub fn delete_logs_in(log_dir: Option<&OwnedDir>, crash_dir: Option<&OwnedDir>) 
 /// delete itself is [`OwnedDir::remove_file`], which opens the file without
 /// following a link, checks where its handle really is, and deletes through
 /// that handle. A file that fails that is counted `failed`, never deleted.
-fn delete_in(dir: &OwnedDir, ours: fn(&str) -> bool, tally: &mut Deleted) {
+pub(crate) fn delete_in(dir: &OwnedDir, ours: fn(&str) -> bool, tally: &mut Deleted) {
     let path = dir.path();
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {}

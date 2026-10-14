@@ -476,10 +476,11 @@ fn remove_tree_no_follow(path: &Path) -> io::Result<()> {
 /// process can REDIRECT via HKCU "User Shell Folders" — pointed at
 /// `%ProgramData%`, a fixed-name target would resolve onto the admin-only
 /// `BirdoVPN` and the sweep would delete the settings keys and markers,
-/// re-arming the migration. Two guards: a root is swept only when its final
-/// path resolves UNDER the token user's HKLM `ProfileList` profile directory
-/// (which HKCU cannot move); and no target that `inspect` reports `AdminOnly`
-/// is ever touched.
+/// re-arming the migration. Two guards: a root is swept only when it is not
+/// itself a link and its final path resolves UNDER the token user's HKLM
+/// `ProfileList` profile directory (which HKCU cannot move), and then it is
+/// held for the sweep and swept at that final path ([`hold_user_root`]); and
+/// no target that `inspect` reports `AdminOnly` is ever touched.
 fn remove_app_data_folders_in(appdata: &Path, localappdata: &Path) -> Leftovers {
     remove_app_data_folders_under(appdata, localappdata, user_profile_dir().as_deref())
 }
@@ -492,14 +493,20 @@ fn remove_app_data_folders_under(
     profile: Option<&Path>,
 ) -> Leftovers {
     let mut done = Leftovers::default();
-    let under_profile = |root: &Path| match profile {
-        Some(p) => path_is_under(root, p),
-        None => false,
+    // Each root is held for the whole sweep and worked on at its verified
+    // final path, never at the path it was found by (`hold_user_root`).
+    let hold = |root: &Path| match hold_user_root_under(root, profile) {
+        Ok(held) => Some(held),
+        Err(e) => {
+            tracing::warn!(
+                "A per-user data root is not the user's own ({e}) — refusing to sweep it"
+            );
+            None
+        }
     };
-    let roam_ok = under_profile(appdata);
-    let local_ok = under_profile(localappdata);
-    if !roam_ok || !local_ok {
-        tracing::warn!("A per-user data root is not under the user profile — refusing to sweep it");
+    let roam = hold(appdata);
+    let local = hold(localappdata);
+    if roam.is_none() || local.is_none() {
         done.failed += 1;
     }
     let mut sweep = |path: &Path| {
@@ -516,18 +523,22 @@ fn remove_app_data_folders_under(
             },
         }
     };
-    if local_ok {
-        sweep(&localappdata.join("BirdoVPN")); // device id, pre-R4 ML-KEM key
-        sweep(&localappdata.join("Birdo VPN")); // crash reports
-        sweep(&localappdata.join(APP_IDENTIFIER)); // the template's local folder
+    if let Some(local) = &local {
+        let local = local.path();
+        sweep(&local.join("BirdoVPN")); // device id, pre-R4 ML-KEM key
+        sweep(&local.join("Birdo VPN")); // crash reports
+        sweep(&local.join(APP_IDENTIFIER)); // the template's local folder
     }
-    if roam_ok {
-        sweep(&appdata.join(APP_IDENTIFIER)); // the template's roaming folder
+    if let Some(roam) = &roam {
+        sweep(&roam.path().join(APP_IDENTIFIER)); // the template's roaming folder
     }
 
     // %APPDATA%\BirdoVPN: logs and the rest, but keep the DNS journal.
-    let birdo = super::safe_fs::OwnedDir::new(appdata, &["BirdoVPN"]);
-    if roam_ok && !matches!(inspect(birdo.path()), Ok(State::AdminOnly)) {
+    let Some(roam) = &roam else {
+        return done;
+    };
+    let birdo = super::safe_fs::OwnedDir::new(roam.path(), &["BirdoVPN"]);
+    if !matches!(inspect(birdo.path()), Ok(State::AdminOnly)) {
         match birdo.hold_open_if_present() {
             Ok(None) => {}
             Err(_) => {
@@ -579,25 +590,93 @@ fn user_profile_dir() -> Option<PathBuf> {
     Some(PathBuf::from(win_api::expand_env(&raw)))
 }
 
-/// The final path of `p` (opened without following a reparse point), or `None`.
-fn final_path_of(p: &Path) -> Option<PathBuf> {
-    let handle = OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(p)
-        .ok()?;
-    win_api::final_path(&handle).ok()
+/// A per-user root folder the OS hands out (`%APPDATA%`, `%LOCALAPPDATA%`),
+/// verified to be the token user's own and held: what an elevated delete
+/// below such a root starts from (D6c, [`remove_app_data_folders_in`]; MR-1946,
+/// WebView2's crash dumps in `utils::webview2`). See [`hold_user_root`].
+pub(crate) struct UserRoot {
+    /// The root's final path, every link on the way to it resolved. Work
+    /// below the root uses this, never the path the root was found by, so a
+    /// junction on that path swapped after the check changes nothing.
+    path: PathBuf,
+    /// Open without `FILE_SHARE_DELETE`: while it lives, neither the root nor
+    /// any folder above it can be renamed, so nothing on [`UserRoot::path`]
+    /// can be replaced with a junction either.
+    _held: File,
 }
 
-/// Whether `child` resolves to `ancestor` or a path beneath it, comparing
-/// resolved final paths component-by-component, case-insensitively (NTFS folds
-/// case). A root that does not resolve is not under anything.
-fn path_is_under(child: &Path, ancestor: &Path) -> bool {
-    let (Some(c), Some(a)) = (final_path_of(child), final_path_of(ancestor)) else {
-        return false;
+impl UserRoot {
+    /// The verified root's final path (`\\?\C:\Users\...`).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// `root` as a [`UserRoot`], if it is the token user's own (D6c).
+///
+/// The roots come from `SHGetKnownFolderPath`, which a same-user process can
+/// redirect in HKCU, so where they point is checked, the way `safe_fs`
+/// resolves a root: by handle, to its final path. The root is opened WITHOUT
+/// following a reparse point and refused if it is one: a junction as the root
+/// would be followed by every later by-path step, while a check of the
+/// junction's own path would find it inside the profile. Its final path (with
+/// any junction ABOVE it resolved) must lie under the profile directory that
+/// HKLM `ProfileList` names for the token user, which only an administrator
+/// can change. The handle that was checked is the one held, so there is no
+/// gap between the check and the hold.
+pub(crate) fn hold_user_root(root: &Path) -> io::Result<UserRoot> {
+    hold_user_root_under(root, user_profile_dir().as_deref())
+}
+
+/// [`hold_user_root`] with the profile directory injected, so a test can
+/// place its fake roots under a profile it controls.
+fn hold_user_root_under(root: &Path, profile: Option<&Path>) -> io::Result<UserRoot> {
+    // winnt.h: list the directory (what makes the open subject to share
+    // modes, see safe_fs's HOLD_ACCESS); share without DELETE.
+    const FILE_LIST_DIRECTORY: u32 = 0x1;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    let refused = |why: &str| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refused the per-user folder: {why}"),
+        )
     };
-    let a_comps: Vec<_> = a.components().collect();
-    let c_comps: Vec<_> = c.components().collect();
+
+    let profile = profile.ok_or_else(|| refused("the user's profile directory is unknown"))?;
+    // The profile as the OS resolves it: HKLM names it, so following a link
+    // on the way there follows the administrator's choice.
+    let profile = win_api::final_path(
+        &OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(profile)?,
+    )?;
+
+    let held = OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root)?;
+    let attributes = held.metadata()?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(refused("it is a link"));
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(refused("it is not a directory"));
+    }
+    let path = win_api::final_path(&held)?;
+    if !is_within(&path, &profile) {
+        return Err(refused("it is not under the user's profile"));
+    }
+    Ok(UserRoot { path, _held: held })
+}
+
+/// Whether the final path `child` is `ancestor` or below it, component by
+/// component, ignoring ASCII case (NTFS folds case).
+fn is_within(child: &Path, ancestor: &Path) -> bool {
+    let a_comps: Vec<_> = ancestor.components().collect();
+    let c_comps: Vec<_> = child.components().collect();
     c_comps.len() >= a_comps.len()
         && a_comps
             .iter()
@@ -1375,6 +1454,106 @@ mod tests {
         let done = remove_app_data_folders_under(&appdata, &local, None);
         assert_eq!(done.app_data, 0);
         assert!(appdata.join("BirdoVPN").exists());
+    }
+
+    /// D6c, the root itself: `%APPDATA%` / `%LOCALAPPDATA%` redirected (HKCU)
+    /// onto a junction INSIDE the profile that points at another account's
+    /// folders. The junction's own path is under the profile, but every
+    /// by-path step below it would follow it, so it is refused and nothing
+    /// behind it is touched. (The check used to resolve the junction without
+    /// following it, find it inside the profile, and sweep behind it.)
+    #[test]
+    fn a_junction_as_the_root_is_refused() {
+        let profile = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_roam = other.path().join("Roaming");
+        let other_local = other.path().join("Local");
+        let victims = [
+            other_roam.join("BirdoVPN"),
+            other_roam.join(APP_IDENTIFIER),
+            other_local.join("BirdoVPN"),
+            other_local.join("Birdo VPN"),
+            other_local.join(APP_IDENTIFIER),
+        ];
+        for dir in &victims {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("precious.txt"), "keep").unwrap();
+        }
+        let appdata = profile.path().join("Roaming");
+        let local = profile.path().join("Local");
+        junction(&appdata, &other_roam);
+        junction(&local, &other_local);
+
+        assert!(hold_user_root_under(&appdata, Some(profile.path())).is_err());
+        assert!(hold_user_root_under(&local, Some(profile.path())).is_err());
+        let done = remove_app_data_folders_under(&appdata, &local, Some(profile.path()));
+
+        assert_eq!(done.app_data, 0, "{done:?}");
+        assert!(done.failed >= 1, "{done:?}");
+        for dir in &victims {
+            assert_eq!(
+                std::fs::read_to_string(dir.join("precious.txt")).unwrap(),
+                "keep",
+                "swept behind a junction as the root"
+            );
+        }
+    }
+
+    /// A root found through a junction further up (inside the profile) is
+    /// worked on at its final path, not through the junction, so swapping the
+    /// junction after the check cannot move the work anywhere else.
+    #[test]
+    fn a_root_found_through_a_junction_is_held_at_its_final_path() {
+        let profile = tempfile::tempdir().unwrap();
+        let real = profile.path().join("Real");
+        std::fs::create_dir_all(real.join("Local")).unwrap();
+        junction(&profile.path().join("Link"), &real);
+
+        let root = hold_user_root_under(
+            &profile.path().join("Link").join("Local"),
+            Some(profile.path()),
+        )
+        .unwrap();
+        let real_final = win_api::final_path(
+            &OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(real.join("Local"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(win_api::same_path(root.path(), &real_final));
+    }
+
+    /// The verified root stays held: it cannot be renamed (so not replaced by
+    /// a junction) until the hold is dropped.
+    #[test]
+    fn a_held_root_cannot_be_renamed() {
+        let profile = tempfile::tempdir().unwrap();
+        let local = profile.path().join("Local");
+        std::fs::create_dir_all(&local).unwrap();
+        let moved = profile.path().join("Moved");
+
+        let root = hold_user_root_under(&local, Some(profile.path())).unwrap();
+        assert!(
+            std::fs::rename(&local, &moved).is_err(),
+            "a held root was renamed"
+        );
+        drop(root);
+        std::fs::rename(&local, &moved).unwrap();
+    }
+
+    /// The real roots: this account's own `%APPDATA%` and `%LOCALAPPDATA%` are
+    /// under its profile; the Windows directory is not.
+    #[test]
+    fn this_accounts_roots_are_its_own() {
+        for root in [dirs::config_dir(), dirs::data_local_dir()] {
+            assert!(hold_user_root(&root.unwrap()).is_ok());
+        }
+        let windows_dir = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .expect("SystemRoot");
+        assert!(hold_user_root(&windows_dir).is_err());
     }
 
     /// D6c LOW-MEDIUM (elevated): a target that resolves onto an admin-only

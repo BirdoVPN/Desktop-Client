@@ -81,8 +81,11 @@ updates:
     open-pull-requests-limit: 5
     groups:
       # tauri, tauri-build and the tauri-plugin-* crates move together.
+      # webview2-com too (MR-1946): the app hands tauri a WebView2 environment
+      # of webview2-com's type (`with_environment`), so a lone bump of either
+      # leaves two versions of that type and does not compile.
       tauri:
-        patterns: ["tauri", "tauri-build", "tauri-plugin-*"]
+        patterns: ["tauri", "tauri-build", "tauri-plugin-*", "webview2-com"]
       # sha2 / hmac / hkdf are ONE RustCrypto `digest` generation: sha2 0.10 +
       # hmac 0.12 + hkdf 0.12 sit on digest 0.10; sha2 0.11 + hmac 0.13 +
       # hkdf 0.13 sit on digest 0.11. A lone bump cannot compile — #173 (hmac
