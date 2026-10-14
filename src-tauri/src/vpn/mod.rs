@@ -345,6 +345,15 @@ pub mod dns_journal {
         #[serde(default)]
         resolv_conf_backup: Option<String>,
 
+        /// Linux (MR-2018): the symlink target /etc/resolv.conf had before the
+        /// pin replaced it (NetworkManager, resolvconf, WSL), so a crash
+        /// recovery puts the LINK back rather than a frozen copy of its
+        /// target. `None` when it was a regular file. Absent in records older
+        /// builds wrote, which restore the bytes as they always did.
+        #[cfg(target_os = "linux")]
+        #[serde(default)]
+        resolv_conf_link: Option<String>,
+
         /// Linux: was the tun link also configured through resolvectl?
         #[cfg(target_os = "linux")]
         #[serde(default)]
@@ -960,17 +969,26 @@ pub mod dns_journal {
     /// legitimately gone) and clears the journal: the user's own resolvers
     /// replaced by two public ones, permanently, by the recovery path.
     ///
+    /// MR-2018: each side is `(bytes, symlink target)`, and the pair moves
+    /// together. A live file that is a SYMLINK is a real baseline even when its
+    /// target cannot be read (a resolver daemon between restarts): our pin is
+    /// only ever a regular file. Only a capture with neither - the live file
+    /// is ours, or unreadable and not a link - defers to the record.
+    ///
     /// Pure for the same reason; only `record_linux` calls it outside tests.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) fn merge_linux_capture(
-        fresh: Option<&str>,
-        retained: Option<&str>,
-    ) -> Option<String> {
+        fresh: (Option<&str>, Option<&str>),
+        retained: (Option<&str>, Option<&str>),
+    ) -> (Option<String>, Option<String>) {
+        let owned = |(bytes, link): (Option<&str>, Option<&str>)| {
+            (bytes.map(str::to_string), link.map(str::to_string))
+        };
         match fresh {
-            // A real, marker-free read of the live file: newer and better than
-            // whatever the record holds.
-            Some(bytes) => Some(bytes.to_string()),
-            None => retained.map(|bytes| bytes.to_string()),
+            // A real read of the live file: newer and better than whatever the
+            // record holds.
+            (Some(_), _) | (_, Some(_)) => owned(fresh),
+            (None, None) => owned(retained),
         }
     }
 
@@ -1041,16 +1059,25 @@ pub mod dns_journal {
 
     /// Record the /etc/resolv.conf `configure_dns` is about to overwrite.
     #[cfg(target_os = "linux")]
-    pub(super) fn record_linux(resolv_conf_backup: Option<String>, uses_systemd_resolved: bool) {
+    pub(super) fn record_linux(
+        resolv_conf_backup: Option<String>,
+        resolv_conf_link: Option<String>,
+        uses_systemd_resolved: bool,
+    ) {
         // Same rule as macOS: the caller's capture is `None` whenever the file
         // already carried our marker, which is precisely the retained-record
         // case. See `merge_linux_capture`.
-        let retained = read().and_then(|old| old.resolv_conf_backup);
-        let resolv_conf_backup =
-            merge_linux_capture(resolv_conf_backup.as_deref(), retained.as_deref());
+        let retained = read()
+            .map(|old| (old.resolv_conf_backup, old.resolv_conf_link))
+            .unwrap_or_default();
+        let (resolv_conf_backup, resolv_conf_link) = merge_linux_capture(
+            (resolv_conf_backup.as_deref(), resolv_conf_link.as_deref()),
+            (retained.0.as_deref(), retained.1.as_deref()),
+        );
         let _ = write(&DnsJournal {
             os: std::env::consts::OS.to_string(),
             resolv_conf_backup,
+            resolv_conf_link,
             uses_systemd_resolved,
         });
     }
@@ -1099,6 +1126,7 @@ pub mod dns_journal {
             #[cfg(target_os = "linux")]
             let outcome = super::tunnel_linux::restore_resolv_conf_if_ours(
                 journal.resolv_conf_backup,
+                journal.resolv_conf_link,
                 journal.uses_systemd_resolved,
             );
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1368,18 +1396,59 @@ pub mod dns_journal {
         #[test]
         fn a_none_capture_never_overwrites_retained_resolv_conf_bytes() {
             assert_eq!(
-                merge_linux_capture(None, Some("nameserver 192.168.1.1\n")),
-                Some("nameserver 192.168.1.1\n".to_string())
+                merge_linux_capture((None, None), (Some("nameserver 192.168.1.1\n"), None)),
+                (Some("nameserver 192.168.1.1\n".to_string()), None)
             );
         }
 
         #[test]
         fn a_real_capture_wins_and_none_over_nothing_stays_none() {
             assert_eq!(
-                merge_linux_capture(Some("nameserver 9.9.9.9\n"), Some("nameserver 1.1.1.1\n")),
-                Some("nameserver 9.9.9.9\n".to_string())
+                merge_linux_capture(
+                    (Some("nameserver 9.9.9.9\n"), None),
+                    (Some("nameserver 1.1.1.1\n"), None)
+                ),
+                (Some("nameserver 9.9.9.9\n".to_string()), None)
             );
-            assert_eq!(merge_linux_capture(None, None), None);
+            assert_eq!(
+                merge_linux_capture((None, None), (None, None)),
+                (None, None)
+            );
+        }
+
+        /// MR-2018: the symlink travels with its bytes. A retained record's
+        /// link survives a capture that reads our own pin back (neither bytes
+        /// nor a link), and is never paired with a fresh capture's bytes.
+        #[test]
+        fn the_retained_symlink_moves_with_its_bytes() {
+            let nm = "/run/NetworkManager/resolv.conf";
+            assert_eq!(
+                merge_linux_capture((None, None), (Some("nameserver 10.0.0.1\n"), Some(nm))),
+                (
+                    Some("nameserver 10.0.0.1\n".to_string()),
+                    Some(nm.to_string())
+                )
+            );
+            // A plain file now: the fresh capture wins whole, link and all.
+            assert_eq!(
+                merge_linux_capture(
+                    (Some("nameserver 9.9.9.9\n"), None),
+                    (Some("nameserver 10.0.0.1\n"), Some(nm))
+                ),
+                (Some("nameserver 9.9.9.9\n".to_string()), None)
+            );
+        }
+
+        /// A live symlink whose target cannot be read is still a real baseline
+        /// (our pin is only ever a regular file), so it is not traded for an
+        /// older record.
+        #[test]
+        fn a_dangling_live_symlink_is_a_baseline() {
+            let wsl = "/mnt/wsl/resolv.conf";
+            assert_eq!(
+                merge_linux_capture((None, Some(wsl)), (Some("nameserver 10.0.0.1\n"), None)),
+                (None, Some(wsl.to_string()))
+            );
         }
     }
 

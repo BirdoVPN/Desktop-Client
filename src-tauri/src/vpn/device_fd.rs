@@ -63,6 +63,30 @@ pub(crate) fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Mark a device fd close-on-exec, or say why not.
+///
+/// A child spawned while the device is open (xray, re-spawned by the stealth
+/// path, or any helper) would otherwise inherit the descriptor and keep the
+/// interface alive after the app closes its own copy: utun stays up holding
+/// the half-default routes, with no packet loop behind it. Linux opens the TUN
+/// with O_CLOEXEC, atomically; Darwin's socket(2) has no SOCK_CLOEXEC, so the
+/// utun socket gets it here, immediately after socket() and before connect()
+/// creates the interface. Fatal on failure, like [`set_nonblocking`].
+#[cfg(target_os = "macos")]
+pub(crate) fn set_cloexec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl(2) on a descriptor number; an invalid one fails (EBADF),
+    // it does not touch memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// How often [`close_when_idle`] re-checks for remaining holders.
 const POLL: Duration = Duration::from_millis(5);
 
