@@ -189,6 +189,8 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::settings::set_autostart,
         commands::settings::reset_settings,
         commands::settings::set_crash_reports_enabled,
+        // The consent text accepted, Rust's own record (MR-1607)
+        commands::consent::record_consent,
         // The on-device diagnostic log's "Delete Logs Now" (MR-808)
         commands::logs::delete_logs,
         // Kill switch

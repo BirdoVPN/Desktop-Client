@@ -392,6 +392,8 @@ const FRONTEND_COMMANDS = [
   'set_autostart',
   'reset_settings',
   'set_crash_reports_enabled',
+  // The consent text accepted, Rust's own record (MR-1607)
+  'record_consent',
   // The on-device diagnostic log's "Delete Logs Now" (MR-808)
   'delete_logs',
   // Kill switch

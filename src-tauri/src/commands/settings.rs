@@ -1462,7 +1462,7 @@ fn config_dir(path: &Path) -> Result<OwnedDir, String> {
 /// turned into a symlink), and both it and the rename act inside the config
 /// directory the app holds open. A failure deletes the staging file through a
 /// checked handle too.
-fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
+pub(crate) fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
     let dir = config_dir(path)?;
     // R5: created inside verified, held parents and held from then on (the
     // start-up hold usually got there first); never `create_dir_all` by path.

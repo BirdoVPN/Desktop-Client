@@ -885,6 +885,10 @@ async fn quick_connect_target(
     if !crate::utils::elevation::is_elevated() {
         return Err(IpcError::not_elevated());
     }
+    // MR-1607: the tray dials with no window, so the consent screen cannot
+    // stand in front of it. Refused (and the window brought up, which shows
+    // the screen) until the current text is accepted.
+    crate::commands::consent::require_consent(app).await?;
     ensure_signed_in(api, credentials).await?;
 
     // MULTI-HOP HONOURED HERE, NOT IN THE UI.

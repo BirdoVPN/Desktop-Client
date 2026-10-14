@@ -43,6 +43,7 @@ import {
   watchKillSwitchAcrossDials,
 } from '@/session/settings-persist';
 import { useCustomDnsGate } from '@/session/custom-dns-gate';
+import { recordConsentInRust, UNATTENDED_CONNECT_HELD_COPY } from '@/session/consent-sync';
 import {
   connectionNotification,
   initNotifications,
@@ -224,6 +225,12 @@ function useSessionData(): void {
  * in and past consent: it never signs anyone in. Asked behind the same gates
  * as Auto-Connect (review of #276, L2): a user who connects or disconnects
  * before the list settles — or while Rust answers — has made the choice.
+ *
+ * Neither dials until Rust's own record of the consent holds the current
+ * text (MR-1607, `consent-sync.ts`): the record the tray asks. It is written
+ * from this store first, so an install that accepted the text in an earlier
+ * build is never held back by a record it has not had the chance to write.
+ * A record that cannot be written holds both back, and the user is told.
  */
 function useAutoConnectOnce(): void {
   const done = useRef(false);
@@ -253,8 +260,15 @@ function useAutoConnectOnce(): void {
     done.current = true;
     void (async () => {
       const resume = await takeUpdateResume();
+      if (moved.current || selectTunnelActive(useAppStore.getState())) return;
+      if (!resume && !useAppStore.getState().settings.autoConnect) return;
+      const consented = await recordConsentInRust();
       const s = useAppStore.getState();
       if (moved.current || selectTunnelActive(s)) return;
+      if (!consented) {
+        s.showNotice({ text: UNATTENDED_CONNECT_HELD_COPY, tone: 'danger' });
+        return;
+      }
       if (resume) {
         void resumeAfterUpdate(resume);
         return;
