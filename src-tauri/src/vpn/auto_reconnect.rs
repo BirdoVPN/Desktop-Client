@@ -802,8 +802,8 @@ struct ReconnectLoop {
 /// closes, they would open a second, redundant window that re-dials a
 /// healthy tunnel if its answer happens to be lost.
 #[cfg(target_os = "windows")]
-async fn rebuild_path(
-    vm: &VpnManager,
+async fn rebuild_path<S: PathSignals>(
+    signals: &S,
     session: &mut SessionWatch,
     path: PhysicalRoute,
     now: Instant,
@@ -811,7 +811,138 @@ async fn rebuild_path(
     session.send_repair.rebuilt(now);
     session.verify_since = Some(now);
     session.heartbeat_misses = 0;
-    vm.repath(path).await.map(|_| ())
+    signals.repath(path).await.map(|_| ())
+}
+
+/// What the packet path's rules read off the live tunnel (Windows), and the
+/// clock they read it by. A trait so a test can drive the rules — in their
+/// order — on paused time (MR-1408); the reconnect loop's is the manager.
+#[cfg(target_os = "windows")]
+trait PathSignals {
+    /// Now, for the stall rule: read after the awaits that gathered the
+    /// signals, not at the start of the look.
+    fn now(&self) -> Instant;
+    async fn packet_path_progress(&self) -> Option<Instant>;
+    async fn send_health(&self) -> Option<super::wireguard_new::SendHealth>;
+    async fn repath(&self, path: PhysicalRoute) -> Result<bool, String>;
+    async fn peer_unresponsive(&self) -> bool;
+}
+
+#[cfg(target_os = "windows")]
+impl PathSignals for VpnManager {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    async fn packet_path_progress(&self) -> Option<Instant> {
+        VpnManager::packet_path_progress(self).await
+    }
+
+    async fn send_health(&self) -> Option<super::wireguard_new::SendHealth> {
+        VpnManager::send_health(self).await
+    }
+
+    async fn repath(&self, path: PhysicalRoute) -> Result<bool, String> {
+        VpnManager::repath(self, path).await
+    }
+
+    async fn peer_unresponsive(&self) -> bool {
+        VpnManager::peer_unresponsive(self).await
+    }
+}
+
+/// The rules that judge the packet path itself, in the order a look applies
+/// them (Windows): the stall rule, the send-path rule, the fast dead-path
+/// rule. `Some` is the look's verdict; `None` leaves it to the handshake-age
+/// backstop. `rebuilt`: this look already rebuilt the relay socket (a roam, a
+/// resume, the link's return).
+///
+/// The stall rule comes first (MR-1408): a packet path that stopped running
+/// stops the retransmits the fast rule counts with it, and whatever the fast
+/// rule or the send-path rule reads beside a stalled path, the cause is the
+/// stall — re-dialled at once, with no old-key probe
+/// (`reconnect_policy::asks_the_old_key`).
+#[cfg(target_os = "windows")]
+async fn judge_packet_path<S: PathSignals>(
+    signals: &S,
+    session: &mut SessionWatch,
+    route: Option<PhysicalRoute>,
+    link: LinkState,
+    rebuilt: bool,
+    now: Instant,
+) -> Option<Liveness> {
+    // WIN-FIX-3 P0: the packet path itself stopped running. Nothing it
+    // carries gets through, the relay's answers included, and boringtun's
+    // retransmits (what the fast rule below counts) stop with it — the
+    // T5 hang sat here, Protected, until the 180 s backstop. Judged over
+    // two looks, so a sleep the machine just woke from is not one
+    // (WIN3-003).
+    // Windows only (MR-1117): macOS and Linux have no stall rule, so a
+    // stalled packet path there is caught by the 180 s backstop.
+    if session
+        .stall
+        .observe(signals.packet_path_progress().await, signals.now())
+    {
+        tracing::warn!("The tunnel's packet path stopped running — declaring the tunnel dead");
+        return Some(Liveness::Dead(DropCause::PacketPathStalled));
+    }
+
+    // Interface loss (2026-10-07): the OS refuses our sends for a path
+    // reason (WSAEINVAL, WSAENETUNREACH, …) and keeps refusing them. The
+    // rules around this one read the relay's side, and a relay with
+    // traffic for us keeps initiating handshakes that reach us, so they
+    // all read healthy while nothing left. Rebuild the socket on the
+    // current path once; refused again, re-dial.
+    if !rebuilt {
+        let health = signals.send_health().await.unwrap_or_default();
+        let broken = super::wireguard_new::send_path_broken(&health, now);
+        match session
+            .send_repair
+            .observe(broken, link == LinkState::Offline, now)
+        {
+            reconnect_policy::SendPathVerdict::Fine => {}
+            reconnect_policy::SendPathVerdict::Rebuild => {
+                tracing::warn!(
+                    "Sends to the relay have been refused for {} s (os error {}) — \
+                     rebuilding the socket on the current path",
+                    health
+                        .failing_since
+                        .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
+                    health.last_code.unwrap_or_default()
+                );
+                let Some(path) = route else {
+                    return Some(Liveness::Dead(DropCause::PathChanged));
+                };
+                if let Err(e) = rebuild_path(signals, session, path, now).await {
+                    tracing::warn!(
+                        "Rebuilding the path to the relay failed ({}) — re-dialling",
+                        e
+                    );
+                    return Some(Liveness::Dead(DropCause::PathChanged));
+                }
+            }
+            reconnect_policy::SendPathVerdict::Escalate => {
+                tracing::warn!(
+                    "Sends to the relay are still refused on the rebuilt socket — declaring \
+                     the tunnel dead"
+                );
+                return Some(Liveness::Dead(DropCause::PathChanged));
+            }
+        }
+    }
+
+    // The fast dead-path rule: with the relay unreachable the tunnel
+    // stops carrying traffic at once, and waiting for the 180 s
+    // handshake-age backstop left the app saying Protected for minutes.
+    if link != LinkState::Offline && signals.peer_unresponsive().await {
+        tracing::warn!(
+            "The relay stopped answering handshakes while traffic is waiting — declaring \
+             the tunnel dead"
+        );
+        return Some(Liveness::Dead(DropCause::HandshakeStale));
+    }
+
+    None
 }
 
 async fn transport_exit(exits: &mut Option<watch::Receiver<u64>>) {
@@ -965,7 +1096,7 @@ impl ReconnectLoop {
             if let (Some(path), false) = (route, rebuilt) {
                 tracing::info!("Resumed — rebuilding the tunnel's path to the relay");
                 rebuilt = true;
-                if let Err(e) = rebuild_path(&vm, session, path, now).await {
+                if let Err(e) = rebuild_path(vm.as_ref(), session, path, now).await {
                     tracing::warn!(
                         "Rebuilding the path to the relay failed ({}) — re-dialling",
                         e
@@ -1001,7 +1132,7 @@ impl ReconnectLoop {
             if let (Some(path), false) = (route, rebuilt) {
                 tracing::info!("The network is back — rebuilding the tunnel's path to the relay");
                 rebuilt = true;
-                if let Err(e) = rebuild_path(&vm, session, path, now).await {
+                if let Err(e) = rebuild_path(vm.as_ref(), session, path, now).await {
                     tracing::warn!(
                         "Rebuilding the path to the relay failed ({}) — re-dialling",
                         e
@@ -1034,78 +1165,12 @@ impl ReconnectLoop {
             vm.force_handshake().await;
         }
 
-        // WIN-FIX-3 P0: the packet path itself stopped running. Nothing it
-        // carries gets through, the relay's answers included, and boringtun's
-        // retransmits (what the fast rule below counts) stop with it — the
-        // T5 hang sat here, Protected, until the 180 s backstop. Judged over
-        // two looks, so a sleep the machine just woke from is not one
-        // (WIN3-003).
-        // Windows only (MR-1117): macOS and Linux have no stall rule, so a
-        // stalled packet path there is caught by the 180 s backstop.
+        // The packet path's own rules (Windows), in their order: the stall
+        // rule, the send-path rule, the fast dead-path rule.
         #[cfg(target_os = "windows")]
-        if session
-            .stall
-            .observe(vm.packet_path_progress().await, Instant::now())
+        if let Some(dead) = judge_packet_path(vm.as_ref(), session, route, link, rebuilt, now).await
         {
-            tracing::warn!("The tunnel's packet path stopped running — declaring the tunnel dead");
-            return Liveness::Dead(DropCause::PacketPathStalled);
-        }
-
-        // Interface loss (2026-10-07): the OS refuses our sends for a path
-        // reason (WSAEINVAL, WSAENETUNREACH, …) and keeps refusing them. The
-        // rules around this one read the relay's side, and a relay with
-        // traffic for us keeps initiating handshakes that reach us, so they
-        // all read healthy while nothing left. Rebuild the socket on the
-        // current path once; refused again, re-dial.
-        #[cfg(target_os = "windows")]
-        if !rebuilt {
-            let health = vm.send_health().await.unwrap_or_default();
-            let broken = super::wireguard_new::send_path_broken(&health, now);
-            match session
-                .send_repair
-                .observe(broken, link == LinkState::Offline, now)
-            {
-                reconnect_policy::SendPathVerdict::Fine => {}
-                reconnect_policy::SendPathVerdict::Rebuild => {
-                    tracing::warn!(
-                        "Sends to the relay have been refused for {} s (os error {}) — \
-                         rebuilding the socket on the current path",
-                        health
-                            .failing_since
-                            .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
-                        health.last_code.unwrap_or_default()
-                    );
-                    let Some(path) = route else {
-                        return Liveness::Dead(DropCause::PathChanged);
-                    };
-                    if let Err(e) = rebuild_path(&vm, session, path, now).await {
-                        tracing::warn!(
-                            "Rebuilding the path to the relay failed ({}) — re-dialling",
-                            e
-                        );
-                        return Liveness::Dead(DropCause::PathChanged);
-                    }
-                }
-                reconnect_policy::SendPathVerdict::Escalate => {
-                    tracing::warn!(
-                        "Sends to the relay are still refused on the rebuilt socket — declaring \
-                         the tunnel dead"
-                    );
-                    return Liveness::Dead(DropCause::PathChanged);
-                }
-            }
-        }
-
-        // The fast dead-path rule: with the relay unreachable the tunnel
-        // stops carrying traffic at once, and waiting for the 180 s
-        // handshake-age backstop left the app saying Protected for minutes.
-        #[cfg(target_os = "windows")]
-        if link != LinkState::Offline && vm.peer_unresponsive().await {
-            tracing::warn!(
-                "The relay stopped answering handshakes while traffic is waiting — declaring \
-                 the tunnel dead"
-            );
-            return Liveness::Dead(DropCause::HandshakeStale);
+            return dead;
         }
 
         let Some(age) = vm.handshake_age().await else {
@@ -2159,9 +2224,9 @@ mod tests {
         assert_eq!(clock.silent_for(now - s(1), now), s(1));
     }
 
-    /// WIN-FIX-3: every network call the loop makes is capped, and a stalled
-    /// packet path is judged before the fast rule (which cannot fire once
-    /// the retransmits it counts have stopped with it).
+    /// WIN-FIX-3: every network call the loop makes is capped. (That a
+    /// stalled packet path is judged before the fast rule is driven in
+    /// `packet_path_rule_tests`, MR-1408.)
     #[test]
     fn every_network_call_of_the_loop_is_capped() {
         let source: String = include_str!("auto_reconnect.rs")
@@ -2181,16 +2246,6 @@ mod tests {
         assert!(probe.contains("ask_twice(OLD_KEY_PROBE_TIMEOUT,||api.heartbeat(key_id))"));
         let twice = body("async fn ask_twice<");
         assert!(twice.contains("timeout(budget,asked)"));
-
-        let liveness = body("async fn check_liveness(");
-        let stall = liveness
-            .find("ifsession.stall.observe(vm.packet_path_progress().await,Instant::now()){")
-            .expect("the stall rule");
-        let fast = liveness
-            .find("vm.peer_unresponsive().await")
-            .expect("the fast rule");
-        assert!(stall < fast);
-        assert!(liveness[stall..fast].contains("Liveness::Dead(DropCause::PacketPathStalled)"));
     }
 
     #[test]
@@ -2239,9 +2294,11 @@ mod tests {
             "session.verify_since = Some(now);",
             "vm.restart_response_watch().await;",
             // Interface loss: the path is rebuilt, not just nudged.
-            "rebuild_path(&vm, session, path, now).await",
+            "rebuild_path(vm.as_ref(), session, path, now).await",
             "vm.force_handshake().await;",
-            "if link != LinkState::Offline && vm.peer_unresponsive().await {",
+            // The fast rule is told the link (`packet_path_rule_tests`
+            // drives it: never consulted while offline).
+            "judge_packet_path(vm.as_ref(), session, route, link, rebuilt, now)",
         ] {
             let needle = needle.trim_end_matches('\n');
             let at = body[last..]
@@ -2253,10 +2310,12 @@ mod tests {
 
     /// Interface loss (2026-10-07), the wiring of the pieces tested in
     /// `reconnect_policy` and `wireguard_new`: a resume rebuilds the path
-    /// like the link's return does; the send-path rule sits between the stall
-    /// rule and the fast rule, rebuilds once and re-dials when that did not
-    /// help; and a re-prove window is judged by the relay's answer to OUR
-    /// initiation, not by boringtun's age.
+    /// like the link's return does; the packet path's rules run before the
+    /// handshake-age backstop (their order — the send-path rule between the
+    /// stall rule and the fast rule, rebuilding once and re-dialling when
+    /// that did not help — is driven in `packet_path_rule_tests`); and a
+    /// re-prove window is judged by the relay's answer to OUR initiation, not
+    /// by boringtun's age.
     #[test]
     fn a_path_the_os_refuses_is_rebuilt_then_redialled() {
         let source = include_str!("auto_reconnect.rs").replace('\r', "");
@@ -2266,19 +2325,12 @@ mod tests {
 
         let resume = &body[body.find("if resumes != session.resumes_seen {").unwrap()..];
         let resume = &resume[..resume.find("vm.force_handshake().await;").unwrap()];
-        assert!(resume.contains("rebuild_path(&vm, session, path, now).await"));
+        assert!(resume.contains("rebuild_path(vm.as_ref(), session, path, now).await"));
 
         let mut last = 0;
         for needle in [
-            "Liveness::Dead(DropCause::PacketPathStalled)",
-            "vm.send_health().await",
-            "super::wireguard_new::send_path_broken(&health, now)",
-            ".observe(broken, link == LinkState::Offline, now)",
-            "reconnect_policy::SendPathVerdict::Rebuild => {",
-            "rebuild_path(&vm, session, path, now).await",
-            "reconnect_policy::SendPathVerdict::Escalate => {",
-            "return Liveness::Dead(DropCause::PathChanged);",
-            "vm.peer_unresponsive().await",
+            "judge_packet_path(vm.as_ref(), session, route, link, rebuilt, now)",
+            "return dead;",
             "let proof_age = vm.proof_age().await.unwrap_or(age);",
             "proof_age < elapsed",
             // A window closed on proof forgets the outage's missed heartbeats.
@@ -2298,7 +2350,7 @@ mod tests {
             "session.send_repair.rebuilt(now);",
             "session.verify_since = Some(now);",
             "session.heartbeat_misses = 0;",
-            "vm.repath(path).await",
+            "signals.repath(path).await",
         ] {
             assert!(helper.contains(step), "rebuild_path lost `{step}`");
         }
@@ -2635,5 +2687,207 @@ mod tests {
         })
         .unwrap();
         assert_eq!(payload, serde_json::json!({ "secondsRemaining": 540 }));
+    }
+}
+
+/// MR-1408 (REVIEW-WIN3-013): the packet path's rules driven in their order
+/// on paused time, against a tunnel whose signals the test sets. These used
+/// to be a source-order pin on `check_liveness`.
+#[cfg(all(test, target_os = "windows"))]
+mod packet_path_rule_tests {
+    use super::*;
+    use crate::vpn::wireguard_new::{
+        SendHealth, PACKET_PATH_STALL, SEND_PATH_BROKEN_AFTER, SEND_PATH_MIN_FAILURES,
+        STALL_CONFIRM,
+    };
+    use std::sync::Mutex;
+    use tokio::time::advance;
+
+    /// A live tunnel as the rules see it: when its packet path last made
+    /// progress, whether the relay reads unresponsive, what the OS says about
+    /// our sends — and the paused clock.
+    #[derive(Default)]
+    struct Tunnel {
+        progress: Mutex<Option<Instant>>,
+        unresponsive: AtomicBool,
+        sends: Mutex<SendHealth>,
+        repaths: AtomicUsize,
+    }
+
+    impl Tunnel {
+        /// The packet path ran just now.
+        fn ticks(&self) {
+            *self.progress.lock().unwrap() = Some(self.now());
+        }
+    }
+
+    impl PathSignals for Tunnel {
+        fn now(&self) -> Instant {
+            tokio::time::Instant::now().into_std()
+        }
+
+        async fn packet_path_progress(&self) -> Option<Instant> {
+            *self.progress.lock().unwrap()
+        }
+
+        async fn send_health(&self) -> Option<SendHealth> {
+            Some(*self.sends.lock().unwrap())
+        }
+
+        async fn repath(&self, _path: PhysicalRoute) -> Result<bool, String> {
+            self.repaths.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn peer_unresponsive(&self) -> bool {
+            self.unresponsive.load(Ordering::SeqCst)
+        }
+    }
+
+    const ROUTE: PhysicalRoute = PhysicalRoute {
+        gateway: std::net::Ipv4Addr::new(192, 0, 2, 1),
+        interface: 7,
+    };
+
+    /// One look, as `check_liveness` takes it.
+    async fn look(
+        tunnel: &Tunnel,
+        session: &mut SessionWatch,
+        link: LinkState,
+    ) -> Option<Liveness> {
+        judge_packet_path(tunnel, session, Some(ROUTE), link, false, tunnel.now()).await
+    }
+
+    const STALLED: Option<Liveness> = Some(Liveness::Dead(DropCause::PacketPathStalled));
+    const PEER_GONE: Option<Liveness> = Some(Liveness::Dead(DropCause::HandshakeStale));
+    const PATH_GONE: Option<Liveness> = Some(Liveness::Dead(DropCause::PathChanged));
+
+    /// The stall rule is judged before the fast rule: on the look that
+    /// confirms a stall, a relay that ALSO reads unresponsive does not make
+    /// it a stale handshake. The cause decides the recovery — a stall is
+    /// re-dialled at once, a stale handshake asks the old key first and
+    /// counts toward the breaker.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_packet_path_is_judged_before_the_fast_rule() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        tunnel.ticks();
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+
+        // The packet path stops. The first look past the stall window only
+        // suspects it: the machine may have just woken (WIN3-003).
+        advance(PACKET_PATH_STALL).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+
+        // The relay reads unresponsive too by the confirming look.
+        tunnel.unresponsive.store(true, Ordering::SeqCst);
+        advance(STALL_CONFIRM).await;
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            STALLED
+        );
+    }
+
+    /// Across a freeze — the machine asleep, or the process frozen with it,
+    /// which `Instant` on Windows counts as time passed (WIN3-003) — the stall
+    /// rule starts over: the looks either side are too far apart to confirm
+    /// anything, and a packet path that runs again on waking is healthy. One
+    /// that stays stopped is still caught, `STALL_CONFIRM` after the first
+    /// look past the wake.
+    #[tokio::test(start_paused = true)]
+    async fn a_freeze_is_not_a_stall_and_a_real_one_after_it_still_is() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        let asleep = Duration::from_secs(3600);
+        tunnel.ticks();
+        advance(PACKET_PATH_STALL).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+
+        advance(asleep).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+        tunnel.ticks();
+        advance(STALL_CONFIRM).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+
+        advance(asleep).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+        advance(STALL_CONFIRM).await;
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            STALLED
+        );
+    }
+
+    /// The control: with the packet path running, the same unresponsive relay
+    /// IS the fast rule's — and while the machine has no route off it the
+    /// fast rule is not consulted at all (REVIEW-WIN2-005).
+    #[tokio::test(start_paused = true)]
+    async fn a_running_packet_path_leaves_an_unresponsive_relay_to_the_fast_rule() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        tunnel.unresponsive.store(true, Ordering::SeqCst);
+        for _ in 0..4 {
+            advance(Duration::from_secs(5)).await;
+            tunnel.ticks();
+            assert_eq!(look(&tunnel, &mut session, LinkState::Offline).await, None);
+        }
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            PEER_GONE
+        );
+    }
+
+    /// A stall beside sends the OS refuses is still the stall: the send-path
+    /// rule, which sits between the two, neither rebuilds the socket nor
+    /// renames the cause.
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_wins_over_refused_sends_too() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        tunnel.ticks();
+        *tunnel.sends.lock().unwrap() = SendHealth {
+            failing_since: Some(tunnel.now()),
+            failures: SEND_PATH_MIN_FAILURES,
+            last_code: Some(10022),
+        };
+        advance(PACKET_PATH_STALL).await;
+        // Not yet a stall, and the sends are broken: the one rebuild.
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+        assert_eq!(tunnel.repaths.load(Ordering::SeqCst), 1);
+        advance(STALL_CONFIRM).await;
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            STALLED
+        );
+        assert_eq!(tunnel.repaths.load(Ordering::SeqCst), 1, "a second rebuild");
+    }
+
+    /// With the packet path running, refused sends are rebuilt once and,
+    /// refused again on the rebuilt socket, re-dialled (interface loss).
+    #[tokio::test(start_paused = true)]
+    async fn refused_sends_are_rebuilt_once_then_redialled() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        *tunnel.sends.lock().unwrap() = SendHealth {
+            failing_since: Some(tunnel.now()),
+            failures: SEND_PATH_MIN_FAILURES,
+            last_code: Some(10051),
+        };
+        advance(SEND_PATH_BROKEN_AFTER).await;
+        tunnel.ticks();
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+        assert_eq!(tunnel.repaths.load(Ordering::SeqCst), 1);
+        assert!(
+            session.verify_since.is_some(),
+            "the rebuilt path is re-proven"
+        );
+
+        advance(Duration::from_secs(5)).await;
+        tunnel.ticks();
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            PATH_GONE
+        );
+        assert_eq!(tunnel.repaths.load(Ordering::SeqCst), 1);
     }
 }

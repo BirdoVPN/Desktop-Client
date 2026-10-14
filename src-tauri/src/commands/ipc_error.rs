@@ -58,6 +58,11 @@ pub enum IpcErrorCode {
     /// same build is refused the same way every time, so it is a hard
     /// refusal: no automatic retry.
     ClientAttestationRequired,
+    /// Quick Connect (the tray's, which needs no window) while the consent
+    /// text the user accepted is older than this build's (MR-1607,
+    /// `commands::consent`). Accepting it is the way out, so asking again
+    /// unchanged cannot succeed.
+    ConsentRequired,
     Unknown,
 }
 
@@ -78,6 +83,7 @@ impl IpcErrorCode {
                 | IpcErrorCode::InvalidCredentials
                 | IpcErrorCode::NotElevated
                 | IpcErrorCode::Cancelled
+                | IpcErrorCode::ConsentRequired
         )
     }
 
@@ -469,6 +475,7 @@ mod tests {
                 IpcErrorCode::ClientAttestationRequired,
                 "client_attestation_required",
             ),
+            (IpcErrorCode::ConsentRequired, "consent_required"),
             (IpcErrorCode::Unknown, "unknown"),
         ];
         for (code, wire) in pairs {
