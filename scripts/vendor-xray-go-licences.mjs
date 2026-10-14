@@ -28,6 +28,9 @@
 // zip it downloaded: each release mirrors every linked module's zip in its
 // corresponding-source asset (scripts/build-corresponding-source.mjs), which
 // refuses a zip that does not match (and checks it against Xray's go.sum).
+// For the toolchain it records the official source archive's name and the
+// SHA-256 go.dev publishes for it (`srcArchive`, `srcSha256`): the asset
+// mirrors that too.
 //
 // Built-in fetch, crypto and zlib only (Node 18+): no new dependency.
 // ============================================================================
@@ -157,13 +160,21 @@ const goLicense = Buffer.from(
   'base64',
 );
 if (!/Copyright .* The Go Authors/.test(goLicense.toString('utf8'))) die(`the ${goVersion} LICENSE does not look like Go's`);
+// The official source archive of that toolchain, which the corresponding-
+// source asset mirrors (review round 2 of #298): its SHA-256 as go.dev
+// publishes it.
+const releases = JSON.parse((await download('https://go.dev/dl/?mode=json&include=all')).toString('utf8'));
+const srcFile = (releases.find((r) => r.version === goVersion)?.files || []).find((f) => f.kind === 'source');
+if (!srcFile || !/^[0-9a-f]{64}$/.test(srcFile.sha256 || '')) die(`go.dev/dl lists no source archive for ${goVersion}`);
 const toolchain = {
   version: goVersion,
   license: 'BSD-3-Clause',
   source: 'https://go.googlesource.com/go',
   texts: vendor('go', goVersion, { LICENSE: goLicense }),
+  srcArchive: srcFile.filename,
+  srcSha256: srcFile.sha256,
 };
-console.log(`Go toolchain ${goVersion}: LICENSE`);
+console.log(`Go toolchain ${goVersion}: LICENSE; ${srcFile.filename} ${srcFile.sha256}`);
 
 const sorted = Object.fromEntries(Object.entries(modules).sort(([a], [b]) => (a < b ? -1 : 1)));
 fs.writeFileSync(tablePath, `${JSON.stringify({ _comment: table._comment, toolchain, modules: sorted }, null, 2)}\n`);

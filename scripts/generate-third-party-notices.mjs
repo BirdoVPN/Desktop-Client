@@ -67,7 +67,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readGoBuildInfo } from './lib/go-buildinfo.mjs';
-import { COPYLEFT, moduleZipMember, sourceAssetUrl, xrayModuleProblems, xrayTagArchiveMember } from './lib/corresponding-source.mjs';
+import {
+  COPYLEFT,
+  goSourceMember,
+  moduleZipMember,
+  sourceAssetUrl,
+  xrayModuleProblems,
+  xrayTagArchiveMember,
+} from './lib/corresponding-source.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tauriDir = path.join(repo, 'src-tauri');
@@ -260,8 +267,8 @@ const sourceAsset = sourceAssetUrl(appVersion);
     lines: [
       `source: ${sourceAsset}`,
       `  (published with BirdoVPN ${appVersion}: ${xrayTagArchiveMember(xrayVersion)} in it is the Xray-core`,
-      `  source at the commit the ${xrayVersion} tag names, and xray/go-modules/ the source of every Go`,
-      '  module listed below, at the version linked)',
+      `  source at the commit the ${xrayVersion} tag names, xray/go-modules/ the source of every Go`,
+      '  module listed below at the version linked, and xray/go/ the source of the Go toolchain)',
       `upstream: https://github.com/XTLS/Xray-core at ${xrayVersion}`,
     ],
   };
@@ -284,12 +291,16 @@ const sourceAsset = sourceAssetUrl(appVersion);
     const problems = xrayModuleProblems(info.modules, table);
     if (problems.length) fail(`xray's Go modules do not match third_party/licenses/xray-go-modules.json:\n  ${problems.join('\n  ')}\n${refresh}`);
 
+    if (toolchain.srcArchive !== `${info.goVersion}.src.tar.gz` || !/^[0-9a-f]{64}$/.test(toolchain.srcSha256 || '')) {
+      fail(`xray-go-modules.json's toolchain has no pinned ${info.goVersion}.src.tar.gz (srcArchive, srcSha256), which the release mirrors. ${refresh}`);
+    }
     const goIds = committedTexts(toolchain.texts, `Go ${info.goVersion.replace(/^go/, '')}`);
     xray.lines.push(
       '',
       'Built with Go, whose standard library and runtime are linked into it:',
       `  Go ${info.goVersion.replace(/^go/, '')} - ${toolchain.license} [${goIds.join(', ')}]`,
-      `    source: ${toolchain.source} at ${info.goVersion}`,
+      `    source: ${goSourceMember(toolchain.srcArchive)} in ${sourceAsset}`,
+      `    upstream: ${toolchain.source} at ${info.goVersion}`,
       '',
       'Go modules linked into it (from its embedded build information); the source of each is',
       `xray/go-modules/<module>@<version>.zip in ${sourceAsset}:`,
@@ -318,9 +329,9 @@ const sourceAsset = sourceAssetUrl(appVersion);
         'the terms of the GNU General Public License version 3; the MPL-2.0 files in it stay available',
         'under MPL-2.0 too. Its complete corresponding source is the release asset named above, on the',
         `same release page as this version of BirdoVPN: the Xray-core ${xrayVersion} source, whose go.mod`,
-        'and go.sum pin every module listed here, and the source of every one of those modules at the',
-        'version linked. (The Go standard library and runtime are part of the Go toolchain, a System',
-        "Library in the GPL-3.0's terms; their source is above.) BirdoVPN runs xray as a separate program.",
+        'and go.sum pin every module listed here, the source of every one of those modules at the',
+        `version linked, and the source of Go ${info.goVersion.replace(/^go/, '')}, whose standard library and runtime are linked`,
+        'in. BirdoVPN runs xray as a separate program.',
       );
     }
   } else {

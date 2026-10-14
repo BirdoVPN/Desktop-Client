@@ -286,7 +286,7 @@ out="$work/appimage-notices.txt"
 if generate "$appdir" "$base" "$out"; then ok 'the fixture AppImage generates (exit 0)'; else bad 'the fixture AppImage did not generate'; fi
 if [ "$(head -c "$(wc -c <"$base")" "$out" | sha256_of /dev/stdin)" = "$(sha256_of "$base")" ]; then ok 'the base notices are kept byte for byte'; else bad 'the base notices were changed'; fi
 contains 'section heading' "$out" '6. AppImage only: what the AppImage carries besides BirdoVPN (20 files)'
-has 'the runtime, by commit' "$out" "  AppImage type2-runtime 20251108 - commit $runtime_commit - MIT [A1]"
+has 'the runtime, by commit' "$out" "  AppImage type2-runtime ${runtime_commit:0:7} - commit $runtime_commit - MIT [A1]"
 contains 'libfuse, statically linked, LGPL-2.1' "$out" '    libfuse 3.15.0 - LGPL-2.1-only [A2, A3]'
 contains "libfuse's LGPL-2.1 text in full" "$out" 'GNU LESSER GENERAL PUBLIC LICENSE'
 contains 'the runtime source in the asset' "$out" "    source: appimage-runtime/type2-runtime-$runtime_commit.tar in https://github.com/BirdoVPN/Desktop-Client/releases/download/v"

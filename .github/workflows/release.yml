@@ -1261,7 +1261,8 @@ jobs:
   # BirdoVPN-<version>-corresponding-source.tar.gz (the URL every package's
   # THIRD-PARTY-NOTICES.txt names first): the Xray-core source at
   # XRAY_SOURCE_COMMIT (`git archive`, tree XRAY_SOURCE_TREE), the module zip
-  # of every module the four bundled binaries link, and the AppImage
+  # of every module the four bundled binaries link, the official source of
+  # the Go toolchain that built them (go.dev's published SHA-256), and the AppImage
   # runtime's source with libfuse's and squashfuse's. The script checks every
   # input before writing anything (the binary zips against XRAY_*_SHA256 and
   # their Go modules against xray-go-modules.json, the tag against the
@@ -1270,7 +1271,7 @@ jobs:
   # library tarballs against appimage-runtime.json) and fails on any
   # mismatch. tests.yml runs the same script on every PR. Nothing secret,
   # read-only; the release job publishes it, puts it in SHA256SUMS.txt and so
-  # under the Sigstore signature. About 120 MB.
+  # under the Sigstore signature. About 155 MB.
   # ══════════════════════════════════════════════════════════════════════
   corresponding-source:
     name: Corresponding source (release asset)

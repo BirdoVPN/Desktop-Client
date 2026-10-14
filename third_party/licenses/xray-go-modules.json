@@ -13,7 +13,10 @@
     "Every module also needs `zipSha256`: the SHA-256 of <module>@<version>.zip from proxy.golang.org, which",
     "every release mirrors in its corresponding-source asset (scripts/build-corresponding-source.mjs; owner decision",
     "2026-10-14 and review round 1: the GPL-3.0 binary's corresponding source covers every linked module) and",
-    "refuses to publish if the downloaded zip differs. The vendor script records it for every module."
+    "refuses to publish if the downloaded zip differs. The vendor script records it for every module.",
+    "The `toolchain` entry also records the official Go source archive of that toolchain (srcArchive, and srcSha256",
+    "as https://go.dev/dl/?mode=json&include=all publishes it): the asset mirrors it too, for the standard library and",
+    "runtime linked into every Go binary (review round 2)."
   ],
   "toolchain": {
     "version": "go1.26.1",
@@ -21,7 +24,9 @@
     "source": "https://go.googlesource.com/go",
     "texts": [
       "xray/go@go1.26.1/LICENSE"
-    ]
+    ],
+    "srcArchive": "go1.26.1.src.tar.gz",
+    "srcSha256": "3172293d04b209dc1144698e7ba13f0477f6ba8c5ffd0be66c20fdbc9785dfbb"
   },
   "modules": {
     "github.com/andybalholm/brotli": {

@@ -61,11 +61,11 @@ export NOTICES_FILE="$notices"
 # the AppImage carries (scripts/ci/appimage-notices.sh): its runtime by
 # commit, and one "    <path>" line per file. make_appimage puts this file
 # in every fake AppImage, whose runtime reports runtime_commit.
-runtime_commit=dd6cebedcbddde9c82f89b011e8e1d40b6e43868
+runtime_commit=8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa
 appimage_section() { # appimage_section [runtime line]
   printf '\n6. AppImage only: what the AppImage carries besides BirdoVPN (fixture)\n\n'
   printf '    usr/bin/birdo-vpn-desktop\n    usr/lib/BirdoVPN/resources/xray\n    usr/lib/BirdoVPN/resources/THIRD-PARTY-NOTICES.txt\n'
-  printf '%s\n' "${1-  AppImage type2-runtime 20251108 - commit $runtime_commit - MIT [A1]}"
+  printf '%s\n' "${1-  AppImage type2-runtime 8f39b89 - commit $runtime_commit - MIT [A1]}"
   printf 'libfixture1 1.0-1 (amd64) [A2]\n  files:\n    usr/lib/libfixture.so.1\n    usr/lib/girepository-1.0/Fixture-1.0.typelib\n'
 }
 appimage_notices="$work/THIRD-PARTY-NOTICES.appimage.txt"

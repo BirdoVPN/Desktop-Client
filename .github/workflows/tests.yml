@@ -866,7 +866,8 @@ jobs:
       # (XRAY_*_SHA256) and the Go modules their binaries link
       # (xray-go-modules.json), the Xray-core source by commit and tree
       # (XRAY_SOURCE_COMMIT/TREE, `git archive`) and the commit the binaries
-      # carry, every module zip (zipSha256, and its line in Xray's go.sum), and
+      # carry, every module zip (zipSha256, and its line in Xray's go.sum), the
+      # Go toolchain's source archive (srcSha256, as go.dev publishes it), and
       # the AppImage runtime's sources (appimage-runtime.json). Built twice, from
       # two downloads (it must be byte-identical), and every module each
       # target's notices list must be in it under the path they give.
@@ -893,7 +894,12 @@ jobs:
                 exit 1
               fi
             done
-            echo "$target: all ${#mods[@]} Go modules its notices list are in $name"
+            go_src=$(sed -nE 's/^      source: (xray\/go\/go[0-9.]+\.src\.tar\.gz) in https:.*$/\1/p' "$out")
+            if [ -z "$go_src" ] || ! grep -qxF "$root/$go_src" <<<"$members"; then
+              echo "::error::the $target notices point at the Go source '$go_src', which $name does not contain"
+              exit 1
+            fi
+            echo "$target: all ${#mods[@]} Go modules its notices list, and $go_src, are in $name"
           done
 
   # Version-consistency gate. The app version is declared in THREE places:

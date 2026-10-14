@@ -195,7 +195,7 @@ const FILLED = new Set(['.digest_md5', '.upd_info', '.sha256_sig']); // what app
   const want = elf64(runtime, 'the pinned runtime');
   const got = elf64(head.subarray(0, read), `the start of ${args.appimage}`);
   if (want.size !== runtime.length || got.size !== want.size) {
-    fail(`${args.appimage}'s runtime is ${got.size} bytes, the pinned ${pins.runtime.release} runtime ${want.size}: not the pinned runtime (LDAI_RUNTIME_FILE not used?)`);
+    fail(`${args.appimage}'s runtime is ${got.size} bytes, the pinned type2-runtime ${pins.runtime.commit.slice(0, 7)} ${want.size}: not the pinned runtime (LDAI_RUNTIME_FILE not used?)`);
   }
   const a = Buffer.from(runtime);
   const b = Buffer.from(head);
@@ -203,8 +203,8 @@ const FILLED = new Set(['.digest_md5', '.upd_info', '.sha256_sig']); // what app
     a.fill(0, s.offset, s.offset + s.size);
     b.fill(0, s.offset, s.offset + s.size);
   }
-  if (!a.equals(b)) fail(`${args.appimage} does not start with the pinned type2-runtime ${pins.runtime.release} (${pins.runtime.commit}) - the bundler used another runtime`);
-  console.log(`runtime: ${args.appimage} starts with type2-runtime ${pins.runtime.release} (${pins.runtime.commit}), as pinned`);
+  if (!a.equals(b)) fail(`${args.appimage} does not start with the pinned type2-runtime ${pins.runtime.commit} - the bundler used another runtime`);
+  console.log(`runtime: ${args.appimage} starts with type2-runtime ${pins.runtime.commit}, as pinned`);
 }
 
 // ── What the AppImage carries ───────────────────────────────────────────────
@@ -332,7 +332,7 @@ const listed = [...new Map([...packages.values()].map((p) => [`${p.name}:${p.arc
   (a, b) => byKey(a.name, b.name) || byKey(a.arch, b.arch),
 );
 // Numbered after the runtime's and the launcher's texts, which come first.
-const runtimeIds = committedTexts(pins.runtime.texts, `type2-runtime ${pins.runtime.release}`);
+const runtimeIds = committedTexts(pins.runtime.texts, `type2-runtime ${pins.runtime.commit.slice(0, 7)}`);
 for (const l of pins.linked) l.ids = committedTexts(l.texts, `${l.name} ${l.version}`);
 for (const t of toolingPins) t.ids = committedTexts(t.texts, t.name || t.file);
 for (const p of listed) {
@@ -406,11 +406,12 @@ out.push(
   '',
   'The AppImage runtime: the program at the start of the .AppImage file, before',
   'the files below, which mounts them and starts BirdoVPN.',
-  `  AppImage type2-runtime ${rt.release} - commit ${rt.commit} - ${rt.license} [${runtimeIds.join(', ')}]`,
+  `  AppImage type2-runtime ${rt.commit.slice(0, 7)} - commit ${rt.commit} - ${rt.license} [${runtimeIds.join(', ')}]`,
   `    source: ${runtimeMember(runtimeSourceFile(rt.commit))} in ${asset}`,
   `    upstream: ${rt.repository} at ${rt.commit}`,
-  `    the unmodified ${rt.url}`,
-  `      (SHA-256 ${rt.sha256}), ${rt.build}`,
+  "    the unmodified runtime-x86_64 type2-runtime's CI built from that commit",
+  `      (SHA-256 ${rt.sha256}; ${rt.url}, ${rt.published.slice(0, 10)}),`,
+  `      ${rt.build}`,
   '  Linked statically into it:',
 );
 for (const l of pins.linked) {
@@ -471,6 +472,6 @@ fs.writeFileSync(args.out, body, 'utf8');
 console.log(
   `Wrote ${args.out}: ${allFiles.length} files (${own.length} BirdoVPN's own, ${tooling.size} launcher/linuxdeploy, ` +
     `${caches.length} generated caches, ${fileCount} from ${listed.length} Ubuntu packages), the type2-runtime ` +
-    `${rt.release} runtime with ${pins.linked.length} static libraries, ${texts.length} licence texts, ` +
+    `${rt.commit.slice(0, 7)} runtime with ${pins.linked.length} static libraries, ${texts.length} licence texts, ` +
     `${Buffer.byteLength(body)} bytes (${Buffer.byteLength(body) - Buffer.byteLength(base)} for the AppImage section)`,
 );

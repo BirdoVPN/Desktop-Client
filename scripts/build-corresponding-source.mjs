@@ -15,6 +15,10 @@
 //                                          four bundled xray binaries link (the
 //                                          GPL-3.0 binary's corresponding
 //                                          source includes the permissive ones)
+//   xray/go/go<version>.src.tar.gz         the official source archive of the
+//                                          Go toolchain that built them (the
+//                                          standard library and runtime are
+//                                          linked into every binary)
 //   appimage-runtime/type2-runtime-<commit>.tar  the AppImage runtime's source
 //   appimage-runtime/fuse-<v>.tar.xz, squashfuse-<v>.tar.gz  the two libraries
 //                                          it links statically that the
@@ -58,6 +62,7 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { readGoBuildInfo } from './lib/go-buildinfo.mjs';
 import {
+  goSourceMember,
   moduleZipMember,
   runtimeMember,
   runtimeSourceFile,
@@ -124,7 +129,7 @@ const runtimePins = JSON.parse(fs.readFileSync(path.join(licences, 'appimage-run
 // The URLs are built from release.yml, the pin files and the binaries' build
 // information: only these upstreams, and only well-formed paths, are fetched.
 const ALLOWED_URL =
-  /^https:\/\/(github\.com\/XTLS\/Xray-core\/releases\/download\/v[0-9.]+\/Xray-[a-z0-9-]+\.zip|proxy\.golang\.org\/[a-z0-9._~!/-]+\/@v\/[A-Za-z0-9._~!+-]+\.zip|github\.com\/libfuse\/libfuse\/releases\/download\/fuse-[0-9.]+\/fuse-[0-9.]+\.tar\.xz|github\.com\/vasi\/squashfuse\/archive\/[0-9.]+\.tar\.gz)$/;
+  /^https:\/\/(github\.com\/XTLS\/Xray-core\/releases\/download\/v[0-9.]+\/Xray-[a-z0-9-]+\.zip|proxy\.golang\.org\/[a-z0-9._~!/-]+\/@v\/[A-Za-z0-9._~!+-]+\.zip|github\.com\/libfuse\/libfuse\/releases\/download\/fuse-[0-9.]+\/fuse-[0-9.]+\.tar\.xz|github\.com\/vasi\/squashfuse\/archive\/[0-9.]+\.tar\.gz|go\.dev\/dl\/go[0-9.]+\.src\.tar\.gz)$/;
 const GIT_REPOS = new Set(['https://github.com/XTLS/Xray-core', 'https://github.com/AppImage/type2-runtime']);
 
 /** A download that must hash to its pin. */
@@ -328,6 +333,20 @@ for (const [modPath, { version, platforms }] of [...linked].sort(([a], [b]) => b
 }
 console.log(`verified ${modules.length} module zips against their pins and the ${xrayVersion} go.sum`);
 
+// ── The Go toolchain's source ───────────────────────────────────────────────
+// The standard library and runtime are linked into every Go binary: mirror
+// the official source archive of exactly the toolchain the binaries name,
+// pinned by the SHA-256 go.dev publishes (xray-go-modules.json `toolchain`).
+const toolchain = table.toolchain || {};
+if (toolchain.version !== goVersion) {
+  fail(`the binaries were built by ${goVersion}; xray-go-modules.json's toolchain is ${toolchain.version || 'none'} - re-run scripts/vendor-xray-go-licences.mjs`);
+}
+if (toolchain.srcArchive !== `${goVersion}.src.tar.gz` || !/^[0-9a-f]{64}$/.test(toolchain.srcSha256 || '')) {
+  fail(`xray-go-modules.json's toolchain has no pinned ${goVersion}.src.tar.gz (srcArchive, srcSha256) - re-run scripts/vendor-xray-go-licences.mjs`);
+}
+const goSourceUrl = `https://go.dev/dl/${toolchain.srcArchive}`;
+const goSource = await pinned(goSourceUrl, toolchain.srcSha256, `${toolchain.srcArchive} (srcSha256 in xray-go-modules.json)`);
+
 // ── The AppImage runtime's sources ──────────────────────────────────────────
 const rt = runtimePins.runtime;
 const runtimeTar = gitSource(rt.repository, rt.commit, rt.tree, `type2-runtime-${rt.commit}`);
@@ -381,8 +400,9 @@ const readme = [
   ...wrap(
     `BirdoVPN bundles the unmodified Xray-core ${xrayVersion} binaries XTLS publishes. Xray-core is under the ` +
       'MPL-2.0; Go modules under the GPL-3.0-or-later and the LGPL-3.0 are linked into it, so each binary as a ' +
-      'whole is under the GPL-3.0, whose corresponding source covers every module linked into it. This part ' +
-      'holds the Xray-core source and the source of every one of those modules, at exactly the version linked.',
+      'whole is under the GPL-3.0, whose corresponding source covers everything linked into it. This part ' +
+      'holds the Xray-core source, the source of every one of those modules at exactly the version linked, and ' +
+      'the source of the Go toolchain whose standard library and runtime are linked in.',
   ),
   '',
   xrayTagArchiveMember(xrayVersion),
@@ -405,11 +425,14 @@ for (const m of modules) {
 }
 readme.push(
   '',
+  goSourceMember(toolchain.srcArchive),
   ...wrap(
-    `The Go standard library and runtime (${goVersion}) are linked in too. They are part of the Go toolchain, a ` +
-      'System Library in the GPL-3.0\'s terms, and their source is at https://go.googlesource.com/go at ' +
-      `${goVersion}.`,
+    `The official source archive of ${goVersion}, the Go toolchain the binaries' build information names: its ` +
+      'standard library and runtime are linked into every binary. As go.dev serves it:',
+    '  ',
   ),
+  `    ${goSourceUrl}`,
+  `  SHA-256 ${toolchain.srcSha256} (the hash go.dev publishes). Licence: BSD-3-Clause.`,
   '',
   'How this maps to the binaries:',
   '',
@@ -446,11 +469,12 @@ readme.push(
 );
 const linkedLibs = runtimePins.linked.map((l) => `${l.name} ${l.version} (${l.license})`).join(', ');
 readme.push(
-  ...heading(`2. The AppImage runtime (type2-runtime ${rt.release})`),
+  ...heading(`2. The AppImage runtime (type2-runtime ${rt.commit.slice(0, 7)})`),
   ...wrap(
     "The Linux AppImage starts with the AppImage project's type2-runtime: the program that mounts the rest of " +
-      `the file and starts BirdoVPN. It is the unmodified runtime-x86_64 of its ${rt.release} release ` +
-      `(${rt.url}, SHA-256 ${rt.sha256}), built from commit ${rt.commit}. The runtime is under the MIT licence ` +
+      'the file and starts BirdoVPN. It is the unmodified runtime-x86_64 that type2-runtime\'s CI built from ' +
+      `commit ${rt.commit} (SHA-256 ${rt.sha256}; published as ${rt.url} on ${rt.published.slice(0, 10)}), ` +
+      'the same runtime BirdoVPN 1.4.46 shipped. The runtime is under the MIT licence ' +
       `and links statically: ${linkedLibs}. libfuse's library is under the LGPL-2.1, so this part holds the ` +
       "runtime's source with its build scripts, and libfuse's and squashfuse's, which that build compiles from " +
       'source. zstd, zlib, mimalloc and musl come from Alpine Linux 3.21\'s packages, under permissive licences.',
@@ -526,6 +550,7 @@ const files = [
   ['README.txt', Buffer.from(readmeText, 'utf8')],
   [xrayTagArchiveMember(xrayVersion), xrayTar],
   ...modules.map((m) => [moduleZipMember(m.path, m.version), m.zip]),
+  [goSourceMember(toolchain.srcArchive), goSource],
   ...runtimeFiles.map((f) => [runtimeMember(f.file), f.data]),
 ].sort(([a], [b]) => byKey(a, b));
 const parts = [];

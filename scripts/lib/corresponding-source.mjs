@@ -10,6 +10,8 @@
 //                                          commit (`git archive`)
 //   xray/go-modules/<module>@<version>.zip every Go module the four bundled
 //                                          xray binaries link, at that version
+//   xray/go/go<version>.src.tar.gz         the Go toolchain that built them
+//                                          (standard library and runtime)
 //   appimage-runtime/...                   the AppImage runtime's source, and
 //                                          libfuse's and squashfuse's
 //   README.txt
@@ -38,6 +40,9 @@ export const moduleZipMember = (modulePath, version) => `xray/go-modules/${modul
 
 /** Where, inside the asset's top-level directory, the Xray-core source is. */
 export const xrayTagArchiveMember = (xrayVersion) => `xray/Xray-core-${xrayVersion}.tar`;
+
+/** Where, inside the asset's top-level directory, the Go toolchain's official source archive is. */
+export const goSourceMember = (srcArchive) => `xray/go/${srcArchive}`;
 
 /** Where, inside the asset's top-level directory, the AppImage runtime's sources are. */
 export const runtimeMember = (file) => `appimage-runtime/${file}`;

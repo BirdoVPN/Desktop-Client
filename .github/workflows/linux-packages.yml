@@ -150,6 +150,20 @@ jobs:
       - name: Pin the AppImage runtime and AppRun (third_party/licenses/appimage-runtime.json)
         run: bash scripts/ci/fetch-appimage-tooling.sh "$RUNNER_TEMP/appimage-tooling"
 
+      # The pinned runtime is the build 1.4.46 shipped (type2-runtime 8f39b89),
+      # taken from type2-runtime's moving `continuous` release while that still
+      # serves it. The fallback for the day it does not - rebuilding it from
+      # 1.4.46's own release asset - must give the very same bytes: prove it
+      # on every PR, before a release needs it. (Not exported: the build above
+      # keeps its runtime.)
+      - name: The pinned runtime is reproducible from 1.4.46's AppImage too
+        run: |
+          set -euo pipefail
+          env -u GITHUB_ENV APPIMAGE_RUNTIME_FROM_FALLBACK=1 XDG_CACHE_HOME="$RUNNER_TEMP/fallback-cache" \
+            bash scripts/ci/fetch-appimage-tooling.sh "$RUNNER_TEMP/appimage-tooling-fallback" >/dev/null
+          cmp "$RUNNER_TEMP/appimage-tooling/runtime-x86_64" "$RUNNER_TEMP/appimage-tooling-fallback/runtime-x86_64"
+          echo "OK: the fallback gives the same runtime ($(sha256sum "$RUNNER_TEMP/appimage-tooling-fallback/runtime-x86_64" | cut -d' ' -f1))"
+
       # A THROWAWAY updater key, made here and gone with the runner - never
       # the real one, which a PR has no access to. With it the build below is
       # release.yml's command verbatim (updater artifacts on), and the re-bundle
