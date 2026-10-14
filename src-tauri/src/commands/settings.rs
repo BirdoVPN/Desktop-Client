@@ -805,7 +805,9 @@ struct VerifyingKeys {
 }
 
 /// What [`load_at`] verifies with on Windows, given this account's
-/// admin-only key (`protected`) and, only while there is none, the
+/// admin-only key (`protected`) and, only while there is none AND this is the
+/// first start after the installer upgraded a pre-MR-1721 install
+/// (`upgrade_window`, R1: `protected_dir::legacy_upgrade_window`), the
 /// pre-MR-1721 sources (`legacy`: their keys, and whether one may be
 /// unreadable right now). See `protected_key`.
 ///
@@ -813,6 +815,7 @@ struct VerifyingKeys {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_verifying_keys(
     protected: KeyFile,
+    upgrade_window: bool,
     legacy: impl FnOnce() -> (Vec<Vec<u8>>, bool),
 ) -> VerifyingKeys {
     match protected {
@@ -831,8 +834,9 @@ fn windows_verifying_keys(
             key_may_still_exist: true,
             accepts_unsigned: false,
         },
-        // None yet for this account: the one migration.
-        KeyFile::Missing => {
+        // None yet for this account, on the first start after an upgrade: the
+        // one migration.
+        KeyFile::Missing if upgrade_window => {
             let (keys, key_may_still_exist) = legacy();
             VerifyingKeys {
                 keys,
@@ -841,6 +845,16 @@ fn windows_verifying_keys(
                 accepts_unsigned: true,
             }
         }
+        // None yet, and no upgrade: a fresh install, a new Windows account,
+        // or a key that was deleted. Nothing in the user's reach is trusted —
+        // the old sources are not even read, and a settings.json there
+        // (signed or not) is quarantined to the secure defaults.
+        KeyFile::Missing => VerifyingKeys {
+            keys: Vec::new(),
+            legacy: false,
+            key_may_still_exist: false,
+            accepts_unsigned: false,
+        },
     }
 }
 
@@ -924,7 +938,11 @@ impl SettingsKeys for OsKeys<'_> {
     fn verifying(&self) -> VerifyingKeys {
         #[cfg(windows)]
         {
-            windows_verifying_keys(protected_key::read(), || legacy_sources(self.settings_path))
+            windows_verifying_keys(
+                protected_key::read(),
+                crate::utils::protected_dir::legacy_upgrade_window(),
+                || legacy_sources(self.settings_path),
+            )
         }
         #[cfg(not(windows))]
         {
@@ -973,7 +991,10 @@ impl SettingsKeys for OsKeys<'_> {
 /// (`utils::protected_dir`), one per Windows account
 /// (`settings-hmac-<SID>.key`), and is never written anywhere else.
 ///
-/// MIGRATION. While this account has no admin-only key, the two old sources
+/// MIGRATION. While this account has no admin-only key, and only on the first
+/// start after the installer upgraded a pre-MR-1721 install (R1: its HKLM
+/// marker, `protected_dir::legacy_upgrade_window`; a fresh install, a new
+/// account or a deleted key never gets this), the two old sources
 /// are read, once: a file they verify, or an unsigned one, is adopted and
 /// re-signed with a FRESH admin-only key ([`adopt_legacy`]), and only then
 /// are the old sources deleted. The old key is never carried over, so
@@ -983,7 +1004,7 @@ impl SettingsKeys for OsKeys<'_> {
 /// unsigned one, verifies against nothing and is quarantined, and the
 /// session runs on the secure defaults (MR-1943). What the migration adopts
 /// is what the pre-MR-1721 build was already applying; the window is the
-/// time from installing this build to its first elevated start.
+/// time from the upgrade to its first elevated start.
 #[cfg(windows)]
 mod protected_key {
     use super::{
@@ -1402,10 +1423,7 @@ fn write_signed_settings(
 ) -> Result<(), String> {
     let _write = SETTINGS_WRITE.lock();
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
-    }
-
+    // The config folder is created (verified, held) by `write_atomically`.
     let settings_json =
         serde_json::to_string(settings).map_err(|e| format!("Failed to serialize: {}", e))?;
     let signed = SignedSettings {
@@ -1446,7 +1464,10 @@ fn config_dir(path: &Path) -> Result<OwnedDir, String> {
 /// checked handle too.
 fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
     let dir = config_dir(path)?;
-    fs::create_dir_all(dir.path()).map_err(|e| format!("Failed to create config dir: {}", e))?;
+    // R5: created inside verified, held parents and held from then on (the
+    // start-up hold usually got there first); never `create_dir_all` by path.
+    dir.ensure_held()
+        .map_err(|e| format!("Failed to create config dir: {}", e))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -3298,6 +3319,9 @@ mod tests {
         retired: std::cell::Cell<bool>,
         /// Mint the admin-only key, then fail the save it was minted for.
         fail_after_mint: bool,
+        /// R1: the first start after the installer upgraded a pre-MR-1721
+        /// install. On by default: the migration tests are upgrades.
+        upgrade_window: bool,
     }
 
     impl WindowsKeys {
@@ -3308,6 +3332,15 @@ mod tests {
                 legacy_may_exist: false,
                 retired: std::cell::Cell::new(false),
                 fail_after_mint: false,
+                upgrade_window: true,
+            }
+        }
+
+        /// A fresh install / new account / deleted key: no upgrade marker.
+        fn without_upgrade(protected: KeyFile, legacy: &[&[u8]]) -> Self {
+            Self {
+                upgrade_window: false,
+                ..Self::new(protected, legacy)
             }
         }
 
@@ -3321,9 +3354,14 @@ mod tests {
 
     impl SettingsKeys for WindowsKeys {
         fn verifying(&self) -> VerifyingKeys {
-            windows_verifying_keys(self.protected.borrow().clone(), || {
+            let legacy = || {
+                assert!(
+                    self.upgrade_window,
+                    "R1: the old sources were read outside an upgrade's first start"
+                );
                 (self.legacy.clone(), self.legacy_may_exist)
-            })
+            };
+            windows_verifying_keys(self.protected.borrow().clone(), self.upgrade_window, legacy)
         }
 
         fn sign(&self, json: &str) -> Result<String, String> {
@@ -3547,23 +3585,94 @@ mod tests {
     /// even read; without it, they are, once, and marked as such.
     #[test]
     fn the_old_sources_are_consulted_only_while_there_is_no_admin_only_key() {
-        let found = windows_verifying_keys(KeyFile::Key(vec![1]), || {
-            panic!("the old sources were read although the admin-only key exists")
+        for window in [true, false] {
+            let found = windows_verifying_keys(KeyFile::Key(vec![1]), window, || {
+                panic!("the old sources were read although the admin-only key exists")
+            });
+            assert_eq!(
+                found,
+                VerifyingKeys {
+                    keys: vec![vec![1]],
+                    legacy: false,
+                    key_may_still_exist: false,
+                    accepts_unsigned: false,
+                }
+            );
+            let found = windows_verifying_keys(KeyFile::Unreadable, window, || panic!("read"));
+            assert!(found.keys.is_empty() && found.key_may_still_exist && !found.accepts_unsigned);
+        }
+        let found = windows_verifying_keys(KeyFile::Missing, true, || (vec![vec![2]], true));
+        assert!(found.legacy && found.accepts_unsigned && found.key_may_still_exist);
+        assert_eq!(found.keys, vec![vec![2]]);
+    }
+
+    /// R1, the rule: with no admin-only key and NO upgrade marker (a fresh
+    /// install, a new Windows account, a deleted key) the old sources are not
+    /// read and nothing unsigned is accepted.
+    #[test]
+    fn without_an_upgrade_the_old_sources_are_never_read() {
+        let found = windows_verifying_keys(KeyFile::Missing, false, || {
+            panic!("the old sources were read on a fresh install")
         });
         assert_eq!(
             found,
             VerifyingKeys {
-                keys: vec![vec![1]],
+                keys: Vec::new(),
                 legacy: false,
                 key_may_still_exist: false,
                 accepts_unsigned: false,
             }
         );
-        let found = windows_verifying_keys(KeyFile::Unreadable, || panic!("read"));
-        assert!(found.keys.is_empty() && found.key_may_still_exist && !found.accepts_unsigned);
-        let found = windows_verifying_keys(KeyFile::Missing, || (vec![vec![2]], true));
-        assert!(found.legacy && found.accepts_unsigned && found.key_may_still_exist);
-        assert_eq!(found.keys, vec![vec![2]]);
+    }
+
+    /// R1, THE FINDING: on a fresh install (no admin-only key yet), a
+    /// settings.json an unelevated process planted together with a key in an
+    /// old source used to be adopted once. Without the installer's upgrade
+    /// marker it is quarantined to the secure defaults, the old key is not
+    /// read, and the defaults are signed with a fresh admin-only key.
+    #[test]
+    fn a_fresh_install_does_not_adopt_a_file_signed_by_an_old_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let planted: [u8; 32] = rand::random();
+        signed_file(&path, &weakened(), &planted);
+        let keys = WindowsKeys::without_upgrade(KeyFile::Missing, &[&planted]);
+
+        let Loaded::Quarantined(settings) = load_at(&path, &keys).unwrap() else {
+            panic!("a planted file was adopted on a fresh install");
+        };
+        assert_secure_defaults(&settings);
+        assert!(!keys.retired.get());
+        assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 1);
+    }
+
+    /// R1: nor an unsigned one.
+    #[test]
+    fn a_fresh_install_does_not_adopt_an_unsigned_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, serde_json::to_string(&weakened()).unwrap()).unwrap();
+        let keys = WindowsKeys::without_upgrade(KeyFile::Missing, &[]);
+
+        let Loaded::Quarantined(settings) = load_at(&path, &keys).unwrap() else {
+            panic!("an unsigned file was adopted on a fresh install");
+        };
+        assert_secure_defaults(&settings);
+        assert!(!keys.retired.get());
+    }
+
+    /// R1: a fresh install with no settings.json is simply the defaults, and
+    /// its first save mints the admin-only key (which closes the migration
+    /// for this account for good).
+    #[test]
+    fn a_fresh_install_without_a_file_starts_on_defaults_and_mints_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let keys = WindowsKeys::without_upgrade(KeyFile::Missing, &[]);
+        assert!(matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(_)));
+        write_signed_settings(&path, &AppSettings::default(), |json| keys.sign(json)).unwrap();
+        assert!(keys.protected_key().is_some());
+        assert!(matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(_)));
     }
 
     /// The Windows key is written nowhere a medium-integrity process can

@@ -113,8 +113,9 @@ fn resolve_with(
 ) -> io::Result<PathBuf> {
     // A recorded fallback is authoritative: the key/markers live there.
     if let Some(name) = recorded() {
-        // A plain directory name, never a path a crafted value could escape.
-        if !name.is_empty() && !name.contains(['/', '\\', ':']) && name != ".." {
+        // Only a name `mint_private` could have written, never a path a
+        // crafted value could escape with (R7).
+        if is_state_dir_name(&name) {
             match secure_named(base, &name) {
                 Ok(dir) => return Ok(dir),
                 Err(e) => tracing::warn!(
@@ -162,6 +163,108 @@ fn random_state_name() -> String {
     format!("{DIR_NAME}-{:016x}", rand::random::<u64>())
 }
 
+/// Whether `name` is one [`random_state_name`] makes: `BirdoVPN-` and 16
+/// lower-case hex digits (R7). Anything else read back from HKLM — `.`, `..`,
+/// a separator, a drive or stream colon, trailing dots Win32 would strip, or
+/// a different prefix — is not used as a directory name.
+fn is_state_dir_name(name: &str) -> bool {
+    name.strip_prefix(DIR_NAME)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|hex| {
+            hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+/// HKLM's record for the app (admin-only to write), where the fallback
+/// directory's name and the installer's legacy-upgrade marker live.
+const STATE_KEY: &str = r"SOFTWARE\BirdoVPN";
+
+/// The value the installer writes when it upgrades an install from before
+/// MR-1721 (nsis-hooks.nsh, `BIRDO_LEGACY_UPGRADE_VALUE`). Pinned by a test.
+pub const LEGACY_UPGRADE_VALUE: &str = "LegacyUpgradePending";
+
+// ── R1: the legacy-trust window is an upgrade's, and only its first start ──
+//
+// MR-1721 migrated what the pre-#287 build had left in the user's reach — the
+// settings key's old sources, an unsigned settings.json, the %APPDATA% DNS
+// journal, the unsigned 1.4.47 resume record — the first time an account had
+// no admin-only state yet. But "no admin-only state yet" is also a FRESH
+// install, a new Windows account, and a key an administrator deleted: each of
+// those adopted, once, whatever an unelevated process had put there.
+//
+// So the window now needs the installer's word that this IS an upgrade of a
+// pre-#287 install: it writes `LEGACY_UPGRADE_VALUE` in HKLM (which only an
+// administrator can write) when, and only when, it replaces such an install.
+// The first elevated start after that consumes it (deletes it) and is the
+// one run allowed to look at the old sources; every later start, and every
+// start of a fresh install, is not. A value that cannot be deleted does not
+// open the window: it would open it on every start.
+
+/// 0: not decided (treated as closed), 1: closed, 2: open.
+static UPGRADE_WINDOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `main()`, once, before anything reads state: consume the installer's
+/// legacy-upgrade marker. Later calls do nothing.
+pub fn decide_legacy_upgrade_window() {
+    use std::sync::atomic::Ordering;
+    if UPGRADE_WINDOW.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    let open = super::elevation::is_elevated()
+        && decide_window(
+            legacy_upgrade_marker_present(),
+            consume_legacy_upgrade_marker,
+        );
+    UPGRADE_WINDOW.store(if open { 2 } else { 1 }, Ordering::SeqCst);
+    if open {
+        tracing::info!(
+            "First start after an upgrade from before MR-1721: the old state is migrated this run"
+        );
+    }
+}
+
+/// Whether this run may migrate (trust once) the state a pre-MR-1721 build
+/// left in the user's reach (R1). False until [`decide_legacy_upgrade_window`]
+/// has found and consumed the installer's marker. Never blocks (the panic hook
+/// reaches it through the DNS journal).
+pub fn legacy_upgrade_window() -> bool {
+    UPGRADE_WINDOW.load(std::sync::atomic::Ordering::SeqCst) == 2
+}
+
+/// The rule: open only when the marker is there AND this run consumed it.
+fn decide_window(present: bool, consume: impl FnOnce() -> io::Result<()>) -> bool {
+    if !present {
+        return false;
+    }
+    match consume() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                "The legacy-upgrade marker could not be consumed ({}); not migrating old state",
+                e
+            );
+            false
+        }
+    }
+}
+
+fn legacy_upgrade_marker_present() -> bool {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(STATE_KEY, KEY_READ)
+        .and_then(|key| key.get_raw_value(LEGACY_UPGRADE_VALUE))
+        .is_ok()
+}
+
+fn consume_legacy_upgrade_marker() -> io::Result<()> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_SET_VALUE};
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(STATE_KEY, KEY_SET_VALUE)?
+        .delete_value(LEGACY_UPGRADE_VALUE)
+}
+
 /// The fallback directory name recorded in HKLM, if any (M3). HKLM is writable
 /// only by administrators, so a user cannot point this at a directory of
 /// theirs.
@@ -170,7 +273,7 @@ fn recorded_dir_name() -> Option<String> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
     RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(r"SOFTWARE\BirdoVPN", KEY_READ)
+        .open_subkey_with_flags(STATE_KEY, KEY_READ)
         .ok()?
         .get_value::<String, _>("ProtectedStateDir")
         .ok()
@@ -181,7 +284,7 @@ fn recorded_dir_name() -> Option<String> {
 #[cfg(windows)]
 fn record_dir_name(name: &str) {
     use winreg::RegKey;
-    match RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).create_subkey(r"SOFTWARE\BirdoVPN") {
+    match RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).create_subkey(STATE_KEY) {
         Ok((key, _)) => {
             if let Err(e) = key.set_value("ProtectedStateDir", &name.to_string()) {
                 tracing::warn!("Could not record the state directory name: {}", e);
@@ -235,6 +338,152 @@ fn fresh_updates_dir_in(admin_only: &Path) -> io::Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// The admin-only directory `dir` (a child of ProgramData) as an
+/// [`OwnedDir`](super::safe_fs::OwnedDir): ProgramData as the root, the
+/// directory's own name as the app's folder.
+fn owned(dir: &Path) -> io::Result<super::safe_fs::OwnedDir> {
+    let (Some(base), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str())) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a directory under ProgramData",
+        ));
+    };
+    Ok(super::safe_fs::OwnedDir::new(base, &[name]))
+}
+
+/// R2 (#287 follow-up L2): the updater leaves the installer it launched in
+/// `updates\` (the plugin never deletes it, and it is running when the app
+/// exits). The next start removes the folder, through a handle checked to be
+/// the admin-only directory's own `updates` (`OwnedDir::remove_dir_tree`).
+/// Best-effort: an installer still finishing keeps its own file, and the next
+/// start (or the next update's `fresh_updates_dir`) takes it.
+pub fn remove_updates_at_start() {
+    let removed = ensure().and_then(|dir| owned(&dir)?.remove_dir_tree(UPDATES));
+    match removed {
+        Ok(()) => tracing::info!("Removed the last update's installer"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => tracing::info!("The last update's installer is not removed yet ({})", e),
+    }
+}
+
+/// The folder the updater's installer goes in.
+const UPDATES: &str = "updates";
+
+/// What [`remove_uninstall_leftovers_in`] removed, in counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Leftovers {
+    pub updates: u32,
+    pub set_aside: u32,
+    pub pq_keys: u32,
+    pub failed: u32,
+}
+
+/// The uninstaller's cleanup (R2, `--remove-leftovers-and-exit` from
+/// nsis-hooks.nsh's NSIS_HOOK_PREUNINSTALL): the updater's `updates\` and the
+/// squatted folders moved aside as `BirdoVPN.untrusted-*`; with
+/// `with_app_data` ("Delete the application data" ticked, D-23) also every
+/// account's ML-KEM keypair (`pq-<SID>.bin`, R4). NEVER the settings keys or
+/// the migration markers: without a key a reinstall can no longer verify (so
+/// quarantines) the user's settings.json, and the markers keep the old
+/// %APPDATA% sources closed for good. Creates nothing (no `ensure()`).
+pub fn remove_uninstall_leftovers(with_app_data: bool) -> Leftovers {
+    match win_api::program_data() {
+        Ok(base) => remove_uninstall_leftovers_in(
+            &base,
+            recorded_dir_name().filter(|name| is_state_dir_name(name)),
+            with_app_data,
+        ),
+        Err(e) => {
+            tracing::warn!("No ProgramData to clean ({})", e);
+            Leftovers::default()
+        }
+    }
+}
+
+/// An account's ML-KEM keypair file in the admin-only directory
+/// (`vpn::birdo_pq`, R4): `pq-S-<digits and dashes>.bin`.
+fn is_pq_key_name(name: &str) -> bool {
+    name.strip_prefix("pq-S-")
+        .and_then(|rest| rest.strip_suffix(".bin"))
+        .is_some_and(|sid| !sid.is_empty() && sid.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+}
+
+/// [`remove_uninstall_leftovers`] under `base`, with the HKLM-recorded
+/// fallback name `recorded` (already checked).
+///
+/// `updates\` (and the keypairs) go only from a directory that IS admin-only:
+/// a squatter's own folder of that name is theirs, and is moved aside on the
+/// next start anyway. The `BirdoVPN.untrusted-*` folders are a user's (that
+/// is why they were set aside), so they may hold junctions and links: they
+/// are removed with `std::fs::remove_dir_all`, which never follows one (it
+/// opens every entry without following a reparse point and deletes a link as
+/// a link). NSIS's own `RMDir /r` follows junctions, so the uninstaller must
+/// not do this itself.
+fn remove_uninstall_leftovers_in(
+    base: &Path,
+    recorded: Option<String>,
+    with_app_data: bool,
+) -> Leftovers {
+    let mut done = Leftovers::default();
+    for name in std::iter::once(DIR_NAME.to_string()).chain(recorded) {
+        if !matches!(inspect(&base.join(&name)), Ok(State::AdminOnly)) {
+            continue;
+        }
+        let owned = super::safe_fs::OwnedDir::new(base, &[name.as_str()]);
+        match owned.remove_dir_tree(UPDATES) {
+            Ok(()) => done.updates += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => done.failed += 1,
+        }
+        if !with_app_data {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(owned.path()) else {
+            done.failed += 1;
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file = entry.file_name();
+            let Some(file) = file.to_str().filter(|f| is_pq_key_name(f)) else {
+                continue;
+            };
+            match owned.remove_file(file) {
+                Ok(()) => done.pq_keys += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => done.failed += 1,
+            }
+        }
+    }
+    let prefix = format!("{DIR_NAME}.untrusted-");
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return done;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|n| n.starts_with(&prefix)) {
+            continue;
+        }
+        let path = base.join(&name);
+        // A directory, or a junction/symlink to one (the link goes, not its
+        // target), through remove_dir_all; a file or a file link by unlinking
+        // the name. Each call opens without following a reparse point, so a
+        // swap between the look and the call only makes it fail.
+        let removed = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 => {
+                std::fs::remove_dir_all(&path)
+            }
+            Ok(_) => std::fs::remove_file(&path),
+            Err(e) => Err(e),
+        };
+        match removed {
+            Ok(()) => done.set_aside += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => done.failed += 1,
+        }
+    }
+    done
 }
 
 /// The signed-in user's SID (`S-1-5-21-…`), from this process's token: the
@@ -621,7 +870,195 @@ mod tests {
         let name = random_state_name();
         assert!(name.starts_with("BirdoVPN-"), "{name}");
         assert!(!name.contains(['/', '\\', ':']), "{name}");
+        assert!(is_state_dir_name(&name), "{name}");
         assert_ne!(random_state_name(), random_state_name());
+    }
+
+    /// R7: the HKLM-recorded name is used only when it is exactly what
+    /// `random_state_name` writes.
+    #[test]
+    fn only_a_minted_name_is_accepted_from_hklm() {
+        assert!(is_state_dir_name("BirdoVPN-0123456789abcdef"));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "BirdoVPN",
+            "BirdoVPN-",
+            "BirdoVPN-..",
+            "BirdoVPN-0123456789abcdef.",
+            "BirdoVPN-0123456789ABCDEF",
+            "BirdoVPN-0123456789abcde",
+            "BirdoVPN-0123456789abcdef0",
+            r"BirdoVPN-0123456789abcd\x",
+            "BirdoVPN-0123456789abcd/x",
+            "BirdoVPN-0123456789abc:de",
+            r"..\..\Windows",
+            "Other-0123456789abcdef",
+            "BirdoVPN.untrusted-0123456",
+        ] {
+            assert!(!is_state_dir_name(bad), "{bad:?} was accepted");
+        }
+    }
+
+    /// R1: the legacy-trust window opens only when the installer's marker is
+    /// there AND this run consumed it; a marker that cannot be deleted would
+    /// re-open it on every start, so it opens nothing.
+    #[test]
+    fn the_upgrade_window_opens_only_on_a_consumed_marker() {
+        assert!(!decide_window(false, || panic!("nothing to consume")));
+        assert!(decide_window(true, || Ok(())));
+        assert!(!decide_window(true, || Err(io::Error::from(
+            io::ErrorKind::PermissionDenied
+        ))));
+    }
+
+    /// The marker's name is the one nsis-hooks.nsh writes, in the key this
+    /// module reads, in the 64-bit view the app reads (the template's
+    /// SetContext sets SetRegView 64 before any hook runs).
+    #[test]
+    fn the_installer_writes_the_marker_this_reads() {
+        let hooks = include_str!("../../nsis-hooks.nsh").replace('\r', "");
+        assert!(hooks.contains(&format!(r#"!define BIRDO_STATE_KEY "{STATE_KEY}""#)));
+        assert!(hooks.contains(&format!(
+            r#"!define BIRDO_LEGACY_UPGRADE_VALUE "{LEGACY_UPGRADE_VALUE}""#
+        )));
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        crate::utils::safe_fs::tests::junction(link, target);
+    }
+
+    /// R2: the uninstaller's cleanup removes the folders set aside as
+    /// untrusted — a user's, so it may have planted junctions in them or BE
+    /// one — without following any link: what the links point at survives.
+    /// A `BirdoVPN` that is not admin-only keeps its `updates` (a squatter's
+    /// folder is not this app's to empty), and nothing else is touched.
+    #[test]
+    fn the_uninstall_cleanup_removes_set_aside_folders_without_following_links() {
+        let base = tempfile::tempdir().unwrap();
+        let b = base.path();
+        let victim = b.join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("precious.txt"), "keep").unwrap();
+
+        // A set-aside folder holding a junction out, and a file.
+        let aside = b.join("BirdoVPN.untrusted-1");
+        std::fs::create_dir(&aside).unwrap();
+        std::fs::write(aside.join("planted.key"), "x").unwrap();
+        junction(&aside.join("out"), &victim);
+        // A set-aside junction (the squat was a junction, renamed itself).
+        junction(&b.join("BirdoVPN.untrusted-2"), &victim);
+        // A set-aside file.
+        std::fs::write(b.join("BirdoVPN.untrusted-3"), "x").unwrap();
+        // Not ours: other names.
+        std::fs::create_dir(b.join("BirdoVPNx")).unwrap();
+        std::fs::create_dir(b.join("Other.untrusted-1")).unwrap();
+        // A `BirdoVPN` a user made (inherited ACL): not admin-only.
+        std::fs::create_dir_all(b.join("BirdoVPN").join("updates")).unwrap();
+        std::fs::write(b.join("BirdoVPN").join("updates").join("x.exe"), "MZ").unwrap();
+
+        let done = remove_uninstall_leftovers_in(b, None, true);
+
+        assert_eq!(done.set_aside, 3, "{done:?}");
+        assert_eq!(done.updates, 0, "{done:?}");
+        for gone in [
+            "BirdoVPN.untrusted-1",
+            "BirdoVPN.untrusted-2",
+            "BirdoVPN.untrusted-3",
+        ] {
+            assert!(std::fs::symlink_metadata(b.join(gone)).is_err(), "{gone}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(victim.join("precious.txt")).unwrap(),
+            "keep",
+            "the cleanup followed a junction"
+        );
+        assert!(b.join("BirdoVPNx").is_dir() && b.join("Other.untrusted-1").is_dir());
+        assert!(b.join("BirdoVPN").join("updates").join("x.exe").exists());
+    }
+
+    /// R2 (elevated): from the admin-only directory — the fixed one and the
+    /// recorded fallback — only `updates\` goes; the keys and the migration
+    /// markers stay (a reinstall still verifies the user's settings).
+    #[test]
+    fn the_uninstall_cleanup_keeps_the_keys_and_markers() {
+        if !elevated_or_skip("the_uninstall_cleanup_keeps_the_keys_and_markers") {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let fixed = ensure_in(base.path()).unwrap();
+        let fallback = secure_named(base.path(), &random_state_name()).unwrap();
+        let fallback_name = fallback.file_name().unwrap().to_str().unwrap().to_string();
+        for dir in [&fixed, &fallback] {
+            let updates = fresh_updates_dir_in(dir).unwrap();
+            std::fs::create_dir(updates.join("BirdoVPN-1.4.48-updater-x")).unwrap();
+            std::fs::write(
+                updates
+                    .join("BirdoVPN-1.4.48-updater-x")
+                    .join("installer.exe"),
+                "MZ",
+            )
+            .unwrap();
+            std::fs::write(dir.join("settings-hmac-S-1-5-21-1.key"), "00").unwrap();
+            std::fs::write(dir.join("dns-journal-migrated-S-1-5-21-1"), "").unwrap();
+            std::fs::write(dir.join("pq-S-1-5-21-1.bin"), "k").unwrap();
+        }
+
+        let done = remove_uninstall_leftovers_in(base.path(), Some(fallback_name.clone()), false);
+
+        assert_eq!(done.updates, 2, "{done:?}");
+        assert_eq!(done.failed, 0, "{done:?}");
+        for dir in [&fixed, &fallback] {
+            assert!(!dir.join("updates").exists());
+            for kept in [
+                "settings-hmac-S-1-5-21-1.key",
+                "dns-journal-migrated-S-1-5-21-1",
+                "pq-S-1-5-21-1.bin",
+            ] {
+                assert!(dir.join(kept).exists(), "{kept} was deleted");
+            }
+        }
+
+        // "Delete the application data" (D-23): the accounts' ML-KEM keys go
+        // too; the settings keys and the markers still stay.
+        let done = remove_uninstall_leftovers_in(base.path(), Some(fallback_name), true);
+        assert_eq!(done.pq_keys, 2, "{done:?}");
+        for dir in [&fixed, &fallback] {
+            assert!(!dir.join("pq-S-1-5-21-1.bin").exists());
+            for kept in [
+                "settings-hmac-S-1-5-21-1.key",
+                "dns-journal-migrated-S-1-5-21-1",
+            ] {
+                assert!(dir.join(kept).exists(), "{kept} was deleted");
+            }
+        }
+    }
+
+    /// Only an account keypair's name is one `--with-app-data` deletes — the
+    /// name `vpn::birdo_pq` gives it.
+    #[test]
+    fn only_keypair_names_are_deleted_with_the_app_data() {
+        assert!(is_pq_key_name(
+            "pq-S-1-5-21-1004336348-1177238915-682003330-1001.bin"
+        ));
+        for not_ours in [
+            "pq-.bin",
+            "pq-S-.bin",
+            "pq-S-1-5.bin.tmp",
+            "pq-S-1-5-21-1.bin.0123456789abcdef.tmp",
+            "settings-hmac-S-1-5-21-1.key",
+            "pq-S-1-5-21-1.key",
+            "pq-S-1-5-21-x.bin",
+        ] {
+            assert!(!is_pq_key_name(not_ours), "{not_ours}");
+        }
+        let source = include_str!("../vpn/birdo_pq.rs");
+        assert!(source.contains(r#"name: format!("pq-{sid}.bin"),"#));
+        assert!(is_pq_key_name(&format!(
+            "pq-{}.bin",
+            current_user_sid().unwrap()
+        )));
     }
 
     /// M3: a fresh, privately named fallback directory is admin-only, the same

@@ -147,7 +147,6 @@ use ml_kem::{
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use sha2::Sha256;
-use std::fs;
 use std::io::{Read, Write};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -396,16 +395,63 @@ fn hkdf_to_psk(shared_secret: &[u8], nonce: &[u8]) -> Result<Zeroizing<[u8; PSK_
 
 /// Where the ML-KEM keypair lives: `name` in the app directory `dir`.
 ///
-/// MR-1945 H1 (#287 review): the keypair is PER-USER security material, so its
-/// home stays `<config_local_dir>/BirdoVPN` (never the machine-wide
-/// `%ProgramData%`, which would share one device's key across the Windows
-/// accounts on a machine). What the review asked for is that the elevated
-/// client's writes to it cannot be redirected: that directory is held open for
-/// the process lifetime (`file_log::hold_app_dirs`) and every create/rename/
-/// delete goes through `dir` ([`OwnedDir`]).
+/// R4 (#287 follow-up): on WINDOWS it is `pq-<account SID>.bin` in the
+/// admin-only `%ProgramData%\BirdoVPN` (`utils::protected_dir`). In
+/// `%LOCALAPPDATA%\BirdoVPN`, where it was, any unelevated process of the
+/// user could read the SECRET key or put a keypair of its own in its place
+/// for the elevated client to use. It stays ONE KEY PER WINDOWS ACCOUNT (the
+/// SID in the name), the same per-account scheme as the settings key: one
+/// machine-wide key would link the accounts on a machine, which audit C-8
+/// made the device identity random to avoid.
+///
+/// The old per-user file is never read: its secret was readable by every
+/// process of the user, so it is not carried over. A fresh key is made in the
+/// admin-only directory and the old file is deleted (through [`OwnedDir`])
+/// once that key is on disk — the same rule as the settings key's migration
+/// (a fresh key, then the old sources go). Re-keying costs nothing: the server
+/// keeps no client PQ key (see [`load_or_generate_at`]), and logout re-keys
+/// anyway (`reset_persisted_keypair`).
+///
+/// On macOS and Linux it stays `<config_local_dir>/BirdoVPN/birdo_pq_v1.bin`,
+/// root's own. Every create/rename/delete goes through `dir` ([`OwnedDir`]).
 struct KeypairLoc {
     dir: OwnedDir,
     name: String,
+}
+
+/// This account's keypair in the admin-only directory `protected` (R4).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn protected_keypair_loc(protected: &std::path::Path, sid: &str) -> Result<KeypairLoc, String> {
+    let (Some(base), Some(folder)) = (
+        protected.parent(),
+        protected.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return Err("the admin-only directory has no parent".to_string());
+    };
+    Ok(KeypairLoc {
+        dir: OwnedDir::new(base, &[folder]),
+        name: format!("pq-{sid}.bin"),
+    })
+}
+
+/// The per-user file every build before R4 kept the keypair in.
+fn per_user_keypair_loc() -> Result<KeypairLoc, String> {
+    let base = dirs::config_local_dir()
+        .ok_or_else(|| "no config_local_dir on this platform".to_string())?;
+    Ok(KeypairLoc {
+        dir: OwnedDir::new(base, &["BirdoVPN"]),
+        name: KEYPAIR_FILENAME.to_string(),
+    })
+}
+
+/// Delete a keypair file the app no longer uses (the per-user one on
+/// Windows), through a checked handle; one that is not there is fine.
+fn retire_keypair_file(loc: &KeypairLoc) {
+    match loc.dir.remove_file(&loc.name) {
+        Ok(()) => tracing::info!("BirdoPQ: deleted the old per-user ML-KEM keypair (R4)"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("BirdoPQ: the old per-user keypair was not deleted: {e}"),
+    }
 }
 
 impl KeypairLoc {
@@ -425,13 +471,24 @@ impl KeypairLoc {
     }
 }
 
-fn keypair_loc() -> Result<KeypairLoc, String> {
-    let base = dirs::config_local_dir()
-        .ok_or_else(|| "no config_local_dir on this platform".to_string())?;
-    Ok(KeypairLoc {
-        dir: OwnedDir::new(base, &["BirdoVPN"]),
-        name: KEYPAIR_FILENAME.to_string(),
-    })
+/// Where this account's keypair lives (R4: the admin-only directory on
+/// Windows), and on Windows the per-user file it replaced, to delete.
+fn keypair_loc() -> Result<(KeypairLoc, Option<KeypairLoc>), String> {
+    #[cfg(windows)]
+    {
+        let protected = crate::utils::protected_dir::ensure()
+            .map_err(|e| format!("admin-only state directory: {e}"))?;
+        let sid = crate::utils::protected_dir::current_user_sid()
+            .map_err(|e| format!("account SID: {e}"))?;
+        Ok((
+            protected_keypair_loc(&protected, &sid)?,
+            per_user_keypair_loc().ok(),
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok((per_user_keypair_loc()?, None))
+    }
 }
 
 fn write_keypair(loc: &KeypairLoc, kp: &StaticKeypair) -> Result<(), String> {
@@ -458,7 +515,11 @@ fn write_keypair(loc: &KeypairLoc, kp: &StaticKeypair) -> Result<(), String> {
     // MR-1945 H1: created new through a checked handle and renamed within the
     // held directory (owner-only on Unix), never a raw path a planted link
     // could redirect.
-    fs::create_dir_all(loc.dir.path()).map_err(|e| format!("create dir: {e}"))?;
+    // R5: created inside verified, held parents and held from then on; never
+    // `create_dir_all` by path.
+    loc.dir
+        .ensure_held()
+        .map_err(|e| format!("keypair folder: {e}"))?;
     let tmp = format!("{}.{:016x}.tmp", loc.name, rand::random::<u64>());
     let result = (|| {
         let mut f = loc
@@ -570,7 +631,14 @@ fn read_keypair(loc: &KeypairLoc) -> Result<Option<StaticKeypair>, KeypairReadEr
 /// per-device PQ key — so the fresh key is simply used from the next connect.
 /// A file that merely failed to read (I/O) is left alone: discarding a
 /// long-lived identity key on a transient error is the worse trade.
-fn load_or_generate_at(loc: &KeypairLoc) -> Result<StaticKeypair, String> {
+///
+/// `retired` (Windows, R4): the per-user file the keypair used to live in. It
+/// is never read; once a fresh key is safely on disk in `loc`, it is deleted.
+/// While `loc` holds a key, it is not touched at all.
+fn load_or_generate_at(
+    loc: &KeypairLoc,
+    retired: Option<&KeypairLoc>,
+) -> Result<StaticKeypair, String> {
     match read_keypair(loc) {
         Ok(Some(kp)) => return Ok(kp),
         Ok(None) => {
@@ -587,11 +655,16 @@ fn load_or_generate_at(loc: &KeypairLoc) -> Result<StaticKeypair, String> {
         }
     }
     let fresh = generate_keypair();
-    if let Err(e) = write_keypair(loc, &fresh) {
-        tracing::warn!(
+    match write_keypair(loc, &fresh) {
+        Ok(()) => {
+            if let Some(old) = retired {
+                retire_keypair_file(old);
+            }
+        }
+        Err(e) => tracing::warn!(
             "BirdoPQ: failed to persist keypair: {e} — \
              continuing in-memory; will regenerate next launch"
-        );
+        ),
     }
     Ok(fresh)
 }
@@ -612,8 +685,8 @@ fn load_or_generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), String> {
             ));
         }
     }
-    let loc = keypair_loc()?;
-    let kp = load_or_generate_at(&loc)?;
+    let (loc, retired) = keypair_loc()?;
+    let kp = load_or_generate_at(&loc, retired.as_ref())?;
     let pk = kp.public_key.clone();
     let sk = Zeroizing::new(kp.secret_key.to_vec());
     *cell.lock() = Some(kp);
@@ -625,7 +698,12 @@ pub fn reset_persisted_keypair() -> Result<(), String> {
     *cache().lock() = None;
     set_mode(PqMode::Disabled);
     // MR-1945: delete through the checked handle in the held directory.
-    let loc = keypair_loc()?;
+    let (loc, retired) = keypair_loc()?;
+    // R4: a per-user keypair an older build left is a persisted keypair of
+    // this user too.
+    if let Some(old) = retired.as_ref() {
+        retire_keypair_file(old);
+    }
     match loc.dir.remove_file(&loc.name) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -773,6 +851,7 @@ pub fn record_disabled() {
 mod tests {
     use super::*;
     use ml_kem::array::sizes::U32;
+    use std::fs;
     use std::path::Path;
 
     /// A keypair location at a temp `path`, for tests.
@@ -964,7 +1043,7 @@ mod tests {
         }
 
         // The recovery: a fresh, valid, persisted keypair.
-        let fresh = load_or_generate_at(&kloc(&path)).expect("must re-key rather than fail");
+        let fresh = load_or_generate_at(&kloc(&path), None).expect("must re-key rather than fail");
         assert_eq!(fresh.secret_key.len(), SECRET_KEY_BYTES);
         assert_ne!(fresh.secret_key.as_slice(), sk.as_slice());
         let reread = read_keypair(&kloc(&path))
@@ -1018,7 +1097,7 @@ mod tests {
 
         // Unusable means re-key, not fail-forever: the replacement file must
         // be readable and its halves must agree.
-        let fresh = load_or_generate_at(&kloc(&path)).expect("must re-key rather than fail");
+        let fresh = load_or_generate_at(&kloc(&path), None).expect("must re-key rather than fail");
         assert_ne!(fresh.public_key, wrong_pk);
         let reread = read_keypair(&kloc(&path))
             .expect("the re-keyed file must be readable")
@@ -1177,6 +1256,103 @@ mod tests {
         let loaded = read_keypair(&kloc(&path)).unwrap().unwrap();
         assert_eq!(loaded.public_key, pk_clone);
         assert_eq!(loaded.secret_key.as_slice(), sk_clone.as_slice());
+    }
+
+    // ── R4: the Windows keypair is per account, in the admin-only folder ──
+
+    /// `<base>/ProgramData/BirdoVPN` standing in for the admin-only
+    /// directory, and `<base>/Local/BirdoVPN/birdo_pq_v1.bin` for the per-user
+    /// file every build before R4 used.
+    fn r4_locations(base: &Path, sid: &str) -> (KeypairLoc, KeypairLoc) {
+        let protected = base.join("ProgramData").join("BirdoVPN");
+        std::fs::create_dir_all(&protected).unwrap();
+        let old = KeypairLoc {
+            dir: OwnedDir::new(base.join("Local"), &["BirdoVPN"]),
+            name: KEYPAIR_FILENAME.to_string(),
+        };
+        (protected_keypair_loc(&protected, sid).unwrap(), old)
+    }
+
+    /// The upgrade, once: the per-user keypair (which any unelevated process
+    /// could read, or have replaced) is NOT carried over. A fresh key goes to
+    /// the admin-only folder and the old file is deleted once it is on disk.
+    #[test]
+    fn the_per_user_keypair_is_replaced_once_never_adopted() {
+        let base = tempfile::tempdir().unwrap();
+        let (loc, old) = r4_locations(base.path(), "S-1-5-21-1-2-3-1001");
+        let planted = generate_keypair();
+        write_keypair(&old, &planted).unwrap();
+
+        let fresh = load_or_generate_at(&loc, Some(&old)).unwrap();
+
+        assert_ne!(
+            fresh.public_key, planted.public_key,
+            "the old key was adopted"
+        );
+        assert!(loc.dir.join(&loc.name).exists());
+        assert!(
+            !old.dir.join(&old.name).exists(),
+            "the old per-user key was left readable"
+        );
+        let stored = read_keypair(&loc).unwrap().unwrap();
+        assert_eq!(stored.public_key, fresh.public_key);
+    }
+
+    /// After that the old location is ignored: a keypair planted there later
+    /// is neither used nor even touched; the admin-only key stays.
+    #[test]
+    fn a_keypair_planted_in_the_old_location_later_is_ignored() {
+        let base = tempfile::tempdir().unwrap();
+        let (loc, old) = r4_locations(base.path(), "S-1-5-21-1-2-3-1001");
+        let first = load_or_generate_at(&loc, Some(&old)).unwrap();
+
+        let planted = generate_keypair();
+        write_keypair(&old, &planted).unwrap();
+        let again = load_or_generate_at(&loc, Some(&old)).unwrap();
+
+        assert_eq!(again.public_key, first.public_key);
+        assert_ne!(again.public_key, planted.public_key);
+        assert_eq!(
+            read_keypair(&old).unwrap().unwrap().public_key,
+            planted.public_key,
+            "the old location is not even touched once the admin-only key exists"
+        );
+    }
+
+    /// One key per Windows account, never one per machine (audit C-8): two
+    /// accounts get two files and two different keys in the same folder.
+    #[test]
+    fn each_windows_account_has_its_own_keypair() {
+        let base = tempfile::tempdir().unwrap();
+        let (alice, old) = r4_locations(base.path(), "S-1-5-21-1-2-3-1001");
+        let (bob, _) = r4_locations(base.path(), "S-1-5-21-1-2-3-1002");
+        assert_eq!(alice.name, "pq-S-1-5-21-1-2-3-1001.bin");
+        assert_eq!(alice.dir.path(), bob.dir.path());
+        assert_ne!(alice.name, bob.name);
+
+        let a = load_or_generate_at(&alice, Some(&old)).unwrap();
+        let b = load_or_generate_at(&bob, Some(&old)).unwrap();
+        assert_ne!(a.public_key, b.public_key);
+        assert_eq!(
+            load_or_generate_at(&alice, Some(&old)).unwrap().public_key,
+            a.public_key
+        );
+        assert_eq!(
+            load_or_generate_at(&bob, Some(&old)).unwrap().public_key,
+            b.public_key
+        );
+    }
+
+    /// The Windows location is the admin-only directory, not %LOCALAPPDATA%.
+    #[test]
+    fn the_windows_keypair_lives_in_the_admin_only_directory() {
+        let source = include_str!("birdo_pq.rs").replace('\r', "");
+        let body = &source[source.find("fn keypair_loc()").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let windows = &body
+            [body.find("#[cfg(windows)]").unwrap()..body.find("#[cfg(not(windows))]").unwrap()];
+        assert!(windows.contains("crate::utils::protected_dir::ensure()"));
+        assert!(windows.contains("protected_keypair_loc(&protected, &sid)"));
     }
 
     #[test]

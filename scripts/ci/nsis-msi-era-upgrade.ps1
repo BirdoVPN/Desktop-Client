@@ -29,6 +29,13 @@
 #   shipped release leaves (the bug, reproduced). Then this build as the in-app
 #   updater runs it (/P /UPDATE): one entry, and the shortcuts the MSI took
 #   with it are re-created even in update mode.
+# Phase C - v1.4.46 alone, then this build silently: the ordinary upgrade of a
+#   release from before #287 (no MSI involved).
+# R1, in every phase: an upgrade of a pre-#287 install (1.4.47 or older, or
+#   MSI-era) leaves the legacy-upgrade marker HKLM\SOFTWARE\BirdoVPN
+#   LegacyUpgradePending = 1 for the app's first start (nsis-install-smoke.ps1
+#   checks that a fresh install leaves none), and our uninstall removes one
+#   that was never consumed.
 # After each upgrade:
 #   - Windows Installer no longer knows the product;
 #   - exactly one BirdoVPN entry (ours) remains;
@@ -115,6 +122,25 @@ $programs = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'
 $msiStartFolder = Join-Path $programs $product
 $nsisStartLnk = Join-Path $programs "$product.lnk"
 $hookLog = Join-Path $env:TEMP 'BirdoVPN-msi-era-uninstall.log' # nsis-hooks.nsh BirdoRemoveMsiEraEntry
+$stateKey = 'HKLM:\SOFTWARE\BirdoVPN'                          # utils/protected_dir.rs STATE_KEY
+$markerValue = 'LegacyUpgradePending'                         # nsis-hooks.nsh BIRDO_LEGACY_UPGRADE_VALUE
+function Get-LegacyMarker {
+    $p = Get-ItemProperty -LiteralPath $stateKey -Name $markerValue -ErrorAction SilentlyContinue
+    if ($p) { return $p.$markerValue }
+    return $null
+}
+# R1: after an upgrade of a pre-#287 install the marker is there, as DWORD 1.
+function Assert-LegacyMarker([string]$when) {
+    Step "R1: the legacy-upgrade marker is set ($when)"
+    $m = Get-LegacyMarker
+    if ($m -ne 1) { Fail "$stateKey $markerValue is '$m' $when, expected 1: the app's first start would not migrate the settings this install left" }
+    Write-Host "   $stateKey $markerValue = $m"
+}
+function Assert-NoLegacyMarker([string]$when) {
+    $m = Get-LegacyMarker
+    if ($null -ne $m) { Fail "$stateKey $markerValue = $m ${when}: an unconsumed marker outlived the install" }
+    Write-Host "   $stateKey $markerValue absent ($when)"
+}
 $work = Join-Path $env:RUNNER_TEMP 'msi-era'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
@@ -348,9 +374,11 @@ foreach ($name in $planted.Keys) {
 $untouched = @{}
 foreach ($name in @('other', 'v100')) { $untouched[$name] = Get-KeySnapshot "$uninstRoot\$($planted[$name].Key)" }
 Show-Entries 'before the upgrade'
+Assert-NoLegacyMarker 'before phase A'
 
 Invoke-Upgrade @('/S')
 Assert-Upgraded $code
+Assert-LegacyMarker 'after the silent upgrade over the MSI-era install'
 
 Step 'the planted entries: the leftover deleted, the others untouched, the stub never run'
 if (Test-Path -LiteralPath "$uninstRoot\$($planted.leftover.Key)") { Fail "the leftover MSI-era entry $($planted.leftover.Key) is still there" }
@@ -411,6 +439,7 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { Fail "$exe is missing a
 Write-Host "   no msiexec log, both entries untouched, stub never ran"
 
 Invoke-OurUninstall
+Assert-NoLegacyMarker 'after our uninstall (phase A)'
 foreach ($name in $untouched.Keys) { Remove-Item -LiteralPath "$uninstRoot\$($planted[$name].Key)" -Recurse -Force }
 
 # -- phase B ------------------------------------------------------------------
@@ -433,10 +462,28 @@ Write-Host '   two entries and the MSI still installed: WIN2-012 as v1.4.46 ship
 # without /R and /ARGS, which only relaunch the app.
 Invoke-Upgrade @('/P', '/UPDATE')
 Assert-Upgraded $code
+Assert-LegacyMarker 'after the in-app-update upgrade over v1.4.46 (passive: read in the GUI init)'
 
 Invoke-OurUninstall
+Assert-NoLegacyMarker 'after our uninstall (phase B)'
 Assert-Clean 'after phase B'
 
+# -- phase C ------------------------------------------------------------------
 Write-Host ''
-Write-Host 'OK - an upgrade over an MSI-era install leaves one entry and no MSI, matches nothing else, never runs an UninstallString, and survives the old msiexec /x'
+Write-Host '== Phase C: v1.4.46 alone -> this build, silent (the ordinary upgrade from before #287)'
+Step "v1.4.46, silently: $(Split-Path -Leaf $Previous) /S"
+$rc = Invoke-Bounded $Previous @('/S') 'the v1.4.46 installer'
+if ($rc -ne 0) { Fail "the v1.4.46 installer exited $rc" }
+$prior = @(Get-ProductEntries)
+if ($prior.Count -ne 1 -or $prior[0].DisplayVersion -ne '1.4.46') { Show-Entries 'after v1.4.46'; Fail 'expected one v1.4.46 entry' }
+Assert-NoLegacyMarker 'after installing v1.4.46'
+Invoke-Upgrade @('/S')
+if ((Get-ProductEntries)[0].DisplayVersion -ne $version) { Show-Entries 'after the upgrade'; Fail "the entry does not say $version after the upgrade" }
+Assert-LegacyMarker 'after the silent upgrade over v1.4.46 (read in NSIS_HOOK_PREINSTALL)'
+Invoke-OurUninstall
+Assert-NoLegacyMarker 'after our uninstall (phase C)'
+Assert-Clean 'after phase C'
+
+Write-Host ''
+Write-Host 'OK - an upgrade over an MSI-era install leaves one entry and no MSI, matches nothing else, never runs an UninstallString, and survives the old msiexec /x; every upgrade from before #287 leaves the legacy-upgrade marker and our uninstall removes it'
 exit 0

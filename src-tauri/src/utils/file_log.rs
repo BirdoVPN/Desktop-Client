@@ -195,51 +195,42 @@ pub fn install(dir: OwnedDir, name: &str) -> &'static RotatingLog {
 /// whole chain is verified (no reparse point, expected final path) at hold
 /// time; one that cannot be verified is left unheld and simply operates as
 /// before. Best-effort: never worth failing startup over, and a no-op where
-/// there is no data directory. The guards are leaked on purpose — they live
-/// as long as the process.
+/// there is no data directory. The guards are kept for the process lifetime
+/// (`safe_fs`'s held set, which the writers' `ensure_held` consults too).
 pub fn hold_app_dirs() {
-    fn keep(guard: io::Result<Option<crate::utils::safe_fs::DirGuard>>) {
-        match guard {
-            Ok(Some(g)) => HELD.lock().unwrap_or_else(|e| e.into_inner()).push(g),
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
+    fn keep<T>(held: io::Result<T>) {
+        if let Err(e) = held {
+            tracing::warn!(
                 "Could not hold a state directory open against a junction swap: {}",
                 e
-            ),
+            );
         }
     }
 
     // Created and held: these hold state written regardless of the on-device
     // log switch — settings (config dir), the update-resume record and the DNS
-    // journal's %APPDATA% ancestor (`%APPDATA%\BirdoVPN`), and the device id and
-    // ML-KEM key (`%LOCALAPPDATA%\BirdoVPN`).
+    // journal's %APPDATA% ancestor (`%APPDATA%\BirdoVPN`), and the device id
+    // (`%LOCALAPPDATA%\BirdoVPN`; the ML-KEM key's own home off Windows).
     if let Some(config) = dirs::config_dir() {
-        keep(
-            OwnedDir::new(config, &[APP_IDENTIFIER])
-                .hold_open()
-                .map(Some),
-        );
+        keep(OwnedDir::new(config, &[APP_IDENTIFIER]).ensure_held());
     }
     if let Some(base) = dirs::data_dir() {
-        keep(OwnedDir::new(base, &["BirdoVPN"]).hold_open().map(Some));
+        keep(OwnedDir::new(base, &["BirdoVPN"]).ensure_held());
     }
     if let Some(base) = dirs::config_local_dir() {
-        keep(OwnedDir::new(base, &["BirdoVPN"]).hold_open().map(Some));
+        keep(OwnedDir::new(base, &["BirdoVPN"]).ensure_held());
     }
     // Held only if they already exist: creating them here would bring the
     // logs / crash folders into being even when the on-device log is off
-    // (MR-808). When logging is later switched on, the writer creates and the
-    // per-operation checks still apply.
+    // (MR-808). When logging is later switched on, the writer creates them
+    // verified and holds them then (`ensure_held`, R5).
     if let Some(dir) = log_dir() {
-        keep(dir.hold_open_if_present());
+        keep(dir.keep_held_if_present());
     }
     if let Some(dir) = crash_dir() {
-        keep(dir.hold_open_if_present());
+        keep(dir.keep_held_if_present());
     }
 }
-
-/// The held directory guards, for the process lifetime.
-static HELD: Mutex<Vec<crate::utils::safe_fs::DirGuard>> = Mutex::new(Vec::new());
 
 /// Apply the user's choice: at start-up (`setup()`), on every settings save
 /// and on a reset, so the live gate always equals what is saved. Takes effect
@@ -936,8 +927,12 @@ mod tests {
             .find("file_log::persists()")
             .expect("write_crash_report no longer checks the switch");
         assert!(
-            gate < writer.find("create_dir_all").unwrap(),
+            gate < writer.find("crash_dir.hold_open()").unwrap(),
             "write_crash_report touches the disk before checking the switch"
+        );
+        assert!(
+            !writer.contains("create_dir_all"),
+            "R5: the crash folder is created verified, never by path"
         );
 
         // The saved choice is read as soon as the subscriber exists...

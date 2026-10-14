@@ -116,24 +116,118 @@ impl OwnedDir {
 
     /// Hold the directory open for as long as the returned guard lives, so no
     /// unprivileged process can rename or replace it with a junction while the
-    /// app runs (MR-1945 H1). The whole chain is verified first: every
-    /// component is a real directory, not a reparse point, and the leaf's
-    /// final path is this directory's own. Creates the directory if absent.
+    /// app runs (MR-1945 H1). Creates the directory if absent.
+    ///
+    /// R5 (#287 follow-up): never `create_dir_all` by path. On Windows each of
+    /// the app's folders is created only inside its parent while that parent
+    /// is held open (no `FILE_SHARE_DELETE`, so it cannot be renamed or
+    /// swapped for a junction meanwhile), and is then opened without
+    /// following a reparse point and verified — a real directory, not a link,
+    /// at exactly the expected final path — before the next one is created in
+    /// it. A junction anywhere in the chain is refused BEFORE anything is
+    /// created behind it, so a user cannot steer where the elevated app makes
+    /// a directory.
     pub fn hold_open(&self) -> io::Result<DirGuard> {
-        std::fs::create_dir_all(self.path())?;
-        imp::hold_open(self)
+        imp::hold_open(self, true)
     }
 
     /// [`OwnedDir::hold_open`], but only if the directory already exists; `None`
-    /// when it does not. Unlike `hold_open` it never CREATES the directory —
+    /// when it does not. Unlike `hold_open` it never CREATES anything —
     /// used for the logs and crash folders, which must not be brought into
     /// being while the on-device log is switched off (MR-808).
     pub fn hold_open_if_present(&self) -> io::Result<Option<DirGuard>> {
         match std::fs::symlink_metadata(self.path()) {
-            Ok(_) => imp::hold_open(self).map(Some),
+            Ok(_) => imp::hold_open(self, false).map(Some),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Make sure the directory exists and is held for the rest of the
+    /// process (R5): [`OwnedDir::hold_open`] the first time, then nothing —
+    /// a held directory cannot have been replaced since. The writers call
+    /// this instead of `create_dir_all` before they create a file in it, so a
+    /// directory that did not exist at start-up (the logs, switched on later)
+    /// is created verified and held too. An error means the directory could
+    /// not be verified: the write must not go ahead.
+    pub fn ensure_held(&self) -> io::Result<()> {
+        held::ensure(self)
+    }
+
+    /// Delete `name`, a real directory directly in this one, with everything
+    /// in it (R2: the updater's `updates\`). The directory is opened without
+    /// following a reparse point and must resolve to exactly this one's
+    /// `name`; the removal then never follows a link inside it either
+    /// (`std::fs::remove_dir_all` opens each entry without following one, and
+    /// deletes a link as a link). `NotFound` when there is none.
+    #[cfg_attr(not(windows), allow(dead_code))] // its callers are Windows-only
+    pub fn remove_dir_tree(&self, name: &str) -> io::Result<()> {
+        check_name(name)?;
+        imp::verify_subdir(self, name)?;
+        std::fs::remove_dir_all(self.join(name))
+    }
+}
+
+/// The directories this process holds open for its lifetime (R5): the ones
+/// `file_log::hold_app_dirs` holds at start, and any a writer created later.
+pub(crate) mod held {
+    use super::*;
+    use std::sync::{Mutex, TryLockError};
+
+    /// Held directories, by path.
+    pub(crate) type Set = Mutex<Vec<(PathBuf, DirGuard)>>;
+
+    static HELD: Set = Mutex::new(Vec::new());
+
+    pub(super) fn ensure(dir: &OwnedDir) -> io::Result<()> {
+        // A test's temp folders are verified the same way but not kept: kept,
+        // they could not be removed (or swapped by the test's next step) for
+        // the rest of the test binary. `ensure_in` itself is tested.
+        if cfg!(test) {
+            return dir.hold_open().map(drop);
+        }
+        ensure_in(&HELD, dir)
+    }
+
+    pub(crate) fn ensure_in(set: &Set, dir: &OwnedDir) -> io::Result<()> {
+        // `try_lock`: this runs inside the log writer, which the panic hook
+        // reaches; a panic that struck while this thread held the lock must
+        // not deadlock it. Contended or not, the directory is still verified
+        // (and held for the call's duration); it is just not kept.
+        let mut held = match set.try_lock() {
+            Ok(held) => held,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return dir.hold_open().map(drop),
+        };
+        if held.iter().any(|(path, _)| path == dir.path()) {
+            return Ok(());
+        }
+        let guard = dir.hold_open()?;
+        held.push((dir.path().to_path_buf(), guard));
+        Ok(())
+    }
+
+    /// Keep `guard` (for `dir`) for the process lifetime.
+    pub(super) fn keep(dir: &OwnedDir, guard: DirGuard) {
+        if cfg!(test) {
+            return;
+        }
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        held.push((dir.path().to_path_buf(), guard));
+    }
+}
+
+impl OwnedDir {
+    /// [`OwnedDir::hold_open_if_present`], kept for the process lifetime
+    /// (`file_log::hold_app_dirs`); `false` when there is no directory.
+    pub fn keep_held_if_present(&self) -> io::Result<bool> {
+        Ok(match self.hold_open_if_present()? {
+            Some(guard) => {
+                held::keep(self, guard);
+                true
+            }
+            None => false,
+        })
     }
 }
 
@@ -239,27 +333,92 @@ mod imp {
     // `FileRenameInfo` to resolve a relative target name.
     const FILE_LIST_DIRECTORY: u32 = 0x1;
 
-    pub(super) fn hold_open(dir: &OwnedDir) -> io::Result<DirGuard> {
-        // No FILE_SHARE_DELETE: while this handle lives, the directory cannot
-        // be renamed or deleted, so it cannot be swapped for a junction.
-        let handle = open_verified_dir(
-            dir,
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-        )?;
+    /// No FILE_SHARE_DELETE: while such a handle lives, the directory cannot
+    /// be renamed or deleted, so it cannot be swapped for a junction.
+    const HOLD_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+    /// What a hold opens the directory for. FILE_LIST_DIRECTORY is what makes
+    /// it a hold: NTFS applies share modes only to opens that ask for data or
+    /// DELETE access, so a handle with FILE_READ_ATTRIBUTES alone (what #287
+    /// held with) blocked nothing, and the "held" directory could still be
+    /// renamed and replaced (R5; `a_held_directory_cannot_be_renamed`).
+    const HOLD_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES;
+
+    /// See [`OwnedDir::hold_open`]. `create`: make the missing folders (each
+    /// inside its held, verified parent); otherwise a missing one is
+    /// `NotFound`.
+    pub(super) fn hold_open(dir: &OwnedDir, create: bool) -> io::Result<DirGuard> {
+        if dir.rel.is_empty() {
+            // The root alone is the OS's (or a test's) own folder.
+            if create {
+                std::fs::create_dir_all(&dir.root)?;
+            }
+            let handle = open_verified_dir(dir, HOLD_ACCESS, HOLD_SHARE)?;
+            return Ok(DirGuard { handle });
+        }
+        // The root as the OS resolves it: folder redirection is the user's own
+        // choice, so where it points is theirs to decide (and an OS folder
+        // that is missing is made, as it always was). Opened for its final
+        // path only, not held: the app's folders below it are.
+        if create && !dir.root.exists() {
+            std::fs::create_dir_all(&dir.root)?;
+        }
+        let root = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&dir.root)?;
+        let mut expected = win_api::final_path(&root)?;
+        drop(root);
+        let mut path = dir.root.clone();
+        // Every folder of the chain stays held until the leaf is verified.
+        let mut chain: Vec<File> = Vec::with_capacity(dir.rel.len());
+        for part in &dir.rel {
+            path.push(part);
+            expected.push(part);
+            if create {
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {}
+                    // Whatever is there — a junction, a file, a squatted
+                    // folder — is judged by the open below, not trusted.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            chain.push(open_dir_at(&path, &expected, HOLD_ACCESS, HOLD_SHARE)?);
+        }
+        let handle = chain.pop().expect("the chain has the leaf");
         Ok(DirGuard { handle })
+    }
+
+    /// `name` in `dir` is a real directory (not a link) at exactly its
+    /// expected final path (R2).
+    pub(super) fn verify_subdir(dir: &OwnedDir, name: &str) -> io::Result<()> {
+        let expected = final_dir(dir)?.join(name);
+        open_dir_at(
+            &dir.join(name),
+            &expected,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        .map(drop)
     }
 
     /// A handle to this directory, verified to be exactly it: not a reparse
     /// point, a real directory, and resolving to its expected final path. Used
-    /// both for the process-lifetime hold and, freshly each time, as the
+    /// for the hold of a root-only directory and, freshly each time, as the
     /// `RootDirectory` a rename is performed relative to.
     fn open_verified_dir(dir: &OwnedDir, access: u32, share: u32) -> io::Result<File> {
+        open_dir_at(dir.path(), &final_dir(dir)?, access, share)
+    }
+
+    /// The directory at `path`, opened without following a reparse point and
+    /// refused unless it is a real directory whose final path is `expected`.
+    fn open_dir_at(path: &Path, expected: &Path, access: u32, share: u32) -> io::Result<File> {
         let handle = OpenOptions::new()
             .access_mode(access)
             .share_mode(share)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(dir.path())?;
+            .open(path)?;
         let attributes = handle.metadata()?.file_attributes();
         if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(refused("state directory", "it is a link"));
@@ -268,7 +427,7 @@ mod imp {
             return Err(refused("state directory", "it is not a directory"));
         }
         let actual = win_api::final_path(&handle)?;
-        if !win_api::same_path(&actual, &final_dir(dir)?) {
+        if !win_api::same_path(&actual, expected) {
             return Err(refused(
                 "state directory",
                 "it resolves somewhere unexpected",
@@ -418,11 +577,25 @@ mod imp {
         Ok(file)
     }
 
-    pub(super) fn hold_open(dir: &OwnedDir) -> io::Result<DirGuard> {
+    pub(super) fn hold_open(dir: &OwnedDir, create: bool) -> io::Result<DirGuard> {
+        // Root's own home (the client runs as root here): the chain is checked
+        // for links after creating it, and a link anywhere is refused.
+        if create {
+            std::fs::create_dir_all(dir.path())?;
+        }
         check_dirs(dir)?;
         Ok(DirGuard {
             handle: File::open(dir.path())?,
         })
+    }
+
+    pub(super) fn verify_subdir(dir: &OwnedDir, name: &str) -> io::Result<()> {
+        check_dirs(dir)?;
+        if std::fs::symlink_metadata(dir.join(name))?.is_dir() {
+            Ok(())
+        } else {
+            Err(refused(name, "not a real directory"))
+        }
     }
 
     pub(super) fn rename_within(dir: &OwnedDir, from: &str, to: &str) -> io::Result<()> {
@@ -758,6 +931,138 @@ pub(crate) mod tests {
         assert!(!dir.join("settings.json.tmp").exists());
     }
 
+    /// R5: a hold is a hold. While the guard lives, the directory cannot be
+    /// renamed (so not swapped for a junction either); #287's handle, opened
+    /// for FILE_READ_ATTRIBUTES alone, is outside NTFS's share checks and let
+    /// this rename through.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_directory_cannot_be_renamed() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        let guard = logs.hold_open().unwrap();
+        let moved = root.path().join("BirdoVPN").join("moved");
+        let err = std::fs::rename(logs.path(), &moved).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(32), "{err}"); // ERROR_SHARING_VIOLATION
+        assert!(logs.path().is_dir() && !moved.exists());
+        // The app's own work inside it is unaffected.
+        std::io::Write::write_all(&mut logs.create_new("a.tmp").unwrap(), b"x").unwrap();
+        logs.rename_within("a.tmp", "birdo.log").unwrap();
+        logs.remove_file("birdo.log").unwrap();
+        drop(guard);
+        std::fs::rename(logs.path(), &moved).unwrap();
+    }
+
+    /// R5, THE FINDING: `create_dir_all` by path, with a junction planted on
+    /// a parent (`BirdoVPN` -> somewhere else), made `logs` wherever the
+    /// junction pointed before anything checked it. Now the junction is
+    /// refused before anything is created behind it.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_parent_is_refused_before_anything_is_created_behind_it() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        junction(&root.path().join("BirdoVPN"), &elsewhere);
+
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        assert!(logs.hold_open().is_err());
+        assert!(logs.ensure_held().is_err());
+        assert!(
+            !elsewhere.join("logs").exists(),
+            "a directory was created behind the junction"
+        );
+        // Nor is anything created through it by a writer that ensures first.
+        assert!(logs
+            .ensure_held()
+            .and_then(|()| logs.create_new("birdo.log"))
+            .is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// The same with the junction on the leaf's own name: refused, and the
+    /// target is not entered.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_on_the_leaf_is_refused_by_ensure_held() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::create_dir(root.path().join("BirdoVPN")).unwrap();
+        junction(&root.path().join("BirdoVPN").join("logs"), &elsewhere);
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        assert!(logs.ensure_held().is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// `ensure_held` creates a missing chain, verified, and keeps it held: a
+    /// second call is a no-op and the directory stays unrenameable. (The
+    /// process-wide set, in a set of the test's own.)
+    #[cfg(windows)]
+    #[test]
+    fn ensure_held_creates_the_chain_and_keeps_it_held() {
+        let root = tempfile::tempdir().unwrap();
+        let set: held::Set = std::sync::Mutex::new(Vec::new());
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        held::ensure_in(&set, &logs).unwrap();
+        assert!(logs.path().is_dir());
+        held::ensure_in(&set, &logs).unwrap();
+        assert_eq!(set.lock().unwrap().len(), 1);
+        assert!(std::fs::rename(logs.path(), root.path().join("moved")).is_err());
+        // A refused one is not kept.
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        junction(&root.path().join("planted"), &elsewhere);
+        assert!(held::ensure_in(&set, &OwnedDir::new(root.path(), &["planted", "x"])).is_err());
+        assert_eq!(set.lock().unwrap().len(), 1);
+        drop(set);
+        std::fs::rename(logs.path(), root.path().join("moved")).unwrap();
+    }
+
+    /// `hold_open_if_present` never creates: not the leaf, not a parent.
+    #[test]
+    fn hold_open_if_present_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        assert!(logs.hold_open_if_present().unwrap().is_none());
+        assert!(!logs.keep_held_if_present().unwrap());
+        assert!(!root.path().join("BirdoVPN").exists());
+    }
+
+    /// R2: `remove_dir_tree` empties and removes a real subdirectory, and
+    /// refuses one that is a junction, leaving its target's contents alone.
+    #[cfg(windows)]
+    #[test]
+    fn remove_dir_tree_removes_a_real_folder_and_refuses_a_junction() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = OwnedDir::new(root.path(), &["BirdoVPN"]);
+        let updates = dir.join("updates");
+        std::fs::create_dir_all(updates.join("BirdoVPN-1.4.48-updater-x")).unwrap();
+        write(
+            &updates
+                .join("BirdoVPN-1.4.48-updater-x")
+                .join("installer.exe"),
+            "MZ",
+        );
+        dir.remove_dir_tree("updates").unwrap();
+        assert!(!updates.exists());
+        assert_eq!(
+            dir.remove_dir_tree("updates").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        write(&victim.join("precious.txt"), "keep");
+        junction(&updates, &victim);
+        assert!(dir.remove_dir_tree("updates").is_err());
+        assert_eq!(
+            std::fs::read_to_string(victim.join("precious.txt")).unwrap(),
+            "keep"
+        );
+        assert!(dir.remove_dir_tree("../victim").is_err());
+    }
+
     /// `hold_open` refuses a junctioned directory (so the caller never trusts
     /// it) and accepts a real one.
     #[cfg(windows)]
@@ -767,9 +1072,11 @@ pub(crate) mod tests {
         let elsewhere = root.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::create_dir_all(root.path().join("BirdoVPN")).unwrap();
-        // A real one holds.
+        // A real one holds (and, held, cannot be removed: R5).
         let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
-        let _guard = logs.hold_open().unwrap();
+        let guard = logs.hold_open().unwrap();
+        assert!(std::fs::remove_dir(logs.path()).is_err());
+        drop(guard);
         // A junction on the leaf is refused.
         std::fs::remove_dir(logs.path()).unwrap();
         junction(logs.path(), &elsewhere);
