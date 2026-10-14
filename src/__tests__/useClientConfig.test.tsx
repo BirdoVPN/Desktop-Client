@@ -81,7 +81,7 @@ beforeEach(() => {
   dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
   setHidden(false);
   // The shipped default. Every "unknown" case below asserts this survives.
-  useAppStore.setState({ dnsFilteringAvailable: true, customDnsByPlan: {} });
+  useAppStore.setState({ dnsFilteringAvailable: true, customDnsByPlan: {}, planPrices: {} });
 });
 
 afterEach(() => {
@@ -483,5 +483,42 @@ describe('useClientConfig -> customDnsByPlan', () => {
     mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: true });
     await runHook();
     expect(useAppStore.getState().customDnsByPlan).toEqual({});
+  });
+});
+
+/** MR-132 / MR-630 / MR-1767 / MR-1979: `plans` (birdo-web #708), through the same fetch. */
+describe('useClientConfig -> planPrices', () => {
+  const recon = { monthlyPrice: 0, yearlyPrice: 0, currency: 'GBP', bandwidthLimitGb: 50 };
+  const operative = { monthlyPrice: 3.99, yearlyPrice: 38, currency: 'GBP', bandwidthLimitGb: null };
+
+  it("the server's per-plan prices reach the store, keyed by plan", async () => {
+    mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: true, plans: { RECON: recon, OPERATIVE: operative } });
+    await runHook();
+    expect(useAppStore.getState().planPrices).toEqual({ RECON: recon, OPERATIVE: operative });
+  });
+
+  it('a payload without `plans`, or a failed fetch, leaves the store empty (the fallback shows)', async () => {
+    mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: true });
+    await runHook();
+    expect(useAppStore.getState().planPrices).toEqual({});
+
+    mockedInvoke.mockReset();
+    mockedInvoke.mockRejectedValue('Failed to get client config: HTTP 500');
+    await runHook();
+    expect(useAppStore.getState().planPrices).toEqual({});
+  });
+
+  it('unknown plan keys and invalid entries are left out', async () => {
+    mockedInvoke.mockResolvedValue({
+      plans: {
+        OPERATIVE: operative,
+        ENTERPRISE: operative,
+        recon,
+        SOVEREIGN: { ...operative, currency: 'pounds' },
+        RECON: { ...recon, bandwidthLimitGb: 0 },
+      },
+    });
+    await runHook();
+    expect(useAppStore.getState().planPrices).toEqual({ OPERATIVE: operative });
   });
 });

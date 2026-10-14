@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { IpcError, LiveMultiHop, VpnPhase, VpnState, VpnStats, VpnStatus } from '@/lib/ipc';
 import { giveUpKind, type GiveUpKind } from '@/lib/errors';
-import type { PlanId } from '@/lib/plan';
+import type { PlanId, PlanPrice } from '@/lib/plan';
 import { CONSENT_VERSION } from '@/lib/consent';
 import { normalizeWireGuardPort } from '@/utils/helpers';
 
@@ -327,6 +327,18 @@ export interface AppState {
   customDnsByPlan: Partial<Record<PlanId, boolean>>;
   setCustomDnsByPlan: (byPlan: Partial<Record<PlanId, boolean>>) => void;
 
+  /**
+   * `plans.<PLAN>` from `GET /api/client-config` (birdo-web #708): prices,
+   * currency and data cap per plan, only the plans the server gave a valid
+   * entry for. The Pricing screen fills any plan missing here from
+   * `FALLBACK_PLAN_PRICES` (`resolvePlanPrices`), so `{}` — the default, an
+   * older web deploy, an offline start — shows the built-in prices. A property
+   * of the service, not of the account: neither persisted nor cleared on
+   * logout, like `customDnsByPlan`.
+   */
+  planPrices: Partial<Record<PlanId, PlanPrice>>;
+  setPlanPrices: (byPlan: Partial<Record<PlanId, PlanPrice>>) => void;
+
   portForwards: PortForward[];
 
   /** `null` until `get_admin_status` answers, so the warning cannot flash at startup. */
@@ -551,6 +563,8 @@ export const useAppStore = create<AppState>()(
       setDnsFilteringAvailable: (dnsFilteringAvailable) => set({ dnsFilteringAvailable }),
       customDnsByPlan: {},
       setCustomDnsByPlan: (customDnsByPlan) => set({ customDnsByPlan }),
+      planPrices: {},
+      setPlanPrices: (planPrices) => set({ planPrices }),
 
       portForwards: [],
       isAdmin: null,

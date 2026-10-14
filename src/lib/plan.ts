@@ -48,6 +48,97 @@ export function customDnsAvailable(
   return id === null || byPlan[id] !== false;
 }
 
+/**
+ * One plan's prices and data cap, as `GET /api/client-config` → `plans.<PLAN>`
+ * serves them (birdo-web #708) and the Rust side validates them.
+ */
+export interface PlanPrice {
+  /** The price of one month, billed monthly. */
+  monthlyPrice: number;
+  /** The ANNUAL TOTAL, billed once a year (38, not 3.17). */
+  yearlyPrice: number;
+  /** ISO 4217 code of both prices. */
+  currency: string;
+  /** Data cap per billing period in GB; `null` = unlimited. */
+  bandwidthLimitGb: number | null;
+}
+
+/**
+ * OFFLINE FALLBACK for the Pricing screen (MR-132 / MR-630 / MR-1767 /
+ * MR-1979): what a plan shows when the server has not priced it — an older web
+ * deploy without `plans`, no network, a failed fetch, or a plan missing from
+ * or malformed in the map. The server's values win whenever it sends them.
+ * These mirror birdo-web's lib/plans.ts as of #708, with the free cap at
+ * 50 GB (owner decision 2026-10-13; it was 10 GB).
+ */
+export const FALLBACK_PLAN_PRICES: Readonly<Record<PlanId, PlanPrice>> = {
+  RECON: { monthlyPrice: 0, yearlyPrice: 0, currency: 'GBP', bandwidthLimitGb: 50 },
+  OPERATIVE: { monthlyPrice: 3.99, yearlyPrice: 38, currency: 'GBP', bandwidthLimitGb: null },
+  SOVEREIGN: { monthlyPrice: 9.99, yearlyPrice: 99, currency: 'GBP', bandwidthLimitGb: null },
+};
+
+/** The largest data cap believed, in GB — Rust's `MAX_PLAN_BANDWIDTH_GB`. */
+const MAX_PLAN_BANDWIDTH_GB = 100_000;
+
+const price = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+
+/**
+ * The same rules as Rust's `PlanPrice::from_wire`, so a value that reached the
+ * store some other way (a test, a future caller) cannot render as NaN or make
+ * `Intl.NumberFormat` throw.
+ */
+export function isPlanPrice(v: unknown): v is PlanPrice {
+  if (typeof v !== 'object' || v === null) return false;
+  const p = v as Record<string, unknown>;
+  const cap = p.bandwidthLimitGb;
+  return (
+    price(p.monthlyPrice) &&
+    price(p.yearlyPrice) &&
+    typeof p.currency === 'string' &&
+    /^[A-Z]{3}$/.test(p.currency) &&
+    (cap === null ||
+      (typeof cap === 'number' && Number.isInteger(cap) && cap > 0 && cap <= MAX_PLAN_BANDWIDTH_GB))
+  );
+}
+
+/** Every plan's prices: the server's where it gave a valid entry, else the fallback. */
+export function resolvePlanPrices(server: Partial<Record<PlanId, PlanPrice>>): Record<PlanId, PlanPrice> {
+  const pick = (id: PlanId) => {
+    const p = server[id];
+    return isPlanPrice(p) ? p : FALLBACK_PLAN_PRICES[id];
+  };
+  return { RECON: pick('RECON'), OPERATIVE: pick('OPERATIVE'), SOVEREIGN: pick('SOVEREIGN') };
+}
+
+/**
+ * "£3.99", "£38", "€9.99": the amount in its own currency, en-GB style. A
+ * whole amount drops its ".00" so the yearly totals read as they always have.
+ */
+export function formatPrice(amount: number, currency: string): string {
+  const whole = Number.isInteger(amount);
+  try {
+    return new Intl.NumberFormat('en-GB', {
+      style: 'currency',
+      currency,
+      ...(whole ? { minimumFractionDigits: 0, maximumFractionDigits: 0 } : {}),
+    }).format(amount);
+  } catch {
+    return `${whole ? amount : amount.toFixed(2)} ${currency}`;
+  }
+}
+
+/**
+ * Whole percent saved by paying yearly instead of 12 monthly payments,
+ * FLOORED so it never overstates — the formula birdo-web's /pricing uses
+ * (lib/pricing-data.ts `pricingFor`). `null` when there is no saving to show.
+ */
+export function yearlySavingPct(p: PlanPrice): number | null {
+  const undiscounted = p.monthlyPrice * 12;
+  if (undiscounted <= 0 || p.yearlyPrice <= 0) return null;
+  const pct = Math.floor(((undiscounted - p.yearlyPrice) / undiscounted) * 100);
+  return pct > 0 ? pct : null;
+}
+
 /** "Free", "Operative", "Sovereign" — the prose names (P1-parity casing rules). */
 export function planName(plan: string): string {
   switch (normalizePlan(plan)) {

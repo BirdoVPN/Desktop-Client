@@ -913,7 +913,7 @@ mod tests {
         let body = serde_json::json!({
             "success": false,
             "quotaExceeded": true,
-            "message": "Free-tier data limit reached (10.0 / 10 GB this period). Your allowance \
+            "message": "Free-tier data limit reached (50.0 / 50 GB this period). Your allowance \
                         resets after 12 Oct. Upgrade to Operative for unlimited data."
         });
         let single: ConnectResponse = serde_json::from_value(body.clone()).unwrap();
@@ -926,6 +926,20 @@ mod tests {
                 response.quota_exceeded,
             );
             assert_eq!(err.code, IpcErrorCode::QuotaExceeded);
+            // MR-1979: what the user reads is the canonical sentence, not the
+            // server's, and it names no cap. The free cap is the server's to
+            // set (10 GB, then 50 GB from 2026-10-13), so a figure written
+            // here would go stale the next time it moves; the Limit tab shows
+            // the account's real cap from `/vpn/stats`.
+            assert_eq!(
+                err.message,
+                crate::vpn::reconnect_policy::quota_exceeded_error().message
+            );
+            assert!(
+                !err.message.chars().any(|c| c.is_ascii_digit()) && !err.message.contains("GB"),
+                "the quota message must not hard-code a cap: {}",
+                err.message
+            );
             assert!(err.code.is_hard_refusal());
             assert!(!err.retryable);
             assert!(!crate::vpn::reconnect_policy::give_up_keeps_block(

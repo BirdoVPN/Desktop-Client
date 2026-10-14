@@ -15,8 +15,15 @@
  * Design: mirrors the existing screens' design-system usage (BirdoTopBar,
  * BirdoCard, BirdoButton, BirdoBadge, brand tokens). Dark-emerald corporate
  * restraint — emerald is an accent only, no colourful gradients / neon glow.
+ *
+ * PRICES COME FROM THE SERVER (MR-132 / MR-630 / MR-1767 / MR-1979): the
+ * prices, currency, savings and data caps are rendered from
+ * `GET /api/client-config` → `plans` (birdo-web #708, via `useClientConfig`),
+ * the same table the web's /pricing and Polar checkout use. They used to be
+ * written here, which is how the free cap still read 10 GB after the server
+ * moved. A plan the server has not priced shows `FALLBACK_PLAN_PRICES`.
  */
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
 import { useShallow } from 'zustand/react/shallow';
 import type { LucideIcon } from 'lucide-react';
@@ -24,7 +31,15 @@ import { Check, Shield, Zap, Crown, ExternalLink } from 'lucide-react';
 import { BirdoTopBar, BirdoCard, BirdoButton, BirdoBadge } from '@/components/birdo';
 import { useAppStore } from '@/store/app-store';
 import { brand, white, hairline, surface, accentA } from '@/lib/birdo-theme';
-import { PLAN_RANK, normalizePlan, type PlanId } from '@/lib/plan';
+import {
+  PLAN_RANK,
+  formatPrice,
+  normalizePlan,
+  resolvePlanPrices,
+  yearlySavingPct,
+  type PlanId,
+  type PlanPrice,
+} from '@/lib/plan';
 import { BILLING_URL } from '@/lib/links';
 
 // Billing lives on the web (the same host Settings opens for "Manage on web").
@@ -37,93 +52,113 @@ interface Tier {
   tagline: string;
   icon: LucideIcon;
   iconTint: string;
-  /** Displayed prices, or null for the free tier. */
+  /** Displayed prices (from the server's `plans`), or null for the free tier. */
   monthly: string | null;
+  /** The ANNUAL TOTAL as the server gives it, shown with "/yr". */
   yearly: string | null;
   /**
    * Yearly saving vs 12 monthly payments, per plan and rounded DOWN (the web
-   * floors it too): Operative £38 vs £47.88 = 20.6%, Sovereign £99 vs £119.88
-   * = 17.4%. A single "save 20%" for both overstated Sovereign (audit A-24 /
-   * A-34); the toggle says "up to 20%".
+   * floors it too), computed from the server's prices: at £3.99 / £38 that is
+   * 20.6% → 20, at £9.99 / £99 17.4% → 17. A single "save 20%" for both
+   * overstated Sovereign (audit A-24 / A-34); the toggle says "up to" the
+   * largest.
    */
   yearlySavingPct: number | null;
+  /** The currency of this tier's prices, for the "Prices in …" line. */
+  currency: string;
   features: string[];
 }
 
-const TIERS: Tier[] = [
-  {
-    id: 'RECON',
-    name: 'Recon',
-    tagline: 'Free — get protected',
-    icon: Shield,
-    iconTint: white.w60,
-    monthly: null,
-    yearly: null,
-    yearlySavingPct: null,
-    // No "Split tunneling": the desktop app has none (vpn/mod.rs — Windows
-    // only has Kill Switch Exceptions, which keep traffic IN the tunnel), so
-    // listing it here sold a feature that does not exist (audit A-24 / D-4).
-    // Wording follows the mobile paywalls (second-pass #16). Custom DNS is
-    // on EVERY plan (owner decision D6, 2026-10-01), so it is listed here, on
-    // the free tier, and the paid tiers have it through "Everything in Recon";
-    // listing it on a paid card would sell it as an upgrade.
-    features: [
-      '1 device connection',
-      'Core server locations',
-      '10 GB monthly bandwidth',
-      'WireGuard® encryption',
-      'Post-quantum key exchange',
-      'Kill switch',
-      'Custom DNS servers',
-    ],
-  },
-  {
-    id: 'OPERATIVE',
-    name: 'Operative',
-    tagline: 'For everyday privacy',
-    icon: Zap,
-    iconTint: brand.accent,
-    monthly: '£3.99',
-    yearly: '£38',
-    yearlySavingPct: 20,
-    // Second-pass #16: no "High-speed servers" line. A node's isHighSpeed is an
-    // owner-set display flag (the server list's filter), and no plan gates on
-    // it: access is decided by the node's minPlan alone, which "All server
-    // locations" already describes. The Recon plan can use a fast node too.
-    features: [
-      'Everything in Recon',
-      '5 device connections',
-      'All server locations',
-      'Unlimited bandwidth',
-      'Stealth mode',
-    ],
-  },
-  {
-    id: 'SOVEREIGN',
-    name: 'Sovereign',
-    tagline: 'Full control',
-    icon: Crown,
-    iconTint: brand.accentLight,
-    monthly: '£9.99',
-    yearly: '£99',
-    yearlySavingPct: 17,
-    // Second-pass #16: no "Priority servers" line (nothing is prioritised: the
-    // backend's isPremium is just minPlan !== 'RECON', and whether any node
-    // is Sovereign-only is a per-node owner setting, not a plan feature), and
-    // no "Custom DNS": it is on every plan (D6, listed on Recon above).
-    features: [
-      'Everything in Operative',
-      '10 device connections',
-      'Multi-hop routing',
-      'Port forwarding',
-    ],
-  },
-];
+/** "50 GB monthly bandwidth" / "Unlimited bandwidth", from the plan's own cap. */
+function bandwidthFeature(p: PlanPrice): string {
+  return p.bandwidthLimitGb === null ? 'Unlimited bandwidth' : `${p.bandwidthLimitGb} GB monthly bandwidth`;
+}
+
+/** A plan's price fields for its card. Free means both prices are zero. */
+function priced(p: PlanPrice): Pick<Tier, 'monthly' | 'yearly' | 'yearlySavingPct' | 'currency'> {
+  const free = p.monthlyPrice === 0 && p.yearlyPrice === 0;
+  return {
+    monthly: free ? null : formatPrice(p.monthlyPrice, p.currency),
+    yearly: free ? null : formatPrice(p.yearlyPrice, p.currency),
+    yearlySavingPct: free ? null : yearlySavingPct(p),
+    currency: p.currency,
+  };
+}
+
+function buildTiers(prices: Record<PlanId, PlanPrice>): Tier[] {
+  return [
+    {
+      id: 'RECON',
+      name: 'Recon',
+      tagline: 'Free — get protected',
+      icon: Shield,
+      iconTint: white.w60,
+      ...priced(prices.RECON),
+      // No "Split tunneling": the desktop app has none (vpn/mod.rs — Windows
+      // only has Kill Switch Exceptions, which keep traffic IN the tunnel), so
+      // listing it here sold a feature that does not exist (audit A-24 / D-4).
+      // Wording follows the mobile paywalls (second-pass #16). Custom DNS is
+      // on EVERY plan (owner decision D6, 2026-10-01), so it is listed here, on
+      // the free tier, and the paid tiers have it through "Everything in Recon";
+      // listing it on a paid card would sell it as an upgrade.
+      features: [
+        '1 device connection',
+        'Core server locations',
+        bandwidthFeature(prices.RECON),
+        'WireGuard® encryption',
+        'Post-quantum key exchange',
+        'Kill switch',
+        'Custom DNS servers',
+      ],
+    },
+    {
+      id: 'OPERATIVE',
+      name: 'Operative',
+      tagline: 'For everyday privacy',
+      icon: Zap,
+      iconTint: brand.accent,
+      ...priced(prices.OPERATIVE),
+      // Second-pass #16: no "High-speed servers" line. A node's isHighSpeed is an
+      // owner-set display flag (the server list's filter), and no plan gates on
+      // it: access is decided by the node's minPlan alone, which "All server
+      // locations" already describes. The Recon plan can use a fast node too.
+      features: [
+        'Everything in Recon',
+        '5 device connections',
+        'All server locations',
+        bandwidthFeature(prices.OPERATIVE),
+        'Stealth mode',
+      ],
+    },
+    {
+      id: 'SOVEREIGN',
+      name: 'Sovereign',
+      tagline: 'Full control',
+      icon: Crown,
+      iconTint: brand.accentLight,
+      ...priced(prices.SOVEREIGN),
+      // Second-pass #16: no "Priority servers" line (nothing is prioritised: the
+      // backend's isPremium is just minPlan !== 'RECON', and whether any node
+      // is Sovereign-only is a per-node owner setting, not a plan feature), and
+      // no "Custom DNS": it is on every plan (D6, listed on Recon above).
+      features: [
+        'Everything in Operative',
+        '10 device connections',
+        'Multi-hop routing',
+        'Port forwarding',
+      ],
+    },
+  ];
+}
 
 export function Pricing() {
-  const { account, popRoute } = useAppStore(
-    useShallow((s) => ({ account: s.account, popRoute: s.popRoute })),
+  const { account, popRoute, planPrices } = useAppStore(
+    useShallow((s) => ({ account: s.account, popRoute: s.popRoute, planPrices: s.planPrices })),
   );
+  const tiers = useMemo(() => buildTiers(resolvePlanPrices(planPrices)), [planPrices]);
+  // "Save up to N%" is the largest per-plan saving, so it never overstates.
+  const maxSavingPct = Math.max(0, ...tiers.map((t) => t.yearlySavingPct ?? 0));
+  const currencies = [...new Set(tiers.filter((t) => t.monthly !== null).map((t) => t.currency))];
   // `null` while the plan is not known yet: no tier is marked current and no
   // Upgrade button is offered to someone who may already be on it (W2-011).
   const currentPlan = account.plan === null ? null : normalizePlan(account.plan);
@@ -166,12 +201,12 @@ export function Pricing() {
                 }}
               >
                 {p === 'monthly' ? 'Monthly' : 'Yearly'}
-                {p === 'yearly' && (
+                {p === 'yearly' && maxSavingPct > 0 && (
                   <span
                     className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold"
                     style={{ backgroundColor: accentA(0.14), color: brand.accentSoft }}
                   >
-                    Save up to 20%
+                    {`Save up to ${maxSavingPct}%`}
                   </span>
                 )}
               </button>
@@ -181,7 +216,7 @@ export function Pricing() {
 
         {/* Tier cards */}
         <div className="mt-4 flex flex-col gap-3">
-          {TIERS.map((tier) => (
+          {tiers.map((tier) => (
             <TierCard
               key={tier.id}
               tier={tier}
@@ -195,7 +230,8 @@ export function Pricing() {
         {/* VAT wording per REMEDIATION-DECISIONS §3: checkout is Polar's
             (merchant of record), whose tax behaviour decides the total. */}
         <p className="mt-5 px-1 text-xs" style={{ color: white.w60 }}>
-          Prices in GBP. Prices include VAT for customers in the UK, EU and most
+          {currencies.length > 0 && `Prices in ${currencies.join(' and ')}. `}
+          Prices include VAT for customers in the UK, EU and most
           other countries. In the United States, Canada and India, sales tax is
           added at checkout. Polar, our reseller, shows the final total before
           you pay. Upgrading opens dashboard.birdo.app in your browser to

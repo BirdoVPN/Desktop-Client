@@ -1,5 +1,7 @@
 /**
- * `GET /api/client-config` → the BirdoShield fleet gate (`dnsFilteringAvailable`).
+ * `GET /api/client-config` → the BirdoShield fleet gate (`dnsFilteringAvailable`),
+ * and, through the same fetch, the per-plan `customDns` flags and the Pricing
+ * screen's price feed (`plans`).
  *
  * WHY THIS IS A HOOK AND NOT AN INLINE EFFECT (PR #162 review, must-fix 2):
  * the three guards below ARE the feature. "Unknown means available" is decided
@@ -16,7 +18,7 @@ import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '@/store/app-store';
-import { knownPlanId, type PlanId } from '@/lib/plan';
+import { isPlanPrice, knownPlanId, type PlanId, type PlanPrice } from '@/lib/plan';
 
 /**
  * The slice of `/api/client-config` this client acts on. The route also serves
@@ -27,10 +29,13 @@ import { knownPlanId, type PlanId } from '@/lib/plan';
  * `null` is as real as `undefined`: an older web deploy predating birdo-web#465
  * omits the key, and JSON `null` survives the Rust `Option<bool>` the same way.
  * `features` is reduced by Rust to `{ <PLAN>: { customDns } }` (item 40).
+ * `plans` (birdo-web #708) arrives already validated by Rust's
+ * `PlanPrice::from_wire`: known plans only, malformed entries dropped.
  */
 export interface ClientConfig {
   dnsFilteringAvailable?: boolean | null;
   features?: Record<string, { customDns?: boolean | null } | null> | null;
+  plans?: Record<string, PlanPrice | null> | null;
 }
 
 /**
@@ -46,6 +51,24 @@ export function customDnsFlags(cfg: ClientConfig | null | undefined): Partial<Re
     const id = knownPlanId(plan);
     const flag = flags?.customDns;
     if (id !== null && typeof flag === 'boolean') byPlan[id] = flag;
+  }
+  return byPlan;
+}
+
+/**
+ * The plans the server priced (MR-132 / MR-630 / MR-1767 / MR-1979), for the
+ * Pricing screen. `null` when the payload has no `plans` map at all, so a
+ * deploy that predates birdo-web #708 leaves the store as it is and the
+ * screen shows its fallback prices; a plan with no valid entry is left out
+ * and falls back on its own.
+ */
+export function planPricesFrom(cfg: ClientConfig | null | undefined): Partial<Record<PlanId, PlanPrice>> | null {
+  const plans = cfg?.plans;
+  if (!plans || typeof plans !== 'object') return null;
+  const byPlan: Partial<Record<PlanId, PlanPrice>> = {};
+  for (const [plan, entry] of Object.entries(plans)) {
+    const id = knownPlanId(plan);
+    if (id !== null && id === plan && isPlanPrice(entry)) byPlan[id] = entry;
   }
   return byPlan;
 }
@@ -182,6 +205,7 @@ export const GATE_POLL_INTERVAL_MS = 60_000;
 export function useClientConfig(): void {
   const setDnsFilteringAvailable = useAppStore((s) => s.setDnsFilteringAvailable);
   const setCustomDnsByPlan = useAppStore((s) => s.setCustomDnsByPlan);
+  const setPlanPrices = useAppStore((s) => s.setPlanPrices);
 
   useEffect(() => {
     let cancelled = false;
@@ -210,6 +234,10 @@ export function useClientConfig(): void {
           // Item 40, the same rule: only explicit booleans count.
           const customDns = customDnsFlags(cfg);
           if (customDns) setCustomDnsByPlan(customDns);
+          // The price feed: the same "only what the server said" rule. No
+          // `plans` (older deploy) leaves the store, and so the fallback, alone.
+          const prices = planPricesFrom(cfg);
+          if (prices) setPlanPrices(prices);
         })
         // GUARD 2: the catch deliberately does NOTHING. The store default is
         // `true`; an offline client, a 500, a 429 or a cold start must leave
@@ -251,5 +279,5 @@ export function useClientConfig(): void {
       window.clearInterval(poll);
       unlistenShown.then((off) => off()).catch(() => {});
     };
-  }, [setDnsFilteringAvailable, setCustomDnsByPlan]);
+  }, [setDnsFilteringAvailable, setCustomDnsByPlan, setPlanPrices]);
 }
