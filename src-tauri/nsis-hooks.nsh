@@ -347,6 +347,15 @@ FunctionEnd
 Var BirdoPriorChecked
 Var BirdoLegacyUpgrade
 
+; D6c HIGH: the user's "Delete the application data" choice, saved in
+; NSIS_HOOK_PREUNINSTALL before that hook zeroes $DeleteAppDataCheckboxState to
+; suppress the template's own `RmDir /r` (which follows junctions in the user's
+; folders, elevated). NSIS_HOOK_POSTUNINSTALL reads this to still clear the
+; Credential Manager entries and the install registry records the template
+; would have cleared. The per-user FOLDERS are deleted by the exe in
+; PREUNINSTALL (`--remove-leftovers-and-exit --with-app-data`).
+Var BirdoDeleteAppData
+
 Function BirdoNotePriorInstall
   ${If} $BirdoPriorChecked = 1
     Return
@@ -508,6 +517,14 @@ FunctionEnd
   ; NSIS's recursive delete follows junctions (checked with NSIS 3.11).
   ; Bounded like the reconcile; a real uninstall only (an in-place update
   ; keeps everything).
+  ;
+  ; D6c HIGH: with "Delete the application data" ticked, the exe ALSO removes
+  ; the per-user folders (the BirdoVPN data folder — keeping dns-restore.json* —
+  ; the local data and crash folders, and the two identifier folders the
+  ; template would) without following links. The template's own recursive
+  ; delete, and this hook's former one, followed junctions in those
+  ; user-controlled folders, so an elevated uninstall could delete files
+  ; anywhere on the machine.
   ${If} $UpdateMode <> 1
     ${If} $DeleteAppDataCheckboxState = 1
       StrCpy $1 " --with-app-data"
@@ -517,6 +534,17 @@ FunctionEnd
     nsExec::Exec /TIMEOUT=60000 '"$INSTDIR\${MAINBINARYNAME}.exe" --remove-leftovers-and-exit$1'
     Pop $0
   ${EndIf}
+
+  ; D6c HIGH: save the choice, then neutralise the template's own
+  ; "$DeleteAppDataCheckboxState = 1" block (installer.nsi), which runs after
+  ; this hook and before NSIS_HOOK_POSTUNINSTALL and would `RmDir /r` the two
+  ; identifier folders following any junction planted in them. Clearing the
+  ; folders here first and letting it run is not enough — a junction can be
+  ; re-planted between this hook and that block — so the block must not run at
+  ; all. NSIS_HOOK_POSTUNINSTALL does the registry/credential cleanup that
+  ; block also did, under the saved value.
+  StrCpy $BirdoDeleteAppData $DeleteAppDataCheckboxState
+  StrCpy $DeleteAppDataCheckboxState 0
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
@@ -544,66 +572,39 @@ FunctionEnd
 
   ; D-23 (audit 2026-09-29): "Delete the application data".
   ;
-  ; Tauri's uninstaller already shows that checkbox on its confirm page and,
-  ; when it is ticked, removes $APPDATA\<identifier> and
-  ; $LOCALAPPDATA\<identifier> (settings.json, the Xray config, the WebView2
-  ; profile holding the consent flag). The client ALSO writes outside those two
-  ; folders, so the same tick has to clear these too:
-  ;   $APPDATA\BirdoVPN        logs (birdo.log*), dns-restore.json
-  ;   $LOCALAPPDATA\BirdoVPN   device_id; birdo_pq_v1.bin (the ML-KEM SECRET
-  ;                            key) from builds before R4, which keep it in
-  ;                            %ProgramData%\BirdoVPN\pq-<SID>.bin (removed by
-  ;                            NSIS_HOOK_PREUNINSTALL's --with-app-data)
-  ;   $LOCALAPPDATA\Birdo VPN  crash files
-  ;   Credential Manager       access/refresh tokens, settings HMAC key,
-  ;                            biometric flag (keyring targets "<name>.BirdoVPN")
-  ;
-  ; Same gate as the template's own deletion: only when the user ticked the box
-  ; and never on an in-place update (/UPDATE), which must keep everything.
-  ; SetShellVarContext current is repeated so this does not depend on the
-  ; template's block having run first. Both variables are declared by Tauri's
-  ; installer.nsi, into which this macro is expanded.
-  ;
-  ; W1-008: the DNS journal survives the deletion when it still exists. The
-  ; pre-uninstall reconcile deletes it once everything it describes is back;
-  ; one that is left describes resolvers that could NOT be restored, and it is
-  ; what lets a reinstall (whose start-up reconcile reads it) or a support
-  ; session still put them back. So does a journal the app set aside as
-  ; unreadable (`dns-restore.json.corrupt`, kept for support), and the
-  ; staging copy (REVIEW-WIN2-018): `dns-restore.json*`. If they cannot be
-  ; copied aside, only the logs go — never the record.
+  ; The FOLDERS are now removed by the exe in NSIS_HOOK_PREUNINSTALL
+  ; (`--remove-leftovers-and-exit --with-app-data`, D6c HIGH): $APPDATA\BirdoVPN
+  ; (logs; keeping dns-restore.json* — W1-008), $LOCALAPPDATA\BirdoVPN
+  ; (device_id; pre-R4 birdo_pq_v1.bin), $LOCALAPPDATA\Birdo VPN (crash files),
+  ; the admin-only accounts' ML-KEM keys, and the two identifier folders the
+  ; template itself used to delete. The exe never follows a link; NSIS's
+  ; `RMDir /r` does, which elevated over a user's folders could delete files
+  ; anywhere on the machine. The template's own app-data block is suppressed
+  ; (PREUNINSTALL zeroed $DeleteAppDataCheckboxState), so what remains here is
+  ; the NON-folder cleanup that block also did, under the saved choice
+  ; ($BirdoDeleteAppData) and never on an in-place update (/UPDATE):
+  ;   - the Credential Manager entries (access/refresh tokens, the settings
+  ;     HMAC key off macOS/Linux history, the biometric flag — keyring targets
+  ;     "<name>.BirdoVPN");
+  ;   - the install records the template cleared: HKLM\${MANUPRODUCTKEY} and the
+  ;     HKCU "Installer Language" (SHCTX was HKLM here, perMachine).
   ;
   ; Not removed: the Wintun driver/adapter (shared, system-wide).
-  ${If} $DeleteAppDataCheckboxState = 1
+  ${If} $BirdoDeleteAppData = 1
   ${AndIf} $UpdateMode <> 1
-    SetShellVarContext current
-    ${If} ${FileExists} "$APPDATA\BirdoVPN\dns-restore.json*"
-      RMDir /r "$TEMP\birdo-journal-keep"
-      CreateDirectory "$TEMP\birdo-journal-keep"
-      ClearErrors
-      CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json*" "$TEMP\birdo-journal-keep"
-      ${IfNot} ${Errors}
-        RMDir /r "$APPDATA\BirdoVPN"
-        CreateDirectory "$APPDATA\BirdoVPN"
-        ClearErrors
-        CopyFiles /SILENT "$TEMP\birdo-journal-keep\dns-restore.json*" "$APPDATA\BirdoVPN"
-        ; A copy back that failed leaves the only copy in %TEMP%: keep it.
-        ${IfNot} ${Errors}
-          RMDir /r "$TEMP\birdo-journal-keep"
-        ${EndIf}
-      ${Else}
-        RMDir /r "$APPDATA\BirdoVPN\logs"
-      ${EndIf}
-    ${Else}
-      RMDir /r "$APPDATA\BirdoVPN"
-    ${EndIf}
-    RMDir /r "$LOCALAPPDATA\BirdoVPN"
-    RMDir /r "$LOCALAPPDATA\Birdo VPN"
     ; CredDeleteW(target, CRED_TYPE_GENERIC = 1, 0). A missing entry just
     ; returns FALSE; there is nothing to handle.
     System::Call 'advapi32::CredDeleteW(w "access_token.BirdoVPN", i 1, i 0) i .r0'
     System::Call 'advapi32::CredDeleteW(w "refresh_token.BirdoVPN", i 1, i 0) i .r0'
     System::Call 'advapi32::CredDeleteW(w "settings_hmac_key.BirdoVPN", i 1, i 0) i .r0'
     System::Call 'advapi32::CredDeleteW(w "biometric_lock_enabled.BirdoVPN", i 1, i 0) i .r0'
+    ; The install records the suppressed template block would have cleared.
+    ; Explicit HKLM/HKCU, not SHCTX (REVIEW-WIN2-016): the template may have
+    ; switched SHCTX to the current user by now.
+    DeleteRegKey HKLM "${BIRDO_MANUPRODUCTKEY}"
+    DeleteRegKey /ifempty HKLM "${BIRDO_MANUKEY}"
+    DeleteRegValue HKCU "${BIRDO_MANUPRODUCTKEY}" "Installer Language"
+    DeleteRegKey /ifempty HKCU "${BIRDO_MANUPRODUCTKEY}"
+    DeleteRegKey /ifempty HKCU "${BIRDO_MANUKEY}"
   ${EndIf}
 !macroend

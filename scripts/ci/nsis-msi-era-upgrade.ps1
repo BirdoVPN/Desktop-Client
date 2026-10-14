@@ -480,10 +480,38 @@ Assert-NoLegacyMarker 'after installing v1.4.46'
 Invoke-Upgrade @('/S')
 if ((Get-ProductEntries)[0].DisplayVersion -ne $version) { Show-Entries 'after the upgrade'; Fail "the entry does not say $version after the upgrade" }
 Assert-LegacyMarker 'after the silent upgrade over v1.4.46 (read in NSIS_HOOK_PREINSTALL)'
+# D6c LOW: the uninstaller's --reconcile-and-exit must NOT consume the marker
+# (it used to), so running it now leaves the marker in place — which is what
+# makes the POSTUNINSTALL DeleteRegValue check below non-vacuous.
+Step 'D6c LOW: --reconcile-and-exit does not consume the legacy-upgrade marker'
+$exeC = Join-Path $instDir "$MainBinaryName.exe"
+$rc = Invoke-Bounded $exeC @('--reconcile-and-exit') 'the installed exe (--reconcile-and-exit)'
+if ($rc -ne 0) { Fail "$exeC --reconcile-and-exit exited $rc" }
+Assert-LegacyMarker 'after --reconcile-and-exit (it must not consume the marker)'
 Invoke-OurUninstall
-Assert-NoLegacyMarker 'after our uninstall (phase C)'
+# The marker was present right above, and reconcile did not take it, so its
+# absence now proves NSIS_HOOK_POSTUNINSTALL's DeleteRegValue ran.
+Assert-NoLegacyMarker 'after our uninstall (phase C): POSTUNINSTALL deleted an unconsumed marker'
 Assert-Clean 'after phase C'
 
+# -- phase D ------------------------------------------------------------------
+# D6c MEDIUM: an upgrade from a POST-#287 build (here, the same version over
+# itself) writes NO marker — only a pre-#287 install (version <= the floor, or
+# MSI-era) does. A build from main is >= 1.4.48, so a reinstall never re-opens
+# the legacy-trust window.
 Write-Host ''
-Write-Host 'OK - an upgrade over an MSI-era install leaves one entry and no MSI, matches nothing else, never runs an UninstallString, and survives the old msiexec /x; every upgrade from before #287 leaves the legacy-upgrade marker and our uninstall removes it'
+Write-Host '== Phase D: this build, then this build again (same version) -> no marker'
+Assert-Clean 'before phase D'
+Step "install this build, silently: $(Split-Path -Leaf $Installer) /S"
+$rc = Invoke-Bounded $Installer @('/S') 'this build (first install)'
+if ($rc -ne 0) { Fail "the installer exited $rc" }
+Assert-NoLegacyMarker 'after a fresh install of this build'
+Invoke-Upgrade @('/S')
+if ((Get-ProductEntries)[0].DisplayVersion -ne $version) { Show-Entries 'after the same-version reinstall'; Fail "the entry does not say $version" }
+Assert-NoLegacyMarker 'after reinstalling the same post-#287 version (no window re-opened)'
+Invoke-OurUninstall
+Assert-Clean 'after phase D'
+
+Write-Host ''
+Write-Host 'OK - an upgrade over an MSI-era install leaves one entry and no MSI, matches nothing else, never runs an UninstallString, and survives the old msiexec /x; a pre-#287 upgrade leaves the legacy-upgrade marker (which --reconcile-and-exit does not consume and the uninstall removes), and a post-#287 reinstall writes none'
 exit 0
