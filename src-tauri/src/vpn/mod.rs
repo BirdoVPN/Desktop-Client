@@ -277,9 +277,18 @@ fn ip_in_ranges(ip: u128, ranges: &[(u128, u128)]) -> bool {
 pub mod dns_journal {
     use serde::{Deserialize, Serialize};
 
-    /// Beside the log file, under the same `<data_dir>/BirdoVPN` main.rs's log
-    /// layer creates — deliberately the same launch context as the log, so a
-    /// client started with `sudo` reads back the file that same client wrote.
+    /// On macOS and Linux beside the log file, under the same
+    /// `<data_dir>/BirdoVPN` main.rs's log layer creates — deliberately the
+    /// same launch context as the log, so a client started with `sudo` reads
+    /// back the file that same client wrote.
+    ///
+    /// On Windows in the admin-only `%ProgramData%\BirdoVPN` (MR-1721,
+    /// `utils::protected_dir`). The record tells the ELEVATED client which
+    /// routes to delete and which resolvers to put on which adapter, and in
+    /// the user's %APPDATA% any unelevated process of theirs could write one:
+    /// a planted journal had the client delete routes and point DNS where it
+    /// said. A journal an older build left in %APPDATA% is taken over once
+    /// ([`migrate_legacy`]) and never read there again.
     const JOURNAL_FILE: &str = "dns-restore.json";
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,11 +347,133 @@ pub mod dns_journal {
     }
 
     fn path() -> Option<std::path::PathBuf> {
-        let mut dir = dirs::data_dir()?;
-        dir.push("BirdoVPN");
-        std::fs::create_dir_all(&dir).ok()?;
-        dir.push(JOURNAL_FILE);
-        Some(dir)
+        #[cfg(windows)]
+        {
+            let dir = match crate::utils::protected_dir::ensure() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    tracing::warn!("No admin-only directory for the DNS journal ({})", e);
+                    return None;
+                }
+            };
+            let path = dir.join(JOURNAL_FILE);
+            migrate_legacy_once(&path);
+            Some(path)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut dir = dirs::data_dir()?;
+            dir.push("BirdoVPN");
+            std::fs::create_dir_all(&dir).ok()?;
+            dir.push(JOURNAL_FILE);
+            Some(dir)
+        }
+    }
+
+    /// [`migrate_legacy`] for this account, at most once per process. A flag
+    /// rather than a `Once`: the panic hook reaches this through
+    /// `reconcile`, and must never wait on another thread.
+    #[cfg(windows)]
+    fn migrate_legacy_once(protected: &std::path::Path) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static TRIED: AtomicBool = AtomicBool::new(false);
+        if TRIED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (Some(base), Ok(sid)) = (
+            dirs::data_dir(),
+            crate::utils::protected_dir::current_user_sid(),
+        ) else {
+            return;
+        };
+        let legacy = crate::utils::safe_fs::OwnedDir::new(base, &["BirdoVPN"]);
+        let marker = protected.with_file_name(format!("dns-journal-migrated-{sid}"));
+        migrate_legacy(&legacy, protected, &marker);
+    }
+
+    /// What became of a journal a pre-MR-1721 build left in %APPDATA%.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    #[derive(Debug, PartialEq, Eq)]
+    enum Migration {
+        /// This account's was looked at before: a file there now is
+        /// something any process of the user could have written.
+        AlreadyDone,
+        /// There was none.
+        NoneThere,
+        /// Moved into the admin-only directory.
+        Moved,
+        /// Left where it is, unread by the app from now on: unreadable, from
+        /// another OS, or a journal is already in the admin-only directory
+        /// (another account's machine state, which is the newer record).
+        LeftInPlace,
+        /// The admin-only copy could not be written; tried again next start.
+        Failed,
+    }
+
+    /// Take over the journal an older build left in `legacy` (this account's
+    /// %APPDATA%\BirdoVPN), ONCE: `marker`, in the admin-only directory where
+    /// an unelevated process can neither create nor delete it, records that
+    /// this account's was looked at, and from then on that folder is never
+    /// read for a journal again. The window is the time from installing this
+    /// build to its first elevated start, the same as the settings key's
+    /// migration (`commands::settings`, `protected_key`).
+    ///
+    /// The old file is read and deleted through checked handles (MR-1945).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn migrate_legacy(
+        legacy: &crate::utils::safe_fs::OwnedDir,
+        protected: &std::path::Path,
+        marker: &std::path::Path,
+    ) -> Migration {
+        use std::io::Read;
+        if marker.exists() {
+            return Migration::AlreadyDone;
+        }
+        let outcome = match legacy.open_rw(JOURNAL_FILE) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Migration::NoneThere,
+            Err(e) => {
+                tracing::warn!(
+                    "The old DNS journal could not be read ({}) — left in place",
+                    e
+                );
+                Migration::LeftInPlace
+            }
+            Ok(file) => {
+                // A journal is a few kilobytes; a larger file is not one.
+                let mut bytes = Vec::new();
+                let read = file.take(1 << 20).read_to_end(&mut bytes);
+                let ours = read.is_ok()
+                    && serde_json::from_slice::<DnsJournal>(&bytes)
+                        .is_ok_and(|journal| journal.os == std::env::consts::OS);
+                if !ours || protected.exists() {
+                    tracing::warn!(
+                        "Left the old DNS journal in %APPDATA% in place, unused (MR-1721)"
+                    );
+                    Migration::LeftInPlace
+                } else {
+                    match write_bytes_atomically(protected, &bytes) {
+                        Ok(()) => {
+                            if let Err(e) = legacy.remove_file(JOURNAL_FILE) {
+                                tracing::warn!("The old DNS journal was not deleted: {}", e);
+                            }
+                            tracing::info!("Moved the DNS journal to the admin-only directory");
+                            Migration::Moved
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Could not move the old DNS journal ({}) — retrying next start",
+                                e
+                            );
+                            return Migration::Failed;
+                        }
+                    }
+                }
+            }
+        };
+        if let Err(e) = std::fs::write(marker, b"") {
+            tracing::warn!("Could not record the DNS journal's migration: {}", e);
+        }
+        outcome
     }
 
     /// Where the new bytes are staged before they replace the record.
@@ -407,7 +538,8 @@ pub mod dns_journal {
         use std::io::Write;
         // The record names network services and resolvers — which machine was on
         // which network. Same sensitivity as birdo.log, so the same owner-only
-        // mode on multi-user Unix hosts (Windows relies on the %APPDATA% ACL).
+        // mode on multi-user Unix hosts. On Windows it inherits the admin-only
+        // directory's ACL (MR-1721): SYSTEM and Administrators alone.
         // The staging file holds those same bytes, so it takes the same mode.
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
@@ -1188,6 +1320,132 @@ pub mod dns_journal {
                 Some("nameserver 9.9.9.9\n".to_string())
             );
             assert_eq!(merge_linux_capture(None, None), None);
+        }
+    }
+
+    /// MR-1721: on Windows the journal lives in the admin-only directory. One
+    /// an older build left in the user's %APPDATA% is taken over once, and
+    /// that folder is never read for a journal again.
+    #[cfg(test)]
+    mod legacy_journal_tests {
+        use super::{migrate_legacy, Migration, JOURNAL_FILE};
+        use crate::utils::safe_fs::OwnedDir;
+        use std::path::PathBuf;
+
+        struct Dirs {
+            _tmp: tempfile::TempDir,
+            legacy: OwnedDir,
+            protected: PathBuf,
+            marker: PathBuf,
+        }
+
+        fn dirs() -> Dirs {
+            let tmp = tempfile::tempdir().unwrap();
+            let legacy = OwnedDir::new(tmp.path(), &["BirdoVPN"]);
+            std::fs::create_dir_all(legacy.path()).unwrap();
+            let admin = tmp.path().join("admin-only");
+            std::fs::create_dir_all(&admin).unwrap();
+            Dirs {
+                protected: admin.join(JOURNAL_FILE),
+                marker: admin.join("dns-journal-migrated-S-1-5-21-1-2-3-1001"),
+                legacy,
+                _tmp: tmp,
+            }
+        }
+
+        fn journal(extra: &str) -> String {
+            format!(r#"{{"os":"{}"{extra}}}"#, std::env::consts::OS)
+        }
+
+        fn read(p: &std::path::Path) -> String {
+            std::fs::read_to_string(p).unwrap()
+        }
+
+        #[test]
+        fn an_old_journal_is_moved_once() {
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                Migration::Moved
+            );
+            assert_eq!(read(&d.protected), journal(""));
+            assert!(!d.legacy.join(JOURNAL_FILE).exists());
+            assert!(d.marker.exists());
+
+            // THE FINDING: what an unelevated process writes there now is
+            // never read — it named routes for the elevated client to delete.
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal(r#","routes":[]"#)).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                Migration::AlreadyDone
+            );
+            assert_eq!(read(&d.protected), journal(""));
+        }
+
+        /// Nothing there at the first look closes it just the same.
+        #[test]
+        fn a_journal_planted_after_the_first_look_is_never_read() {
+            let d = dirs();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                Migration::NoneThere
+            );
+            assert!(d.marker.exists());
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                Migration::AlreadyDone
+            );
+            assert!(!d.protected.exists());
+        }
+
+        /// The machine-wide record already in the admin-only directory is
+        /// the newer one: it is never overwritten by an account's old file.
+        #[test]
+        fn a_journal_already_in_the_admin_only_directory_is_kept() {
+            let d = dirs();
+            std::fs::write(&d.protected, journal(r#","boot":1"#)).unwrap();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                Migration::LeftInPlace
+            );
+            assert_eq!(read(&d.protected), journal(r#","boot":1"#));
+            assert!(d.legacy.join(JOURNAL_FILE).exists(), "kept for support");
+        }
+
+        /// Not a journal of this OS: left for a support session, not taken.
+        #[test]
+        fn an_unreadable_or_foreign_journal_is_left_in_place() {
+            for bytes in ["not json", r#"{"os":"plan9"}"#] {
+                let d = dirs();
+                std::fs::write(d.legacy.join(JOURNAL_FILE), bytes).unwrap();
+                assert_eq!(
+                    migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                    Migration::LeftInPlace,
+                    "{bytes}"
+                );
+                assert!(!d.protected.exists());
+                assert_eq!(read(&d.legacy.join(JOURNAL_FILE)), bytes);
+                assert!(d.marker.exists());
+            }
+        }
+
+        /// The Windows journal path is the admin-only directory's, never the
+        /// user's data folder.
+        #[test]
+        fn the_windows_journal_lives_in_the_admin_only_directory() {
+            let src = include_str!("mod.rs").replace('\r', "");
+            let path_fn = &src[src
+                .find("    fn path() -> Option<std::path::PathBuf> {")
+                .expect("path()")..];
+            let windows = &path_fn[..path_fn.find("#[cfg(not(windows))]").unwrap()];
+            assert!(windows.contains("#[cfg(windows)]"));
+            assert!(windows.contains("crate::utils::protected_dir::ensure()"));
+            assert!(windows.contains("migrate_legacy_once(&path)"));
+            assert!(!windows.contains("data_dir"), "{windows}");
         }
     }
 
