@@ -119,6 +119,34 @@ fn reconcile_and_exit() -> ! {
     std::process::exit(0)
 }
 
+/// The uninstaller's PREUNINSTALL hook (nsis-hooks.nsh) runs the exe with this
+/// flag after the reconcile, on a real uninstall only (R2), and adds
+/// [`WITH_APP_DATA`] when "Delete the application data" is ticked.
+const REMOVE_LEFTOVERS_AND_EXIT: &str = "--remove-leftovers-and-exit";
+#[cfg_attr(not(windows), allow(dead_code))]
+const WITH_APP_DATA: &str = "--with-app-data";
+
+/// R2 (#287 follow-up L2): remove the updater's `updates\` and the squatted
+/// folders moved aside as `%ProgramData%\BirdoVPN.untrusted-*` (and, with
+/// [`WITH_APP_DATA`], the accounts' ML-KEM keypairs there, R4/D-23), never the
+/// settings keys or the migration markers (a reinstall needs the keys to
+/// verify the user's settings). Done here, not by NSIS: the set-aside folders
+/// are a user's, and NSIS's `RMDir /r` follows the junctions a user can plant
+/// in them (`protected_dir::remove_uninstall_leftovers_in`). Creates nothing,
+/// touches no other state, and exits before any window, tray or plugin.
+fn remove_leftovers_and_exit() -> ! {
+    #[cfg(windows)]
+    {
+        let with_app_data = std::env::args().any(|arg| arg == WITH_APP_DATA);
+        let done = crate::utils::protected_dir::remove_uninstall_leftovers(with_app_data);
+        info!(
+            "{}: removed {} updates folder(s), {} set-aside folder(s), {} ML-KEM key(s); {} failed",
+            REMOVE_LEFTOVERS_AND_EXIT, done.updates, done.set_aside, done.pq_keys, done.failed
+        );
+    }
+    std::process::exit(0)
+}
+
 /// The IPC command table.
 ///
 /// Registering `get_settings` here is its one allowed use in Rust code: it is
@@ -330,6 +358,19 @@ fn main() {
         crate::utils::log_retention::KEEP_CRASH_REPORTS,
     );
 
+    // R2: the uninstaller's cleanup. Before the upgrade window below: this run
+    // must not consume the installer's marker.
+    if std::env::args().any(|arg| arg == REMOVE_LEFTOVERS_AND_EXIT) {
+        remove_leftovers_and_exit();
+    }
+
+    // R1: whether this is the first start after the installer upgraded a
+    // pre-MR-1721 install — the one run that may migrate (trust once) what
+    // that build left in the user's reach. Decided once, here, before any of
+    // it is read (settings key, DNS journal, resume record).
+    #[cfg(windows)]
+    crate::utils::protected_dir::decide_legacy_upgrade_window();
+
     if std::env::args().any(|arg| arg == RECONCILE_AND_EXIT) {
         reconcile_and_exit();
     }
@@ -456,6 +497,13 @@ fn main() {
             // start of the new version. Read and deleted here; the session
             // controller takes it once (commands::update_resume).
             commands::update_resume::load_at_start();
+
+            // R2: the installer the last in-app update launched stays in the
+            // admin-only `updates` folder; this start removes it (here, past
+            // the single-instance check, so a second launch can never delete
+            // an installer that is still in use).
+            #[cfg(windows)]
+            crate::utils::protected_dir::remove_updates_at_start();
 
             // Give the forced-version-floor gate a handle so a 426 from ANY
             // request can raise the blocking "update required" screen. Must be
@@ -1032,7 +1080,13 @@ fn write_crash_report(location: &str, message: &str) {
 
     let crash_dir = crash_dir();
 
-    let _ = std::fs::create_dir_all(crash_dir.path());
+    // R5: created (if absent) inside verified, held parents and held for the
+    // write, never by path; a folder that cannot be verified gets no crash
+    // file. (`hold_open`, not `ensure_held`: this runs in the panic hook,
+    // which must not touch the held set's lock.)
+    let Ok(_held) = crash_dir.hold_open() else {
+        return;
+    };
 
     // P6-CLI-D-05: crash files used to accumulate forever (a permanent,
     // timestamped on-disk history on a product that claims to retain

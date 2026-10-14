@@ -98,6 +98,9 @@ extern "system" {
         length: u32,
         class: i32,
     ) -> i32;
+    // The Win32 error an NTSTATUS stands for (ERROR_MR_MID_NOT_FOUND when
+    // there is none), so a failed native call reads like any other I/O error.
+    fn RtlNtStatusToDosError(status: i32) -> u32;
 }
 
 #[repr(C)]
@@ -105,6 +108,51 @@ extern "system" {
 struct IoStatusBlock {
     status_or_pointer: usize,
     information: usize,
+}
+
+/// `FILE_RENAME_INFORMATION` (ntifs.h), declared only so the compiler checks
+/// the byte offsets [`rename_by_handle`] writes (MR-1945 R6):
+/// `{ union { BOOLEAN ReplaceIfExists; ULONG Flags; }; HANDLE RootDirectory;
+/// ULONG FileNameLength; WCHAR FileName[1]; }`.
+#[repr(C)]
+#[allow(dead_code)] // never built: a layout to check offsets against
+struct FileRenameInformation {
+    flags: u32,
+    root_directory: *mut c_void,
+    file_name_length: u32,
+    file_name: [u16; 1],
+}
+
+// The offsets `rename_by_handle` writes are the 64-bit layout (the HANDLE is
+// 8-aligned, so 4 bytes of padding follow the flags). Any other layout fails
+// the build here rather than handing the kernel a misread buffer.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("rename_by_handle writes the 64-bit FILE_RENAME_INFORMATION layout");
+const RENAME_ROOT_AT: usize = 8;
+const RENAME_LENGTH_AT: usize = 16;
+const RENAME_NAME_AT: usize = 20;
+const _: () = {
+    assert!(std::mem::offset_of!(FileRenameInformation, root_directory) == RENAME_ROOT_AT);
+    assert!(std::mem::offset_of!(FileRenameInformation, file_name_length) == RENAME_LENGTH_AT);
+    assert!(std::mem::offset_of!(FileRenameInformation, file_name) == RENAME_NAME_AT);
+    assert!(std::mem::size_of::<*mut c_void>() == 8);
+};
+
+/// ERROR_MR_MID_NOT_FOUND: what `RtlNtStatusToDosError` answers for an
+/// NTSTATUS with no Win32 equivalent.
+const ERROR_MR_MID_NOT_FOUND: u32 = 317;
+
+/// The `io::Error` a failed native call's NTSTATUS stands for: the Win32 error
+/// it maps to, so `kind()` is `NotFound`, `PermissionDenied`, `AlreadyExists`
+/// and so on like every other I/O error here (MR-1945 R6). A status with no
+/// Win32 equivalent keeps its NTSTATUS in the message.
+pub fn nt_status_error(status: i32) -> io::Error {
+    // SAFETY: a pure table lookup; no pointers, no preconditions.
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    if code == 0 || code == ERROR_MR_MID_NOT_FOUND {
+        return io::Error::other(format!("NTSTATUS {status:#010x}"));
+    }
+    io::Error::from_raw_os_error(code as i32)
 }
 
 // winnt.h / winbase.h values, for `std::os::windows::fs::OpenOptionsExt`.
@@ -294,21 +342,23 @@ pub fn rename_by_handle(file: &File, dir: &File, new_name: &[u16]) -> io::Result
         Some((0, head)) => head,
         _ => new_name,
     };
-    // FILE_RENAME_INFORMATION on x64:
+    // FILE_RENAME_INFORMATION on x64 (offsets checked at compile time against
+    // `FileRenameInformation`, above):
     //   [0..4]   ReplaceIfExists (union, as a DWORD)
     //   [4..8]   padding (HANDLE is 8-aligned)
     //   [8..16]  RootDirectory (HANDLE)
     //   [16..20] FileNameLength (bytes)
     //   [20..]   FileName (WCHARs, no terminator)
-    const HEADER: usize = 20;
+    const HEADER: usize = RENAME_NAME_AT;
     let name_bytes = name.len() * 2;
     // Allocate as u64 so the struct is 8-byte aligned for the HANDLE field.
     let mut buf = vec![0u64; (HEADER + name_bytes).div_ceil(8).max(1)];
     let bytes: &mut [u8] = bytemuck_cast(&mut buf);
     bytes[0..4].copy_from_slice(&1u32.to_le_bytes()); // ReplaceIfExists = TRUE
     let root = dir.as_raw_handle() as usize as u64;
-    bytes[8..16].copy_from_slice(&root.to_le_bytes());
-    bytes[16..20].copy_from_slice(&(name_bytes as u32).to_le_bytes());
+    bytes[RENAME_ROOT_AT..RENAME_ROOT_AT + 8].copy_from_slice(&root.to_le_bytes());
+    bytes[RENAME_LENGTH_AT..RENAME_LENGTH_AT + 4]
+        .copy_from_slice(&(name_bytes as u32).to_le_bytes());
     for (i, unit) in name.iter().enumerate() {
         let at = HEADER + i * 2;
         bytes[at..at + 2].copy_from_slice(&unit.to_le_bytes());
@@ -326,10 +376,10 @@ pub fn rename_by_handle(file: &File, dir: &File, new_name: &[u16]) -> io::Result
             FILE_RENAME_INFORMATION,
         )
     };
-    if status != 0 {
-        return Err(io::Error::other(format!(
-            "NtSetInformationFile(rename) failed: {status:#010x}"
-        )));
+    // NT_SUCCESS is `status >= 0`; informational and warning statuses are not
+    // what a rename answers, but any negative one is a failure.
+    if status < 0 {
+        return Err(nt_status_error(status));
     }
     Ok(())
 }
@@ -404,6 +454,60 @@ mod tests {
         let expected = final_path(&File::open(&path).unwrap()).unwrap();
         assert!(same_path(&resolved, &expected));
         assert!(resolved.ends_with("x.txt"), "{}", resolved.display());
+    }
+
+    /// R6: an NTSTATUS becomes the Win32 error it stands for, so callers
+    /// match on `kind()` as for any other I/O error.
+    #[test]
+    fn an_nt_status_maps_to_its_win32_error_kind() {
+        const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+        const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+        const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+        const STATUS_SHARING_VIOLATION: u32 = 0xC000_0043;
+        let denied = nt_status_error(STATUS_ACCESS_DENIED as i32);
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(denied.raw_os_error(), Some(5));
+        assert_eq!(
+            nt_status_error(STATUS_OBJECT_NAME_NOT_FOUND as i32).kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            nt_status_error(STATUS_OBJECT_NAME_COLLISION as i32).kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            nt_status_error(STATUS_SHARING_VIOLATION as i32).raw_os_error(),
+            Some(32)
+        );
+        // A status with no Win32 equivalent keeps the NTSTATUS in the text.
+        let unmapped = nt_status_error(0xC0FF_EE00_u32 as i32);
+        assert!(unmapped.to_string().contains("0xc0ffee00"), "{unmapped}");
+    }
+
+    /// R6, through the real call: renaming onto an existing DIRECTORY is
+    /// refused by the kernel, and the error says so as PermissionDenied (it
+    /// used to be `ErrorKind::Other` with a hex status).
+    #[test]
+    fn a_failed_rename_reports_a_real_error_kind() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.tmp"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("taken")).unwrap();
+        let source = std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .open(dir.path().join("a.tmp"))
+            .unwrap();
+        let parent = std::fs::OpenOptions::new()
+            .access_mode(0x1 | FILE_READ_ATTRIBUTES) // FILE_LIST_DIRECTORY
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir.path())
+            .unwrap();
+        let err = rename_by_handle(&source, &parent, &wide(OsStr::new("taken"))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(dir.path().join("a.tmp").exists());
+        // And a good rename still lands.
+        rename_by_handle(&source, &parent, &wide(OsStr::new("b.txt"))).unwrap();
+        assert!(dir.path().join("b.txt").exists());
     }
 
     #[test]

@@ -388,7 +388,12 @@ pub mod dns_journal {
         };
         let legacy = crate::utils::safe_fs::OwnedDir::new(base, &["BirdoVPN"]);
         let marker = protected.with_file_name(format!("dns-journal-migrated-{sid}"));
-        migrate_legacy(&legacy, protected, &marker);
+        migrate_legacy(
+            &legacy,
+            protected,
+            &marker,
+            crate::utils::protected_dir::legacy_upgrade_window(),
+        );
     }
 
     /// What became of a journal a pre-MR-1721 build left in %APPDATA%.
@@ -400,6 +405,10 @@ pub mod dns_journal {
         AlreadyDone,
         /// There was none.
         NoneThere,
+        /// Not the first start after an upgrade of a pre-MR-1721 install (R1):
+        /// a fresh install or a new account. The folder is not read, and is
+        /// never read for a journal from now on.
+        NotAnUpgrade,
         /// Moved into the admin-only directory.
         Moved,
         /// Left where it is, unread by the app from now on: unreadable, from
@@ -414,9 +423,13 @@ pub mod dns_journal {
     /// %APPDATA%\BirdoVPN), ONCE: `marker`, in the admin-only directory where
     /// an unelevated process can neither create nor delete it, records that
     /// this account's was looked at, and from then on that folder is never
-    /// read for a journal again. The window is the time from installing this
-    /// build to its first elevated start, the same as the settings key's
-    /// migration (`commands::settings`, `protected_key`).
+    /// read for a journal again. The window is the first elevated start after
+    /// the installer upgraded a pre-MR-1721 install (`upgrade_window`, R1:
+    /// `protected_dir::legacy_upgrade_window`), the same as the settings key's
+    /// migration (`commands::settings`, `protected_key`). Any other start — a
+    /// fresh install, a new account — closes the folder unread: a journal
+    /// planted there could make the elevated client delete routes and set
+    /// adapter DNS.
     ///
     /// The old file is read and deleted through checked handles (MR-1945).
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -424,10 +437,17 @@ pub mod dns_journal {
         legacy: &crate::utils::safe_fs::OwnedDir,
         protected: &std::path::Path,
         marker: &std::path::Path,
+        upgrade_window: bool,
     ) -> Migration {
         use std::io::Read;
         if marker.exists() {
             return Migration::AlreadyDone;
+        }
+        if !upgrade_window {
+            if let Err(e) = std::fs::write(marker, b"") {
+                tracing::warn!("Could not record the DNS journal's migration: {}", e);
+            }
+            return Migration::NotAnUpgrade;
         }
         let outcome = match legacy.open_rw(JOURNAL_FILE) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Migration::NoneThere,
@@ -1367,7 +1387,7 @@ pub mod dns_journal {
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
 
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::Moved
             );
             assert_eq!(read(&d.protected), journal(""));
@@ -1378,7 +1398,7 @@ pub mod dns_journal {
             // never read — it named routes for the elevated client to delete.
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal(r#","routes":[]"#)).unwrap();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::AlreadyDone
             );
             assert_eq!(read(&d.protected), journal(""));
@@ -1389,13 +1409,37 @@ pub mod dns_journal {
         fn a_journal_planted_after_the_first_look_is_never_read() {
             let d = dirs();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::NoneThere
             );
             assert!(d.marker.exists());
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
+                Migration::AlreadyDone
+            );
+            assert!(!d.protected.exists());
+        }
+
+        /// R1, THE FINDING: outside an upgrade's first start (a fresh
+        /// install, a new account) a journal in %APPDATA% is something any
+        /// process of the user could have written. It is not read, not moved,
+        /// and the folder is closed for good: a later upgrade window does not
+        /// re-open it for this account.
+        #[test]
+        fn outside_an_upgrade_an_old_journal_is_never_read() {
+            let d = dirs();
+            let planted = journal(r#","routes":[]"#);
+            std::fs::write(d.legacy.join(JOURNAL_FILE), &planted).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, false),
+                Migration::NotAnUpgrade
+            );
+            assert!(!d.protected.exists(), "a planted journal was taken over");
+            assert_eq!(read(&d.legacy.join(JOURNAL_FILE)), planted);
+            assert!(d.marker.exists());
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::AlreadyDone
             );
             assert!(!d.protected.exists());
@@ -1409,7 +1453,7 @@ pub mod dns_journal {
             std::fs::write(&d.protected, journal(r#","boot":1"#)).unwrap();
             std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
             assert_eq!(
-                migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                 Migration::LeftInPlace
             );
             assert_eq!(read(&d.protected), journal(r#","boot":1"#));
@@ -1423,7 +1467,7 @@ pub mod dns_journal {
                 let d = dirs();
                 std::fs::write(d.legacy.join(JOURNAL_FILE), bytes).unwrap();
                 assert_eq!(
-                    migrate_legacy(&d.legacy, &d.protected, &d.marker),
+                    migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
                     Migration::LeftInPlace,
                     "{bytes}"
                 );
@@ -1552,6 +1596,121 @@ pub mod dns_journal {
                 .find(r#"CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json*""#)
                 .unwrap();
             assert!(copied < first_folder_delete);
+        }
+
+        /// R2: after the reconcile, a real uninstall has the exe remove the
+        /// updater's installer and the set-aside squats from
+        /// %ProgramData% — not NSIS, whose `RMDir /r` follows the junctions a
+        /// user can plant in those folders — and never on an in-place update.
+        /// "Delete the application data" adds the accounts' ML-KEM keys.
+        #[test]
+        fn the_uninstaller_removes_only_the_leftovers_through_the_exe() {
+            let pre = hook_macro("NSIS_HOOK_PREUNINSTALL");
+            in_order(
+                pre,
+                &[
+                    "--reconcile-and-exit",
+                    "${If} $UpdateMode <> 1",
+                    "${If} $DeleteAppDataCheckboxState = 1",
+                    r#"StrCpy $1 " --with-app-data""#,
+                    "nsExec::Exec /TIMEOUT=",
+                    r#""$INSTDIR\${MAINBINARYNAME}.exe" --remove-leftovers-and-exit$1'"#,
+                    "${EndIf}",
+                ],
+            );
+            assert!(MAIN.contains(
+                r#"const REMOVE_LEFTOVERS_AND_EXIT: &str = "--remove-leftovers-and-exit";"#
+            ));
+            assert!(MAIN.contains(r#"const WITH_APP_DATA: &str = "--with-app-data";"#));
+            let flag = MAIN
+                .find("arg == REMOVE_LEFTOVERS_AND_EXIT")
+                .expect("main() handles it");
+            let window = MAIN
+                .find("protected_dir::decide_legacy_upgrade_window()")
+                .expect("main() decides the upgrade window");
+            let reconcile = MAIN.find("arg == RECONCILE_AND_EXIT").unwrap();
+            let tauri = MAIN.find("tauri::Builder::default()").unwrap();
+            assert!(
+                flag < window,
+                "the cleanup run must not consume the upgrade marker"
+            );
+            assert!(window < reconcile && reconcile < tauri);
+            // Nothing in ProgramData is deleted by NSIS itself, and nothing
+            // ever deletes the state key (ProtectedStateDir) or a settings key.
+            for m in ["NSIS_HOOK_PREUNINSTALL", "NSIS_HOOK_POSTUNINSTALL"] {
+                let code: Vec<&str> = hook_macro(m)
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with(';'))
+                    .collect();
+                for line in &code {
+                    assert!(!line.contains("ProgramData"), "{m}: {line}");
+                    assert!(!line.contains("SetShellVarContext all"), "{m}: {line}");
+                    assert!(
+                        !(line.contains("DeleteRegKey") && line.contains("BIRDO_STATE_KEY")),
+                        "{m}: {line}"
+                    );
+                }
+            }
+        }
+
+        /// R1: the installer marks the upgrade of a pre-#287 install, and only
+        /// that: the version on the entry it replaces (read before the
+        /// reinstall page's uninstall-first can delete it, and for a silent
+        /// install in PREINSTALL), an MSI-era install, or a marker still
+        /// pending. Written only once the install has succeeded; an
+        /// uninstall drops one never consumed, as a value (the key keeps
+        /// ProtectedStateDir).
+        #[test]
+        fn the_installer_marks_only_the_upgrade_of_a_pre_287_install() {
+            // v1.4.47 (d4f0968) is the last release without #287 (8958efa4).
+            assert!(HOOKS.contains(r#"!define BIRDO_LAST_PRE_TRUST_VERSION "1.4.47""#));
+            // The first statement of the GUI-init/PREINSTALL adoption.
+            assert!(hook_function("BirdoAdoptLegacyRecord")
+                .lines()
+                .skip(1)
+                .find(|l| !l.trim_start().starts_with(';') && !l.trim().is_empty())
+                .is_some_and(|l| l.trim() == "Call BirdoNotePriorInstall"));
+            let note = hook_function("BirdoNotePriorInstall");
+            in_order(
+                note,
+                &[
+                    "${If} $BirdoPriorChecked = 1",
+                    "Return",
+                    r#"ReadRegDWORD $0 HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}""#,
+                    "StrCpy $BirdoLegacyUpgrade 1",
+                    r#"ReadRegStr $0 HKLM "${BIRDO_UNINSTALL_ROOT}\BirdoVPN" "DisplayVersion""#,
+                    r#"${If} $0 != """#,
+                    r#"${VersionCompare} $0 "${BIRDO_LAST_PRE_TRUST_VERSION}" $1"#,
+                    "${If} $1 != 1",
+                    "StrCpy $BirdoLegacyUpgrade 1",
+                ],
+            );
+            in_order(
+                hook_macro("NSIS_HOOK_PREINSTALL"),
+                &[
+                    "Call BirdoAdoptLegacyRecord",
+                    "Call BirdoMsiEraEntries",
+                    "${If} $0 > 0",
+                    "StrCpy $BirdoLegacyUpgrade 1",
+                ],
+            );
+            in_order(
+                hook_macro("NSIS_HOOK_POSTINSTALL"),
+                &[
+                    "${If} $BirdoLegacyUpgrade = 1",
+                    r#"WriteRegDWORD HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}" 1"#,
+                    "${EndIf}",
+                ],
+            );
+            assert_eq!(HOOKS.matches("WriteRegDWORD").count(), 1);
+            in_order(
+                hook_macro("NSIS_HOOK_POSTUNINSTALL"),
+                &[
+                    "${If} $UpdateMode <> 1",
+                    r#"DeleteRegValue HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}""#,
+                    "${EndIf}",
+                ],
+            );
         }
 
         /// REVIEW-WIN2-011: an in-place update keeps the launch-at-login

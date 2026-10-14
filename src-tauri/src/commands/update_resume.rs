@@ -315,7 +315,8 @@ impl ResumeStore {
 /// renamed within `dir`, never written to a predictable path a user could have
 /// turned into a symlink; `dir` is held open for the process lifetime.
 fn write_record(dir: &OwnedDir, record: &SignedRecord) -> std::io::Result<()> {
-    fs::create_dir_all(dir.path())?;
+    // R5: created inside verified, held parents and held from then on.
+    dir.ensure_held()?;
     let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
     let staging = format!("{FILE_NAME}.{:016x}.tmp", rand::random::<u64>());
     let written = dir
@@ -414,12 +415,30 @@ fn default_legacy_marker() -> Option<PathBuf> {
     {
         let dir = crate::utils::protected_dir::ensure().ok()?;
         let sid = crate::utils::protected_dir::current_user_sid().ok()?;
-        Some(dir.join(format!("resume-unsigned-consumed-{sid}")))
+        windows_legacy_marker(
+            &dir,
+            &sid,
+            crate::utils::protected_dir::legacy_upgrade_window(),
+        )
     }
     #[cfg(not(windows))]
     {
         dirs::data_dir().map(|base| base.join("BirdoVPN").join("resume-unsigned-consumed"))
     }
+}
+
+/// R1 (Windows): the unsigned 1.4.47 record can only be the update FROM
+/// 1.4.47, so its one-time acceptance exists only on the first start after the
+/// installer upgraded a pre-MR-1721 install (`upgrade_window`). On a fresh
+/// install there is no marker, so `accept_unsigned_once` accepts nothing: an
+/// unsigned record planted there with a fresh `written_at` connects nobody.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_legacy_marker(
+    admin_only: &std::path::Path,
+    sid: &str,
+    upgrade_window: bool,
+) -> Option<PathBuf> {
+    upgrade_window.then(|| admin_only.join(format!("resume-unsigned-consumed-{sid}")))
 }
 
 static STORE: LazyLock<ResumeStore> = LazyLock::new(|| {
@@ -891,6 +910,36 @@ mod tests {
         );
         s2.load("1.4.48", T + 6);
         assert_eq!(s2.take("1.4.48", T + 7), None, "the window stays closed");
+    }
+
+    /// R1: on Windows the one-time acceptance exists only on the first start
+    /// after the installer upgraded a pre-MR-1721 install. On a fresh install
+    /// (no upgrade marker) there is no window at all: an unsigned 1.4.47
+    /// record planted there with a fresh `written_at` is dropped.
+    #[test]
+    fn a_fresh_install_accepts_no_unsigned_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin = dir.path().join("admin-only");
+        assert_eq!(
+            windows_legacy_marker(&admin, "S-1-5-21-1", true),
+            Some(admin.join("resume-unsigned-consumed-S-1-5-21-1"))
+        );
+        let marker = windows_legacy_marker(&admin, "S-1-5-21-1", false);
+        assert_eq!(marker, None);
+
+        fs::write(
+            dir.path().join(FILE_NAME),
+            unsigned_bytes(&record_of(single("attacker-node"))),
+        )
+        .unwrap();
+        let s = ResumeStore::new(Some(OwnedDir::new(dir.path(), &[])), keyed(*KEY), marker);
+        s.load("1.4.48", T + 5);
+        assert_eq!(
+            s.take("1.4.48", T + 6),
+            None,
+            "a fresh install resumed a plant"
+        );
+        assert!(!dir.path().join(FILE_NAME).exists(), "the plant is deleted");
     }
 
     /// What `record` writes is signed, verifies with the key, and with that

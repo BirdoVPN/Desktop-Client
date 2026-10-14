@@ -18,7 +18,14 @@
 #       NSIS_HOOK_PREUNINSTALL   runs "$INSTDIR\<exe>" --reconcile-and-exit, whose
 #                                log line proves the exe started from the install dir
 #       NSIS_HOOK_POSTUNINSTALL  drops the mirror again;
-#   - the silent uninstaller removes the files, the entry and birdo://.
+#   - the silent uninstaller removes the files, the entry and birdo://;
+#   - R1: a FRESH install writes no legacy-upgrade marker
+#     (HKLM\SOFTWARE\BirdoVPN LegacyUpgradePending), so the app trusts nothing
+#     an older build could have left in the user's reach;
+#   - R2: the uninstall (NSIS_HOOK_PREUNINSTALL's --remove-leftovers-and-exit)
+#     removes %ProgramData%\BirdoVPN\updates and the set-aside
+#     %ProgramData%\BirdoVPN.untrusted-* folders WITHOUT following a junction
+#     planted in them, and keeps the admin-only directory's keys and markers.
 #
 # Safe on a runner, and checked rather than assumed. No VPN is started: a
 # silent install without /R never launches the app. --reconcile-and-exit
@@ -99,10 +106,18 @@ $appData = Join-Path $env:APPDATA 'BirdoVPN'
 $log = Join-Path $appData 'logs\birdo.log'
 $journal = Join-Path $appData 'dns-restore.json'
 $reconciled = '--reconcile-and-exit done (DNS restored: false)'
+$stateKey = 'HKLM:\SOFTWARE\BirdoVPN'                         # utils/protected_dir.rs STATE_KEY
+$markerValue = 'LegacyUpgradePending'                        # nsis-hooks.nsh BIRDO_LEGACY_UPGRADE_VALUE
+$protected = Join-Path $env:ProgramData 'BirdoVPN'           # the admin-only state directory
+function Get-LegacyMarker {
+    $p = Get-ItemProperty -LiteralPath $stateKey -Name $markerValue -ErrorAction SilentlyContinue
+    if ($p) { return $p.$markerValue }
+    return $null
+}
 
 # -- a clean runner -----------------------------------------------------------
 Step 'the runner has no BirdoVPN'
-$traces = @($instDir, $uninstKey, $recordKey, $mirrorParent, $appData) +
+$traces = @($instDir, $uninstKey, $recordKey, $mirrorParent, $appData, $protected, $stateKey) +
     @($schemes | ForEach-Object { "HKLM:\SOFTWARE\Classes\$_" })
 foreach ($t in $traces) {
     if (Test-Path -LiteralPath $t) { Fail "$t already exists: not a clean runner, refusing to install over or uninstall anything" }
@@ -176,6 +191,48 @@ foreach ($s in $schemes) {
     Write-Host "   ${s}:// -> $cmd"
 }
 
+Step 'R1: a fresh install writes no legacy-upgrade marker'
+$marker = Get-LegacyMarker
+if ($null -ne $marker) { Fail "$stateKey $markerValue = $marker after a FRESH install: the app would migrate (trust) state an older build never left" }
+Write-Host "   $stateKey $markerValue absent"
+
+# -- R2: what the uninstall must remove from %ProgramData%, and what it must keep
+Step 'R2: plant the leftovers the uninstall removes, and the state it keeps'
+# The admin-only directory, made by the app the way every start makes it (the
+# reconcile is a no-op on a runner, as below). The exe is a GUI-subsystem
+# binary, so it is waited for explicitly.
+$code = Invoke-Bounded $exe @('--reconcile-and-exit') 'the exe (--reconcile-and-exit)'
+if ($code -ne 0) { Fail "$exe --reconcile-and-exit exited $code" }
+if (-not (Test-Path -LiteralPath $protected -PathType Container)) { Fail "the app did not create $protected" }
+Write-Host "   $protected  $((Get-Acl -LiteralPath $protected).Sddl)"
+# The log this run wrote must not stand in for the uninstaller's run below.
+if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force }
+# The updater's leftovers: its temp folder and the installer it launched.
+$updater = Join-Path $protected 'updates\BirdoVPN-0.0.0-updater-ci'
+New-Item -ItemType Directory -Force -Path $updater | Out-Null
+Set-Content -LiteralPath (Join-Path $updater 'BirdoVPN_0.0.0_x64-setup.exe') -Value 'MZ'
+# What must survive: a settings key, an ML-KEM key (a silent uninstall does
+# not tick "Delete the application data") and the app's own markers.
+$kept = @(
+    (Join-Path $protected 'settings-hmac-S-1-5-21-0-0-0-1001.key'),
+    (Join-Path $protected 'pq-S-1-5-21-0-0-0-1001.bin')
+)
+foreach ($k in $kept) { Set-Content -LiteralPath $k -Value '00' }
+$kept += @(Get-ChildItem -LiteralPath $protected -File -Filter 'dns-journal-migrated-*' | ForEach-Object { $_.FullName })
+if ($kept.Count -lt 3) { Fail "the app wrote no dns-journal-migrated marker in $protected" }
+# Two squats the app set aside: a folder with a junction out of it, and a
+# junction itself. The junctions point at a folder that must survive.
+$victim = Join-Path $env:RUNNER_TEMP 'birdo-r2-victim'
+New-Item -ItemType Directory -Force -Path $victim | Out-Null
+Set-Content -LiteralPath (Join-Path $victim 'precious.txt') -Value 'keep'
+$aside1 = Join-Path $env:ProgramData 'BirdoVPN.untrusted-1'
+$aside2 = Join-Path $env:ProgramData 'BirdoVPN.untrusted-2'
+New-Item -ItemType Directory -Force -Path $aside1 | Out-Null
+Set-Content -LiteralPath (Join-Path $aside1 'planted.key') -Value 'x'
+New-Item -ItemType Junction -Path (Join-Path $aside1 'out') -Target $victim | Out-Null
+New-Item -ItemType Junction -Path $aside2 -Target $victim | Out-Null
+Get-ChildItem -LiteralPath $protected -Recurse -Force | ForEach-Object { Write-Host "   $($_.FullName)" }
+
 # -- uninstall ----------------------------------------------------------------
 Step "silent uninstall: $uninstaller /S"
 $code = Invoke-Bounded $uninstaller @('/S') 'the uninstaller'
@@ -200,6 +257,21 @@ if (-not (Select-String -LiteralPath $log -SimpleMatch -Pattern $reconciled -Qui
     Fail "the app log has no '$reconciled': the reconcile did not run to the end, or found something to restore on a clean runner"
 }
 if (Test-Path -LiteralPath $journal) { Fail "$journal exists after the uninstall: the reconcile wrote a DNS journal on a runner that had none" }
+
+Step 'R2: the uninstall removed the leftovers, kept the keys and markers, and followed no junction'
+foreach ($gone in @((Join-Path $protected 'updates'), $aside1, $aside2)) {
+    if (Test-Path -LiteralPath $gone) { Fail "$gone is still there after the uninstall (--remove-leftovers-and-exit)" }
+}
+if ((Get-Content -LiteralPath (Join-Path $victim 'precious.txt') -ErrorAction SilentlyContinue) -ne 'keep') {
+    Fail "$victim\precious.txt is gone: the uninstall followed a junction planted in a set-aside folder"
+}
+foreach ($k in $kept) {
+    if (-not (Test-Path -LiteralPath $k -PathType Leaf)) { Fail "$k was deleted: the uninstall must keep the keys and markers" }
+}
+if ($null -ne (Get-LegacyMarker)) { Fail "$stateKey $markerValue exists after the uninstall" }
+Write-Host "   gone: updates\, BirdoVPN.untrusted-1, BirdoVPN.untrusted-2; kept: $(($kept | ForEach-Object { Split-Path -Leaf $_ }) -join ', '); $victim intact"
+Remove-Item -LiteralPath $victim -Recurse -Force
+foreach ($k in $kept) { if ($k -notlike '*dns-journal-migrated-*') { Remove-Item -LiteralPath $k -Force } }
 
 Step 'the uninstall removed what the install added'
 $left = @(Get-Process -Name $MainBinaryName -ErrorAction SilentlyContinue)

@@ -87,7 +87,10 @@ fn generate() -> String {
 /// file is created new through a checked handle and renamed within the held
 /// directory, owner-only on Unix.
 fn persist(dir: &OwnedDir, name: &str, id: &str) -> Result<(), String> {
-    std::fs::create_dir_all(dir.path()).map_err(|e| format!("create dir: {e}"))?;
+    // R5: created inside verified, held parents and held from then on; a
+    // folder that cannot be verified is not written to.
+    dir.ensure_held()
+        .map_err(|e| format!("device id folder: {e}"))?;
     let tmp = format!("{name}.{:016x}.tmp", rand::random::<u64>());
     let written = dir
         .create_new(&tmp)

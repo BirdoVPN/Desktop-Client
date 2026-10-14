@@ -51,6 +51,8 @@ Var BirdoOutPathBeforeAdoption
 ; in-app updater's included), before the reinstall and folder pages, and again
 ; from NSIS_HOOK_PREINSTALL for a silent install, which has no GUI init.
 Function BirdoAdoptLegacyRecord
+  ; R1 (below): note what this install replaces while its entry still exists.
+  Call BirdoNotePriorInstall
   Push $0
   ReadRegStr $0 SHCTX "${BIRDO_MANUPRODUCTKEY}" ""
   ${If} $0 == ""
@@ -310,6 +312,65 @@ Function BirdoMsiEraEntries
   Exch $R0
 FunctionEnd
 
+; ── R1 (#287 follow-up M2): the legacy-upgrade marker ──────────────────────
+;
+; #287 (first released after 1.4.47) moved the elevated client's trust out of
+; the user's reach: the settings key to the admin-only %ProgramData%\BirdoVPN,
+; the DNS journal with it, a signed resume record. The app migrates — trusts,
+; once — what a pre-#287 install left in the user's reach (the old key
+; sources, an unsigned settings.json, the %APPDATA% DNS journal, the unsigned
+; 1.4.47 resume record) ONLY on the first start after this installer has
+; written BIRDO_LEGACY_UPGRADE_VALUE, and consumes it (utils/protected_dir.rs,
+; decide_legacy_upgrade_window). A fresh install, a new Windows account or a
+; deleted key gets no marker, so nothing in the user's reach is ever trusted
+; there.
+;
+; It is written (NSIS_HOOK_POSTINSTALL, once the install has succeeded) when
+; this install replaces:
+;   - an NSIS install whose Apps & features entry says version
+;     BIRDO_LAST_PRE_TRUST_VERSION or older; or
+;   - an MSI-era install (WIN2-012, all of them 1.4.30 or older); or
+;   - an install that still has an unconsumed marker of its own (its first
+;     start has not happened yet): kept, since the reinstall page's "uninstall
+;     before installing" runs the old uninstaller, which deletes it.
+; The entry is read before anything can remove it: from the GUI init (via
+; BirdoAdoptLegacyRecord, before the reinstall page) and from
+; NSIS_HOOK_PREINSTALL for a silent install, which has neither. Never written
+; for an entry with no version, or a newer one. HKLM, 64-bit view (the
+; template's SetContext has set SetRegView 64 by now), which only an
+; administrator can write. The uninstaller deletes an unconsumed marker
+; (NSIS_HOOK_POSTUNINSTALL), so it never outlives the install it was for.
+!define BIRDO_STATE_KEY "SOFTWARE\BirdoVPN"
+!define BIRDO_LEGACY_UPGRADE_VALUE "LegacyUpgradePending"
+!define BIRDO_LAST_PRE_TRUST_VERSION "1.4.47"
+
+Var BirdoPriorChecked
+Var BirdoLegacyUpgrade
+
+Function BirdoNotePriorInstall
+  ${If} $BirdoPriorChecked = 1
+    Return
+  ${EndIf}
+  StrCpy $BirdoPriorChecked 1
+  Push $0
+  Push $1
+  ClearErrors
+  ReadRegDWORD $0 HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}"
+  ${IfNot} ${Errors}
+    StrCpy $BirdoLegacyUpgrade 1
+  ${EndIf}
+  ReadRegStr $0 HKLM "${BIRDO_UNINSTALL_ROOT}\BirdoVPN" "DisplayVersion"
+  ${If} $0 != ""
+    ; 0: the same version, 2: older. 1: newer than the last pre-#287 one.
+    ${VersionCompare} $0 "${BIRDO_LAST_PRE_TRUST_VERSION}" $1
+    ${If} $1 != 1
+      StrCpy $BirdoLegacyUpgrade 1
+    ${EndIf}
+  ${EndIf}
+  Pop $1
+  Pop $0
+FunctionEnd
+
 !macro NSIS_HOOK_PREINSTALL
   ; The literals above must be the template's, or the adoption writes a key
   ; nothing reads: fail the build instead (REVIEW-WIN2-017: the parent key
@@ -344,6 +405,8 @@ FunctionEnd
   Call BirdoMsiEraEntries
   Pop $0
   ${If} $0 > 0
+    ; R1: an MSI-era install is from long before #287.
+    StrCpy $BirdoLegacyUpgrade 1
     ; Its exe sits at our exe's path. Stop it the way the template does right
     ; after this hook, so that msiexec finds nothing in use.
     !insertmacro BIRDO_STOP_APP_IF_RUNNING
@@ -372,6 +435,12 @@ FunctionEnd
   ; as long as a rollback to a pre-D8 build is supported.
   WriteRegStr HKLM "${BIRDO_LEGACY_MANUPRODUCTKEY}" "" $INSTDIR
   !insertmacro BIRDO_DROP_LEGACY_LANGUAGE
+  ; R1: this install replaced a pre-#287 one (see BirdoNotePriorInstall): its
+  ; first start may migrate what that install left in the user's reach. Not
+  ; written for a fresh install, or over a post-#287 one.
+  ${If} $BirdoLegacyUpgrade = 1
+    WriteRegDWORD HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}" 1
+  ${EndIf}
   ; 1.4.46 and older installed resources\.gitkeep, which bundle.resources'
   ; "resources/*" glob matched; #256 stopped shipping it. The uninstaller
   ; deletes only the files it ships, so after an upgrade that file used to
@@ -424,6 +493,30 @@ FunctionEnd
   ; whatever is still running. A reconcile cut short keeps its record (I5).
   nsExec::Exec /TIMEOUT=60000 '"$INSTDIR\${MAINBINARYNAME}.exe" --reconcile-and-exit'
   Pop $0
+
+  ; R2 (#287 follow-up L2): the admin-only %ProgramData%\BirdoVPN keeps what
+  ; the uninstall must leave — the accounts' settings keys (without them a
+  ; reinstall can no longer verify, so quarantines, the user's settings.json)
+  ; and the per-account migration markers (which keep the old %APPDATA%
+  ; sources closed for good) — and what it should not: the in-app updater's
+  ; installer in updates\, and the squatted folders the app moved aside
+  ; (BirdoVPN.untrusted-*). `--remove-leftovers-and-exit` removes those two
+  ; and nothing else; with "Delete the application data" ticked, also the
+  ; accounts' ML-KEM keys (pq-<SID>.bin, which R4 moved there from
+  ; $LOCALAPPDATA\BirdoVPN: D-23 below). The exe does it, not NSIS: the
+  ; set-aside folders are a user's, who can plant junctions in them, and
+  ; NSIS's recursive delete follows junctions (checked with NSIS 3.11).
+  ; Bounded like the reconcile; a real uninstall only (an in-place update
+  ; keeps everything).
+  ${If} $UpdateMode <> 1
+    ${If} $DeleteAppDataCheckboxState = 1
+      StrCpy $1 " --with-app-data"
+    ${Else}
+      StrCpy $1 ""
+    ${EndIf}
+    nsExec::Exec /TIMEOUT=60000 '"$INSTDIR\${MAINBINARYNAME}.exe" --remove-leftovers-and-exit$1'
+    Pop $0
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
@@ -440,6 +533,14 @@ FunctionEnd
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "BirdoVPN"
   ; D8: the old publisher's record (the mirror NSIS_HOOK_POSTINSTALL keeps).
   !insertmacro BIRDO_DROP_LEGACY_PUBLISHER_RECORD
+  ; R1: a legacy-upgrade marker the app never consumed (not started since the
+  ; upgrade) must not outlive the install: a later FRESH install would find
+  ; it. The value only — the key keeps ProtectedStateDir, the record of where
+  ; the admin-only state lives. (A reinstall's "uninstall before installing"
+  ; puts it back: BirdoNotePriorInstall read it first.)
+  ${If} $UpdateMode <> 1
+    DeleteRegValue HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}"
+  ${EndIf}
 
   ; D-23 (audit 2026-09-29): "Delete the application data".
   ;
@@ -449,7 +550,10 @@ FunctionEnd
   ; profile holding the consent flag). The client ALSO writes outside those two
   ; folders, so the same tick has to clear these too:
   ;   $APPDATA\BirdoVPN        logs (birdo.log*), dns-restore.json
-  ;   $LOCALAPPDATA\BirdoVPN   birdo_pq_v1.bin (the ML-KEM SECRET key), device_id
+  ;   $LOCALAPPDATA\BirdoVPN   device_id; birdo_pq_v1.bin (the ML-KEM SECRET
+  ;                            key) from builds before R4, which keep it in
+  ;                            %ProgramData%\BirdoVPN\pq-<SID>.bin (removed by
+  ;                            NSIS_HOOK_PREUNINSTALL's --with-app-data)
   ;   $LOCALAPPDATA\Birdo VPN  crash files
   ;   Credential Manager       access/refresh tokens, settings HMAC key,
   ;                            biometric flag (keyring targets "<name>.BirdoVPN")

@@ -439,7 +439,7 @@ impl RotatingLog {
     /// A log that is always on, opened now.
     #[cfg(test)]
     pub fn open(dir: OwnedDir, name: &str, cap: u64) -> io::Result<Self> {
-        std::fs::create_dir_all(dir.path())?;
+        dir.ensure_held()?;
         let file = dir.open_append(name)?;
         Ok(Self {
             dir,
@@ -551,8 +551,15 @@ impl RotatingLog {
     /// before it was decided.
     fn ensure_open(&self, state: &mut RotatingState) {
         if state.file.is_none() {
-            let _ = std::fs::create_dir_all(self.dir.path());
-            state.file = self.dir.open_append(&self.name).ok();
+            // R5: the folder is created inside verified, held parents and held
+            // for the rest of the process — never `create_dir_all` by path,
+            // which a junction on a parent steered — and a folder that cannot
+            // be verified gets no log.
+            state.file = self
+                .dir
+                .ensure_held()
+                .and_then(|()| self.dir.open_append(&self.name))
+                .ok();
         }
         if let Some(file) = state.file.as_mut() {
             let held = self.gate.take_held();
