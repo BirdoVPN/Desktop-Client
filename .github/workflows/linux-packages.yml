@@ -39,7 +39,7 @@ on:
       - ".github/workflows/linux-packages.yml"
       - ".github/workflows/release.yml" # the Xray pins are read from it
       - "scripts/ci/appimage-notices.sh"
-      - "scripts/ci/fetch-appimage-tooling.mjs"
+      - "scripts/ci/fetch-appimage-tooling.sh"
       - "scripts/ci/verify-updater-signature.mjs"
       - "scripts/ci/verify-bundled-xray.sh"
       - "scripts/generate-appimage-notices.mjs"
@@ -58,7 +58,7 @@ on:
       - ".github/workflows/linux-packages.yml"
       - ".github/workflows/release.yml"
       - "scripts/ci/appimage-notices.sh"
-      - "scripts/ci/fetch-appimage-tooling.mjs"
+      - "scripts/ci/fetch-appimage-tooling.sh"
       - "scripts/ci/verify-updater-signature.mjs"
       - "scripts/ci/verify-bundled-xray.sh"
       - "scripts/generate-appimage-notices.mjs"
@@ -148,7 +148,7 @@ jobs:
       # release.yml's step: the pinned AppImage runtime (LDAI_RUNTIME_FILE)
       # and AppRun (Tauri's tool cache), instead of the moving downloads.
       - name: Pin the AppImage runtime and AppRun (third_party/licenses/appimage-runtime.json)
-        run: node scripts/ci/fetch-appimage-tooling.mjs --out-dir "$RUNNER_TEMP/appimage-tooling"
+        run: bash scripts/ci/fetch-appimage-tooling.sh "$RUNNER_TEMP/appimage-tooling"
 
       # A THROWAWAY updater key, made here and gone with the runner - never
       # the real one, which a PR has no access to. With it the build below is

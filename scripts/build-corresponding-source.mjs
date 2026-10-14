@@ -46,8 +46,8 @@
 // conversion. tests.yml builds it twice and compares. Node built-ins and git
 // only: no new dependency. Run by release.yml's corresponding-source job (its
 // output is a release asset, in SHA256SUMS.txt and so under the Sigstore
-// signature) and by tests.yml on every PR. --download-dir keeps the
-// downloads between runs (each is checked again every time).
+// signature) and by tests.yml on every PR. Downloads are held in memory
+// only, never written anywhere but into the archive.
 // ============================================================================
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -82,13 +82,10 @@ const args = {};
   for (let i = 0; i < argv.length; i += 2) {
     if (i + 1 >= argv.length) fail(`${argv[i]} needs a value`);
     if (argv[i] === '--out-dir') args.outDir = path.resolve(argv[i + 1]);
-    else if (argv[i] === '--download-dir') args.downloadDir = path.resolve(argv[i + 1]);
     else fail(`unknown argument ${argv[i]}`);
   }
-  if (!args.outDir) fail('usage: node scripts/build-corresponding-source.mjs --out-dir <dir> [--download-dir <dir>]');
+  if (!args.outDir) fail('usage: node scripts/build-corresponding-source.mjs --out-dir <dir>');
 }
-const downloadDir = args.downloadDir || fs.mkdtempSync(path.join(os.tmpdir(), 'corresponding-source-'));
-fs.mkdirSync(downloadDir, { recursive: true });
 
 const byKey = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -126,26 +123,13 @@ const runtimePins = JSON.parse(fs.readFileSync(path.join(licences, 'appimage-run
 // ── Downloads ───────────────────────────────────────────────────────────────
 // The URLs are built from release.yml, the pin files and the binaries' build
 // information: only these upstreams, and only well-formed paths, are fetched.
-const ALLOWED_URL = new RegExp(
-  '^https://(' +
-    [
-      'github\\.com/XTLS/Xray-core/releases/download/v[0-9.]+/Xray-[a-z0-9-]+\\.zip',
-      'proxy\\.golang\\.org/[a-z0-9._~!/-]+/@v/[A-Za-z0-9._~!+-]+\\.zip',
-      'github\\.com/libfuse/libfuse/releases/download/fuse-[0-9.]+/fuse-[0-9.]+\\.tar\\.xz',
-      'github\\.com/vasi/squashfuse/archive/[0-9.]+\\.tar\\.gz',
-    ].join('|') +
-    ')$',
-);
+const ALLOWED_URL =
+  /^https:\/\/(github\.com\/XTLS\/Xray-core\/releases\/download\/v[0-9.]+\/Xray-[a-z0-9-]+\.zip|proxy\.golang\.org\/[a-z0-9._~!/-]+\/@v\/[A-Za-z0-9._~!+-]+\.zip|github\.com\/libfuse\/libfuse\/releases\/download\/fuse-[0-9.]+\/fuse-[0-9.]+\.tar\.xz|github\.com\/vasi\/squashfuse\/archive\/[0-9.]+\.tar\.gz)$/;
 const GIT_REPOS = new Set(['https://github.com/XTLS/Xray-core', 'https://github.com/AppImage/type2-runtime']);
 
-/** A pinned download: reused from --download-dir when it still hashes to the pin. */
-async function pinned(url, expected, cacheName, what) {
+/** A download that must hash to its pin. */
+async function pinned(url, expected, what) {
   if (!ALLOWED_URL.test(url)) return fail(`refusing to fetch ${url}: not one of the pinned upstreams`);
-  const cached = path.join(downloadDir, cacheName.replace(/[^A-Za-z0-9._@-]/g, '_'));
-  if (fs.existsSync(cached)) {
-    const buf = fs.readFileSync(cached);
-    if (sha256(buf) === expected) return buf;
-  }
   let buf;
   for (let attempt = 1; ; attempt++) {
     try {
@@ -161,7 +145,6 @@ async function pinned(url, expected, cacheName, what) {
   }
   const actual = sha256(buf);
   if (actual !== expected) fail(`${what}: SHA-256 ${actual}, pinned ${expected} (${url})`);
-  fs.writeFileSync(cached, buf);
   console.log(`verified ${url} (${actual})`);
   return buf;
 }
@@ -202,7 +185,7 @@ const escapePath = (s) => s.replace(/[A-Z]/g, (c) => `!${c.toLowerCase()}`);
 const linked = new Map(); // module path -> { version, platforms: [] }
 let goVersion = '';
 for (const p of PLATFORMS) {
-  const zip = await pinned(`https://github.com/XTLS/Xray-core/releases/download/${xrayVersion}/${p.zip}`, p.sha, `${xrayVersion}-${p.zip}`, p.zip);
+  const zip = await pinned(`https://github.com/XTLS/Xray-core/releases/download/${xrayVersion}/${p.zip}`, p.sha, p.zip);
   let bin;
   try {
     const members = zipEntries(zip).filter((e) => e.name === p.binary);
@@ -328,7 +311,7 @@ const modules = [];
 for (const [modPath, { version, platforms }] of [...linked].sort(([a], [b]) => byKey(a, b))) {
   const e = table.modules[modPath];
   const url = `https://proxy.golang.org/${escapePath(modPath)}/@v/${escapePath(version)}.zip`;
-  const zip = await pinned(url, e.zipSha256, `${modPath}@${version}.zip`, `${modPath}@${version}.zip (zipSha256 in xray-go-modules.json)`);
+  const zip = await pinned(url, e.zipSha256, `${modPath}@${version}.zip (zipSha256 in xray-go-modules.json)`);
   let h1;
   try {
     const prefix = `${modPath}@${version}/`;
@@ -360,7 +343,7 @@ const runtimeFiles = [{ file: runtimeSourceFile(rt.commit), data: runtimeTar }];
     if (!text.includes(url) || !text.includes(`${want}  ${fetched}`)) {
       fail(`type2-runtime ${rt.commit}'s build does not fetch ${url} pinned at ${want} - the mirrored ${lib.name} would not be what the runtime links`);
     }
-    runtimeFiles.push({ file, data: await pinned(url, want, file, `${lib.name} ${lib.version} source (appimage-runtime.json)`) });
+    runtimeFiles.push({ file, data: await pinned(url, want, `${lib.name} ${lib.version} source (appimage-runtime.json)`) });
   }
 }
 

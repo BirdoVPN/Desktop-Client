@@ -826,7 +826,7 @@ jobs:
       # names - the ones the notices list and the corresponding-source asset
       # mirrors the source of. The notices step checks the AppImage has them.
       - name: Pin the AppImage runtime and AppRun (third_party/licenses/appimage-runtime.json)
-        run: node scripts/ci/fetch-appimage-tooling.mjs --out-dir "$RUNNER_TEMP/appimage-tooling"
+        run: bash scripts/ci/fetch-appimage-tooling.sh "$RUNNER_TEMP/appimage-tooling"
 
       - name: Build Tauri application
         env:

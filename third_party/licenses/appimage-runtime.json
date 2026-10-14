@@ -2,7 +2,7 @@
   "_comment": [
     "What the AppImage carries besides BirdoVPN and the system libraries: the AppImage runtime (the ELF program at",
     "the start of the .AppImage file, which mounts the rest) and the AppRun launcher, plus what linuxdeploy writes.",
-    "Owner decision 2026-10-14 (L2, review round 1). scripts/ci/fetch-appimage-tooling.mjs downloads the pinned",
+    "Owner decision 2026-10-14 (L2, review round 1). scripts/ci/fetch-appimage-tooling.sh downloads the pinned",
     "runtime and AppRun (refusing any other bytes) and hands them to the bundler: the runtime via linuxdeploy-plugin-",
     "appimage's LDAI_RUNTIME_FILE (appimagetool --runtime-file; otherwise it downloads type2-runtime's moving",
     "`continuous` build), AppRun into Tauri's tool cache. scripts/generate-appimage-notices.mjs checks the built",

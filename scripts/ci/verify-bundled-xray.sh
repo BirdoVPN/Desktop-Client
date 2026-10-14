@@ -240,7 +240,7 @@ check_appimage_contents() {
     if printf '%s' "$reported" | grep -qF "/commit/${commit:0:7}"; then
       echo "  runtime  : type2-runtime ${commit:0:7}, as its notices say"
     else
-      err "$label: its runtime reports '$reported', its notices name type2-runtime $commit - the bundler used another runtime (LDAI_RUNTIME_FILE, scripts/ci/fetch-appimage-tooling.mjs)"
+      err "$label: its runtime reports '$reported', its notices name type2-runtime $commit - the bundler used another runtime (LDAI_RUNTIME_FILE, scripts/ci/fetch-appimage-tooling.sh)"
     fi
   fi
   # Check 10: the generic notices first, then the AppImage's sections.

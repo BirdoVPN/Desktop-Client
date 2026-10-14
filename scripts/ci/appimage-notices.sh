@@ -13,7 +13,7 @@
 #     keeps) plus the AppImage-only sections: every file in that AppImage
 #     (libraries by their Ubuntu package, source package and version,
 #     copyright file and cited licence texts), and its runtime, which must be
-#     the pinned one (APPIMAGE_RUNTIME_FILE, set by fetch-appimage-tooling.mjs
+#     the pinned one (APPIMAGE_RUNTIME_FILE, set by fetch-appimage-tooling.sh
 #     before the build), with the libraries it links;
 #  3. re-bundles ONLY the AppImage with <out file> as resources/THIRD-PARTY-
 #     NOTICES.txt: `tauri bundle --bundles appimage` (nothing is recompiled:
@@ -45,7 +45,7 @@ if [ ! -s "$generic" ]; then
 fi
 runtime="${APPIMAGE_RUNTIME_FILE:-}"
 if [ -z "$runtime" ] || [ ! -s "$runtime" ] || [ "${LDAI_RUNTIME_FILE:-}" != "$runtime" ]; then
-  echo "::error::APPIMAGE_RUNTIME_FILE and LDAI_RUNTIME_FILE must name the pinned AppImage runtime - run scripts/ci/fetch-appimage-tooling.mjs before tauri build"
+  echo "::error::APPIMAGE_RUNTIME_FILE and LDAI_RUNTIME_FILE must name the pinned AppImage runtime - run scripts/ci/fetch-appimage-tooling.sh before tauri build"
   exit 1
 fi
 

@@ -867,14 +867,14 @@ jobs:
       # (xray-go-modules.json), the Xray-core source by commit and tree
       # (XRAY_SOURCE_COMMIT/TREE, `git archive`) and the commit the binaries
       # carry, every module zip (zipSha256, and its line in Xray's go.sum), and
-      # the AppImage runtime's sources (appimage-runtime.json). Built twice from
-      # the same downloads (it must be byte-identical), and every module each
+      # the AppImage runtime's sources (appimage-runtime.json). Built twice, from
+      # two downloads (it must be byte-identical), and every module each
       # target's notices list must be in it under the path they give.
       - name: Build the corresponding-source asset, as the release does (pins, determinism, agreement with the notices)
         run: |
           set -euo pipefail
-          node scripts/build-corresponding-source.mjs --out-dir "$RUNNER_TEMP/source-a" --download-dir "$RUNNER_TEMP/source-downloads"
-          node scripts/build-corresponding-source.mjs --out-dir "$RUNNER_TEMP/source-b" --download-dir "$RUNNER_TEMP/source-downloads"
+          node scripts/build-corresponding-source.mjs --out-dir "$RUNNER_TEMP/source-a"
+          node scripts/build-corresponding-source.mjs --out-dir "$RUNNER_TEMP/source-b"
           built=("$RUNNER_TEMP"/source-a/*.tar.gz)
           name=$(basename "${built[0]}")
           cmp "${built[0]}" "$RUNNER_TEMP/source-b/$name"

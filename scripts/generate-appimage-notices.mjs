@@ -220,7 +220,7 @@ const isOwn = (rel) =>
   rel === `usr/bin/${binaryName}` ||
   rel.startsWith(`usr/lib/${productName}/`) ||
   rel === `usr/share/applications/${productName}.desktop` ||
-  new RegExp(`^usr/share/icons/hicolor/[^/]+/apps/${binaryName.replace(/[.-]/g, '\\$&')}\\.png$`).test(rel) ||
+  (rel.startsWith('usr/share/icons/hicolor/') && rel.endsWith(`/apps/${binaryName}.png`) && rel.split('/').length === 7) ||
   rel === `${productName}.png`;
 const GENERATED_CACHES = new Set(['loaders.cache', 'immodules.cache', 'giomodule.cache', 'gschemas.compiled']);
 
