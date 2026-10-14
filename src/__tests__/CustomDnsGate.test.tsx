@@ -100,6 +100,36 @@ describe('useCustomDnsGate', () => {
     await waitFor(() => expect(saves()).toHaveLength(1));
   });
 
+  // WIN3-009 item 4: the switch-off's live rebuild fails, and Rust puts the
+  // previous settings back — Custom DNS on again. The gate used to stay put
+  // (one attempt only), leaving the addresses in use on a plan without them.
+  it('a switch-off a failed reapply put back is made again, saving the file only', async () => {
+    useAppStore.setState({ connectionState: 'connected' });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case 'reapply_vpn_settings':
+          return 'reverted';
+        // What Rust saved back: the session's own settings, Custom DNS on.
+        case 'get_settings':
+          return { custom_dns: ['9.9.9.9'], killswitch_enabled: true, lockdown_mode: true };
+        default:
+          return undefined;
+      }
+    });
+    const reapplies = () => mockedInvoke.mock.calls.filter(([c]) => c === 'reapply_vpn_settings');
+    renderHook(() => useCustomDnsGate());
+    act(() => useAppStore.setState({ customDnsByPlan: { RECON: false } }));
+    await waitFor(() => expect(reapplies()).toHaveLength(1), { timeout: 3000 });
+    await waitFor(() => expect(saves()).toHaveLength(2), { timeout: 3000 });
+    expect(saves().map((s) => s.custom_dns)).toEqual([null, null]);
+    expect(useAppStore.getState().settings.customDnsEnabled).toBe(false);
+    // No second rebuild for the same change: it would loop on a rebuild that
+    // keeps failing.
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(reapplies()).toHaveLength(1);
+    expect(saves()).toHaveLength(2);
+  });
+
   it('a failed save is tried once, not in a loop', async () => {
     saveFails = true;
     renderHook(() => useCustomDnsGate());
