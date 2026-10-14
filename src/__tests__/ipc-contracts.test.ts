@@ -407,6 +407,8 @@ const FRONTEND_COMMANDS = [
   'get_required_update',
   // The session an update ended, resumed once (MR-1861)
   'take_update_resume',
+  // Settings › About › Licences: the bundled third-party notices (MR-1685)
+  'get_third_party_notices',
   // Account data
   'get_subscription_status',
   'get_usage_stats',
@@ -427,6 +429,8 @@ const FRONTEND_COMMANDS = [
   'take_pending_deep_link',
   // The window up from the tray: re-consent behind Start Minimized (REVIEW-WIN2-010)
   'show_main_window',
+  // The anonymous account number, kept out of clipboard history (MR-1723)
+  'copy_sensitive',
 ] as const;
 
 function sourceFiles(dir: string): string[] {

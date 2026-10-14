@@ -16,6 +16,9 @@
 #   5. EMPTY expected hash                   -> 1   (GITHUB_ENV never set)
 #   6. -RequireAuthenticode on unsigned data -> 1
 #   7. missing installer path                -> 1
+#   8. no resources\THIRD-PARTY-NOTICES.txt, one outside resources\, or
+#      another build's                       -> 1   (MR-1685)
+#   9. EMPTY or missing -ExpectedNotices     -> 1
 #
 # Each scenario runs the gate in a CHILD PowerShell process so `exit` codes
 # are observed the way GitHub Actions observes them. Runs under Windows
@@ -34,10 +37,23 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 # so compute the expectation with the same primitive.
 $payload = [byte[]](0..4095 | ForEach-Object { ($_ * 7 + 13) -band 0xFF })
 
+# The notices this "build" generated (MR-1685). Every fake installer carries
+# them at resources\THIRD-PARTY-NOTICES.txt unless a scenario says otherwise,
+# and every gate run is given them unless a scenario passes its own.
+$noticesFile = Join-Path $work 'THIRD-PARTY-NOTICES.txt'
+[System.IO.File]::WriteAllText($noticesFile, "THIRD-PARTY SOFTWARE NOTICES - fixture")
+$noticesBytes = [System.IO.File]::ReadAllBytes($noticesFile)
+
 function New-FakeInstaller {
-    param([string]$Name, [string]$InnerRelativePath, [byte[]]$Bytes)
+    param([string]$Name, [string]$InnerRelativePath, [byte[]]$Bytes,
+        [string]$NoticesRelativePath = 'resources\THIRD-PARTY-NOTICES.txt', [byte[]]$Notices = $noticesBytes)
     $stage = Join-Path $work ("stage-" + $Name)
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    if ($NoticesRelativePath) {
+        $n = Join-Path $stage $NoticesRelativePath
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $n) | Out-Null
+        [System.IO.File]::WriteAllBytes($n, $Notices)
+    }
     if ($InnerRelativePath) {
         $file = Join-Path $stage $InnerRelativePath
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $file) | Out-Null
@@ -59,6 +75,7 @@ function New-FakeInstaller {
 function Invoke-Gate {
     param([string[]]$GateArgs)
     $extract = Join-Path $work ("extract-" + [System.IO.Path]::GetRandomFileName())
+    if ($GateArgs -notcontains '-ExpectedNotices') { $GateArgs = $GateArgs + @('-ExpectedNotices', $noticesFile) }
     $allArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $script) + $GateArgs + @('-ExtractDir', $extract)
     # Capture via a log file rather than 2>&1: under Windows PowerShell 5.1
     # with $ErrorActionPreference='Stop', a child's stderr line redirected
@@ -123,7 +140,7 @@ Assert-Exit '-RequireAuthenticode on unsigned payload fails' (Invoke-Gate @('-In
 # v1.4.42 tag build died on exactly that difference while the child-process
 # harness stayed green. This scenario binds the switch the way the workflow
 # does, so the harness and the workflow can no longer disagree.
-$inproc = @{ Installer = $good; ExpectedSha256 = $goodSha; RequireAuthenticode = $true; ExtractDir = (Join-Path $work 'extract-inproc') }
+$inproc = @{ Installer = $good; ExpectedSha256 = $goodSha; ExpectedNotices = $noticesFile; RequireAuthenticode = $true; ExtractDir = (Join-Path $work 'extract-inproc') }
 # *>&1, not 2>&1: in-process Write-Host goes to the Information stream (6), which
 # 2>&1 never merges — the first cut of this scenario captured an EMPTY string and
 # reported FAIL while the gate had exited 1 correctly (#159 review).
@@ -136,7 +153,7 @@ if ($inprocCode -ne 1 -or $inprocOut -notmatch 'Authenticode status') {
 } else {
     Write-Host "PASS in-process hashtable splat binds -RequireAuthenticode (exit 1, refused unsigned payload)"
 }
-$inprocOk = @{ Installer = $good; ExpectedSha256 = $goodSha; ExtractDir = (Join-Path $work 'extract-inproc-ok') }
+$inprocOk = @{ Installer = $good; ExpectedSha256 = $goodSha; ExpectedNotices = $noticesFile; ExtractDir = (Join-Path $work 'extract-inproc-ok') }
 $null = & $script @inprocOk *>&1 | Out-String
 if ($LASTEXITCODE -ne 0) {
     Write-Host "FAIL in-process hashtable splat without the switch: expected exit 0, got $LASTEXITCODE"
@@ -147,6 +164,18 @@ if ($LASTEXITCODE -ne 0) {
 
 # 7. missing installer
 Assert-Exit 'missing installer fails' (Invoke-Gate @('-Installer', (Join-Path $work 'does-not-exist-setup.exe'), '-ExpectedSha256', $goodSha)) 1 'installer not found'
+
+# 8. MR-1685: the installer carries the notices this build generated
+$noNotices = New-FakeInstaller -Name 'nonotices' -InnerRelativePath 'resources\xray.exe' -Bytes $payload -NoticesRelativePath ''
+Assert-Exit 'installer without THIRD-PARTY-NOTICES.txt fails' (Invoke-Gate @('-Installer', $noNotices, '-ExpectedSha256', $goodSha)) 1 'would ship without its third-party licence notices'
+$looseNotices = New-FakeInstaller -Name 'loosenotices' -InnerRelativePath 'resources\xray.exe' -Bytes $payload -NoticesRelativePath 'THIRD-PARTY-NOTICES.txt'
+Assert-Exit 'THIRD-PARTY-NOTICES.txt outside resources\ fails' (Invoke-Gate @('-Installer', $looseNotices, '-ExpectedSha256', $goodSha)) 1 'found 0'
+$oldNotices = New-FakeInstaller -Name 'oldnotices' -InnerRelativePath 'resources\xray.exe' -Bytes $payload -Notices ([System.Text.Encoding]::UTF8.GetBytes("notices from another build"))
+Assert-Exit "another build's THIRD-PARTY-NOTICES.txt fails" (Invoke-Gate @('-Installer', $oldNotices, '-ExpectedSha256', $goodSha)) 1 'is not the file this build generated'
+
+# 9. the expectation itself must be given
+Assert-Exit 'empty -ExpectedNotices fails' (Invoke-Gate @('-Installer', $good, '-ExpectedSha256', $goodSha, '-ExpectedNotices', '')) 1 'ExpectedNotices must name'
+Assert-Exit 'missing -ExpectedNotices file fails' (Invoke-Gate @('-Installer', $good, '-ExpectedSha256', $goodSha, '-ExpectedNotices', (Join-Path $work 'no-such-notices.txt'))) 1 'ExpectedNotices must name'
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 

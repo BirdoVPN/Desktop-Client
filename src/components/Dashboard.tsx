@@ -89,7 +89,7 @@ export function Dashboard() {
         : findLiveServer(s.servers, s.liveServerId, s.liveServerName),
       liveMultiHop: s.liveMultiHop,
       userEmail: s.account.email ?? s.userEmail,
-      anonymous: resolveAnonymousAccount(s.account, s.account.email ?? s.userEmail).isAnon,
+      anonymous: resolveAnonymousAccount(s.account).isAnon,
       plan: s.account.plan,
       lastServerId: s.lastServerId,
       multiHopEnabled: s.settings.multiHopEnabled,

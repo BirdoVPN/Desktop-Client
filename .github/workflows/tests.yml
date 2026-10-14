@@ -733,6 +733,96 @@ jobs:
       - name: Run the gate against fake packages (pass + must-fail scenarios)
         run: bash scripts/ci/verify-bundled-xray.tests.sh
 
+  # MR-1685: every package ships resources/THIRD-PARTY-NOTICES.txt, which
+  # release.yml generates per build job (scripts/generate-third-party-notices.mjs)
+  # and its post-bundle gates require. The generator FAILS on a crate or npm
+  # package whose licence it cannot ship the text of, so run it here for all
+  # four release targets: a dependency bump that adds such a package fails the
+  # PR, not the next release. No --xray: the Go modules are read from the
+  # bundled binary by the build jobs (and on PRs by nsis-installer.yml).
+  third-party-notices:
+    name: Third-party notices generate for every release target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      # The generator reads each npm package's licence files from node_modules.
+      - name: Install dependencies
+        run: npm ci
+
+      # The release-day path, before release day: the Xray and Wintun zips
+      # release.yml bundles (its URLs, version and SHA-256 pins, read from it),
+      # then `--release` with each platform's own xray binary (PE, ELF and
+      # both Mach-O), so the Go build-info reader, the module/version/licence
+      # match against third_party/licenses/xray-go-modules.json and the
+      # archives' licence checks all run on every PR.
+      - name: Fetch the Xray and Wintun archives release.yml pins
+        run: |
+          set -euo pipefail
+          rel=.github/workflows/release.yml
+          pin() { sed -nE "s/^[[:space:]]*$1: ([0-9a-zA-Z.]+)$/\1/p" "$rel"; }
+          version=$(pin XRAY_VERSION)
+          fetch() { # fetch <url> <sha256> <dir>
+            local zip
+            zip="$RUNNER_TEMP/$(basename "$1")"
+            curl -fsSL --retry 3 "$1" -o "$zip"
+            echo "$2  $zip" | sha256sum -c -
+            mkdir -p "$3"
+            unzip -q -o "$zip" -d "$3"
+          }
+          base="https://github.com/XTLS/Xray-core/releases/download/$version"
+          fetch "$base/Xray-windows-64.zip" "$(pin XRAY_WINDOWS_SHA256)" "$RUNNER_TEMP/xray-windows"
+          fetch "$base/Xray-linux-64.zip" "$(pin XRAY_LINUX_SHA256)" "$RUNNER_TEMP/xray-linux"
+          fetch "$base/Xray-macos-arm64-v8a.zip" "$(pin XRAY_MACOS_ARM64_SHA256)" "$RUNNER_TEMP/xray-macos-arm64"
+          fetch "$base/Xray-macos-64.zip" "$(pin XRAY_MACOS_AMD64_SHA256)" "$RUNNER_TEMP/xray-macos-x64"
+          # [$]: a literal dollar (PowerShell's variable sigil in release.yml).
+          wintun_url=$(sed -nE 's/^[[:space:]]*[$]wintunUrl = "(https:[^"]+)"$/\1/p' "$rel")
+          wintun_sha=$(sed -nE 's/^[[:space:]]*[$]expectedSha = "([0-9a-f]{64})"$/\1/p' "$rel")
+          fetch "$wintun_url" "$wintun_sha" "$RUNNER_TEMP/wintun"
+
+      - name: Generate the notices for each release target, as the release does
+        run: |
+          set -euo pipefail
+          xray_version=$(sed -nE 's/^[[:space:]]*XRAY_VERSION: (v[0-9.]+)$/\1/p' .github/workflows/release.yml)
+          gen() { # gen <target> <xray dir> <xray binary name> [extra args]
+            local target="$1" dir="$2" bin="$3"
+            shift 3
+            node scripts/generate-third-party-notices.mjs --release --target "$target" \
+              --xray "$dir/$bin" --xray-license "$dir/LICENSE" --out "$RUNNER_TEMP/notices-$target.txt" "$@"
+          }
+          gen x86_64-pc-windows-msvc "$RUNNER_TEMP/xray-windows" xray.exe --wintun-license "$RUNNER_TEMP/wintun/wintun/LICENSE.txt"
+          gen x86_64-unknown-linux-gnu "$RUNNER_TEMP/xray-linux" xray
+          gen aarch64-apple-darwin "$RUNNER_TEMP/xray-macos-arm64" xray
+          gen x86_64-apple-darwin "$RUNNER_TEMP/xray-macos-x64" xray
+          for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            out="$RUNNER_TEMP/notices-$target.txt"
+            # What MR-1685 requires of every package's file, checked by name.
+            grep -qxF "  source: https://github.com/XTLS/Xray-core at $xray_version" "$out"
+            grep -qF 'Mozilla Public License Version 2.0' "$out"
+            grep -qF 'GNU GENERAL PUBLIC LICENSE' "$out"
+            grep -qF 'SIL OPEN FONT LICENSE Version 1.1' "$out"
+            grep -qE '^    Go [0-9.]+ - BSD-3-Clause \[T[0-9]+\]$' "$out"
+            case "$target" in
+              *windows*) grep -qF 'Prebuilt Binaries License' "$out" ;;
+              *) if grep -qF 'wintun.dll' "$out"; then echo "::error::$target lists wintun.dll"; exit 1; fi ;;
+            esac
+          done
+
   # Version-consistency gate. The app version is declared in THREE places:
   # package.json, src-tauri/tauri.conf.json, and src-tauri/Cargo.toml
   # ([package] version). The in-app updater matches installed-vs-release by

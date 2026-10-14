@@ -176,8 +176,27 @@ describe('Profile', () => {
     expect(document.body.textContent).not.toContain('1234 5678');
     await userEvent.click(screen.getByRole('button', { name: 'Show account number' }));
     expect(screen.getByTestId('account-number')).toHaveTextContent('1234 5678 9012 3456 7890 1234');
-    await userEvent.click(screen.getByRole('button', { name: 'Copy account number' }));
-    expect(writeText).toHaveBeenCalledWith('123456789012345678901234');
+    const realUserAgent = navigator.userAgent;
+    const setUserAgent = (ua: string) =>
+      Object.defineProperty(window.navigator, 'userAgent', { value: ua, configurable: true });
+    try {
+      // MR-1723, Windows: through Rust's copy_sensitive (kept out of clipboard
+      // history, cleared after a minute), not the webview's ordinary clipboard.
+      setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/141.0');
+      mockedInvoke.mockImplementation(async (cmd: string) => (cmd === 'copy_sensitive' ? true : undefined));
+      await userEvent.click(screen.getByRole('button', { name: 'Copy account number' }));
+      await waitFor(() =>
+        expect(callsTo('copy_sensitive')).toEqual([['copy_sensitive', { text: '123456789012345678901234' }]]),
+      );
+      expect(writeText).not.toHaveBeenCalled();
+      // macOS / Linux: the ordinary copy, at once (inside the click), no IPC.
+      setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15');
+      await userEvent.click(screen.getByRole('button', { name: 'Copy account number' }));
+      expect(writeText).toHaveBeenCalledWith('123456789012345678901234');
+      expect(callsTo('copy_sensitive')).toHaveLength(1);
+    } finally {
+      setUserAgent(realUserAgent);
+    }
   });
 
   it('a server that sends no number: still "Anonymous account", no number, and says why', () => {
@@ -198,19 +217,24 @@ describe('Profile', () => {
     expect(document.body.textContent).not.toContain('member@');
   });
 
-  it('an old server: the account number comes from the synthetic email, still masked', () => {
+  // MR-918: the number comes from `/auth/me`'s accountNumber only; the
+  // synthetic email beside it (phase 1) is neither parsed nor rendered.
+  it('the account number comes from accountNumber, never from the synthetic email', () => {
     useAppStore.setState({
       account: {
         ...useAppStore.getState().account,
-        email: 'anon_123456789012345678901234@anonymous.local',
+        email: 'anon_111122223333444455556666@anonymous.local',
+        isAnonymous: true,
+        accountNumber: '999988887777666655554321',
         plan: 'RECON',
       },
     });
     render(<Profile />);
     // The identity card and the Sign out row both say so.
     expect(screen.getAllByText('Anonymous account').length).toBeGreaterThan(0);
-    expect(screen.getByTestId('account-number')).toHaveTextContent('•••• •••• •••• •••• •••• 1234');
+    expect(screen.getByTestId('account-number')).toHaveTextContent('•••• •••• •••• •••• •••• 4321');
     expect(document.body.textContent).not.toContain('anon_');
+    expect(document.body.textContent).not.toContain('6666');
   });
 
   it('not connected: "Not connected · Click Connect to start"', () => {

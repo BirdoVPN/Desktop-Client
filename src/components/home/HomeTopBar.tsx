@@ -5,11 +5,10 @@
 import { Lock, LogOut, Route as AltRoute } from 'lucide-react';
 import { BirdoIconAction } from '@/components/birdo';
 import { brand, hairline, white } from '@/lib/birdo-theme';
-import { anonAccountNumber } from '@/utils/helpers';
 
 interface HomeTopBarProps {
   userEmail: string | null;
-  /** `resolveAnonymousAccount` (item 86): the server's answer, or the email's shape. */
+  /** `resolveAnonymousAccount`: `/auth/me`'s `isAnonymous` (item 86, MR-918). */
   anonymous: boolean;
   multiHopArmed: boolean;
   /** `null` = plan not known yet: no lock badge, no upsell (W2-011). */
@@ -29,10 +28,10 @@ export function HomeTopBar({
   onToggleMultiHop,
   onSignOut,
 }: HomeTopBarProps) {
-  // Never the synthetic `anon_<account number>@anonymous.local`: it is the
+  // Never an anonymous account's email: its synthetic address carries the
   // account's only credential, on the screen people screenshot most
   // (P1-parity-007). iOS shows the same words.
-  const identity = anonymous || anonAccountNumber(userEmail) ? 'Anonymous account' : userEmail;
+  const identity = anonymous ? 'Anonymous account' : userEmail;
   return (
     <div
       className="relative z-20 flex items-center gap-2 px-4 pt-3 pb-2"

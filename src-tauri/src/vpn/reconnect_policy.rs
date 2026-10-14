@@ -719,13 +719,14 @@ impl ReconnectPolicy {
                 let delay = if std::mem::take(&mut self.immediate) {
                     Duration::ZERO
                 } else {
-                    // MR-1639: a refusal that names its own wait
-                    // (`quota_check_unavailable`, `psk_delivery_unavailable`)
-                    // is never re-dialled sooner than the server asked.
+                    // MR-1639 / MR-1808: a refusal that names its own wait
+                    // (`quota_check_unavailable`, `psk_delivery_unavailable`,
+                    // a 429's or a busy 5xx's `Retry-After`) is never
+                    // re-dialled sooner than the server asked.
                     let backoff = backoff_delay(self.attempts, &self.budget);
                     self.last_error
                         .as_ref()
-                        .and_then(IpcError::server_asked_to_wait)
+                        .and_then(IpcError::retry_wait)
                         .map_or(backoff, |wait| backoff.max(wait))
                 };
                 self.attempts += 1;
@@ -958,20 +959,68 @@ mod tests {
         }
     }
 
-    /// Only a retryable `server_error` names a wait the policy honours: a
-    /// `retry_after_secs` on any other code (the sign-in rate limit) is not a
-    /// dial-path answer, and changes nothing here.
+    /// Which waits each dial path honours. The connect's one automatic retry
+    /// (`server_asked_to_wait`) is for a retryable `server_error` only — a
+    /// rate limit is reported with its wait instead. Auto-reconnect
+    /// (`retry_wait`) honours the wait of any retryable error, a 429's
+    /// included (MR-1808): re-dialling inside it would only be refused again.
+    /// A hard refusal names no wait at all.
     #[test]
-    fn only_a_retryable_server_error_carries_a_dial_wait() {
+    fn which_waits_each_dial_path_honours() {
+        let s30 = Some(Duration::from_secs(30));
         let rate_limited =
             IpcError::new(IpcErrorCode::RateLimited, "slow down").with_retry_after(30);
         assert_eq!(rate_limited.server_asked_to_wait(), None);
+        assert_eq!(rate_limited.retry_wait(), s30);
         let server = IpcError::new(IpcErrorCode::ServerError, "x").with_retry_after(30);
-        assert_eq!(server.server_asked_to_wait(), Some(Duration::from_secs(30)));
-        assert_eq!(
-            IpcError::new(IpcErrorCode::ServerError, "x").server_asked_to_wait(),
-            None
-        );
+        assert_eq!(server.server_asked_to_wait(), s30);
+        assert_eq!(server.retry_wait(), s30);
+        let bare = IpcError::new(IpcErrorCode::ServerError, "x");
+        assert_eq!(bare.server_asked_to_wait(), None);
+        assert_eq!(bare.retry_wait(), None);
+        let refused = IpcError::new(IpcErrorCode::DeviceLimit, "x").with_retry_after(30);
+        assert_eq!(refused.retry_wait(), None);
+    }
+
+    /// MR-1808: a re-dial answered 429, or a busy 5xx, with `Retry-After` is
+    /// re-dialled no sooner than the server asked — through the client's real
+    /// classification. It used to re-dial on the plain backoff (2 s, 4 s, …),
+    /// spending the budget against a server that had said when to come back.
+    #[test]
+    fn a_rate_limited_or_busy_redial_waits_for_retry_after() {
+        use crate::api::BirdoApi;
+        use reqwest::StatusCode;
+        for (status, body) in [
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"statusCode":429,"message":"ThrottlerException: Too Many Requests"}"#,
+            ),
+            (StatusCode::SERVICE_UNAVAILABLE, ""),
+            (
+                StatusCode::BAD_GATEWAY,
+                r#"{"statusCode":502,"message":"Bad gateway"}"#,
+            ),
+        ] {
+            let mut p = ReconnectPolicy::new(budget());
+            let now = Instant::now();
+            let mut delays = Vec::new();
+            for _ in 0..3 {
+                match p.decide(&not_connected(now)) {
+                    Action::Dial { delay, .. } => delays.push(delay.as_secs()),
+                    other => panic!("{other:?}"),
+                }
+                let error = IpcError::from_api(&BirdoApi::classify_error_response_after(
+                    status,
+                    body,
+                    Some(45),
+                ));
+                assert!(!error.code.is_hard_refusal(), "{status}");
+                p.on_dial_failed(error);
+            }
+            // The first dial follows the drop; then max(backoff 2, 4; the
+            // server's 45).
+            assert_eq!(delays, vec![1, 45, 45], "{status}");
+        }
     }
 
     /// The 426 latch (W1 section (b)): recovery stops; a live tunnel is left
