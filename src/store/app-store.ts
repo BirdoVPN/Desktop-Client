@@ -99,7 +99,8 @@ export type RouteId =
   | 'vpnSettings'
   | 'splitTunnel'
   | 'portForward'
-  | 'pricing';
+  | 'pricing'
+  | 'licences';
 
 export interface AppSettings {
   killSwitchEnabled: boolean;

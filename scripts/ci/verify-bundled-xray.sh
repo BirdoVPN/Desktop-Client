@@ -13,7 +13,7 @@
 # the binary on every stealth connect, on every machine.
 #
 # Usage:
-#   scripts/ci/verify-bundled-xray.sh <expected-sha256> <artifact> [<artifact>...]
+#   NOTICES_FILE=src-tauri/resources/THIRD-PARTY-NOTICES.txt #     scripts/ci/verify-bundled-xray.sh <expected-sha256> <artifact> [<artifact>...]
 #
 # Artifact kinds, chosen by name:
 #   *.app         macOS bundle dir  -> Contents/Resources/resources/xray
@@ -38,6 +38,13 @@
 #      usr/lib/BirdoVPN/resources/.gitkeep (#256). The build jobs now delete
 #      the tracked src-tauri/resources/.gitkeep before bundling; this proves
 #      they did. (The Windows twin: nsis-install-smoke.ps1.)
+#   7. exactly one resources/THIRD-PARTY-NOTICES.txt, a regular file
+#      byte-identical to the file NOTICES_FILE names - the notices this
+#      build generated (scripts/generate-third-party-notices.mjs). MR-1685:
+#      every package ships Xray-core's and the GPL modules' licences, the
+#      Xray source pointer and every crate's and npm package's licence, and
+#      Settings › About › Licences reads this file. NOTICES_FILE is required:
+#      unset, empty or missing fails before any artifact is opened.
 #
 # Self-test: scripts/ci/verify-bundled-xray.tests.sh (tests.yml runs it on
 # Linux and macOS on every PR), with fixtures for each failure path.
@@ -62,6 +69,7 @@ if ! printf '%s' "$expected" | grep -qE '^[0-9a-fA-F]{64}$'; then
   exit 1
 fi
 expected_lc="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
+notices="${NOTICES_FILE:-}"
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -70,6 +78,12 @@ sha256_of() {
     shasum -a 256 "$1" | awk '{print $1}'
   fi
 }
+
+if [ -z "$notices" ] || [ ! -s "$notices" ]; then
+  echo "::error::verify-bundled-xray: NOTICES_FILE must name this build's generated THIRD-PARTY-NOTICES.txt (got '$notices') - without it no package can be checked for its third-party notices (MR-1685)"
+  exit 1
+fi
+notices_sha="$(sha256_of "$notices")"
 
 work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/xray-gate.XXXXXX")"
 mounts=()
@@ -95,22 +109,36 @@ collect() {
 }
 
 # check_tree <label> <root> <macos|linux>
-# Applies checks 2-6 to an unpacked artifact tree.
+# Applies checks 2-7 to an unpacked artifact tree.
 check_tree() {
   local label="$1" root="$2" kind="$3"
-  local xray_pattern bin_pattern resources_pattern
+  local xray_pattern bin_pattern resources_pattern notices_pattern
   case "$kind" in
     macos)
       xray_pattern='*/Contents/Resources/resources/xray'
       bin_pattern='*/Contents/MacOS/*'
       resources_pattern='*/Contents/Resources/resources/*'
+      notices_pattern='*/Contents/Resources/resources/THIRD-PARTY-NOTICES.txt'
       ;;
     linux)
       xray_pattern='*/usr/lib/*/resources/xray'
       bin_pattern='*/usr/bin/*'
       resources_pattern='*/usr/lib/*/resources/*'
+      notices_pattern='*/usr/lib/*/resources/THIRD-PARTY-NOTICES.txt'
       ;;
   esac
+
+  # Check 7, also before the early returns below.
+  collect "$root" -path "$notices_pattern" ! -type d
+  if [ "${#found[@]}" -ne 1 ]; then
+    err "$label: expected one resources/THIRD-PARTY-NOTICES.txt, found ${#found[@]} - the package would ship without its third-party licence notices (MR-1685)"
+  elif [ -L "${found[0]}" ] || [ ! -f "${found[0]}" ]; then
+    err "$label: ${found[0]#"$root"/} is not a regular file"
+  elif [ "$(sha256_of "${found[0]}")" != "$notices_sha" ]; then
+    err "$label: the bundled THIRD-PARTY-NOTICES.txt is not the file this build generated ($notices)"
+  else
+    echo "  notices  : ${found[0]#"$root"/} is this build's ($notices_sha)"
+  fi
 
   # Check 6 first: the checks below return early on a missing xray.
   collect "$root" -path "$resources_pattern" -name '.*'
@@ -240,4 +268,4 @@ if [ "$fail_count" -gt 0 ]; then
   echo "verify-bundled-xray: $fail_count failure(s) across $n artifact(s)"
   exit 1
 fi
-echo "OK: every artifact ($n) ships an executable resources/xray matching the compiled-in XRAY_BINARY_SHA256 ($expected_lc), and no dotfile under resources/"
+echo "OK: every artifact ($n) ships an executable resources/xray matching the compiled-in XRAY_BINARY_SHA256 ($expected_lc), this build's resources/THIRD-PARTY-NOTICES.txt, and no dotfile under resources/"

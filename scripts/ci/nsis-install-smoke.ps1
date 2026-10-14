@@ -9,7 +9,8 @@
 # of BirdoVPN is already on the machine.
 #
 # What it proves, beyond "the installer runs":
-#   - the installer lays down the app and its resources (and no dotfile such
+#   - the installer lays down the app and its resources, the third-party
+#     notices among them (and no dotfile such
 #     as resources\.gitkeep), the Apps & features entry (version and
 #     publisher as tauri.conf.json says) and birdo://;
 #   - the hooks in src-tauri/nsis-hooks.nsh are compiled in AND run:
@@ -128,7 +129,9 @@ $code = Invoke-Bounded $Installer @('/S') 'the installer'
 if ($code -ne 0) { Fail "the installer exited $code" }
 
 Step "installed files under $instDir"
-foreach ($f in @($exe, $uninstaller, (Join-Path $instDir 'resources\xray.exe'), (Join-Path $instDir 'resources\wintun.dll'))) {
+# THIRD-PARTY-NOTICES.txt: the licence notices that Settings > About >
+# Licences reads from the install dir (MR-1685).
+foreach ($f in @($exe, $uninstaller, (Join-Path $instDir 'resources\xray.exe'), (Join-Path $instDir 'resources\wintun.dll'), (Join-Path $instDir 'resources\THIRD-PARTY-NOTICES.txt'))) {
     if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { Fail "missing after install: $f" }
 }
 Get-ChildItem -LiteralPath $instDir -Recurse -File -Force |

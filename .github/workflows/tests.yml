@@ -731,6 +731,54 @@ jobs:
       - name: Run the gate against fake packages (pass + must-fail scenarios)
         run: bash scripts/ci/verify-bundled-xray.tests.sh
 
+  # MR-1685: every package ships resources/THIRD-PARTY-NOTICES.txt, which
+  # release.yml generates per build job (scripts/generate-third-party-notices.mjs)
+  # and its post-bundle gates require. The generator FAILS on a crate or npm
+  # package whose licence it cannot ship the text of, so run it here for all
+  # four release targets: a dependency bump that adds such a package fails the
+  # PR, not the next release. No --xray: the Go modules are read from the
+  # bundled binary by the build jobs (and on PRs by nsis-installer.yml).
+  third-party-notices:
+    name: Third-party notices generate for every release target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up the pinned Rust toolchain (rust-toolchain.toml)
+        uses: ./.github/actions/setup-rust
+
+      # The generator reads each npm package's licence files from node_modules.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate the notices for each release target
+        run: |
+          set -euo pipefail
+          xray_version=$(sed -nE 's/^[[:space:]]*XRAY_VERSION: (v[0-9.]+)$/\1/p' .github/workflows/release.yml)
+          for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            out="$RUNNER_TEMP/notices-$target.txt"
+            node scripts/generate-third-party-notices.mjs --target "$target" --out "$out"
+            # What MR-1685 requires of every package's file, checked by name.
+            grep -qxF "  source: https://github.com/XTLS/Xray-core at $xray_version" "$out"
+            grep -qF 'Mozilla Public License Version 2.0' "$out"
+            case "$target" in
+              *windows*) grep -qF 'Prebuilt Binaries License' "$out" ;;
+              *) if grep -qF 'wintun.dll' "$out"; then echo "::error::$target lists wintun.dll"; exit 1; fi ;;
+            esac
+          done
+
   # Version-consistency gate. The app version is declared in THREE places:
   # package.json, src-tauri/tauri.conf.json, and src-tauri/Cargo.toml
   # ([package] version). The in-app updater matches installed-vs-release by

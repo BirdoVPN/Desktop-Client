@@ -43,6 +43,7 @@ import {
   Bug,
   ScrollText,
   Trash2,
+  Scale,
 } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
 import { isMacPlatform, isPrivateDnsAddress, isValidDnsAddress, isWindowsPlatform } from '@/utils/helpers';
@@ -619,6 +620,14 @@ export function Settings() {
               leadingIcon={ExternalLink}
               leadingTint={brand.accentSoft}
               onClick={() => openExternal(DASHBOARD_URL).catch(() => {})}
+            />
+            {/* MR-1685: the third-party notices this package ships. */}
+            <BirdoNavRow
+              title="Licences"
+              subtitle="Third-party software notices"
+              leadingIcon={Scale}
+              leadingTint={brand.accentSoft}
+              onClick={() => pushRoute('licences')}
             />
           </BirdoCard>
 

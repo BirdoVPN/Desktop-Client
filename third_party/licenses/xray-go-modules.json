@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "The Go modules linked into the bundled xray binary, by module path, with their licence (MR-1685).",
+    "scripts/generate-third-party-notices.mjs reads the module list (and each version) from the xray",
+    "binary's own Go build information and FAILS on a module that is not listed here, so an Xray bump",
+    "that links a new module cannot ship until someone has looked at that module's licence.",
+    "`source` and `texts` are required for a module whose licence needs its source offered or its",
+    "text shipped (GPL, LGPL, MPL); `texts` are paths under third_party/licenses/.",
+    "Checked 2026-10-14 against Xray-core v26.3.27: the union of the Windows, Linux and both macOS",
+    "release binaries (golang.zx2c4.com/wintun is in the Windows one only, vishvananda/* in Linux only)."
+  ],
+  "github.com/andybalholm/brotli": { "license": "MIT" },
+  "github.com/apernet/quic-go": { "license": "MIT" },
+  "github.com/cloudflare/circl": { "license": "BSD-3-Clause" },
+  "github.com/ghodss/yaml": { "license": "MIT AND BSD-3-Clause" },
+  "github.com/google/btree": { "license": "Apache-2.0" },
+  "github.com/gorilla/websocket": { "license": "BSD-2-Clause" },
+  "github.com/juju/ratelimit": {
+    "license": "LGPL-3.0-only WITH LGPL-3.0-linking-exception",
+    "source": "https://github.com/juju/ratelimit",
+    "texts": ["xray/juju-ratelimit-LICENSE.txt", "GPL-3.0.txt"]
+  },
+  "github.com/klauspost/compress": { "license": "BSD-3-Clause AND Apache-2.0 AND MIT" },
+  "github.com/klauspost/cpuid/v2": { "license": "MIT" },
+  "github.com/miekg/dns": { "license": "BSD-3-Clause" },
+  "github.com/pelletier/go-toml": { "license": "MIT AND Apache-2.0" },
+  "github.com/pires/go-proxyproto": { "license": "Apache-2.0" },
+  "github.com/quic-go/qpack": { "license": "MIT" },
+  "github.com/refraction-networking/utls": { "license": "BSD-3-Clause" },
+  "github.com/sagernet/sing": {
+    "license": "GPL-3.0-or-later",
+    "source": "https://github.com/SagerNet/sing",
+    "texts": ["xray/sagernet-sing-LICENSE.txt", "GPL-3.0.txt"]
+  },
+  "github.com/sagernet/sing-shadowsocks": {
+    "license": "GPL-3.0-or-later",
+    "source": "https://github.com/SagerNet/sing-shadowsocks",
+    "texts": ["xray/sagernet-sing-LICENSE.txt", "GPL-3.0.txt"]
+  },
+  "github.com/vishvananda/netlink": { "license": "Apache-2.0" },
+  "github.com/vishvananda/netns": { "license": "Apache-2.0" },
+  "github.com/xtls/reality": {
+    "license": "MPL-2.0",
+    "source": "https://github.com/XTLS/REALITY",
+    "texts": ["MPL-2.0.txt"]
+  },
+  "go4.org/netipx": { "license": "BSD-3-Clause" },
+  "golang.org/x/crypto": { "license": "BSD-3-Clause" },
+  "golang.org/x/exp": { "license": "BSD-3-Clause" },
+  "golang.org/x/net": { "license": "BSD-3-Clause" },
+  "golang.org/x/sync": { "license": "BSD-3-Clause" },
+  "golang.org/x/sys": { "license": "BSD-3-Clause" },
+  "golang.org/x/text": { "license": "BSD-3-Clause" },
+  "golang.org/x/time": { "license": "BSD-3-Clause" },
+  "golang.zx2c4.com/wintun": { "license": "MIT" },
+  "golang.zx2c4.com/wireguard": { "license": "MIT" },
+  "google.golang.org/genproto/googleapis/rpc": { "license": "Apache-2.0" },
+  "google.golang.org/grpc": { "license": "Apache-2.0" },
+  "google.golang.org/protobuf": { "license": "BSD-3-Clause" },
+  "gopkg.in/yaml.v2": { "license": "Apache-2.0 AND MIT" },
+  "gvisor.dev/gvisor": { "license": "Apache-2.0" },
+  "lukechampine.com/blake3": { "license": "MIT" }
+}

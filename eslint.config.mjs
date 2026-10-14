@@ -29,6 +29,16 @@ export default [
 
   js.configs.recommended,
 
+  // Node scripts run by CI (scripts/generate-third-party-notices.mjs, MR-1685).
+  {
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: { ...globals.node },
+    },
+  },
+
   // TypeScript / React sources.
   {
     files: ['src/**/*.{ts,tsx}'],
