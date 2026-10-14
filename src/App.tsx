@@ -26,6 +26,7 @@ import { exit } from '@tauri-apps/plugin-process';
 import { notifyUpdateAvailable } from '@/utils/notifications';
 import { identityPatch, type AuthStateIdentity } from '@/utils/helpers';
 import { hasCurrentConsent } from '@/lib/consent';
+import { CONSENT_REQUIRED_EVENT, onConsentRequired, recordConsentInRust } from '@/session/consent-sync';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 
 /** Whether the window is on screen; unknown counts as visible (never skip a prompt the user can see). */
@@ -181,6 +182,28 @@ function App() {
       .catch(() => {
         /* best effort: the tray's Show Window still reaches it */
       });
+  }, []);
+
+  // MR-1607: Rust keeps its own record of the consent accepted, which the
+  // tray's Quick Connect asks before it dials. Written whenever this store
+  // holds the current version: at every start (the migration — an install
+  // that accepted this text in an earlier build has no Rust record yet, and
+  // must not be asked again) and the moment the user accepts. Rust only ever
+  // raises it.
+  useEffect(() => {
+    if (hasAcceptedConsent) void recordConsentInRust();
+  }, [hasAcceptedConsent]);
+
+  // A tray Quick Connect Rust refused for want of consent. Rust has brought
+  // the window up: on the consent screen, or — if only Rust's record fell
+  // behind — with the record written again and a word about it.
+  useEffect(() => {
+    const unlisten = listen(CONSENT_REQUIRED_EVENT, () => {
+      void onConsentRequired();
+    });
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
   }, []);
 
   // NOTE: the tray icon, tooltip and menu are driven by Rust from its state

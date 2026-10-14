@@ -184,18 +184,52 @@ export async function takeUpdateResume(): Promise<ResumeTarget | null> {
   }
 }
 
+/** MR-1932: the server the update ended is gone, offline or out of the plan now. */
+export const RESUME_SERVER_GONE_COPY =
+  "The server you were connected to before the update isn't available now, so BirdoVPN didn't " +
+  'reconnect. Choose a server to connect.';
+
+/** MR-1932: the same, for a Multi-Hop route (either of its servers). */
+export const RESUME_ROUTE_GONE_COPY =
+  "Your Multi-Hop route from before the update isn't available now, so BirdoVPN didn't " +
+  'reconnect. Choose its servers again to connect.';
+
 /**
  * Put back the session an update ended (MR-1861): the same server, or the
  * same Multi-Hop route, through the ordinary connect commands — so with the
- * saved settings, kill switch included. A server that is gone, offline or no
- * longer in the plan falls back to the plain Connect rule.
+ * saved settings, kill switch included.
+ *
+ * Exactly that session or none (MR-1932). The target is checked against the
+ * settled server list: one that is gone, offline or no longer in the plan —
+ * for Multi-Hop, either end of the route — is NOT replaced by another server
+ * (it used to fall back to the plain Connect rule, possibly another country,
+ * and a Multi-Hop route was dialled unchecked). The user is told and stays
+ * disconnected. An EMPTY list (the fetch failed) cannot say a server is gone,
+ * so the target is dialled as recorded and Rust's connect answers for it —
+ * never `quick_connect`, which picks a server of its own.
  */
 export async function resumeAfterUpdate(target: ResumeTarget): Promise<boolean> {
   const s = useAppStore.getState();
-  s.showNotice({ text: RESUME_AFTER_UPDATE_COPY, tone: 'info' });
-  if (target.kind === 'multiHop') return connectMultiHop(target.entryId, target.exitId);
+  const listed = s.servers.length > 0;
+  const live = (id: string) => usable(s.servers.find((srv) => srv.id === id));
+  if (target.kind === 'multiHop') {
+    if (listed && !(live(target.entryId) && live(target.exitId))) {
+      s.showNotice({ text: RESUME_ROUTE_GONE_COPY, tone: 'danger' });
+      return false;
+    }
+    s.showNotice({ text: RESUME_AFTER_UPDATE_COPY, tone: 'info' });
+    return connectMultiHop(target.entryId, target.exitId);
+  }
   const server = s.servers.find((srv) => srv.id === target.serverId);
-  return usable(server) ? connectToServer(server) : connectPreferred();
+  if (listed && !usable(server)) {
+    s.showNotice({ text: RESUME_SERVER_GONE_COPY, tone: 'danger' });
+    return false;
+  }
+  s.showNotice({ text: RESUME_AFTER_UPDATE_COPY, tone: 'info' });
+  if (usable(server)) return connectToServer(server);
+  const ok = await run('connecting', 'connect_vpn', { serverId: target.serverId });
+  if (ok) useAppStore.getState().setLastServerId(target.serverId);
+  return ok;
 }
 
 /**
