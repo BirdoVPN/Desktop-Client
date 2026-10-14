@@ -2061,6 +2061,14 @@ mod endpoint_route_tests {
     /// surviving route is normal and must not be fatal.
     ///
     /// Root-only — it really installs a route to TEST-NET-1 and removes it.
+    /// TEMPORARY (reverted before review): proves a failing root test's
+    /// name now reaches the CI log.
+    #[test]
+    #[ignore = "R8 proof: runs only in the root step"]
+    fn r8_proof_deliberately_failing_macos_root_test() {
+        panic!("deliberate failure: R8 proof");
+    }
+
     #[test]
     #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
     fn an_already_present_route_is_tolerated() {
