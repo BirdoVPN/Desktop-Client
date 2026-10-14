@@ -231,7 +231,13 @@ fn main() {
         // log (and the rotated birdo.log.1 beside it) back to the retention
         // window on every launch, so the file can only ever describe recent
         // activity. See utils::log_retention before widening the window.
-        crate::utils::log_retention::enforce(&p, chrono::Utc::now());
+        // MR-1945: through the directory's checked handles, never a path:
+        // this runs elevated in a folder the user can write.
+        crate::utils::log_retention::enforce(
+            &dir,
+            crate::utils::file_log::LOG_FILE_NAME,
+            chrono::Utc::now(),
+        );
         //
         // PWR-5 (size). birdo.log is open in append mode for the life of the
         // process, so a long-running session (this is a VPN client — it can
@@ -995,9 +1001,9 @@ fn cleanup_on_crash() {
 }
 
 /// Where crash reports are written.
-fn crash_dir() -> std::path::PathBuf {
+fn crash_dir() -> crate::utils::safe_fs::OwnedDir {
     crate::utils::file_log::crash_dir_in(
-        &dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
+        dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
     )
 }
 
@@ -1014,7 +1020,7 @@ fn write_crash_report(location: &str, message: &str) {
 
     let crash_dir = crash_dir();
 
-    let _ = std::fs::create_dir_all(&crash_dir);
+    let _ = std::fs::create_dir_all(crash_dir.path());
 
     // P6-CLI-D-05: crash files used to accumulate forever (a permanent,
     // timestamped on-disk history on a product that claims to retain

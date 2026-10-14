@@ -42,6 +42,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::file_log::{Held, LogGate};
+use super::safe_fs::OwnedDir;
 
 /// How far back `birdo.log` may reach. See the module docs before changing it.
 pub const MAX_LOG_AGE_DAYS: i64 = 7;
@@ -198,29 +199,35 @@ fn shift_head_off(file: &mut std::fs::File, from: u64) -> io::Result<()> {
     file.flush()
 }
 
-/// Apply the retention window to a single log file.
+/// Apply the retention window to the log file `name` in `dir`.
 ///
 /// Returns the decision that was applied, or an IO error. Missing file is not
 /// an error — it is the first-run case — and reports [`Retention::KeepAll`].
-pub fn enforce_file(path: &Path, cutoff: DateTime<Utc>) -> io::Result<Retention> {
-    let mut file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    {
+///
+/// MR-1945: the file is opened through [`OwnedDir::open_rw`], never by a
+/// plain path. This runs elevated in a directory the user can write, and a
+/// truncation that followed a planted junction or link emptied whatever old
+/// file it named; a file that is not exactly the app's is an error, and is
+/// left as it is.
+pub fn enforce_file(dir: &OwnedDir, name: &str, cutoff: DateTime<Utc>) -> io::Result<Retention> {
+    let mut file = match dir.open_rw(name) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Retention::KeepAll),
         Err(e) => return Err(e),
     };
+    prune(&mut file, cutoff)
+}
 
+/// [`enforce_file`] on a file it has opened and checked.
+fn prune(file: &mut std::fs::File, cutoff: DateTime<Utc>) -> io::Result<Retention> {
     let decision = {
-        let mut reader = BufReader::new(&file);
+        let mut reader = BufReader::new(&*file);
         scan(&mut reader, cutoff)?
     };
 
     match decision {
         Retention::KeepAll => {}
-        Retention::DropFirst(offset) => shift_head_off(&mut file, offset)?,
+        Retention::DropFirst(offset) => shift_head_off(file, offset)?,
         Retention::DropAll => {
             file.set_len(0)?;
             file.flush()?;
@@ -252,23 +259,30 @@ pub fn enforce_file(path: &Path, cutoff: DateTime<Utc>) -> io::Result<Retention>
 /// Best-effort by design: this runs before the tracing subscriber exists, and
 /// no log-hygiene failure is worth refusing to start a VPN client over.
 /// Diagnostics go to stderr, the only sink available this early.
-pub fn enforce(log_path: &Path, now: DateTime<Utc>) {
+///
+/// MR-1945: both files are opened, and `.1` deleted, through `dir`
+/// ([`OwnedDir`]), never by a plain path: see [`enforce_file`].
+pub fn enforce(dir: &OwnedDir, log_name: &str, now: DateTime<Utc>) {
     let cutoff = cutoff(now);
 
-    if let Err(e) = enforce_file(log_path, cutoff) {
+    if let Err(e) = enforce_file(dir, log_name, cutoff) {
         eprintln!("birdo.log retention sweep failed (continuing): {}", e);
     }
 
-    let rotated = rotated_path(log_path);
-    match enforce_file(&rotated, cutoff) {
-        Ok(_) => {
-            let empty = std::fs::metadata(&rotated)
-                .map(|m| m.len() == 0)
-                .unwrap_or(false);
-            if empty {
-                let _ = std::fs::remove_file(&rotated);
-            }
+    let rotated = rotated_path(Path::new(log_name));
+    let Some(rotated) = rotated.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let pruned = dir.open_rw(rotated).and_then(|mut file| {
+        prune(&mut file, cutoff)?;
+        Ok(file.metadata()?.len() == 0)
+    });
+    match pruned {
+        Ok(true) => {
+            let _ = dir.remove_file(rotated);
         }
+        Ok(false) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => eprintln!("birdo.log.1 retention sweep failed (continuing): {}", e),
     }
 }
@@ -302,37 +316,42 @@ fn crash_report_time(name: &str) -> Option<DateTime<Utc>> {
 /// well as before each new report. A report dated by neither its name nor its
 /// mtime is left alone, like an undated log. Best-effort: never worth failing
 /// startup or a crash path over.
-pub fn prune_crash_reports(dir: &Path, now: DateTime<Utc>, keep: usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+///
+/// MR-1945: every delete goes through `dir` ([`OwnedDir::remove_file`]),
+/// never a plain path: this runs elevated in the user's
+/// `%LOCALAPPDATA%`, where a planted junction turned the sweep into a delete
+/// of any file named like a crash report, anywhere.
+pub fn prune_crash_reports(dir: &OwnedDir, now: DateTime<Utc>, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir.path()) else {
         return; // no crash yet
     };
     let cutoff = cutoff(now);
-    let mut recent: Vec<(DateTime<Utc>, PathBuf)> = Vec::new();
-    for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    let mut recent: Vec<(DateTime<Utc>, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        if !is_crash_report_name(name) {
+        if !is_crash_report_name(&name) {
             continue;
         }
-        let written = crash_report_time(name).or_else(|| {
-            std::fs::metadata(&path)
+        let written = crash_report_time(&name).or_else(|| {
+            std::fs::symlink_metadata(dir.join(&name))
                 .and_then(|m| m.modified())
                 .ok()
                 .map(DateTime::<Utc>::from)
         });
         match written {
             Some(at) if at < cutoff => {
-                let _ = std::fs::remove_file(&path);
+                let _ = dir.remove_file(&name);
             }
-            Some(at) => recent.push((at, path)),
+            Some(at) => recent.push((at, name)),
             None => {}
         }
     }
     recent.sort();
     let excess = recent.len().saturating_sub(keep);
-    for (_, path) in &recent[..excess] {
-        let _ = std::fs::remove_file(path);
+    for (_, name) in &recent[..excess] {
+        let _ = dir.remove_file(name);
     }
 }
 
@@ -364,8 +383,11 @@ pub fn rotate_if_large(path: &Path) {
 
 /// Open `path` for appending, owner-only on multi-user Unix hosts.
 ///
-/// P6-CLI-D-08: the log records which VPN nodes were used and when. (Windows
-/// relies on the per-user %APPDATA% ACL, same as the settings file.)
+/// P6-CLI-D-08: the log records which VPN nodes were used and when. On
+/// Windows the file inherits its folder's ACL: the log and crash folders are
+/// in the user's profile (`%APPDATA%`, `%LOCALAPPDATA%`), whose ACL grants the
+/// user, SYSTEM and Administrators and no other local user (MR-843, pinned by
+/// `tests::the_log_and_a_crash_report_are_not_readable_by_other_users_on_windows`).
 pub fn open_for_append(path: &Path) -> io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
@@ -581,9 +603,22 @@ mod tests {
         std::fs::read_to_string(p).unwrap()
     }
 
+    /// `dir` standing in for one of the app's directories.
+    fn here(dir: &Path) -> OwnedDir {
+        OwnedDir::new(dir, &[])
+    }
+
+    /// [`enforce_file`] on the file at `p`.
+    fn enforce_at(p: &Path, cutoff: DateTime<Utc>) -> io::Result<Retention> {
+        let name = p.file_name().unwrap().to_str().unwrap();
+        enforce_file(&here(p.parent().unwrap()), name, cutoff)
+    }
+
     /// P6-CLI-D-08 (MR-843): the log, a rotated log's fresh file and a crash
     /// report are created owner-only on Unix. The modes were set, and nothing
-    /// asserted them. (Windows relies on the per-user %APPDATA% ACL.)
+    /// asserted them. Run by tests.yml's Linux and macOS job (its FILTER
+    /// names `log_retention::tests`); the Windows half is
+    /// `the_log_and_a_crash_report_are_not_readable_by_other_users_on_windows`.
     #[cfg(unix)]
     #[test]
     fn the_log_and_a_crash_report_are_owner_only_on_unix() {
@@ -631,7 +666,7 @@ mod tests {
         let p = write(dir.path(), "birdo.log", &format!("{old}{recent}"));
 
         // "now" is 2026-06-21, so the window starts on the 14th.
-        let applied = enforce_file(&p, cutoff(at(21))).unwrap();
+        let applied = enforce_at(&p, cutoff(at(21))).unwrap();
 
         assert_eq!(applied, Retention::DropFirst(old.len() as u64));
         assert_eq!(read(&p), recent);
@@ -652,10 +687,7 @@ mod tests {
             "birdo.log",
             &format!("{}{}", line(1, "INFO  a"), line(2, "INFO  b")),
         );
-        assert_eq!(
-            enforce_file(&p, cutoff(at(28))).unwrap(),
-            Retention::DropAll
-        );
+        assert_eq!(enforce_at(&p, cutoff(at(28))).unwrap(), Retention::DropAll);
         assert_eq!(read(&p), "");
     }
 
@@ -666,10 +698,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contents = format!("{}{}", line(20, "INFO  a"), line(21, "INFO  b"));
         let p = write(dir.path(), "birdo.log", &contents);
-        assert_eq!(
-            enforce_file(&p, cutoff(at(21))).unwrap(),
-            Retention::KeepAll
-        );
+        assert_eq!(enforce_at(&p, cutoff(at(21))).unwrap(), Retention::KeepAll);
         assert_eq!(read(&p), contents);
     }
 
@@ -690,7 +719,7 @@ mod tests {
         );
         let p = write(dir.path(), "birdo.log", &format!("{expired}{kept}"));
 
-        enforce_file(&p, cutoff(at(21))).unwrap();
+        enforce_at(&p, cutoff(at(21))).unwrap();
 
         assert_eq!(read(&p), kept);
     }
@@ -712,7 +741,7 @@ mod tests {
         assert!(kept.len() > 3 * 64 * 1024, "test must span several buffers");
         let p = write(dir.path(), "birdo.log", &format!("{expired}{kept}"));
 
-        enforce_file(&p, cutoff(at(21))).unwrap();
+        enforce_at(&p, cutoff(at(21))).unwrap();
 
         assert_eq!(read(&p), kept);
     }
@@ -731,7 +760,7 @@ mod tests {
             &line(1, "DEBUG vpn::manager: endpoint=203.0.113.7:51820"),
         );
 
-        enforce(&live, at(21));
+        enforce(&here(dir.path()), "birdo.log", at(21));
 
         assert_eq!(read(&live), line(20, "INFO  fresh"));
         assert!(
@@ -751,9 +780,134 @@ mod tests {
             &format!("{}{}", line(1, "INFO  old"), line(20, "INFO  recent")),
         );
 
-        enforce(&live, at(21));
+        enforce(&here(dir.path()), "birdo.log", at(21));
 
         assert_eq!(read(&rotated), line(20, "INFO  recent"));
+        assert_eq!(read(&live), line(21, "INFO  fresh"));
+    }
+
+    // ── a user-writable directory, an elevated sweep (MR-1945) ────────────
+
+    /// THE FINDING. `logs` is a junction any process of the user can plant;
+    /// the sweep runs elevated. Through it, the old code emptied an expired
+    /// `birdo.log` and deleted an emptied `birdo.log.1` wherever the junction
+    /// pointed (and, via `\RPC Control`, any file at all). Nothing behind it
+    /// is touched now.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_log_directory_is_neither_truncated_nor_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let expired = format!("{}{}", line(1, "INFO  a"), line(2, "INFO  b"));
+        let live = write(&elsewhere, "birdo.log", &expired);
+        let rotated = write(&elsewhere, "birdo.log.1", &expired);
+        crate::utils::safe_fs::tests::junction(&root.path().join("logs"), &elsewhere);
+
+        enforce(&OwnedDir::new(root.path(), &["logs"]), "birdo.log", at(28));
+
+        assert_eq!(
+            read(&live),
+            expired,
+            "the sweep truncated through the junction"
+        );
+        assert_eq!(
+            read(&rotated),
+            expired,
+            "the sweep deleted through the junction"
+        );
+    }
+
+    /// A link named like the rotated log is the link, never its target.
+    /// Needs the symlink privilege: a dev account without it skips, saying
+    /// so; CI (an administrator) must not skip.
+    #[cfg(windows)]
+    #[test]
+    fn a_symlinked_rotated_log_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = format!("{}{}", line(1, "INFO  a"), line(2, "INFO  b"));
+        let precious = write(dir.path(), "precious.txt", &old);
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_file(&precious, logs.join("birdo.log.1")) {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI cannot create a symlink ({e}), so this test would test nothing"
+            );
+            eprintln!("SKIPPED: this account cannot create symlinks ({e})");
+            return;
+        }
+
+        enforce(&OwnedDir::new(dir.path(), &["logs"]), "birdo.log", at(28));
+
+        assert_eq!(
+            read(&precious),
+            old,
+            "the sweep truncated the link's target"
+        );
+        assert!(std::fs::symlink_metadata(logs.join("birdo.log.1")).is_ok());
+    }
+
+    /// The crash sweep's twin of the finding.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_crash_directory_is_not_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let victim = write(&elsewhere, &crash_name(1, "120000"), "not the app's");
+        std::fs::create_dir_all(root.path().join("Birdo VPN")).unwrap();
+        crate::utils::safe_fs::tests::junction(
+            &root.path().join("Birdo VPN").join("crashes"),
+            &elsewhere,
+        );
+
+        let crashes = OwnedDir::new(root.path(), &["Birdo VPN", "crashes"]);
+        prune_crash_reports(&crashes, at(20), 0);
+
+        assert!(
+            victim.exists(),
+            "the crash sweep deleted through the junction"
+        );
+    }
+
+    /// MR-843, the Windows half: the log and a crash report, created where
+    /// the app creates them (the user's roaming and local profile folders),
+    /// grant nothing to any other local user: only the user, SYSTEM and
+    /// Administrators. The Unix half is the 0600 test above.
+    #[cfg(windows)]
+    #[test]
+    fn the_log_and_a_crash_report_are_not_readable_by_other_users_on_windows() {
+        use crate::utils::protected_dir::{current_user_sid, Security};
+        use crate::utils::win_api::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let user = current_user_sid().unwrap();
+        let allowed = ["S-1-5-18", "S-1-5-32-544", "S-1-3-4", user.as_str()];
+        let roots = [dirs::data_dir().unwrap(), dirs::data_local_dir().unwrap()];
+        for root in roots {
+            let dir = tempfile::tempdir_in(&root).unwrap();
+            let log = dir.path().join("birdo.log");
+            let crash = dir.path().join("crash_20261013_120000.txt");
+            drop(open_for_append(&log).unwrap());
+            drop(create_owner_only(&crash).unwrap());
+            for p in [dir.path(), log.as_path(), crash.as_path()] {
+                let handle = std::fs::OpenOptions::new()
+                    .access_mode(READ_CONTROL)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(p)
+                    .unwrap();
+                let granted = Security::of(&handle)
+                    .unwrap()
+                    .granted_sids()
+                    .expect("a DACL (none would grant everyone everything)");
+                assert!(
+                    granted.iter().all(|sid| allowed.contains(&sid.as_str())),
+                    "{} grants {granted:?}",
+                    p.display()
+                );
+            }
+        }
     }
 
     /// The sweep must target exactly the file rotation writes. If these two
@@ -817,10 +971,7 @@ mod tests {
     fn a_missing_log_is_the_first_run_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("birdo.log");
-        assert_eq!(
-            enforce_file(&p, cutoff(at(21))).unwrap(),
-            Retention::KeepAll
-        );
+        assert_eq!(enforce_at(&p, cutoff(at(21))).unwrap(), Retention::KeepAll);
         assert!(!p.exists(), "the sweep must not create the log");
     }
 
@@ -828,10 +979,7 @@ mod tests {
     fn an_empty_log_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), "birdo.log", "");
-        assert_eq!(
-            enforce_file(&p, cutoff(at(21))).unwrap(),
-            Retention::Undated
-        );
+        assert_eq!(enforce_at(&p, cutoff(at(21))).unwrap(), Retention::Undated);
         assert_eq!(read(&p), "");
     }
 
@@ -869,7 +1017,7 @@ mod tests {
         bytes.extend_from_slice(line(20, "INFO  fresh").as_bytes());
         std::fs::write(&p, &bytes).unwrap();
 
-        enforce_file(&p, cutoff(at(21))).unwrap();
+        enforce_at(&p, cutoff(at(21))).unwrap();
 
         assert_eq!(
             std::fs::read(&p).unwrap(),
@@ -965,7 +1113,7 @@ mod tests {
         }
         write(dir.path(), "notes.txt", "not ours");
 
-        prune_crash_reports(dir.path(), at(20), KEEP_CRASH_REPORTS);
+        prune_crash_reports(&here(dir.path()), at(20), KEEP_CRASH_REPORTS);
 
         let mut want = recent.clone();
         want.push("notes.txt".into());
@@ -980,7 +1128,7 @@ mod tests {
         for name in &recent {
             write(dir.path(), name, "BirdoVPN Crash Report\n");
         }
-        prune_crash_reports(dir.path(), at(20), KEEP_CRASH_REPORTS);
+        prune_crash_reports(&here(dir.path()), at(20), KEEP_CRASH_REPORTS);
         assert_eq!(files_in(dir.path()), recent[2..].to_vec());
     }
 
@@ -989,9 +1137,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let name = crash_name(19, "101010");
         write(dir.path(), &name, "x");
-        prune_crash_reports(dir.path(), at(20), KEEP_CRASH_REPORTS);
+        prune_crash_reports(&here(dir.path()), at(20), KEEP_CRASH_REPORTS);
         assert!(dir.path().join(&name).exists());
-        prune_crash_reports(&dir.path().join("absent"), at(20), KEEP_CRASH_REPORTS);
+        prune_crash_reports(
+            &OwnedDir::new(dir.path(), &["absent"]),
+            at(20),
+            KEEP_CRASH_REPORTS,
+        );
     }
 
     #[test]

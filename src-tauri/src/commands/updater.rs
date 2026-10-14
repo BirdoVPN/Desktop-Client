@@ -35,6 +35,13 @@
 //!
 //! MR-1824: that GitHub download is also why a kill-switch block holds it on
 //! macOS and Linux — see [`download_route`].
+//!
+//! MR-1722: on Windows the plugin verifies the signature on the downloaded
+//! bytes in memory, then writes the installer to a temporary directory and
+//! launches it — elevated, since this app is. That directory was the user's
+//! `%TEMP%`, where any process of theirs could swap the verified installer
+//! for its own between the write and the launch. It is now a fresh folder in
+//! the admin-only `%ProgramData%\BirdoVPN` ([`AdminOnlyTemp`]).
 
 use std::time::Duration;
 
@@ -383,9 +390,29 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
     if let Some(target) = &resume {
         crate::commands::update_resume::record(target);
     }
+    // MR-1722: the folder the installer is written to and launched from is
+    // admin-only. Made before the teardown, so a machine where it cannot be
+    // made keeps its session; a launch from the user's %TEMP% is never the
+    // fallback.
+    let admin_only_temp = match installer_temp() {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!("Update not installed: {e}");
+            return Err(UpdateFailure::before_install(
+                "install_failed",
+                format!("Update failed: {e}"),
+            ));
+        }
+    };
     end_session(&app, EndReason::Update).await;
 
-    if let Err(e) = update.install(bundle) {
+    let installed = {
+        // Windows: `install` exits the process once the installer runs, so
+        // only a failed install gets here, and drops the guard first.
+        let _admin_only_temp = admin_only_temp;
+        update.install(bundle)
+    };
+    if let Err(e) = installed {
         tracing::warn!("Update install failed: {e}");
         // Still this version, still running: nothing for a next start to resume.
         crate::commands::update_resume::discard();
@@ -393,6 +420,78 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
     }
 
     Ok(true)
+}
+
+/// MR-1722: this process's temporary directory, pointed at a fresh
+/// admin-only folder (`%ProgramData%\BirdoVPN\updates`) for as long as the
+/// guard lives.
+///
+/// WHY THE ENVIRONMENT. tauri-plugin-updater 2.13.1 offers no way to choose
+/// where the installer goes, or to launch it ourselves with what `install`
+/// passes it: on Windows `Update::install` -> `extract` -> `write_to_temp` ->
+/// `make_temp_dir` makes `tempfile::Builder::new().tempdir()`, which is
+/// `std::env::temp_dir()` (tempfile 3.27, no override set), which is
+/// `GetTempPath2W` — `%TMP%`, then `%TEMP%` — for a process that is not
+/// SYSTEM; it writes the installer there and `ShellExecuteW`s it from there.
+/// Pointing TMP and TEMP at an admin-only folder puts both the write and the
+/// launch out of reach of the user's unelevated processes, with no fork. The
+/// folder inherits the protected DACL (SYSTEM and Administrators; owner
+/// rights cut to READ_CONTROL), and so does everything the plugin creates in
+/// it. The installer inherits the environment, so NSIS's own plugin folder
+/// lands there too rather than in the user's %TEMP%.
+///
+/// `tests::the_installer_temp_dir_is_pinned_to_the_plugin_that_honours_it`
+/// fails on any bump of the plugin, so this is re-checked against the new
+/// version's `install`, not assumed.
+#[cfg(windows)]
+struct AdminOnlyTemp {
+    tmp: Option<std::ffi::OsString>,
+    temp: Option<std::ffi::OsString>,
+}
+
+#[cfg(windows)]
+impl AdminOnlyTemp {
+    fn to(dir: &std::path::Path) -> Self {
+        let saved = Self {
+            tmp: std::env::var_os("TMP"),
+            temp: std::env::var_os("TEMP"),
+        };
+        // SetEnvironmentVariableW: thread-safe on Windows.
+        std::env::set_var("TMP", dir);
+        std::env::set_var("TEMP", dir);
+        saved
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AdminOnlyTemp {
+    fn drop(&mut self) {
+        for (name, value) in [("TMP", self.tmp.take()), ("TEMP", self.temp.take())] {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// The admin-only temporary directory for the install ([`AdminOnlyTemp`]).
+#[cfg(windows)]
+fn installer_temp() -> Result<AdminOnlyTemp, String> {
+    crate::utils::protected_dir::fresh_updates_dir()
+        .map(|dir| AdminOnlyTemp::to(&dir))
+        .map_err(|e| format!("no admin-only folder for the installer ({e})"))
+}
+
+/// macOS and Linux: the plugin replaces the app in place there, and launches
+/// no installer from a temporary directory (MR-1722 is Windows'). A unit
+/// struct, not `()`, so the guard reads the same on every platform.
+#[cfg(not(windows))]
+struct AdminOnlyTemp;
+
+#[cfg(not(windows))]
+fn installer_temp() -> Result<AdminOnlyTemp, String> {
+    Ok(AdminOnlyTemp)
 }
 
 #[cfg(test)]
@@ -411,7 +510,61 @@ mod tests {
             .expect("teardown");
         let install = body.find("update.install(bundle)").expect("install");
         assert!(download < teardown && teardown < install);
+        // MR-1722: the admin-only temp dir is in place before the teardown,
+        // and held across the install.
+        let temp = body.find("installer_temp()").expect("installer_temp");
+        assert!(download < temp && temp < teardown);
+        let held = body
+            .find("let _admin_only_temp = admin_only_temp;")
+            .expect("the guard is held across the install");
+        assert!(teardown < held && held < install);
         assert!(!body.contains(&["download", "_and_install"].concat()));
+    }
+
+    /// MR-1722: what the plugin calls to place the installer
+    /// (`tempfile::Builder::new().prefix(..).tempdir()`) lands in the folder
+    /// `AdminOnlyTemp` points TMP and TEMP at, and both are put back.
+    ///
+    /// The redirect is process-wide while it lasts, so the folder is one that
+    /// outlives the test: a temp dir another test makes in that instant must
+    /// not be deleted under it.
+    #[cfg(windows)]
+    #[test]
+    fn the_installer_temp_dir_follows_the_redirect() {
+        let target = std::env::temp_dir().join("birdo-mr1722-redirect-test");
+        std::fs::create_dir_all(&target).unwrap();
+        let (tmp, temp) = (std::env::var_os("TMP"), std::env::var_os("TEMP"));
+        let made = {
+            let _guard = super::AdminOnlyTemp::to(&target);
+            tempfile::Builder::new()
+                .prefix("BirdoVPN-9.9.9-updater-")
+                .tempdir()
+                .unwrap()
+        };
+        assert_eq!(
+            (std::env::var_os("TMP"), std::env::var_os("TEMP")),
+            (tmp, temp)
+        );
+        let made_in = made.path().parent().unwrap().canonicalize().unwrap();
+        assert_eq!(made_in, target.canonicalize().unwrap());
+    }
+
+    /// MR-1722 depends on how tauri-plugin-updater 2.13.1 places the
+    /// installer (see `AdminOnlyTemp`). A different version must be checked
+    /// again before it ships: confirm its Windows `install` still writes the
+    /// installer under `std::env::temp_dir()` (or now offers a directory, or
+    /// a launch of our own), then update the version here.
+    #[test]
+    fn the_installer_temp_dir_is_pinned_to_the_plugin_that_honours_it() {
+        let lock = include_str!("../../Cargo.lock").replace('\r', "");
+        let entry = &lock[lock
+            .find("name = \"tauri-plugin-updater\"\n")
+            .expect("tauri-plugin-updater in Cargo.lock")..];
+        let version = entry.lines().nth(1).unwrap();
+        assert_eq!(
+            version, "version = \"2.13.1\"",
+            "tauri-plugin-updater moved: re-verify MR-1722 (AdminOnlyTemp) against its Windows install"
+        );
     }
 
     /// REVIEW-WIN-002: the exit hook runs before the installer is launched, so
