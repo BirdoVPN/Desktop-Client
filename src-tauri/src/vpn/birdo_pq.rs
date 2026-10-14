@@ -685,12 +685,39 @@ fn load_or_generate() -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), String> {
             ));
         }
     }
-    let (loc, retired) = keypair_loc()?;
-    let kp = load_or_generate_at(&loc, retired.as_ref())?;
+    let kp = resolve_keypair(keypair_loc())?;
     let pk = kp.public_key.clone();
     let sk = Zeroizing::new(kp.secret_key.to_vec());
     *cell.lock() = Some(kp);
     Ok((pk, sk))
+}
+
+/// The keypair for `located`, with the D6c LOW fallback.
+///
+/// A failure to even locate the keypair file (on Windows R4 now needs the
+/// admin-only directory and the account SID) must NOT abort a connect when
+/// quantum protection is on. Before R4 the location was `config_local_dir`,
+/// which effectively never failed, and a write failure already fell through to
+/// an in-memory key (`load_or_generate_at`); R4 made `keypair_loc()` fallible,
+/// and `?` on it turned a missing location into a hard PQ failure that aborts
+/// the connect (`commands::vpn` fails closed with quantum on). So a location
+/// error falls back to an ephemeral keypair for this session — regenerated
+/// next launch, which the server tolerates (it persists no client PQ key) —
+/// rather than failing closed. An unreadable PERSISTED file (`Io`) still
+/// propagates: that is a long-lived identity key we must not silently discard.
+fn resolve_keypair(
+    located: Result<(KeypairLoc, Option<KeypairLoc>), String>,
+) -> Result<StaticKeypair, String> {
+    match located {
+        Ok((loc, retired)) => load_or_generate_at(&loc, retired.as_ref()),
+        Err(e) => {
+            tracing::warn!(
+                "BirdoPQ: no persistent keypair location ({e}) — using an in-memory keypair for \
+                 this session (regenerated next launch)"
+            );
+            Ok(generate_keypair())
+        }
+    }
 }
 
 /// Permanently delete the persisted keypair. Use on user logout.
@@ -1340,6 +1367,27 @@ mod tests {
         assert_eq!(
             load_or_generate_at(&bob, Some(&old)).unwrap().public_key,
             b.public_key
+        );
+    }
+
+    /// D6c LOW: a location failure falls back to an in-memory keypair (so a
+    /// connect with quantum on is not aborted), while an unreadable PERSISTED
+    /// file still propagates as an error (the identity key is not discarded).
+    #[test]
+    fn a_missing_location_falls_back_to_an_in_memory_keypair() {
+        let kp = resolve_keypair(Err("no admin-only directory".to_string()))
+            .expect("a location failure must not fail the keypair");
+        assert_eq!(kp.public_key.len(), PUBLIC_KEY_BYTES);
+        assert_eq!(kp.secret_key.len(), SECRET_KEY_BYTES);
+
+        // A located-but-fresh dir persists as before (no fallback).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEYPAIR_FILENAME);
+        let got = resolve_keypair(Ok((kloc(&path), None))).unwrap();
+        assert!(path.exists());
+        assert_eq!(
+            read_keypair(&kloc(&path)).unwrap().unwrap().public_key,
+            got.public_key
         );
     }
 

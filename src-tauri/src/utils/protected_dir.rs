@@ -195,56 +195,61 @@ pub const LEGACY_UPGRADE_VALUE: &str = "LegacyUpgradePending";
 // So the window now needs the installer's word that this IS an upgrade of a
 // pre-#287 install: it writes `LEGACY_UPGRADE_VALUE` in HKLM (which only an
 // administrator can write) when, and only when, it replaces such an install.
-// The first elevated start after that consumes it (deletes it) and is the
-// one run allowed to look at the old sources; every later start, and every
-// start of a fresh install, is not. A value that cannot be deleted does not
-// open the window: it would open it on every start.
+// Reading is not consuming (D6c LOW): the window is LATCHED read-only on the
+// first call and used by every migration this run, but the marker is DELETED
+// only by [`consume_legacy_upgrade_window`], which the primary instance calls
+// in `setup()` AFTER the settings migration has succeeded. An auxiliary exit
+// (`--reconcile-and-exit`, `--remove-leftovers-and-exit`), a second instance
+// the single-instance plugin turns away, or a first-start crash therefore no
+// longer burns the window: the marker survives for the real first start, and
+// a crash mid-migration leaves it for the retry. Every later start, and every
+// fresh install, finds no marker.
 
-/// 0: not decided (treated as closed), 1: closed, 2: open.
+/// 0: not latched yet, 1: closed, 2: open.
 static UPGRADE_WINDOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// `main()`, once, before anything reads state: consume the installer's
-/// legacy-upgrade marker. Later calls do nothing.
-pub fn decide_legacy_upgrade_window() {
+/// Whether this run may migrate (trust once) the state a pre-MR-1721 build
+/// left in the user's reach (R1). Reads and latches the installer's marker on
+/// the first call (read-only — it does not consume it); every later call
+/// returns the latched value, so the whole run sees one answer even after
+/// [`consume_legacy_upgrade_window`] has deleted the marker. Never blocks (the
+/// panic hook reaches it through the DNS journal).
+pub fn legacy_upgrade_window() -> bool {
     use std::sync::atomic::Ordering;
-    if UPGRADE_WINDOW.load(Ordering::SeqCst) != 0 {
+    match UPGRADE_WINDOW.load(Ordering::SeqCst) {
+        0 => {
+            let open = super::elevation::is_elevated() && legacy_upgrade_marker_present();
+            // A race latches the same value, so `store` rather than a CAS loop.
+            UPGRADE_WINDOW.store(if open { 2 } else { 1 }, Ordering::SeqCst);
+            if open {
+                tracing::info!(
+                    "First start after an upgrade from before MR-1721: the old state may be \
+                     migrated this run"
+                );
+            }
+            open
+        }
+        2 => true,
+        _ => false,
+    }
+}
+
+/// Delete the installer's legacy-upgrade marker, once the migrations that were
+/// allowed to read it have run (D6c LOW). Called by the PRIMARY instance in
+/// `setup()`, not by `main()` or an auxiliary exit: see the note above. The
+/// latched window value is unchanged, so anything later in this run still sees
+/// the window it migrated under. Best-effort and `#[cfg(windows)]`-only; a
+/// non-elevated process cannot write HKLM and never reaches here.
+pub fn consume_legacy_upgrade_window() {
+    if !legacy_upgrade_window() {
         return;
     }
-    let open = super::elevation::is_elevated()
-        && decide_window(
-            legacy_upgrade_marker_present(),
-            consume_legacy_upgrade_marker,
-        );
-    UPGRADE_WINDOW.store(if open { 2 } else { 1 }, Ordering::SeqCst);
-    if open {
-        tracing::info!(
-            "First start after an upgrade from before MR-1721: the old state is migrated this run"
-        );
-    }
-}
-
-/// Whether this run may migrate (trust once) the state a pre-MR-1721 build
-/// left in the user's reach (R1). False until [`decide_legacy_upgrade_window`]
-/// has found and consumed the installer's marker. Never blocks (the panic hook
-/// reaches it through the DNS journal).
-pub fn legacy_upgrade_window() -> bool {
-    UPGRADE_WINDOW.load(std::sync::atomic::Ordering::SeqCst) == 2
-}
-
-/// The rule: open only when the marker is there AND this run consumed it.
-fn decide_window(present: bool, consume: impl FnOnce() -> io::Result<()>) -> bool {
-    if !present {
-        return false;
-    }
-    match consume() {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(
-                "The legacy-upgrade marker could not be consumed ({}); not migrating old state",
-                e
-            );
-            false
-        }
+    match consume_legacy_upgrade_marker() {
+        Ok(()) => tracing::info!("The legacy-upgrade window is consumed"),
+        Err(e) => tracing::warn!(
+            "Could not consume the legacy-upgrade marker ({}); the next start would migrate again",
+            e
+        ),
     }
 }
 
@@ -377,6 +382,8 @@ pub struct Leftovers {
     pub updates: u32,
     pub set_aside: u32,
     pub pq_keys: u32,
+    /// Per-user app-data entries removed under `--with-app-data` (D6c HIGH).
+    pub app_data: u32,
     pub failed: u32,
 }
 
@@ -384,12 +391,13 @@ pub struct Leftovers {
 /// nsis-hooks.nsh's NSIS_HOOK_PREUNINSTALL): the updater's `updates\` and the
 /// squatted folders moved aside as `BirdoVPN.untrusted-*`; with
 /// `with_app_data` ("Delete the application data" ticked, D-23) also every
-/// account's ML-KEM keypair (`pq-<SID>.bin`, R4). NEVER the settings keys or
-/// the migration markers: without a key a reinstall can no longer verify (so
-/// quarantines) the user's settings.json, and the markers keep the old
-/// %APPDATA% sources closed for good. Creates nothing (no `ensure()`).
+/// account's ML-KEM keypair (`pq-<SID>.bin`, R4) and the per-user app-data
+/// folders (D6c HIGH — see [`remove_app_data_folders_in`]). NEVER the settings
+/// keys or the migration markers: without a key a reinstall can no longer
+/// verify (so quarantines) the user's settings.json, and the markers keep the
+/// old %APPDATA% sources closed for good. Creates nothing (no `ensure()`).
 pub fn remove_uninstall_leftovers(with_app_data: bool) -> Leftovers {
-    match win_api::program_data() {
+    let mut done = match win_api::program_data() {
         Ok(base) => remove_uninstall_leftovers_in(
             &base,
             recorded_dir_name().filter(|name| is_state_dir_name(name)),
@@ -399,7 +407,115 @@ pub fn remove_uninstall_leftovers(with_app_data: bool) -> Leftovers {
             tracing::warn!("No ProgramData to clean ({})", e);
             Leftovers::default()
         }
+    };
+    // D6c HIGH: the per-user folders. Done here, in the elevated exe, not by
+    // NSIS — `RMDir /r` follows the junctions a user can plant in their own
+    // %APPDATA% / %LOCALAPPDATA%, which would delete files anywhere on the
+    // machine as administrator. `std::fs::remove_dir_all` never follows one.
+    if with_app_data {
+        match (dirs::config_dir(), dirs::config_local_dir()) {
+            // config_dir() is %APPDATA% (Roaming), config_local_dir() is
+            // %LOCALAPPDATA% (Local) on Windows.
+            (Some(appdata), Some(localappdata)) => {
+                let ad = remove_app_data_folders_in(&appdata, &localappdata);
+                done.app_data += ad.app_data;
+                done.failed += ad.failed;
+            }
+            _ => {
+                tracing::warn!("No %APPDATA%/%LOCALAPPDATA% to clean");
+                done.failed += 1;
+            }
+        }
     }
+    done
+}
+
+/// The Tauri bundle identifier (tauri.conf.json), the folder the template's own
+/// "delete the application data" removes under %APPDATA% and %LOCALAPPDATA%.
+/// Pinned to tauri.conf.json by a test.
+const APP_IDENTIFIER: &str = "uk.birdo.vpn.desktop";
+
+/// A name the per-user sweep KEEPS in `%APPDATA%\BirdoVPN` (W1-008): the
+/// DNS-restore journal and its variants (`dns-restore.json`, `.corrupt`,
+/// `.tmp`). A reinstall's reconcile still needs it to put back resolvers a
+/// killed session could not restore; the old hook round-tripped it through
+/// `%TEMP%`, which was itself a user-writable path (D6c HIGH).
+fn is_dns_journal_name(name: &str) -> bool {
+    name.starts_with("dns-restore.json")
+}
+
+/// Remove `path` and everything under it WITHOUT following a link at any level
+/// (D6c HIGH). `std::fs::remove_dir_all` opens every entry — and the top —
+/// without following a reparse point and deletes a link as a link (verified
+/// against NSIS 3.11's `RMDir /r`, which does follow them); a plain file or a
+/// file link is unlinked. A missing path is success.
+fn remove_tree_no_follow(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 => {
+            std::fs::remove_dir_all(path)
+        }
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The per-user "delete the application data" sweep (D6c HIGH), replacing the
+/// hook's `RMDir /r` (and its `%TEMP%` journal round-trip) and the Tauri
+/// template's own `RmDir /r` of the two identifier folders.
+///
+/// Four folders go entirely; `%APPDATA%\BirdoVPN` keeps only the DNS-restore
+/// journal (W1-008). Nothing follows a link: the four use
+/// [`remove_tree_no_follow`], and `%APPDATA%\BirdoVPN` is HELD open first
+/// (verified not a reparse point, unrenameable while held) before it is listed,
+/// so it cannot be swapped for a junction between the check and the delete; its
+/// children are each removed with [`remove_tree_no_follow`]. A junction planted
+/// in its place is unlinked, never entered.
+fn remove_app_data_folders_in(appdata: &Path, localappdata: &Path) -> Leftovers {
+    let mut done = Leftovers::default();
+    let mut sweep = |path: &Path| match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        _ => match remove_tree_no_follow(path) {
+            Ok(()) => done.app_data += 1,
+            Err(_) => done.failed += 1,
+        },
+    };
+    sweep(&localappdata.join("BirdoVPN")); // device id, pre-R4 ML-KEM key
+    sweep(&localappdata.join("Birdo VPN")); // crash reports
+    sweep(&appdata.join(APP_IDENTIFIER)); // the template's own %APPDATA% folder
+    sweep(&localappdata.join(APP_IDENTIFIER)); // the template's own %LOCALAPPDATA% folder
+
+    // %APPDATA%\BirdoVPN: logs and the rest, but keep the DNS journal.
+    let birdo = super::safe_fs::OwnedDir::new(appdata, &["BirdoVPN"]);
+    match birdo.hold_open_if_present() {
+        Ok(None) => {}
+        Err(_) => {
+            // A junction (or an unverifiable folder) in its place: unlink it
+            // without entering. Nothing of ours is really behind a junction.
+            match remove_tree_no_follow(birdo.path()) {
+                Ok(()) => done.app_data += 1,
+                Err(_) => done.failed += 1,
+            }
+        }
+        Ok(Some(_guard)) => {
+            let Ok(entries) = std::fs::read_dir(birdo.path()) else {
+                done.failed += 1;
+                return done;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if is_dns_journal_name(name) {
+                    continue;
+                }
+                match remove_tree_no_follow(&birdo.join(name)) {
+                    Ok(()) => done.app_data += 1,
+                    Err(_) => done.failed += 1,
+                }
+            }
+        }
+    }
+    done
 }
 
 /// An account's ML-KEM keypair file in the admin-only directory
@@ -901,16 +1017,22 @@ mod tests {
         }
     }
 
-    /// R1: the legacy-trust window opens only when the installer's marker is
-    /// there AND this run consumed it; a marker that cannot be deleted would
-    /// re-open it on every start, so it opens nothing.
+    /// D6c LOW: reading the window does not consume the marker. The marker's
+    /// delete is `consume_legacy_upgrade_marker` (HKLM write), exercised only
+    /// on a device; here we pin that the reader and the consumer are two
+    /// separate operations, so an auxiliary exit that only reads cannot burn
+    /// the window. (The real wiring is checked in `main.rs` by a source pin in
+    /// `vpn::dns_journal::uninstall_tests`.)
     #[test]
-    fn the_upgrade_window_opens_only_on_a_consumed_marker() {
-        assert!(!decide_window(false, || panic!("nothing to consume")));
-        assert!(decide_window(true, || Ok(())));
-        assert!(!decide_window(true, || Err(io::Error::from(
-            io::ErrorKind::PermissionDenied
-        ))));
+    fn reading_the_window_is_separate_from_consuming_it() {
+        let src = include_str!("protected_dir.rs");
+        // `legacy_upgrade_window` never deletes; only `consume_*` does.
+        let reader = &src[src.find("pub fn legacy_upgrade_window()").unwrap()
+            ..src.find("pub fn consume_legacy_upgrade_window()").unwrap()];
+        assert!(!reader.contains("delete_value"));
+        assert!(!reader.contains("consume_legacy_upgrade_marker"));
+        let consumer = &src[src.find("pub fn consume_legacy_upgrade_window()").unwrap()..];
+        assert!(consumer.contains("consume_legacy_upgrade_marker()"));
     }
 
     /// The marker's name is the one nsis-hooks.nsh writes, in the key this
@@ -1059,6 +1181,111 @@ mod tests {
             "pq-{}.bin",
             current_user_sid().unwrap()
         )));
+    }
+
+    /// D6c HIGH: the identifier the per-user sweep deletes is tauri.conf.json's.
+    #[test]
+    fn the_app_identifier_is_the_bundle_identifier() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"].as_str().unwrap(), APP_IDENTIFIER);
+    }
+
+    /// D6c HIGH: `--with-app-data` removes the five per-user folders, keeps the
+    /// DNS journal in `%APPDATA%\BirdoVPN`, and follows NO junction — planted at
+    /// the top of a folder or inside one — so files anywhere else survive.
+    #[test]
+    fn the_app_data_sweep_removes_the_folders_without_following_junctions() {
+        let base = tempfile::tempdir().unwrap();
+        let appdata = base.path().join("Roaming");
+        let local = base.path().join("Local");
+        let victim = base.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("precious.txt"), "keep").unwrap();
+
+        // %APPDATA%\BirdoVPN: a journal to keep, logs to remove, and a junction
+        // inside (logs\out -> victim) that must not be followed.
+        let roam_birdo = appdata.join("BirdoVPN");
+        std::fs::create_dir_all(roam_birdo.join("logs")).unwrap();
+        std::fs::write(roam_birdo.join("dns-restore.json"), "{}").unwrap();
+        std::fs::write(roam_birdo.join("dns-restore.json.corrupt"), "{}").unwrap();
+        std::fs::write(roam_birdo.join("resume-after-update.json"), "x").unwrap();
+        std::fs::write(roam_birdo.join("logs").join("birdo.log"), "x").unwrap();
+        junction(&roam_birdo.join("logs").join("out"), &victim);
+
+        // The four folders removed entirely; one holds a junction, one IS a
+        // junction (the whole %LOCALAPPDATA%\Birdo VPN swapped for a link).
+        std::fs::create_dir_all(local.join("BirdoVPN")).unwrap();
+        std::fs::write(local.join("BirdoVPN").join("device_id"), "d").unwrap();
+        junction(&local.join("BirdoVPN").join("out"), &victim);
+        junction(&local.join("Birdo VPN"), &victim); // the folder itself is a junction
+        std::fs::create_dir_all(appdata.join(APP_IDENTIFIER)).unwrap();
+        std::fs::write(appdata.join(APP_IDENTIFIER).join("settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(local.join(APP_IDENTIFIER)).unwrap();
+
+        let done = remove_app_data_folders_in(&appdata, &local);
+
+        assert_eq!(done.failed, 0, "{done:?}");
+        // The journal survives; everything else in %APPDATA%\BirdoVPN goes.
+        assert!(roam_birdo.join("dns-restore.json").exists());
+        assert!(roam_birdo.join("dns-restore.json.corrupt").exists());
+        assert!(!roam_birdo.join("logs").exists());
+        assert!(!roam_birdo.join("resume-after-update.json").exists());
+        // The four folders are gone.
+        assert!(!local.join("BirdoVPN").exists());
+        assert!(std::fs::symlink_metadata(local.join("Birdo VPN")).is_err());
+        assert!(!appdata.join(APP_IDENTIFIER).exists());
+        assert!(!local.join(APP_IDENTIFIER).exists());
+        // No junction was followed.
+        assert_eq!(
+            std::fs::read_to_string(victim.join("precious.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    /// D6c HIGH: a junction planted where `%APPDATA%\BirdoVPN` should be is
+    /// unlinked, not entered, and its target's files survive.
+    #[test]
+    fn a_junctioned_appdata_folder_is_unlinked_not_entered() {
+        let base = tempfile::tempdir().unwrap();
+        let appdata = base.path().join("Roaming");
+        let local = base.path().join("Local");
+        std::fs::create_dir_all(&appdata).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        let victim = base.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("precious.txt"), "keep").unwrap();
+        junction(&appdata.join("BirdoVPN"), &victim);
+
+        let done = remove_app_data_folders_in(&appdata, &local);
+
+        assert_eq!(done.failed, 0, "{done:?}");
+        assert!(std::fs::symlink_metadata(appdata.join("BirdoVPN")).is_err());
+        assert!(
+            std::fs::read_to_string(victim.join("precious.txt")).unwrap() == "keep",
+            "the sweep entered a junctioned folder"
+        );
+    }
+
+    /// Only the DNS-restore journal and its variants are kept.
+    #[test]
+    fn only_the_dns_journal_is_kept() {
+        for keep in [
+            "dns-restore.json",
+            "dns-restore.json.corrupt",
+            "dns-restore.json.tmp",
+        ] {
+            assert!(is_dns_journal_name(keep), "{keep}");
+        }
+        for go in [
+            "birdo.log",
+            "birdo.log.1",
+            "resume-after-update.json",
+            "device_id",
+            "x.json",
+        ] {
+            assert!(!is_dns_journal_name(go), "{go}");
+        }
     }
 
     /// M3: a fresh, privately named fallback directory is admin-only, the same

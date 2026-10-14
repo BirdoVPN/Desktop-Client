@@ -196,6 +196,45 @@ $marker = Get-LegacyMarker
 if ($null -ne $marker) { Fail "$stateKey $markerValue = $marker after a FRESH install: the app would migrate (trust) state an older build never left" }
 Write-Host "   $stateKey $markerValue absent"
 
+# -- D6c HIGH: --with-app-data removes the per-user folders without following
+#    a junction planted at the top of, or inside, any of them.
+Step 'D6c HIGH: --with-app-data deletes the per-user folders and follows no junction'
+$victim0 = Join-Path $env:RUNNER_TEMP 'birdo-appdata-victim'
+Remove-Item -LiteralPath $victim0 -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $victim0 | Out-Null
+Set-Content -LiteralPath (Join-Path $victim0 'precious.txt') -Value 'keep'
+$roamBirdo = Join-Path $env:APPDATA 'BirdoVPN'
+$localBirdo = Join-Path $env:LOCALAPPDATA 'BirdoVPN'
+$localBirdoSpace = Join-Path $env:LOCALAPPDATA 'Birdo VPN'
+$roamId = Join-Path $env:APPDATA 'uk.birdo.vpn.desktop'
+$localId = Join-Path $env:LOCALAPPDATA 'uk.birdo.vpn.desktop'
+# %APPDATA%\BirdoVPN: a journal to KEEP, logs to remove, a junction inside.
+New-Item -ItemType Directory -Force -Path (Join-Path $roamBirdo 'logs') | Out-Null
+Set-Content -LiteralPath (Join-Path $roamBirdo 'dns-restore.json') -Value '{}'
+Set-Content -LiteralPath (Join-Path $roamBirdo 'logs\birdo.log') -Value 'x'
+New-Item -ItemType Junction -Path (Join-Path $roamBirdo 'logs\out') -Target $victim0 | Out-Null
+# Removed entirely; one holds a junction, one IS a junction.
+New-Item -ItemType Directory -Force -Path $localBirdo | Out-Null
+Set-Content -LiteralPath (Join-Path $localBirdo 'device_id') -Value 'd'
+New-Item -ItemType Junction -Path (Join-Path $localBirdo 'out') -Target $victim0 | Out-Null
+New-Item -ItemType Junction -Path $localBirdoSpace -Target $victim0 | Out-Null
+New-Item -ItemType Directory -Force -Path $roamId | Out-Null
+Set-Content -LiteralPath (Join-Path $roamId 'settings.json') -Value '{}'
+New-Item -ItemType Directory -Force -Path $localId | Out-Null
+$code = Invoke-Bounded $exe @('--remove-leftovers-and-exit', '--with-app-data') 'the exe (--with-app-data)'
+if ($code -ne 0) { Fail "$exe --remove-leftovers-and-exit --with-app-data exited $code" }
+if (-not (Test-Path -LiteralPath (Join-Path $roamBirdo 'dns-restore.json'))) { Fail 'the DNS journal was not kept (W1-008)' }
+foreach ($g in @((Join-Path $roamBirdo 'logs'), $localBirdo, $localBirdoSpace, $roamId, $localId)) {
+    if (Test-Path -LiteralPath $g) { Fail "$g survived --with-app-data" }
+}
+if ((Get-Content -LiteralPath (Join-Path $victim0 'precious.txt') -ErrorAction SilentlyContinue) -ne 'keep') {
+    Fail 'the --with-app-data sweep followed a junction: a file outside the app folders was deleted'
+}
+Write-Host '   per-user folders removed, dns-restore.json kept, no junction followed'
+# Tidy the runner: the journal we kept, and the victim.
+Remove-Item -LiteralPath $roamBirdo -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $victim0 -Recurse -Force -ErrorAction SilentlyContinue
+
 # -- R2: what the uninstall must remove from %ProgramData%, and what it must keep
 Step 'R2: plant the leftovers the uninstall removes, and the state it keeps'
 # The admin-only directory, made by the app the way every start makes it (the

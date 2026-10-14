@@ -953,6 +953,26 @@ pub(crate) mod tests {
         std::fs::rename(logs.path(), &moved).unwrap();
     }
 
+    /// D6c: the MS-FSA rule the design relies on — while a directory is held
+    /// open, its PARENT (and any ancestor) cannot be renamed either, so the
+    /// path to the held directory cannot be swapped out from under it between a
+    /// check and a by-path write inside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_directorys_parent_cannot_be_renamed() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        let guard = logs.hold_open().unwrap();
+        let parent = root.path().join("BirdoVPN");
+        // ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32): either way
+        // the parent is not moved while a descendant is held.
+        let err = std::fs::rename(&parent, root.path().join("moved")).unwrap_err();
+        assert!(matches!(err.raw_os_error(), Some(5) | Some(32)), "{err}");
+        assert!(parent.is_dir() && !root.path().join("moved").exists());
+        drop(guard);
+        std::fs::rename(&parent, root.path().join("moved")).unwrap();
+    }
+
     /// R5, THE FINDING: `create_dir_all` by path, with a junction planted on
     /// a parent (`BirdoVPN` -> somewhere else), made `logs` wherever the
     /// junction pointed before anything checked it. Now the junction is
