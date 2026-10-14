@@ -21,6 +21,11 @@ pub mod tunnel;
 pub mod tunnel_linux;
 #[cfg(target_os = "macos")]
 pub mod tunnel_macos;
+// Shared ownership of the Linux/macOS tunnel fd, so no blocking read/write can
+// outlive its descriptor (MR-820). Compiled into every test build too, so the
+// Windows job runs its tests.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+mod device_fd;
 
 #[cfg(target_os = "windows")]
 mod tunnel_dns; // netsh DNS reads + their captured-output parsers (Windows only)

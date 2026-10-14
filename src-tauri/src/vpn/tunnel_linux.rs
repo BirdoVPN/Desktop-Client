@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
+use super::device_fd::{self, CloseOutcome, DeviceSlot, SharedFd};
 use super::wireguard_new::{WgPrivateKey, WireGuardSession};
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
@@ -160,8 +162,9 @@ pub struct LinuxTunnel {
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
     /// The TUN device name (e.g. "birdo0")
     tun_name: Arc<RwLock<Option<String>>>,
-    /// The raw file descriptor for the TUN device
-    tun_fd: Arc<RwLock<Option<i32>>>,
+    /// The TUN device's file descriptor, shared with the packet loop and each
+    /// of its in-flight blocking reads/writes (MR-820, see `device_fd`).
+    tun_fd: Arc<DeviceSlot<OwnedFd>>,
     /// Network snapshot for restoration on disconnect
     network_snapshot: Arc<RwLock<Option<NetworkSnapshot>>>,
     /// Whether to allow local network access while VPN is active
@@ -170,11 +173,10 @@ pub struct LinuxTunnel {
     endpoint_ip: Arc<RwLock<Option<String>>>,
     /// JoinHandle of the spawned packet loop.
     ///
-    /// P1-dk-tun-fd-close-race: stop() must JOIN this task before closing the
-    /// TUN fd. The loop's spawn_blocking closures capture the raw i32; closing
-    /// while one is still in flight lets the kernel recycle the descriptor
-    /// number, and the stale read()/write() then lands on whatever unrelated
-    /// file or socket this process opens next.
+    /// P1-dk-tun-fd-close-race: stop() JOINS this task before closing the TUN
+    /// fd. Joining the task alone did not join the blocking reads/writes it
+    /// had already handed off (MR-820); those now hold the fd themselves, and
+    /// the close waits for them (`device_fd::close_when_idle`).
     packet_loop: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -231,7 +233,7 @@ impl LinuxTunnel {
         tracing::info!("Created TUN device: {}", tun_name);
 
         *self.tun_name.write().await = Some(tun_name.clone());
-        *self.tun_fd.write().await = Some(tun_fd);
+        *self.tun_fd.write().await = Some(Arc::new(tun_fd));
 
         // Create WireGuard session BEFORE configuring routes.
         //
@@ -366,7 +368,15 @@ impl LinuxTunnel {
         let packets_sent = self.packets_sent.clone();
         let packets_received = self.packets_received.clone();
         let wg_session = self.wg_session.clone();
-        let fd = tun_fd;
+        // The loop's own reference (MR-820), taken from the slot so start()
+        // keeps none: an unwind's close must not wait on a local of ours.
+        // Bound first: the read guard must be gone before the unwind's close
+        // takes the write lock.
+        let loop_fd = self.tun_fd.read().await.clone();
+        let Some(fd) = loop_fd else {
+            self.unwind_failed_start().await;
+            return Err("The TUN device was closed before the packet loop started".to_string());
+        };
 
         let loop_handle = tokio::spawn(async move {
             Self::packet_loop(
@@ -426,16 +436,16 @@ impl LinuxTunnel {
         }
 
         // P1-dk-tun-fd-close-race: JOIN the packet loop before the fd close
-        // below. The loop's spawn_blocking closures capture the raw i32 fd;
-        // without the join, an in-flight libc::read/libc::write can execute
-        // AFTER close(2) returns the number to the kernel's free pool — and the
-        // stale syscall then reads from or writes packet bytes into whatever
-        // unrelated descriptor (log file, TLS socket, keystore handle) this
-        // process opened next. The fd is O_NONBLOCK, so the loop drains within
-        // one iteration of the shutdown signal; the timeout is a safety valve
-        // only. If it ever fires we abort the task and fall through to the
-        // close anyway — a stuck loop must not leave the device alive owning
-        // the half-default routes (that is the frozen-switch blackhole).
+        // below. The fd is O_NONBLOCK, so the loop drains within one iteration
+        // of the shutdown signal; the timeout is a safety valve only. If it
+        // ever fires we abort the task and fall through to the close anyway —
+        // a stuck loop must not leave the device alive owning the half-default
+        // routes (that is the frozen-switch blackhole).
+        //
+        // MR-820: the task join does not cover a read the loop had already
+        // handed to the blocking pool (the select! detaches it when shutdown
+        // wins). Each of those holds its own reference to the fd now, and the
+        // close at the end of stop() waits for them.
         if let Some(handle) = self.packet_loop.write().await.take() {
             let abort = handle.abort_handle();
             if tokio::time::timeout(std::time::Duration::from_secs(5), handle)
@@ -479,10 +489,18 @@ impl LinuxTunnel {
             .await;
         }
 
-        // Close the TUN file descriptor (kernel auto-removes the device)
-        if let Some(fd) = self.tun_fd.write().await.take() {
-            let _ = unsafe { libc::close(fd) };
-            tracing::info!("Closed TUN file descriptor");
+        // Close the TUN file descriptor (kernel auto-removes the device) — once
+        // no in-flight blocking read/write still holds it (MR-820). Closing
+        // under one used to hand its number to the kernel's free pool while
+        // the syscall had yet to run.
+        match device_fd::close_when_idle(&self.tun_fd, device_fd::IN_FLIGHT_WAIT).await {
+            CloseOutcome::Closed => tracing::info!("Closed TUN file descriptor"),
+            CloseOutcome::Deferred => tracing::warn!(
+                "TUN fd still held by in-flight I/O after {:?} — released our reference; it \
+                 closes when that I/O returns",
+                device_fd::IN_FLIGHT_WAIT
+            ),
+            CloseOutcome::Empty => {}
         }
 
         *self.tun_name.write().await = None;
@@ -557,9 +575,13 @@ impl LinuxTunnel {
     /// on every non-idle iteration a page fault or memset for the pages the
     /// kernel actually filled) per packet, on the hot path, for the whole
     /// session. See [`tun_read_owned`].
+    ///
+    /// MR-820: every blocking read/write gets its own clone of `tun_fd` and
+    /// holds it for the length of the syscall, so the descriptor cannot be
+    /// closed (and its number recycled) under one the loop has detached.
     #[allow(clippy::too_many_arguments)] // shared session handles, moved into the task once
     async fn packet_loop(
-        tun_fd: i32,
+        tun_fd: SharedFd,
         wg_session: Arc<RwLock<Option<WireGuardSession>>>,
         running: Arc<AtomicBool>,
         bytes_sent: Arc<AtomicU64>,
@@ -568,7 +590,7 @@ impl LinuxTunnel {
         packets_received: Arc<AtomicU64>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
-        tracing::info!("Packet loop started on TUN fd={}", tun_fd);
+        tracing::info!("Packet loop started on TUN fd={}", tun_fd.as_raw_fd());
 
         const MAX_PACKET_SIZE: usize = 65536;
 
@@ -618,10 +640,13 @@ impl LinuxTunnel {
                 }
                 // Read from TUN (async via spawn_blocking for the fd read). The
                 // owned buffer is moved in and returned, never reallocated.
+                // The closure owns a reference to the fd until the read returns
+                // (MR-820): when shutdown wins this select!, it is detached, not
+                // cancelled.
                 result = tokio::task::spawn_blocking({
-                    let fd = tun_fd;
+                    let fd = Arc::clone(&tun_fd);
                     let buf = std::mem::take(&mut read_buf);
-                    move || tun_read_owned(fd, buf)
+                    move || tun_read_owned(fd.as_raw_fd(), buf)
                 }) => {
                     if let Ok((buf, n)) = result {
                         // Hand the buffer back for the next iteration BEFORE
@@ -657,12 +682,16 @@ impl LinuxTunnel {
                         let packet_len = decrypted.len() as u64;
 
                         // Linux TUN with IFF_NO_PI: write raw IP packet directly (no header)
-                        let fd = tun_fd;
+                        let fd = Arc::clone(&tun_fd);
                         let buf = decrypted;
                         let buf_len = buf.len();
                         let write_result = tokio::task::spawn_blocking(move || {
                             let written = unsafe {
-                                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+                                libc::write(
+                                    fd.as_raw_fd(),
+                                    buf.as_ptr() as *const libc::c_void,
+                                    buf.len(),
+                                )
                             };
                             if written < 0 {
                                 tracing::debug!(
@@ -762,7 +791,8 @@ fn tun_read_owned(fd: i32, mut buf: Vec<u8>) -> (Vec<u8>, Option<usize>) {
 
 /// F6: the packet loop's read helper must reuse its buffer. Exercised on a
 /// pipe (any fd works for `read(2)`) on the ubuntu leg of tests.yml — no TUN
-/// device or root needed.
+/// device or root needed. MR-820's fd-lifetime tests live here too, for the
+/// same reason (`device_fd`'s own tests cover the protocol on every platform).
 #[cfg(test)]
 mod tun_read_tests {
     use super::tun_read_owned;
@@ -853,6 +883,88 @@ mod tun_read_tests {
             libc::close(r);
         }
     }
+
+    /// Writing to a pipe whose read end is gone fails with EPIPE (Rust
+    /// ignores SIGPIPE), which is how these tests see that the read end — the
+    /// stand-in for the TUN fd — was really closed.
+    fn read_end_is_closed(w: i32) -> bool {
+        let n = unsafe { libc::write(w, b"?".as_ptr() as *const libc::c_void, 1) };
+        n == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
+    }
+
+    /// MR-820: the tunnel letting go of the fd (stop() or Drop) while a
+    /// blocking read the loop detached still holds it must not free its
+    /// NUMBER. The old raw `close(fd)` did, and pipe()/open() hand out the
+    /// lowest free number — that one — so the late read landed on whatever
+    /// the process opened next. Held, the number cannot be handed out again.
+    #[test]
+    fn a_held_fd_keeps_its_number_until_the_last_holder_lets_go() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::sync::Arc;
+
+        let (r, w) = nonblocking_pipe();
+        let tunnels_ref = Arc::new(unsafe { OwnedFd::from_raw_fd(r) });
+        let in_flight = Arc::clone(&tunnels_ref);
+        drop(tunnels_ref); // what stop()/Drop do with their reference
+
+        let (r2, w2) = nonblocking_pipe();
+        assert_ne!(r2, r, "the held fd's number was handed out again");
+        assert_ne!(w2, r, "the held fd's number was handed out again");
+        // Still open (and, being held, still ours: nothing can reuse it).
+        assert_ne!(
+            unsafe { libc::fcntl(r, libc::F_GETFD) },
+            -1,
+            "closed while a read still held it"
+        );
+
+        // The detached read still reads ITS device, not a newcomer.
+        write_all(w, b"x");
+        let (buf, n) = tun_read_owned(in_flight.as_raw_fd(), vec![0u8; 8]);
+        assert_eq!((n, buf[0]), (Some(1), b'x'));
+
+        drop(in_flight); // the last holder closes it
+        assert!(read_end_is_closed(w));
+        unsafe {
+            libc::close(w);
+            libc::close(r2);
+            libc::close(w2);
+        }
+    }
+
+    /// MR-820: stop()'s close waits for the blocking read the loop detached,
+    /// then closes — the read runs against its own, still-open fd.
+    #[tokio::test]
+    async fn the_close_waits_for_a_detached_read_then_closes() {
+        use crate::vpn::device_fd::{close_when_idle, CloseOutcome, DeviceSlot, IN_FLIGHT_WAIT};
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::sync::Arc;
+
+        let (r, w) = nonblocking_pipe();
+        let slot: DeviceSlot<OwnedFd> =
+            tokio::sync::RwLock::new(Some(Arc::new(unsafe { OwnedFd::from_raw_fd(r) })));
+        write_all(w, b"x");
+
+        // A read handed to the blocking pool that has not run yet.
+        let fd = Arc::clone(slot.read().await.as_ref().unwrap());
+        let read = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            tun_read_owned(fd.as_raw_fd(), vec![0u8; 8])
+        });
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            close_when_idle(&slot, IN_FLIGHT_WAIT).await,
+            CloseOutcome::Closed
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(80),
+            "closed before the detached read ran"
+        );
+        let (buf, n) = read.join().unwrap();
+        assert_eq!((n, buf[0]), (Some(1), b'x'));
+        assert!(read_end_is_closed(w));
+        unsafe { libc::close(w) };
+    }
 }
 
 /// LAST-RESORT teardown, mirroring UtunTunnel's Drop (tunnel_macos.rs). start()
@@ -866,6 +978,10 @@ mod tun_read_tests {
 /// every route through it.
 impl Drop for LinuxTunnel {
     fn drop(&mut self) {
+        // A packet loop still running (a tunnel dropped without stop()) holds
+        // its own reference to the fd: stop it so it lets go. Its shutdown
+        // sender goes with this struct, which also ends its select!.
+        self.running.store(false, Ordering::SeqCst);
         // Drop cannot await. try_write is enough: by the time the tunnel is
         // being dropped nothing else legitimately holds this lock, and failing
         // to acquire it must never panic or block a teardown.
@@ -876,13 +992,16 @@ impl Drop for LinuxTunnel {
         let Some(fd) = fd else {
             return; // stop()/unwind already ran — nothing leaked
         };
-        // Drop cannot join the packet loop (no await), so this close carries
-        // the small fd-recycle race stop() eliminates. Accepted: this is the
-        // last-resort path for a DROPPED half-built tunnel, and leaving the
-        // device alive (the alternative) is a guaranteed IPv4 blackhole.
-        let _ = unsafe { libc::close(fd) };
+        // Drop cannot wait for in-flight I/O (no await), and with the fd
+        // shared it does not need to (MR-820): letting go of our reference
+        // closes it now, or — if a blocking read/write or the exiting loop
+        // still holds it — the moment that returns. Never under a syscall that
+        // is still using the number, and never twice. This used to close the
+        // raw fd outright and accept the recycle race as the price of not
+        // leaving the device alive (a guaranteed IPv4 blackhole).
+        drop(fd);
         tracing::warn!(
-            "LinuxTunnel dropped with the TUN fd still open — closed it to \
+            "LinuxTunnel dropped with the TUN fd still open — released it to \
              destroy the device and release its routes"
         );
         // A cancellation can also strike after /etc/resolv.conf was pinned but
@@ -970,8 +1089,9 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
 /// Create a Linux TUN device via /dev/net/tun ioctl.
 ///
 /// Uses IFF_TUN | IFF_NO_PI for raw IP packet I/O (no protocol info header).
-/// Returns (tun_name, raw_fd) on success.
-fn create_tun_device() -> Result<(String, i32), String> {
+/// Returns (tun_name, fd) on success; the fd is owned from here on (MR-820), so
+/// it is closed exactly once, by whoever lets go of it last.
+fn create_tun_device() -> Result<(String, OwnedFd), String> {
     // struct ifreq — only the fields we need
     #[repr(C)]
     struct IfReq {
@@ -1046,7 +1166,9 @@ fn create_tun_device() -> Result<(String, i32), String> {
     }
 
     tracing::info!("Successfully created TUN device: {} (fd={})", tun_name, fd);
-    Ok((tun_name, fd))
+    // SAFETY: `fd` was opened above, is valid, and nothing else owns it: every
+    // earlier return closed it, and from here on only the OwnedFd does.
+    Ok((tun_name, unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
 /// Configure the TUN interface IP address and MTU using `ip` command.

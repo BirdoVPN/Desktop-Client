@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
+use super::device_fd::{self, CloseOutcome, DeviceSlot, SharedFd};
 use super::wireguard_new::{WgPrivateKey, WireGuardSession};
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
@@ -168,8 +170,9 @@ pub struct UtunTunnel {
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
     /// The utun device name assigned by the kernel (e.g. "utun3")
     utun_name: Arc<RwLock<Option<String>>>,
-    /// The raw file descriptor for the utun device
-    utun_fd: Arc<RwLock<Option<i32>>>,
+    /// The utun device's file descriptor, shared with the packet loop and each
+    /// of its in-flight blocking reads/writes (MR-820, see `device_fd`).
+    utun_fd: Arc<DeviceSlot<OwnedFd>>,
     /// Network snapshot for restoration on disconnect
     network_snapshot: Arc<RwLock<Option<NetworkSnapshot>>>,
     /// Whether to allow local network access while VPN is active
@@ -178,11 +181,10 @@ pub struct UtunTunnel {
     endpoint_ip: Arc<RwLock<Option<String>>>,
     /// JoinHandle of the spawned packet loop.
     ///
-    /// P1-dk-tun-fd-close-race: stop() must JOIN this task before closing the
-    /// utun fd. The loop's spawn_blocking closures capture the raw i32; closing
-    /// while one is still in flight lets the kernel recycle the descriptor
-    /// number, and the stale read()/write() then lands on whatever unrelated
-    /// file or socket this process opens next.
+    /// P1-dk-tun-fd-close-race: stop() JOINS this task before closing the utun
+    /// fd. Joining the task alone did not join the blocking reads/writes it
+    /// had already handed off (MR-820); those now hold the fd themselves, and
+    /// the close waits for them (`device_fd::close_when_idle`).
     packet_loop: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -207,15 +209,18 @@ impl Drop for UtunTunnel {
         // acquire it must never panic or block a teardown.
         if let Ok(mut guard) = self.utun_fd.try_write() {
             if let Some(fd) = guard.take() {
-                // Drop cannot join the packet loop (no await), so this close
-                // carries the small fd-recycle race stop() eliminates.
-                // Accepted: this is the last-resort path for a DROPPED
-                // half-built tunnel, and leaving the device alive for good
-                // (the alternative) is a guaranteed IPv4 blackhole.
+                // Drop cannot wait for in-flight I/O (no await), and with the
+                // fd shared it does not need to (MR-820): letting go of this
+                // reference closes it now, or — if a blocking read/write or the
+                // exiting loop still holds it — the moment that returns. Never
+                // under a syscall still using the number, never twice. This
+                // used to close the raw fd outright and accept the recycle race
+                // as the price of not leaving the device alive for good (a
+                // guaranteed IPv4 blackhole).
                 let close = move || {
-                    let _ = unsafe { libc::close(fd) };
+                    drop(fd);
                     tracing::warn!(
-                        "UtunTunnel dropped with the utun fd still open — closed it to \
+                        "UtunTunnel dropped with the utun fd still open — released it to \
                          destroy the interface and release its routes"
                     );
                 };
@@ -290,7 +295,7 @@ impl UtunTunnel {
         tracing::info!("Created utun device: {}", utun_name);
 
         *self.utun_name.write().await = Some(utun_name.clone());
-        *self.utun_fd.write().await = Some(utun_fd);
+        *self.utun_fd.write().await = Some(Arc::new(utun_fd));
 
         // MR-1125: the kill switch permits the tunnel by interface NAME — this
         // one, whichever free unit it landed on, and no other — so record it
@@ -440,7 +445,15 @@ impl UtunTunnel {
         let packets_sent = self.packets_sent.clone();
         let packets_received = self.packets_received.clone();
         let wg_session = self.wg_session.clone();
-        let fd = utun_fd;
+        // The loop's own reference (MR-820), taken from the slot so start()
+        // keeps none. Bound first: the read guard must be gone before stop()
+        // takes the write lock. An empty slot means a stop() already ran; this
+        // one finishes whatever it did not.
+        let loop_fd = self.utun_fd.read().await.clone();
+        let Some(fd) = loop_fd else {
+            let _ = self.stop().await;
+            return Err("The utun device was closed before the packet loop started".to_string());
+        };
 
         let loop_handle = tokio::spawn(async move {
             Self::packet_loop(
@@ -474,7 +487,9 @@ impl UtunTunnel {
         crate::commands::killswitch::tunnel_interface_down(name).await;
         let mut slot = self.utun_fd.write().await;
         if let Some(fd) = slot.take() {
-            let _ = unsafe { libc::close(fd) };
+            // No packet loop exists yet, so this is the only reference and
+            // letting go of it closes the fd (MR-820).
+            drop(fd);
             tracing::warn!("Closed utun file descriptor after startup failure");
         }
     }
@@ -491,16 +506,16 @@ impl UtunTunnel {
         }
 
         // P1-dk-tun-fd-close-race: JOIN the packet loop before the fd close
-        // below. The loop's spawn_blocking closures capture the raw i32 fd;
-        // without the join, an in-flight libc::read/libc::write can execute
-        // AFTER close(2) returns the number to the kernel's free pool — and the
-        // stale syscall then reads from or writes packet bytes into whatever
-        // unrelated descriptor (log file, TLS socket, keystore handle) this
-        // process opened next. The fd is O_NONBLOCK, so the loop drains within
-        // one iteration of the shutdown signal; the timeout is a safety valve
-        // only. If it ever fires we abort the task and fall through to the
-        // close anyway — a stuck loop must not leave the device alive owning
-        // the half-default routes (that is the frozen-switch blackhole).
+        // below. The fd is O_NONBLOCK, so the loop drains within one iteration
+        // of the shutdown signal; the timeout is a safety valve only. If it
+        // ever fires we abort the task and fall through to the close anyway —
+        // a stuck loop must not leave the device alive owning the half-default
+        // routes (that is the frozen-switch blackhole).
+        //
+        // MR-820: the task join does not cover a read the loop had already
+        // handed to the blocking pool (the select! detaches it when shutdown
+        // wins). Each of those holds its own reference to the fd now, and the
+        // close at the end of stop() waits for them.
         if let Some(handle) = self.packet_loop.write().await.take() {
             let abort = handle.abort_handle();
             if tokio::time::timeout(std::time::Duration::from_secs(5), handle)
@@ -540,7 +555,10 @@ impl UtunTunnel {
         // 10 s cap on a teardown and drops this future when it fires; an fd
         // taken out of `utun_fd` before the await was then closed by nobody,
         // and the device lived on. It is taken and closed with no await in
-        // between, so a cancel leaves it where `Drop` finds it.
+        // between, so a cancel leaves it where `Drop` finds it — and that holds
+        // for the wait on in-flight I/O below too (MR-820: closing under a
+        // blocking read/write used to hand its number to the free pool while
+        // the syscall had yet to run).
         let open = self.utun_fd.read().await.is_some();
         let utun_name = self.utun_name.read().await.clone();
         if open {
@@ -548,12 +566,14 @@ impl UtunTunnel {
                 crate::commands::killswitch::tunnel_interface_down(name).await;
             }
         }
-        {
-            let mut slot = self.utun_fd.write().await;
-            if let Some(fd) = slot.take() {
-                let _ = unsafe { libc::close(fd) };
-                tracing::info!("Closed utun file descriptor");
-            }
+        match device_fd::close_when_idle(&self.utun_fd, device_fd::IN_FLIGHT_WAIT).await {
+            CloseOutcome::Closed => tracing::info!("Closed utun file descriptor"),
+            CloseOutcome::Deferred => tracing::warn!(
+                "utun fd still held by in-flight I/O after {:?} — released our reference; it \
+                 closes when that I/O returns",
+                device_fd::IN_FLIGHT_WAIT
+            ),
+            CloseOutcome::Empty => {}
         }
         *self.utun_name.write().await = None;
 
@@ -617,9 +637,13 @@ impl UtunTunnel {
     }
 
     /// Packet processing loop: read from utun, encrypt via WireGuard, send to server.
+    ///
+    /// MR-820: every blocking read/write gets its own clone of `utun_fd` and
+    /// holds it for the length of the syscall, so the descriptor cannot be
+    /// closed (and its number recycled) under one the loop has detached.
     #[allow(clippy::too_many_arguments)] // shared session handles, moved into the task once
     async fn packet_loop(
-        utun_fd: i32,
+        utun_fd: SharedFd,
         wg_session: Arc<RwLock<Option<WireGuardSession>>>,
         running: Arc<AtomicBool>,
         bytes_sent: Arc<AtomicU64>,
@@ -628,7 +652,7 @@ impl UtunTunnel {
         packets_received: Arc<AtomicU64>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
-        tracing::info!("Packet loop started on utun fd={}", utun_fd);
+        tracing::info!("Packet loop started on utun fd={}", utun_fd.as_raw_fd());
 
         // macOS utun prepends a 4-byte protocol header (AF_INET = 2 for IPv4)
         const UTUN_HEADER_SIZE: usize = 4;
@@ -679,11 +703,16 @@ impl UtunTunnel {
                 // The owned read buffer is moved into the blocking task and returned back
                 // together with the byte count, so it is reused across iterations instead of
                 // cloning ~64KB every loop cycle (including idle EAGAIN polls).
+                // The closure owns a reference to the fd until the read returns
+                // (MR-820): when shutdown wins this select!, it is detached, not
+                // cancelled.
                 result = tokio::task::spawn_blocking({
-                    let fd = utun_fd;
+                    let fd = Arc::clone(&utun_fd);
                     let mut buf = std::mem::take(&mut read_buf);
                     move || {
-                        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                        let n = unsafe {
+                            libc::read(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                        };
                         if n < 0 {
                             let err = std::io::Error::last_os_error();
                             if err.raw_os_error() != Some(libc::EAGAIN) {
@@ -731,7 +760,7 @@ impl UtunTunnel {
                         write_buf[4..4 + decrypted.len()].copy_from_slice(&decrypted);
 
                         let write_len = 4 + decrypted.len();
-                        let fd = utun_fd;
+                        let fd = Arc::clone(&utun_fd);
                         let buf = write_buf[..write_len].to_vec();
                         let expected = buf.len();
                         // P1-dk-macos-rx-counters-on-failed-write: only count a
@@ -741,7 +770,11 @@ impl UtunTunnel {
                         // fires.
                         let write_ok = tokio::task::spawn_blocking(move || {
                             let written = unsafe {
-                                libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
+                                libc::write(
+                                    fd.as_raw_fd(),
+                                    buf.as_ptr() as *const libc::c_void,
+                                    buf.len(),
+                                )
                             };
                             if written < 0 {
                                 tracing::debug!(
@@ -869,8 +902,9 @@ fn validate_config(config: &VpnConfig) -> Result<(), String> {
 
 /// Create a macOS utun device via AF_SYSTEM socket.
 ///
-/// Returns (utun_name, raw_fd) on success.
-fn create_utun_device() -> Result<(String, i32), String> {
+/// Returns (utun_name, fd) on success; the fd is owned from here on (MR-820),
+/// so it is closed exactly once, by whoever lets go of it last.
+fn create_utun_device() -> Result<(String, OwnedFd), String> {
     use std::os::unix::io::RawFd;
 
     // macOS-specific constants for utun
@@ -972,7 +1006,9 @@ fn create_utun_device() -> Result<(String, i32), String> {
                 );
             }
 
-            return Ok((utun_name, fd));
+            // SAFETY: `fd` was opened above, is valid, and nothing else owns
+            // it; from here on only the OwnedFd does.
+            return Ok((utun_name, unsafe { OwnedFd::from_raw_fd(fd) }));
         }
     }
 
