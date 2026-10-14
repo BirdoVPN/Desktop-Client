@@ -3,7 +3,7 @@
 Every desktop release is built by this repository's
 [`release.yml`](../.github/workflows/release.yml) workflow from a `vX.Y.Z` tag. The
 release carries one `SHA256SUMS.txt` (the SHA-256 of every installer and package in
-the release) and one `SHA256SUMS.txt.sigstore` bundle: a [Sigstore](https://www.sigstore.dev/)
+the release, and of its corresponding-source archive) and one `SHA256SUMS.txt.sigstore` bundle: a [Sigstore](https://www.sigstore.dev/)
 keyless signature over that checksums file, made by that workflow run and recorded
 in the public Rekor transparency log.
 
@@ -68,7 +68,7 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 
 | Layer | Covers | Checked by |
 |---|---|---|
-| Sigstore bundle over `SHA256SUMS.txt` | every installer and package in the release | you, with the commands above |
+| Sigstore bundle over `SHA256SUMS.txt` | every installer and package in the release, and `BirdoVPN-<version>-corresponding-source.tar.gz` (the source of the bundled Xray-core, every Go module it links and the Go toolchain that built it, and of the AppImage runtime with libfuse and squashfuse) | you, with the commands above |
 | Authenticode (Azure Trusted Signing) | the Windows installer, the app `.exe` inside it, and the bundled `xray.exe` | Windows, automatically |
 | Tauri updater signature (`*.sig`, minisign) | each auto-update bundle | the in-app updater, against the public key built into the app |
 
