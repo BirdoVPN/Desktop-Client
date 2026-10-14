@@ -1563,23 +1563,29 @@ fn forget_saved_account_choices(app: &AppHandle) {
     }
 }
 
-/// Put the tunnel-shaping settings of `good` back over what is saved now, and
-/// save: the revert of a settings change the live session could not apply
-/// (WIN-FIX-3, `vpn::reapply_vpn_settings`). Returns what was saved. On the
-/// blocking pool, like the commands (review of #222).
+/// Put the tunnel-shaping settings that the failed change (`attempted`) moved
+/// back to `good` over what is saved now, and save: the revert of a settings
+/// change the live session could not apply (WIN-FIX-3,
+/// `vpn::reapply_vpn_settings`). Returns what was saved. On the blocking
+/// pool, like the commands (review of #222).
 pub(crate) async fn restore_tunnel_settings(
     app: &AppHandle,
     good: &AppSettings,
+    attempted: &AppSettings,
 ) -> Result<AppSettings, String> {
-    let (app, good) = (app.clone(), good.clone());
-    tokio::task::spawn_blocking(move || restore_tunnel_settings_now(&app, &good))
+    let (app, good, attempted) = (app.clone(), good.clone(), attempted.clone());
+    tokio::task::spawn_blocking(move || restore_tunnel_settings_now(&app, &good, &attempted))
         .await
         .map_err(|e| format!("Settings task failed: {e}"))?
 }
 
-fn restore_tunnel_settings_now(app: &AppHandle, good: &AppSettings) -> Result<AppSettings, String> {
+fn restore_tunnel_settings_now(
+    app: &AppHandle,
+    good: &AppSettings,
+    attempted: &AppSettings,
+) -> Result<AppSettings, String> {
     let _write = SETTINGS_WRITE.lock();
-    let restored = restored_over(load_settings(app)?, good)?;
+    let restored = restored_over(load_settings(app)?, good, attempted)?;
     save_settings_inner(app, &restored)?;
     Ok(restored)
 }
@@ -1589,9 +1595,13 @@ fn restore_tunnel_settings_now(app: &AppHandle, good: &AppSettings) -> Result<Ap
 /// replaced the user's kill switch, lockdown, autostart, server and every
 /// other preference with defaults. The revert then fails, and the error the
 /// reapply met stands.
-fn restored_over(loaded: Loaded, good: &AppSettings) -> Result<AppSettings, String> {
+fn restored_over(
+    loaded: Loaded,
+    good: &AppSettings,
+    attempted: &AppSettings,
+) -> Result<AppSettings, String> {
     verified(loaded)
-        .map(|current| with_tunnel_settings_of(current, good))
+        .map(|current| with_tunnel_settings_of(current, good, attempted))
         .map_err(|refusal| refusal.message)
 }
 
@@ -1636,20 +1646,72 @@ fn may_save_over(loaded: Result<Loaded, LoadError>) -> Result<(), IpcError> {
     }
 }
 
-/// `current` with every setting a live reapply rebuilds the tunnel for taken
-/// from `good`. Only those: anything else changed since (a notification
-/// toggle, the server the user picked) is not part of the revert.
-fn with_tunnel_settings_of(current: AppSettings, good: &AppSettings) -> AppSettings {
+/// `current` with the settings a live reapply rebuilds the tunnel for put
+/// back to `good` — each only where the failed change moved it (`attempted`
+/// differs from `good`) and it still holds what was attempted.
+///
+/// WIN3-009 item 3: the revert used to copy every tunnel setting from `good`,
+/// the settings the session connected with. That also threw away changes
+/// that were never attempted: one saved while the rebuild ran (the UI holds
+/// its saves for a while, not for ever, and `scheduleReapply` does nothing
+/// mid-switch), or one saved earlier that no rebuild took up. A setting the
+/// change did not move, or one changed again since, keeps what is saved.
+/// Anything that shapes no tunnel (a notification toggle, the server the user
+/// picked) is not part of the revert at all.
+fn with_tunnel_settings_of(
+    current: AppSettings,
+    good: &AppSettings,
+    attempted: &AppSettings,
+) -> AppSettings {
+    fn back<T: PartialEq + Clone>(current: T, good: &T, attempted: &T) -> T {
+        if attempted != good && current == *attempted {
+            good.clone()
+        } else {
+            current
+        }
+    }
     AppSettings {
-        custom_dns: good.custom_dns.clone(),
-        local_network_sharing: good.local_network_sharing,
-        wireguard_port: good.wireguard_port.clone(),
-        wireguard_mtu: good.wireguard_mtu,
-        stealth_mode: good.stealth_mode,
-        quantum_protection: good.quantum_protection,
-        dns_filtering: good.dns_filtering,
-        split_tunneling_enabled: good.split_tunneling_enabled,
-        split_tunnel_apps: good.split_tunnel_apps.clone(),
+        custom_dns: back(current.custom_dns, &good.custom_dns, &attempted.custom_dns),
+        local_network_sharing: back(
+            current.local_network_sharing,
+            &good.local_network_sharing,
+            &attempted.local_network_sharing,
+        ),
+        wireguard_port: back(
+            current.wireguard_port,
+            &good.wireguard_port,
+            &attempted.wireguard_port,
+        ),
+        wireguard_mtu: back(
+            current.wireguard_mtu,
+            &good.wireguard_mtu,
+            &attempted.wireguard_mtu,
+        ),
+        stealth_mode: back(
+            current.stealth_mode,
+            &good.stealth_mode,
+            &attempted.stealth_mode,
+        ),
+        quantum_protection: back(
+            current.quantum_protection,
+            &good.quantum_protection,
+            &attempted.quantum_protection,
+        ),
+        dns_filtering: back(
+            current.dns_filtering,
+            &good.dns_filtering,
+            &attempted.dns_filtering,
+        ),
+        split_tunneling_enabled: back(
+            current.split_tunneling_enabled,
+            &good.split_tunneling_enabled,
+            &attempted.split_tunneling_enabled,
+        ),
+        split_tunnel_apps: back(
+            current.split_tunnel_apps,
+            &good.split_tunnel_apps,
+            &attempted.split_tunnel_apps,
+        ),
         ..current
     }
 }
@@ -2140,7 +2202,8 @@ mod tests {
     }
 
     /// WIN-FIX-3: a reapply that cannot be applied puts back what the live
-    /// session runs on — every tunnel-shaping setting — and nothing else.
+    /// session runs on — every tunnel-shaping setting the change moved — and
+    /// nothing else.
     #[test]
     fn a_revert_restores_the_tunnel_settings_and_keeps_the_rest() {
         let good = AppSettings::default();
@@ -2160,7 +2223,7 @@ mod tests {
             auto_connect: true,
             ..AppSettings::default()
         };
-        let restored = with_tunnel_settings_of(changed, &good);
+        let restored = with_tunnel_settings_of(changed.clone(), &good, &changed);
         assert_eq!(restored.wireguard_port, good.wireguard_port);
         assert_eq!(restored.wireguard_mtu, good.wireguard_mtu);
         assert_eq!(restored.custom_dns, good.custom_dns);
@@ -2178,6 +2241,58 @@ mod tests {
         assert!(restored.auto_connect);
     }
 
+    /// WIN3-009 item 3: a revert puts back only what the failed change moved.
+    /// A setting changed since and never attempted (saved while the rebuild
+    /// ran, or before it and never taken up) keeps what is saved — also when
+    /// it is a setting the change moved and the user moved again.
+    #[test]
+    fn a_revert_keeps_changes_that_were_never_attempted() {
+        let good = AppSettings::default();
+        // The change that failed: Stealth Mode on.
+        let attempted = AppSettings {
+            stealth_mode: true,
+            ..good.clone()
+        };
+        // Saved since, never attempted: an MTU and an excepted app.
+        let current = AppSettings {
+            wireguard_mtu: 1280,
+            split_tunneling_enabled: true,
+            split_tunnel_apps: vec!["C:\\apps\\game.exe".into()],
+            ..attempted.clone()
+        };
+        let restored = with_tunnel_settings_of(current, &good, &attempted);
+        assert!(!restored.stealth_mode, "the failed change is reverted");
+        assert_eq!(restored.wireguard_mtu, 1280, "a later change was undone");
+        assert!(restored.split_tunneling_enabled);
+        assert_eq!(restored.split_tunnel_apps, vec!["C:\\apps\\game.exe"]);
+
+        // The failed change's own setting, moved again since: the newer
+        // choice stands (it was never attempted either).
+        let attempted = AppSettings {
+            wireguard_mtu: 1300,
+            ..good.clone()
+        };
+        let current = AppSettings {
+            wireguard_mtu: 1340,
+            ..good.clone()
+        };
+        let restored = with_tunnel_settings_of(current, &good, &attempted);
+        assert_eq!(restored.wireguard_mtu, 1340);
+
+        // A Custom DNS the change turned off comes back — the gate in the UI
+        // retries its own switch-off (`custom-dns-gate.ts`, item 4).
+        let good = AppSettings {
+            custom_dns: Some(vec!["9.9.9.9".into()]),
+            ..AppSettings::default()
+        };
+        let attempted = AppSettings {
+            custom_dns: None,
+            ..good.clone()
+        };
+        let restored = with_tunnel_settings_of(attempted.clone(), &good, &attempted);
+        assert_eq!(restored.custom_dns, good.custom_dns);
+    }
+
     /// WIN3-010: a revert never saves over the defaults a load serves while
     /// it cannot verify the file (its signing key unreadable): they are not
     /// the user's settings, and saving them replaced every preference. Over
@@ -2190,13 +2305,23 @@ mod tests {
             wireguard_mtu: 1280,
             ..AppSettings::default()
         };
-        assert!(restored_over(Loaded::Unverified(AppSettings::default()), &good).is_err());
+        let attempted = AppSettings {
+            wireguard_mtu: 1420,
+            ..AppSettings::default()
+        };
+        assert!(restored_over(
+            Loaded::Unverified(AppSettings::default()),
+            &good,
+            &attempted
+        )
+        .is_err());
         let saved = AppSettings {
             killswitch_enabled: false,
             wireguard_mtu: 1420,
             ..AppSettings::default()
         };
-        let restored = restored_over(Loaded::Saved(saved), &good).expect("a verified file");
+        let restored =
+            restored_over(Loaded::Saved(saved), &good, &attempted).expect("a verified file");
         assert_eq!(restored.wireguard_mtu, 1280);
         assert!(!restored.killswitch_enabled, "not part of the revert");
 
@@ -2212,7 +2337,7 @@ mod tests {
                 .expect("end of fn")]
         };
         let restore = body("fn restore_tunnel_settings_now(");
-        assert!(restore.contains("restored_over(load_settings(app)?, good)?"));
+        assert!(restore.contains("restored_over(load_settings(app)?, good, attempted)?"));
         let load = body("fn load_settings(app: &AppHandle) -> Result<Loaded, LoadError> {");
         let lock = load.find("SETTINGS_WRITE.lock()").expect("the lock");
         assert!(lock < load.find("get_settings_path(app)").unwrap());
@@ -3245,7 +3370,7 @@ mod tests {
             ),
             (
                 include_str!("vpn.rs"),
-                "restore_tunnel_settings(&app, &previous).await",
+                "restore_tunnel_settings(self.app, previous, &self.attempted)",
             ),
             (
                 include_str!("killswitch.rs"),
