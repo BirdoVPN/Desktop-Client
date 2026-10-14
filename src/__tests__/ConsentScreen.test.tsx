@@ -8,13 +8,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
 import { ConsentScreen, CONSENT_COPY, TERMS_URL, PRIVACY_URL } from '@/components/ConsentScreen';
 import { createHash } from 'node:crypto';
 import { CONSENT_VERSION } from '@/lib/consent';
 
-vi.mock('@tauri-apps/plugin-shell', () => ({
-  open: vi.fn().mockResolvedValue(undefined),
+vi.mock('@tauri-apps/plugin-opener', () => ({
+  openUrl: vi.fn().mockResolvedValue(undefined),
 }));
 
 function stripMotion(props: Record<string, unknown>) {

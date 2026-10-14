@@ -10,7 +10,17 @@
     "core:window:allow-set-position",
     "core:window:allow-set-size",
     "core:window:allow-set-decorations",
-    "shell:allow-open",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://birdo.app" },
+        { "url": "https://birdo.app/*" },
+        { "url": "https://auth.birdo.app" },
+        { "url": "https://auth.birdo.app/*" },
+        { "url": "https://dashboard.birdo.app" },
+        { "url": "https://dashboard.birdo.app/*" }
+      ]
+    },
     "notification:default",
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",
