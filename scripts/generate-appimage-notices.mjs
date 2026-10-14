@@ -122,16 +122,15 @@ if (!fs.existsSync(path.join(args.appdir, 'usr'))) fail(`${args.appdir} has no u
 const ELF = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
 const elfFiles = [];
 (function walk(dir) {
-  for (const name of fs.readdirSync(dir).sort(byKey)) {
-    const file = path.join(dir, name);
-    const st = fs.lstatSync(file);
-    if (st.isDirectory()) walk(file);
-    else if (st.isFile() && st.size >= 4) {
-      const fd = fs.openSync(file, 'r');
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => byKey(a.name, b.name))) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) walk(file);
+    else if (entry.isFile()) {
       const head = Buffer.alloc(4);
-      fs.readSync(fd, head, 0, 4, 0);
+      const fd = fs.openSync(file, 'r');
+      const read = fs.readSync(fd, head, 0, 4, 0);
       fs.closeSync(fd);
-      if (head.equals(ELF)) elfFiles.push(path.relative(args.appdir, file).split(path.sep).join('/'));
+      if (read === 4 && head.equals(ELF)) elfFiles.push(path.relative(args.appdir, file).split(path.sep).join('/'));
     }
     // Symlinks are not followed: linuxdeploy's links point at files inside
     // the AppDir, which are listed under their own paths.
@@ -218,10 +217,12 @@ for (const line of run('dpkg-query', ['-W', `-f=${FIELDS}`, ...pkgNames]).split(
   packages.set(query, entry);
   if (!packages.has(name)) packages.set(name, entry); // dpkg -S may name it with or without :arch
 }
-for (const [rel, { pkg }] of packageOf) {
+for (const [rel, { pkg, hostPath }] of packageOf) {
   const p = packages.get(pkg) || packages.get(pkg.replace(/:[^:]+$/, ''));
   if (!p) fail(`dpkg-query does not know ${pkg} (owner of ${rel})`);
   p.files.push(rel);
+  // The mapping, for the build log.
+  console.log(`  ${rel} <- ${hostPath} (${p.name} ${p.version})`);
 }
 
 // ── Licence texts: each printed once, numbered by first use ────────────────
@@ -251,9 +252,12 @@ for (const p of listed) {
   const copyright = normalize(fs.readFileSync(copyrightFile, 'utf8'));
   p.texts = [addText(copyright, `/usr/share/doc/${p.name}/copyright`)];
   for (const m of copyright.matchAll(CITED)) {
-    // A sentence's full stop is not part of the name; "GPL-2+" means GPL-2.
+    // A sentence's full stop is not part of the name; "GPL-2+" means GPL-2,
+    // and so does "GPL-2.0" (pango's copyright file cites that; Debian's
+    // file is GPL-2).
     const cited = m[1].replace(/\.+$/, '');
-    const name = [cited, cited.replace(/\+$/, '')].find((n) => fs.existsSync(path.posix.join(args.licensesRoot, n)));
+    const bare = cited.replace(/\+$/, '');
+    const name = [cited, bare, bare.replace(/\.0$/, '')].find((n) => fs.existsSync(path.posix.join(args.licensesRoot, n)));
     if (!name) {
       problems.push(`${p.name}: its copyright file cites /usr/share/common-licenses/${cited}, which this host does not have`);
       continue;

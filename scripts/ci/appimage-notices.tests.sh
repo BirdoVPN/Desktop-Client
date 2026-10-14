@@ -124,9 +124,11 @@ License: BSD-2-clause and LGPL-2.1+
 
 License: LGPL-2.1+
  See /usr/share/common-licenses/LGPL-2.1.
+ Parts: GPL-2+, see /usr/share/common-licenses/GPL-2.0 (sic, as pango's file).
 EOF
 printf 'FIXTURE LGPL-2 FULL TEXT\n' >"$licences/LGPL-2"
 printf 'FIXTURE LGPL-2.1 FULL TEXT\n' >"$licences/LGPL-2.1"
+printf 'FIXTURE GPL-2 FULL TEXT\n' >"$licences/GPL-2"
 printf 'PRETTY_NAME="Ubuntu 22.04.5 LTS"\nNAME="Ubuntu"\n' >"$work/os-release"
 hostroot="$work/host"
 mkdir -p "$hostroot/usr/lib/x86_64-linux-gnu"
@@ -203,6 +205,7 @@ has 'DEP-5 licence names' "$out" '  licences named in its copyright file: LGPL-2
 has 'a non-DEP-5 copyright file' "$out" '  licence: as its copyright file says'
 has 'the cited LGPL-2 text in full' "$out" 'FIXTURE LGPL-2 FULL TEXT'
 has 'the cited LGPL-2.1 text in full (trailing full stop dropped)' "$out" 'FIXTURE LGPL-2.1 FULL TEXT'
+has "a cited GPL-2.0 is Debian's GPL-2" "$out" 'FIXTURE GPL-2 FULL TEXT'
 contains 'identical copyright files printed once' "$out" '----- [A3] /usr/share/doc/libsoname3/copyright (and 1 more identical) -'
 has 'copyright text normalised (CRLF, trailing spaces)' "$out" '(C) 1995 Jean-loup Gailly and Mark Adler'
 hasnt 'AppRun is not a bundled system library' "$out" 'AppRun'

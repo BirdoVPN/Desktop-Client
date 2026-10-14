@@ -94,7 +94,13 @@ const appVersion = JSON.parse(fs.readFileSync(path.join(repo, 'src-tauri', 'taur
 const table = JSON.parse(fs.readFileSync(path.join(repo, 'third_party', 'licenses', 'xray-go-modules.json'), 'utf8'));
 
 // ── Downloads ───────────────────────────────────────────────────────────────
+// The URLs are built from release.yml, xray-go-modules.json and the binaries'
+// build information: only the two upstreams, and only well-formed paths, are
+// ever fetched (the vendor script applies the same rule).
+const ALLOWED_URL =
+  /^https:\/\/(github\.com\/XTLS\/Xray-core\/(releases\/download\/v[0-9.]+\/Xray-[a-z0-9-]+\.zip|archive\/refs\/tags\/v[0-9.]+\.tar\.gz)|proxy\.golang\.org\/[a-z0-9._~!/-]+\/@v\/[A-Za-z0-9._~!+-]+\.zip)$/;
 async function download(url) {
+  if (!ALLOWED_URL.test(url)) return fail(`refusing to fetch ${url}: not a Xray-core release/tag archive or a Go module proxy zip URL`);
   for (let attempt = 1; ; attempt++) {
     try {
       const res = await fetch(url);
