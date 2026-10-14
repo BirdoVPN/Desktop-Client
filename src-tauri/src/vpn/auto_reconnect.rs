@@ -204,6 +204,26 @@ impl AutoReconnectConfig {
 /// `valid:false` answer is how a revocation arrives.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Whether a heartbeat is due for the session the loop watches (MR-946).
+///
+/// The FIRST one goes out as soon as the session is seen Connected — a new
+/// connect, a re-dial or a server switch alike, since each of them starts a
+/// fresh `SessionWatch` — and then one every [`HEARTBEAT_INTERVAL`]. It used
+/// to count the first interval from the connect, so a key's first check-in
+/// came 30 s late.
+///
+/// `last` is stamped BEFORE each request goes out (`ReconnectLoop::heartbeat`),
+/// so a heartbeat that fails or never answers still waits a full interval for
+/// the next: a failing heartbeat cannot become a burst. A new session beats
+/// at once only after a connect the server has just accepted, which is
+/// itself paced by the reconnect backoff and its breaker.
+fn heartbeat_due(connected_since: Option<Instant>, last: Option<Instant>, now: Instant) -> bool {
+    if connected_since.is_none() {
+        return false;
+    }
+    last.is_none_or(|last| now.saturating_duration_since(last) >= HEARTBEAT_INTERVAL)
+}
+
 /// The one heartbeat for a dead session's key, after its tunnel came down: a
 /// network that is down must not hold the recovery up for longer than this.
 const OLD_KEY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -357,11 +377,11 @@ impl Pulse {
     /// while its beat is still the one on record. A loop that ended has
     /// cleared it, and a cleared pulse stays clear: re-beating it is what had
     /// the watchdog restart a loop that had already finished (WIN3-008).
-    fn renew(&self, generation: u64, allowance: Duration) -> bool {
+    fn renew(&self, generation: u64, allowance: Duration, now: Instant) -> bool {
         let mut beat = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match beat.as_mut() {
             Some(b) if b.generation == generation => {
-                b.at = Instant::now();
+                b.at = now;
                 b.allowance = allowance;
                 true
             }
@@ -419,6 +439,25 @@ impl WatchdogClock {
     fn silent_for(&self, beat: Instant, now: Instant) -> Duration {
         now.saturating_duration_since(beat.max(self.awake_since))
     }
+}
+
+/// One look of the watchdog at `now`: the loop to restart, if one is overdue,
+/// with how long it has been silent (for the log). A verdict renews that
+/// loop's allowance from `now`, so the restart gets a whole allowance before
+/// the next one — and a loop that ended (its pulse cleared) gets none
+/// (WIN3-008). Apart from the thread so a test can drive it across a freeze
+/// (REVIEW-WIN3-013).
+fn watchdog_look(
+    clock: &mut WatchdogClock,
+    pulse: &Pulse,
+    now: Instant,
+    period: Duration,
+) -> Option<(Beat, Duration)> {
+    clock.look(now, period);
+    let beat = pulse.read()?;
+    let silent_for = clock.silent_for(beat.at, now);
+    (overdue(silent_for, beat.allowance) && pulse.renew(beat.generation, beat.allowance, now))
+        .then_some((beat, silent_for))
 }
 
 /// Held by a loop task for as long as it lives — an aborted one included,
@@ -606,20 +645,11 @@ impl AutoReconnectService {
                 let mut clock = WatchdogClock::new(Instant::now());
                 loop {
                     std::thread::sleep(period);
-                    let now = Instant::now();
-                    clock.look(now, period);
-                    let Some(beat) = svc.pulse.read() else {
+                    let Some((beat, silent_for)) =
+                        watchdog_look(&mut clock, &svc.pulse, Instant::now(), period)
+                    else {
                         continue;
                     };
-                    let silent_for = clock.silent_for(beat.at, now);
-                    if !overdue(silent_for, beat.allowance) {
-                        continue;
-                    }
-                    // The restart gets a whole allowance before the next
-                    // verdict — unless the loop has ended meanwhile.
-                    if !svc.pulse.renew(beat.generation, beat.allowance) {
-                        continue;
-                    }
                     tracing::error!(
                         "Auto-reconnect has not checked in for {} s (allowed {} s) — restarting \
                          it; the kill switch's block is left as it is (blocking: {})",
@@ -772,8 +802,8 @@ struct ReconnectLoop {
 /// closes, they would open a second, redundant window that re-dials a
 /// healthy tunnel if its answer happens to be lost.
 #[cfg(target_os = "windows")]
-async fn rebuild_path(
-    vm: &VpnManager,
+async fn rebuild_path<S: PathSignals>(
+    signals: &S,
     session: &mut SessionWatch,
     path: PhysicalRoute,
     now: Instant,
@@ -781,7 +811,138 @@ async fn rebuild_path(
     session.send_repair.rebuilt(now);
     session.verify_since = Some(now);
     session.heartbeat_misses = 0;
-    vm.repath(path).await.map(|_| ())
+    signals.repath(path).await.map(|_| ())
+}
+
+/// What the packet path's rules read off the live tunnel (Windows), and the
+/// clock they read it by. A trait so a test can drive the rules — in their
+/// order — on paused time (MR-1408); the reconnect loop's is the manager.
+#[cfg(target_os = "windows")]
+trait PathSignals {
+    /// Now, for the stall rule: read after the awaits that gathered the
+    /// signals, not at the start of the look.
+    fn now(&self) -> Instant;
+    async fn packet_path_progress(&self) -> Option<Instant>;
+    async fn send_health(&self) -> Option<super::wireguard_new::SendHealth>;
+    async fn repath(&self, path: PhysicalRoute) -> Result<bool, String>;
+    async fn peer_unresponsive(&self) -> bool;
+}
+
+#[cfg(target_os = "windows")]
+impl PathSignals for VpnManager {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    async fn packet_path_progress(&self) -> Option<Instant> {
+        VpnManager::packet_path_progress(self).await
+    }
+
+    async fn send_health(&self) -> Option<super::wireguard_new::SendHealth> {
+        VpnManager::send_health(self).await
+    }
+
+    async fn repath(&self, path: PhysicalRoute) -> Result<bool, String> {
+        VpnManager::repath(self, path).await
+    }
+
+    async fn peer_unresponsive(&self) -> bool {
+        VpnManager::peer_unresponsive(self).await
+    }
+}
+
+/// The rules that judge the packet path itself, in the order a look applies
+/// them (Windows): the stall rule, the send-path rule, the fast dead-path
+/// rule. `Some` is the look's verdict; `None` leaves it to the handshake-age
+/// backstop. `rebuilt`: this look already rebuilt the relay socket (a roam, a
+/// resume, the link's return).
+///
+/// The stall rule comes first (MR-1408): a packet path that stopped running
+/// stops the retransmits the fast rule counts with it, and whatever the fast
+/// rule or the send-path rule reads beside a stalled path, the cause is the
+/// stall — re-dialled at once, with no old-key probe
+/// (`reconnect_policy::asks_the_old_key`).
+#[cfg(target_os = "windows")]
+async fn judge_packet_path<S: PathSignals>(
+    signals: &S,
+    session: &mut SessionWatch,
+    route: Option<PhysicalRoute>,
+    link: LinkState,
+    rebuilt: bool,
+    now: Instant,
+) -> Option<Liveness> {
+    // WIN-FIX-3 P0: the packet path itself stopped running. Nothing it
+    // carries gets through, the relay's answers included, and boringtun's
+    // retransmits (what the fast rule below counts) stop with it — the
+    // T5 hang sat here, Protected, until the 180 s backstop. Judged over
+    // two looks, so a sleep the machine just woke from is not one
+    // (WIN3-003).
+    // Windows only (MR-1117): macOS and Linux have no stall rule, so a
+    // stalled packet path there is caught by the 180 s backstop.
+    if session
+        .stall
+        .observe(signals.packet_path_progress().await, signals.now())
+    {
+        tracing::warn!("The tunnel's packet path stopped running — declaring the tunnel dead");
+        return Some(Liveness::Dead(DropCause::PacketPathStalled));
+    }
+
+    // Interface loss (2026-10-07): the OS refuses our sends for a path
+    // reason (WSAEINVAL, WSAENETUNREACH, …) and keeps refusing them. The
+    // rules around this one read the relay's side, and a relay with
+    // traffic for us keeps initiating handshakes that reach us, so they
+    // all read healthy while nothing left. Rebuild the socket on the
+    // current path once; refused again, re-dial.
+    if !rebuilt {
+        let health = signals.send_health().await.unwrap_or_default();
+        let broken = super::wireguard_new::send_path_broken(&health, now);
+        match session
+            .send_repair
+            .observe(broken, link == LinkState::Offline, now)
+        {
+            reconnect_policy::SendPathVerdict::Fine => {}
+            reconnect_policy::SendPathVerdict::Rebuild => {
+                tracing::warn!(
+                    "Sends to the relay have been refused for {} s (os error {}) — \
+                     rebuilding the socket on the current path",
+                    health
+                        .failing_since
+                        .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
+                    health.last_code.unwrap_or_default()
+                );
+                let Some(path) = route else {
+                    return Some(Liveness::Dead(DropCause::PathChanged));
+                };
+                if let Err(e) = rebuild_path(signals, session, path, now).await {
+                    tracing::warn!(
+                        "Rebuilding the path to the relay failed ({}) — re-dialling",
+                        e
+                    );
+                    return Some(Liveness::Dead(DropCause::PathChanged));
+                }
+            }
+            reconnect_policy::SendPathVerdict::Escalate => {
+                tracing::warn!(
+                    "Sends to the relay are still refused on the rebuilt socket — declaring \
+                     the tunnel dead"
+                );
+                return Some(Liveness::Dead(DropCause::PathChanged));
+            }
+        }
+    }
+
+    // The fast dead-path rule: with the relay unreachable the tunnel
+    // stops carrying traffic at once, and waiting for the 180 s
+    // handshake-age backstop left the app saying Protected for minutes.
+    if link != LinkState::Offline && signals.peer_unresponsive().await {
+        tracing::warn!(
+            "The relay stopped answering handshakes while traffic is waiting — declaring \
+             the tunnel dead"
+        );
+        return Some(Liveness::Dead(DropCause::HandshakeStale));
+    }
+
+    None
 }
 
 async fn transport_exit(exits: &mut Option<watch::Receiver<u64>>) {
@@ -935,7 +1096,7 @@ impl ReconnectLoop {
             if let (Some(path), false) = (route, rebuilt) {
                 tracing::info!("Resumed — rebuilding the tunnel's path to the relay");
                 rebuilt = true;
-                if let Err(e) = rebuild_path(&vm, session, path, now).await {
+                if let Err(e) = rebuild_path(vm.as_ref(), session, path, now).await {
                     tracing::warn!(
                         "Rebuilding the path to the relay failed ({}) — re-dialling",
                         e
@@ -971,7 +1132,7 @@ impl ReconnectLoop {
             if let (Some(path), false) = (route, rebuilt) {
                 tracing::info!("The network is back — rebuilding the tunnel's path to the relay");
                 rebuilt = true;
-                if let Err(e) = rebuild_path(&vm, session, path, now).await {
+                if let Err(e) = rebuild_path(vm.as_ref(), session, path, now).await {
                     tracing::warn!(
                         "Rebuilding the path to the relay failed ({}) — re-dialling",
                         e
@@ -1004,78 +1165,12 @@ impl ReconnectLoop {
             vm.force_handshake().await;
         }
 
-        // WIN-FIX-3 P0: the packet path itself stopped running. Nothing it
-        // carries gets through, the relay's answers included, and boringtun's
-        // retransmits (what the fast rule below counts) stop with it — the
-        // T5 hang sat here, Protected, until the 180 s backstop. Judged over
-        // two looks, so a sleep the machine just woke from is not one
-        // (WIN3-003).
-        // Windows only (MR-1117): macOS and Linux have no stall rule, so a
-        // stalled packet path there is caught by the 180 s backstop.
+        // The packet path's own rules (Windows), in their order: the stall
+        // rule, the send-path rule, the fast dead-path rule.
         #[cfg(target_os = "windows")]
-        if session
-            .stall
-            .observe(vm.packet_path_progress().await, Instant::now())
+        if let Some(dead) = judge_packet_path(vm.as_ref(), session, route, link, rebuilt, now).await
         {
-            tracing::warn!("The tunnel's packet path stopped running — declaring the tunnel dead");
-            return Liveness::Dead(DropCause::PacketPathStalled);
-        }
-
-        // Interface loss (2026-10-07): the OS refuses our sends for a path
-        // reason (WSAEINVAL, WSAENETUNREACH, …) and keeps refusing them. The
-        // rules around this one read the relay's side, and a relay with
-        // traffic for us keeps initiating handshakes that reach us, so they
-        // all read healthy while nothing left. Rebuild the socket on the
-        // current path once; refused again, re-dial.
-        #[cfg(target_os = "windows")]
-        if !rebuilt {
-            let health = vm.send_health().await.unwrap_or_default();
-            let broken = super::wireguard_new::send_path_broken(&health, now);
-            match session
-                .send_repair
-                .observe(broken, link == LinkState::Offline, now)
-            {
-                reconnect_policy::SendPathVerdict::Fine => {}
-                reconnect_policy::SendPathVerdict::Rebuild => {
-                    tracing::warn!(
-                        "Sends to the relay have been refused for {} s (os error {}) — \
-                         rebuilding the socket on the current path",
-                        health
-                            .failing_since
-                            .map_or(0, |t| now.saturating_duration_since(t).as_secs()),
-                        health.last_code.unwrap_or_default()
-                    );
-                    let Some(path) = route else {
-                        return Liveness::Dead(DropCause::PathChanged);
-                    };
-                    if let Err(e) = rebuild_path(&vm, session, path, now).await {
-                        tracing::warn!(
-                            "Rebuilding the path to the relay failed ({}) — re-dialling",
-                            e
-                        );
-                        return Liveness::Dead(DropCause::PathChanged);
-                    }
-                }
-                reconnect_policy::SendPathVerdict::Escalate => {
-                    tracing::warn!(
-                        "Sends to the relay are still refused on the rebuilt socket — declaring \
-                         the tunnel dead"
-                    );
-                    return Liveness::Dead(DropCause::PathChanged);
-                }
-            }
-        }
-
-        // The fast dead-path rule: with the relay unreachable the tunnel
-        // stops carrying traffic at once, and waiting for the 180 s
-        // handshake-age backstop left the app saying Protected for minutes.
-        #[cfg(target_os = "windows")]
-        if link != LinkState::Offline && vm.peer_unresponsive().await {
-            tracing::warn!(
-                "The relay stopped answering handshakes while traffic is waiting — declaring \
-                 the tunnel dead"
-            );
-            return Liveness::Dead(DropCause::HandshakeStale);
+            return dead;
         }
 
         let Some(age) = vm.handshake_age().await else {
@@ -1125,7 +1220,9 @@ impl ReconnectLoop {
                 if !killswitch::holds_block_while_connected() {
                     let _ = killswitch::deactivate_killswitch().await;
                 }
-                Flow::Continue
+                // MR-946: the re-dialled key checks in now, not one tick (or
+                // one heartbeat interval) later.
+                self.heartbeat(now).await
             }
             Action::TearDown { cause } => {
                 tracing::warn!(
@@ -1366,10 +1463,11 @@ impl ReconnectLoop {
     }
 
     async fn heartbeat(&mut self, now: Instant) -> Flow {
-        let Some(since) = self.session.last_heartbeat.or(self.session.connected_since) else {
-            return Flow::Continue;
-        };
-        if now.duration_since(since) < HEARTBEAT_INTERVAL {
+        if !heartbeat_due(
+            self.session.connected_since,
+            self.session.last_heartbeat,
+            now,
+        ) {
             return Flow::Continue;
         }
         self.session.last_heartbeat = Some(now);
@@ -1388,14 +1486,12 @@ impl ReconnectLoop {
             Ok(Err(e)) => {
                 tracing::warn!("Heartbeat failed: {}", heartbeat_failure(&e));
                 // An HTTP status crossed the tunnel to arrive; only a failure
-                // on the network itself says the tunnel may carry nothing.
+                // on the network itself says the tunnel may carry nothing,
+                // and one never sent says nothing either way.
                 #[cfg(target_os = "windows")]
                 {
-                    self.session.heartbeat_misses = if heartbeat_missed_the_network(&e) {
-                        self.session.heartbeat_misses.saturating_add(1)
-                    } else {
-                        0
-                    };
+                    self.session.heartbeat_misses =
+                        misses_after_failure(self.session.heartbeat_misses, &e);
                 }
                 return Flow::Continue;
             }
@@ -1508,15 +1604,7 @@ impl ReconnectLoop {
             self.alive
                 .is_some_and(|(_, resumes)| resumes != network_events::resume_count()),
         );
-        let ending = reconnect_policy::after_teardown(reply.as_ref().ok(), alive);
-        // One line either way, with no identifiers (the node-agent privacy
-        // convention), so a re-dial after a takeover can be told apart from
-        // a probe that never got its answer (Android logs the same).
-        let answer = match &reply {
-            Ok(r) if r.valid => "valid",
-            Ok(r) => r.reason.as_deref().unwrap_or("invalid, no reason"),
-            Err(why) => why,
-        };
+        let (ending, answer) = probe_verdict(&reply, alive);
         let outcome = if ending.is_some() {
             "end the session"
         } else {
@@ -1619,6 +1707,26 @@ async fn request_fresh_response(
     Ok(response)
 }
 
+/// What the old-key probe's `reply` decides, and how it reads in the log
+/// (WIN3-001): an answer that says the session is over ends it
+/// (`reconnect_policy::after_teardown`); no answer — both requests failed,
+/// the budget ran out, the loop is shutting down — re-dials. The log line has
+/// no identifiers (the node-agent privacy convention), so a re-dial after a
+/// takeover can be told apart from a probe that never got its answer
+/// (Android logs the same).
+fn probe_verdict<'r>(
+    reply: &'r Result<crate::api::types::HeartbeatResponse, &'static str>,
+    recently_alive: bool,
+) -> (Option<IpcError>, &'r str) {
+    let ending = reconnect_policy::after_teardown(reply.as_ref().ok(), recently_alive);
+    let answer = match reply {
+        Ok(r) if r.valid => "valid",
+        Ok(r) => r.reason.as_deref().unwrap_or("invalid, no reason"),
+        Err(why) => why,
+    };
+    (ending, answer)
+}
+
 /// Ask, and ask once more if the request FAILED, all inside `budget`
 /// (WIN3-001). A request that ran out of time is not repeated: the budget is
 /// spent. `Err` says which, for the probe's log line.
@@ -1670,6 +1778,21 @@ fn heartbeat_missed_the_network(e: &crate::api::ApiError) -> bool {
     matches!(e, crate::api::ApiError::Network(_))
 }
 
+/// The run of network misses after a heartbeat that failed with `e`
+/// (Windows only; see `SessionWatch`): one more when it failed on the
+/// network; reset by an answer, which had to cross the tunnel to arrive; and
+/// UNCHANGED when it was never sent — the API client's retry gate answered it
+/// (`ApiError::Held`, MR-1808), so it says nothing about the tunnel either way
+/// (review of #289).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn misses_after_failure(misses: u32, e: &crate::api::ApiError) -> u32 {
+    match e {
+        crate::api::ApiError::Held { .. } => misses,
+        e if heartbeat_missed_the_network(e) => misses.saturating_add(1),
+        _ => 0,
+    }
+}
+
 /// What a failed heartbeat met, for the log: a status or a kind, never the
 /// error's text — a transport error names the URL, and the heartbeat's URL
 /// carries the session's key id (the node-agent privacy convention).
@@ -1681,9 +1804,12 @@ fn heartbeat_failure(e: &crate::api::ApiError) -> String {
         E::Unauthorized => "HTTP 401".into(),
         E::Forbidden => "HTTP 403".into(),
         E::NotFound => "HTTP 404".into(),
-        E::RateLimited => "HTTP 429".into(),
+        E::RateLimited { .. } => "HTTP 429".into(),
+        E::Held { status, .. } => format!("not sent (waiting out HTTP {status}'s Retry-After)"),
         E::UpgradeRequired(_) => "HTTP 426".into(),
-        E::ServerError(status) | E::Rejected { status, .. } => format!("HTTP {status}"),
+        E::ServerError(status) | E::ServerBusy { status, .. } | E::Rejected { status, .. } => {
+            format!("HTTP {status}")
+        }
         E::Parse(_) => "unreadable reply".into(),
         E::CertificatePinningFailed(_) => "certificate pin mismatch".into(),
         _ => "other error".into(),
@@ -1714,6 +1840,130 @@ mod tests {
             );
         }
         assert_eq!(heartbeat_failure(&ApiError::ServerError(503)), "HTTP 503");
+        assert_eq!(
+            heartbeat_failure(&ApiError::RateLimited {
+                retry_after_secs: Some(30)
+            }),
+            "HTTP 429"
+        );
+        assert_eq!(
+            heartbeat_failure(&ApiError::ServerBusy {
+                status: 503,
+                retry_after_secs: 30
+            }),
+            "HTTP 503"
+        );
+    }
+
+    /// Review of #289: a heartbeat the retry gate answered was never sent, so
+    /// it neither counts as a network miss nor clears the run of them (that
+    /// would hide a dead tunnel from the re-prove rule); a real answer, which
+    /// crossed the tunnel, clears it; a network failure adds one.
+    #[test]
+    fn a_heartbeat_that_was_never_sent_leaves_the_misses_alone() {
+        use crate::api::ApiError;
+        let held = ApiError::Held {
+            status: 429,
+            retry_after_secs: 30,
+        };
+        assert_eq!(misses_after_failure(2, &held), 2);
+        assert_eq!(misses_after_failure(0, &held), 0);
+        assert_eq!(
+            misses_after_failure(2, &ApiError::Network("reset".into())),
+            3
+        );
+        assert_eq!(
+            misses_after_failure(u32::MAX, &ApiError::Network("reset".into())),
+            u32::MAX
+        );
+        for answered in [
+            ApiError::RateLimited {
+                retry_after_secs: Some(30),
+            },
+            ApiError::ServerBusy {
+                status: 503,
+                retry_after_secs: 30,
+            },
+            ApiError::ServerError(502),
+            ApiError::Unauthorized,
+        ] {
+            assert_eq!(misses_after_failure(2, &answered), 0, "{answered:?}");
+        }
+        assert_eq!(
+            heartbeat_failure(&held),
+            "not sent (waiting out HTTP 429's Retry-After)"
+        );
+    }
+
+    /// MR-946: the first heartbeat goes out as soon as the session is seen
+    /// Connected, then one per interval. It used to wait a whole interval
+    /// first, so a new key's first check-in came 30 s after the connect.
+    #[test]
+    fn the_first_heartbeat_goes_out_at_once_then_every_interval() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        // No session: nothing to beat for.
+        assert!(!heartbeat_due(None, None, t0));
+        // Just connected, never beaten: due now, not 30 s from now.
+        assert!(heartbeat_due(Some(t0), None, t0));
+        // Beaten at t0: the next one waits the interval.
+        for later in [s(0), s(1), s(5), s(29)] {
+            assert!(!heartbeat_due(Some(t0), Some(t0), t0 + later), "{later:?}");
+        }
+        assert!(heartbeat_due(Some(t0), Some(t0), t0 + HEARTBEAT_INTERVAL));
+
+        // A heartbeat failing on every 5 s tick for two minutes is still one
+        // request per interval (it is stamped before it goes out), never a
+        // burst: t = 0, 30, 60, 90, 120.
+        let mut last = None;
+        let mut sent = Vec::new();
+        for tick in 0..=24u64 {
+            let now = t0 + s(5 * tick);
+            if heartbeat_due(Some(t0), last, now) {
+                last = Some(now);
+                sent.push(5 * tick);
+            }
+        }
+        assert_eq!(sent, vec![0, 30, 60, 90, 120]);
+
+        // A re-dial or a server switch starts a fresh watch: its key checks
+        // in at once too.
+        let fresh = SessionWatch::default();
+        let redialled = t0 + s(42);
+        assert!(heartbeat_due(
+            Some(redialled),
+            fresh.last_heartbeat,
+            redialled
+        ));
+    }
+
+    /// MR-946, the wiring: the stamp is written before the request goes out
+    /// (so a failure cannot repeat at once), and a recovered session beats
+    /// on the step that sees it back, not on the next tick.
+    #[test]
+    fn a_heartbeat_is_stamped_before_it_goes_out_and_a_recovery_beats() {
+        let source: String = include_str!("auto_reconnect.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let beat = &source[source
+            .find("asyncfnheartbeat(&mutself,now:Instant)->Flow{")
+            .expect("the heartbeat")..];
+        let due = beat.find("heartbeat_due(").expect("the due check");
+        let stamp = beat
+            .find("self.session.last_heartbeat=Some(now);")
+            .expect("the stamp");
+        let request = beat
+            .find("self.api.heartbeat(&key_id)")
+            .expect("the request");
+        assert!(due < stamp && stamp < request);
+
+        let recovered = &source[source.find("Action::Recovered=>{").expect("Recovered")..];
+        let recovered = &recovered[..recovered.find("Action::TearDown").expect("next arm")];
+        assert!(
+            recovered.contains("self.heartbeat(now).await"),
+            "{recovered}"
+        );
     }
 
     fn service() -> AutoReconnectService {
@@ -1763,9 +2013,21 @@ mod tests {
         svc.start().await.unwrap();
         wait_until("the first check-in", || svc.pulse.read().is_some()).await;
 
+        let stalled = running(&svc).await.expect("a loop");
         let record = svc.last_reconnect_info.write().await;
         wait_until("a restart", || svc.restarts.load(Ordering::SeqCst) >= 1).await;
-        assert!(svc.live_loops() <= 1, "the stalled loop was not stopped");
+        // REVIEW-WIN3-013: this read `live_loops() <= 1` once, right here.
+        // But the restart waits only a second for the aborted loop to be
+        // dropped before it starts the next one, and a loaded runner can take
+        // longer, so the count could read 2 for a moment and fail a correct
+        // restart. What must hold is that the stalled loop goes and its
+        // successor is a different one: waited for, not sampled.
+        wait_until("the stalled loop to be gone", || svc.live_loops() <= 1).await;
+        assert_ne!(
+            running(&svc).await,
+            Some(stalled),
+            "the stalled loop runs on"
+        );
         drop(record);
 
         wait_until("one live loop checking in again", || {
@@ -1835,15 +2097,81 @@ mod tests {
         svc.stop().await;
 
         let pulse = Pulse::default();
+        let now = Instant::now();
         pulse.beat(7, Duration::from_secs(30));
-        assert!(pulse.renew(7, Duration::from_secs(30)));
+        assert!(pulse.renew(7, Duration::from_secs(30), now));
         assert!(
-            !pulse.renew(8, Duration::from_secs(30)),
+            !pulse.renew(8, Duration::from_secs(30), now),
             "another loop's beat"
         );
         pulse.clear(7);
-        assert!(!pulse.renew(7, Duration::from_secs(30)));
+        assert!(!pulse.renew(7, Duration::from_secs(30), now));
         assert!(pulse.read().is_none(), "a cleared pulse was re-beaten");
+    }
+
+    /// The watchdog's own looks across a standby (WIN3-003; REVIEW-WIN3-013
+    /// found no freeze or resume test). A healthy loop is not restarted for
+    /// the hour the machine slept; one that stays silent after the wake is,
+    /// one allowance later, and once — the restart gets a whole allowance
+    /// before the next verdict. A loop that checks in after the wake, or one
+    /// that ended, is never restarted.
+    #[test]
+    fn the_watchdog_judges_a_loop_across_a_standby() {
+        let s = Duration::from_secs;
+        let (period, allowance) = (s(5), s(30));
+        let t0 = Instant::now();
+        let beat_at = |pulse: &Pulse, generation: u64, at: Instant| {
+            *pulse.0.lock().unwrap() = Some(Beat {
+                generation,
+                at,
+                allowance,
+            });
+        };
+        let looks = |clock: &mut WatchdogClock, pulse: &Pulse, from: Instant, to: Instant| {
+            let mut verdicts = Vec::new();
+            let mut now = from;
+            while now <= to {
+                if let Some((beat, silent)) = watchdog_look(clock, pulse, now, period) {
+                    verdicts.push((now, beat.generation, silent));
+                }
+                now += period;
+            }
+            verdicts
+        };
+
+        // A loop that checked in just before the machine slept for an hour,
+        // and is silent after the wake.
+        let pulse = Pulse::default();
+        let mut clock = WatchdogClock::new(t0);
+        beat_at(&pulse, 1, t0);
+        assert!(looks(&mut clock, &pulse, t0 + period, t0 + s(25)).is_empty());
+        let woke = t0 + s(25) + s(3600);
+        let verdicts = looks(&mut clock, &pulse, woke, woke + s(60));
+        assert_eq!(
+            verdicts.iter().map(|v| (v.0, v.1)).collect::<Vec<_>>(),
+            [(woke + s(35), 1)],
+            "restarted for the sleep, or more than once per allowance: {verdicts:?}"
+        );
+        assert_eq!(verdicts[0].2, s(35), "the sleep counted as silence");
+
+        // A loop that checks in after the wake is left alone.
+        let pulse = Pulse::default();
+        let mut clock = WatchdogClock::new(t0);
+        beat_at(&pulse, 2, t0);
+        assert!(looks(&mut clock, &pulse, t0 + period, t0 + s(25)).is_empty());
+        let mut now = woke;
+        for _ in 0..24 {
+            assert!(watchdog_look(&mut clock, &pulse, now, period).is_none());
+            beat_at(&pulse, 2, now);
+            now += period;
+        }
+
+        // A loop that ended (a give-up) is not restarted, slept on or not.
+        let pulse = Pulse::default();
+        let mut clock = WatchdogClock::new(t0);
+        beat_at(&pulse, 3, t0);
+        pulse.clear(3);
+        assert!(looks(&mut clock, &pulse, t0 + period, woke + s(60)).is_empty());
     }
 
     #[test]
@@ -1896,9 +2224,9 @@ mod tests {
         assert_eq!(clock.silent_for(now - s(1), now), s(1));
     }
 
-    /// WIN-FIX-3: every network call the loop makes is capped, and a stalled
-    /// packet path is judged before the fast rule (which cannot fire once
-    /// the retransmits it counts have stopped with it).
+    /// WIN-FIX-3: every network call the loop makes is capped. (That a
+    /// stalled packet path is judged before the fast rule is driven in
+    /// `packet_path_rule_tests`, MR-1408.)
     #[test]
     fn every_network_call_of_the_loop_is_capped() {
         let source: String = include_str!("auto_reconnect.rs")
@@ -1918,16 +2246,6 @@ mod tests {
         assert!(probe.contains("ask_twice(OLD_KEY_PROBE_TIMEOUT,||api.heartbeat(key_id))"));
         let twice = body("async fn ask_twice<");
         assert!(twice.contains("timeout(budget,asked)"));
-
-        let liveness = body("async fn check_liveness(");
-        let stall = liveness
-            .find("ifsession.stall.observe(vm.packet_path_progress().await,Instant::now()){")
-            .expect("the stall rule");
-        let fast = liveness
-            .find("vm.peer_unresponsive().await")
-            .expect("the fast rule");
-        assert!(stall < fast);
-        assert!(liveness[stall..fast].contains("Liveness::Dead(DropCause::PacketPathStalled)"));
     }
 
     #[test]
@@ -1976,9 +2294,11 @@ mod tests {
             "session.verify_since = Some(now);",
             "vm.restart_response_watch().await;",
             // Interface loss: the path is rebuilt, not just nudged.
-            "rebuild_path(&vm, session, path, now).await",
+            "rebuild_path(vm.as_ref(), session, path, now).await",
             "vm.force_handshake().await;",
-            "if link != LinkState::Offline && vm.peer_unresponsive().await {",
+            // The fast rule is told the link (`packet_path_rule_tests`
+            // drives it: never consulted while offline).
+            "judge_packet_path(vm.as_ref(), session, route, link, rebuilt, now)",
         ] {
             let needle = needle.trim_end_matches('\n');
             let at = body[last..]
@@ -1990,10 +2310,12 @@ mod tests {
 
     /// Interface loss (2026-10-07), the wiring of the pieces tested in
     /// `reconnect_policy` and `wireguard_new`: a resume rebuilds the path
-    /// like the link's return does; the send-path rule sits between the stall
-    /// rule and the fast rule, rebuilds once and re-dials when that did not
-    /// help; and a re-prove window is judged by the relay's answer to OUR
-    /// initiation, not by boringtun's age.
+    /// like the link's return does; the packet path's rules run before the
+    /// handshake-age backstop (their order — the send-path rule between the
+    /// stall rule and the fast rule, rebuilding once and re-dialling when
+    /// that did not help — is driven in `packet_path_rule_tests`); and a
+    /// re-prove window is judged by the relay's answer to OUR initiation, not
+    /// by boringtun's age.
     #[test]
     fn a_path_the_os_refuses_is_rebuilt_then_redialled() {
         let source = include_str!("auto_reconnect.rs").replace('\r', "");
@@ -2003,19 +2325,12 @@ mod tests {
 
         let resume = &body[body.find("if resumes != session.resumes_seen {").unwrap()..];
         let resume = &resume[..resume.find("vm.force_handshake().await;").unwrap()];
-        assert!(resume.contains("rebuild_path(&vm, session, path, now).await"));
+        assert!(resume.contains("rebuild_path(vm.as_ref(), session, path, now).await"));
 
         let mut last = 0;
         for needle in [
-            "Liveness::Dead(DropCause::PacketPathStalled)",
-            "vm.send_health().await",
-            "super::wireguard_new::send_path_broken(&health, now)",
-            ".observe(broken, link == LinkState::Offline, now)",
-            "reconnect_policy::SendPathVerdict::Rebuild => {",
-            "rebuild_path(&vm, session, path, now).await",
-            "reconnect_policy::SendPathVerdict::Escalate => {",
-            "return Liveness::Dead(DropCause::PathChanged);",
-            "vm.peer_unresponsive().await",
+            "judge_packet_path(vm.as_ref(), session, route, link, rebuilt, now)",
+            "return dead;",
             "let proof_age = vm.proof_age().await.unwrap_or(age);",
             "proof_age < elapsed",
             // A window closed on proof forgets the outage's missed heartbeats.
@@ -2035,7 +2350,7 @@ mod tests {
             "session.send_repair.rebuilt(now);",
             "session.verify_since = Some(now);",
             "session.heartbeat_misses = 0;",
-            "vm.repath(path).await",
+            "signals.repath(path).await",
         ] {
             assert!(helper.contains(step), "rebuild_path lost `{step}`");
         }
@@ -2113,7 +2428,11 @@ mod tests {
         let heartbeat = &heartbeat[..heartbeat
             .find("matchreconnect_policy::heartbeat_verdict")
             .unwrap()];
-        assert!(heartbeat.contains("ifheartbeat_missed_the_network(&e){"));
+        // The failure rule itself, with a gated (never sent) heartbeat, is
+        // `misses_after_failure` (a_heartbeat_that_was_never_sent_…).
+        assert!(heartbeat.contains(
+            "self.session.heartbeat_misses=misses_after_failure(self.session.heartbeat_misses,&e);"
+        ));
         assert!(heartbeat.contains(
             "self.session.heartbeat_misses=self.session.heartbeat_misses.saturating_add(1);"
         ));
@@ -2202,7 +2521,9 @@ mod tests {
         // heartbeats left behind.
         assert!(probe.contains("let api = self.api_after_teardown();"));
         assert!(probe.contains("ask_twice(OLD_KEY_PROBE_TIMEOUT, || api.heartbeat(key_id))"));
-        assert!(probe.contains("reconnect_policy::after_teardown("));
+        // What the reply decides is driven in
+        // `a_failed_probe_re_dials_and_never_ends_the_session`.
+        assert!(probe.contains("let (ending, answer) = probe_verdict(&reply, alive);"));
         assert_eq!(OLD_KEY_PROBE_TIMEOUT, Duration::from_secs(5));
         let fresh = &source[source.find("fn api_after_teardown(&self)").unwrap()..];
         assert!(fresh[..fresh.find("\n    }").unwrap()]
@@ -2281,6 +2602,54 @@ mod tests {
         );
     }
 
+    /// WIN3-001 (REVIEW-WIN3-013: "a failed probe request" was untested
+    /// end to end): a probe whose requests fail gives no answer, and no
+    /// answer re-dials — even for a session that was alive a moment ago,
+    /// where a "session over" answer would end it. A first request that
+    /// fails and a second that answers is decided by that answer.
+    #[tokio::test]
+    async fn a_failed_probe_re_dials_and_never_ends_the_session() {
+        use crate::api::types::HeartbeatResponse;
+        use crate::api::ApiError;
+        let budget = Duration::from_secs(5);
+        let answer =
+            |json: &'static str| -> HeartbeatResponse { serde_json::from_str(json).unwrap() };
+
+        let reply: Result<HeartbeatResponse, _> = ask_twice(budget, || async {
+            Err(ApiError::Network("connection aborted".into()))
+        })
+        .await;
+        for recently_alive in [true, false] {
+            let (ending, said) = probe_verdict(&reply, recently_alive);
+            assert!(ending.is_none(), "a failed probe ended the session");
+            assert_eq!(said, "request failed twice");
+        }
+
+        let reply: Result<HeartbeatResponse, _> = ask_twice(Duration::from_millis(50), || {
+            std::future::pending::<Result<HeartbeatResponse, ApiError>>()
+        })
+        .await;
+        let (ending, said) = probe_verdict(&reply, true);
+        assert!(ending.is_none());
+        assert_eq!(said, "no answer in time");
+
+        let calls = AtomicUsize::new(0);
+        let reply = ask_twice(budget, || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call == 0 {
+                    Err(ApiError::Network("connection aborted".into()))
+                } else {
+                    Ok(answer(r#"{"valid":false,"reason":"evicted"}"#))
+                }
+            }
+        })
+        .await;
+        let (ending, said) = probe_verdict(&reply, false);
+        assert_eq!(said, "evicted");
+        assert_eq!(ending.map(|e| e.code), Some(IpcErrorCode::Revoked));
+    }
+
     /// The grace warning goes out once per session, not on every 30 s
     /// heartbeat of the 15-minute window.
     #[tokio::test]
@@ -2318,5 +2687,207 @@ mod tests {
         })
         .unwrap();
         assert_eq!(payload, serde_json::json!({ "secondsRemaining": 540 }));
+    }
+}
+
+/// MR-1408 (REVIEW-WIN3-013): the packet path's rules driven in their order
+/// on paused time, against a tunnel whose signals the test sets. These used
+/// to be a source-order pin on `check_liveness`.
+#[cfg(all(test, target_os = "windows"))]
+mod packet_path_rule_tests {
+    use super::*;
+    use crate::vpn::wireguard_new::{
+        SendHealth, PACKET_PATH_STALL, SEND_PATH_BROKEN_AFTER, SEND_PATH_MIN_FAILURES,
+        STALL_CONFIRM,
+    };
+    use std::sync::Mutex;
+    use tokio::time::advance;
+
+    /// A live tunnel as the rules see it: when its packet path last made
+    /// progress, whether the relay reads unresponsive, what the OS says about
+    /// our sends — and the paused clock.
+    #[derive(Default)]
+    struct Tunnel {
+        progress: Mutex<Option<Instant>>,
+        unresponsive: AtomicBool,
+        sends: Mutex<SendHealth>,
+        repaths: AtomicUsize,
+    }
+
+    impl Tunnel {
+        /// The packet path ran just now.
+        fn ticks(&self) {
+            *self.progress.lock().unwrap() = Some(self.now());
+        }
+    }
+
+    impl PathSignals for Tunnel {
+        fn now(&self) -> Instant {
+            tokio::time::Instant::now().into_std()
+        }
+
+        async fn packet_path_progress(&self) -> Option<Instant> {
+            *self.progress.lock().unwrap()
+        }
+
+        async fn send_health(&self) -> Option<SendHealth> {
+            Some(*self.sends.lock().unwrap())
+        }
+
+        async fn repath(&self, _path: PhysicalRoute) -> Result<bool, String> {
+            self.repaths.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn peer_unresponsive(&self) -> bool {
+            self.unresponsive.load(Ordering::SeqCst)
+        }
+    }
+
+    const ROUTE: PhysicalRoute = PhysicalRoute {
+        gateway: std::net::Ipv4Addr::new(192, 0, 2, 1),
+        interface: 7,
+    };
+
+    /// One look, as `check_liveness` takes it.
+    async fn look(
+        tunnel: &Tunnel,
+        session: &mut SessionWatch,
+        link: LinkState,
+    ) -> Option<Liveness> {
+        judge_packet_path(tunnel, session, Some(ROUTE), link, false, tunnel.now()).await
+    }
+
+    const STALLED: Option<Liveness> = Some(Liveness::Dead(DropCause::PacketPathStalled));
+    const PEER_GONE: Option<Liveness> = Some(Liveness::Dead(DropCause::HandshakeStale));
+    const PATH_GONE: Option<Liveness> = Some(Liveness::Dead(DropCause::PathChanged));
+
+    /// The stall rule is judged before the fast rule: on the look that
+    /// confirms a stall, a relay that ALSO reads unresponsive does not make
+    /// it a stale handshake. The cause decides the recovery — a stall is
+    /// re-dialled at once, a stale handshake asks the old key first and
+    /// counts toward the breaker.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_packet_path_is_judged_before_the_fast_rule() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        tunnel.ticks();
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+
+        // The packet path stops. The first look past the stall window only
+        // suspects it: the machine may have just woken (WIN3-003).
+        advance(PACKET_PATH_STALL).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+
+        // The relay reads unresponsive too by the confirming look.
+        tunnel.unresponsive.store(true, Ordering::SeqCst);
+        advance(STALL_CONFIRM).await;
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            STALLED
+        );
+    }
+
+    /// Across a freeze — the machine asleep, or the process frozen with it,
+    /// which `Instant` on Windows counts as time passed (WIN3-003) — the stall
+    /// rule starts over: the looks either side are too far apart to confirm
+    /// anything, and a packet path that runs again on waking is healthy. One
+    /// that stays stopped is still caught, `STALL_CONFIRM` after the first
+    /// look past the wake.
+    #[tokio::test(start_paused = true)]
+    async fn a_freeze_is_not_a_stall_and_a_real_one_after_it_still_is() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        let asleep = Duration::from_secs(3600);
+        tunnel.ticks();
+        advance(PACKET_PATH_STALL).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+
+        advance(asleep).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+        tunnel.ticks();
+        advance(STALL_CONFIRM).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+
+        advance(asleep).await;
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+        advance(STALL_CONFIRM).await;
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            STALLED
+        );
+    }
+
+    /// The control: with the packet path running, the same unresponsive relay
+    /// IS the fast rule's — and while the machine has no route off it the
+    /// fast rule is not consulted at all (REVIEW-WIN2-005).
+    #[tokio::test(start_paused = true)]
+    async fn a_running_packet_path_leaves_an_unresponsive_relay_to_the_fast_rule() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        tunnel.unresponsive.store(true, Ordering::SeqCst);
+        for _ in 0..4 {
+            advance(Duration::from_secs(5)).await;
+            tunnel.ticks();
+            assert_eq!(look(&tunnel, &mut session, LinkState::Offline).await, None);
+        }
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            PEER_GONE
+        );
+    }
+
+    /// A stall beside sends the OS refuses is still the stall: the send-path
+    /// rule, which sits between the two, neither rebuilds the socket nor
+    /// renames the cause.
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_wins_over_refused_sends_too() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        tunnel.ticks();
+        *tunnel.sends.lock().unwrap() = SendHealth {
+            failing_since: Some(tunnel.now()),
+            failures: SEND_PATH_MIN_FAILURES,
+            last_code: Some(10022),
+        };
+        advance(PACKET_PATH_STALL).await;
+        // Not yet a stall, and the sends are broken: the one rebuild.
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+        assert_eq!(tunnel.repaths.load(Ordering::SeqCst), 1);
+        advance(STALL_CONFIRM).await;
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            STALLED
+        );
+        assert_eq!(tunnel.repaths.load(Ordering::SeqCst), 1, "a second rebuild");
+    }
+
+    /// With the packet path running, refused sends are rebuilt once and,
+    /// refused again on the rebuilt socket, re-dialled (interface loss).
+    #[tokio::test(start_paused = true)]
+    async fn refused_sends_are_rebuilt_once_then_redialled() {
+        let tunnel = Tunnel::default();
+        let mut session = SessionWatch::default();
+        *tunnel.sends.lock().unwrap() = SendHealth {
+            failing_since: Some(tunnel.now()),
+            failures: SEND_PATH_MIN_FAILURES,
+            last_code: Some(10051),
+        };
+        advance(SEND_PATH_BROKEN_AFTER).await;
+        tunnel.ticks();
+        assert_eq!(look(&tunnel, &mut session, LinkState::Online).await, None);
+        assert_eq!(tunnel.repaths.load(Ordering::SeqCst), 1);
+        assert!(
+            session.verify_since.is_some(),
+            "the rebuilt path is re-proven"
+        );
+
+        advance(Duration::from_secs(5)).await;
+        tunnel.ticks();
+        assert_eq!(
+            look(&tunnel, &mut session, LinkState::Online).await,
+            PATH_GONE
+        );
+        assert_eq!(tunnel.repaths.load(Ordering::SeqCst), 1);
     }
 }

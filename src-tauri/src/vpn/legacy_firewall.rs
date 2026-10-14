@@ -43,10 +43,29 @@ pub(crate) const LEGACY_RULE_NAMES: [&str; 14] = [
     "BirdoVPN_BlockTURN",
 ];
 
+/// The "cleanup done" marker. On Windows it lives in the admin-only
+/// `%ProgramData%\BirdoVPN` (`utils::protected_dir`), never in the user's
+/// %APPDATA%: the heal is machine-wide (the rules are), and a marker the
+/// elevated client writes by path into a user-writable folder could be
+/// redirected (MR-1945). A marker an older build left in %APPDATA% is
+/// deliberately NOT honoured — anyone could have planted it to skip the heal —
+/// so an upgrading machine simply runs the heal once more, which is harmless:
+/// every delete names one of our rules, and a missing one is a no-op.
+/// `None` while the admin-only directory is unavailable (not elevated): the
+/// heal then waits for a start that can record it.
 fn marker_path() -> Option<PathBuf> {
-    let mut dir = dirs::data_dir()?;
-    dir.push("BirdoVPN");
-    Some(dir.join("legacy-firewall-cleanup.done"))
+    #[cfg(windows)]
+    {
+        crate::utils::protected_dir::ensure()
+            .ok()
+            .map(|dir| dir.join("legacy-firewall-cleanup.done"))
+    }
+    #[cfg(not(windows))]
+    {
+        let mut dir = dirs::data_dir()?;
+        dir.push("BirdoVPN");
+        Some(dir.join("legacy-firewall-cleanup.done"))
+    }
 }
 
 /// What one `delete rule` did.
@@ -232,5 +251,17 @@ mod tests {
             );
             assert!(!text.contains("Remove-NetFirewallRule"), "{file}");
         }
+    }
+
+    /// MR-1945 (#287 review): on Windows the marker is in the admin-only
+    /// directory, never the user's %APPDATA%, and an old %APPDATA% marker is
+    /// not consulted (the heal re-runs once, harmlessly).
+    #[test]
+    fn the_windows_marker_lives_in_the_admin_only_directory() {
+        let src = include_str!("legacy_firewall.rs").replace('\r', "");
+        let f = &src[src.find("fn marker_path() -> Option<PathBuf> {").unwrap()..];
+        let windows = &f[..f.find("#[cfg(not(windows))]").unwrap()];
+        assert!(windows.contains("crate::utils::protected_dir::ensure()"));
+        assert!(!windows.contains("data_dir"), "{windows}");
     }
 }

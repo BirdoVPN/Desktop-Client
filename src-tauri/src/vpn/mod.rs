@@ -21,6 +21,11 @@ pub mod tunnel;
 pub mod tunnel_linux;
 #[cfg(target_os = "macos")]
 pub mod tunnel_macos;
+// Shared ownership of the Linux/macOS tunnel fd, so no blocking read/write can
+// outlive its descriptor (MR-820). Compiled into every test build too, so the
+// Windows job runs its tests.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+mod device_fd;
 
 #[cfg(target_os = "windows")]
 mod tunnel_dns; // netsh DNS reads + their captured-output parsers (Windows only)
@@ -277,9 +282,18 @@ fn ip_in_ranges(ip: u128, ranges: &[(u128, u128)]) -> bool {
 pub mod dns_journal {
     use serde::{Deserialize, Serialize};
 
-    /// Beside the log file, under the same `<data_dir>/BirdoVPN` main.rs's log
-    /// layer creates — deliberately the same launch context as the log, so a
-    /// client started with `sudo` reads back the file that same client wrote.
+    /// On macOS and Linux beside the log file, under the same
+    /// `<data_dir>/BirdoVPN` main.rs's log layer creates — deliberately the
+    /// same launch context as the log, so a client started with `sudo` reads
+    /// back the file that same client wrote.
+    ///
+    /// On Windows in the admin-only `%ProgramData%\BirdoVPN` (MR-1721,
+    /// `utils::protected_dir`). The record tells the ELEVATED client which
+    /// routes to delete and which resolvers to put on which adapter, and in
+    /// the user's %APPDATA% any unelevated process of theirs could write one:
+    /// a planted journal had the client delete routes and point DNS where it
+    /// said. A journal an older build left in %APPDATA% is taken over once
+    /// ([`migrate_legacy`]) and never read there again.
     const JOURNAL_FILE: &str = "dns-restore.json";
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,11 +352,188 @@ pub mod dns_journal {
     }
 
     fn path() -> Option<std::path::PathBuf> {
-        let mut dir = dirs::data_dir()?;
-        dir.push("BirdoVPN");
-        std::fs::create_dir_all(&dir).ok()?;
-        dir.push(JOURNAL_FILE);
-        Some(dir)
+        #[cfg(windows)]
+        {
+            let dir = match crate::utils::protected_dir::ensure() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    tracing::warn!("No admin-only directory for the DNS journal ({})", e);
+                    return None;
+                }
+            };
+            let path = dir.join(JOURNAL_FILE);
+            migrate_legacy_once(&path);
+            Some(path)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut dir = dirs::data_dir()?;
+            dir.push("BirdoVPN");
+            std::fs::create_dir_all(&dir).ok()?;
+            dir.push(JOURNAL_FILE);
+            Some(dir)
+        }
+    }
+
+    /// [`migrate_legacy`] for this account, at most once per process. A flag
+    /// rather than a `Once`: the panic hook reaches this through
+    /// `reconcile`, and must never wait on another thread.
+    #[cfg(windows)]
+    fn migrate_legacy_once(protected: &std::path::Path) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static TRIED: AtomicBool = AtomicBool::new(false);
+        if TRIED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (Some(base), Ok(sid)) = (
+            dirs::data_dir(),
+            crate::utils::protected_dir::current_user_sid(),
+        ) else {
+            return;
+        };
+        let legacy = crate::utils::safe_fs::OwnedDir::new(base, &["BirdoVPN"]);
+        let marker = protected.with_file_name(format!("dns-journal-migrated-{sid}"));
+        migrate_legacy(
+            &legacy,
+            protected,
+            &marker,
+            crate::utils::protected_dir::legacy_upgrade_window(),
+        );
+    }
+
+    /// What became of a journal a pre-MR-1721 build left in %APPDATA%.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    #[derive(Debug, PartialEq, Eq)]
+    enum Migration {
+        /// This account's was looked at before: a file there now is
+        /// something any process of the user could have written.
+        AlreadyDone,
+        /// There was none.
+        NoneThere,
+        /// Moved into the admin-only directory.
+        Moved,
+        /// Left where it is, unread by the app from now on: unreadable, from
+        /// another OS, or a journal is already in the admin-only directory
+        /// (another account's machine state, which is the newer record).
+        LeftInPlace,
+        /// The admin-only copy could not be written; tried again next start.
+        Failed,
+    }
+
+    /// Take over the journal an older build left in `legacy` (this account's
+    /// %APPDATA%\BirdoVPN), ONCE: `marker`, in the admin-only directory where
+    /// an unelevated process can neither create nor delete it, records that
+    /// this account's was looked at, and from then on that folder is never
+    /// read for a journal again.
+    ///
+    /// Rewrite an unverified %APPDATA% journal for a takeover OUTSIDE the
+    /// legacy-upgrade window (D6c): drop every route (nothing is deleted on an
+    /// unverified record) and heal every recorded adapter to DHCP / automatic
+    /// DNS rather than to its journal-supplied resolver values. `None` when the
+    /// bytes do not parse (the caller keeps them as-is; the OS check already
+    /// refused a non-journal). Windows only; a no-op elsewhere.
+    #[cfg(windows)]
+    fn sanitize_unverified_journal(bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut journal: DnsJournal = serde_json::from_slice(bytes).ok()?;
+        journal.routes.clear();
+        for adapter in &mut journal.adapters {
+            adapter.dns_servers.clear();
+            adapter.dns_servers_v6.clear();
+            adapter.v4_was_dhcp = true;
+            adapter.v6_was_dhcp = true;
+        }
+        serde_json::to_vec(&journal).ok()
+    }
+
+    #[cfg(not(windows))]
+    fn sanitize_unverified_journal(_bytes: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// D6c (W1-008 vs #293 R1): the journal describes MACHINE state — adapter
+    /// DNS a killed session parked, routes a crash stranded — so it is taken
+    /// over on every account's first start, not only inside the legacy-upgrade
+    /// window; otherwise on a multi-account PC the account that did not consume
+    /// the machine-wide window would have its journal marked migrated UNREAD and
+    /// the machine left without DNS.
+    ///
+    /// But the %APPDATA% journal is UNSIGNED and only checked to parse with
+    /// `os == "windows"`, and the same-boot test is freshness, not authorship.
+    /// So OUTSIDE the window a same-user process could plant one to make the
+    /// elevated app delete the gateway routes it names and set journal-supplied
+    /// resolvers on parked adapters, machine-wide. Outside the window the
+    /// takeover is therefore SANITISED ([`sanitize_unverified_journal`]): the
+    /// `routes` are dropped (no route is deleted on an unverified record) and
+    /// every adapter is healed to DHCP/automatic DNS instead of to
+    /// journal-supplied resolver values — still enough to lift a park and give
+    /// the machine working DNS back, but it cannot be steered to attacker
+    /// values. INSIDE the window (a genuine pre-#287 upgrade) the record is
+    /// trusted as before, routes and resolvers included.
+    ///
+    /// The old file is read and deleted through checked handles (MR-1945).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn migrate_legacy(
+        legacy: &crate::utils::safe_fs::OwnedDir,
+        protected: &std::path::Path,
+        marker: &std::path::Path,
+        upgrade_window: bool,
+    ) -> Migration {
+        use std::io::Read;
+        if marker.exists() {
+            return Migration::AlreadyDone;
+        }
+        let outcome = match legacy.open_rw(JOURNAL_FILE) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Migration::NoneThere,
+            Err(e) => {
+                tracing::warn!(
+                    "The old DNS journal could not be read ({}) — left in place",
+                    e
+                );
+                Migration::LeftInPlace
+            }
+            Ok(file) => {
+                // A journal is a few kilobytes; a larger file is not one.
+                let mut bytes = Vec::new();
+                let read = file.take(1 << 20).read_to_end(&mut bytes);
+                let ours = read.is_ok()
+                    && serde_json::from_slice::<DnsJournal>(&bytes)
+                        .is_ok_and(|journal| journal.os == std::env::consts::OS);
+                if !ours || protected.exists() {
+                    tracing::warn!(
+                        "Left the old DNS journal in %APPDATA% in place, unused (MR-1721)"
+                    );
+                    Migration::LeftInPlace
+                } else {
+                    // Outside the upgrade window the record is unverified: drop
+                    // routes and heal to DHCP, never to journal-supplied values.
+                    let bytes = if upgrade_window {
+                        bytes
+                    } else {
+                        sanitize_unverified_journal(&bytes).unwrap_or(bytes)
+                    };
+                    match write_bytes_atomically(protected, &bytes) {
+                        Ok(()) => {
+                            if let Err(e) = legacy.remove_file(JOURNAL_FILE) {
+                                tracing::warn!("The old DNS journal was not deleted: {}", e);
+                            }
+                            tracing::info!("Moved the DNS journal to the admin-only directory");
+                            Migration::Moved
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Could not move the old DNS journal ({}) — retrying next start",
+                                e
+                            );
+                            return Migration::Failed;
+                        }
+                    }
+                }
+            }
+        };
+        if let Err(e) = std::fs::write(marker, b"") {
+            tracing::warn!("Could not record the DNS journal's migration: {}", e);
+        }
+        outcome
     }
 
     /// Where the new bytes are staged before they replace the record.
@@ -407,7 +598,8 @@ pub mod dns_journal {
         use std::io::Write;
         // The record names network services and resolvers — which machine was on
         // which network. Same sensitivity as birdo.log, so the same owner-only
-        // mode on multi-user Unix hosts (Windows relies on the %APPDATA% ACL).
+        // mode on multi-user Unix hosts. On Windows it inherits the admin-only
+        // directory's ACL (MR-1721): SYSTEM and Administrators alone.
         // The staging file holds those same bytes, so it takes the same mode.
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
@@ -1191,6 +1383,228 @@ pub mod dns_journal {
         }
     }
 
+    /// MR-1721: on Windows the journal lives in the admin-only directory. One
+    /// an older build left in the user's %APPDATA% is taken over once, and
+    /// that folder is never read for a journal again.
+    #[cfg(test)]
+    mod legacy_journal_tests {
+        #[cfg(windows)]
+        use super::DnsJournal;
+        use super::{migrate_legacy, Migration, JOURNAL_FILE};
+        use crate::utils::safe_fs::OwnedDir;
+        use std::path::PathBuf;
+
+        struct Dirs {
+            _tmp: tempfile::TempDir,
+            legacy: OwnedDir,
+            protected: PathBuf,
+            marker: PathBuf,
+        }
+
+        fn dirs() -> Dirs {
+            let tmp = tempfile::tempdir().unwrap();
+            let legacy = OwnedDir::new(tmp.path(), &["BirdoVPN"]);
+            std::fs::create_dir_all(legacy.path()).unwrap();
+            let admin = tmp.path().join("admin-only");
+            std::fs::create_dir_all(&admin).unwrap();
+            Dirs {
+                protected: admin.join(JOURNAL_FILE),
+                marker: admin.join("dns-journal-migrated-S-1-5-21-1-2-3-1001"),
+                legacy,
+                _tmp: tmp,
+            }
+        }
+
+        fn journal(extra: &str) -> String {
+            format!(r#"{{"os":"{}"{extra}}}"#, std::env::consts::OS)
+        }
+
+        fn read(p: &std::path::Path) -> String {
+            std::fs::read_to_string(p).unwrap()
+        }
+
+        #[test]
+        fn an_old_journal_is_moved_once() {
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
+                Migration::Moved
+            );
+            assert_eq!(read(&d.protected), journal(""));
+            assert!(!d.legacy.join(JOURNAL_FILE).exists());
+            assert!(d.marker.exists());
+
+            // THE FINDING: what an unelevated process writes there now is
+            // never read — it named routes for the elevated client to delete.
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal(r#","routes":[]"#)).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
+                Migration::AlreadyDone
+            );
+            assert_eq!(read(&d.protected), journal(""));
+        }
+
+        /// Nothing there at the first look closes it just the same.
+        #[test]
+        fn a_journal_planted_after_the_first_look_is_never_read() {
+            let d = dirs();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
+                Migration::NoneThere
+            );
+            assert!(d.marker.exists());
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
+                Migration::AlreadyDone
+            );
+            assert!(!d.protected.exists());
+        }
+
+        /// D6c (W1-008): the DNS journal is MACHINE state, so its takeover does
+        /// not depend on the legacy-upgrade window — unlike the settings key and
+        /// the resume record. A new account whose crashed session parked DNS
+        /// still has its journal read and moved into the admin-only directory
+        /// (where the reconcile restores it), rather than marked migrated unread,
+        /// which would leave the machine without DNS.
+        #[test]
+        fn the_journal_is_taken_over_regardless_of_the_upgrade_window() {
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, false),
+                Migration::Moved,
+                "a new account's journal must still be restored (machine state)"
+            );
+            // Taken over (sanitised outside the window — see the sanitise tests);
+            // still a journal of this OS that the reconcile can read.
+            assert!(d.protected.exists());
+            assert!(read(&d.protected).contains(&format!("\"os\":\"{}\"", std::env::consts::OS)));
+            assert!(!d.legacy.join(JOURNAL_FILE).exists());
+            assert!(d.marker.exists());
+        }
+
+        /// D6c MEDIUM: OUTSIDE the upgrade window the journal is unverified, so
+        /// its takeover drops the routes (the elevated app deletes none) and
+        /// heals adapters to DHCP, never to journal-supplied resolver values —
+        /// a planted journal cannot steer DNS or delete gateway routes. INSIDE
+        /// the window (a genuine upgrade) routes and resolvers are preserved.
+        #[cfg(windows)]
+        #[test]
+        fn an_unverified_journal_is_sanitised_outside_the_window() {
+            use super::super::tunnel::AdapterDnsSnapshot;
+            use super::super::win_machine_state::OwnedRoute;
+            use std::net::{IpAddr, Ipv4Addr};
+
+            let make = || DnsJournal {
+                os: std::env::consts::OS.to_string(),
+                adapters: vec![AdapterDnsSnapshot {
+                    adapter_name: "Wi-Fi".into(),
+                    adapter_guid: "{GUID}".into(),
+                    v4_was_dhcp: false,
+                    v6_was_dhcp: false,
+                    dns_servers: vec!["203.0.113.53".into()],
+                    dns_servers_v6: vec!["2001:db8::53".into()],
+                }],
+                routes: vec![OwnedRoute {
+                    dest: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+                    prefix_len: 32,
+                    next_hop: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                    if_index: 7,
+                }],
+                boot: Some(123),
+            };
+            let bytes = serde_json::to_vec(&make()).unwrap();
+
+            // Outside the window: sanitised.
+            let d = dirs();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), &bytes).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, false),
+                Migration::Moved
+            );
+            let got: DnsJournal =
+                serde_json::from_slice(&std::fs::read(&d.protected).unwrap()).unwrap();
+            assert!(
+                got.routes.is_empty(),
+                "routes must be dropped outside the window"
+            );
+            assert_eq!(got.adapters.len(), 1);
+            let a = &got.adapters[0];
+            assert!(a.dns_servers.is_empty() && a.dns_servers_v6.is_empty());
+            assert!(
+                a.v4_was_dhcp && a.v6_was_dhcp,
+                "adapter must be healed to DHCP"
+            );
+            assert_eq!(a.adapter_guid, "{GUID}", "the adapter identity is kept");
+
+            // Inside the window: trusted verbatim.
+            let d2 = dirs();
+            std::fs::write(d2.legacy.join(JOURNAL_FILE), &bytes).unwrap();
+            assert_eq!(
+                migrate_legacy(&d2.legacy, &d2.protected, &d2.marker, true),
+                Migration::Moved
+            );
+            let kept: DnsJournal =
+                serde_json::from_slice(&std::fs::read(&d2.protected).unwrap()).unwrap();
+            assert_eq!(kept.routes.len(), 1, "routes kept inside the window");
+            assert_eq!(
+                kept.adapters[0].dns_servers,
+                vec!["203.0.113.53".to_string()]
+            );
+            assert!(!kept.adapters[0].v4_was_dhcp);
+        }
+
+        /// The machine-wide record already in the admin-only directory is
+        /// the newer one: it is never overwritten by an account's old file.
+        #[test]
+        fn a_journal_already_in_the_admin_only_directory_is_kept() {
+            let d = dirs();
+            std::fs::write(&d.protected, journal(r#","boot":1"#)).unwrap();
+            std::fs::write(d.legacy.join(JOURNAL_FILE), journal("")).unwrap();
+            assert_eq!(
+                migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
+                Migration::LeftInPlace
+            );
+            assert_eq!(read(&d.protected), journal(r#","boot":1"#));
+            assert!(d.legacy.join(JOURNAL_FILE).exists(), "kept for support");
+        }
+
+        /// Not a journal of this OS: left for a support session, not taken.
+        #[test]
+        fn an_unreadable_or_foreign_journal_is_left_in_place() {
+            for bytes in ["not json", r#"{"os":"plan9"}"#] {
+                let d = dirs();
+                std::fs::write(d.legacy.join(JOURNAL_FILE), bytes).unwrap();
+                assert_eq!(
+                    migrate_legacy(&d.legacy, &d.protected, &d.marker, true),
+                    Migration::LeftInPlace,
+                    "{bytes}"
+                );
+                assert!(!d.protected.exists());
+                assert_eq!(read(&d.legacy.join(JOURNAL_FILE)), bytes);
+                assert!(d.marker.exists());
+            }
+        }
+
+        /// The Windows journal path is the admin-only directory's, never the
+        /// user's data folder.
+        #[test]
+        fn the_windows_journal_lives_in_the_admin_only_directory() {
+            let src = include_str!("mod.rs").replace('\r', "");
+            let path_fn = &src[src
+                .find("    fn path() -> Option<std::path::PathBuf> {")
+                .expect("path()")..];
+            let windows = &path_fn[..path_fn.find("#[cfg(not(windows))]").unwrap()];
+            assert!(windows.contains("#[cfg(windows)]"));
+            assert!(windows.contains("crate::utils::protected_dir::ensure()"));
+            assert!(windows.contains("migrate_legacy_once(&path)"));
+            assert!(!windows.contains("data_dir"), "{windows}");
+        }
+    }
+
     /// W1-008: the uninstaller restores what the journal describes BEFORE it
     /// deletes anything, and keeps a journal that still describes something.
     /// Source pins: the hook script is not reachable from a unit test, and
@@ -1251,49 +1665,236 @@ pub mod dns_journal {
             );
         }
 
-        /// REVIEW-WIN2-020: this used to `rfind` a path that also matched
-        /// inside the `${FileExists}` line, so deleting both copies left it
-        /// green. Each step is a distinct line now, in order, and a failed
-        /// copy never reaches the deletion of the folder that holds the
-        /// record (REVIEW-WIN2-018).
+        /// D6c HIGH: the uninstaller never deletes a per-user FOLDER with NSIS
+        /// (`RMDir /r` follows junctions, so an elevated uninstall could delete
+        /// files anywhere); the exe does it without following links. No hook
+        /// touches $APPDATA/$LOCALAPPDATA/%TEMP% with RMDir or CopyFiles any
+        /// more, and the old %TEMP% journal round-trip is gone.
         #[test]
-        fn a_journal_that_still_describes_something_survives_the_deletion() {
+        fn no_hook_recursively_deletes_a_user_folder() {
+            for m in ["NSIS_HOOK_PREUNINSTALL", "NSIS_HOOK_POSTUNINSTALL"] {
+                let body = hook_macro(m);
+                for line in body.lines().filter(|l| !l.trim_start().starts_with(';')) {
+                    assert!(!line.contains("RMDir"), "{m}: {line}");
+                    assert!(!line.contains("CopyFiles"), "{m}: {line}");
+                    assert!(!line.contains("birdo-journal-keep"), "{m}: {line}");
+                    assert!(!line.contains("$APPDATA"), "{m}: {line}");
+                    assert!(!line.contains("$LOCALAPPDATA"), "{m}: {line}");
+                }
+            }
+            // The exe removes the folders without following a link
+            // (`remove_tree_no_follow`), keeping the DNS journal.
+            let pd = include_str!("../utils/protected_dir.rs");
+            assert!(pd.contains("fn remove_app_data_folders_in("));
+            assert!(pd.contains("fn remove_tree_no_follow("));
+            assert!(pd.contains(r#"name.starts_with("dns-restore.json")"#));
+        }
+
+        /// D6c HIGH: with "Delete the application data" ticked, POSTUNINSTALL
+        /// still clears the Credential Manager entries and the install registry
+        /// records the suppressed template block would have — under the saved
+        /// choice, not $DeleteAppDataCheckboxState (which PREUNINSTALL zeroed).
+        #[test]
+        fn the_non_folder_app_data_cleanup_runs_under_the_saved_choice() {
             let post = hook_macro("NSIS_HOOK_POSTUNINSTALL");
             let delete = &post[post
-                .find("${If} $DeleteAppDataCheckboxState = 1")
-                .expect("the delete-app-data block")..];
+                .find("${If} $BirdoDeleteAppData = 1")
+                .expect("the saved-choice app-data block")..];
             in_order(
                 delete,
                 &[
-                    r#"${If} ${FileExists} "$APPDATA\BirdoVPN\dns-restore.json*""#,
-                    "ClearErrors",
-                    r#"CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json*" "$TEMP\birdo-journal-keep""#,
-                    "${IfNot} ${Errors}",
-                    r#"RMDir /r "$APPDATA\BirdoVPN""#,
-                    r#"CreateDirectory "$APPDATA\BirdoVPN""#,
-                    r#"CopyFiles /SILENT "$TEMP\birdo-journal-keep\dns-restore.json*" "$APPDATA\BirdoVPN""#,
-                    // The copy failed: only the logs go.
-                    "${Else}",
-                    r#"RMDir /r "$APPDATA\BirdoVPN\logs""#,
-                    // No journal at all: the whole folder.
-                    "${Else}",
-                    r#"RMDir /r "$APPDATA\BirdoVPN""#,
+                    "${AndIf} $UpdateMode <> 1",
+                    r#"CredDeleteW(w "access_token.BirdoVPN""#,
+                    r#"CredDeleteW(w "refresh_token.BirdoVPN""#,
+                    r#"CredDeleteW(w "settings_hmac_key.BirdoVPN""#,
+                    r#"CredDeleteW(w "biometric_lock_enabled.BirdoVPN""#,
+                    r#"DeleteRegKey HKLM "${BIRDO_MANUPRODUCTKEY}""#,
+                    r#"DeleteRegValue HKCU "${BIRDO_MANUPRODUCTKEY}" "Installer Language""#,
                 ],
             );
-            // The `*` keeps the journal the app set aside as unreadable
-            // (`dns-restore.json.corrupt`, kept for support) — the name
-            // `vpn/mod.rs` gives it.
-            assert!(
-                super::preserved_path(std::path::Path::new("dns-restore.json"))
-                    .to_string_lossy()
-                    .starts_with("dns-restore.json")
+            // POSTUNINSTALL's LOGIC must not read the template's own variable
+            // (PREUNINSTALL zeroed it); a mention in a comment is fine.
+            for line in post.lines().filter(|l| !l.trim_start().starts_with(';')) {
+                assert!(
+                    !line.contains("$DeleteAppDataCheckboxState"),
+                    "POSTUNINSTALL reads the zeroed template flag: {line}"
+                );
+            }
+        }
+
+        /// R2 / D6c HIGH: after the reconcile, a real uninstall has the exe
+        /// remove the updater's installer, the set-aside squats and the
+        /// per-user folders — not NSIS, whose `RMDir /r` follows junctions —
+        /// and never on an in-place update. PREUNINSTALL then zeroes the
+        /// template's own delete-app-data flag so its `RmDir /r` cannot run.
+        #[test]
+        fn the_uninstaller_removes_only_the_leftovers_through_the_exe() {
+            let pre = hook_macro("NSIS_HOOK_PREUNINSTALL");
+            in_order(
+                pre,
+                &[
+                    "--reconcile-and-exit",
+                    "${If} $UpdateMode <> 1",
+                    "${If} $DeleteAppDataCheckboxState = 1",
+                    r#"StrCpy $1 " --with-app-data""#,
+                    "nsExec::Exec /TIMEOUT=",
+                    r#""$INSTDIR\${MAINBINARYNAME}.exe" --remove-leftovers-and-exit$1'"#,
+                    "${EndIf}",
+                    // Save the choice, then neutralise the template's RmDir.
+                    "StrCpy $BirdoDeleteAppData $DeleteAppDataCheckboxState",
+                    "StrCpy $DeleteAppDataCheckboxState 0",
+                ],
             );
-            // Nothing deletes the folder before the journal is safe.
-            let first_folder_delete = delete.find(r#"RMDir /r "$APPDATA\BirdoVPN""#).unwrap();
-            let copied = delete
-                .find(r#"CopyFiles /SILENT "$APPDATA\BirdoVPN\dns-restore.json*""#)
-                .unwrap();
-            assert!(copied < first_folder_delete);
+            assert!(MAIN.contains(
+                r#"const REMOVE_LEFTOVERS_AND_EXIT: &str = "--remove-leftovers-and-exit";"#
+            ));
+            assert!(MAIN.contains(r#"const WITH_APP_DATA: &str = "--with-app-data";"#));
+            let flag = MAIN
+                .find("arg == REMOVE_LEFTOVERS_AND_EXIT")
+                .expect("main() handles it");
+            // D6c BLOCKER: the cleanup sweep is dispatched BEFORE the process
+            // holds the per-user directories (hold_app_dirs) and before the file
+            // logger opens birdo.log inside one of them — otherwise this process
+            // would hold what the sweep must delete.
+            let hold = MAIN
+                .find("file_log::hold_app_dirs();")
+                .expect("main() holds the app dirs");
+            let init = MAIN.find(".init();").expect("main() starts the subscriber");
+            assert!(
+                flag < hold && flag < init,
+                "the cleanup sweep must run before hold_app_dirs() and the file logger"
+            );
+            // D6c LOW: main() only LATCHES the window (read-only) before the
+            // reconcile short-circuit; it never consumes it.
+            let latch = MAIN
+                .find("let _ = crate::utils::protected_dir::legacy_upgrade_window();")
+                .expect("main() latches the upgrade window read-only");
+            let reconcile = MAIN.find("arg == RECONCILE_AND_EXIT").unwrap();
+            let tauri = MAIN.find("tauri::Builder::default()").unwrap();
+            assert!(
+                flag < latch && latch < reconcile && reconcile < tauri,
+                "the window is latched before the reconcile short-circuit, after the cleanup flag"
+            );
+            // The marker is consumed only in setup (the primary instance),
+            // after the settings load, and never in main()'s pre-setup path.
+            let pre_setup = &MAIN[..tauri];
+            assert!(
+                !pre_setup.contains("consume_legacy_upgrade_window"),
+                "an auxiliary exit must not consume the upgrade marker"
+            );
+            let setup = &MAIN[MAIN.find(".setup(").expect("setup")..];
+            in_order(
+                setup,
+                &[
+                    "load_startup_settings",
+                    "if startup_verified {",
+                    "consume_legacy_upgrade_window()",
+                ],
+            );
+            // Nothing in ProgramData is deleted by NSIS itself, and nothing
+            // ever deletes the state key (ProtectedStateDir) or a settings key.
+            for m in ["NSIS_HOOK_PREUNINSTALL", "NSIS_HOOK_POSTUNINSTALL"] {
+                let code: Vec<&str> = hook_macro(m)
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with(';'))
+                    .collect();
+                for line in &code {
+                    assert!(!line.contains("ProgramData"), "{m}: {line}");
+                    assert!(!line.contains("SetShellVarContext all"), "{m}: {line}");
+                    assert!(
+                        !(line.contains("DeleteRegKey") && line.contains("BIRDO_STATE_KEY")),
+                        "{m}: {line}"
+                    );
+                }
+            }
+        }
+
+        /// D6c MEDIUM: the app version must be strictly greater than
+        /// BIRDO_LAST_PRE_TRUST_VERSION. The installer marks "entry version <=
+        /// floor" as a pre-#287 upgrade, and the v1.4.47 tag predates #287, so a
+        /// build from main that still reported 1.4.47 would make every
+        /// reinstall/upgrade re-open the legacy-trust window.
+        #[test]
+        fn the_app_version_is_past_the_legacy_trust_floor() {
+            fn semver(s: &str) -> Vec<u64> {
+                s.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+            }
+            let conf: serde_json::Value =
+                serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+            let app = conf["version"].as_str().unwrap();
+            assert_eq!(
+                app,
+                env!("CARGO_PKG_VERSION"),
+                "tauri.conf.json vs Cargo.toml"
+            );
+            let floor = "1.4.47"; // == BIRDO_LAST_PRE_TRUST_VERSION
+            assert!(HOOKS.contains(&format!(
+                r#"!define BIRDO_LAST_PRE_TRUST_VERSION "{floor}""#
+            )));
+            assert!(
+                semver(app) > semver(floor),
+                "the app version {app} must be strictly greater than the legacy-trust floor {floor}"
+            );
+        }
+
+        /// R1: the installer marks the upgrade of a pre-#287 install, and only
+        /// that: the version on the entry it replaces (read before the
+        /// reinstall page's uninstall-first can delete it, and for a silent
+        /// install in PREINSTALL), an MSI-era install, or a marker still
+        /// pending. Written only once the install has succeeded; an
+        /// uninstall drops one never consumed, as a value (the key keeps
+        /// ProtectedStateDir).
+        #[test]
+        fn the_installer_marks_only_the_upgrade_of_a_pre_287_install() {
+            // v1.4.47 (d4f0968) is the last release without #287 (8958efa4).
+            assert!(HOOKS.contains(r#"!define BIRDO_LAST_PRE_TRUST_VERSION "1.4.47""#));
+            // The first statement of the GUI-init/PREINSTALL adoption.
+            assert!(hook_function("BirdoAdoptLegacyRecord")
+                .lines()
+                .skip(1)
+                .find(|l| !l.trim_start().starts_with(';') && !l.trim().is_empty())
+                .is_some_and(|l| l.trim() == "Call BirdoNotePriorInstall"));
+            let note = hook_function("BirdoNotePriorInstall");
+            in_order(
+                note,
+                &[
+                    "${If} $BirdoPriorChecked = 1",
+                    "Return",
+                    r#"ReadRegDWORD $0 HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}""#,
+                    "StrCpy $BirdoLegacyUpgrade 1",
+                    r#"ReadRegStr $0 HKLM "${BIRDO_UNINSTALL_ROOT}\BirdoVPN" "DisplayVersion""#,
+                    r#"${If} $0 != """#,
+                    r#"${VersionCompare} $0 "${BIRDO_LAST_PRE_TRUST_VERSION}" $1"#,
+                    "${If} $1 != 1",
+                    "StrCpy $BirdoLegacyUpgrade 1",
+                ],
+            );
+            in_order(
+                hook_macro("NSIS_HOOK_PREINSTALL"),
+                &[
+                    "Call BirdoAdoptLegacyRecord",
+                    "Call BirdoMsiEraEntries",
+                    "${If} $0 > 0",
+                    "StrCpy $BirdoLegacyUpgrade 1",
+                ],
+            );
+            in_order(
+                hook_macro("NSIS_HOOK_POSTINSTALL"),
+                &[
+                    "${If} $BirdoLegacyUpgrade = 1",
+                    r#"WriteRegDWORD HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}" 1"#,
+                    "${EndIf}",
+                ],
+            );
+            assert_eq!(HOOKS.matches("WriteRegDWORD").count(), 1);
+            in_order(
+                hook_macro("NSIS_HOOK_POSTUNINSTALL"),
+                &[
+                    "${If} $UpdateMode <> 1",
+                    r#"DeleteRegValue HKLM "${BIRDO_STATE_KEY}" "${BIRDO_LEGACY_UPGRADE_VALUE}""#,
+                    "${EndIf}",
+                ],
+            );
         }
 
         /// REVIEW-WIN2-011: an in-place update keeps the launch-at-login

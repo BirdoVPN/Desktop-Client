@@ -119,6 +119,48 @@ fn reconcile_and_exit() -> ! {
     std::process::exit(0)
 }
 
+/// The uninstaller's PREUNINSTALL hook (nsis-hooks.nsh) runs the exe with this
+/// flag after the reconcile, on a real uninstall only (R2), and adds
+/// [`WITH_APP_DATA`] when "Delete the application data" is ticked.
+const REMOVE_LEFTOVERS_AND_EXIT: &str = "--remove-leftovers-and-exit";
+#[cfg_attr(not(windows), allow(dead_code))]
+const WITH_APP_DATA: &str = "--with-app-data";
+
+/// R2 (#287 follow-up L2): remove the updater's `updates\` and the squatted
+/// folders moved aside as `%ProgramData%\BirdoVPN.untrusted-*` (and, with
+/// [`WITH_APP_DATA`], the accounts' ML-KEM keypairs there, R4/D-23, and the
+/// per-user app-data folders, D6c HIGH), never the settings keys or the
+/// migration markers (a reinstall needs the keys to verify the user's
+/// settings). Done here, not by NSIS: the folders are a user's, and NSIS's
+/// `RMDir /r` follows the junctions a user can plant in them
+/// (`protected_dir::remove_uninstall_leftovers`). Creates nothing, touches no
+/// other state, and exits before any window, tray or plugin.
+///
+/// D6c BLOCKER: dispatched from `main()` BEFORE `file_log::hold_app_dirs()` and
+/// before the file logger opens — otherwise THIS process would hold the very
+/// per-user directories (no `FILE_SHARE_DELETE`) and the open `birdo.log` it
+/// then tries to delete, and the sweep would fail
+/// ("…\Roaming\BirdoVPN\logs survived"). So it logs to stderr only (no
+/// subscriber is installed yet); the uninstaller's nsExec captures that.
+fn remove_leftovers_and_exit() -> ! {
+    #[cfg(windows)]
+    {
+        let with_app_data = std::env::args().any(|arg| arg == WITH_APP_DATA);
+        let done = crate::utils::protected_dir::remove_uninstall_leftovers(with_app_data);
+        eprintln!(
+            "{}: removed {} updates folder(s), {} set-aside folder(s), {} ML-KEM key(s), \
+             {} app-data entr(ies); {} failed",
+            REMOVE_LEFTOVERS_AND_EXIT,
+            done.updates,
+            done.set_aside,
+            done.pq_keys,
+            done.app_data,
+            done.failed
+        );
+    }
+    std::process::exit(0)
+}
+
 /// The IPC command table.
 ///
 /// Registering `get_settings` here is its one allowed use in Rust code: it is
@@ -161,6 +203,8 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::settings::set_autostart,
         commands::settings::reset_settings,
         commands::settings::set_crash_reports_enabled,
+        // The consent text accepted, Rust's own record (MR-1607)
+        commands::consent::record_consent,
         // The on-device diagnostic log's "Delete Logs Now" (MR-808)
         commands::logs::delete_logs,
         // Kill switch
@@ -174,6 +218,8 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::updater::install_update,
         commands::updater::get_required_update,
         commands::update_resume::take_update_resume, // MR-1861: the session an update ended
+        // Settings › About › Licences (MR-1685)
+        commands::licences::get_third_party_notices,
         // Extended VPN info
         commands::vpn::get_subscription_status,
         commands::vpn::get_usage_stats,
@@ -197,12 +243,34 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         take_pending_deep_link,
         // The window up from the tray (re-consent behind Start Minimized)
         commands::tray::show_main_window,
+        // The anonymous account number, kept out of clipboard history (MR-1723)
+        commands::clipboard::copy_sensitive,
     ]
 }
 
 fn main() {
     // Set custom panic hook for crash recovery
     setup_panic_hook();
+
+    // R2 / D6c BLOCKER: the uninstaller's cleanup sweep runs FIRST — before
+    // hold_app_dirs() holds the per-user directories (without FILE_SHARE_DELETE)
+    // and before the file logger opens birdo.log inside one of them. Otherwise
+    // this very process would hold what the sweep must delete, and
+    // `--with-app-data` would leave `…\Roaming\BirdoVPN\logs` behind. It logs to
+    // stderr only (no subscriber yet) and exits; it never consumes the
+    // legacy-upgrade marker (item 4).
+    if std::env::args().any(|arg| arg == REMOVE_LEFTOVERS_AND_EXIT) {
+        remove_leftovers_and_exit();
+    }
+
+    // MR-1945 H1: hold the user-writable state directories (config, logs,
+    // crashes) open for the whole run, BEFORE anything writes to them, so an
+    // unprivileged process cannot swap one for a junction while this elevated
+    // process creates, appends to, renames or deletes files in it. Each
+    // directory's chain is verified at hold time; one that cannot be is left
+    // unheld (the per-operation checks still apply). Any diagnostic is held by
+    // the log gate until the subscriber below decides it.
+    crate::utils::file_log::hold_app_dirs();
 
     // Initialize logging.
     //
@@ -218,7 +286,6 @@ fn main() {
     // utils::file_log. The directory is created when the file is first
     // opened, so a log that is off is never created at all.
     let file_layer = crate::utils::file_log::log_dir().map(|dir| {
-        let p = dir.join(crate::utils::file_log::LOG_FILE_NAME);
         // TWO CAPS ON THE SAME FILE, and they run in this order.
         //
         // LOG-002 (age). Everything else that protects birdo.log is
@@ -231,7 +298,13 @@ fn main() {
         // log (and the rotated birdo.log.1 beside it) back to the retention
         // window on every launch, so the file can only ever describe recent
         // activity. See utils::log_retention before widening the window.
-        crate::utils::log_retention::enforce(&p, chrono::Utc::now());
+        // MR-1945: through the directory's checked handles, never a path:
+        // this runs elevated in a folder the user can write.
+        crate::utils::log_retention::enforce(
+            &dir,
+            crate::utils::file_log::LOG_FILE_NAME,
+            chrono::Utc::now(),
+        );
         //
         // PWR-5 (size). birdo.log is open in append mode for the life of the
         // process, so a long-running session (this is a VPN client — it can
@@ -241,13 +314,13 @@ fn main() {
         // AFTER the sweep — the sweep may already have brought it back under
         // the cap, and rotating first would only push expired content into
         // .1 to be pruned there.
-        crate::utils::log_retention::rotate_if_large(&p);
+        crate::utils::log_retention::rotate_if_large(&dir, crate::utils::file_log::LOG_FILE_NAME);
         // The in-session twin of that rotation (W1-019): a weeks-long session
         // passes the cap too, and once it did, every later line used to be
         // dropped until the next launch. A stat per log event at info level is
         // negligible. Owner-only on multi-user Unix hosts (P6-CLI-D-08).
         // Gated on the user's choice (MR-808), which setup() applies.
-        let log = crate::utils::file_log::install(&p);
+        let log = crate::utils::file_log::install(dir, crate::utils::file_log::LOG_FILE_NAME);
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(move || log.writer())
@@ -315,6 +388,18 @@ fn main() {
     // Tauri starts, so before this session's WebView2 is running.
     #[cfg(windows)]
     crate::utils::webview2::prune_dumps(chrono::Utc::now());
+
+    // R1 / D6c LOW: latch (read-only) whether this is the first start after the
+    // installer upgraded a pre-MR-1721 install — the one run that may migrate
+    // (trust once) the settings key's old sources and an unsigned resume
+    // record. Latched here, before the `--reconcile-and-exit` short-circuit, so
+    // the value is stable for the run; it is NOT consumed here. The marker is
+    // deleted only by the PRIMARY instance in `setup()`, after the settings
+    // migration has actually landed — so this auxiliary exit, a second
+    // instance the single-instance plugin turns away, or a crash before setup
+    // never burns the window.
+    #[cfg(windows)]
+    let _ = crate::utils::protected_dir::legacy_upgrade_window();
 
     if std::env::args().any(|arg| arg == RECONCILE_AND_EXIT) {
         reconcile_and_exit();
@@ -388,7 +473,7 @@ fn main() {
             info!("Second instance launch intercepted — focusing the running window");
             restore_and_focus(app);
         }))
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -461,6 +546,27 @@ fn main() {
             // start of the new version. Read and deleted here; the session
             // controller takes it once (commands::update_resume).
             commands::update_resume::load_at_start();
+
+            // R2: the installer the last in-app update launched stays in the
+            // admin-only `updates` folder; this start removes it (here, past
+            // the single-instance check, so a second launch can never delete
+            // an installer that is still in use).
+            #[cfg(windows)]
+            crate::utils::protected_dir::remove_updates_at_start();
+
+            // R1 / D6c LOW: consume the legacy-upgrade marker now — the PRIMARY
+            // instance (only it reaches setup; the single-instance plugin turns
+            // a second one away), after the settings migration above. Gated on
+            // `startup_verified`: a verified/saved load (including a fresh
+            // install with no file) means the migration is done and the window
+            // may close; an Unverified load (a transient M1 re-sign failure, or
+            // an unreadable key) leaves the marker so the next start migrates
+            // again. The window stays latched for the rest of this run, so the
+            // DNS reconcile below is unaffected.
+            #[cfg(windows)]
+            if startup_verified {
+                crate::utils::protected_dir::consume_legacy_upgrade_window();
+            }
 
             // Give the forced-version-floor gate a handle so a 426 from ANY
             // request can raise the blocking "update required" screen. Must be
@@ -800,23 +906,20 @@ fn main() {
                         .name("birdo-exit-fallback".into())
                         .spawn(|| {
                             std::thread::sleep(EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN);
-                            if !EXIT_TEARDOWN_DONE.load(std::sync::atomic::Ordering::SeqCst) {
-                                utils::run_on_helper_for(
-                                    "birdo-exit-cleanup",
-                                    EXIT_FALLBACK_CLEANUP,
-                                    || {
-                                        error!(
-                                            "Exit teardown never ran to its end — exiting \
-                                             without it"
-                                        );
-                                        #[cfg(target_os = "windows")]
-                                        {
-                                            let _ = vpn::win_machine_state::release_dns_at_exit();
-                                        }
-                                    },
-                                );
-                                std::process::exit(0);
-                            }
+                            utils::exit_unless_torn_down(
+                                &EXIT_TEARDOWN_DONE,
+                                EXIT_FALLBACK_CLEANUP,
+                                || {
+                                    error!(
+                                        "Exit teardown never ran to its end — exiting without it"
+                                    );
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        let _ = vpn::win_machine_state::release_dns_at_exit();
+                                    }
+                                },
+                                || std::process::exit(0),
+                            );
                         });
                     let app = app_handle.clone();
                     tauri::async_runtime::spawn(async move {
@@ -1018,9 +1121,9 @@ fn cleanup_on_crash() {
 }
 
 /// Where crash reports are written.
-fn crash_dir() -> std::path::PathBuf {
+fn crash_dir() -> crate::utils::safe_fs::OwnedDir {
     crate::utils::file_log::crash_dir_in(
-        &dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
+        dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
     )
 }
 
@@ -1037,7 +1140,13 @@ fn write_crash_report(location: &str, message: &str) {
 
     let crash_dir = crash_dir();
 
-    let _ = std::fs::create_dir_all(&crash_dir);
+    // R5: created (if absent) inside verified, held parents and held for the
+    // write, never by path; a folder that cannot be verified gets no crash
+    // file. (`hold_open`, not `ensure_held`: this runs in the panic hook,
+    // which must not touch the held set's lock.)
+    let Ok(_held) = crash_dir.hold_open() else {
+        return;
+    };
 
     // P6-CLI-D-05: crash files used to accumulate forever (a permanent,
     // timestamped on-disk history on a product that claims to retain
@@ -1050,10 +1159,13 @@ fn write_crash_report(location: &str, message: &str) {
     );
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
+    let crash_name = format!("crash_{}.txt", timestamp);
+    let crash_file = crash_dir.join(&crash_name);
 
-    // P6-CLI-D-08: owner-readable only on multi-user Unix hosts.
-    if let Ok(mut file) = crate::utils::log_retention::create_owner_only(&crash_file) {
+    // MR-1945 H1 / P6-CLI-D-08: created new through a checked handle (never a
+    // raw path a planted link could redirect), owner-only on multi-user Unix
+    // hosts, in the crash directory held open for the process lifetime.
+    if let Ok(mut file) = crash_dir.create_new(&crash_name) {
         let _ = writeln!(file, "BirdoVPN Crash Report");
         let _ = writeln!(file, "=====================");
         let _ = writeln!(file, "Time: {}", chrono::Utc::now().to_rfc3339());

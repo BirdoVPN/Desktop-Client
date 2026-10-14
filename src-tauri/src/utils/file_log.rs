@@ -49,41 +49,48 @@
 //! otherwise be lost. Unreadable or unparseable, the file says nothing, and
 //! such a run persists nothing. `setup()` still makes the verified decision.
 //!
-//! NOT A LOG: the DNS journal (`vpn::dns_journal`, `dns-restore.json` in the
-//! directory above `logs`). It is the record of the resolvers to put back, the
-//! machine's only way to undo a DNS change a crash left behind, so neither the
-//! switch nor the delete touches it. Neither touches `settings.json`, the device
-//! id, the PQ key or the Xray config.
+//! NOT A LOG: the DNS journal (`vpn::dns_journal`, `dns-restore.json`: in the
+//! admin-only `%ProgramData%\BirdoVPN` on Windows since MR-1721, in the
+//! directory above `logs` elsewhere). It is the record of the resolvers to put
+//! back, the machine's only way to undo a DNS change a crash left behind, so
+//! neither the switch nor the delete touches it. Neither touches
+//! `settings.json`, the device id, the PQ key or the Xray config.
+//!
+//! THE DELETES RUN ELEVATED in folders the user can write (MR-1945), so every
+//! one goes through [`OwnedDir`]: by a checked handle, never by a path.
 
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use super::log_retention::{is_crash_report_name, RotatingLog, MAX_LOG_BYTES};
+use super::safe_fs::OwnedDir;
 
 /// The live log's file name. Its rotated generation is
 /// `log_retention::rotated_path` of it (`birdo.log.1`).
 pub const LOG_FILE_NAME: &str = "birdo.log";
 
 /// Where `birdo.log` lives: `<data dir>/BirdoVPN/logs`. The single definition:
-/// `main()` writes there, and [`delete_logs`] deletes there.
-pub fn log_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|base| base.join("BirdoVPN").join("logs"))
+/// `main()` writes and prunes there, and [`delete_logs`] deletes there.
+pub fn log_dir() -> Option<OwnedDir> {
+    dirs::data_dir().map(|base| OwnedDir::new(base, &["BirdoVPN", "logs"]))
 }
 
 /// Where crash reports go, under `base` (the local data directory). The
 /// single definition, shared by `main.rs`'s writer and [`crash_dir`].
-pub fn crash_dir_in(base: &Path) -> PathBuf {
-    base.join("Birdo VPN").join("crashes")
+pub fn crash_dir_in(base: PathBuf) -> OwnedDir {
+    OwnedDir::new(base, &["Birdo VPN", "crashes"])
 }
 
 /// Where crash reports go: `<local data dir>/Birdo VPN/crashes`. `None` when
 /// the OS has no such directory: [`delete_logs`] then deletes nothing there
 /// rather than guess (the writer's fallback is the working directory, which is
 /// nobody's to clear).
-pub fn crash_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|base| crash_dir_in(&base))
+pub fn crash_dir() -> Option<OwnedDir> {
+    dirs::data_local_dir().map(crash_dir_in)
 }
 
 const UNDECIDED: u8 = 0;
@@ -182,8 +189,54 @@ static FILE_LOG: OnceLock<RotatingLog> = OnceLock::new();
 /// Build this process's `birdo.log` writer at `path`, gated on the user's
 /// choice. Opens nothing: the file is opened on the first line written after
 /// [`apply`] has said on.
-pub fn install(path: &Path) -> &'static RotatingLog {
-    FILE_LOG.get_or_init(|| RotatingLog::gated(path, MAX_LOG_BYTES, &FILE_LOGGING))
+pub fn install(dir: OwnedDir, name: &str) -> &'static RotatingLog {
+    FILE_LOG.get_or_init(|| RotatingLog::gated(dir, name, MAX_LOG_BYTES, &FILE_LOGGING))
+}
+
+/// Hold the app's user-writable state directories open for the process
+/// lifetime (MR-1945 H1): the config directory (`settings.json` and its
+/// atomic writes), the logs directory and the crash directory. While a handle
+/// is held, an unprivileged process cannot rename the directory or replace it
+/// with a junction, so the elevated client's by-path create/append/rename
+/// operations in those directories cannot be redirected. Each directory's
+/// whole chain is verified (no reparse point, expected final path) at hold
+/// time; one that cannot be verified is left unheld and simply operates as
+/// before. Best-effort: never worth failing startup over, and a no-op where
+/// there is no data directory. The guards are kept for the process lifetime
+/// (`safe_fs`'s held set, which the writers' `ensure_held` consults too).
+pub fn hold_app_dirs() {
+    fn keep<T>(held: io::Result<T>) {
+        if let Err(e) = held {
+            tracing::warn!(
+                "Could not hold a state directory open against a junction swap: {}",
+                e
+            );
+        }
+    }
+
+    // Created and held: these hold state written regardless of the on-device
+    // log switch — settings (config dir), the update-resume record and the DNS
+    // journal's %APPDATA% ancestor (`%APPDATA%\BirdoVPN`), and the device id
+    // (`%LOCALAPPDATA%\BirdoVPN`; the ML-KEM key's own home off Windows).
+    if let Some(config) = dirs::config_dir() {
+        keep(OwnedDir::new(config, &[APP_IDENTIFIER]).ensure_held());
+    }
+    if let Some(base) = dirs::data_dir() {
+        keep(OwnedDir::new(base, &["BirdoVPN"]).ensure_held());
+    }
+    if let Some(base) = dirs::config_local_dir() {
+        keep(OwnedDir::new(base, &["BirdoVPN"]).ensure_held());
+    }
+    // Held only if they already exist: creating them here would bring the
+    // logs / crash folders into being even when the on-device log is off
+    // (MR-808). When logging is later switched on, the writer creates them
+    // verified and holds them then (`ensure_held`, R5).
+    if let Some(dir) = log_dir() {
+        keep(dir.keep_held_if_present());
+    }
+    if let Some(dir) = crash_dir() {
+        keep(dir.keep_held_if_present());
+    }
 }
 
 /// Apply the user's choice: at start-up (`setup()`), on every settings save
@@ -219,7 +272,7 @@ pub(crate) const APP_IDENTIFIER: &str = "uk.birdo.vpn.desktop";
 /// Tauri's `app_config_dir()`, which is `dirs::config_dir()/<identifier>`
 /// (tauri 2, `path/desktop.rs`) because this app sets no
 /// `appDirectoriesOverride`. Both are pinned by a test.
-fn settings_path() -> Option<PathBuf> {
+pub(crate) fn settings_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join(APP_IDENTIFIER).join("settings.json"))
 }
 
@@ -335,7 +388,7 @@ fn is_log_file_name(name: &str) -> bool {
 /// it. Another program holding a file without that share mode does block it:
 /// the file is counted as `failed`, never reported as deleted.
 pub fn delete_logs() -> Deleted {
-    let run = || delete_logs_in(log_dir().as_deref(), crash_dir().as_deref());
+    let run = || delete_logs_in(log_dir().as_ref(), crash_dir().as_ref());
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut done = match FILE_LOG.get() {
         Some(log) => log.closed_for(run),
@@ -349,7 +402,7 @@ pub fn delete_logs() -> Deleted {
 
 /// [`delete_logs`] over given directories. Only names this app writes are
 /// deleted: `birdo.log*` from `log_dir`, `crash_*.txt` from `crash_dir`.
-pub fn delete_logs_in(log_dir: Option<&Path>, crash_dir: Option<&Path>) -> Deleted {
+pub fn delete_logs_in(log_dir: Option<&OwnedDir>, crash_dir: Option<&OwnedDir>) -> Deleted {
     let mut tally = Deleted::default();
     if let Some(dir) = log_dir {
         delete_in(dir, is_log_file_name, &mut tally);
@@ -363,17 +416,23 @@ pub fn delete_logs_in(log_dir: Option<&Path>, crash_dir: Option<&Path>) -> Delet
 /// Remove every regular file directly in `dir` whose name `ours` accepts.
 ///
 /// No paths from anywhere else: `dir` is one of the app's known directories
-/// (the two above, and WebView2's dump folder, which `webview2` reaches
-/// through real directories only), and each candidate is `dir` joined with a
-/// name read from it.
-/// Never recursive, and never through a link: a `dir` that is a symlink or a
-/// junction is refused outright (`symlink_metadata` does not follow it, and a
-/// junction is a link there too), and an entry that is a link or a directory is
-/// skipped, whatever its name. Removing a link would only unlink the link
-/// (neither `DeleteFileW` nor `unlink` follows one), but it is not a file this
-/// app wrote, so it is not this app's to remove.
-pub(crate) fn delete_in(dir: &Path, ours: fn(&str) -> bool, tally: &mut Deleted) {
-    match std::fs::symlink_metadata(dir) {
+/// (the two above, and WebView2's dump folder, which `webview2` holds open
+/// for the call), and each candidate is a name read from it. Never recursive,
+/// and never through a link: a `dir` that is a symlink or a junction is
+/// refused outright (`symlink_metadata` does not follow it, and a junction is
+/// a link there too), and an entry that is a link or a directory is skipped,
+/// whatever its name: it is not a file this app wrote, so it is not this app's
+/// to remove.
+///
+/// Those checks are a first pass over a listing, and a listing is only a
+/// snapshot of a folder the user can change between the check and the delete
+/// (MR-1945): the junction may be planted after, or above, `logs`. So the
+/// delete itself is [`OwnedDir::remove_file`], which opens the file without
+/// following a link, checks where its handle really is, and deletes through
+/// that handle. A file that fails that is counted `failed`, never deleted.
+pub(crate) fn delete_in(dir: &OwnedDir, ours: fn(&str) -> bool, tally: &mut Deleted) {
+    let path = dir.path();
+    match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {}
         // A link or a file where the directory should be: refused, and said.
         Ok(_) => {
@@ -387,7 +446,7 @@ pub(crate) fn delete_in(dir: &Path, ours: fn(&str) -> bool, tally: &mut Deleted)
             return;
         }
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(path) else {
         tally.failed += 1;
         return;
     };
@@ -399,12 +458,11 @@ pub(crate) fn delete_in(dir: &Path, ours: fn(&str) -> bool, tally: &mut Deleted)
         if !ours(name) {
             continue;
         }
-        let path = dir.join(name);
-        match std::fs::symlink_metadata(&path) {
+        match std::fs::symlink_metadata(dir.join(name)) {
             Ok(meta) if meta.file_type().is_file() => {}
             _ => continue,
         }
-        match std::fs::remove_file(&path) {
+        match dir.remove_file(name) {
             Ok(()) => tally.deleted += 1,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(_) => tally.failed += 1,
@@ -424,6 +482,13 @@ mod tests {
         )
         .unwrap();
         p
+    }
+
+    /// The folder at `dir`, standing in for one of the app's: its parent as
+    /// the root, its own name as the app's folder.
+    fn under(dir: &Path) -> OwnedDir {
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        OwnedDir::new(dir.parent().unwrap(), &[name])
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -456,7 +521,7 @@ mod tests {
         write(&crashes, "readme.txt");
         let journal = write(root.path(), "dns-restore.json");
 
-        let done = delete_logs_in(Some(&logs), Some(&crashes));
+        let done = delete_logs_in(Some(&under(&logs)), Some(&under(&crashes)));
 
         assert_eq!(
             done,
@@ -478,7 +543,7 @@ mod tests {
         let absent = root.path().join("crashes");
 
         assert_eq!(
-            delete_logs_in(Some(&empty), Some(&absent)),
+            delete_logs_in(Some(&under(&empty)), Some(&under(&absent))),
             Deleted::default()
         );
         assert_eq!(delete_logs_in(None, None), Deleted::default());
@@ -493,7 +558,10 @@ mod tests {
         std::fs::create_dir_all(logs.join("birdo.log.1")).unwrap();
         write(&logs.join("birdo.log.1"), "birdo.log");
 
-        assert_eq!(delete_logs_in(Some(&logs), None), Deleted::default());
+        assert_eq!(
+            delete_logs_in(Some(&under(&logs)), None),
+            Deleted::default()
+        );
         assert!(logs.join("birdo.log.1").join("birdo.log").exists());
     }
 
@@ -508,7 +576,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, logs.join("birdo.log")).unwrap();
         write(&logs, "birdo.log.1");
 
-        let done = delete_logs_in(Some(&logs), None);
+        let done = delete_logs_in(Some(&under(&logs)), None);
 
         assert_eq!(
             done,
@@ -535,7 +603,7 @@ mod tests {
         let logs = root.path().join("logs");
         std::os::unix::fs::symlink(&elsewhere, &logs).unwrap();
 
-        let done = delete_logs_in(Some(&logs), None);
+        let done = delete_logs_in(Some(&under(&logs)), None);
 
         assert_eq!(
             done,
@@ -567,7 +635,7 @@ mod tests {
         }
         write(&logs, "birdo.log.1");
 
-        let done = delete_logs_in(Some(&logs), None);
+        let done = delete_logs_in(Some(&under(&logs)), None);
 
         assert_eq!(
             done,
@@ -608,7 +676,7 @@ mod tests {
             "std must see a junction as a link, or the refusal below is luck"
         );
 
-        let done = delete_logs_in(Some(&logs), None);
+        let done = delete_logs_in(Some(&under(&logs)), None);
 
         assert_eq!(
             done,
@@ -618,6 +686,38 @@ mod tests {
             }
         );
         assert!(victim.exists(), "the delete followed the junction");
+    }
+
+    /// MR-1945: a junction one level ABOVE `logs` (on `BirdoVPN`) makes
+    /// `logs` a real directory somewhere else, so the directory check passes
+    /// and the old delete removed whatever `birdo.log*` it found there. The
+    /// delete goes through a checked handle now: nothing behind the junction
+    /// is removed, and each refusal is counted.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_above_the_log_directory_deletes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("logs")).unwrap();
+        let victims = [
+            write(&elsewhere.join("logs"), "birdo.log"),
+            write(&elsewhere.join("logs"), "birdo.log.1"),
+        ];
+        crate::utils::safe_fs::tests::junction(&root.path().join("BirdoVPN"), &elsewhere);
+
+        let logs = OwnedDir::new(root.path(), &["BirdoVPN", "logs"]);
+        let done = delete_logs_in(Some(&logs), None);
+
+        assert_eq!(
+            done,
+            Deleted {
+                deleted: 0,
+                failed: 2
+            }
+        );
+        for victim in victims {
+            assert!(victim.exists(), "the delete followed the junction");
+        }
     }
 
     #[test]
@@ -643,6 +743,12 @@ mod tests {
         Box::leak(Box::new(LogGate::undecided()))
     }
 
+    /// A gated log at `path`, for tests that still address it by path.
+    fn gated_log(path: &Path, cap: u64, gate: &'static LogGate) -> RotatingLog {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        RotatingLog::gated(OwnedDir::new(path.parent().unwrap(), &[]), name, cap, gate)
+    }
+
     /// THE FINDING (MR-808): with the log off, launching must neither create
     /// nor append to it — not even with the lines logged before `setup()`
     /// read the choice.
@@ -651,7 +757,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("logs").join(LOG_FILE_NAME);
         let gate = leaked_gate();
-        let log = RotatingLog::gated(&path, MAX_LOG_BYTES, gate);
+        let log = gated_log(&path, MAX_LOG_BYTES, gate);
 
         log.writer()
             .write_all(b"NOT running as administrator\n")
@@ -672,7 +778,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("logs").join(LOG_FILE_NAME);
         let gate = leaked_gate();
-        let log = RotatingLog::gated(&path, MAX_LOG_BYTES, gate);
+        let log = gated_log(&path, MAX_LOG_BYTES, gate);
 
         log.writer().write_all(b"one\n").unwrap();
         gate.set(true);
@@ -688,7 +794,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LOG_FILE_NAME);
         let gate = leaked_gate();
-        let log = RotatingLog::gated(&path, MAX_LOG_BYTES, gate);
+        let log = gated_log(&path, MAX_LOG_BYTES, gate);
         gate.set(true);
         log.writer().write_all(b"kept\n").unwrap();
 
@@ -715,11 +821,11 @@ mod tests {
         let path = logs.join(LOG_FILE_NAME);
         let gate = leaked_gate();
         gate.set(true);
-        let log = RotatingLog::gated(&path, MAX_LOG_BYTES, gate);
+        let log = gated_log(&path, MAX_LOG_BYTES, gate);
         log.writer().write_all(b"history\n").unwrap();
         write(&logs, "birdo.log.1");
 
-        let done = log.closed_for(|| delete_logs_in(Some(&logs), None));
+        let done = log.closed_for(|| delete_logs_in(Some(&under(&logs)), None));
 
         assert_eq!(
             done,
@@ -835,8 +941,12 @@ mod tests {
             .find("file_log::persists()")
             .expect("write_crash_report no longer checks the switch");
         assert!(
-            gate < writer.find("create_dir_all").unwrap(),
+            gate < writer.find("crash_dir.hold_open()").unwrap(),
             "write_crash_report touches the disk before checking the switch"
+        );
+        assert!(
+            !writer.contains("create_dir_all"),
+            "R5: the crash folder is created verified, never by path"
         );
 
         // The saved choice is read as soon as the subscriber exists...

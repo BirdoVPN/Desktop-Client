@@ -376,7 +376,13 @@ fn delete_failure_message(error: &ApiError) -> IpcError {
         ),
         other => (IpcError::from_api(other).code, other.to_string()),
     };
-    IpcError::new(code, format!("Account deletion failed: {}", reason))
+    let failed = IpcError::new(code, format!("Account deletion failed: {}", reason));
+    // MR-1808: a rate limit keeps the server's `Retry-After`, so the dialog
+    // can say how long to wait.
+    match IpcError::from_api(error).retry_after_secs {
+        Some(secs) => failed.with_retry_after(secs),
+        None => failed,
+    }
 }
 
 /// The physical interface's address while a tunnel is up, for a request that
@@ -534,9 +540,19 @@ pub async fn get_auth_state(
                 // strict bucket), so a 429 would amplify into two. Keep the
                 // session and report the identity as unknown for this cycle; the
                 // next poll succeeds once the window rolls over.
-                Err(crate::api::error::ApiError::RateLimited) => {
+                //
+                // MR-1808: this arm matched only a 429 WITHOUT a message, and
+                // the backend puts one on every error, so a real 429 went on
+                // to the refresh anyway. Every 429 is `RateLimited` now; a 5xx
+                // that named its wait (`ServerBusy`) is the same "come back
+                // later", and says nothing about the token either.
+                Err(
+                    e @ (crate::api::error::ApiError::RateLimited { .. }
+                    | crate::api::error::ApiError::ServerBusy { .. }
+                    | crate::api::error::ApiError::Held { .. }),
+                ) => {
                     tracing::warn!(
-                        "Profile fetch rate limited (429) — NOT refreshing; session kept, \
+                        "Profile fetch refused for now ({e}) — NOT refreshing; session kept, \
                          identity unknown this cycle"
                     );
                     Ok(AuthState::unknown_identity(true))
@@ -1146,7 +1162,9 @@ mod account_boundary_tests {
             IpcErrorCode::InvalidCredentials
         );
         assert_eq!(
-            sign_in_failure_code(&ApiError::RateLimited),
+            sign_in_failure_code(&ApiError::RateLimited {
+                retry_after_secs: Some(60)
+            }),
             IpcErrorCode::RateLimited
         );
         assert_eq!(
@@ -1189,9 +1207,18 @@ mod account_boundary_tests {
             IpcErrorCode::RateLimited
         );
         assert_eq!(
-            delete_failure_message(&ApiError::RateLimited).code,
+            delete_failure_message(&ApiError::RateLimited {
+                retry_after_secs: None
+            })
+            .code,
             IpcErrorCode::RateLimited
         );
+        // MR-1808: the server's wait reaches the dialog.
+        let limited = delete_failure_message(&ApiError::RateLimited {
+            retry_after_secs: Some(30),
+        });
+        assert_eq!(limited.code, IpcErrorCode::RateLimited);
+        assert_eq!(limited.retry_after_secs, Some(30));
     }
 
     /// The UI sends `two_factor_code` only on the retry; today's dialog sends
@@ -1227,7 +1254,7 @@ mod account_boundary_tests {
         assert_eq!(
             serde_json::to_value(&state).unwrap()["email"],
             "anon_123456789012345678901234@anonymous.local",
-            "the UI still gets it (the email-shape fallback)"
+            "passed through as sent; the UI never parses it (MR-918)"
         );
 
         // Phase 2 of the contract: the email no longer carries the number.

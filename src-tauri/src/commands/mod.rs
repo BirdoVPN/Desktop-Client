@@ -4,8 +4,11 @@
 
 pub mod auth;
 pub mod biometric;
+pub mod clipboard;
+pub mod consent;
 pub mod ipc_error;
 pub mod killswitch;
+pub mod licences;
 pub mod logs;
 pub mod oauth;
 pub mod servers;
@@ -20,3 +23,7 @@ pub mod vouchers;
 pub mod vpn;
 pub mod vpn_multi_hop;
 pub mod vpn_port_forward;
+
+// MR-713: the opener plugin's URL scope (capabilities/default.json).
+#[cfg(test)]
+mod capability_scope_tests;

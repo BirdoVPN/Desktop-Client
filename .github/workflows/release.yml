@@ -2,6 +2,10 @@
 # UNIFIED release workflow — Windows + Linux + macOS build TOGETHER and
 # publish into ONE GitHub Release from a SINGLE tag (v*.*.* e.g. v1.4.16).
 # Published directly (draft: false), not as a draft - owner decision 2026-10-01.
+# Opt-in exception (owner ruling 2026-10-13, Desktop 1.4.47): an ANNOTATED tag
+# whose message has a line `release: draft` is created as a DRAFT that does not
+# take Latest, so the exact signed bytes can be smoke-tested and then published
+# from the GitHub UI without a rebuild. Every other tag behaves as before.
 #
 # This superseded the three separate per-platform pipelines
 # (build-windows.yml, build-linux.yml, build-macos.yml). All three are GONE:
@@ -559,6 +563,23 @@ jobs:
           Write-Host "xray.exe signed by $($sig.SignerCertificate.Subject)"
           Write-Host "XRAY_BINARY_SHA256: $before (unsigned) -> $after (signed, compiled in)"
 
+      # MR-1685: resources/THIRD-PARTY-NOTICES.txt - every linked crate and
+      # shipped npm package with its licence text, Xray-core's MPL-2.0 text
+      # and source pointer at XRAY_VERSION, the GPL/LGPL Go modules this
+      # xray.exe links (read from the binary) with the GPL-3.0 text, and the
+      # Wintun licence. Written into src-tauri/resources/ so the build bundles
+      # it; the licence files from the two archives downloaded above must
+      # match the committed copies. The post-bundle gate below checks the
+      # installer carries exactly this file.
+      - name: Generate the third-party notices (resources/THIRD-PARTY-NOTICES.txt)
+        shell: pwsh
+        run: |
+          node scripts/generate-third-party-notices.mjs --release --target x86_64-pc-windows-msvc `
+            --xray src-tauri/resources/xray.exe `
+            --xray-license "$env:RUNNER_TEMP\xray\LICENSE" `
+            --wintun-license "$env:RUNNER_TEMP\wintun\wintun\LICENSE.txt"
+          if ($LASTEXITCODE -ne 0) { throw "the notices generator exited $LASTEXITCODE" }
+
       - name: Build Tauri application
         timeout-minutes: 25
         env:
@@ -589,7 +610,10 @@ jobs:
       # was just compiled with. Runs on EVERY build (unsigned ones must match
       # trivially); on signed builds the bundled file must also carry a Valid
       # Authenticode signature. Script + self-test: scripts/ci/.
-      - name: Gate — bundled resources\xray.exe must hash to the compiled-in XRAY_BINARY_SHA256
+      # MR-1685: the same gate also requires exactly one
+      # resources\THIRD-PARTY-NOTICES.txt, byte-identical to the file the
+      # generator step wrote (-ExpectedNotices).
+      - name: Gate — bundled resources\xray.exe must hash to the compiled-in XRAY_BINARY_SHA256; THIRD-PARTY-NOTICES.txt must be this build's
         shell: pwsh
         env:
           SIGNED: ${{ steps.sign-mode.outputs.enabled }}
@@ -605,7 +629,7 @@ jobs:
           # the workflow were invoking the gate two different ways. The
           # self-test now also calls the script in-process with exactly this
           # form. The gate failed CLOSED, which is the right failure.
-          $gateArgs = @{ Installer = $nsis.FullName; ExpectedSha256 = "$env:XRAY_BINARY_SHA256" }
+          $gateArgs = @{ Installer = $nsis.FullName; ExpectedSha256 = "$env:XRAY_BINARY_SHA256"; ExpectedNotices = 'src-tauri/resources/THIRD-PARTY-NOTICES.txt' }
           if ($env:SIGNED -eq 'true') { $gateArgs.RequireAuthenticode = $true }
           & ./scripts/ci/verify-bundled-xray-hash.ps1 @gateArgs
           if ($LASTEXITCODE -ne 0) { throw "bundled xray.exe gate failed (exit $LASTEXITCODE)" }
@@ -761,6 +785,15 @@ jobs:
           echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
           echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
 
+      # MR-1685, as build-windows (no Wintun here). Checked in the .deb and
+      # the AppImage by the post-bundle gate (NOTICES_FILE).
+      - name: Generate the third-party notices (resources/THIRD-PARTY-NOTICES.txt)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          node scripts/generate-third-party-notices.mjs --release --target "$ARCH" \
+            --xray src-tauri/resources/xray --xray-license "${RUNNER_TEMP}/xray/LICENSE"
+
       # A tagged release MUST be able to attest itself: without the secret,
       # option_env! is None and the shipped client silently sends no signature,
       # which an `enforce` server policy refuses. Fail here rather than ship it.
@@ -796,9 +829,11 @@ jobs:
       # XRAY_BINARY_SHA256 this build compiled in (and that the app binary
       # really carries that value). Script + self-test: scripts/ci/; passes on
       # the published v1.4.45 packages.
-      - name: Gate — bundled xray (.deb, .AppImage) must hash to the compiled-in XRAY_BINARY_SHA256
+      # MR-1685: and each must carry this build's THIRD-PARTY-NOTICES.txt.
+      - name: Gate — bundled xray (.deb, .AppImage) must hash to the compiled-in XRAY_BINARY_SHA256; THIRD-PARTY-NOTICES.txt must be this build's
         env:
           ARCH: ${{ matrix.arch }}
+          NOTICES_FILE: src-tauri/resources/THIRD-PARTY-NOTICES.txt
         run: |
           set -euo pipefail
           bundle="src-tauri/target/$ARCH/release/bundle"
@@ -986,6 +1021,16 @@ jobs:
           echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
           echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
 
+      # MR-1685, as build-windows (no Wintun here), for this leg's arch.
+      # Checked in the .app, the .app.tar.gz and the .dmg by the post-bundle
+      # gate (NOTICES_FILE).
+      - name: Generate the third-party notices (resources/THIRD-PARTY-NOTICES.txt)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          node scripts/generate-third-party-notices.mjs --release --target "$ARCH" \
+            --xray src-tauri/resources/xray --xray-license "${RUNNER_TEMP}/xray/LICENSE"
+
       # A tagged release MUST be able to attest itself: without the secret,
       # option_env! is None and the shipped client silently sends no signature,
       # which an `enforce` server policy refuses. Fail here rather than ship it.
@@ -1121,9 +1166,11 @@ jobs:
       # and the app binary must carry that value. Placed after notarize/staple
       # so it inspects the final bytes. Passes on the published v1.4.45
       # packages (both arches). Script + self-test: scripts/ci/.
-      - name: Gate — bundled xray (.app, .app.tar.gz, .dmg) must hash to the compiled-in XRAY_BINARY_SHA256
+      # MR-1685: and each must carry this build's THIRD-PARTY-NOTICES.txt.
+      - name: Gate — bundled xray (.app, .app.tar.gz, .dmg) must hash to the compiled-in XRAY_BINARY_SHA256; THIRD-PARTY-NOTICES.txt must be this build's
         env:
           ARCH: ${{ matrix.arch }}
+          NOTICES_FILE: src-tauri/resources/THIRD-PARTY-NOTICES.txt
         run: |
           set -euo pipefail
           bundle="src-tauri/target/$ARCH/release/bundle"
@@ -1387,14 +1434,50 @@ jobs:
       # A tag that is not plain vX.Y.Z (e.g. v1.5.0-rc.1) is published as a
       # PRERELEASE and never takes Latest: the website reads /releases/latest,
       # and the in-app updater ignores prereleases.
-      - name: Decide whether this tag becomes GitHub Latest
-        id: latest
+      # Opt-in DRAFT (owner ruling 2026-10-13): only an ANNOTATED tag whose
+      # message has a line that is exactly `release: draft`. A lightweight tag,
+      # or any other message, publishes as before. If the tag cannot be read the
+      # job FAILS rather than guess: publishing a release that was meant to be a
+      # draft cannot be undone for anyone whose updater already fetched it.
+      - name: Decide whether this tag is released as a draft
+        id: draft
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          type=${ref%% *}
+          sha=${ref##* }
+          draft=false
+          if [ "$type" = tag ]; then
+            message=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .message)
+            if printf '%s' "$message" | grep -qxE 'release:[[:space:]]*draft[[:space:]]*'; then
+              draft=true
+            fi
+          fi
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          if [ "$draft" = true ]; then
+            echo "::notice::$TAG asks for a DRAFT release (annotated tag message 'release: draft') - it will not be published or take Latest"
+          fi
+
+      - name: Decide whether this tag becomes GitHub Latest
+        id: latest
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          DRAFT: ${{ steps.draft.outputs.draft }}
+        run: |
+          set -euo pipefail
+          if [ "$DRAFT" = true ]; then
+            # A draft is not a release yet: it never takes Latest here. Whoever
+            # publishes it in the GitHub UI decides Latest there.
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "make_latest=false" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -1429,7 +1512,8 @@ jobs:
           fi
 
       # Only actually publish on a real tag push (workflow_dispatch builds are
-      # for manual/debug runs and cut no release); no hand-flipped drafts. The
+      # for manual/debug runs and cut no release). A draft only via the opt-in
+      # `release: draft` tag message above, never a hand-flipped one. The
       # guard above already refuses to get here unless the test gate and every
       # required platform succeeded.
       - name: Create GitHub Release
@@ -1445,6 +1529,6 @@ jobs:
             release-files/SHA256SUMS.txt
             release-files/SHA256SUMS.txt.sigstore
           generate_release_notes: true
-          draft: false
+          draft: ${{ steps.draft.outputs.draft == 'true' }}
           prerelease: ${{ steps.latest.outputs.prerelease }}
           make_latest: ${{ steps.latest.outputs.make_latest }}

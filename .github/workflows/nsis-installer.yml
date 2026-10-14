@@ -49,6 +49,9 @@ on:
       - "scripts/ci/nsis-install-smoke.ps1"
       - "scripts/ci/nsis-msi-era-upgrade.ps1"
       - "scripts/ci/verify-bundled-xray-hash.ps1"
+      - "scripts/generate-third-party-notices.mjs"
+      - "scripts/lib/go-buildinfo.mjs"
+      - "third_party/licenses/**"
   push:
     branches: [main]
     paths:
@@ -64,6 +67,9 @@ on:
       - "scripts/ci/nsis-install-smoke.ps1"
       - "scripts/ci/nsis-msi-era-upgrade.ps1"
       - "scripts/ci/verify-bundled-xray-hash.ps1"
+      - "scripts/generate-third-party-notices.mjs"
+      - "scripts/lib/go-buildinfo.mjs"
+      - "third_party/licenses/**"
   # Weekly on main: the runner image, WebView2 and Windows itself change
   # without a commit here, and a release should not be the first to notice.
   schedule:
@@ -170,6 +176,18 @@ jobs:
           # in, or the installer puts it in Program Files (release.yml does the
           # same; the smoke test below fails on any installed dotfile).
           if (Test-Path -LiteralPath src-tauri/resources/.gitkeep) { Remove-Item -LiteralPath src-tauri/resources/.gitkeep }
+
+      # MR-1685, as release.yml's build-windows does it: the notices go into
+      # src-tauri/resources/ before the build bundles that directory. The
+      # licence files come from the archives fetched above and must match the
+      # committed copies; the Go modules are read from this xray.exe.
+      - name: Generate the third-party notices (resources/THIRD-PARTY-NOTICES.txt)
+        run: |
+          node scripts/generate-third-party-notices.mjs --release --target x86_64-pc-windows-msvc `
+            --xray src-tauri/resources/xray.exe `
+            --xray-license "$env:RUNNER_TEMP\xray\LICENSE" `
+            --wintun-license "$env:RUNNER_TEMP\wintun\wintun\LICENSE.txt"
+          if ($LASTEXITCODE -ne 0) { throw "the notices generator exited $LASTEXITCODE" }
           Get-ChildItem -LiteralPath src-tauri/resources -File -Force | ForEach-Object { Write-Host "resources/$($_.Name)" }
 
       - name: Build the NSIS installer (unsigned)
@@ -210,11 +228,11 @@ jobs:
 
       # release.yml's own post-bundle gate, on an unsigned installer as its
       # unsigned dispatch builds run it.
-      - name: Bundled resources\xray.exe hashes to the compiled-in XRAY_BINARY_SHA256
+      - name: Bundled resources\xray.exe hashes to the compiled-in XRAY_BINARY_SHA256; THIRD-PARTY-NOTICES.txt is this build's
         run: |
           $nsis = @(Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe")
           if ($nsis.Count -ne 1) { throw "expected one NSIS installer, found $($nsis.Count)" }
-          & ./scripts/ci/verify-bundled-xray-hash.ps1 -Installer $nsis[0].FullName -ExpectedSha256 "$env:XRAY_BINARY_SHA256"
+          & ./scripts/ci/verify-bundled-xray-hash.ps1 -Installer $nsis[0].FullName -ExpectedSha256 "$env:XRAY_BINARY_SHA256" -ExpectedNotices src-tauri/resources/THIRD-PARTY-NOTICES.txt
           if ($LASTEXITCODE -ne 0) { throw "bundled xray.exe gate failed (exit $LASTEXITCODE)" }
 
       # Safe on a GitHub-hosted runner: no VPN, no WFP/route/DNS change (the

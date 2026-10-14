@@ -153,7 +153,7 @@ Create the following screenshots at 1366x768 or 1920x1080 (16:9):
 
 ## Pricing
 
-**Free** to download, with a free plan (Recon: 1 device, 10 GB per month).
+**Free** to download, with a free plan (Recon: 1 device, 50 GB per month).
 There is **no in-app purchase**: paid plans are bought on the web at
 birdo.app, where Polar is the reseller (merchant of record), and the app only
 links there.

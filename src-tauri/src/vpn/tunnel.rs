@@ -5,7 +5,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -710,6 +710,33 @@ pub struct WintunTunnel {
     /// `local_network_routes_added` flags: "did we change anything" is now
     /// answered by the owner, which cannot disagree with itself.
     state_gen: crate::vpn::win_machine_state::Gen,
+    /// What `Drop`'s emergency cleanup and `start()`'s wait for one depend on
+    /// (MR-823). Always [`TeardownHooks::system`] outside tests.
+    teardown: TeardownHooks,
+}
+
+/// Everything a tunnel's emergency cleanup reaches outside itself (MR-823):
+/// the ownership predicate `Drop` asks, the cleanup it hands off, the counter
+/// of cleanups still running, and how long `start()` waits on that counter.
+/// One process-wide set in production; each test builds its own, so none of
+/// them touches the machine or shares a counter with a test running beside it.
+#[derive(Clone, Copy)]
+struct TeardownHooks {
+    owns: fn(crate::vpn::win_machine_state::Gen) -> bool,
+    cleanup: fn(crate::vpn::win_machine_state::Gen),
+    in_flight: &'static AtomicUsize,
+    start_wait: Duration,
+}
+
+impl TeardownHooks {
+    fn system() -> Self {
+        Self {
+            owns: crate::vpn::win_machine_state::is_owner,
+            cleanup: emergency_teardown,
+            in_flight: &EMERGENCY_TEARDOWNS_IN_FLIGHT,
+            start_wait: START_TEARDOWN_WAIT,
+        }
+    }
 }
 
 impl WintunTunnel {
@@ -738,6 +765,7 @@ impl WintunTunnel {
             saved_default_gateway: Arc::new(RwLock::new(None)),
             local_network_sharing,
             state_gen: crate::vpn::win_machine_state::next_generation(),
+            teardown: TeardownHooks::system(),
         })
     }
 
@@ -773,6 +801,20 @@ impl WintunTunnel {
         // connect's fresh block (removing a live block = the exact leak this
         // guards against); the manager's synchronous lift is the single, race-free
         // mechanism.
+
+        // MR-823: a dropped tunnel's emergency cleanup runs on its own thread
+        // now. Never claim the machine state while one still runs: it holds
+        // the previous tunnel's creator `Adapter` — and dropping that handle
+        // REMOVES the adapter (W1-039), the one this start is about to open —
+        // and it may still be resetting that adapter's DNS (the #98 class).
+        // Wait for it, and if it is still running, refuse BEFORE claiming,
+        // retryably (it maps to AdapterFailed): the next attempt finds it done.
+        if !emergency_teardowns_settled(self.teardown.in_flight, self.teardown.start_wait).await {
+            return Err(format!(
+                "{}: a previous tunnel's cleanup is still running; try again in a moment",
+                ERR_EMERGENCY_CLEANUP_RUNNING
+            ));
+        }
 
         // I1: claim the machine state BEFORE the first mutation, so everything
         // installed from here on is attributable to this generation and nothing
@@ -2322,7 +2364,7 @@ impl Drop for WintunTunnel {
         // by CONNECT_TIMEOUT never set `running` yet had already parked the
         // adapters; the owner knows what was installed, so it cannot disagree
         // with a flag about it.
-        if !crate::vpn::win_machine_state::is_owner(self.state_gen) {
+        if !(self.teardown.owns)(self.state_gen) {
             if self.running.load(Ordering::SeqCst) {
                 tracing::warn!(
                     "A tunnel was dropped while still marked running but no longer owning the \
@@ -2341,41 +2383,423 @@ impl Drop for WintunTunnel {
         );
         self.running.store(false, Ordering::SeqCst);
 
+        // MR-823: the cleanup spawns ipconfig and two netsh (seconds each on an
+        // AV-heavy machine) and takes the machine-state lock. Run inline, it
+        // blocked whatever thread dropped the tunnel — a Tokio worker when the
+        // manager's CONNECT_TIMEOUT drops a half-built start() — and with it
+        // every task queued on that worker, for the whole run. It runs on its
+        // own thread now (see `dispatch_emergency_teardown` for the ordering
+        // and process-exit trade-offs). The adapter and session go with it and
+        // are released only AFTER the cleanup, as they were inline (a Drop body
+        // runs before the fields drop): the DNS reset needs the adapter.
+        let adapter = self.adapter.try_write().ok().and_then(|mut a| a.take());
+        let session = self.session.try_write().ok().and_then(|mut s| s.take());
+        let state_gen = self.state_gen;
+        let hooks = self.teardown;
+        dispatch_emergency_teardown(hooks.in_flight, move || {
+            (hooks.cleanup)(state_gen);
+            drop(session);
+            drop(adapter);
+        });
+    }
+}
+
+/// T-2: the emergency cleanup a [`WintunTunnel`] dropped still owning the
+/// machine state hands off. MR-823 moved it off the dropping thread, bounded
+/// each subprocess like `stop()` does (a hung netsh used to hold the cleanup —
+/// and, now that `start()` waits on it, every later connect), and asks for
+/// ownership again before each step.
+fn emergency_teardown(state_gen: crate::vpn::win_machine_state::Gen) {
+    emergency_teardown_steps(
+        &|| crate::vpn::win_machine_state::is_owner(state_gen),
+        &mut |program, args| {
+            if let Err(e) = crate::utils::output_within(cmd(program).args(args), SUBPROCESS_TIMEOUT)
+            {
+                tracing::warn!("Emergency cleanup: `{} {}`: {}", program, args.join(" "), e);
+            }
+        },
+        &|| {
+            crate::vpn::win_machine_state::release_all(state_gen);
+        },
+    );
+}
+
+/// [`emergency_teardown`]'s steps in their order, over injected effects so the
+/// tests can drive the ownership re-checks: `owns` is asked before each
+/// subprocess, `run` runs one, `release` is the owner-gated release.
+fn emergency_teardown_steps(
+    owns: &dyn Fn() -> bool,
+    run: &mut dyn FnMut(&str, &[&str]),
+    release: &dyn Fn(),
+) {
+    // MR-823: `Drop` decided "owner" on the dropping thread, but this runs
+    // later, on another one, and each step can take seconds under AV. A tunnel
+    // that took over meanwhile (`start()` refuses to claim while this runs, but
+    // the manager's transition can still move ownership) owns the adapter's
+    // DNS, and resetting it under a live session would be issue #98 again. So
+    // ownership is asked again before EACH step; the release asks it itself,
+    // under the state lock.
+    if owns() {
         // Best-effort: flush DNS cache to clear VPN-specific entries
-        let _ = cmd("ipconfig").args(["/flushdns"]).output();
+        run("ipconfig", &["/flushdns"]);
+    }
 
-        // Best-effort: reset VPN adapter DNS to DHCP (prevents DNS leak).
-        //
-        // BOTH families. This was the `ip` context only, while `configure_dns`
-        // sets the tunnel resolvers and `restore_dns` clears both — the same
-        // v4/v6 twin that has drifted twice in this file already.
-        for family in ["ip", "ipv6"] {
-            let _ = cmd("netsh")
-                .args([
-                    "interface",
-                    family,
-                    "set",
-                    "dns",
-                    &format!("name={}", ADAPTER_NAME),
-                    "dhcp",
-                ])
-                .output();
+    // Best-effort: reset VPN adapter DNS to DHCP (prevents DNS leak).
+    //
+    // BOTH families. This was the `ip` context only, while `configure_dns`
+    // sets the tunnel resolvers and `restore_dns` clears both — the same
+    // v4/v6 twin that has drifted twice in this file already.
+    let adapter = format!("name={}", ADAPTER_NAME);
+    for family in ["ip", "ipv6"] {
+        if !owns() {
+            tracing::warn!(
+                "Emergency cleanup: another tunnel took over the machine state — leaving the \
+                 adapter's DNS to it"
+            );
+            break;
         }
+        run(
+            "netsh",
+            &["interface", family, "set", "dns", &adapter, "dhcp"],
+        );
+    }
 
-        // Best-effort: lift the DNS guard and remove exactly the routes this
-        // generation installed — the same owner-gated path the clean teardown
-        // uses, so the two cannot drift.
-        crate::vpn::win_machine_state::release_all(self.state_gen);
+    // Best-effort: lift the DNS guard and remove exactly the routes this
+    // generation installed — the same owner-gated path the clean teardown
+    // uses, so the two cannot drift.
+    release();
 
-        // Nothing to remove for IPv6: the WFP IPv6 block lives in the dynamic
-        // session and goes with it. (W1-036: the PowerShell + netsh deletion of
-        // the <= 1.3.19 firewall rules ran here on every unwind, seconds of
-        // AV-scanned process spawns on the crash path; it runs once per install
-        // now, see `legacy_firewall`.) No adapter-binding "re-enable" either
-        // (D-24): this build never disables an ms_tcpip6 binding, so the only
-        // bindings a blanket re-enable could change are ones the USER turned off.
+    // Nothing to remove for IPv6: the WFP IPv6 block lives in the dynamic
+    // session and goes with it. (W1-036: the PowerShell + netsh deletion of
+    // the <= 1.3.19 firewall rules ran here on every unwind, seconds of
+    // AV-scanned process spawns on the crash path; it runs once per install
+    // now, see `legacy_firewall`.) No adapter-binding "re-enable" either
+    // (D-24): this build never disables an ms_tcpip6 binding, so the only
+    // bindings a blanket re-enable could change are ones the USER turned off.
 
-        tracing::warn!("Emergency cleanup complete — DNS/route state may need manual verification");
+    tracing::warn!("Emergency cleanup complete — DNS/route state may need manual verification");
+}
+
+/// Emergency cleanups handed to their own thread and not finished yet
+/// (MR-823). `start()` and the manager's failed-build arm wait on it.
+static EMERGENCY_TEARDOWNS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// The most one emergency cleanup can take: its three subprocesses, each
+/// bounded by SUBPROCESS_TIMEOUT, plus the release (native calls). What the
+/// manager's failed-build arm waits for before it lifts the IPv6 block.
+const EMERGENCY_TEARDOWN_BOUND: Duration =
+    Duration::from_secs(3 * SUBPROCESS_TIMEOUT.as_secs() + 5);
+
+/// How long `start()` waits for an in-flight cleanup before it refuses,
+/// retryably. Inside CONNECT_TIMEOUT (30 s), so the user gets that refusal
+/// rather than a generic timeout.
+const START_TEARDOWN_WAIT: Duration = Duration::from_secs(20);
+
+/// Marks a `start()` refused because an emergency cleanup was still running
+/// (MR-823). Not a handshake marker, so it surfaces as AdapterFailed, which is
+/// retryable.
+const ERR_EMERGENCY_CLEANUP_RUNNING: &str = "the previous tunnel is still being cleaned up";
+
+/// Run a dropped tunnel's emergency cleanup off the dropping thread (MR-823),
+/// counted in `in_flight` until it ends.
+///
+/// - Inside a Tokio runtime — the case that matters: a worker dropping a
+///   half-built tunnel — it runs on a dedicated thread and `Drop` returns at
+///   once. `start()` refuses to claim the machine state while it runs, and the
+///   manager's failed-build arm waits for it (`wait_for_emergency_teardowns`),
+///   so the next tunnel is never set up underneath it.
+/// - Outside a runtime there is no async worker to stall, and the usual
+///   reason is process exit (the runtime is already gone), where a detached
+///   thread would be killed mid-netsh. It runs inline, to completion, exactly
+///   as it always did.
+/// - If the thread cannot be started it runs inline too: blocking a worker is
+///   the lesser harm than skipping the cleanup.
+///
+/// The trade-off left is accepted rather than hidden: a cleanup handed to a
+/// thread just before the process exits from inside the runtime, by any path
+/// that does not wait for it, can be cut short. None of it is lost for good —
+/// the routes are journaled when installed and the startup reconcile deletes
+/// what is left (W1-041), the DNS guard is WFP dynamic-session state that dies
+/// with the process, and the next connect rewrites the adapter's DNS. Nothing
+/// here leaves a half-written file behind either: the steps are subprocesses
+/// and the owner's record.
+fn dispatch_emergency_teardown(
+    in_flight: &'static AtomicUsize,
+    teardown: impl FnOnce() + Send + 'static,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        teardown();
+        return;
+    }
+
+    /// Counts the cleanup as in flight until its thread ends, however it ends
+    /// (a panic included), or until a failed spawn drops it unrun.
+    struct InFlight(&'static AtomicUsize);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    in_flight.fetch_add(1, Ordering::SeqCst);
+    let in_flight = InFlight(in_flight);
+
+    // Shared so a failed spawn can still run it: `spawn` drops its closure.
+    let job = Arc::new(std::sync::Mutex::new(Some(teardown)));
+    let for_thread = Arc::clone(&job);
+    let spawned = std::thread::Builder::new()
+        .name("birdo-emergency-teardown".to_string())
+        .spawn(move || {
+            let _in_flight = in_flight;
+            let teardown = for_thread.lock().ok().and_then(|mut t| t.take());
+            if let Some(teardown) = teardown {
+                teardown();
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("Could not start the emergency-cleanup thread ({e}) — running it inline");
+        let teardown = job.lock().ok().and_then(|mut t| t.take());
+        if let Some(teardown) = teardown {
+            teardown();
+        }
+    }
+}
+
+/// Wait up to `limit` for the cleanups counted in `in_flight` to finish
+/// (MR-823). Returns whether none is left.
+async fn emergency_teardowns_settled(in_flight: &AtomicUsize, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "A dropped tunnel's emergency cleanup is still running after {:?}",
+                limit
+            );
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// For the manager's failed-build arm (MR-823): wait, as long as one can take,
+/// for any emergency cleanup a dropped tunnel handed off. Its release of the
+/// machine state must come before the arm lifts the IPv6 block (the #114
+/// order), and an exit that cancelled into that arm must not end the process
+/// under it. Returns whether none is left.
+pub(crate) async fn wait_for_emergency_teardowns() -> bool {
+    emergency_teardowns_settled(&EMERGENCY_TEARDOWNS_IN_FLIGHT, EMERGENCY_TEARDOWN_BOUND).await
+}
+
+/// MR-823: `Drop` must hand the emergency cleanup off, not run it on the
+/// dropping thread; the cleanup must still run, bounded, asking for ownership
+/// before each step; and nothing may claim the machine state while one runs.
+/// Each test builds its own `TeardownHooks`: none touches the machine or a
+/// counter another test shares.
+#[cfg(test)]
+mod emergency_teardown_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// Generations the stand-in cleanup finished, in order.
+    static FINISHED: Mutex<Vec<crate::vpn::win_machine_state::Gen>> = Mutex::new(Vec::new());
+
+    /// Stands in for `emergency_teardown`: as slow as netsh under a scanning
+    /// AV, and touching nothing. Only the drop test uses it, keyed by its own
+    /// generation.
+    fn slow_teardown(gen: crate::vpn::win_machine_state::Gen) {
+        std::thread::sleep(Duration::from_millis(1500));
+        FINISHED.lock().unwrap().push(gen);
+    }
+
+    fn finished(gen: crate::vpn::win_machine_state::Gen) -> bool {
+        FINISHED.lock().unwrap().contains(&gen)
+    }
+
+    fn config() -> VpnConfig {
+        VpnConfig {
+            server_id: "mr823".into(),
+            key_id: "mr823".into(),
+            public_key: String::new(),
+            server_public_key: String::new(),
+            preshared_key: None,
+            endpoint: "192.0.2.1:51820".into(),
+            allowed_ips: vec!["0.0.0.0/0".into()],
+            dns: vec![],
+            custom_dns: false,
+            client_ip: "10.0.0.2".into(),
+            client_ipv6: None,
+            allowed_ips_v6: vec![],
+            mtu: 1420,
+            persistent_keepalive: 25,
+        }
+    }
+
+    /// The regression: a tunnel dropped on a runtime worker while it still
+    /// owns the machine state ran the whole cleanup inline, so the worker
+    /// stalled for as long as netsh took. Drop must now return at once, and
+    /// the cleanup still finish. Its own hooks: an owner probe that says yes,
+    /// a stand-in cleanup and a counter of its own — nothing process-wide.
+    #[tokio::test]
+    async fn drop_on_a_runtime_worker_returns_before_the_cleanup_finishes() {
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        let mut tunnel = WintunTunnel::create(config(), false).await.unwrap();
+        tunnel.teardown = TeardownHooks {
+            owns: |_| true,
+            cleanup: slow_teardown,
+            in_flight: &IN_FLIGHT,
+            start_wait: Duration::from_millis(50),
+        };
+        let gen = tunnel.state_gen;
+
+        let started = Instant::now();
+        drop(tunnel);
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_millis(500),
+            "Drop blocked the worker for {took:?} on the cleanup"
+        );
+        assert!(!finished(gen), "the cleanup ran inline");
+        assert_eq!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            1,
+            "the cleanup is not counted"
+        );
+
+        assert!(
+            emergency_teardowns_settled(&IN_FLIGHT, Duration::from_secs(10)).await,
+            "the cleanup never finished"
+        );
+        assert!(
+            finished(gen),
+            "the count reached zero before the cleanup ran"
+        );
+    }
+
+    /// The review's MEDIUM: a start() that claimed the machine state while a
+    /// cleanup still ran would open the adapter that cleanup's creator handle
+    /// is about to remove, under a cleanup that may still reset its DNS. It
+    /// must refuse BEFORE claiming, and retryably.
+    #[tokio::test]
+    async fn start_refuses_retryably_while_a_cleanup_runs() {
+        // One cleanup still running, as far as this tunnel's counter knows.
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(1);
+        let mut tunnel = WintunTunnel::create(config(), false).await.unwrap();
+        tunnel.teardown = TeardownHooks {
+            owns: |_| false,
+            cleanup: |_| {},
+            in_flight: &IN_FLIGHT,
+            start_wait: Duration::from_millis(100),
+        };
+        let gen = tunnel.state_gen;
+
+        let started = Instant::now();
+        let err = tunnel
+            .start(WgPrivateKey::generate())
+            .await
+            .expect_err("start() went ahead while a cleanup was running");
+
+        assert!(err.contains(ERR_EMERGENCY_CLEANUP_RUNNING), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Refused before claiming (a unique generation: no other test can
+        // make this true).
+        assert!(!crate::vpn::win_machine_state::is_owner(gen));
+        assert!(
+            crate::commands::ipc_error::IpcError::from_tunnel_failure(&err).retryable,
+            "the refusal must be retryable"
+        );
+    }
+
+    /// Process exit: no runtime left, so the cleanup runs inline and is done
+    /// when the dispatch returns — a detached thread would be killed.
+    #[test]
+    fn without_a_runtime_the_cleanup_runs_inline() {
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        dispatch_emergency_teardown(&IN_FLIGHT, move || flag.store(true, Ordering::SeqCst));
+        assert!(ran.load(Ordering::SeqCst));
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0);
+    }
+
+    /// The steps run against a scripted owner probe; returns the subprocesses
+    /// they ran and how often they released.
+    fn run_steps(owner_answers: &[bool]) -> (Vec<String>, u32) {
+        let answers = std::cell::RefCell::new(owner_answers.iter().copied());
+        let released = std::cell::Cell::new(0);
+        let mut ran = Vec::new();
+        emergency_teardown_steps(
+            &|| answers.borrow_mut().next().unwrap_or(false),
+            &mut |program, args| ran.push(format!("{program} {}", args.join(" "))),
+            &|| released.set(released.get() + 1),
+        );
+        (ran, released.get())
+    }
+
+    /// The review's MEDIUM: ownership is asked again before EACH adapter DNS
+    /// reset, so one that takes over between the two netsh calls (each can
+    /// take seconds) keeps its adapter DNS. The release always runs: it is
+    /// owner-gated itself.
+    #[test]
+    fn ownership_is_asked_again_before_each_adapter_reset() {
+        let v4 = format!("netsh interface ip set dns name={ADAPTER_NAME} dhcp");
+        let v6 = format!("netsh interface ipv6 set dns name={ADAPTER_NAME} dhcp");
+
+        let (ran, released) = run_steps(&[true, true, true]);
+        assert_eq!(ran, vec!["ipconfig /flushdns".to_string(), v4.clone(), v6]);
+        assert_eq!(released, 1);
+
+        // Taken over after the IPv4 reset: the IPv6 one must not run.
+        let (ran, released) = run_steps(&[true, true, false]);
+        assert_eq!(ran, vec!["ipconfig /flushdns".to_string(), v4]);
+        assert_eq!(released, 1);
+
+        // Taken over before the cleanup ran at all.
+        let (ran, released) = run_steps(&[false, false, false]);
+        assert!(ran.is_empty(), "{ran:?}");
+        assert_eq!(released, 1);
+    }
+
+    /// The review's MEDIUM: every subprocess the cleanup spawns is bounded,
+    /// like stop()'s. An unbounded one would hold the cleanup — and, since
+    /// start() waits on it, every later connect.
+    #[test]
+    fn every_cleanup_subprocess_is_bounded() {
+        let source = include_str!("tunnel.rs").replace('\r', "");
+        let start = source
+            .find("fn emergency_teardown(state_gen")
+            .expect("emergency_teardown");
+        let end = start
+            + source[start..]
+                .find("static EMERGENCY_TEARDOWNS_IN_FLIGHT")
+                .expect("end of the cleanup");
+        let cleanup = &source[start..end];
+        assert!(cleanup.contains("output_within("), "{cleanup}");
+        assert!(cleanup.contains("SUBPROCESS_TIMEOUT"), "{cleanup}");
+        assert!(
+            !cleanup.contains(".output()"),
+            "an unbounded subprocess is back in the emergency cleanup"
+        );
+    }
+
+    /// LOW (a) of the review: a failed, timed-out or cancelled build may have
+    /// dropped a tunnel that handed its cleanup to a thread. The manager waits
+    /// for it before ANY failure arm runs, so the machine state is released
+    /// before the IPv6 block is lifted (the #114 order), and an exit that
+    /// cancelled into the build does not end the process under it.
+    #[test]
+    fn a_failed_build_waits_for_the_cleanup_before_any_failure_arm() {
+        let source = include_str!("manager.rs").replace('\r', "");
+        let build = source
+            .find("let tunnel_result = tokio::select!")
+            .expect("the build race");
+        let after = &source[build..];
+        let wait = after
+            .find("tunnel::wait_for_emergency_teardowns()")
+            .expect("the manager does not wait for a handed-off cleanup");
+        let arms = after.find("match tunnel_result").expect("the arms");
+        assert!(wait < arms, "the wait must come before the failure arms");
     }
 }
 

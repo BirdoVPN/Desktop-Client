@@ -6,25 +6,43 @@
  * - Savings per plan (Operative 20%, Sovereign 17%) or "up to 20%", never a
  *   flat figure that overstates Sovereign.
  * - Prices unchanged: £3.99 / £38 and £9.99 / £99. No location counts.
+ * - MR-132 / MR-630 / MR-1767 / MR-1979: prices, savings and caps render from
+ *   the server's `plans` (birdo-web #708); without it, or for a plan it left
+ *   out, the fallback (the prices above, the free cap at 50 GB, not 10).
  *
  * Run: npx vitest run src/__tests__/PricingScreen.test.tsx
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Pricing } from '@/screens/Pricing';
 
-vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('zustand/react/shallow', () => ({ useShallow: (fn: unknown) => fn }));
 
 const mockStoreState = {
   account: { plan: 'RECON' },
   popRoute: vi.fn(),
+  /** `GET /api/client-config` → `plans`, as `useClientConfig` stores it. */
+  planPrices: {} as Record<string, unknown>,
 };
 vi.mock('@/store/app-store', () => {
   const useAppStore = vi.fn((selector) => selector(mockStoreState));
   return { useAppStore };
 });
+
+beforeEach(() => {
+  mockStoreState.planPrices = {};
+});
+
+const plan = (monthlyPrice: number, yearlyPrice: number, currency: string, bandwidthLimitGb: number | null) => ({
+  monthlyPrice,
+  yearlyPrice,
+  currency,
+  bandwidthLimitGb,
+});
+
+const showMonthly = () => userEvent.click(screen.getByRole('button', { name: /^monthly$/i }));
 
 describe('Pricing', () => {
   it('lists no split tunnelling on any card', () => {
@@ -71,5 +89,98 @@ describe('Pricing', () => {
     // on a paid card as if it were an upgrade.
     expect(text.match(/custom dns/gi)).toHaveLength(1);
     expect(text.indexOf('Custom DNS servers')).toBeLessThan(text.indexOf('Everything in Recon'));
+  });
+});
+
+describe('Pricing renders the server price feed (MR-132 / MR-630 / MR-1767 / MR-1979)', () => {
+  it("shows the server's prices, savings and caps, not the built-in ones", async () => {
+    mockStoreState.planPrices = {
+      RECON: plan(0, 0, 'GBP', 75),
+      OPERATIVE: plan(4.49, 45, 'GBP', null),
+      SOVEREIGN: plan(10.99, 109, 'GBP', null),
+    };
+    const { container } = render(<Pricing />);
+    const text = () => container.textContent ?? '';
+    // Yearly (the default): the ANNUAL total as sent, with "/yr".
+    expect(screen.getByText('£45')).toBeInTheDocument();
+    expect(screen.getByText('£109')).toBeInTheDocument();
+    // Floored from the server's numbers: 45 vs 53.88 = 16.5%, 109 vs 131.88 = 17.3%.
+    expect(text()).toContain('Save 16% vs paying monthly');
+    expect(text()).toContain('Save 17% vs paying monthly');
+    expect(screen.getByText('Save up to 17%')).toBeInTheDocument();
+    expect(text()).toContain('75 GB monthly bandwidth');
+    expect(text()).not.toMatch(/£38|£99|\b50 GB|\b10 GB/);
+    expect(screen.getByText('Free')).toBeInTheDocument();
+    await showMonthly();
+    expect(screen.getByText('£4.49')).toBeInTheDocument();
+    expect(screen.getByText('£10.99')).toBeInTheDocument();
+    expect(text()).not.toMatch(/£3\.99|£9\.99/);
+  });
+
+  it('a paid plan the server caps shows its cap instead of "Unlimited bandwidth"', () => {
+    mockStoreState.planPrices = { OPERATIVE: plan(3.99, 38, 'GBP', 200) };
+    const { container } = render(<Pricing />);
+    const text = container.textContent ?? '';
+    expect(text).toContain('200 GB monthly bandwidth');
+    expect(text).not.toContain('Unlimited bandwidth');
+  });
+
+  it('without `plans` (older server, offline, failed fetch) it shows the fallback, free cap 50 GB', async () => {
+    const { container } = render(<Pricing />);
+    const text = () => container.textContent ?? '';
+    expect(text()).toContain('50 GB monthly bandwidth');
+    expect(text()).not.toMatch(/\b10 ?GB/);
+    expect(text()).toContain('Unlimited bandwidth');
+    expect(screen.getByText('£38')).toBeInTheDocument();
+    expect(screen.getByText('£99')).toBeInTheDocument();
+    expect(screen.getByText('Save up to 20%')).toBeInTheDocument();
+    expect(text()).toContain('Prices in GBP.');
+    await showMonthly();
+    expect(screen.getByText('£3.99')).toBeInTheDocument();
+    expect(screen.getByText('£9.99')).toBeInTheDocument();
+  });
+
+  it('a partial `plans` uses the server for the plans it priced and the fallback for the rest', () => {
+    mockStoreState.planPrices = { OPERATIVE: plan(4.99, 48, 'GBP', null) };
+    const { container } = render(<Pricing />);
+    const text = container.textContent ?? '';
+    expect(screen.getByText('£48')).toBeInTheDocument(); // server
+    expect(text).toContain('Save 19% vs paying monthly'); // 48 vs 59.88 = 19.8%
+    expect(screen.getByText('£99')).toBeInTheDocument(); // fallback Sovereign
+    expect(text).toContain('Save 17% vs paying monthly');
+    expect(text).toContain('50 GB monthly bandwidth'); // fallback Recon
+    expect(text).not.toContain('£38');
+  });
+
+  it('an entry that is not a valid price falls back for that plan alone', () => {
+    mockStoreState.planPrices = {
+      OPERATIVE: plan(Number.NaN, 38, 'GBP', null),
+      SOVEREIGN: plan(9.99, 99, 'pounds', null),
+      RECON: plan(0, 0, 'GBP', 0),
+    };
+    const { container } = render(<Pricing />);
+    const text = container.textContent ?? '';
+    expect(screen.getByText('£38')).toBeInTheDocument();
+    expect(screen.getByText('£99')).toBeInTheDocument();
+    expect(text).toContain('50 GB monthly bandwidth');
+    expect(text).not.toMatch(/NaN|pounds|\b0 GB/);
+  });
+
+  it('formats a non-GBP currency with Intl.NumberFormat and says which currency', async () => {
+    mockStoreState.planPrices = {
+      RECON: plan(0, 0, 'EUR', 50),
+      OPERATIVE: plan(4.49, 42, 'EUR', null),
+      SOVEREIGN: plan(10.99, 99.5, 'EUR', null),
+    };
+    const { container } = render(<Pricing />);
+    const text = () => container.textContent ?? '';
+    expect(screen.getByText('€42')).toBeInTheDocument();
+    // A fractional annual total keeps its pence; a whole one drops ".00".
+    expect(screen.getByText('€99.50')).toBeInTheDocument();
+    expect(text()).toContain('Prices in EUR.');
+    expect(text()).not.toMatch(/£|GBP/);
+    await showMonthly();
+    expect(screen.getByText('€4.49')).toBeInTheDocument();
+    expect(screen.getByText('€10.99')).toBeInTheDocument();
   });
 });

@@ -257,8 +257,13 @@ describe('Dashboard: Multi-Hop and identity', () => {
     expect(useAppStore.getState().navStack).toEqual([]);
   });
 
+  // MR-918: told by `/auth/me`'s isAnonymous, which the same answer as the
+  // synthetic email always carries — not by parsing the email.
   it('never renders the synthetic anonymous address (P1-parity-007)', () => {
-    useAppStore.setState({ userEmail: 'anon_123456789012345678901234@anonymous.local' });
+    useAppStore.setState({
+      userEmail: 'anon_123456789012345678901234@anonymous.local',
+      account: { ...useAppStore.getState().account, isAnonymous: true },
+    });
     setStatus({ state: 'disconnected' });
     const { container } = render(<Dashboard />);
     expect(screen.getByText('Anonymous account')).toBeInTheDocument();

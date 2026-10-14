@@ -52,6 +52,17 @@
 //! `settings.dat`, `attachments\`) are left to Crashpad, which drops the index
 //! entry, and any attachments, of a report whose dump is gone the next time it
 //! cleans its database.
+//!
+//! THE DELETES RUN ELEVATED (MR-1945), so they go through `safe_fs` like the
+//! app's own logs and crash files: the folder is an [`OwnedDir`] (the local
+//! data directory as its root, the four folders below it as the app's), held
+//! open for the call once every level has been opened without following a
+//! reparse point and found at its expected final path, and each dump is
+//! deleted through a handle checked to be exactly that file
+//! ([`OwnedDir::remove_file`]), never by path. On Windows the root itself
+//! must resolve under the user's own profile directory, the uninstaller
+//! sweep's guard (D6c, `protected_dir::is_under_user_profile`): a
+//! `%LOCALAPPDATA%` redirected onto another account's profile is refused.
 
 // Off Windows only the tests reach the dump helpers: WebKit keeps no such
 // folder (see the MR-1946 PR), so nothing calls them there.
@@ -64,17 +75,33 @@ use chrono::{DateTime, Utc};
 
 use super::file_log::{self, Deleted};
 use super::log_retention;
+use super::safe_fs::{DirGuard, OwnedDir};
 
 /// The folder the app gives WebView2 as its user data folder:
 /// `<local data dir>\uk.birdo.vpn.desktop`, which is Tauri's
 /// `app_local_data_dir()`, the folder Tauri would have given it (tauri 2.12,
 /// `manager/webview.rs`). WebView2 keeps everything in `EBWebView` inside it.
-pub fn user_data_dir_in(local_data: &Path) -> PathBuf {
-    local_data.join(file_log::APP_IDENTIFIER)
+/// One of the app's directories ([`OwnedDir`]), so that the elevated app
+/// creates it the way it creates any folder in the user's profile.
+fn user_data_owned_dir(local_data: &Path) -> OwnedDir {
+    OwnedDir::new(local_data, &[file_log::APP_IDENTIFIER])
+}
+
+/// [`user_data_owned_dir`]'s path.
+#[cfg(test)]
+fn user_data_dir_in(local_data: &Path) -> PathBuf {
+    user_data_owned_dir(local_data).path().to_path_buf()
 }
 
 /// Where Crashpad keeps WebView2's dumps, below the local data directory.
 const DUMP_DIR: [&str; 4] = [file_log::APP_IDENTIFIER, "EBWebView", "Crashpad", "reports"];
+
+/// The dump folder below `local_data` as one of the app's directories: the
+/// local data directory is the root the OS hands out, and the four folders
+/// below it are the app's, checked by handle on every delete (`safe_fs`).
+fn dump_dir_in(local_data: &Path) -> OwnedDir {
+    OwnedDir::new(local_data, &DUMP_DIR)
+}
 
 /// A Crashpad dump's name: `<uuid>.dmp`, the UUID in its 8-4-4-4-12 hex form
 /// (crashpad `crash_report_database_win.cc`, `kCrashReportFileExtension`).
@@ -93,7 +120,7 @@ pub fn is_dump_name(name: &str) -> bool {
 /// What [`known_dir`] found.
 enum KnownDir {
     /// Every part is a real directory.
-    Found(PathBuf),
+    Found,
     /// A part does not exist: nothing was ever written below it.
     Absent,
     /// A link, a junction or a file where a directory should be, or a part
@@ -106,6 +133,9 @@ enum KnownDir {
 /// reports a junction as a link: `file_log`'s junction test pins that). A link
 /// at any level is refused, not only at the last one: the parts below
 /// `%LOCALAPPDATA%` are the user's to create, and this runs elevated.
+///
+/// A first pass by path, which tells a folder that was never made from one
+/// that is refused; [`open_dumps`] then checks every level again by handle.
 fn known_dir(base: &Path, parts: &[&str]) -> KnownDir {
     let mut dir = base.to_path_buf();
     for part in parts {
@@ -117,26 +147,77 @@ fn known_dir(base: &Path, parts: &[&str]) -> KnownDir {
             Err(_) => return KnownDir::Refused,
         }
     }
-    KnownDir::Found(dir)
+    KnownDir::Found
+}
+
+/// What [`open_dumps`] found.
+enum Dumps {
+    /// The dump folder, verified, and held open while the guard lives: it
+    /// cannot be renamed or swapped for a junction meanwhile.
+    Held(OwnedDir, DirGuard),
+    /// No dump folder: nothing was ever written there.
+    Absent,
+    /// A link, a junction or a file where a folder should be, or a folder
+    /// that cannot be verified.
+    Refused,
+}
+
+/// The dump folder below `local_data`, held for the caller's deletes. After
+/// [`known_dir`]'s pass by path, [`OwnedDir::hold_open_if_present`] (which
+/// creates nothing) opens every level again without following a reparse
+/// point, checks each one's final path, and holds the folder. A listing of it
+/// is still only a snapshot, so each delete is [`OwnedDir::remove_file`],
+/// through a handle checked to be exactly that file.
+fn open_dumps(local_data: &Path) -> Dumps {
+    match known_dir(local_data, &DUMP_DIR) {
+        KnownDir::Found => {}
+        KnownDir::Absent => return Dumps::Absent,
+        KnownDir::Refused => return Dumps::Refused,
+    }
+    let dir = dump_dir_in(local_data);
+    match dir.hold_open_if_present() {
+        Ok(Some(guard)) => Dumps::Held(dir, guard),
+        Ok(None) => Dumps::Absent,
+        Err(_) => Dumps::Refused,
+    }
 }
 
 /// Delete every WebView2 crash dump below `local_data` (the platform's local
 /// data directory), adding to `tally`: counts only, never a path. The same
 /// per-file rules as the rest of "Delete Logs Now" (`file_log::delete_in`):
-/// regular files only, by name, never recursive.
+/// regular files only, by name, never recursive, each through a checked
+/// handle ([`OwnedDir::remove_file`]).
 pub fn delete_dumps_in(local_data: &Path, tally: &mut Deleted) {
-    match known_dir(local_data, &DUMP_DIR) {
-        KnownDir::Found(dir) => file_log::delete_in(&dir, is_dump_name, tally),
-        KnownDir::Absent => {}
-        KnownDir::Refused => tally.failed += 1,
+    match open_dumps(local_data) {
+        Dumps::Held(dir, _held) => file_log::delete_in(&dir, is_dump_name, tally),
+        Dumps::Absent => {}
+        Dumps::Refused => tally.failed += 1,
     }
 }
 
-/// "Delete Logs Now", WebView2's part: Windows only, where the dumps are.
+/// The local data directory, the root the dump folder is found under, if it
+/// resolves under the signed-in user's own profile directory (see the module
+/// docs): `Some(Err(()))` when it does not, `None` when the OS has none.
+#[cfg(windows)]
+fn local_data_root() -> Option<Result<PathBuf, ()>> {
+    let local_data = dirs::data_local_dir()?;
+    Some(
+        if super::protected_dir::is_under_user_profile(&local_data) {
+            Ok(local_data)
+        } else {
+            Err(())
+        },
+    )
+}
+
+/// "Delete Logs Now", WebView2's part: Windows only, where the dumps are. A
+/// local data directory outside the user's profile is refused, and counted.
 #[cfg(windows)]
 pub fn delete_dumps(tally: &mut Deleted) {
-    if let Some(local_data) = dirs::data_local_dir() {
-        delete_dumps_in(&local_data, tally);
+    match local_data_root() {
+        Some(Ok(local_data)) => delete_dumps_in(&local_data, tally),
+        Some(Err(())) => tally.failed += 1,
+        None => {}
     }
 }
 
@@ -145,26 +226,26 @@ pub fn delete_dumps(tally: &mut Deleted) {
 /// rule `log_retention::prune_crash_reports` applies to the app's own crash
 /// files. A Crashpad name carries no date, so a dump is dated by when it was
 /// last written; one whose time cannot be read is left alone, like an undated
-/// log. Best-effort and silent: never worth failing a launch over.
+/// log. Best-effort and silent: never worth failing a launch over. Every
+/// delete goes through the held folder ([`OwnedDir::remove_file`]), never a
+/// path, as `prune_crash_reports`'s do.
 pub fn prune_dumps_in(local_data: &Path, now: DateTime<Utc>, keep: usize) {
-    let KnownDir::Found(dir) = known_dir(local_data, &DUMP_DIR) else {
+    let Dumps::Held(dir, _held) = open_dumps(local_data) else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = std::fs::read_dir(dir.path()) else {
         return;
     };
     let cutoff = log_retention::cutoff(now);
-    let mut recent: Vec<(DateTime<Utc>, PathBuf)> = Vec::new();
+    let mut recent: Vec<(DateTime<Utc>, String)> = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+        let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        if !is_dump_name(name) {
+        if !is_dump_name(&name) {
             continue;
         }
-        let path = dir.join(name);
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(&name)) else {
             continue;
         };
         if !meta.file_type().is_file() {
@@ -174,23 +255,24 @@ pub fn prune_dumps_in(local_data: &Path, now: DateTime<Utc>, keep: usize) {
             continue;
         };
         if written < cutoff {
-            let _ = std::fs::remove_file(&path);
+            let _ = dir.remove_file(&name);
         } else {
-            recent.push((written, path));
+            recent.push((written, name));
         }
     }
     recent.sort();
     let excess = recent.len().saturating_sub(keep);
-    for (_, path) in &recent[..excess] {
-        let _ = std::fs::remove_file(path);
+    for (_, name) in &recent[..excess] {
+        let _ = dir.remove_file(name);
     }
 }
 
 /// The launch sweep, run by `main()` before Tauri starts, so before this
-/// session's WebView2 (and its Crashpad handler) is running. Windows only.
+/// session's WebView2 (and its Crashpad handler) is running. Windows only; a
+/// local data directory outside the user's profile is left alone.
 #[cfg(windows)]
 pub fn prune_dumps(now: DateTime<Utc>) {
-    if let Some(local_data) = dirs::data_local_dir() {
+    if let Some(Ok(local_data)) = local_data_root() {
         prune_dumps_in(&local_data, now, log_retention::KEEP_CRASH_REPORTS);
     }
 }
@@ -208,9 +290,7 @@ pub fn build_main_window(
 ) -> tauri::Result<tauri::WebviewWindow> {
     let builder = tauri::WebviewWindowBuilder::from_config(app, config)?;
     #[cfg(windows)]
-    let builder = match dirs::data_local_dir()
-        .map(|dir| create_environment(&user_data_dir_in(&dir)))
-    {
+    let builder = match dirs::data_local_dir().map(|dir| create_environment(&dir)) {
         Some(Ok(environment)) => builder.with_environment(environment),
         Some(Err(e)) => {
             tracing::warn!(
@@ -240,12 +320,13 @@ const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreen
 /// The WebView2 environment for the app's window: what wry would make for it
 /// (its browser arguments, extensions off, the user's display language,
 /// default scroll bars, the same user data folder), with WebView2's crash
-/// reports kept on this device. Must run on the main thread, before the window
-/// is built: it pumps that thread's messages until WebView2 answers, as wry
-/// does.
+/// reports kept on this device. `local_data` is the local data directory; the
+/// user data folder is [`user_data_owned_dir`] in it. Must run on the main thread,
+/// before the window is built: it pumps that thread's messages until WebView2
+/// answers, as wry does.
 #[cfg(windows)]
 pub fn create_environment(
-    user_data: &Path,
+    local_data: &Path,
 ) -> webview2_com::Result<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment> {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2EnvironmentOptions,
@@ -259,8 +340,14 @@ pub fn create_environment(
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
     // Tauri creates the user data folder before it builds a webview; this
-    // runs first, so it does the same.
-    std::fs::create_dir_all(user_data)
+    // runs first, so it does the same, the way the elevated app makes any
+    // folder in the user's profile (R5, `safe_fs`): never `create_dir_all` by
+    // path, but inside its verified parent, and refused if a link or a
+    // junction is in its place. The error names no path.
+    let user_data = user_data_owned_dir(local_data);
+    user_data
+        .hold_open()
+        .map(drop)
         .map_err(|e| webview2_com::Error::CallbackError(e.to_string()))?;
 
     // What wry's `new_in_hwnd` does first, result ignored the same way.
@@ -284,7 +371,7 @@ pub fn create_environment(
     unsafe {
         CreateCoreWebView2EnvironmentWithOptions(
             PCWSTR::null(),
-            &HSTRING::from(user_data),
+            &HSTRING::from(user_data.path()),
             &options,
             &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
                 move |error_code, environment| {
@@ -562,6 +649,98 @@ mod tests {
     #[test]
     fn a_symlink_anywhere_on_the_way_down_is_refused() {
         every_linked_folder_is_refused(|at, to| std::os::unix::fs::symlink(to, at).unwrap());
+    }
+
+    /// MR-1945, for this folder: [`known_dir`]'s pass is by path, a snapshot,
+    /// and a junction can be planted after it. The checks behind it refuse
+    /// one on their own, at every level: the hold ([`open_dumps`]) and, for a
+    /// listing made through the junction, each delete
+    /// ([`OwnedDir::remove_file`], which checks its handle's final path).
+    /// Driven here without the first pass.
+    #[cfg(windows)]
+    #[test]
+    fn without_the_first_pass_the_handle_checks_still_refuse_a_junction() {
+        use crate::utils::safe_fs::tests::junction;
+        for depth in 1..=DUMP_DIR.len() {
+            let local = tempfile::tempdir().unwrap();
+            let elsewhere = local.path().join("elsewhere");
+            let mut target = elsewhere.clone();
+            for part in &DUMP_DIR[depth..] {
+                target.push(part);
+            }
+            std::fs::create_dir_all(&target).unwrap();
+            let victim = write(&target, DUMP_A);
+            let mut at = local.path().to_path_buf();
+            for part in &DUMP_DIR[..depth - 1] {
+                at.push(part);
+            }
+            std::fs::create_dir_all(&at).unwrap();
+            junction(&at.join(DUMP_DIR[depth - 1]), &elsewhere);
+            let level = DUMP_DIR[depth - 1];
+
+            let dir = dump_dir_in(local.path());
+            assert!(
+                dir.hold_open_if_present().is_err(),
+                "held through a junction in place of {level}"
+            );
+            let mut tally = Deleted::default();
+            file_log::delete_in(&dir, is_dump_name, &mut tally);
+            assert_eq!(
+                tally,
+                Deleted {
+                    deleted: 0,
+                    failed: 1
+                },
+                "a junction in place of {level}"
+            );
+            assert!(dir.remove_file(DUMP_A).is_err(), "{level}");
+            assert!(
+                victim.exists(),
+                "deleted through a junction in place of {level}"
+            );
+        }
+    }
+
+    /// The root check behind [`delete_dumps`] and [`prune_dumps`] (D6c): this
+    /// account's own local data directory passes; a folder outside the
+    /// profile does not.
+    #[cfg(windows)]
+    #[test]
+    fn the_local_data_root_must_be_under_the_users_profile() {
+        assert!(
+            matches!(local_data_root(), Some(Ok(_))),
+            "this account's %LOCALAPPDATA% is not under its profile"
+        );
+        let windows_dir = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .expect("SystemRoot");
+        assert!(!crate::utils::protected_dir::is_under_user_profile(
+            &windows_dir
+        ));
+    }
+
+    /// Every delete and create in this file goes through `safe_fs` (MR-1945,
+    /// R5), as the app's own logs' and crash files' do: outside the tests,
+    /// nothing removes, creates or writes by path.
+    #[test]
+    fn nothing_here_deletes_or_creates_by_path() {
+        let here = include_str!("webview2.rs").replace('\r', "");
+        let code = &here[..here.find("#[cfg(test)]\nmod tests {").unwrap()];
+        for by_path in [
+            "fs::remove_file(",
+            "fs::remove_dir(",
+            "fs::remove_dir_all(",
+            "fs::create_dir(",
+            "fs::create_dir_all(",
+            "fs::write(",
+            "fs::rename(",
+        ] {
+            assert!(!code.contains(by_path), "webview2.rs calls {by_path}");
+        }
+        assert!(code.contains("file_log::delete_in(&dir, is_dump_name, tally)"));
+        assert!(code.contains("let _ = dir.remove_file(&name);"));
+        assert!(code.contains("let _ = dir.remove_file(name);"));
+        assert!(code.contains("user_data\n        .hold_open()"));
     }
 
     /// A link named like a dump is skipped, and what it points at survives.
@@ -862,7 +1041,7 @@ mod tests {
         use windows::core::{Interface, PWSTR};
 
         let local = tempfile::tempdir().unwrap();
-        let environment = match create_environment(&user_data_dir_in(local.path())) {
+        let environment = match create_environment(local.path()) {
             Ok(environment) => environment,
             Err(e) => {
                 assert!(
@@ -904,7 +1083,7 @@ mod tests {
         };
 
         let local = tempfile::tempdir().unwrap();
-        let environment = create_environment(&user_data_dir_in(local.path())).unwrap();
+        let environment = create_environment(local.path()).unwrap();
         // SAFETY: a hidden window of a system class, destroyed below.
         let window = unsafe {
             CreateWindowExW(
@@ -960,6 +1139,21 @@ mod tests {
             .args(["-NoProfile", "-NonInteractive", "-Command", &query])
             .output()
             .unwrap();
+
+        // "Delete Logs Now" and the launch sweep with this webview's browser
+        // process (and its Crashpad handler) running: holding the folders
+        // open and checking them by handle must not collide with WebView2.
+        let reports = DUMP_DIR
+            .iter()
+            .fold(local.path().to_path_buf(), |dir, part| dir.join(part));
+        std::fs::create_dir_all(&reports).unwrap();
+        write(&reports, DUMP_A);
+        let deleted_live = deleted(local.path());
+        let old = write(&reports, DUMP_B);
+        written_days_ago(&old, Utc::now(), 30);
+        prune_dumps_in(local.path(), Utc::now(), log_retention::KEEP_CRASH_REPORTS);
+        let swept_live = !old.exists();
+
         // SAFETY: closing what this test created.
         unsafe { controller.Close() }.unwrap();
         // SAFETY: the window this test created.
@@ -977,5 +1171,14 @@ mod tests {
             ])
             .status();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "True");
+        assert_eq!(
+            deleted_live,
+            Deleted {
+                deleted: 1,
+                failed: 0
+            },
+            "Delete Logs Now beside a running WebView2"
+        );
+        assert!(swept_live, "the sweep beside a running WebView2");
     }
 }

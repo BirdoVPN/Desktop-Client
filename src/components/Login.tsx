@@ -1,12 +1,13 @@
 import { useState, useRef, useId, useEffect, type FormEvent, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-shell';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAppStore } from '@/store/app-store';
 import { useShallow } from 'zustand/react/shallow';
 import { ShieldCheck, KeyRound, Copy, Check, ShieldAlert, Info } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { BirdoButton, BirdoTextField, AppIconMark } from './birdo';
 import { brand, gradient, white, status, hairline, motion as motionTokens } from '@/lib/birdo-theme';
+import { copySensitive } from '@/lib/clipboard';
 import { errorCopy, SESSION_EXPIRED_COPY, type ErrorContext } from '@/lib/errors';
 import { toIpcError } from '@/lib/ipc';
 import { formatAccountNumber, identityPatch, type AuthStateIdentity } from '@/utils/helpers';
@@ -238,7 +239,8 @@ export function Login() {
     if (!createdId) return;
     try {
       // Digits only: that is what the sign-in field and the backend take.
-      await navigator.clipboard.writeText(createdId.replace(/\D/g, ''));
+      // MR-1723: kept out of clipboard history and cleared after a minute.
+      await copySensitive(createdId.replace(/\D/g, ''));
       setCopiedId(true);
       setTimeout(() => setCopiedId(false), 2000);
     } catch {
@@ -248,7 +250,7 @@ export function Login() {
 
   const handleForgotPassword = async () => {
     try {
-      await open('https://auth.birdo.app/reset-password');
+      await openUrl('https://auth.birdo.app/reset-password');
     } catch {
       setError("Couldn't open your browser. Visit auth.birdo.app to reset your password.");
     }

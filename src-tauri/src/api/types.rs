@@ -667,9 +667,11 @@ impl std::fmt::Debug for UserProfile {
 }
 
 impl UserProfile {
-    /// Whether this is an anonymous account, from the explicit fields when the
-    /// server sends them. `None` on an older backend: the UI then falls back to
-    /// the synthetic email's shape (`anon_<number>@anonymous.local`).
+    /// Whether this is an anonymous account, from the explicit fields
+    /// (`isAnonymous`, else `accountType`). birdo-web's `/auth/me` sends both
+    /// for every account, so `None` means only that no profile said; nothing
+    /// — here or in the UI — reads the synthetic email's shape
+    /// (`anon_<number>@anonymous.local`) any more (MR-918).
     pub fn is_anonymous_account(&self) -> Option<bool> {
         self.is_anonymous.or_else(|| {
             self.account_type
@@ -729,7 +731,8 @@ where
 /// cert pins, the rest of the per-plan feature entitlements and consent copy,
 /// none of which the desktop client reads (pins are vendored into
 /// `third_party/` and enforced at build time). Adding fields here would create
-/// a second source of truth for each of them.
+/// a second source of truth for each of them. `plans` is here because the
+/// Pricing screen does read it: it replaced the screen's own price table.
 ///
 /// Every field is `Option` and defaulted: a payload from an OLDER web deploy —
 /// one that predates the field — must deserialize, not error. `None` means
@@ -757,6 +760,95 @@ pub struct ClientConfigResponse {
     /// absent map or flag means ENABLED, as for `dns_filtering_available`.
     #[serde(default, deserialize_with = "plan_features_or_none")]
     pub features: Option<BTreeMap<String, PlanFeatures>>,
+    /// The price feed for the Pricing screen (birdo-web #708; MR-132 / MR-630
+    /// / MR-1767 / MR-1979): `plans.<PLAN>` = prices, currency and data cap,
+    /// derived server-side from the same table the web's /pricing renders.
+    /// Only the three known plans are kept, and only entries that pass
+    /// `PlanPrice::from_wire`; anything else is dropped rather than failing
+    /// the config. `None` (older web deploy) and a plan missing from the map
+    /// both mean "not said": the UI then shows its built-in fallback prices.
+    #[serde(default, deserialize_with = "plan_prices_or_none")]
+    pub plans: Option<BTreeMap<String, PlanPrice>>,
+}
+
+/// The plan ids `ClientConfigResponse::plans` is read for. Any other key is
+/// ignored: a price for a plan this build cannot show is not a price for one
+/// it can.
+const PRICED_PLANS: [&str; 3] = ["RECON", "OPERATIVE", "SOVEREIGN"];
+
+/// The largest data cap believed, in GB (100 TB). A bigger number is a typo on
+/// the server, not a plan, and the entry is dropped for the fallback.
+pub const MAX_PLAN_BANDWIDTH_GB: u64 = 100_000;
+
+/// One plan's entry in `ClientConfigResponse::plans`, validated.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanPrice {
+    /// The price of one month, billed monthly. Finite and non-negative.
+    pub monthly_price: f64,
+    /// The ANNUAL TOTAL, billed once a year (38, not 3.17). Finite and
+    /// non-negative.
+    pub yearly_price: f64,
+    /// ISO 4217 code of both prices: three ASCII letters, upper-cased.
+    pub currency: String,
+    /// The data cap per billing period in GB. `None` (JSON `null`, which is
+    /// how it reaches the UI too) is UNLIMITED; otherwise a whole number of GB
+    /// from 1 to `MAX_PLAN_BANDWIDTH_GB`.
+    pub bandwidth_limit_gb: Option<u64>,
+}
+
+impl PlanPrice {
+    /// One `plans.<PLAN>` value, or `None` if any field is missing or out of
+    /// shape. All four keys are required: an entry without
+    /// `bandwidthLimitGb` is malformed, not unlimited, because reading a
+    /// missing cap as "unlimited" would over-promise the free plan.
+    fn from_wire(entry: &serde_json::Value) -> Option<Self> {
+        let price = |key: &str| {
+            entry
+                .get(key)?
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+        };
+        let currency = entry
+            .get("currency")?
+            .as_str()
+            .filter(|c| c.len() == 3 && c.bytes().all(|b| b.is_ascii_alphabetic()))?
+            .to_ascii_uppercase();
+        let bandwidth_limit_gb = match entry.get("bandwidthLimitGb")? {
+            serde_json::Value::Null => None,
+            cap => {
+                let gb = cap.as_f64().filter(|n| {
+                    n.fract() == 0.0 && *n >= 1.0 && *n <= MAX_PLAN_BANDWIDTH_GB as f64
+                })?;
+                Some(gb as u64)
+            }
+        };
+        Some(Self {
+            monthly_price: price("monthlyPrice")?,
+            yearly_price: price("yearlyPrice")?,
+            currency,
+            bandwidth_limit_gb,
+        })
+    }
+}
+
+/// `plans` read entry by entry, like `features`: an unknown plan key or a
+/// malformed entry is dropped, and a `plans` that is not an object reads as
+/// absent. Never an error, which would also lose `dnsFilteringAvailable`.
+fn plan_prices_or_none<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, PlanPrice>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(|v| v.as_object()).map(|plans| {
+        plans
+            .iter()
+            .filter(|(plan, _)| PRICED_PLANS.contains(&plan.as_str()))
+            .filter_map(|(plan, entry)| PlanPrice::from_wire(entry).map(|p| (plan.clone(), p)))
+            .collect()
+    }))
 }
 
 /// One plan's entry in `ClientConfigResponse::features`.

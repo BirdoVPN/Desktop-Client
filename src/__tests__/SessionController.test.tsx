@@ -32,7 +32,12 @@ import {
   setKillSwitch,
 } from '@/session/settings-persist';
 import { CONSENT_VERSION } from '@/lib/consent';
-import { RESUME_AFTER_UPDATE_COPY } from '@/session/vpn-actions';
+import {
+  RESUME_AFTER_UPDATE_COPY,
+  RESUME_ROUTE_GONE_COPY,
+  RESUME_SERVER_GONE_COPY,
+} from '@/session/vpn-actions';
+import { UNATTENDED_CONNECT_HELD_COPY } from '@/session/consent-sync';
 
 vi.mock('@tauri-apps/api/core');
 
@@ -89,12 +94,14 @@ beforeEach(() => {
     settings: { ...defaultSettings, notifications: true },
     settingsHydrated: false,
     lastServerId: null,
+    // The controller is mounted only past the consent screen (App).
+    acceptedConsentVersion: CONSENT_VERSION,
   });
   status = { state: 'disconnected', seq: 1, kill_switch_blocking: false, error: null };
   rustSettings = { auto_connect: false, killswitch_enabled: true, lockdown_mode: true };
   servers = [server('a', 50), server('b', 10), server('c', 30)];
   mockedInvoke.mockReset();
-  mockedInvoke.mockImplementation(async (cmd: string) => {
+  mockedInvoke.mockImplementation(async (cmd: string, args?: unknown) => {
     switch (cmd) {
       case 'get_vpn_status':
         return status;
@@ -108,6 +115,9 @@ beforeEach(() => {
         return { plan: 'OPERATIVE', status: 'active' };
       case 'get_admin_status':
         return true;
+      // Rust's consent record answers what it holds now (MR-1607).
+      case 'record_consent':
+        return (args as { version: number }).version;
       default:
         return undefined;
     }
@@ -358,6 +368,56 @@ describe('Auto-Connect (W2-002)', () => {
     expect(callsTo('connect_vpn')).toHaveLength(0);
     expect(callsTo('quick_connect')).toHaveLength(0);
   });
+
+  // MR-1607: Rust keeps its own record of the consent accepted, which the
+  // tray asks. Auto-Connect writes it from the store first — so an install
+  // that accepted this text in an earlier build is not held back — and dials
+  // only once Rust holds the current version.
+  it("dials only after Rust's consent record holds the current text", async () => {
+    rustSettings = { ...rustSettings, auto_connect: true };
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toHaveLength(1));
+    expect(callsTo('record_consent')).toEqual([['record_consent', { version: CONSENT_VERSION }]]);
+    const order = mockedInvoke.mock.calls.map(([c]) => c);
+    expect(order.indexOf('record_consent')).toBeLessThan(order.indexOf('connect_vpn'));
+  });
+
+  it('a consent record Rust cannot write holds Auto-Connect back, and says so', async () => {
+    rustSettings = { ...rustSettings, auto_connect: true };
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'record_consent') throw { code: 'unknown', message: 'disk full', retryable: true };
+      return scripted?.(cmd, args, options);
+    });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(UNATTENDED_CONNECT_HELD_COPY));
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it('a Rust record still older than this text holds it back too', async () => {
+    rustSettings = { ...rustSettings, auto_connect: true };
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) =>
+      cmd === 'record_consent' ? CONSENT_VERSION - 1 : scripted?.(cmd, args, options),
+    );
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(UNATTENDED_CONNECT_HELD_COPY));
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+  });
+
+  it('with nothing to dial, nothing is said about consent', async () => {
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'record_consent') throw { code: 'unknown', message: 'disk full', retryable: true };
+      return scripted?.(cmd, args, options);
+    });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('take_update_resume')).toHaveLength(1));
+    await act(async () => {});
+    expect(callsTo('record_consent')).toHaveLength(0);
+    expect(useAppStore.getState().notice).toBeNull();
+  });
 });
 
 /**
@@ -400,11 +460,71 @@ describe('Resume after an update (MR-1861)', () => {
     expect(callsTo('connect_vpn')).toHaveLength(0);
   });
 
-  it("a server that is gone now falls back to the user's own server", async () => {
+  // MR-1932: exactly that session, or none. A server that is gone is never
+  // replaced by another one (possibly in another country); the user is told
+  // and stays disconnected.
+  it('a server that is gone now is not replaced by another: the user is told and stays disconnected', async () => {
     answerResume({ kind: 'singleHop', serverId: 'retired' });
     useAppStore.setState({ lastServerId: 'a' });
     render(<VpnSessionController />);
-    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'a' }]]));
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(RESUME_SERVER_GONE_COPY));
+    await act(async () => {});
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(callsTo('connect_multi_hop')).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it('nor is one that is offline, or no longer in the plan', async () => {
+    servers = [server('a', 50), server('c', 30, { isOnline: false })];
+    answerResume({ kind: 'singleHop', serverId: 'c' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(RESUME_SERVER_GONE_COPY));
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+  });
+
+  it('a Multi-Hop route is checked against the list too: a retired exit is not dialled', async () => {
+    answerResume({ kind: 'multiHop', entryId: 'a', exitId: 'retired' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(RESUME_ROUTE_GONE_COPY));
+    await act(async () => {});
+    expect(callsTo('connect_multi_hop')).toHaveLength(0);
+    expect(callsTo('connect_vpn')).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+  });
+
+  it('a Multi-Hop entry no longer in the plan is not dialled either', async () => {
+    // The wire's `accessible` (the plan gate), which the parser reads as isAccessible.
+    servers = [server('a', 50, { accessible: false } as Partial<Server>), server('b', 10)];
+    answerResume({ kind: 'multiHop', entryId: 'a', exitId: 'b' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(RESUME_ROUTE_GONE_COPY));
+    expect(callsTo('connect_multi_hop')).toHaveLength(0);
+  });
+
+  it('with no server list (the fetch failed), the recorded server is dialled as it is, never quick_connect', async () => {
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'get_servers') throw { code: 'network_offline', message: 'offline', retryable: true };
+      return cmd === 'take_update_resume' ? { kind: 'singleHop', serverId: 'c' } : scripted?.(cmd, args, options);
+    });
+    useAppStore.setState({ lastServerId: 'a' });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(callsTo('connect_vpn')).toEqual([['connect_vpn', { serverId: 'c' }]]));
+    expect(useAppStore.getState().servers).toHaveLength(0);
+    expect(callsTo('quick_connect')).toHaveLength(0);
+    expect(useAppStore.getState().notice?.text).toBe(RESUME_AFTER_UPDATE_COPY);
+  });
+
+  it('MR-1607: the resume waits for the consent record like Auto-Connect, and a failed one holds it back', async () => {
+    answerResume({ kind: 'singleHop', serverId: 'c' });
+    const scripted = mockedInvoke.getMockImplementation();
+    mockedInvoke.mockImplementation(async (cmd, args, options) => {
+      if (cmd === 'record_consent') throw { code: 'unknown', message: 'disk full', retryable: true };
+      return scripted?.(cmd, args, options);
+    });
+    render(<VpnSessionController />);
+    await waitFor(() => expect(useAppStore.getState().notice?.text).toBe(UNATTENDED_CONNECT_HELD_COPY));
+    expect(callsTo('connect_vpn')).toHaveLength(0);
   });
 
   it('nothing to resume (no update, or disconnected when it began): nothing dials', async () => {
@@ -659,7 +779,7 @@ describe('App: the controller runs under the biometric cover (W2-001, W2-026)', 
       primaryMonitor: async () => null,
     }));
     vi.doMock('@tauri-apps/plugin-process', () => ({ exit: vi.fn(), relaunch: vi.fn() }));
-    vi.doMock('@tauri-apps/plugin-shell', () => ({ open: vi.fn() }));
+    vi.doMock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn() }));
     mockedInvoke.mockImplementation(async (cmd: string) => {
       switch (cmd) {
         case 'check_biometric_available':
