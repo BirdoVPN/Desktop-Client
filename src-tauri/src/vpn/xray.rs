@@ -1474,9 +1474,9 @@ mod tests {
 
     /// MR-849, the finding itself: dropped while the slot is held (what a
     /// health check mid-`try_wait` holds), xray used to be left running on
-    /// macOS/Linux. It is SIGTERMed by its recorded PID now. Not in a CI
-    /// filter (the Linux/macOS job runs the tunnel modules); run it with
-    /// `cargo test --lib xray::tests` on a Unix host.
+    /// macOS/Linux. It is SIGTERMed by its recorded PID now. Unix-only, so
+    /// the Linux and macOS legs of tests.yml run it (`xray::tests` in their
+    /// FILTER); the Windows job compiles it out.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn dropped_with_the_slot_held_xray_is_killed_by_its_recorded_pid() {
