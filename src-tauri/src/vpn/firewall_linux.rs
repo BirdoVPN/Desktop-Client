@@ -621,8 +621,10 @@ impl Xtables for Iptables {
 ///
 /// - a block that is WANTED — the last request was an activation, and the
 ///   kill switch is on, both read under the lock — is read back, and re-armed
-///   (a generation swap, as on every reconnect) if anything is missing: our
-///   jumps, or our chains' rules (`iptables -F` empties them in place);
+///   (a generation swap, as on every reconnect) if anything is missing: a
+///   jump, a chain's loaded rule count, or its final DROP (`iptables -F`
+///   empties our chains in place). Rule text is not compared; see
+///   `iptables_watchdog::missing` for what that leaves undetected;
 /// - a block held but not wanted is a lift that failed, retried;
 /// - nothing held, nothing wanted: nothing is read. `None` whenever nothing
 ///   had to be done.

@@ -1041,14 +1041,24 @@ pub(crate) mod iptables_watchdog {
             .collect()
     }
 
-    /// What the live block lacks, read from iptables itself: `None` while
-    /// every jump is in place and every chain holds exactly the rules loaded
-    /// into it, ending in its DROP. An empty chain with its jump still in
-    /// place filters nothing (the packet falls through to the built-in
-    /// chain's ACCEPT policy), so a jump alone is not proof. A read that
-    /// fails counts as missing: the re-arm that follows is a generation swap,
-    /// which never opens a window, so a false alarm costs a re-load and no
-    /// more.
+    /// What the live block lacks, read from iptables itself. `None` while,
+    /// in each family read back: every jump to our chains is present in
+    /// OUTPUT/INPUT/FORWARD (`-C`), each chain holds as many rules as the
+    /// live generation loaded into it, and each ends in its DROP (`-S`). An
+    /// empty chain with its jump still in place filters nothing (the packet
+    /// falls through to the built-in chain's ACCEPT policy), so a jump alone
+    /// is not proof. A read that fails counts as missing: the re-arm that
+    /// follows is a generation swap, which never opens a window, so a false
+    /// alarm costs a re-load and no more.
+    ///
+    /// Deliberately NOT checked: the rules' text, and where our jump sits.
+    /// iptables canonicalises its `-S` listing (`-m tcp`, `/32`, option
+    /// order), so comparing it with the text we loaded would flap and re-arm
+    /// every pass. So a same-count swap inside our chain (a rule replaced by
+    /// an ACCEPT, the DROP kept last), or another tool inserting an ACCEPT
+    /// above our jump in OUTPUT, is not detected. What this catches is the
+    /// finding: a flush (`iptables -F`, `-F <chain>`, `nft flush ruleset`), a
+    /// deleted chain or jump, a rule added to or removed from our chains.
     pub(crate) fn missing(x: &impl Xtables, live: &Live) -> Option<String> {
         let mut families = vec![(false, live.v4)];
         if let Some(v6) = live.v6 {
@@ -2617,10 +2627,12 @@ mod tests {
         );
     }
 
-    /// Anything else that makes the chains differ from what was loaded: one
-    /// jump gone, a rule slipped in ahead of ours, the DROP swapped out.
+    /// What `missing` checks beyond a flush: a jump present, each chain's
+    /// rule count equal to what the generation loaded (a rule slipped in
+    /// ahead of ours changes it), and each chain ending in its DROP. Rule
+    /// text and our jump's position are not compared (see `missing`).
     #[test]
-    fn every_change_to_our_chains_is_noticed() {
+    fn a_missing_jump_a_changed_rule_count_or_a_lost_final_drop_is_noticed() {
         let (x, live) = armed();
         x.unhook(false, "FORWARD", &live.inn);
         assert_eq!(
