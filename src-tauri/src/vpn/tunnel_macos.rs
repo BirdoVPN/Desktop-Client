@@ -572,11 +572,6 @@ impl UtunTunnel {
         Ok(())
     }
 
-    /// Check if the tunnel is currently running.
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
     /// Get tunnel statistics: (bytes_sent, bytes_received, packets_sent, packets_received)
     pub fn get_stats(&self) -> (u64, u64, u64, u64) {
         (
@@ -612,16 +607,6 @@ impl UtunTunnel {
         if let Some(session) = self.wg_session.read().await.as_ref() {
             session.force_handshake().await;
         }
-    }
-
-    /// Get the client IP address.
-    pub fn get_client_ip(&self) -> &str {
-        &self.config.client_ip
-    }
-
-    /// Get the server endpoint address.
-    pub fn get_endpoint(&self) -> &str {
-        &self.config.endpoint
     }
 
     /// Packet processing loop: read from utun, encrypt via WireGuard, send to server.
