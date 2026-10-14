@@ -91,7 +91,14 @@ base64 -i developer_id.p12 -o developer_id.b64
 | `APPLE_KEYCHAIN_PASSWORD` | Random ≥20-char string — used only inside the runner |
 
 When all of the above are present the workflow performs:
-1. `codesign` with hardened runtime + entitlements
+1. `codesign` with the hardened runtime and no entitlements file. The app is
+   not sandboxed (a Developer ID build, not the Mac App Store), so App
+   Sandbox keys such as `com.apple.security.network.client` would do
+   nothing, and it needs no hardened-runtime exception. The old
+   `Entitlements.plist` declared only those, plus a keychain key Apple does
+   not define (MR-845); no build ever applied it, since every macOS build so
+   far is unsigned. When signing is first turned on, check the result with
+   `codesign -d --entitlements - BirdoVPN.app` before notarising.
 2. `notarytool submit --wait` (Apple notarization service)
 3. `stapler staple` — embeds the notarization ticket into the DMG so the
    user can install offline without contacting Apple.
