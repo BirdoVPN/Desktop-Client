@@ -49,6 +49,13 @@ if (binaries.length === 0) die('usage: node scripts/vendor-xray-go-licences.mjs 
 
 // ── What the binaries link ──────────────────────────────────────────────────
 const linked = new Map();
+// Only well-formed module paths and versions go into a URL, and only to the
+// Go module proxy and the Go repository: nothing else read from a binary
+// leaves this machine.
+const MODULE_PATH = /^[a-z0-9][a-z0-9._~-]*(\/[A-Za-z0-9._~-]+)+$/;
+const MODULE_VERSION = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+incompatible)?$/;
+const GO_VERSION = /^go1\.\d+(\.\d+)?$/;
+
 let goVersion = '';
 for (const bin of binaries) {
   let info;
@@ -59,11 +66,13 @@ for (const bin of binaries) {
   }
   if (info.main !== 'github.com/xtls/xray-core') die(`${bin} is ${info.main}, not github.com/xtls/xray-core`);
   if (goVersion && goVersion !== info.goVersion) die(`the binaries were built by different Go versions (${goVersion}, ${info.goVersion})`);
-  goVersion = info.goVersion;
+  if (GO_VERSION.test(info.goVersion)) goVersion = info.goVersion;
+  else die(`${bin}: unexpected Go version '${info.goVersion}'`);
   for (const m of info.modules) {
     const seen = linked.get(m.path);
     if (seen && seen !== m.version) die(`${m.path} is ${seen} in one binary and ${m.version} in another`);
-    linked.set(m.path, m.version);
+    if (MODULE_PATH.test(m.path) && MODULE_VERSION.test(m.version)) linked.set(m.path, m.version);
+    else die(`${bin}: unexpected module '${m.path}' '${m.version}'`);
   }
 }
 
@@ -133,7 +142,12 @@ function vendor(dirName, version, files) {
 }
 
 // ── Vendor ──────────────────────────────────────────────────────────────────
-const table = fs.existsSync(tablePath) ? JSON.parse(fs.readFileSync(tablePath, 'utf8')) : {};
+let table;
+try {
+  table = JSON.parse(fs.readFileSync(tablePath, 'utf8'));
+} catch (e) {
+  die(`cannot read ${path.relative(repo, tablePath)}: ${e.message}`);
+}
 const modules = table.modules || {};
 const keepOthers = (entry, dirName) => (entry.texts || []).filter((t) => !t.startsWith(`xray/${dirName}@`));
 

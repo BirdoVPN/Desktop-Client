@@ -788,8 +788,9 @@ jobs:
           fetch "$base/Xray-linux-64.zip" "$(pin XRAY_LINUX_SHA256)" "$RUNNER_TEMP/xray-linux"
           fetch "$base/Xray-macos-arm64-v8a.zip" "$(pin XRAY_MACOS_ARM64_SHA256)" "$RUNNER_TEMP/xray-macos-arm64"
           fetch "$base/Xray-macos-64.zip" "$(pin XRAY_MACOS_AMD64_SHA256)" "$RUNNER_TEMP/xray-macos-x64"
-          wintun_url=$(sed -nE 's/^[[:space:]]*\$wintunUrl = "(https:[^"]+)"$/\1/p' "$rel")
-          wintun_sha=$(sed -nE 's/^[[:space:]]*\$expectedSha = "([0-9a-f]{64})"$/\1/p' "$rel")
+          # [$]: a literal dollar (PowerShell's variable sigil in release.yml).
+          wintun_url=$(sed -nE 's/^[[:space:]]*[$]wintunUrl = "(https:[^"]+)"$/\1/p' "$rel")
+          wintun_sha=$(sed -nE 's/^[[:space:]]*[$]expectedSha = "([0-9a-f]{64})"$/\1/p' "$rel")
           fetch "$wintun_url" "$wintun_sha" "$RUNNER_TEMP/wintun"
 
       - name: Generate the notices for each release target, as the release does
