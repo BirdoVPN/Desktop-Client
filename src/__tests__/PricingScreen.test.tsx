@@ -14,7 +14,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Pricing } from '@/screens/Pricing';
 
-vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('zustand/react/shallow', () => ({ useShallow: (fn: unknown) => fn }));
 
 const mockStoreState = {

@@ -384,7 +384,7 @@ fn main() {
             info!("Second instance launch intercepted — focusing the running window");
             restore_and_focus(app);
         }))
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())

@@ -659,7 +659,7 @@ describe('App: the controller runs under the biometric cover (W2-001, W2-026)', 
       primaryMonitor: async () => null,
     }));
     vi.doMock('@tauri-apps/plugin-process', () => ({ exit: vi.fn(), relaunch: vi.fn() }));
-    vi.doMock('@tauri-apps/plugin-shell', () => ({ open: vi.fn() }));
+    vi.doMock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn() }));
     mockedInvoke.mockImplementation(async (cmd: string) => {
       switch (cmd) {
         case 'check_biometric_available':

@@ -24,7 +24,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tauri::{Manager, State};
-use tauri_plugin_shell::ShellExt;
+use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -169,14 +169,16 @@ fn urldecode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Open a URL in the system browser via the shell plugin (the app's established
-/// browser-open mechanism — see Login.tsx). `Shell::open` is deprecated in favour
-/// of tauri-plugin-opener, but adding that plugin means a new dep + capability +
-/// cargo-deny review; the shell path still works and matches the frontend.
-#[allow(deprecated)]
+/// Open a URL in the system browser via tauri-plugin-opener, the same plugin
+/// the frontend's links use (MR-713 replaced the deprecated `Shell::open`).
+///
+/// A Rust-side call is not checked against the capability's
+/// `opener:allow-open-url` scope — that scope governs IPC from the webview —
+/// and neither was the shell plugin's (`Shell::open` passed no scope). The
+/// only caller builds the URL from the [`OAUTH_WEB_BASE`] constant.
 fn open_in_browser(app: &tauri::AppHandle, url: String) -> Result<(), String> {
-    app.shell()
-        .open(url, None)
+    app.opener()
+        .open_url(url, None::<&str>)
         .map_err(|e| format!("Could not open the browser: {e}"))
 }
 
