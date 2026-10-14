@@ -25,21 +25,28 @@
 //  * npm packages in the shipped UI bundle: package-lock.json entries that
 //    are neither `dev` nor `devOptional`, i.e. package.json `dependencies`
 //    and what they pull in. Read from node_modules (run `npm ci` first).
+//  * Other code and assets in the UI bundle (third_party/licenses/
+//    bundle-extras.json): the Inter font, and the devDependencies whose own
+//    code the build copies in (Tailwind's Preflight, Vite's modulepreload
+//    polyfill, rolldown's runtime helpers).
 //  * Xray-core: its licence (MPL-2.0), "source: https://github.com/XTLS/
-//    Xray-core at <XRAY_VERSION>" (the version release.yml downloads), and
-//    the Go modules linked into the binary, read from the binary's own Go
-//    build information with --xray. Each module must be listed, with its
-//    licence, in third_party/licenses/xray-go-modules.json; GPL/LGPL/MPL ones
-//    get a source pointer at their version and their texts (GPL-3.0 among
-//    them).
+//    Xray-core at <XRAY_VERSION>" (the version release.yml downloads), and,
+//    with --xray, the Go toolchain and every Go module linked into the
+//    binary, read from the binary's own Go build information. Each must be
+//    in third_party/licenses/xray-go-modules.json with exactly the linked
+//    version and its vendored licence files (scripts/vendor-xray-go-
+//    licences.mjs); GPL/LGPL/MPL ones also get a source pointer at their
+//    version, and the GPL-3.0 text.
 //  * Wintun (Windows targets): its Prebuilt Binaries License.
 //
 // Every licence text is printed in full, once, and each component names the
 // texts that apply to it. A component's own LICENSE/COPYING/NOTICE files are
-// used where it ships them; one that ships none gets the standard text of
-// each licence it declares from third_party/licenses/ (MIT, BSD and Zlib with the
-// package's authors as the copyright line). A licence with neither fails the
-// run: the fix is to add its text there, not to skip the package.
+// used where it ships them; one that ships none gets its project's licence
+// files from third_party/licenses/package-licences.json, or else the
+// standard text of each licence it declares from third_party/licenses/
+// (MIT, BSD and Zlib with the package's authors as the copyright line). A
+// licence with no text fails the run: the fix is to add its text there, not
+// to skip the package.
 //
 // --xray-license / --wintun-license: the licence file from the archive the
 // build actually downloaded; it must match the committed copy, so a changed
@@ -54,6 +61,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readGoBuildInfo } from './lib/go-buildinfo.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tauriDir = path.join(repo, 'src-tauri');
@@ -115,6 +123,10 @@ function committed(name) {
   return readText(file);
 }
 
+function readJson(name) {
+  return JSON.parse(fs.readFileSync(path.join(licensesDir, name), 'utf8'));
+}
+
 /** Byte order with no locale, so every OS sorts the same way. */
 const byKey = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -151,10 +163,15 @@ function addText(body, origin) {
   return entry.id;
 }
 
+/** Committed texts (paths under third_party/licenses/), registered; returns their ids. */
+function committedTexts(paths, label) {
+  return [...new Set(paths.map((t) => addText(committed(t), `${path.basename(t)} of ${label}`)))];
+}
+
 const LICENSE_FILE = /^(licen[cs]e|copying|copyright|notice|unlicense)([-._].*)?$/i;
 // LICENSE.spdx (the Tauri packages) is SPDX metadata naming the licences, not
-// their text: @tauri-apps/plugin-* ship nothing else, and get the standard
-// texts instead.
+// their text: @tauri-apps/plugin-* ship nothing else, and get their project's
+// licence files from package-licences.json instead.
 const NOT_A_TEXT = /\.spdx$/i;
 
 /** The licence files a package ships at its root (plus Cargo's license-file). */
@@ -182,22 +199,26 @@ function spdxIds(expression) {
   )];
 }
 
-// Standard texts for a package that ships no licence file. MIT, BSD and Zlib carry
-// a copyright line, filled with the package's own authors.
+// Standard texts, the last resort for a package that ships no licence file and
+// has no entry in package-licences.json. MIT, BSD and Zlib carry a copyright
+// line, filled with the package's own authors.
 const TEMPLATED = new Set(['MIT', 'BSD-2-Clause', 'BSD-3-Clause', 'Zlib']);
+const packageLicences = readJson('package-licences.json');
 
-function fallbackTexts(label, expression, authors) {
+function fallbackTexts(name, label, expression, authors) {
+  const upstream = packageLicences[name];
+  if (upstream) return committedTexts(upstream.texts, `${label} (from ${upstream.from})`);
   const ids = [];
   const declared = spdxIds(expression);
   if (declared.length === 0) fail(`${label} ships no licence file and declares no SPDX licence`);
   for (const id of declared) {
     const file = path.join(licensesDir, `${id}.txt`);
     if (!fs.existsSync(file)) {
-      fail(`${label} ships no licence file and declares ${id}, which has no standard text in third_party/licenses/${id}.txt - add it`);
+      fail(`${label} ships no licence file and declares ${id}, which has no standard text in third_party/licenses/${id}.txt - add its project's licence files to package-licences.json, or the standard text`);
     }
     let body = readText(file);
     if (TEMPLATED.has(id)) {
-      const holders = authors.length ? authors.join(', ') : `the ${label.split(' ')[0]} authors`;
+      const holders = authors.length ? authors.join(', ') : `the ${name} authors`;
       body = `Copyright (c) ${holders}\n\n${body}`;
     }
     ids.push(addText(body, `${id} (standard text; ${label} ships no licence file)`));
@@ -205,9 +226,9 @@ function fallbackTexts(label, expression, authors) {
   return ids;
 }
 
-function componentTexts(label, dir, expression, authors, licenseFile) {
+function componentTexts(name, label, dir, expression, authors, licenseFile) {
   const files = licenseFiles(dir, licenseFile);
-  if (files.length === 0) return fallbackTexts(label, expression, authors);
+  if (files.length === 0) return fallbackTexts(name, label, expression, authors);
   return files.map((file) => addText(readText(file), `${path.basename(file)} of ${label}`));
 }
 
@@ -215,6 +236,7 @@ function componentTexts(label, dir, expression, authors, licenseFile) {
 const appVersion = JSON.parse(fs.readFileSync(path.join(tauriDir, 'tauri.conf.json'), 'utf8')).version;
 const xrayVersion = releasePin(/^\s*XRAY_VERSION: (v[0-9][0-9.]*)$/gm, 'XRAY_VERSION');
 const programs = [];
+const COPYLEFT = /GPL|MPL/; // GPL, LGPL, AGPL, MPL: the source must be offered
 
 {
   const mpl = committed('MPL-2.0.txt');
@@ -229,42 +251,63 @@ const programs = [];
     lines: [`source: https://github.com/XTLS/Xray-core at ${xrayVersion}`],
   };
   if (args.xray) {
-    const modules = goModules(args.xray);
-    const table = JSON.parse(fs.readFileSync(path.join(licensesDir, 'xray-go-modules.json'), 'utf8'));
-    const unknown = modules.filter((m) => !table[m.path]);
-    if (unknown.length) {
-      fail(
-        `the xray binary links Go modules with no licence entry in third_party/licenses/xray-go-modules.json: ` +
-          `${unknown.map((m) => `${m.path} ${m.version}`).join(', ')}. Check each one's licence and add it ` +
-          '(with `source` and `texts` if it is GPL, LGPL or MPL).',
-      );
+    let info;
+    try {
+      info = readGoBuildInfo(args.xray);
+    } catch (e) {
+      fail(e.message);
     }
-    const copyleft = modules.filter((m) => table[m.path].texts);
-    for (const m of copyleft) {
-      if (!table[m.path].source) fail(`xray-go-modules.json: ${m.path} has texts but no source`);
+    if (info.main !== 'github.com/xtls/xray-core') fail(`${args.xray} is ${info.main}, not github.com/xtls/xray-core`);
+    const table = readJson('xray-go-modules.json');
+    const refresh =
+      'Run `node scripts/vendor-xray-go-licences.mjs <the four release xray binaries>`, review what it ' +
+      'marks NEW, and commit third_party/licenses/.';
+    const toolchain = table.toolchain || {};
+    if (toolchain.version !== info.goVersion) {
+      fail(`the xray binary was built by ${info.goVersion}; xray-go-modules.json has the Go licence of ${toolchain.version || 'none'}. ${refresh}`);
+    }
+    const problems = [];
+    for (const m of info.modules) {
+      const e = (table.modules || {})[m.path];
+      if (!e) problems.push(`${m.path} ${m.version} is not listed`);
+      else if (!e.license || e.license === 'UNREVIEWED') problems.push(`${m.path}: licence not reviewed`);
+      else if (e.version !== m.version) problems.push(`${m.path}: the binary links ${m.version}, the vendored licence is ${e.version || 'none'}`);
+      else if (!Array.isArray(e.texts) || e.texts.length === 0) problems.push(`${m.path}: no licence texts`);
+      else if (COPYLEFT.test(e.license) && !e.source) problems.push(`${m.path}: ${e.license} needs a \`source\``);
+    }
+    if (problems.length) fail(`xray's Go modules do not match third_party/licenses/xray-go-modules.json:\n  ${problems.join('\n  ')}\n${refresh}`);
+
+    const goIds = committedTexts(toolchain.texts, `Go ${info.goVersion.replace(/^go/, '')}`);
+    xray.lines.push(
+      '',
+      'Built with Go, whose standard library and runtime are linked into it:',
+      `  Go ${info.goVersion.replace(/^go/, '')} - ${toolchain.license} [${goIds.join(', ')}]`,
+      `    source: ${toolchain.source} at ${info.goVersion}`,
+      '',
+      'Go modules linked into it (from its embedded build information):',
+    );
+    const copyleft = [];
+    for (const m of info.modules) {
+      const e = table.modules[m.path];
+      const ids = committedTexts(e.texts, `${m.path} ${m.version}`);
+      xray.lines.push(`  ${m.path} ${m.version} - ${e.license} [${ids.join(', ')}]`);
+      if (COPYLEFT.test(e.license)) copyleft.push({ ...m, e });
     }
     if (copyleft.length) {
-      xray.lines.push('', 'Go modules linked into this xray binary whose licence requires their source to be offered:');
-      for (const m of copyleft) {
-        const entry = table[m.path];
-        const ids = entry.texts.map((t) => addText(committed(t), `${t.replace(/^xray\//, '')} (${m.path})`));
-        xray.lines.push(`  ${m.path} ${m.version} - ${entry.license} [${[...new Set(ids)].join(', ')}]`);
-        xray.lines.push(`    source: ${entry.source} at ${m.version}`);
-      }
-      if (copyleft.some((m) => /\bGPL/.test(table[m.path].license))) {
-        xray.lines.push(
-          '',
-          'Because GPL-3.0 modules are linked into it, this xray binary as a whole is distributed under',
-          'the terms of the GNU General Public License version 3; the MPL-2.0 files in it stay available',
-          `under MPL-2.0 too. Its complete corresponding source is Xray-core at ${xrayVersion} (above),`,
-          'whose go.mod and go.sum pin every module listed below. BirdoVPN runs xray as a separate program.',
-        );
-      }
+      xray.lines.push('', 'Of those, the ones whose licence requires their source to be offered:');
+      for (const m of copyleft) xray.lines.push(`  ${m.path} ${m.version} - ${m.e.license}`, `    source: ${m.e.source} at ${m.version}`);
     }
-    xray.lines.push('', 'All Go modules linked into this xray binary (from its embedded build information):');
-    for (const m of modules) xray.lines.push(`  ${m.path} ${m.version} - ${table[m.path].license}`);
+    if (copyleft.some((m) => /\bGPL/.test(m.e.license))) {
+      xray.lines.push(
+        '',
+        'Because GPL-3.0 modules are linked into it, this xray binary as a whole is distributed under',
+        'the terms of the GNU General Public License version 3; the MPL-2.0 files in it stay available',
+        `under MPL-2.0 too. Its complete corresponding source is Xray-core at ${xrayVersion} (above),`,
+        'whose go.mod and go.sum pin every module listed here. BirdoVPN runs xray as a separate program.',
+      );
+    }
   } else {
-    xray.lines.push('', 'Go modules: not read in this run (no --xray binary given; release builds pass it).');
+    xray.lines.push('', 'Go toolchain and modules: not read in this run (no --xray binary given; release builds pass it).');
   }
   programs.push(xray);
 }
@@ -285,44 +328,6 @@ if (windows) {
       'BirdoVPN uses wintun.dll only through the API in wintun.h.',
     ],
   });
-}
-
-/** Go modules from a Go binary's build information (Go 1.18+ inline format). */
-function goModules(file) {
-  const buf = fs.readFileSync(file);
-  const at = buf.indexOf(Buffer.from('\xff Go buildinf:', 'latin1'));
-  if (at < 0) fail(`${file}: no Go build information - is this the xray binary?`);
-  if ((buf[at + 15] & 2) === 0) fail(`${file}: Go build information in the pre-Go 1.18 format`);
-  let p = at + 32;
-  const uvarint = () => {
-    let x = 0;
-    for (let shift = 0; ; shift += 7) {
-      const b = buf[p++];
-      x += (b & 0x7f) * 2 ** shift;
-      if (b < 0x80) return x;
-    }
-  };
-  const str = () => {
-    const n = uvarint();
-    const s = buf.subarray(p, p + n).toString('utf8');
-    p += n;
-    return s;
-  };
-  str(); // the Go version
-  const info = str();
-  // 16-byte sentinels on either side of the module text.
-  const lines = info.length > 32 ? info.slice(16, -16).split('\n') : [];
-  if (!lines.some((l) => /^mod\tgithub\.com\/xtls\/xray-core\t/.test(l))) {
-    fail(`${file}: its build information is not github.com/xtls/xray-core's`);
-  }
-  const modules = [];
-  for (const line of lines) {
-    const [kind, modPath, version] = line.split('\t');
-    if (kind === '=>') fail(`${file}: a replaced module (${line.trim()}): extend the generator to name the replacement's source`);
-    if (kind === 'dep') modules.push({ path: modPath, version });
-  }
-  if (modules.length === 0) fail(`${file}: no Go modules in its build information`);
-  return modules.sort((a, b) => byKey(a.path, b.path));
 }
 
 // ── Rust crates ─────────────────────────────────────────────────────────────
@@ -354,34 +359,42 @@ const crates = [];
     if (pkg.id === root.id) continue;
     const label = `${pkg.name} ${pkg.version}`;
     if (!pkg.license && !pkg.license_file) fail(`crate ${label} declares no licence`);
-    const expression = pkg.license || `see ${pkg.license_file}`;
     crates.push({
       name: pkg.name,
       version: pkg.version,
-      license: expression,
+      license: pkg.license || `see ${pkg.license_file}`,
       url: pkg.repository || pkg.homepage || `https://crates.io/crates/${pkg.name}`,
-      texts: componentTexts(label, path.dirname(pkg.manifest_path), pkg.license || '', pkg.authors || [], pkg.license_file),
+      texts: componentTexts(pkg.name, label, path.dirname(pkg.manifest_path), pkg.license || '', pkg.authors || [], pkg.license_file),
     });
   }
   if (crates.length < 100) fail(`only ${crates.length} crates for ${args.target} - cargo tree output not understood`);
 }
 
-// ── npm packages ────────────────────────────────────────────────────────────
+// ── npm packages, and the rest of the UI bundle ─────────────────────────────
+const lock = JSON.parse(fs.readFileSync(path.join(repo, 'package-lock.json'), 'utf8'));
+
+function installed(key) {
+  const dir = path.join(repo, key);
+  const pkgJson = path.join(dir, 'package.json');
+  if (!fs.existsSync(pkgJson)) fail(`${key} is not installed - run \`npm ci\` first`);
+  return { dir, manifest: JSON.parse(fs.readFileSync(pkgJson, 'utf8')) };
+}
+
+const npmUrl = (manifest, name) => {
+  const repoUrl = typeof manifest.repository === 'string' ? manifest.repository : manifest.repository?.url;
+  return (repoUrl || manifest.homepage || `https://www.npmjs.com/package/${name}`).replace(/^git\+/, '');
+};
+
 const npmPackages = [];
 {
-  const lock = JSON.parse(fs.readFileSync(path.join(repo, 'package-lock.json'), 'utf8'));
   const shipped = Object.entries(lock.packages)
     .filter(([key, entry]) => key.startsWith('node_modules/') && !entry.dev && !entry.devOptional)
     .map(([key, entry]) => ({ key, entry, name: key.slice(key.lastIndexOf('node_modules/') + 'node_modules/'.length) }))
     .sort((a, b) => byKey(a.name, b.name) || byKey(a.entry.version, b.entry.version) || byKey(a.key, b.key));
   for (const { key, entry, name } of shipped) {
-    const dir = path.join(repo, key);
-    const pkgJson = path.join(dir, 'package.json');
-    if (!fs.existsSync(pkgJson)) fail(`${key} is not installed - run \`npm ci\` first`);
-    const manifest = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
+    const { dir, manifest } = installed(key);
     const license = entry.license || manifest.license;
     if (!license) fail(`npm package ${name} ${entry.version} declares no licence`);
-    const repoUrl = typeof manifest.repository === 'string' ? manifest.repository : manifest.repository?.url;
     // `author` is the standard field; the Tauri packages use `authors`.
     const people = [manifest.author, ...[manifest.authors, manifest.contributors].flatMap((v) => (Array.isArray(v) ? v : []))];
     const authors = people.map((p) => (typeof p === 'string' ? p : p?.name)).filter(Boolean);
@@ -389,11 +402,47 @@ const npmPackages = [];
       name,
       version: entry.version,
       license,
-      url: (repoUrl || manifest.homepage || `https://www.npmjs.com/package/${name}`).replace(/^git\+/, ''),
-      texts: componentTexts(`${name} ${entry.version}`, dir, license, authors),
+      url: npmUrl(manifest, name),
+      texts: componentTexts(name, `${name} ${entry.version}`, dir, license, authors),
     });
   }
   if (npmPackages.length === 0) fail('no npm packages found in package-lock.json');
+}
+
+const uiExtras = [];
+{
+  const extras = readJson('bundle-extras.json');
+  for (const a of extras.assets) {
+    if (!fs.existsSync(path.join(repo, a.file))) fail(`bundle-extras.json: ${a.file} does not exist - update the entry`);
+    uiExtras.push({
+      line: `${a.name} ${a.version} - ${a.license} - ${a.url}`,
+      what: `${a.what} (${a.file})`,
+      texts: committedTexts(a.texts, `${a.name} ${a.version}`),
+    });
+  }
+  for (const d of extras.devPackages) {
+    const key = `node_modules/${d.package}`;
+    const entry = lock.packages[key];
+    if (!entry) fail(`bundle-extras.json: ${d.package} is not in package-lock.json - update the entry`);
+    const { dir, manifest } = installed(key);
+    const label = `${d.package} ${entry.version}`;
+    const files = licenseFiles(dir);
+    if (files.length === 0) fail(`${label} ships no licence file`);
+    const ids = files.map((file) => {
+      let body = readText(file);
+      if (d.cutAt) {
+        const at = body.indexOf(d.cutAt);
+        if (at < 0) fail(`bundle-extras.json: "${d.cutAt}" is not in ${label}'s ${path.basename(file)} - update cutAt`);
+        body = normalize(body.slice(0, at));
+      }
+      return addText(body, `${path.basename(file)} of ${label}`);
+    });
+    uiExtras.push({
+      line: `${d.package} ${entry.version} - ${entry.license || manifest.license} - ${npmUrl(manifest, d.package)}`,
+      what: d.what,
+      texts: [...new Set(ids)],
+    });
+  }
 }
 
 // ── Render ──────────────────────────────────────────────────────────────────
@@ -404,7 +453,7 @@ out.push(
   '',
   'BirdoVPN includes the third-party software listed below. Each component is',
   'distributed under its own licence; the full text of every licence is in',
-  'section 4, and each component names the texts [T1], [T2], ... that apply to it.',
+  'section 5, and each component names the texts [T1], [T2], ... that apply to it.',
   'Generated by scripts/generate-third-party-notices.mjs from src-tauri/Cargo.lock,',
   'package-lock.json and the programs bundled in this build.',
   '',
@@ -416,13 +465,16 @@ for (const p of programs) {
   out.push('', `${p.name} - ${p.file}`, `  Licence: ${p.license} [${p.texts.join(', ')}]`);
   for (const line of p.lines) out.push(line ? `  ${line}` : '');
 }
+const heading = (title) => out.push('', rule, title, rule, '');
 const listing = (title, items) => {
-  out.push('', rule, title, rule, '');
+  heading(title);
   for (const c of items) out.push(`${c.name} ${c.version} - ${c.license} - ${c.url} [${[...new Set(c.texts)].join(', ')}]`);
 };
 listing(`2. Rust crates compiled into BirdoVPN (${crates.length})`, crates);
 listing(`3. npm packages in the BirdoVPN user interface (${npmPackages.length})`, npmPackages);
-out.push('', rule, `4. Licence texts (${texts.length})`, rule);
+heading(`4. Other code and assets in the BirdoVPN user interface (${uiExtras.length})`);
+for (const x of uiExtras) out.push(`${x.line} [${x.texts.join(', ')}]`, `  ${x.what}`);
+out.push('', rule, `5. Licence texts (${texts.length})`, rule);
 for (const t of texts) {
   const more = t.more ? ` (and ${t.more} more identical)` : '';
   out.push('', `----- [${t.id}] ${t.origin}${more} `.padEnd(78, '-'), '', t.body);
@@ -433,5 +485,6 @@ fs.mkdirSync(path.dirname(args.out), { recursive: true });
 fs.writeFileSync(args.out, body, 'utf8');
 console.log(
   `Wrote ${path.relative(repo, args.out)}: ${crates.length} crates, ${npmPackages.length} npm packages, ` +
-    `${programs.length} bundled programs, ${texts.length} licence texts, ${body.length} bytes (${args.target})`,
+    `${uiExtras.length} other UI items, ${programs.length} bundled programs, ${texts.length} licence texts, ` +
+    `${Buffer.byteLength(body)} bytes (${args.target})`,
 );

@@ -13,7 +13,8 @@
 # the binary on every stealth connect, on every machine.
 #
 # Usage:
-#   NOTICES_FILE=src-tauri/resources/THIRD-PARTY-NOTICES.txt #     scripts/ci/verify-bundled-xray.sh <expected-sha256> <artifact> [<artifact>...]
+#   NOTICES_FILE=src-tauri/resources/THIRD-PARTY-NOTICES.txt \
+#     scripts/ci/verify-bundled-xray.sh <expected-sha256> <artifact> [<artifact>...]
 #
 # Artifact kinds, chosen by name:
 #   *.app         macOS bundle dir  -> Contents/Resources/resources/xray

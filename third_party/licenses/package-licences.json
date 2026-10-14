@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "Upstream licence files for crates and npm packages that ship none in their package (MR-1685).",
+    "scripts/generate-third-party-notices.mjs uses a package's own LICENSE/COPYING/NOTICE files when it",
+    "ships any; otherwise these (copied from the project's repository, `from`); otherwise the standard",
+    "text of each declared licence with the package's authors as the copyright line.",
+    "`texts` are paths under third_party/licenses/."
+  ],
+  "alloc-stdlib": {
+    "from": "https://github.com/dropbox/rust-alloc-no-stdlib/blob/master/LICENSE",
+    "texts": ["packages/rust-alloc-no-stdlib/LICENSE"]
+  },
+  "boringtun": {
+    "from": "https://github.com/cloudflare/boringtun/blob/boringtun-0.7.1/LICENSE.md",
+    "texts": ["packages/boringtun/LICENSE.md"]
+  },
+  "c2rust-bitfields": {
+    "from": "https://github.com/immunant/c2rust/blob/v0.18.0/LICENSE",
+    "texts": ["packages/c2rust/LICENSE"]
+  },
+  "webview2-com": {
+    "from": "https://github.com/wravery/webview2-rs/blob/main/LICENSE",
+    "texts": ["packages/webview2-rs/LICENSE"]
+  },
+  "webview2-com-sys": {
+    "from": "https://github.com/wravery/webview2-rs/blob/main/LICENSE",
+    "texts": ["packages/webview2-rs/LICENSE"]
+  },
+  "dlopen2": {
+    "from": "https://github.com/OpenByteDev/dlopen2/blob/master/LICENSE",
+    "texts": ["packages/dlopen2/LICENSE"]
+  },
+  "libappindicator-sys": {
+    "from": "https://github.com/tauri-apps/libappindicator-rs/tree/libappindicator-sys-v0.9.0",
+    "texts": ["packages/libappindicator-rs/LICENSE-MIT", "packages/libappindicator-rs/LICENSE-APACHE"]
+  },
+  "mac-notification-sys": {
+    "from": "https://github.com/h4llow3En/mac-notification-sys/tree/v0.6.9",
+    "texts": ["packages/mac-notification-sys/LICENSE-MIT", "packages/mac-notification-sys/LICENSE-Apache"]
+  },
+  "objc2": { "from": "https://github.com/madsmtm/objc2/tree/main (MIT crates)", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-encode": { "from": "https://github.com/madsmtm/objc2/tree/main (MIT crates)", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-foundation": { "from": "https://github.com/madsmtm/objc2/tree/main (MIT crates)", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-MIT.txt"] },
+  "block2": { "from": "https://github.com/madsmtm/objc2/tree/main (MIT crates)", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-MIT.txt"] },
+  "dispatch2": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-app-kit": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-cloud-kit": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-core-data": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-core-foundation": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-core-graphics": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-core-image": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-core-location": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-core-text": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-exception-helper": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-io-surface": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-osa-kit": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-quartz-core": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-security": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-service-management": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-user-notifications": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "objc2-web-kit": { "from": "https://github.com/madsmtm/objc2/tree/main", "texts": ["packages/objc2/LICENSE.md", "packages/objc2/LICENSE-ZLIB.txt", "packages/objc2/LICENSE-APACHE.txt", "packages/objc2/LICENSE-MIT.txt"] },
+  "@tauri-apps/plugin-dialog": {
+    "from": "https://github.com/tauri-apps/plugins-workspace/tree/v2 (the npm package ships only LICENSE.spdx)",
+    "texts": ["packages/tauri-plugins-workspace/LICENSE_MIT", "packages/tauri-plugins-workspace/LICENSE_APACHE-2.0"]
+  },
+  "@tauri-apps/plugin-notification": {
+    "from": "https://github.com/tauri-apps/plugins-workspace/tree/v2 (the npm package ships only LICENSE.spdx)",
+    "texts": ["packages/tauri-plugins-workspace/LICENSE_MIT", "packages/tauri-plugins-workspace/LICENSE_APACHE-2.0"]
+  },
+  "@tauri-apps/plugin-opener": {
+    "from": "https://github.com/tauri-apps/plugins-workspace/tree/v2 (the npm package ships only LICENSE.spdx)",
+    "texts": ["packages/tauri-plugins-workspace/LICENSE_MIT", "packages/tauri-plugins-workspace/LICENSE_APACHE-2.0"]
+  },
+  "@tauri-apps/plugin-process": {
+    "from": "https://github.com/tauri-apps/plugins-workspace/tree/v2 (the npm package ships only LICENSE.spdx)",
+    "texts": ["packages/tauri-plugins-workspace/LICENSE_MIT", "packages/tauri-plugins-workspace/LICENSE_APACHE-2.0"]
+  }
+}

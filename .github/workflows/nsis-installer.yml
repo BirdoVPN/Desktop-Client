@@ -50,6 +50,7 @@ on:
       - "scripts/ci/nsis-msi-era-upgrade.ps1"
       - "scripts/ci/verify-bundled-xray-hash.ps1"
       - "scripts/generate-third-party-notices.mjs"
+      - "scripts/lib/go-buildinfo.mjs"
       - "third_party/licenses/**"
   push:
     branches: [main]
@@ -67,6 +68,7 @@ on:
       - "scripts/ci/nsis-msi-era-upgrade.ps1"
       - "scripts/ci/verify-bundled-xray-hash.ps1"
       - "scripts/generate-third-party-notices.mjs"
+      - "scripts/lib/go-buildinfo.mjs"
       - "third_party/licenses/**"
   # Weekly on main: the runner image, WebView2 and Windows itself change
   # without a commit here, and a release should not be the first to notice.

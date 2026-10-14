@@ -1,63 +1,281 @@
 {
   "_comment": [
-    "The Go modules linked into the bundled xray binary, by module path, with their licence (MR-1685).",
-    "scripts/generate-third-party-notices.mjs reads the module list (and each version) from the xray",
-    "binary's own Go build information and FAILS on a module that is not listed here, so an Xray bump",
-    "that links a new module cannot ship until someone has looked at that module's licence.",
-    "`source` and `texts` are required for a module whose licence needs its source offered or its",
-    "text shipped (GPL, LGPL, MPL); `texts` are paths under third_party/licenses/.",
-    "Checked 2026-10-14 against Xray-core v26.3.27: the union of the Windows, Linux and both macOS",
-    "release binaries (golang.zx2c4.com/wintun is in the Windows one only, vishvananda/* in Linux only)."
+    "The Go modules linked into the bundled xray binary, and the Go toolchain that built it (MR-1685).",
+    "scripts/generate-third-party-notices.mjs reads the modules, their versions and the Go version from the",
+    "xray binary itself and FAILS unless each one is listed here with that exact version, a reviewed licence",
+    "and its licence texts: an Xray bump cannot ship until the licences of what it links are vendored and read.",
+    "Refresh with `node scripts/vendor-xray-go-licences.mjs <the four release xray binaries>`: it vendors",
+    "every module's root LICENSE/COPYING/NOTICE files from proxy.golang.org into third_party/licenses/xray/",
+    "<module>@<version>/ and Go's LICENSE for the toolchain, and sets `version` and `texts`. `license` (SPDX)",
+    "and `source` are a person's job: a new module arrives as UNREVIEWED, which the generator refuses. GPL,",
+    "LGPL and MPL modules need `source`; extra texts such as GPL-3.0.txt (paths under third_party/licenses/)",
+    "are kept across refreshes."
   ],
-  "github.com/andybalholm/brotli": { "license": "MIT" },
-  "github.com/apernet/quic-go": { "license": "MIT" },
-  "github.com/cloudflare/circl": { "license": "BSD-3-Clause" },
-  "github.com/ghodss/yaml": { "license": "MIT AND BSD-3-Clause" },
-  "github.com/google/btree": { "license": "Apache-2.0" },
-  "github.com/gorilla/websocket": { "license": "BSD-2-Clause" },
-  "github.com/juju/ratelimit": {
-    "license": "LGPL-3.0-only WITH LGPL-3.0-linking-exception",
-    "source": "https://github.com/juju/ratelimit",
-    "texts": ["xray/juju-ratelimit-LICENSE.txt", "GPL-3.0.txt"]
+  "toolchain": {
+    "version": "go1.26.1",
+    "license": "BSD-3-Clause",
+    "source": "https://go.googlesource.com/go",
+    "texts": [
+      "xray/go@go1.26.1/LICENSE"
+    ]
   },
-  "github.com/klauspost/compress": { "license": "BSD-3-Clause AND Apache-2.0 AND MIT" },
-  "github.com/klauspost/cpuid/v2": { "license": "MIT" },
-  "github.com/miekg/dns": { "license": "BSD-3-Clause" },
-  "github.com/pelletier/go-toml": { "license": "MIT AND Apache-2.0" },
-  "github.com/pires/go-proxyproto": { "license": "Apache-2.0" },
-  "github.com/quic-go/qpack": { "license": "MIT" },
-  "github.com/refraction-networking/utls": { "license": "BSD-3-Clause" },
-  "github.com/sagernet/sing": {
-    "license": "GPL-3.0-or-later",
-    "source": "https://github.com/SagerNet/sing",
-    "texts": ["xray/sagernet-sing-LICENSE.txt", "GPL-3.0.txt"]
-  },
-  "github.com/sagernet/sing-shadowsocks": {
-    "license": "GPL-3.0-or-later",
-    "source": "https://github.com/SagerNet/sing-shadowsocks",
-    "texts": ["xray/sagernet-sing-LICENSE.txt", "GPL-3.0.txt"]
-  },
-  "github.com/vishvananda/netlink": { "license": "Apache-2.0" },
-  "github.com/vishvananda/netns": { "license": "Apache-2.0" },
-  "github.com/xtls/reality": {
-    "license": "MPL-2.0",
-    "source": "https://github.com/XTLS/REALITY",
-    "texts": ["MPL-2.0.txt"]
-  },
-  "go4.org/netipx": { "license": "BSD-3-Clause" },
-  "golang.org/x/crypto": { "license": "BSD-3-Clause" },
-  "golang.org/x/exp": { "license": "BSD-3-Clause" },
-  "golang.org/x/net": { "license": "BSD-3-Clause" },
-  "golang.org/x/sync": { "license": "BSD-3-Clause" },
-  "golang.org/x/sys": { "license": "BSD-3-Clause" },
-  "golang.org/x/text": { "license": "BSD-3-Clause" },
-  "golang.org/x/time": { "license": "BSD-3-Clause" },
-  "golang.zx2c4.com/wintun": { "license": "MIT" },
-  "golang.zx2c4.com/wireguard": { "license": "MIT" },
-  "google.golang.org/genproto/googleapis/rpc": { "license": "Apache-2.0" },
-  "google.golang.org/grpc": { "license": "Apache-2.0" },
-  "google.golang.org/protobuf": { "license": "BSD-3-Clause" },
-  "gopkg.in/yaml.v2": { "license": "Apache-2.0 AND MIT" },
-  "gvisor.dev/gvisor": { "license": "Apache-2.0" },
-  "lukechampine.com/blake3": { "license": "MIT" }
+  "modules": {
+    "github.com/andybalholm/brotli": {
+      "license": "MIT",
+      "texts": [
+        "xray/github.com/andybalholm/brotli@v1.0.6/LICENSE"
+      ],
+      "version": "v1.0.6"
+    },
+    "github.com/apernet/quic-go": {
+      "license": "MIT",
+      "texts": [
+        "xray/github.com/apernet/quic-go@v0.59.1-0.20260217092621-db4786c77a22/LICENSE"
+      ],
+      "version": "v0.59.1-0.20260217092621-db4786c77a22"
+    },
+    "github.com/cloudflare/circl": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/github.com/cloudflare/circl@v1.6.3/LICENSE"
+      ],
+      "version": "v1.6.3"
+    },
+    "github.com/ghodss/yaml": {
+      "license": "MIT AND BSD-3-Clause",
+      "texts": [
+        "xray/github.com/ghodss/yaml@v1.0.1-0.20220118164431-d8423dcdf344/LICENSE"
+      ],
+      "version": "v1.0.1-0.20220118164431-d8423dcdf344"
+    },
+    "github.com/google/btree": {
+      "license": "Apache-2.0",
+      "texts": [
+        "xray/github.com/google/btree@v1.1.2/LICENSE"
+      ],
+      "version": "v1.1.2"
+    },
+    "github.com/gorilla/websocket": {
+      "license": "BSD-2-Clause",
+      "texts": [
+        "xray/github.com/gorilla/websocket@v1.5.3/LICENSE"
+      ],
+      "version": "v1.5.3"
+    },
+    "github.com/juju/ratelimit": {
+      "license": "LGPL-3.0-only WITH LGPL-3.0-linking-exception",
+      "source": "https://github.com/juju/ratelimit",
+      "texts": [
+        "xray/github.com/juju/ratelimit@v1.0.2/LICENSE",
+        "GPL-3.0.txt"
+      ],
+      "version": "v1.0.2"
+    },
+    "github.com/klauspost/compress": {
+      "license": "BSD-3-Clause AND Apache-2.0 AND MIT",
+      "texts": [
+        "xray/github.com/klauspost/compress@v1.17.4/LICENSE"
+      ],
+      "version": "v1.17.4"
+    },
+    "github.com/klauspost/cpuid/v2": {
+      "license": "MIT",
+      "texts": [
+        "xray/github.com/klauspost/cpuid/v2@v2.3.0/LICENSE"
+      ],
+      "version": "v2.3.0"
+    },
+    "github.com/miekg/dns": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/github.com/miekg/dns@v1.1.72/COPYRIGHT",
+        "xray/github.com/miekg/dns@v1.1.72/LICENSE"
+      ],
+      "version": "v1.1.72"
+    },
+    "github.com/pelletier/go-toml": {
+      "license": "MIT AND Apache-2.0",
+      "texts": [
+        "xray/github.com/pelletier/go-toml@v1.9.5/LICENSE"
+      ],
+      "version": "v1.9.5"
+    },
+    "github.com/pires/go-proxyproto": {
+      "license": "Apache-2.0",
+      "texts": [
+        "xray/github.com/pires/go-proxyproto@v0.11.0/LICENSE"
+      ],
+      "version": "v0.11.0"
+    },
+    "github.com/quic-go/qpack": {
+      "license": "MIT",
+      "texts": [
+        "xray/github.com/quic-go/qpack@v0.6.0/LICENSE.md"
+      ],
+      "version": "v0.6.0"
+    },
+    "github.com/refraction-networking/utls": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/github.com/refraction-networking/utls@v1.8.3-0.20260301010127-aa6edf4b11af/LICENSE"
+      ],
+      "version": "v1.8.3-0.20260301010127-aa6edf4b11af"
+    },
+    "github.com/sagernet/sing": {
+      "license": "GPL-3.0-or-later",
+      "source": "https://github.com/SagerNet/sing",
+      "texts": [
+        "xray/github.com/sagernet/sing@v0.5.1/LICENSE",
+        "GPL-3.0.txt"
+      ],
+      "version": "v0.5.1"
+    },
+    "github.com/sagernet/sing-shadowsocks": {
+      "license": "GPL-3.0-or-later",
+      "source": "https://github.com/SagerNet/sing-shadowsocks",
+      "texts": [
+        "xray/github.com/sagernet/sing-shadowsocks@v0.2.7/LICENSE",
+        "GPL-3.0.txt"
+      ],
+      "version": "v0.2.7"
+    },
+    "github.com/vishvananda/netlink": {
+      "license": "Apache-2.0",
+      "texts": [
+        "xray/github.com/vishvananda/netlink@v1.3.1/LICENSE"
+      ],
+      "version": "v1.3.1"
+    },
+    "github.com/vishvananda/netns": {
+      "license": "Apache-2.0",
+      "texts": [
+        "xray/github.com/vishvananda/netns@v0.0.5/LICENSE"
+      ],
+      "version": "v0.0.5"
+    },
+    "github.com/xtls/reality": {
+      "license": "MPL-2.0 AND BSD-3-Clause",
+      "source": "https://github.com/XTLS/REALITY",
+      "texts": [
+        "xray/github.com/xtls/reality@v0.0.0-20260322125925-9234c772ba8f/LICENSE",
+        "xray/github.com/xtls/reality@v0.0.0-20260322125925-9234c772ba8f/LICENSE-Go"
+      ],
+      "version": "v0.0.0-20260322125925-9234c772ba8f"
+    },
+    "go4.org/netipx": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/go4.org/netipx@v0.0.0-20231129151722-fdeea329fbba/LICENSE"
+      ],
+      "version": "v0.0.0-20231129151722-fdeea329fbba"
+    },
+    "golang.org/x/crypto": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/golang.org/x/crypto@v0.49.0/LICENSE"
+      ],
+      "version": "v0.49.0"
+    },
+    "golang.org/x/exp": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/golang.org/x/exp@v0.0.0-20240506185415-9bf2ced13842/LICENSE"
+      ],
+      "version": "v0.0.0-20240506185415-9bf2ced13842"
+    },
+    "golang.org/x/net": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/golang.org/x/net@v0.52.0/LICENSE"
+      ],
+      "version": "v0.52.0"
+    },
+    "golang.org/x/sync": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/golang.org/x/sync@v0.20.0/LICENSE"
+      ],
+      "version": "v0.20.0"
+    },
+    "golang.org/x/sys": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/golang.org/x/sys@v0.42.0/LICENSE"
+      ],
+      "version": "v0.42.0"
+    },
+    "golang.org/x/text": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/golang.org/x/text@v0.35.0/LICENSE"
+      ],
+      "version": "v0.35.0"
+    },
+    "golang.org/x/time": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/golang.org/x/time@v0.12.0/LICENSE"
+      ],
+      "version": "v0.12.0"
+    },
+    "golang.zx2c4.com/wintun": {
+      "license": "MIT",
+      "texts": [
+        "xray/golang.zx2c4.com/wintun@v0.0.0-20230126152724-0fa3db229ce2/LICENSE"
+      ],
+      "version": "v0.0.0-20230126152724-0fa3db229ce2"
+    },
+    "golang.zx2c4.com/wireguard": {
+      "license": "MIT",
+      "texts": [
+        "xray/golang.zx2c4.com/wireguard@v0.0.0-20250521234502-f333402bd9cb/LICENSE"
+      ],
+      "version": "v0.0.0-20250521234502-f333402bd9cb"
+    },
+    "google.golang.org/genproto/googleapis/rpc": {
+      "license": "Apache-2.0",
+      "texts": [
+        "xray/google.golang.org/genproto/googleapis/rpc@v0.0.0-20251202230838-ff82c1b0f217/LICENSE"
+      ],
+      "version": "v0.0.0-20251202230838-ff82c1b0f217"
+    },
+    "google.golang.org/grpc": {
+      "license": "Apache-2.0",
+      "texts": [
+        "xray/google.golang.org/grpc@v1.79.3/LICENSE",
+        "xray/google.golang.org/grpc@v1.79.3/NOTICE.txt"
+      ],
+      "version": "v1.79.3"
+    },
+    "google.golang.org/protobuf": {
+      "license": "BSD-3-Clause",
+      "texts": [
+        "xray/google.golang.org/protobuf@v1.36.11/LICENSE"
+      ],
+      "version": "v1.36.11"
+    },
+    "gopkg.in/yaml.v2": {
+      "license": "Apache-2.0 AND MIT",
+      "texts": [
+        "xray/gopkg.in/yaml.v2@v2.4.0/LICENSE",
+        "xray/gopkg.in/yaml.v2@v2.4.0/LICENSE.libyaml",
+        "xray/gopkg.in/yaml.v2@v2.4.0/NOTICE"
+      ],
+      "version": "v2.4.0"
+    },
+    "gvisor.dev/gvisor": {
+      "license": "Apache-2.0",
+      "texts": [
+        "xray/gvisor.dev/gvisor@v0.0.0-20260122175437-89a5d21be8f0/LICENSE"
+      ],
+      "version": "v0.0.0-20260122175437-89a5d21be8f0"
+    },
+    "lukechampine.com/blake3": {
+      "license": "MIT",
+      "texts": [
+        "xray/lukechampine.com/blake3@v1.4.1/LICENSE"
+      ],
+      "version": "v1.4.1"
+    }
+  }
 }
