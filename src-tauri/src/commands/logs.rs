@@ -9,9 +9,10 @@ use crate::commands::ipc_error::IpcError;
 use crate::utils::file_log::{self, Deleted};
 
 /// Delete the diagnostic log (`birdo.log` and its rotated generation) and the
-/// local crash reports, now. Takes no path: the two directories are the app's
-/// own, and only the names it writes there are deleted. Answers counts, never
-/// a path. Works with the log on or off; on, the next line starts a new file.
+/// local crash reports, now; on Windows also WebView2's crash dumps (MR-1946,
+/// `utils::webview2`). Takes no path: the directories are the app's own, and
+/// only the names written there are deleted. Answers counts, never a path.
+/// Works with the log on or off; on, the next line starts a new file.
 ///
 /// File I/O, so it runs on the blocking pool rather than parking a runtime
 /// worker (P1-dk-blocking-io-on-async-runtime).

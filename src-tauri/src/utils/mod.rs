@@ -12,6 +12,7 @@ pub mod os_rng;
 pub mod protected_dir;
 pub mod redact;
 pub mod safe_fs;
+pub mod webview2;
 #[cfg(windows)]
 pub mod win_api;
 
