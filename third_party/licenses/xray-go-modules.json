@@ -9,7 +9,11 @@
     "<module>@<version>/ and Go's LICENSE for the toolchain, and sets `version` and `texts`. `license` (SPDX)",
     "and `source` are a person's job: a new module arrives as UNREVIEWED, which the generator refuses. GPL,",
     "LGPL and MPL modules need `source`; extra texts such as GPL-3.0.txt (paths under third_party/licenses/)",
-    "are kept across refreshes."
+    "are kept across refreshes.",
+    "GPL, LGPL and MPL modules also need `zipSha256`: the SHA-256 of <module>@<version>.zip from proxy.golang.org,",
+    "which every release mirrors in its Xray corresponding-source asset (scripts/build-xray-source-archive.mjs,",
+    "owner decision 2026-10-14) and refuses to publish if the downloaded zip differs. The vendor script records",
+    "it for every module whose `license` is already copyleft."
   ],
   "toolchain": {
     "version": "go1.26.1",
@@ -69,7 +73,8 @@
         "xray/github.com/juju/ratelimit@v1.0.2/LICENSE",
         "GPL-3.0.txt"
       ],
-      "version": "v1.0.2"
+      "version": "v1.0.2",
+      "zipSha256": "881dd22b8ec7dadbbb1e9d08ed7eb2c1f1ce8b6b4c48f739bb65f4c7d2ec12ed"
     },
     "github.com/klauspost/compress": {
       "license": "BSD-3-Clause AND Apache-2.0 AND MIT",
@@ -128,7 +133,8 @@
         "xray/github.com/sagernet/sing@v0.5.1/LICENSE",
         "GPL-3.0.txt"
       ],
-      "version": "v0.5.1"
+      "version": "v0.5.1",
+      "zipSha256": "651e38489c33ec283b652f88b258d9832d889304cd42c94743c3d9237e825068"
     },
     "github.com/sagernet/sing-shadowsocks": {
       "license": "GPL-3.0-or-later",
@@ -137,7 +143,8 @@
         "xray/github.com/sagernet/sing-shadowsocks@v0.2.7/LICENSE",
         "GPL-3.0.txt"
       ],
-      "version": "v0.2.7"
+      "version": "v0.2.7",
+      "zipSha256": "9f910b57d0a67038408b548b69f3d2c0892e6604991739979fe16af023dd2815"
     },
     "github.com/vishvananda/netlink": {
       "license": "Apache-2.0",
@@ -160,7 +167,8 @@
         "xray/github.com/xtls/reality@v0.0.0-20260322125925-9234c772ba8f/LICENSE",
         "xray/github.com/xtls/reality@v0.0.0-20260322125925-9234c772ba8f/LICENSE-Go"
       ],
-      "version": "v0.0.0-20260322125925-9234c772ba8f"
+      "version": "v0.0.0-20260322125925-9234c772ba8f",
+      "zipSha256": "d9b3bfd9dd281b400a59f052ebf95b852ec64c92f743c94bc7ab49d33ea6e799"
     },
     "go4.org/netipx": {
       "license": "BSD-3-Clause",

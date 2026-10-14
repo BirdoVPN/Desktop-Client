@@ -14,6 +14,7 @@
 #
 # Usage:
 #   NOTICES_FILE=src-tauri/resources/THIRD-PARTY-NOTICES.txt \
+#   APPIMAGE_NOTICES_FILE=<the AppImage's own notices, needed with an .AppImage> \
 #     scripts/ci/verify-bundled-xray.sh <expected-sha256> <artifact> [<artifact>...]
 #
 # Artifact kinds, chosen by name:
@@ -46,6 +47,15 @@
 #      Xray source pointer and every crate's and npm package's licence, and
 #      Settings › About › Licences reads this file. NOTICES_FILE is required:
 #      unset, empty or missing fails before any artifact is opened.
+#      An AppImage's file is instead byte-identical to APPIMAGE_NOTICES_FILE:
+#      the same notices plus the sections listing the system libraries that
+#      only the AppImage bundles (scripts/ci/appimage-notices.sh; owner
+#      decision 2026-10-14, L2). Unset, empty or missing fails that AppImage.
+#   8. (AppImage only) every ELF file under usr/ - each bundled shared
+#      library and module, WebKitGTK's helper programs, BirdoVPN's own
+#      binary and xray - is listed, as a line "    <path>", in those
+#      notices: a library the bundler added after the notices were generated
+#      fails the release instead of shipping unlisted.
 #
 # Self-test: scripts/ci/verify-bundled-xray.tests.sh (tests.yml runs it on
 # Linux and macOS on every PR), with fixtures for each failure path.
@@ -71,6 +81,7 @@ if ! printf '%s' "$expected" | grep -qE '^[0-9a-fA-F]{64}$'; then
 fi
 expected_lc="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
 notices="${NOTICES_FILE:-}"
+appimage_notices="${APPIMAGE_NOTICES_FILE:-}"
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -84,7 +95,6 @@ if [ -z "$notices" ] || [ ! -s "$notices" ]; then
   echo "::error::verify-bundled-xray: NOTICES_FILE must name this build's generated THIRD-PARTY-NOTICES.txt (got '$notices') - without it no package can be checked for its third-party notices (MR-1685)"
   exit 1
 fi
-notices_sha="$(sha256_of "$notices")"
 
 work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/xray-gate.XXXXXX")"
 mounts=()
@@ -109,10 +119,12 @@ collect() {
   done < <(find "$root" "$@" 2>/dev/null | LC_ALL=C sort)
 }
 
-# check_tree <label> <root> <macos|linux>
+# check_tree <label> <root> <macos|linux> <expected notices file>
 # Applies checks 2-7 to an unpacked artifact tree.
 check_tree() {
-  local label="$1" root="$2" kind="$3"
+  local label="$1" root="$2" kind="$3" want_notices="$4"
+  local want_sha
+  want_sha="$(sha256_of "$want_notices")"
   local xray_pattern bin_pattern resources_pattern notices_pattern
   case "$kind" in
     macos)
@@ -135,10 +147,10 @@ check_tree() {
     err "$label: expected one resources/THIRD-PARTY-NOTICES.txt, found ${#found[@]} - the package would ship without its third-party licence notices (MR-1685)"
   elif [ -L "${found[0]}" ] || [ ! -f "${found[0]}" ]; then
     err "$label: ${found[0]#"$root"/} is not a regular file"
-  elif [ "$(sha256_of "${found[0]}")" != "$notices_sha" ]; then
-    err "$label: the bundled THIRD-PARTY-NOTICES.txt is not the file this build generated ($notices)"
+  elif [ "$(sha256_of "${found[0]}")" != "$want_sha" ]; then
+    err "$label: the bundled THIRD-PARTY-NOTICES.txt is not the file this build generated ($want_notices)"
   else
-    echo "  notices  : ${found[0]#"$root"/} is this build's ($notices_sha)"
+    echo "  notices  : ${found[0]#"$root"/} is this build's ($want_notices, $want_sha)"
   fi
 
   # Check 6 first: the checks below return early on a missing xray.
@@ -194,6 +206,26 @@ check_tree() {
   fi
 }
 
+# check_appimage_libraries <label> <root> <notices file>
+# Check 8: every ELF file under usr/ in the unpacked AppImage is listed.
+check_appimage_libraries() {
+  local label="$1" root="$2" list="$3"
+  local f rel total=0 missing=0
+  collect "$root/usr" -type f
+  for f in "${found[@]+"${found[@]}"}"; do
+    if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" != 7f454c46 ]; then continue; fi
+    total=$((total + 1))
+    rel="${f#"$root"/}"
+    if ! grep -qxF -- "    $rel" "$list"; then
+      missing=$((missing + 1))
+      err "$label: $rel is bundled but not listed in the AppImage's notices ($list) - every library the AppImage carries must be listed with its package, source and licence (owner decision 2026-10-14, L2)"
+    fi
+  done
+  if [ "$missing" -eq 0 ]; then
+    echo "  libraries: all $total ELF files under usr/ are listed in its notices"
+  fi
+}
+
 n=0
 for artifact in "$@"; do
   n=$((n + 1))
@@ -204,14 +236,14 @@ for artifact in "$@"; do
   case "$artifact" in
     *.app)
       if [ ! -d "$artifact" ]; then err "$label: not found (expected an .app directory)"; continue; fi
-      check_tree "$label" "$(cd "$(dirname "$artifact")" && pwd)/$(basename "$artifact")" macos
+      check_tree "$label" "$(cd "$(dirname "$artifact")" && pwd)/$(basename "$artifact")" macos "$notices"
       ;;
     *.app.tar.gz)
       if [ ! -f "$artifact" ]; then err "$label: not found"; continue; fi
       if ! tar -xzf "$artifact" -C "$dest"; then err "$label: tar could not extract it"; continue; fi
       collect "$dest" -mindepth 1 -maxdepth 1 -name '*.app' -type d
       if [ "${#found[@]}" -ne 1 ]; then err "$label: expected exactly one top-level .app, found ${#found[@]}"; continue; fi
-      check_tree "$label" "$dest" macos
+      check_tree "$label" "$dest" macos "$notices"
       ;;
     *.dmg)
       if [ ! -f "$artifact" ]; then err "$label: not found"; continue; fi
@@ -238,15 +270,19 @@ for artifact in "$@"; do
       mounts+=("$dest/mnt")
       collect "$dest/mnt" -mindepth 1 -maxdepth 1 -name '*.app' -type d
       if [ "${#found[@]}" -ne 1 ]; then err "$label: expected exactly one .app at the volume root, found ${#found[@]}"; continue; fi
-      check_tree "$label" "$dest/mnt" macos
+      check_tree "$label" "$dest/mnt" macos "$notices"
       ;;
     *.deb)
       if [ ! -f "$artifact" ]; then err "$label: not found"; continue; fi
       if ! dpkg-deb -x "$artifact" "$dest"; then err "$label: dpkg-deb could not extract it"; continue; fi
-      check_tree "$label" "$dest" linux
+      check_tree "$label" "$dest" linux "$notices"
       ;;
     *.AppImage)
       if [ ! -f "$artifact" ]; then err "$label: not found"; continue; fi
+      if [ -z "$appimage_notices" ] || [ ! -s "$appimage_notices" ]; then
+        err "$label: APPIMAGE_NOTICES_FILE must name the AppImage's own generated notices, with its bundled libraries (scripts/ci/appimage-notices.sh) - got '$appimage_notices'"
+        continue
+      fi
       abs="$(cd "$(dirname "$artifact")" && pwd)/$(basename "$artifact")"
       if [ ! -x "$abs" ]; then
         # Never change the mode of the file we ship; run a copy instead.
@@ -257,7 +293,8 @@ for artifact in "$@"; do
       # The AppImage runtime (static, no FUSE needed for extraction) unpacks
       # its own squashfs into ./squashfs-root.
       if ! (cd "$dest" && "$abs" --appimage-extract >/dev/null); then err "$label: --appimage-extract failed"; continue; fi
-      check_tree "$label" "$dest/squashfs-root" linux
+      check_tree "$label" "$dest/squashfs-root" linux "$appimage_notices"
+      check_appimage_libraries "$label" "$dest/squashfs-root" "$appimage_notices"
       ;;
     *)
       err "$label: unknown artifact kind (expected .app, .app.tar.gz, .dmg, .deb or .AppImage)"
@@ -269,4 +306,4 @@ if [ "$fail_count" -gt 0 ]; then
   echo "verify-bundled-xray: $fail_count failure(s) across $n artifact(s)"
   exit 1
 fi
-echo "OK: every artifact ($n) ships an executable resources/xray matching the compiled-in XRAY_BINARY_SHA256 ($expected_lc), this build's resources/THIRD-PARTY-NOTICES.txt, and no dotfile under resources/"
+echo "OK: every artifact ($n) ships an executable resources/xray matching the compiled-in XRAY_BINARY_SHA256 ($expected_lc), this build's resources/THIRD-PARTY-NOTICES.txt (an AppImage: its own, listing every library it bundles), and no dotfile under resources/"

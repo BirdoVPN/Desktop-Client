@@ -733,15 +733,46 @@ jobs:
       - name: Run the gate against fake packages (pass + must-fail scenarios)
         run: bash scripts/ci/verify-bundled-xray.tests.sh
 
+  # Owner decision 2026-10-14 (L2): the AppImage's own notices list every
+  # system library it bundles (scripts/generate-appimage-notices.mjs, run by
+  # release.yml's build-linux through scripts/ci/appimage-notices.sh). Only a
+  # release and linux-packages.yml (path-filtered) build an AppImage, so this
+  # proves the mapping on every PR with a fake dpkg/dpkg-query, a fake
+  # /usr/share/doc and a fake unpacked AppImage: each kind of bundled file
+  # maps to its package, source package and licence texts, each failure path
+  # fails, and the gate's check 8 accepts exactly what the generator lists.
+  appimage-notices-selftest:
+    name: AppImage library notices self-test (fake dpkg)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The generator uses node built-ins only: nothing to install.
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Run the generator and the gate against fixtures (pass + must-fail scenarios)
+        run: bash scripts/ci/appimage-notices.tests.sh
+
   # MR-1685: every package ships resources/THIRD-PARTY-NOTICES.txt, which
   # release.yml generates per build job (scripts/generate-third-party-notices.mjs)
   # and its post-bundle gates require. The generator FAILS on a crate or npm
   # package whose licence it cannot ship the text of, so run it here for all
   # four release targets: a dependency bump that adds such a package fails the
-  # PR, not the next release. No --xray: the Go modules are read from the
-  # bundled binary by the build jobs (and on PRs by nsis-installer.yml).
+  # PR, not the next release. With --xray, as the release runs it (below).
+  # And (owner decision 2026-10-14, L1) the Xray corresponding-source asset
+  # those notices point at: built from every pin it has, as release.yml's
+  # xray-source job builds it, so a stale pin fails the PR, not release day.
   third-party-notices:
-    name: Third-party notices generate for every release target
+    name: Third-party notices + Xray source asset for every release target
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -809,10 +840,15 @@ jobs:
           gen x86_64-unknown-linux-gnu "$RUNNER_TEMP/xray-linux" xray
           gen aarch64-apple-darwin "$RUNNER_TEMP/xray-macos-arm64" xray
           gen x86_64-apple-darwin "$RUNNER_TEMP/xray-macos-x64" xray
+          app_version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          asset="https://github.com/BirdoVPN/Desktop-Client/releases/download/v$app_version/BirdoVPN-$app_version-xray-corresponding-source.tar.gz"
           for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
             out="$RUNNER_TEMP/notices-$target.txt"
             # What MR-1685 requires of every package's file, checked by name.
-            grep -qxF "  source: https://github.com/XTLS/Xray-core at $xray_version" "$out"
+            # The source: this release's own asset first (L1), then upstream.
+            grep -qxF "  source: $asset" "$out"
+            grep -qxF "  upstream: https://github.com/XTLS/Xray-core at $xray_version" "$out"
+            grep -qE "^      source: go-modules/github\.com/sagernet/sing@v[0-9][^ ]*\.zip in https://" "$out"
             grep -qF 'Mozilla Public License Version 2.0' "$out"
             grep -qF 'GNU GENERAL PUBLIC LICENSE' "$out"
             grep -qF 'SIL OPEN FONT LICENSE Version 1.1' "$out"
@@ -821,6 +857,40 @@ jobs:
               *windows*) grep -qF 'Prebuilt Binaries License' "$out" ;;
               *) if grep -qF 'wintun.dll' "$out"; then echo "::error::$target lists wintun.dll"; exit 1; fi ;;
             esac
+          done
+
+      # L1 (owner decision 2026-10-14): the asset the notices above point at,
+      # built as release.yml's xray-source job builds it, from every pin it
+      # has: the four Xray release zips (XRAY_*_SHA256) and the Go modules
+      # their binaries link (xray-go-modules.json), the tag archive
+      # (XRAY_SOURCE_SHA256) and the commit the binaries carry, and each
+      # GPL/LGPL/MPL module zip (zipSha256, and its line in Xray's go.sum).
+      # Built twice (it must be byte-identical), and every module zip the
+      # notices name must be in it under the path they give.
+      - name: Build the Xray corresponding-source asset, as the release does (pins, determinism, agreement with the notices)
+        run: |
+          set -euo pipefail
+          node scripts/build-xray-source-archive.mjs --out-dir "$RUNNER_TEMP/source-a"
+          node scripts/build-xray-source-archive.mjs --out-dir "$RUNNER_TEMP/source-b"
+          built=("$RUNNER_TEMP"/source-a/*.tar.gz)
+          name=$(basename "${built[0]}")
+          cmp "${built[0]}" "$RUNNER_TEMP/source-b/$name"
+          echo "deterministic: $name ($(sha256sum "${built[0]}" | cut -d' ' -f1))"
+          tar -tzvf "${built[0]}"
+          members=$(tar -tzf "${built[0]}")
+          root="${name%.tar.gz}"
+          for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            out="$RUNNER_TEMP/notices-$target.txt"
+            grep -qF "/$name" "$out"
+            mapfile -t zips < <(sed -nE 's/^      source: (go-modules\/[^ ]+\.zip) in https:.*$/\1/p' "$out")
+            if [ "${#zips[@]}" -eq 0 ]; then echo "::error::the $target notices name no module zip"; exit 1; fi
+            for z in "${zips[@]}"; do
+              if ! grep -qxF "$root/$z" <<<"$members"; then
+                echo "::error::the $target notices point at $z, which $name does not contain"
+                exit 1
+              fi
+            done
+            echo "$target: the ${#zips[@]} module zips its notices name are all in $name"
           done
 
   # Version-consistency gate. The app version is declared in THREE places:

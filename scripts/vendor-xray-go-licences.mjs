@@ -24,14 +24,21 @@
 // module seen for the first time - the generator refuses that until a person
 // has read the module's licence and filled in its SPDX id (and `source`, for
 // GPL, LGPL or MPL). Older vendored versions of a module are removed.
+// For a GPL, LGPL or MPL module it also records `zipSha256`, the SHA-256 of
+// the module zip it downloaded: each release mirrors that zip as part of its
+// Xray corresponding-source asset (scripts/build-xray-source-archive.mjs),
+// which refuses a zip that does not match. A module that becomes copyleft at
+// review needs one more run of this script to get its `zipSha256`.
 //
-// Built-in fetch and zlib only (Node 18+): no new dependency.
+// Built-in fetch, crypto and zlib only (Node 18+): no new dependency.
 // ============================================================================
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { readGoBuildInfo } from './lib/go-buildinfo.mjs';
+import { COPYLEFT } from './lib/xray-source.mjs';
+import { zipEntries } from './lib/zip.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const licensesDir = path.join(repo, 'third_party', 'licenses');
@@ -88,37 +95,16 @@ const escapePath = (s) => s.replace(/[A-Z]/g, (c) => `!${c.toLowerCase()}`);
 
 /** The files at the root of a zip whose name passes `keep`, as { name: Buffer }. */
 function unzipRoot(zip, prefix, keep) {
-  let eocd = -1;
-  for (let i = zip.length - 22; i >= Math.max(0, zip.length - 65557); i--) {
-    if (zip.readUInt32LE(i) === 0x06054b50) {
-      eocd = i;
-      break;
-    }
-  }
-  if (eocd < 0) die('not a zip archive (no end of central directory)');
-  const count = zip.readUInt16LE(eocd + 10);
-  let p = zip.readUInt32LE(eocd + 16);
-  if (p === 0xffffffff) die('ZIP64 archive: not supported');
   const out = {};
-  for (let i = 0; i < count; i++) {
-    if (zip.readUInt32LE(p) !== 0x02014b50) die('corrupt zip central directory');
-    const method = zip.readUInt16LE(p + 10);
-    const size = zip.readUInt32LE(p + 20);
-    const nameLen = zip.readUInt16LE(p + 28);
-    const extraLen = zip.readUInt16LE(p + 30);
-    const commentLen = zip.readUInt16LE(p + 32);
-    const local = zip.readUInt32LE(p + 42);
-    const name = zip.subarray(p + 46, p + 46 + nameLen).toString('utf8');
-    p += 46 + nameLen + extraLen + commentLen;
-    if (!name.startsWith(prefix)) continue;
-    const base = name.slice(prefix.length);
-    if (base.includes('/') || !keep(base)) continue;
-    if (zip.readUInt32LE(local) !== 0x04034b50) die(`corrupt zip local header for ${name}`);
-    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
-    const data = zip.subarray(start, start + size);
-    if (method === 0) out[base] = Buffer.from(data);
-    else if (method === 8) out[base] = zlib.inflateRawSync(data);
-    else die(`${name}: zip compression method ${method} not supported`);
+  try {
+    for (const entry of zipEntries(zip)) {
+      if (!entry.name.startsWith(prefix)) continue;
+      const base = entry.name.slice(prefix.length);
+      if (base.includes('/') || !keep(base)) continue;
+      out[base] = entry.read();
+    }
+  } catch (e) {
+    die(`${prefix}: ${e.message}`);
   }
   return out;
 }
@@ -153,11 +139,14 @@ const keepOthers = (entry, dirName) => (entry.texts || []).filter((t) => !t.star
 
 for (const [modPath, version] of [...linked].sort(([a], [b]) => (a < b ? -1 : 1))) {
   const url = `https://proxy.golang.org/${escapePath(modPath)}/@v/${escapePath(version)}.zip`;
-  const files = unzipRoot(await download(url), `${modPath}@${version}/`, (n) => LICENSE_FILE.test(n));
+  const zip = await download(url);
+  const files = unzipRoot(zip, `${modPath}@${version}/`, (n) => LICENSE_FILE.test(n));
   if (Object.keys(files).length === 0) die(`${modPath}@${version} has no licence file at its root - vendor its licence by hand`);
-  const entry = modules[modPath] || { license: 'UNREVIEWED' };
+  const entry = { ...(modules[modPath] || { license: 'UNREVIEWED' }) };
+  delete entry.zipSha256; // the hash of this run's zip, below, or none
   const texts = vendor(modPath, version, files);
-  modules[modPath] = { ...entry, version, texts: [...texts, ...keepOthers(entry, modPath)] };
+  const copyleft = COPYLEFT.test(entry.license) ? { zipSha256: createHash('sha256').update(zip).digest('hex') } : {};
+  modules[modPath] = { ...entry, version, texts: [...texts, ...keepOthers(entry, modPath)], ...copyleft };
   console.log(`${modPath} ${version}: ${Object.keys(files).join(', ')}${entry.license === 'UNREVIEWED' ? '  <- NEW: review its licence' : ''}`);
 }
 for (const modPath of Object.keys(modules)) {

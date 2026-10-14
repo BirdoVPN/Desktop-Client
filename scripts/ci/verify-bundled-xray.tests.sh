@@ -19,6 +19,10 @@
 #          empty / non-hex expected hash (GITHUB_ENV never set)
 #          no resources/THIRD-PARTY-NOTICES.txt, or not this build's (MR-1685)
 #          NOTICES_FILE unset or naming a missing file
+#          (AppImage) its notices are not its own (APPIMAGE_NOTICES_FILE), or
+#          that is unset; a bundled ELF library its notices do not list
+#          (owner decision 2026-10-14, L2) - a listed one, a non-ELF file
+#          and a symlink pass
 #          missing artifact, unknown artifact kind, tarball with two .app dirs
 #          one bad artifact among good ones still fails the whole call
 #
@@ -51,6 +55,15 @@ printf 'THIRD-PARTY SOFTWARE NOTICES - fixture
 Xray-core v0.0.0
 ' >"$notices"
 export NOTICES_FILE="$notices"
+# The AppImage's own notices: the same, plus the section listing what only
+# the AppImage bundles (scripts/ci/appimage-notices.sh), one "    <path>" line
+# per ELF file. make_appimage puts this file in every fake AppImage.
+appimage_notices="$work/THIRD-PARTY-NOTICES.appimage.txt"
+{
+  cat "$notices"
+  printf '\n6. AppImage only: bundled system libraries (fixture)\n\nlibfixture1 1.0-1 (amd64) [A1]\n  files:\n    usr/lib/libfixture.so.1\n'
+} >"$appimage_notices"
+export APPIMAGE_NOTICES_FILE="$appimage_notices"
 other_sha="$(printf 'not the payload' | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}')"
 
 # --- fixture builders ---------------------------------------------------------
@@ -84,10 +97,13 @@ make_linux_root() {
   cp "$notices" "$root/usr/lib/BirdoVPN/resources/THIRD-PARTY-NOTICES.txt"
 }
 
-# make_appimage <out.AppImage> <root>: a shell script that unpacks <root> into
-# ./squashfs-root on --appimage-extract, like the real AppImage runtime.
+# make_appimage <out.AppImage> <root> [keep]: a shell script that unpacks
+# <root> into ./squashfs-root on --appimage-extract, like the real AppImage
+# runtime. Its notices become the AppImage's own, unless `keep`.
 make_appimage() {
   local out="$1" root="$2"
+  local own="$root/usr/lib/BirdoVPN/resources/THIRD-PARTY-NOTICES.txt"
+  if [ -f "$own" ] && [ "${3-}" != keep ]; then cp "$appimage_notices" "$own"; fi
   tar -czf "$out.payload.tgz" -C "$root" .
   cat >"$out" <<EOF
 #!/bin/sh
@@ -219,6 +235,29 @@ make_linux_root "$work/lroot-nonotices"
 rm "$work/lroot-nonotices/usr/lib/BirdoVPN/resources/THIRD-PARTY-NOTICES.txt"
 make_appimage "$work/nonotices.AppImage" "$work/lroot-nonotices"
 expect 1 'AppImage without THIRD-PARTY-NOTICES.txt fails' 'found 0 - the package would ship without its third-party licence notices' -- "$good_sha" "$work/nonotices.AppImage"
+
+# L2 (owner decision 2026-10-14): the AppImage carries its own notices, which
+# list every ELF file it bundles. A fake ELF is the 4-byte magic and a little.
+fake_elf() { mkdir -p "$(dirname "$1")" && printf '\177ELF\002\001\001\000fixture' >"$1"; }
+make_linux_root "$work/lroot-libs"
+fake_elf "$work/lroot-libs/usr/lib/libfixture.so.1"
+printf 'typelib, not ELF\n' >"$work/lroot-libs/usr/lib/Fixture-1.0.typelib"
+ln -s libfixture.so.1 "$work/lroot-libs/usr/lib/libfixture-link.so"
+make_appimage "$work/libs.AppImage" "$work/lroot-libs"
+expect 0 'AppImage whose ELF libraries are all listed passes (non-ELF file, symlink ignored)' 'libraries: all 1 ELF files under usr/ are listed' -- "$good_sha" "$work/libs.AppImage"
+
+make_linux_root "$work/lroot-unlisted"
+fake_elf "$work/lroot-unlisted/usr/lib/libfixture.so.1"
+fake_elf "$work/lroot-unlisted/usr/lib/gtk-3.0/3.0.0/immodules/im-unlisted.so"
+make_appimage "$work/unlisted.AppImage" "$work/lroot-unlisted"
+expect 1 'AppImage with a library its notices do not list fails' 'usr/lib/gtk-3.0/3.0.0/immodules/im-unlisted.so is bundled but not listed' -- "$good_sha" "$work/unlisted.AppImage"
+
+make_linux_root "$work/lroot-generic"
+make_appimage "$work/generic.AppImage" "$work/lroot-generic" keep
+expect 1 'AppImage carrying the generic notices, not its own, fails' 'is not the file this build generated' -- "$good_sha" "$work/generic.AppImage"
+APPIMAGE_NOTICES_FILE='' expect 1 'APPIMAGE_NOTICES_FILE unset fails an AppImage' 'APPIMAGE_NOTICES_FILE must name' -- "$good_sha" "$work/good.AppImage"
+APPIMAGE_NOTICES_FILE="$work/no-such-notices.txt" expect 1 'APPIMAGE_NOTICES_FILE naming a missing file fails' 'APPIMAGE_NOTICES_FILE must name' -- "$good_sha" "$work/good.AppImage"
+APPIMAGE_NOTICES_FILE='' expect 0 'APPIMAGE_NOTICES_FILE is not needed without an AppImage' 'OK: every artifact' -- "$good_sha" "$work/good.app.tar.gz"
 
 if command -v dpkg-deb >/dev/null 2>&1; then
   for v in good bad gitkeep nonotices; do

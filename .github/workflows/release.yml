@@ -83,6 +83,10 @@ env:
   XRAY_LINUX_SHA256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
   XRAY_MACOS_ARM64_SHA256: 2e93a67e8aa1936ecefb307e120830fcbd4c643ab9b1c46a2d0838d5f8409eaf
   XRAY_MACOS_AMD64_SHA256: f5b0471d3459eff1b82e48af0aeac186abcc3298210070afbbbd8437a4e8b203
+  # The Xray-core tag archive at XRAY_VERSION (github.com/XTLS/Xray-core/archive/refs/tags/<version>.tar.gz),
+  # mirrored with every release as its corresponding source (the xray-source job). Bump with XRAY_VERSION;
+  # the module zips it is published with are pinned in third_party/licenses/xray-go-modules.json (zipSha256).
+  XRAY_SOURCE_SHA256: 992a4997e6bb846d11469435d687f99ef812fcde1e0a009bb8e95189ea20331d
 
 jobs:
   # ══════════════════════════════════════════════════════════════════════
@@ -785,8 +789,9 @@ jobs:
           echo "XRAY_BINARY_SHA256=$BINARY_SHA" >> "$GITHUB_ENV"
           echo "Xray ready: src-tauri/resources/xray ($BINARY_SHA)"
 
-      # MR-1685, as build-windows (no Wintun here). Checked in the .deb and
-      # the AppImage by the post-bundle gate (NOTICES_FILE).
+      # MR-1685, as build-windows (no Wintun here). Checked in the .deb by the
+      # post-bundle gate (NOTICES_FILE); the AppImage gets this file plus the
+      # list of the libraries it bundles (L2, after the build below).
       - name: Generate the third-party notices (resources/THIRD-PARTY-NOTICES.txt)
         env:
           ARCH: ${{ matrix.arch }}
@@ -823,19 +828,41 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: npx tauri build --target "$ARCH" -- --locked
 
+      # Owner decision 2026-10-14 (L2): the AppImage carries system libraries
+      # from this ubuntu-22.04 image (WebKitGTK, GTK, GLib, libsoup and what
+      # they link) that the .deb leaves to the user's system, so its own
+      # THIRD-PARTY-NOTICES.txt also lists every one: its Ubuntu package (dpkg
+      # -S on this runner), source package at the exact version, copyright
+      # file and the licence texts that cites. Which libraries linuxdeploy
+      # bundled is only known now, so the script maps them, writes the
+      # AppImage's notices and re-bundles ONLY the AppImage with them (`tauri
+      # bundle`: nothing recompiles; the updater .sig is made again). The .deb
+      # keeps the generic file. Fails on a library it cannot account for.
+      # Self-test (fake dpkg): scripts/ci/appimage-notices.tests.sh, in
+      # tests.yml; the real path runs on PRs in linux-packages.yml.
+      - name: AppImage — list its bundled system libraries in its own notices, then re-bundle it
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          ARCH: ${{ matrix.arch }}
+        run: bash scripts/ci/appimage-notices.sh "$ARCH" "$RUNNER_TEMP/appimage-notices/THIRD-PARTY-NOTICES.txt"
+
       # MR-720 / MR-736: the Linux twin of build-windows' xray gate. Unpacks the
       # .deb and the AppImage exactly as shipped and requires
       # usr/lib/BirdoVPN/resources/xray to be executable and to hash to the
       # XRAY_BINARY_SHA256 this build compiled in (and that the app binary
       # really carries that value). Script + self-test: scripts/ci/; passes on
       # the published v1.4.45 packages.
-      # MR-1685: and each must carry this build's THIRD-PARTY-NOTICES.txt.
+      # MR-1685: and each must carry this build's THIRD-PARTY-NOTICES.txt -
+      # the .deb the generic file, the AppImage its own (L2: APPIMAGE_NOTICES_
+      # FILE), in which every ELF file the AppImage carries must be listed.
       - name: Gate — bundled xray (.deb, .AppImage) must hash to the compiled-in XRAY_BINARY_SHA256; THIRD-PARTY-NOTICES.txt must be this build's
         env:
           ARCH: ${{ matrix.arch }}
           NOTICES_FILE: src-tauri/resources/THIRD-PARTY-NOTICES.txt
         run: |
           set -euo pipefail
+          export APPIMAGE_NOTICES_FILE="$RUNNER_TEMP/appimage-notices/THIRD-PARTY-NOTICES.txt"
           bundle="src-tauri/target/$ARCH/release/bundle"
           shopt -s nullglob
           debs=("$bundle"/deb/*.deb)
@@ -1208,13 +1235,61 @@ jobs:
           compression-level: 0 # .dmg / .app.tar.gz are already compressed
 
   # ══════════════════════════════════════════════════════════════════════
+  # XRAY CORRESPONDING SOURCE — owner decision 2026-10-14 (L1: mirror the
+  # source per release). The bundled xray links GPL-3.0-or-later and LGPL-3.0
+  # Go modules, so every release publishes, next to its installers, the exact
+  # Xray-core tag archive at XRAY_VERSION and the module zip of each GPL,
+  # LGPL and MPL module the four bundled binaries link, at the linked
+  # version: BirdoVPN-<version>-xray-corresponding-source.tar.gz, the URL
+  # every package's THIRD-PARTY-NOTICES.txt names first. The script checks
+  # every input before writing anything (the binary zips against the
+  # XRAY_*_SHA256 pins and their Go modules against xray-go-modules.json,
+  # the tag archive against XRAY_SOURCE_SHA256 and the commit the binaries
+  # carry, each module zip against its zipSha256 pin and Xray's own go.sum)
+  # and fails on any mismatch. tests.yml runs the same script on every PR.
+  # Nothing secret, read-only; the release job publishes it, puts it in
+  # SHA256SUMS.txt and so under the Sigstore signature.
+  # ══════════════════════════════════════════════════════════════════════
+  xray-source:
+    name: Xray corresponding source (release asset)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          # No npm cache (the workflow header says why); nothing is installed.
+          package-manager-cache: false
+
+      - name: Build + verify BirdoVPN-<version>-xray-corresponding-source.tar.gz
+        run: node scripts/build-xray-source-archive.mjs --out-dir xray-source
+
+      - name: Upload the source asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: birdo-vpn-xray-source
+          path: xray-source/*.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+          compression-level: 0 # already gzip
+
+  # ══════════════════════════════════════════════════════════════════════
   # ONE GitHub Release for ALL platforms, from ONE tag.
   # Windows, Linux AND macOS are REQUIRED: the guard below refuses to publish
   # unless each succeeded. The only exception is macOS once the Mac App Store
   # app is live (then build-macos is skipped by design and no DMG ships).
+  # The Xray corresponding source (xray-source) is required too: every
+  # package's notices point at it.
   # ══════════════════════════════════════════════════════════════════════
   release:
-    needs: [test, build-windows, build-linux, mac-app-store, build-macos]
+    needs: [test, build-windows, build-linux, mac-app-store, build-macos, xray-source]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1230,9 +1305,14 @@ jobs:
           MAS_RESULT: ${{ needs.mac-app-store.result }}
           MAS_LIVE: ${{ needs.mac-app-store.outputs.live }}
           MACOS_RESULT: ${{ needs.build-macos.result }}
+          XRAY_SOURCE_RESULT: ${{ needs.xray-source.result }}
         run: |
           set -euo pipefail
           fail=0
+          if [ "$XRAY_SOURCE_RESULT" != "success" ]; then
+            echo "::error::xray-source result=$XRAY_SOURCE_RESULT — every package's notices point at this release's Xray corresponding-source asset (GPL-3.0 §6, owner decision 2026-10-14), refusing to publish a release without it"
+            fail=1
+          fi
           if [ "$TEST_RESULT" != "success" ]; then
             echo "::error::test result=$TEST_RESULT — the Rust unit tests / vitest gate did not pass, refusing to publish a release"
             fail=1
@@ -1255,7 +1335,7 @@ jobs:
             fail=1
           fi
           [ "$fail" -eq 0 ] || exit 1
-          echo "Test gate, Windows, Linux and macOS OK."
+          echo "Test gate, Windows, Linux, macOS and the Xray source OK."
 
       - name: Download Windows artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1293,6 +1373,37 @@ jobs:
         with:
           name: birdo-vpn-macos-x64
           path: release-files/macos-x64/
+
+      - name: Download the Xray corresponding source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: birdo-vpn-xray-source
+          path: release-files/source/
+
+      # Every package's THIRD-PARTY-NOTICES.txt names this asset by URL
+      # (releases/download/v<version>/BirdoVPN-<version>-xray-corresponding-
+      # source.tar.gz, scripts/lib/xray-source.mjs). The test gate has tied the
+      # tag to the source version, so the asset must carry exactly that name,
+      # or the notices would point at nothing.
+      - name: Require the Xray source asset under the name the notices give
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          want="BirdoVPN-${TAG#v}-xray-corresponding-source.tar.gz"
+          ls -la release-files/source/
+          got=$(find release-files/source -type f | wc -l)
+          if [ "$got" -ne 1 ] || [ ! -f "release-files/source/$want" ]; then
+            echo "::error::expected release-files/source/$want alone (the URL THIRD-PARTY-NOTICES.txt names), found $got file(s)"
+            exit 1
+          fi
+          members=$(tar -tzf "release-files/source/$want")
+          if ! grep -qxF "${want%.tar.gz}/README.txt" <<<"$members"; then
+            echo "::error::$want has no ${want%.tar.gz}/README.txt - not the archive scripts/build-xray-source-archive.mjs builds"
+            exit 1
+          fi
+          echo "OK: $want"
 
       # Name every asset for the platform it runs on, and disambiguate the
       # basenames that would otherwise collide.
@@ -1526,6 +1637,7 @@ jobs:
             release-files/linux/**/*
             release-files/macos-arm64/**/*
             release-files/macos-x64/**/*
+            release-files/source/*
             release-files/SHA256SUMS.txt
             release-files/SHA256SUMS.txt.sigstore
           generate_release_notes: true
