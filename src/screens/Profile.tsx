@@ -9,7 +9,7 @@
  */
 import { useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-shell';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { useShallow } from 'zustand/react/shallow';
 import { Gift, LogOut, Trash, Download, CreditCard } from 'lucide-react';
 import { useAppStore } from '@/store/app-store';
@@ -117,7 +117,7 @@ export function Profile() {
                 rank === null || isFreeTier
                   ? () => pushRoute('pricing')
                   : () => {
-                      void open(BILLING_URL).catch(() => {});
+                      void openUrl(BILLING_URL).catch(() => {});
                     }
               }
             />

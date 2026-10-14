@@ -86,9 +86,6 @@
     "longDescription": "Birdo VPN - a lightweight VPN client using the WireGuard protocol."
   },
   "plugins": {
-    "shell": {
-      "open": "^https://(birdo\\.app|[a-zA-Z0-9-]+\\.birdo\\.app)(/.*)?$"
-    },
     "updater": {
       "endpoints": [
         "https://api.birdo.app/updates/{{target}}/{{arch}}/{{current_version}}"
