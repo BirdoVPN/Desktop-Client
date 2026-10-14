@@ -1306,22 +1306,24 @@ mod lifecycle_tests {
                 "api.prevent_exit();",
                 "std::thread::Builder::new()",
                 "std::thread::sleep(EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN)",
-                "if !EXIT_TEARDOWN_DONE.load(",
-                "utils::run_on_helper_for(",
+                "utils::exit_unless_torn_down(",
+                "&EXIT_TEARDOWN_DONE,",
                 "EXIT_FALLBACK_CLEANUP,",
                 "error!(",
                 "release_dns_at_exit()",
-                "std::process::exit(0)",
+                "|| std::process::exit(0),",
                 "tauri::async_runtime::spawn(async move {",
             ],
         );
-        // WIN3-006: nothing between the decision and the bounded helper can
-        // wait on what the wedged teardown holds (the helper's own wait is
-        // tested in `utils`).
-        let decided = &held[held.find("if !EXIT_TEARDOWN_DONE.load(").unwrap()..];
-        let before_helper = &decided[..decided.find("utils::run_on_helper_for(").unwrap()];
+        // WIN3-006: nothing between the sleep and the bounded decision can
+        // wait on what the wedged teardown holds. What the decision does is
+        // driven in `utils::tests::the_exit_fallback_exits_whatever_its_cleanup_waits_on`.
+        let slept = &held[held
+            .find("EXIT_TEARDOWN_CAP + EXIT_FALLBACK_MARGIN")
+            .unwrap()..];
+        let before_decision = &slept[..slept.find("utils::exit_unless_torn_down(").unwrap()];
         for blocking in ["error!(", "release_dns_at_exit", "restore_dns_blocking"] {
-            assert!(!before_helper.contains(blocking), "{blocking}");
+            assert!(!before_decision.contains(blocking), "{blocking}");
         }
     }
 
