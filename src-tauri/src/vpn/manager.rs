@@ -932,6 +932,19 @@ impl VpnManager {
             _ = self.cancelled(epoch) => None,
         };
 
+        // MR-823: a build that failed, timed out or was cancelled after its
+        // tunnel claimed the machine state dropped that tunnel, and its Drop
+        // handed the cleanup (DNS guard, routes) to a thread. Wait for it
+        // before any failure arm: the machine state is released BEFORE the
+        // IPv6 block is lifted (the #114 order below), and an exit that
+        // cancelled into the build does not end the process under it.
+        #[cfg(target_os = "windows")]
+        if !matches!(tunnel_result, Some(Ok(Ok(_))))
+            && !crate::vpn::tunnel::wait_for_emergency_teardowns().await
+        {
+            tracing::warn!("Continuing with a dropped tunnel's cleanup still running");
+        }
+
         match tunnel_result {
             Some(Ok(Ok(tunnel))) => {
                 if !self.is_current(epoch) {
