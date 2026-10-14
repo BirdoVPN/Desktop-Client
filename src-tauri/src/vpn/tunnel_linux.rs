@@ -140,6 +140,13 @@ struct NetworkSnapshot {
     uses_systemd_resolved: bool,
     /// Original resolv.conf contents for fallback restoration
     resolv_conf_backup: Option<String>,
+    /// MR-2018: what /etc/resolv.conf pointed at when it was a SYMLINK
+    /// (NetworkManager, resolvconf, WSL's /mnt/wsl/resolv.conf), as read_link
+    /// returned it. configure_dns replaces the link with a regular file, so
+    /// restoring only `resolv_conf_backup`'s bytes froze the host on a copy:
+    /// the link's owner kept updating its target and nothing read it any more.
+    /// `None` when the file was not a symlink.
+    resolv_conf_link: Option<std::path::PathBuf>,
     /// True once configure_dns has OVERWRITTEN /etc/resolv.conf this session.
     /// This — not `uses_systemd_resolved` — is what drives the file restore on
     /// disconnect: the two signals disagree on real hosts (resolved unit
@@ -167,8 +174,11 @@ pub struct LinuxTunnel {
     network_snapshot: Arc<RwLock<Option<NetworkSnapshot>>>,
     /// Whether to allow local network access while VPN is active
     local_network_sharing: bool,
-    /// Endpoint IP for route exclusion
-    endpoint_ip: Arc<RwLock<Option<String>>>,
+    /// Every route THIS session added, recorded the moment its add succeeded,
+    /// and removed (qualified exactly as it was added) by stop(), the failed-
+    /// start unwind and Drop. A std Mutex, never held across an await, so Drop
+    /// can take it.
+    owned_routes: Arc<OwnedRoutes>,
     /// JoinHandle of the spawned packet loop.
     ///
     /// P1-dk-tun-fd-close-race: stop() JOINS this task before closing the TUN
@@ -199,7 +209,7 @@ impl LinuxTunnel {
             tun_fd: Arc::new(RwLock::new(None)),
             network_snapshot: Arc::new(RwLock::new(None)),
             local_network_sharing,
-            endpoint_ip: Arc::new(RwLock::new(None)),
+            owned_routes: Arc::new(OwnedRoutes::default()),
             packet_loop: Arc::new(RwLock::new(None)),
         })
     }
@@ -264,7 +274,6 @@ impl LinuxTunnel {
             "WireGuard endpoint IP: {}",
             redact_ip(&endpoint_ip.to_string())
         );
-        *self.endpoint_ip.write().await = Some(endpoint_ip.to_string());
 
         // Configure the TUN interface IP and bring it up
         if let Err(e) = configure_tun_address(&tun_name, &self.config.client_ip, &self.config.mtu) {
@@ -278,13 +287,18 @@ impl LinuxTunnel {
             &endpoint_ip.to_string(),
             &self.config.allowed_ips,
             self.local_network_sharing,
+            &self.owned_routes,
         )
         .await
         {
             // configure_routes can fail MID-LOOP with the endpoint route and
-            // 0.0.0.0/1 already installed — the unwind's remove_routes (via
-            // stop()) deletes exactly what went in; closing the fd alone would
-            // leave the endpoint/LAN routes pointing at a stale gateway.
+            // 0.0.0.0/1 already installed. Each route it added is already in
+            // owned_routes, so the unwind (via stop()) deletes exactly those —
+            // and nothing that merely shares a prefix with them: the collision
+            // that failed this start is usually ANOTHER VPN's 0.0.0.0/1, which
+            // an unqualified delete used to remove (bug B). Closing the fd
+            // alone would leave the endpoint/LAN routes pointing at a stale
+            // gateway.
             self.unwind_failed_start().await;
             return Err(e);
         }
@@ -469,23 +483,11 @@ impl LinuxTunnel {
         // (a stuck block would leave the host without IPv6 after disconnect).
         remove_ipv6_leak_block();
 
-        // Remove routes. The snapshot supplies the gateway/interface the LAN
-        // routes were added through, so their deletion can be qualified the same
-        // way and cannot match a route belonging to something else.
-        if let Some(ep_ip) = self.endpoint_ip.read().await.as_ref() {
-            let snap = self.network_snapshot.read().await;
-            let gw = snap.as_ref().and_then(|s| s.default_gateway.clone());
-            let iface = snap.as_ref().and_then(|s| s.default_interface.clone());
-            drop(snap);
-            remove_routes(
-                ep_ip,
-                &self.config.allowed_ips,
-                self.local_network_sharing,
-                gw.as_deref(),
-                iface.as_deref(),
-            )
-            .await;
-        }
+        // Remove the routes this session added — only those, each qualified
+        // exactly as it was added, so a route that merely shares a prefix with
+        // one of ours (another VPN's 0.0.0.0/1, the host's own endpoint route)
+        // is never touched.
+        remove_owned_routes(take_owned_routes(&self.owned_routes));
 
         // Close the TUN file descriptor (kernel auto-removes the device) — once
         // no in-flight blocking read/write still holds it (MR-820). Closing
@@ -1052,6 +1054,20 @@ impl Drop for LinuxTunnel {
         // its own reference to the fd: stop it so it lets go. Its shutdown
         // sender goes with this struct, which also ends its select!.
         self.running.store(false, Ordering::SeqCst);
+        // Routes this session added that nothing has removed yet: a start()
+        // cancelled after configure_routes. Closing the fd withdraws the
+        // routes THROUGH the device, but not the endpoint host route (relay
+        // /32 via the uplink) or the LAN-sharing routes, which used to outlive
+        // every such drop pointing at whatever gateway the host had then.
+        // Removed first, as stop() does, and qualified the same way.
+        let routes = take_owned_routes(&self.owned_routes);
+        if !routes.is_empty() {
+            tracing::warn!(
+                "LinuxTunnel dropped with {} route(s) still installed — removing them",
+                routes.len()
+            );
+            remove_owned_routes(routes);
+        }
         // Drop cannot await. try_write is enough: by the time the tunnel is
         // being dropped nothing else legitimately holds this lock, and failing
         // to acquire it must never panic or block a teardown.
@@ -1418,6 +1434,18 @@ async fn configure_ipv6(tun_name: &str, config: &VpnConfig) -> Result<(), String
     Ok(())
 }
 
+/// Networks routed around the tunnel when Local Network Sharing is on.
+///
+/// These used to be installed and then NEVER removed — leaving routes pointing
+/// at a gateway that stops existing the moment the user changes network. Each
+/// one that goes in is now an [`OwnedRoute`], removed at teardown.
+const LAN_SHARING_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
+
 /// Expand a default route into two halves, leaving everything else untouched.
 ///
 /// The Linux FIB keys on (destination, metric), so a second `0.0.0.0/0` only
@@ -1430,19 +1458,8 @@ async fn configure_ipv6(tun_name: &str, config: &VpnConfig) -> Result<(), String
 /// longest-prefix match picks them regardless of metric, without deleting the
 /// host default — so teardown has nothing to restore.
 ///
-/// Shared by configure_routes and remove_routes so the two can never disagree
-/// about what was installed.
-/// Networks routed around the tunnel when Local Network Sharing is on.
-///
-/// Shared between install and teardown so the two cannot drift. These used to
-/// be installed and then NEVER removed — leaving routes pointing at a gateway
-/// that stops existing the moment the user changes network.
-const LAN_SHARING_CIDRS: [&str; 4] = [
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "169.254.0.0/16",
-];
+/// Teardown does not re-expand this: it removes what configure_routes recorded
+/// adding ([`OwnedRoute`]), so it cannot disagree about what was installed.
 fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
     allowed_ips
         .iter()
@@ -1453,11 +1470,68 @@ fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// A route this session added, held as the exact qualifiers its add used.
+///
+/// Bug B: teardown used to delete by PREFIX alone (`ip route del 0.0.0.0/1`,
+/// `ip route del <relay>/32`), and a bare delete removes whichever route with
+/// that prefix the kernel finds first — not necessarily ours. The textbook case
+/// is a start that FAILS because another VPN (OpenVPN's redirect-gateway def1)
+/// already owns 0.0.0.0/1 and 128.0.0.0/1: the unwind then deleted both of
+/// ITS routes, and that VPN's traffic fell back to the physical default. Now a
+/// route is recorded only once its add succeeded, and deleted with the same
+/// `via`/`dev` it was added with, so a delete can only ever match a route of
+/// ours. A route that already existed ("File exists") was not added by us and
+/// is not recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedRoute {
+    dst: String,
+    via: Option<String>,
+    dev: String,
+}
+
+impl OwnedRoute {
+    /// `ip` argv for `route <verb> <dst> [via <gw>] dev <dev>`: the add and the
+    /// delete come from the same place, so they cannot be qualified differently.
+    fn ip_args<'a>(&'a self, verb: &'a str) -> Vec<&'a str> {
+        let mut args = vec!["route", verb, self.dst.as_str()];
+        if let Some(via) = &self.via {
+            args.extend(["via", via.as_str()]);
+        }
+        args.extend(["dev", self.dev.as_str()]);
+        args
+    }
+}
+
+/// The routes a tunnel owns, in the order they were added.
+type OwnedRoutes = std::sync::Mutex<Vec<OwnedRoute>>;
+
+/// Take every owned route out of `owned`, leaving it empty. A poisoned lock
+/// still yields its routes: a teardown must never skip them.
+fn take_owned_routes(owned: &OwnedRoutes) -> Vec<OwnedRoute> {
+    std::mem::take(&mut *owned.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `ip route add` `route`, recording it in `owned` as soon as the add
+/// succeeded — before anything else can fail or be cancelled. Returns the
+/// failure's stderr.
+fn add_owned_route(route: OwnedRoute, owned: &OwnedRoutes) -> Result<(), String> {
+    let output = cmd("ip")
+        .args(route.ip_args("add"))
+        .output()
+        .map_err(|e| format!("could not run ip: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    owned.lock().unwrap_or_else(|e| e.into_inner()).push(route);
+    Ok(())
+}
+
 async fn configure_routes(
     tun_name: &str,
     endpoint_ip: &str,
     allowed_ips: &[String],
     local_network_sharing: bool,
+    owned: &OwnedRoutes,
 ) -> Result<(), String> {
     // Get current default gateway for endpoint route
     let default_gw = get_default_gateway()?;
@@ -1470,44 +1544,32 @@ async fn configure_routes(
 
     // Add a specific route for the VPN endpoint via the real gateway
     // so WireGuard UDP packets don't get caught in the VPN tunnel
-    let output = cmd("ip")
-        .args([
-            "route",
-            "add",
-            &format!("{}/32", endpoint_ip),
-            "via",
-            &default_gw,
-            "dev",
-            &default_iface,
-        ])
-        .output()
-        .map_err(|e| format!("Failed to add endpoint route: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let endpoint_route = OwnedRoute {
+        dst: format!("{}/32", endpoint_ip),
+        via: Some(default_gw.clone()),
+        dev: default_iface.clone(),
+    };
+    if let Err(stderr) = add_owned_route(endpoint_route, owned) {
         // MUST be fatal (except an existing identical route). Once the default
         // below is genuinely captured, a missing endpoint route sends WireGuard's
         // own outer UDP back into the tunnel — an encapsulation loop that reaches
         // Connected and carries zero traffic. Warning here would convert a visible
-        // failure into an invisible one.
+        // failure into an invisible one. An existing route is not ours, so it
+        // is not recorded and teardown leaves it where it was.
         if !stderr.contains("File exists") {
-            return Err(format!(
-                "Failed to pin the endpoint route: {}",
-                stderr.trim()
-            ));
+            return Err(format!("Failed to pin the endpoint route: {}", stderr));
         }
     }
 
     // Add routes for allowed_ips via the TUN interface
     let allowed_ips = expand_default_v4(allowed_ips);
     for cidr in &allowed_ips {
-        let output = cmd("ip")
-            .args(["route", "add", cidr, "dev", tun_name])
-            .output()
-            .map_err(|e| format!("Failed to add route for {}: {}", cidr, e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let route = OwnedRoute {
+            dst: cidr.clone(),
+            via: None,
+            dev: tun_name.to_string(),
+        };
+        if let Err(stderr) = add_owned_route(route, owned) {
             // Fatal now that defaults are split. Before the split a `0.0.0.0/0`
             // collision was routine and swallowing it looked harmless; after it, a
             // collision on `0.0.0.0/1` or `128.0.0.0/1` means the tunnel did NOT
@@ -1515,8 +1577,7 @@ async fn configure_routes(
             // everything egresses the physical NIC.
             return Err(format!(
                 "Failed to route {} into the tunnel: {}",
-                cidr,
-                stderr.trim()
+                cidr, stderr
             ));
         }
     }
@@ -1526,19 +1587,15 @@ async fn configure_routes(
         // 169.254/16 included for mDNS/Bonjour, matching Windows. Without it
         // printer and AirPlay DISCOVERY fails even though the LAN itself is
         // reachable, which reads as "Local Network Sharing is broken".
-        let rfc1918 = LAN_SHARING_CIDRS;
-        for cidr in &rfc1918 {
-            let _ = cmd("ip")
-                .args([
-                    "route",
-                    "add",
-                    cidr,
-                    "via",
-                    &default_gw,
-                    "dev",
-                    &default_iface,
-                ])
-                .output();
+        for cidr in LAN_SHARING_CIDRS {
+            let route = OwnedRoute {
+                dst: cidr.to_string(),
+                via: Some(default_gw.clone()),
+                dev: default_iface.clone(),
+            };
+            // Best-effort, as before; only a route that went in is ours to
+            // remove — NetworkManager's link-scope 169.254.0.0/16 is not.
+            let _ = add_owned_route(route, owned);
         }
         tracing::info!("Added local network sharing routes (RFC1918)");
     }
@@ -1632,10 +1689,18 @@ async fn configure_dns(
         // reconcile's marker check then finds a file that is not ours and does
         // nothing. The marker filter mirrors capture_network_snapshot: a
         // resolv.conf we wrote is never a valid baseline (see the note there).
+        //
+        // The symlink, if it is one, is recorded too (MR-2018): the rename
+        // below replaces the LINK, and only the link puts the host back on
+        // the file its resolver manager keeps updating. A target that is not
+        // valid UTF-8 cannot be journaled; recovery then restores the bytes.
         crate::vpn::dns_journal::record_linux(
             std::fs::read_to_string(RESOLV_CONF)
                 .ok()
                 .filter(|c| !c.starts_with(RESOLV_CONF_MARKER)),
+            std::fs::read_link(RESOLV_CONF)
+                .ok()
+                .and_then(|target| target.to_str().map(str::to_owned)),
             uses_resolved,
         );
         let tmp = "/etc/.resolv.conf.birdo";
@@ -1883,20 +1948,37 @@ fn restore_dns(snapshot: &NetworkSnapshot) -> DnsRestoreOutcome {
         // Nothing of ours in the file: `settle` drops the stale record.
         return outcome;
     }
-    let (contents, source) = if let Some(ref backup) = snapshot.resolv_conf_backup {
-        (backup.clone(), "backup")
-    } else {
-        // We overwrote the file but its original bytes were unreadable at
-        // snapshot time. Best effort: write back the original DNS servers.
-        (resolv_conf_from_servers(&snapshot.dns_servers), "snapshot")
-    };
-
     // Verified, not attempted. The journal is deleted off this answer, and it
     // is the only thing that still knows the pre-connect resolvers.
-    let restored = write_resolv_conf_verified(RESOLV_CONF, &contents);
-    if restored {
-        tracing::info!("Restored {} from {}", RESOLV_CONF, source);
+    let restored = if let Some(target) = &snapshot.resolv_conf_link {
+        // MR-2018: it was a symlink, so it goes back as THAT symlink. Writing
+        // the backup bytes over our pin left a regular file the link's owner
+        // never updates again — a later NetworkManager/resolvconf/WSL change
+        // no longer reached /etc/resolv.conf.
+        let restored = restore_resolv_conf_link_verified(
+            RESOLV_CONF,
+            target,
+            snapshot.resolv_conf_backup.is_some(),
+        );
+        if restored {
+            tracing::info!("Restored {} as its original symlink", RESOLV_CONF);
+        }
+        restored
     } else {
+        let (contents, source) = if let Some(ref backup) = snapshot.resolv_conf_backup {
+            (backup.clone(), "backup")
+        } else {
+            // We overwrote the file but its original bytes were unreadable at
+            // snapshot time. Best effort: write back the original DNS servers.
+            (resolv_conf_from_servers(&snapshot.dns_servers), "snapshot")
+        };
+        let restored = write_resolv_conf_verified(RESOLV_CONF, &contents);
+        if restored {
+            tracing::info!("Restored {} from {}", RESOLV_CONF, source);
+        }
+        restored
+    };
+    if !restored {
         // The caller KEEPS the record deliberately (see dns_journal::settle). It
         // carries the pre-connect bytes; deleting it here is what turned a crash
         // into a machine with no resolvers at all, permanently. The next start
@@ -1935,6 +2017,7 @@ fn restore_dns(snapshot: &NetworkSnapshot) -> DnsRestoreOutcome {
 /// path and the clean path cannot drift.
 pub(super) fn restore_resolv_conf_if_ours(
     resolv_conf_backup: Option<String>,
+    resolv_conf_link: Option<String>,
     uses_systemd_resolved: bool,
 ) -> DnsRestoreOutcome {
     if !resolv_conf_is_ours() {
@@ -1955,69 +2038,148 @@ pub(super) fn restore_resolv_conf_if_ours(
     // re-wrapping it also keeps the count and the banner text single-sourced -
     // wrapping produced a second, differently-worded problem line for the same
     // failure.
+    //
+    // The link comes off a file in the user's data directory, so it is checked
+    // before root makes /etc/resolv.conf point at it: a resolver manager writes
+    // THROUGH that link, and one aimed at an arbitrary file would have it
+    // overwritten. A target that does not look like a resolv.conf falls back to
+    // the bytes, as before MR-2018.
+    let resolv_conf_link = resolv_conf_link.filter(|target| {
+        let plausible = plausible_resolv_conf_link(target);
+        if !plausible {
+            tracing::warn!(
+                "The DNS journal names a resolv.conf symlink target that is not a resolv.conf — \
+                 restoring the file's bytes instead"
+            );
+        }
+        plausible
+    });
     restore_dns(&NetworkSnapshot {
         dns_servers: Vec::new(),
         default_gateway: None,
         default_interface: None,
         uses_systemd_resolved,
         resolv_conf_backup,
+        resolv_conf_link: resolv_conf_link.map(std::path::PathBuf::from),
         resolv_conf_pinned: true,
     })
 }
 
-/// Remove VPN-specific routes.
-async fn remove_routes(
-    endpoint_ip: &str,
-    allowed_ips: &[String],
-    local_network_sharing: bool,
-    default_gateway: Option<&str>,
-    default_interface: Option<&str>,
-) {
-    // Remove endpoint route
-    let _ = cmd("ip")
-        .args(["route", "del", &format!("{}/32", endpoint_ip)])
-        .output();
+/// Could `target` be what a resolver manager links /etc/resolv.conf to? Its
+/// file name must name a resolv.conf: NetworkManager's and resolvconf's
+/// `resolv.conf`, systemd-resolved's `stub-resolv.conf`, WSL's
+/// `/mnt/wsl/resolv.conf`. Checked only for a link read back from the journal.
+fn plausible_resolv_conf_link(target: &str) -> bool {
+    std::path::Path::new(target)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains("resolv"))
+}
 
-    // Remove allowed_ip routes.
-    //
-    // Expanded through the SAME helper configure_routes used, so we delete exactly
-    // the routes we installed. Previously this emitted `ip route del 0.0.0.0/0`,
-    // which on a metric-0 host does not match anything we added (the add had
-    // failed) and instead deletes the HOST'S OWN default — stranding the machine
-    // with no internet after disconnect.
-    let allowed_ips = expand_default_v4(allowed_ips);
-    for cidr in &allowed_ips {
-        let _ = cmd("ip").args(["route", "del", cidr]).output();
+/// Put `path` back as a symlink to `target`, atomically, and PROVE it.
+///
+/// A temporary link is created beside `path` and renamed over it, so a reader
+/// sees either our pin or the link, never neither — the same reason
+/// configure_dns writes through a temp file. Never writes THROUGH the link:
+/// whatever it points at belongs to the resolver manager that owns it.
+///
+/// Verified like a byte restore (see [`resolv_conf_link_read_back_verified`]),
+/// two attempts, because the journal is deleted off this answer.
+fn restore_resolv_conf_link_verified(
+    path: &str,
+    target: &std::path::Path,
+    target_was_readable: bool,
+) -> bool {
+    let path = std::path::Path::new(path);
+    let tmp = path.with_file_name(".resolv.conf.birdo-link");
+    for attempt in 1..=2 {
+        // A stale temp from an earlier, interrupted attempt would make
+        // symlink() fail with EEXIST.
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) =
+            std::os::unix::fs::symlink(target, &tmp).and_then(|()| std::fs::rename(&tmp, path))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::error!(
+                "Could not put {} back as a symlink (attempt {}): {}",
+                path.display(),
+                attempt,
+                e
+            );
+            continue;
+        }
+        let link_after = std::fs::read_link(path).ok();
+        let content_after = std::fs::read_to_string(path).ok();
+        if resolv_conf_link_read_back_verified(
+            target,
+            link_after.as_deref(),
+            content_after.as_deref(),
+            target_was_readable,
+        ) {
+            return true;
+        }
+        tracing::error!(
+            "{} was put back as a symlink but does not read back as the original link to a \
+             resolv.conf that is not ours (attempt {})",
+            path.display(),
+            attempt
+        );
     }
+    false
+}
 
-    // Remove the Local Network Sharing routes too.
-    //
-    // These were installed and NEVER removed, so they outlived the session
-    // pointing at a gateway that stops existing the moment the user changes
-    // network — a stale RFC1918 route to a dead gateway silently blackholes LAN
-    // traffic long after Birdo is closed. Unconditional and best-effort: if LAN
-    // sharing was off there is nothing to delete and the command simply fails.
-    // ONLY if we added them, and QUALIFIED by gateway + device.
-    //
-    // Unconditional deletion repeated the mistake just fixed for the default
-    // route: removing something we never installed. With sharing OFF we add
-    // nothing, so every delete targeted the user's own routes. And a bare
-    // `ip route del <prefix>` matches the lowest-metric entry regardless of
-    // device — on a normal desktop that is NetworkManager's link-scope
-    // 169.254.0.0/16, which we must never touch.
-    //
-    // Qualifying with via/dev is the same argv shape the ADD uses, so a delete
-    // can only ever match a route of ours.
-    if local_network_sharing {
-        if let (Some(gw), Some(iface)) = (default_gateway, default_interface) {
-            for cidr in LAN_SHARING_CIDRS {
-                let _ = cmd("ip")
-                    .args(["route", "del", cidr, "via", gw, "dev", iface])
-                    .output();
-            }
+/// Does a read-back PROVE a symlink restore landed? `link_after` is what
+/// read_link returns now, `content_after` what reading through it returns.
+///
+/// The link must be exactly the original, and what it resolves to must not be
+/// our pin. The CONTENT is deliberately not compared with the bytes captured at
+/// connect: the link's owner may have rewritten its target mid-session (a DHCP
+/// renewal), and following those updates is the whole point of restoring the
+/// link. A target that was readable at connect must still be readable; one
+/// that was dangling then (its daemon not running) is not required to be now.
+fn resolv_conf_link_read_back_verified(
+    target: &std::path::Path,
+    link_after: Option<&std::path::Path>,
+    content_after: Option<&str>,
+    target_was_readable: bool,
+) -> bool {
+    if link_after != Some(target) {
+        return false;
+    }
+    match content_after {
+        Some(content) => !content.starts_with(RESOLV_CONF_MARKER),
+        None => !target_was_readable,
+    }
+}
+
+/// Remove the routes this session added, newest first, each with the exact
+/// qualifiers it was added with (see [`OwnedRoute`]).
+///
+/// Synchronous so Drop can call it. Best-effort: a route through the TUN device
+/// is already gone if the device is, and a failed delete must never stop the
+/// rest of a teardown.
+///
+/// This replaces deleting by prefix, which removed routes we never installed:
+/// the HOST's own default once (`ip route del 0.0.0.0/0` on a metric-0 host),
+/// NetworkManager's link-scope 169.254.0.0/16 (LAN sharing off), and, on a
+/// start that failed because another VPN owned the half-defaults, that VPN's
+/// 0.0.0.0/1 + 128.0.0.0/1 (bug B).
+fn remove_owned_routes(routes: Vec<OwnedRoute>) {
+    if routes.is_empty() {
+        return;
+    }
+    for route in routes.iter().rev() {
+        match cmd("ip").args(route.ip_args("del")).output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => tracing::debug!(
+                "Route {} was already gone at teardown: {}",
+                redact_ip(&route.dst),
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => tracing::warn!("Could not run ip to remove a route: {}", e),
         }
     }
-    tracing::info!("Removed VPN routes");
+    tracing::info!("Removed {} VPN route(s)", routes.len());
 }
 
 /// Capture current network configuration for later restoration.
@@ -2101,12 +2263,18 @@ async fn capture_network_snapshot() -> Result<NetworkSnapshot, String> {
             .collect()
     };
 
+    // MR-2018: a symlinked resolv.conf is restored as the LINK, not as a copy
+    // of what it pointed at (see NetworkSnapshot::resolv_conf_link). Never our
+    // own pin: configure_dns only ever writes a regular file.
+    let resolv_conf_link = std::fs::read_link(RESOLV_CONF).ok();
+
     Ok(NetworkSnapshot {
         dns_servers,
         default_gateway,
         default_interface,
         uses_systemd_resolved: uses_resolved,
         resolv_conf_backup,
+        resolv_conf_link,
         // Set by start() once configure_dns has actually written the file.
         resolv_conf_pinned: false,
     })
@@ -2377,6 +2545,176 @@ mod resolv_conf_restore_tests {
             Some(still_ours.as_str())
         ));
     }
+
+    /// MR-2018: our pin (a regular file) goes back as the SYMLINK it replaced,
+    /// and the link's owner's later updates reach it again. The old restore
+    /// wrote the target's bytes into the pin: a frozen copy.
+    #[test]
+    fn a_symlinked_resolv_conf_is_put_back_as_the_same_link() {
+        use super::restore_resolv_conf_link_verified;
+
+        let dir = tmp_path("link-dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("nm-resolv.conf");
+        std::fs::write(&target, "nameserver 192.168.1.1\n").unwrap();
+        let resolv = dir.join("resolv.conf");
+        std::fs::write(
+            &resolv,
+            format!(
+                "{} — will be restored on disconnect\nnameserver 10.8.0.1\n",
+                RESOLV_CONF_MARKER
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            restore_resolv_conf_link_verified(resolv.to_str().unwrap(), &target, true),
+            "the link restore must verify"
+        );
+        assert_eq!(std::fs::read_link(&resolv).unwrap(), target);
+        assert!(
+            !dir.join(".resolv.conf.birdo-link").exists(),
+            "the temporary link was left behind"
+        );
+        // The link's owner publishes a new config: it reaches resolv.conf.
+        std::fs::write(&target, "nameserver 10.99.0.77\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&resolv).unwrap(),
+            "nameserver 10.99.0.77\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restore that cannot land is not reported as one (the journal is
+    /// deleted off this answer): here the directory is gone.
+    #[test]
+    fn a_link_restore_that_cannot_land_is_never_reported_as_restored() {
+        use super::restore_resolv_conf_link_verified;
+
+        let mut resolv = tmp_path("no-such-link-dir");
+        resolv.push("resolv.conf");
+        assert!(!restore_resolv_conf_link_verified(
+            resolv.to_str().unwrap(),
+            std::path::Path::new("/run/NetworkManager/resolv.conf"),
+            true
+        ));
+    }
+
+    /// The read-back rule: the exact link, resolving to something that is not
+    /// our pin. Content changed by the link's owner mid-session still counts.
+    #[test]
+    fn the_link_read_back_rule() {
+        use super::resolv_conf_link_read_back_verified as verified;
+        use std::path::Path;
+
+        let nm = Path::new("/run/NetworkManager/resolv.conf");
+        let ours = format!("{} pinned\n", RESOLV_CONF_MARKER);
+        assert!(verified(
+            nm,
+            Some(nm),
+            Some("nameserver 192.168.1.1\n"),
+            true
+        ));
+        assert!(
+            verified(nm, Some(nm), Some("nameserver 10.0.0.9\n"), true),
+            "the owner rewrote its file mid-session: still the right link"
+        );
+        assert!(
+            !verified(nm, None, Some("nameserver 192.168.1.1\n"), true),
+            "not a link"
+        );
+        assert!(
+            !verified(nm, Some(Path::new("/tmp/elsewhere")), Some("x"), true),
+            "a different link"
+        );
+        assert!(
+            !verified(nm, Some(nm), Some(ours.as_str()), true),
+            "resolves to our pin"
+        );
+        assert!(
+            !verified(nm, Some(nm), None, true),
+            "readable at connect, dangling now"
+        );
+        assert!(
+            verified(nm, Some(nm), None, false),
+            "dangling at connect too: the link is all there was to restore"
+        );
+    }
+
+    /// Only a link that names a resolv.conf is taken from the journal.
+    #[test]
+    fn only_a_resolv_conf_shaped_link_is_trusted_from_the_journal() {
+        use super::plausible_resolv_conf_link as plausible;
+
+        for ok in [
+            "/run/NetworkManager/resolv.conf",
+            "../run/systemd/resolve/stub-resolv.conf",
+            "/run/resolvconf/resolv.conf",
+            "/mnt/wsl/resolv.conf",
+        ] {
+            assert!(plausible(ok), "{ok}");
+        }
+        for bad in ["/etc/shadow", "/root/.ssh/authorized_keys", "", "/"] {
+            assert!(!plausible(bad), "{bad}");
+        }
+    }
+}
+
+/// Bug B: a route is deleted with exactly the qualifiers it was added with.
+/// Pure, so it runs unprivileged in the Linux loop of tests.yml.
+#[cfg(test)]
+mod owned_route_tests {
+    use super::{take_owned_routes, OwnedRoute, OwnedRoutes};
+
+    #[test]
+    fn the_delete_is_qualified_exactly_as_the_add() {
+        let half = OwnedRoute {
+            dst: "0.0.0.0/1".into(),
+            via: None,
+            dev: "birdo0".into(),
+        };
+        assert_eq!(
+            half.ip_args("add"),
+            ["route", "add", "0.0.0.0/1", "dev", "birdo0"]
+        );
+        assert_eq!(
+            half.ip_args("del"),
+            ["route", "del", "0.0.0.0/1", "dev", "birdo0"]
+        );
+
+        let endpoint = OwnedRoute {
+            dst: "203.0.113.7/32".into(),
+            via: Some("192.168.1.1".into()),
+            dev: "eth0".into(),
+        };
+        assert_eq!(
+            endpoint.ip_args("del"),
+            [
+                "route",
+                "del",
+                "203.0.113.7/32",
+                "via",
+                "192.168.1.1",
+                "dev",
+                "eth0"
+            ]
+        );
+    }
+
+    /// Teardown takes the routes exactly once: stop(), the unwind and Drop
+    /// cannot each delete the same set (or a later session's routes).
+    #[test]
+    fn owned_routes_are_taken_once() {
+        let owned = OwnedRoutes::default();
+        owned.lock().unwrap().push(OwnedRoute {
+            dst: "0.0.0.0/1".into(),
+            via: None,
+            dev: "birdo0".into(),
+        });
+        assert_eq!(take_owned_routes(&owned).len(), 1);
+        assert!(take_owned_routes(&owned).is_empty());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2588,5 +2926,423 @@ mod configure_ipv6_tests {
             err.contains("route add") || err.contains("File exists"),
             "refused, but not for the collision: {err}"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Teardown on a real Linux network stack: MR-764 (a dropped or failed start
+// leaves no birdo0), bug B (a failed start leaves another VPN's routes alone)
+// and MR-2018 (a symlinked /etc/resolv.conf comes back as the same symlink).
+//
+// These create birdo0, add and delete routes and rewrite /etc/resolv.conf, so
+// they run ONLY inside a private network + mount namespace that
+// scripts/ci/linux-netns-tests.sh builds: an overlay over /etc, a tmpfs /run,
+// a dummy uplink with a default route (nothing answers on it), and stand-ins
+// for systemctl/resolvectl so the host's systemd-resolved is never touched.
+// Every test refuses to run anywhere else. CI runs them as root in the Linux
+// job; locally:
+//
+//   sudo -E unshare --net --mount --fork --propagation private \
+//     bash scripts/ci/linux-netns-tests.sh "$(command -v cargo)"
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod netns_teardown_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    /// The relay. Routed via the dummy uplink, so start() can connect its UDP
+    /// socket and install every route; nothing ever answers.
+    const ENDPOINT: &str = "10.99.0.7:51820";
+    const RELAY: &str = "10.99.0.7";
+    const FIXTURE: &str = "# netns test fixture\nnameserver 10.99.0.1\noptions edns0\n";
+    /// Where NetworkManager keeps the file it links /etc/resolv.conf to.
+    const NM_RESOLV_CONF: &str = "/run/NetworkManager/resolv.conf";
+
+    /// Refuse to run outside the namespace the CI script builds. PID 1 is the
+    /// host's init (the script does not unshare the PID namespace), so a
+    /// namespace that is still PID 1's is the host's.
+    fn assert_isolated() {
+        for kind in ["net", "mnt"] {
+            let ours = std::fs::read_link(format!("/proc/self/ns/{kind}")).ok();
+            let host = std::fs::read_link(format!("/proc/1/ns/{kind}")).ok();
+            assert!(
+                ours.is_some() && host.is_some() && ours != host,
+                "refusing to run outside a private {kind} namespace: these tests rewrite routes \
+                 and /etc/resolv.conf. Run scripts/ci/linux-netns-tests.sh under sudo unshare."
+            );
+        }
+        assert_eq!(
+            std::env::var("BIRDO_NETNS_TESTS").as_deref(),
+            Ok("1"),
+            "not started by scripts/ci/linux-netns-tests.sh"
+        );
+    }
+
+    fn ip(args: &[&str]) -> (bool, String) {
+        match cmd("ip").args(args).output() {
+            Ok(o) => (
+                o.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (false, e.to_string()),
+        }
+    }
+
+    /// The routing state these tests reason about, read in-process: the TUN
+    /// fd dies with the process, so only a read taken while the process is
+    /// alive can see a leaked device.
+    #[derive(Debug)]
+    struct Net {
+        birdo0: bool,
+        /// 0.0.0.0/1 and 128.0.0.0/1, whichever device holds them.
+        halves: String,
+        /// Host routes to the relay, whichever device holds them.
+        relay_routes: String,
+    }
+
+    fn net() -> Net {
+        Net {
+            birdo0: ip(&["link", "show", TUN_DEVICE_NAME]).0,
+            halves: format!(
+                "{}{}",
+                ip(&["route", "show", "0.0.0.0/1"]).1,
+                ip(&["route", "show", "128.0.0.0/1"]).1
+            ),
+            relay_routes: ip(&["route", "show", RELAY]).1,
+        }
+    }
+
+    impl Net {
+        fn nothing_of_ours(&self) -> bool {
+            !self.birdo0
+                && !self.halves.contains(TUN_DEVICE_NAME)
+                && !self.relay_routes.contains("uplink0")
+        }
+    }
+
+    fn config() -> VpnConfig {
+        use base64::Engine as _;
+        VpnConfig {
+            server_id: "netns".into(),
+            key_id: "netns".into(),
+            public_key: String::new(),
+            server_public_key: base64::engine::general_purpose::STANDARD
+                .encode(WgPrivateKey::generate().public_key().as_bytes()),
+            preshared_key: None,
+            endpoint: ENDPOINT.into(),
+            allowed_ips: vec!["0.0.0.0/0".into()],
+            dns: vec!["10.66.0.53".into()],
+            custom_dns: false,
+            client_ip: "10.66.0.2".into(),
+            client_ipv6: None,
+            allowed_ips_v6: vec![],
+            mtu: 1420,
+            persistent_keepalive: 25,
+        }
+    }
+
+    async fn tunnel() -> LinuxTunnel {
+        LinuxTunnel::create(config(), false)
+            .await
+            .expect("create the tunnel")
+    }
+
+    /// /etc/resolv.conf as a plain file (the overlay keeps this private).
+    fn plain_resolv_conf() {
+        let _ = std::fs::remove_file(RESOLV_CONF);
+        std::fs::write(RESOLV_CONF, FIXTURE).expect("write the resolv.conf fixture");
+    }
+
+    /// /etc/resolv.conf as NetworkManager leaves it: a symlink into /run.
+    fn symlinked_resolv_conf() -> PathBuf {
+        std::fs::create_dir_all("/run/NetworkManager").expect("mkdir /run/NetworkManager");
+        std::fs::write(NM_RESOLV_CONF, FIXTURE).expect("write NetworkManager's resolv.conf");
+        let _ = std::fs::remove_file(RESOLV_CONF);
+        std::os::unix::fs::symlink(NM_RESOLV_CONF, RESOLV_CONF).expect("link /etc/resolv.conf");
+        PathBuf::from(NM_RESOLV_CONF)
+    }
+
+    /// (symlink target, content read through it).
+    fn resolv_conf() -> (Option<PathBuf>, Option<String>) {
+        (
+            std::fs::read_link(RESOLV_CONF).ok(),
+            std::fs::read_to_string(RESOLV_CONF).ok(),
+        )
+    }
+
+    /// The link's owner publishes a new config: does it reach /etc/resolv.conf?
+    fn link_owner_updates_reach_resolv_conf(target: &Path) -> bool {
+        std::fs::write(target, "nameserver 10.99.0.77\n").expect("update the link target");
+        std::fs::read_to_string(RESOLV_CONF).is_ok_and(|c| c.contains("10.99.0.77"))
+    }
+
+    async fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        done()
+    }
+
+    type SnapshotGuard = tokio::sync::OwnedRwLockReadGuard<Option<NetworkSnapshot>>;
+
+    /// Run `start` (a LinuxTunnel::start) in its own task and PARK it with
+    /// everything installed — birdo0, the endpoint route, both halves, the
+    /// leak block, /etc/resolv.conf pinned — and `running` still false: the
+    /// state a CONNECT_TIMEOUT drops. The test's read guard on the snapshot
+    /// stops start() at the write that records the pin.
+    async fn spawn_parked_after_dns_pin(
+        snapshot: Arc<RwLock<Option<NetworkSnapshot>>>,
+        start: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> (tokio::task::JoinHandle<()>, SnapshotGuard) {
+        let task = tokio::spawn(start);
+        assert!(
+            wait_until(Duration::from_secs(10), || snapshot
+                .try_read()
+                .is_ok_and(|s| s.is_some()))
+            .await,
+            "start() never captured its snapshot"
+        );
+        let guard = Arc::clone(&snapshot).read_owned().await;
+        assert!(
+            wait_until(Duration::from_secs(15), resolv_conf_is_ours).await,
+            "start() never pinned /etc/resolv.conf: {:?}",
+            net()
+        );
+        // Give start() time to reach the write it parks on: it cannot get
+        // past it while the guard is held.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "start() was not parked: it finished before the guard was taken"
+        );
+        let parked = net();
+        assert!(
+            parked.birdo0
+                && parked.halves.contains(TUN_DEVICE_NAME)
+                && parked.relay_routes.contains("uplink0"),
+            "precondition: birdo0, both halves and the endpoint route are in: {parked:?}"
+        );
+        (task, guard)
+    }
+
+    /// MR-764 + LOW: start() cancelled with everything installed — the
+    /// manager's CONNECT_TIMEOUT drops the future, and the tunnel with it.
+    /// Drop must leave no birdo0, no half-default through it, no endpoint host
+    /// route (that one used to stay), and resolv.conf as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_start_dropped_after_routes_and_dns_leaves_nothing_behind() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        let tunnel = tunnel().await;
+        let snapshot = Arc::clone(&tunnel.network_snapshot);
+        let (task, guard) = spawn_parked_after_dns_pin(snapshot, async move {
+            let result = tunnel.start(WgPrivateKey::generate()).await;
+            // Reached only if start() was never parked; the caller asserts it was.
+            eprintln!("start() was meant to be cancelled, but returned {result:?}");
+        })
+        .await;
+
+        task.abort();
+        let joined = task.await;
+        assert!(
+            joined.as_ref().is_err_and(|e| e.is_cancelled()),
+            "the start task was not cancelled: {joined:?}"
+        );
+        drop(guard);
+
+        let after = net();
+        assert!(
+            after.nothing_of_ours(),
+            "the dropped tunnel left state behind: {after:?}"
+        );
+        assert_eq!(
+            resolv_conf(),
+            before,
+            "Drop did not put /etc/resolv.conf back"
+        );
+    }
+
+    /// NEGATIVE CONTROL for the probe above: the same cancel, but the tunnel
+    /// outlives its start() future, so its Drop does not run — what a
+    /// LinuxTunnel without `impl Drop` left behind. The probe must SEE the
+    /// device, or the test above proves nothing. Then cleaned up for real.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn control_without_drop_the_probe_sees_the_leaked_device() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+        // ManuallyDrop: even the last handle going away must not run Drop
+        // here; the control is the state without it.
+        let tunnel = Arc::new(std::mem::ManuallyDrop::new(tunnel().await));
+        let snapshot = Arc::clone(&tunnel.network_snapshot);
+        let in_task = Arc::clone(&tunnel);
+        let (task, guard) = spawn_parked_after_dns_pin(snapshot, async move {
+            let result = in_task.start(WgPrivateKey::generate()).await;
+            // Reached only if start() was never parked; the caller asserts it was.
+            eprintln!("start() was meant to be cancelled, but returned {result:?}");
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        drop(guard);
+
+        let leaked = net();
+        assert!(
+            leaked.birdo0 && leaked.halves.contains(TUN_DEVICE_NAME),
+            "CONTROL: with Drop suppressed the probe must see birdo0 and its routes: {leaked:?}"
+        );
+
+        // Clean up through the real unwind, then prove that too.
+        tunnel.unwind_failed_start().await;
+        let after = net();
+        assert!(
+            after.nothing_of_ours(),
+            "the unwind left state behind: {after:?}"
+        );
+        assert_eq!(resolv_conf(), before);
+    }
+
+    /// Bug B + MR-764 (unwind): another VPN (OpenVPN's redirect-gateway def1)
+    /// already owns 0.0.0.0/1 + 128.0.0.0/1 and a host route to the relay, so
+    /// our start fails on the first half. The unwind used to delete all three
+    /// of ITS routes by prefix; it must delete only ours, and leave no birdo0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_failed_start_leaves_another_vpns_routes_alone() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+
+        struct OtherVpn;
+        impl Drop for OtherVpn {
+            fn drop(&mut self) {
+                let _ = ip(&["link", "del", "othervpn"]);
+            }
+        }
+        let _ = ip(&["link", "del", "othervpn"]);
+        assert!(ip(&["link", "add", "othervpn", "type", "dummy"]).0);
+        let _other = OtherVpn;
+        for args in [
+            &["link", "set", "othervpn", "up"][..],
+            &["route", "add", "0.0.0.0/1", "dev", "othervpn"],
+            &["route", "add", "128.0.0.0/1", "dev", "othervpn"],
+            &["route", "add", RELAY, "dev", "othervpn"],
+        ] {
+            let (ok, out) = ip(args);
+            assert!(ok, "ip {args:?}: {out}");
+        }
+
+        let tunnel = tunnel().await;
+        let result = tunnel.start(WgPrivateKey::generate()).await;
+        let err = result.expect_err("start() must fail: another VPN owns the half-defaults");
+        assert!(
+            err.contains("0.0.0.0/1"),
+            "failed for another reason: {err}"
+        );
+
+        let after = net();
+        assert!(!after.birdo0, "the unwind left birdo0 behind: {after:?}");
+        for (prefix, out) in [
+            ("0.0.0.0/1", ip(&["route", "show", "0.0.0.0/1"]).1),
+            ("128.0.0.0/1", ip(&["route", "show", "128.0.0.0/1"]).1),
+            (RELAY, after.relay_routes.clone()),
+        ] {
+            assert!(
+                out.contains("dev othervpn"),
+                "our failed start deleted the other VPN's {prefix} route: {out:?}"
+            );
+        }
+        assert_eq!(resolv_conf(), before);
+    }
+
+    /// MR-2018: a symlinked /etc/resolv.conf is the SAME symlink after a
+    /// connect + disconnect, and its owner's later updates still reach it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_symlinked_resolv_conf_is_the_same_symlink_after_disconnect() {
+        assert_isolated();
+        let target = symlinked_resolv_conf();
+        let before = resolv_conf();
+
+        let tunnel = tunnel().await;
+        tunnel
+            .start(WgPrivateKey::generate())
+            .await
+            .expect("start() against the namespace's dummy uplink");
+        assert!(
+            resolv_conf_is_ours(),
+            "precondition: connected, resolv.conf is pinned"
+        );
+        tunnel.stop().await.expect("stop()");
+
+        assert_eq!(
+            resolv_conf(),
+            before,
+            "not the original symlink after disconnect"
+        );
+        assert!(
+            link_owner_updates_reach_resolv_conf(&target),
+            "/etc/resolv.conf is a detached copy: the link owner's update no longer reaches it"
+        );
+        assert!(net().nothing_of_ours());
+    }
+
+    /// MR-2018, crash path: the session dies with resolv.conf pinned, and the
+    /// startup reconcile — the journal and the live file are all it reads —
+    /// must put the symlink back too, not a frozen copy of its target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_symlinked_resolv_conf_is_the_same_symlink_after_journal_recovery() {
+        assert_isolated();
+        let target = symlinked_resolv_conf();
+        let before = resolv_conf();
+
+        let tunnel = tunnel().await;
+        tunnel
+            .start(WgPrivateKey::generate())
+            .await
+            .expect("start() against the namespace's dummy uplink");
+        assert!(
+            resolv_conf_is_ours(),
+            "precondition: connected, resolv.conf is pinned"
+        );
+
+        // What the next launch runs after a SIGKILL. It reads only the journal
+        // and the live file; the tunnel still being up is irrelevant to it.
+        assert!(
+            crate::vpn::dns_journal::reconcile(),
+            "the journal-driven recovery restored nothing"
+        );
+        assert_eq!(
+            resolv_conf(),
+            before,
+            "not the original symlink after recovery"
+        );
+        assert!(
+            link_owner_updates_reach_resolv_conf(&target),
+            "/etc/resolv.conf is a detached copy after recovery"
+        );
+
+        // Cleanup. The tunnel's own snapshot still says it pinned the file, so
+        // the disconnect puts the same link back once more; still the original.
+        tunnel.stop().await.expect("stop()");
+        assert_eq!(
+            resolv_conf().0,
+            before.0,
+            "the disconnect changed the restored link"
+        );
+        assert!(net().nothing_of_ours());
     }
 }

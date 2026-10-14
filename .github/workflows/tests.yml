@@ -255,7 +255,8 @@ jobs:
           OS: ${{ matrix.os }}
           # Linux: resolv_conf_restore_tests + tun_read_tests (F6: the packet
           # loop's buffer-reuse helper, run on a pipe fd; and the TUN fd's
-          # close-on-exec check). macOS: dns_journal_restore_tests
+          # close-on-exec check) + owned_route_tests (bug B: a route is deleted
+          # exactly as it was added). macOS: dns_journal_restore_tests
           # (restore_services_pass, interpret_dns_query, dns_write_verified)
           # and utun_fd_tests (the utun socket is close-on-exec, checked
           # unprivileged). Both: log_retention::tests,
@@ -268,13 +269,14 @@ jobs:
           # MR-849 test (Drop kills xray by its recorded PID while the slot is
           # held) is Unix-only. Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests' || 'resolv_conf_restore_tests tun_read_tests log_retention::tests file_log::tests safe_fs::tests xray::tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
-          # FILTER plus the root-only ipv6 step further down, whose tests are
-          # #[ignore]d and so cannot run in the loop above.
-          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests' || 'configure_ipv6_tests ipv6_leak_block_tests resolv_conf_restore_tests tun_read_tests' }}
+          # FILTER plus the root-only steps further down (ipv6, the netns
+          # teardown tests), whose tests are #[ignore]d and so cannot run in
+          # the loop above.
+          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests' || 'configure_ipv6_tests ipv6_leak_block_tests netns_teardown_tests owned_route_tests resolv_conf_restore_tests tun_read_tests' }}
         run: |
           set -euo pipefail
           # $FILTER/$COVERED are space-separated lists; split them explicitly
@@ -464,6 +466,36 @@ jobs:
           # by before: a green job proving only that a filter typo compiled.
           if ! echo "$out" | grep -qE 'test result: ok\. 2 passed'; then
             echo "::error::configure_ipv6_tests did not run both tests"
+            exit 1
+          fi
+
+      # The tunnel's teardown on a REAL network stack, in a private network +
+      # mount namespace the script builds (an overlay over /etc, a tmpfs over
+      # /run, a dummy uplink; systemctl/resolvectl stand-ins so the runner's
+      # systemd-resolved is never touched). MR-764: a start cancelled with
+      # everything installed, or one that fails, leaves no birdo0 and no route
+      # of ours - with a control that suppresses Drop to prove the probe sees
+      # a leaked device. Bug B: a start that fails because another VPN owns
+      # 0.0.0.0/1 + 128.0.0.0/1 leaves that VPN's routes alone. MR-2018: a
+      # symlinked /etc/resolv.conf is the same symlink after a disconnect and
+      # after the journal-driven crash recovery. The tests refuse to run
+      # outside that namespace.
+      - name: Tunnel teardown tests (Linux, root, private net+mount namespace)
+        if: matrix.os == 'linux'
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          out=$(sudo -E unshare --net --mount --fork --propagation private \
+            bash ../scripts/ci/linux-netns-tests.sh "$(command -v cargo)") || {
+            echo "$out"
+            echo "::error::netns_teardown_tests failed"
+            exit 1
+          }
+          echo "$out"
+          # Five tests, all required: an --ignored filter that matches nothing
+          # still exits 0.
+          if ! grep -qE 'test result: ok\. 5 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all five tests"
             exit 1
           fi
 
