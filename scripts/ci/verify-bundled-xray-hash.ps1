@@ -20,9 +20,14 @@
 #
 # Standalone usage (any Windows box with 7-Zip):
 #   pwsh scripts/ci/verify-bundled-xray-hash.ps1 `
-#       -Installer 'BirdoVPN_1.4.42_x64-setup.exe' -ExpectedSha256 <64 hex>
+#       -Installer 'BirdoVPN_1.4.42_x64-setup.exe' -ExpectedSha256 <64 hex> `
+#       -ExpectedNotices src-tauri/resources/THIRD-PARTY-NOTICES.txt
 # Exit 0 only when the extracted resources\xray.exe hashes to ExpectedSha256
-# (and, with -RequireAuthenticode, carries a Valid Authenticode signature).
+# (and, with -RequireAuthenticode, carries a Valid Authenticode signature),
+# and the installer carries exactly one resources\THIRD-PARTY-NOTICES.txt,
+# byte-identical to -ExpectedNotices: the notices this build generated
+# (scripts/generate-third-party-notices.mjs, MR-1685). -ExpectedNotices is
+# required, like the hash.
 # Every other outcome - missing 7z, missing installer, no/ambiguous inner
 # xray.exe, EMPTY expected hash (the GITHUB_ENV-never-set case), mismatch -
 # exits 1 with a ::error:: line so the CI job fails loudly.
@@ -37,6 +42,9 @@ param(
     # Deliberately NOT Mandatory: an empty string must reach the validation
     # below and fail with a clear message, not a PowerShell prompt/exception.
     [string]$ExpectedSha256 = '',
+    # The THIRD-PARTY-NOTICES.txt this build generated. Not Mandatory for the
+    # same reason: a missing value fails below with a message.
+    [string]$ExpectedNotices = '',
     [string]$SevenZip = '7z',
     [switch]$RequireAuthenticode,
     # Where to extract. Default: a fresh directory under $env:RUNNER_TEMP
@@ -57,6 +65,11 @@ if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
     Fail "ExpectedSha256 is not a 64-hex SHA-256 (got '$ExpectedSha256'). An empty value means the build never captured XRAY_BINARY_SHA256 - the app would refuse xray at runtime, refusing the bundle."
 }
 $expected = $ExpectedSha256.ToLowerInvariant()
+
+if (-not $ExpectedNotices -or -not (Test-Path -LiteralPath $ExpectedNotices -PathType Leaf) -or (Get-Item -LiteralPath $ExpectedNotices).Length -eq 0) {
+    Fail "ExpectedNotices must name this build's generated THIRD-PARTY-NOTICES.txt (got '$ExpectedNotices') - without it the installer cannot be checked for its third-party notices (MR-1685)"
+}
+$expectedNotices = (Get-FileHash -LiteralPath $ExpectedNotices -Algorithm SHA256).Hash.ToLowerInvariant()
 
 if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
     Fail "installer not found: $Installer"
@@ -118,5 +131,17 @@ if ($RequireAuthenticode) {
 }
 
 Write-Host "OK: bundled resources\xray.exe matches XRAY_BINARY_SHA256 ($actual)"
+
+# --- Third-party notices (MR-1685) --------------------------------------------
+$notices = @(Get-ChildItem -Path $ExtractDir -Recurse -File -Filter 'THIRD-PARTY-NOTICES.txt' |
+    Where-Object { $_.Directory.Name -ieq 'resources' })
+if ($notices.Count -ne 1) {
+    Fail "expected one resources\THIRD-PARTY-NOTICES.txt inside $installerPath, found $($notices.Count) - the installer would ship without its third-party licence notices (MR-1685)"
+}
+$noticesActual = (Get-FileHash -LiteralPath $notices[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($noticesActual -ne $expectedNotices) {
+    Fail "the bundled resources\THIRD-PARTY-NOTICES.txt ($noticesActual) is not the file this build generated ($ExpectedNotices, $expectedNotices)"
+}
+Write-Host "OK: bundled resources\THIRD-PARTY-NOTICES.txt is this build's ($noticesActual)"
 Remove-Item -LiteralPath $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
 exit 0

@@ -7,6 +7,7 @@ pub mod biometric;
 pub mod clipboard;
 pub mod ipc_error;
 pub mod killswitch;
+pub mod licences;
 pub mod logs;
 pub mod oauth;
 pub mod servers;

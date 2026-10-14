@@ -42,6 +42,9 @@ yarn-error.log*
 # Wintun DLL (downloaded at build time)
 wintun.dll
 
+# Third-party notices, generated per build by scripts/generate-third-party-notices.mjs (MR-1685)
+src-tauri/resources/THIRD-PARTY-NOTICES.txt
+
 # Tauri updater signing keys
 .tauri/
 *.key

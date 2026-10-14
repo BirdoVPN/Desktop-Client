@@ -174,6 +174,8 @@ fn ipc_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         commands::updater::install_update,
         commands::updater::get_required_update,
         commands::update_resume::take_update_resume, // MR-1861: the session an update ended
+        // Settings › About › Licences (MR-1685)
+        commands::licences::get_third_party_notices,
         // Extended VPN info
         commands::vpn::get_subscription_status,
         commands::vpn::get_usage_stats,

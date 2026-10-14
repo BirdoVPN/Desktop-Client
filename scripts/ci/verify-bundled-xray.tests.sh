@@ -17,6 +17,8 @@
 #          hash not compiled into the app binary (stale option_env!)
 #          a dotfile under resources/ (.app, AppImage, .deb; #256's .gitkeep)
 #          empty / non-hex expected hash (GITHUB_ENV never set)
+#          no resources/THIRD-PARTY-NOTICES.txt, or not this build's (MR-1685)
+#          NOTICES_FILE unset or naming a missing file
 #          missing artifact, unknown artifact kind, tarball with two .app dirs
 #          one bad artifact among good ones still fails the whole call
 #
@@ -41,6 +43,14 @@ sha256_of() {
 payload="$work/payload.bin"
 LC_ALL=C awk 'BEGIN { for (i = 0; i < 4096; i++) printf "%c", (i * 7 + 13) % 256 }' </dev/null >"$payload"
 good_sha="$(sha256_of "$payload")"
+# The notices this "build" generated (check 7). Exported: every gate run
+# below inherits it, as release.yml's steps do.
+notices="$work/THIRD-PARTY-NOTICES.txt"
+printf 'THIRD-PARTY SOFTWARE NOTICES - fixture
+
+Xray-core v0.0.0
+' >"$notices"
+export NOTICES_FILE="$notices"
 other_sha="$(printf 'not the payload' | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | awk '{print $1}')"
 
 # --- fixture builders ---------------------------------------------------------
@@ -55,6 +65,8 @@ make_app() {
     cp "$bytes" "$app/$rel"
     chmod "$mode" "$app/$rel"
   fi
+  mkdir -p "$app/Contents/Resources/resources"
+  cp "$notices" "$app/Contents/Resources/resources/THIRD-PARTY-NOTICES.txt"
 }
 
 # make_linux_root <root> [xray_rel] [compiled_sha] [xray_mode] [bytes_file]
@@ -68,6 +80,8 @@ make_linux_root() {
     cp "$bytes" "$root/$rel"
     chmod "$mode" "$root/$rel"
   fi
+  mkdir -p "$root/usr/lib/BirdoVPN/resources"
+  cp "$notices" "$root/usr/lib/BirdoVPN/resources/THIRD-PARTY-NOTICES.txt"
 }
 
 # make_appimage <out.AppImage> <root>: a shell script that unpacks <root> into
@@ -160,6 +174,21 @@ make_app "$work/two/B.app"
 make_tar "$work/two.app.tar.gz" "$work/two"
 expect 1 'tarball with two .app dirs fails' 'exactly one top-level .app' -- "$good_sha" "$work/two.app.tar.gz"
 
+# MR-1685: the notices this build generated, in every package.
+make_app "$work/nonotices/BirdoVPN.app"
+rm "$work/nonotices/BirdoVPN.app/Contents/Resources/resources/THIRD-PARTY-NOTICES.txt"
+make_tar "$work/nonotices.app.tar.gz" "$work/nonotices"
+expect 1 '.app.tar.gz without THIRD-PARTY-NOTICES.txt fails' 'found 0 - the package would ship without its third-party licence notices' -- "$good_sha" "$work/nonotices.app.tar.gz"
+make_app "$work/oldnotices/BirdoVPN.app"
+printf 'notices from another build
+' >"$work/oldnotices/BirdoVPN.app/Contents/Resources/resources/THIRD-PARTY-NOTICES.txt"
+expect 1 '.app with another build'"'"'s notices fails' 'is not the file this build generated' -- "$good_sha" "$work/oldnotices/BirdoVPN.app"
+make_app "$work/misplacednotices/BirdoVPN.app"
+mv "$work/misplacednotices/BirdoVPN.app/Contents/Resources/resources/THIRD-PARTY-NOTICES.txt" "$work/misplacednotices/BirdoVPN.app/Contents/Resources/"
+expect 1 'notices outside resources/ fails' 'found 0' -- "$good_sha" "$work/misplacednotices/BirdoVPN.app"
+NOTICES_FILE='' expect 1 'NOTICES_FILE unset fails' 'NOTICES_FILE must name' -- "$good_sha" "$work/good.app.tar.gz"
+NOTICES_FILE="$work/no-such-notices.txt" expect 1 'NOTICES_FILE naming a missing file fails' 'NOTICES_FILE must name' -- "$good_sha" "$work/good.app.tar.gz"
+
 expect 1 'empty expected hash fails' 'never captured XRAY_BINARY_SHA256' -- '' "$work/good.app.tar.gz"
 expect 1 'non-hex expected hash fails' 'not 64 hex' -- 'not-a-sha' "$work/good.app.tar.gz"
 expect 1 'missing artifact fails' 'not found' -- "$good_sha" "$work/does-not-exist.app.tar.gz"
@@ -186,8 +215,13 @@ make_linux_root "$work/lroot-bad" usr/lib/BirdoVPN/resources/xray "$good_sha" 75
 make_appimage "$work/bad.AppImage" "$work/lroot-bad"
 expect 1 'AppImage with rewritten xray fails' 'v1.4.40/v1.4.41' -- "$good_sha" "$work/bad.AppImage"
 
+make_linux_root "$work/lroot-nonotices"
+rm "$work/lroot-nonotices/usr/lib/BirdoVPN/resources/THIRD-PARTY-NOTICES.txt"
+make_appimage "$work/nonotices.AppImage" "$work/lroot-nonotices"
+expect 1 'AppImage without THIRD-PARTY-NOTICES.txt fails' 'found 0 - the package would ship without its third-party licence notices' -- "$good_sha" "$work/nonotices.AppImage"
+
 if command -v dpkg-deb >/dev/null 2>&1; then
-  for v in good bad gitkeep; do
+  for v in good bad gitkeep nonotices; do
     d="$work/deb-$v"
     case "$v" in
       good) make_linux_root "$d" ;;
@@ -196,6 +230,10 @@ if command -v dpkg-deb >/dev/null 2>&1; then
         make_linux_root "$d"
         : >"$d/usr/lib/BirdoVPN/resources/.gitkeep" # v1.4.46's .deb
         ;;
+      nonotices)
+        make_linux_root "$d"
+        rm "$d/usr/lib/BirdoVPN/resources/THIRD-PARTY-NOTICES.txt"
+        ;;
     esac
     mkdir -p "$d/DEBIAN"
     printf 'Package: birdo-selftest\nVersion: 1.0\nArchitecture: amd64\nMaintainer: ci\nDescription: gate fixture\n' >"$d/DEBIAN/control"
@@ -203,6 +241,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
   done
   expect 0 '.deb passes' 'OK: every artifact' -- "$good_sha" "$work/good.deb"
   expect 1 '.deb with rewritten xray fails' 'v1.4.40/v1.4.41' -- "$good_sha" "$work/bad.deb"
+  expect 1 '.deb without THIRD-PARTY-NOTICES.txt fails' 'found 0' -- "$good_sha" "$work/nonotices.deb"
   expect 1 '.deb with resources/.gitkeep fails' 'usr/lib/BirdoVPN/resources/.gitkeep - a dotfile under resources/' -- "$good_sha" "$work/gitkeep.deb"
 else
   echo "SKIP  .deb scenarios (no dpkg-deb on this OS; the Linux leg runs them)"

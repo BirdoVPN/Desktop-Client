@@ -407,6 +407,8 @@ const FRONTEND_COMMANDS = [
   'get_required_update',
   // The session an update ended, resumed once (MR-1861)
   'take_update_resume',
+  // Settings › About › Licences: the bundled third-party notices (MR-1685)
+  'get_third_party_notices',
   // Account data
   'get_subscription_status',
   'get_usage_stats',
