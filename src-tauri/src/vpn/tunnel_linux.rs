@@ -875,20 +875,28 @@ mod tun_read_tests {
         n == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
     }
 
-    /// MR-820: the tunnel letting go of the fd (stop() or Drop) while a
-    /// blocking read the loop detached still holds it must not free its
-    /// NUMBER. The old raw `close(fd)` did, and pipe()/open() hand out the
-    /// lowest free number — that one — so the late read landed on whatever
-    /// the process opened next. Held, the number cannot be handed out again.
-    #[test]
-    fn a_held_fd_keeps_its_number_until_the_last_holder_lets_go() {
+    /// MR-820: when stop()'s close runs out of patience with a read the loop
+    /// detached (`close_when_idle` past its wait: Deferred), the fd's NUMBER
+    /// must stay taken until that read lets go. The old raw `close(fd)` freed
+    /// it at once, and pipe()/open() hand out the lowest free number — that
+    /// one — so the late read landed on whatever the process opened next.
+    #[tokio::test]
+    async fn a_deferred_close_keeps_the_number_until_the_detached_read_lets_go() {
+        use crate::vpn::device_fd::{close_when_idle, CloseOutcome, DeviceSlot};
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::sync::Arc;
 
         let (r, w) = nonblocking_pipe();
-        let tunnels_ref = Arc::new(unsafe { OwnedFd::from_raw_fd(r) });
-        let in_flight = Arc::clone(&tunnels_ref);
-        drop(tunnels_ref); // what stop()/Drop do with their reference
+        let slot: DeviceSlot<OwnedFd> =
+            tokio::sync::RwLock::new(Some(Arc::new(unsafe { OwnedFd::from_raw_fd(r) })));
+        // A read the loop handed to the blocking pool, still holding the fd.
+        let in_flight = Arc::clone(slot.read().await.as_ref().unwrap());
+
+        assert_eq!(
+            close_when_idle(&slot, std::time::Duration::from_millis(20)).await,
+            CloseOutcome::Deferred
+        );
+        assert!(slot.read().await.is_none(), "stop()'s reference is gone");
 
         let (r2, w2) = nonblocking_pipe();
         assert_ne!(r2, r, "the held fd's number was handed out again");
@@ -912,6 +920,47 @@ mod tun_read_tests {
             libc::close(r2);
             libc::close(w2);
         }
+    }
+
+    /// Review of MR-820: the close above relies on every read returning at
+    /// once, so a device fd that cannot be made non-blocking is refused, not
+    /// warned about. A BLOCKING pipe with nothing in it stands in for an idle
+    /// device: after set_nonblocking the read returns at once (EAGAIN) instead
+    /// of hanging. A bad descriptor is an error, not a silent pass.
+    #[test]
+    fn set_nonblocking_makes_an_idle_read_return_and_refuses_a_bad_fd() {
+        use crate::vpn::device_fd::set_nonblocking;
+
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        assert_eq!(
+            unsafe { libc::fcntl(r, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0,
+            "the pipe starts out blocking"
+        );
+
+        set_nonblocking(r).expect("a valid fd");
+        // Checked before reading, so a regression fails here instead of
+        // hanging the job in a blocking read.
+        assert_ne!(
+            unsafe { libc::fcntl(r, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0,
+            "O_NONBLOCK was not set"
+        );
+        let started = std::time::Instant::now();
+        let (_, n) = tun_read_owned(r, vec![0u8; 8]);
+        assert_eq!(n, None, "an idle read must come back empty (EAGAIN)");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        unsafe {
+            libc::close(w);
+            libc::close(r);
+        }
+        assert!(
+            set_nonblocking(-1).is_err(),
+            "a bad fd passed as non-blocking"
+        );
     }
 
     /// MR-820: stop()'s close waits for the blocking read the loop detached,
@@ -1131,21 +1180,13 @@ fn create_tun_device() -> Result<(String, OwnedFd), String> {
         .unwrap_or(libc::IFNAMSIZ);
     let tun_name = String::from_utf8_lossy(&ifr.ifr_name[..name_end]).to_string();
 
-    // Set non-blocking mode
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        let set_ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        if set_ret < 0 {
-            tracing::warn!(
-                "Failed to set O_NONBLOCK on TUN fd: {} (device may remain blocking)",
-                std::io::Error::last_os_error()
-            );
-        }
-    } else {
-        tracing::warn!(
-            "fcntl F_GETFL failed on TUN fd: {} (could not set non-blocking mode)",
-            std::io::Error::last_os_error()
-        );
+    // Non-blocking, or no device. This used to warn and carry on, but stop()'s
+    // close waits for in-flight reads (MR-820), and a blocking read on an idle
+    // TUN never returns: the device would outlive stop() and the next start's
+    // TUNSETIFF on birdo0 would fail with EBUSY.
+    if let Err(e) = device_fd::set_nonblocking(fd) {
+        unsafe { libc::close(fd) };
+        return Err(format!("Could not make the TUN fd non-blocking: {}", e));
     }
 
     tracing::info!("Successfully created TUN device: {} (fd={})", tun_name, fd);

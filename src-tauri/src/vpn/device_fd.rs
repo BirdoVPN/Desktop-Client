@@ -36,9 +36,32 @@ pub(crate) type SharedFd = Arc<std::os::fd::OwnedFd>;
 pub(crate) type DeviceSlot<T> = RwLock<Option<Arc<T>>>;
 
 /// How long `stop()` waits for in-flight I/O to let go of the device. The fd
-/// is O_NONBLOCK and the loop is already joined when this runs, so a holder is
-/// a syscall that is about to return; the bound only matters if it is not.
+/// is O_NONBLOCK ([`set_nonblocking`] is fatal on failure) and the loop is
+/// already joined when this runs, so a holder is a syscall that is about to
+/// return; the bound only matters if it is not.
 pub(crate) const IN_FLIGHT_WAIT: Duration = Duration::from_secs(2);
+
+/// Put a device fd in O_NONBLOCK mode, or say why not.
+///
+/// The wait in [`close_when_idle`] assumes every read/write on the device
+/// returns at once. A BLOCKING read on an idle device would hold its reference
+/// for good: a Deferred close, the device alive — and on Linux the next
+/// start's TUNSETIFF on `birdo0` failing with EBUSY. So the tunnels treat a
+/// failure here as fatal rather than warning and carrying on.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl(2) on a descriptor number; an invalid one fails (EBADF),
+    // it does not touch memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// How often [`close_when_idle`] re-checks for remaining holders.
 const POLL: Duration = Duration::from_millis(5);

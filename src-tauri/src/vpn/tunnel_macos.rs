@@ -961,22 +961,13 @@ fn create_utun_device() -> Result<(String, OwnedFd), String> {
                 fd
             );
 
-            // Set non-blocking mode. Failure here is logged: a blocking fd would
-            // cause the packet_loop read() to hang, so surface it for diagnosis.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags >= 0 {
-                let set_ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-                if set_ret < 0 {
-                    tracing::warn!(
-                        "Failed to set O_NONBLOCK on utun fd: {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    "Failed to read flags (F_GETFL) on utun fd; cannot set non-blocking mode: {}",
-                    std::io::Error::last_os_error()
-                );
+            // Non-blocking, or no device. This used to warn and carry on, but
+            // a blocking read on an idle utun never returns, and stop()'s close
+            // waits for in-flight reads (MR-820): the interface would outlive
+            // stop(), still holding the half-default routes.
+            if let Err(e) = device_fd::set_nonblocking(fd) {
+                unsafe { libc::close(fd) };
+                return Err(format!("Could not make the utun fd non-blocking: {}", e));
             }
 
             // SAFETY: `fd` was opened above, is valid, and nothing else owns
