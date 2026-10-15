@@ -13,14 +13,15 @@
 //! | rule                                            | why                          |
 //! |-------------------------------------------------|------------------------------|
 //! | `-o lo`                                         | local IPC, the stealth helper|
-//! | udp to port 67                                  | DHCP: the lease outlives the block |
+//! | udp from port 68 to port 67                     | DHCP: the lease outlives the block |
 //! | `-d <relay>`                                    | the re-dial (WireGuard, stealth) |
 //! | `-o birdo0`                                     | traffic already in the tunnel |
 //! | the LAN ranges, with Local Network Sharing      | printers, NAS, SSH           |
 //! | our uid's tcp/443 to each control-plane address | the control plane: API and DoH |
 //!
-//! Everything else meets `-j DROP`. IPv6 permits nothing but loopback, DHCPv6
-//! and link-local ICMPv6: the control plane is reached over IPv4 only.
+//! Everything else meets `-j DROP`. IPv6 permits nothing but loopback, the
+//! tunnel, DHCPv6 to its servers' group and link-local ICMPv6: the control
+//! plane is reached over IPv4 only.
 
 use std::net::Ipv4Addr;
 
@@ -31,6 +32,10 @@ const TUNNEL_INTERFACE: &str = "birdo0";
 /// own permit; nothing else of the app's needs a way out while the block is
 /// up (the macOS and Windows twins scope it the same way).
 const CONTROL_PLANE_PORT: &str = "443";
+
+/// All_DHCP_Relay_Agents_and_Servers (RFC 8415): the link-scoped group a
+/// DHCPv6 client sends Solicit, Request, Renew and Rebind to.
+const DHCPV6_SERVERS: &str = "ff02::1:2";
 
 /// RFC 1918 plus 169.254/16, which carries mDNS discovery.
 const LAN_RANGES: [&str; 4] = [
@@ -78,8 +83,20 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
     // ---------------------------------------------------------------- IPv4 OUT
     let mut out_v4 = vec![
         rule(&["-o", "lo", "-j", "ACCEPT"]),
-        // DHCP client -> server, so the machine can keep its lease.
-        rule(&["-p", "udp", "--dport", "67", "-j", "ACCEPT"]),
+        // DHCP client -> server, so the machine can keep its lease. From the
+        // client's port as well as to the server's (MR-2087): `--dport 67`
+        // alone let any process send udp/67 to any host from the real
+        // address. Port 68 is below 1024, so only root (or a holder of
+        // CAP_NET_BIND_SERVICE) can send from it: the DHCP client. The
+        // destination stays open: a renewal is unicast to the server that
+        // granted the lease (RFC 2131 §4.4.5), which this module does not
+        // know and which need not be on the LAN — an ISP's, behind a bridged
+        // modem. Limiting it to the broadcast address and the LAN ranges
+        // would push those renewals out to the rebinding broadcast at 7/8 of
+        // the lease.
+        rule(&[
+            "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT",
+        ]),
     ];
     // The relay: WireGuard handshake and the stealth fallback.
     if let Some(ip) = b.relay {
@@ -141,8 +158,10 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
     // ----------------------------------------------------------- IPv4 IN/FWD
     let mut in_v4 = vec![
         rule(&["-i", "lo", "-j", "ACCEPT"]),
-        // DHCP server -> client.
-        rule(&["-p", "udp", "--dport", "68", "-j", "ACCEPT"]),
+        // DHCP server -> client: from the server's port to the client's.
+        rule(&[
+            "-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT",
+        ]),
     ];
     if let Some(ip) = b.relay {
         in_v4.push(rule(&["-s", &ip.to_string(), "-j", "ACCEPT"]));
@@ -167,13 +186,37 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
     in_v4.push(rule(&["-j", "DROP"]));
 
     // ---------------------------------------------------------------- IPv6
-    // AUDIT-N5: dual-stack hosts must not leak IPv6 around the IPv4-only
-    // tunnel. ICMPv6 (NDP / RA / RS) is scoped to link-local and multicast:
-    // a blanket `-p ipv6-icmp` accept would sit in front of tunnel_linux's
-    // BIRDO_IPV6_LEAK_BLOCK and re-permit ICMPv6 to GLOBAL destinations.
+    // AUDIT-N5: dual-stack hosts must not leak IPv6 around the tunnel.
+    //
+    // This chain and tunnel_linux's BIRDO_IPV6_LEAK_BLOCK both go in at the
+    // top of OUTPUT, so either can sit first, and an ACCEPT here is final:
+    // whenever this chain is first, whatever it accepts never meets the leak
+    // block. So off the tunnel it accepts nothing the leak block refuses —
+    // loopback, link-local and link-scoped multicast only. ICMPv6 (NDP / RA
+    // / RS) is scoped that way: a blanket `-p ipv6-icmp` accept re-permitted
+    // ICMPv6 to GLOBAL destinations. And so is DHCPv6 (MR-2087): `--dport
+    // 547` alone let any process send udp/547 to any IPv6 host.
     let mut out_v6 = vec![
         rule(&["-o", "lo", "-j", "ACCEPT"]),
-        rule(&["-p", "udp", "--dport", "547", "-j", "ACCEPT"]),
+        // DHCPv6 client -> its servers' group, from the client's port.
+        rule(&[
+            "-d",
+            DHCPV6_SERVERS,
+            "-p",
+            "udp",
+            "--sport",
+            "546",
+            "--dport",
+            "547",
+            "-j",
+            "ACCEPT",
+        ]),
+        // MR-2086: IPv6 inside the tunnel. tunnel_linux routes it there on a
+        // dual-stack node (configure_ipv6), and with no permit the kill
+        // switch dropped it for the whole session. What leaves through
+        // birdo0 is encrypted to the relay — inside the tunnel, not around
+        // it — so this is the one permit the leak block has no say in.
+        rule(&["-o", TUNNEL_INTERFACE, "-j", "ACCEPT"]),
     ];
     for dst in ["fe80::/10", "ff02::/16"] {
         out_v6.push(rule(&["-p", "ipv6-icmp", "-d", dst, "-j", "ACCEPT"]));
@@ -182,7 +225,22 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
 
     let mut in_v6 = vec![
         rule(&["-i", "lo", "-j", "ACCEPT"]),
-        rule(&["-p", "udp", "--dport", "546", "-j", "ACCEPT"]),
+        // DHCPv6 server or relay -> client: from the server's port to the
+        // client's, at the link-local address the client sends from.
+        rule(&[
+            "-d",
+            "fe80::/10",
+            "-p",
+            "udp",
+            "--sport",
+            "547",
+            "--dport",
+            "546",
+            "-j",
+            "ACCEPT",
+        ]),
+        // MR-2086: what comes back through the tunnel.
+        rule(&["-i", TUNNEL_INTERFACE, "-j", "ACCEPT"]),
     ];
     for src in ["fe80::/10", "ff02::/16"] {
         in_v6.push(rule(&["-p", "ipv6-icmp", "-s", src, "-j", "ACCEPT"]));

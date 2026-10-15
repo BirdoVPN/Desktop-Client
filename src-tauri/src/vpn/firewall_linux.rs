@@ -33,7 +33,7 @@
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
-use crate::commands::killswitch::iptables_watchdog::{watch, Live, Watched, Xtables};
+use crate::commands::killswitch::iptables_watchdog::{FirstArm, Live, Watched, Xtables};
 use crate::vpn::iptables_policy;
 
 /// Tracks whether iptables blocking rules are active
@@ -50,6 +50,10 @@ static WANTED: AtomicBool = AtomicBool::new(false);
 /// watchdog reads back. `None` while no generation of ours is live. Written
 /// under [`CHAINS`] (and by the panic path, which clears it).
 static LIVE: std::sync::Mutex<Option<Live>> = std::sync::Mutex::new(None);
+
+/// MR-2090: where the watchdog's retries of a wanted block that never went
+/// up stand (`iptables_watchdog::FirstArm`). Used under [`CHAINS`] only.
+static FIRST_ARM: std::sync::Mutex<FirstArm> = std::sync::Mutex::new(FirstArm::new());
 
 fn set_live(live: Option<Live>) {
     *LIVE
@@ -443,8 +447,10 @@ fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
                 // Nothing of ours is live, so nothing restricts any address.
                 PERMITTED_GEN.store(u64::MAX, Ordering::SeqCst);
             }
-            tracing::error!("Kill switch: rule build failed, block NOT changed: {}", e);
-            return Err(e);
+            // Logged by the caller, which knows whether it is news: the
+            // watchdog retries a first arm that failed and reports one error
+            // per streak of failures, not one per attempt (MR-2090).
+            return Err(format!("rule build failed, block NOT changed: {e}"));
         }
     };
     let covered = iptables_policy::covered_generation(control_plane_gen, self_permits_loaded);
@@ -623,6 +629,9 @@ impl Xtables for Iptables {
 ///   jump, a chain's loaded rule count, or its final DROP (`iptables -F`
 ///   empties our chains in place). Rule text is not compared; see
 ///   `iptables_watchdog::missing` for what that leaves undetected;
+/// - a block WANTED of which no generation is live — its first arm failed —
+///   is put up, retried at the pace `iptables_watchdog::FirstArm` keeps
+///   (MR-2090);
 /// - a block held but not wanted is a lift that failed, retried;
 /// - nothing held, nothing wanted: nothing is read. `None` whenever nothing
 ///   had to be done.
@@ -631,7 +640,10 @@ pub(crate) async fn watchdog(server_ip: Option<Ipv4Addr>) -> Option<Watched> {
     let wanted = WANTED.load(Ordering::SeqCst) && crate::commands::killswitch::is_enabled();
     let held = IPTABLES_BLOCKING.load(Ordering::SeqCst);
     let current = live();
-    watch(
+    let mut first_arm = FIRST_ARM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    first_arm.pass(
         &Iptables,
         wanted,
         held,

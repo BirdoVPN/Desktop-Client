@@ -137,9 +137,18 @@ pub(crate) fn block_all_ruleset(b: &BlockAll<'_>) -> String {
     // with the LAN connection dying underneath it — and, because the tunnel
     // itself kept working until the lease actually lapsed, the cause looked
     // nothing like the kill switch.
+    //
+    // `inet` (MR-2087): with no address family these matched IPv6 too, so
+    // udp from port 68 to port 67 of ANY IPv6 host got through a block-all
+    // that drops every other IPv6 packet (DHCPv6 is 546/547; nothing needs
+    // these ports over IPv6). The destination stays `any`, the narrowest that
+    // still renews: a renewal is unicast to the server that granted the lease
+    // (RFC 2131 §4.4.5), which pf cannot name and which need not be on the
+    // LAN — an ISP's, behind a bridged modem. The Linux twin scopes it the
+    // same way (`iptables_policy`).
     r.push_str(
-        "pass out quick proto udp from any port 68 to any port 67 no state\n\
-         pass in quick proto udp from any port 67 to any port 68 no state\n",
+        "pass out quick inet proto udp from any port 68 to any port 67 no state\n\
+         pass in quick inet proto udp from any port 67 to any port 68 no state\n",
     );
 
     // LAN permit: honour Local Network Sharing while the block is engaged, so a
