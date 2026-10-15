@@ -7,6 +7,7 @@ pub mod elevation;
 pub mod file_log;
 pub mod log_policy;
 pub mod log_retention;
+pub mod navigation_guard;
 pub mod os_rng;
 #[cfg(windows)]
 pub mod protected_dir;

@@ -282,7 +282,9 @@ pub fn prune_dumps(now: DateTime<Utc>) {
 }
 
 /// Build the main window from its tauri.conf.json entry: on Windows with the
-/// environment from [`create_environment`], elsewhere exactly as Tauri would.
+/// environment from [`create_environment`], elsewhere exactly as Tauri would,
+/// and on every platform with the navigation guard (MR-2011,
+/// [`crate::utils::navigation_guard`]): it never leaves the app.
 ///
 /// If that environment cannot be made, the window is built on WebView2's
 /// defaults rather than not at all, and the log says so: a WebView2 that
@@ -292,7 +294,8 @@ pub fn build_main_window(
     app: &tauri::AppHandle,
     config: &tauri::utils::config::WindowConfig,
 ) -> tauri::Result<tauri::WebviewWindow> {
-    let builder = tauri::WebviewWindowBuilder::from_config(app, config)?;
+    let builder = tauri::WebviewWindowBuilder::from_config(app, config)?
+        .on_navigation(crate::utils::navigation_guard::guard(app));
     #[cfg(windows)]
     let builder = match dirs::data_local_dir().map(|dir| create_environment(&dir)) {
         Some(Ok(environment)) => builder.with_environment(environment),
