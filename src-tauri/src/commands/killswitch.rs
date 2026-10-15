@@ -3193,16 +3193,24 @@ mod tests {
         );
     }
 
+    /// The body of the fn whose signature begins with `start` in `source`,
+    /// up to its closing brace at column 0.
+    fn fn_body(source: &str, start: &str) -> String {
+        let from = &source[source.find(start).unwrap_or_else(|| panic!("{start}"))..];
+        from[..from.find("\n}\n").expect("end of fn")].to_string()
+    }
+
+    /// `source` without its test module: the code the app runs.
+    fn non_test(source: &str) -> &str {
+        &source[..source.find("\n#[cfg(test)]\nmod ").expect("a test module")]
+    }
+
     /// The wiring the Windows job cannot run: the Linux block starts the
     /// watchdog, on the macOS period; its pass reads WANTED and the intent
     /// under the chains' lock; every activation wants the block and every
     /// lift request stops wanting it, before it runs.
     #[test]
     fn the_linux_block_starts_the_watchdog_and_its_pass_reads_under_the_lock() {
-        let fn_body = |source: &str, start: &str| -> String {
-            let from = &source[source.find(start).unwrap_or_else(|| panic!("{start}"))..];
-            from[..from.find("\n}\n").expect("end of fn")].to_string()
-        };
         let source = include_str!("killswitch.rs").replace('\r', "");
         let activate = fn_body(&source, "async fn activate_platform_block(");
         let started = activate
@@ -3232,5 +3240,206 @@ mod tests {
         assert!(on.find("WANTED.store(true").unwrap() < on.find("activate_locked(").unwrap());
         let off = fn_body(&linux, "pub async fn deactivate_blocking(");
         assert!(off.find("WANTED.store(false").unwrap() < off.find("deactivate_locked()").unwrap());
+    }
+
+    /// MR-2001: another tool's ACCEPT inserted above our jump (`iptables -I
+    /// OUTPUT 1 -j ACCEPT`) lets every packet out before our chain is
+    /// reached, and the watchdog, comparing counts and the final DROP only,
+    /// read that block as whole. Our jump must be the first rule of its hook;
+    /// the re-arm inserts the new generation at the top, above the other
+    /// tool's rule, which stays where it is never reached.
+    #[test]
+    fn an_accept_inserted_above_our_jump_is_noticed_and_re_armed_above_it() {
+        for (v6, family) in [(false, "iptables"), (true, "ip6tables")] {
+            for (hook, chain) in [
+                ("OUTPUT", "BIRDO_KS_OUT0"),
+                ("INPUT", "BIRDO_KS_IN0"),
+                ("FORWARD", "BIRDO_KS_IN0"),
+            ] {
+                let (x, live) = armed();
+                x.rules(v6, hook).insert(0, "-j ACCEPT".into());
+                assert_eq!(
+                    missing(&x, &live),
+                    Some(format!("{family}: a rule above the {hook} jump to {chain}"))
+                );
+                let watched = watch(&x, true, true, Some(&live), rearm(&x, &live), no_lift);
+                assert!(
+                    matches!(watched, Some(Watched::Restored { .. })),
+                    "{family} {hook}: {watched:?}"
+                );
+                let jump = if hook == "OUTPUT" {
+                    "-j BIRDO_KS_OUT1"
+                } else {
+                    "-j BIRDO_KS_IN1"
+                };
+                assert_eq!(*x.rules(v6, hook), vec![jump, "-j ACCEPT"]);
+            }
+        }
+    }
+
+    /// MR-2001: a rule of ours swapped for another, the count and the final
+    /// DROP unchanged, is noticed too: each chain is compared, rule by rule,
+    /// with what iptables listed once it was loaded. The finding names the
+    /// rule by its place, never by its text, which carries the relay's and
+    /// the control plane's addresses.
+    #[test]
+    fn a_rule_of_ours_swapped_for_another_is_noticed() {
+        let (x, live) = armed();
+        x.rules(false, &live.out)[1] = "-j ACCEPT".into();
+        assert_eq!(
+            missing(&x, &live).as_deref(),
+            Some("iptables: rule 2 of BIRDO_KS_OUT0 is not the one loaded")
+        );
+
+        let (x, live) = armed();
+        x.rules(true, &live.inn)[0] = "-j ACCEPT".into();
+        assert_eq!(
+            missing(&x, &live).as_deref(),
+            Some("ip6tables: rule 1 of BIRDO_KS_IN0 is not the one loaded")
+        );
+        let watched = watch(&x, true, true, Some(&live), rearm(&x, &live), no_lift);
+        assert!(
+            matches!(watched, Some(Watched::Restored { .. })),
+            "{watched:?}"
+        );
+    }
+
+    /// MR-2001: the one rule that may sit above our jump is the IPv6 leak
+    /// block's (F-001). Every tunnel start inserts it at the top of
+    /// ip6tables' OUTPUT while our block is held for the whole session, and
+    /// it lets nothing routable out; flagging it would re-arm the block, and
+    /// blame another tool, at every connect. Its name is tunnel_linux.rs's.
+    #[test]
+    fn the_ipv6_leak_block_may_sit_above_our_jump() {
+        let (x, live) = armed();
+        x.rules(true, "OUTPUT")
+            .insert(0, "-j BIRDO_IPV6_LEAK_BLOCK".into());
+        assert_eq!(missing(&x, &live), None);
+        assert_eq!(watch(&x, true, true, Some(&live), no_rearm, no_lift), None);
+
+        let tunnel = include_str!("../vpn/tunnel_linux.rs").replace('\r', "");
+        assert!(tunnel.contains("const IPV6_BLOCK_CHAIN: &str = \"BIRDO_IPV6_LEAK_BLOCK\";"));
+        assert!(tunnel.contains("ip6t(&[\"-I\", \"OUTPUT\", \"1\", \"-j\", IPV6_BLOCK_CHAIN])"));
+    }
+
+    /// MR-1998 (with AUD-DESK-09's two more sites): the relay a Linux block
+    /// permits is read in the step that builds it, under the chains' lock,
+    /// as macOS reads it under pf's (P3-3). The activation, the control-plane
+    /// re-arm and the watchdog's pass each read it BEFORE they waited for
+    /// the lock: a server switch that got the lock first and re-armed for the
+    /// new relay was then undone by a re-arm for the old one, which dropped
+    /// the new relay's handshake.
+    #[test]
+    fn the_linux_block_reads_its_relay_under_the_chains_lock() {
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let code = non_test(&source);
+        for call in [
+            "firewall_linux::activate_blocking()",
+            "firewall_linux::refresh_control_plane(generation)",
+            "firewall_linux::watchdog()",
+        ] {
+            assert!(code.contains(call), "{call} is handed no relay");
+        }
+        // Here, only macOS's pf_inputs reads it, under pf's lock.
+        for (at, _) in code.match_indices("vpn_server_ip()") {
+            let owner = code[..at].rfind("fn ").unwrap() + 3;
+            let name = &code[owner..owner + code[owner..].find('(').unwrap()];
+            assert!(
+                ["vpn_server_ip", "pf_inputs"].contains(&name),
+                "the relay is read in {name}"
+            );
+        }
+
+        let linux = include_str!("../vpn/firewall_linux.rs").replace('\r', "");
+        let linux = non_test(&linux);
+        let reads: Vec<usize> = linux
+            .match_indices("vpn_server_ip()")
+            .map(|(at, _)| at)
+            .collect();
+        let built = linux.find("fn activate_locked(").expect("activate_locked");
+        let end = built + linux[built..].find("\n}\n").unwrap();
+        assert_eq!(reads.len(), 1, "read once, where the block is built");
+        assert!(built < reads[0] && reads[0] < end);
+        // activate_locked takes no relay, and runs with CHAINS held only.
+        assert!(linux.contains("fn activate_locked() -> Result<(), String>"));
+    }
+
+    /// MR-1999: the Linux OFF lifts under the chains' lock, deciding there
+    /// from what is live, like macOS's `pf_lift_if_loaded` (N2). It asked the
+    /// lock-free `is_blocking()` first: a first arm that hooked only part of
+    /// its jumps, not OUTPUT's, reads as not blocking with a generation live,
+    /// so an OFF that landed while the watchdog re-armed it lifted nothing,
+    /// and the re-arm put the block up behind it until the next pass lifted
+    /// it, 30 s later. Taking the lock waits that pass out first.
+    #[test]
+    fn the_linux_off_lifts_under_the_chains_lock() {
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let live = fn_body(&source, "pub async fn set_killswitch_live(");
+        let linux_off = live
+            .find("#[cfg(target_os = \"linux\")]")
+            .expect("a Linux OFF of its own");
+        let off = &live[linux_off + 1..];
+        let off = &off[..off.find("#[cfg(").expect("the other platforms' OFF")];
+        assert!(off.contains("firewall_linux::lift_if_held()"), "{off}");
+        assert!(off.contains("|| true,"), "decided under the lock: {off}");
+
+        let linux = include_str!("../vpn/firewall_linux.rs").replace('\r', "");
+        let lift = fn_body(&linux, "pub async fn lift_if_held(");
+        let locked = lift.find("with_chains(").expect("under CHAINS");
+        for step in [
+            "WANTED.store(false",
+            "LIVE_GEN.load(",
+            "IPTABLES_BLOCKING.load(",
+            "deactivate_locked()",
+        ] {
+            let at = lift.find(step).unwrap_or_else(|| panic!("{step}"));
+            assert!(locked < at, "{step} before the lock");
+        }
+    }
+
+    /// MR-2000: every iptables run of the Linux kill switch waits a bounded
+    /// time for the xtables lock (`-w 5`): a bare `-w` waited for as long as
+    /// another tool held it, with CHAINS held. Every change to the chains,
+    /// and every watchdog pass, runs with CHAINS held OFF the async workers
+    /// (`with_chains`): they were blocking process spawns on a tokio worker,
+    /// the watchdog's every 30 s. A failure that persists is reported once
+    /// per streak.
+    #[test]
+    fn the_linux_chains_change_off_the_async_workers_with_a_bounded_wait() {
+        let linux = include_str!("../vpn/firewall_linux.rs").replace('\r', "");
+        let code = non_test(&linux);
+        assert!(code.contains("const XTABLES_WAIT_SECS: &str = \"5\";"));
+        assert_eq!(
+            code.matches("hidden_cmd(").count(),
+            1,
+            "one way to run iptables"
+        );
+        let run = fn_body(code, "fn xtables(");
+        assert!(run.contains(".args([\"-w\", XTABLES_WAIT_SECS])"), "{run}");
+        assert!(!code.contains(".arg(\"-w\")"));
+
+        assert!(
+            !code.contains("CHAINS.lock("),
+            "CHAINS is taken in with_chains alone"
+        );
+        let with_chains = fn_body(code, "async fn with_chains<");
+        assert!(
+            with_chains.contains("locked_blocking(&CHAINS, work)"),
+            "{with_chains}"
+        );
+        for entry in [
+            "pub async fn activate_blocking(",
+            "pub async fn refresh_control_plane(",
+            "pub async fn deactivate_blocking(",
+            "pub async fn lift_if_held(",
+            "pub(crate) async fn watchdog(",
+        ] {
+            assert!(fn_body(code, entry).contains("with_chains("), "{entry}");
+        }
+
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let tick = fn_body(&source, "async fn iptables_watchdog_tick(");
+        let counted = tick.find("failing.record(").expect("failures counted");
+        assert!(counted < tick.find("match watched").unwrap());
     }
 }
