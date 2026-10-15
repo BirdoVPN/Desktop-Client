@@ -605,7 +605,10 @@ fn main() {
             // arms above: no tunnel can be up this early, so a journal on disk
             // means exactly one thing — the previous session did not restore
             // DNS. Each platform still re-checks that the live state is the one
-            // it left before touching anything.
+            // it left before touching anything. MR-740: on Linux and macOS the
+            // same call removes the routes a killed session left via the
+            // physical gateway (vpn::route_journal), which Windows keeps in this
+            // journal; it runs from the panic hook and --reconcile-and-exit too.
             if crate::vpn::dns_journal::reconcile() {
                 tracing::warn!("Restored DNS left moved aside by a previous session");
             }

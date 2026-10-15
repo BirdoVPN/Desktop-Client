@@ -17,6 +17,7 @@ use super::wireguard_new::{WgPrivateKey, WireGuardSession};
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
 use crate::vpn::dns_journal::DnsRestoreOutcome;
+use crate::vpn::route_journal::{self, GatewayRoute, RouteDelete};
 
 /// Run a command (no special flags needed on Linux — no console window issue)
 fn cmd(program: &str) -> Command {
@@ -1500,6 +1501,44 @@ impl OwnedRoute {
         args.extend(["dev", self.dev.as_str()]);
         args
     }
+
+    /// MR-740: this route's crash-recovery record, when it outlives the
+    /// tunnel. A route via the physical gateway (the endpoint host route, the
+    /// LAN-sharing routes) does; one through birdo0 dies with the device.
+    fn gateway_record(&self) -> Option<GatewayRoute> {
+        Some(GatewayRoute {
+            dst: self.dst.clone(),
+            via: self.via.clone()?,
+            dev: Some(self.dev.clone()),
+        })
+    }
+
+    /// `ip route del` this route, exactly as it was added.
+    fn delete(&self) -> RouteDelete {
+        match cmd("ip").args(self.ip_args("del")).output() {
+            Ok(o) => route_journal::ip_route_del_outcome(
+                o.status.success(),
+                &String::from_utf8_lossy(&o.stderr),
+            ),
+            Err(e) => RouteDelete::Failed(format!("could not run ip: {}", e)),
+        }
+    }
+}
+
+/// MR-740: delete a route the crash-recovery record names, with the exact
+/// qualifiers it was added with. `route_journal::reconcile` calls this, at
+/// start-up, where no tunnel of this process is up.
+pub(super) fn delete_recorded_route(route: &GatewayRoute) -> RouteDelete {
+    let Some(dev) = route.dev.clone() else {
+        // Refused by the record's own check before it gets here.
+        return RouteDelete::Failed("no interface on record".to_string());
+    };
+    OwnedRoute {
+        dst: route.dst.clone(),
+        via: Some(route.via.clone()),
+        dev,
+    }
+    .delete()
 }
 
 /// The routes a tunnel owns, in the order they were added.
@@ -1514,6 +1553,10 @@ fn take_owned_routes(owned: &OwnedRoutes) -> Vec<OwnedRoute> {
 /// `ip route add` `route`, recording it in `owned` as soon as the add
 /// succeeded — before anything else can fail or be cancelled. Returns the
 /// failure's stderr.
+///
+/// MR-740: a route that outlives the tunnel is also put on the crash-recovery
+/// record at once, so a session killed from here on (SIGKILL, OOM, a panic)
+/// leaves the next start a record of it to remove.
 fn add_owned_route(route: OwnedRoute, owned: &OwnedRoutes) -> Result<(), String> {
     let output = cmd("ip")
         .args(route.ip_args("add"))
@@ -1522,7 +1565,11 @@ fn add_owned_route(route: OwnedRoute, owned: &OwnedRoutes) -> Result<(), String>
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
+    let record = route.gateway_record();
     owned.lock().unwrap_or_else(|e| e.into_inner()).push(route);
+    if let Some(record) = record {
+        route_journal::remember(&record);
+    }
     Ok(())
 }
 
@@ -2164,19 +2211,29 @@ fn resolv_conf_link_read_back_verified(
 /// NetworkManager's link-scope 169.254.0.0/16 (LAN sharing off), and, on a
 /// start that failed because another VPN owned the half-defaults, that VPN's
 /// 0.0.0.0/1 + 128.0.0.0/1 (bug B).
+///
+/// MR-740: a route proved gone leaves the crash-recovery record; one whose
+/// delete failed stays on it, for the next start to retry.
 fn remove_owned_routes(routes: Vec<OwnedRoute>) {
     if routes.is_empty() {
         return;
     }
     for route in routes.iter().rev() {
-        match cmd("ip").args(route.ip_args("del")).output() {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => tracing::debug!(
-                "Route {} was already gone at teardown: {}",
-                redact_ip(&route.dst),
-                String::from_utf8_lossy(&o.stderr).trim()
+        let deleted = route.delete();
+        match &deleted {
+            RouteDelete::Removed => {}
+            RouteDelete::Absent => tracing::debug!(
+                "Route {} was already gone at teardown",
+                redact_ip(&route.dst)
             ),
-            Err(e) => tracing::warn!("Could not run ip to remove a route: {}", e),
+            RouteDelete::Failed(e) => {
+                tracing::warn!("Could not remove route {}: {}", redact_ip(&route.dst), e)
+            }
+        }
+        if deleted.settled() {
+            if let Some(record) = route.gateway_record() {
+                route_journal::forget(&record);
+            }
         }
     }
     tracing::info!("Removed {} VPN route(s)", routes.len());
@@ -2699,6 +2756,33 @@ mod owned_route_tests {
                 "dev",
                 "eth0"
             ]
+        );
+    }
+
+    /// MR-740: the routes via the physical gateway outlive birdo0, so they
+    /// (and only they) go on the crash-recovery record, with the qualifiers
+    /// their exact delete needs.
+    #[test]
+    fn only_routes_via_the_gateway_go_on_the_crash_record() {
+        let half = OwnedRoute {
+            dst: "0.0.0.0/1".into(),
+            via: None,
+            dev: "birdo0".into(),
+        };
+        assert_eq!(half.gateway_record(), None);
+
+        let endpoint = OwnedRoute {
+            dst: "203.0.113.7/32".into(),
+            via: Some("192.168.1.1".into()),
+            dev: "eth0".into(),
+        };
+        assert_eq!(
+            endpoint.gateway_record(),
+            Some(crate::vpn::route_journal::GatewayRoute {
+                dst: "203.0.113.7/32".into(),
+                via: "192.168.1.1".into(),
+                dev: Some("eth0".into()),
+            })
         );
     }
 
@@ -3400,5 +3484,54 @@ mod netns_teardown_tests {
             "the disconnect changed the restored link"
         );
         assert!(net().nothing_of_ours());
+    }
+
+    /// MR-740: a session killed with its routes in (SIGKILL, an OOM kill, a
+    /// panic under `panic = "abort"`). birdo0 and the routes through it die
+    /// with the process; the endpoint route via the uplink does not, and it
+    /// used to stay until reboot, pinned to the old gateway. The next start's
+    /// journal-driven recovery must remove it, beside the DNS restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_killed_sessions_endpoint_route_is_removed_at_the_next_start() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+
+        let (tunnel, key, _relay) = tunnel().await;
+        tunnel
+            .start(key)
+            .await
+            .expect("start() against the namespace's dummy uplink");
+        let connected = net();
+        assert!(
+            connected.relay_routes.contains("uplink0"),
+            "precondition: the endpoint route via the uplink is in: {connected:?}"
+        );
+
+        // What the next launch runs after a SIGKILL. It reads only its
+        // records and the live state; the tunnel still being up is
+        // irrelevant to it.
+        crate::vpn::dns_journal::reconcile();
+        let recovered = net();
+        assert!(
+            !recovered.relay_routes.contains("uplink0"),
+            "the endpoint route a killed session left survived the next start's recovery: \
+             {recovered:?}"
+        );
+        assert_eq!(
+            resolv_conf(),
+            before,
+            "the recovery did not put resolv.conf back"
+        );
+
+        // Cleanup: the disconnect finds its endpoint route already gone, and
+        // the crash record ends empty.
+        tunnel.stop().await.expect("stop()");
+        assert!(net().nothing_of_ours());
+        assert!(
+            !Path::new("/run/birdovpn/routes.json").exists(),
+            "the crash record outlived the routes it describes"
+        );
     }
 }
