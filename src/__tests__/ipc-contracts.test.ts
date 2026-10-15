@@ -15,7 +15,9 @@
  *     driven through the real screen and checked against the Rust command's
  *     parameter names.
  *  3. The command registry: every command the UI invokes (scanned from the
- *     source, so the list cannot drift) is registered in main.rs.
+ *     source, so the list cannot drift) is registered in main.rs, and
+ *     granted to the main window by capabilities/default.json, which grants
+ *     no other app command (MR-2011).
  *
  * Run: npx vitest run src/__tests__/ipc-contracts.test.ts
  */
@@ -435,6 +437,45 @@ const FRONTEND_COMMANDS = [
   'copy_sensitive',
 ] as const;
 
+/**
+ * MR-2011: the registered commands the UI does not call. They stay registered
+ * (and in build.rs's APP_COMMANDS), but no capability grants them, so the
+ * webview cannot reach them. Each says why; a command registered for the UI
+ * and missing from both lists fails below.
+ */
+const NOT_GRANTED: Record<string, string> = {
+  get_multi_hop_routes: "the UI never calls it: Multi-Hop's entry and exit are picked from the server list",
+};
+
+/** The capability file names, and each file parsed. */
+function loadCapabilities(): { file: string; cap: Record<string, unknown> }[] {
+  const dir = findUp('src-tauri/capabilities');
+  return readdirSync(dir).map((file) => ({
+    file,
+    cap: JSON.parse(readFileSync(join(dir, file), 'utf8')) as Record<string, unknown>,
+  }));
+}
+
+/**
+ * The app commands the capabilities grant: every permission with no plugin
+ * prefix (`core:`, `opener:`, ...) is the app's own, `allow-<command>` with
+ * the command's underscores as dashes (tauri-build's naming). Each comes with
+ * the file and the capability that grants it.
+ */
+function grantedAppCommands(): { command: string; file: string; cap: Record<string, unknown> }[] {
+  const out: { command: string; file: string; cap: Record<string, unknown> }[] = [];
+  for (const { file, cap } of loadCapabilities()) {
+    for (const entry of cap.permissions as unknown[]) {
+      const id = typeof entry === 'string' ? entry : String((entry as { identifier: unknown }).identifier);
+      if (id.includes(':')) continue;
+      const m = /^allow-([a-z0-9-]+)$/.exec(id);
+      if (!m) throw new Error(`${file}: app permission '${id}' is not an allow-<command>`);
+      out.push({ command: m[1].replace(/-/g, '_'), file, cap });
+    }
+  }
+  return out;
+}
+
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];
   for (const name of readdirSync(dir)) {
@@ -506,5 +547,33 @@ describe('IPC Contract: command registry cross-check (frontend ↔ Rust)', () =>
 
   it.each(FRONTEND_COMMANDS)("frontend command '%s' is registered in main.rs generate_handler!", (cmd) => {
     expect(registeredSet.has(cmd)).toBe(true);
+  });
+
+  // MR-2011: with an app permission manifest, Tauri refuses any app command
+  // no capability grants (invoke rejects "not allowed by ACL"). So a command
+  // the UI calls and the capability misses is a broken button, and one the
+  // capability grants beyond the UI is surface for nothing.
+  it('the capabilities grant the main window exactly the commands the UI invokes (MR-2011)', () => {
+    const granted = grantedAppCommands();
+    expect(granted.map((g) => g.command).sort()).toEqual([...FRONTEND_COMMANDS].sort());
+    expect(granted.filter((g, i) => granted.findIndex((h) => h.command === g.command) !== i)).toEqual([]);
+    for (const { command, file, cap } of granted) {
+      expect({ command, file, windows: cap.windows }).toEqual({ command, file, windows: ['main'] });
+      expect({ command, file, webviews: cap.webviews, remote: cap.remote }).toEqual({
+        command,
+        file,
+        webviews: undefined,
+        remote: undefined,
+      });
+    }
+  });
+
+  it('every registered command is either invoked by the UI or listed as not granted, with a reason (MR-2011)', () => {
+    const ungranted = registered.filter((cmd) => !(FRONTEND_COMMANDS as readonly string[]).includes(cmd)).sort();
+    expect(ungranted).toEqual(Object.keys(NOT_GRANTED).sort());
+    for (const [cmd, why] of Object.entries(NOT_GRANTED)) {
+      expect({ cmd, granted: grantedAppCommands().some((g) => g.command === cmd) }).toEqual({ cmd, granted: false });
+      expect(why.length).toBeGreaterThan(20);
+    }
   });
 });

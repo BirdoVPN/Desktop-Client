@@ -27,3 +27,7 @@ pub mod vpn_port_forward;
 // MR-713: the opener plugin's URL scope (capabilities/default.json).
 #[cfg(test)]
 mod capability_scope_tests;
+
+// MR-2011: the app's own commands, granted to the main window only.
+#[cfg(test)]
+mod app_permission_tests;
