@@ -93,7 +93,8 @@ fn intent_off_since(seen: u64) -> Option<bool> {
 
 /// Global state for kill switch - stores allowed VPN server IP. A plain
 /// mutex, so the pf backend reads it under its own lock, synchronously, in the
-/// same step that loads it (P3-3).
+/// same step that loads it (P3-3), and iptables under its chains' lock in the
+/// step that builds them (MR-1998).
 static VPN_SERVER_IP: std::sync::Mutex<Option<Ipv4Addr>> = std::sync::Mutex::new(None);
 
 /// The relay the block permits.
@@ -281,8 +282,9 @@ async fn activate_platform_block() -> Result<bool, String> {
     {
         // MR-833: from the first block on, it is re-verified on a timer.
         ensure_iptables_watchdog();
-        let server_ip = vpn_server_ip();
-        if let Err(e) = firewall_linux::activate_blocking(server_ip).await {
+        // MR-1998: the relay is read under the chains' lock, where the block
+        // is built, not here before waiting for it.
+        if let Err(e) = firewall_linux::activate_blocking().await {
             tracing::error!("Failed to activate iptables blocking: {}", e);
             return Err(format!("Failed to activate blocking: {}", e));
         }
@@ -422,7 +424,22 @@ pub async fn set_killswitch_live(
             || true,
         )
         .await;
-        #[cfg(not(target_os = "macos"))]
+        // Linux likewise, under the chains' lock (MR-1999): the lock-free
+        // `is_blocking()` reads no block for a first arm that hooked only
+        // part of its jumps, and a watchdog pass re-arming that one then put
+        // the block up behind the OFF. `lift_if_held` waits the pass out and
+        // lifts what it put up.
+        #[cfg(target_os = "linux")]
+        let turned_off = turn_off(
+            || async {
+                let lifted = firewall_linux::lift_if_held().await;
+                blocking_may_have_changed();
+                lifted
+            },
+            || true,
+        )
+        .await;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let turned_off = turn_off(deactivate_killswitch, platform_is_blocking).await;
         turned_off.map_err(|e| {
             IpcError::new(
@@ -442,8 +459,8 @@ pub async fn set_killswitch_live(
 /// lift, called at most once, `FnOnce() -> impl Future<Output = Result<bool,
 /// String>>` (its error is the OFF's error); `blocking` says whether a block
 /// is up right now. `set_killswitch_live` passes `deactivate_killswitch` and
-/// `platform_is_blocking`; a backend with a lift of its own (macOS pf) passes
-/// that instead.
+/// `platform_is_blocking`; a backend with a lift of its own, decided under
+/// its own lock (macOS pf; Linux iptables, MR-1999), passes that instead.
 async fn turn_off<L, LF>(lift: L, blocking: impl Fn() -> bool) -> Result<bool, String>
 where
     L: FnOnce() -> LF,
@@ -897,7 +914,8 @@ pub fn control_plane_permits(generation: u64) -> bool {
 #[cfg(target_os = "linux")]
 pub async fn control_plane_learned(generation: u64) -> Result<(), String> {
     let result = learn_control_plane(
-        || firewall_linux::refresh_control_plane(vpn_server_ip(), generation),
+        // The re-arm reads the relay under the chains' lock (MR-1998).
+        || firewall_linux::refresh_control_plane(generation),
         deactivate_platform_block,
         activate_platform_block,
         platform_is_blocking,
@@ -999,35 +1017,47 @@ fn ensure_iptables_watchdog() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         tauri::async_runtime::spawn(async {
+            let mut failing = iptables_watchdog::Failing::default();
             loop {
                 tokio::time::sleep(IPTABLES_WATCHDOG_INTERVAL).await;
-                iptables_watchdog_tick().await;
+                iptables_watchdog_tick(&mut failing).await;
             }
         });
     });
 }
 
 /// One watchdog pass: see [`iptables_watchdog::watch`] and
-/// `firewall_linux::watchdog`.
+/// `firewall_linux::watchdog`. `failing`: the passes before it that failed
+/// in a row, so a failure that persists is one error, not one every 30 s
+/// (MR-2000).
 #[cfg(target_os = "linux")]
-async fn iptables_watchdog_tick() {
+async fn iptables_watchdog_tick(failing: &mut iptables_watchdog::Failing) {
     use iptables_watchdog::Watched;
-    let Some(watched) = firewall_linux::watchdog(vpn_server_ip()).await else {
+    let watched = firewall_linux::watchdog().await;
+    let failed = failing.record(watched.as_ref());
+    let Some(watched) = watched else {
         return;
     };
     let armed = matches!(watched, Watched::Armed { .. });
     match watched {
         Watched::Restored { what } => tracing::warn!(
-            "Kill switch watchdog: something else had removed part of the iptables block \
-             ({}); restored",
+            "Kill switch watchdog: something else had removed or changed part of the iptables \
+             block ({}); restored",
             what
         ),
-        Watched::NotRestored { what, why } => tracing::error!(
+        Watched::NotRestored { what, why } if failed == 1 => tracing::error!(
             "Kill switch watchdog: part of the iptables block is gone ({}) and could not be \
-             put back: {}. Retried every {}s.",
+             put back: {}. Retried every {}s; reported again once it is back.",
             what,
             why,
             IPTABLES_WATCHDOG_INTERVAL.as_secs()
+        ),
+        Watched::NotRestored { what, why } => tracing::debug!(
+            "Kill switch watchdog: part of the iptables block ({}) still could not be put \
+             back (failed pass {}): {}",
+            what,
+            failed,
+            why
         ),
         // MR-2090: one error per streak; the attempts after it are counted.
         Watched::NotArmed { why, failed: 1 } => tracing::error!(
@@ -1053,8 +1083,16 @@ async fn iptables_watchdog_tick() {
                 "Kill switch watchdog: retried an owed lift of the iptables block; lifted"
             )
         }
-        Watched::LiftRetried(Err(e)) => tracing::error!(
-            "Kill switch watchdog: an owed lift of the iptables block failed again: {}",
+        Watched::LiftRetried(Err(e)) if failed == 1 => tracing::error!(
+            "Kill switch watchdog: an owed lift of the iptables block failed again: {}. \
+             Retried every {}s; reported again once it lands.",
+            e,
+            IPTABLES_WATCHDOG_INTERVAL.as_secs()
+        ),
+        Watched::LiftRetried(Err(e)) => tracing::debug!(
+            "Kill switch watchdog: an owed lift of the iptables block still fails \
+             (failed pass {}): {}",
+            failed,
             e
         ),
     }
@@ -1079,9 +1117,9 @@ async fn iptables_watchdog_tick() {
 /// scripted iptables — the seam `pf_policy` gives the macOS watchdog.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod iptables_watchdog {
-    /// `iptables -w <args>` (`ip6tables` when `v6`): its stdout when it exits
-    /// 0, why not otherwise. `firewall_linux` runs the real commands; the
-    /// tests script them.
+    /// `iptables -w 5 <args>` (`ip6tables` when `v6`): its stdout when it
+    /// exits 0, why not otherwise. `firewall_linux` runs the real commands;
+    /// the tests script them.
     pub(crate) trait Xtables {
         fn run(&self, v6: bool, args: &[&str]) -> Result<String, String>;
     }
@@ -1094,12 +1132,21 @@ pub(crate) mod iptables_watchdog {
         pub out: String,
         /// The chain hooked into INPUT and FORWARD.
         pub inn: String,
-        /// How many rules were loaded into `out` and `inn`, IPv4.
-        pub v4: (usize, usize),
+        /// The rules of `out` and `inn`, IPv4, as iptables listed them
+        /// ([`rules_of`]) once they were loaded (MR-2001).
+        pub v4: (Vec<String>, Vec<String>),
         /// ...and IPv6. `None` on a host without ip6tables, where there is
         /// nothing to read back.
-        pub v6: Option<(usize, usize)>,
+        pub v6: Option<(Vec<String>, Vec<String>)>,
     }
+
+    /// The one rule that may sit above our jump in a built-in chain: the
+    /// IPv6 leak block's (F-001, `tunnel_linux::install_ipv6_leak_block`).
+    /// Every tunnel start inserts it at the top of ip6tables' OUTPUT, while
+    /// our block is held for the whole session, and it lets nothing
+    /// routable out (`iptables_policy` keeps our IPv6 chain from accepting
+    /// anything it refuses, whichever of the two sits first).
+    const MAY_PRECEDE: [&str; 1] = ["-j BIRDO_IPV6_LEAK_BLOCK"];
 
     /// The rules of `chain` in an `iptables -S <chain>` listing, each as the
     /// text after `-A <chain> `.
@@ -1112,27 +1159,35 @@ pub(crate) mod iptables_watchdog {
             .collect()
     }
 
-    /// What the live block lacks, read from iptables itself. `None` while,
-    /// in each family read back: every jump to our chains is present in
-    /// OUTPUT/INPUT/FORWARD (`-C`), each chain holds as many rules as the
-    /// live generation loaded into it, and each ends in its DROP (`-S`). An
-    /// empty chain with its jump still in place filters nothing (the packet
-    /// falls through to the built-in chain's ACCEPT policy), so a jump alone
-    /// is not proof. A read that fails counts as missing: the re-arm that
-    /// follows is a generation swap, which never opens a window, so a false
-    /// alarm costs a re-load and no more.
+    /// What the live block lacks, read from iptables itself (`-S`). `None`
+    /// while, in each family read back: our jump is in OUTPUT/INPUT/FORWARD
+    /// with nothing above it but [`MAY_PRECEDE`], and each chain holds the
+    /// rules iptables listed for it once it was loaded, in order, its DROP
+    /// last. An empty chain with its jump still in place filters nothing (the
+    /// packet falls through to the built-in chain's ACCEPT policy), so a jump
+    /// alone is not proof. A read that fails counts as missing: the re-arm
+    /// that follows is a generation swap, which never opens a window, so a
+    /// false alarm costs a re-load and no more.
     ///
-    /// Deliberately NOT checked: the rules' text, and where our jump sits.
-    /// iptables canonicalises its `-S` listing (`-m tcp`, `/32`, option
-    /// order), so comparing it with the text we loaded would flap and re-arm
-    /// every pass. So a same-count swap inside our chain (a rule replaced by
-    /// an ACCEPT, the DROP kept last), or another tool inserting an ACCEPT
-    /// above our jump in OUTPUT, is not detected. What this catches is the
-    /// finding: a flush (`iptables -F`, `-F <chain>`, `nft flush ruleset`), a
-    /// deleted chain or jump, a rule added to or removed from our chains.
+    /// MR-2001: the rules are compared as text, and our jump's place too.
+    /// Comparing with the text we loaded would flap and re-arm every pass
+    /// (iptables canonicalises its listing: `-m tcp`, `/32`, option order),
+    /// so the baseline is the kernel's own listing, read back once loaded.
+    /// Caught: a flush (`iptables -F`, `-F <chain>`, `nft flush ruleset`), a
+    /// deleted chain or jump, a rule added to, removed from or changed in our
+    /// chains, and another tool's rule above our jump (`iptables -I OUTPUT 1
+    /// -j ACCEPT`), which the re-arm puts back underneath.
+    ///
+    /// What this still leaves (the residual): a change is found by the next
+    /// pass, up to 30 s later, not as it happens; a tool that keeps putting
+    /// its rule back on top makes every pass re-arm (logged, never a gap);
+    /// the IPv6 leak block's chain is not ours to check here; and rules in
+    /// other tables or nftables chains are not read, though none of them can
+    /// accept a packet past our DROP (an accept ends a packet's walk through
+    /// one base chain only, a drop anywhere ends it).
     pub(crate) fn missing(x: &impl Xtables, live: &Live) -> Option<String> {
-        let mut families = vec![(false, live.v4)];
-        if let Some(v6) = live.v6 {
+        let mut families = vec![(false, &live.v4)];
+        if let Some(v6) = &live.v6 {
             families.push((true, v6));
         }
         for (v6, (out_rules, in_rules)) in families {
@@ -1142,8 +1197,20 @@ pub(crate) mod iptables_watchdog {
                 ("INPUT", live.inn.as_str()),
                 ("FORWARD", live.inn.as_str()),
             ] {
-                if x.run(v6, &["-C", hook, "-j", chain]).is_err() {
-                    return Some(format!("{family}: the {hook} jump to {chain}"));
+                let jump = format!("-j {chain}");
+                // `None`: no jump (or no listing); `Some(on_top)`: whether
+                // nothing but MAY_PRECEDE sits above it.
+                let placed = x.run(v6, &["-S", hook]).ok().and_then(|listing| {
+                    let rules = rules_of(&listing, hook);
+                    let at = rules.iter().position(|rule| *rule == jump)?;
+                    Some(rules[..at].iter().all(|rule| MAY_PRECEDE.contains(rule)))
+                });
+                match placed {
+                    None => return Some(format!("{family}: the {hook} jump to {chain}")),
+                    Some(false) => {
+                        return Some(format!("{family}: a rule above the {hook} jump to {chain}"))
+                    }
+                    Some(true) => {}
                 }
             }
             for (chain, loaded) in [
@@ -1154,14 +1221,23 @@ pub(crate) mod iptables_watchdog {
                     return Some(format!("{family}: the chain {chain}"));
                 };
                 let held = rules_of(&listing, chain);
-                if held.len() != loaded {
+                if held.len() != loaded.len() {
                     return Some(format!(
-                        "{family}: {chain} holds {} rules where {loaded} were loaded",
-                        held.len()
+                        "{family}: {chain} holds {} rules where {} were loaded",
+                        held.len(),
+                        loaded.len()
                     ));
                 }
                 if held.last() != Some(&"-j DROP") {
                     return Some(format!("{family}: {chain} no longer ends in its DROP"));
+                }
+                // Which rule, never its text: it carries the relay's and the
+                // control plane's addresses.
+                if let Some(n) = held.iter().zip(loaded).position(|(now, was)| now != was) {
+                    return Some(format!(
+                        "{family}: rule {} of {chain} is not the one loaded",
+                        n + 1
+                    ));
                 }
             }
         }
@@ -1303,6 +1379,28 @@ pub(crate) mod iptables_watchdog {
                     watched
                 }
             }
+        }
+    }
+
+    /// MR-2000: the watchdog's passes in a row that failed — a restore, or an
+    /// owed lift, that did not land — so a failure that persists is reported
+    /// once, by the pass that opens the streak, and not every 30 s. (A first
+    /// arm's streak is [`FirstArm`]'s.)
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub(crate) struct Failing(u32);
+
+    impl Failing {
+        /// One pass's outcome. The `n`-th pass in a row that failed is `n`
+        /// (1 opens a streak); a pass that did not fail is 0, and ends the
+        /// streak.
+        pub(crate) fn record(&mut self, watched: Option<&Watched>) -> u32 {
+            self.0 = match watched {
+                Some(Watched::NotRestored { .. } | Watched::LiftRetried(Err(_))) => {
+                    self.0.saturating_add(1)
+                }
+                _ => 0,
+            };
+            self.0
         }
     }
 }
@@ -2610,7 +2708,7 @@ mod tests {
 
     // ── MR-833: the Linux watchdog, against a scripted iptables ─────────
 
-    use iptables_watchdog::{missing, rules_of, watch, FirstArm, Live, Watched, Xtables};
+    use iptables_watchdog::{missing, rules_of, watch, Failing, FirstArm, Live, Watched, Xtables};
     use std::cell::{Cell, RefCell, RefMut};
     use std::collections::BTreeMap;
 
@@ -2618,10 +2716,11 @@ mod tests {
 
     /// iptables as the kernel holds it, one filter table per family: every
     /// chain's rules in order, the built-in OUTPUT/INPUT/FORWARD included. It
-    /// answers the two reads the watchdog makes — `-C <hook> -j <chain>` and
-    /// `-S <chain>` — with iptables' own exit status and listing, and fails
-    /// the test on anything else: the watchdog only reads. What other tools
-    /// do to the tables are its methods (the twin of pf_policy's `FakePf`).
+    /// answers the one read the watchdog makes — `-S <chain>`, built-in
+    /// chains included — with iptables' own exit status and listing, and
+    /// fails the test on anything else: the watchdog only reads. What other
+    /// tools do to the tables are its methods (the twin of pf_policy's
+    /// `FakePf`).
     struct FakeXtables {
         /// [IPv4, IPv6].
         tables: RefCell<[BTreeMap<String, Vec<String>>; 2]>,
@@ -2689,11 +2788,13 @@ mod tests {
                     table.remove(&old.inn);
                 }
             }
+            // What iptables lists once they are loaded: the fake lists the
+            // text it was given.
             Live {
                 out,
                 inn,
-                v4: (chains.out_v4.len(), chains.in_v4.len()),
-                v6: (!self.no_ip6tables).then_some((chains.out_v6.len(), chains.in_v6.len())),
+                v4: (text(&chains.out_v4), text(&chains.in_v4)),
+                v6: (!self.no_ip6tables).then(|| (text(&chains.out_v6), text(&chains.in_v6))),
             }
         }
 
@@ -2738,19 +2839,6 @@ mod tests {
             }
             let table = self.table(v6);
             match args {
-                ["-C", hook, "-j", chain] => {
-                    if !table.contains_key(*chain) {
-                        return Err(format!("iptables v1.8.10: Couldn't load target {chain}"));
-                    }
-                    let jump = format!("-j {chain}");
-                    match table.get(*hook) {
-                        Some(rules) if rules.contains(&jump) => Ok(String::new()),
-                        _ => Err(
-                            "iptables: Bad rule (does a matching rule exist in that chain?)."
-                                .to_string(),
-                        ),
-                    }
-                }
                 ["-S", chain] => {
                     let rules = table
                         .get(*chain)
@@ -2849,7 +2937,7 @@ mod tests {
             missing(&x, &live),
             Some(format!(
                 "iptables: BIRDO_KS_OUT0 holds 0 rules where {} were loaded",
-                live.v4.0
+                live.v4.0.len()
             ))
         );
         let watched = watch(&x, true, true, Some(&live), rearm(&x, &live), no_lift);
@@ -2879,7 +2967,7 @@ mod tests {
     /// What `missing` checks beyond a flush: a jump present, each chain's
     /// rule count equal to what the generation loaded (a rule slipped in
     /// ahead of ours changes it), and each chain ending in its DROP. Rule
-    /// text and our jump's position are not compared (see `missing`).
+    /// text and our jump's position are compared too (MR-2001, below).
     #[test]
     fn a_missing_jump_a_changed_rule_count_or_a_lost_final_drop_is_noticed() {
         let (x, live) = armed();
@@ -2895,8 +2983,8 @@ mod tests {
             missing(&x, &live),
             Some(format!(
                 "iptables: BIRDO_KS_OUT0 holds {} rules where {} were loaded",
-                live.v4.0 + 1,
-                live.v4.0
+                live.v4.0.len() + 1,
+                live.v4.0.len()
             ))
         );
 
@@ -3174,6 +3262,41 @@ mod tests {
         assert_eq!(pace, FirstArm::new());
     }
 
+    /// MR-2000: a restore or an owed lift that keeps failing was logged as an
+    /// error every 30 s, for as long as it failed. Only the pass that opens
+    /// a streak reports it now (`failed == 1` in the tick); the passes after
+    /// it are counted, and a pass that does not fail ends the streak.
+    #[test]
+    fn a_failure_that_persists_is_one_streak() {
+        let not_restored = Watched::NotRestored {
+            what: "iptables: the OUTPUT jump to BIRDO_KS_OUT0".into(),
+            why: "iptables: Resource temporarily unavailable.".into(),
+        };
+        let lift_failed = Watched::LiftRetried(Err("teardown incomplete".into()));
+        let mut failing = Failing::default();
+        assert_eq!(failing.record(Some(&not_restored)), 1, "opens the streak");
+        assert_eq!(failing.record(Some(&not_restored)), 2);
+        assert_eq!(failing.record(Some(&lift_failed)), 3);
+        assert_eq!(failing.record(None), 0, "a whole block ends it");
+        assert_eq!(failing.record(Some(&lift_failed)), 1, "a new streak");
+        for ended in [
+            Watched::LiftRetried(Ok(())),
+            Watched::Restored {
+                what: "iptables: the OUTPUT jump to BIRDO_KS_OUT0".into(),
+            },
+            Watched::Armed { failed: 0 },
+            // A first arm's streak is FirstArm's to count.
+            Watched::NotArmed {
+                why: "iptables: Permission denied".into(),
+                failed: 3,
+            },
+        ] {
+            failing.record(Some(&not_restored));
+            assert_eq!(failing.record(Some(&ended)), 0, "{ended:?}");
+            assert_eq!(failing, Failing::default());
+        }
+    }
+
     /// The listing as the kernel prints it (`-m tcp` and all): one entry per
     /// rule of exactly that chain.
     #[test]
@@ -3225,7 +3348,8 @@ mod tests {
 
         let linux = include_str!("../vpn/firewall_linux.rs").replace('\r', "");
         let pass = fn_body(&linux, "pub(crate) async fn watchdog(");
-        let locked = pass.find("CHAINS.lock().await").expect("under the lock");
+        // CHAINS held, off the async workers (MR-2000).
+        let locked = pass.find("with_chains(").expect("under the lock");
         assert!(locked < pass.find("WANTED.load(").unwrap());
         assert!(locked < pass.find("killswitch::is_enabled()").unwrap());
         // MR-2090: the pass is paced, and the pace kept under the same lock.
@@ -3359,7 +3483,10 @@ mod tests {
         let built = linux.find("fn activate_locked(").expect("activate_locked");
         let end = built + linux[built..].find("\n}\n").unwrap();
         assert_eq!(reads.len(), 1, "read once, where the block is built");
-        assert!(built < reads[0] && reads[0] < end);
+        assert!(
+            (built..end).contains(&reads[0]),
+            "read outside activate_locked"
+        );
         // activate_locked takes no relay, and runs with CHAINS held only.
         assert!(linux.contains("fn activate_locked() -> Result<(), String>"));
     }

@@ -30,10 +30,9 @@
 //! answer brings an address it does not cover yet, before that address is
 //! cached or dialled ([`refresh_control_plane`]).
 
-use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
-use crate::commands::killswitch::iptables_watchdog::{FirstArm, Live, Watched, Xtables};
+use crate::commands::killswitch::iptables_watchdog::{rules_of, FirstArm, Live, Watched, Xtables};
 use crate::vpn::iptables_policy;
 
 /// Tracks whether iptables blocking rules are active
@@ -86,9 +85,38 @@ static SELF_PERMITS_MISSING: AtomicBool = AtomicBool::new(false);
 /// re-arm a newly learned control-plane address asks for (which comes from
 /// the API resolver, concurrently with the reconnect loop's own re-arms). Two
 /// activations at once would both build — and flush — the same staging
-/// generation. Never held across anything but our own iptables runs; the
-/// panic path ([`emergency_cleanup`]) does not take it.
+/// generation. Never held across anything but our own iptables runs, and
+/// taken in [`with_chains`] alone; the panic path ([`emergency_cleanup`])
+/// does not take it.
 static CHAINS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Run `work` with [`CHAINS`] held, on the blocking pool (MR-2000): every
+/// change to our chains and every watchdog pass. Each iptables run is a
+/// blocking process spawn, dozens to an activation, and they ran on a tokio
+/// worker, the watchdog's every 30 s. A caller cancelled meanwhile does not
+/// release the lock before `work` is done (`utils::locked_blocking`).
+async fn with_chains<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    crate::utils::locked_blocking(&CHAINS, work).await
+}
+
+/// MR-2000: how long one iptables or ip6tables run waits for the xtables
+/// lock while another tool (firewalld, docker, ...) holds it. A bare `-w`
+/// waited for as long as the lock was held, forever behind a wedged holder,
+/// and with [`CHAINS`] held, so every activation, lift and watchdog pass
+/// waited behind it too. A run that gives up fails like any other, and
+/// each caller fails closed on that: a re-arm keeps the previous
+/// generation, and a first arm that failed is retried by the watchdog.
+const XTABLES_WAIT_SECS: &str = "5";
+
+/// `<cmd> -w 5 <args>`: every iptables and ip6tables run of this module.
+fn xtables(cmd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    crate::utils::hidden_cmd(cmd)
+        .args(["-w", XTABLES_WAIT_SECS])
+        .args(args)
+        .output()
+}
 
 /// Chain carrying the OUTPUT policy for generation `gen`.
 fn chain_out(gen: i8) -> String {
@@ -120,13 +148,11 @@ const HOOKS: [&str; 3] = ["OUTPUT", "INPUT", "FORWARD"];
 ///
 /// `-w` waits for the xtables lock instead of failing instantly when another
 /// process (firewalld, docker, ...) holds it — a transient insert failure
-/// mid-swap is exactly what used to poison LIVE_GEN.
+/// mid-swap is exactly what used to poison LIVE_GEN. For at most
+/// [`XTABLES_WAIT_SECS`] (MR-2000).
 fn iptables(args: &[&str]) -> Result<(), String> {
-    let output = crate::utils::hidden_cmd("iptables")
-        .arg("-w")
-        .args(args)
-        .output()
-        .map_err(|e| format!("iptables command failed: {}", e))?;
+    let output =
+        xtables("iptables", args).map_err(|e| format!("iptables command failed: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -148,11 +174,7 @@ fn iptables(args: &[&str]) -> Result<(), String> {
 /// returning Ok on `command not found`; presence of ip6tables but failure on
 /// a specific rule is still surfaced as an error.
 fn ip6tables(args: &[&str]) -> Result<(), String> {
-    let output = match crate::utils::hidden_cmd("ip6tables")
-        .arg("-w")
-        .args(args)
-        .output()
-    {
+    let output = match xtables("ip6tables", args) {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!("ip6tables not present — skipping IPv6 rule (host is IPv4-only)");
@@ -175,27 +197,21 @@ fn ip6tables(args: &[&str]) -> Result<(), String> {
 
 /// Check if one of our chains exists in the IPv4 table.
 fn chain_exists(name: &str) -> bool {
-    crate::utils::hidden_cmd("iptables")
-        .args(["-w", "-L", name, "-n"])
-        .output()
+    xtables("iptables", &["-L", name, "-n"])
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 /// AUDIT-N5: Check if one of our chains exists in the IPv6 table.
 fn chain_exists_v6(name: &str) -> bool {
-    crate::utils::hidden_cmd("ip6tables")
-        .args(["-w", "-L", name, "-n"])
-        .output()
+    xtables("ip6tables", &["-L", name, "-n"])
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 /// Whether a jump from `hook` to `name` is currently installed (IPv4).
 fn jump_present(hook: &str, name: &str) -> bool {
-    crate::utils::hidden_cmd("iptables")
-        .args(["-w", "-C", hook, "-j", name])
-        .output()
+    xtables("iptables", &["-C", hook, "-j", name])
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -226,7 +242,7 @@ fn reset_chain_v6(name: &str) -> Result<(), String> {
 /// A self-permit that will not load is logged and skipped: the block still
 /// goes up, only narrower (no control plane). Any other rule failing abandons
 /// the generation. Returns how many rules loaded: fewer than `rules` only when
-/// a self-permit was skipped. (The watchdog reads that many back, MR-833.)
+/// a self-permit was skipped.
 fn load_chain(
     run: fn(&[&str]) -> Result<(), String>,
     chain: &str,
@@ -256,8 +272,8 @@ fn load_chain(
 
 /// Build the fully-populated rule set for `gen` in both address families, as
 /// `iptables_policy::block_all` decides it. `Ok`: whether every control-plane
-/// self-permit loaded, and the generation as loaded (what the watchdog reads
-/// back once it is hooked, MR-833).
+/// self-permit loaded, and the generation as iptables lists it once loaded
+/// (what the watchdog compares with once it is hooked, MR-833, MR-2001).
 ///
 /// Nothing here is reachable from a built-in chain yet, so a failure part-way
 /// through cannot leave a half-armed policy in the packet path: the caller
@@ -272,17 +288,35 @@ fn build_chains(gen: i8, inputs: &iptables_policy::BlockAll<'_>) -> Result<(bool
     // Only a self-permit may be skipped, and they are all IPv4 OUT rules.
     let self_permits_loaded = out_v4 == chains.out_v4.len();
     reset_chain(&inn)?;
-    let in_v4 = load_chain(iptables, &inn, &chains.in_v4)?;
+    load_chain(iptables, &inn, &chains.in_v4)?;
 
     // AUDIT-N5: IPv6 parity — dual-stack hosts must not leak IPv6 around the
     // IPv4-only tunnel (Windows closes the same gap with block_all_v6).
     reset_chain_v6(&out)?;
-    let out_v6 = load_chain(ip6tables, &out, &chains.out_v6)?;
+    load_chain(ip6tables, &out, &chains.out_v6)?;
     reset_chain_v6(&inn)?;
-    let in_v6 = load_chain(ip6tables, &inn, &chains.in_v6)?;
-    // ip6tables() answers Ok on a host without it, so "loaded" says nothing
-    // there: the chain itself does.
-    let v6 = chain_exists_v6(&out).then_some((out_v6, in_v6));
+    load_chain(ip6tables, &inn, &chains.in_v6)?;
+
+    // MR-2001: what the watchdog compares every later listing with, rule by
+    // rule — each chain as iptables lists it (`-S`) once loaded. Not the text
+    // we sent: the listing canonicalises it (`-m tcp`, `/32`, its own option
+    // order). A read that fails leaves nothing to compare, so the watchdog's
+    // next pass finds the chain changed and re-arms, which reads it again.
+    let read_back = |v6: bool, chain: &str| -> Vec<String> {
+        Iptables
+            .run(v6, &["-S", chain])
+            .map(|listing| {
+                rules_of(&listing, chain)
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let v4 = (read_back(false, &out), read_back(false, &inn));
+    // ip6tables() answers Ok on a host without it, so a load that went
+    // through says nothing there: the chain itself does.
+    let v6 = chain_exists_v6(&out).then(|| (read_back(true, &out), read_back(true, &inn)));
 
     if inputs.lan_sharing {
         tracing::info!("Kill switch: LAN sharing permitted (RFC1918 + link-local)");
@@ -294,15 +328,7 @@ fn build_chains(gen: i8, inputs: &iptables_policy::BlockAll<'_>) -> Result<(bool
             inputs.control_plane.len()
         );
     }
-    Ok((
-        self_permits_loaded,
-        Live {
-            out,
-            inn,
-            v4: (out_v4, in_v4),
-            v6,
-        },
-    ))
+    Ok((self_permits_loaded, Live { out, inn, v4, v6 }))
 }
 
 /// Hook generation `gen` into OUTPUT/INPUT/FORWARD in both families.
@@ -394,21 +420,30 @@ fn leftover_chains() -> Vec<String> {
 /// Builds a fresh generation of chains, swaps the built-in jumps onto it, and
 /// only then tears down the previous generation — so re-arming (which happens on
 /// every reconnect tick) never opens a window where traffic is unfiltered.
-pub async fn activate_blocking(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
-    let _chains = CHAINS.lock().await;
-    WANTED.store(true, Ordering::SeqCst);
-    activate_locked(server_ip)
+/// The relay it permits is the kill switch's as it is once the lock is held.
+pub async fn activate_blocking() -> Result<(), String> {
+    with_chains(|| {
+        WANTED.store(true, Ordering::SeqCst);
+        activate_locked()
+    })
+    .await?
 }
 
 /// [`activate_blocking`] with [`CHAINS`] held.
-fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
+fn activate_locked() -> Result<(), String> {
     tracing::info!("Activating Linux iptables kill switch");
 
     // Read under the lock: a re-arm for a newly learned control-plane address
-    // must be built from a set that includes it.
+    // must be built from a set that includes it. So must the relay (MR-1998):
+    // each caller used to read it before it waited for the lock, so a server
+    // switch that got the lock first, and re-armed for the new relay, was
+    // undone by a re-arm for the old one, which dropped the new relay's
+    // handshake. Every write of the relay is followed by a re-arm under this
+    // lock while a block is up (`session::apply_relay_permit`), so the last
+    // re-arm is always built from the latest relay, as macOS's (P3-3).
     let (control_plane, control_plane_gen) = crate::api::doh_resolver::control_plane();
     let inputs = iptables_policy::BlockAll {
-        relay: server_ip,
+        relay: crate::commands::killswitch::vpn_server_ip(),
         control_plane: &control_plane,
         euid: unsafe { libc::geteuid() },
         lan_sharing: crate::commands::killswitch::lan_sharing_enabled(),
@@ -533,15 +568,14 @@ pub fn self_permits_missing() -> bool {
 /// already. Whether a block is WANTED is the caller's to decide
 /// (`killswitch::control_plane_learned`, under the one rule for the intent);
 /// this never puts up a block that is not already up.
-pub async fn refresh_control_plane(
-    server_ip: Option<Ipv4Addr>,
-    generation: u64,
-) -> Result<bool, String> {
-    let _chains = CHAINS.lock().await;
-    if permits(generation) || LIVE_GEN.load(Ordering::SeqCst) < 0 {
-        return Ok(false);
-    }
-    activate_locked(server_ip).map(|()| true)
+pub async fn refresh_control_plane(generation: u64) -> Result<bool, String> {
+    with_chains(move || {
+        if permits(generation) || LIVE_GEN.load(Ordering::SeqCst) < 0 {
+            return Ok(false);
+        }
+        activate_locked().map(|()| true)
+    })
+    .await?
 }
 
 /// Deactivate blocking: remove our chains from both filter tables.
@@ -551,11 +585,38 @@ pub async fn refresh_control_plane(
 /// the app believes it is not blocking: every later lift is gated on that flag,
 /// so nothing ever retries.
 pub async fn deactivate_blocking() -> Result<(), String> {
-    let _chains = CHAINS.lock().await;
-    // Every lift request, whether or not it lands: a block still held after
-    // a failed one is a lift owed, which the watchdog retries (MR-833).
-    WANTED.store(false, Ordering::SeqCst);
-    deactivate_locked()
+    with_chains(|| {
+        // Every lift request, whether or not it lands: a block still held
+        // after a failed one is a lift owed, which the watchdog retries
+        // (MR-833).
+        WANTED.store(false, Ordering::SeqCst);
+        deactivate_locked()
+    })
+    .await?
+}
+
+/// The kill switch's live OFF (`killswitch::set_killswitch_live`): lift a
+/// block of ours, decided under [`CHAINS`] (MR-1999). `Ok(true)`: one was
+/// lifted; `Ok(false)`: none was up.
+///
+/// The OFF used to ask the lock-free [`is_blocking`] and lift only on a
+/// yes. A first arm that hooked only part of its jumps, not OUTPUT's, says
+/// no there while a generation is live, and the watchdog's next pass
+/// re-arms it: an OFF that landed while that pass ran found nothing to
+/// lift, and the pass then put the block up behind it, held until the pass
+/// after lifted it, 30 s later. Under the lock, whatever pass or activation
+/// is in flight finishes first, and what it put up is lifted here, as
+/// macOS's `pf_lift_if_loaded` does (N2).
+pub async fn lift_if_held() -> Result<bool, String> {
+    with_chains(|| {
+        // A lift request like any other, whether or not anything is up.
+        WANTED.store(false, Ordering::SeqCst);
+        if LIVE_GEN.load(Ordering::SeqCst) < 0 && !IPTABLES_BLOCKING.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        deactivate_locked().map(|()| true)
+    })
+    .await?
 }
 
 /// [`deactivate_blocking`] with [`CHAINS`] held.
@@ -593,19 +654,16 @@ pub fn is_blocking() -> bool {
     IPTABLES_BLOCKING.load(Ordering::SeqCst)
 }
 
-/// `iptables` / `ip6tables`, as the watchdog reads them (MR-833). The listings
-/// carry the relay's and the control plane's addresses: they are compared,
-/// never logged.
+/// `iptables` / `ip6tables`, as the watchdog reads them (MR-833), each run
+/// bounded like every other ([`xtables`], MR-2000). The listings carry the
+/// relay's and the control plane's addresses: they are compared, never
+/// logged.
 struct Iptables;
 
 impl Xtables for Iptables {
     fn run(&self, v6: bool, args: &[&str]) -> Result<String, String> {
         let cmd = if v6 { "ip6tables" } else { "iptables" };
-        let out = crate::utils::hidden_cmd(cmd)
-            .arg("-w")
-            .args(args)
-            .output()
-            .map_err(|e| format!("{cmd} could not run: {e}"))?;
+        let out = xtables(cmd, args).map_err(|e| format!("{cmd} could not run: {e}"))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
@@ -620,40 +678,48 @@ impl Xtables for Iptables {
 
 /// One pass of the kill switch's watchdog (MR-833), every 30 s from the first
 /// activation on (`killswitch::ensure_iptables_watchdog`). Under [`CHAINS`],
-/// so it never interleaves with an activation or a lift; what it decides is
+/// so it never interleaves with an activation or a lift, and off the async
+/// workers ([`with_chains`], MR-2000); what it decides is
 /// `killswitch::iptables_watchdog::watch`:
 ///
 /// - a block that is WANTED — the last request was an activation, and the
 ///   kill switch is on, both read under the lock — is read back, and re-armed
-///   (a generation swap, as on every reconnect) if anything is missing: a
-///   jump, a chain's loaded rule count, or its final DROP (`iptables -F`
-///   empties our chains in place). Rule text is not compared; see
-///   `iptables_watchdog::missing` for what that leaves undetected;
+///   (a generation swap, as on every reconnect) if anything is missing or
+///   changed: a jump, or its place at the top of its hook, or a chain's rules
+///   as iptables listed them once loaded, its final DROP last (`iptables -F`
+///   empties our chains in place). See `iptables_watchdog::missing` for what
+///   that still leaves undetected (MR-2001);
 /// - a block WANTED of which no generation is live — its first arm failed —
 ///   is put up, retried at the pace `iptables_watchdog::FirstArm` keeps
 ///   (MR-2090);
 /// - a block held but not wanted is a lift that failed, retried;
 /// - nothing held, nothing wanted: nothing is read. `None` whenever nothing
-///   had to be done.
-pub(crate) async fn watchdog(server_ip: Option<Ipv4Addr>) -> Option<Watched> {
-    let _chains = CHAINS.lock().await;
-    let wanted = WANTED.load(Ordering::SeqCst) && crate::commands::killswitch::is_enabled();
-    let held = IPTABLES_BLOCKING.load(Ordering::SeqCst);
-    let current = live();
-    let mut first_arm = FIRST_ARM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    first_arm.pass(
-        &Iptables,
-        wanted,
-        held,
-        current.as_ref(),
-        || {
-            activate_locked(server_ip)?;
-            live().ok_or_else(|| "no generation is live after the re-arm".to_string())
-        },
-        deactivate_locked,
-    )
+///   had to be done, and when the pass could not run at all (logged here).
+pub(crate) async fn watchdog() -> Option<Watched> {
+    let pass = with_chains(|| {
+        let wanted = WANTED.load(Ordering::SeqCst) && crate::commands::killswitch::is_enabled();
+        let held = IPTABLES_BLOCKING.load(Ordering::SeqCst);
+        let current = live();
+        let mut first_arm = FIRST_ARM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        first_arm.pass(
+            &Iptables,
+            wanted,
+            held,
+            current.as_ref(),
+            || {
+                activate_locked()?;
+                live().ok_or_else(|| "no generation is live after the re-arm".to_string())
+            },
+            deactivate_locked,
+        )
+    })
+    .await;
+    pass.unwrap_or_else(|e| {
+        tracing::error!("Kill switch watchdog: the pass could not run: {}", e);
+        None
+    })
 }
 
 /// Emergency cleanup — called from panic handler.
@@ -675,23 +741,18 @@ mod iptables_chain_tests {
     use super::*;
     use crate::commands::killswitch::iptables_watchdog;
     use crate::vpn::iptables_policy::check::{self, Packet};
-    use std::net::{IpAddr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     /// Whether a jump from `hook` to `name` is installed in the IPv6 table.
     fn jump_present_v6(hook: &str, name: &str) -> bool {
-        crate::utils::hidden_cmd("ip6tables")
-            .args(["-w", "-C", hook, "-j", name])
-            .output()
+        xtables("ip6tables", &["-C", hook, "-j", name])
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
 
     /// `<cmd> -S <chain>`: the kernel's own listing.
     fn listing(cmd: &str, chain: &str) -> Result<String, String> {
-        let out = crate::utils::hidden_cmd(cmd)
-            .args(["-w", "-S", chain])
-            .output()
-            .map_err(|e| format!("{cmd}: {e}"))?;
+        let out = xtables(cmd, &["-S", chain]).map_err(|e| format!("{cmd}: {e}"))?;
         if !out.status.success() {
             return Err(format!(
                 "{cmd} -S {chain}: {}",
@@ -751,19 +812,22 @@ mod iptables_chain_tests {
         let (loaded, live) = built.expect("every rule loaded");
         assert!(loaded, "every self-permit loaded");
 
-        // MR-833: the watchdog reads back what the kernel lists. A count that
-        // differed from what was loaded would re-arm the block every 30 s on
-        // every Linux host.
+        // MR-833, MR-2001: the watchdog compares what the kernel lists, rule
+        // by rule, with the listing read back once the chain was loaded. A
+        // second read that differed from it (a listing that is not stable),
+        // or a count that differed from what was loaded, would re-arm the
+        // block every 30 s on every Linux host.
         assert_eq!((live.out.as_str(), live.inn.as_str()), (&*out, &*inn));
-        let (n6_out, n6_in) = live.v6.expect("the runner has ip6tables");
-        for (text, chain, loaded) in [
-            (&v4, &out, live.v4.0),
-            (&v4_in, &inn, live.v4.1),
-            (&v6, &out, n6_out),
-            (&v6_in, &inn, n6_in),
+        let (base6_out, base6_in) = live.v6.as_ref().expect("the runner has ip6tables");
+        for (text, chain, base, loaded) in [
+            (&v4, &out, &live.v4.0, want.out_v4.len()),
+            (&v4_in, &inn, &live.v4.1, want.in_v4.len()),
+            (&v6, &out, base6_out, want.out_v6.len()),
+            (&v6_in, &inn, base6_in, want.in_v6.len()),
         ] {
             let text = text.as_deref().expect("-S");
             let held = iptables_watchdog::rules_of(text, chain);
+            assert_eq!(held, *base, "{text}");
             assert_eq!(held.len(), loaded, "{text}");
             assert_eq!(held.last(), Some(&"-j DROP"), "{text}");
         }
