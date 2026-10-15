@@ -257,9 +257,12 @@ jobs:
           # loop's buffer-reuse helper, run on a pipe fd; and the TUN fd's
           # close-on-exec check) + owned_route_tests (bug B: a route is deleted
           # exactly as it was added). macOS: dns_journal_restore_tests
-          # (restore_services_pass, interpret_dns_query, dns_write_verified)
-          # and utun_fd_tests (the utun socket is close-on-exec, checked
-          # unprivileged). Both: log_retention::tests,
+          # (restore_services_pass, interpret_dns_query, dns_write_verified),
+          # utun_fd_tests (the utun socket is close-on-exec, checked
+          # unprivileged) and owned_route_tests (MR-2088: a route is deleted
+          # with the qualifiers it was added with, only while `route -n get`
+          # shows it is still ours, and a collision is taken over only from a
+          # utun that no longer exists). Both: log_retention::tests,
           # whose owner-only (0600) log-file test is #[cfg(unix)], so the
           # Windows job compiles it out; and file_log::tests, whose symlinked
           # log and symlinked log-directory tests (MR-808) are #[cfg(unix)]
@@ -279,14 +282,14 @@ jobs:
           # from creation, a folder others can write refused), #[cfg(unix)] too.
           # Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests owned_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
           # FILTER plus the root-only steps further down (ipv6, the netns
           # teardown tests), whose tests are #[ignore]d and so cannot run in
           # the loop above.
-          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests' || 'configure_ipv6_tests ipv6_leak_block_tests netns_teardown_tests owned_route_tests resolv_conf_restore_tests tun_read_tests' }}
+          COVERED: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests owned_route_tests utun_fd_tests' || 'configure_ipv6_tests ipv6_leak_block_tests netns_teardown_tests owned_route_tests resolv_conf_restore_tests tun_read_tests' }}
         run: |
           set -euo pipefail
           # $FILTER/$COVERED are space-separated lists; split them explicitly
@@ -431,8 +434,12 @@ jobs:
       # place it can run. It installs a route to TEST-NET-1 and removes it.
       # MR-740: and the endpoint route a killed session left (another
       # TEST-NET-1 host) is removed by the next start's journal-driven
-      # recovery. Two tests, both required.
-      - name: Endpoint-route tolerated-duplicate + crash-recovery tests (macOS, root)
+      # recovery. MR-2088: teardown leaves an endpoint route it did not add, a
+      # start neither takes nor deletes another utun's route at one of its
+      # prefixes (TEST-NET-2 through a second utun) and its unwind removes the
+      # endpoint route it pinned, and a dropped tunnel removes it too. Five
+      # tests, all required.
+      - name: Endpoint-route + route-ownership tests (macOS, root)
         if: matrix.os == 'macos'
         working-directory: src-tauri
         run: |
@@ -443,8 +450,8 @@ jobs:
             exit 1
           }
           echo "$out"
-          if ! echo "$out" | grep -qE 'test result: ok\. 2 passed'; then
-            echo "::error::the macOS endpoint-route root tests did not both run"
+          if ! echo "$out" | grep -qE 'test result: ok\. 5 passed'; then
+            echo "::error::the macOS endpoint-route root tests did not all run"
             exit 1
           fi
 

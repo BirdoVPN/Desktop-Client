@@ -11,6 +11,7 @@ import {
   giveUpKind,
   giveUpMessage,
   isSilentError,
+  KILLSWITCH_HOLDING_COPY,
   PQ_FAILED_COPY,
   QUOTA_EXCEEDED_COPY,
   quotaGraceMessage,
@@ -18,6 +19,7 @@ import {
   SESSION_EXPIRED_COPY,
   STEALTH_FAILED_COPY,
   UPDATE_REQUIRED_COPY,
+  vpnErrorCopy,
 } from './errors';
 import type { IpcError, IpcErrorCode } from './ipc';
 
@@ -121,6 +123,25 @@ describe('errorCopy', () => {
 
   it('a legacy string error gets the generic sentence, not its own text', () => {
     expect(errorText('Session expired — please reconnect')).toBe('Something went wrong. Please try again.');
+  });
+});
+
+// MR-2111: the kept tunnel (Desktop #313) is `killswitch_failed` with traffic
+// held. Try again repeats the failure; Disconnect releases it.
+describe('vpnErrorCopy', () => {
+  it('says traffic is held, with Disconnect, for a kill-switch failure while blocking', () => {
+    expect(vpnErrorCopy(err('killswitch_failed'), true)).toEqual({
+      message: KILLSWITCH_HOLDING_COPY,
+      action: 'disconnect',
+    });
+    expect(KILLSWITCH_HOLDING_COPY).toMatch(/traffic is held/);
+    expect(KILLSWITCH_HOLDING_COPY).toMatch(/Disconnect/);
+    expect(KILLSWITCH_HOLDING_COPY).not.toMatch(/try again/i);
+  });
+
+  it('is errorCopy for everything else', () => {
+    expect(vpnErrorCopy(err('killswitch_failed'), false)).toEqual(errorCopy(err('killswitch_failed'), 'vpn'));
+    expect(vpnErrorCopy(err('server_unreachable'), true)).toEqual(errorCopy(err('server_unreachable'), 'vpn'));
   });
 });
 

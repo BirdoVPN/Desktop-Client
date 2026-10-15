@@ -238,30 +238,63 @@ pub(crate) fn route_tool_outcome(success: bool, output: &str) -> RouteDelete {
     }
 }
 
+/// macOS: one field of `route -n get`'s output (`destination:`, `mask:`,
+/// `gateway:`, `interface:`), `None` when it prints no such line.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn route_get_field<'a>(output: &'a str, name: &str) -> Option<&'a str> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(name).map(str::trim))
+}
+
+/// macOS: is the route `route -n get` describes the one at exactly `dst` —
+/// this destination and this mask — rather than a broader one the lookup fell
+/// back to? `route` prints the address 0.0.0.0 as `default`, so the
+/// `0.0.0.0/1` half-default reads `destination: default`, `mask: 128.0.0.0`;
+/// a host route prints no mask.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn route_get_is_at(output: &str, dst: &str) -> bool {
+    let Some((net, prefix)) = super::parse_ipv4_cidr(dst) else {
+        return false;
+    };
+    let ip = |value: Option<&str>| {
+        value.and_then(|v| match v {
+            "default" => Some(std::net::Ipv4Addr::UNSPECIFIED),
+            v => v.parse::<std::net::Ipv4Addr>().ok(),
+        })
+    };
+    let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+    let dst_ok = ip(route_get_field(output, "destination:")) == Some(std::net::Ipv4Addr::from(net));
+    let mask_ok = match route_get_field(output, "mask:") {
+        // A host route prints no mask.
+        None => prefix == 32,
+        Some(m) => ip(Some(m)) == Some(std::net::Ipv4Addr::from(mask)),
+    };
+    dst_ok && mask_ok
+}
+
 /// macOS: does `route -n get`'s output describe `route` itself — this
 /// destination and mask, via this gateway? BSD `route delete` matches on the
-/// destination alone, so this is what keeps a recovery from deleting a route
+/// destination alone, so this is what keeps a delete from removing a route
 /// someone else has since put there (a corporate VPN's 10.0.0.0/8, say).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn route_get_describes(output: &str, route: &GatewayRoute) -> bool {
-    let field = |name: &str| {
-        output
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(name).map(str::trim))
-    };
-    let Some((net, prefix)) = super::parse_ipv4_cidr(&route.dst) else {
-        return false;
-    };
-    let ip = |value: Option<&str>| value.and_then(|v| v.parse::<std::net::Ipv4Addr>().ok());
-    let mask = std::net::Ipv4Addr::from(u32::MAX << (32 - u32::from(prefix.max(1))));
-    let dst_ok = ip(field("destination:")) == Some(std::net::Ipv4Addr::from(net));
-    let via_ok = ip(field("gateway:")) == route.via.parse().ok();
-    let mask_ok = match field("mask:") {
-        // A host route prints no mask.
-        None => prefix == 32,
-        Some(m) => ip(Some(m)) == Some(mask),
-    };
-    dst_ok && via_ok && mask_ok
+    let gateway =
+        route_get_field(output, "gateway:").and_then(|v| v.parse::<std::net::Ipv4Addr>().ok());
+    route_get_is_at(output, &route.dst) && gateway.is_some() && gateway == route.via.parse().ok()
+}
+
+/// macOS: the interface of the route `route -n get` describes, if that route
+/// is the one at exactly `dst`. A route added with `-interface` (the utun's
+/// own) has no gateway, so this is what tells ours from another VPN's at the
+/// same destination: a utun's name is unique while it exists (MR-2088).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn route_get_interface_at<'a>(output: &'a str, dst: &str) -> Option<&'a str> {
+    if route_get_is_at(output, dst) {
+        route_get_field(output, "interface:")
+    } else {
+        None
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -507,23 +540,10 @@ pub(crate) fn remember(route: &GatewayRoute) {
 }
 
 /// Drop `route` from the record: a teardown proved it gone.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn forget(route: &GatewayRoute) {
     if let Err(e) = forget_in(Path::new(RECORD_DIR), current_boot().as_deref(), |r| {
         r == route
-    }) {
-        tracing::warn!("Route record not updated: {}", e);
-    }
-}
-
-/// Drop every entry for `dst`: a teardown deleted the route at that
-/// destination (macOS deletes by destination).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn forget_destination(dst: &str) {
-    if let Err(e) = forget_in(Path::new(RECORD_DIR), current_boot().as_deref(), |r| {
-        r.dst == dst
     }) {
         tracing::warn!("Route record not updated: {}", e);
     }
@@ -834,6 +854,58 @@ mod tests {
             "destination: 10.0.0.0\n    gateway: 192.168.1.1\n",
             &net
         ));
+        // No gateway line at all (an `-interface` route) is not via ours.
+        assert!(!route_get_describes(
+            "destination: 10.0.0.0\n       mask: 255.0.0.0\n  interface: utun4\n",
+            &net
+        ));
+    }
+
+    /// MR-2088: a route into a utun (added with `-interface`, so no gateway)
+    /// is told apart by its interface — and only the route at exactly that
+    /// prefix counts. `route` prints the address 0.0.0.0 as `default`.
+    #[test]
+    fn route_get_names_the_interface_of_the_route_at_exactly_that_prefix() {
+        let low = "   route to: default\ndestination: default\n       mask: 128.0.0.0\n  interface: utun3\n      flags: <UP,DONE,STATIC>\n";
+        assert_eq!(route_get_interface_at(low, "0.0.0.0/1"), Some("utun3"));
+        let high = "   route to: 128.0.0.0\ndestination: 128.0.0.0\n       mask: 128.0.0.0\n  interface: utun3\n      flags: <UP,DONE,STATIC>\n";
+        assert_eq!(route_get_interface_at(high, "128.0.0.0/1"), Some("utun3"));
+        // Printed in full, 0.0.0.0 reads the same.
+        assert_eq!(
+            route_get_interface_at(
+                &low.replace("destination: default", "destination: 0.0.0.0"),
+                "0.0.0.0/1"
+            ),
+            Some("utun3")
+        );
+
+        // The host default a lookup falls back to is not the half-default.
+        let host_default = "   route to: default\ndestination: default\n       mask: default\n    gateway: 192.168.1.1\n  interface: en0\n";
+        assert_eq!(route_get_interface_at(host_default, "0.0.0.0/1"), None);
+        // Another prefix at the same address is not this one.
+        assert_eq!(
+            route_get_interface_at(
+                &high.replace("mask: 128.0.0.0", "mask: 192.0.0.0"),
+                "128.0.0.0/1"
+            ),
+            None
+        );
+        assert_eq!(route_get_interface_at(high, "0.0.0.0/1"), None);
+        // No interface line, or a failed lookup: nothing to match.
+        assert_eq!(
+            route_get_interface_at(
+                "destination: 128.0.0.0\n       mask: 128.0.0.0\n",
+                "128.0.0.0/1"
+            ),
+            None
+        );
+        assert_eq!(
+            route_get_interface_at(
+                "route: writing to routing socket: not in table\n",
+                "0.0.0.0/1"
+            ),
+            None
+        );
     }
 
     /// The record and its directory are the effective user's alone (root's,

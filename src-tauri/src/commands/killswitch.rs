@@ -703,11 +703,16 @@ async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
         return Ok(false);
     }
 
+    // MR-2110: an engine that cannot be opened leaves the intent ON
+    // ([`open_engine`]), so every teardown, dial and switch after this fails
+    // closed instead of reading "no block wanted".
     #[cfg(target_os = "windows")]
-    {
-        wfp::initialize()
-            .await
-            .map_err(|e| format!("Failed to initialize kill-switch firewall: {}", e))?;
+    if let Err(e) = open_engine(wfp::initialize(), seen).await {
+        // Lockdown's always-on block cannot go up without the engine either:
+        // degrade to the reactive kill switch for this session, as when its
+        // activation fails below.
+        wfp::set_lockdown_mode(false);
+        return Err(e);
     }
 
     if !intent_on_since(seen) {
@@ -785,6 +790,40 @@ async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
         tracing::info!("Kill switch armed for active session (reactive)");
         Ok(true)
     }
+}
+
+/// [`arm_with_preference`]'s step that opens the kill switch's firewall engine
+/// (`open`: `wfp::initialize()`), with the preference ON and `seen` the
+/// intent's sequence from before the preference was read. Split out so the
+/// failure can be injected in tests.
+///
+/// MR-2110: a failed open used to return before the intent was stored, so it
+/// stayed OFF while the user's preference was ON. `activate_killswitch()` then
+/// answered `Ok(false)`, which a reconnect teardown and `fail_connect` read as
+/// "the user wants no block" (`reconnect_policy::teardown_covered`) and let
+/// go ahead with nothing blocking; `move_relay` dropped the guard of a server
+/// switch the same way. The intent is stored ON now, before the error is
+/// returned, unless the switch changed since `seen` (an OFF or a Disconnect
+/// since wins, as for any arm). With no engine, the block each of those steps
+/// asks for fails, and they fail closed: the dead tunnel is held, the dial
+/// aborted, the switch refused before the old tunnel is touched (MR-2070,
+/// MR-2071).
+#[cfg(any(target_os = "windows", test))]
+async fn open_engine(
+    open: impl std::future::Future<Output = Result<(), String>>,
+    seen: u64,
+) -> Result<(), String> {
+    let Err(e) = open.await else {
+        return Ok(());
+    };
+    if intent_on_since(seen) {
+        tracing::error!(
+            "The kill switch's firewall could not be initialized ({}); it stays on, so \
+             nothing is torn down, re-dialled or switched without its block",
+            e
+        );
+    }
+    Err(format!("Failed to initialize kill-switch firewall: {}", e))
 }
 
 /// Disarm the kill switch when the user ends the session: clear the intent flag
@@ -976,6 +1015,7 @@ async fn iptables_watchdog_tick() {
     let Some(watched) = firewall_linux::watchdog(vpn_server_ip()).await else {
         return;
     };
+    let armed = matches!(watched, Watched::Armed { .. });
     match watched {
         Watched::Restored { what } => tracing::warn!(
             "Kill switch watchdog: something else had removed part of the iptables block \
@@ -989,6 +1029,25 @@ async fn iptables_watchdog_tick() {
             why,
             IPTABLES_WATCHDOG_INTERVAL.as_secs()
         ),
+        // MR-2090: one error per streak; the attempts after it are counted.
+        Watched::NotArmed { why, failed: 1 } => tracing::error!(
+            "Kill switch watchdog: the kill switch is ON but its iptables block is NOT up — \
+             it could not be put up: {}. The session runs without the block until it is; \
+             retried, at most {}s apart.",
+            why,
+            IPTABLES_WATCHDOG_INTERVAL.as_secs()
+                * u64::from(iptables_watchdog::FirstArm::MAX_APART)
+        ),
+        Watched::NotArmed { why, failed } => tracing::debug!(
+            "Kill switch watchdog: the iptables block still could not be put up (attempt {}): {}",
+            failed,
+            why
+        ),
+        Watched::Armed { failed } => tracing::warn!(
+            "Kill switch watchdog: the iptables block, wanted but not up since its activation \
+             failed, is up now (after {} failed retries)",
+            failed
+        ),
         Watched::LiftRetried(Ok(())) => {
             tracing::info!(
                 "Kill switch watchdog: retried an owed lift of the iptables block; lifted"
@@ -998,6 +1057,18 @@ async fn iptables_watchdog_tick() {
             "Kill switch watchdog: an owed lift of the iptables block failed again: {}",
             e
         ),
+    }
+    if armed {
+        // A block put up where none was is an activation, so the one rule
+        // for the intent applies: an OFF that landed while it went up found
+        // no block to lift ([`unless_turned_off`]).
+        let _ = unless_turned_off(
+            std::future::ready(Ok(true)),
+            deactivate_platform_block,
+            activate_platform_block,
+            platform_is_blocking,
+        )
+        .await;
     }
     blocking_may_have_changed();
 }
@@ -1105,6 +1176,13 @@ pub(crate) mod iptables_watchdog {
         Restored { what: String },
         /// ...and could not be put back, for `why`.
         NotRestored { what: String, why: String },
+        /// MR-2090: a wanted block of which no generation was live — its
+        /// first arm had failed — was put up, and reads back whole. `failed`:
+        /// how many attempts before this one could not ([`FirstArm`]).
+        Armed { failed: u32 },
+        /// ...or could not be, for `why`: the `failed`-th attempt in a row
+        /// that could not ([`FirstArm`]); 1 opens the streak.
+        NotArmed { why: String, failed: u32 },
         /// A block held but no longer wanted: a lift that failed earlier,
         /// retried.
         LiftRetried(Result<(), String>),
@@ -1116,11 +1194,18 @@ pub(crate) mod iptables_watchdog {
     ///   on) with a generation `live`: read it back ([`missing`]). Whole:
     ///   nothing to do, `None`. Otherwise `rearm` — a fresh generation,
     ///   swapped in like every re-arm — and the new one is read back too.
+    /// - `wanted` with NO generation live: the first arm failed (the rule
+    ///   build, say), so none ever was. `rearm` puts one up, read back the
+    ///   same way (MR-2090: this read nothing, and the session ran without
+    ///   its block until a reconnect happened to re-arm it). This call knows
+    ///   of no earlier attempt, so it reports `Armed { failed: 0 }` or
+    ///   `NotArmed { failed: 1, .. }`; [`FirstArm::pass`] paces the retries
+    ///   and counts them.
     /// - not wanted, but still `held`: a lift that failed — the give-up's
     ///   included, which lifts but leaves the intent set (N1 on macOS) — is
     ///   retried through `lift`. The block is never put back then: one that
     ///   somebody removed after we stopped wanting it stays removed.
-    /// - anything else: nothing is read, `None`.
+    /// - not wanted and not held: nothing is read, `None`.
     pub(crate) fn watch(
         x: &impl Xtables,
         wanted: bool,
@@ -1132,7 +1217,17 @@ pub(crate) mod iptables_watchdog {
         if !wanted {
             return held.then(|| Watched::LiftRetried(lift()));
         }
-        let what = missing(x, live?)?;
+        let Some(live) = live else {
+            let armed = rearm().and_then(|now| match missing(x, &now) {
+                None => Ok(()),
+                Some(still) => Err(format!("armed, but {still} is missing")),
+            });
+            return Some(match armed {
+                Ok(()) => Watched::Armed { failed: 0 },
+                Err(why) => Watched::NotArmed { why, failed: 1 },
+            });
+        };
+        let what = missing(x, live)?;
         let restored = rearm().and_then(|now| match missing(x, &now) {
             None => Ok(()),
             Some(still) => Err(format!("re-armed, but {still} is still missing")),
@@ -1141,6 +1236,74 @@ pub(crate) mod iptables_watchdog {
             Ok(()) => Watched::Restored { what },
             Err(why) => Watched::NotRestored { what, why },
         })
+    }
+
+    /// MR-2090: the pace at which the watchdog retries a wanted block that
+    /// never went up.
+    ///
+    /// At once on the next pass, then 1, 2 and at most [`Self::MAX_APART`]
+    /// passes apart (30 s, 1 min, 2 min): a host where iptables cannot work
+    /// at all is not made to rebuild the chains every 30 s for the whole
+    /// session, and one that recovers is armed within two minutes. The
+    /// attempts of one streak are counted, so only the one that opens it is
+    /// reported as an error.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub(crate) struct FirstArm {
+        /// Attempts that failed in a row.
+        failed: u32,
+        /// Passes still to sit out before the next attempt.
+        wait: u32,
+    }
+
+    impl FirstArm {
+        /// The most passes between two attempts.
+        pub(crate) const MAX_APART: u32 = 4;
+
+        pub(crate) const fn new() -> Self {
+            Self { failed: 0, wait: 0 }
+        }
+
+        /// One pass of [`watch`], paced: while the block is wanted and none
+        /// of ours is live, a pass that is not due reads nothing and is
+        /// `None`. The streak ends whenever there is nothing to put up any
+        /// more — the block went up, a generation is live (a reconnect armed
+        /// it), or it is no longer wanted.
+        pub(crate) fn pass(
+            &mut self,
+            x: &impl Xtables,
+            wanted: bool,
+            held: bool,
+            live: Option<&Live>,
+            rearm: impl FnOnce() -> Result<Live, String>,
+            lift: impl FnOnce() -> Result<(), String>,
+        ) -> Option<Watched> {
+            if wanted && live.is_none() && self.wait > 0 {
+                self.wait -= 1;
+                return None;
+            }
+            match watch(x, wanted, held, live, rearm, lift) {
+                Some(Watched::NotArmed { why, .. }) => {
+                    self.failed = self.failed.saturating_add(1);
+                    // 1, 2, 4, 4, ... passes on to the next attempt.
+                    let apart = 1u32
+                        .checked_shl(self.failed - 1)
+                        .unwrap_or(u32::MAX)
+                        .min(Self::MAX_APART);
+                    self.wait = apart - 1;
+                    Some(Watched::NotArmed {
+                        why,
+                        failed: self.failed,
+                    })
+                }
+                Some(Watched::Armed { .. }) => Some(Watched::Armed {
+                    failed: std::mem::take(self).failed,
+                }),
+                watched => {
+                    *self = Self::new();
+                    watched
+                }
+            }
+        }
     }
 }
 
@@ -2284,6 +2447,92 @@ mod tests {
         assert!(check < arm.find("wfp::initialize()").unwrap());
     }
 
+    /// MR-2110: the arm's engine open fails (the injected `wfp::initialize`
+    /// error) with the preference ON. The intent stays ON, so the block the
+    /// next teardown asks for is reported as failed rather than as "no block
+    /// wanted", and the teardown rule (`reconnect_policy::teardown_covered`,
+    /// MR-2071) holds the tunnel. The arm used to return before storing the
+    /// intent: `Ok(false)`, and the teardown went ahead with nothing blocking.
+    #[tokio::test]
+    async fn a_failed_engine_open_keeps_the_kill_switch_on() {
+        use crate::vpn::reconnect_policy::{killswitch_failed_error, teardown_covered};
+        let _tests = FLAG_TESTS.lock().await;
+        let not_opened = || {
+            std::future::ready(Err::<(), String>(
+                "FwpmEngineOpen0 failed: 0x800706D9".into(),
+            ))
+        };
+        intent_off();
+
+        let opened = open_engine(not_opened(), intent_seq()).await;
+        assert_eq!(
+            opened,
+            Err(
+                "Failed to initialize kill-switch firewall: FwpmEngineOpen0 failed: 0x800706D9"
+                    .into()
+            ),
+            "the arm still fails, and says why"
+        );
+        assert!(
+            is_enabled(),
+            "the preference is ON: a failed engine open must not leave the intent OFF"
+        );
+
+        // What a reconnect teardown, a dial and a failed connect then ask for
+        // (`activate_killswitch`, through `unless_turned_off`): with no engine
+        // the platform refuses (`wfp::activate_blocking`), nothing is up, and
+        // that refusal is the answer, so the tunnel is held.
+        let engaged = unless_turned_off(
+            std::future::ready(Err(
+                "Failed to activate blocking: Kill switch not initialized".into(),
+            )),
+            || std::future::ready(Ok(true)),
+            || std::future::ready(Ok(true)),
+            || false,
+        )
+        .await;
+        assert!(engaged.is_err(), "{engaged:?}");
+        assert_eq!(
+            teardown_covered(&engaged, false),
+            Err(killswitch_failed_error()),
+            "the teardown must be held, not let through as if no block were wanted"
+        );
+
+        // An OFF (or a Disconnect) since the preference was read still wins.
+        intent_off();
+        let seen = intent_seq();
+        intent_off();
+        assert!(open_engine(not_opened(), seen).await.is_err());
+        assert!(!is_enabled(), "a stale ON is not stored");
+
+        // An engine that opens stores nothing here: the arm's own
+        // `intent_on_since(seen)` does, after it.
+        let seen = intent_seq();
+        assert_eq!(open_engine(std::future::ready(Ok(())), seen).await, Ok(()));
+        assert!(!is_enabled());
+        assert_eq!(intent_seq(), seen);
+    }
+
+    /// MR-2110: the arm opens its engine through [`open_engine`] (Windows),
+    /// ahead of its own ON, and a failure there drops lockdown for the session,
+    /// as a lockdown activation that fails does. (The arm's ON path needs an
+    /// elevated host: a source check.)
+    #[test]
+    fn the_arm_opens_its_engine_through_the_step_that_keeps_the_intent() {
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let arm = &source[source.find("async fn arm_with_preference(").unwrap()..];
+        let arm = &arm[..arm.find("\n}\n").unwrap()];
+        let open = arm
+            .find("if let Err(e) = open_engine(wfp::initialize(), seen).await {")
+            .expect("the engine is opened through open_engine");
+        let degrade = arm[open..]
+            .find("wfp::set_lockdown_mode(false);\n        return Err(e);")
+            .expect("a failed open drops lockdown, then fails the arm");
+        assert!(open + degrade < arm.find("if !intent_on_since(seen) {").unwrap());
+        assert_eq!(arm.matches("wfp::initialize()").count(), 1);
+        assert!(!arm.contains(".map_err(|e| format!(\"Failed to initialize kill-switch firewall"));
+    }
+
     /// Round 3 of the review (P2-1): a settings read that never returns (a
     /// hung credential store, a `schtasks` holding the settings lock) must not
     /// hold up `disarm`, the Disconnect escape. Round 2's `arm` held an async
@@ -2431,7 +2680,7 @@ mod tests {
 
     // ── MR-833: the Linux watchdog, against a scripted iptables ─────────
 
-    use iptables_watchdog::{missing, rules_of, watch, Live, Watched, Xtables};
+    use iptables_watchdog::{missing, rules_of, watch, FirstArm, Live, Watched, Xtables};
     use std::cell::{Cell, RefCell, RefMut};
     use std::collections::BTreeMap;
 
@@ -2817,12 +3066,12 @@ mod tests {
         );
     }
 
-    /// Nothing held, or nothing wanted and nothing owed: the pass reads
-    /// nothing and spawns no process — the idle watchdog after a lift.
+    /// Nothing wanted and nothing owed: the pass reads nothing and spawns no
+    /// process — the idle watchdog after a lift. (A block wanted with
+    /// nothing live is not idle: MR-2090, below.)
     #[test]
     fn an_idle_watchdog_runs_nothing() {
         let x = FakeXtables::new();
-        assert_eq!(watch(&x, true, false, None, no_rearm, no_lift), None);
         assert_eq!(watch(&x, false, false, None, no_rearm, no_lift), None);
         assert_eq!(x.runs.get(), 0);
         let (x, live) = armed();
@@ -2832,6 +3081,167 @@ mod tests {
             None
         );
         assert_eq!(x.runs.get(), runs, "a lifted block is not read back");
+    }
+
+    /// MR-2090: the first arm failed (the rule build, say), so no generation
+    /// of ours was ever live while the block is wanted. The watchdog read
+    /// nothing then and the session ran without its block until a reconnect
+    /// happened to re-arm it. It puts the block up now, and reads it back.
+    #[test]
+    fn a_wanted_block_that_never_went_up_is_put_up() {
+        let x = FakeXtables::new();
+        let put_up = RefCell::new(None);
+        let watched = watch(
+            &x,
+            true,
+            false,
+            None,
+            || {
+                let live = x.arm(0, None);
+                *put_up.borrow_mut() = Some(live.clone());
+                Ok(live)
+            },
+            no_lift,
+        );
+        let live = put_up
+            .into_inner()
+            .expect("the watchdog put up the wanted block that never went up");
+        assert_eq!(missing(&x, &live), None, "and it reads back whole");
+        assert!(watched.is_some(), "and the pass says what it did");
+        assert_eq!(watched, Some(Watched::Armed { failed: 0 }));
+    }
+
+    /// MR-2090: an arm that does not take — it fails, or what it put up does
+    /// not read back — is reported as not armed, never as armed.
+    #[test]
+    fn a_first_arm_that_did_not_take_is_not_called_armed() {
+        let x = FakeXtables::new();
+        let failed = watch(
+            &x,
+            true,
+            false,
+            None,
+            || Err("rule build failed, block NOT changed: iptables: No chain/target/match".into()),
+            no_lift,
+        );
+        assert_eq!(
+            failed,
+            Some(Watched::NotArmed {
+                why: "rule build failed, block NOT changed: iptables: No chain/target/match".into(),
+                failed: 1,
+            })
+        );
+        let lost = watch(
+            &x,
+            true,
+            false,
+            None,
+            || {
+                let now = x.arm(0, None);
+                x.flush_all(false);
+                Ok(now)
+            },
+            no_lift,
+        );
+        match lost {
+            Some(Watched::NotArmed { why, .. }) => assert_eq!(
+                why,
+                "armed, but iptables: the OUTPUT jump to BIRDO_KS_OUT0 is missing"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// MR-2090: a first arm that keeps failing is retried at once, then 1, 2
+    /// and at most `FirstArm::MAX_APART` passes apart; the attempts of the
+    /// streak are counted, so only its first is reported as an error, and
+    /// the arm that lands says how many failed before it. A later failure
+    /// opens a new streak.
+    #[test]
+    fn a_failing_first_arm_is_retried_with_backoff_and_counted() {
+        let x = FakeXtables::new();
+        let mut pace = FirstArm::new();
+        let mut attempts = Vec::new();
+        let mut opened = 0;
+        for n in 0..20 {
+            let tried = Cell::new(false);
+            let watched = pace.pass(
+                &x,
+                true,
+                false,
+                None,
+                || {
+                    tried.set(true);
+                    Err("iptables: Resource temporarily unavailable.".into())
+                },
+                no_lift,
+            );
+            match watched {
+                None => assert!(!tried.get(), "pass {n} sat out, and ran nothing"),
+                Some(Watched::NotArmed { failed, .. }) => {
+                    assert!(tried.get());
+                    attempts.push(n);
+                    assert_eq!(failed as usize, attempts.len(), "the streak is counted");
+                    if failed == 1 {
+                        opened += 1;
+                    }
+                }
+                other => panic!("pass {n}: {other:?}"),
+            }
+        }
+        // 1, 2, 4, 4, 4... passes apart.
+        assert_eq!(attempts, vec![0, 1, 3, 7, 11, 15, 19]);
+        assert_eq!(opened, 1, "one streak, one error");
+        assert_eq!(x.runs.get(), 0, "nothing was read back from a failed arm");
+
+        // It goes up at the next attempt that is due.
+        let mut landed = None;
+        for _ in 0..FirstArm::MAX_APART {
+            landed = pace.pass(&x, true, false, None, || Ok(x.arm(0, None)), no_lift);
+            if landed.is_some() {
+                break;
+            }
+        }
+        assert_eq!(landed, Some(Watched::Armed { failed: 7 }));
+        assert_eq!(pace, FirstArm::new(), "the streak is over");
+
+        // A new failure opens a new streak, retried at once.
+        let fail = || Err::<Live, String>("iptables: Permission denied".into());
+        assert!(matches!(
+            pace.pass(&x, true, false, None, fail, no_lift),
+            Some(Watched::NotArmed { failed: 1, .. })
+        ));
+        assert!(matches!(
+            pace.pass(&x, true, false, None, fail, no_lift),
+            Some(Watched::NotArmed { failed: 2, .. })
+        ));
+    }
+
+    /// The streak also ends when there is nothing left to put up: another
+    /// activation made the block live (a reconnect re-armed it), or it is no
+    /// longer wanted. Neither waits out the pace or is put up by it.
+    #[test]
+    fn a_live_or_unwanted_block_ends_the_streak() {
+        let fail = || Err::<Live, String>("iptables: Resource temporarily unavailable.".into());
+        let (x, live) = armed();
+        let mut pace = FirstArm::new();
+        pace.pass(&x, true, false, None, fail, no_lift);
+        pace.pass(&x, true, false, None, fail, no_lift);
+        assert_ne!(pace, FirstArm::new());
+        assert_eq!(
+            pace.pass(&x, true, true, Some(&live), no_rearm, no_lift),
+            None,
+            "a whole live block is read back at once, whatever the pace"
+        );
+        assert_eq!(pace, FirstArm::new());
+
+        pace.pass(&x, true, false, None, fail, no_lift);
+        assert_eq!(
+            pace.pass(&x, false, false, None, no_rearm, no_lift),
+            None,
+            "a block no longer wanted is not put up"
+        );
+        assert_eq!(pace, FirstArm::new());
     }
 
     /// The listing as the kernel prints it (`-m tcp` and all): one entry per
@@ -2880,6 +3290,14 @@ mod tests {
         let locked = pass.find("CHAINS.lock().await").expect("under the lock");
         assert!(locked < pass.find("WANTED.load(").unwrap());
         assert!(locked < pass.find("killswitch::is_enabled()").unwrap());
+        // MR-2090: the pass is paced, and the pace kept under the same lock.
+        assert!(locked < pass.find("FIRST_ARM").expect("paced"));
+        assert!(pass.contains("first_arm.pass("));
+        // ...and a block it put up where none was meets the one rule for the
+        // intent, as every activation does.
+        let tick = fn_body(&source, "async fn iptables_watchdog_tick(");
+        let armed = tick.find("if armed {").expect("an arm is followed up");
+        assert!(armed < tick.find("unless_turned_off(").expect("by the one rule"));
         let on = fn_body(&linux, "pub async fn activate_blocking(");
         assert!(on.find("WANTED.store(true").unwrap() < on.find("activate_locked(").unwrap());
         let off = fn_body(&linux, "pub async fn deactivate_blocking(");

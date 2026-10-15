@@ -5,7 +5,7 @@
  * state of the app. One region for the whole app (not a live region per
  * banner), so a single change is announced once.
  */
-import { errorCopy, giveUpMessage } from '@/lib/errors';
+import { giveUpMessage, vpnErrorCopy } from '@/lib/errors';
 import { KILL_SWITCH_BLOCKING_TEXT, statusPill } from '@/lib/vpn-display';
 import { useAppStore } from '@/store/app-store';
 import { selectDisplayState } from '@/store/selectors';
@@ -21,7 +21,7 @@ export function LiveAnnouncer() {
       parts.push(giveUpMessage(s.giveUp.kind, s.giveUp.attempts, s.killSwitchBlocking));
     } else {
       const err = s.vpnError ?? s.commandError;
-      if (err && err.code !== 'cancelled') parts.push(errorCopy(err, 'vpn').message);
+      if (err && err.code !== 'cancelled') parts.push(vpnErrorCopy(err, s.killSwitchBlocking).message);
     }
     return parts.join('. ');
   });
