@@ -1231,8 +1231,18 @@ impl ReconnectLoop {
                 self.check_in(TEARDOWN_ALLOWANCE);
                 // Fail closed FIRST: from here until a new tunnel is up,
                 // nothing may leave on the physical NIC.
-                if let Err(e) = killswitch::activate_killswitch().await {
+                let engaged = killswitch::activate_killswitch().await;
+                if let Err(e) = &engaged {
                     tracing::warn!("Kill switch activation before teardown failed: {}", e);
+                }
+                // MR-2071: without a block, the dead tunnel's routes are all
+                // that keep traffic off the physical NIC. The teardown used
+                // to go ahead regardless, and everything left in the clear
+                // until the dial aborted; the tunnel is held instead.
+                if let Err(error) =
+                    reconnect_policy::teardown_covered(&engaged, killswitch::platform_is_blocking())
+                {
+                    return self.hold_dead_tunnel(error).await;
                 }
                 // The dead session's key, read before the teardown clears it.
                 let old_key = vm.get_key_id().await;
@@ -1316,10 +1326,7 @@ impl ReconnectLoop {
                 e,
                 attempt
             );
-            let error = IpcError::new(
-                IpcErrorCode::KillswitchFailed,
-                "The kill switch could not block traffic while reconnecting.",
-            );
+            let error = reconnect_policy::killswitch_failed_error();
             self.policy.on_dial_failed(error.clone());
             vm.set_reconnecting(attempt, Some(error), max).await;
             return Flow::Continue;
@@ -1443,13 +1450,18 @@ impl ReconnectLoop {
         .await?;
         // The block `dial` engaged is rebuilt around this relay before the
         // handshake (REVIEW-WIN2-001: in lockdown it used to keep naming the
-        // relay of the session that died).
-        crate::commands::session::apply_relay_permit(
+        // relay of the session that died). Only a block in force is rebuilt
+        // here, and one that could not be stays in force (MR-2070): nothing
+        // leaves in the clear, and a handshake it drops fails the attempt.
+        if let Err(e) = crate::commands::session::apply_relay_permit(
             &prepared.relay_endpoint,
             prepared.started_stealth,
             false,
         )
-        .await;
+        .await
+        {
+            tracing::warn!("The re-dial's relay permit was not rebuilt: {}", e);
+        }
 
         vm.set_phase(ConnectPhase::Handshaking);
         vm.connect(
@@ -1551,6 +1563,29 @@ impl ReconnectLoop {
                 Flow::Continue
             }
         }
+    }
+
+    /// MR-2071: the kill switch could not cover the teardown of a dead tunnel
+    /// (`reconnect_policy::teardown_covered`), so it is NOT torn down: its /1
+    /// routes swallow everything, which keeps traffic off the physical NIC.
+    /// The session reads `Reconnecting` with the kill switch's error, and the
+    /// next look asks for the teardown again (a held tunnel comes first,
+    /// W1-001) — behind a block, if one goes up by then. Each held teardown
+    /// spends an attempt (`ReconnectPolicy::on_teardown_held`), so a kill
+    /// switch that never arms ends in the give-up, whose own teardown ends the
+    /// session in `Error`. Disconnect is the way out meanwhile, as in any
+    /// reconnect; turning the kill switch off is another (the next look's
+    /// engage then answers `Ok(false)`, and the teardown goes ahead).
+    async fn hold_dead_tunnel(&mut self, error: IpcError) -> Flow {
+        tracing::error!(
+            "The kill switch could not block traffic — keeping the dead tunnel in place, so \
+             nothing leaves outside it, and trying again"
+        );
+        let attempt = self.policy.on_teardown_held(error.clone());
+        self.vpn_manager
+            .set_reconnecting(attempt, Some(error), self.policy.reconnect_max())
+            .await;
+        Flow::Continue
     }
 
     /// The server ended the session (a heartbeat said so, or the old key's
@@ -2528,6 +2563,52 @@ mod tests {
         let fresh = &source[source.find("fn api_after_teardown(&self)").unwrap()..];
         assert!(fresh[..fresh.find("\n    }").unwrap()]
             .contains("self.api.on_fresh_connections(local)"));
+    }
+
+    /// MR-2071, the wiring of `reconnect_policy::teardown_covered` (the rule,
+    /// and the budget a held tunnel spends, are driven in `reconnect_policy`):
+    /// the block goes up first, and a teardown it does not cover goes to the
+    /// hold before anything is torn down. The hold tears nothing down, reads
+    /// `Reconnecting`, and ends the step: the next look asks again.
+    #[test]
+    fn a_dead_tunnel_is_held_when_the_kill_switch_cannot_block() {
+        fn in_order(haystack: &str, needles: &[&str]) {
+            let mut last = 0;
+            for needle in needles {
+                let at = haystack[last..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("`{needle}` missing or out of order"));
+                last += at + needle.len();
+            }
+        }
+        let source = include_str!("auto_reconnect.rs").replace('\r', "");
+        let arm = &source[source.find("Action::TearDown { cause } => {").unwrap()..];
+        let arm = &arm[..arm.find("Action::PauseOffline").unwrap()];
+        in_order(
+            arm,
+            &[
+                "let engaged = killswitch::activate_killswitch().await;",
+                "reconnect_policy::teardown_covered(",
+                "&engaged,",
+                "killswitch::platform_is_blocking()",
+                "return self.hold_dead_tunnel(error).await;",
+                "let old_key = vm.get_key_id().await;",
+                ".disconnect_to(ConnectionState::Reconnecting {",
+            ],
+        );
+        let hold = &source[source.find("async fn hold_dead_tunnel(").unwrap()..];
+        let hold = &hold[..hold.find("\n    }\n").unwrap()];
+        for teardown in ["disconnect_to", "end_in_error", "deactivate_killswitch"] {
+            assert!(!hold.contains(teardown), "the hold calls `{teardown}`");
+        }
+        in_order(
+            hold,
+            &[
+                "self.policy.on_teardown_held(error.clone())",
+                ".set_reconnecting(attempt, Some(error), self.policy.reconnect_max())",
+                "Flow::Continue",
+            ],
+        );
     }
 
     /// MR-691: the re-dial follows a teardown too, so its `/vpn/connect` (or

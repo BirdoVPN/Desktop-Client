@@ -98,7 +98,7 @@ static VPN_SERVER_IP: std::sync::Mutex<Option<Ipv4Addr>> = std::sync::Mutex::new
 
 /// The relay the block permits.
 #[cfg(not(target_os = "windows"))]
-fn vpn_server_ip() -> Option<Ipv4Addr> {
+pub(crate) fn vpn_server_ip() -> Option<Ipv4Addr> {
     *VPN_SERVER_IP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

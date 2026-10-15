@@ -12,7 +12,9 @@
 //!   1. The 426 floor stops recovery. A live tunnel is left alone (the floor
 //!      blocks the control plane, not the data plane).
 //!   2. A tunnel that is gone dead is torn down BEFORE anything else is
-//!      consulted — its routes are what made the old probe lie.
+//!      consulted — its routes are what made the old probe lie. Only behind
+//!      the kill switch's block: one the block cannot cover is held, and the
+//!      teardown tried again, each try spending budget (MR-2071).
 //!   3. A hard refusal (session expired, revoked, device limit, plan, 426,
 //!      elevation) gives up at once; no retry can change the answer.
 //!   4. The circuit breaker (iOS `TunnelCircuitBreaker` parity): a session that
@@ -447,6 +449,35 @@ pub fn revoked_error(server_message: Option<&str>) -> IpcError {
     IpcError::new(IpcErrorCode::Revoked, message)
 }
 
+/// The error for a recovery step the kill switch could not cover: a re-dial
+/// (PB-4) or the teardown of a dead tunnel (MR-2071). Retryable, never a hard
+/// refusal: each one spends an attempt, and the give-up words the last.
+pub fn killswitch_failed_error() -> IpcError {
+    IpcError::new(
+        IpcErrorCode::KillswitchFailed,
+        "The kill switch could not block traffic while reconnecting.",
+    )
+}
+
+/// Whether a dead tunnel may be torn down, now that the kill switch has been
+/// asked to block (MR-2071). Until a new tunnel is up, the dead one's routes
+/// are what keep traffic off the physical NIC, so it goes only behind a block:
+/// `engaged` (`killswitch::activate_killswitch`) succeeded — the block is up,
+/// or the user wants none (`Ok(false)`) — or it failed with a block still in
+/// force (`blocking`, `killswitch::platform_is_blocking`): a refresh that
+/// failed keeps the previous block, and so does a lift that failed. Like
+/// `killswitch::unless_turned_off`, it asks whether a block IS up, not whether
+/// this engage put one up. `Err`: hold the tunnel, showing this meanwhile.
+/// A failed user connect that holds the block keeps a tunnel by the same rule
+/// (`session::fail_connect`, MR-2070).
+pub fn teardown_covered(engaged: &Result<bool, String>, blocking: bool) -> Result<(), IpcError> {
+    if engaged.is_ok() || blocking {
+        Ok(())
+    } else {
+        Err(killswitch_failed_error())
+    }
+}
+
 /// What the loop saw this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
@@ -584,6 +615,23 @@ impl ReconnectPolicy {
         self.last_error = Some(error);
     }
 
+    /// The kill switch could not cover a dead tunnel's teardown
+    /// ([`teardown_covered`], MR-2071): the tunnel is kept, and the next look
+    /// tries the teardown again. Like a re-dial whose block failed (PB-4), it
+    /// spends an attempt of the episode, so a kill switch that never arms still
+    /// reaches the give-up (MR-773) instead of holding the machine for good.
+    /// The attempt it spent, for the status.
+    pub fn on_teardown_held(&mut self, error: IpcError) -> u32 {
+        self.attempts += 1;
+        self.last_error = Some(error);
+        self.attempts
+    }
+
+    /// Every attempt of the episode is spent (never, with an unbounded budget).
+    fn budget_spent(&self) -> bool {
+        self.budget.max_attempts != 0 && self.attempts >= self.budget.max_attempts
+    }
+
     fn open_episode(&mut self, cause: DropCause, now: Instant) {
         self.attempts = 0;
         self.recovering = true;
@@ -679,8 +727,14 @@ impl ReconnectPolicy {
                 // W1-001: a tunnel still held while nothing is connected is a
                 // dead one. Its /1 routes swallow everything, including any
                 // attempt to find out whether the network is up. Remove it
-                // before looking at anything else.
+                // before looking at anything else — unless teardowns the kill
+                // switch could not cover (`on_teardown_held`, MR-2071) have
+                // spent the budget: the give-up then ends the session in
+                // `Error`, its own teardown included.
                 if tick.holds_tunnel {
+                    if self.budget_spent() {
+                        return Action::GiveUp(self.give_up_error());
+                    }
                     return Action::TearDown {
                         cause: DropCause::HandshakeStale,
                     };
@@ -713,7 +767,7 @@ impl ReconnectPolicy {
                     self.immediate = true;
                 }
 
-                if self.budget.max_attempts != 0 && self.attempts >= self.budget.max_attempts {
+                if self.budget_spent() {
                     return Action::GiveUp(self.give_up_error());
                 }
                 let delay = if std::mem::take(&mut self.immediate) {
@@ -879,6 +933,114 @@ mod tests {
         for _ in 0..50 {
             assert!(matches!(p.decide(&not_connected(now)), Action::Dial { .. }));
             p.on_dial_failed(IpcError::new(IpcErrorCode::ServerUnreachable, "x"));
+        }
+    }
+
+    /// MR-2071: a dead tunnel goes only behind a block — the engage put one
+    /// up, the user wants none, or a block is still in force after the engage
+    /// failed. With no block at all it is held, with the kill switch's error.
+    #[test]
+    fn a_dead_tunnel_is_torn_down_only_behind_a_block() {
+        let failed: Result<bool, String> = Err("FwpmTransactionCommit0 failed".into());
+        assert_eq!(
+            teardown_covered(&Ok(true), false),
+            Ok(()),
+            "the block is up"
+        );
+        assert_eq!(
+            teardown_covered(&Ok(false), false),
+            Ok(()),
+            "the kill switch is off"
+        );
+        assert_eq!(
+            teardown_covered(&failed, true),
+            Ok(()),
+            "a refresh that failed keeps the previous block in force"
+        );
+        let held = teardown_covered(&failed, false).expect_err("no block: held");
+        assert_eq!(held, killswitch_failed_error());
+        assert_eq!(held.code, IpcErrorCode::KillswitchFailed);
+        assert!(held.code.retryable() && !held.code.is_hard_refusal());
+    }
+
+    /// MR-2071 with MR-773: while the kill switch cannot arm, the dead tunnel
+    /// is held and its teardown asked for again on every look — before the
+    /// offline pause or a dial (W1-001) — and each held teardown spends an
+    /// attempt, so recovery still ends, in a give-up that names the kill
+    /// switch, rather than holding the machine for good.
+    #[test]
+    fn a_teardown_the_kill_switch_cannot_cover_is_held_then_given_up() {
+        let mut p = ReconnectPolicy::new(budget());
+        let now = Instant::now();
+        let mut t = tick(now, Observed::Connected);
+        t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+        assert!(matches!(p.decide(&t), Action::TearDown { .. }));
+
+        let mut held = not_connected(now);
+        held.holds_tunnel = true;
+        for spent in 1..=3 {
+            assert_eq!(p.on_teardown_held(killswitch_failed_error()), spent);
+            // No route off the machine changes nothing: the held tunnel first.
+            held.connectivity = if spent == 1 {
+                Connectivity::Offline
+            } else {
+                Connectivity::Online
+            };
+            let next = p.decide(&held);
+            if spent < 3 {
+                assert_eq!(
+                    next,
+                    Action::TearDown {
+                        cause: DropCause::HandshakeStale
+                    },
+                    "after {spent} held"
+                );
+                continue;
+            }
+            match next {
+                Action::GiveUp(err) => {
+                    assert_eq!(err.code, IpcErrorCode::KillswitchFailed);
+                    assert!(
+                        err.message.contains("after 3 attempts")
+                            && err.message.contains("kill switch could not block"),
+                        "{}",
+                        err.message
+                    );
+                    assert!(marks_give_up(err.code));
+                }
+                other => panic!("expected the give-up, got {other:?}"),
+            }
+        }
+    }
+
+    /// The kill switch arms on a later look: the teardown goes ahead, and the
+    /// re-dial counts on from the held attempts. An unbounded budget holds
+    /// for as long as it takes, like its dials.
+    #[test]
+    fn a_held_teardown_that_gets_its_block_goes_on_to_the_dial() {
+        let mut p = ReconnectPolicy::new(budget());
+        let now = Instant::now();
+        let mut t = tick(now, Observed::Connected);
+        t.liveness = Liveness::Dead(DropCause::HandshakeStale);
+        assert!(matches!(p.decide(&t), Action::TearDown { .. }));
+        p.on_teardown_held(killswitch_failed_error());
+        assert_eq!(
+            p.decide(&not_connected(now)),
+            Action::Dial {
+                attempt: 2,
+                delay: Duration::from_secs(2)
+            }
+        );
+
+        let mut unbounded = ReconnectPolicy::new(Budget {
+            max_attempts: 0,
+            ..budget()
+        });
+        let mut held = not_connected(now);
+        held.holds_tunnel = true;
+        for _ in 0..50 {
+            unbounded.on_teardown_held(killswitch_failed_error());
+            assert!(matches!(unbounded.decide(&held), Action::TearDown { .. }));
         }
     }
 
