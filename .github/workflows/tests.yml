@@ -273,9 +273,13 @@ jobs:
           # `tauri://localhost` origin, #[cfg(not(windows))]); and MR-740's
           # route_journal::tests, whose owner-only, symlink and
           # foreign-writable checks on the crash-recovery route record are
-          # Unix-only. Space-separated: libtest
+          # Unix-only; and MR-2089/MR-2050's root_write_tests (the DNS journal,
+          # the settings key and settings.json, macOS's pf reference record and
+          # utils::root_state: never written through a planted link, owner-only
+          # from creation, a folder others can write refused), #[cfg(unix)] too.
+          # Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests root_write_tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -

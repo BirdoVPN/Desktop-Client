@@ -3828,3 +3828,64 @@ mod tests {
         assert!(windows.contains("crate::utils::protected_dir::ensure()"));
     }
 }
+
+/// MR-2089: off Windows the client runs as root, so the key file and
+/// settings.json are never written through a link at their names, are
+/// owner-only from creation, and go only into a config folder nobody else can
+/// write. Unix only; tests.yml runs these unprivileged on Linux and macOS.
+#[cfg(all(test, unix))]
+mod root_write_tests {
+    use super::{legacy_key_path, write_atomically, write_key_file};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    const KEY: [u8; 32] = [7; 32];
+
+    /// `<config dir>/<identifier>/settings.json`, the shape of
+    /// `get_settings_path`.
+    fn settings_in(root: &Path) -> PathBuf {
+        let dir = root.join("uk.birdo.vpn.desktop");
+        std::fs::create_dir(&dir).unwrap();
+        dir.join("settings.json")
+    }
+
+    /// The key used to be `fs::write` by path and then chmod 0600: root wrote
+    /// THROUGH a link planted at the name, over any file on the machine.
+    #[test]
+    fn a_link_on_the_key_file_is_not_written_through() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = settings_in(root.path());
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, "not the key's").unwrap();
+        let key = legacy_key_path(&settings);
+        std::os::unix::fs::symlink(&victim, &key).unwrap();
+
+        write_key_file(&settings, &KEY).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not the key's");
+        let meta = std::fs::symlink_metadata(&key).unwrap();
+        assert!(meta.is_file(), "the key is a file of its own, not the link");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), hex::encode(KEY));
+    }
+
+    /// A config folder someone else can write is one they could have planted
+    /// anything in: root writes neither the key nor the settings there.
+    #[test]
+    fn a_config_folder_others_can_write_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = settings_in(root.path());
+        let dir = settings.parent().unwrap();
+        for wider in [0o770, 0o707, 0o777] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(wider)).unwrap();
+            assert!(write_key_file(&settings, &KEY).is_err(), "{wider:o}");
+            assert!(write_atomically(&settings, "{}").is_err(), "{wider:o}");
+            assert!(!legacy_key_path(&settings).exists(), "{wider:o}");
+            assert!(!settings.exists(), "{wider:o}");
+        }
+
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_key_file(&settings, &KEY).expect("control: an owner-only folder is written");
+        write_atomically(&settings, "{}").expect("control: an owner-only folder is written");
+    }
+}

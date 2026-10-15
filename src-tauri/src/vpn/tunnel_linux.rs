@@ -2716,6 +2716,29 @@ mod resolv_conf_restore_tests {
             assert!(!plausible(bad), "{bad}");
         }
     }
+
+    /// MR-2050: nor a link into a folder a user can write. Root pointing
+    /// /etc/resolv.conf at a file the user controls would hand that user every
+    /// resolver lookup on the machine, for good.
+    #[test]
+    fn a_journal_link_a_user_could_write_is_not_trusted() {
+        use super::plausible_resolv_conf_link as plausible;
+
+        // A temp folder: this test's user owns it, under a /tmp anyone can
+        // write.
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("resolv.conf");
+        for bad in [
+            theirs.to_str().unwrap(),
+            "/tmp/resolv.conf",
+            "../tmp/resolv.conf",
+            "/run/../tmp/resolv.conf",
+            "/run/user/1000/resolv.conf",
+            "/var/run/user/1000/resolv.conf",
+        ] {
+            assert!(!plausible(bad), "{bad}");
+        }
+    }
 }
 
 /// Bug B: a route is deleted with exactly the qualifiers it was added with.

@@ -2350,6 +2350,98 @@ pub mod dns_journal {
             assert!(!preserved_path(&path).exists());
         }
     }
+
+    /// MR-2089: off Windows the whole client runs as root, so the journal is
+    /// written and read without ever following a link at its name, and is
+    /// owner-only from the moment it exists. Unix only (on Windows it sits in
+    /// the admin-only directory, MR-1721); tests.yml runs these unprivileged
+    /// on Linux and macOS.
+    #[cfg(all(test, unix))]
+    mod root_write_tests {
+        use super::{read_at, staging_path, write_bytes_atomically};
+        use std::os::unix::fs::PermissionsExt;
+
+        /// The smallest record this host reads back: every other field
+        /// defaults.
+        fn record() -> Vec<u8> {
+            format!("{{\"os\":\"{}\"}}", std::env::consts::OS).into_bytes()
+        }
+
+        fn mode(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        /// A link planted on the staging name used to be opened with
+        /// O_CREAT|O_TRUNC and written THROUGH: root truncated and overwrote
+        /// whatever file it named.
+        #[test]
+        fn a_link_on_the_staging_name_is_not_written_through() {
+            let dir = tempfile::tempdir().unwrap();
+            let victim = dir.path().join("victim");
+            std::fs::write(&victim, b"not the journal's").unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::os::unix::fs::symlink(&victim, staging_path(&path)).unwrap();
+
+            write_bytes_atomically(&path, &record()).unwrap();
+
+            assert_eq!(std::fs::read(&victim).unwrap(), b"not the journal's");
+            assert!(
+                std::fs::symlink_metadata(&path).unwrap().is_file(),
+                "the journal is a file of its own, not the link"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), record());
+            assert_eq!(mode(&path), 0o600);
+        }
+
+        /// A staging file a crash left behind kept its own mode under O_TRUNC,
+        /// and the rename then made that mode the journal's.
+        #[test]
+        fn the_journal_is_owner_only_from_creation() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::fs::write(staging_path(&path), b"left by a crash").unwrap();
+            std::fs::set_permissions(staging_path(&path), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+
+            write_bytes_atomically(&path, &record()).unwrap();
+
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(std::fs::read(&path).unwrap(), record());
+        }
+
+        /// The journal tells root what to put back into /etc/resolv.conf or
+        /// the network services, so a link at its name is never followed...
+        #[test]
+        fn a_linked_journal_is_not_read() {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = dir.path().join("elsewhere.json");
+            std::fs::write(&elsewhere, record()).unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+            assert!(read_at(&path).is_none());
+            assert_eq!(std::fs::read(&elsewhere).unwrap(), record());
+        }
+
+        /// ...and a journal someone else could have written is not read.
+        #[test]
+        fn a_journal_others_can_write_is_not_read() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::fs::write(&path, record()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                read_at(&path).is_some(),
+                "control: an owner-only journal is read"
+            );
+
+            for wider in [0o620, 0o602, 0o666] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(wider)).unwrap();
+                assert!(read_at(&path).is_none(), "{wider:o}");
+                assert!(path.exists(), "{wider:o}: refused, not set aside");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

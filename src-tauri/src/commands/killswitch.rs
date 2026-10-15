@@ -1346,6 +1346,38 @@ mod pf_reference_journal {
     pub(super) fn read() -> Option<PfRef> {
         pf_policy::decode_reference(&std::fs::read_to_string(path()?).ok()?)
     }
+
+    /// MR-2089: root never writes through a link planted on the staging name,
+    /// and the record is owner-only from creation. tests.yml runs this
+    /// unprivileged on macOS.
+    #[cfg(test)]
+    mod root_write_tests {
+        use super::write_atomically;
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn a_link_on_the_staging_name_is_not_written_through() {
+            let dir = tempfile::tempdir().unwrap();
+            let victim = dir.path().join("victim");
+            std::fs::write(&victim, "not the record's").unwrap();
+            let path = dir.path().join("pf-reference");
+            std::os::unix::fs::symlink(&victim, path.with_extension("tmp")).unwrap();
+
+            write_atomically(&path, b"1 2").unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "not the record's"
+            );
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                meta.is_file(),
+                "the record is a file of its own, not the link"
+            );
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::read(&path).unwrap(), b"1 2");
+        }
+    }
 }
 
 /// N3: the panic hook's share — drop our pf reference now, if the lock is
