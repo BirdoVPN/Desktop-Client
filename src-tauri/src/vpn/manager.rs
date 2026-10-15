@@ -207,6 +207,12 @@ pub struct PublishedStatus {
     pub phase: Option<ConnectPhase>,
     pub reconnect_max: Option<u32>,
     pub kill_switch_blocking: bool,
+    /// MR-2070: a failed connect kept its tunnel in place of the block the
+    /// kill switch could not put up ([`VpnManager::keep_tunnel_in_error`]).
+    /// Its routes hold the traffic as the block would, so the status reads
+    /// as blocked (`kill_switch_blocking`), with Disconnect as the way out.
+    /// Dropped with the `Error` state or the tunnel, whichever goes first.
+    pub tunnel_kept: bool,
     pub server_id: Option<String>,
     pub multi_hop: Option<MultiHopStatus>,
     pub gave_up: Option<GaveUp>,
@@ -236,7 +242,9 @@ fn platform_block_probe() -> BlockProbe {
 /// (lockdown carries its traffic through the tunnel-interface permit), and
 /// neither does a switch whose OLD tunnel is still up under a block that
 /// permits it. Everything else with the block engaged — reconnecting, a
-/// failed switch, the lockdown give-up, always-on with no tunnel — does.
+/// failed switch, the lockdown give-up, always-on with no tunnel — does. So
+/// does a tunnel a failed connect kept in place of a block that could not go
+/// up (`PublishedStatus::tunnel_kept`, added in by `StatusBus::publish`).
 pub fn kill_switch_blocking(
     probe: BlockProbe,
     state: &ConnectionState,
@@ -272,6 +280,7 @@ impl StatusBus {
                 phase: None,
                 reconnect_max: None,
                 kill_switch_blocking: false,
+                tunnel_kept: false,
                 server_id: None,
                 multi_hop: None,
                 gave_up: None,
@@ -298,7 +307,14 @@ impl StatusBus {
         if !matches!(p.state, ConnectionState::Error(_)) {
             p.gave_up = None;
         }
-        p.kill_switch_blocking = kill_switch_blocking(probe, &p.state, tunnel_present);
+        // Only the kept tunnel itself: a teardown that ends in `Error`
+        // publishes that state while its tunnel is still held, and must not
+        // flash "blocked" on the way.
+        if !matches!(p.state, ConnectionState::Error(_)) || !tunnel_present {
+            p.tunnel_kept = false;
+        }
+        p.kill_switch_blocking =
+            p.tunnel_kept || kill_switch_blocking(probe, &p.state, tunnel_present);
         p.seq = before.seq;
         if *p != before {
             p.seq = before.seq.wrapping_add(1);
@@ -1139,6 +1155,19 @@ impl VpnManager {
         }
     }
 
+    /// MR-2070: end a failed connect in `Error` WITHOUT tearing down the
+    /// tunnel it still holds, because the kill switch wants a block and could
+    /// not put one up (`session::fail_connect`). The tunnel's routes keep the
+    /// traffic in its place, so the status reads as blocked
+    /// (`PublishedStatus::tunnel_kept`), and Disconnect, the main button
+    /// there, releases it. A plain `Error` would read as "no tunnel, no
+    /// block" and offer Connect, which keeps the tunnel again.
+    pub async fn keep_tunnel_in_error(&self, error: IpcError) {
+        let _ = self
+            .write_state_with(ConnectionState::Error(error), |p| p.tunnel_kept = true)
+            .await;
+    }
+
     async fn disconnect_to_with(
         &self,
         final_state: ConnectionState,
@@ -1594,6 +1623,53 @@ mod tests {
         mgr.refresh_status();
         assert!(mgr.published().kill_switch_blocking);
         assert_eq!(mgr.published().seq, seq + 1);
+    }
+
+    /// MR-2070: a failed connect that keeps its tunnel because the kill
+    /// switch could not block (`session::fail_connect`) reads as blocked, so
+    /// the UI offers Disconnect as its main action and says all traffic is
+    /// blocked. It used to read as a plain `error` — "nothing held, nothing
+    /// blocked", with Connect — over a machine its tunnel held offline.
+    #[tokio::test]
+    async fn a_tunnel_kept_in_place_of_the_block_reads_as_blocked() {
+        let mgr = VpnManager::with_block_probe(not_blocking);
+        let kept = || IpcError::new(IpcErrorCode::KillswitchFailed, "kept");
+        mgr.set_tunnel_present(true);
+
+        // A teardown ending in `Error` publishes it while its tunnel is still
+        // held: never "blocked" on the way.
+        mgr.set_state(ConnectionState::Error(kept())).await.unwrap();
+        assert!(!mgr.published().kill_switch_blocking);
+
+        mgr.keep_tunnel_in_error(kept()).await;
+        let p = mgr.published();
+        assert_eq!(p.state, ConnectionState::Error(kept()));
+        assert!(p.tunnel_kept && p.kill_switch_blocking);
+        // It outlasts a re-derive (the kill switch's observer).
+        mgr.refresh_status();
+        assert!(mgr.published().kill_switch_blocking);
+
+        // A connect from here (or a Disconnect's `Disconnecting`) leaves it.
+        mgr.set_state(ConnectionState::Connecting).await.unwrap();
+        assert!(!mgr.published().tunnel_kept);
+        assert!(!mgr.published().kill_switch_blocking);
+        mgr.set_state(ConnectionState::Error(kept())).await.unwrap();
+        assert!(
+            !mgr.published().kill_switch_blocking,
+            "a later error is not kept"
+        );
+
+        // And so does the tunnel going.
+        mgr.keep_tunnel_in_error(kept()).await;
+        assert!(mgr.published().kill_switch_blocking);
+        mgr.set_tunnel_present(false);
+        mgr.refresh_status();
+        assert!(!mgr.published().tunnel_kept);
+        assert!(!mgr.published().kill_switch_blocking);
+
+        // With no tunnel held, there is nothing kept.
+        mgr.keep_tunnel_in_error(kept()).await;
+        assert!(!mgr.published().kill_switch_blocking);
     }
 
     /// REVIEW-WIN-013: the module docs promise a Disconnect during a stuck

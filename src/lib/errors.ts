@@ -177,15 +177,21 @@ export function errorText(e: unknown, context: ErrorContext = 'general'): string
 
 /**
  * Why auto-reconnect stopped, in the three kinds iOS's TunnelCircuitBreaker
- * distinguishes. The final `error` status says THAT it gave up (`gaveUp`,
- * REVIEW-WIN-009) and its error code says why (§3.4); these are the codes
- * that map onto iOS's kinds.
+ * distinguishes, plus one of the desktop's own. The final `error` status says
+ * THAT it gave up (`gaveUp`, REVIEW-WIN-009) and its error code says why
+ * (§3.4); these are the codes that map onto the kinds.
+ *
+ * `killswitch_failed` (MR-2071): the kill switch could not block traffic for
+ * a re-dial or a dead tunnel's teardown, so recovery stopped rather than go
+ * on unprotected. Read as `died_after_handshake`, it blamed the server and
+ * sent the user to another location, when the cause is on this device.
  */
-export type GiveUpKind = 'revoked' | 'never_established' | 'died_after_handshake';
+export type GiveUpKind = 'revoked' | 'never_established' | 'died_after_handshake' | 'killswitch_failed';
 
 export function giveUpKind(error: IpcError | null | undefined): GiveUpKind {
   if (error?.code === 'revoked') return 'revoked';
   if (error?.code === 'server_unreachable') return 'never_established';
+  if (error?.code === 'killswitch_failed') return 'killswitch_failed';
   return 'died_after_handshake';
 }
 
@@ -218,6 +224,11 @@ export function giveUpMessage(kind: GiveUpKind, attempts: number | null, stillBl
       return (
         `BirdoVPN stopped reconnecting${tries}: the connection to this server keeps dropping. ` +
         `${blocked} Click Connect to retry, or pick another location.`
+      );
+    case 'killswitch_failed':
+      return (
+        `BirdoVPN stopped reconnecting${tries}: the kill switch couldn't be armed on this ` +
+        `device, so BirdoVPN didn't reconnect without it. ${blocked} Click Connect to try again.`
       );
   }
 }

@@ -1239,10 +1239,11 @@ impl ReconnectLoop {
                 // that keep traffic off the physical NIC. The teardown used
                 // to go ahead regardless, and everything left in the clear
                 // until the dial aborted; the tunnel is held instead.
-                if let Err(error) =
-                    reconnect_policy::teardown_covered(&engaged, killswitch::platform_is_blocking())
+                if let Some(held) = self
+                    .hold_dead_tunnel(&engaged, killswitch::platform_is_blocking())
+                    .await
                 {
-                    return self.hold_dead_tunnel(error).await;
+                    return held;
                 }
                 // The dead session's key, read before the teardown clears it.
                 let old_key = vm.get_key_id().await;
@@ -1565,18 +1566,26 @@ impl ReconnectLoop {
         }
     }
 
-    /// MR-2071: the kill switch could not cover the teardown of a dead tunnel
-    /// (`reconnect_policy::teardown_covered`), so it is NOT torn down: its /1
-    /// routes swallow everything, which keeps traffic off the physical NIC.
-    /// The session reads `Reconnecting` with the kill switch's error, and the
-    /// next look asks for the teardown again (a held tunnel comes first,
-    /// W1-001) — behind a block, if one goes up by then. Each held teardown
-    /// spends an attempt (`ReconnectPolicy::on_teardown_held`), so a kill
-    /// switch that never arms ends in the give-up, whose own teardown ends the
-    /// session in `Error`. Disconnect is the way out meanwhile, as in any
-    /// reconnect; turning the kill switch off is another (the next look's
-    /// engage then answers `Ok(false)`, and the teardown goes ahead).
-    async fn hold_dead_tunnel(&mut self, error: IpcError) -> Flow {
+    /// MR-2071: `engaged` is the kill switch's answer to the block asked for
+    /// before a dead tunnel's teardown, `blocking` whether a block is in force
+    /// now. `None`: the block covers the teardown
+    /// (`reconnect_policy::teardown_covered`), which goes ahead. Otherwise
+    /// the tunnel is NOT torn down: its /1 routes swallow everything, which
+    /// keeps traffic off the physical NIC. The session reads `Reconnecting`
+    /// with the kill switch's error, and the next look asks for the teardown
+    /// again (a held tunnel comes first, W1-001) — behind a block, if one goes
+    /// up by then. Each held teardown spends an attempt
+    /// (`ReconnectPolicy::on_teardown_held`), so a kill switch that never arms
+    /// ends in the give-up, whose own teardown ends the session in `Error`.
+    /// Disconnect is the way out meanwhile, as in any reconnect; turning the
+    /// kill switch off is another (the next look's engage then answers
+    /// `Ok(false)`, and the teardown goes ahead).
+    async fn hold_dead_tunnel(
+        &mut self,
+        engaged: &Result<bool, String>,
+        blocking: bool,
+    ) -> Option<Flow> {
+        let error = reconnect_policy::teardown_covered(engaged, blocking).err()?;
         tracing::error!(
             "The kill switch could not block traffic — keeping the dead tunnel in place, so \
              nothing leaves outside it, and trying again"
@@ -1585,7 +1594,7 @@ impl ReconnectLoop {
         self.vpn_manager
             .set_reconnecting(attempt, Some(error), self.policy.reconnect_max())
             .await;
-        Flow::Continue
+        Some(Flow::Continue)
     }
 
     /// The server ended the session (a heartbeat said so, or the old key's
@@ -2588,10 +2597,8 @@ mod tests {
             arm,
             &[
                 "let engaged = killswitch::activate_killswitch().await;",
-                "reconnect_policy::teardown_covered(",
-                "&engaged,",
-                "killswitch::platform_is_blocking()",
-                "return self.hold_dead_tunnel(error).await;",
+                ".hold_dead_tunnel(&engaged, killswitch::platform_is_blocking())",
+                "return held;",
                 "let old_key = vm.get_key_id().await;",
                 ".disconnect_to(ConnectionState::Reconnecting {",
             ],
@@ -2604,11 +2611,78 @@ mod tests {
         in_order(
             hold,
             &[
+                "reconnect_policy::teardown_covered(engaged, blocking).err()?;",
                 "self.policy.on_teardown_held(error.clone())",
                 ".set_reconnecting(attempt, Some(error), self.policy.reconnect_max())",
-                "Flow::Continue",
+                "Some(Flow::Continue)",
             ],
         );
+    }
+
+    /// MR-2071, the hold driven by an injected engage result (no firewall is
+    /// touched): an engage that failed with nothing blocking holds the dead
+    /// tunnel — the step ends there, reading `Reconnecting` with the kill
+    /// switch's error, an attempt spent — and every engage that covers the
+    /// teardown lets it go ahead, with nothing written.
+    #[tokio::test]
+    async fn the_hold_follows_the_engage_it_is_given() {
+        use crate::vpn::manager::BlockProbe;
+        let vm = Arc::new(VpnManager::with_block_probe(|| BlockProbe {
+            blocking: false,
+            holds_block_while_connected: false,
+        }));
+        vm.set_state(ConnectionState::Connected).await.unwrap();
+        let cfg = AutoReconnectConfig::default();
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let mut lp = ReconnectLoop {
+            vpn_manager: Arc::clone(&vm),
+            last_reconnect_info: Arc::new(RwLock::new(None)),
+            api: Arc::new(BirdoApi::new()),
+            app: None,
+            shutdown,
+            network: network_events::subscribe(),
+            transport_exits: None,
+            policy: ReconnectPolicy::new(cfg.budget()),
+            session: SessionWatch::default(),
+            quota_notice: QuotaNotice::default(),
+            alive: None,
+            pulse: Pulse::default(),
+            generation: 0,
+            step_allowance: Duration::from_secs(1),
+        };
+        let failed = || Err::<bool, String>("FwpmTransactionCommit0 failed".into());
+
+        // Covered: the block is up, the user wants none, or a block is still
+        // in force after a failed refresh. The teardown goes ahead.
+        for (engaged, blocking) in [(Ok(true), false), (Ok(false), false), (failed(), true)] {
+            assert!(
+                lp.hold_dead_tunnel(&engaged, blocking).await.is_none(),
+                "{engaged:?} blocking={blocking}"
+            );
+        }
+        assert_eq!(lp.policy.attempts(), 0);
+        let seq = vm.published().seq;
+        assert_eq!(vm.get_state().await, ConnectionState::Connected);
+
+        // Not covered: held, and the step ends (`Continue`, not `Again`).
+        for attempt in 1..=2 {
+            let held = lp.hold_dead_tunnel(&failed(), false).await;
+            assert!(matches!(held, Some(Flow::Continue)), "attempt {attempt}");
+            assert_eq!(lp.policy.attempts(), attempt);
+            match vm.get_state().await {
+                ConnectionState::Reconnecting {
+                    attempt: shown,
+                    last_error: Some(error),
+                } => {
+                    assert_eq!(shown, attempt);
+                    assert_eq!(error, reconnect_policy::killswitch_failed_error());
+                }
+                other => panic!("expected Reconnecting, got {other:?}"),
+            }
+        }
+        let p = vm.published();
+        assert!(p.seq > seq);
+        assert_eq!(p.reconnect_max, Some(cfg.max_attempts));
     }
 
     /// MR-691: the re-dial follows a teardown too, so its `/vpn/connect` (or

@@ -735,8 +735,9 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
     // tunnel still held in place, so its routes keep the traffic the block
     // could not (`reconnect_policy::teardown_covered`, the rule the reconnect
     // loop's teardown follows). Torn down, everything went out in the clear
-    // as soon as a switch refused at the relay permit ended. Disconnect (the
-    // tray's, in `error` with no block) releases it, as it releases a block;
+    // as soon as a switch refused at the relay permit ended. The kept tunnel
+    // reads as the block (`VpnManager::keep_tunnel_in_error`): Disconnect,
+    // the main button and the tray's, releases it, as it releases a block;
     // with the kill switch turned off, the next connect displaces it
     // unguarded, as asked.
     let mut keep_tunnel = false;
@@ -764,7 +765,9 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
     } else {
         error
     };
-    if held && !keep_tunnel {
+    if held && keep_tunnel {
+        vm.keep_tunnel_in_error(error.clone()).await;
+    } else if held {
         let _ = vm
             .disconnect_to(ConnectionState::Error(error.clone()))
             .await;
@@ -1862,7 +1865,12 @@ mod lifecycle_tests {
                 "let held = vm.holds_tunnel().await;",
                 "let error = if held && keep_tunnel {",
                 "kept_tunnel_error()",
-                "if held && !keep_tunnel {",
+                // The kept tunnel reads as the block, with Disconnect
+                // (`VpnManager::keep_tunnel_in_error`, driven in the
+                // manager's tests): a plain `error` read as "nothing held".
+                "if held && keep_tunnel {",
+                "vm.keep_tunnel_in_error(error.clone()).await;",
+                "} else if held {",
                 ".disconnect_to(ConnectionState::Error(error.clone()))",
                 "} else {",
                 ".set_state(ConnectionState::Error(error.clone()))",
@@ -1873,8 +1881,10 @@ mod lifecycle_tests {
             super::kept_tunnel_error().code,
             crate::commands::ipc_error::IpcErrorCode::KillswitchFailed
         );
-        // A kept tunnel is torn down nowhere else on the way out.
+        // A kept tunnel is torn down nowhere else on the way out, and is
+        // kept nowhere else.
         assert_eq!(failed.matches("disconnect_to(").count(), 1);
+        assert_eq!(failed.matches("keep_tunnel_in_error(").count(), 1);
     }
 
     /// MR-2070: a relay permit that cannot move — or, with no relay to
