@@ -50,7 +50,9 @@ Push tag v* → release.yml (test gate first)
              and the NSIS installer (Authenticode) → updater .sig (minisign)
   → Linux:   Tauri build → AppImage + .deb → updater .sig for the AppImage
   → macOS:   Tauri build, unsigned and un-notarised → DMGs + .app.tar.gz → updater .sig
-  → release job: SHA256SUMS.txt over every asset except the .sig files
+  → release job: every updater .sig verified against plugins.updater.pubkey
+                 (tauri.conf.json); any mismatch and nothing is published
+    → SHA256SUMS.txt over every asset except the .sig files
     → cosign sign-blob --yes --bundle SHA256SUMS.txt.sigstore SHA256SUMS.txt
       → Fulcio issues a short-lived cert (GitHub OIDC identity)
       → the signature is recorded in the Rekor transparency log

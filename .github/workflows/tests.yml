@@ -813,6 +813,39 @@ jobs:
       - name: Run the generator and the gate against fixtures (pass + must-fail scenarios)
         run: bash scripts/ci/appimage-notices.tests.sh
 
+  # MR-2072 (AUD-DESK-21): release.yml's release job verifies every updater
+  # .sig against tauri.conf.json's updater pubkey before it publishes
+  # (scripts/ci/verify-release-updater-signatures.sh). Only a release runs
+  # that gate, so prove it on every PR: two THROWAWAY keys from the locked
+  # tauri CLI (never the release key) sign a fake release; it passes, and a
+  # changed bundle, a wrong key, an edited trusted comment or a missing .sig
+  # each fail it. Also checks release.yml still runs the gate before it
+  # publishes.
+  updater-signature-gate-selftest:
+    name: Updater signature gate self-test (throwaway keys)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # The locked @tauri-apps/cli signs the fixtures, as `tauri build` signs a release.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the gate against a throwaway-signed fake release (pass + must-fail scenarios)
+        run: bash scripts/ci/verify-release-updater-signatures.tests.sh
+
   # MR-1685: every package ships resources/THIRD-PARTY-NOTICES.txt, which
   # release.yml generates per build job (scripts/generate-third-party-notices.mjs)
   # and its post-bundle gates require. The generator FAILS on a crate or npm
