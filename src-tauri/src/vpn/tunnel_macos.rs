@@ -17,6 +17,7 @@ use super::wireguard_new::{WgPrivateKey, WireGuardSession};
 use crate::api::types::VpnConfig;
 use crate::utils::redact_ip;
 use crate::vpn::dns_journal::DnsRestoreOutcome;
+use crate::vpn::route_journal::{self, GatewayRoute, RouteDelete};
 
 /// Run a command without visible terminal window
 fn cmd(program: &str) -> Command {
@@ -1097,6 +1098,11 @@ fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
 /// hardware — its route behaviour differs from Linux. This does not replace
 /// that; it covers the half the audit is really about, which is that a failed
 /// route-add is RETURNED rather than swallowed.
+///
+/// MR-740: a route this call added goes on the crash-recovery record at once.
+/// It sits on the physical interface, so unlike the utun's routes it outlives
+/// a killed process; the next start removes it. One that was already there is
+/// not ours and is not recorded.
 fn pin_endpoint_route(endpoint_ip: &str, default_gw: &str) -> Result<(), String> {
     let output = cmd("route")
         .args(["-n", "add", "-host", endpoint_ip, default_gw])
@@ -1117,8 +1123,98 @@ fn pin_endpoint_route(endpoint_ip: &str, default_gw: &str) -> Result<(), String>
             ));
         }
         tracing::debug!("Endpoint route already present");
+        return Ok(());
     }
+    route_journal::remember(&gateway_record(&format!("{endpoint_ip}/32"), default_gw));
     Ok(())
+}
+
+/// MR-740: the crash-recovery record of a route to `dst` via `gateway`.
+fn gateway_record(dst: &str, gateway: &str) -> GatewayRoute {
+    GatewayRoute {
+        dst: dst.to_string(),
+        via: gateway.to_string(),
+        dev: None,
+    }
+}
+
+/// `route` arguments that name `dst` (an IPv4 CIDR) as a host or a network.
+fn route_target(dst: &str) -> Option<Vec<String>> {
+    let (net, prefix) = dst.split_once('/')?;
+    let prefix = prefix.parse::<u8>().ok().filter(|p| (1..=32).contains(p))?;
+    Some(if prefix == 32 {
+        vec!["-host".to_string(), net.to_string()]
+    } else {
+        vec![
+            "-net".to_string(),
+            net.to_string(),
+            "-netmask".to_string(),
+            prefix_to_mask(prefix),
+        ]
+    })
+}
+
+/// `route -n <verb> <target> [extra]`, its stdout and stderr together.
+fn run_route(verb: &str, target: &[String], extra: &[&str]) -> Result<(bool, String), String> {
+    let out = cmd("route")
+        .args(["-n", verb])
+        .args(target)
+        .args(extra)
+        .output()
+        .map_err(|e| format!("could not run route: {}", e))?;
+    Ok((
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    ))
+}
+
+/// MR-740: delete a route the crash-recovery record names — only while the
+/// table still holds it as ours. BSD `route delete` matches on the
+/// destination alone, so `route -n get` must first show this destination
+/// (and mask) via the recorded gateway; a route someone else has put there
+/// since is left alone. `route_journal::reconcile` calls this, at start-up,
+/// where no tunnel of this process is up.
+pub(super) fn delete_recorded_route(route: &GatewayRoute) -> RouteDelete {
+    let Some(target) = route_target(&route.dst) else {
+        return RouteDelete::Absent;
+    };
+    let got = match run_route("get", &target, &[]) {
+        Ok(got) => got,
+        Err(e) => return RouteDelete::Failed(e),
+    };
+    match got {
+        (false, output) => route_journal::route_tool_outcome(false, &output),
+        (true, output) if !route_journal::route_get_describes(&output, route) => {
+            tracing::info!(
+                "A recorded route to {} is no longer ours — left in place",
+                redact_ip(&route.dst)
+            );
+            RouteDelete::Absent
+        }
+        (true, _) => match run_route("delete", &target, &[route.via.as_str()]) {
+            Ok((ok, output)) => route_journal::route_tool_outcome(ok, &output),
+            Err(e) => RouteDelete::Failed(e),
+        },
+    }
+}
+
+/// Teardown's delete of the route at `dst`, by destination as before; once it
+/// is gone it leaves the crash-recovery record.
+fn delete_route_at(dst: &str) {
+    let Some(target) = route_target(dst) else {
+        return;
+    };
+    let deleted = match run_route("delete", &target, &[]) {
+        Ok((ok, output)) => route_journal::route_tool_outcome(ok, &output),
+        Err(e) => RouteDelete::Failed(e),
+    };
+    if deleted.settled() {
+        route_journal::forget_destination(dst);
+    }
 }
 
 async fn configure_routes(
@@ -1236,7 +1332,7 @@ async fn configure_routes(
         for cidr in &rfc1918 {
             let parts: Vec<&str> = cidr.split('/').collect();
             let mask = prefix_to_mask(parts[1].parse().unwrap_or(8));
-            let _ = cmd("route")
+            let added = cmd("route")
                 .args([
                     "-n",
                     "add",
@@ -1246,7 +1342,14 @@ async fn configure_routes(
                     &mask,
                     &default_gw,
                 ])
-                .output();
+                .output()
+                .is_ok_and(|o| o.status.success());
+            // MR-740: a route that went in is ours and outlives the utun, so
+            // it goes on the crash-recovery record (169.254/16 is macOS's own
+            // and its add fails with "File exists").
+            if added {
+                route_journal::remember(&gateway_record(cidr, &default_gw));
+            }
         }
         tracing::info!("Added local network sharing routes (RFC1918)");
     }
@@ -1581,10 +1684,8 @@ fn restore_services_pass(
 
 /// Remove VPN-specific routes.
 async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String], local_network_sharing: bool) {
-    // Remove endpoint route
-    let _ = cmd("route")
-        .args(["-n", "delete", "-host", endpoint_ip])
-        .output();
+    // Remove endpoint route (and, once it is gone, its crash record, MR-740)
+    delete_route_at(&format!("{endpoint_ip}/32"));
 
     // Remove allowed_ip routes.
     //
@@ -1631,14 +1732,7 @@ async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String], local_network_
     // alone and does not care who created it.
     if local_network_sharing {
         for cidr in LAN_SHARING_CIDRS_OWNED {
-            if let Some((net, prefix)) = cidr.split_once('/') {
-                if let Ok(p) = prefix.parse::<u8>() {
-                    let mask = prefix_to_mask(p);
-                    let _ = cmd("route")
-                        .args(["-n", "delete", "-net", net, "-netmask", &mask])
-                        .output();
-                }
-            }
+            delete_route_at(cidr);
         }
     }
     tracing::info!("Removed VPN routes");

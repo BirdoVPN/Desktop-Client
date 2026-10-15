@@ -67,6 +67,13 @@ pub(crate) mod iptables_policy;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod pf_policy;
 
+// MR-740: the crash-recovery record of the routes a Linux/macOS session puts
+// via the physical gateway, which outlive the tunnel device. Root-only; the
+// next start removes what a killed session left. Compiled into every test
+// build too, so the Windows job runs its tests.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+pub(crate) mod route_journal;
+
 // Re-export the new boringtun-based implementation
 pub use manager::VpnManager;
 #[allow(unused_imports)]
@@ -1096,7 +1103,24 @@ pub mod dns_journal {
     /// for state a read-back PROVED is back — see `settle`.
     ///
     /// Returns whether anything was actually restored.
+    ///
+    /// MR-740: on Linux and macOS this is also where the routes a killed
+    /// session left via the physical gateway are removed (`route_journal`;
+    /// Windows keeps them in this journal, W1-041). They have their own
+    /// root-only record, so they are reconciled whether or not DNS was moved
+    /// aside. They do not count towards the return value, which is about DNS.
     pub fn reconcile() -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let removed = super::route_journal::reconcile();
+            if removed > 0 {
+                tracing::warn!(
+                    "Removed {} route(s) a previous session left behind",
+                    removed
+                );
+            }
+        }
+
         let Some(journal) = read() else {
             return false;
         };

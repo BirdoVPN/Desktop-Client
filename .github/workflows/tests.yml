@@ -270,9 +270,12 @@ jobs:
           # held) is Unix-only; and MR-2011's app_permission_tests (the app
           # command ACL that build.rs's non-Windows branch generates, resolved
           # by Tauri for this target) and navigation_guard::tests (the
-          # `tauri://localhost` origin, #[cfg(not(windows))]). Space-separated: libtest
+          # `tauri://localhost` origin, #[cfg(not(windows))]); and MR-740's
+          # route_journal::tests, whose owner-only, symlink and
+          # foreign-writable checks on the crash-recovery route record are
+          # Unix-only. Space-separated: libtest
           # runs every test matching ANY of the filters after `--`.
-          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests' }}
+          FILTER: ${{ matrix.os == 'macos' && 'dns_journal_restore_tests endpoint_route_tests utun_fd_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests' || 'resolv_conf_restore_tests tun_read_tests owned_route_tests log_retention::tests file_log::tests safe_fs::tests xray::tests app_permission_tests navigation_guard::tests route_journal::tests' }}
           # The cfg-gated file those tests live in.
           SRC: ${{ matrix.os == 'macos' && 'src/vpn/tunnel_macos.rs' || 'src/vpn/tunnel_linux.rs' }}
           # Every test module in $SRC that some step of THIS job executes -
