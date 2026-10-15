@@ -105,6 +105,10 @@ struct AttemptContext {
     /// this connect displaced a tunnel it found held (see `session_was_live`
     /// and the guard before `vm.connect`).
     was_live: bool,
+    /// `was_live` as the connect started, before the guard widened it to a
+    /// dead tunnel it found held. Only a session live then can be kept when
+    /// the switch fails before `vm.connect` (MR-2070, `old_session_gone`).
+    live_at_start: bool,
     /// The block-all was engaged for the rebuild and must be released on
     /// success where the platform does not hold it for the session.
     block_engaged: bool,
@@ -139,6 +143,16 @@ impl AttemptContext {
     fn old_transport_touched(&self, xray: &XrayManager) -> bool {
         self.old_stealth_mark
             .is_some_and(|mark| xray.ended_count() != mark)
+    }
+
+    /// Whether the old session can no longer carry traffic, even with its
+    /// tunnel still held: its stealth transport was stopped, or it was never
+    /// live — a dead tunnel the guard before `vm.connect` took into
+    /// `was_live`, which a switch refused at the relay permit (MR-2070) now
+    /// fails on while that tunnel is still held. Such a tunnel is never kept
+    /// as the session: a failure holds the block instead.
+    fn old_session_gone(&self, xray: &XrayManager) -> bool {
+        !self.live_at_start || self.old_transport_touched(xray)
     }
 }
 
@@ -252,6 +266,7 @@ pub(crate) async fn connect_session_for(
     let mut ctx = AttemptContext {
         epoch,
         was_live,
+        live_at_start: was_live,
         // A block already engaged — a reconnect this connect interrupted, or
         // a give-up — is released on success exactly like the rebuild guard:
         // left alone, a reactive block (no tunnel permit) would hold the new
@@ -529,12 +544,28 @@ async fn attempt(
     // block already held (a give-up, lockdown) is rebuilt with the new relay
     // by the same call. A switch that fails before this point leaves the old
     // session's permit.
+    //
+    // MR-2070: and when that step fails, nothing is rebuilt. `vm.connect`
+    // tears down the tunnel it displaces and dials the new relay; with the
+    // guard not up (reactive mode, no block before it) all of that went out
+    // in the clear, the failure only logged. The switch fails here instead,
+    // before the old tunnel is touched: `fail_connect` keeps a live session,
+    // its relay permit pointed back, and ends anything else in `error` with
+    // the block held — or, where no block can go up, the tunnel left in
+    // place.
     apply_relay_permit(
         &prepared.relay_endpoint,
         prepared.started_stealth,
         guard_rebuild,
     )
-    .await;
+    .await
+    .map_err(|e| {
+        tracing::error!("Not rebuilding: the kill switch is not ready for the new relay ({e})");
+        IpcError::new(
+            IpcErrorCode::KillswitchFailed,
+            "The kill switch could not block traffic for the new connection.",
+        )
+    })?;
 
     let label = SessionLabel {
         server_name: match &multi_hop {
@@ -617,24 +648,31 @@ enum FailureOutcome {
     /// iOS #354: a switch that failed BEFORE the old tunnel was touched keeps
     /// the old session, and the error is shown beside it.
     KeepOldSession,
-    /// End in `error`. `hold_block`: a protected session was live, and its
-    /// traffic has nowhere safe to go, so the block (if armed) stays up.
+    /// End in `error`. `hold_block`: a protected session was live, or a
+    /// tunnel is still held, and its traffic has nowhere safe to go, so the
+    /// block (if armed) stays up.
     Error { hold_block: bool },
 }
 
+/// `old_session_gone`: [`AttemptContext::old_session_gone`].
+///
+/// MR-2070: a tunnel still held when a connect fails is the user's protection
+/// whatever the start of the connect believed — a dead one included, which
+/// the kill switch keeps in place while it cannot block (`fail_connect`,
+/// `auto_reconnect`'s hold). It used to be torn down with no block asked for.
 fn failure_outcome(
     superseded: bool,
     was_live: bool,
-    old_transport_touched: bool,
+    old_session_gone: bool,
     old_tunnel_held: bool,
 ) -> FailureOutcome {
     if superseded {
         FailureOutcome::Cancelled
-    } else if was_live && !old_transport_touched && old_tunnel_held {
+    } else if was_live && !old_session_gone && old_tunnel_held {
         FailureOutcome::KeepOldSession
     } else {
         FailureOutcome::Error {
-            hold_block: was_live,
+            hold_block: was_live || old_tunnel_held,
         }
     }
 }
@@ -650,7 +688,7 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
     let outcome = failure_outcome(
         error.code == IpcErrorCode::Cancelled || !vm.is_current(ctx.epoch),
         ctx.was_live,
-        ctx.old_transport_touched(&app.state::<XrayManager>()),
+        ctx.old_session_gone(&app.state::<XrayManager>()),
         vm.holds_tunnel().await,
     );
     let hold_block = match outcome {
@@ -660,7 +698,9 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
             // The relay permit may already have moved to the new server, just
             // before the rebuild (REVIEW-WIN2-001); a block held for the
             // session (lockdown) would then drop the kept session's own
-            // WireGuard traffic. Point it back.
+            // WireGuard traffic. Point it back. A move that failed (MR-2070)
+            // left the old block in force, but the relay it records already
+            // names the new server, for the next block that goes up.
             #[cfg(target_os = "windows")]
             if let Some(relay) = ctx.old_relay {
                 if crate::vpn::wfp::current_relay() != Some(relay) {
@@ -690,12 +730,44 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
 
     // The UI shows `kill_switch_blocking` with a working Disconnect, which is
     // the documented way out. (A no-op when the kill switch is not armed.)
+    //
+    // MR-2070: a block the kill switch wants but cannot put up leaves the
+    // tunnel still held in place, so its routes keep the traffic the block
+    // could not (`reconnect_policy::teardown_covered`, the rule the reconnect
+    // loop's teardown follows). Torn down, everything went out in the clear
+    // as soon as a switch refused at the relay permit ended. The kept tunnel
+    // reads as the block (`VpnManager::keep_tunnel_in_error`): Disconnect,
+    // the main button and the tray's, releases it, as it releases a block;
+    // with the kill switch turned off, the next connect displaces it
+    // unguarded, as asked.
+    let mut keep_tunnel = false;
     if hold_block {
-        if let Err(e) = killswitch::activate_killswitch().await {
+        let engaged = killswitch::activate_killswitch().await;
+        if let Err(e) = &engaged {
             tracing::warn!("Kill switch activation after a failed switch failed: {}", e);
         }
+        keep_tunnel = crate::vpn::reconnect_policy::teardown_covered(
+            &engaged,
+            killswitch::platform_is_blocking(),
+        )
+        .is_err();
     }
-    if vm.holds_tunnel().await {
+    let held = vm.holds_tunnel().await;
+    let error = if held && keep_tunnel {
+        tracing::error!(
+            "The kill switch could not block traffic — keeping the tunnel in place, so \
+             nothing leaves outside it, until you disconnect"
+        );
+        // What holds the traffic now is the kill switch's doing, so that is
+        // the error shown: the connect's own (a dead tunnel swallows its API
+        // call, so often "unreachable") would send the user to their network.
+        kept_tunnel_error()
+    } else {
+        error
+    };
+    if held && keep_tunnel {
+        vm.keep_tunnel_in_error(error.clone()).await;
+    } else if held {
         let _ = vm
             .disconnect_to(ConnectionState::Error(error.clone()))
             .await;
@@ -705,6 +777,16 @@ async fn fail_connect(app: &AppHandle, error: IpcError, ctx: &AttemptContext) ->
     // Nothing is left for a stealth transport to carry.
     app.state::<XrayManager>().stop().await;
     error
+}
+
+/// The error a failed connect ends in when it keeps its tunnel because the
+/// kill switch could not block (MR-2070, `fail_connect`).
+fn kept_tunnel_error() -> IpcError {
+    IpcError::new(
+        IpcErrorCode::KillswitchFailed,
+        "The kill switch could not block traffic, so the old tunnel is kept in place and \
+         nothing leaves outside it. Disconnect to release it.",
+    )
 }
 
 /// VERIFY THE ROUTE WE ASKED FOR IS THE ROUTE WE GOT.
@@ -895,8 +977,23 @@ pub(crate) async fn prepare_tunnel(
 /// (REVIEW-WIN2-001). `stealth`: the relay is reached by the xray helper over
 /// TCP rather than by our own WireGuard socket over UDP, which is what the
 /// Windows permit is scoped to (W1-013).
-pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bool) {
+///
+/// MR-2070: `Err` when the permit could not be moved or the block could not
+/// go up, where it used to be logged and dialled past. A block already in
+/// force then stays as it was, naming the previous relay; with `engage`,
+/// nothing at all may be blocking. The user's connect fails on it before the
+/// old tunnel is touched (`attempt`). The re-dial dials on: the block its
+/// `dial` put up first stays in force and drops a handshake it does not
+/// permit.
+pub(crate) async fn apply_relay_permit(
+    endpoint: &str,
+    stealth: bool,
+    engage: bool,
+) -> Result<(), String> {
     let ip = parse_endpoint_ip(endpoint);
+    // macOS/Linux: the relay the block permits now, for a guard that fails.
+    #[cfg(not(target_os = "windows"))]
+    let previous = killswitch::vpn_server_ip();
     match ip {
         Some(ip) => killswitch::set_vpn_server_ip(Some(ip)).await,
         None => {
@@ -921,24 +1018,17 @@ pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bo
         } else {
             RelayTransport::WireGuardUdp
         };
-        match parse_relay(endpoint, transport) {
-            Some(relay) => {
-                if let Err(e) = killswitch::move_relay(relay, engage).await {
-                    tracing::warn!("Failed to move the WFP relay permit: {}", e);
-                }
-            }
-            None => {
-                if ip.is_some() {
-                    tracing::warn!("Kill switch relay endpoint has no usable port");
-                }
-                // No relay to permit, but the rebuild is still guarded.
-                if engage {
-                    if let Err(e) = killswitch::activate_killswitch().await {
-                        tracing::warn!("Kill switch activation before the rebuild failed: {}", e);
-                    }
-                }
-            }
+        let relay = parse_relay(endpoint, transport);
+        if relay.is_none() && ip.is_some() {
+            tracing::warn!("Kill switch relay endpoint has no usable port");
         }
+        permit_relay(
+            relay,
+            engage,
+            killswitch::move_relay,
+            killswitch::activate_killswitch,
+        )
+        .await
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -946,13 +1036,18 @@ pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bo
         if engage {
             // pf and iptables read the relay from VPN_SERVER_IP, recorded
             // above, so engaging now is one load that already permits it.
-            if let Err(e) = killswitch::activate_killswitch().await {
-                tracing::warn!("Kill switch activation before the rebuild failed: {}", e);
-            }
-            return;
+            // MR-2070: one that fails gives the relay back to the session
+            // the block was for, which the switch then keeps (`attempt`).
+            return match killswitch::activate_killswitch().await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    killswitch::set_vpn_server_ip(previous).await;
+                    Err(format!("the block could not go up for the rebuild: {e}"))
+                }
+            };
         }
         let Some(ip) = ip else {
-            return;
+            return Ok(());
         };
         // Linux twin: the relay is permitted by ADDRESS and the self-permit is
         // scoped to tcp/443, so a connect onto a different server needs the
@@ -966,9 +1061,9 @@ pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bo
         {
             let _ = ip;
             if killswitch::platform_is_blocking() {
-                if let Err(e) = killswitch::activate_killswitch().await {
-                    tracing::warn!("Failed to update iptables VPN server permit: {}", e);
-                }
+                killswitch::activate_killswitch()
+                    .await
+                    .map_err(|e| format!("the iptables relay permit was not updated: {e}"))?;
             }
         }
         // macOS twin: pf bakes the relay permit into the loaded ruleset, so an
@@ -978,11 +1073,43 @@ pub(crate) async fn apply_relay_permit(endpoint: &str, stealth: bool, engage: bo
         {
             let _ = ip;
             if killswitch::pf_blocking_active() {
-                if let Err(e) = killswitch::activate_killswitch().await {
-                    tracing::warn!("Failed to update pf VPN server permit: {}", e);
-                }
+                killswitch::activate_killswitch()
+                    .await
+                    .map_err(|e| format!("the pf relay permit was not updated: {e}"))?;
             }
         }
+        Ok(())
+    }
+}
+
+/// Windows: the relay-permit half of [`apply_relay_permit`]. `move_relay`
+/// (`killswitch::move_relay`) points the permit at `relay` and, with
+/// `engage`, puts the block-all up in the same commit; with no relay to
+/// permit, `engage` puts the block up alone (`activate`,
+/// `killswitch::activate_killswitch`). Either failure is returned, never
+/// logged and dialled past (MR-2070). The two kill-switch calls are
+/// parameters so these paths are tested without a WFP session.
+#[cfg(target_os = "windows")]
+async fn permit_relay<MF, AF>(
+    relay: Option<crate::vpn::wfp_policy::Relay>,
+    engage: bool,
+    move_relay: impl FnOnce(crate::vpn::wfp_policy::Relay, bool) -> MF,
+    activate: impl FnOnce() -> AF,
+) -> Result<(), String>
+where
+    MF: std::future::Future<Output = Result<(), String>>,
+    AF: std::future::Future<Output = Result<bool, String>>,
+{
+    match relay {
+        Some(relay) => move_relay(relay, engage)
+            .await
+            .map_err(|e| format!("the WFP relay permit was not moved: {e}")),
+        // No relay to permit, but the rebuild is still guarded.
+        None if engage => activate()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("the block could not go up for the rebuild: {e}")),
+        None => Ok(()),
     }
 }
 
@@ -1372,6 +1499,7 @@ mod lifecycle_tests {
         let ctx = AttemptContext {
             epoch: 1,
             was_live: false,
+            live_at_start: false,
             block_engaged: false,
             old_stealth_mark: None,
             #[cfg(target_os = "windows")]
@@ -1607,6 +1735,221 @@ mod lifecycle_tests {
         );
     }
 
+    /// MR-2070: a relay permit that could not move (or a guard that could
+    /// not go up) ends the attempt before `vm.connect`, which would tear down
+    /// the session it displaces and dial the new relay with nothing blocking.
+    /// What the step returns is driven in
+    /// `a_relay_permit_that_cannot_move_is_the_steps_error`; where the failed
+    /// switch lands, in
+    /// `a_switch_refused_before_the_rebuild_keeps_only_a_live_session`.
+    #[test]
+    fn a_switch_whose_relay_permit_cannot_move_is_not_rebuilt() {
+        order(
+            body("async fn attempt("),
+            &[
+                "apply_relay_permit(",
+                "guard_rebuild,",
+                ".map_err(|e| {",
+                "IpcErrorCode::KillswitchFailed,",
+                "})?;",
+                "vm.set_phase(ConnectPhase::Handshaking);",
+                "vm.connect(",
+            ],
+        );
+        // Each kill-switch step's failure is returned, none logged and
+        // dialled past; and on macOS/Linux a guard that fails gives the
+        // relay back to the session the switch keeps.
+        let permit = body("pub(crate) async fn apply_relay_permit(");
+        assert!(
+            !permit.contains("if let Err(e) = killswitch::"),
+            "a kill-switch failure is swallowed"
+        );
+        order(
+            permit,
+            &[
+                "let previous = killswitch::vpn_server_ip();",
+                "killswitch::set_vpn_server_ip(Some(ip))",
+                "permit_relay(",
+                "killswitch::move_relay,",
+                "killswitch::activate_killswitch,",
+                "if engage {",
+                "Err(e) => {",
+                "killswitch::set_vpn_server_ip(previous).await;",
+                "Err(format!(",
+            ],
+        );
+        for rebuilt in [
+            "the iptables relay permit was not updated: {e}\"))?;",
+            "the pf relay permit was not updated: {e}\"))?;",
+        ] {
+            assert!(permit.contains(rebuilt), "{rebuilt}");
+        }
+    }
+
+    /// MR-2070, where the refused switch lands (`fail_connect`). A session
+    /// live when the connect started, its transport untouched, is kept: no
+    /// teardown, no dial, its relay permit pointed back. A dead tunnel the
+    /// guard took into `was_live` (one the reconnect loop had not torn down,
+    /// still held when the step failed) is never kept as the session — it
+    /// would read Connected — and the failure holds the block instead.
+    #[test]
+    fn a_switch_refused_before_the_rebuild_keeps_only_a_live_session() {
+        use super::{failure_outcome, AttemptContext, FailureOutcome};
+        use crate::vpn::xray::XrayManager;
+
+        let xray = XrayManager::new();
+        // After the guard: `was_live` is set for whatever tunnel it found.
+        let guarded = |live_at_start| AttemptContext {
+            epoch: 1,
+            was_live: true,
+            live_at_start,
+            block_engaged: true,
+            old_stealth_mark: None,
+            #[cfg(target_os = "windows")]
+            old_relay: None,
+            intent_seen: 0,
+            stealth_mode: false,
+        };
+
+        let live = guarded(true);
+        assert!(!live.old_session_gone(&xray));
+        assert_eq!(
+            failure_outcome(false, live.was_live, live.old_session_gone(&xray), true),
+            FailureOutcome::KeepOldSession
+        );
+
+        let dead = guarded(false);
+        assert!(dead.old_session_gone(&xray));
+        assert_eq!(
+            failure_outcome(false, dead.was_live, dead.old_session_gone(&xray), true),
+            FailureOutcome::Error { hold_block: true }
+        );
+    }
+
+    /// MR-2070: a failed connect that still holds a tunnel holds the block
+    /// before that tunnel goes — a dead one too, which the start of the
+    /// connect did not count as live (the kill switch keeps one in place while
+    /// it cannot block: the reconnect loop's hold, or this path's own). When
+    /// no block can go up while the kill switch wants one, the tunnel is not
+    /// torn down at all, and its routes keep the traffic. The rule is
+    /// `reconnect_policy::teardown_covered`, driven in its own tests.
+    #[test]
+    fn a_failed_connect_tears_a_held_tunnel_down_only_behind_a_block() {
+        use super::{failure_outcome, FailureOutcome};
+        // Not live when the connect started, a tunnel still held: the block
+        // is held. It used to be torn down with no block asked for.
+        for gone in [false, true] {
+            assert_eq!(
+                failure_outcome(false, false, gone, true),
+                FailureOutcome::Error { hold_block: true },
+                "gone={gone}"
+            );
+        }
+        // Nothing live and nothing held: nothing to hold.
+        assert_eq!(
+            failure_outcome(false, false, true, false),
+            FailureOutcome::Error { hold_block: false }
+        );
+
+        let failed = body("async fn fail_connect(");
+        order(
+            failed,
+            &[
+                "FailureOutcome::Error { hold_block } => hold_block,",
+                "if hold_block {",
+                "let engaged = killswitch::activate_killswitch().await;",
+                "keep_tunnel = crate::vpn::reconnect_policy::teardown_covered(",
+                "&engaged,",
+                "killswitch::platform_is_blocking(),",
+                ".is_err();",
+                "let held = vm.holds_tunnel().await;",
+                "let error = if held && keep_tunnel {",
+                "kept_tunnel_error()",
+                // The kept tunnel reads as the block, with Disconnect
+                // (`VpnManager::keep_tunnel_in_error`, driven in the
+                // manager's tests): a plain `error` read as "nothing held".
+                "if held && keep_tunnel {",
+                "vm.keep_tunnel_in_error(error.clone()).await;",
+                "} else if held {",
+                ".disconnect_to(ConnectionState::Error(error.clone()))",
+                "} else {",
+                ".set_state(ConnectionState::Error(error.clone()))",
+            ],
+        );
+        // A kept tunnel says why the traffic is held: the kill switch.
+        assert_eq!(
+            super::kept_tunnel_error().code,
+            crate::commands::ipc_error::IpcErrorCode::KillswitchFailed
+        );
+        // A kept tunnel is torn down nowhere else on the way out, and is
+        // kept nowhere else.
+        assert_eq!(failed.matches("disconnect_to(").count(), 1);
+        assert_eq!(failed.matches("keep_tunnel_in_error(").count(), 1);
+    }
+
+    /// MR-2070: a relay permit that cannot move — or, with no relay to
+    /// permit, a guard that cannot go up — is the step's error; it used to be
+    /// logged and the switch dialled past it. The kill switch's two calls are
+    /// stubbed: no WFP session is opened.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn a_relay_permit_that_cannot_move_is_the_steps_error() {
+        use super::permit_relay;
+        use crate::vpn::wfp_policy::{parse_relay, Relay, RelayTransport};
+        use std::future::{ready, Ready};
+
+        let relay = parse_relay("192.0.2.1:51820", RelayTransport::WireGuardUdp);
+        assert!(relay.is_some());
+        let refused = |_: Relay, _: bool| {
+            ready(Err::<(), String>(
+                "FwpmTransactionCommit0 failed: 0x80320008".into(),
+            ))
+        };
+        let nothing_to_move = |_: Relay, _: bool| -> Ready<Result<(), String>> {
+            panic!("there is no relay to move")
+        };
+        let not_engaged_alone = || -> Ready<Result<bool, String>> {
+            panic!("the move puts the block up in its own commit")
+        };
+
+        // Putting the block up with the move, or rebuilding one in force.
+        for engage in [true, false] {
+            let moved = permit_relay(relay, engage, refused, not_engaged_alone).await;
+            assert!(
+                moved
+                    .as_ref()
+                    .is_err_and(|e| e.contains("FwpmTransactionCommit0")),
+                "engage={engage}: {moved:?}"
+            );
+        }
+        // No relay to permit: the guard alone, and its failure.
+        let guarded = permit_relay(None, true, nothing_to_move, || {
+            ready(Err::<bool, String>("Kill switch not initialized".into()))
+        })
+        .await;
+        assert!(guarded.is_err(), "{guarded:?}");
+
+        // The controls: a move that commits, a guard that goes up or is not
+        // wanted, and nothing asked of the step at all.
+        let committed = permit_relay(
+            relay,
+            true,
+            |moved: Relay, engage| {
+                assert!(engage && Some(moved) == relay);
+                ready(Ok(()))
+            },
+            not_engaged_alone,
+        )
+        .await;
+        assert_eq!(committed, Ok(()));
+        for engaged in [true, false] {
+            let up = permit_relay(None, true, nothing_to_move, || ready(Ok(engaged))).await;
+            assert_eq!(up, Ok(()));
+        }
+        let idle = permit_relay(None, false, nothing_to_move, not_engaged_alone).await;
+        assert_eq!(idle, Ok(()));
+    }
+
     /// REVIEW-WIN-001, the reapply-racing-a-switch scenario. Connected to A;
     /// switch B is in its API call and has published `Switching`; a settings
     /// reapply C supersedes it. Tunnel A is still held and carrying traffic,
@@ -1672,6 +2015,7 @@ mod lifecycle_tests {
         let ctx = AttemptContext {
             epoch: 1,
             was_live: true,
+            live_at_start: true,
             block_engaged: false,
             old_stealth_mark: Some(xray.ended_count()),
             old_relay: None,

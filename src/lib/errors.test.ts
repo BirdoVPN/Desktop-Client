@@ -139,6 +139,20 @@ describe('reconnect give-up (P1-parity-020)', () => {
     );
   });
 
+  // MR-2071: recovery stopped because the kill switch could not be armed. It
+  // used to read as 'died_after_handshake': blamed the server and sent the
+  // user to another location, when the cause is on this device.
+  it('names the kill switch when it is why reconnecting stopped', () => {
+    expect(giveUpKind(err('killswitch_failed'))).toBe('killswitch_failed');
+    const m = giveUpMessage(giveUpKind(err('killswitch_failed')), 10, false);
+    expect(m).toBe(
+      "BirdoVPN stopped reconnecting after 10 attempts: the kill switch couldn't be armed on this " +
+        "device, so BirdoVPN didn't reconnect without it. Traffic is no longer being blocked. " +
+        'Click Connect to try again.',
+    );
+    expect(m).not.toMatch(/server|location/);
+  });
+
   it('never claims traffic is unblocked while the always-on kill switch still holds it', () => {
     const m = giveUpMessage('never_established', 1, true);
     expect(m).not.toContain('no longer being blocked');
