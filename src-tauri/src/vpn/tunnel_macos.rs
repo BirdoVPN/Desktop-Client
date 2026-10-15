@@ -166,8 +166,10 @@ pub struct UtunTunnel {
     network_snapshot: Arc<RwLock<Option<NetworkSnapshot>>>,
     /// Whether to allow local network access while VPN is active
     local_network_sharing: bool,
-    /// Endpoint IP for route exclusion
-    endpoint_ip: Arc<RwLock<Option<String>>>,
+    /// The routes this session added, in the order they went in (MR-2088).
+    /// Teardown — stop(), a failed start's unwind, `Drop` — removes exactly
+    /// these, and nothing that merely shares a prefix with one of them.
+    owned_routes: OwnedRoutes,
     /// JoinHandle of the spawned packet loop.
     ///
     /// P1-dk-tun-fd-close-race: stop() JOINS this task before closing the utun
@@ -188,11 +190,27 @@ pub struct UtunTunnel {
 /// blackhole: the next connect then failed with "File exists" adding its own
 /// half-defaults, the connectivity probes (routed INTO the tunnel) could not
 /// answer, and the app was declared offline — the start of the frozen-switch
-/// cascade. Closing the fd destroys the interface, and the kernel drops its
-/// routes with it.
+/// cascade. Closing the fd destroys the interface, and the kernel drops the
+/// routes INTO it with it; the routes this session added via the physical
+/// gateway are removed first (MR-2088).
 impl Drop for UtunTunnel {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // MR-2088: routes this session added that nothing has removed yet (a
+        // stop() cut short by the switch-teardown cap, a start() cancelled
+        // after configure_routes). Closing the fd withdraws the routes into
+        // the utun, but not the endpoint host route or the LAN-sharing routes
+        // via the physical gateway, which used to outlive every such drop
+        // pointing at whatever gateway the host had then. Removed first, as
+        // stop() does, and only while they are still ours.
+        let routes = take_owned_routes(&self.owned_routes);
+        if !routes.is_empty() {
+            tracing::warn!(
+                "UtunTunnel dropped with {} route(s) still installed — removing them",
+                routes.len()
+            );
+            remove_owned_routes(routes);
+        }
         // Drop cannot await. `try_write` is enough: by the time the tunnel is
         // being dropped nothing else legitimately holds this lock, and failing to
         // acquire it must never panic or block a teardown.
@@ -252,7 +270,7 @@ impl UtunTunnel {
             utun_fd: Arc::new(RwLock::new(None)),
             network_snapshot: Arc::new(RwLock::new(None)),
             local_network_sharing,
-            endpoint_ip: Arc::new(RwLock::new(None)),
+            owned_routes: OwnedRoutes::default(),
             packet_loop: Arc::new(RwLock::new(None)),
         })
     }
@@ -326,7 +344,6 @@ impl UtunTunnel {
             "WireGuard endpoint IP: {}",
             redact_ip(&endpoint_ip.to_string())
         );
-        *self.endpoint_ip.write().await = Some(endpoint_ip.to_string());
 
         // Configure the utun interface IP
         if let Err(e) = configure_utun_address(&utun_name, &self.config.client_ip, &self.config.mtu)
@@ -335,12 +352,16 @@ impl UtunTunnel {
             return Err(e);
         }
 
-        // Configure routing
+        // Configure routing. It can fail part-way, with the endpoint route and
+        // a half-default already in: each route it added is in owned_routes by
+        // then, so the unwind removes exactly those (MR-2088) — never the
+        // route that failed this start, which is usually another VPN's.
         if let Err(e) = configure_routes(
             &utun_name,
             &endpoint_ip.to_string(),
             &self.config.allowed_ips,
             self.local_network_sharing,
+            &self.owned_routes,
         )
         .await
         {
@@ -465,14 +486,17 @@ impl UtunTunnel {
         Ok(())
     }
 
-    /// A start that failed after the utun device existed. Its kill-switch
-    /// permit leaves a held block FIRST, while this process still owns the
-    /// unit (P3-4) — not just forgotten until the next load — and only then is
-    /// the fd closed, which destroys the device and its routes. The fd stays
-    /// in `utun_fd` across the await, so a cancelled start still leaves it
-    /// to `Drop`; it is taken and closed with no await in between (N7), so it
-    /// can never be closed twice either.
+    /// A start that failed after the utun device existed. The routes it added
+    /// go first (MR-2088): closing the utun withdraws only the routes INTO
+    /// it, and the endpoint and LAN-sharing routes via the physical gateway
+    /// used to outlive every failed start. Its kill-switch permit then leaves
+    /// a held block, while this process still owns the unit (P3-4) — not just
+    /// forgotten until the next load — and only then is the fd closed, which
+    /// destroys the device. The fd stays in `utun_fd` across the await, so a
+    /// cancelled start still leaves it to `Drop`; it is taken and closed with
+    /// no await in between (N7), so it can never be closed twice either.
     async fn abandon_utun(&self, name: &str) {
+        remove_owned_routes(take_owned_routes(&self.owned_routes));
         crate::commands::killswitch::tunnel_interface_down(name).await;
         let mut slot = self.utun_fd.write().await;
         if let Some(fd) = slot.take() {
@@ -528,10 +552,11 @@ impl UtunTunnel {
         // (a stuck block would leave the host without IPv6 after disconnect).
         crate::commands::killswitch::ipv6_block_deactivate().await;
 
-        // Remove routes
-        if let Some(ep_ip) = self.endpoint_ip.read().await.as_ref() {
-            remove_routes(ep_ip, &self.config.allowed_ips, self.local_network_sharing).await;
-        }
+        // Remove the routes this session added — only those, and each only
+        // while it is still ours (MR-2088), so a route that merely shares a
+        // prefix with one of them (another VPN's 0.0.0.0/1, an endpoint route
+        // that was there before we connected) is never touched.
+        remove_owned_routes(take_owned_routes(&self.owned_routes));
 
         // Close the utun file descriptor — destroying the interface — but take
         // its permit out of a held kill-switch block FIRST (MR-1125 / P3-4):
@@ -1041,7 +1066,22 @@ fn configure_utun_address(utun_name: &str, client_ip: &str, mtu: &u16) -> Result
     Ok(())
 }
 
-/// Configure routing to send traffic through the VPN tunnel.
+/// Networks routed around the tunnel when Local Network Sharing is on.
+///
+/// These used to be installed and then NEVER removed — leaving routes pointing
+/// at a gateway that stops existing the moment the user changes network. Each
+/// one that goes in is now an [`OwnedRoute`], removed at teardown; one that was
+/// already there is not ours and stays. On most Macs that is 169.254.0.0/16:
+/// macOS installs its own link-local route on the primary interface, our add
+/// fails with "File exists", and teardown leaves the OS's route alone
+/// (deleting it would break mDNS/Bonjour for every other app on the machine).
+const LAN_SHARING_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
+
 /// Expand a default route into two halves, leaving everything else untouched.
 ///
 /// The BSD routing table keys on (destination, netmask) with no metric tiebreak,
@@ -1053,31 +1093,8 @@ fn configure_utun_address(utun_name: &str, client_ip: &str, mtu: &u16) -> Result
 /// longest-prefix match picks them over the existing default without deleting
 /// it — which also means teardown has nothing to restore.
 ///
-/// Shared by configure_routes and remove_routes so the two can never disagree
-/// about what was installed.
-/// Networks routed around the tunnel when Local Network Sharing is on.
-///
-/// Shared between install and teardown so the two cannot drift. These used to
-/// be installed and then NEVER removed — leaving routes pointing at a gateway
-/// that stops existing the moment the user changes network.
-const LAN_SHARING_CIDRS: [&str; 4] = [
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "169.254.0.0/16",
-];
-
-/// Teardown subset — deliberately EXCLUDES 169.254.0.0/16.
-///
-/// macOS installs its own link-local route on the primary interface, so our
-/// `route add` for it always fails with "File exists". We therefore never owned
-/// it, and deleting it at teardown would remove the OS's route rather than ours —
-/// breaking mDNS/Bonjour for every other app on the machine.
-///
-/// Kept adjacent to the add-side list above so any drift between them is visible
-/// in one screen.
-const LAN_SHARING_CIDRS_OWNED: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
-
+/// Teardown does not re-expand this: it removes what configure_routes recorded
+/// adding ([`OwnedRoute`]), so it cannot disagree about what was installed.
 fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
     allowed_ips
         .iter()
@@ -1102,30 +1119,28 @@ fn expand_default_v4(allowed_ips: &[String]) -> Vec<String> {
 /// MR-740: a route this call added goes on the crash-recovery record at once.
 /// It sits on the physical interface, so unlike the utun's routes it outlives
 /// a killed process; the next start removes it. One that was already there is
-/// not ours and is not recorded.
-fn pin_endpoint_route(endpoint_ip: &str, default_gw: &str) -> Result<(), String> {
-    let output = cmd("route")
-        .args(["-n", "add", "-host", endpoint_ip, default_gw])
-        .output()
-        .map_err(|e| format!("Failed to add endpoint route: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+/// not ours: it is not recorded, and teardown leaves it where it was (MR-2088
+/// — it used to delete it by destination, someone else's or not).
+fn pin_endpoint_route(
+    endpoint_ip: &str,
+    default_gw: &str,
+    owned: &OwnedRoutes,
+) -> Result<(), String> {
+    let route = OwnedRoute {
+        dst: format!("{endpoint_ip}/32"),
+        via: RouteVia::Gateway(default_gw.to_string()),
+    };
+    if let Err(output) = add_owned_route(route, owned) {
         // MUST be fatal (except an existing identical route). Once the default
         // is genuinely captured, a missing endpoint route sends WireGuard's own
         // outer UDP back into the tunnel — an encapsulation loop that reaches
         // Connected and carries zero traffic. Warning here would convert a
         // visible failure into an invisible one.
-        if !stderr.contains("File exists") {
-            return Err(format!(
-                "Failed to pin the endpoint route: {}",
-                stderr.trim()
-            ));
+        if !output.contains("File exists") {
+            return Err(format!("Failed to pin the endpoint route: {}", output));
         }
         tracing::debug!("Endpoint route already present");
-        return Ok(());
     }
-    route_journal::remember(&gateway_record(&format!("{endpoint_ip}/32"), default_gw));
     Ok(())
 }
 
@@ -1154,66 +1169,305 @@ fn route_target(dst: &str) -> Option<Vec<String>> {
     })
 }
 
-/// `route -n <verb> <target> [extra]`, its stdout and stderr together.
-fn run_route(verb: &str, target: &[String], extra: &[&str]) -> Result<(bool, String), String> {
+/// `route -n <verb> <target>`, its stdout and stderr together.
+fn run_route(verb: &str, target: &[String]) -> Result<(bool, String), String> {
+    let mut args = vec!["-n".to_string(), verb.to_string()];
+    args.extend_from_slice(target);
+    run_route_args(&args)
+}
+
+/// `route <args>`: whether the kernel made the change, and stdout and stderr
+/// together.
+fn run_route_args(args: &[String]) -> Result<(bool, String), String> {
     let out = cmd("route")
-        .args(["-n", verb])
-        .args(target)
-        .args(extra)
+        .args(args)
         .output()
         .map_err(|e| format!("could not run route: {}", e))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
     Ok((
-        out.status.success(),
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
+        route_change_made(out.status.success(), &stderr),
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr),
     ))
 }
 
-/// MR-740: delete a route the crash-recovery record names — only while the
-/// table still holds it as ours. BSD `route delete` matches on the
-/// destination alone, so `route -n get` must first show this destination
-/// (and mask) via the recorded gateway; a route someone else has put there
-/// since is left alone. `route_journal::reconcile` calls this, at start-up,
-/// where no tunnel of this process is up.
-pub(super) fn delete_recorded_route(route: &GatewayRoute) -> RouteDelete {
-    let Some(target) = route_target(&route.dst) else {
-        return RouteDelete::Absent;
-    };
-    let got = match run_route("get", &target, &[]) {
-        Ok(got) => got,
-        Err(e) => return RouteDelete::Failed(e),
-    };
-    match got {
-        (false, output) => route_journal::route_tool_outcome(false, &output),
-        (true, output) if !route_journal::route_get_describes(&output, route) => {
-            tracing::info!(
-                "A recorded route to {} is no longer ours — left in place",
-                redact_ip(&route.dst)
-            );
-            RouteDelete::Absent
+/// Did `route` make the change? Its exit status alone does not say: macOS
+/// `route` exits 0 when the kernel refuses an add ("File exists") or a delete
+/// or lookup ("not in table"), and only warns about it on stderr ("route:
+/// writing to routing socket: File exists"). Read by its status, every
+/// collision was a route we had added (MR-2088), and the fatal paths for a
+/// refused add in pin_endpoint_route and configure_routes never ran. A change
+/// counts as made only when nothing was written to stderr either.
+fn route_change_made(exit_ok: bool, stderr: &str) -> bool {
+    exit_ok && stderr.trim().is_empty()
+}
+
+/// Where a route of ours points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteVia {
+    /// The physical gateway: the endpoint host route, the LAN-sharing routes.
+    Gateway(String),
+    /// The session's utun (`-interface utunN`): the allowed IPs.
+    Interface(String),
+}
+
+/// A route this session added, held with what makes it ours (MR-2088).
+///
+/// BSD `route delete` matches on the destination and mask alone; the kernel
+/// ignores a gateway or interface named with it. Teardown used to delete by
+/// prefix, so it removed whatever route held each one: another VPN's
+/// `0.0.0.0/1` and `128.0.0.0/1`, or an endpoint host route that was already
+/// there when we connected (which our add had only met as "File exists"). Now
+/// a route is recorded only once its add succeeded, and deleted only while
+/// `route -n get` still shows it where we put it: via our gateway, or into our
+/// utun. The Linux twin is tunnel_linux.rs's `OwnedRoute` (bug B, #300).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedRoute {
+    /// IPv4 CIDR, e.g. `0.0.0.0/1` or `203.0.113.7/32`.
+    dst: String,
+    via: RouteVia,
+}
+
+impl OwnedRoute {
+    /// `route` argv for `-n <verb> <target> <gateway>` or
+    /// `-n <verb> <target> -interface <utun>`: the add and the delete come from
+    /// the same place, so they cannot be qualified differently. `None` for a
+    /// destination [`route_target`] cannot name (a /0 above all).
+    fn route_args(&self, verb: &str) -> Option<Vec<String>> {
+        let mut args = vec!["-n".to_string(), verb.to_string()];
+        args.extend(route_target(&self.dst)?);
+        match &self.via {
+            RouteVia::Gateway(gateway) => args.push(gateway.clone()),
+            RouteVia::Interface(utun) => args.extend(["-interface".to_string(), utun.clone()]),
         }
-        (true, _) => match run_route("delete", &target, &[route.via.as_str()]) {
-            Ok((ok, output)) => route_journal::route_tool_outcome(ok, &output),
-            Err(e) => RouteDelete::Failed(e),
-        },
+        Some(args)
+    }
+
+    /// MR-740: this route's crash-recovery record, when it outlives the utun.
+    /// A route via the physical gateway does; one into the utun dies with it.
+    fn gateway_record(&self) -> Option<GatewayRoute> {
+        match &self.via {
+            RouteVia::Gateway(gateway) => Some(gateway_record(&self.dst, gateway)),
+            RouteVia::Interface(_) => None,
+        }
+    }
+
+    /// Does `route -n get`'s answer describe this route itself: the same
+    /// destination and mask, via our gateway or into our utun?
+    fn described_by(&self, output: &str) -> bool {
+        match &self.via {
+            RouteVia::Gateway(gateway) => {
+                route_journal::route_get_describes(output, &gateway_record(&self.dst, gateway))
+            }
+            RouteVia::Interface(utun) => {
+                route_journal::route_get_interface_at(output, &self.dst) == Some(utun.as_str())
+            }
+        }
+    }
+
+    /// Delete this route — only while the table still holds it as ours. A
+    /// route someone else has put at the same destination since, or had there
+    /// all along, is left alone.
+    fn delete(&self) -> RouteDelete {
+        let (Some(target), Some(args)) = (route_target(&self.dst), self.route_args("delete"))
+        else {
+            return RouteDelete::Absent;
+        };
+        let got = match run_route("get", &target) {
+            Ok(got) => got,
+            Err(e) => return RouteDelete::Failed(e),
+        };
+        match got {
+            (false, output) => route_journal::route_tool_outcome(false, &output),
+            (true, output) if !self.described_by(&output) => {
+                tracing::info!(
+                    "The route to {} is no longer ours — left in place",
+                    redact_ip(&self.dst)
+                );
+                RouteDelete::Absent
+            }
+            (true, _) => match run_route_args(&args) {
+                Ok((ok, output)) => route_journal::route_tool_outcome(ok, &output),
+                Err(e) => RouteDelete::Failed(e),
+            },
+        }
     }
 }
 
-/// Teardown's delete of the route at `dst`, by destination as before; once it
-/// is gone it leaves the crash-recovery record.
-fn delete_route_at(dst: &str) {
-    let Some(target) = route_target(dst) else {
+/// MR-740: delete a route the crash-recovery record names, exactly as a
+/// teardown deletes one of ours: only while `route -n get` still shows this
+/// destination (and mask) via the recorded gateway; a route someone else has
+/// put there since is left alone. `route_journal::reconcile` calls this, at
+/// start-up, where no tunnel of this process is up.
+pub(super) fn delete_recorded_route(route: &GatewayRoute) -> RouteDelete {
+    OwnedRoute {
+        dst: route.dst.clone(),
+        via: RouteVia::Gateway(route.via.clone()),
+    }
+    .delete()
+}
+
+/// The routes a tunnel owns, in the order they were added.
+type OwnedRoutes = std::sync::Mutex<Vec<OwnedRoute>>;
+
+/// Take every owned route out of `owned`, leaving it empty. A poisoned lock
+/// still yields its routes: a teardown must never skip them.
+fn take_owned_routes(owned: &OwnedRoutes) -> Vec<OwnedRoute> {
+    std::mem::take(&mut *owned.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `route add` `route`, recording it in `owned` as soon as the add succeeded —
+/// before anything else can fail or be cancelled. Returns `route`'s answer on
+/// a failure ("File exists" when something already holds the destination).
+///
+/// MR-740: a route that outlives the utun also goes on the crash-recovery
+/// record at once, so a session killed from here on (SIGKILL, a panic) leaves
+/// the next start a record of it to remove.
+fn add_owned_route(route: OwnedRoute, owned: &OwnedRoutes) -> Result<(), String> {
+    let Some(args) = route.route_args("add") else {
+        return Err(format!("{} is not a prefix `route` can name", route.dst));
+    };
+    let (ok, output) = run_route_args(&args)?;
+    if !ok {
+        return Err(output.trim().to_string());
+    }
+    let record = route.gateway_record();
+    owned.lock().unwrap_or_else(|e| e.into_inner()).push(route);
+    if let Some(record) = record {
+        route_journal::remember(&record);
+    }
+    Ok(())
+}
+
+/// Remove the routes this session added, newest first, each only while it is
+/// still ours (see [`OwnedRoute`]).
+///
+/// Synchronous so `Drop` can call it. Best-effort: a route into the utun is
+/// already gone if the utun is, and a failed delete must never stop the rest
+/// of a teardown.
+///
+/// This replaces deleting by prefix, which removed routes we never installed:
+/// the HOST's own default once (an unqualified `0.0.0.0/0` delete), macOS's
+/// link-local 169.254.0.0/16, an endpoint route that was already there, and
+/// another VPN's half-defaults (MR-2088).
+///
+/// MR-740: a route proved gone leaves the crash-recovery record; one whose
+/// delete failed stays on it, for the next start to retry.
+fn remove_owned_routes(routes: Vec<OwnedRoute>) {
+    if routes.is_empty() {
         return;
+    }
+    for route in routes.iter().rev() {
+        let deleted = route.delete();
+        match &deleted {
+            RouteDelete::Removed => {}
+            RouteDelete::Absent => tracing::debug!(
+                "Route {} was already gone at teardown",
+                redact_ip(&route.dst)
+            ),
+            RouteDelete::Failed(e) => {
+                tracing::warn!("Could not remove route {}: {}", redact_ip(&route.dst), e)
+            }
+        }
+        if deleted.settled() {
+            if let Some(record) = route.gateway_record() {
+                route_journal::forget(&record);
+            }
+        }
+    }
+    tracing::info!("Removed {} VPN route(s)", routes.len());
+}
+
+/// What holds a destination an allowed-IP add collided with ("File exists").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Collision {
+    /// A route into this session's own utun: in already (a repeated allowed
+    /// IP, or the utun's own address). Nothing to do.
+    Ours,
+    /// A route into a utun that no longer exists: a dead tunnel's leftover,
+    /// which nothing can be using. Taken over.
+    Stale,
+    /// Anything else — another VPN's live utun, a route via a gateway, an
+    /// answer that cannot be read. Left alone, and the start fails.
+    Foreign,
+}
+
+/// Classify a collision at `dst` from `route -n get`'s answer about it.
+/// `utun_exists` is the one question it asks the system, so this is pure.
+fn classify_collision(
+    output: &str,
+    dst: &str,
+    our_utun: &str,
+    utun_exists: impl Fn(&str) -> bool,
+) -> Collision {
+    match route_journal::route_get_interface_at(output, dst) {
+        Some(iface) if iface == our_utun => Collision::Ours,
+        Some(iface) if is_utun_name(iface) && !utun_exists(iface) => Collision::Stale,
+        _ => Collision::Foreign,
+    }
+}
+
+/// `utun` and a unit number: the only kind of interface whose leftover route
+/// a start may take over.
+fn is_utun_name(name: &str) -> bool {
+    name.strip_prefix("utun")
+        .is_some_and(|unit| !unit.is_empty() && unit.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Does an interface called `name` exist right now? A name that cannot even
+/// be asked about counts as existing, so it is never taken for a dead one.
+fn interface_exists(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return true;
     };
-    let deleted = match run_route("delete", &target, &[]) {
-        Ok((ok, output)) => route_journal::route_tool_outcome(ok, &output),
-        Err(e) => RouteDelete::Failed(e),
+    // SAFETY: `name` is a valid NUL-terminated string for the whole call.
+    unsafe { libc::if_nametoindex(name.as_ptr()) != 0 }
+}
+
+/// Our add of `route` (into this session's utun) met "File exists". Returns
+/// whether the destination is now routed into this utun; `false` leaves the
+/// collision to fail the start.
+///
+/// A collision used to be reclaimed unconditionally: the route at that prefix
+/// was deleted, whoever's it was, and ours added in its place — which took
+/// another VPN's `0.0.0.0/1` and `128.0.0.0/1` away from it (MR-2088). The
+/// case it was written for, our own previous utun surviving an interrupted
+/// teardown with its half-defaults, is now covered where it starts: stop(),
+/// a failed start's unwind and `Drop` each remove the routes they added. So
+/// only a route into a utun that no longer exists is taken over here.
+fn resolve_collision(route: &OwnedRoute, owned: &OwnedRoutes) -> Result<bool, String> {
+    let RouteVia::Interface(utun) = &route.via else {
+        return Ok(false);
     };
-    if deleted.settled() {
-        route_journal::forget_destination(dst);
+    let Some(target) = route_target(&route.dst) else {
+        return Ok(false);
+    };
+    let (_, output) = run_route("get", &target)?;
+    match classify_collision(&output, &route.dst, utun, interface_exists) {
+        Collision::Ours => Ok(true),
+        Collision::Foreign => {
+            tracing::warn!(
+                "Route {} is already held by another interface or gateway — not ours, left in \
+                 place",
+                route.dst
+            );
+            Ok(false)
+        }
+        Collision::Stale => {
+            tracing::warn!(
+                "Route {} still points at a utun that no longer exists — reclaiming it",
+                route.dst
+            );
+            // By destination only: the dead utun can no longer be named to
+            // `route`, and the lookup above showed what holds the prefix.
+            let _ = run_route("delete", &target);
+            match add_owned_route(route.clone(), owned) {
+                Ok(()) => Ok(true),
+                Err(e) => {
+                    tracing::error!("Reclaiming route {} failed: {}", route.dst, e);
+                    Ok(false)
+                }
+            }
+        }
     }
 }
 
@@ -1222,104 +1476,38 @@ async fn configure_routes(
     endpoint_ip: &str,
     allowed_ips: &[String],
     local_network_sharing: bool,
+    owned: &OwnedRoutes,
 ) -> Result<(), String> {
     // Get current default gateway for endpoint route
     let default_gw = get_default_gateway()?;
     tracing::info!("Default gateway: {}", redact_ip(&default_gw));
 
-    pin_endpoint_route(endpoint_ip, &default_gw)?;
+    pin_endpoint_route(endpoint_ip, &default_gw, owned)?;
 
     let allowed_ips = expand_default_v4(allowed_ips);
 
-    // Add routes for allowed_ips via the utun interface
+    // Add routes for allowed_ips via the utun interface:
+    // route -n add -net <network> -netmask <mask> -interface <utun>
     for cidr in &allowed_ips {
-        let parts: Vec<&str> = cidr.split('/').collect();
-        if parts.len() != 2 {
-            tracing::warn!(
-                "Skipping malformed allowed_ip (expected CIDR notation): {}",
-                cidr
-            );
-            continue;
-        }
-
-        let network = parts[0];
-        let prefix: u8 = match parts[1].parse() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::warn!("Skipping allowed_ip with invalid CIDR prefix: {}", cidr);
+        let route = OwnedRoute {
+            dst: cidr.clone(),
+            via: RouteVia::Interface(utun_name.to_string()),
+        };
+        if let Err(output) = add_owned_route(route.clone(), owned) {
+            // A collision is taken over only from a utun that no longer
+            // exists (see resolve_collision); another VPN's route stays its.
+            if output.contains("File exists") && resolve_collision(&route, owned)? {
                 continue;
             }
-        };
-        let mask = prefix_to_mask(prefix);
-
-        // route -n add -net <network> -netmask <mask> -interface <utun>
-        let output = cmd("route")
-            .args([
-                "-n",
-                "add",
-                "-net",
-                network,
-                "-netmask",
-                &mask,
-                "-interface",
-                utun_name,
-            ])
-            .output()
-            .map_err(|e| format!("Failed to add route for {}: {}", cidr, e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // A collision is usually OUR OWN leaked state: if a previous teardown
-            // was cut short (e.g. the switch teardown cap fired while restore_dns
-            // was still running), the old utun's `0.0.0.0/1` + `128.0.0.0/1`
-            // survive and every later connect fails here forever — the machine
-            // becomes permanently unable to connect until reboot. Reclaim the route
-            // instead: delete it and retry ONCE. Ownership is still verified,
-            // because a retry that fails is treated exactly as before.
-            let mut recovered = false;
-            if stderr.contains("File exists") {
-                tracing::warn!(
-                    "Route {} already exists (stale from an interrupted teardown?) — \
-                     reclaiming it",
-                    cidr
-                );
-                let _ = cmd("route")
-                    .args(["-n", "delete", "-net", network, "-netmask", &mask])
-                    .output();
-                let retry = cmd("route")
-                    .args([
-                        "-n",
-                        "add",
-                        "-net",
-                        network,
-                        "-netmask",
-                        &mask,
-                        "-interface",
-                        utun_name,
-                    ])
-                    .output()
-                    .map_err(|e| format!("Failed to re-add route for {}: {}", cidr, e))?;
-                recovered = retry.status.success();
-                if !recovered {
-                    tracing::error!(
-                        "Reclaiming route {} failed: {}",
-                        cidr,
-                        String::from_utf8_lossy(&retry.stderr).trim()
-                    );
-                }
-            }
-            if !recovered {
-                // Fatal now that defaults are split. Before the split a `0.0.0.0/0`
-                // collision was expected and warning was survivable-looking; after
-                // it, a collision on `0.0.0.0/1` or `128.0.0.0/1` means the tunnel
-                // did NOT capture traffic, and continuing would report Connected
-                // while everything egresses the physical NIC.
-                return Err(format!(
-                    "Failed to route {} into the tunnel: {}",
-                    cidr,
-                    stderr.trim()
-                ));
-            }
+            // Fatal now that defaults are split. Before the split a `0.0.0.0/0`
+            // collision was expected and warning was survivable-looking; after
+            // it, a collision on `0.0.0.0/1` or `128.0.0.0/1` means the tunnel
+            // did NOT capture traffic, and continuing would report Connected
+            // while everything egresses the physical NIC.
+            return Err(format!(
+                "Failed to route {} into the tunnel: {}",
+                cidr, output
+            ));
         }
     }
 
@@ -1328,28 +1516,14 @@ async fn configure_routes(
         // 169.254/16 included for mDNS/Bonjour, matching Windows. Without it
         // printer and AirPlay DISCOVERY fails even though the LAN itself is
         // reachable, which reads as "Local Network Sharing is broken".
-        let rfc1918 = LAN_SHARING_CIDRS;
-        for cidr in &rfc1918 {
-            let parts: Vec<&str> = cidr.split('/').collect();
-            let mask = prefix_to_mask(parts[1].parse().unwrap_or(8));
-            let added = cmd("route")
-                .args([
-                    "-n",
-                    "add",
-                    "-net",
-                    parts[0],
-                    "-netmask",
-                    &mask,
-                    &default_gw,
-                ])
-                .output()
-                .is_ok_and(|o| o.status.success());
-            // MR-740: a route that went in is ours and outlives the utun, so
-            // it goes on the crash-recovery record (169.254/16 is macOS's own
-            // and its add fails with "File exists").
-            if added {
-                route_journal::remember(&gateway_record(cidr, &default_gw));
-            }
+        for cidr in LAN_SHARING_CIDRS {
+            let route = OwnedRoute {
+                dst: cidr.to_string(),
+                via: RouteVia::Gateway(default_gw.clone()),
+            };
+            // Best-effort, as before; only a route that went in is ours to
+            // remove — macOS's own 169.254.0.0/16 is not (LAN_SHARING_CIDRS).
+            let _ = add_owned_route(route, owned);
         }
         tracing::info!("Added local network sharing routes (RFC1918)");
     }
@@ -1680,62 +1854,6 @@ fn restore_services_pass(
         }
     }
     outcome
-}
-
-/// Remove VPN-specific routes.
-async fn remove_routes(endpoint_ip: &str, allowed_ips: &[String], local_network_sharing: bool) {
-    // Remove endpoint route (and, once it is gone, its crash record, MR-740)
-    delete_route_at(&format!("{endpoint_ip}/32"));
-
-    // Remove allowed_ip routes.
-    //
-    // Expanded through the SAME helper configure_routes used, so we delete
-    // exactly the routes we installed and nothing else. Previously this emitted
-    // an unqualified `route -n delete -net 0.0.0.0 -netmask 0.0.0.0`, which does
-    // not match anything we added (we never managed to add a default) and instead
-    // deletes the HOST'S OWN default — stranding the machine with no internet
-    // after every disconnect.
-    let allowed_ips = expand_default_v4(allowed_ips);
-
-    for cidr in &allowed_ips {
-        let parts: Vec<&str> = cidr.split('/').collect();
-        if parts.len() != 2 {
-            tracing::warn!(
-                "Skipping malformed allowed_ip during route removal: {}",
-                cidr
-            );
-            continue;
-        }
-        let prefix: u8 = match parts[1].parse() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::warn!(
-                    "Skipping allowed_ip with invalid CIDR prefix during route removal: {}",
-                    cidr
-                );
-                continue;
-            }
-        };
-        let mask = prefix_to_mask(prefix);
-        let _ = cmd("route")
-            .args(["-n", "delete", "-net", parts[0], "-netmask", &mask])
-            .output();
-    }
-
-    // Remove the Local Network Sharing routes — ONLY if we added them, and only
-    // the ones we could actually own.
-    //
-    // This was unconditional, which repeated on the LAN routes the exact mistake
-    // that had just been fixed for the default route: deleting something we never
-    // installed. With sharing OFF we add nothing, so every delete here targeted
-    // the USER'S own routes — `route delete -net <cidr>` matches on destination
-    // alone and does not care who created it.
-    if local_network_sharing {
-        for cidr in LAN_SHARING_CIDRS_OWNED {
-            delete_route_at(cidr);
-        }
-    }
-    tracing::info!("Removed VPN routes");
 }
 
 /// Capture current network configuration for later restoration.
@@ -2111,10 +2229,15 @@ mod dns_journal_restore_tests {
 // F-008 macOS parity: the endpoint route
 //
 // The owner has no Mac, so this runs on the CI runner. It cannot cover what a
-// real Mac would — no utun, no tunnel, no network path — and F-008's note that
-// macOS route behaviour deserves real hardware still stands. What it does cover
-// is the contract the audit is named for: the failure is RETURNED, not
+// real Mac would — no tunnel, no network path — and F-008's note that macOS
+// route behaviour deserves real hardware still stands. What it does cover is
+// the contract the audit is named for: the failure is RETURNED, not
 // swallowed, and the ONE tolerated case is an already-present route.
+//
+// MR-2088: and route ownership against the real `route` tool and real utuns
+// (TEST-NET prefixes only, never a default half): teardown deletes only what
+// this session added, a start takes no other tunnel's route, and a failed
+// start or a dropped tunnel removes the endpoint route it pinned.
 // ────────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod endpoint_route_tests {
@@ -2129,7 +2252,7 @@ mod endpoint_route_tests {
     /// touched.
     #[test]
     fn a_malformed_endpoint_is_fatal_not_swallowed() {
-        let err = pin_endpoint_route("999.999.999.999", "192.0.2.1")
+        let err = pin_endpoint_route("999.999.999.999", "192.0.2.1", &OwnedRoutes::default())
             .expect_err("a malformed endpoint must not be accepted");
         assert!(
             err.contains("Failed to pin the endpoint route")
@@ -2141,7 +2264,7 @@ mod endpoint_route_tests {
     /// Same from the gateway side.
     #[test]
     fn a_malformed_gateway_is_fatal_not_swallowed() {
-        let err = pin_endpoint_route("192.0.2.10", "not-a-gateway")
+        let err = pin_endpoint_route("192.0.2.10", "not-a-gateway", &OwnedRoutes::default())
             .expect_err("a malformed gateway must not be accepted");
         assert!(
             err.contains("Failed to pin the endpoint route")
@@ -2166,9 +2289,10 @@ mod endpoint_route_tests {
 
         let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
 
-        pin_endpoint_route(DEST, &gw).expect("first add should succeed");
+        let owned = OwnedRoutes::default();
+        pin_endpoint_route(DEST, &gw, &owned).expect("first add should succeed");
         // Second call hits "File exists" — the tolerated case.
-        let second = pin_endpoint_route(DEST, &gw);
+        let second = pin_endpoint_route(DEST, &gw, &owned);
 
         let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
 
@@ -2209,7 +2333,8 @@ mod endpoint_route_tests {
         const DEST: &str = "192.0.2.124"; // RFC 5737 TEST-NET-1
 
         let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
-        pin_endpoint_route(DEST, &gw).expect("the add should succeed");
+        // The session is killed: what it owned is never torn down.
+        pin_endpoint_route(DEST, &gw, &OwnedRoutes::default()).expect("the add should succeed");
         let pinned = host_route_via(DEST, &gw);
 
         // What the next launch runs after a SIGKILL.
@@ -2222,6 +2347,407 @@ mod endpoint_route_tests {
             !left,
             "the endpoint route a killed session left survived the next start's recovery"
         );
+    }
+
+    /// Does the table hold the route to exactly `net`/`mask` into `iface`?
+    fn routed_into(net: &str, mask: &str, iface: &str) -> bool {
+        let Ok(out) = cmd("route")
+            .args(["-n", "get", "-net", net, "-netmask", mask])
+            .output()
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let field = |name: &str| {
+            text.lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.trim() == name)
+                .map(|(_, v)| v.trim().to_string())
+        };
+        out.status.success()
+            && field("destination").as_deref() == Some(net)
+            && field("mask").as_deref() == Some(mask)
+            && field("interface").as_deref() == Some(iface)
+    }
+
+    /// MR-2088: an endpoint route that was already there when we connected is
+    /// not ours — the pin met "File exists" — and teardown leaves it. It used
+    /// to delete it by destination.
+    ///
+    /// Root-only — it really installs a route to TEST-NET-1 and removes it.
+    #[test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    fn a_teardown_leaves_an_endpoint_route_it_did_not_add() {
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(e) => panic!("no default gateway on this runner: {e}"),
+        };
+        const DEST: &str = "192.0.2.125"; // RFC 5737 TEST-NET-1
+
+        let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
+        // Someone else's pin to the same address.
+        let theirs = cmd("route")
+            .args(["-n", "add", "-host", DEST, gw.as_str()])
+            .output()
+            .is_ok_and(|o| o.status.success());
+
+        let owned = OwnedRoutes::default();
+        let pinned = pin_endpoint_route(DEST, &gw, &owned);
+        remove_owned_routes(take_owned_routes(&owned));
+        let left = host_route_via(DEST, &gw);
+
+        let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
+        assert!(theirs, "precondition: the other route is in");
+        pinned.expect("an endpoint route already there is tolerated");
+        assert!(
+            left,
+            "teardown deleted an endpoint route this session never added"
+        );
+    }
+
+    /// MR-2088: another tunnel's route at one of our allowed IPs is neither
+    /// taken (the start fails instead) nor deleted, and the failed start's
+    /// unwind removes the endpoint route it had already pinned. The old start
+    /// deleted the other tunnel's route and put ours in its place, and its
+    /// unwind (abandon_utun) removed no route at all.
+    ///
+    /// Root-only — it creates two utuns, routes TEST-NET-2 through one of
+    /// them, pins a TEST-NET-1 host and removes everything again.
+    #[tokio::test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    async fn a_start_neither_takes_nor_deletes_another_tunnels_route() {
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(e) => panic!("no default gateway on this runner: {e}"),
+        };
+        const ENDPOINT: &str = "192.0.2.126"; // RFC 5737 TEST-NET-1
+        const NET: &str = "198.51.100.0/24"; // RFC 5737 TEST-NET-2
+
+        let (theirs, their_fd) = create_utun_device().expect("a utun (root)");
+        let (ours, our_fd) = create_utun_device().expect("a second utun (root)");
+        configure_utun_address(&theirs, "198.18.0.1", &1420).expect("their address");
+        configure_utun_address(&ours, "198.18.0.2", &1420).expect("our address");
+        let _ = cmd("route")
+            .args(["-n", "delete", "-host", ENDPOINT])
+            .output();
+        let theirs_in = cmd("route")
+            .args([
+                "-n",
+                "add",
+                "-net",
+                "198.51.100.0",
+                "-netmask",
+                "255.255.255.0",
+                "-interface",
+                theirs.as_str(),
+            ])
+            .output()
+            .is_ok_and(|o| o.status.success());
+
+        let owned = OwnedRoutes::default();
+        let started = configure_routes(&ours, ENDPOINT, &[NET.to_string()], false, &owned).await;
+        // What a failed start's unwind (abandon_utun) does with the routes.
+        remove_owned_routes(take_owned_routes(&owned));
+        let theirs_kept = routed_into("198.51.100.0", "255.255.255.0", &theirs);
+        let endpoint_left = host_route_via(ENDPOINT, &gw);
+
+        let _ = cmd("route")
+            .args([
+                "-n",
+                "delete",
+                "-net",
+                "198.51.100.0",
+                "-netmask",
+                "255.255.255.0",
+            ])
+            .output();
+        let _ = cmd("route")
+            .args(["-n", "delete", "-host", ENDPOINT])
+            .output();
+        drop(our_fd);
+        drop(their_fd);
+        assert!(theirs_in, "precondition: the other tunnel's route is in");
+        assert!(
+            started.is_err(),
+            "a start that collided with another tunnel's route reported success"
+        );
+        assert!(
+            theirs_kept,
+            "the start took or deleted another tunnel's route"
+        );
+        assert!(
+            !endpoint_left,
+            "the failed start left its endpoint route behind"
+        );
+    }
+
+    fn drop_test_config() -> VpnConfig {
+        VpnConfig {
+            server_id: "test".into(),
+            key_id: "test".into(),
+            public_key: String::new(),
+            server_public_key: String::new(),
+            preshared_key: None,
+            endpoint: "192.0.2.127:51820".into(),
+            allowed_ips: vec!["0.0.0.0/0".into()],
+            dns: vec!["198.18.0.53".into()],
+            custom_dns: false,
+            client_ip: "198.18.0.3".into(),
+            client_ipv6: None,
+            allowed_ips_v6: Vec::new(),
+            mtu: 1420,
+            persistent_keepalive: 25,
+        }
+    }
+
+    /// MR-2088: a tunnel dropped with its routes still in (a stop() cut short
+    /// by the switch-teardown cap, a cancelled start) removes the endpoint
+    /// route it pinned. Closing the utun withdraws only the routes INTO it,
+    /// and that was all the old Drop did.
+    ///
+    /// Root-only — it creates a utun, routes TEST-NET-2 into it, pins a
+    /// TEST-NET-1 host and drops the tunnel.
+    #[tokio::test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    async fn a_dropped_tunnel_removes_the_endpoint_route_it_pinned() {
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(e) => panic!("no default gateway on this runner: {e}"),
+        };
+        const ENDPOINT: &str = "192.0.2.127"; // RFC 5737 TEST-NET-1
+        const NET: &str = "198.51.100.0/24"; // RFC 5737 TEST-NET-2
+
+        let tunnel = UtunTunnel::create(drop_test_config(), false)
+            .await
+            .expect("a valid config");
+        let (ours, fd) = create_utun_device().expect("a utun (root)");
+        configure_utun_address(&ours, "198.18.0.3", &1420).expect("our address");
+        *tunnel.utun_fd.write().await = Some(Arc::new(fd));
+        let _ = cmd("route")
+            .args(["-n", "delete", "-host", ENDPOINT])
+            .output();
+
+        let routed = configure_routes(
+            &ours,
+            ENDPOINT,
+            &[NET.to_string()],
+            false,
+            &tunnel.owned_routes,
+        )
+        .await;
+        let pinned = host_route_via(ENDPOINT, &gw);
+        drop(tunnel);
+        let left = host_route_via(ENDPOINT, &gw);
+
+        let _ = cmd("route")
+            .args(["-n", "delete", "-host", ENDPOINT])
+            .output();
+        routed.expect("the routes went in");
+        assert!(pinned, "precondition: the endpoint route is in");
+        assert!(!left, "a dropped tunnel left its endpoint route behind");
+    }
+}
+
+/// MR-2088: a route is added and deleted with the same qualifiers, counts as
+/// ours only while `route -n get` shows it where we put it, and a collision is
+/// taken over only from a utun that no longer exists. Pure, so it runs
+/// unprivileged in the macOS loop of tests.yml (the Linux twin is
+/// tunnel_linux.rs's `owned_route_tests`).
+#[cfg(test)]
+mod owned_route_tests {
+    use super::{
+        classify_collision, is_utun_name, route_change_made, take_owned_routes, Collision,
+        OwnedRoute, OwnedRoutes, RouteVia,
+    };
+
+    fn half(utun: &str) -> OwnedRoute {
+        OwnedRoute {
+            dst: "0.0.0.0/1".into(),
+            via: RouteVia::Interface(utun.into()),
+        }
+    }
+
+    fn endpoint() -> OwnedRoute {
+        OwnedRoute {
+            dst: "203.0.113.7/32".into(),
+            via: RouteVia::Gateway("192.168.1.1".into()),
+        }
+    }
+
+    /// `route -n get` for the `0.0.0.0/1` half-default into `iface`: `route`
+    /// prints the address 0.0.0.0 as `default`, and an `-interface` route has
+    /// no gateway line.
+    fn low_half_into(iface: &str) -> String {
+        format!(
+            "   route to: default\ndestination: default\n       mask: 128.0.0.0\n  interface: {iface}\n      flags: <UP,DONE,STATIC>\n"
+        )
+    }
+
+    #[test]
+    fn the_delete_is_qualified_exactly_as_the_add() {
+        assert_eq!(
+            half("utun3").route_args("add").unwrap(),
+            [
+                "-n",
+                "add",
+                "-net",
+                "0.0.0.0",
+                "-netmask",
+                "128.0.0.0",
+                "-interface",
+                "utun3"
+            ]
+        );
+        assert_eq!(
+            half("utun3").route_args("delete").unwrap(),
+            [
+                "-n",
+                "delete",
+                "-net",
+                "0.0.0.0",
+                "-netmask",
+                "128.0.0.0",
+                "-interface",
+                "utun3"
+            ]
+        );
+        assert_eq!(
+            endpoint().route_args("delete").unwrap(),
+            ["-n", "delete", "-host", "203.0.113.7", "192.168.1.1"]
+        );
+        let lan = OwnedRoute {
+            dst: "10.0.0.0/8".into(),
+            via: RouteVia::Gateway("192.168.1.1".into()),
+        };
+        assert_eq!(
+            lan.route_args("add").unwrap(),
+            [
+                "-n",
+                "add",
+                "-net",
+                "10.0.0.0",
+                "-netmask",
+                "255.0.0.0",
+                "192.168.1.1"
+            ]
+        );
+        // A prefix `route` cannot name is never handed to it — a /0 above all.
+        let default = OwnedRoute {
+            dst: "0.0.0.0/0".into(),
+            via: RouteVia::Interface("utun3".into()),
+        };
+        assert_eq!(default.route_args("delete"), None);
+    }
+
+    /// MR-740: only a route via the physical gateway outlives the utun, so
+    /// only such a route goes on the crash-recovery record.
+    #[test]
+    fn only_routes_via_the_gateway_go_on_the_crash_record() {
+        assert_eq!(half("utun3").gateway_record(), None);
+        assert_eq!(
+            endpoint().gateway_record(),
+            Some(crate::vpn::route_journal::GatewayRoute {
+                dst: "203.0.113.7/32".into(),
+                via: "192.168.1.1".into(),
+                dev: None,
+            })
+        );
+    }
+
+    /// A route is ours only while the table shows it where we put it. The
+    /// same prefix through another VPN's utun, via another VPN's gateway, or
+    /// the host default a lookup falls back to, is not.
+    #[test]
+    fn a_route_is_ours_only_where_we_put_it() {
+        assert!(half("utun3").described_by(&low_half_into("utun3")));
+        assert!(!half("utun3").described_by(&low_half_into("utun5")));
+        let openvpn = "   route to: default\ndestination: default\n       mask: 128.0.0.0\n    gateway: 10.8.0.1\n  interface: utun5\n";
+        assert!(!half("utun3").described_by(openvpn));
+        let host_default = "   route to: default\ndestination: default\n       mask: default\n    gateway: 192.168.1.1\n  interface: en0\n";
+        assert!(!half("utun3").described_by(host_default));
+
+        let pinned = "   route to: 203.0.113.7\ndestination: 203.0.113.7\n    gateway: 192.168.1.1\n  interface: en0\n";
+        assert!(endpoint().described_by(pinned));
+        assert!(!endpoint().described_by(&pinned.replace("192.168.1.1", "192.168.1.254")));
+        assert!(!endpoint().described_by(host_default));
+    }
+
+    /// "File exists" on an allowed IP: a route into our own utun is in
+    /// already, and only one into a utun that no longer exists is taken over.
+    /// Another VPN's live utun, a non-utun interface, the host default and a
+    /// failed lookup are left alone, and the start fails.
+    #[test]
+    fn a_collision_is_taken_over_only_from_a_dead_utun() {
+        // `exists`: what the system answers about every interface it is asked
+        // about.
+        let at = |iface: &str, exists: bool| {
+            classify_collision(
+                &low_half_into(iface),
+                "0.0.0.0/1",
+                "utun3",
+                move |_: &str| exists,
+            )
+        };
+        assert_eq!(at("utun3", true), Collision::Ours);
+        assert_eq!(at("utun7", false), Collision::Stale);
+        assert_eq!(at("utun7", true), Collision::Foreign);
+        assert_eq!(at("en0", false), Collision::Foreign);
+
+        let host_default = "destination: default\n       mask: default\n    gateway: 192.168.1.1\n  interface: en0\n";
+        assert_eq!(
+            classify_collision(host_default, "0.0.0.0/1", "utun3", |_: &str| false),
+            Collision::Foreign
+        );
+        assert_eq!(
+            classify_collision(
+                "route: writing to routing socket: not in table\n",
+                "0.0.0.0/1",
+                "utun3",
+                |_: &str| false
+            ),
+            Collision::Foreign
+        );
+    }
+
+    /// macOS `route` exits 0 when the kernel refuses the change and only
+    /// warns on stderr: by its status alone, a collision read as an add of
+    /// ours (seen on the CI runner: another tunnel's route was recorded as
+    /// ours, and a pre-existing endpoint route deleted at teardown).
+    #[test]
+    fn a_refused_change_is_not_read_as_made() {
+        assert!(route_change_made(true, ""));
+        assert!(route_change_made(true, "\n"));
+        assert!(!route_change_made(
+            true,
+            "route: writing to routing socket: File exists\n"
+        ));
+        assert!(!route_change_made(
+            true,
+            "route: writing to routing socket: not in table\n"
+        ));
+        assert!(!route_change_made(false, ""));
+        assert!(!route_change_made(
+            false,
+            "route: must be root to alter routing table\n"
+        ));
+    }
+
+    #[test]
+    fn only_a_utun_name_is_reclaimable() {
+        assert!(is_utun_name("utun0") && is_utun_name("utun12"));
+        for name in ["utun", "en0", "utun1a", "-utun1", "ipsec0", ""] {
+            assert!(!is_utun_name(name), "{name}");
+        }
+    }
+
+    /// Teardown takes the routes exactly once: stop(), the unwind and Drop
+    /// cannot each delete the same set.
+    #[test]
+    fn owned_routes_are_taken_once() {
+        let owned = OwnedRoutes::default();
+        owned.lock().unwrap().push(half("utun3"));
+        assert_eq!(take_owned_routes(&owned).len(), 1);
+        assert!(take_owned_routes(&owned).is_empty());
     }
 }
 
