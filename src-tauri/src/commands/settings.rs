@@ -460,22 +460,16 @@ fn read_key_at(key_path: &Path) -> KeyFile {
 }
 
 /// Write the 0600 HMAC key file that sits beside settings.json.
+///
+/// MR-2089: through [`write_atomically`], as settings.json itself is: a
+/// staging file created new (O_EXCL|O_NOFOLLOW) and 0600 from the start, then
+/// renamed over the key, in a config folder that must be ours alone. It used
+/// to be `fs::write` by path and then a chmod, so root wrote THROUGH a link
+/// planted at the name, and the key was readable by everyone until the chmod.
 #[cfg(not(windows))]
 fn write_key_file(settings_path: &Path, key: &[u8]) -> Result<(), String> {
-    let key_path = legacy_key_path(settings_path);
-    if let Some(parent) = key_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
-    }
-    fs::write(&key_path, hex::encode(key))
-        .map_err(|e| format!("Failed to write HMAC key file: {}", e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Best-effort: the directory is already root-owned, so a failure here
-        // does not widen access beyond what settings.json itself has.
-        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    write_atomically(&legacy_key_path(settings_path), &hex::encode(key))
+        .map_err(|e| format!("Failed to write HMAC key file: {}", e))
 }
 
 /// Mirror the canonical key into both sources (best-effort) so a transient
@@ -1468,6 +1462,14 @@ pub(crate) fn write_atomically(path: &Path, content: &str) -> Result<(), String>
     // start-up hold usually got there first); never `create_dir_all` by path.
     dir.ensure_held()
         .map_err(|e| format!("Failed to create config dir: {}", e))?;
+    // MR-2089: off Windows root writes here, in a folder under HOME, which is
+    // the user's own whenever the launch kept it (`sudo -E`). So only while
+    // the folder is ours alone: owned by the effective user, writable by
+    // nobody else. (On Windows it is the user's %APPDATA% by design, and the
+    // checked handles above are what guard it, MR-1945.)
+    #[cfg(unix)]
+    crate::utils::root_state::check_private_dir(dir.path())
+        .map_err(|e| format!("Refusing to write in the config folder: {}", e))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -3846,6 +3848,7 @@ mod root_write_tests {
     fn settings_in(root: &Path) -> PathBuf {
         let dir = root.join("uk.birdo.vpn.desktop");
         std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir.join("settings.json")
     }
 

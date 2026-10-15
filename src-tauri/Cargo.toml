@@ -211,9 +211,11 @@ boringtun = "0.7.1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Per-user state locations: the log file, crash reports, device id, BirdoPQ
-# keypair, the DNS and pf-reference journals and the legacy-firewall marker
-# (data_dir / data_local_dir / config_local_dir). settings.json and its HMAC
-# key file resolve through tauri's app_config_dir() (dirs::config_dir()).
+# keypair, the folder older builds kept the DNS and pf-reference journals in
+# (each taken over once: MR-1721 on Windows, MR-2050 elsewhere) and the
+# legacy-firewall marker (data_dir / data_local_dir / config_local_dir).
+# settings.json and its HMAC key file resolve through tauri's
+# app_config_dir() (dirs::config_dir()).
 # 7.0 (2026-10), taken with tauri 2.12, which itself requires dirs ^7: its ONLY
 # change from 6.0 is that preference_dir() on Windows moves from LocalAppData
 # to RoamingAppData. Nothing in this crate or in tauri / tauri-build / wry /

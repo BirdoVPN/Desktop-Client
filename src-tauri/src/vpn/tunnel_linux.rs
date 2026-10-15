@@ -2086,17 +2086,18 @@ pub(super) fn restore_resolv_conf_if_ours(
     // wrapping produced a second, differently-worded problem line for the same
     // failure.
     //
-    // The link comes off a file in the user's data directory, so it is checked
-    // before root makes /etc/resolv.conf point at it: a resolver manager writes
-    // THROUGH that link, and one aimed at an arbitrary file would have it
-    // overwritten. A target that does not look like a resolv.conf falls back to
-    // the bytes, as before MR-2018.
+    // The link comes off the journal, so it is checked before root makes
+    // /etc/resolv.conf point at it: a resolver manager writes THROUGH that
+    // link, and one aimed at an arbitrary file would have it overwritten; and
+    // one aimed at a file a user can write would hand them every lookup on the
+    // machine (MR-2050). A target that fails the check falls back to the
+    // bytes, as before MR-2018.
     let resolv_conf_link = resolv_conf_link.filter(|target| {
         let plausible = plausible_resolv_conf_link(target);
         if !plausible {
             tracing::warn!(
-                "The DNS journal names a resolv.conf symlink target that is not a resolv.conf — \
-                 restoring the file's bytes instead"
+                "The DNS journal names a resolv.conf symlink target that is not a resolv.conf \
+                 only the system can write — restoring the file's bytes instead"
             );
         }
         plausible
@@ -2116,11 +2117,76 @@ pub(super) fn restore_resolv_conf_if_ours(
 /// file name must name a resolv.conf: NetworkManager's and resolvconf's
 /// `resolv.conf`, systemd-resolved's `stub-resolv.conf`, WSL's
 /// `/mnt/wsl/resolv.conf`. Checked only for a link read back from the journal.
+///
+/// MR-2050: and it must be somewhere only the system writes. A relative
+/// target is taken from /etc, as the kernel does, and may climb out of it only
+/// at its start (a `..` after a name could step back out of a linked folder).
+/// It must never be in a user's own /run/user (logind hands those to the
+/// user, so one that does not exist yet is no safer). It must then be in the
+/// runtime trees resolver managers write (/run, /var/run, WSL's /mnt/wsl), or
+/// else every part of it that exists must be root's and writable by nobody
+/// else.
 fn plausible_resolv_conf_link(target: &str) -> bool {
-    std::path::Path::new(target)
+    let named = std::path::Path::new(target)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains("resolv"))
+        .is_some_and(|name| name.contains("resolv"));
+    named
+        && resolved_from_etc(target).is_some_and(|path| {
+            !in_user_runtime_dir(&path)
+                && (in_system_runtime_dir(&path) || root_only_all_the_way(&path))
+        })
+}
+
+/// `target` as the absolute path a link in /etc names, with `.` and leading
+/// `..` resolved. `None` for a `..` that follows a name.
+fn resolved_from_etc(target: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut path = std::path::PathBuf::from("/etc");
+    let mut named = false;
+    for part in std::path::Path::new(target).components() {
+        match part {
+            Component::RootDir => path = std::path::PathBuf::from("/"),
+            Component::CurDir => {}
+            Component::ParentDir if !named => {
+                path.pop();
+            }
+            Component::ParentDir | Component::Prefix(_) => return None,
+            Component::Normal(name) => {
+                named = true;
+                path.push(name);
+            }
+        }
+    }
+    Some(path)
+}
+
+/// Below /run, /var/run or /mnt/wsl.
+fn in_system_runtime_dir(path: &std::path::Path) -> bool {
+    let below = |dir: &str| path.starts_with(dir) && path != std::path::Path::new(dir);
+    below("/run") || below("/var/run") || below("/mnt/wsl")
+}
+
+/// In the per-user runtime folders logind creates and gives to each user.
+fn in_user_runtime_dir(path: &std::path::Path) -> bool {
+    path.starts_with("/run/user") || path.starts_with("/var/run/user")
+}
+
+/// Every part of `path` that exists is root's and writable by nobody else.
+/// A part that does not exist yet can then only be made by root.
+fn root_only_all_the_way(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mut at = std::path::PathBuf::new();
+    for part in path.components() {
+        at.push(part);
+        match std::fs::metadata(&at) {
+            Ok(meta) if meta.uid() == 0 && meta.mode() & 0o022 == 0 => {}
+            Ok(_) => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Put `path` back as a symlink to `target`, atomically, and PROVE it.
@@ -2738,6 +2804,9 @@ mod resolv_conf_restore_tests {
         ] {
             assert!(!plausible(bad), "{bad}");
         }
+        // Outside the runtime trees, only where root alone writes: the old
+        // resolvconf layout under /etc still is.
+        assert!(plausible("/etc/resolvconf/run/resolv.conf"));
     }
 }
 

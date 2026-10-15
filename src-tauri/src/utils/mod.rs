@@ -12,6 +12,8 @@ pub mod os_rng;
 #[cfg(windows)]
 pub mod protected_dir;
 pub mod redact;
+#[cfg(unix)]
+pub mod root_state;
 pub mod safe_fs;
 pub mod webview2;
 #[cfg(windows)]
