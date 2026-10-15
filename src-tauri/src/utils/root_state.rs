@@ -330,7 +330,9 @@ mod root_write_tests {
         let legacy = root.path().join("BirdoVPN");
         std::fs::create_dir(&legacy).unwrap();
         set_mode(&legacy, 0o755);
-        let state = root.path().join("birdovpn");
+        // Not "birdovpn": macOS's default file system is case-insensitive,
+        // so that would be the legacy folder itself.
+        let state = root.path().join("state");
         ensure_private_dir(&state).unwrap();
         Dirs {
             dest: state.join("record"),
