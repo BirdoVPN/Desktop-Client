@@ -703,11 +703,16 @@ async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
         return Ok(false);
     }
 
+    // MR-2110: an engine that cannot be opened leaves the intent ON
+    // ([`open_engine`]), so every teardown, dial and switch after this fails
+    // closed instead of reading "no block wanted".
     #[cfg(target_os = "windows")]
-    {
-        wfp::initialize()
-            .await
-            .map_err(|e| format!("Failed to initialize kill-switch firewall: {}", e))?;
+    if let Err(e) = open_engine(wfp::initialize(), seen).await {
+        // Lockdown's always-on block cannot go up without the engine either:
+        // degrade to the reactive kill switch for this session, as when its
+        // activation fails below.
+        wfp::set_lockdown_mode(false);
+        return Err(e);
     }
 
     if !intent_on_since(seen) {
@@ -785,6 +790,40 @@ async fn arm_with_preference(enabled: bool, seen: u64) -> Result<bool, String> {
         tracing::info!("Kill switch armed for active session (reactive)");
         Ok(true)
     }
+}
+
+/// [`arm_with_preference`]'s step that opens the kill switch's firewall engine
+/// (`open`: `wfp::initialize()`), with the preference ON and `seen` the
+/// intent's sequence from before the preference was read. Split out so the
+/// failure can be injected in tests.
+///
+/// MR-2110: a failed open used to return before the intent was stored, so it
+/// stayed OFF while the user's preference was ON. `activate_killswitch()` then
+/// answered `Ok(false)`, which a reconnect teardown and `fail_connect` read as
+/// "the user wants no block" (`reconnect_policy::teardown_covered`) and let
+/// go ahead with nothing blocking; `move_relay` dropped the guard of a server
+/// switch the same way. The intent is stored ON now, before the error is
+/// returned, unless the switch changed since `seen` (an OFF or a Disconnect
+/// since wins, as for any arm). With no engine, the block each of those steps
+/// asks for fails, and they fail closed: the dead tunnel is held, the dial
+/// aborted, the switch refused before the old tunnel is touched (MR-2070,
+/// MR-2071).
+#[cfg(any(target_os = "windows", test))]
+async fn open_engine(
+    open: impl std::future::Future<Output = Result<(), String>>,
+    seen: u64,
+) -> Result<(), String> {
+    let Err(e) = open.await else {
+        return Ok(());
+    };
+    if intent_on_since(seen) {
+        tracing::error!(
+            "The kill switch's firewall could not be initialized ({}); it stays on, so \
+             nothing is torn down, re-dialled or switched without its block",
+            e
+        );
+    }
+    Err(format!("Failed to initialize kill-switch firewall: {}", e))
 }
 
 /// Disarm the kill switch when the user ends the session: clear the intent flag
@@ -2212,6 +2251,92 @@ mod tests {
             .find("if intent_seq() != seen {")
             .expect("checked before the engine");
         assert!(check < arm.find("wfp::initialize()").unwrap());
+    }
+
+    /// MR-2110: the arm's engine open fails (the injected `wfp::initialize`
+    /// error) with the preference ON. The intent stays ON, so the block the
+    /// next teardown asks for is reported as failed rather than as "no block
+    /// wanted", and the teardown rule (`reconnect_policy::teardown_covered`,
+    /// MR-2071) holds the tunnel. The arm used to return before storing the
+    /// intent: `Ok(false)`, and the teardown went ahead with nothing blocking.
+    #[tokio::test]
+    async fn a_failed_engine_open_keeps_the_kill_switch_on() {
+        use crate::vpn::reconnect_policy::{killswitch_failed_error, teardown_covered};
+        let _tests = FLAG_TESTS.lock().await;
+        let not_opened = || {
+            std::future::ready(Err::<(), String>(
+                "FwpmEngineOpen0 failed: 0x800706D9".into(),
+            ))
+        };
+        intent_off();
+
+        let opened = open_engine(not_opened(), intent_seq()).await;
+        assert_eq!(
+            opened,
+            Err(
+                "Failed to initialize kill-switch firewall: FwpmEngineOpen0 failed: 0x800706D9"
+                    .into()
+            ),
+            "the arm still fails, and says why"
+        );
+        assert!(
+            is_enabled(),
+            "the preference is ON: a failed engine open must not leave the intent OFF"
+        );
+
+        // What a reconnect teardown, a dial and a failed connect then ask for
+        // (`activate_killswitch`, through `unless_turned_off`): with no engine
+        // the platform refuses (`wfp::activate_blocking`), nothing is up, and
+        // that refusal is the answer, so the tunnel is held.
+        let engaged = unless_turned_off(
+            std::future::ready(Err(
+                "Failed to activate blocking: Kill switch not initialized".into(),
+            )),
+            || std::future::ready(Ok(true)),
+            || std::future::ready(Ok(true)),
+            || false,
+        )
+        .await;
+        assert!(engaged.is_err(), "{engaged:?}");
+        assert_eq!(
+            teardown_covered(&engaged, false),
+            Err(killswitch_failed_error()),
+            "the teardown must be held, not let through as if no block were wanted"
+        );
+
+        // An OFF (or a Disconnect) since the preference was read still wins.
+        intent_off();
+        let seen = intent_seq();
+        intent_off();
+        assert!(open_engine(not_opened(), seen).await.is_err());
+        assert!(!is_enabled(), "a stale ON is not stored");
+
+        // An engine that opens stores nothing here: the arm's own
+        // `intent_on_since(seen)` does, after it.
+        let seen = intent_seq();
+        assert_eq!(open_engine(std::future::ready(Ok(())), seen).await, Ok(()));
+        assert!(!is_enabled());
+        assert_eq!(intent_seq(), seen);
+    }
+
+    /// MR-2110: the arm opens its engine through [`open_engine`] (Windows),
+    /// ahead of its own ON, and a failure there drops lockdown for the session,
+    /// as a lockdown activation that fails does. (The arm's ON path needs an
+    /// elevated host: a source check.)
+    #[test]
+    fn the_arm_opens_its_engine_through_the_step_that_keeps_the_intent() {
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let arm = &source[source.find("async fn arm_with_preference(").unwrap()..];
+        let arm = &arm[..arm.find("\n}\n").unwrap()];
+        let open = arm
+            .find("if let Err(e) = open_engine(wfp::initialize(), seen).await {")
+            .expect("the engine is opened through open_engine");
+        let degrade = arm[open..]
+            .find("wfp::set_lockdown_mode(false);\n        return Err(e);")
+            .expect("a failed open drops lockdown, then fails the arm");
+        assert!(open + degrade < arm.find("if !intent_on_since(seen) {").unwrap());
+        assert_eq!(arm.matches("wfp::initialize()").count(), 1);
+        assert!(!arm.contains(".map_err(|e| format!(\"Failed to initialize kill-switch firewall"));
     }
 
     /// Round 3 of the review (P2-1): a settings read that never returns (a

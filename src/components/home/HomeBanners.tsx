@@ -11,7 +11,7 @@
 import { useId, useState } from 'react';
 import { CircleAlert, TriangleAlert, ShieldAlert, type LucideIcon } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import { errorCopy, giveUpMessage, type ErrorAction } from '@/lib/errors';
+import { giveUpMessage, vpnErrorCopy, type ErrorAction } from '@/lib/errors';
 import { status } from '@/lib/birdo-theme';
 import { useAppStore } from '@/store/app-store';
 
@@ -21,6 +21,7 @@ const ACTION_LABEL: Record<Exclude<ErrorAction, null | 'update' | 'sign_in'>, st
   choose_server: 'Choose server',
   connect: 'Connect',
   retry: 'Try again',
+  disconnect: 'Disconnect',
 };
 
 interface HomeBannersProps {
@@ -58,7 +59,9 @@ export function HomeBanners({ onAction }: HomeBannersProps) {
     errorText = giveUpMessage(giveUp.kind, giveUp.attempts, blocking);
     action = blocking ? null : giveUp.kind === 'never_established' ? 'choose_server' : 'connect';
   } else if (error && error.code !== 'cancelled') {
-    const copy = errorCopy(error, 'vpn');
+    // A kill-switch failure while traffic is held (the kept tunnel, MR-2111)
+    // says so, with Disconnect: Try again would repeat the failure.
+    const copy = vpnErrorCopy(error, blocking);
     errorText = copy.message;
     action = copy.action;
   }

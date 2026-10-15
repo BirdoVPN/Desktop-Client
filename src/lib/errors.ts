@@ -18,6 +18,7 @@ export type ErrorAction =
   | 'connect'
   | 'retry'
   | 'update'
+  | 'disconnect'
   | null;
 
 export interface ErrorCopy {
@@ -166,6 +167,32 @@ export function errorCopy(error: IpcError, context: ErrorContext = 'general'): E
     };
   }
   return COPY[error.code];
+}
+
+/**
+ * MR-2111: a kill switch that could not block, while traffic is held anyway.
+ * A failed connect keeps its tunnel in place of the block it could not put up
+ * (Desktop #313, MR-2070): the status is `error`, `killswitch_failed`, and
+ * `kill_switch_blocking`. The `killswitch_failed` copy offered Try again,
+ * which repeats the same failure while the kill switch stays broken, and
+ * never said that traffic is held or how to release it.
+ */
+export const KILLSWITCH_HOLDING_COPY =
+  "The kill switch couldn't be armed, so all traffic is held rather than sent unprotected. " +
+  'Disconnect to release it.';
+
+/**
+ * The connection error as the Home banner, the screen-reader announcement and
+ * the error notification word it: `errorCopy(error, 'vpn')`, except for a
+ * kill-switch failure while traffic is held (`blocking`, the
+ * `kill_switch_blocking` bit), which says so and offers Disconnect instead of
+ * Try again (MR-2111).
+ */
+export function vpnErrorCopy(error: IpcError, blocking: boolean): ErrorCopy {
+  if (blocking && error.code === 'killswitch_failed') {
+    return { message: KILLSWITCH_HOLDING_COPY, action: 'disconnect' };
+  }
+  return errorCopy(error, 'vpn');
 }
 
 /** Convenience for call sites that only need the sentence. */

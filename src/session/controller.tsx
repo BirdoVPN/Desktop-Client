@@ -20,7 +20,7 @@ import { useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { parseQuotaWarning, parseSessionExpired, parseVpnStats, parseVpnStatus } from '@/lib/ipc';
-import { errorCopy, giveUpMessage, quotaGraceMessage } from '@/lib/errors';
+import { giveUpMessage, quotaGraceMessage, vpnErrorCopy } from '@/lib/errors';
 import { useAppStore, type Server } from '@/store/app-store';
 import { selectTunnelActive } from '@/store/selectors';
 import { endSession } from '@/session/session';
@@ -332,7 +332,7 @@ function useConnectionNotifications(): void {
             next.giveUp
               ? giveUpMessage(next.giveUp.kind, next.giveUp.attempts, next.killSwitchBlocking)
               : err
-                ? errorCopy(err, 'vpn').message
+                ? vpnErrorCopy(err, next.killSwitchBlocking).message
                 : 'The VPN connection stopped. Open BirdoVPN to reconnect.',
           );
           break;
