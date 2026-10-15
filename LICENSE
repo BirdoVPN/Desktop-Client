@@ -37,6 +37,15 @@ Notices:
     licensing, sublicensing, hosting as a paid service, or bundling into a paid
     product. Personal use, academic research, security review, and non-revenue
     community contributions are NOT considered commercial purposes.
+  - Third-party code and files in this repository are NOT covered by this
+    licence and stay under their own licences. That includes everything under
+    src-tauri/wintun-extract/wintun/ (Wintun, under WireGuard LLC's Prebuilt
+    Binaries License in its LICENSE.txt, which also covers the wintun.dll the
+    Windows build places there) and everything under third_party/licenses/
+    (the licence texts and notices of the third-party components the app
+    ships, each under its own terms). The app lists every third-party
+    component it ships, with its licence, in THIRD-PARTY-NOTICES.txt, which
+    every package carries and Settings › About › Licences shows.
 
 For commercial licensing enquiries: licensing@birdo.app
 
