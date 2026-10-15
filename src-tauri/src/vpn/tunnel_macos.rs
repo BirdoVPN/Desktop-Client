@@ -1176,20 +1176,29 @@ fn run_route(verb: &str, target: &[String]) -> Result<(bool, String), String> {
     run_route_args(&args)
 }
 
-/// `route <args>`, its stdout and stderr together.
+/// `route <args>`: whether the kernel made the change, and stdout and stderr
+/// together.
 fn run_route_args(args: &[String]) -> Result<(bool, String), String> {
     let out = cmd("route")
         .args(args)
         .output()
         .map_err(|e| format!("could not run route: {}", e))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
     Ok((
-        out.status.success(),
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
+        route_change_made(out.status.success(), &stderr),
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr),
     ))
+}
+
+/// Did `route` make the change? Its exit status alone does not say: macOS
+/// `route` exits 0 when the kernel refuses an add ("File exists") or a delete
+/// or lookup ("not in table"), and only warns about it on stderr ("route:
+/// writing to routing socket: File exists"). Read by its status, every
+/// collision was a route we had added (MR-2088), and the fatal paths for a
+/// refused add in pin_endpoint_route and configure_routes never ran. A change
+/// counts as made only when nothing was written to stderr either.
+fn route_change_made(exit_ok: bool, stderr: &str) -> bool {
+    exit_ok && stderr.trim().is_empty()
 }
 
 /// Where a route of ours points.
@@ -2547,8 +2556,8 @@ mod endpoint_route_tests {
 #[cfg(test)]
 mod owned_route_tests {
     use super::{
-        classify_collision, is_utun_name, take_owned_routes, Collision, OwnedRoute, OwnedRoutes,
-        RouteVia,
+        classify_collision, is_utun_name, route_change_made, take_owned_routes, Collision,
+        OwnedRoute, OwnedRoutes, RouteVia,
     };
 
     fn half(utun: &str) -> OwnedRoute {
@@ -2698,6 +2707,29 @@ mod owned_route_tests {
             ),
             Collision::Foreign
         );
+    }
+
+    /// macOS `route` exits 0 when the kernel refuses the change and only
+    /// warns on stderr: by its status alone, a collision read as an add of
+    /// ours (seen on the CI runner: another tunnel's route was recorded as
+    /// ours, and a pre-existing endpoint route deleted at teardown).
+    #[test]
+    fn a_refused_change_is_not_read_as_made() {
+        assert!(route_change_made(true, ""));
+        assert!(route_change_made(true, "\n"));
+        assert!(!route_change_made(
+            true,
+            "route: writing to routing socket: File exists\n"
+        ));
+        assert!(!route_change_made(
+            true,
+            "route: writing to routing socket: not in table\n"
+        ));
+        assert!(!route_change_made(false, ""));
+        assert!(!route_change_made(
+            false,
+            "route: must be root to alter routing table\n"
+        ));
     }
 
     #[test]
