@@ -427,8 +427,12 @@ jobs:
       # place it can run. It installs a route to TEST-NET-1 and removes it.
       # MR-740: and the endpoint route a killed session left (another
       # TEST-NET-1 host) is removed by the next start's journal-driven
-      # recovery. Two tests, both required.
-      - name: Endpoint-route tolerated-duplicate + crash-recovery tests (macOS, root)
+      # recovery. MR-2088: teardown leaves an endpoint route it did not add, a
+      # start neither takes nor deletes another utun's route at one of its
+      # prefixes (TEST-NET-2 through a second utun) and its unwind removes the
+      # endpoint route it pinned, and a dropped tunnel removes it too. Five
+      # tests, all required.
+      - name: Endpoint-route + route-ownership tests (macOS, root)
         if: matrix.os == 'macos'
         working-directory: src-tauri
         run: |
@@ -439,8 +443,8 @@ jobs:
             exit 1
           }
           echo "$out"
-          if ! echo "$out" | grep -qE 'test result: ok\. 2 passed'; then
-            echo "::error::the macOS endpoint-route root tests did not both run"
+          if ! echo "$out" | grep -qE 'test result: ok\. 5 passed'; then
+            echo "::error::the macOS endpoint-route root tests did not all run"
             exit 1
           fi
 

@@ -2223,6 +2223,192 @@ mod endpoint_route_tests {
             "the endpoint route a killed session left survived the next start's recovery"
         );
     }
+
+    /// Does the table hold the route to exactly `net`/`mask` into `iface`?
+    fn routed_into(net: &str, mask: &str, iface: &str) -> bool {
+        let Ok(out) = cmd("route")
+            .args(["-n", "get", "-net", net, "-netmask", mask])
+            .output()
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let field = |name: &str| {
+            text.lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.trim() == name)
+                .map(|(_, v)| v.trim().to_string())
+        };
+        out.status.success()
+            && field("destination").as_deref() == Some(net)
+            && field("mask").as_deref() == Some(mask)
+            && field("interface").as_deref() == Some(iface)
+    }
+
+    /// MR-2088 (WIP: the old code's teardown): an endpoint route that was
+    /// already there when we connected is not ours — the pin met "File
+    /// exists" — and teardown must leave it.
+    ///
+    /// Root-only — it really installs a route to TEST-NET-1 and removes it.
+    #[tokio::test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    async fn a_teardown_leaves_an_endpoint_route_it_did_not_add() {
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(e) => panic!("no default gateway on this runner: {e}"),
+        };
+        const DEST: &str = "192.0.2.125"; // RFC 5737 TEST-NET-1
+
+        let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
+        // Someone else's pin to the same address.
+        let theirs = cmd("route")
+            .args(["-n", "add", "-host", DEST, gw.as_str()])
+            .output()
+            .is_ok_and(|o| o.status.success());
+
+        let pinned = pin_endpoint_route(DEST, &gw);
+        remove_routes(DEST, &[], false).await;
+        let left = host_route_via(DEST, &gw);
+
+        let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
+        assert!(theirs, "precondition: the other route is in");
+        pinned.expect("an endpoint route already there is tolerated");
+        assert!(
+            left,
+            "teardown deleted an endpoint route this session never added"
+        );
+    }
+
+    /// MR-2088 (WIP: the old code's start): another tunnel's route at one of
+    /// our allowed IPs is neither taken (the start fails instead) nor
+    /// deleted, and the failed start's unwind removes the endpoint route it
+    /// had already pinned. The old unwind (abandon_utun) removes no route.
+    ///
+    /// Root-only — it creates two utuns, routes TEST-NET-2 through one of
+    /// them, pins a TEST-NET-1 host and removes everything again.
+    #[tokio::test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    async fn a_start_neither_takes_nor_deletes_another_tunnels_route() {
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(e) => panic!("no default gateway on this runner: {e}"),
+        };
+        const ENDPOINT: &str = "192.0.2.126"; // RFC 5737 TEST-NET-1
+        const NET: &str = "198.51.100.0/24"; // RFC 5737 TEST-NET-2
+
+        let (theirs, their_fd) = create_utun_device().expect("a utun (root)");
+        let (ours, our_fd) = create_utun_device().expect("a second utun (root)");
+        configure_utun_address(&theirs, "198.18.0.1", &1420).expect("their address");
+        configure_utun_address(&ours, "198.18.0.2", &1420).expect("our address");
+        let _ = cmd("route")
+            .args(["-n", "delete", "-host", ENDPOINT])
+            .output();
+        let theirs_in = cmd("route")
+            .args([
+                "-n",
+                "add",
+                "-net",
+                "198.51.100.0",
+                "-netmask",
+                "255.255.255.0",
+                "-interface",
+                theirs.as_str(),
+            ])
+            .output()
+            .is_ok_and(|o| o.status.success());
+
+        let started = configure_routes(&ours, ENDPOINT, &[NET.to_string()], false).await;
+        let theirs_kept = routed_into("198.51.100.0", "255.255.255.0", &theirs);
+        let endpoint_left = host_route_via(ENDPOINT, &gw);
+
+        let _ = cmd("route")
+            .args([
+                "-n",
+                "delete",
+                "-net",
+                "198.51.100.0",
+                "-netmask",
+                "255.255.255.0",
+            ])
+            .output();
+        let _ = cmd("route")
+            .args(["-n", "delete", "-host", ENDPOINT])
+            .output();
+        drop(our_fd);
+        drop(their_fd);
+        assert!(theirs_in, "precondition: the other tunnel's route is in");
+        assert!(
+            started.is_err(),
+            "a start that collided with another tunnel's route reported success"
+        );
+        assert!(
+            theirs_kept,
+            "the start took or deleted another tunnel's route"
+        );
+        assert!(
+            !endpoint_left,
+            "the failed start left its endpoint route behind"
+        );
+    }
+
+    fn drop_test_config() -> VpnConfig {
+        VpnConfig {
+            server_id: "test".into(),
+            key_id: "test".into(),
+            public_key: String::new(),
+            server_public_key: String::new(),
+            preshared_key: None,
+            endpoint: "192.0.2.127:51820".into(),
+            allowed_ips: vec!["0.0.0.0/0".into()],
+            dns: vec!["198.18.0.53".into()],
+            custom_dns: false,
+            client_ip: "198.18.0.3".into(),
+            client_ipv6: None,
+            allowed_ips_v6: Vec::new(),
+            mtu: 1420,
+            persistent_keepalive: 25,
+        }
+    }
+
+    /// MR-2088 (WIP: the old code's Drop): a tunnel dropped with its routes
+    /// still in (a stop() cut short by the switch-teardown cap, a cancelled
+    /// start) removes the endpoint route it pinned. Closing the utun
+    /// withdraws only the routes INTO it.
+    ///
+    /// Root-only — it creates a utun, routes TEST-NET-2 into it, pins a
+    /// TEST-NET-1 host and drops the tunnel.
+    #[tokio::test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    async fn a_dropped_tunnel_removes_the_endpoint_route_it_pinned() {
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(e) => panic!("no default gateway on this runner: {e}"),
+        };
+        const ENDPOINT: &str = "192.0.2.127"; // RFC 5737 TEST-NET-1
+        const NET: &str = "198.51.100.0/24"; // RFC 5737 TEST-NET-2
+
+        let tunnel = UtunTunnel::create(drop_test_config(), false)
+            .await
+            .expect("a valid config");
+        let (ours, fd) = create_utun_device().expect("a utun (root)");
+        configure_utun_address(&ours, "198.18.0.3", &1420).expect("our address");
+        *tunnel.utun_fd.write().await = Some(Arc::new(fd));
+        let _ = cmd("route")
+            .args(["-n", "delete", "-host", ENDPOINT])
+            .output();
+
+        let routed = configure_routes(&ours, ENDPOINT, &[NET.to_string()], false).await;
+        let pinned = host_route_via(ENDPOINT, &gw);
+        drop(tunnel);
+        let left = host_route_via(ENDPOINT, &gw);
+
+        let _ = cmd("route")
+            .args(["-n", "delete", "-host", ENDPOINT])
+            .output();
+        routed.expect("the routes went in");
+        assert!(pinned, "precondition: the endpoint route is in");
+        assert!(!left, "a dropped tunnel left its endpoint route behind");
+    }
 }
 
 /// The utun descriptor is close-on-exec. Run UNPRIVILEGED on the macOS leg of
