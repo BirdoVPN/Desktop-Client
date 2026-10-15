@@ -6,6 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   CLIENT_ATTESTATION_COPY,
+  CONSENT_REQUIRED_COPY,
   errorCopy,
   errorText,
   giveUpKind,
@@ -111,6 +112,15 @@ describe('errorCopy', () => {
     expect(copy.message).toMatch(/latest version/);
     // Rust's wire shape is a known code, not `unknown`.
     expect(errorText({ code: 'client_attestation_required', message: 'raw' })).toBe(CLIENT_ATTESTATION_COPY);
+  });
+
+  // MR-2016: the window's own Quick Connect meets `consent_required` only with
+  // the consent screen already accepted (Rust's record failed to save), so the
+  // copy says it was not saved, and sends nobody to "review the privacy terms".
+  it('a consent refusal says the consent was not saved, not "review and accept"', () => {
+    expect(errorCopy(err('consent_required'))).toEqual({ message: CONSENT_REQUIRED_COPY, action: null });
+    expect(CONSENT_REQUIRED_COPY).toMatch(/wasn't saved/);
+    expect(CONSENT_REQUIRED_COPY).not.toMatch(/review|accept/i);
   });
 
   it('says how long to wait when Rust knows', () => {

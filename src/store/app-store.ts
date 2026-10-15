@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { IpcError, LiveMultiHop, VpnPhase, VpnState, VpnStats, VpnStatus } from '@/lib/ipc';
 import { giveUpKind, type GiveUpKind } from '@/lib/errors';
-import type { PlanId, PlanPrice } from '@/lib/plan';
+import type { PlanGates, PlanId, PlanPrice } from '@/lib/plan';
 import { CONSENT_VERSION } from '@/lib/consent';
 import { normalizeWireGuardPort } from '@/utils/helpers';
 
@@ -339,6 +339,17 @@ export interface AppState {
   planPrices: Partial<Record<PlanId, PlanPrice>>;
   setPlanPrices: (byPlan: Partial<Record<PlanId, PlanPrice>>) => void;
 
+  /**
+   * MR-1517: `features.<PLAN>.{stealthMode,multiHop,portForwarding}` from
+   * `GET /api/client-config`, the server's plan-gating table, only the flags it
+   * gave as booleans. `planHasFeature` falls back to `FEATURE_MIN_PLAN` for
+   * anything missing here, so `{}` (the default, an older deploy, an offline
+   * start) gates as the built-in table does. Like `customDnsByPlan`, a property
+   * of the service: neither persisted nor cleared on logout.
+   */
+  planGates: Partial<Record<PlanId, PlanGates>>;
+  setPlanGates: (byPlan: Partial<Record<PlanId, PlanGates>>) => void;
+
   portForwards: PortForward[];
 
   /** `null` until `get_admin_status` answers, so the warning cannot flash at startup. */
@@ -565,6 +576,8 @@ export const useAppStore = create<AppState>()(
       setCustomDnsByPlan: (customDnsByPlan) => set({ customDnsByPlan }),
       planPrices: {},
       setPlanPrices: (planPrices) => set({ planPrices }),
+      planGates: {},
+      setPlanGates: (planGates) => set({ planGates }),
 
       portForwards: [],
       isAdmin: null,

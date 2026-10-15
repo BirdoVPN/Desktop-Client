@@ -36,9 +36,30 @@ fn friendly_redeem_error(err: &ApiError) -> String {
         ApiError::Unknown(msg) if msg.contains("410") => {
             "This voucher has expired and can no longer be redeemed.".to_string()
         }
+        // MR-2014: a busy 5xx that named its wait, and the same answer from
+        // the API client's retry gate while that wait runs (MR-1808), say the
+        // service is busy and for how long. They used to fall through to
+        // their Display text, which for the held one reads "Not sent: the
+        // server asked to wait (HTTP 503)".
+        ApiError::ServerBusy {
+            retry_after_secs, ..
+        }
+        | ApiError::Held {
+            status: 500..=599,
+            retry_after_secs,
+        } => busy_copy(*retry_after_secs),
         // Network / server / parse / pinning errors keep their own descriptive text.
         other => other.to_string(),
     }
+}
+
+/// "The voucher service is busy right now. Please try again in 20 seconds."
+fn busy_copy(retry_after_secs: u64) -> String {
+    let secs = retry_after_secs.max(1);
+    format!(
+        "The voucher service is busy right now. Please try again in {secs} second{}.",
+        if secs == 1 { "" } else { "s" }
+    )
 }
 
 /// Redeem a voucher code. Returns the updated plan + days added on success.
@@ -91,6 +112,43 @@ mod tests {
         let conflict = friendly_redeem_error(&ApiError::Unknown("HTTP 409".into()));
         assert!(conflict.contains("already") || conflict.contains("downgrade"));
         assert!(friendly_redeem_error(&ApiError::Unknown("HTTP 410".into())).contains("expired"));
+    }
+
+    /// MR-2014: a busy 5xx, and the retry gate's answer while its wait runs,
+    /// say the service is busy and how long to wait; on main the held one
+    /// read "Not sent: the server asked to wait (HTTP 503); try again in 20 s".
+    #[test]
+    fn a_busy_or_held_5xx_says_the_service_is_busy() {
+        for err in [
+            ApiError::ServerBusy {
+                status: 503,
+                retry_after_secs: 20,
+            },
+            ApiError::Held {
+                status: 503,
+                retry_after_secs: 20,
+            },
+            ApiError::Held {
+                status: 502,
+                retry_after_secs: 20,
+            },
+        ] {
+            assert_eq!(
+                friendly_redeem_error(&err),
+                "The voucher service is busy right now. Please try again in 20 seconds."
+            );
+        }
+        assert!(friendly_redeem_error(&ApiError::Held {
+            status: 503,
+            retry_after_secs: 1,
+        })
+        .ends_with("in 1 second."));
+        // A held 429 stays the rate-limit copy.
+        assert!(friendly_redeem_error(&ApiError::Held {
+            status: 429,
+            retry_after_secs: 20,
+        })
+        .contains("Too many attempts"));
     }
 
     #[test]

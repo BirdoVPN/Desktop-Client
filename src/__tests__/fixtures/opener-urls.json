@@ -1,5 +1,5 @@
 {
-  "$comment": "MR-713. `opened`: every URL the webview hands to openUrl (@tauri-apps/plugin-opener). OpenerLinks.test.tsx clicks each link and requires the URLs it observes to be exactly this list; src-tauri/src/commands/capability_scope_tests.rs requires every one to pass the opener:allow-open-url scope in src-tauri/capabilities/default.json, matched with the same glob crate the plugin uses. https://birdo.app/clients is the backend's 426 updateUrl (UpdateRequired's 'Download manually'). `refused`: URLs the scope must reject.",
+  "$comment": "MR-713. `opened`: every URL the webview hands to openUrl (@tauri-apps/plugin-opener). OpenerLinks.test.tsx clicks each link and requires the URLs it observes to be exactly this list; src-tauri/src/commands/capability_scope_tests.rs requires every one to pass the opener:allow-open-url scope in src-tauri/capabilities/default.json, matched with the same glob crate the plugin uses. https://birdo.app/clients is the backend's 426 updateUrl (UpdateRequired's 'Download manually'); MR-2015: it is the only one birdo-web sends (backend/src/vpn/vpn.controller.ts), so the scope stays birdo.app, auth. and dashboard.; another host is refused and the wall's notice says where to go. `refused`: URLs the scope must reject.",
   "opened": [
     "https://birdo.app/terms",
     "https://birdo.app/privacy",

@@ -237,6 +237,50 @@ describe('Profile', () => {
     expect(document.body.textContent).not.toContain('6666');
   });
 
+  // MR-2014: the identity card never shows the synthetic address, even
+  // before `/auth/me` has said the account is anonymous.
+  it('the identity card never shows the synthetic address before /auth/me answers', () => {
+    useAppStore.setState({
+      userEmail: 'anon_111122223333444455556666@anonymous.local',
+      account: {
+        ...useAppStore.getState().account,
+        email: null,
+        isAnonymous: null,
+        accountNumber: null,
+        plan: 'RECON',
+      },
+    });
+    render(<Profile />);
+    expect(document.body.textContent).not.toContain('anon_');
+    expect(document.body.textContent).not.toContain('@anonymous.local');
+    expect(screen.getByText('Signed in')).toBeInTheDocument();
+  });
+
+  // MR-2014: a busy (or held) 5xx on redeem says the service is busy and for
+  // how long. On main it read "Something went wrong on our side".
+  it('a busy voucher service says so, and how long to wait', async () => {
+    useAppStore.setState({ account: { ...useAppStore.getState().account, plan: 'RECON' } });
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'redeem_voucher') {
+        throw {
+          code: 'server_error',
+          message: 'The voucher service is busy right now. Please try again in 20 seconds.',
+          retryable: true,
+          retry_after_secs: 20,
+        };
+      }
+      return undefined;
+    });
+    render(<Profile />);
+    await userEvent.click(screen.getByRole('button', { name: /Redeem voucher/ }));
+    await userEvent.type(screen.getByLabelText('Voucher code'), 'BIRD-AAAA-BBBB-CCCC');
+    await userEvent.click(screen.getByRole('button', { name: 'Redeem' }));
+    expect(
+      await screen.findByText('The voucher service is busy right now. Please try again in 20 seconds.'),
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('Something went wrong');
+  });
+
   it('not connected: "Not connected · Click Connect to start"', () => {
     useAppStore.setState({ account: { ...useAppStore.getState().account, plan: 'RECON' } });
     render(<Profile />);

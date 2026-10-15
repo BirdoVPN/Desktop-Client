@@ -10,7 +10,15 @@
 //! and clears it after [`CLEAR_AFTER`] — only if it still holds exactly what
 //! was copied, so nothing the user copied since is wiped.
 //!
+//! MR-2013: or sooner, when the app exits first ([`clear_on_exit`], from
+//! `main.rs`): the delayed clear is a task of this process, and a Quit inside
+//! the minute used to take it down with the process and leave the account
+//! number on the clipboard for good.
+//!
 //! Elsewhere it answers `false` and the UI copies the ordinary way, as before.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use zeroize::Zeroizing;
 
@@ -40,6 +48,85 @@ const PRIVACY_FORMATS: [&str; 3] = [
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const DWORD_ZERO: [u8; 4] = 0u32.to_le_bytes();
 
+/// The copy whose clear has not run yet (MR-2013): the latest one, as only
+/// the latest can still be on the clipboard (each copy replaces the last).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct Pending {
+    /// Which copy this is ([`PendingClears::arm`]).
+    copy: u64,
+    /// The clipboard's sequence number right after it ([`should_clear`]).
+    armed: u32,
+    /// The text, as [`to_wide_nul`] made it. Wiped on drop.
+    text: Zeroizing<Vec<u16>>,
+}
+
+/// The clear each copy still owes: taken once, by its own delayed clear or by
+/// the exit, whichever comes first.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct PendingClears {
+    next: AtomicU64,
+    pending: Mutex<Option<Pending>>,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl PendingClears {
+    const fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            pending: Mutex::new(None),
+        }
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<Pending>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A copy was made: it is the one a clear is owed for now. Answers which
+    /// copy it is, for its delayed clear.
+    fn arm(&self, armed: u32, text: Zeroizing<Vec<u16>>) -> u64 {
+        let copy = self.next.fetch_add(1, Ordering::Relaxed);
+        *self.slot() = Some(Pending { copy, armed, text });
+        copy
+    }
+
+    /// The delayed clear of `copy`: its own pending clear, unless a later copy
+    /// replaced it or the exit already took it.
+    fn take_own(&self, copy: u64) -> Option<Pending> {
+        let mut slot = self.slot();
+        if slot.as_ref().is_some_and(|p| p.copy == copy) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// The exit: whatever clear is still owed.
+    fn take_any(&self) -> Option<Pending> {
+        self.slot().take()
+    }
+}
+
+/// This process's copies awaiting their clear.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+static PENDING: PendingClears = PendingClears::new();
+
+/// MR-2013: clear the last credential copy now if its delayed clear has not
+/// run yet, under the same rule ([`should_clear`]): only if the clipboard
+/// still holds exactly it and nothing was copied since. `main.rs` calls it as
+/// the process ends (`RunEvent::Exit`, the exit fallback) and the updater
+/// before its installer takes over. Synchronous and brief: one clipboard open,
+/// retried for at most ~200 ms.
+pub fn clear_on_exit() {
+    #[cfg(target_os = "windows")]
+    if let Some(pending) = PENDING.take_any() {
+        match win::clear_if_unchanged(pending.armed, &pending.text) {
+            Ok(true) => tracing::info!("copy_sensitive: the copy was cleared at exit"),
+            Ok(false) => tracing::debug!("copy_sensitive: the clipboard changed since; left alone"),
+            Err(e) => tracing::warn!("copy_sensitive: could not clear the copy at exit ({e})"),
+        }
+    }
+}
+
 /// Copy `text` as a credential. `Ok(true)`: it is on the clipboard, kept out
 /// of clipboard history and the cloud clipboard, and is cleared after
 /// [`CLEAR_AFTER`] if still there (Windows). `Ok(false)`: nothing was done on
@@ -63,11 +150,19 @@ pub async fn copy_sensitive(text: String) -> Result<bool, IpcError> {
                 tracing::warn!("copy_sensitive: the clipboard refused the copy ({e})");
                 IpcError::unknown("The clipboard could not be reached.")
             })?;
+        // MR-2013: owed from now on, by this task or, if the app exits first,
+        // by `clear_on_exit`.
+        let copy = PENDING.arm(armed, wide);
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(CLEAR_AFTER).await;
-            let cleared =
-                tauri::async_runtime::spawn_blocking(move || win::clear_if_unchanged(armed, &wide))
-                    .await;
+            let Some(pending) = PENDING.take_own(copy) else {
+                // A later copy owns the clipboard now, or the exit cleared it.
+                return;
+            };
+            let cleared = tauri::async_runtime::spawn_blocking(move || {
+                win::clear_if_unchanged(pending.armed, &pending.text)
+            })
+            .await;
             match cleared {
                 Ok(Ok(true)) => tracing::debug!("copy_sensitive: the copy was cleared"),
                 Ok(Ok(false)) => {
@@ -552,10 +647,93 @@ mod tests {
         assert!(!retry("clear", || win::clear_if_unchanged(armed, &ours)));
         assert!(holds(&theirs), "the user's copy was wiped");
 
+        // MR-2013: the app exits inside the minute. The copy still owed its
+        // clear is cleared then (the only test that uses `PENDING`).
+        let armed = retry("copy", || win::set(&ours));
+        PENDING.arm(
+            armed,
+            to_wide_nul(&format!("birdo-copy-sensitive-test-{}", std::process::id())),
+        );
+        assert!(holds(&ours));
+        clear_on_exit();
+        assert!(
+            win::probe::snapshot().text.is_none(),
+            "the exit left the copy on the clipboard"
+        );
+
         say(&format!(
             "copy_sensitive clipboard round-trip: RAN (sequence numbers: {})",
             if armed != 0 { "yes" } else { "no, text only" }
         ));
+    }
+
+    /// MR-2013: each copy's clear is owed once, to whichever comes first: its
+    /// own delayed clear, or the exit. A later copy takes the debt over (only
+    /// the latest can still be on the clipboard), so an earlier copy's timer
+    /// finds nothing to do, and after the exit neither does the latest's.
+    #[test]
+    fn a_copys_clear_is_owed_once_to_its_timer_or_the_exit() {
+        let clears = PendingClears::new();
+        assert!(clears.take_any().is_none(), "nothing copied, nothing owed");
+
+        let first = clears.arm(7, to_wide_nul("111122223333444455556666"));
+        let second = clears.arm(8, to_wide_nul("999988887777666655554444"));
+        assert_ne!(first, second);
+        assert!(
+            clears.take_own(first).is_none(),
+            "the later copy took it over"
+        );
+
+        // The app exits inside the minute: the exit takes the latest copy.
+        let owed = clears.take_any().expect("the latest copy is owed a clear");
+        assert_eq!(owed.copy, second);
+        assert_eq!(owed.armed, 8);
+        assert!(same_text(
+            &owed.text,
+            &to_wide_nul("999988887777666655554444")
+        ));
+        assert!(
+            clears.take_own(second).is_none(),
+            "the exit already cleared it"
+        );
+        assert!(clears.take_any().is_none());
+
+        // Its timer, when the app stays: taken once, by its own copy only.
+        let third = clears.arm(9, to_wide_nul("123412341234123412341234"));
+        assert!(clears.take_own(third + 1).is_none());
+        assert_eq!(clears.take_own(third).map(|p| p.armed), Some(9));
+        assert!(clears.take_any().is_none());
+    }
+
+    /// MR-2013: the exit clears it. `main.rs` calls `clear_on_exit` where the
+    /// process ends (`RunEvent::Exit`, and the exit fallback that exits
+    /// without the teardown), and the updater before its installer exits the
+    /// process (Windows).
+    #[test]
+    fn every_exit_clears_a_pending_copy() {
+        let main = include_str!("../main.rs");
+        let exit = &main[main
+            .find("if matches!(event, RunEvent::Exit) {")
+            .expect("the Exit arm")..];
+        let exit = &exit[..exit.find("\n            }").unwrap()];
+        assert!(
+            exit.contains("commands::clipboard::clear_on_exit();"),
+            "RunEvent::Exit"
+        );
+        let fallback = &main[main
+            .find(".name(\"birdo-exit-fallback\".into())")
+            .expect("the exit fallback")..];
+        let fallback = &fallback[..fallback.find("|| std::process::exit(0),").unwrap()];
+        assert!(
+            fallback.contains("commands::clipboard::clear_on_exit();"),
+            "the exit fallback"
+        );
+        let updater = include_str!("updater.rs");
+        let install = &updater[updater.find("pub async fn install_update(").unwrap()..];
+        let clear = install
+            .find("crate::commands::clipboard::clear_on_exit();")
+            .expect("the updater clears before its installer exits the process");
+        assert!(clear < install.find("update.install(bundle)").unwrap());
     }
 
     /// Off Windows nothing is done natively: the UI copies the ordinary way.

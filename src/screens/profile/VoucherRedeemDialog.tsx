@@ -12,12 +12,25 @@ import { errorCopy } from '@/lib/errors';
 import { toIpcError } from '@/lib/ipc';
 import { planName } from '@/lib/plan';
 
-/** The contract has no voucher codes: an unclassified refusal is about the code itself. */
+/** MR-2014: what a busy voucher service says (the Rust command's own words). */
+export function voucherBusyCopy(secs: number): string {
+  return `The voucher service is busy right now. Please try again in ${secs} second${secs === 1 ? '' : 's'}.`;
+}
+
+/**
+ * The contract has no voucher codes: an unclassified refusal is about the code
+ * itself. MR-2014: a busy 5xx that named its wait, or the same answer from
+ * Rust's retry gate while that wait runs, arrives as `server_error` with the
+ * wait, and says the service is busy and for how long; it used to read as the
+ * generic "Something went wrong on our side".
+ */
 function voucherErrorText(e: unknown): string {
   const err = toIpcError(e);
-  return err.code === 'unknown'
-    ? "Couldn't redeem that voucher. Check the code and try again."
-    : errorCopy(err).message;
+  if (err.code === 'unknown') return "Couldn't redeem that voucher. Check the code and try again.";
+  if (err.code === 'server_error' && err.retry_after_secs !== null && err.retry_after_secs > 0) {
+    return voucherBusyCopy(Math.ceil(err.retry_after_secs));
+  }
+  return errorCopy(err).message;
 }
 
 export function VoucherRedeemDialog({

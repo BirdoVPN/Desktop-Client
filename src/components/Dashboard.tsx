@@ -28,7 +28,7 @@ import { MultiHopServerPair, ServerSelectorCard } from './home/ServerCards';
 import { SignOutDialog } from './home/SignOutDialog';
 import { hairline, motion as motionTokens, white } from '@/lib/birdo-theme';
 import { connectCta } from '@/lib/vpn-display';
-import { planRank, titleCasePlan } from '@/lib/plan';
+import { lowestPlanWith, planHasFeature, planName, titleCasePlan } from '@/lib/plan';
 import type { ErrorAction } from '@/lib/errors';
 import { pickBestServer } from '@/lib/ipc';
 import { useAppStore, type Server } from '@/store/app-store';
@@ -67,6 +67,7 @@ export function Dashboard() {
     userEmail,
     anonymous,
     plan,
+    planGates,
     lastServerId,
     multiHopEnabled,
     entryId,
@@ -91,6 +92,7 @@ export function Dashboard() {
       userEmail: s.account.email ?? s.userEmail,
       anonymous: resolveAnonymousAccount(s.account).isAnon,
       plan: s.account.plan,
+      planGates: s.planGates,
       lastServerId: s.lastServerId,
       multiHopEnabled: s.settings.multiHopEnabled,
       entryId: s.settings.multiHopEntryNodeId,
@@ -101,9 +103,10 @@ export function Dashboard() {
   );
 
   const isConnected = display === 'connected';
-  const rank = planRank(plan);
-  // null = the plan is not known yet: no lock, no upsell (W2-011).
-  const multiHopUnlocked = rank === null ? null : rank >= 2;
+  // null = the plan is not known yet: no lock, no upsell (W2-011). MR-1517:
+  // the server's plan-gating table decides, the built-in one where it is silent.
+  const multiHopUnlocked = planHasFeature(plan, planGates, 'multiHop');
+  const multiHopPlan = planName(lowestPlanWith('multiHop', planGates) ?? 'SOVEREIGN');
 
   // ── Multi-Hop route ─────────────────────────────────────────────────
   // While a session is up (or coming up) the pair shows the LIVE route and
@@ -129,7 +132,7 @@ export function Dashboard() {
       return;
     }
     if (!multiHopUnlocked) {
-      notice({ text: 'Multi-Hop is a Sovereign feature. Upgrade to enable.', tone: 'info' });
+      notice({ text: `Multi-Hop is a ${multiHopPlan} feature. Upgrade to enable.`, tone: 'info' });
       useAppStore.getState().pushRoute('pricing');
       return;
     }
@@ -226,6 +229,7 @@ export function Dashboard() {
         anonymous={anonymous}
         multiHopArmed={multiHopEnabled}
         multiHopUnlocked={multiHopUnlocked}
+        multiHopPlan={multiHopPlan}
         multiHopLocked={tunnelActive}
         onToggleMultiHop={handleToggleMultiHop}
         onSignOut={() => setShowSignOut(true)}

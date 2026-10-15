@@ -282,6 +282,15 @@ impl IpcError {
                  try again in a moment.",
                 *retry_after_secs,
             ),
+            // MR-2057: retryable as well (birdo-web #711). The allocator failed
+            // closed on a reservation it could not read; the SAME request
+            // succeeds once that clears. Not `server_unavailable` either: the
+            // server is fine, and "try another location" is not the advice.
+            ApiError::TunnelAddressUnavailable { retry_after_secs } => Self::transient(
+                "BirdoVPN couldn't assign your connection an address on this server just now. \
+                 Please try again in a moment.",
+                *retry_after_secs,
+            ),
             ApiError::Unknown(message) => Self::unknown(message),
         }
     }
@@ -299,7 +308,8 @@ impl IpcError {
     /// How long the server asked this client to wait before sending the SAME
     /// request again: `Some` only for a retryable `server_error` that carries
     /// a wait, i.e. `quota_check_unavailable`, `psk_delivery_unavailable`
-    /// (MR-1639) and a busy 5xx's `Retry-After` (MR-1808). A connect retries
+    /// (MR-1639), `tunnel_address_unavailable` (MR-2057) and a busy 5xx's
+    /// `Retry-After` (MR-1808). A connect retries
     /// its request once after it (`session::attempt`); a rate limit is not
     /// retried there, the user is told how long to wait instead.
     pub fn server_asked_to_wait(&self) -> Option<std::time::Duration> {
@@ -564,6 +574,12 @@ mod tests {
                 },
                 IpcErrorCode::ServerError,
             ),
+            (
+                ApiError::TunnelAddressUnavailable {
+                    retry_after_secs: Some(15),
+                },
+                IpcErrorCode::ServerError,
+            ),
         ];
         // Cases are named by index, not by `{api:?}`: an ApiError can carry what a
         // user typed, and CodeQL reads formatting it as cleartext logging.
@@ -798,6 +814,62 @@ mod tests {
             assert_eq!(err.retry_after_secs, None, "{bare}");
             assert_eq!(err.server_asked_to_wait(), None, "{bare}");
         }
+    }
+
+    /// MR-2057: birdo-web #711's `tunnel_address_unavailable`, byte for byte as
+    /// GlobalExceptionFilter writes it (vpn.controller.ts
+    /// `rethrowRetryableConnectRefusal`;
+    /// TunnelAddressUnavailableError.RETRY_AFTER_SECONDS = 15). On main it fell
+    /// through to `Rejected { 503 }`: `server_unavailable`, no wait, and so no
+    /// retry of the connect and a re-dial on the plain backoff.
+    #[test]
+    fn a_tunnel_address_refusal_is_retryable_with_its_wait() {
+        let body = r#"{"statusCode":503,"message":"We could not assign your connection an address on this server just now. Please try again in a moment.","error":"tunnel_address_unavailable","timestamp":"2026-10-15T09:00:00.000Z","path":"/api/v1/vpn/connect","requestId":"req-1","details":{"retryable":true,"retryAfterSeconds":15}}"#;
+        let api = classify_503(body);
+        assert!(matches!(
+            api,
+            ApiError::TunnelAddressUnavailable {
+                retry_after_secs: Some(15)
+            }
+        ));
+        let err = IpcError::from_api(&api);
+        assert_eq!(err.code, IpcErrorCode::ServerError);
+        assert!(err.retryable);
+        assert!(!err.code.is_hard_refusal());
+        assert_eq!(err.retry_after_secs, Some(15));
+        assert_eq!(
+            err.server_asked_to_wait(),
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert!(err.message.contains("address"), "{}", err.message);
+        assert!(!err.message.contains("another location"), "{}", err.message);
+        assert_eq!(err.transport, None);
+        assert_eq!(crate::commands::vpn::transport_fallback_reason(&err), None);
+        let wire = serde_json::to_value(&err).unwrap();
+        assert_eq!(wire["code"], "server_error");
+        assert_eq!(wire["retryable"], true);
+        assert_eq!(wire["retry_after_secs"], 15);
+
+        // The multi-hop connect sends the same refusal; without a wait it is
+        // still retryable, and the clamp applies as for the other two.
+        let bare = classify_503(
+            r#"{"statusCode":503,"message":"m","error":"tunnel_address_unavailable"}"#,
+        );
+        assert!(matches!(
+            bare,
+            ApiError::TunnelAddressUnavailable {
+                retry_after_secs: None
+            }
+        ));
+        assert!(IpcError::from_api(&bare).retryable);
+        assert!(matches!(
+            classify_503(
+                r#"{"error":"tunnel_address_unavailable","details":{"retryable":true,"retryAfterSeconds":86400}}"#
+            ),
+            ApiError::TunnelAddressUnavailable {
+                retry_after_secs: Some(crate::api::error::RETRY_AFTER_MAX_SECS)
+            }
+        ));
     }
 
     /// MR-1639: `retryAfterSeconds` is clamped to 1..=RETRY_AFTER_MAX_SECS, so

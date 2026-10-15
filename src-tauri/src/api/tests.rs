@@ -1041,10 +1041,7 @@ mod types_serialization_tests {
             r#"{"dnsFilteringAvailable":true,"features":{"RECON":{"dnsFiltering":true}}}"#,
         )
         .unwrap();
-        assert_eq!(
-            today.features.unwrap()["RECON"],
-            PlanFeatures { custom_dns: None }
-        );
+        assert_eq!(today.features.unwrap()["RECON"], PlanFeatures::default());
         let no_map: ClientConfigResponse = serde_json::from_str(r#"{"version":1}"#).unwrap();
         assert!(no_map.features.is_none());
 
@@ -1073,6 +1070,42 @@ mod types_serialization_tests {
         assert_eq!(
             serde_json::to_value(&new).unwrap()["features"]["SOVEREIGN"],
             serde_json::json!({ "customDns": false })
+        );
+    }
+
+    /// MR-1517: the server's plan-gating table reaches the UI, flag by flag,
+    /// as the server sent it (birdo-web route.ts: Stealth from OPERATIVE,
+    /// Multi-Hop and Port Forwarding on SOVEREIGN). A flag it did not send, or
+    /// one of another shape, is "not said" and leaves the UI's own default.
+    #[test]
+    fn client_config_carries_the_plan_gating_table() {
+        let cfg: ClientConfigResponse = serde_json::from_str(
+            r#"{"features":{
+                "RECON":{"customDns":true,"stealthMode":false,"multiHop":false,"portForwarding":false,"splitTunneling":true},
+                "OPERATIVE":{"customDns":true,"stealthMode":true,"multiHop":false,"portForwarding":false},
+                "SOVEREIGN":{"customDns":true,"stealthMode":true,"multiHop":true,"portForwarding":"yes"}
+            }}"#,
+        )
+        .unwrap();
+        let features = cfg.features.as_ref().unwrap();
+        assert_eq!(features["RECON"].stealth_mode, Some(false));
+        assert_eq!(features["OPERATIVE"].stealth_mode, Some(true));
+        assert_eq!(features["OPERATIVE"].multi_hop, Some(false));
+        assert_eq!(features["SOVEREIGN"].multi_hop, Some(true));
+        assert_eq!(features["SOVEREIGN"].port_forwarding, None, "not a boolean");
+        let wire = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            wire["features"]["OPERATIVE"],
+            serde_json::json!({
+                "customDns": true,
+                "stealthMode": true,
+                "multiHop": false,
+                "portForwarding": false
+            })
+        );
+        assert_eq!(
+            wire["features"]["SOVEREIGN"],
+            serde_json::json!({ "customDns": true, "stealthMode": true, "multiHop": true })
         );
     }
 

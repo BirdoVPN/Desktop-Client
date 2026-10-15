@@ -61,6 +61,7 @@ beforeEach(() => {
     servers: [S('a'), S('b', { load: 5 })],
     serversStatus: 'ready',
     account: { ...useAppStore.getState().account, plan: 'OPERATIVE' },
+    planGates: {},
   });
 });
 
@@ -257,6 +258,22 @@ describe('Dashboard: Multi-Hop and identity', () => {
     expect(useAppStore.getState().navStack).toEqual([]);
   });
 
+  // MR-1517: Multi-Hop follows the server's plan-gating table. On main the
+  // rank was hard-coded (Sovereign only), whatever the server said.
+  it("Multi-Hop follows the server's plan-gating table, and names the plan it comes with", async () => {
+    setStatus({ state: 'disconnected' });
+    // The default table: an Operative user sees it locked, for Sovereign.
+    const { unmount } = render(<Dashboard />);
+    expect(screen.getByRole('button', { name: 'Multi-Hop (Sovereign plan)' })).toBeInTheDocument();
+    unmount();
+
+    useAppStore.setState({ planGates: { OPERATIVE: { multiHop: true } } });
+    render(<Dashboard />);
+    await userEvent.click(screen.getByRole('button', { name: 'Multi-Hop' }));
+    expect(useAppStore.getState().settings.multiHopEnabled).toBe(true);
+    expect(useAppStore.getState().navStack).toEqual([]);
+  });
+
   // MR-918: told by `/auth/me`'s isAnonymous, which the same answer as the
   // synthetic email always carries — not by parsing the email.
   it('never renders the synthetic anonymous address (P1-parity-007)', () => {
@@ -269,5 +286,30 @@ describe('Dashboard: Multi-Hop and identity', () => {
     expect(screen.getByText('Anonymous account')).toBeInTheDocument();
     expect(container.textContent).not.toContain('anon_');
     expect(container.textContent).not.toContain('1234567890');
+  });
+
+  // MR-2014: an email-form sign-in with the synthetic address puts it in
+  // `userEmail` before `/auth/me` says the account is anonymous. On main it
+  // was shown, credential and all, until that answer came in.
+  it('never renders the synthetic address before /auth/me has answered either', () => {
+    useAppStore.setState({
+      userEmail: 'anon_123456789012345678901234@anonymous.local',
+      account: { ...useAppStore.getState().account, email: null, isAnonymous: null },
+    });
+    setStatus({ state: 'disconnected' });
+    const { container } = render(<Dashboard />);
+    expect(container.textContent).not.toContain('anon_');
+    expect(container.textContent).not.toContain('@anonymous.local');
+    expect(container.textContent).not.toContain('1234567890');
+  });
+
+  it('a real address is still shown', () => {
+    useAppStore.setState({
+      userEmail: 'member@example.com',
+      account: { ...useAppStore.getState().account, email: null, isAnonymous: false },
+    });
+    setStatus({ state: 'disconnected' });
+    render(<Dashboard />);
+    expect(screen.getByText('member@example.com')).toBeInTheDocument();
   });
 });

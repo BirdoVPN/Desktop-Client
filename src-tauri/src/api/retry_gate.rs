@@ -15,6 +15,26 @@
 //! hostage to a throttled speed test. The dial paths honour the same wait on
 //! their own (`IpcError::retry_wait`), so a re-dial is scheduled after it
 //! instead of spending an attempt on a request this gate would refuse.
+//!
+//! MR-2012: what "a request" is follows the backend's buckets ([`hold_key`]).
+//! The credential routes (every `/auth...` path but `/auth/me` and
+//! `/auth/refresh`, and any `/login` or `/register`) share ONE bucket per
+//! network address on the server (birdo-web `GlobalRateLimitMiddleware`
+//! category `auth`, 10 per 60 s, and the auth limiters in main.ts), so a 429
+//! on one of them holds them all: sending the next one would only meet the
+//! same refusal. Every other route stays held on its own, on purpose. The
+//! `vpn` category (120 per 60 s per account) shares a bucket too, but its
+//! routes also carry limits of their own that say nothing about each other:
+//! the speed test's (vpn/speed-test.ts) and the connect limiter's
+//! (vpn.service.ts) answer 429 with `Retry-After` as well, so a category hold
+//! there would hold the heartbeat hostage to a throttled speed test. Holding
+//! per route costs one more refused request per route when the shared bucket
+//! itself is spent, nothing more.
+//!
+//! Holds are the session's: sign-out (`BirdoApi::clear_tokens`) forgets them
+//! ([`RetryGate::forget_session`]), all but the credential bucket, which the
+//! server keys on the network rather than on the account and so still holds
+//! for whoever signs in next from here.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -22,6 +42,34 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use super::error::ApiError;
+
+/// The hold key of the credential routes' shared bucket (MR-2012).
+const CREDENTIAL_BUCKET: &str = "auth credential routes";
+
+/// What a request is held under (MR-2012): the credential routes' shared
+/// bucket ([`CREDENTIAL_BUCKET`]) for every path the backend counts in its
+/// `auth` category, and `"{method} {path}"` for every other request.
+pub(crate) fn hold_key(method: &reqwest::Method, path: &str) -> String {
+    if is_credential_route(path) {
+        CREDENTIAL_BUCKET.to_owned()
+    } else {
+        format!("{method} {path}")
+    }
+}
+
+/// birdo-web `GlobalRateLimitMiddleware.getEndpointCategory` = `auth`: a path
+/// under `/auth`, or one with `/login` or `/register` in it, except `/auth/me`
+/// and `/auth/refresh`, which it buckets as `default` (they take no
+/// credential, and the refresh has a limiter keyed on its own token). Read
+/// the way the backend reads it: lower-cased, without a query.
+fn is_credential_route(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let path = path.trim_end_matches('/').to_ascii_lowercase();
+    if path == "/auth/me" || path == "/auth/refresh" {
+        return false;
+    }
+    path.starts_with("/auth") || path.contains("/login") || path.contains("/register")
+}
 
 /// Requests held at once. Holds last at most `RETRY_AFTER_MAX_SECS`, so in
 /// practice a handful; past this the hold nearest its end is forgotten first
@@ -78,6 +126,15 @@ impl RetryGate {
             }
         }
         held.insert(key.to_owned(), (status, until));
+    }
+
+    /// The session ended (sign-out, an expired or deleted account): forget
+    /// every hold but the credential routes' (MR-2012). The others were the
+    /// signed-out account's: the server keys them on the account (or, for
+    /// the refresh, on its token), so the next account to sign in here owes
+    /// them nothing. The credential bucket is the network's.
+    pub(crate) fn forget_session(&self) {
+        self.held.lock().retain(|key, _| key == CREDENTIAL_BUCKET);
     }
 
     #[cfg(test)]
@@ -188,6 +245,98 @@ mod tests {
         ] {
             gate.note("GET /x", &error, t0);
             assert!(gate.check("GET /x", t0).is_ok(), "{error:?}");
+        }
+    }
+
+    /// MR-2012: the credential routes share the backend's `auth` bucket, so
+    /// a 429 on one holds them all; `/auth/me`, the refresh and every other
+    /// route keep holds of their own. On main the key was method and path for
+    /// every request, so after a refused sign-in the 2FA code, the account
+    /// creation and the SSO exchange all went out to meet the same 429.
+    #[test]
+    fn the_credential_routes_share_one_hold() {
+        use reqwest::Method;
+        let credential = [
+            (Method::POST, "/auth/login/desktop"),
+            (Method::POST, "/auth/login/anonymous"),
+            (Method::POST, "/auth/register/anonymous"),
+            (Method::POST, "/auth/native/exchange"),
+            (Method::POST, "/auth/2fa/verify"),
+            (Method::POST, "/auth/logout"),
+            (Method::POST, "/AUTH/Login/Desktop?x=1"),
+        ];
+        let key = |method: &Method, path: &str| hold_key(method, path);
+        let login = key(&Method::POST, "/auth/login/desktop");
+        for (method, path) in &credential {
+            assert_eq!(key(method, path), login, "{method} {path}");
+        }
+        let own: Vec<String> = [
+            (Method::GET, "/auth/me"),
+            (Method::POST, "/auth/refresh"),
+            (Method::GET, "/vpn/servers"),
+            (Method::POST, "/vpn/heartbeat/k1"),
+            (Method::GET, "/api/v1/gdpr/export"),
+        ]
+        .iter()
+        .map(|(method, path)| key(method, path))
+        .collect();
+        for k in &own {
+            assert_ne!(*k, login);
+        }
+
+        let gate = RetryGate::default();
+        let t0 = Instant::now();
+        gate.note(
+            &login,
+            &ApiError::RateLimited {
+                retry_after_secs: Some(40),
+            },
+            t0,
+        );
+        for (method, path) in &credential {
+            assert!(
+                matches!(
+                    gate.check(&key(method, path), t0 + s(1)),
+                    Err(ApiError::Held {
+                        status: 429,
+                        retry_after_secs: 39
+                    })
+                ),
+                "{method} {path}"
+            );
+        }
+        for k in &own {
+            assert!(gate.check(k, t0).is_ok(), "{k}");
+        }
+    }
+
+    /// MR-2012: a sign-out forgets the session's holds, so the next account
+    /// signed in here is not held for the last one's; the credential bucket,
+    /// keyed on the network, stays.
+    #[test]
+    fn a_sign_out_forgets_the_sessions_holds() {
+        use reqwest::Method;
+        let gate = RetryGate::default();
+        let t0 = Instant::now();
+        let limited = ApiError::RateLimited {
+            retry_after_secs: Some(60),
+        };
+        let keys = [
+            hold_key(&Method::POST, "/auth/login/desktop"),
+            hold_key(&Method::GET, "/auth/me"),
+            hold_key(&Method::POST, "/auth/refresh"),
+            hold_key(&Method::GET, "/vpn/servers"),
+        ];
+        for key in &keys {
+            gate.note(key, &limited, t0);
+        }
+        gate.forget_session();
+        assert!(
+            gate.check(&keys[0], t0).is_err(),
+            "the network's bucket stays"
+        );
+        for key in &keys[1..] {
+            assert!(gate.check(key, t0).is_ok(), "{key}");
         }
     }
 
