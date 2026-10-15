@@ -33,7 +33,7 @@
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
-use crate::commands::killswitch::iptables_watchdog::{watch, Live, Watched, Xtables};
+use crate::commands::killswitch::iptables_watchdog::{FirstArm, Live, Watched, Xtables};
 use crate::vpn::iptables_policy;
 
 /// Tracks whether iptables blocking rules are active
@@ -50,6 +50,10 @@ static WANTED: AtomicBool = AtomicBool::new(false);
 /// watchdog reads back. `None` while no generation of ours is live. Written
 /// under [`CHAINS`] (and by the panic path, which clears it).
 static LIVE: std::sync::Mutex<Option<Live>> = std::sync::Mutex::new(None);
+
+/// MR-2090: where the watchdog's retries of a wanted block that never went
+/// up stand (`iptables_watchdog::FirstArm`). Used under [`CHAINS`] only.
+static FIRST_ARM: std::sync::Mutex<FirstArm> = std::sync::Mutex::new(FirstArm::new());
 
 fn set_live(live: Option<Live>) {
     *LIVE
@@ -443,8 +447,10 @@ fn activate_locked(server_ip: Option<Ipv4Addr>) -> Result<(), String> {
                 // Nothing of ours is live, so nothing restricts any address.
                 PERMITTED_GEN.store(u64::MAX, Ordering::SeqCst);
             }
-            tracing::error!("Kill switch: rule build failed, block NOT changed: {}", e);
-            return Err(e);
+            // Logged by the caller, which knows whether it is news: the
+            // watchdog retries a first arm that failed and reports one error
+            // per streak of failures, not one per attempt (MR-2090).
+            return Err(format!("rule build failed, block NOT changed: {e}"));
         }
     };
     let covered = iptables_policy::covered_generation(control_plane_gen, self_permits_loaded);
@@ -623,6 +629,9 @@ impl Xtables for Iptables {
 ///   jump, a chain's loaded rule count, or its final DROP (`iptables -F`
 ///   empties our chains in place). Rule text is not compared; see
 ///   `iptables_watchdog::missing` for what that leaves undetected;
+/// - a block WANTED of which no generation is live — its first arm failed —
+///   is put up, retried at the pace `iptables_watchdog::FirstArm` keeps
+///   (MR-2090);
 /// - a block held but not wanted is a lift that failed, retried;
 /// - nothing held, nothing wanted: nothing is read. `None` whenever nothing
 ///   had to be done.
@@ -631,7 +640,10 @@ pub(crate) async fn watchdog(server_ip: Option<Ipv4Addr>) -> Option<Watched> {
     let wanted = WANTED.load(Ordering::SeqCst) && crate::commands::killswitch::is_enabled();
     let held = IPTABLES_BLOCKING.load(Ordering::SeqCst);
     let current = live();
-    watch(
+    let mut first_arm = FIRST_ARM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    first_arm.pass(
         &Iptables,
         wanted,
         held,
@@ -769,6 +781,7 @@ mod iptables_chain_tests {
         let tcp443 = |dst: IpAddr, uid: u32| Packet {
             proto: "tcp",
             dst,
+            sport: 40000,
             dport: 443,
             oif: "eth0",
             uid,
@@ -800,6 +813,55 @@ mod iptables_chain_tests {
             check::verdict(&rules6, &tcp443(cloudflare_v6, euid)),
             Some("DROP"),
             "{v6}"
+        );
+
+        // MR-2087, as the kernel holds it: DHCP only from the client's port,
+        // to wherever the lease's server is; DHCPv6 only to its servers'
+        // link-scoped group.
+        let udp = |sport: u16, dst: IpAddr, dport: u16| Packet {
+            proto: "udp",
+            dst,
+            sport,
+            dport,
+            oif: "eth0",
+            uid: euid,
+        };
+        let google = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        for (sport, to, want) in [
+            (40000, google, "DROP"),
+            (68, IpAddr::V4(Ipv4Addr::BROADCAST), "ACCEPT"),
+            (68, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), "ACCEPT"),
+        ] {
+            assert_eq!(
+                check::verdict(&rules, &udp(sport, to, 67)),
+                Some(want),
+                "udp from {sport} to {to}:67\n{v4}"
+            );
+        }
+        let global = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let dhcp_servers = IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 1, 2));
+        assert_eq!(
+            check::verdict(&rules6, &udp(546, global, 547)),
+            Some("DROP"),
+            "{v6}"
+        );
+        assert_eq!(
+            check::verdict(&rules6, &udp(546, dhcp_servers, 547)),
+            Some("ACCEPT"),
+            "{v6}"
+        );
+
+        // MR-2086: IPv6 inside the tunnel gets out, and its replies in.
+        let tunnelled = Packet {
+            oif: "birdo0",
+            ..tcp443(cloudflare_v6, euid)
+        };
+        assert_eq!(check::verdict(&rules6, &tunnelled), Some("ACCEPT"), "{v6}");
+        let v6_in = v6_in.expect("ip6tables -S");
+        let tunnel_in: Vec<String> = ["-i", "birdo0", "-j", "ACCEPT"].map(String::from).to_vec();
+        assert!(
+            check::parse_listing(&v6_in, &inn).contains(&tunnel_in),
+            "{v6_in}"
         );
     }
 }
