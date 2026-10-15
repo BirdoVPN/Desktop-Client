@@ -1118,8 +1118,10 @@ mod tests {
                 let r = block_all_ruleset(&shape);
                 let mut allowed = vec![
                     "pass quick on lo0 all".to_string(),
-                    "pass out quick proto udp from any port 68 to any port 67 no state".to_string(),
-                    "pass in quick proto udp from any port 67 to any port 68 no state".to_string(),
+                    "pass out quick inet proto udp from any port 68 to any port 67 no state"
+                        .to_string(),
+                    "pass in quick inet proto udp from any port 67 to any port 68 no state"
+                        .to_string(),
                 ];
                 if let Some(t) = shape.tunnel_interface {
                     allowed.push(format!("pass quick on {t} all"));
@@ -1296,8 +1298,8 @@ mod tests {
         for rule in [
             "pass out quick inet proto { udp tcp } to 203.0.113.7 keep state\n",
             "pass in quick inet proto { udp tcp } from 203.0.113.7 keep state\n",
-            "pass out quick proto udp from any port 68 to any port 67 no state\n",
-            "pass in quick proto udp from any port 67 to any port 68 no state\n",
+            "pass out quick inet proto udp from any port 68 to any port 67 no state\n",
+            "pass in quick inet proto udp from any port 67 to any port 68 no state\n",
             "pass quick to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } no state\n",
         ] {
             assert!(with.contains(rule), "missing {rule:?} in:\n{with}");
@@ -1311,6 +1313,31 @@ mod tests {
         });
         assert!(!without.contains("203.0.113.7"), "{without}");
         assert!(!without.contains("10.0.0.0/8"), "{without}");
+    }
+
+    /// MR-2087: the DHCP permits are IPv4 only. With no address family they
+    /// matched IPv6 too, so udp from port 68 to port 67 of ANY IPv6 host got
+    /// through a block-all that drops every other IPv6 packet (DHCPv6 is
+    /// 546/547; nothing needs these ports over IPv6).
+    #[test]
+    fn the_dhcp_permits_are_ipv4_only() {
+        for control_plane in [&[DOH, API][..], &[][..]] {
+            for shape in every_shape(control_plane) {
+                let r = block_all_ruleset(&shape);
+                let dhcp: Vec<&str> = r
+                    .lines()
+                    .filter(|l| l.contains("port 67") || l.contains("port 68"))
+                    .collect();
+                assert_eq!(dhcp.len(), 2, "{r}");
+                for l in dhcp {
+                    assert!(
+                        l.starts_with("pass out quick inet proto udp from any port 68 ")
+                            || l.starts_with("pass in quick inet proto udp from any port 67 "),
+                        "{l}"
+                    );
+                }
+            }
+        }
     }
 
     // ── The read-back detector ─────────────────────────────────────────

@@ -2747,12 +2747,12 @@ mod tests {
         );
     }
 
-    /// Nothing held, or nothing wanted and nothing owed: the pass reads
-    /// nothing and spawns no process — the idle watchdog after a lift.
+    /// Nothing wanted and nothing owed: the pass reads nothing and spawns no
+    /// process — the idle watchdog after a lift. (A block wanted with
+    /// nothing live is not idle: MR-2090, below.)
     #[test]
     fn an_idle_watchdog_runs_nothing() {
         let x = FakeXtables::new();
-        assert_eq!(watch(&x, true, false, None, no_rearm, no_lift), None);
         assert_eq!(watch(&x, false, false, None, no_rearm, no_lift), None);
         assert_eq!(x.runs.get(), 0);
         let (x, live) = armed();
@@ -2762,6 +2762,33 @@ mod tests {
             None
         );
         assert_eq!(x.runs.get(), runs, "a lifted block is not read back");
+    }
+
+    /// MR-2090: the first arm failed (the rule build, say), so no generation
+    /// of ours was ever live while the block is wanted. The watchdog read
+    /// nothing then and the session ran without its block until a reconnect
+    /// happened to re-arm it. It puts the block up now, and reads it back.
+    #[test]
+    fn a_wanted_block_that_never_went_up_is_put_up() {
+        let x = FakeXtables::new();
+        let put_up = RefCell::new(None);
+        let watched = watch(
+            &x,
+            true,
+            false,
+            None,
+            || {
+                let live = x.arm(0, None);
+                *put_up.borrow_mut() = Some(live.clone());
+                Ok(live)
+            },
+            no_lift,
+        );
+        let live = put_up
+            .into_inner()
+            .expect("the watchdog put up the wanted block that never went up");
+        assert_eq!(missing(&x, &live), None, "and it reads back whole");
+        assert!(watched.is_some(), "and the pass says what it did");
     }
 
     /// The listing as the kernel prints it (`-m tcp` and all): one entry per

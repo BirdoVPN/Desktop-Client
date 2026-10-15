@@ -769,6 +769,7 @@ mod iptables_chain_tests {
         let tcp443 = |dst: IpAddr, uid: u32| Packet {
             proto: "tcp",
             dst,
+            sport: 40000,
             dport: 443,
             oif: "eth0",
             uid,
@@ -800,6 +801,55 @@ mod iptables_chain_tests {
             check::verdict(&rules6, &tcp443(cloudflare_v6, euid)),
             Some("DROP"),
             "{v6}"
+        );
+
+        // MR-2087, as the kernel holds it: DHCP only from the client's port,
+        // to wherever the lease's server is; DHCPv6 only to its servers'
+        // link-scoped group.
+        let udp = |sport: u16, dst: IpAddr, dport: u16| Packet {
+            proto: "udp",
+            dst,
+            sport,
+            dport,
+            oif: "eth0",
+            uid: euid,
+        };
+        let google = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        for (sport, to, want) in [
+            (40000, google, "DROP"),
+            (68, IpAddr::V4(Ipv4Addr::BROADCAST), "ACCEPT"),
+            (68, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), "ACCEPT"),
+        ] {
+            assert_eq!(
+                check::verdict(&rules, &udp(sport, to, 67)),
+                Some(want),
+                "udp from {sport} to {to}:67\n{v4}"
+            );
+        }
+        let global = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let dhcp_servers = IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 1, 2));
+        assert_eq!(
+            check::verdict(&rules6, &udp(546, global, 547)),
+            Some("DROP"),
+            "{v6}"
+        );
+        assert_eq!(
+            check::verdict(&rules6, &udp(546, dhcp_servers, 547)),
+            Some("ACCEPT"),
+            "{v6}"
+        );
+
+        // MR-2086: IPv6 inside the tunnel gets out, and its replies in.
+        let tunnelled = Packet {
+            oif: "birdo0",
+            ..tcp443(cloudflare_v6, euid)
+        };
+        assert_eq!(check::verdict(&rules6, &tunnelled), Some("ACCEPT"), "{v6}");
+        let v6_in = v6_in.expect("ip6tables -S");
+        let tunnel_in: Vec<String> = ["-i", "birdo0", "-j", "ACCEPT"].map(String::from).to_vec();
+        assert!(
+            check::parse_listing(&v6_in, &inn).contains(&tunnel_in),
+            "{v6_in}"
         );
     }
 }
