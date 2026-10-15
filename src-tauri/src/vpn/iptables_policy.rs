@@ -13,14 +13,15 @@
 //! | rule                                            | why                          |
 //! |-------------------------------------------------|------------------------------|
 //! | `-o lo`                                         | local IPC, the stealth helper|
-//! | udp to port 67                                  | DHCP: the lease outlives the block |
+//! | udp from port 68 to port 67                     | DHCP: the lease outlives the block |
 //! | `-d <relay>`                                    | the re-dial (WireGuard, stealth) |
 //! | `-o birdo0`                                     | traffic already in the tunnel |
 //! | the LAN ranges, with Local Network Sharing      | printers, NAS, SSH           |
 //! | our uid's tcp/443 to each control-plane address | the control plane: API and DoH |
 //!
-//! Everything else meets `-j DROP`. IPv6 permits nothing but loopback, DHCPv6
-//! and link-local ICMPv6: the control plane is reached over IPv4 only.
+//! Everything else meets `-j DROP`. IPv6 permits nothing but loopback, the
+//! tunnel, DHCPv6 to its servers' group and link-local ICMPv6: the control
+//! plane is reached over IPv4 only.
 
 use std::net::Ipv4Addr;
 
@@ -31,6 +32,10 @@ const TUNNEL_INTERFACE: &str = "birdo0";
 /// own permit; nothing else of the app's needs a way out while the block is
 /// up (the macOS and Windows twins scope it the same way).
 const CONTROL_PLANE_PORT: &str = "443";
+
+/// All_DHCP_Relay_Agents_and_Servers (RFC 8415): the link-scoped group a
+/// DHCPv6 client sends Solicit, Request, Renew and Rebind to.
+const DHCPV6_SERVERS: &str = "ff02::1:2";
 
 /// RFC 1918 plus 169.254/16, which carries mDNS discovery.
 const LAN_RANGES: [&str; 4] = [
@@ -78,8 +83,20 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
     // ---------------------------------------------------------------- IPv4 OUT
     let mut out_v4 = vec![
         rule(&["-o", "lo", "-j", "ACCEPT"]),
-        // DHCP client -> server, so the machine can keep its lease.
-        rule(&["-p", "udp", "--dport", "67", "-j", "ACCEPT"]),
+        // DHCP client -> server, so the machine can keep its lease. From the
+        // client's port as well as to the server's (MR-2087): `--dport 67`
+        // alone let any process send udp/67 to any host from the real
+        // address. Port 68 is below 1024, so only root (or a holder of
+        // CAP_NET_BIND_SERVICE) can send from it: the DHCP client. The
+        // destination stays open: a renewal is unicast to the server that
+        // granted the lease (RFC 2131 §4.4.5), which this module does not
+        // know and which need not be on the LAN — an ISP's, behind a bridged
+        // modem. Limiting it to the broadcast address and the LAN ranges
+        // would push those renewals out to the rebinding broadcast at 7/8 of
+        // the lease.
+        rule(&[
+            "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT",
+        ]),
     ];
     // The relay: WireGuard handshake and the stealth fallback.
     if let Some(ip) = b.relay {
@@ -141,8 +158,10 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
     // ----------------------------------------------------------- IPv4 IN/FWD
     let mut in_v4 = vec![
         rule(&["-i", "lo", "-j", "ACCEPT"]),
-        // DHCP server -> client.
-        rule(&["-p", "udp", "--dport", "68", "-j", "ACCEPT"]),
+        // DHCP server -> client: from the server's port to the client's.
+        rule(&[
+            "-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT",
+        ]),
     ];
     if let Some(ip) = b.relay {
         in_v4.push(rule(&["-s", &ip.to_string(), "-j", "ACCEPT"]));
@@ -167,13 +186,37 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
     in_v4.push(rule(&["-j", "DROP"]));
 
     // ---------------------------------------------------------------- IPv6
-    // AUDIT-N5: dual-stack hosts must not leak IPv6 around the IPv4-only
-    // tunnel. ICMPv6 (NDP / RA / RS) is scoped to link-local and multicast:
-    // a blanket `-p ipv6-icmp` accept would sit in front of tunnel_linux's
-    // BIRDO_IPV6_LEAK_BLOCK and re-permit ICMPv6 to GLOBAL destinations.
+    // AUDIT-N5: dual-stack hosts must not leak IPv6 around the tunnel.
+    //
+    // This chain and tunnel_linux's BIRDO_IPV6_LEAK_BLOCK both go in at the
+    // top of OUTPUT, so either can sit first, and an ACCEPT here is final:
+    // whenever this chain is first, whatever it accepts never meets the leak
+    // block. So off the tunnel it accepts nothing the leak block refuses —
+    // loopback, link-local and link-scoped multicast only. ICMPv6 (NDP / RA
+    // / RS) is scoped that way: a blanket `-p ipv6-icmp` accept re-permitted
+    // ICMPv6 to GLOBAL destinations. And so is DHCPv6 (MR-2087): `--dport
+    // 547` alone let any process send udp/547 to any IPv6 host.
     let mut out_v6 = vec![
         rule(&["-o", "lo", "-j", "ACCEPT"]),
-        rule(&["-p", "udp", "--dport", "547", "-j", "ACCEPT"]),
+        // DHCPv6 client -> its servers' group, from the client's port.
+        rule(&[
+            "-d",
+            DHCPV6_SERVERS,
+            "-p",
+            "udp",
+            "--sport",
+            "546",
+            "--dport",
+            "547",
+            "-j",
+            "ACCEPT",
+        ]),
+        // MR-2086: IPv6 inside the tunnel. tunnel_linux routes it there on a
+        // dual-stack node (configure_ipv6), and with no permit the kill
+        // switch dropped it for the whole session. What leaves through
+        // birdo0 is encrypted to the relay — inside the tunnel, not around
+        // it — so this is the one permit the leak block has no say in.
+        rule(&["-o", TUNNEL_INTERFACE, "-j", "ACCEPT"]),
     ];
     for dst in ["fe80::/10", "ff02::/16"] {
         out_v6.push(rule(&["-p", "ipv6-icmp", "-d", dst, "-j", "ACCEPT"]));
@@ -182,7 +225,22 @@ pub(crate) fn block_all(b: &BlockAll<'_>) -> Chains {
 
     let mut in_v6 = vec![
         rule(&["-i", "lo", "-j", "ACCEPT"]),
-        rule(&["-p", "udp", "--dport", "546", "-j", "ACCEPT"]),
+        // DHCPv6 server or relay -> client: from the server's port to the
+        // client's, at the link-local address the client sends from.
+        rule(&[
+            "-d",
+            "fe80::/10",
+            "-p",
+            "udp",
+            "--sport",
+            "547",
+            "--dport",
+            "546",
+            "-j",
+            "ACCEPT",
+        ]),
+        // MR-2086: what comes back through the tunnel.
+        rule(&["-i", TUNNEL_INTERFACE, "-j", "ACCEPT"]),
     ];
     for src in ["fe80::/10", "ff02::/16"] {
         in_v6.push(rule(&["-p", "ipv6-icmp", "-s", src, "-j", "ACCEPT"]));
@@ -230,6 +288,7 @@ pub(crate) mod check {
     pub(crate) struct Packet<'a> {
         pub proto: &'a str,
         pub dst: IpAddr,
+        pub sport: u16,
         pub dport: u16,
         pub oif: &'a str,
         pub uid: u32,
@@ -253,6 +312,7 @@ pub(crate) mod check {
                 "-o" => value() == p.oif,
                 "-d" => cidr_contains(value(), p.dst),
                 "-p" => value() == p.proto,
+                "--sport" => value().parse::<u16>().ok() == Some(p.sport),
                 "--dport" => value().parse::<u16>().ok() == Some(p.dport),
                 "--uid-owner" => value().parse::<u32>().ok() == Some(p.uid),
                 // A module load; its options are matched above.
@@ -390,10 +450,27 @@ mod tests {
         Packet {
             proto: "tcp",
             dst,
+            sport: 40000,
             dport: 443,
             oif: "eth0",
             uid,
         }
+    }
+
+    /// udp from `sport` to `dst`:`dport`, out a real interface, as any uid.
+    fn udp(sport: u16, dst: IpAddr, dport: u16) -> Packet<'static> {
+        Packet {
+            proto: "udp",
+            dst,
+            sport,
+            dport,
+            oif: "eth0",
+            uid: 1000,
+        }
+    }
+
+    fn v6(addr: &str) -> IpAddr {
+        IpAddr::V6(addr.parse::<Ipv6Addr>().expect("an IPv6 address"))
     }
 
     // ── the root tcp/443 permit (P3-MAC review of #221) ────────────────
@@ -525,6 +602,7 @@ mod tests {
             assert_eq!(verdict(&out, &lo), Some("ACCEPT"));
             let dhcp = Packet {
                 proto: "udp",
+                sport: 68,
                 dport: 67,
                 ..tcp443(IpAddr::V4(Ipv4Addr::BROADCAST), any_uid)
             };
@@ -556,7 +634,9 @@ mod tests {
                 let c = block_all(&shape);
                 let mut want = vec![
                     rule(&["-o", "lo", "-j", "ACCEPT"]),
-                    rule(&["-p", "udp", "--dport", "67", "-j", "ACCEPT"]),
+                    rule(&[
+                        "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT",
+                    ]),
                 ];
                 if let Some(ip) = shape.relay {
                     want.push(rule(&["-d", &ip.to_string(), "-j", "ACCEPT"]));
@@ -612,6 +692,217 @@ mod tests {
                 verdict(&out, &tcp443(cloudflare_v6, shape.euid)),
                 Some("DROP")
             );
+        }
+    }
+
+    // ── MR-2087: the DHCP permits carry DHCP and nothing else ──────────
+
+    /// DHCP gets through the block — a discovery broadcast, a renewal to the
+    /// LAN's server and one to a server off the LAN (an ISP's, behind a
+    /// bridged modem) — and only from the client's port: `--dport 67` alone
+    /// let any process send udp/67 to any host from the real address.
+    #[test]
+    fn the_dhcp_permit_needs_the_client_port() {
+        let lan_server = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let isp_server = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let google = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        for control in CONTROL_SETS {
+            for shape in every_shape(control) {
+                let out = block_all(&shape).out_v4;
+                for to in [IpAddr::V4(Ipv4Addr::BROADCAST), lan_server, isp_server] {
+                    assert_eq!(verdict(&out, &udp(68, to, 67)), Some("ACCEPT"), "{to}");
+                }
+                for sport in [40000, 53, 67, 0] {
+                    assert_eq!(
+                        verdict(&out, &udp(sport, google, 67)),
+                        Some("DROP"),
+                        "udp from {sport} to 8.8.8.8:67"
+                    );
+                }
+                // The client's port to anything but the server's: no.
+                assert_eq!(verdict(&out, &udp(68, google, 53)), Some("DROP"));
+            }
+        }
+    }
+
+    /// DHCPv6 reaches its servers' link-scoped group (Solicit, Request,
+    /// Renew and Rebind all go there) and nothing else: `--dport 547` alone
+    /// let any process send udp/547 to any IPv6 host.
+    #[test]
+    fn the_dhcpv6_permit_reaches_only_the_servers_group() {
+        let servers = v6("ff02::1:2");
+        let global = v6("2001:db8::1");
+        for shape in every_shape(&[DOH]) {
+            let out = block_all(&shape).out_v6;
+            assert_eq!(verdict(&out, &udp(546, servers, 547)), Some("ACCEPT"));
+            assert_eq!(verdict(&out, &udp(546, global, 547)), Some("DROP"));
+            assert_eq!(verdict(&out, &udp(40000, global, 547)), Some("DROP"));
+            assert_eq!(verdict(&out, &udp(40000, servers, 547)), Some("DROP"));
+        }
+    }
+
+    /// What tunnel_linux's BIRDO_IPV6_LEAK_BLOCK holds
+    /// (`install_ipv6_leak_block`; tests.yml's root step reads the real one
+    /// back in `ipv6_leak_block_tests`), its REJECT read as a verdict.
+    fn ipv6_leak_block() -> Vec<Rule> {
+        vec![
+            rule(&["-o", "lo", "-j", "ACCEPT"]),
+            rule(&["-d", "fe80::/10", "-j", "ACCEPT"]),
+            rule(&["-d", "ff02::/16", "-j", "ACCEPT"]),
+            rule(&["-j", "REJECT"]),
+        ]
+    }
+
+    /// MR-2087: the kill switch's IPv6 chain and the leak block are each
+    /// hooked in at the top of OUTPUT, so either can sit first, and an
+    /// ACCEPT in the first is final. Nothing the kill switch accepts on a
+    /// real interface may be something the leak block refuses, or a packet
+    /// gets past the leak block whenever the kill switch's jump is on top.
+    #[test]
+    fn no_ipv6_permit_lets_a_packet_past_the_leak_block() {
+        let leak_block = ipv6_leak_block();
+        let destinations = [
+            "2001:db8::1",
+            "2606:4700:4700::1111",
+            "fe80::1",
+            "ff02::1",
+            "ff02::1:2",
+            "ff05::1:3",
+        ];
+        let flows: [(&str, u16, u16); 6] = [
+            ("udp", 546, 547),
+            ("udp", 40000, 547),
+            ("udp", 68, 67),
+            ("udp", 40000, 53),
+            ("tcp", 40000, 443),
+            ("ipv6-icmp", 0, 0),
+        ];
+        for shape in every_shape(&[DOH]) {
+            let out = block_all(&shape).out_v6;
+            for oif in ["eth0", "wlan0"] {
+                for dst in destinations {
+                    for (proto, sport, dport) in flows {
+                        let p = Packet {
+                            proto,
+                            dst: v6(dst),
+                            sport,
+                            dport,
+                            oif,
+                            uid: 0,
+                        };
+                        if verdict(&out, &p) == Some("ACCEPT") {
+                            assert_eq!(
+                                verdict(&leak_block, &p),
+                                Some("ACCEPT"),
+                                "the kill switch accepts {p:?}, which the leak block refuses"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── MR-2086: IPv6 inside the tunnel ────────────────────────────────
+
+    /// On a dual-stack node tunnel_linux routes IPv6 through birdo0; the
+    /// kill switch dropped it for the whole session. It gets out through the
+    /// tunnel now, both ways, and the same packet on a real interface still
+    /// meets the DROP.
+    #[test]
+    fn tunnelled_ipv6_gets_through_and_only_through_the_tunnel() {
+        let anywhere = v6("2606:4700:4700::1111");
+        for shape in every_shape(&[DOH]) {
+            let c = block_all(&shape);
+            for p in [tcp443(anywhere, 1234), udp(40000, anywhere, 53)] {
+                let tunnelled = Packet { oif: "birdo0", ..p };
+                assert_eq!(verdict(&c.out_v6, &tunnelled), Some("ACCEPT"), "{p:?}");
+                assert_eq!(verdict(&c.out_v6, &p), Some("DROP"), "{p:?}");
+            }
+            assert!(
+                c.in_v6.contains(&rule(&["-i", "birdo0", "-j", "ACCEPT"])),
+                "{:?}",
+                c.in_v6
+            );
+        }
+    }
+
+    /// The other three chains, as exhaustively as the IPv4 OUT chain above:
+    /// each DHCP permit names both ports and the IPv6 ones their link-scoped
+    /// addresses (MR-2087), and IPv6 permits the tunnel both ways (MR-2086).
+    #[test]
+    fn every_in_and_ipv6_rule_is_whitelisted() {
+        for control in CONTROL_SETS {
+            for shape in every_shape(control) {
+                let c = block_all(&shape);
+                let mut in_v4 = vec![
+                    rule(&["-i", "lo", "-j", "ACCEPT"]),
+                    rule(&[
+                        "-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT",
+                    ]),
+                ];
+                if let Some(ip) = shape.relay {
+                    in_v4.push(rule(&["-s", &ip.to_string(), "-j", "ACCEPT"]));
+                }
+                in_v4.push(rule(&["-i", "birdo0", "-j", "ACCEPT"]));
+                if shape.lan_sharing {
+                    for cidr in LAN_RANGES {
+                        in_v4.push(rule(&["-s", cidr, "-j", "ACCEPT"]));
+                    }
+                }
+                in_v4.push(rule(&[
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ]));
+                in_v4.push(rule(&["-j", "DROP"]));
+                assert_eq!(c.in_v4, in_v4);
+
+                let out_v6 = vec![
+                    rule(&["-o", "lo", "-j", "ACCEPT"]),
+                    rule(&[
+                        "-d",
+                        "ff02::1:2",
+                        "-p",
+                        "udp",
+                        "--sport",
+                        "546",
+                        "--dport",
+                        "547",
+                        "-j",
+                        "ACCEPT",
+                    ]),
+                    rule(&["-o", "birdo0", "-j", "ACCEPT"]),
+                    rule(&["-p", "ipv6-icmp", "-d", "fe80::/10", "-j", "ACCEPT"]),
+                    rule(&["-p", "ipv6-icmp", "-d", "ff02::/16", "-j", "ACCEPT"]),
+                    rule(&["-j", "DROP"]),
+                ];
+                assert_eq!(c.out_v6, out_v6);
+
+                let in_v6 = vec![
+                    rule(&["-i", "lo", "-j", "ACCEPT"]),
+                    rule(&[
+                        "-d",
+                        "fe80::/10",
+                        "-p",
+                        "udp",
+                        "--sport",
+                        "547",
+                        "--dport",
+                        "546",
+                        "-j",
+                        "ACCEPT",
+                    ]),
+                    rule(&["-i", "birdo0", "-j", "ACCEPT"]),
+                    rule(&["-p", "ipv6-icmp", "-s", "fe80::/10", "-j", "ACCEPT"]),
+                    rule(&["-p", "ipv6-icmp", "-s", "ff02::/16", "-j", "ACCEPT"]),
+                    rule(&["-j", "DROP"]),
+                ];
+                assert_eq!(c.in_v6, in_v6);
+            }
         }
     }
 
