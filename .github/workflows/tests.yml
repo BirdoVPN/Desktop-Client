@@ -422,7 +422,10 @@ jobs:
       # F-008 macOS: the ONE tolerated route failure, proven rather than
       # asserted in a comment. The owner has no Mac, so this runner is the only
       # place it can run. It installs a route to TEST-NET-1 and removes it.
-      - name: Endpoint-route tolerated-duplicate test (macOS, root)
+      # MR-740: and the endpoint route a killed session left (another
+      # TEST-NET-1 host) is removed by the next start's journal-driven
+      # recovery. Two tests, both required.
+      - name: Endpoint-route tolerated-duplicate + crash-recovery tests (macOS, root)
         if: matrix.os == 'macos'
         working-directory: src-tauri
         run: |
@@ -433,8 +436,8 @@ jobs:
             exit 1
           }
           echo "$out"
-          if ! echo "$out" | grep -qE 'test result: ok\. 1 passed'; then
-            echo "::error::the macOS endpoint-route root test did not run"
+          if ! echo "$out" | grep -qE 'test result: ok\. 2 passed'; then
+            echo "::error::the macOS endpoint-route root tests did not both run"
             exit 1
           fi
 
@@ -481,8 +484,9 @@ jobs:
       # a leaked device. Bug B: a start that fails because another VPN owns
       # 0.0.0.0/1 + 128.0.0.0/1 leaves that VPN's routes alone. MR-2018: a
       # symlinked /etc/resolv.conf is the same symlink after a disconnect and
-      # after the journal-driven crash recovery. The tests refuse to run
-      # outside that namespace.
+      # after the journal-driven crash recovery. MR-740: the endpoint route a
+      # killed session left via the uplink is removed by the next start's
+      # recovery. The tests refuse to run outside that namespace.
       - name: Tunnel teardown tests (Linux, root, private net+mount namespace)
         if: matrix.os == 'linux'
         working-directory: src-tauri
@@ -495,10 +499,10 @@ jobs:
             exit 1
           }
           echo "$out"
-          # Five tests, all required: an --ignored filter that matches nothing
+          # Six tests, all required: an --ignored filter that matches nothing
           # still exits 0.
-          if ! grep -qE 'test result: ok\. 5 passed' <<<"$out"; then
-            echo "::error::netns_teardown_tests did not run all five tests"
+          if ! grep -qE 'test result: ok\. 6 passed' <<<"$out"; then
+            echo "::error::netns_teardown_tests did not run all six tests"
             exit 1
           fi
 

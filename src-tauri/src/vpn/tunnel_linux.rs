@@ -3401,4 +3401,53 @@ mod netns_teardown_tests {
         );
         assert!(net().nothing_of_ours());
     }
+
+    /// MR-740: a session killed with its routes in (SIGKILL, an OOM kill, a
+    /// panic under `panic = "abort"`). birdo0 and the routes through it die
+    /// with the process; the endpoint route via the uplink does not, and it
+    /// used to stay until reboot, pinned to the old gateway. The next start's
+    /// journal-driven recovery must remove it, beside the DNS restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root in a private net+mount namespace: scripts/ci/linux-netns-tests.sh"]
+    async fn a_killed_sessions_endpoint_route_is_removed_at_the_next_start() {
+        assert_isolated();
+        plain_resolv_conf();
+        let before = resolv_conf();
+
+        let (tunnel, key, _relay) = tunnel().await;
+        tunnel
+            .start(key)
+            .await
+            .expect("start() against the namespace's dummy uplink");
+        let connected = net();
+        assert!(
+            connected.relay_routes.contains("uplink0"),
+            "precondition: the endpoint route via the uplink is in: {connected:?}"
+        );
+
+        // What the next launch runs after a SIGKILL. It reads only its
+        // records and the live state; the tunnel still being up is
+        // irrelevant to it.
+        crate::vpn::dns_journal::reconcile();
+        let recovered = net();
+        assert!(
+            !recovered.relay_routes.contains("uplink0"),
+            "the endpoint route a killed session left survived the next start's recovery: \
+             {recovered:?}"
+        );
+        assert_eq!(
+            resolv_conf(),
+            before,
+            "the recovery did not put resolv.conf back"
+        );
+
+        // Cleanup: the disconnect finds its endpoint route already gone, and
+        // the crash record ends empty.
+        tunnel.stop().await.expect("stop()");
+        assert!(net().nothing_of_ours());
+        assert!(
+            !Path::new("/run/birdovpn/routes.json").exists(),
+            "the crash record outlived the routes it describes"
+        );
+    }
 }

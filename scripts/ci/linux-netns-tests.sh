@@ -4,7 +4,9 @@
 # real network stack (MR-764: a dropped or failed start leaves no birdo0; bug B:
 # a failed start leaves another VPN's routes alone; MR-2018: a symlinked
 # /etc/resolv.conf comes back as the same symlink, after a disconnect and after
-# a journal-driven crash recovery).
+# a journal-driven crash recovery; MR-740: that recovery also removes the
+# endpoint route a killed session left via the uplink, whose record it keeps
+# in /run/birdovpn - the namespace's private /run below).
 #
 # Those tests create birdo0, add and delete routes and rewrite
 # /etc/resolv.conf, so they run only in the private namespace built here, and

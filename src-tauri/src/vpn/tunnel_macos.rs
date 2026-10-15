@@ -2080,6 +2080,55 @@ mod endpoint_route_tests {
 
         second.expect("an already-present endpoint route must be tolerated, not fatal");
     }
+
+    /// Does the table hold a host route to `dest` via `gw`?
+    fn host_route_via(dest: &str, gw: &str) -> bool {
+        let Ok(out) = cmd("route").args(["-n", "get", "-host", dest]).output() else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let field = |name: &str| {
+            text.lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.trim() == name)
+                .map(|(_, v)| v.trim().to_string())
+        };
+        out.status.success()
+            && field("destination").as_deref() == Some(dest)
+            && field("gateway").as_deref() == Some(gw)
+    }
+
+    /// MR-740: the endpoint route outlives a killed session (the utun dies
+    /// with the process; this route, via the physical gateway, does not) and
+    /// used to stay until reboot. The next start's journal-driven recovery
+    /// must remove it.
+    ///
+    /// Root-only — it really installs a route to TEST-NET-1, and the recovery
+    /// keeps its record in /var/run/birdovpn.
+    #[test]
+    #[ignore = "mutates host routing; run as root via --ignored (CI does)"]
+    fn a_pinned_route_a_killed_session_left_is_removed_at_the_next_start() {
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(e) => panic!("no default gateway on this runner: {e}"),
+        };
+        const DEST: &str = "192.0.2.124"; // RFC 5737 TEST-NET-1
+
+        let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
+        pin_endpoint_route(DEST, &gw).expect("the add should succeed");
+        let pinned = host_route_via(DEST, &gw);
+
+        // What the next launch runs after a SIGKILL.
+        crate::vpn::dns_journal::reconcile();
+        let left = host_route_via(DEST, &gw);
+
+        let _ = cmd("route").args(["-n", "delete", "-host", DEST]).output();
+        assert!(pinned, "precondition: the pinned route is in");
+        assert!(
+            !left,
+            "the endpoint route a killed session left survived the next start's recovery"
+        );
+    }
 }
 
 /// The utun descriptor is close-on-exec. Run UNPRIVILEGED on the macOS leg of
