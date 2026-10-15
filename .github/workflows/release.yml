@@ -679,7 +679,8 @@ jobs:
       # bundle.createUpdaterArtifacts=true makes `tauri build` write a
       # <setup>.exe.sig next to the NSIS installer, signed with
       # TAURI_SIGNING_PRIVATE_KEY. This is what the in-app updater verifies
-      # against the embedded pubkey.
+      # against the embedded pubkey. Here only that it EXISTS: the release job
+      # verifies every .sig against that pubkey before it publishes (MR-2072).
       - name: Verify Tauri updater signatures (.sig) exist
         if: steps.sign-mode.outputs.enabled == 'true'
         shell: pwsh
@@ -1360,6 +1361,21 @@ jobs:
           [ "$fail" -eq 0 ] || exit 1
           echo "Test gate, Windows, Linux, macOS and the corresponding source OK."
 
+      # For the updater signature gate below (MR-2072): this ref's
+      # scripts/ci, and this ref's tauri.conf.json, whose updater pubkey is
+      # the one the apps were built with. Before the downloads: checkout
+      # cleans the workspace.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          # No npm cache (the workflow header says why); nothing is installed.
+          package-manager-cache: false
+
       - name: Download Windows artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1528,6 +1544,17 @@ jobs:
           check release-files/macos-x64   "macOS x64"    '\.app\.tar\.gz$' '(x86[_-]?64|x64|amd64)'
           [ "$fail" -eq 0 ] || { echo "Updater asset contract violated — refusing to publish"; exit 1; }
 
+      # MR-2072 (AUD-DESK-21): the step above only checks that each .sig
+      # EXISTS. Verify every one against plugins.updater.pubkey in this ref's
+      # tauri.conf.json - the key compiled into the app, so the one the in-app
+      # updater checks with - and refuse to publish on any mismatch: another
+      # key, other bytes, an edited trusted comment, a bundle with no .sig. On
+      # the final bytes, after the rename (a signature covers bytes, not
+      # names). Runs on dispatch too, so a dry run exercises it. Self-test on
+      # every PR, with throwaway keys: tests.yml updater-signature-gate-selftest.
+      - name: Verify every updater .sig against the updater public key in tauri.conf.json
+        run: bash scripts/ci/verify-release-updater-signatures.sh release-files src-tauri/tauri.conf.json
+
       # ── ONE checksums file over the FINAL asset names ─────────────────
       # Generated AFTER the rename so the names in SHA256SUMS.txt are exactly
       # the names users download (the per-platform files this replaces listed
@@ -1535,8 +1562,9 @@ jobs:
       # so `sha256sum -c` could never succeed). Its single Sigstore bundle
       # transitively covers every artifact EXCEPT the updater `.sig` files,
       # which the find below deliberately excludes — those are verified
-      # independently by the updater against its embedded minisign public key,
-      # not via this checksums file (P5-CICD-25). Verify (MR-747: pin the
+      # independently by the updater against its embedded minisign public key
+      # (and by the gate above, before publishing), not via this checksums
+      # file (P5-CICD-25). Verify (MR-747: pin the
       # signer to THIS workflow at THIS tag, or any GitHub Actions identity
       # passes - cosign v3 refuses to verify at all without an identity):
       #   cosign verify-blob --bundle SHA256SUMS.txt.sigstore \
