@@ -32,7 +32,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
-use crate::commands::killswitch::iptables_watchdog::{rules_of, FirstArm, Live, Watched, Xtables};
+use crate::commands::killswitch::iptables_watchdog::{
+    block_may_be_up, rules_of, still_installed, FirstArm, Live, Probe, Watched, Xtables,
+};
 use crate::vpn::iptables_policy;
 
 /// Tracks whether iptables blocking rules are active
@@ -101,13 +103,29 @@ async fn with_chains<T: Send + 'static>(
     crate::utils::locked_blocking(&CHAINS, work).await
 }
 
+/// MR-2000: what the entry points that are NOT the watchdog's return, its
+/// failure logged at error, outside the lock. The locked work logs no
+/// error of its own: the watchdog runs it every 30 s, and reports a failure
+/// that persists once per streak (`iptables_watchdog::Failing`,
+/// `FirstArm`), where an error logged inside it fired on every pass.
+fn logged<T>(what: &str, result: Result<T, String>) -> Result<T, String> {
+    if let Err(e) = &result {
+        tracing::error!("Kill switch: {}: {}", what, e);
+    }
+    result
+}
+
 /// MR-2000: how long one iptables or ip6tables run waits for the xtables
 /// lock while another tool (firewalld, docker, ...) holds it. A bare `-w`
 /// waited for as long as the lock was held, forever behind a wedged holder,
 /// and with [`CHAINS`] held, so every activation, lift and watchdog pass
-/// waited behind it too. A run that gives up fails like any other, and
-/// each caller fails closed on that: a re-arm keeps the previous
-/// generation, and a first arm that failed is retried by the watchdog.
+/// waited behind it too. A run that gives up exits 4. A change fails like
+/// any other on that, and fails closed: a re-arm keeps the previous
+/// generation, and a first arm that failed is retried by the watchdog. A
+/// probe says it could not tell ([`Probe::Unknown`]), never "not there":
+/// a teardown then still tries the removal and does not report a block it
+/// could not see as lifted, and a partial arm counts the OUTPUT jump it
+/// could not see as filtering.
 const XTABLES_WAIT_SECS: &str = "5";
 
 /// `<cmd> -w 5 <args>`: every iptables and ip6tables run of this module.
@@ -195,46 +213,50 @@ fn ip6tables(args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Check if one of our chains exists in the IPv4 table.
-fn chain_exists(name: &str) -> bool {
-    xtables("iptables", &["-L", name, "-n"])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Run a probe: what it says, by how it ended ([`Probe::of`], MR-2000). It
+/// used to be "exited 0, or not there", and with `-w 5` a probe that waited
+/// out the xtables lock read as "not there" too.
+fn probe(cmd: &str, args: &[&str]) -> Probe {
+    Probe::of(
+        xtables(cmd, args)
+            .map(|o| o.status.code())
+            .map_err(|e| e.kind()),
+    )
 }
 
-/// AUDIT-N5: Check if one of our chains exists in the IPv6 table.
-fn chain_exists_v6(name: &str) -> bool {
-    xtables("ip6tables", &["-L", name, "-n"])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Whether one of our chains exists in the IPv4 table.
+fn chain_exists(name: &str) -> Probe {
+    probe("iptables", &["-L", name, "-n"])
+}
+
+/// AUDIT-N5: Whether one of our chains exists in the IPv6 table.
+fn chain_exists_v6(name: &str) -> Probe {
+    probe("ip6tables", &["-L", name, "-n"])
 }
 
 /// Whether a jump from `hook` to `name` is currently installed (IPv4).
-fn jump_present(hook: &str, name: &str) -> bool {
-    xtables("iptables", &["-C", hook, "-j", name])
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+fn jump_present(hook: &str, name: &str) -> Probe {
+    probe("iptables", &["-C", hook, "-j", name])
 }
 
 /// Create (or empty) a chain that is NOT currently hooked. Safe to flush
-/// precisely because nothing jumps to it yet.
+/// precisely because nothing jumps to it yet. A probe that could not tell
+/// (MR-2000) is answered by trying both: `-N` fails on a chain that exists.
 fn reset_chain(name: &str) -> Result<(), String> {
-    if !chain_exists(name) {
-        iptables(&["-N", name])?;
-    } else {
-        iptables(&["-F", name])?;
+    match chain_exists(name) {
+        Probe::Absent => iptables(&["-N", name]),
+        Probe::Present => iptables(&["-F", name]),
+        Probe::Unknown => iptables(&["-N", name]).or_else(|_| iptables(&["-F", name])),
     }
-    Ok(())
 }
 
 /// IPv6 twin of [`reset_chain`].
 fn reset_chain_v6(name: &str) -> Result<(), String> {
-    if !chain_exists_v6(name) {
-        ip6tables(&["-N", name])?;
-    } else {
-        ip6tables(&["-F", name])?;
+    match chain_exists_v6(name) {
+        Probe::Absent => ip6tables(&["-N", name]),
+        Probe::Present => ip6tables(&["-F", name]),
+        Probe::Unknown => ip6tables(&["-N", name]).or_else(|_| ip6tables(&["-F", name])),
     }
-    Ok(())
 }
 
 /// Load `rules` into `chain` (IPv4 or IPv6, by `run`), in order.
@@ -254,15 +276,26 @@ fn load_chain(
         args.extend(rule.iter().map(String::as_str));
         match run(&args) {
             Ok(()) => loaded += 1,
+            // MR-2000: once. A re-arm of chains that already lacked it —
+            // every reconnect, every watchdog pass that re-arms — is not
+            // news (under CHAINS, so the flag is the live generation's).
             Err(e) if iptables_policy::is_self_permit(rule) => {
-                // Loudly, like Windows does — a kill switch the client cannot
-                // escape is a support incident, not a silent degradation.
-                tracing::error!(
-                    "Kill switch: could NOT install a control-plane self-permit ({}). \
-                     Auto-reconnect may not be able to reach the control plane while \
-                     the block is armed.",
-                    e
-                );
+                if SELF_PERMITS_MISSING.load(Ordering::SeqCst) {
+                    tracing::debug!(
+                        "Kill switch: a control-plane self-permit still does not load ({})",
+                        e
+                    );
+                } else {
+                    // Loudly, like Windows does — a kill switch the client
+                    // cannot escape is a support incident, not a silent
+                    // degradation.
+                    tracing::error!(
+                        "Kill switch: could NOT install a control-plane self-permit ({}). \
+                         Auto-reconnect may not be able to reach the control plane while \
+                         the block is armed.",
+                        e
+                    );
+                }
             }
             Err(e) => return Err(e),
         }
@@ -302,21 +335,36 @@ fn build_chains(gen: i8, inputs: &iptables_policy::BlockAll<'_>) -> Result<(bool
     // we sent: the listing canonicalises it (`-m tcp`, `/32`, its own option
     // order). A read that fails leaves nothing to compare, so the watchdog's
     // next pass finds the chain changed and re-arms, which reads it again.
+    // The block is up and whole either way: failing the build on it would
+    // leave a first arm with no block at all, and a re-arm on the previous
+    // generation, which a watchdog re-arm replaces because it is broken.
     let read_back = |v6: bool, chain: &str| -> Vec<String> {
-        Iptables
-            .run(v6, &["-S", chain])
-            .map(|listing| {
-                rules_of(&listing, chain)
-                    .into_iter()
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default()
+        match Iptables.run(v6, &["-S", chain]) {
+            Ok(listing) => rules_of(&listing, chain)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            Err(e) => {
+                // Said here, where it happens: the "restored" the next pass
+                // logs is this read, not another tool's change.
+                tracing::warn!(
+                    "Kill switch: {} could not be read back once loaded ({}); the watchdog's \
+                     next pass re-arms the block to read it again",
+                    chain,
+                    e
+                );
+                Vec::new()
+            }
+        }
     };
     let v4 = (read_back(false, &out), read_back(false, &inn));
     // ip6tables() answers Ok on a host without it, so a load that went
-    // through says nothing there: the chain itself does.
-    let v6 = chain_exists_v6(&out).then(|| (read_back(true, &out), read_back(true, &inn)));
+    // through says nothing there: the chain itself does. One the probe
+    // could not see is read back and checked like any other (MR-2000): the
+    // watchdog does not stop checking IPv6 for a probe that timed out.
+    let v6 = chain_exists_v6(&out)
+        .may_be_there()
+        .then(|| (read_back(true, &out), read_back(true, &inn)));
 
     if inputs.lan_sharing {
         tracing::info!("Kill switch: LAN sharing permitted (RFC1918 + link-local)");
@@ -360,10 +408,12 @@ fn retire_chains(gen: i8) {
 /// chain cannot be deleted while referenced), then the chain itself.
 ///
 /// A jump can only exist if its target chain does, so the existence probe also
-/// tells us whether the unhook attempts are worth spawning at all.
+/// tells us whether the unhook attempts are worth spawning at all. A probe
+/// that could not tell (MR-2000: the xtables lock not had within `-w 5`) is
+/// no proof the chain is gone, so the removal is tried there too.
 fn remove_chain(name: &str) {
-    let v4 = chain_exists(name);
-    let v6 = chain_exists_v6(name);
+    let v4 = chain_exists(name).may_be_there();
+    let v6 = chain_exists_v6(name).may_be_there();
     if !v4 && !v6 {
         return;
     }
@@ -405,12 +455,24 @@ fn remove_all_chains() {
     }
 }
 
-/// Chains that survived a teardown attempt (empty == fully removed).
-fn leftover_chains() -> Vec<String> {
+/// Chains that survived a teardown attempt (empty == fully removed). One a
+/// probe could not see counts while `ours_up`, a block of ours may be up
+/// (MR-2000, `iptables_watchdog::still_installed`).
+fn leftover_chains(ours_up: bool) -> Vec<String> {
     all_chain_names()
         .into_iter()
-        .filter(|n| chain_exists(n) || chain_exists_v6(n))
+        .filter(|n| still_installed([chain_exists(n), chain_exists_v6(n)], ours_up))
         .collect()
+}
+
+/// Whether a block of ours may be up (`iptables_watchdog::block_may_be_up`),
+/// from the flags as they are. Asked with [`CHAINS`] held, so no activation
+/// or lift is half done (MR-1998, MR-1999).
+fn ours_may_be_up() -> bool {
+    block_may_be_up(
+        LIVE_GEN.load(Ordering::SeqCst),
+        IPTABLES_BLOCKING.load(Ordering::SeqCst),
+    )
 }
 
 /// Activate blocking: block all traffic except what `iptables_policy`
@@ -438,9 +500,11 @@ fn activate_locked() -> Result<(), String> {
     // each caller used to read it before it waited for the lock, so a server
     // switch that got the lock first, and re-armed for the new relay, was
     // undone by a re-arm for the old one, which dropped the new relay's
-    // handshake. Every write of the relay is followed by a re-arm under this
-    // lock while a block is up (`session::apply_relay_permit`), so the last
-    // re-arm is always built from the latest relay, as macOS's (P3-3).
+    // handshake. Every write of the relay is followed by a re-arm while a
+    // block of ours may be up, decided under this lock too ([`rearm_if_up`],
+    // from `session::apply_relay_permit`): an arm in flight that read the
+    // previous relay finishes first and is re-armed. So the last re-arm is
+    // always built from the latest relay, as macOS's (P3-3).
     let (control_plane, control_plane_gen) = crate::api::doh_resolver::control_plane();
     let inputs = iptables_policy::BlockAll {
         relay: crate::commands::killswitch::vpn_server_ip(),
@@ -460,8 +524,9 @@ fn activate_locked() -> Result<(), String> {
         // First activation of this process. Anything still installed is debris
         // from a crash or a previous build; clear it before we start, so the
         // staging generation we are about to flush cannot be one that is still
-        // referenced from a built-in chain.
-        let stale = leftover_chains();
+        // referenced from a built-in chain. (Named only when a probe saw it;
+        // the removal also tries the chains a probe could not see.)
+        let stale = leftover_chains(false);
         if !stale.is_empty() {
             tracing::warn!(
                 "Found kill-switch chains from a previous run ({}) — removing before re-arming",
@@ -498,18 +563,14 @@ fn activate_locked() -> Result<(), String> {
         // otherwise the following re-arm would flush the old, still-hooked
         // chains, and an empty hooked chain falls through to the default ACCEPT
         // policy for the whole per-rule rebuild (defect #1 all over again).
-        if live >= 0 {
+        let why = if live >= 0 {
             // The old generation is still fully hooked underneath, every chain
             // DROP-terminated — so unhooking whatever next-gen jumps landed is
             // fail-closed. Retire the staging generation and keep LIVE_GEN on
             // the old one (and PERMITTED_GEN on what the old one covers).
             retire_chains(next);
             IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
-            tracing::error!(
-                "Kill switch: re-arm could not hook the new rule set ({}); \
-                 previous generation left armed",
-                e
-            );
+            format!("re-arm could not hook the new rule set ({e}); previous generation left armed")
         } else {
             // First arm: part of the swap landed and there is no previous
             // generation to fall back on. Do NOT roll back into an unprotected
@@ -517,21 +578,23 @@ fn activate_locked() -> Result<(), String> {
             // hooked fails closed, and the retry path is safe (the next
             // activation builds the OTHER generation). Report the truth:
             // `blocking` reflects whether OUTPUT is actually filtered, not
-            // whether we finished.
-            let blocking = jump_present("OUTPUT", &chain_out(next));
+            // whether we finished. An OUTPUT jump the probe could not see
+            // (MR-2000) counts as filtering: the OFF and the relay re-arm
+            // must not skip a block that may be hooked.
+            let blocking = jump_present("OUTPUT", &chain_out(next)).may_be_there();
             LIVE_GEN.store(next, Ordering::SeqCst);
             // The watchdog finds the jumps that did not land and re-arms.
             set_live(Some(built));
             PERMITTED_GEN.store(covered, Ordering::SeqCst);
             SELF_PERMITS_MISSING.store(!self_permits_loaded, Ordering::SeqCst);
             IPTABLES_BLOCKING.store(blocking, Ordering::SeqCst);
-            tracing::error!(
-                "Kill switch: only part of the rule set could be hooked ({}); blocking={}",
-                e,
-                blocking
-            );
-        }
-        return Err(e);
+            format!("only part of the rule set could be hooked ({e}); blocking={blocking}")
+        };
+        // Logged by the caller (MR-2000), as a failed build is: the watchdog
+        // reports a failure that persists at error once per streak, where an
+        // error logged here fired on every pass that re-armed.
+        tracing::debug!("Kill switch: {}", why);
+        return Err(why);
     }
 
     // New generation is live in every hook — retire the old one.
@@ -569,13 +632,38 @@ pub fn self_permits_missing() -> bool {
 /// (`killswitch::control_plane_learned`, under the one rule for the intent);
 /// this never puts up a block that is not already up.
 pub async fn refresh_control_plane(generation: u64) -> Result<bool, String> {
-    with_chains(move || {
+    let refreshed = with_chains(move || {
         if permits(generation) || LIVE_GEN.load(Ordering::SeqCst) < 0 {
             return Ok(false);
         }
         activate_locked().map(|()| true)
     })
-    .await?
+    .await
+    .and_then(|refreshed| refreshed);
+    logged("the control-plane re-arm failed", refreshed)
+}
+
+/// The relay was just recorded (`killswitch::rearm_for_relay`, from
+/// `session::apply_relay_permit`): re-arm a block of ours around it, if one
+/// may be up, decided under [`CHAINS`] (MR-1998). `Ok(true)`: re-armed;
+/// `Ok(false)`: none of ours is up, and the next activation reads the
+/// relay. Asked lock-free ([`is_blocking`]), a first arm still in flight,
+/// which read the previous relay, said no, and so did a partial first arm,
+/// which reads as not blocking while its generation is live (MR-1999):
+/// either kept the old relay, and dropped the new one's handshake, until
+/// the next reconnect. Under the lock an arm in flight finishes first, and
+/// is re-armed here. Wanted, like every activation.
+pub async fn rearm_if_up() -> Result<bool, String> {
+    let rearmed = with_chains(|| {
+        if !ours_may_be_up() {
+            return Ok(false);
+        }
+        WANTED.store(true, Ordering::SeqCst);
+        activate_locked().map(|()| true)
+    })
+    .await
+    .and_then(|rearmed| rearmed);
+    logged("the re-arm around the new relay failed", rearmed)
 }
 
 /// Deactivate blocking: remove our chains from both filter tables.
@@ -585,14 +673,16 @@ pub async fn refresh_control_plane(generation: u64) -> Result<bool, String> {
 /// the app believes it is not blocking: every later lift is gated on that flag,
 /// so nothing ever retries.
 pub async fn deactivate_blocking() -> Result<(), String> {
-    with_chains(|| {
+    let lifted = with_chains(|| {
         // Every lift request, whether or not it lands: a block still held
         // after a failed one is a lift owed, which the watchdog retries
         // (MR-833).
         WANTED.store(false, Ordering::SeqCst);
         deactivate_locked()
     })
-    .await?
+    .await
+    .and_then(|lifted| lifted);
+    logged("the lift failed", lifted)
 }
 
 /// The kill switch's live OFF (`killswitch::set_killswitch_live`): lift a
@@ -606,37 +696,51 @@ pub async fn deactivate_blocking() -> Result<(), String> {
 /// lift, and the pass then put the block up behind it, held until the pass
 /// after lifted it, 30 s later. Under the lock, whatever pass or activation
 /// is in flight finishes first, and what it put up is lifted here, as
-/// macOS's `pf_lift_if_loaded` does (N2).
+/// macOS's `pf_lift_if_loaded` does (N2). Whether one may be up is
+/// `iptables_watchdog::block_may_be_up`, unit-tested on every OS.
 pub async fn lift_if_held() -> Result<bool, String> {
-    with_chains(|| {
+    let lifted = with_chains(|| {
         // A lift request like any other, whether or not anything is up.
         WANTED.store(false, Ordering::SeqCst);
-        if LIVE_GEN.load(Ordering::SeqCst) < 0 && !IPTABLES_BLOCKING.load(Ordering::SeqCst) {
+        if !ours_may_be_up() {
             return Ok(false);
         }
         deactivate_locked().map(|()| true)
     })
-    .await?
+    .await
+    .and_then(|lifted| lifted);
+    logged("the lift failed", lifted)
 }
 
 /// [`deactivate_blocking`] with [`CHAINS`] held.
 fn deactivate_locked() -> Result<(), String> {
     tracing::info!("Deactivating Linux iptables kill switch");
 
+    // Read before the teardown: whether a probe that cannot tell counts as
+    // a chain still there (MR-2000).
+    let ours_up = ours_may_be_up();
     remove_all_chains();
 
     // `iptables -X` refuses to delete a chain that is still referenced, so an
-    // absent chain proves both its rules and every jump to it are gone.
-    let leftover = leftover_chains();
+    // absent chain proves both its rules and every jump to it are gone. One a
+    // probe could not see (the xtables lock not had within `-w 5`) proves
+    // nothing, and is listed while a block of ours may be up: reported as
+    // lifted, it would clear IPTABLES_BLOCKING over a block still hooked,
+    // and nothing would retry the lift.
+    let leftover = leftover_chains(ours_up);
     if !leftover.is_empty() {
         // Keep the flag TRUE: the kernel is (or may still be) filtering, and the
         // caller must be able to retry rather than assume success.
         IPTABLES_BLOCKING.store(true, Ordering::SeqCst);
         let msg = format!(
-            "Kill switch teardown incomplete — these chains are still installed: {}",
+            "Kill switch teardown incomplete — these chains are still installed, or could not \
+             be checked: {}",
             leftover.join(", ")
         );
-        tracing::error!("{}", msg);
+        // Logged by the caller (MR-2000): the watchdog retries an owed lift
+        // every 30 s and reports one error per streak; logged here, every
+        // retry was an error.
+        tracing::debug!("{}", msg);
         return Err(msg);
     }
 
@@ -744,10 +848,8 @@ mod iptables_chain_tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     /// Whether a jump from `hook` to `name` is installed in the IPv6 table.
-    fn jump_present_v6(hook: &str, name: &str) -> bool {
-        xtables("ip6tables", &["-C", hook, "-j", name])
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    fn jump_present_v6(hook: &str, name: &str) -> Probe {
+        probe("ip6tables", &["-C", hook, "-j", name])
     }
 
     /// `<cmd> -S <chain>`: the kernel's own listing.
@@ -792,23 +894,41 @@ mod iptables_chain_tests {
         let v6 = listing("ip6tables", &out);
         let v4_in = listing("iptables", &inn);
         let v6_in = listing("ip6tables", &inn);
+        // A probe that cannot tell counts as hooked, and as left behind.
         let hooked: Vec<&str> = HOOKS
             .into_iter()
             .filter(|h| {
-                jump_present(h, &out)
-                    || jump_present(h, &inn)
-                    || jump_present_v6(h, &out)
-                    || jump_present_v6(h, &inn)
+                [
+                    jump_present(h, &out),
+                    jump_present(h, &inn),
+                    jump_present_v6(h, &out),
+                    jump_present_v6(h, &inn),
+                ]
+                .into_iter()
+                .any(Probe::may_be_there)
             })
             .collect();
+        let probed = (
+            chain_exists(&out),
+            chain_exists_v6(&inn),
+            jump_present("OUTPUT", &out),
+        );
         retire_chains(gen);
         let left: Vec<&String> = [&out, &inn]
             .into_iter()
-            .filter(|c| chain_exists(c) || chain_exists_v6(c))
+            .filter(|c| still_installed([chain_exists(c), chain_exists_v6(c)], true))
             .collect();
 
         assert!(hooked.is_empty(), "the test hooked {hooked:?}");
         assert!(left.is_empty(), "the test left {left:?} behind");
+        // MR-2000: the kernel's own answers, as Probe::of reads them: a chain
+        // there exits 0, a jump not there and a chain gone exit 1 (never
+        // "could not tell", which a teardown counts as still installed).
+        assert_eq!(probed, (Probe::Present, Probe::Present, Probe::Absent));
+        assert_eq!(
+            (chain_exists(&out), chain_exists_v6(&inn)),
+            (Probe::Absent, Probe::Absent)
+        );
         let (loaded, live) = built.expect("every rule loaded");
         assert!(loaded, "every self-permit loaded");
 

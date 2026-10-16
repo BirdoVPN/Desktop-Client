@@ -317,6 +317,33 @@ pub(crate) async fn move_relay(
     result
 }
 
+/// Linux: the relay was just recorded (`session::apply_relay_permit`), so a
+/// block of ours that may be up is re-armed around it. Whether one is up is
+/// decided under the chains' lock (MR-1998): asked lock-free, a first arm
+/// still in flight, which read the previous relay, or a partial one that
+/// reads as not blocking, said no, and kept the old relay until the next
+/// reconnect. Under the lock that arm finishes first and is re-armed
+/// here. The intent is honoured like every activation's: read before the
+/// load, re-read after it ([`unless_turned_off`]).
+#[cfg(target_os = "linux")]
+pub(crate) async fn rearm_for_relay() -> Result<bool, String> {
+    let engage = async {
+        if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        firewall_linux::rearm_if_up().await
+    };
+    let result = unless_turned_off(
+        engage,
+        deactivate_platform_block,
+        activate_platform_block,
+        platform_is_blocking,
+    )
+    .await;
+    blocking_may_have_changed();
+    result
+}
+
 /// Deactivate the kill switch (restore normal traffic).
 ///
 /// DT-7: Not a Tauri IPC command — called internally by the auto-reconnect
@@ -1145,8 +1172,84 @@ pub(crate) mod iptables_watchdog {
     /// Every tunnel start inserts it at the top of ip6tables' OUTPUT, while
     /// our block is held for the whole session, and it lets nothing
     /// routable out (`iptables_policy` keeps our IPv6 chain from accepting
-    /// anything it refuses, whichever of the two sits first).
-    const MAY_PRECEDE: [&str; 1] = ["-j BIRDO_IPV6_LEAK_BLOCK"];
+    /// anything it refuses, whichever of the two sits first). There alone:
+    /// the same jump in iptables, or in INPUT or FORWARD, is not one
+    /// `tunnel_linux` ever inserted, so it is no exception ([`may_precede`]).
+    const LEAK_BLOCK_JUMP: &str = "-j BIRDO_IPV6_LEAK_BLOCK";
+
+    /// Whether `rule` may sit above our jump in `hook` of the family `v6`
+    /// says: the IPv6 leak block's jump, in ip6tables' OUTPUT only.
+    fn may_precede(v6: bool, hook: &str, rule: &str) -> bool {
+        v6 && hook == "OUTPUT" && rule == LEAK_BLOCK_JUMP
+    }
+
+    /// What an iptables probe (`-L <chain>`, `-C <hook> -j <chain>`) says
+    /// about what it asked for (MR-2000).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Probe {
+        /// It is installed: the probe exited 0.
+        Present,
+        /// It is not: the probe exited 1 (`No chain/target/match by that
+        /// name`, `Bad rule (does a matching rule exist in that chain?)`),
+        /// or the command is not installed (an IPv4-only host's ip6tables,
+        /// AUDIT-N5), so nothing of ours can be in its table.
+        Absent,
+        /// The probe could not tell. Exit 4 is iptables' RESOURCE_PROBLEM:
+        /// the xtables lock not had within `-w 5` ("Another app is
+        /// currently holding the xtables lock. Stopped waiting after 5s."),
+        /// a kernel that said EAGAIN; and iptables run without root, which
+        /// is why a teardown counts it only while a block of ours may be up
+        /// ([`still_installed`]). Or any other exit (2, a parameter problem,
+        /// is also a `-C` jump to a chain that does not exist: we only ask
+        /// that of a chain just built), a run killed by a signal, a spawn
+        /// that failed. With `-w 5`, a probe under lock contention exits 4
+        /// where a bare `-w` waited and then answered, so "not 0" is no
+        /// longer "not there".
+        Unknown,
+    }
+
+    impl Probe {
+        /// From how the probe ended: its exit code (`None` when killed by a
+        /// signal), or why it could not be spawned.
+        pub(crate) fn of(ended: Result<Option<i32>, std::io::ErrorKind>) -> Self {
+            match ended {
+                Ok(Some(0)) => Self::Present,
+                Ok(Some(1)) | Err(std::io::ErrorKind::NotFound) => Self::Absent,
+                _ => Self::Unknown,
+            }
+        }
+
+        /// Whether what was probed may be installed: it is, or the probe
+        /// could not tell. What a teardown removes, and what a partial arm
+        /// reports as filtering, fail closed on.
+        pub(crate) fn may_be_there(self) -> bool {
+            self != Self::Absent
+        }
+    }
+
+    /// Whether a block of ours may be up: a generation of chains is live
+    /// (`live_gen`, `LIVE_GEN`), or a block is held (`blocking`,
+    /// `IPTABLES_BLOCKING`). A first arm that hooked only part of its jumps,
+    /// not OUTPUT's, is live while it reads as not blocking (MR-1999), and
+    /// a lift that failed is held with its generation still named. What
+    /// the OFF lifts, what a new relay re-arms (MR-1998), and when a
+    /// teardown counts a chain its probe could not see as still there
+    /// ([`still_installed`]): decided under the chains' lock, every time.
+    pub(crate) fn block_may_be_up(live_gen: i8, blocking: bool) -> bool {
+        live_gen >= 0 || blocking
+    }
+
+    /// Whether a chain survived a teardown, from its IPv4 and IPv6 probes
+    /// (MR-2000). Present in either: yes. One that could not tell counts
+    /// while a block of ours may be up (`ours_up`, [`block_may_be_up`]): a
+    /// lift that cannot confirm it landed is not reported as landed, or
+    /// IPTABLES_BLOCKING would be cleared over a block still hooked, with
+    /// nothing left to retry it. With none of ours up there is nothing for
+    /// the lift to have left, and a host where every probe fails (iptables
+    /// run without root exits 4 too) would fail every disarm.
+    pub(crate) fn still_installed(probes: [Probe; 2], ours_up: bool) -> bool {
+        probes.contains(&Probe::Present) || (ours_up && probes.contains(&Probe::Unknown))
+    }
 
     /// The rules of `chain` in an `iptables -S <chain>` listing, each as the
     /// text after `-A <chain> `.
@@ -1161,11 +1264,11 @@ pub(crate) mod iptables_watchdog {
 
     /// What the live block lacks, read from iptables itself (`-S`). `None`
     /// while, in each family read back: our jump is in OUTPUT/INPUT/FORWARD
-    /// with nothing above it but [`MAY_PRECEDE`], and each chain holds the
-    /// rules iptables listed for it once it was loaded, in order, its DROP
-    /// last. An empty chain with its jump still in place filters nothing (the
-    /// packet falls through to the built-in chain's ACCEPT policy), so a jump
-    /// alone is not proof. A read that fails counts as missing: the re-arm
+    /// with nothing above it that [`may_precede`] does not allow, and each
+    /// chain holds the rules iptables listed for it once it was loaded, in
+    /// order, its DROP last. An empty chain with its jump still in place
+    /// filters nothing (the packet falls through to the built-in chain's
+    /// ACCEPT policy), so a jump alone is not proof. A read that fails counts as missing: the re-arm
     /// that follows is a generation swap, which never opens a window, so a
     /// false alarm costs a re-load and no more.
     ///
@@ -1199,11 +1302,11 @@ pub(crate) mod iptables_watchdog {
             ] {
                 let jump = format!("-j {chain}");
                 // `None`: no jump (or no listing); `Some(on_top)`: whether
-                // nothing but MAY_PRECEDE sits above it.
+                // nothing but what may_precede sits above it.
                 let placed = x.run(v6, &["-S", hook]).ok().and_then(|listing| {
                     let rules = rules_of(&listing, hook);
                     let at = rules.iter().position(|rule| *rule == jump)?;
-                    Some(rules[..at].iter().all(|rule| MAY_PRECEDE.contains(rule)))
+                    Some(rules[..at].iter().all(|rule| may_precede(v6, hook, rule)))
                 });
                 match placed {
                     None => return Some(format!("{family}: the {hook} jump to {chain}")),
@@ -1387,20 +1490,36 @@ pub(crate) mod iptables_watchdog {
     /// once, by the pass that opens the streak, and not every 30 s. (A first
     /// arm's streak is [`FirstArm`]'s.)
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
-    pub(crate) struct Failing(u32);
+    pub(crate) struct Failing {
+        /// What the streak is of: an owed lift (`true`) or a restore.
+        lift: bool,
+        /// Its passes so far; 0 while there is no streak.
+        passes: u32,
+    }
 
     impl Failing {
-        /// One pass's outcome. The `n`-th pass in a row that failed is `n`
-        /// (1 opens a streak); a pass that did not fail is 0, and ends the
-        /// streak.
+        /// One pass's outcome. The `n`-th pass in a row that failed the same
+        /// way is `n` (1 opens a streak); a pass that did not fail is 0, and
+        /// ends the streak. A failure of the other kind opens a streak of
+        /// its own: a restore that kept failing, then an owed lift that
+        /// fails once the user turned the switch off, is news (reported),
+        /// not more of the same.
         pub(crate) fn record(&mut self, watched: Option<&Watched>) -> u32 {
-            self.0 = match watched {
-                Some(Watched::NotRestored { .. } | Watched::LiftRetried(Err(_))) => {
-                    self.0.saturating_add(1)
+            let lift = match watched {
+                Some(Watched::NotRestored { .. }) => false,
+                Some(Watched::LiftRetried(Err(_))) => true,
+                _ => {
+                    *self = Self::default();
+                    return 0;
                 }
-                _ => 0,
             };
-            self.0
+            let passes = if self.passes > 0 && self.lift == lift {
+                self.passes.saturating_add(1)
+            } else {
+                1
+            };
+            *self = Self { lift, passes };
+            passes
         }
     }
 }
@@ -2692,6 +2811,7 @@ mod tests {
                     "wfp::activate_blocking(",
                     "firewall_linux::activate_blocking(",
                     "firewall_linux::refresh_control_plane(",
+                    "firewall_linux::rearm_if_up(",
                     "update_vpn_server(",
                 ] {
                     if text.contains(call) {
@@ -2708,7 +2828,10 @@ mod tests {
 
     // ── MR-833: the Linux watchdog, against a scripted iptables ─────────
 
-    use iptables_watchdog::{missing, rules_of, watch, Failing, FirstArm, Live, Watched, Xtables};
+    use iptables_watchdog::{
+        block_may_be_up, missing, rules_of, still_installed, watch, Failing, FirstArm, Live, Probe,
+        Watched, Xtables,
+    };
     use std::cell::{Cell, RefCell, RefMut};
     use std::collections::BTreeMap;
 
@@ -3265,7 +3388,10 @@ mod tests {
     /// MR-2000: a restore or an owed lift that keeps failing was logged as an
     /// error every 30 s, for as long as it failed. Only the pass that opens
     /// a streak reports it now (`failed == 1` in the tick); the passes after
-    /// it are counted, and a pass that does not fail ends the streak.
+    /// it are counted, and a pass that does not fail ends the streak. A
+    /// failure of the other kind opens a streak of its own: a restore that
+    /// kept failing, then an owed lift that fails once the user turned the
+    /// switch off, was counted as pass 3 of one streak, reported at debug.
     #[test]
     fn a_failure_that_persists_is_one_streak() {
         let not_restored = Watched::NotRestored {
@@ -3276,7 +3402,13 @@ mod tests {
         let mut failing = Failing::default();
         assert_eq!(failing.record(Some(&not_restored)), 1, "opens the streak");
         assert_eq!(failing.record(Some(&not_restored)), 2);
-        assert_eq!(failing.record(Some(&lift_failed)), 3);
+        assert_eq!(
+            failing.record(Some(&lift_failed)),
+            1,
+            "a lift that fails is news after restores that did"
+        );
+        assert_eq!(failing.record(Some(&lift_failed)), 2);
+        assert_eq!(failing.record(Some(&not_restored)), 1, "and back");
         assert_eq!(failing.record(None), 0, "a whole block ends it");
         assert_eq!(failing.record(Some(&lift_failed)), 1, "a new streak");
         for ended in [
@@ -3433,6 +3565,9 @@ mod tests {
     /// ip6tables' OUTPUT while our block is held for the whole session, and
     /// it lets nothing routable out; flagging it would re-arm the block, and
     /// blame another tool, at every connect. Its name is tunnel_linux.rs's.
+    /// There alone: tunnel_linux inserts it nowhere else, so the same jump
+    /// above our IPv4 OUTPUT jump, or above an INPUT or FORWARD jump, is
+    /// another tool's rule, and noticed.
     #[test]
     fn the_ipv6_leak_block_may_sit_above_our_jump() {
         let (x, live) = armed();
@@ -3441,9 +3576,192 @@ mod tests {
         assert_eq!(missing(&x, &live), None);
         assert_eq!(watch(&x, true, true, Some(&live), no_rearm, no_lift), None);
 
+        for (v6, family, hook, chain) in [
+            (false, "iptables", "OUTPUT", "BIRDO_KS_OUT0"),
+            (false, "iptables", "INPUT", "BIRDO_KS_IN0"),
+            (true, "ip6tables", "INPUT", "BIRDO_KS_IN0"),
+            (true, "ip6tables", "FORWARD", "BIRDO_KS_IN0"),
+        ] {
+            let (x, live) = armed();
+            x.rules(v6, hook)
+                .insert(0, "-j BIRDO_IPV6_LEAK_BLOCK".into());
+            assert_eq!(
+                missing(&x, &live),
+                Some(format!("{family}: a rule above the {hook} jump to {chain}"))
+            );
+        }
+
         let tunnel = include_str!("../vpn/tunnel_linux.rs").replace('\r', "");
         assert!(tunnel.contains("const IPV6_BLOCK_CHAIN: &str = \"BIRDO_IPV6_LEAK_BLOCK\";"));
         assert!(tunnel.contains("ip6t(&[\"-I\", \"OUTPUT\", \"1\", \"-j\", IPV6_BLOCK_CHAIN])"));
+        // ...and inserts it nowhere else.
+        assert_eq!(tunnel.matches("\"-I\", ").count(), 1, "{tunnel}");
+    }
+
+    /// MR-2000: with `-w 5`, a probe (`-L <chain>`, `-C <hook> -j <chain>`)
+    /// that waits out another tool's hold on the xtables lock exits 4. It
+    /// was read as "not there", like the exit 1 of a chain that is gone. A
+    /// lift under that contention then probed none of our chains, unhooked
+    /// nothing, verified nothing left, and reported the block lifted:
+    /// IPTABLES_BLOCKING cleared over a block still hooked, and nothing
+    /// retried. Only iptables' "no such chain or rule" (exit 1), or no
+    /// iptables at all, is absence now; anything else could not tell.
+    #[test]
+    fn a_probe_that_waited_out_the_xtables_lock_is_not_absence() {
+        use std::io::ErrorKind;
+        let exit = |code| Probe::of(Ok(Some(code)));
+        assert_eq!(exit(0), Probe::Present);
+        assert_eq!(exit(1), Probe::Absent, "No chain/target/match by that name");
+        assert_eq!(
+            Probe::of(Err(ErrorKind::NotFound)),
+            Probe::Absent,
+            "an IPv4-only host's ip6tables (AUDIT-N5)"
+        );
+        // "Another app is currently holding the xtables lock. Stopped
+        // waiting after 5s." — RESOURCE_PROBLEM.
+        assert_eq!(exit(4), Probe::Unknown);
+        assert_eq!(exit(2), Probe::Unknown);
+        assert_eq!(Probe::of(Ok(None)), Probe::Unknown, "killed by a signal");
+        assert_eq!(Probe::of(Err(ErrorKind::PermissionDenied)), Probe::Unknown);
+        assert!(Probe::Present.may_be_there() && Probe::Unknown.may_be_there());
+        assert!(!Probe::Absent.may_be_there());
+
+        // The lift under contention: a block is up (generation 0, held),
+        // and every probe of the teardown's check exits 4. Every chain
+        // counts as still installed, so the lift returns Err, the flag
+        // stays set and the watchdog retries the owed lift.
+        let ours_up = block_may_be_up(0, true);
+        assert!(still_installed([exit(4), exit(4)], ours_up));
+        assert!(still_installed([exit(4), exit(1)], ours_up));
+        // A partial first arm (live, read as not blocking) is ours too.
+        assert!(still_installed(
+            [exit(1), exit(4)],
+            block_may_be_up(1, false)
+        ));
+        // Gone in both families: lifted.
+        assert!(!still_installed([exit(1), exit(1)], ours_up));
+        assert!(!still_installed(
+            [exit(1), Probe::of(Err(ErrorKind::NotFound))],
+            ours_up
+        ));
+        // Seen in either family: never lifted, whatever is up.
+        assert!(still_installed([exit(1), exit(0)], false));
+        // With none of ours up (a disarm after the lift landed, a process
+        // that never armed: iptables run without root exits 4 on every
+        // probe), a probe that cannot tell is no leftover of ours.
+        assert!(!still_installed(
+            [exit(4), exit(4)],
+            block_may_be_up(-1, false)
+        ));
+    }
+
+    /// MR-1999: whether a block of ours may be up, as the OFF, the relay
+    /// re-arm and the teardown's check decide it under the chains' lock. A
+    /// first arm that hooked only part of its jumps, not OUTPUT's, is live
+    /// (LIVE_GEN >= 0) while it reads as not blocking: the OFF must lift it.
+    /// A lift that failed keeps the block held with its generation named.
+    #[test]
+    fn a_partial_first_arm_is_a_block_the_off_lifts() {
+        assert!(!block_may_be_up(-1, false), "nothing of ours");
+        assert!(block_may_be_up(0, false), "a partial first arm");
+        assert!(block_may_be_up(1, false), "a partial first arm");
+        assert!(block_may_be_up(0, true), "an armed block");
+        assert!(block_may_be_up(-1, true), "held, no generation named");
+
+        // The Linux OFF, the relay re-arm and the teardown's check ask it,
+        // with the chains' lock held, from the flags as they are.
+        let linux = include_str!("../vpn/firewall_linux.rs").replace('\r', "");
+        let code = non_test(&linux);
+        let flags = fn_body(code, "fn ours_may_be_up(");
+        for read in [
+            "block_may_be_up(",
+            "LIVE_GEN.load(Ordering::SeqCst)",
+            "IPTABLES_BLOCKING.load(Ordering::SeqCst)",
+        ] {
+            assert!(flags.contains(read), "{flags}");
+        }
+        for entry in [
+            "pub async fn lift_if_held(",
+            "pub async fn rearm_if_up(",
+            "fn deactivate_locked(",
+        ] {
+            let body = fn_body(code, entry);
+            assert!(body.contains("ours_may_be_up()"), "{entry}");
+            assert!(
+                !body.contains("LIVE_GEN.load("),
+                "{entry} decides on its own"
+            );
+        }
+    }
+
+    /// MR-2000: what the watchdog's re-arm and lift run with the chains'
+    /// lock held logs no error of its own. The pass returns the failure,
+    /// and the tick reports a failure that persists once per streak
+    /// (`Failing`, `FirstArm`); an error logged inside — "teardown
+    /// incomplete", "re-arm could not hook the new rule set" — fired on
+    /// every pass, every 30 s, for as long as the failure lasted. The
+    /// callers that are not the watchdog log it at error, outside the lock.
+    #[test]
+    fn the_watchdogs_locked_work_logs_no_error_of_its_own() {
+        let linux = include_str!("../vpn/firewall_linux.rs").replace('\r', "");
+        let code = non_test(&linux);
+        let mut seen = Vec::new();
+        for (at, _) in code.match_indices("tracing::error!") {
+            let owner = code[..at].rfind("fn ").unwrap() + 3;
+            let name = &code[owner..owner + code[owner..].find(['(', '<']).unwrap()];
+            let body = fn_body(code, &format!("fn {name}"));
+            let here = at - code.find(&format!("fn {name}")).unwrap();
+            match name {
+                // The non-watchdog entry points' helper.
+                "logged" => {}
+                // Once the pass is over, outside the lock: it could not run.
+                "watchdog" => assert!(body.find(".await").unwrap() < here),
+                // A self-permit that would not load, when it is news: the
+                // live generation had its self-permits. A re-arm of chains
+                // that lacked them already says so at debug.
+                "load_chain" => {
+                    let news = body
+                        .find("if SELF_PERMITS_MISSING.load(Ordering::SeqCst) {")
+                        .expect("decided by what the live generation lacks");
+                    let otherwise = news + body[news..].find("} else {").unwrap();
+                    assert!(otherwise < here, "{body}");
+                }
+                other => panic!("{other} logs at error"),
+            }
+            seen.push(name);
+        }
+        assert_eq!(seen, ["logged", "load_chain", "watchdog"]);
+
+        for (entry, logs) in [
+            (
+                "pub async fn deactivate_blocking(",
+                "logged(\"the lift failed\", lifted)",
+            ),
+            (
+                "pub async fn lift_if_held(",
+                "logged(\"the lift failed\", lifted)",
+            ),
+            (
+                "pub async fn refresh_control_plane(",
+                "logged(\"the control-plane re-arm failed\", refreshed)",
+            ),
+            (
+                "pub async fn rearm_if_up(",
+                "logged(\"the re-arm around the new relay failed\", rearmed)",
+            ),
+        ] {
+            let body = fn_body(code, entry);
+            let lock = body.find("with_chains(").expect(entry);
+            assert!(lock < body.find(logs).expect(entry), "{entry}");
+        }
+        // activate_blocking's one caller logs its failure at error.
+        let source = include_str!("killswitch.rs").replace('\r', "");
+        let activate = fn_body(&source, "async fn activate_platform_block(");
+        let call = activate
+            .find("firewall_linux::activate_blocking()")
+            .unwrap();
+        assert!(activate[call..]
+            .contains("tracing::error!(\"Failed to activate iptables blocking: {}\", e);"));
     }
 
     /// MR-1998 (with AUD-DESK-09's two more sites): the relay a Linux block
@@ -3489,6 +3807,46 @@ mod tests {
         );
         // activate_locked takes no relay, and runs with CHAINS held only.
         assert!(linux.contains("fn activate_locked() -> Result<(), String>"));
+
+        // A relay write re-arms whatever of ours may be up, decided under
+        // the lock too: asked lock-free (`platform_is_blocking()`), a first
+        // arm still in flight, built from the previous relay, said no, and
+        // kept it until the next reconnect.
+        let session = include_str!("session.rs").replace('\r', "");
+        let permit = fn_body(&session, "pub(crate) async fn apply_relay_permit(");
+        let linux_permit = permit
+            .find("#[cfg(target_os = \"linux\")]")
+            .expect("a Linux re-arm");
+        let linux_permit = &permit[linux_permit..];
+        let linux_permit =
+            &linux_permit[..linux_permit.find("#[cfg(target_os = \"macos\")]").unwrap()];
+        assert!(
+            linux_permit.contains("killswitch::rearm_for_relay()"),
+            "{linux_permit}"
+        );
+        assert!(
+            !linux_permit.contains("platform_is_blocking()"),
+            "{linux_permit}"
+        );
+        let relay = fn_body(&source, "pub(crate) async fn rearm_for_relay(");
+        let mut at = 0;
+        for step in [
+            "KILLSWITCH_ENABLED.load(",
+            "firewall_linux::rearm_if_up()",
+            "unless_turned_off(",
+        ] {
+            at += relay[at..].find(step).unwrap_or_else(|| panic!("{step}"));
+        }
+        let rearm = fn_body(linux, "pub async fn rearm_if_up(");
+        let mut at = 0;
+        for step in [
+            "with_chains(",
+            "if !ours_may_be_up() {",
+            "WANTED.store(true",
+            "activate_locked()",
+        ] {
+            at += rearm[at..].find(step).unwrap_or_else(|| panic!("{step}"));
+        }
     }
 
     /// MR-1999: the Linux OFF lifts under the chains' lock, deciding there
@@ -3513,10 +3871,11 @@ mod tests {
         let linux = include_str!("../vpn/firewall_linux.rs").replace('\r', "");
         let lift = fn_body(&linux, "pub async fn lift_if_held(");
         let locked = lift.find("with_chains(").expect("under CHAINS");
+        // `ours_may_be_up`: LIVE_GEN and IPTABLES_BLOCKING, as
+        // `a_partial_first_arm_is_a_block_the_off_lifts` decides them.
         for step in [
             "WANTED.store(false",
-            "LIVE_GEN.load(",
-            "IPTABLES_BLOCKING.load(",
+            "if !ours_may_be_up() {",
             "deactivate_locked()",
         ] {
             let at = lift.find(step).unwrap_or_else(|| panic!("{step}"));
@@ -3557,6 +3916,7 @@ mod tests {
         for entry in [
             "pub async fn activate_blocking(",
             "pub async fn refresh_control_plane(",
+            "pub async fn rearm_if_up(",
             "pub async fn deactivate_blocking(",
             "pub async fn lift_if_held(",
             "pub(crate) async fn watchdog(",
