@@ -1057,15 +1057,15 @@ pub(crate) async fn apply_relay_permit(
         // Through the kill switch, like macOS below (review of #222): it reads
         // the intent before and after the load, and lifts what an OFF no
         // longer wants — a partial load included. iptables reads the relay
-        // from VPN_SERVER_IP, recorded above.
+        // from VPN_SERVER_IP, recorded above, under the chains' lock, where
+        // whether a block is up is decided too (MR-1998): asked lock-free
+        // here, an arm still in flight said no and kept the old relay.
         #[cfg(target_os = "linux")]
         {
             let _ = ip;
-            if killswitch::platform_is_blocking() {
-                killswitch::activate_killswitch()
-                    .await
-                    .map_err(|e| format!("the iptables relay permit was not updated: {e}"))?;
-            }
+            killswitch::rearm_for_relay()
+                .await
+                .map_err(|e| format!("the iptables relay permit was not updated: {e}"))?;
         }
         // macOS twin: pf bakes the relay permit into the loaded ruleset, so an
         // engaged block must be re-loaded with the NEW relay IP (block drop

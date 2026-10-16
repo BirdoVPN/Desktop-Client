@@ -140,6 +140,31 @@ pub fn output_within(
     }
 }
 
+/// Run blocking `work` with `lock` held, on tokio's blocking pool instead of
+/// the async worker that awaits it (MR-2000: the Linux kill switch's
+/// iptables runs, each a process spawn, dozens to an activation).
+///
+/// The guard goes INTO the blocking task. Held across the await instead, it
+/// would be released by a caller cancelled while `work` runs, and the next
+/// holder would start while `work` is still going. `Err` only if the runtime
+/// shut down before `work` ran; a panic in `work` is resumed here.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // the Linux kill switch is its one caller
+pub async fn locked_blocking<T: Send + 'static>(
+    lock: &'static tokio::sync::Mutex<()>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let held = lock.lock().await;
+    let task = tokio::task::spawn_blocking(move || {
+        let _held = held;
+        work()
+    });
+    match task.await {
+        Ok(done) => Ok(done),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => Err(format!("the work did not run: {e}")),
+    }
+}
+
 /// Run `work` on a thread of its own and wait for it at most `limit`; `true`
 /// if it finished. Whatever `work` waits on — a lock a wedged teardown holds,
 /// a log write that does not return — holds that thread, never the caller
@@ -326,6 +351,62 @@ mod bounded_process_tests {
             Duration::from_secs(5),
             || {}
         ));
+    }
+
+    /// MR-2000: locked work runs on the blocking pool, not on the async
+    /// worker that awaits it. On this test's runtime there is ONE worker
+    /// thread, and the work waits for a task that only that worker can run:
+    /// run inline, it would hold the worker and wait out its timeout.
+    #[tokio::test]
+    async fn locked_work_runs_off_the_async_worker() {
+        use std::time::Duration;
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let work = super::locked_blocking(&LOCK, move || {
+            rx.recv_timeout(Duration::from_secs(10)).is_ok()
+        });
+        let signal = async move {
+            tokio::task::yield_now().await;
+            tx.send(()).unwrap();
+        };
+        let (ran, ()) = tokio::join!(work, signal);
+        assert_eq!(ran, Ok(true), "the work held the async worker");
+    }
+
+    /// MR-2000: a caller cancelled while its work runs (its future dropped)
+    /// does not let the next holder of the lock in before the work is done:
+    /// the guard is the blocking task's, not the caller's.
+    #[tokio::test]
+    async fn a_cancelled_caller_holds_the_lock_until_its_work_is_done() {
+        use std::time::Duration;
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let mut caller = Box::pin(super::locked_blocking(&LOCK, move || {
+            started_tx.send(()).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        }));
+        let started = tokio::task::spawn_blocking(move || {
+            started_rx.recv_timeout(Duration::from_secs(10)).is_ok()
+        });
+        tokio::select! {
+            _ = &mut caller => panic!("the work finished before it was told to"),
+            went = started => assert!(went.unwrap(), "the work never started"),
+        }
+        drop(caller);
+        assert!(
+            LOCK.try_lock().is_err(),
+            "a cancelled caller let the next holder in while its work ran"
+        );
+
+        done_tx.send(()).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(10), LOCK.lock()).await;
+        assert!(
+            next.is_ok(),
+            "the lock was not released once the work was done"
+        );
     }
 
     /// WIN3-006 (REVIEW-WIN3-013, which found this a source-order pin): the
