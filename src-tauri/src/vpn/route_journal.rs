@@ -16,10 +16,11 @@
 //! journalled the same routes since W1-041 (`dns_journal`'s `routes`); this is
 //! that record for the two Unix platforms.
 //!
-//! WHERE. Root-only, never the user's home (MR-2050: the DNS journal still
-//! lives in `dirs::data_dir()`, which is the user's own folder when the GUI is
-//! started with a kept HOME, and a record there would let any process of that
-//! user name routes for root to delete). `/run/birdovpn` on Linux and
+//! WHERE. Root-only, never the user's home (MR-2050: a record in
+//! `dirs::data_dir()`, the user's own folder when the GUI is started with a
+//! kept HOME, would let any process of that user name routes for root to
+//! delete; the DNS journal left that folder for `root_state::STATE_DIR` for
+//! the same reason). `/run/birdovpn` on Linux and
 //! `/var/run/birdovpn` on macOS: a directory this process creates 0700, and
 //! refuses unless it is a real directory owned by the effective user (root,
 //! for the elevated client) that nobody else can write. Both sit on storage

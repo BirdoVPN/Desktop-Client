@@ -15,8 +15,9 @@
 #     goes nowhere (start() pins its endpoint route via that gateway), and the
 #     relay's address 10.99.0.7 on lo, where the tests run a WireGuard
 #     responder: start() handshakes before it adds a route or touches DNS;
-#   - a private MOUNT namespace: an overlay over /etc (upper dir on a tmpfs),
-#     and a tmpfs over /run, which also hides the host's D-Bus socket;
+#   - a private MOUNT namespace: overlays over /etc and /var/lib (upper dirs
+#     on a tmpfs; the DNS journal lives in /var/lib/birdovpn, MR-2050), and a
+#     tmpfs over /run, which also hides the host's D-Bus socket;
 #   - systemctl / resolvectl stand-ins first on PATH, so the code takes its
 #     plain-resolv.conf path and can never reconfigure the host's
 #     systemd-resolved (which would act on HOST interface indexes).
@@ -41,11 +42,17 @@ die() {
 scratch=$(mktemp -d)
 mount -t tmpfs birdo-netns "$scratch"
 mkdir -p "$scratch/upper" "$scratch/work" "$scratch/bin" "$scratch/xdg"
+mkdir -p "$scratch/varlib-upper" "$scratch/varlib-work"
 mount -t overlay birdo-etc -o "lowerdir=/etc,upperdir=$scratch/upper,workdir=$scratch/work" /etc
 [ "$(findmnt -n -o FSTYPE --mountpoint /etc | tail -1)" = overlay ] || die "/etc is not the overlay"
 touch /etc/.birdo-netns-probe
 [ -e "$scratch/upper/.birdo-netns-probe" ] || die "/etc writes do not land in the scratch overlay"
 rm -f /etc/.birdo-netns-probe
+mount -t overlay birdo-varlib -o "lowerdir=/var/lib,upperdir=$scratch/varlib-upper,workdir=$scratch/varlib-work" /var/lib
+[ "$(findmnt -n -o FSTYPE --mountpoint /var/lib | tail -1)" = overlay ] || die "/var/lib is not the overlay"
+touch /var/lib/.birdo-netns-probe
+[ -e "$scratch/varlib-upper/.birdo-netns-probe" ] || die "/var/lib writes do not land in the scratch overlay"
+rm -f /var/lib/.birdo-netns-probe
 mount -t tmpfs birdo-run /run
 
 # systemd-resolved is "inactive" here; resolvectl must never reach the host's.
@@ -63,7 +70,8 @@ ip link set uplink0 up
 ip addr add 10.99.0.2/24 dev uplink0
 ip route add default via 10.99.0.1 dev uplink0
 
-# The DNS journal goes to the scratch dir, never root's real data dir.
+# The DNS journal goes to /var/lib/birdovpn, the overlay above; the old
+# per-HOME folder it is taken over from stays in the scratch dir.
 export XDG_DATA_HOME="$scratch/xdg" BIRDO_NETNS_TESTS=1
 
 # --offline: this namespace has no internet. The earlier root steps of the job

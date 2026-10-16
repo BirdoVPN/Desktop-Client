@@ -473,22 +473,16 @@ fn read_key_at(key_path: &Path) -> KeyFile {
 }
 
 /// Write the 0600 HMAC key file that sits beside settings.json.
+///
+/// MR-2089: through [`write_atomically`], as settings.json itself is: a
+/// staging file created new (O_EXCL|O_NOFOLLOW) and 0600 from the start, then
+/// renamed over the key, in a config folder that must be ours alone. It used
+/// to be `fs::write` by path and then a chmod, so root wrote THROUGH a link
+/// planted at the name, and the key was readable by everyone until the chmod.
 #[cfg(not(windows))]
 fn write_key_file(settings_path: &Path, key: &[u8]) -> Result<(), String> {
-    let key_path = legacy_key_path(settings_path);
-    if let Some(parent) = key_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
-    }
-    fs::write(&key_path, hex::encode(key))
-        .map_err(|e| format!("Failed to write HMAC key file: {}", e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Best-effort: the directory is already root-owned, so a failure here
-        // does not widen access beyond what settings.json itself has.
-        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    write_atomically(&legacy_key_path(settings_path), &hex::encode(key))
+        .map_err(|e| format!("Failed to write HMAC key file: {}", e))
 }
 
 /// Mirror the canonical key into both sources (best-effort) so a transient
@@ -1664,6 +1658,56 @@ fn config_dir(path: &Path) -> Result<OwnedDir, String> {
     Ok(OwnedDir::new(root, &[identifier]))
 }
 
+/// What root keeps in the config folder: carried over when
+/// [`make_config_dir_private`] sets a folder aside.
+#[cfg(unix)]
+const CONFIG_FILES: [&str; 3] = [
+    "settings.json",
+    "settings_hmac.key",
+    crate::commands::consent::FILE_NAME,
+];
+
+/// Serialises [`make_config_dir_private`]: two writes setting the same folder
+/// aside at once would set aside the new one too.
+#[cfg(unix)]
+static CONFIG_DIR_CHECK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// MR-2089 (review of #327): make the config folder `dir` ours alone before
+/// root reads or writes in it, at start-up (`file_log::hold_app_dirs`) and
+/// before every write ([`write_atomically`]), rather than refuse it for good.
+///
+/// The first check refused every save, key and consent write in a folder the
+/// app itself had made: one an unprivileged launch from the desktop menu or
+/// Finder made (that user's), before a launch as root that kept HOME; or one
+/// root made under a umask of 002 (0775). Now (`root_state::make_private`): a
+/// folder of ours that our own group can write is made 0700; anything else
+/// that is not ours alone is, for root, set aside as
+/// `uk.birdo.vpn.desktop.untrusted-<time>` and made anew, 0700, with the
+/// settings, their key and the consent record carried over only where root
+/// itself wrote them. What anyone else could have written stays behind, so
+/// those settings start from the secure defaults, as after a quarantine
+/// ([`no_verifying_key`]). New folders are made 0700 (`safe_fs`). A process
+/// that is not root moves nothing, and the error names the folder to delete.
+#[cfg(unix)]
+pub(crate) fn make_config_dir_private(dir: &Path) -> std::io::Result<()> {
+    let _check = CONFIG_DIR_CHECK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match crate::utils::root_state::make_private(dir, &CONFIG_FILES)? {
+        crate::utils::root_state::Made::AsItWas => {}
+        crate::utils::root_state::Made::Tightened => {
+            tracing::warn!("The config folder was writable by its group: made owner-only");
+        }
+        crate::utils::root_state::Made::SetAside(_) => {
+            tracing::warn!(
+                "The config folder was not root's alone: set aside and made anew. Settings \
+                 root did not write itself start from the defaults."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// FIX-2-6: write to a temp file, then rename over `path`, so a crash or a
 /// power cut mid-write never leaves a torn settings file.
 ///
@@ -1674,10 +1718,22 @@ fn config_dir(path: &Path) -> Result<OwnedDir, String> {
 /// checked handle too.
 pub(crate) fn write_atomically(path: &Path, content: &str) -> Result<(), String> {
     let dir = config_dir(path)?;
+    // MR-2089: off Windows root writes here, in a folder under HOME, which is
+    // the user's own whenever the launch kept it (`sudo -E`; `sudo` on
+    // macOS). So only while the folder is ours alone: owned by the effective
+    // user, writable by nobody else, made so first where it can be
+    // ([`make_config_dir_private`]). (On Windows it is the user's %APPDATA% by
+    // design, and the checked handles below are what guard it, MR-1945.)
+    #[cfg(unix)]
+    make_config_dir_private(dir.path())
+        .map_err(|e| format!("Refusing to write in the config folder: {}", e))?;
     // R5: created inside verified, held parents and held from then on (the
     // start-up hold usually got there first); never `create_dir_all` by path.
     dir.ensure_held()
         .map_err(|e| format!("Failed to create config dir: {}", e))?;
+    #[cfg(unix)]
+    crate::utils::root_state::check_private_dir(dir.path())
+        .map_err(|e| format!("Refusing to write in the config folder: {}", e))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -4292,5 +4348,115 @@ mod tests {
             "the key went to Credential Manager"
         );
         assert!(windows.contains("crate::utils::protected_dir::ensure()"));
+    }
+}
+
+/// MR-2089: off Windows the client runs as root, so the key file and
+/// settings.json are never written through a link at their names, are
+/// owner-only from creation, and go only into a config folder nobody else can
+/// write. Unix only; tests.yml runs these unprivileged on Linux and macOS.
+#[cfg(all(test, unix))]
+mod root_write_tests {
+    use super::{legacy_key_path, write_atomically, write_key_file};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    const KEY: [u8; 32] = [7; 32];
+
+    /// `<config dir>/<identifier>/settings.json`, the shape of
+    /// `get_settings_path`.
+    fn settings_in(root: &Path) -> PathBuf {
+        let dir = root.join("uk.birdo.vpn.desktop");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir.join("settings.json")
+    }
+
+    /// The key used to be `fs::write` by path and then chmod 0600: root wrote
+    /// THROUGH a link planted at the name, over any file on the machine.
+    #[test]
+    fn a_link_on_the_key_file_is_not_written_through() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = settings_in(root.path());
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, "not the key's").unwrap();
+        let key = legacy_key_path(&settings);
+        std::os::unix::fs::symlink(&victim, &key).unwrap();
+
+        write_key_file(&settings, &KEY).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not the key's");
+        let meta = std::fs::symlink_metadata(&key).unwrap();
+        assert!(meta.is_file(), "the key is a file of its own, not the link");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), hex::encode(KEY));
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// A config folder everyone can write is one anyone could have planted
+    /// anything in. A process that is not root writes neither the key nor the
+    /// settings there, and the error names the folder to delete. (Root sets
+    /// it aside and starts anew: `root_state`'s `make_private` tests.)
+    #[test]
+    fn a_config_folder_everyone_can_write_is_refused_naming_it() {
+        if is_root() {
+            return; // root sets it aside instead
+        }
+        let root = tempfile::tempdir().unwrap();
+        let settings = settings_in(root.path());
+        let dir = settings.parent().unwrap();
+        let named = dir.display().to_string();
+        for wider in [0o707, 0o777] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(wider)).unwrap();
+            let e = write_key_file(&settings, &KEY).unwrap_err();
+            assert!(e.contains(&named) && e.contains("delete it"), "{e}");
+            let e = write_atomically(&settings, "{}").unwrap_err();
+            assert!(e.contains(&named) && e.contains("delete it"), "{e}");
+            assert!(!legacy_key_path(&settings).exists(), "{wider:o}");
+            assert!(!settings.exists(), "{wider:o}");
+            assert_eq!(mode(dir), wider, "left as it was");
+        }
+
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_key_file(&settings, &KEY).expect("control: an owner-only folder is written");
+        write_atomically(&settings, "{}").expect("control: an owner-only folder is written");
+    }
+
+    /// Review of #327: a config folder of ours that our group can write (root
+    /// under a umask of 002 made it 0775) was refused for good, so no save,
+    /// key or consent record was ever written again. It is made 0700 and
+    /// written.
+    #[test]
+    fn a_config_folder_our_group_can_write_is_made_owner_only_and_written() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = settings_in(root.path());
+        let dir = settings.parent().unwrap();
+        // SAFETY: getegid has no preconditions and cannot fail.
+        std::os::unix::fs::chown(dir, None, Some(unsafe { libc::getegid() })).unwrap();
+        for wider in [0o770, 0o775] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(wider)).unwrap();
+            write_key_file(&settings, &KEY).expect("the key is written");
+            assert_eq!(mode(dir), 0o700, "{wider:o}");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(wider)).unwrap();
+            write_atomically(&settings, "{}").expect("the settings are written");
+            assert_eq!(mode(dir), 0o700, "{wider:o}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(legacy_key_path(&settings)).unwrap(),
+            hex::encode(KEY)
+        );
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{}");
     }
 }

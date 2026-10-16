@@ -581,7 +581,28 @@ mod imp {
         // Root's own home (the client runs as root here): the chain is checked
         // for links after creating it, and a link anywhere is refused.
         if create {
-            std::fs::create_dir_all(dir.path())?;
+            std::fs::create_dir_all(&dir.root)?;
+            // MR-2089 (review of #327): the app's own folders are owner-only
+            // (0700) from creation, never what the umask leaves: under a
+            // umask of 002 root made the config folder 0775, which the
+            // config folder's write check then refused for good. The OS
+            // folders above them (`root`) keep their usual mode: one made
+            // 0700 in a user's HOME would lock that user out of it.
+            let mut at = dir.root.clone();
+            for part in &dir.rel {
+                at.push(part);
+                let mut builder = std::fs::DirBuilder::new();
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                match builder.create(&at) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
         check_dirs(dir)?;
         Ok(DirGuard {
@@ -794,6 +815,30 @@ pub(crate) mod tests {
         assert!(direct.open_rw("birdo.log").is_err());
         assert!(direct.open_append("birdo.log").is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not the app's");
+    }
+
+    /// MR-2089 (review of #327): the app's own folders are made 0700, not
+    /// what the umask leaves (0755 under 022, 0775 under 002), and the OS
+    /// folder above them keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_apps_folders_are_made_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("config");
+        let config = OwnedDir::new(&base, &["uk.birdo.vpn.desktop"]);
+        let logs = OwnedDir::new(&base, &["BirdoVPN", "logs"]);
+        config.ensure_held().unwrap();
+        logs.ensure_held().unwrap();
+        let birdo = base.join("BirdoVPN");
+        for dir in [config.path(), logs.path(), birdo.as_path()] {
+            assert_eq!(mode(dir), 0o700, "{}", dir.display());
+        }
+        // Made as `create_dir_all` makes any folder: the umask's choice.
+        let plain = root.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(mode(&base), mode(&plain), "the OS folder is not the app's");
     }
 
     // ── MR-1945 H1: the create/append/truncate/hold path ──────────────────

@@ -289,10 +289,14 @@ fn ip_in_ranges(ip: u128, ranges: &[(u128, u128)]) -> bool {
 pub mod dns_journal {
     use serde::{Deserialize, Serialize};
 
-    /// On macOS and Linux beside the log file, under the same
-    /// `<data_dir>/BirdoVPN` main.rs's log layer creates — deliberately the
-    /// same launch context as the log, so a client started with `sudo` reads
-    /// back the file that same client wrote.
+    /// On macOS and Linux in the root-only `utils::root_state::STATE_DIR`
+    /// (MR-2050, `/var/lib/birdovpn` / `/var/db/birdovpn`), the twin of the
+    /// Windows directory below. It used to sit beside the log in
+    /// `<data_dir>/BirdoVPN`, which is the USER's folder whenever the launch
+    /// kept HOME (`sudo -E`): any process of theirs could plant a journal there
+    /// and have root point /etc/resolv.conf where it said. A journal an older
+    /// build left there is taken over once, only if root wrote it
+    /// (`adopt_legacy_once`), and never read there again.
     ///
     /// On Windows in the admin-only `%ProgramData%\BirdoVPN` (MR-1721,
     /// `utils::protected_dir`). The record tells the ELEVATED client which
@@ -383,12 +387,43 @@ pub mod dns_journal {
         }
         #[cfg(not(windows))]
         {
-            let mut dir = dirs::data_dir()?;
-            dir.push("BirdoVPN");
-            std::fs::create_dir_all(&dir).ok()?;
-            dir.push(JOURNAL_FILE);
-            Some(dir)
+            // MR-2050: a fixed root-only directory, never one HOME names.
+            let dir = std::path::Path::new(crate::utils::root_state::STATE_DIR);
+            if let Err(e) = crate::utils::root_state::ensure_private_dir(dir) {
+                tracing::warn!("No root-only directory for the DNS journal ({})", e);
+                return None;
+            }
+            let path = dir.join(JOURNAL_FILE);
+            adopt_legacy_once(&path);
+            Some(path)
         }
+    }
+
+    /// MR-2050: take over the journal an older build left in
+    /// `<data_dir>/BirdoVPN`, at most once per process (a flag, as
+    /// `migrate_legacy_once`, because the panic hook reaches this too). Only
+    /// one root wrote is moved (`root_state::adopt_legacy`); one in a folder the
+    /// user owns or can write is left there, unread.
+    #[cfg(not(windows))]
+    fn adopt_legacy_once(path: &std::path::Path) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static TRIED: AtomicBool = AtomicBool::new(false);
+        if TRIED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(base) = dirs::data_dir() else {
+            return;
+        };
+        crate::utils::root_state::adopt_legacy(
+            &base.join("BirdoVPN"),
+            JOURNAL_FILE,
+            path,
+            |bytes| {
+                serde_json::from_slice::<DnsJournal>(bytes)
+                    .is_ok_and(|journal| journal.os == std::env::consts::OS)
+            },
+            write_bytes_atomically,
+        );
     }
 
     /// [`migrate_legacy`] for this account, at most once per process. A flag
@@ -617,14 +652,19 @@ pub mod dns_journal {
         // mode on multi-user Unix hosts. On Windows it inherits the admin-only
         // directory's ACL (MR-1721): SYSTEM and Administrators alone.
         // The staging file holds those same bytes, so it takes the same mode.
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
+        //
+        // MR-2089: off Windows root writes it, so it is created NEW
+        // (O_EXCL|O_NOFOLLOW) with that mode from the start. It used to be
+        // opened with O_TRUNC, which wrote THROUGH a link planted at the name
+        // and kept the mode of a file already there.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(staging)?;
+        let mut f = crate::utils::root_state::create_new_private(staging)?;
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(staging)?;
         f.write_all(bytes)?;
         f.sync_all()
     }
@@ -677,9 +717,9 @@ pub mod dns_journal {
     fn write(journal: &DnsJournal) -> Result<(), String> {
         let Some(path) = path() else {
             tracing::warn!(
-                "No data directory — DNS could not be made restorable after an abnormal exit"
+                "No journal directory — DNS could not be made restorable after an abnormal exit"
             );
-            return Err("no data directory".to_string());
+            return Err("no journal directory".to_string());
         };
         let json = match serde_json::to_vec_pretty(journal) {
             Ok(json) => json,
@@ -710,7 +750,7 @@ pub mod dns_journal {
     }
 
     fn read_at(path: &std::path::Path) -> Option<DnsJournal> {
-        let bytes = std::fs::read(path).ok()?;
+        let bytes = read_bytes(path)?;
         match serde_json::from_slice::<DnsJournal>(&bytes) {
             Ok(journal) if journal.os == std::env::consts::OS => Some(journal),
             Ok(journal) => {
@@ -748,6 +788,33 @@ pub mod dns_journal {
                 None
             }
         }
+    }
+
+    /// The record's bytes, `None` when there is none.
+    ///
+    /// MR-2089: off Windows root acts on what it reads here, so the file is
+    /// opened without following a link and must be a regular file that only
+    /// we can write (`root_state::open_private`); anything else is refused and
+    /// left alone. A journal is a few kilobytes; a larger file is not one.
+    #[cfg(unix)]
+    fn read_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let read = crate::utils::root_state::open_private(path)
+            .and_then(|file| file.take(1 << 20).read_to_end(&mut bytes));
+        match read {
+            Ok(_) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::warn!("DNS journal not read: {}", e);
+                None
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn read_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+        std::fs::read(path).ok()
     }
 
     /// What one platform's restore pass actually achieved.
@@ -2348,6 +2415,98 @@ pub mod dns_journal {
             assert!(read_at(&path).is_none());
             assert!(path.exists());
             assert!(!preserved_path(&path).exists());
+        }
+    }
+
+    /// MR-2089: off Windows the whole client runs as root, so the journal is
+    /// written and read without ever following a link at its name, and is
+    /// owner-only from the moment it exists. Unix only (on Windows it sits in
+    /// the admin-only directory, MR-1721); tests.yml runs these unprivileged
+    /// on Linux and macOS.
+    #[cfg(all(test, unix))]
+    mod root_write_tests {
+        use super::{read_at, staging_path, write_bytes_atomically};
+        use std::os::unix::fs::PermissionsExt;
+
+        /// The smallest record this host reads back: every other field
+        /// defaults.
+        fn record() -> Vec<u8> {
+            format!("{{\"os\":\"{}\"}}", std::env::consts::OS).into_bytes()
+        }
+
+        fn mode(path: &std::path::Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        /// A link planted on the staging name used to be opened with
+        /// O_CREAT|O_TRUNC and written THROUGH: root truncated and overwrote
+        /// whatever file it named.
+        #[test]
+        fn a_link_on_the_staging_name_is_not_written_through() {
+            let dir = tempfile::tempdir().unwrap();
+            let victim = dir.path().join("victim");
+            std::fs::write(&victim, b"not the journal's").unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::os::unix::fs::symlink(&victim, staging_path(&path)).unwrap();
+
+            write_bytes_atomically(&path, &record()).unwrap();
+
+            assert_eq!(std::fs::read(&victim).unwrap(), b"not the journal's");
+            assert!(
+                std::fs::symlink_metadata(&path).unwrap().is_file(),
+                "the journal is a file of its own, not the link"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), record());
+            assert_eq!(mode(&path), 0o600);
+        }
+
+        /// A staging file a crash left behind kept its own mode under O_TRUNC,
+        /// and the rename then made that mode the journal's.
+        #[test]
+        fn the_journal_is_owner_only_from_creation() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::fs::write(staging_path(&path), b"left by a crash").unwrap();
+            std::fs::set_permissions(staging_path(&path), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+
+            write_bytes_atomically(&path, &record()).unwrap();
+
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(std::fs::read(&path).unwrap(), record());
+        }
+
+        /// The journal tells root what to put back into /etc/resolv.conf or
+        /// the network services, so a link at its name is never followed...
+        #[test]
+        fn a_linked_journal_is_not_read() {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = dir.path().join("elsewhere.json");
+            std::fs::write(&elsewhere, record()).unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+            assert!(read_at(&path).is_none());
+            assert_eq!(std::fs::read(&elsewhere).unwrap(), record());
+        }
+
+        /// ...and a journal someone else could have written is not read.
+        #[test]
+        fn a_journal_others_can_write_is_not_read() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("dns-restore.json");
+            std::fs::write(&path, record()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                read_at(&path).is_some(),
+                "control: an owner-only journal is read"
+            );
+
+            for wider in [0o620, 0o602, 0o666] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(wider)).unwrap();
+                assert!(read_at(&path).is_none(), "{wider:o}");
+                assert!(path.exists(), "{wider:o}: refused, not set aside");
+            }
         }
     }
 }
