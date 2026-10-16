@@ -137,6 +137,22 @@ export function resolveAnonymousAccount(account: {
   return { isAnon, accountNumber: isAnon ? account.accountNumber : null };
 }
 
+/**
+ * The email an identity line may show: `null` for an address on the
+ * `anonymous.local` domain, the synthetic address an anonymous account
+ * carries (`anon_<number>@anonymous.local` in phase 1 of item 86, which holds
+ * the account's only credential). MR-2014: which account is anonymous is
+ * still decided by `/auth/me` alone (`resolveAnonymousAccount`, MR-918); this
+ * only keeps such an address off the screen while that answer is not in yet
+ * (an email-form sign-in with the synthetic address puts it in `userEmail`
+ * before `/auth/me` answers), or from a server that does not say.
+ */
+export function displayableEmail(email: string | null | undefined): string | null {
+  const trimmed = email?.trim();
+  if (!trimmed) return null;
+  return /@anonymous\.local$/i.test(trimmed) ? null : trimmed;
+}
+
 /** "123456789012…" → "1234 5678 9012 …": six groups of four, space-separated (canonical). */
 export function formatAccountNumber(digits: string): string {
   return digits.replace(/\D/g, '').replace(/(\d{4})(?=\d)/g, '$1 ');

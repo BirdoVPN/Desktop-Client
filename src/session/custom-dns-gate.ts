@@ -17,6 +17,11 @@
  * file only. The live session took the revert, and rebuilding it again for
  * the same change would loop for as long as the rebuild keeps failing: the
  * next connect applies it.
+ *
+ * MR-2016, accepted as it is: until that next connect, the live session keeps
+ * the Custom DNS servers the plan no longer offers. No plan can stop offering
+ * them today (D6: the server sends `true` for every plan), and a rebuild loop
+ * on a failing relay is the worse failure of the two.
  */
 import { useEffect, useRef, useState } from 'react';
 import { customDnsAvailable } from '@/lib/plan';

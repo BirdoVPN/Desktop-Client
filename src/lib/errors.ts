@@ -51,11 +51,15 @@ export const CLIENT_ATTESTATION_COPY =
   "BirdoVPN couldn't verify this copy of the app. Install the latest version from birdo.app, " +
   'then try again.';
 /**
- * Quick Connect (the tray's, which needs no window) while the consent text the
- * user accepted is older than this build's (MR-1607). The window comes up on
- * the consent screen with it.
+ * Quick Connect refused because Rust's record of the consent is older than
+ * this build's text (MR-1607). The tray's brings the window up on the consent
+ * screen. The window's own Quick Connect can only meet it with the consent
+ * screen already accepted, when Rust's record failed to save (MR-2016): there
+ * is nothing left to review then, and "Review and accept the privacy terms"
+ * sent the user looking for a screen that was not there. The record is saved
+ * again at once (`onConsentRequired`), which says to try again.
  */
-export const CONSENT_REQUIRED_COPY = 'Review and accept the privacy terms to connect.';
+export const CONSENT_REQUIRED_COPY = "Your privacy consent wasn't saved, so BirdoVPN didn't connect.";
 export const SETTINGS_UNVERIFIED_COPY =
   "Your saved settings couldn't be verified right now, so this change wasn't saved. " +
   'Try again in a moment, or reset your settings to their defaults.';

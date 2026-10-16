@@ -65,6 +65,7 @@ beforeEach(() => {
     settings: { ...defaultSettings },
     account: { ...useAppStore.getState().account, plan: 'OPERATIVE' },
     customDnsByPlan: {},
+    planGates: {},
   });
   mockedInvoke.mockReset();
   mockedInvoke.mockImplementation(async (cmd: string) => {
@@ -216,6 +217,28 @@ describe('Custom DNS follows the server flag for the plan (client-config feature
     expect(toggle).toHaveAttribute('aria-checked', 'true');
     expect(toggle).not.toHaveAttribute('aria-disabled', 'true');
     expect(screen.getByRole('textbox', { name: 'Primary DNS' })).toBeInTheDocument();
+  });
+});
+
+/**
+ * MR-1517: Stealth Mode follows the server's plan-gating table. On main the
+ * row was hard-coded to Operative and up.
+ */
+describe("Stealth Mode follows the server's plan-gating table", () => {
+  it('the built-in table without one: open to an Operative user', () => {
+    render(<VpnSettings />);
+    expect(screen.getByRole('switch', { name: /Stealth Mode/ })).toBeEnabled();
+  });
+
+  it('a server that keeps it for Sovereign locks it for an Operative user, naming Sovereign', async () => {
+    useAppStore.setState({
+      planGates: { OPERATIVE: { stealthMode: false }, SOVEREIGN: { stealthMode: true } },
+      settings: { ...defaultSettings, stealthMode: true },
+    });
+    render(<VpnSettings />);
+    expect(screen.queryByRole('switch', { name: /Stealth Mode/, checked: true })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Stealth Mode.*Sovereign/ }));
+    expect(useAppStore.getState().navStack).toEqual(['pricing']);
   });
 });
 

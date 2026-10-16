@@ -48,6 +48,55 @@ export function customDnsAvailable(
   return id === null || byPlan[id] !== false;
 }
 
+/** The features a plan gates (MR-1517), as `features.<PLAN>` names them. */
+export type GatedFeature = 'stealthMode' | 'multiHop' | 'portForwarding';
+
+/** One plan's gating flags from `GET /api/client-config` → `features.<PLAN>`. */
+export type PlanGates = Partial<Record<GatedFeature, boolean>>;
+
+/**
+ * MR-1517: the plan-gating table the owner decided on 2026-10-07 (Stealth from
+ * OPERATIVE; Multi-Hop and Port Forwarding on SOVEREIGN), the lowest plan with
+ * each feature. The SERVER's table (`features.<PLAN>`, birdo-web
+ * app/api/client-config/route.ts, the same rules its `planAllows` enforces)
+ * wins wherever it gave a flag; this is what a plan or feature it said nothing
+ * about falls back to (an older deploy, no network, a failed fetch).
+ */
+export const FEATURE_MIN_PLAN: Readonly<Record<GatedFeature, PlanId>> = {
+  stealthMode: 'OPERATIVE',
+  multiHop: 'SOVEREIGN',
+  portForwarding: 'SOVEREIGN',
+};
+
+const PLAN_IDS: readonly PlanId[] = ['RECON', 'OPERATIVE', 'SOVEREIGN'];
+
+/**
+ * Whether `plan` has `feature` (MR-1517): the server's flag for that plan when
+ * it sent one, else `FEATURE_MIN_PLAN`. `null` while the plan is not known yet
+ * (no lock, no upsell: W2-011). An unknown plan slug reads no server flag (one
+ * plan's flag is never read for another) and ranks as the free tier.
+ */
+export function planHasFeature(
+  plan: string | null | undefined,
+  gates: Partial<Record<PlanId, PlanGates>> | undefined,
+  feature: GatedFeature,
+): boolean | null {
+  const rank = planRank(plan);
+  if (plan == null || rank === null) return null;
+  const id = knownPlanId(plan);
+  const said = id === null ? undefined : gates?.[id]?.[feature];
+  if (typeof said === 'boolean') return said;
+  return rank >= PLAN_RANK[FEATURE_MIN_PLAN[feature]];
+}
+
+/** The lowest plan that has `feature`, by `planHasFeature`; `null` if none does. */
+export function lowestPlanWith(
+  feature: GatedFeature,
+  gates: Partial<Record<PlanId, PlanGates>> | undefined,
+): PlanId | null {
+  return PLAN_IDS.find((id) => planHasFeature(id, gates, feature) === true) ?? null;
+}
+
 /**
  * One plan's prices and data cap, as `GET /api/client-config` → `plans.<PLAN>`
  * serves them (birdo-web #708) and the Rust side validates them.

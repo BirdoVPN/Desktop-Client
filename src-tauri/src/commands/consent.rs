@@ -23,11 +23,19 @@
 //! block if the record were lost mid-session.
 //!
 //! The UI writes the record through [`record_consent`]: when the user accepts,
-//! and at every start while the webview holds the current version. That
-//! second write is the migration: an install that accepted version 2 in an
-//! earlier build has no record yet, and gets one from what the webview
-//! already holds, at the first start — no second consent screen. The record
-//! only ever goes up, and never past this build's version.
+//! and at every start, with the version the webview holds. That start-up
+//! write is the migration: an install that accepted version 2 in an earlier
+//! build has no record yet, and gets one from what the webview already holds,
+//! at the first start — no second consent screen. The record never goes past
+//! this build's version.
+//!
+//! MR-2016: and it follows the webview DOWN as well. It used to only rise, so
+//! a webview that lost its storage (cleared site data, a reset profile) showed
+//! the consent screen while this record still said "accepted" and the tray
+//! dialled. The webview's version is what the screen asks about, so the
+//! record is now set to it ([`held`]): the start-up write of a webview with
+//! no consent lowers it, and the tray waits for the consent screen like the
+//! window does.
 //!
 //! WHY A FILE OF ITS OWN and not a field of the signed settings: a field the
 //! UI never sends would be reset by every whole-object `save_settings`; a
@@ -84,15 +92,20 @@ pub(crate) fn refusal(accepted: u32) -> Option<IpcError> {
     (!has_current_consent(accepted)).then(|| {
         IpcError::new(
             IpcErrorCode::ConsentRequired,
-            "Open BirdoVPN and review the privacy terms before connecting.",
+            // MR-2016: true whichever way it fell behind. The screen asks for
+            // the terms when they were never accepted (or the webview lost
+            // them); when only this record's write failed, there is nothing
+            // to review, and "review the privacy terms" sent the user looking.
+            "Your privacy consent is not saved in BirdoVPN, so it did not connect.",
         )
     })
 }
 
-/// What a record raised by `asked` holds: never lower than `stored`, never
-/// higher than this build's version.
-fn raised(stored: u32, asked: u32) -> u32 {
-    stored.max(asked.min(CONSENT_VERSION))
+/// What the record holds once the webview says it holds `asked`: exactly
+/// that, never higher than this build's version (MR-2016: lower too, see the
+/// module doc).
+fn held(asked: u32) -> u32 {
+    asked.min(CONSENT_VERSION)
 }
 
 fn record_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -116,14 +129,14 @@ fn read_at(path: &Path) -> u32 {
         .map_or(0, |r| r.accepted_version)
 }
 
-/// Raise the record at `path` to `asked` ([`raised`]) and answer what it
-/// holds. Writes only when that changes it.
-fn raise_at(path: &Path, asked: u32) -> Result<u32, String> {
+/// Set the record at `path` to `asked` ([`held`]) and answer what it holds.
+/// Writes only when that changes it.
+fn record_at(path: &Path, asked: u32) -> Result<u32, String> {
     let _write = RECORD_WRITE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let stored = read_at(path);
-    let accepted = raised(stored, asked);
+    let accepted = held(asked);
     if accepted != stored {
         let json = serde_json::to_string(&Record {
             accepted_version: accepted,
@@ -134,14 +147,14 @@ fn raise_at(path: &Path, asked: u32) -> Result<u32, String> {
     Ok(accepted)
 }
 
-/// Record that the user accepted consent text `version` (the consent screen,
-/// and the start-up migration from what the webview holds). Answers the
-/// version now on record.
+/// Record the consent text `version` the webview holds (the consent screen's
+/// accept, and every start: the migration, and MR-2016's lowering). Answers
+/// the version now on record.
 #[tauri::command]
 pub async fn record_consent(app: AppHandle, version: u32) -> Result<u32, IpcError> {
     tokio::task::spawn_blocking(move || {
         let path = record_path(&app).map_err(IpcError::unknown)?;
-        raise_at(&path, version).map_err(IpcError::unknown)
+        record_at(&path, version).map_err(IpcError::unknown)
     })
     .await
     .map_err(|e| IpcError::unknown(format!("Consent task failed: {e}")))?
@@ -203,21 +216,19 @@ mod tests {
         assert!(refusal(CONSENT_VERSION + 1).is_none());
     }
 
-    /// The record goes up, never down, never past this build's text; a
-    /// missing, foreign or oversized file is no record.
+    /// The record holds what the webview holds, never past this build's
+    /// text; a missing, foreign or oversized file is no record.
     #[test]
-    fn the_record_only_rises_to_this_builds_text() {
+    fn the_record_follows_the_webview_up_to_this_builds_text() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.birdo.test").join(FILE_NAME);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
         assert_eq!(read_at(&path), 0, "no record");
-        assert_eq!(raise_at(&path, 1).unwrap(), 1);
-        assert_eq!(raise_at(&path, 0).unwrap(), 1, "lowered");
-        assert_eq!(raise_at(&path, CONSENT_VERSION).unwrap(), CONSENT_VERSION);
-        assert_eq!(raise_at(&path, 1).unwrap(), CONSENT_VERSION, "lowered");
+        assert_eq!(record_at(&path, 1).unwrap(), 1);
+        assert_eq!(record_at(&path, CONSENT_VERSION).unwrap(), CONSENT_VERSION);
         assert_eq!(
-            raise_at(&path, 999).unwrap(),
+            record_at(&path, 999).unwrap(),
             CONSENT_VERSION,
             "a future text this build never showed"
         );
@@ -228,8 +239,45 @@ mod tests {
         std::fs::write(&path, " ".repeat(MAX_RECORD_BYTES as usize + 1)).unwrap();
         assert_eq!(read_at(&path), 0);
         // A record that is not ours is replaced, not trusted.
-        assert_eq!(raise_at(&path, CONSENT_VERSION).unwrap(), CONSENT_VERSION);
+        assert_eq!(record_at(&path, CONSENT_VERSION).unwrap(), CONSENT_VERSION);
         assert_eq!(read_at(&path), CONSENT_VERSION);
+    }
+
+    /// MR-2016: a webview that lost its consent (its storage was cleared)
+    /// shows the consent screen, and its start-up write takes the record down
+    /// with it, so the tray's Quick Connect is refused until the user accepts
+    /// again. On main the record only rose: the tray dialled while the screen
+    /// asked for consent.
+    #[test]
+    fn a_webview_that_lost_its_consent_takes_the_record_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.birdo.test").join(FILE_NAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert_eq!(record_at(&path, CONSENT_VERSION).unwrap(), CONSENT_VERSION);
+        assert!(refusal(read_at(&path)).is_none());
+
+        assert_eq!(record_at(&path, 0).unwrap(), 0, "the webview holds none");
+        assert_eq!(read_at(&path), 0);
+        assert!(
+            refusal(read_at(&path)).is_some(),
+            "the tray waits for consent"
+        );
+
+        assert_eq!(record_at(&path, CONSENT_VERSION).unwrap(), CONSENT_VERSION);
+        assert!(refusal(read_at(&path)).is_none(), "accepted again");
+    }
+
+    /// MR-2016: the refusal does not send the user to "review the privacy
+    /// terms": when only the record's write failed there is nothing to review.
+    #[test]
+    fn the_refusal_says_the_consent_is_not_saved() {
+        let error = refusal(0).expect("refused");
+        assert!(error.message.contains("not saved"), "{}", error.message);
+        assert!(
+            !error.message.to_lowercase().contains("review"),
+            "{}",
+            error.message
+        );
     }
 
     /// The tray's Quick Connect asks the record first — before elevation is

@@ -12,6 +12,19 @@
  * list to pass the `opener:allow-open-url` scope, so a new or changed link
  * fails one side or the other until the scope and the list agree.
  *
+ * MR-2015: and no call site is missed. `DRIVEN_CALL_SITES` counts, per file,
+ * the opener calls the tests here drive; the last test counts them in the
+ * source (every file under src/ but the tests), so a new call, or a new file
+ * that imports the opener, fails until a test here drives it.
+ *
+ * The scope (birdo.app, auth. and dashboard.; MR-2015, documented rather than
+ * widened): the one URL here that comes from the server is the 426's
+ * `updateUrl`, and birdo-web sends exactly https://birdo.app/clients on every
+ * path that answers 426 (backend/src/vpn/vpn.controller.ts). One on any other
+ * host is refused by the scope, and the update wall says where to go instead
+ * (the fallback notice tested below). A server that starts sending another
+ * host widens the scope in the same release, here and in default.json.
+ *
  * Run: npx vitest run src/__tests__/OpenerLinks.test.tsx
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -19,8 +32,8 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readdirSync, readFileSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
 import { ConsentScreen } from '@/components/ConsentScreen';
 import { Login } from '@/components/Login';
 import { Settings } from '@/components/Settings';
@@ -116,6 +129,20 @@ describe('every external link goes through openUrl with its URL', () => {
     expect(openedUrls()).toEqual(['https://birdo.app/clients']);
   });
 
+  it('Update wall: an updateUrl on a host outside the scope falls back to the same notice', async () => {
+    // The opener plugin refuses it (the capability scope); the mock stands in.
+    mockedOpenUrl.mockRejectedValueOnce(new Error('Not allowed to open url https://downloads.birdo.app/x'));
+    render(<UpdateRequired info={{ downloadUrl: 'https://downloads.birdo.app/x' }} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Download manually' }));
+    await waitFor(() =>
+      expect(useAppStore.getState().notice?.text).toBe(
+        "Couldn't open your browser. Visit birdo.app to download the latest version.",
+      ),
+    );
+    // Not one of the links the app has: kept out of `observed`.
+    mockedOpenUrl.mockReset();
+  });
+
   it("Update wall: a refused open falls back to a notice naming birdo.app", async () => {
     mockedOpenUrl.mockRejectedValueOnce(new Error('Not allowed to open url'));
     render(<UpdateRequired info={{ downloadUrl: 'https://birdo.app/clients' }} />);
@@ -152,5 +179,68 @@ describe('every external link goes through openUrl with its URL', () => {
   // checks. Running this test alone, it fails - nothing has been observed.
   it('the URLs observed above are exactly fixtures/opener-urls.json `opened`', () => {
     expect([...observed].sort()).toEqual([...fixture.opened].sort());
+  });
+});
+
+/**
+ * MR-2015: the opener calls the tests above drive, per file (paths under
+ * src/). A call site the tests do not drive is a link no test proves the
+ * scope lets through.
+ */
+const DRIVEN_CALL_SITES: Record<string, number> = {
+  'components/ConsentScreen.tsx': 2, // Terms, Privacy
+  'components/Login.tsx': 1, // Forgot password
+  'components/Settings.tsx': 3, // Privacy, Terms, Manage on web
+  'components/UpdateRequired.tsx': 1, // Download manually (the 426 updateUrl)
+  'screens/Pricing.tsx': 1, // Upgrade
+  'screens/Profile.tsx': 1, // Manage Subscription
+};
+
+const SRC = resolve(import.meta.dirname, '..');
+
+/** Every source file under src/, tests left out. */
+function sourceFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = resolve(dir, entry.name);
+    if (entry.isDirectory()) return entry.name === '__tests__' || entry.name === '__mocks__' ? [] : sourceFiles(path);
+    return /\.(ts|tsx)$/.test(entry.name) && !/\.test\.(ts|tsx)$/.test(entry.name) ? [path] : [];
+  });
+}
+
+/** The opener calls in `source`: each name it imports from the plugin, called. */
+function openerCalls(source: string): number {
+  const named = [...source.matchAll(/import\s*\{([^}]*)\}\s*from\s*['"]@tauri-apps\/plugin-opener['"]/g)];
+  const names = named.flatMap((m) =>
+    m[1]
+      .split(',')
+      .map((part) => part.trim().split(/\s+as\s+/).pop()?.trim() ?? '')
+      .filter(Boolean),
+  );
+  const calls = names.reduce(
+    (n, name) => n + (source.match(new RegExp(`\\b${name}\\(`, 'g'))?.length ?? 0),
+    0,
+  );
+  // Any other way in (a namespace or default import, a dynamic import) is a
+  // call site this count cannot see: counted as one so it fails.
+  const other = source.match(/from\s*['"]@tauri-apps\/plugin-opener['"]|import\(\s*['"]@tauri-apps\/plugin-opener['"]\s*\)/g)?.length ?? 0;
+  return calls + Math.max(0, other - named.length);
+}
+
+describe('MR-2015: every opener call site in the app is one a test above drives', () => {
+  it('the opener calls counted in the source are exactly DRIVEN_CALL_SITES', () => {
+    const found: Record<string, number> = {};
+    for (const file of sourceFiles(SRC)) {
+      const n = openerCalls(readFileSync(file, 'utf8'));
+      if (n > 0) found[relative(SRC, file).replace(/\\/g, '/')] = n;
+    }
+    expect(found).toEqual(DRIVEN_CALL_SITES);
+  });
+
+  it('the counter sees aliased, plain, namespace and dynamic imports', () => {
+    expect(openerCalls("import { openUrl } from '@tauri-apps/plugin-opener';\nopenUrl('a'); openUrl('b');")).toBe(2);
+    expect(openerCalls("import { openUrl as go } from '@tauri-apps/plugin-opener';\ngo('a');")).toBe(1);
+    expect(openerCalls("import * as opener from '@tauri-apps/plugin-opener';")).toBe(1);
+    expect(openerCalls("const m = await import('@tauri-apps/plugin-opener');")).toBe(1);
+    expect(openerCalls("import { openUrl } from '@tauri-apps/plugin-opener';")).toBe(0);
   });
 });
