@@ -23,11 +23,15 @@
 //! file passes the same ownership check. Persistent storage, not /run: the
 //! resolv.conf pin and the macOS service DNS survive a reboot, so the record
 //! that undoes them has to as well.
+//!
+//! THE CONFIG FOLDER. settings.json, its key and the consent record stay in
+//! the config folder under HOME, where Tauri puts them; [`make_private`] makes
+//! that folder ours alone before root reads or writes there (MR-2089).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The root-only state directory.
 #[cfg(target_os = "linux")]
@@ -75,6 +79,286 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         }
     }
     check_private_dir(dir)
+}
+
+/// What [`make_private`] did with one of the app's folders.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Made {
+    /// There was none, or it was ours alone already.
+    AsItWas,
+    /// Ours, and writable by our own group too: made 0700.
+    Tightened,
+    /// Not ours alone: renamed to this name beside it, and made anew (0700)
+    /// with the files root itself wrote in it carried over.
+    SetAside(PathBuf),
+}
+
+/// MR-2089 (review of #327): make `dir`, one of the app's folders in a place
+/// its user can write (the config folder under HOME), ours alone, so that
+/// [`check_private_dir`] passes, instead of refusing it for good.
+///
+/// A folder of ours that our own group can write (the umask 002 of a Fedora
+/// shell made it 0775) is made 0700 through a handle opened without following
+/// a link. Anything else that is not ours alone (a folder another user owns,
+/// such as the one an unprivileged launch from the desktop menu or Finder
+/// made before a launch as root that kept HOME; one everyone can write; a
+/// link) is, when this process is root, renamed aside (`<name>.untrusted-…`)
+/// and made anew, 0700. Of what was in it, only `carry` (file names) are
+/// carried over, and only those root itself wrote ([`carry_over`]): the rest,
+/// which anyone could have put there, stays behind unread. A process that is
+/// not root never moves anything: a folder root made is root's, and the
+/// error says which folder to delete.
+pub(crate) fn make_private(dir: &Path, carry: &[&str]) -> io::Result<Made> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
+    make_private_as(dir, carry, root)
+}
+
+/// [`make_private`]; `may_set_aside` says whether this process may move a
+/// folder that is not ours alone (root). A parameter so the tests, where the
+/// test user plays root, reach that path unprivileged.
+fn make_private_as(dir: &Path, carry: &[&str], may_set_aside: bool) -> io::Result<Made> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Made::AsItWas),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let ours = meta.is_dir() && meta.uid() == euid;
+    if ours && meta.mode() & 0o022 == 0 {
+        return Ok(Made::AsItWas);
+    }
+    if ours && meta.mode() & 0o002 == 0 && meta.gid() == egid {
+        tighten(dir, &meta)?;
+        return Ok(Made::Tightened);
+    }
+    let why = if !meta.is_dir() {
+        "is not a folder"
+    } else if meta.uid() != euid {
+        "is owned by another user"
+    } else {
+        "is writable by other users"
+    };
+    if !may_set_aside {
+        return Err(refused(
+            &format!("the folder {}", dir.display()),
+            &format!("{why}: delete it (or move it away) and start BirdoVPN again"),
+        ));
+    }
+    // The folder as it was looked at, held across the move: what is carried
+    // over is read from THIS folder, whatever its old or new name is made to
+    // point at meanwhile. A link, or a folder swapped since, carries nothing.
+    let held = if meta.is_dir() {
+        open_seen_dir(dir, &meta).ok()
+    } else {
+        None
+    };
+    let aside = set_aside(dir)?;
+    ensure_private_dir(dir)?;
+    // The new folder, too, through a handle from here on: its name is in a
+    // folder the user can write, where it could be renamed away and a link
+    // put in its place between the check above and a write.
+    let fresh = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    check_owner(&fresh.metadata()?, "the new folder")?;
+    if let Some(held) = &held {
+        for name in carry {
+            carry_over(held, &fresh, name);
+        }
+    }
+    tracing::warn!(
+        "A folder of the app's that was not root's alone ({why}) was set aside as {} and made anew",
+        aside
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    );
+    Ok(Made::SetAside(aside))
+}
+
+/// `dir` opened without following a link, and only while it is still the
+/// folder `seen` described.
+fn open_seen_dir(dir: &Path, seen: &std::fs::Metadata) -> io::Result<File> {
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let meta = handle.metadata()?;
+    if (meta.dev(), meta.ino()) != (seen.dev(), seen.ino()) {
+        return Err(refused("the folder", "changed while it was looked at"));
+    }
+    Ok(handle)
+}
+
+/// Make `dir` 0700 through a handle to the folder `seen` described.
+fn tighten(dir: &Path, seen: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // fchmod, on the handle.
+    open_seen_dir(dir, seen)?.set_permissions(std::fs::Permissions::from_mode(0o700))
+}
+
+/// Rename `dir` to an unused `<name>.untrusted-<UTC time>` beside it.
+/// rename(2) never follows a link at either name.
+fn set_aside(dir: &Path) -> io::Result<PathBuf> {
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| refused("the folder", "has no name"))?;
+    let base = format!(
+        "{name}.untrusted-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    );
+    for n in 1..100 {
+        let candidate = if n == 1 {
+            dir.with_file_name(&base)
+        } else {
+            dir.with_file_name(format!("{base}-{n}"))
+        };
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            continue;
+        }
+        std::fs::rename(dir, &candidate)?;
+        return Ok(candidate);
+    }
+    Err(refused(
+        "the folder",
+        "could not be set aside: no free name",
+    ))
+}
+
+/// `name` as a C string: a plain name for the `*at` calls below.
+fn c_name(name: &str) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a file name"))
+}
+
+/// [`open_private`] for `name`, a plain name, in the folder `dir` is a
+/// handle to (openat): never through a path that could be made to point
+/// elsewhere.
+fn open_private_in(dir: &File, name: &str) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let c_name = c_name(name)?;
+    // SAFETY: `dir` is an open directory and `c_name` a NUL-terminated string,
+    // both alive for the call; openat takes no mode without O_CREAT.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a descriptor openat just returned, owned by nothing
+    // else.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(refused("the file", "is not a regular file"));
+    }
+    check_owner(&meta, "the file")?;
+    Ok(file)
+}
+
+/// Unlink `name`, a plain name, in the folder `dir` is a handle to (unlinkat
+/// never follows a link). `NotFound` when there is nothing there.
+fn unlink_in(dir: &File, name: &str) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let c_name = c_name(name)?;
+    // SAFETY: `dir` is an open directory and `c_name` a NUL-terminated string,
+    // both alive for the call.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// [`create_new_private`] for `name`, a plain name, in the folder `dir` is a
+/// handle to: whatever is at the name is unlinked first ([`unlink_in`]), then
+/// a new file is made, O_CREAT|O_EXCL|O_NOFOLLOW, 0600.
+fn create_new_private_in(dir: &File, name: &str) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if let Err(e) = unlink_in(dir, name) {
+        if e.kind() != io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    let c_name = c_name(name)?;
+    // SAFETY: `dir` is an open directory and `c_name` a NUL-terminated string,
+    // both alive for the call; with O_CREAT openat takes the mode as its one
+    // variadic argument, passed promoted as C does.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a descriptor openat just returned, owned by nothing
+    // else.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Rename `from` to `to`, both plain names, within the folder `dir` is a
+/// handle to (renameat, which never follows a link at either name).
+fn rename_in(dir: &File, from: &str, to: &str) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (from, to) = (c_name(from)?, c_name(to)?);
+    let at = dir.as_raw_fd();
+    // SAFETY: `dir` is an open directory and both names NUL-terminated
+    // strings, all alive for the call.
+    if unsafe { libc::renameat(at, from.as_ptr(), at, to.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Copy `name` from the folder set aside (`from`, a handle to it) into the
+/// new one (`to`, a handle to it), only if root itself wrote it: a regular
+/// file (not a link) that only we can write ([`open_private_in`]), with no
+/// other name (a hard link could be any file of ours), and no larger than a
+/// record of ours. Anything else stays behind, unread.
+fn carry_over(from: &File, to: &File, name: &str) -> bool {
+    let read = open_private_in(from, name).and_then(|file| {
+        let meta = file.metadata()?;
+        if meta.nlink() != 1 {
+            return Err(refused("the file", "has other names"));
+        }
+        if meta.len() > MAX_LEGACY_BYTES {
+            return Err(refused("the file", "is too large"));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_LEGACY_BYTES).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            tracing::warn!("Left {} behind in the folder set aside ({})", name, e);
+            return false;
+        }
+    };
+    let staging = format!("{name}.tmp");
+    let written = create_new_private_in(to, &staging)
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, &bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| rename_in(to, &staging, name));
+    if let Err(e) = written {
+        let _ = unlink_in(to, &staging);
+        tracing::warn!("Could not carry {} over into the new folder: {}", name, e);
+        return false;
+    }
+    true
 }
 
 /// Create `path` as a brand-new file for writing: O_CREAT|O_EXCL|O_NOFOLLOW,
@@ -443,5 +727,172 @@ mod root_write_tests {
         );
         assert_eq!(outcome, Adopted::Failed);
         assert!(d.legacy.join("record").exists());
+    }
+
+    /// The config folder's three files, as `settings` names them.
+    const CARRY: [&str; 3] = ["settings.json", "settings_hmac.key", "consent.json"];
+
+    /// `<temp>/uk.birdo.vpn.desktop`, made with `mode`, in our own group.
+    fn app_folder(root: &Path, mode: u32) -> PathBuf {
+        let dir = root.join("uk.birdo.vpn.desktop");
+        std::fs::create_dir(&dir).unwrap();
+        // SAFETY: getegid has no preconditions and cannot fail.
+        std::os::unix::fs::chown(&dir, None, Some(unsafe { libc::getegid() })).unwrap();
+        set_mode(&dir, mode);
+        dir
+    }
+
+    fn write_private(path: &Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+        set_mode(path, 0o600);
+    }
+
+    #[test]
+    fn a_folder_ours_alone_is_left_as_it_is() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            make_private_as(&root.path().join("absent"), &CARRY, true).unwrap(),
+            Made::AsItWas
+        );
+        for alone in [0o700, 0o755] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = app_folder(root.path(), alone);
+            assert_eq!(make_private_as(&dir, &CARRY, true).unwrap(), Made::AsItWas);
+            assert_eq!(mode(&dir), alone);
+        }
+    }
+
+    /// The umask 002 of a Fedora or RHEL shell made the folder 0775, which
+    /// the write check refused for good. It is ours: it is made 0700, kept.
+    #[test]
+    fn a_folder_our_group_can_write_is_made_owner_only() {
+        for wider in [0o770, 0o775] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = app_folder(root.path(), wider);
+            write_private(&dir.join("settings.json"), "ours");
+            for may_set_aside in [true, false] {
+                set_mode(&dir, wider);
+                assert_eq!(
+                    make_private_as(&dir, &CARRY, may_set_aside).unwrap(),
+                    Made::Tightened,
+                    "{wider:o}"
+                );
+                assert_eq!(mode(&dir), 0o700, "{wider:o}");
+                check_private_dir(&dir).expect("ours alone now");
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("settings.json")).unwrap(),
+                    "ours",
+                    "the folder is kept, not replaced"
+                );
+            }
+        }
+    }
+
+    /// Root under a kept HOME, in a folder others could have filled: it is
+    /// set aside and made anew, and of what was in it only what root itself
+    /// wrote comes along.
+    #[test]
+    fn a_folder_not_ours_alone_is_set_aside_and_made_anew() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = app_folder(root.path(), 0o700);
+        write_private(&dir.join("settings.json"), "ours, signed");
+        // Planted: writable by others, a link, a second name for a file.
+        std::fs::write(dir.join("consent.json"), "theirs").unwrap();
+        set_mode(&dir.join("consent.json"), 0o666);
+        let victim = root.path().join("victim");
+        write_private(&victim, "not the key's");
+        std::os::unix::fs::symlink(&victim, dir.join("settings_hmac.key")).unwrap();
+        set_mode(&dir, 0o777);
+
+        let Made::SetAside(aside) = make_private_as(&dir, &CARRY, true).unwrap() else {
+            panic!("not set aside");
+        };
+
+        assert!(aside
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("uk.birdo.vpn.desktop.untrusted-"));
+        assert_eq!(aside.parent(), dir.parent());
+        assert_eq!(mode(&aside), 0o777, "set aside as it was");
+        assert_eq!(
+            std::fs::read_to_string(aside.join("consent.json")).unwrap(),
+            "theirs"
+        );
+        assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+        assert_eq!(mode(&dir), 0o700, "made anew, owner-only");
+        check_private_dir(&dir).expect("ours alone now");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.json")).unwrap(),
+            "ours, signed"
+        );
+        assert_eq!(mode(&dir.join("settings.json")), 0o600);
+        assert!(!dir.join("consent.json").exists(), "others could write it");
+        assert!(
+            std::fs::symlink_metadata(dir.join("settings_hmac.key")).is_err(),
+            "a link"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not the key's");
+        assert!(!dir.join("settings.json.tmp").exists());
+
+        // A file of ours under a second name could be any file of ours.
+        let root = tempfile::tempdir().unwrap();
+        let dir = app_folder(root.path(), 0o700);
+        let elsewhere = root.path().join("elsewhere");
+        write_private(&elsewhere, "some other file of ours");
+        std::fs::hard_link(&elsewhere, dir.join("settings.json")).unwrap();
+        set_mode(&dir, 0o777);
+        assert!(matches!(
+            make_private_as(&dir, &CARRY, true).unwrap(),
+            Made::SetAside(_)
+        ));
+        assert!(!dir.join("settings.json").exists(), "a hard link");
+    }
+
+    /// A link at the folder's name is moved as a link, never followed.
+    #[test]
+    fn a_link_at_the_folders_name_is_set_aside_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        set_mode(&real, 0o755);
+        write_private(&real.join("settings.json"), "elsewhere");
+        let dir = root.path().join("uk.birdo.vpn.desktop");
+        std::os::unix::fs::symlink(&real, &dir).unwrap();
+
+        let Made::SetAside(aside) = make_private_as(&dir, &CARRY, true).unwrap() else {
+            panic!("not set aside");
+        };
+
+        assert!(std::fs::symlink_metadata(&aside)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+        assert!(
+            !dir.join("settings.json").exists(),
+            "nothing through a link"
+        );
+        assert_eq!(mode(&real), 0o755, "the link's target is untouched");
+    }
+
+    /// A process that is not root moves nothing (a folder root made is
+    /// root's) and says which folder to delete.
+    #[test]
+    fn a_process_that_is_not_root_says_which_folder_to_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = app_folder(root.path(), 0o700);
+        write_private(&dir.join("settings.json"), "ours?");
+        for wider in [0o707, 0o777] {
+            set_mode(&dir, wider);
+            let e = make_private_as(&dir, &CARRY, false).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{wider:o}");
+            let said = e.to_string();
+            assert!(said.contains(&dir.display().to_string()), "{said}");
+            assert!(said.contains("delete it"), "{said}");
+            assert_eq!(mode(&dir), wider, "left as it was");
+            assert!(dir.join("settings.json").exists());
+        }
     }
 }

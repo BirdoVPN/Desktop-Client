@@ -60,7 +60,7 @@ pub const CONSENT_VERSION: u32 = 2;
 pub const CONSENT_REQUIRED_EVENT: &str = "consent-required";
 
 /// Beside settings.json, in the app's config directory.
-const FILE_NAME: &str = "consent.json";
+pub(crate) const FILE_NAME: &str = "consent.json";
 
 /// The record is a few bytes; anything larger is not ours and reads as none.
 const MAX_RECORD_BYTES: u64 = 1024;

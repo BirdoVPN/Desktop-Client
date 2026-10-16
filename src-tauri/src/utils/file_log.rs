@@ -219,6 +219,16 @@ pub fn hold_app_dirs() {
     // journal's %APPDATA% ancestor (`%APPDATA%\BirdoVPN`), and the device id
     // (`%LOCALAPPDATA%\BirdoVPN`; the ML-KEM key's own home off Windows).
     if let Some(config) = dirs::config_dir() {
+        // MR-2089: off Windows, ours alone before anything reads or writes in
+        // it: root under a kept HOME sets aside a folder an unprivileged
+        // launch made (see `make_config_dir_private`).
+        #[cfg(unix)]
+        {
+            let dir = config.join(APP_IDENTIFIER);
+            if let Err(e) = crate::commands::settings::make_config_dir_private(&dir) {
+                tracing::warn!("The config folder is not ours alone: {}", e);
+            }
+        }
         keep(OwnedDir::new(config, &[APP_IDENTIFIER]).ensure_held());
     }
     if let Some(base) = dirs::data_dir() {

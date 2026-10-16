@@ -2122,10 +2122,11 @@ pub(super) fn restore_resolv_conf_if_ours(
 /// target is taken from /etc, as the kernel does, and may climb out of it only
 /// at its start (a `..` after a name could step back out of a linked folder).
 /// It must never be in a user's own /run/user (logind hands those to the
-/// user, so one that does not exist yet is no safer). It must then be in the
-/// runtime trees resolver managers write (/run, /var/run, WSL's /mnt/wsl), or
-/// else every part of it that exists must be root's and writable by nobody
-/// else.
+/// user, so one that does not exist yet is no safer). In WSL's /mnt/wsl it is
+/// taken as it is. In the runtime trees resolver managers write (/run,
+/// /var/run) nothing on its way may be writable by a user
+/// ([`only_the_system_writes`]: /run/lock is everyone's). Anywhere else every
+/// part of it that exists must be root's and writable by nobody else.
 fn plausible_resolv_conf_link(target: &str) -> bool {
     let named = std::path::Path::new(target)
         .file_name()
@@ -2133,8 +2134,12 @@ fn plausible_resolv_conf_link(target: &str) -> bool {
         .is_some_and(|name| name.contains("resolv"));
     named
         && resolved_from_etc(target).is_some_and(|path| {
+            // (Whatever passes `root_only_all_the_way` passes
+            // `only_the_system_writes` too.)
             !in_user_runtime_dir(&path)
-                && (in_system_runtime_dir(&path) || root_only_all_the_way(&path))
+                && (in_wsl_runtime_dir(&path)
+                    || (in_system_runtime_dir(&path) && only_the_system_writes(&path))
+                    || root_only_all_the_way(&path))
         })
 }
 
@@ -2161,10 +2166,56 @@ fn resolved_from_etc(target: &str) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// Below /run, /var/run or /mnt/wsl.
+/// Strictly below `dir`.
+fn below(path: &std::path::Path, dir: &str) -> bool {
+    path.starts_with(dir) && path != std::path::Path::new(dir)
+}
+
+/// Below /run or /var/run.
 fn in_system_runtime_dir(path: &std::path::Path) -> bool {
-    let below = |dir: &str| path.starts_with(dir) && path != std::path::Path::new(dir);
-    below("/run") || below("/var/run") || below("/mnt/wsl")
+    below(path, "/run") || below(path, "/var/run")
+}
+
+/// Below WSL's /mnt/wsl.
+fn in_wsl_runtime_dir(path: &std::path::Path) -> bool {
+    below(path, "/mnt/wsl")
+}
+
+/// Under /run (review of #327): no user can have put `path` there or can
+/// replace it. Every part of it that exists may be written by its owner alone
+/// (resolver managers run as root or as their own system user:
+/// systemd-resolved's /run/systemd/resolve and its stub-resolv.conf are
+/// systemd-resolve's), except a sticky folder of root's (a bare tmpfs /run, or
+/// /run/lock), where anyone may ADD an entry but none may replace another's.
+/// So an entry in such a folder must be root's own, link or not, and one not
+/// made yet must not be in one at all: /run/lock/resolv.conf is anyone's to
+/// make.
+fn only_the_system_writes(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    const STICKY: u32 = 0o1000;
+    let mut at = std::path::PathBuf::new();
+    // Whether the folder `at` is in lets every user add entries to it.
+    let mut in_shared_folder = false;
+    for part in path.components() {
+        at.push(part);
+        let meta = match std::fs::metadata(&at) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return !in_shared_folder,
+            Err(_) => return false,
+        };
+        if in_shared_folder {
+            match std::fs::symlink_metadata(&at) {
+                Ok(entry) if entry.uid() == 0 => {}
+                _ => return false,
+            }
+        }
+        let shared = meta.mode() & 0o022 != 0;
+        if shared && !(meta.is_dir() && meta.mode() & STICKY != 0 && meta.uid() == 0) {
+            return false;
+        }
+        in_shared_folder = shared;
+    }
+    true
 }
 
 /// In the per-user runtime folders logind creates and gives to each user.
@@ -2807,6 +2858,46 @@ mod resolv_conf_restore_tests {
         // Outside the runtime trees, only where root alone writes: the old
         // resolvconf layout under /etc still is.
         assert!(plausible("/etc/resolvconf/run/resolv.conf"));
+    }
+
+    /// Review of #327: nor a link under /run into a folder every user can add
+    /// to. /run/lock is root's, sticky and world-writable (Debian, Ubuntu):
+    /// a resolv.conf not there yet is anyone's to make.
+    #[test]
+    fn a_journal_link_into_a_shared_runtime_folder_is_not_trusted() {
+        use super::{only_the_system_writes, plausible_resolv_conf_link as plausible};
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Path;
+
+        let shared_sticky = |dir: &str| {
+            std::fs::symlink_metadata(dir)
+                .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o1002 == 0o1002)
+        };
+        if shared_sticky("/run/lock") {
+            assert!(!plausible("/run/lock/resolv.conf"));
+            assert!(!plausible("../run/lock/resolv.conf"));
+            assert!(!plausible("/var/run/lock/resolv.conf"));
+        }
+
+        // The same walk on /tmp, root's sticky shared folder on every Linux.
+        assert!(shared_sticky("/tmp"), "precondition");
+        assert!(!only_the_system_writes(Path::new(
+            "/tmp/birdo-review-327-absent/resolv.conf"
+        )));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            // This test's own folder in it: a user's. (In /tmp itself, not
+            // wherever TMPDIR points.)
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            let theirs = dir.path().join("resolv.conf");
+            std::fs::write(&theirs, "nameserver 10.0.0.9\n").unwrap();
+            assert!(!only_the_system_writes(&theirs));
+        }
+        // Under a folder only its owner writes, a part not made yet can only
+        // be made by that owner.
+        assert!(only_the_system_writes(Path::new(
+            "/proc/birdo-review-327-absent/resolv.conf"
+        )));
     }
 }
 
@@ -3550,6 +3641,27 @@ mod netns_teardown_tests {
             resolv_conf_is_ours(),
             "precondition: connected, resolv.conf is pinned"
         );
+
+        // MR-2050: the journal this recovery reads is root's own, in the
+        // root-only state directory, and nothing is in the per-HOME folder it
+        // used to be in (the script points XDG_DATA_HOME at a scratch dir).
+        {
+            use std::os::unix::fs::MetadataExt;
+            let journal = std::fs::symlink_metadata("/var/lib/birdovpn/dns-restore.json")
+                .expect("connected: no DNS journal in /var/lib/birdovpn");
+            assert!(journal.is_file(), "the DNS journal is not a regular file");
+            assert_eq!(journal.uid(), 0, "the DNS journal is not root's");
+            assert_eq!(journal.mode() & 0o777, 0o600, "the DNS journal is not 0600");
+            let old = dirs::data_dir()
+                .expect("XDG_DATA_HOME: the script sets it")
+                .join("BirdoVPN")
+                .join("dns-restore.json");
+            assert!(
+                std::fs::symlink_metadata(&old).is_err(),
+                "a DNS journal in the user's data folder: {}",
+                old.display()
+            );
+        }
 
         // What the next launch runs after a SIGKILL. It reads only the journal
         // and the live file; the tunnel still being up is irrelevant to it.
