@@ -22,6 +22,13 @@
  * the same table the web's /pricing and Polar checkout use. They used to be
  * written here, which is how the free cap still read 10 GB after the server
  * moved. A plan the server has not priced shows `FALLBACK_PLAN_PRICES`.
+ *
+ * So does the copy around them (MR-2030): the line under the title, and what
+ * "Everything in …" claims, follow the plans' caps; and each gated feature is
+ * sold on the card of the lowest plan the server's gating table gives it to
+ * (MR-1517, `lowestPlanWith`), not on a card of this file's choosing. These
+ * are the web checkout's (Polar) card prices; the desktop app has no in-app
+ * purchase, so no store price is ever meant here.
  */
 import { useMemo, useState } from 'react';
 import { openUrl as openExternal } from '@tauri-apps/plugin-opener';
@@ -34,9 +41,13 @@ import { brand, white, hairline, surface, accentA } from '@/lib/birdo-theme';
 import {
   PLAN_RANK,
   formatPrice,
+  lowestPlanWith,
   normalizePlan,
+  planHasFeature,
   resolvePlanPrices,
   yearlySavingPct,
+  type GatedFeature,
+  type PlanGates,
   type PlanId,
   type PlanPrice,
 } from '@/lib/plan';
@@ -52,9 +63,15 @@ interface Tier {
   tagline: string;
   icon: LucideIcon;
   iconTint: string;
-  /** Displayed prices (from the server's `plans`), or null for the free tier. */
+  /** Both prices are zero: the free tier. */
+  free: boolean;
+  /**
+   * The monthly price as shown, from the server's `plans`; `null` for none (the
+   * free tier, or MR-2030: a paid plan priced 0 a month, which is not offered
+   * monthly, so the card shows its yearly price instead of "£0").
+   */
   monthly: string | null;
-  /** The ANNUAL TOTAL as the server gives it, shown with "/yr". */
+  /** The ANNUAL TOTAL as the server gives it, shown with "/yr"; `null` likewise. */
   yearly: string | null;
   /**
    * Yearly saving vs 12 monthly payments, per plan and rounded DOWN (the web
@@ -75,17 +92,78 @@ function bandwidthFeature(p: PlanPrice): string {
 }
 
 /** A plan's price fields for its card. Free means both prices are zero. */
-function priced(p: PlanPrice): Pick<Tier, 'monthly' | 'yearly' | 'yearlySavingPct' | 'currency'> {
+function priced(p: PlanPrice): Pick<Tier, 'free' | 'monthly' | 'yearly' | 'yearlySavingPct' | 'currency'> {
   const free = p.monthlyPrice === 0 && p.yearlyPrice === 0;
   return {
-    monthly: free ? null : formatPrice(p.monthlyPrice, p.currency),
-    yearly: free ? null : formatPrice(p.yearlyPrice, p.currency),
+    free,
+    // MR-2030: a price of 0 is "not offered for that period", never "£0".
+    monthly: p.monthlyPrice > 0 ? formatPrice(p.monthlyPrice, p.currency) : null,
+    yearly: p.yearlyPrice > 0 ? formatPrice(p.yearlyPrice, p.currency) : null,
     yearlySavingPct: free ? null : yearlySavingPct(p),
     currency: p.currency,
   };
 }
 
-function buildTiers(prices: Record<PlanId, PlanPrice>): Tier[] {
+/** A data cap as a number to compare: unlimited is more than any cap. */
+const capOf = (p: PlanPrice) => p.bandwidthLimitGb ?? Number.POSITIVE_INFINITY;
+
+/** The gated features, in the order the cards list them, with their lines. */
+const GATED_LINES: readonly [GatedFeature, string][] = [
+  ['stealthMode', 'Stealth mode'],
+  ['multiHop', 'Multi-hop routing'],
+  ['portForwarding', 'Port forwarding'],
+];
+
+/** The tier below each paid one, which its "Everything in …" line names. */
+const LOWER: Partial<Record<PlanId, PlanId>> = { OPERATIVE: 'RECON', SOVEREIGN: 'OPERATIVE' };
+
+/**
+ * MR-2030: whether `id` has everything the tier below it has, as far as the
+ * plan data says (its cap, and every gated feature): only then may its card
+ * say "Everything in …". Otherwise the card lists what it has itself.
+ */
+function includesTierBelow(id: PlanId, prices: Record<PlanId, PlanPrice>, gates: Partial<Record<PlanId, PlanGates>>): boolean {
+  const lower = LOWER[id];
+  if (!lower) return false;
+  return (
+    capOf(prices[id]) >= capOf(prices[lower]) &&
+    GATED_LINES.every(([f]) => !planHasFeature(lower, gates, f) || planHasFeature(id, gates, f) === true)
+  );
+}
+
+/**
+ * The gated features `id`'s card sells (MR-1517): each on the lowest plan the
+ * gating table gives it to, and, on a card that cannot say "Everything in …",
+ * every one the plan has.
+ */
+function gatedLines(id: PlanId, claimsLower: boolean, gates: Partial<Record<PlanId, PlanGates>>): string[] {
+  return GATED_LINES.filter(([f]) =>
+    claimsLower ? lowestPlanWith(f, gates) === id : planHasFeature(id, gates, f) === true,
+  ).map(([, line]) => line);
+}
+
+/**
+ * MR-2030: the line under the title, from the plans' caps. It used to say
+ * "unlimited bandwidth" whatever the server priced.
+ */
+function upgradeIntro(prices: Record<PlanId, PlanPrice>): string {
+  const paid = [prices.OPERATIVE, prices.SOVEREIGN];
+  const bandwidth = paid.every((p) => p.bandwidthLimitGb === null)
+    ? prices.RECON.bandwidthLimitGb === null
+      ? null
+      : 'unlimited bandwidth'
+    : paid.every((p) => capOf(p) > capOf(prices.RECON))
+      ? 'more bandwidth'
+      : null;
+  const what = bandwidth
+    ? `${bandwidth}, every server location and more devices`
+    : 'every server location and more devices';
+  return `Upgrade for ${what}. Billing is managed securely on the web.`;
+}
+
+function buildTiers(prices: Record<PlanId, PlanPrice>, gates: Partial<Record<PlanId, PlanGates>>): Tier[] {
+  const operativeClaims = includesTierBelow('OPERATIVE', prices, gates);
+  const sovereignClaims = includesTierBelow('SOVEREIGN', prices, gates);
   return [
     {
       id: 'RECON',
@@ -109,6 +187,7 @@ function buildTiers(prices: Record<PlanId, PlanPrice>): Tier[] {
         'Post-quantum key exchange',
         'Kill switch',
         'Custom DNS servers',
+        ...gatedLines('RECON', false, gates),
       ],
     },
     {
@@ -123,11 +202,11 @@ function buildTiers(prices: Record<PlanId, PlanPrice>): Tier[] {
       // it: access is decided by the node's minPlan alone, which "All server
       // locations" already describes. The Recon plan can use a fast node too.
       features: [
-        'Everything in Recon',
+        ...(operativeClaims ? ['Everything in Recon'] : []),
         '5 device connections',
         'All server locations',
         bandwidthFeature(prices.OPERATIVE),
-        'Stealth mode',
+        ...gatedLines('OPERATIVE', operativeClaims, gates),
       ],
     },
     {
@@ -141,24 +220,35 @@ function buildTiers(prices: Record<PlanId, PlanPrice>): Tier[] {
       // backend's isPremium is just minPlan !== 'RECON', and whether any node
       // is Sovereign-only is a per-node owner setting, not a plan feature), and
       // no "Custom DNS": it is on every plan (D6, listed on Recon above).
+      // MR-2030: "Everything in Operative" only while the data says so, and
+      // its own cap whenever it differs from Operative's (it used to inherit
+      // Operative's line, whatever the server priced).
       features: [
-        'Everything in Operative',
+        ...(sovereignClaims ? ['Everything in Operative'] : []),
         '10 device connections',
-        'Multi-hop routing',
-        'Port forwarding',
+        ...(!sovereignClaims || capOf(prices.SOVEREIGN) !== capOf(prices.OPERATIVE)
+          ? [bandwidthFeature(prices.SOVEREIGN)]
+          : []),
+        ...gatedLines('SOVEREIGN', sovereignClaims, gates),
       ],
     },
   ];
 }
 
 export function Pricing() {
-  const { account, popRoute, planPrices } = useAppStore(
-    useShallow((s) => ({ account: s.account, popRoute: s.popRoute, planPrices: s.planPrices })),
+  const { account, popRoute, planPrices, planGates } = useAppStore(
+    useShallow((s) => ({
+      account: s.account,
+      popRoute: s.popRoute,
+      planPrices: s.planPrices,
+      planGates: s.planGates,
+    })),
   );
-  const tiers = useMemo(() => buildTiers(resolvePlanPrices(planPrices)), [planPrices]);
+  const prices = useMemo(() => resolvePlanPrices(planPrices), [planPrices]);
+  const tiers = useMemo(() => buildTiers(prices, planGates ?? {}), [prices, planGates]);
   // "Save up to N%" is the largest per-plan saving, so it never overstates.
   const maxSavingPct = Math.max(0, ...tiers.map((t) => t.yearlySavingPct ?? 0));
-  const currencies = [...new Set(tiers.filter((t) => t.monthly !== null).map((t) => t.currency))];
+  const currencies = [...new Set(tiers.filter((t) => !t.free).map((t) => t.currency))];
   // `null` while the plan is not known yet: no tier is marked current and no
   // Upgrade button is offered to someone who may already be on it (W2-011).
   const currentPlan = account.plan === null ? null : normalizePlan(account.plan);
@@ -175,8 +265,7 @@ export function Pricing() {
 
       <div className="flex-1 overflow-y-auto px-4 pb-8 pt-3">
         <p className="px-1 text-[13px]" style={{ color: white.w60 }}>
-          Upgrade for unlimited bandwidth, every server location and more devices. Billing is
-          managed securely on the web.
+          {upgradeIntro(prices)}
         </p>
 
         {/* Monthly / Yearly segmented toggle — mirrors the segmented control
@@ -251,19 +340,19 @@ interface TierCardProps {
 
 function TierCard({ tier, period, currentPlan, onUpgrade }: TierCardProps) {
   const Icon = tier.icon;
-  const isFree = tier.monthly === null;
+  const isFree = tier.free;
   const tRank = PLAN_RANK[tier.id];
   const cRank = currentPlan === null ? null : PLAN_RANK[currentPlan];
   const isCurrent = cRank !== null && tRank === cRank;
   const isUpgrade = cRank !== null && tRank > cRank;
 
-  // `?? ''` keeps this non-null-assertion-free (eslint no-non-null-assertion is
-  // a warning, and lint runs at --max-warnings 0). For a paid tier both prices
-  // are non-null, so the fallback is never actually reached.
-  const priceAmount = isFree
-    ? 'Free'
-    : (period === 'monthly' ? tier.monthly : tier.yearly) ?? '';
-  const priceSuffix = isFree ? null : period === 'monthly' ? '/mo' : '/yr';
+  // MR-2030: a paid tier not offered for the chosen period (a price of 0)
+  // shows the period it is offered for, never "£0". A paid tier has at least
+  // one price, so the `?? ''` (lint runs at --max-warnings 0, which a non-null
+  // assertion would trip) is never reached.
+  const showYearly = period === 'yearly' ? tier.yearly !== null : tier.monthly === null;
+  const priceAmount = isFree ? 'Free' : (showYearly ? tier.yearly : tier.monthly) ?? '';
+  const priceSuffix = isFree ? null : showYearly ? '/yr' : '/mo';
 
   return (
     <BirdoCard
@@ -310,7 +399,7 @@ function TierCard({ tier, period, currentPlan, onUpgrade }: TierCardProps) {
           </span>
         )}
       </div>
-      {!isFree && period === 'yearly' && tier.yearlySavingPct !== null && (
+      {!isFree && showYearly && tier.yearlySavingPct !== null && (
         <div className="mt-1 text-[12px]" style={{ color: brand.accentSoft }}>
           Save {tier.yearlySavingPct}% vs paying monthly
         </div>

@@ -45,7 +45,7 @@ const SCHEMA_SRC: &str = include_str!("../../contract/vpn-protocol.schema.json")
 /// `sha256sum` of birdo-web `backend/contract/vpn-protocol.schema.json` at the
 /// commit vendored (LF bytes, as git stores them). The test normalises `\r\n`
 /// so an autocrlf checkout hashes the same as CI.
-const SCHEMA_SHA256: &str = "4b159a273f6dc640ebb98247cd104053db90a4307b116ac6879ed30da7c6e5ee";
+const SCHEMA_SHA256: &str = "ea19cbe0a94609f4f875fd2a4d9712fe61b243c783787767f58782c1df9a499c";
 
 const CONNECT: &str = "ConnectRequest";
 const MULTI_HOP: &str = "MultiHopConnectRequest";
@@ -777,7 +777,7 @@ fn envelope(status: u16, code: &str, message: &str, details: Option<Value>) -> V
 
 /// Every code in `$defs/ErrorCode`, decided. The 503s carry birdo-web's
 /// `RETRY_AFTER_SECONDS` (30, QuotaCheckUnavailableError and
-/// PskOverSshRefusedError alike).
+/// PskOverSshRefusedError alike; 15, TunnelAddressUnavailableError).
 fn error_code_cases() -> Vec<ErrorCodeCase> {
     let retry = Some(json!({ "retryable": true, "retryAfterSeconds": 30 }));
     vec![
@@ -834,6 +834,20 @@ fn error_code_cases() -> Vec<ErrorCodeCase> {
             ),
             ipc: IpcErrorCode::ServerError,
             wait_secs: Some(30),
+        },
+        // MR-2057 (birdo-web #711): the allocator could not prove a tunnel
+        // address free and failed closed. Retryable after the server's wait,
+        // like the two above; before this it read as `server_unavailable`.
+        ErrorCodeCase {
+            code: "tunnel_address_unavailable",
+            body: envelope(
+                503,
+                "tunnel_address_unavailable",
+                "We could not assign your connection an address on this server just now.                  Please try again in a moment.",
+                Some(json!({ "retryable": true, "retryAfterSeconds": 15 })),
+            ),
+            ipc: IpcErrorCode::ServerError,
+            wait_secs: Some(15),
         },
     ]
 }

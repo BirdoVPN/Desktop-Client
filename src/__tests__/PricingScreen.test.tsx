@@ -25,6 +25,8 @@ const mockStoreState = {
   popRoute: vi.fn(),
   /** `GET /api/client-config` → `plans`, as `useClientConfig` stores it. */
   planPrices: {} as Record<string, unknown>,
+  /** `features.<PLAN>`'s gating flags (MR-1517). */
+  planGates: {} as Record<string, unknown>,
 };
 vi.mock('@/store/app-store', () => {
   const useAppStore = vi.fn((selector) => selector(mockStoreState));
@@ -33,6 +35,7 @@ vi.mock('@/store/app-store', () => {
 
 beforeEach(() => {
   mockStoreState.planPrices = {};
+  mockStoreState.planGates = {};
 });
 
 const plan = (monthlyPrice: number, yearlyPrice: number, currency: string, bandwidthLimitGb: number | null) => ({
@@ -122,7 +125,11 @@ describe('Pricing renders the server price feed (MR-132 / MR-630 / MR-1767 / MR-
     const { container } = render(<Pricing />);
     const text = container.textContent ?? '';
     expect(text).toContain('200 GB monthly bandwidth');
-    expect(text).not.toContain('Unlimited bandwidth');
+    // MR-2030: Sovereign (the fallback, unlimited) says its own cap now; it
+    // used to inherit Operative's 200 GB through "Everything in Operative".
+    expect(text.indexOf('200 GB monthly bandwidth')).toBeLessThan(text.indexOf('Everything in Operative'));
+    expect(text.indexOf('Everything in Operative')).toBeLessThan(text.indexOf('Unlimited bandwidth'));
+    expect(text.match(/Unlimited bandwidth/g)).toHaveLength(1);
   });
 
   it('without `plans` (older server, offline, failed fetch) it shows the fallback, free cap 50 GB', async () => {
@@ -138,6 +145,56 @@ describe('Pricing renders the server price feed (MR-132 / MR-630 / MR-1767 / MR-
     await showMonthly();
     expect(screen.getByText('£3.99')).toBeInTheDocument();
     expect(screen.getByText('£9.99')).toBeInTheDocument();
+  });
+
+  // MR-2030: the line under the title follows the plans' caps. It used to say
+  // "unlimited bandwidth" whatever the server priced.
+  it('the line under the title follows the caps', () => {
+    const intro = () => screen.getByText(/^Upgrade for /).textContent;
+    const { unmount } = render(<Pricing />);
+    expect(intro()).toBe(
+      'Upgrade for unlimited bandwidth, every server location and more devices. Billing is managed securely on the web.',
+    );
+    unmount();
+    mockStoreState.planPrices = { OPERATIVE: plan(3.99, 38, 'GBP', 500), SOVEREIGN: plan(9.99, 99, 'GBP', 2000) };
+    render(<Pricing />);
+    expect(intro()).toBe(
+      'Upgrade for more bandwidth, every server location and more devices. Billing is managed securely on the web.',
+    );
+  });
+
+  // MR-2030: a paid plan priced 0 a month is not offered monthly: its card
+  // shows the yearly price, never "£0" (unreachable today, guarded anyway).
+  it('a paid plan with no monthly price never shows £0', async () => {
+    mockStoreState.planPrices = { SOVEREIGN: plan(0, 99, 'GBP', null) };
+    const { container } = render(<Pricing />);
+    await showMonthly();
+    const text = container.textContent ?? '';
+    expect(text).not.toMatch(/£0(?![.\d])/);
+    expect(screen.getByText('£99')).toBeInTheDocument();
+    expect(screen.getByText('£3.99')).toBeInTheDocument();
+    expect(text).toContain('Prices in GBP.');
+  });
+
+  // MR-1517: each gated feature is sold on the card of the lowest plan the
+  // server's gating table gives it to. On main the cards were fixed: Stealth
+  // on Operative, whatever the server said.
+  it("sells each gated feature on the plan the server's gating table gives it to", () => {
+    const { container, unmount } = render(<Pricing />);
+    let text = container.textContent ?? '';
+    // The built-in table, as before: Stealth on Operative, the rest on Sovereign.
+    expect(text.indexOf('Stealth mode')).toBeLessThan(text.indexOf('Everything in Operative'));
+    expect(text.indexOf('Everything in Operative')).toBeLessThan(text.indexOf('Multi-hop routing'));
+    unmount();
+
+    mockStoreState.planGates = {
+      RECON: { stealthMode: false },
+      OPERATIVE: { stealthMode: false, multiHop: false },
+      SOVEREIGN: { stealthMode: true, multiHop: true, portForwarding: true },
+    };
+    text = render(<Pricing />).container.textContent ?? '';
+    expect(text.match(/Stealth mode/g)).toHaveLength(1);
+    expect(text.indexOf('Everything in Operative')).toBeLessThan(text.indexOf('Stealth mode'));
   });
 
   it('a partial `plans` uses the server for the plans it priced and the fallback for the rest', () => {

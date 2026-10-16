@@ -274,14 +274,13 @@ impl ResumeStore {
         let Some(marker) = self.legacy_marker.as_ref() else {
             return;
         };
-        if marker.exists() {
+        if marker_present(marker) {
             return;
         }
-        if let Some(parent) = marker.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Err(e) = fs::write(marker, b"") {
-            tracing::warn!("Could not close the unsigned-record window ({e})");
+        match create_marker(marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => tracing::warn!("Could not close the unsigned-record window ({e})"),
         }
     }
 
@@ -378,19 +377,16 @@ impl ResumeStore {
         if record.version != LEGACY_UNSIGNED_VERSION {
             return None;
         }
-        if marker.exists() {
+        if marker_present(marker) {
             tracing::warn!("An unsigned VPN session record was ignored (already accepted once)");
             return None;
         }
         // Close the window first, whatever happens next: this one-time
         // acceptance must not be re-armable even if the record is then too old
         // to resume.
-        if let Some(parent) = marker.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Err(e) = fs::write(marker, b"") {
-            // Could not record the one-shot: refuse rather than risk accepting
-            // it again on the next boot.
+        if let Err(e) = create_marker(marker) {
+            // Could not record the one-shot (or one appeared meanwhile):
+            // refuse rather than risk accepting it again on the next boot.
             tracing::warn!("Could not mark the 1.4.47 resume record consumed ({e}); ignoring it");
             return None;
         }
@@ -409,7 +405,12 @@ fn default_dir() -> Option<OwnedDir> {
 
 /// The one-shot marker for the 1.4.47 unsigned-record acceptance (MR-1933),
 /// where a user cannot delete it: the admin-only directory on Windows (per
-/// account), root's own `<data_dir>/BirdoVPN` elsewhere.
+/// account), root's own state directory elsewhere.
+///
+/// MR-2089 (review of #327): that is `root_state::STATE_DIR` now. It was
+/// `<data_dir>/BirdoVPN`, the USER's own folder whenever the launch kept HOME,
+/// where they could delete it to re-open the window, and where root created
+/// it by path through any link planted at its name ([`create_marker`]).
 fn default_legacy_marker() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -423,8 +424,74 @@ fn default_legacy_marker() -> Option<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        dirs::data_dir().map(|base| base.join("BirdoVPN").join("resume-unsigned-consumed"))
+        Some(
+            std::path::Path::new(crate::utils::root_state::STATE_DIR)
+                .join("resume-unsigned-consumed"),
+        )
     }
+}
+
+/// Off Windows, where 1.4.48 kept the one-shot marker: `<data_dir>/BirdoVPN`.
+/// Looked at only by [`carry_closed_window`], never opened or followed.
+#[cfg(not(windows))]
+fn marker_of_1_4_48() -> Option<PathBuf> {
+    dirs::data_dir().map(|base| base.join("BirdoVPN").join("resume-unsigned-consumed"))
+}
+
+/// Keep the window 1.4.48 closed closed now that the marker lives in the
+/// state directory: anything at `old` (that build's marker) has `marker` made
+/// first, before the first start of this build can accept a planted unsigned
+/// record there. It can only ever close the window: whoever can write `old`
+/// can only stop a record from being accepted.
+#[cfg(not(windows))]
+fn carry_closed_window(old: Option<&std::path::Path>, marker: &std::path::Path) {
+    if !old.is_some_and(marker_present) || marker_present(marker) {
+        return;
+    }
+    match create_marker(marker) {
+        Ok(()) => {
+            tracing::info!("The unsigned-record window an earlier version closed stays closed")
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        // `accept_unsigned_once` refuses all the same when it cannot make the
+        // marker either.
+        Err(e) => tracing::warn!("Could not carry the closed unsigned-record window over ({e})"),
+    }
+}
+
+/// Whether the one-shot marker is there. Anything at its name counts, a link
+/// too: it is never followed (a dangling link answered `exists()` false).
+fn marker_present(marker: &std::path::Path) -> bool {
+    fs::symlink_metadata(marker).is_ok()
+}
+
+/// Create the one-shot marker: a new empty file, never through a link at its
+/// name. `AlreadyExists` when anything is there already.
+///
+/// MR-2089 (review of #327): it was `fs::write` by path (O_CREAT|O_TRUNC,
+/// following a link) after an `exists()` check that a dangling link passes,
+/// so root created or emptied whatever file a link at the name pointed to:
+/// `/etc/nologin`, say, which locks every other user out. Off Windows it is
+/// now O_CREAT|O_EXCL|O_NOFOLLOW, owner-only, in a folder that must be ours
+/// alone (`root_state::ensure_private_dir`, never `create_dir_all`).
+fn create_marker(marker: &std::path::Path) -> std::io::Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(parent) = marker.parent() {
+            crate::utils::root_state::ensure_private_dir(parent)?;
+        }
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    opts.open(marker).map(drop)
 }
 
 /// R1 (Windows): the unsigned 1.4.47 record can only be the update FROM
@@ -442,10 +509,15 @@ fn windows_legacy_marker(
 }
 
 static STORE: LazyLock<ResumeStore> = LazyLock::new(|| {
+    let marker = default_legacy_marker();
+    #[cfg(not(windows))]
+    if let Some(marker) = &marker {
+        carry_closed_window(marker_of_1_4_48().as_deref(), marker);
+    }
     ResumeStore::new(
         default_dir(),
         Box::new(crate::commands::settings::existing_signing_keys),
-        default_legacy_marker(),
+        marker,
     )
 });
 
@@ -1162,5 +1234,163 @@ mod tests {
         }
         let sso = body(include_str!("oauth.rs"), "pub async fn native_oauth_login(");
         assert!(sso.contains("crate::commands::update_resume::discard();"));
+    }
+}
+
+/// MR-2089 (review of #327): off Windows the one-shot marker is root's own
+/// (`root_state::STATE_DIR`) and is never created through a link at its
+/// name. Unix only; tests.yml runs these unprivileged on Linux and macOS.
+#[cfg(all(test, unix))]
+mod root_write_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    const T: i64 = 1_791_000_000;
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A store in `dir` whose one-shot marker is `marker`.
+    fn store(dir: &Path, marker: &Path) -> ResumeStore {
+        ResumeStore::new(
+            Some(OwnedDir::new(dir, &[])),
+            Box::new(|| vec![vec![7; 32]]),
+            Some(marker.to_path_buf()),
+        )
+    }
+
+    /// An unsigned record of 1.4.47's, the one the window accepts once.
+    fn plant_unsigned(dir: &Path) {
+        let record = Record {
+            version: LEGACY_UNSIGNED_VERSION.into(),
+            written_at: T,
+            target: ResumeTarget::SingleHop {
+                server_id: "node-7".into(),
+            },
+        };
+        fs::write(dir.join(FILE_NAME), serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+
+    /// `<dir>/marker/consumed`, its folder ours alone.
+    fn marker_in(dir: &Path) -> std::path::PathBuf {
+        let folder = dir.join("marker");
+        fs::create_dir(&folder).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        folder.join("consumed")
+    }
+
+    #[test]
+    fn the_marker_lives_in_the_root_only_state_directory() {
+        assert_eq!(
+            default_legacy_marker(),
+            Some(Path::new(crate::utils::root_state::STATE_DIR).join("resume-unsigned-consumed"))
+        );
+    }
+
+    /// The marker was `fs::write` by path after `exists()`, which a dangling
+    /// link answers false: closing the window at every start created the file
+    /// the link named, as root.
+    #[test]
+    fn closing_the_window_never_creates_a_file_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = marker_in(dir.path());
+        let victim = dir.path().join("victim");
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+
+        store(dir.path(), &marker).load("1.4.48", T + 5);
+
+        assert!(
+            fs::symlink_metadata(&victim).is_err(),
+            "created through the link"
+        );
+        assert!(fs::symlink_metadata(&marker)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// The same link at the one-time acceptance: it was written through and
+    /// the plant accepted. Anything at the marker's name is the window closed.
+    #[test]
+    fn a_link_on_the_marker_neither_is_written_through_nor_opens_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = marker_in(dir.path());
+        let victim = dir.path().join("victim");
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+        plant_unsigned(dir.path());
+
+        let s = store(dir.path(), &marker);
+        s.load("1.4.48", T + 5);
+
+        assert!(
+            fs::symlink_metadata(&victim).is_err(),
+            "created through the link"
+        );
+        assert_eq!(s.take("1.4.48", T + 6), None, "the plant was resumed");
+    }
+
+    /// The marker is owner-only from creation, in a folder made owner-only.
+    #[test]
+    fn the_marker_is_owner_only_in_a_folder_of_ours_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("state").join("consumed");
+
+        store(dir.path(), &marker).load("1.4.48", T + 5);
+
+        assert!(fs::symlink_metadata(&marker).unwrap().is_file());
+        assert_eq!(mode(&marker), 0o600);
+        assert_eq!(mode(marker.parent().unwrap()), 0o700);
+    }
+
+    /// A marker folder others can write is one they could empty: no marker is
+    /// made there, and so nothing is accepted on the strength of one.
+    #[test]
+    fn a_marker_folder_others_can_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = marker_in(dir.path());
+        fs::set_permissions(marker.parent().unwrap(), fs::Permissions::from_mode(0o777)).unwrap();
+        plant_unsigned(dir.path());
+
+        let s = store(dir.path(), &marker);
+        s.load("1.4.48", T + 5);
+
+        assert!(fs::symlink_metadata(&marker).is_err());
+        assert_eq!(s.take("1.4.48", T + 6), None);
+    }
+
+    /// 1.4.48 kept the marker in `<data_dir>/BirdoVPN`. A window it closed
+    /// there stays closed now that the marker lives in the state directory:
+    /// otherwise the first start of this build would accept a planted
+    /// unsigned record once more. With nothing there, the one-time window is
+    /// what it was.
+    #[test]
+    fn a_window_an_earlier_version_closed_stays_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("consumed-by-1.4.48");
+        fs::write(&old, b"").unwrap();
+        let marker = marker_in(dir.path());
+        plant_unsigned(dir.path());
+
+        carry_closed_window(Some(&old), &marker);
+
+        assert!(marker_present(&marker));
+        let s = store(dir.path(), &marker);
+        s.load("1.4.48", T + 5);
+        assert_eq!(s.take("1.4.48", T + 6), None, "the window re-opened");
+
+        // Control: nothing at the old name, so nothing is made, and the
+        // record is accepted once.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = marker_in(dir.path());
+        plant_unsigned(dir.path());
+        carry_closed_window(Some(&dir.path().join("absent")), &marker);
+        carry_closed_window(None, &marker);
+        assert!(!marker_present(&marker));
+        let s = store(dir.path(), &marker);
+        s.load("1.4.48", T + 5);
+        assert!(s.take("1.4.48", T + 6).is_some(), "the one-time window");
+        assert!(marker_present(&marker));
     }
 }

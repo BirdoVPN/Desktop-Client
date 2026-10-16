@@ -26,7 +26,12 @@ import { exit } from '@tauri-apps/plugin-process';
 import { notifyUpdateAvailable } from '@/utils/notifications';
 import { identityPatch, type AuthStateIdentity } from '@/utils/helpers';
 import { hasCurrentConsent } from '@/lib/consent';
-import { CONSENT_REQUIRED_EVENT, onConsentRequired, recordConsentInRust } from '@/session/consent-sync';
+import {
+  CONSENT_REQUIRED_EVENT,
+  onConsentRequired,
+  recordConsentInRust,
+  withdrawConsentInRust,
+} from '@/session/consent-sync';
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion';
 
 /** Whether the window is on screen; unknown counts as visible (never skip a prompt the user can see). */
@@ -188,10 +193,11 @@ function App() {
   // tray's Quick Connect asks before it dials. Written whenever this store
   // holds the current version: at every start (the migration — an install
   // that accepted this text in an earlier build has no Rust record yet, and
-  // must not be asked again) and the moment the user accepts. Rust only ever
-  // raises it.
+  // must not be asked again) and the moment the user accepts. MR-2016: and
+  // taken down to what the store holds while it holds no current version (the
+  // consent screen is up), so the tray cannot dial behind the screen.
   useEffect(() => {
-    if (hasAcceptedConsent) void recordConsentInRust();
+    void (hasAcceptedConsent ? recordConsentInRust() : withdrawConsentInRust());
   }, [hasAcceptedConsent]);
 
   // A tray Quick Connect Rust refused for want of consent. Rust has brought

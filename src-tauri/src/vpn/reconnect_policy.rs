@@ -775,7 +775,8 @@ impl ReconnectPolicy {
                 } else {
                     // MR-1639 / MR-1808: a refusal that names its own wait
                     // (`quota_check_unavailable`, `psk_delivery_unavailable`,
-                    // a 429's or a busy 5xx's `Retry-After`) is never
+                    // `tunnel_address_unavailable` (MR-2057), a 429's or a
+                    // busy 5xx's `Retry-After`) is never
                     // re-dialled sooner than the server asked.
                     let backoff = backoff_delay(self.attempts, &self.budget);
                     self.last_error
@@ -1064,17 +1065,18 @@ mod tests {
         }
     }
 
-    /// MR-1639: the two retryable 503s (`psk_delivery_unavailable`,
-    /// `quota_check_unavailable`) are re-dialled, never given up on at once,
-    /// and never sooner than the server's `retryAfterSeconds`. A longer
-    /// backoff still wins; the budget still ends it; without a wait the plain
-    /// backoff applies.
+    /// MR-1639: the retryable 503s (`psk_delivery_unavailable`,
+    /// `quota_check_unavailable`, and MR-2057's `tunnel_address_unavailable`)
+    /// are re-dialled, never given up on at once, and never sooner than the
+    /// server's `retryAfterSeconds`. A longer backoff still wins; the budget
+    /// still ends it; without a wait the plain backoff applies.
     #[test]
     fn a_retryable_refusal_is_redialled_no_sooner_than_the_server_asked() {
         use crate::api::ApiError;
-        let refusals: [fn(Option<u64>) -> ApiError; 2] = [
+        let refusals: [fn(Option<u64>) -> ApiError; 3] = [
             |retry_after_secs| ApiError::PskDeliveryUnavailable { retry_after_secs },
             |retry_after_secs| ApiError::QuotaCheckUnavailable { retry_after_secs },
+            |retry_after_secs| ApiError::TunnelAddressUnavailable { retry_after_secs },
         ];
         for refusal in refusals {
             let mut p = ReconnectPolicy::new(Budget {

@@ -384,10 +384,12 @@ impl BirdoApi {
         true
     }
 
-    /// Clear authentication tokens
+    /// Clear authentication tokens. MR-2012: the session's request holds go
+    /// with them (`RetryGate::forget_session`).
     pub async fn clear_tokens(&self) {
         *self.access_token.write().await = None;
         *self.refresh_token.write().await = None;
+        self.retry_gate.forget_session();
     }
 
     /// Clear the tokens only while the session in memory is still the one
@@ -404,6 +406,7 @@ impl BirdoApi {
         }
         *access = None;
         *self.refresh_token.write().await = None;
+        self.retry_gate.forget_session();
         true
     }
 
@@ -1196,8 +1199,9 @@ impl BirdoApi {
         // MR-1808: a request the server asked to hold is answered here
         // (`ApiError::Held`, nothing sent), with the wait that is left, until
         // that wait is over. Never logged: a heartbeat's path carries the
-        // session's key id.
-        let held = format!("{method} {path}");
+        // session's key id. MR-2012: held by the backend's bucket, which for
+        // the credential routes is shared (`retry_gate::hold_key`).
+        let held = super::retry_gate::hold_key(method, path);
         self.retry_gate.check(&held, std::time::Instant::now())?;
         let mut request = self.client.request(method.clone(), &url);
 
@@ -1331,6 +1335,16 @@ impl BirdoApi {
     /// Store a refresh's result only if the refresh token it presented is
     /// still this client's, in the lock order of `clear_tokens_if` (access,
     /// then refresh). `persist` runs under both locks.
+    ///
+    /// MR-2016, accepted as it is: a keystore that asks the user first (a
+    /// locked Secret Service keyring on Linux) holds every authenticated
+    /// request at the token locks until it is answered. The hold is what keeps
+    /// a Sign Out's keystore clear AFTER this write, never before it (a
+    /// rotated token written after the clear signs the user back in at the
+    /// next launch, or puts one account's tokens over another's); and the
+    /// requests it holds are the ones the expired token sent into this
+    /// refresh, which wait on the refresh lock until it ends anyway. Requests
+    /// that need no token (the client config, a sign-in) are not held.
     async fn adopt_refreshed(
         &self,
         presented: &str,
@@ -1490,6 +1504,16 @@ impl BirdoApi {
             // the allowance check: retry the same request.
             Some("psk_delivery_unavailable") => {
                 return ApiError::PskDeliveryUnavailable {
+                    retry_after_secs: retry_after_secs(),
+                };
+            }
+            // MR-2057 (birdo-web #711): the allocator could not prove a
+            // tunnel address free and failed closed. Same shape and
+            // semantics again: retry the same request after the wait. It
+            // used to fall through to `Rejected` (503: "server unavailable,
+            // try another location") with no retry at all.
+            Some("tunnel_address_unavailable") => {
+                return ApiError::TunnelAddressUnavailable {
                     retry_after_secs: retry_after_secs(),
                 };
             }
@@ -2131,6 +2155,37 @@ mod retry_after_tests {
             now,
         );
         assert!(fresh.retry_gate.check("POST /auth/refresh", now).is_err());
+    }
+
+    /// MR-2012: signing out forgets the session's holds, whichever way the
+    /// session ends (`clear_tokens`, `clear_tokens_if`).
+    #[tokio::test]
+    async fn signing_out_forgets_the_sessions_holds() {
+        let api = BirdoApi::new();
+        let now = std::time::Instant::now();
+        let servers = super::super::retry_gate::hold_key(&reqwest::Method::GET, "/vpn/servers");
+        let hold = || {
+            api.retry_gate.note(
+                &servers,
+                &ApiError::RateLimited {
+                    retry_after_secs: Some(60),
+                },
+                now,
+            )
+        };
+        hold();
+        api.clear_tokens().await;
+        assert!(api.retry_gate.check(&servers, now).is_ok());
+
+        api.set_tokens("a1".into(), "r1".into()).await;
+        hold();
+        assert!(!api.clear_tokens_if(Some("someone else")).await);
+        assert!(
+            api.retry_gate.check(&servers, now).is_err(),
+            "not this session's end"
+        );
+        assert!(api.clear_tokens_if(Some("a1")).await);
+        assert!(api.retry_gate.check(&servers, now).is_ok());
     }
 
     /// The wiring: every control-plane request (the refresh a 401 runs

@@ -5,6 +5,7 @@
 import { Lock, LogOut, Route as AltRoute } from 'lucide-react';
 import { BirdoIconAction } from '@/components/birdo';
 import { brand, hairline, white } from '@/lib/birdo-theme';
+import { displayableEmail } from '@/utils/helpers';
 
 interface HomeTopBarProps {
   userEmail: string | null;
@@ -13,6 +14,8 @@ interface HomeTopBarProps {
   multiHopArmed: boolean;
   /** `null` = plan not known yet: no lock badge, no upsell (W2-011). */
   multiHopUnlocked: boolean | null;
+  /** The plan Multi-Hop comes with, for the locked label (MR-1517). */
+  multiHopPlan?: string;
   /** On a live session the route cannot change (W2-010). */
   multiHopLocked: boolean;
   onToggleMultiHop: () => void;
@@ -24,14 +27,17 @@ export function HomeTopBar({
   anonymous,
   multiHopArmed,
   multiHopUnlocked,
+  multiHopPlan = 'Sovereign',
   multiHopLocked,
   onToggleMultiHop,
   onSignOut,
 }: HomeTopBarProps) {
   // Never an anonymous account's email: its synthetic address carries the
   // account's only credential, on the screen people screenshot most
-  // (P1-parity-007). iOS shows the same words.
-  const identity = anonymous ? 'Anonymous account' : userEmail;
+  // (P1-parity-007). iOS shows the same words. MR-2014: nor the synthetic
+  // address before `/auth/me` has said the account is anonymous (an
+  // email-form sign-in with it): nothing is shown until then.
+  const identity = anonymous ? 'Anonymous account' : displayableEmail(userEmail);
   return (
     <div
       className="relative z-20 flex items-center gap-2 px-4 pt-3 pb-2"
@@ -42,6 +48,7 @@ export function HomeTopBar({
       <MultiHopTopAction
         armed={multiHopArmed}
         unlocked={multiHopUnlocked}
+        plan={multiHopPlan}
         routeLocked={multiHopLocked}
         onClick={onToggleMultiHop}
       />
@@ -59,11 +66,13 @@ export function HomeTopBar({
 function MultiHopTopAction({
   armed,
   unlocked,
+  plan,
   routeLocked,
   onClick,
 }: {
   armed: boolean;
   unlocked: boolean | null;
+  plan: string;
   routeLocked: boolean;
   onClick: () => void;
 }) {
@@ -71,7 +80,7 @@ function MultiHopTopAction({
   const tint = unlocked === false ? white.w40 : active ? brand.accent : white.w80;
   const label =
     unlocked === false
-      ? 'Multi-Hop (Sovereign plan)'
+      ? `Multi-Hop (${plan} plan)`
       : routeLocked
         ? 'Multi-Hop (disconnect to change your route)'
         : 'Multi-Hop';

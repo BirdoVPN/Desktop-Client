@@ -81,7 +81,7 @@ beforeEach(() => {
   dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
   setHidden(false);
   // The shipped default. Every "unknown" case below asserts this survives.
-  useAppStore.setState({ dnsFilteringAvailable: true, customDnsByPlan: {}, planPrices: {} });
+  useAppStore.setState({ dnsFilteringAvailable: true, customDnsByPlan: {}, planPrices: {}, planGates: {} });
 });
 
 afterEach(() => {
@@ -486,6 +486,36 @@ describe('useClientConfig -> customDnsByPlan', () => {
   });
 });
 
+/** MR-1517: the server's plan-gating table, through the same fetch. */
+describe('useClientConfig -> planGates', () => {
+  it("the server's gating flags reach the store, only the booleans", async () => {
+    mockedInvoke.mockResolvedValue({
+      features: {
+        RECON: { customDns: true, stealthMode: false, multiHop: false, portForwarding: false },
+        OPERATIVE: { stealthMode: true, multiHop: 'no' },
+        SOVEREIGN: { customDns: true },
+        ENTERPRISE: { multiHop: true },
+      },
+    });
+    await runHook();
+    expect(useAppStore.getState().planGates).toEqual({
+      RECON: { stealthMode: false, multiHop: false, portForwarding: false },
+      OPERATIVE: { stealthMode: true },
+    });
+  });
+
+  it('a payload without `features`, or a failed fetch, leaves what the store holds', async () => {
+    useAppStore.setState({ planGates: { OPERATIVE: { multiHop: true } } });
+    mockedInvoke.mockResolvedValue({ dnsFilteringAvailable: true });
+    await runHook();
+    expect(useAppStore.getState().planGates).toEqual({ OPERATIVE: { multiHop: true } });
+    mockedInvoke.mockReset();
+    mockedInvoke.mockRejectedValue('Failed to get client config: HTTP 500');
+    await runHook();
+    expect(useAppStore.getState().planGates).toEqual({ OPERATIVE: { multiHop: true } });
+  });
+});
+
 /** MR-132 / MR-630 / MR-1767 / MR-1979: `plans` (birdo-web #708), through the same fetch. */
 describe('useClientConfig -> planPrices', () => {
   const recon = { monthlyPrice: 0, yearlyPrice: 0, currency: 'GBP', bandwidthLimitGb: 50 };
@@ -506,6 +536,20 @@ describe('useClientConfig -> planPrices', () => {
     mockedInvoke.mockRejectedValue('Failed to get client config: HTTP 500');
     await runHook();
     expect(useAppStore.getState().planPrices).toEqual({});
+  });
+
+  // MR-2030: a failed fetch keeps the prices an earlier one stored. The test
+  // above starts from an empty store, so a catch that emptied it would pass.
+  it('a failed fetch keeps the prices an earlier fetch stored', async () => {
+    mockedInvoke.mockResolvedValue({ plans: { RECON: recon, OPERATIVE: operative } });
+    await runHook();
+    expect(useAppStore.getState().planPrices).toEqual({ RECON: recon, OPERATIVE: operative });
+
+    mockedInvoke.mockReset();
+    mockedInvoke.mockRejectedValue('Failed to get client config: HTTP 500');
+    await runHook();
+    expect(mockedInvoke).toHaveBeenCalledWith('get_client_config');
+    expect(useAppStore.getState().planPrices).toEqual({ RECON: recon, OPERATIVE: operative });
   });
 
   it('unknown plan keys and invalid entries are left out', async () => {

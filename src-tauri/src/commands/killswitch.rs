@@ -1674,25 +1674,59 @@ impl Pf for Pfctl {
 /// N3: the pf reference we hold, on disk. XNU frees a token only on `pfctl -X`
 /// or `pfctl -d` — never when the process that took it exits — so a crash
 /// mid-session (every session holds one for the IPv6 block) kept pf enabled
-/// for good. The next start releases what this names. Root-only: the app runs
-/// as root, so this lives in root's own Application Support, mode 0600.
+/// for good. The next start releases what this names.
+///
+/// MR-2089: root-only, in the state directory `utils::root_state` keeps
+/// (`/var/db/birdovpn`), mode 0600 from creation. It used to be in
+/// `dirs::data_dir()`, the USER's Application Support whenever the launch
+/// kept HOME, where root wrote it by path and through any link at the name.
 #[cfg(target_os = "macos")]
 mod pf_reference_journal {
+    use crate::utils::root_state;
     use crate::vpn::pf_policy::{self, PfRef};
 
+    const RECORD_FILE: &str = "pf-reference";
+
     fn path() -> Option<std::path::PathBuf> {
-        let mut dir = dirs::data_dir()?;
-        dir.push("BirdoVPN");
-        std::fs::create_dir_all(&dir).ok()?;
-        dir.push("pf-reference");
-        Some(dir)
+        let dir = std::path::Path::new(root_state::STATE_DIR);
+        if let Err(e) = root_state::ensure_private_dir(dir) {
+            tracing::warn!("pf reference journal: no root-only directory ({e})");
+            return None;
+        }
+        let path = dir.join(RECORD_FILE);
+        adopt_legacy_once(&path);
+        Some(path)
+    }
+
+    /// Take over, once per process, the record an older build left in
+    /// `<data_dir>/BirdoVPN`: only one root wrote (`root_state::adopt_legacy`).
+    fn adopt_legacy_once(path: &std::path::Path) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static TRIED: AtomicBool = AtomicBool::new(false);
+        if TRIED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(base) = dirs::data_dir() else {
+            return;
+        };
+        root_state::adopt_legacy(
+            &base.join("BirdoVPN"),
+            RECORD_FILE,
+            path,
+            |bytes| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(pf_policy::decode_reference)
+                    .is_some()
+            },
+            write_atomically,
+        );
     }
 
     /// Replace the record with `held` (or remove it), staged and renamed so a
     /// crash leaves the old record or the new one, never half of one.
     pub(super) fn write(held: Option<PfRef>) {
         let Some(path) = path() else {
-            tracing::warn!("pf reference journal: no data directory");
             return;
         };
         let written = match held {
@@ -1707,24 +1741,60 @@ mod pf_reference_journal {
         }
     }
 
+    /// The staging file is created NEW (O_EXCL|O_NOFOLLOW), mode 0600 from
+    /// the start: never opened through a link at its name (MR-2089).
     fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let staging = path.with_extension("tmp");
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&staging)?;
+        let mut f = root_state::create_new_private(&staging)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         std::fs::rename(&staging, path)
     }
 
-    /// What a previous run left, if anything.
+    /// What a previous run left, if anything: read without following a link,
+    /// and only from a file that only we can write.
     pub(super) fn read() -> Option<PfRef> {
-        pf_policy::decode_reference(&std::fs::read_to_string(path()?).ok()?)
+        use std::io::Read;
+        let mut text = String::new();
+        root_state::open_private(&path()?)
+            .ok()?
+            .take(4096)
+            .read_to_string(&mut text)
+            .ok()?;
+        pf_policy::decode_reference(&text)
+    }
+
+    /// MR-2089: root never writes through a link planted on the staging name,
+    /// and the record is owner-only from creation. tests.yml runs this
+    /// unprivileged on macOS.
+    #[cfg(test)]
+    mod root_write_tests {
+        use super::write_atomically;
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn a_link_on_the_staging_name_is_not_written_through() {
+            let dir = tempfile::tempdir().unwrap();
+            let victim = dir.path().join("victim");
+            std::fs::write(&victim, "not the record's").unwrap();
+            let path = dir.path().join("pf-reference");
+            std::os::unix::fs::symlink(&victim, path.with_extension("tmp")).unwrap();
+
+            write_atomically(&path, b"1 2").unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "not the record's"
+            );
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                meta.is_file(),
+                "the record is a file of its own, not the link"
+            );
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::read(&path).unwrap(), b"1 2");
+        }
     }
 }
 

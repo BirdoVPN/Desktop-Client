@@ -231,6 +231,13 @@ function useSessionData(): void {
  * from this store first, so an install that accepted the text in an earlier
  * build is never held back by a record it has not had the chance to write.
  * A record that cannot be written holds both back, and the user is told.
+ *
+ * MR-2016: the resume is TAKEN before that write, on purpose. Taking it is
+ * what tells this controller there is a session to put back, and so whether
+ * to say that nothing reconnected. Left untaken it would be lost all the same:
+ * Rust deleted the record from disk at start (used once, MR-1933), keeps it in
+ * memory for this run only, every Quit discards it, and nothing but this
+ * controller, once per run, ever takes it.
  */
 function useAutoConnectOnce(): void {
   const done = useRef(false);

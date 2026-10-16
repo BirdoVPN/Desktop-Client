@@ -66,6 +66,14 @@ pub enum ApiError {
     /// this relay's. Nothing was downgraded, and the SAME request is worth
     /// retrying, after `retry_after_secs` when the server says.
     PskDeliveryUnavailable { retry_after_secs: Option<u64> },
+    /// 503 `error: "tunnel_address_unavailable"` (birdo-web #711,
+    /// `VpnController.rethrowRetryableConnectRefusal`, MR-2057): the server's
+    /// address allocator could not prove a tunnel address free (a reservation
+    /// it must read did not answer) and refused rather than risk handing out
+    /// another customer's address. Nothing is wrong with the account or the
+    /// server, and the SAME request is worth retrying, after
+    /// `retry_after_secs` when the server says (it sends 15).
+    TunnelAddressUnavailable { retry_after_secs: Option<u64> },
     /// 403 `error: "client_attestation_required"` (contract `$defs/ErrorCode`,
     /// MR-1944): the server's attestation policy refused this build. Its own
     /// variant so it is not read as a plan refusal (a bare 403 is
@@ -195,6 +203,12 @@ impl fmt::Display for ApiError {
                 write!(
                     f,
                     "A secure connection to this server could not be set up right now"
+                )
+            }
+            ApiError::TunnelAddressUnavailable { .. } => {
+                write!(
+                    f,
+                    "A connection address on this server could not be assigned right now"
                 )
             }
             ApiError::Unknown(msg) => write!(f, "Unknown error: {}", msg),

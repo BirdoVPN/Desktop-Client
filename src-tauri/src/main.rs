@@ -850,6 +850,9 @@ fn main() {
                     app_handle,
                     EXIT_TEARDOWN_STARTED.load(std::sync::atomic::Ordering::SeqCst),
                 );
+                // MR-2013: a copied account number whose one-minute clear has
+                // not run yet would outlive the process on the clipboard.
+                commands::clipboard::clear_on_exit();
             }
             if let RunEvent::ExitRequested { code, api, .. } = &event {
                 // A restart (`plugin-process` relaunch: the frontend's
@@ -920,6 +923,8 @@ fn main() {
                                     {
                                         let _ = vpn::win_machine_state::release_dns_at_exit();
                                     }
+                                    // MR-2013: this exit skips `RunEvent::Exit`.
+                                    commands::clipboard::clear_on_exit();
                                 },
                                 || std::process::exit(0),
                             );

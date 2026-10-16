@@ -18,7 +18,7 @@ import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '@/store/app-store';
-import { isPlanPrice, knownPlanId, type PlanId, type PlanPrice } from '@/lib/plan';
+import { isPlanPrice, knownPlanId, type PlanGates, type PlanId, type PlanPrice } from '@/lib/plan';
 
 /**
  * The slice of `/api/client-config` this client acts on. The route also serves
@@ -28,13 +28,22 @@ import { isPlanPrice, knownPlanId, type PlanId, type PlanPrice } from '@/lib/pla
  *
  * `null` is as real as `undefined`: an older web deploy predating birdo-web#465
  * omits the key, and JSON `null` survives the Rust `Option<bool>` the same way.
- * `features` is reduced by Rust to `{ <PLAN>: { customDns } }` (item 40).
+ * `features` is reduced by Rust to `{ <PLAN>: { customDns } }` (item 40) and,
+ * MR-1517, the plan-gating flags `stealthMode`, `multiHop`, `portForwarding`.
  * `plans` (birdo-web #708) arrives already validated by Rust's
  * `PlanPrice::from_wire`: known plans only, malformed entries dropped.
  */
 export interface ClientConfig {
   dnsFilteringAvailable?: boolean | null;
-  features?: Record<string, { customDns?: boolean | null } | null> | null;
+  features?: Record<
+    string,
+    {
+      customDns?: boolean | null;
+      stealthMode?: boolean | null;
+      multiHop?: boolean | null;
+      portForwarding?: boolean | null;
+    } | null
+  > | null;
   plans?: Record<string, PlanPrice | null> | null;
 }
 
@@ -51,6 +60,28 @@ export function customDnsFlags(cfg: ClientConfig | null | undefined): Partial<Re
     const id = knownPlanId(plan);
     const flag = flags?.customDns;
     if (id !== null && typeof flag === 'boolean') byPlan[id] = flag;
+  }
+  return byPlan;
+}
+
+/**
+ * MR-1517: the server's plan-gating table, only the flags it gave as booleans.
+ * `null` when the payload has no `features` map at all, so a deploy that
+ * predates it leaves the store as it is (`FEATURE_MIN_PLAN` gates).
+ */
+export function planGatesFrom(cfg: ClientConfig | null | undefined): Partial<Record<PlanId, PlanGates>> | null {
+  const features = cfg?.features;
+  if (!features || typeof features !== 'object') return null;
+  const byPlan: Partial<Record<PlanId, PlanGates>> = {};
+  for (const [plan, flags] of Object.entries(features)) {
+    const id = knownPlanId(plan);
+    if (id === null || !flags || typeof flags !== 'object') continue;
+    const gates: PlanGates = {};
+    for (const feature of ['stealthMode', 'multiHop', 'portForwarding'] as const) {
+      const flag = flags[feature];
+      if (typeof flag === 'boolean') gates[feature] = flag;
+    }
+    if (Object.keys(gates).length > 0) byPlan[id] = gates;
   }
   return byPlan;
 }
@@ -206,6 +237,7 @@ export function useClientConfig(): void {
   const setDnsFilteringAvailable = useAppStore((s) => s.setDnsFilteringAvailable);
   const setCustomDnsByPlan = useAppStore((s) => s.setCustomDnsByPlan);
   const setPlanPrices = useAppStore((s) => s.setPlanPrices);
+  const setPlanGates = useAppStore((s) => s.setPlanGates);
 
   useEffect(() => {
     let cancelled = false;
@@ -238,6 +270,9 @@ export function useClientConfig(): void {
           // `plans` (older deploy) leaves the store, and so the fallback, alone.
           const prices = planPricesFrom(cfg);
           if (prices) setPlanPrices(prices);
+          // MR-1517: the plan-gating table, the same rule again.
+          const gates = planGatesFrom(cfg);
+          if (gates) setPlanGates(gates);
         })
         // GUARD 2: the catch deliberately does NOTHING. The store default is
         // `true`; an offline client, a 500, a 429 or a cold start must leave
@@ -279,5 +314,5 @@ export function useClientConfig(): void {
       window.clearInterval(poll);
       unlistenShown.then((off) => off()).catch(() => {});
     };
-  }, [setDnsFilteringAvailable, setCustomDnsByPlan, setPlanPrices]);
+  }, [setDnsFilteringAvailable, setCustomDnsByPlan, setPlanPrices, setPlanGates]);
 }

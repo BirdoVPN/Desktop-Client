@@ -33,17 +33,19 @@ import {
 import { useAppStore } from '@/store/app-store';
 import { isValidMtu, isWindowsPlatform } from '@/utils/helpers';
 import { white, status, brand } from '@/lib/birdo-theme';
-import { planRank } from '@/lib/plan';
+import { lowestPlanWith, planHasFeature, planName } from '@/lib/plan';
 import { persistSettings } from '@/session/settings-persist';
 import { loadSubscription } from '@/session/session-data';
 
 export function VpnSettings() {
-  const { settings, popRoute, pushRoute, plan, connectionState, dnsFilteringAvailable, reapplying } = useAppStore(
+  const { settings, popRoute, pushRoute, plan, planGates, connectionState, dnsFilteringAvailable, reapplying } =
+    useAppStore(
     useShallow((s) => ({
       settings: s.settings,
       popRoute: s.popRoute,
       pushRoute: s.pushRoute,
       plan: s.account.plan,
+      planGates: s.planGates,
       connectionState: s.connectionState,
       dnsFilteringAvailable: s.dnsFilteringAvailable,
       reapplying: s.reapplying,
@@ -54,7 +56,10 @@ export function VpnSettings() {
 
   // Stealth Mode is OPERATIVE+ (enforced server-side too). `null` = the plan is
   // not known yet: the row waits instead of showing a paying user a lock.
-  const rank = planRank(plan);
+  // MR-1517: the server's plan-gating table decides, the built-in one where it
+  // is silent.
+  const stealthUnlocked = planHasFeature(plan, planGates, 'stealthMode');
+  const stealthPlan = planName(lowestPlanWith('stealthMode', planGates) ?? 'OPERATIVE');
 
   // BirdoShield vs Custom DNS (PR #160 review, must-fix 1): the Rust tunnel
   // builder applies the user's Custom DNS servers BEFORE the server-supplied
@@ -114,24 +119,24 @@ export function VpnSettings() {
           <BirdoToggleRow
             title="Stealth Mode"
             subtitle={
-              rank === null
+              stealthUnlocked === null
                 ? 'Checking your plan…'
                 : 'Wraps WireGuard in an encrypted transport for networks that block VPNs. Slower.'
             }
             subtitleWrap
             leadingIcon={EyeOff}
             leadingTint={status.blue}
-            // `&& rank >= 1` so a saved ON cannot resurface after a downgrade.
-            checked={settings.stealthMode && (rank ?? 0) >= 1}
+            // `&& unlocked` so a saved ON cannot resurface after a downgrade.
+            checked={settings.stealthMode && stealthUnlocked === true}
             onCheckedChange={(v) => save({ stealthMode: v })}
-            enabled={rank !== null}
+            enabled={stealthUnlocked !== null}
             locked={
-              rank === 0
-                ? { onClick: () => pushRoute('pricing'), label: 'Operative' }
+              stealthUnlocked === false
+                ? { onClick: () => pushRoute('pricing'), label: stealthPlan }
                 : undefined
             }
           />
-          {rank === null && (
+          {stealthUnlocked === null && (
             <button
               type="button"
               onClick={() => void loadSubscription(true)}

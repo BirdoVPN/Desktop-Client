@@ -55,6 +55,9 @@ export function UpdateRequired({ info }: { info: RequiredUpdate }) {
   const installing = phase === 'installing';
   const waiting = phase === 'waiting';
 
+  // The backend's `updateUrl`: birdo-web sends https://birdo.app/clients on
+  // every 426. The opener's scope (capabilities/default.json) refuses any
+  // other host, and the notice below then says where to go (MR-2015).
   const openDownloadPage = useCallback(() => {
     if (!downloadUrl) return;
     openExternal(downloadUrl).catch(() => {

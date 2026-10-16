@@ -753,11 +753,14 @@ pub struct ClientConfigResponse {
     /// happens on an explicit `false`.
     #[serde(default)]
     pub dns_filtering_available: Option<bool>,
-    /// The per-plan `features` map, reduced to the one flag this client acts
+    /// The per-plan `features` map, reduced to the flags this client acts
     /// on: `features.<PLAN>.customDns` (Account API contract item 40). Custom
     /// DNS is on every plan (owner decision D6), so the server sends `true`
     /// for each; only an explicit `false` turns it off for that plan, and an
     /// absent map or flag means ENABLED, as for `dns_filtering_available`.
+    /// MR-1517: and the plan-gating table (`stealthMode`, `multiHop`,
+    /// `portForwarding`), so the app gates and sells each feature on the
+    /// plans the server says, not on a list of its own.
     #[serde(default, deserialize_with = "plan_features_or_none")]
     pub features: Option<BTreeMap<String, PlanFeatures>>,
     /// The price feed for the Pricing screen (birdo-web #708; MR-132 / MR-630
@@ -857,6 +860,16 @@ where
 pub struct PlanFeatures {
     /// `None`: the server did not say, which counts as enabled.
     pub custom_dns: Option<bool>,
+    /// MR-1517: the server's plan-gating table (birdo-web
+    /// app/api/client-config/route.ts, the same `planAllows` rules the
+    /// backend enforces). `None`: the server did not say, and the UI falls
+    /// back to its built-in plan for the feature (`src/lib/plan.ts`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stealth_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_hop: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_forwarding: Option<bool>,
 }
 
 /// `features` read flag by flag: a plan entry, or a flag, of a shape this
@@ -873,8 +886,16 @@ where
         plans
             .iter()
             .map(|(plan, flags)| {
-                let custom_dns = flags.get("customDns").and_then(serde_json::Value::as_bool);
-                (plan.clone(), PlanFeatures { custom_dns })
+                let flag = |name: &str| flags.get(name).and_then(serde_json::Value::as_bool);
+                (
+                    plan.clone(),
+                    PlanFeatures {
+                        custom_dns: flag("customDns"),
+                        stealth_mode: flag("stealthMode"),
+                        multi_hop: flag("multiHop"),
+                        port_forwarding: flag("portForwarding"),
+                    },
+                )
             })
             .collect()
     }))

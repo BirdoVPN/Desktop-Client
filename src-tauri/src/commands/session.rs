@@ -411,7 +411,8 @@ async fn attempt(
 
     vm.set_phase(ConnectPhase::Authenticating);
     // MR-1639: a refusal the server marks retryable with a wait
-    // (`psk_delivery_unavailable`, `quota_check_unavailable`) is asked ONCE
+    // (`psk_delivery_unavailable`, `quota_check_unavailable`,
+    // `tunnel_address_unavailable` since MR-2057) is asked ONCE
     // more, after that wait (clamped at parse), with the SAME `settings` and
     // the SAME post-quantum key. Nothing is re-read between the two, so the
     // second request cannot go out without the Quantum Protection (or
