@@ -13,7 +13,8 @@
  *    another process can: UDP to the relay's WireGuard port.
  *  - W7, W9, W10, W15 (MR-671, AUD-DOC-14): the four Windows checks that had
  *    no step and no Results row. The log lines they wait for and the UI labels
- *    they name must exist in the app.
+ *    they name must exist in the app, and their checks must be able to fail
+ *    (W9 lets the filters settle; W15 checks xray only where one runs).
  *  - LICENCE (MR-1688): the CC BY-NC notice keeps third-party code under its
  *    own licence, naming paths that exist.
  *
@@ -157,6 +158,7 @@ describe('W7, W9, W10 and W15 (MR-671, AUD-DOC-14)', () => {
       'Exit teardown never ran to its end',
       'Kill switch: no WFP app id',
       'Moved the DNS journal to the admin-only directory',
+      'Left the old DNS journal in %APPDATA% in place, unused',
       'Quit BirdoVPN',
     ]) {
       expect(CHECKLIST_FLAT, line).toContain(line);
@@ -189,6 +191,42 @@ describe('W7, W9, W10 and W15 (MR-671, AUD-DOC-14)', () => {
       expect(CHECKLIST_FLAT, label).toContain(label);
     }
   });
+
+  it('W9 lets the filters settle after a log line the app writes before changing them', () => {
+    // auto_reconnect.rs logs `Reconnection successful` before it releases the
+    // block, and `Auto-reconnect gave up` before the teardown: the filter and
+    // web checks straight after the wait could catch the old state.
+    const lines = section(CHECKLIST, 'W9').split('\n');
+    for (const waited of ['Reconnection successful', 'Auto-reconnect gave up']) {
+      const at = lines.findIndex((l) => l.startsWith('Birdo-WaitLog') && l.includes(`'${waited}'`));
+      expect(at, waited).toBeGreaterThan(-1);
+      expect(lines[at + 1], waited).toMatch(/^Start-Sleep \d+/);
+    }
+  });
+
+  it('W10 says what a stealth relay routed into the tunnel means', () => {
+    const w10 = section(CHECKLIST, 'W10').replace(/\s+/g, ' ');
+    expect(w10).toMatch(/names `Birdo VPN`, record FAIL and file it against MR-1628/);
+  });
+
+  it('W15 checks xray only in a Stealth session, confirming it runs before each exit', () => {
+    // Without Stealth Mode there is no xray, and "xray is gone" passes without
+    // testing the kill-on-close job (xray.rs, W1-005).
+    const parts = section(CHECKLIST, 'W15').split(/\n(?=\*\*Part \d)/);
+    const xrayParts = parts.filter((p) => /Get-Process[^\n]*\bxray\b/.test(p));
+    expect(xrayParts.length).toBeGreaterThan(0);
+    for (const part of xrayParts) {
+      expect(part).toContain('Stealth Mode');
+      expect(part).toContain('N/A');
+      const exits = [...part.matchAll(/\*\*(Quit BirdoVPN|End task)\*\*/g)].map((m) => m.index ?? 0);
+      expect(exits.length).toBe(2);
+      let from = 0;
+      for (const exit of exits) {
+        expect(part.slice(from, exit)).toContain('$x = Get-Process xray');
+        from = exit;
+      }
+    }
+  });
 });
 
 describe('licence carve-out for bundled third-party code (MR-1688)', () => {
@@ -202,7 +240,7 @@ describe('licence carve-out for bundled third-party code (MR-1688)', () => {
   });
 
   it('names the bundled third-party paths, which exist', () => {
-    for (const path of ['src-tauri/wintun-extract/wintun/', 'third_party/licenses/']) {
+    for (const path of ['src-tauri/wintun-extract/wintun/', 'third_party/licenses/', 'src/assets/fonts/']) {
       expect(flat, path).toContain(path);
       expect(existsSync(resolve(ROOT, path)), path).toBe(true);
     }
