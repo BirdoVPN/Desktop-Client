@@ -442,6 +442,10 @@ pub async fn install_update(app: AppHandle) -> Result<bool, UpdateFailure> {
         // keeps a second call from restoring them mid-install).
         #[cfg(windows)]
         let _env = AdminOnlyTemp::to(&updates_dir);
+        // MR-2013: on Windows `install` exits the process from inside, past
+        // `RunEvent::Exit`: a copied account number still owed its clear
+        // would stay on the clipboard.
+        crate::commands::clipboard::clear_on_exit();
         update.install(bundle)
     };
     if let Err(e) = installed {

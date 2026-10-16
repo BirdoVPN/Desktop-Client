@@ -6,6 +6,19 @@
 //! Windows in the admin-only `%ProgramData%\BirdoVPN` (MR-1721,
 //! `protected_key`), on macOS and Linux in the OS credential store and a
 //! 0600 file in root's own config directory (`get_hmac_key`).
+//!
+//! MR-2004: a signature says WHO wrote the file, not WHEN. On Windows
+//! settings.json sits in the user's %APPDATA%, so a same-user process could
+//! put back an older file this app genuinely signed (one from a day the user
+//! had the kill switch off, say) and have it applied. The MACs the file has
+//! held are kept beside the key, in the admin-only directory ([`MacLedger`]),
+//! and a file whose MAC was written over since is refused like a tampered
+//! one. The ledger knows only what it saw: a file signed before it existed
+//! (by a build before 1.4.49), or one more than [`MAC_LEDGER_LEN`] saves old,
+//! can each be put back and applied ONCE, and is refused after that. macOS
+//! and Linux keep no ledger: there the file, its key file and the process
+//! are all root's, so whoever can put an old file back can as well sign a
+//! new one.
 
 // digest 0.11 moved `new_from_slice` off the `Mac` trait and onto `KeyInit`,
 // so the constructor needs its own import now.
@@ -533,6 +546,82 @@ fn verify_hmac(settings_json: &str, expected_hmac: &str, key: &[u8]) -> bool {
     mac.verify_slice(&expected_bytes).is_ok()
 }
 
+/// How many MACs [`MacLedger`] remembers: a file older than this many saves
+/// is no longer recognised as written over (and is applied, as before
+/// MR-2004). Each is 65 bytes, so the ledger stays under 17 KB.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MAC_LEDGER_LEN: usize = 256;
+
+/// MR-2004: the MACs settings.json has held, oldest first. The last one is
+/// what it holds now; every earlier one was written over by this app, so a
+/// file that carries one of those is an older file put back: a replay.
+///
+/// A MAC the ledger does not know is not refused. That is a file from before
+/// the ledger (the first start of this build), from an older build after a
+/// downgrade, or one whose write landed while recording it did not (a crash
+/// in between): each only this app could have signed, and each is then
+/// recorded as what the file holds. So a crash can only ever let one replay
+/// through, never refuse the user's own file. Only an earlier, SUPERSEDED
+/// MAC is refused. Kept on Windows only (see the module doc); the type is
+/// tested on every host.
+///
+/// What that costs: a MAC the ledger never saw includes every file signed
+/// before the ledger existed (by a build before 1.4.49) and every file more
+/// than [`MAC_LEDGER_LEN`] saves old. A same-user process that kept such a
+/// copy can put it back and have it applied ONCE; it is recorded then, and
+/// refused if put back after the next save. So the guarantee is for files
+/// written by 1.4.49 and later, within the last [`MAC_LEDGER_LEN`] saves.
+/// Refusing unknown MACs instead would refuse the user's own file after a
+/// crash, a downgrade or the upgrade itself.
+#[derive(Debug, Default, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct MacLedger(Vec<String>);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl MacLedger {
+    /// The ledger as stored: one MAC per line. Anything else is dropped.
+    fn parse(text: &str) -> Self {
+        Self(text.lines().filter_map(normalized_mac).collect())
+    }
+
+    fn render(&self) -> String {
+        self.0.iter().map(|mac| format!("{mac}\n")).collect()
+    }
+
+    /// Whether `mac` is one the file held before and was written over since.
+    fn superseded(&self, mac: &str) -> bool {
+        let Some(mac) = normalized_mac(mac) else {
+            return false;
+        };
+        self.0.last() != Some(&mac) && self.0.contains(&mac)
+    }
+
+    /// The file holds `mac` now. Answers whether the ledger changed.
+    fn holds(&mut self, mac: &str) -> bool {
+        let Some(mac) = normalized_mac(mac) else {
+            return false;
+        };
+        if self.0.last() == Some(&mac) {
+            return false;
+        }
+        self.0.retain(|m| *m != mac);
+        self.0.push(mac);
+        let excess = self.0.len().saturating_sub(MAC_LEDGER_LEN);
+        self.0.drain(..excess);
+        true
+    }
+}
+
+/// A MAC as the ledger keeps it: 64 hex digits, lower-cased. `verify_hmac`
+/// accepts either case, so the ledger must not tell them apart: an older
+/// file with its MAC upper-cased is the same file.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn normalized_mac(mac: &str) -> Option<String> {
+    let mac = mac.trim();
+    (mac.len() == 64 && mac.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| mac.to_ascii_lowercase())
+}
+
 /// Normalize settings loaded from disk to enforce non-negotiable invariants.
 ///
 /// The kill switch defaults ON (via the `default_true` serde default when the
@@ -904,6 +993,15 @@ trait SettingsKeys {
     /// The re-sign that `sign` minted the admin-only key for failed: take
     /// the key back, so the next load can still migrate (Windows).
     fn undo_mint(&self);
+    /// MR-2004: whether `mac` is one settings.json held before and was
+    /// written over since ([`MacLedger::superseded`]): an older file put back.
+    /// Never, where no ledger is kept (macOS, Linux).
+    fn superseded(&self, _mac: &str) -> bool {
+        false
+    }
+    /// MR-2004: settings.json holds the file signed `mac` now (just written,
+    /// or verified and not superseded).
+    fn now_holds(&self, _mac: &str) {}
 }
 
 /// The OS's key sources for the settings file at `settings_path`.
@@ -973,6 +1071,22 @@ impl SettingsKeys for OsKeys<'_> {
     fn undo_mint(&self) {
         #[cfg(windows)]
         protected_key::forget();
+    }
+
+    fn superseded(&self, _mac: &str) -> bool {
+        #[cfg(windows)]
+        {
+            protected_key::ledger().is_ok_and(|ledger| ledger.superseded(_mac))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn now_holds(&self, _mac: &str) {
+        #[cfg(windows)]
+        protected_key::record_held(_mac);
     }
 }
 
@@ -1108,6 +1222,54 @@ mod protected_key {
             KeyFile::Missing | KeyFile::Unreadable => None,
         }
     }
+
+    /// MR-2004: this account's MAC ledger, beside its key.
+    fn ledger_path() -> Result<PathBuf, String> {
+        let dir = crate::utils::protected_dir::ensure()
+            .map_err(|e| format!("admin-only state directory: {e}"))?;
+        let user = crate::utils::protected_dir::current_user_sid()
+            .map_err(|e| format!("account SID: {e}"))?;
+        Ok(dir.join(format!("settings-macs-{user}.txt")))
+    }
+
+    /// The ledger: empty when there is none yet. `Err` when it is there and
+    /// cannot be read right now: nothing is refused for it then, and nothing
+    /// is written over it.
+    pub(super) fn ledger() -> Result<super::MacLedger, String> {
+        use std::io::Read;
+        let path = ledger_path()?;
+        let mut text = String::new();
+        match std::fs::File::open(&path) {
+            Ok(file) => file
+                // A ledger is under 17 KB; more is not one of ours.
+                .take(64 * 1024)
+                .read_to_string(&mut text)
+                .map(|_| super::MacLedger::parse(&text))
+                .map_err(|e| format!("Failed to read the settings MAC ledger: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(super::MacLedger::default()),
+            Err(e) => Err(format!("Failed to open the settings MAC ledger: {e}")),
+        }
+    }
+
+    /// Record that settings.json holds the file signed `mac` now. Written
+    /// whole, through a staging file and a rename, in the admin-only
+    /// directory nobody unelevated can write. A failure is logged: the next
+    /// load records the file again, and until then one replay could pass.
+    pub(super) fn record_held(mac: &str) {
+        let result = ledger().and_then(|mut ledger| {
+            if !ledger.holds(mac) {
+                return Ok(());
+            }
+            let path = ledger_path()?;
+            let staging = path.with_extension("txt.tmp");
+            std::fs::write(&staging, ledger.render())
+                .and_then(|()| std::fs::rename(&staging, &path))
+                .map_err(|e| format!("Failed to write the settings MAC ledger: {e}"))
+        });
+        if let Err(e) = result {
+            tracing::warn!("Could not record the settings file's MAC ({e})");
+        }
+    }
 }
 
 /// The settings key as it is now, for other state the elevated client must
@@ -1195,7 +1357,7 @@ fn verify_signed(signed: SignedSettings, keys: &[Vec<u8>]) -> Result<Option<Veri
 /// vouches for. See `protected_key`.
 #[must_use]
 fn adopt_legacy(path: &Path, settings: &AppSettings, keys: &dyn SettingsKeys) -> bool {
-    match write_signed_settings(path, settings, |json| keys.sign(json)) {
+    match write_signed(path, settings, keys) {
         Ok(()) => {
             tracing::info!(
                 "Settings re-signed with the admin-only key; the old key sources are retired"
@@ -1228,6 +1390,7 @@ fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {
     // Try to parse as signed settings (new format)
     if let Ok(signed) = serde_json::from_str::<SignedSettings>(&content) {
         let found = keys.verifying();
+        let mac = signed.hmac.clone();
         return match verify_signed(signed, &found.keys)? {
             Some(verified) if found.legacy => {
                 if adopt_legacy(path, &verified.settings, keys) {
@@ -1240,17 +1403,27 @@ fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {
                     Ok(Loaded::Unverified(AppSettings::default()))
                 }
             }
+            // MR-2004: genuinely signed, and written over since: an older
+            // file put back. Refused like a tampered one: set aside, and the
+            // secure defaults stand in its place.
+            Some(_) if keys.superseded(&mac) => {
+                tracing::warn!(
+                    "settings.json is an older signed file put back over a newer one — refusing it"
+                );
+                Ok(replayed(path, &content, keys))
+            }
             Some(verified) => {
                 keys.verified_with(&verified.key);
                 if verified.resave {
-                    if let Err(e) =
-                        write_signed_settings(path, &verified.settings, |json| keys.sign(json))
-                    {
+                    if let Err(e) = write_signed(path, &verified.settings, keys) {
                         tracing::warn!(
                             "Failed to save migrated settings: {} (will retry next load)",
                             e
                         );
+                        keys.now_holds(&mac);
                     }
+                } else {
+                    keys.now_holds(&mac);
                 }
                 Ok(Loaded::Saved(verified.settings))
             }
@@ -1258,7 +1431,7 @@ fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {
                 path,
                 &content,
                 found.key_may_still_exist,
-                |json| keys.sign(json),
+                keys,
             )),
         };
     }
@@ -1275,7 +1448,7 @@ fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {
                     path,
                     &content,
                     found.key_may_still_exist,
-                    |json| keys.sign(json),
+                    keys,
                 ));
             }
             tracing::info!("Migrating unsigned settings to HMAC-protected format");
@@ -1287,7 +1460,7 @@ fn load_at(path: &Path, keys: &dyn SettingsKeys) -> Result<Loaded, LoadError> {
                 if !adopt_legacy(path, &settings, keys) {
                     return Ok(Loaded::Unverified(AppSettings::default()));
                 }
-            } else if let Err(e) = write_signed_settings(path, &settings, |json| keys.sign(json)) {
+            } else if let Err(e) = write_signed(path, &settings, keys) {
                 // Log on failure so a persistent failure to upgrade (disk
                 // full, permissions, credential store down) is observable
                 // rather than silently leaving settings unprotected.
@@ -1330,12 +1503,12 @@ fn key_may_still_exist(keystore: &Result<Option<Vec<u8>>, String>, key_file: &Ke
 /// disk — and the defaults load as what is saved ([`quarantine`]). `content`
 /// is the file as this load read it: its log choice is taken from those
 /// bytes, not from a second read that a brief lock (an antivirus scan) could
-/// fail (MR-1956). `sign` signs those defaults like any save.
+/// fail (MR-1956). `keys` sign those defaults like any save.
 fn no_verifying_key(
     path: &Path,
     content: &str,
     key_may_still_exist: bool,
-    sign: impl FnOnce(&str) -> Result<String, String>,
+    keys: &dyn SettingsKeys,
 ) -> Loaded {
     if key_may_still_exist {
         tracing::error!(
@@ -1347,7 +1520,16 @@ fn no_verifying_key(
         "Settings HMAC verification failed — tampered, or its key is gone. Resetting to defaults."
     );
     let saved = crate::utils::file_log::saved_choice(Ok(content.to_owned()));
-    Loaded::Quarantined(quarantine(path, saved, sign))
+    Loaded::Quarantined(quarantine(path, saved, keys))
+}
+
+/// MR-2004: the end of a load whose file verifies but was written over since
+/// ([`MacLedger::superseded`]). Not a key that may come back: the file is set
+/// aside and the defaults are what is saved now, exactly as for a file no key
+/// verifies ([`no_verifying_key`]).
+fn replayed(path: &Path, content: &str, keys: &dyn SettingsKeys) -> Loaded {
+    let saved = crate::utils::file_log::saved_choice(Ok(content.to_owned()));
+    Loaded::Quarantined(quarantine(path, saved, keys))
 }
 
 /// Set `path` aside as tampered ([`aside_path`]) and return the defaults that
@@ -1357,16 +1539,22 @@ fn no_verifying_key(
 /// `saved` is the file's own log choice (`file_log::saved_choice` over the
 /// bytes the load read), and [`after_quarantine`] keeps an "off" as it does
 /// at start-up. With the log off, those defaults are saved now, signed with
-/// `sign` (a parameter so a test can sign without the OS credential store): a
+/// `keys` (a parameter so a test can sign without the OS credential store): a
 /// quarantine in the middle of a session (the signing key vanished while the
 /// app runs) used to leave no file at all, so the next launch read the log as
 /// on and the user's "off" was lost. With the log on, nothing is written: no
 /// file reads as the default. A file that could not be moved is not written
 /// over either; it still says "off" to the next launch.
+///
+/// MR-2004 (review of #329): the save goes through [`write_signed`], so its
+/// MAC is recorded like every other write's. These defaults always sign the
+/// same, and a user may once have saved exactly them: unrecorded, that MAC
+/// stayed behind a later one in the ledger, and every following load took
+/// the app's own file for a replay and quarantined it again.
 fn quarantine(
     path: &Path,
     saved: crate::utils::file_log::SavedChoice,
-    sign: impl FnOnce(&str) -> Result<String, String>,
+    keys: &dyn SettingsKeys,
 ) -> AppSettings {
     let (defaults, _) = after_quarantine(AppSettings::default(), saved);
     let moved = aside_path(path, "tampered");
@@ -1381,7 +1569,7 @@ fn quarantine(
         return defaults;
     }
     if !defaults.file_logging_enabled {
-        if let Err(e) = write_signed_settings(path, &defaults, sign) {
+        if let Err(e) = write_signed(path, &defaults, keys) {
             tracing::warn!("Could not keep the log switched off after the reset: {}", e);
         }
     }
@@ -1391,8 +1579,30 @@ fn quarantine(
 /// Internal save function used by both save_settings command and migration
 fn save_settings_inner(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = get_settings_path(app)?;
-    let keys = OsKeys::new(&path);
-    write_signed_settings(&path, settings, |json| keys.sign(json))
+    write_signed(&path, settings, &OsKeys::new(&path))
+}
+
+/// [`write_signed_settings`] signed with `keys`, recording the new MAC once
+/// the file is in place (MR-2004, [`MacLedger`]): only then, so a write that
+/// never landed cannot make the file on disk read as written over. The write
+/// and the record hold [`SETTINGS_WRITE`] together: two saves recorded in the
+/// other order than they landed would leave the file's own MAC written over.
+fn write_signed(
+    path: &Path,
+    settings: &AppSettings,
+    keys: &dyn SettingsKeys,
+) -> Result<(), String> {
+    let _write = SETTINGS_WRITE.lock();
+    let mut mac = None;
+    write_signed_settings(path, settings, |json| {
+        let signed = keys.sign(json)?;
+        mac = Some(signed.clone());
+        Ok(signed)
+    })?;
+    if let Some(mac) = mac {
+        keys.now_holds(&mac);
+    }
+    Ok(())
 }
 
 /// Serialises every settings write in this process (REVIEW-WIN-006).
@@ -1655,9 +1865,21 @@ fn may_save_over(loaded: Result<Loaded, LoadError>) -> Result<(), IpcError> {
 /// that were never attempted: one saved while the rebuild ran (the UI holds
 /// its saves for a while, not for ever, and `scheduleReapply` does nothing
 /// mid-switch), or one saved earlier that no rebuild took up. A setting the
-/// change did not move, or one changed again since, keeps what is saved.
+/// change did not move keeps what is saved, and so does one changed again
+/// since to ANOTHER value. One saved again with the very value attempted
+/// cannot be told from the attempt here, and goes back to `good` with it
+/// (MR-2016: this used to say every setting changed again since was kept).
 /// Anything that shapes no tunnel (a notification toggle, the server the user
 /// picked) is not part of the revert at all.
+///
+/// MR-2016, accepted as it is: what is kept was never connected with, and
+/// the revert's rebuild (`vpn::reapply_vpn_settings` → `reconnect_following`,
+/// through `connect_session_for`, which reads this file) dials it as saved.
+/// Those are the user's own later choices, which the next reapply would apply
+/// anyway. Rebuilding on `good` alone instead would leave the session running
+/// on settings the file no longer holds, which the UI shows. A rebuild that
+/// fails on one of them ends like any failed rebuild: in `error`, fail-closed
+/// where the kill switch is armed, with Disconnect and Retry.
 fn with_tunnel_settings_of(
     current: AppSettings,
     good: &AppSettings,
@@ -2362,7 +2584,8 @@ mod tests {
             1
         );
         let lock = at.find("SETTINGS_WRITE.lock()").expect("the lock");
-        assert!(lock < at.find("write_signed_settings(").unwrap());
+        // MR-2004: its writes sign through `write_signed`, which records the MAC.
+        assert!(lock < at.find("write_signed(").unwrap());
         assert!(lock < at.find("adopt_legacy(").unwrap());
     }
 
@@ -2968,7 +3191,7 @@ mod tests {
 
         for round in ["one", "two"] {
             fs::write(&path, round).unwrap();
-            let _ = no_verifying_key(&path, round, false, signs_nothing);
+            let _ = no_verifying_key(&path, round, false, &SignsNothing);
         }
         assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 2);
     }
@@ -3184,7 +3407,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         let content = r#"{"settings":{},"hmac":"00"}"#;
         fs::write(&path, content).unwrap();
-        let loaded = no_verifying_key(&path, content, false, signs_nothing);
+        let loaded = no_verifying_key(&path, content, false, &SignsNothing);
         assert!(
             matches!(loaded, Loaded::Quarantined(_)),
             "quarantined, and so said"
@@ -3226,7 +3449,8 @@ mod tests {
         let saved = saved_choice(Ok(original.clone()));
         assert_eq!(saved, SavedChoice::Off);
 
-        let kept = quarantine(&path, saved, |json| compute_hmac(json, &fresh));
+        let keys = WindowsKeys::new(KeyFile::Key(fresh.to_vec()), &[]);
+        let kept = quarantine(&path, saved, &keys);
         assert!(!kept.file_logging_enabled, "the saved off is kept");
 
         // A new settings file, signed, with the log off and the rest at its
@@ -3243,6 +3467,8 @@ mod tests {
             &signed.hmac,
             &fresh
         ));
+        // MR-2004: and recorded as what the file holds, like any save.
+        assert_eq!(keys.ledger.borrow().0, [signed.hmac.as_str()]);
         let reset = AppSettings {
             file_logging_enabled: true,
             ..signed.settings
@@ -3266,9 +3492,11 @@ mod tests {
         })
         .unwrap();
         let said_on = saved_choice(Ok(fs::read_to_string(&path).unwrap()));
-        let on = quarantine(&path, said_on, |_| unreachable!("nothing is saved"));
+        let untouched = WindowsKeys::new(KeyFile::Key(fresh.to_vec()), &[]);
+        let on = quarantine(&path, said_on, &untouched);
         assert!(on.file_logging_enabled);
-        assert!(!path.exists());
+        assert!(!path.exists(), "nothing is saved");
+        assert_eq!(*untouched.ledger.borrow(), MacLedger::default());
 
         // The load's quarantine is this one, signed like any save. The
         // choice is taken from the bytes the load already read (MR-1956): a
@@ -3288,14 +3516,15 @@ mod tests {
             .unwrap();
         assert!(choice < quarantined);
         assert!(
-            load[quarantined..].starts_with("Loaded::Quarantined(quarantine(path, saved, sign))")
+            load[quarantined..].starts_with("Loaded::Quarantined(quarantine(path, saved, keys))")
         );
         assert!(!body("fn quarantine(").contains("read_to_string"));
-        // ...and the load hands it the signing every save uses.
+        // ...and the load hands it the keys every save uses.
         let at = body("fn load_at(");
         for call in at.split("no_verifying_key(").skip(1) {
             let args = &call[..call.find("))").expect("end of the call")];
-            assert!(args.contains("|json| keys.sign(json)"), "{args}");
+            let last = args.rsplit(',').map(str::trim).find(|a| !a.is_empty());
+            assert_eq!(last, Some("keys"), "{args}");
         }
     }
 
@@ -3314,7 +3543,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, "{}").unwrap();
         assert!(matches!(
-            no_verifying_key(&path, "{}", true, signs_nothing),
+            no_verifying_key(&path, "{}", true, &SignsNothing),
             Loaded::Unverified(_)
         ));
         assert!(path.exists());
@@ -3426,8 +3655,22 @@ mod tests {
     }
 
     /// For a quarantine that writes nothing: there is nothing to sign.
-    fn signs_nothing(_: &str) -> Result<String, String> {
-        Err("this test signs nothing".to_string())
+    struct SignsNothing;
+
+    impl SettingsKeys for SignsNothing {
+        fn verifying(&self) -> VerifyingKeys {
+            unreachable!("a quarantine verifies nothing")
+        }
+
+        fn sign(&self, _: &str) -> Result<String, String> {
+            Err("this test signs nothing".to_string())
+        }
+
+        fn verified_with(&self, _: &[u8]) {}
+
+        fn retire_legacy(&self) {}
+
+        fn undo_mint(&self) {}
     }
 
     // ── MR-1721: the key an unelevated process cannot read ─────────────
@@ -3447,6 +3690,8 @@ mod tests {
         /// R1: the first start after the installer upgraded a pre-MR-1721
         /// install. On by default: the migration tests are upgrades.
         upgrade_window: bool,
+        /// MR-2004: the admin-only MAC ledger, in memory.
+        ledger: std::cell::RefCell<MacLedger>,
     }
 
     impl WindowsKeys {
@@ -3458,6 +3703,7 @@ mod tests {
                 retired: std::cell::Cell::new(false),
                 fail_after_mint: false,
                 upgrade_window: true,
+                ledger: std::cell::RefCell::default(),
             }
         }
 
@@ -3512,6 +3758,226 @@ mod tests {
         fn undo_mint(&self) {
             *self.protected.borrow_mut() = KeyFile::Missing;
         }
+
+        fn superseded(&self, mac: &str) -> bool {
+            self.ledger.borrow().superseded(mac)
+        }
+
+        fn now_holds(&self, mac: &str) {
+            self.ledger.borrow_mut().holds(mac);
+        }
+    }
+
+    // ── MR-2004: an older genuinely signed file put back ───────────────
+
+    /// The ledger: the last MAC is what the file holds; an earlier one was
+    /// written over (a replay); one it never saw is not refused. Case-blind,
+    /// like `verify_hmac`; bounded, oldest out first.
+    #[test]
+    fn the_mac_ledger_refuses_only_a_mac_written_over() {
+        let mac = |n: u8| format!("{:02x}", n).repeat(32);
+        let mut ledger = MacLedger::default();
+        assert!(
+            !ledger.superseded(&mac(1)),
+            "an empty ledger refuses nothing"
+        );
+        assert!(ledger.holds(&mac(1)));
+        assert!(!ledger.holds(&mac(1)), "already what the file holds");
+        assert!(ledger.holds(&mac(2)));
+        assert!(ledger.superseded(&mac(1)));
+        assert!(ledger.superseded(&mac(1).to_uppercase()), "the same MAC");
+        assert!(!ledger.superseded(&mac(2)), "what the file holds now");
+        assert!(!ledger.superseded(&mac(3)), "never seen: not refused");
+        assert!(!ledger.superseded("not a mac"));
+        // The same settings saved again sign the same: current once more.
+        assert!(ledger.holds(&mac(1)));
+        assert!(!ledger.superseded(&mac(1)));
+        assert!(ledger.superseded(&mac(2)));
+        // Stored and read back, junk lines dropped.
+        let text = format!("{}junk\n{}", ledger.render(), "\r\n");
+        assert_eq!(MacLedger::parse(&text), ledger);
+        // Bounded: the oldest goes first.
+        for n in 0..=255u8 {
+            ledger.holds(&mac(n));
+        }
+        ledger.holds(&"0123456789abcdef".repeat(4));
+        assert_eq!(ledger.0.len(), MAC_LEDGER_LEN);
+        assert!(!ledger.superseded(&mac(0)), "forgotten");
+        assert!(ledger.superseded(&mac(1)));
+    }
+
+    /// THE FINDING (MR-2004). The user once saved the kill switch and
+    /// lockdown OFF, then turned them back ON. A same-user process copied the
+    /// first file, genuinely signed by this app, back over settings.json. On
+    /// main it verified and was applied; now its MAC is one the file held
+    /// and was written over, so it is set aside and the secure defaults run.
+    #[test]
+    fn an_older_signed_file_put_back_is_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let keys = WindowsKeys::new(KeyFile::Key(rand::random::<[u8; 32]>().to_vec()), &[]);
+        write_signed(&path, &weakened(), &keys).unwrap();
+        let older = fs::read(&path).unwrap();
+        let newer = AppSettings {
+            killswitch_enabled: true,
+            lockdown_mode: true,
+            ..AppSettings::default()
+        };
+        write_signed(&path, &newer, &keys).unwrap();
+        assert!(matches!(
+            load_at(&path, &keys).unwrap(),
+            Loaded::Saved(s) if s.killswitch_enabled && s.lockdown_mode
+        ));
+
+        fs::write(&path, &older).unwrap();
+
+        let Loaded::Quarantined(settings) = load_at(&path, &keys).unwrap() else {
+            panic!("the older file was applied");
+        };
+        assert_secure_defaults(&settings);
+        assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 1);
+
+        // Its MAC upper-cased verifies just the same (hex is case-blind),
+        // and is refused just the same.
+        let shouted: serde_json::Value = serde_json::from_slice(&older).unwrap();
+        let mut shouted = shouted;
+        let mac = shouted["hmac"].as_str().unwrap().to_uppercase();
+        shouted["hmac"] = serde_json::Value::String(mac);
+        fs::write(&path, serde_json::to_vec(&shouted).unwrap()).unwrap();
+        assert!(matches!(
+            load_at(&path, &keys).unwrap(),
+            Loaded::Quarantined(_)
+        ));
+    }
+
+    /// A file the ledger never saw is the user's own: one from before the
+    /// ledger (the first start of this build), or one whose write landed
+    /// while its record did not. It loads, and from then on it is what the
+    /// file holds, so the one before it is refused if put back. The user's
+    /// file is never refused for a record that did not land.
+    #[test]
+    fn a_file_the_ledger_never_saw_is_applied_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let key = rand::random::<[u8; 32]>().to_vec();
+        let keys = WindowsKeys::new(KeyFile::Key(key.clone()), &[]);
+        // Written by a build without the ledger.
+        signed_file(&path, &weakened(), &key);
+        let first = fs::read(&path).unwrap();
+        assert!(matches!(
+            load_at(&path, &keys).unwrap(),
+            Loaded::Saved(s) if !s.killswitch_enabled
+        ));
+        // A save whose record did not land (the process died in between).
+        let saved = AppSettings {
+            wireguard_mtu: 1380,
+            ..AppSettings::default()
+        };
+        signed_file(&path, &saved, &key);
+        assert!(matches!(
+            load_at(&path, &keys).unwrap(),
+            Loaded::Saved(s) if s.wireguard_mtu == 1380
+        ));
+        assert!(matches!(
+            load_at(&path, &keys).unwrap(),
+            Loaded::Saved(s) if s.wireguard_mtu == 1380
+        ));
+        // Recorded by those loads: the first file is written over now.
+        fs::write(&path, &first).unwrap();
+        assert!(matches!(
+            load_at(&path, &keys).unwrap(),
+            Loaded::Quarantined(_)
+        ));
+    }
+
+    /// Review of #329: the defaults a quarantine saves (the log kept off)
+    /// always sign the same, Q. The user once saved exactly those, then A,
+    /// then B: the ledger is [Q, A, B]. A is put back with the log off, so
+    /// it is set aside and Q is written. Unrecorded, Q stayed behind B, and
+    /// every later load took the app's own file for a replay and quarantined
+    /// it again, one more tampered file and false warning each time. Now Q
+    /// is recorded: the next load is Saved, with the one tampered file.
+    #[test]
+    fn the_defaults_a_quarantine_saves_are_not_taken_for_a_replay() {
+        use crate::utils::file_log::SavedChoice;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let keys = WindowsKeys::new(KeyFile::Key(rand::random::<[u8; 32]>().to_vec()), &[]);
+        let (q, _) = after_quarantine(AppSettings::default(), SavedChoice::Off);
+        write_signed(&path, &q, &keys).unwrap();
+        let a = AppSettings {
+            file_logging_enabled: false,
+            ..weakened()
+        };
+        write_signed(&path, &a, &keys).unwrap();
+        let older = fs::read(&path).unwrap();
+        let b = AppSettings {
+            file_logging_enabled: false,
+            wireguard_mtu: 1380,
+            ..AppSettings::default()
+        };
+        write_signed(&path, &b, &keys).unwrap();
+        assert_eq!(keys.ledger.borrow().0.len(), 3, "[Q, A, B]");
+
+        fs::write(&path, &older).unwrap();
+        let Loaded::Quarantined(settings) = load_at(&path, &keys).unwrap() else {
+            panic!("the older file was applied");
+        };
+        assert!(!settings.file_logging_enabled, "the log stays off");
+
+        let Loaded::Saved(next) = load_at(&path, &keys).unwrap() else {
+            panic!("the app's own defaults were taken for a replay");
+        };
+        assert_eq!(
+            serde_json::to_string(&next).unwrap(),
+            serde_json::to_string(&q).unwrap()
+        );
+        assert!(matches!(load_at(&path, &keys).unwrap(), Loaded::Saved(_)));
+        assert_eq!(names_in(dir.path(), "settings.json.tampered-").len(), 1);
+    }
+
+    /// Every write the app makes records its MAC (MR-2004): the saves, the
+    /// migrations, the legacy adoption and the quarantine's defaults all sign
+    /// through `write_signed`.
+    #[test]
+    fn every_signed_write_records_its_mac() {
+        let source = include_str!("settings.rs").replace('\r', "");
+        let body = |signature: &str| {
+            let rest = &source[source.find(signature).expect(signature)..];
+            rest[..rest.find("\n}\n").expect("end of fn")].to_string()
+        };
+        assert!(body("fn save_settings_inner(")
+            .contains("write_signed(&path, settings, &OsKeys::new(&path))"));
+        assert!(body("fn adopt_legacy(").contains("write_signed(path, settings, keys)"));
+        let at = body("fn load_at(");
+        assert_eq!(
+            at.matches("write_signed(").count(),
+            2,
+            "the resave and the unsigned migration"
+        );
+        assert!(!at.contains("write_signed_settings("));
+        // Review of #329: the quarantine's save of the defaults too.
+        let quarantine = body("fn quarantine(");
+        assert!(quarantine.contains("write_signed(path, &defaults, keys)"));
+        assert!(!quarantine.contains("write_signed_settings("));
+        // And nothing else signs past it: outside the tests, the only call
+        // of `write_signed_settings` is the one in `write_signed`.
+        let app = &source[..source.find("#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert_eq!(
+            app.matches("write_signed_settings(").count(),
+            2,
+            "its definition and `write_signed`'s call"
+        );
+        let write = body("fn write_signed(");
+        let lock = write
+            .find("SETTINGS_WRITE.lock()")
+            .expect("one lock over both");
+        assert!(lock < write.find("write_signed_settings(").unwrap());
+        assert!(
+            write.find("write_signed_settings(").unwrap()
+                < write.find("keys.now_holds(&mac)").unwrap(),
+            "recorded only once the file is in place"
+        );
     }
 
     /// What an unelevated process wants applied.

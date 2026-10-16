@@ -17,7 +17,7 @@ import { BirdoCard, BirdoSectionHeader, BirdoNavRow } from '@/components/birdo';
 import { brand, status as statusTokens } from '@/lib/birdo-theme';
 import { planRank } from '@/lib/plan';
 import { BILLING_URL } from '@/lib/links';
-import { resolveAnonymousAccount } from '@/utils/helpers';
+import { displayableEmail, resolveAnonymousAccount } from '@/utils/helpers';
 import { loadSubscription } from '@/session/session-data';
 import { signOut } from '@/session/session';
 import { AccountNumberCard, IdentityCard, SubscriptionCard } from './profile/ProfileCards';
@@ -48,7 +48,9 @@ export function Profile() {
   const isFreeTier = rank === 0;
   // The email is mirrored in both `account.email` and `userEmail` (set at
   // sign-in); fall back so the card never reads "Anonymous" for a real user.
-  const resolvedEmail = account.email ?? userEmail ?? null;
+  // MR-2014: never the synthetic anonymous address, even before `/auth/me`
+  // has said the account is anonymous (the card then reads "Signed in").
+  const resolvedEmail = displayableEmail(account.email ?? userEmail);
   // An anonymous account's email is never rendered; its number is shown
   // instead — both from `/auth/me`'s own fields (item 86, MR-918).
   const { isAnon, accountNumber } = resolveAnonymousAccount(account);

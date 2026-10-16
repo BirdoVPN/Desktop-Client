@@ -167,23 +167,44 @@ describe("Rust's consent record (MR-1607)", () => {
     expect(screen.queryByRole('button', { name: /i agree & continue/i })).not.toBeInTheDocument();
   });
 
-  it('an older acceptance writes nothing until the user accepts the current text', async () => {
+  // MR-2016: an older acceptance is written as it is, which takes Rust's
+  // record down with it, so the tray waits for the consent screen; then the
+  // accept writes the current text. On main nothing was written until the
+  // accept, and a record left at the current text kept the tray dialling.
+  it('an older acceptance takes the record down at start, and the accept writes the current text', async () => {
     answerRecord((v) => v);
     useAppStore.setState({ acceptedConsentVersion: 1 });
     render(<App />);
     const button = await agree();
-    expect(callsTo('record_consent')).toHaveLength(0);
+    await waitFor(() => expect(callsTo('record_consent')).toEqual([['record_consent', { version: 1 }]]));
     await userEvent.click(button);
-    await waitFor(() => expect(callsTo('record_consent')).toEqual([['record_consent', { version: CONSENT_VERSION }]]));
+    await waitFor(() =>
+      expect(callsTo('record_consent')).toEqual([
+        ['record_consent', { version: 1 }],
+        ['record_consent', { version: CONSENT_VERSION }],
+      ]),
+    );
   });
 
-  it('a tray Quick Connect refused behind the consent screen leaves the screen up and writes nothing', async () => {
+  // MR-2016: the webview lost its storage (no acceptance at all) while Rust's
+  // record still says accepted: the consent screen is up, and the start-up
+  // write takes the record to 0, so the tray's Quick Connect is refused.
+  it('a webview that lost its consent takes the record down with it', async () => {
+    answerRecord((v) => v);
+    useAppStore.setState({ acceptedConsentVersion: 0 });
+    render(<App />);
+    await agree();
+    await waitFor(() => expect(callsTo('record_consent')).toEqual([['record_consent', { version: 0 }]]));
+  });
+
+  it('a tray Quick Connect refused behind the consent screen leaves the screen up and writes nothing more', async () => {
     answerRecord((v) => v);
     useAppStore.setState({ acceptedConsentVersion: 1 });
     render(<App />);
     await agree();
+    await waitFor(() => expect(callsTo('record_consent')).toHaveLength(1));
     await emit('consent-required');
-    expect(callsTo('record_consent')).toHaveLength(0);
+    expect(callsTo('record_consent')).toHaveLength(1);
     expect(useAppStore.getState().notice).toBeNull();
     expect(screen.getByRole('button', { name: /i agree & continue/i })).toBeInTheDocument();
   });

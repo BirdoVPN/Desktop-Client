@@ -11,10 +11,15 @@
  * This module keeps the record in step with the store:
  *
  *  - whenever the store holds the current version — every start, and the
- *    moment the user accepts — it is written to Rust (`record_consent` only
- *    ever raises it). The start-up write is the MIGRATION: an install that
- *    accepted version 2 in an earlier build has no Rust record yet, and gets
- *    one from what the store already holds, with no second consent screen;
+ *    moment the user accepts — it is written to Rust. The start-up write is
+ *    the MIGRATION: an install that accepted version 2 in an earlier build has
+ *    no Rust record yet, and gets one from what the store already holds, with
+ *    no second consent screen;
+ *  - MR-2016: and when it does not — the consent screen is up, because the
+ *    text is newer or this webview lost its storage — the start-up write says
+ *    so, and Rust takes its record down to match (`withdrawConsentInRust`).
+ *    The record used to only rise, so a webview that lost its storage showed
+ *    the consent screen while the tray's Quick Connect still dialled;
  *  - Auto-Connect and the resume after an update dial only once Rust's record
  *    holds the current version (`recordConsentInRust` again, so they never
  *    race the start-up write);
@@ -54,6 +59,26 @@ export async function recordConsentInRust(): Promise<boolean> {
     return typeof recorded === 'number' && hasCurrentConsent(recorded);
   } catch {
     return false;
+  }
+}
+
+/**
+ * MR-2016: the store holds no current consent, so the consent screen is what
+ * the window shows: Rust's record is set to what the store holds, and the
+ * tray waits for the screen as the window does. Never throws: a failed write
+ * leaves Rust's record as it was (the start-up write repeats at every start).
+ *
+ * Should it land after the accept's own write (it is sent at start, the accept
+ * seconds later, so only in theory), the next tray Quick Connect is refused
+ * and `onConsentRequired` writes the record again.
+ */
+export async function withdrawConsentInRust(): Promise<void> {
+  const held = useAppStore.getState().acceptedConsentVersion;
+  if (hasCurrentConsent(held)) return;
+  try {
+    await invoke('record_consent', { version: held });
+  } catch {
+    /* as it was: retried at the next start */
   }
 }
 
