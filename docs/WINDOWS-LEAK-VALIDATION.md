@@ -142,13 +142,17 @@ DNS a session changed is machine-wide, in the admin-only
 `%ProgramData%\BirdoVPN` (`src-tauri/src/utils/protected_dir.rs`). Only an
 elevated process can read it, so check it from the elevated window. The log
 stays per-user in `%APPDATA%`. If `HKLM:\SOFTWARE\BirdoVPN` has a
-`ProtectedStateDir` value, the app found `BirdoVPN` squatted at its first
-start and uses `%ProgramData%\<that value>` instead: point `$Jrnl` there.
+`ProtectedStateDir` value, the app found `BirdoVPN` squatted (at some start,
+not only the first), could not secure it, and has used `%ProgramData%\<that
+value>` since: point `$Jrnl` there.
 `$LegacyJrnl` is where builds before #287 wrote the journal. The first start of
 a newer build moves one it finds there into `$Jrnl`, once per account: as
 written on the first start after an upgrade from such a build, otherwise with
-its routes dropped and its adapters set back to automatic DNS. It never reads
-that folder for a journal again; only A1 looks at it.
+its routes dropped and its adapters set back to automatic DNS. If `$Jrnl`
+already exists, or the file is not a Windows journal, the legacy one is left
+in place, unused (`Left the old DNS journal in %APPDATA% in place, unused`).
+Either way the app never reads that folder for a journal again; only A1 looks
+at it.
 
 On the owner's PC, `$Phys` is `WiFi 3` and `$PhysDns` is `8.8.8.8, 8.8.4.4`
 (static). `Ethernet 2` (VirtualBox host-only) and `vEthernet (WSL (Hyper-V
@@ -183,9 +187,12 @@ Test-Path $LegacyJrnl
 **Pass:** `filters.txt` is empty (no `Birdo:` filter exists). Note whether
 either journal exists. `$Jrnl` means a killed session of a build since #287
 left routes or DNS behind; `$LegacyJrnl` means an older build did. The first
-start of the build under test heals either (a legacy one is first moved into
-`$Jrnl`, logged as `Moved the DNS journal to the admin-only directory`). B9
-part 1 tests that heal on a record you plant.
+start of the build under test heals `$Jrnl`. A legacy one is first moved into
+`$Jrnl` (logged as `Moved the DNS journal to the admin-only directory`) only
+when there is no `$Jrnl` yet. When `$Jrnl` already exists, the legacy one is
+left in place, unused and never healed (logged as `Left the old DNS journal in
+%APPDATA% in place, unused`); only `$Jrnl` is. B9 part 1 tests that heal on a
+record you plant.
 
 ### A2. The comparison every Part B step uses
 
@@ -706,6 +713,7 @@ Invoke-WebRequest https://1.1.1.1/cdn-cgi/trace -UseBasicParsing -TimeoutSec 10 
 Resolve-DnsName example.com -DnsOnly -Server 8.8.8.8 -QuickTimeout
 Remove-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay'
 Birdo-WaitLog $m 'Reconnection successful' 180
+Start-Sleep 5   # the app logs this line before it releases the block
 Birdo-LogSince $m | Select-String 'Auto-reconnect successful|Reconnection successful'
 Birdo-Filters
 ```
@@ -731,6 +739,7 @@ Birdo-ArmDeadMan
 $m = Birdo-LogMark
 New-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay' -Direction Outbound -RemoteAddress $Relay -Protocol UDP -Action Block | Out-Null
 Birdo-WaitLog $m 'Auto-reconnect gave up' 900
+Start-Sleep 5   # the app logs this line before the teardown and the release
 Birdo-Filters
 Invoke-WebRequest https://example.com -UseBasicParsing -TimeoutSec 10 | Select-Object StatusCode
 Remove-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay'
@@ -775,6 +784,10 @@ Resolve-DnsName example.com -DnsOnly -Server 8.8.8.8 -QuickTimeout
 - xray runs from under `$env:ProgramFiles\BirdoVPN\`.
 - `Find-NetRoute` resolves the stealth relay to `$Phys`, not `Birdo VPN`:
   xray's connection, and the probe after it, leave on the physical adapter.
+  If it names `Birdo VPN`, record FAIL and file it against MR-1628 (the
+  stealth path): no code pins a route for the stealth relay, because
+  `configure_routes` pins only the WireGuard endpoint, which in a Stealth
+  session is xray's `127.0.0.1`.
 - `TcpTestSucceeded` is `False`. The port is open (xray holds a connection to
   it), so this is the stealth permit's app scoping: only xray.exe may reach
   the relay.
@@ -815,13 +828,16 @@ disconnect (`$Rollback` also removes the rule and stops xray).
 
 ### W15. Quit and Task Manager cleanup
 
+Parts 1 and 2 run a WireGuard session (Stealth Mode off), so `$Relay` names
+the relay. Part 3 repeats both exits in a Stealth session, where xray runs.
+
 **Part 1: Quit while connected.** Connect (lockdown on) and do not
 disconnect. Run `$p = Get-Process BirdoVPN`, choose **Quit BirdoVPN** in the
 tray menu, and then at once:
 
 ```powershell
 $p.WaitForExit(20000)
-Get-Process BirdoVPN, xray -ErrorAction SilentlyContinue
+Get-Process BirdoVPN -ErrorAction SilentlyContinue
 Birdo-Filters
 Get-NetAdapter -Name 'Birdo VPN' -ErrorAction SilentlyContinue
 route print -4 | Select-String $Relay
@@ -834,7 +850,7 @@ Select-String -Path $Log -Pattern 'Application exit requested|Exit teardown' | S
 **Pass:**
 
 - `WaitForExit` prints `True` (the app is gone within about 20 s of the
-  click), and no BirdoVPN or xray process is left.
+  click), and no BirdoVPN process is left.
 - No `Birdo:` filter, no relay route, no journal.
 - `Birdo-Compare` is empty and the default resolution works.
 - Record whether `Birdo VPN` is still listed. Wintun removes the adapter with
@@ -849,10 +865,48 @@ administrator** (the app runs elevated; an unelevated Task Manager cannot end
 it), go to **Details**, select `BirdoVPN.exe` and choose **End task**. Then run
 B4's two command blocks (skip its `taskkill` line).
 
-**Pass:** B4's criteria. Also, `Get-Process xray` finds nothing: xray runs in a
-kill-on-close job and goes with the app.
+**Pass:** B4's criteria.
 **Rollback:** start BirdoVPN once (do not connect) if a relay route remains,
 as in B4.
+
+**Part 3: xray goes with the app.** This needs Stealth Mode (W10). If the
+account's plan does not include it, record Part 3 as N/A in the Results row:
+without Stealth Mode there is no xray, and "xray is gone" would pass without
+testing anything. Otherwise start the app, turn **Stealth Mode** on (Settings ›
+VPN Settings), keep Always-on Kill Switch on, connect, and run:
+
+```powershell
+$p = Get-Process BirdoVPN; $x = Get-Process xray; $x.Id
+```
+
+It must print a process id. If `Get-Process xray` finds nothing, Stealth is
+not active: stop and fix that first. Then choose **Quit BirdoVPN** in the tray
+menu, and at once:
+
+```powershell
+$p.WaitForExit(20000); $x.WaitForExit(20000)
+Get-Process xray -ErrorAction SilentlyContinue
+Birdo-Filters
+```
+
+Start the app again and connect (Stealth Mode stays on). Run
+`$x = Get-Process xray; $x.Id` again; it must print a process id. Then, in
+the administrator Task Manager (Details), select `BirdoVPN.exe` and choose
+**End task**, and run:
+
+```powershell
+$x.WaitForExit(10000)
+Get-Process xray -ErrorAction SilentlyContinue
+Birdo-Filters
+```
+
+**Pass:** before the Quit and before the End task, `$x.Id` printed a process
+id. After each, `WaitForExit` prints `True`, `Get-Process xray` finds nothing
+and there is no `Birdo:` filter. After the End task nothing in the app ran to
+stop xray: it goes because it runs in a kill-on-close job that closes with
+the app (W1-005).
+**Rollback:** `taskkill /F /IM xray.exe` if one is left. Start BirdoVPN once
+(do not connect), as in B4, and turn Stealth Mode off.
 **Then stop the dead-man's switch:** `Stop-Process $DeadMan`.
 
 ---

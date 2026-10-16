@@ -41,11 +41,14 @@ Notices:
     licence and stay under their own licences. That includes everything under
     src-tauri/wintun-extract/wintun/ (Wintun, under WireGuard LLC's Prebuilt
     Binaries License in its LICENSE.txt, which also covers the wintun.dll the
-    Windows build places there) and everything under third_party/licenses/
-    (the licence texts and notices of the third-party components the app
-    ships, each under its own terms). The app lists every third-party
-    component it ships, with its licence, in THIRD-PARTY-NOTICES.txt, which
-    every package carries and Settings › About › Licences shows.
+    Windows build places there), src/assets/fonts/ (the Inter typeface, under
+    the SIL Open Font License 1.1, whose notice is in
+    third_party/licenses/assets/inter/LICENSE.txt) and everything under
+    third_party/licenses/ (the licence texts and notices of the third-party
+    components the app ships, each under its own terms). The app lists every
+    third-party component it ships, with its licence, in
+    THIRD-PARTY-NOTICES.txt, which every package carries and Settings › About ›
+    Licences shows.
 
 For commercial licensing enquiries: licensing@birdo.app
 
