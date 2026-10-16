@@ -21,9 +21,16 @@
 //! `/auth/refresh`, and any `/login` or `/register`) share ONE bucket per
 //! network address on the server (birdo-web `GlobalRateLimitMiddleware`
 //! category `auth`, 10 per 60 s, and the auth limiters in main.ts), so a 429
-//! on one of them holds them all: sending the next one would only meet the
-//! same refusal. Every other route stays held on its own, on purpose. The
-//! `vpn` category (120 per 60 s per account) shares a bucket too, but its
+//! on one of them holds them all. The shared hold is conservative, not exact:
+//! the login route also has a limiter of its own, keyed on the network AND
+//! the identity signing in (birdo-web `bootstrap-rate-limiter.ts`), so a 429
+//! from it for one identity also holds register, 2FA verify and the SSO
+//! exchange here, for at most `RETRY_AFTER_MAX_SECS`. That errs on the safe
+//! side: no request goes out sooner than the server asked; at worst another
+//! credential route waits when it did not have to.
+//!
+//! Every other route stays held on its own, on purpose. The `vpn` category
+//! (120 per 60 s per account) shares a bucket too, but its
 //! routes also carry limits of their own that say nothing about each other:
 //! the speed test's (vpn/speed-test.ts) and the connect limiter's
 //! (vpn.service.ts) answer 429 with `Retry-After` as well, so a category hold

@@ -257,7 +257,9 @@ describe('Profile', () => {
   });
 
   // MR-2014: a busy (or held) 5xx on redeem says the service is busy and for
-  // how long. On main it read "Something went wrong on our side".
+  // how long. On main it read "Something went wrong on our side". The
+  // rejection is exactly what Rust serialises for ServerBusy/Held{503, 20}
+  // (vouchers.rs, `a_busy_or_held_5xx_crosses_ipc_with_its_wait`).
   it('a busy voucher service says so, and how long to wait', async () => {
     useAppStore.setState({ account: { ...useAppStore.getState().account, plan: 'RECON' } });
     mockedInvoke.mockImplementation(async (cmd: string) => {
