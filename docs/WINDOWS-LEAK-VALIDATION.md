@@ -11,7 +11,8 @@ Applies to the build that replaced DNS parking with the WFP DNS guard
 (W1-007), scoped the kill-switch permits to the app (W1-013), added the inbound
 block (W1-014), the event-driven data plane (W1-006), in-place roaming (W1-003),
 fast dead-path detection, the route journal (W1-041) and the uninstall heal
-(W1-008).
+(W1-008), and to every build since #287 (MR-1721), which moved that journal
+into the admin-only `%ProgramData%\BirdoVPN`.
 
 ---
 
@@ -83,9 +84,9 @@ resolved, birdo.log says so at ERROR and the relay permit falls back to
 address + protocol + port; its name then ends `any app — app id unavailable`.
 
 **Routes.** The endpoint `/32` and the LAN-sharing routes go via the physical
-gateway. They are written to `%APPDATA%\BirdoVPN\dns-restore.json` with the
-boot time, and a start after a crash in the same boot deletes exactly those
-rows. The tunnel address is `/32`, and every tunnel resolver gets an on-link
+gateway. They are written to `%ProgramData%\BirdoVPN\dns-restore.json`
+(admin-only: only an elevated process can read or write it) with the boot
+time, and a start after a crash in the same boot deletes exactly those rows. The tunnel address is `/32`, and every tunnel resolver gets an on-link
 `/32` route on `Birdo VPN`.
 
 **Roaming.** When the default route moves to another gateway or interface,
@@ -106,7 +107,8 @@ Run everything in an **elevated** PowerShell. Set these once per session:
 ```powershell
 $Exe   = "$env:ProgramFiles\BirdoVPN\BirdoVPN.exe"      # adjust for a dev build
 $Log   = "$env:APPDATA\BirdoVPN\logs\birdo.log"
-$Jrnl  = "$env:APPDATA\BirdoVPN\dns-restore.json"
+$Jrnl  = "$env:ProgramData\BirdoVPN\dns-restore.json"   # the route/DNS journal (admin-only, since #287)
+$LegacyJrnl = "$env:APPDATA\BirdoVPN\dns-restore.json"  # where builds before #287 wrote it; A1 only
 $Base  = "$env:TEMP\birdo-baseline"
 $Ifaces = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces'
 $Phys  = (Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias
@@ -123,7 +125,34 @@ function Birdo-Filters {
 }
 function Birdo-LogMark { (Get-Content $Log | Measure-Object -Line).Lines }
 function Birdo-LogSince($mark) { Get-Content $Log | Select-Object -Skip $mark }
+# Keeps traffic waiting (a ping a second) until birdo.log has $pattern after
+# $mark: $true, or $false after about $seconds seconds.
+function Birdo-WaitLog($mark, $pattern, $seconds = 90) {
+  foreach ($i in 1..$seconds) {
+    if (Birdo-LogSince $mark | Select-String -Quiet $pattern) { return $true }
+    Test-Connection 1.1.1.1 -Count 1 -Quiet -ErrorAction SilentlyContinue | Out-Null
+    Start-Sleep 1
+  }
+  $false
+}
 ```
+
+**Where the journal is.** Since #287 (MR-1721) the record of the routes and
+DNS a session changed is machine-wide, in the admin-only
+`%ProgramData%\BirdoVPN` (`src-tauri/src/utils/protected_dir.rs`). Only an
+elevated process can read it, so check it from the elevated window. The log
+stays per-user in `%APPDATA%`. If `HKLM:\SOFTWARE\BirdoVPN` has a
+`ProtectedStateDir` value, the app found `BirdoVPN` squatted (at some start,
+not only the first), could not secure it, and has used `%ProgramData%\<that
+value>` since: point `$Jrnl` there.
+`$LegacyJrnl` is where builds before #287 wrote the journal. The first start of
+a newer build moves one it finds there into `$Jrnl`, once per account: as
+written on the first start after an upgrade from such a build, otherwise with
+its routes dropped and its adapters set back to automatic DNS. If `$Jrnl`
+already exists, or the file is not a Windows journal, the legacy one is left
+in place, unused (`Left the old DNS journal in %APPDATA% in place, unused`).
+Either way the app never reads that folder for a journal again; only A1 looks
+at it.
 
 On the owner's PC, `$Phys` is `WiFi 3` and `$PhysDns` is `8.8.8.8, 8.8.4.4`
 (static). `Ethernet 2` (VirtualBox host-only) and `vEthernet (WSL (Hyper-V
@@ -152,11 +181,18 @@ Get-ChildItem $Ifaces | ForEach-Object {
 route print -4 | Out-File "$Base\routes.txt"
 Birdo-Filters | Out-File "$Base\filters.txt"
 Test-Path $Jrnl
+Test-Path $LegacyJrnl
 ```
 
 **Pass:** `filters.txt` is empty (no `Birdo:` filter exists). Note whether
-`dns-restore.json` exists. If it does, an older build left something behind,
-and B9 part 1 is the step that heals it.
+either journal exists. `$Jrnl` means a killed session of a build since #287
+left routes or DNS behind; `$LegacyJrnl` means an older build did. The first
+start of the build under test heals `$Jrnl`. A legacy one is first moved into
+`$Jrnl` (logged as `Moved the DNS journal to the admin-only directory`) only
+when there is no `$Jrnl` yet. When `$Jrnl` already exists, the legacy one is
+left in place, unused and never healed (logged as `Left the old DNS journal in
+%APPDATA% in place, unused`); only `$Jrnl` is. B9 part 1 tests that heal on a
+record you plant.
 
 ### A2. The comparison every Part B step uses
 
@@ -178,7 +214,7 @@ every static `NameServer`.
 
 ## Part B — network-affecting (each step undoes itself)
 
-### B0. Dead-man's switch (start before B1, stop after B12)
+### B0. Dead-man's switch (start before B1, stop after W15)
 
 ```powershell
 $Rollback = "$Base\rollback.ps1"
@@ -200,8 +236,16 @@ foreach ($b in Import-Clixml "$env:TEMP\birdo-baseline\nameserver.xml") {
 }
 ipconfig /flushdns | Out-Null
 '@ | Set-Content -Encoding UTF8 $Rollback
-$DeadMan = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile','-Command',"Start-Sleep 1800; & '$Rollback'"
+function Birdo-ArmDeadMan {
+  if ($global:DeadMan) { Stop-Process $global:DeadMan -ErrorAction SilentlyContinue }
+  $global:DeadMan = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile','-Command',"Start-Sleep 1800; & '$Rollback'"
+}
+Birdo-ArmDeadMan
 ```
+
+The switch fires 30 minutes after it was last armed, and Part B takes longer
+than that. Run `Birdo-ArmDeadMan` again at the start of every step: it replaces
+the switch already running.
 
 The rollback does four things:
 
@@ -270,7 +314,8 @@ Birdo-Compare
 
 ### B2. Reactive mode: the DNS guard without the block-all
 
-Settings › Security › turn **Always-on kill switch** off, then reconnect.
+Settings › Privacy & Security › turn **Always-on Kill Switch** off (leave
+**Kill Switch** on), then reconnect.
 
 ```powershell
 Birdo-Filters
@@ -346,33 +391,61 @@ previous session left behind`.
 **Rollback:** if a route remains, run `& $Rollback` and then
 `route delete $Relay`.
 
-### B5. App-scoped permits (W1-013, D-24)
+### B5. App-scoped relay permit (W1-013, D-24)
 
-Connect with lockdown on, then run from PowerShell (a process that is not
-BirdoVPN):
+The relay permit is `BirdoVPN.exe` + the relay's `/32` + UDP + the WireGuard
+port (51820, see "Accepted residuals"). The one flow that tells an app-scoped
+permit from an address- or port-scoped one is that same flow from another
+process: a UDP datagram to the relay on 51820. TCP probes to other ports prove
+nothing here (any port-scoped permit blocks them too), so B5 does not use them.
+
+Connect with lockdown on. The relay's `/32` route goes via the physical
+gateway, so the probe below leaves on `$Phys`, not through the tunnel. Run, in
+the elevated PowerShell (a process that is not BirdoVPN):
 
 ```powershell
-Test-NetConnection $Relay -Port 22 -WarningAction SilentlyContinue | Select-Object TcpTestSucceeded
-Test-NetConnection $Relay -Port 443 -WarningAction SilentlyContinue | Select-Object TcpTestSucceeded
+Birdo-Filters | Select-String 'Permit the relay'
+Select-String -Path $Log -Pattern 'no WFP app id' | Select-Object -Last 1
+auditpol /set /subcategory:"Filtering Platform Connection" /failure:enable
+auditpol /set /subcategory:"Filtering Platform Packet Drop" /failure:enable
+$t0 = Get-Date
+$u = [System.Net.Sockets.UdpClient]::new()
+try { $u.Send([byte[]](1..32), 32, $Relay, 51820) | Out-Null } catch { $_.Exception.Message } finally { $u.Close() }
+Start-Sleep 2
+netsh wfp show filters file="$env:TEMP\birdo-wfp.xml" | Out-Null
+$FilterName = @{}
+([xml](Get-Content "$env:TEMP\birdo-wfp.xml")).SelectNodes('//item[filterId]') |
+  ForEach-Object { $FilterName[$_.filterId] = $_.displayData.name }
+Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 5157; StartTime = $t0 } -ErrorAction SilentlyContinue |
+  ForEach-Object { $d = @{}; ([xml]$_.ToXml()).Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }; [pscustomobject]$d } |
+  Where-Object { $_.DestAddress -eq $Relay -and $_.DestPort -eq '51820' } |
+  ForEach-Object { '{0} -> {1}:{2} protocol {3}: {4}' -f $_.Application, $_.DestAddress, $_.DestPort, $_.Protocol, $FilterName[$_.FilterRTID] }
+Invoke-WebRequest https://example.com -UseBasicParsing -TimeoutSec 10 | Select-Object StatusCode
 ```
 
-**Pass:** both are `False`. The old unscoped relay permit let any process
-reach the relay on any port.
+**Pass**, all of:
 
-A closed port also reads `False`. To tell the two apart, enable the drop audit
-first (`auditpol /set /subcategory:"Filtering Platform Packet Drop" /failure:enable`).
-Then look for a drop naming `Birdo: Block all outbound IPv4` in
-`netsh wfp show netevents file=$env:TEMP\ne.xml`.
-**Rollback:** `auditpol /set /subcategory:"Filtering Platform Packet Drop" /failure:disable`.
+- The permits are `Birdo: Permit the relay (WireGuard)` and `… (inbound)`.
+  Neither name ends `any app — app id unavailable`, and birdo.log has no
+  `Kill switch: no WFP app id` line.
+- The Security log has a blocked connection (event 5157) from
+  `…\powershell.exe` (or `pwsh.exe`) to the relay, port `51820`, protocol
+  `17`, and the filter it names is `Birdo: Block all outbound IPv4`. The
+  `Send` itself may print nothing or an "access forbidden" error; UDP has no
+  answer to wait for, so only the event decides. (`netsh wfp show netevents`
+  shows the same drop, as a `CLASSIFY_DROP` with the same `filterId`, if you
+  prefer it.)
+- The web request returns `200`: in the same seconds, BirdoVPN.exe still
+  reaches the same relay on the same port.
 
-Stealth: enable Stealth Mode and reconnect.
+**FAIL:** no such event while `auditpol /get /subcategory:"Filtering Platform
+Connection"` shows Failure auditing on. The datagram then left: the relay
+permit is not scoped to the app (D-24, MR-655).
+**Rollback:** `auditpol /set /subcategory:"Filtering Platform Connection" /failure:disable`
+and the same for `"Filtering Platform Packet Drop"` (skip either that was on
+before you started).
 
-- `Birdo-Filters` shows `Permit the relay (stealth)` instead of the WireGuard
-  pair.
-- Read xray's relay connection with
-  `$StealthRelay = (Get-NetTCPConnection -OwningProcess (Get-Process xray).Id -State Established | Select-Object -First 1).RemoteAddress`.
-- From PowerShell, `Test-NetConnection $StealthRelay -Port 8443` is `False`
-  while the tunnel carries traffic.
+Stealth sessions put xray.exe in the relay permit instead: W10 tests that.
 
 ### B6. Inbound block (W1-014)
 
@@ -457,7 +530,15 @@ the fallback; xray owns its relay connection.
 ### B9. Uninstall and the heal of older builds (W1-008)
 
 **Part 1: an older build's park, healed by `--reconcile-and-exit`** (the step
-the uninstaller runs). Do this while not connected:
+the uninstaller runs). Do this while not connected.
+
+The record is planted where this build reads it: `$Jrnl`, in the admin-only
+folder. That folder exists once the app has started elevated (any earlier step
+did that). Never create it by hand: a `BirdoVPN` folder the app did not create
+admin-only is moved aside as `BirdoVPN.untrusted-*` and a fresh one is made
+(the squatting guard), and the planted record goes with the old folder. A
+record planted at `$LegacyJrnl` tests nothing here, because this account's
+legacy folder was looked at once, at its first start, and is not read again.
 
 ```powershell
 $json = @{ os = 'windows'; adapters = @(@{ adapter_name = $Phys; adapter_guid = $PhysGuid.ToUpper(); v4_was_dhcp = $false; v6_was_dhcp = $true; dns_servers = @($PhysDns); dns_servers_v6 = @() }) } |
@@ -489,11 +570,17 @@ Birdo-Compare
 
 - `route print -4 | Select-String $Relay` is empty.
 - `Birdo-Compare` is empty.
-- `$env:APPDATA\BirdoVPN` is gone. It may hold only `dns-restore.json` if a
-  restore could not be verified; birdo.log then said why before the folder went.
+- `Test-Path $Jrnl` is `False`: the uninstaller's reconcile put everything
+  back and dropped the record. The uninstaller never removes
+  `%ProgramData%\BirdoVPN` itself (the settings keys and migration markers stay
+  there), so a journal is left there only when a restore could not be
+  verified; birdo.log said why before the logs went.
+- `Get-ChildItem $env:APPDATA\BirdoVPN` lists nothing, or only a
+  `dns-restore.json*` an older build left (the sweep keeps those names, and
+  nothing reads them). `$env:LOCALAPPDATA\BirdoVPN` is gone.
 
-Repeat with the box unticked: the same results, and `$env:APPDATA\BirdoVPN\logs`
-remains.
+Repeat with the box unticked: the same route, DNS and journal results, and
+`$env:APPDATA\BirdoVPN\logs` remains.
 **Rollback:** reinstall.
 
 ### B10. Local Network Sharing
@@ -548,6 +635,278 @@ Test-Path $Jrnl
 **Pass:** no `Birdo:` filter, `Birdo-Compare` is empty, and there is no
 journal. The route comparison shows no difference beyond ones the OS made on
 its own.
+**Then W7, W9, W10 and W15.** Keep the dead-man's switch armed until W15 ends.
+
+### The Windows release checks W7, W9, W10 and W15
+
+These four had no step in this checklist (AUD-DOC-14). They keep the numbers
+of the Windows device-check list. Start the app again for W7 and sign in;
+lockdown (Always-on Kill Switch) is on unless a step says otherwise. After
+each connect, read `$Relay` again (Conventions): another server is another
+relay.
+
+### W7. Kill Switch Exceptions (split tunnelling)
+
+The Windows app has no route-based split tunnelling. Its "split tunnelling" is
+**Kill Switch Exceptions** (Settings › VPN Settings › Kill Switch Exceptions):
+an excepted app is exempt from the kill switch's block, in both directions,
+while the tunnel is down. While the VPN is connected, its traffic still goes
+through the tunnel like everything else.
+
+Before connecting, read the line's own address:
+`curl.exe -s -m 10 https://1.1.1.1/cdn-cgi/trace | Select-String '^ip='`.
+Then turn **Kill Switch Exceptions** on, type `C:\Windows\System32\curl.exe`
+under "Add by path or name" and add it. Connect, and run:
+
+```powershell
+Birdo-Filters | Select-String 'kill-switch exception'
+curl.exe -s -m 10 https://1.1.1.1/cdn-cgi/trace | Select-String '^ip='
+(Invoke-RestMethod https://1.1.1.1/cdn-cgi/trace -TimeoutSec 10) -split "`n" | Select-String '^ip='
+```
+
+Then open a reconnect gap and keep it open (B7's rule), and run the probes
+again while the app shows Reconnecting…:
+
+```powershell
+$m = Birdo-LogMark
+New-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay' -Direction Outbound -RemoteAddress $Relay -Protocol UDP -Action Block | Out-Null
+Birdo-WaitLog $m 'Tunnel declared dead'
+Birdo-Filters | Select-String 'kill-switch exception|Block all outbound IPv4|Permit the tunnel interface'
+curl.exe -s -m 10 https://1.1.1.1/cdn-cgi/trace | Select-String '^ip='
+Invoke-WebRequest https://1.1.1.1/cdn-cgi/trace -UseBasicParsing -TimeoutSec 10 | Select-Object StatusCode
+Remove-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay'
+Birdo-WaitLog $m 'Auto-reconnect successful' 180
+curl.exe -s -m 10 https://1.1.1.1/cdn-cgi/trace | Select-String '^ip='
+```
+
+**Pass:**
+
+- Connected: `Birdo: Permit kill-switch exception (curl.exe)` is listed on all
+  four layers (connect v4/v6, recv-accept v4/v6). curl.exe and PowerShell
+  print the same `ip=`, the relay's exit address, not the line's own.
+- In the gap: the first `Birdo-WaitLog` prints `True`; `Block all outbound
+  IPv4` and the exception permits are listed, and `Permit the tunnel
+  interface` is not. curl.exe still answers, now with the line's own `ip=`:
+  the exception keeps it online outside the tunnel, which is what the user
+  asked for. The PowerShell request fails (any error).
+- After the rule is removed, the second `Birdo-WaitLog` prints `True`
+  (`Auto-reconnect successful`) and curl.exe's `ip=` is the relay's again.
+
+Not a failure: in the gap an excepted app still cannot look up a name the DNS
+cache does not hold, because the DNS block outranks every permit ("What this
+build does"). That is why this step uses an address.
+**Rollback:** remove the curl.exe entry, turn Kill Switch Exceptions off (the
+`kill-switch exception` filters go after the brief reconnect), and remove the
+rule if it is still there (`$Rollback` also removes it).
+
+### W9. Reactive mode through a reconnect gap
+
+Settings › Privacy & Security: **Kill Switch** on, **Always-on Kill Switch**
+off, then reconnect. B2's filter set is the connected state. Now open a gap:
+
+```powershell
+$m = Birdo-LogMark
+New-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay' -Direction Outbound -RemoteAddress $Relay -Protocol UDP -Action Block | Out-Null
+Birdo-WaitLog $m 'Tunnel declared dead'
+Birdo-Filters
+Invoke-WebRequest https://1.1.1.1/cdn-cgi/trace -UseBasicParsing -TimeoutSec 10 | Select-Object StatusCode
+Resolve-DnsName example.com -DnsOnly -Server 8.8.8.8 -QuickTimeout
+Remove-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay'
+Birdo-WaitLog $m 'Reconnection successful' 180
+Start-Sleep 5   # the app logs this line before it releases the block
+Birdo-LogSince $m | Select-String 'Auto-reconnect successful|Reconnection successful'
+Birdo-Filters
+```
+
+**Pass:**
+
+- The first `Birdo-WaitLog` prints `True`, and in the gap the block is up:
+  `Block all outbound IPv4`, `Block all outbound IPv6`, `Block all inbound
+  IPv4`, `Block all inbound IPv6`, with `Permit the relay (WireGuard)` and its
+  `(inbound)` twin and `Permit the app's own HTTPS (control plane)`. There is
+  no `Permit the tunnel interface`.
+- The web request and the 8.8.8.8 query both fail.
+- After the rule is removed, the log has `Auto-reconnect successful on attempt
+  N` and then `Reconnection successful`, and the last `Birdo-Filters` is
+  exactly B2's set again: in reactive mode the block is released as soon as
+  the tunnel is back. (With Always-on, it stays for the whole session.)
+
+Then the give-up. The app tries ten times with a growing back-off, so allow
+15 minutes, and re-arm the dead-man's switch first:
+
+```powershell
+Birdo-ArmDeadMan
+$m = Birdo-LogMark
+New-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay' -Direction Outbound -RemoteAddress $Relay -Protocol UDP -Action Block | Out-Null
+Birdo-WaitLog $m 'Auto-reconnect gave up' 900
+Start-Sleep 5   # the app logs this line before the teardown and the release
+Birdo-Filters
+Invoke-WebRequest https://example.com -UseBasicParsing -TimeoutSec 10 | Select-Object StatusCode
+Remove-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay'
+```
+
+**Pass:** `Birdo-WaitLog` prints `True` and the app shows the error, not
+Reconnecting…; there is no `Birdo:` filter; and the request returns `200`,
+outside the tunnel. In reactive mode a session that is over does not hold the
+machine offline. With Always-on, the same give-up keeps the block until you
+disconnect.
+**Rollback:** `Remove-NetFirewallRule -DisplayName 'BirdoTest-BlockRelay'`,
+turn **Always-on Kill Switch** back on, and disconnect.
+
+### W10. Stealth Mode with lockdown
+
+This needs an account whose plan includes Stealth Mode. Read the line's own
+address first (W7). Then Settings › VPN Settings › turn **Stealth Mode** on,
+keep Always-on Kill Switch on, and connect.
+
+```powershell
+Birdo-Filters | Select-String 'Permit the relay|Block all outbound IPv4|Permit the tunnel interface'
+Select-String -Path $Log -Pattern 'no WFP app id' | Select-Object -Last 1
+(Get-Process xray).Path
+$x = Get-NetTCPConnection -OwningProcess (Get-Process xray).Id -State Established |
+  Where-Object { $_.RemoteAddress -notmatch '^(127\.|::1$)' } | Select-Object -First 1
+$StealthRelay = $x.RemoteAddress; $StealthPort = $x.RemotePort
+"$StealthRelay port $StealthPort"
+Find-NetRoute -RemoteIPAddress $StealthRelay | Select-Object -First 1 InterfaceAlias
+Test-NetConnection $StealthRelay -Port $StealthPort -WarningAction SilentlyContinue | Select-Object TcpTestSucceeded
+(Invoke-RestMethod https://1.1.1.1/cdn-cgi/trace -TimeoutSec 10) -split "`n" | Select-String '^ip='
+Resolve-DnsName example.com -DnsOnly
+Resolve-DnsName example.com -DnsOnly -Server 8.8.8.8 -QuickTimeout
+```
+
+**Pass**, connected:
+
+- `Birdo-Filters` shows `Birdo: Permit the relay (stealth)` (connect v4 only)
+  and neither `Permit the relay (WireGuard)` nor its `(inbound)` twin, plus
+  `Block all outbound IPv4` and `Permit the tunnel interface`. No name ends
+  `any app — app id unavailable`, and birdo.log has no `Kill switch: no WFP app
+  id` line.
+- xray runs from under `$env:ProgramFiles\BirdoVPN\`.
+- `Find-NetRoute` resolves the stealth relay to `$Phys`, not `Birdo VPN`:
+  xray's connection, and the probe after it, leave on the physical adapter.
+  If it names `Birdo VPN`, record FAIL and file it against MR-1628 (the
+  stealth path): no code pins a route for the stealth relay, because
+  `configure_routes` pins only the WireGuard endpoint, which in a Stealth
+  session is xray's `127.0.0.1`.
+- `TcpTestSucceeded` is `False`. The port is open (xray holds a connection to
+  it), so this is the stealth permit's app scoping: only xray.exe may reach
+  the relay.
+- The `ip=` is the relay's exit address, not the line's own. The default
+  resolution works and the 8.8.8.8 query fails.
+
+Then kill the transport and keep the gap open by blocking xray's relay:
+
+```powershell
+$m = Birdo-LogMark
+New-NetFirewallRule -DisplayName 'BirdoTest-BlockStealth' -Direction Outbound -RemoteAddress $StealthRelay -Protocol TCP -Action Block | Out-Null
+$oldXray = (Get-Process xray).Id
+Stop-Process -Name xray -Force
+Birdo-WaitLog $m 'Tunnel declared dead' 60
+Birdo-LogSince $m | Select-String 'Xray exited under the session|Tunnel declared dead'
+Birdo-Filters | Select-String 'Permit the relay|Block all outbound IPv4|Permit the tunnel interface'
+Invoke-WebRequest https://1.1.1.1/cdn-cgi/trace -UseBasicParsing -TimeoutSec 10 | Select-Object StatusCode
+Resolve-DnsName example.com -DnsOnly -Server 8.8.8.8 -QuickTimeout
+Remove-NetFirewallRule -DisplayName 'BirdoTest-BlockStealth'
+Birdo-WaitLog $m 'Auto-reconnect successful' 180
+(Get-Process xray).Id -ne $oldXray
+(Invoke-RestMethod https://1.1.1.1/cdn-cgi/trace -TimeoutSec 10) -split "`n" | Select-String '^ip='
+```
+
+**Pass**, in the gap (the app shows Reconnecting…):
+
+- The log has `Xray exited under the session — reporting a dead transport`
+  and then `Tunnel declared dead (TransportDied)`.
+- `Block all outbound IPv4` and `Permit the relay (stealth)` are listed, and
+  `Permit the tunnel interface` is not.
+- The web request and the 8.8.8.8 query fail.
+
+After the rule is removed: the last `Birdo-WaitLog` prints `True`
+(`Auto-reconnect successful`), xray is a new process (`True`), and the `ip=`
+is the relay's again.
+**Rollback:** remove the rule if it is still there, turn Stealth Mode off, and
+disconnect (`$Rollback` also removes the rule and stops xray).
+
+### W15. Quit and Task Manager cleanup
+
+Parts 1 and 2 run a WireGuard session (Stealth Mode off), so `$Relay` names
+the relay. Part 3 repeats both exits in a Stealth session, where xray runs.
+
+**Part 1: Quit while connected.** Connect (lockdown on) and do not
+disconnect. Run `$p = Get-Process BirdoVPN`, choose **Quit BirdoVPN** in the
+tray menu, and then at once:
+
+```powershell
+$p.WaitForExit(20000)
+Get-Process BirdoVPN -ErrorAction SilentlyContinue
+Birdo-Filters
+Get-NetAdapter -Name 'Birdo VPN' -ErrorAction SilentlyContinue
+route print -4 | Select-String $Relay
+Test-Path $Jrnl
+Birdo-Compare
+Resolve-DnsName example.com -DnsOnly
+Select-String -Path $Log -Pattern 'Application exit requested|Exit teardown' | Select-Object -Last 3
+```
+
+**Pass:**
+
+- `WaitForExit` prints `True` (the app is gone within about 20 s of the
+  click), and no BirdoVPN process is left.
+- No `Birdo:` filter, no relay route, no journal.
+- `Birdo-Compare` is empty and the default resolution works.
+- Record whether `Birdo VPN` is still listed. Wintun removes the adapter with
+  the handle that created it, so one a session reused (after B4) can stay;
+  the next connect reuses it again.
+- The log has `Application exit requested — tearing down VPN + kill switch
+  first`, and neither `Exit teardown timed out` nor `Exit teardown never ran
+  to its end`.
+
+**Part 2: End task.** Start the app again and connect. Open Task Manager **as
+administrator** (the app runs elevated; an unelevated Task Manager cannot end
+it), go to **Details**, select `BirdoVPN.exe` and choose **End task**. Then run
+B4's two command blocks (skip its `taskkill` line).
+
+**Pass:** B4's criteria.
+**Rollback:** start BirdoVPN once (do not connect) if a relay route remains,
+as in B4.
+
+**Part 3: xray goes with the app.** This needs Stealth Mode (W10). If the
+account's plan does not include it, record Part 3 as N/A in the Results row:
+without Stealth Mode there is no xray, and "xray is gone" would pass without
+testing anything. Otherwise start the app, turn **Stealth Mode** on (Settings ›
+VPN Settings), keep Always-on Kill Switch on, connect, and run:
+
+```powershell
+$p = Get-Process BirdoVPN; $x = Get-Process xray; $x.Id
+```
+
+It must print a process id. If `Get-Process xray` finds nothing, Stealth is
+not active: stop and fix that first. Then choose **Quit BirdoVPN** in the tray
+menu, and at once:
+
+```powershell
+$p.WaitForExit(20000); $x.WaitForExit(20000)
+Get-Process xray -ErrorAction SilentlyContinue
+Birdo-Filters
+```
+
+Start the app again and connect (Stealth Mode stays on). Run
+`$x = Get-Process xray; $x.Id` again; it must print a process id. Then, in
+the administrator Task Manager (Details), select `BirdoVPN.exe` and choose
+**End task**, and run:
+
+```powershell
+$x.WaitForExit(10000)
+Get-Process xray -ErrorAction SilentlyContinue
+Birdo-Filters
+```
+
+**Pass:** before the Quit and before the End task, `$x.Id` printed a process
+id. After each, `WaitForExit` prints `True`, `Get-Process xray` finds nothing
+and there is no `Birdo:` filter. After the End task nothing in the app ran to
+stop xray: it goes because it runs in a kill-on-close job that closes with
+the app (W1-005).
+**Rollback:** `taskkill /F /IM xray.exe` if one is left. Start BirdoVPN once
+(do not connect), as in B4, and turn Stealth Mode off.
 **Then stop the dead-man's switch:** `Stop-Process $DeadMan`.
 
 ---
@@ -595,3 +954,7 @@ port check of 2026-10-01). Record them if seen; do not file them.
 | B10 | | |
 | B11 | | |
 | B12 | | |
+| W7 | | |
+| W9 | | |
+| W10 | | |
+| W15 | | |
