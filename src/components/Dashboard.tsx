@@ -191,6 +191,9 @@ export function Dashboard() {
       case 'retry':
         void connectPreferred();
         break;
+      case 'disconnect':
+        void disconnectVpn();
+        break;
       default:
         break;
     }

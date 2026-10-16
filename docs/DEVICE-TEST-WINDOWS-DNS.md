@@ -154,14 +154,18 @@ without them.
 | --- | --- |
 | DNS on every adapter | `netsh interface ipv4 show dns` / `netsh interface ipv6 show dns` |
 | the split-default pair and owned routes | `route print -4`, or `Get-NetRoute -DestinationPrefix 0.0.0.0/1,128.0.0.0/1` |
-| the crash-durable park record | `%APPDATA%\BirdoVPN\dns-restore.json` (`src-tauri/src/vpn/mod.rs:252`, `:294`) |
-| a park record that could not be parsed | `%APPDATA%\BirdoVPN\dns-restore.json.corrupt` — set aside there, never deleted. `dns-restore.json.tmp` is the staging sibling of an atomic write and is normally absent. |
-| the app log | `%APPDATA%\BirdoVPN\logs\birdo.log` (`src-tauri/src/main.rs:143`) |
+| the crash-durable park record | `%ProgramData%\BirdoVPN\dns-restore.json`, admin-only since #287 (MR-1721; `src-tauri/src/vpn/mod.rs` `dns_journal::path`, `src-tauri/src/utils/protected_dir.rs`). Builds before #287 wrote it to `%APPDATA%\BirdoVPN\dns-restore.json`; a newer build's first start moves that one across once and never reads the old place again. |
+| a park record that could not be parsed | `%ProgramData%\BirdoVPN\dns-restore.json.corrupt` — set aside there, never deleted. `dns-restore.json.tmp` is the staging sibling of an atomic write and is normally absent. |
+| the app log | `%APPDATA%\BirdoVPN\logs\birdo.log` (`src-tauri/src/utils/file_log.rs`, `log_dir`) |
 
-Those files sit under `dirs::data_dir()` = `%APPDATA%` (Roaming). The app is
+The log sits under `dirs::data_dir()` = `%APPDATA%` (Roaming). The app is
 elevated via UAC on **your** account, so it writes **your** `%APPDATA%`. If you
 launch it as a *different* administrator, look under that account's profile
-instead.
+instead. The park record is machine-wide, in the admin-only
+`%ProgramData%\BirdoVPN`, which only an elevated process can read: use the
+elevated window for it. (If `HKLM\SOFTWARE\BirdoVPN` has a `ProtectedStateDir`
+value, the app found `BirdoVPN` squatted and uses `%ProgramData%\<that value>`
+instead.)
 
 Two watch loops worth leaving running in their own windows:
 
@@ -171,7 +175,7 @@ while ($true) { Clear-Host; Get-Date -Format o; netsh interface ipv4 show dns; S
 
 # W2 - the journal, once a second
 while ($true) { Clear-Host; Get-Date -Format o;
-  Get-Content "$env:APPDATA\BirdoVPN\dns-restore.json" -ErrorAction SilentlyContinue
+  Get-Content "$env:ProgramData\BirdoVPN\dns-restore.json" -ErrorAction SilentlyContinue
   Start-Sleep 1 }
 ```
 
@@ -814,7 +818,7 @@ cleared**.
 
 Compare against the baseline (S1's `Compare-Object`). If adapters are stranded,
 restore them by hand from `baseline-dns-v4.txt` / `-v6.txt`, then delete
-`%APPDATA%\BirdoVPN\dns-restore.json` **only after** the machine's DNS is
+`%ProgramData%\BirdoVPN\dns-restore.json` **only after** the machine's DNS is
 correct — while it exists it is the only description of what to put back.
 
 ---
@@ -845,7 +849,7 @@ correct — while it exists it is the only description of what to put back.
 3. **Immediately** check the machine — do not relaunch yet:
    ```powershell
    netsh interface ipv4 show dns          # everything still None - expected
-   Get-Content "$env:APPDATA\BirdoVPN\dns-restore.json"
+   Get-Content "$env:ProgramData\BirdoVPN\dns-restore.json"
    netsh interface show interface name="Birdo VPN"
    ```
 4. Now launch the app. Do **not** connect.
@@ -935,8 +939,8 @@ netsh interface ip   set dns name="<adapter>" static <first> validate=no
 netsh interface ip   add dns name="<adapter>" <second> index=2
 ```
 
-Delete `%APPDATA%\BirdoVPN\dns-restore.json` only after the machine's DNS is
-correct.
+Delete `%ProgramData%\BirdoVPN\dns-restore.json` only after the machine's DNS
+is correct.
 
 ---
 
@@ -1059,7 +1063,7 @@ Compare-Object (Get-Content C:\birdo-test\baseline-dns-v4.txt) (Get-Content C:\b
 Compare-Object (Get-Content C:\birdo-test\baseline-dns-v6.txt) (Get-Content C:\birdo-test\final-v6.txt)
 
 # 7. Journal gone:
-Get-Item "$env:APPDATA\BirdoVPN\dns-restore.json" -ErrorAction SilentlyContinue
+Get-Item "$env:ProgramData\BirdoVPN\dns-restore.json" -ErrorAction SilentlyContinue
 
 # 8. Kill Switch back ON in Settings if S1c turned it off.
 ```
