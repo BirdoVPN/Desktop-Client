@@ -15,6 +15,22 @@ ignore = [
     # our side can move it. Review-by: 2026-12-01 (re-check notify-rust's pin).
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # RUSTSEC-2026-0367 / -0368 / -0369: zip < 9 extraction keeps SUID/SGID bits,
+    # creates symlinks pointing outside the destination, and applies modes through
+    # them. zip 4.6.1 comes only from tauri-plugin-updater, which needs it only on
+    # Windows (`zip ^4` under cfg(target_os = "windows")); 2.14.0, the latest 2.x,
+    # still requires `zip ^4`, so nothing on our side can move it. Its one call,
+    # `ZipArchive::extract` in the Windows install path, runs only when the bytes
+    # are a zip, and commands/updater.rs installs only bytes that `download()`
+    # returned after verifying the minisign signature against
+    # `plugins.updater.pubkey`. `bundle.createUpdaterArtifacts` is `true`, so the
+    # Windows artifact we sign and serve is the NSIS setup .exe, not a .zip. The
+    # SUID/mode code is cfg(unix) and not built on Windows; the symlink code is
+    # built there, but reaching it needs an archive signed with our updater key.
+    # Review-by: 2026-12-01 (re-check tauri-plugin-updater's zip requirement).
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 # v2: `unmaintained` is a scope enum, not a severity. We gate on vulnerabilities
 # (always denied) and yanked crates; unmaintained advisories are not enforced
