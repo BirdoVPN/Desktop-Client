@@ -49,7 +49,13 @@ png = "0.18"
 tauri-plugin-opener = "=2.7.0"
 tauri-plugin-notification = "2.0"
 tauri-plugin-autostart = "2.0"
-tauri-plugin-updater = "2.0"
+# Default features minus `zip`. That feature only extracts .zip / .tar.gz update
+# bundles (Windows .nsis.zip / .msi.zip, Linux .AppImage.tar.gz), which
+# `createUpdaterArtifacts: true` never produces: we sign and serve the NSIS
+# setup .exe (installed through extract_exe) and the raw .AppImage. macOS
+# .app.tar.gz extraction does not depend on it. Dropping it removes zip 4.6.1
+# (RUSTSEC-2026-0367/0368/0369) from the build.
+tauri-plugin-updater = { version = "2.0", default-features = false, features = ["rustls-tls", "system-proxy"] }
 tauri-plugin-deep-link = "2.0"
 tauri-plugin-dialog = "2.0"  # Native file picker for split-tunnel .exe selection
 # Single-instance guard: a VPN client must never run twice (a 2nd process would
