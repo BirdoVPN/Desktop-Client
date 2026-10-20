@@ -5,12 +5,12 @@
   "_merge_order": "upstream_commit_on_main is MEASURED by scripts/stamp-cert-pins-provenance.py (git merge-base --is-ancestor against birdo-shared origin/main) and cannot be written by hand without check 1 catching it on any checkout that has ../birdo-shared. While it is false, check 1b FAILS on every run, including CI: the consumer PR that vendors an unmerged SSOT branch stays red until the SSOT PR merges and this copy is re-vendored and re-stamped from main. That is the merge order, made mechanical.",
   "upstream_repo": "BirdoVPN/birdo-shared",
   "upstream_path": "cert-pins.json",
-  "upstream_commit": "06a30427556a6d7f4a1eb12b1844b19698b709c9",
-  "upstream_branch": "main",
-  "upstream_subject": "cert-pins: retire dns.google and dns.quad9.net - no client built from main uses them (#20)",
+  "upstream_commit": "9c64a059356fb41a059485a57840816890a24350",
+  "upstream_branch": "(no local branch contains it)",
+  "upstream_subject": "cert-pins: birdo.app served by an ACM advanced certificate from Google Trust Services (MR-1862) (#22)",
   "upstream_commit_on_main": true,
-  "upstream_main_ref": "origin/main@06a30427556a",
+  "upstream_main_ref": "origin/main@9c64a059356f",
   "upstream_main_fetched": true,
-  "vendored_on": "2026-10-13",
-  "canonical_sha256": "09557dcb9f2734cf2ae34832761fbc2f3079e20d162ba6be369f8a42f333c6a5"
+  "vendored_on": "2026-10-20",
+  "canonical_sha256": "7d4c5cf9efd3a98c1716a4b7e3fe003cd5a316447ef466268d0afb1f972fc5f2"
 }
