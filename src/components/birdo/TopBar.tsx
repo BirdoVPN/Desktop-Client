@@ -54,7 +54,10 @@ export function BirdoTopBar({
           <div className="w-2 shrink-0" />
         )}
         <div className="min-w-0 flex-1">
+          {/* The screen's heading, as on mobile (`semantics { heading() }`). */}
           <div
+            role="heading"
+            aria-level={1}
             className="truncate text-[17px] font-semibold"
             style={{ color: '#FFFFFF' }}
           >

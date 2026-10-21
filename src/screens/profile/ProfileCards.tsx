@@ -12,7 +12,7 @@ import { planGradient, planName, planRank } from '@/lib/plan';
 import { findLiveServer } from '@/session/vpn-actions';
 import { useAppStore, type LoadStatus } from '@/store/app-store';
 import { selectDisplayState } from '@/store/selectors';
-import { formatAccountNumber, formatDate, maskAccountNumber } from '@/utils/helpers';
+import { formatAccountNumber, formatDataCap, formatDate, maskAccountNumber } from '@/utils/helpers';
 
 // ── Identity ────────────────────────────────────────────────────────────────
 
@@ -207,6 +207,7 @@ interface SubscriptionCardProps {
   accountStatus: 'active' | 'expired' | 'cancelled' | 'unknown';
   expiresAt: string | null;
   maxDevices: number;
+  /** The monthly cap in BYTES (`/auth/me`), 0 = none; see `formatDataCap`. */
   bandwidthLimit: number;
   onRetry: () => void;
 }
@@ -274,7 +275,7 @@ export function SubscriptionCard({
 
   const chips = [
     `${maxDevices} device${maxDevices === 1 ? '' : 's'}`,
-    bandwidthLimit > 0 ? `${bandwidthLimit} GB / month` : 'Unlimited data',
+    formatDataCap(bandwidthLimit),
     ...(paid ? ['Premium servers'] : []),
   ];
 

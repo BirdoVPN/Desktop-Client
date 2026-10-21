@@ -7,15 +7,22 @@
  * Retry, no favourites, no search results, and the list. It used to have only
  * "No servers match", shown even when nothing had loaded, behind a card that
  * refused to open on an empty list.
+ *
+ * Each server appears ONCE (owner, 2026-10-21): no pinned "Fastest server" row
+ * above the list (mobile has none; it repeated the list's first row, whose
+ * order is already lowest load first), and a row's subtitle never repeats its
+ * title (`serverSubtitle`). The Connect card still offers the fastest server
+ * when nothing is chosen (W2-028).
  */
 import { useMemo, useRef, useState, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, X, Star, Gauge, ArrowRightLeft, Lock, RefreshCw, Zap } from 'lucide-react';
+import { Search, X, Star, Gauge, ArrowRightLeft, Lock, RefreshCw } from 'lucide-react';
 import type { LoadStatus, Server } from '@/store/app-store';
 import { surface, white, hairline, brand, status, motion as motionTokens } from '@/lib/birdo-theme';
 import { countryCodeToFlag } from '@/utils/helpers';
 import { useModalRoot } from '@/lib/modal';
 import { titleCasePlan } from '@/lib/plan';
+import { serverLabel, serverSubtitle, serverTitle } from '@/lib/vpn-display';
 
 // "Streaming" and "P2P" are gone on purpose. Every exit IP is a datacenter ASN,
 // so streaming-unblocking is undeliverable, and Birdo does not advertise
@@ -37,8 +44,6 @@ export interface ServerSelectorSheetProps {
   status: LoadStatus;
   pings: Record<string, number>;
   selectedServerId?: string | null;
-  /** Shown as a pinned "Fastest server" row when given (single-hop only). */
-  fastestServer?: Server | null;
   favoriteServers: string[];
   onSelect: (server: Server) => void;
   /** A plan-locked row was chosen: explain and offer the upgrade (W2-015). */
@@ -58,7 +63,6 @@ function SheetBody({
   status: loadStatus,
   pings,
   selectedServerId,
-  fastestServer,
   favoriteServers,
   onSelect,
   onSelectLocked,
@@ -105,7 +109,6 @@ function SheetBody({
     onSelect(server);
     onDismiss();
   };
-  const showFastest = !!fastestServer && !query.trim() && filter === 'all';
 
   let body: ReactNode;
   if (servers.length === 0 && (loadStatus === 'loading' || loadStatus === 'idle')) {
@@ -138,33 +141,6 @@ function SheetBody({
   } else {
     body = (
       <ul className="space-y-2.5 pb-2">
-        {showFastest && fastestServer && (
-          <li>
-            <button
-              type="button"
-              onClick={() => pick(fastestServer)}
-              className="flex w-full items-center gap-3.5 rounded-xl px-3.5 py-3.5 text-left transition-colors hover:bg-white/5"
-              style={{ backgroundColor: white.w05, border: `1px solid ${hairline.soft}` }}
-              aria-label={`Fastest server: ${fastestServer.name}, ${fastestServer.city}, ${fastestServer.country}`}
-            >
-              <span
-                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl"
-                style={{ backgroundColor: brand.accentBg }}
-                aria-hidden
-              >
-                <Zap size={20} color={brand.accentLight} />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-[15px] font-semibold" style={{ color: white.w100 }}>
-                  Fastest server
-                </span>
-                <span className="mt-0.5 block truncate text-xs" style={{ color: white.w60 }}>
-                  {fastestServer.name} · {fastestServer.city}, {fastestServer.country}
-                </span>
-              </span>
-            </button>
-          </li>
-        )}
         {filtered.map((server) => (
           <ServerRow
             key={server.id}
@@ -367,7 +343,9 @@ function ServerRow({ server, ping, isSelected, isFavorite, onSelect, onToggleFav
   const hasPing = ping != null && Number.isFinite(ping) && ping >= 0;
   const locked = !server.isAccessible;
   const offline = !server.isOnline;
-  const place = [server.city, server.country].filter(Boolean).join(', ');
+  const title = serverTitle(server);
+  const subtitle = serverSubtitle(server);
+  const label = serverLabel(server);
 
   // A row that cannot be picked still has to say WHY, to a screen reader as
   // much as to the eye. `minPlan` is the node's own requirement, so the copy
@@ -379,9 +357,7 @@ function ServerRow({ server, ping, isSelected, isFavorite, onSelect, onToggleFav
     : offline
       ? 'Offline'
       : null;
-  const rowLabel = lockedReason
-    ? `${server.name}, ${place} — ${lockedReason}`
-    : `Connect to ${server.name}, ${place}`;
+  const rowLabel = lockedReason ? `${label} — ${lockedReason}` : `Connect to ${label}`;
 
   // The star is a SIBLING of the row button, not a child: nested interactive
   // content is invalid, a doubled tab stop, and was inert exactly where it
@@ -418,16 +394,18 @@ function ServerRow({ server, ping, isSelected, isFavorite, onSelect, onToggleFav
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-1.5">
             <span className="truncate text-[15px] font-semibold" style={{ color: white.w100 }}>
-              {server.name || server.city}
+              {title}
             </span>
             {server.isHighSpeed && <Gauge size={12} color={brand.accent} role="img" aria-label="High-speed" />}
             {server.isPortForwarding && (
               <ArrowRightLeft size={12} color={status.blue} role="img" aria-label="Port forwarding" />
             )}
           </span>
-          <span className="mt-0.5 block truncate text-xs" style={{ color: white.w60 }}>
-            {place}
-          </span>
+          {subtitle && (
+            <span className="mt-0.5 block truncate text-xs" style={{ color: white.w60 }}>
+              {subtitle}
+            </span>
+          )}
         </span>
 
         <span className="flex shrink-0 items-center gap-2.5 text-xs">
@@ -447,7 +425,7 @@ function ServerRow({ server, ping, isSelected, isFavorite, onSelect, onToggleFav
 
       <button
         type="button"
-        aria-label={isFavorite ? `Remove ${server.name} from favorites` : `Add ${server.name} to favorites`}
+        aria-label={isFavorite ? `Remove ${title} from favorites` : `Add ${title} to favorites`}
         aria-pressed={isFavorite}
         onClick={onToggleFavorite}
         className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/10"

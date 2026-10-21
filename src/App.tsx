@@ -44,7 +44,7 @@ async function windowIsVisible(): Promise<boolean> {
 }
 
 function App() {
-  const { isAuthenticated, hasAcceptedConsent, storedCrashChoice, setAuthenticated, setLoading, setUserEmail, setAccount, acceptConsent, windowCorner, pushed } =
+  const { isAuthenticated, hasAcceptedConsent, storedCrashChoice, setAuthenticated, setLoading, setUserEmail, setAccount, acceptConsent, windowCorner, pushed, onConnectTab } =
     useAppStore(
       useShallow((s) => ({
         isAuthenticated: s.isAuthenticated,
@@ -60,6 +60,7 @@ function App() {
         acceptConsent: s.acceptConsent,
         windowCorner: s.windowCorner,
         pushed: s.navStack.length > 0,
+        onConnectTab: s.tab === 'home',
       })),
     );
   // The startup sign-in check has answered. It runs only once the CURRENT
@@ -426,14 +427,33 @@ function App() {
     screenKey = 'login';
     screen = <Login />;
   }
+  const showAmbientGrid = !(screenKey === 'appshell' && onConnectTab);
 
   return (
     // MotionConfig wraps EVERY screen: the loading, lock and update screens
     // used to animate outside it, ignoring reduced motion (W2-034).
     <MotionConfig reducedMotion="user">
       <div className="relative flex h-screen flex-col overflow-hidden bg-birdo-black">
-        {/* Parked while a pushed sub-screen (which has its own) covers it. */}
-        <PixelCanvas paused={pushed} />
+        {/* The ambient grid, behind every screen but the Connect tab (as on
+            Android, BirdoNavGraph / A2-019): there the globe is the backdrop.
+            Unmounted there, not hidden, so nothing keeps redrawing; faded so
+            a tab switch does not pop. Parked while a pushed sub-screen (which
+            has its own) covers it. */}
+        <AnimatePresence initial={false}>
+          {showAmbientGrid && (
+            <motion.div
+              key="ambient-grid"
+              data-testid="ambient-grid"
+              className="pointer-events-none fixed inset-0"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: motionTokens.standard, ease: motionTokens.ease }}
+            >
+              <PixelCanvas className="absolute inset-0 h-full w-full" paused={pushed} />
+            </motion.div>
+          )}
+        </AnimatePresence>
         {/* Outside the content boundary: a crash in a screen must never take
             the frameless window's only controls with it (W2-044). */}
         <TitleBar />

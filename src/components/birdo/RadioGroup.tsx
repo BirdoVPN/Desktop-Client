@@ -6,7 +6,7 @@
  */
 import { useRef, type KeyboardEvent } from 'react';
 import type { LucideIcon } from 'lucide-react';
-import { brand, white } from '@/lib/birdo-theme';
+import { accentA, brand, surface, white } from '@/lib/birdo-theme';
 
 export interface RadioOption<T extends string> {
   value: T;
@@ -49,10 +49,16 @@ export function BirdoRadioGroup<T extends string>({
     <div
       role="radiogroup"
       aria-label={label}
-      className={variant === 'segmented' ? 'grid gap-1 rounded-birdo-sm p-1' : 'space-y-1'}
+      // Segmented = mobile `BirdoSegmentedControl`: a raised track, 4px inset,
+      // the selected segment tinted and outlined in the accent.
+      className={variant === 'segmented' ? 'grid gap-1 p-1' : 'space-y-1'}
       style={
         variant === 'segmented'
-          ? { gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, backgroundColor: white.w05 }
+          ? {
+              gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+              backgroundColor: surface.s2,
+              borderRadius: 12,
+            }
           : undefined
       }
     >
@@ -74,11 +80,14 @@ export function BirdoRadioGroup<T extends string>({
           <button
             key={opt.value}
             {...common}
-            className="birdo-radio flex items-center justify-center gap-1.5 rounded-birdo-xs px-2 py-2 text-[12px] font-medium transition-colors"
+            className={`birdo-radio flex min-h-10 items-center justify-center gap-1.5 px-2 py-2 text-[13px] transition-colors ${
+              checked ? 'font-semibold' : 'font-medium'
+            }`}
             style={{
-              backgroundColor: checked ? brand.accentBg : 'transparent',
-              border: checked ? `1px solid ${brand.accent}` : '1px solid transparent',
-              color: checked ? brand.accentSoft : white.w60,
+              borderRadius: 9,
+              backgroundColor: checked ? accentA(0.22) : 'transparent',
+              border: checked ? `1px solid ${accentA(0.55)}` : '1px solid transparent',
+              color: checked ? brand.accent : white.w60,
             }}
           >
             {Icon && <Icon size={14} aria-hidden />}

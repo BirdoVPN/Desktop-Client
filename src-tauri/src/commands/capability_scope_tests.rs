@@ -4,7 +4,7 @@
 //! regex, `^https://(birdo\.app|[a-zA-Z0-9-]+\.birdo\.app)(/.*)?$`. The opener
 //! plugin's equivalent is the scope on `opener:allow-open-url` in
 //! `capabilities/default.json`, and its entries are GLOBS, matched by
-//! tauri-plugin-opener 2.7.0 `scope.rs` as `glob::Pattern::new(url)` then
+//! tauri-plugin-opener 2.7.1 `scope.rs` as `glob::Pattern::new(url)` then
 //! `pattern.matches(u)`. These tests run the scope through that same crate
 //! (the `glob` dev-dependency unifies with the plugin's), so they test the
 //! matcher the app uses, not a re-implementation of it.
@@ -102,7 +102,7 @@ fn open_url_scope() -> (Vec<glob::Pattern>, Vec<glob::Pattern>) {
     (allow, deny)
 }
 
-/// tauri-plugin-opener 2.7.0 `Scope::is_url_allowed` for `with = None` (a
+/// tauri-plugin-opener 2.7.1 `Scope::is_url_allowed` for `with = None` (a
 /// `url`-only entry is `Application::Default`, which matches only `None`).
 fn allowed(url: &str, (allow, deny): &(Vec<glob::Pattern>, Vec<glob::Pattern>)) -> bool {
     !deny.iter().any(|p| p.matches(url)) && allow.iter().any(|p| p.matches(url))

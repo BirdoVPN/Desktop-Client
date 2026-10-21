@@ -1,6 +1,6 @@
 [package]
 name = "birdo-vpn-desktop"
-version = "1.4.49"
+version = "1.4.50"
 description = "Birdo VPN Desktop Client (Windows, macOS & Linux)"
 authors = ["Birdo VPN"]
 license = "CC-BY-NC-4.0" # SPDX id of ../LICENSE (source-available, not open source)
@@ -43,10 +43,10 @@ png = "0.18"
 # in favour of the opener, and it also shipped a process-spawning `Command`
 # API this app never used. The webview's URL allowlist is the scoped
 # `opener:allow-open-url` entry in capabilities/default.json, pinned by
-# src/commands/capability_scope_tests.rs. EXACT pin: 2.7.1 was inside the
-# 7-day release cooldown when this landed, and the npm twin
-# @tauri-apps/plugin-opener is pinned to the same 2.7.0.
-tauri-plugin-opener = "=2.7.0"
+# src/commands/capability_scope_tests.rs. EXACT pin, moved with its npm twin
+# @tauri-apps/plugin-opener, which is pinned to the same 2.7.1 (2.7.1 changed
+# only the iOS entry point; the Rust scope matcher is the same as 2.7.0's).
+tauri-plugin-opener = "=2.7.1"
 tauri-plugin-notification = "2.0"
 tauri-plugin-autostart = "2.0"
 # Default features minus `zip`. That feature only extracts .zip / .tar.gz update
