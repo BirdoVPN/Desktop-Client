@@ -191,7 +191,10 @@ type RawUsage = Partial<Record<keyof UsageStats, unknown>>;
 export function loadUsage(): Promise<void> {
   if (usageInFlight) return usageInFlight;
   const s = useAppStore.getState();
-  s.setUsage(s.usage, s.usage ? 'ready' : 'loading');
+  // 'loading' with a held reading too: the Limit tab keeps showing it and its
+  // refresh pill says "Updating…" (mobile, A2-018). It used to stay 'ready',
+  // so the pill's spinner could never show.
+  s.setUsage(s.usage, 'loading');
   usageInFlight = (async () => {
     try {
       const raw = (await command<RawUsage | null>('get_usage_stats')) ?? {};
