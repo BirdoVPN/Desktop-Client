@@ -20,6 +20,11 @@
 //! (`$defs/ErrorCode`, MR-1639): every code has a decided handling, and a
 //! sample body in the server's envelope decodes to it.
 //!
+//! And the heartbeat reply (`$defs/HeartbeatResponse`, MR-1638): every
+//! `$defs/HeartbeatReason` has a decided handling on both paths that read a
+//! reply, a body per reason (the quota fields included) decodes into desktop's
+//! model, and every property is either read or listed as deliberately unread.
+//!
 //! Fixtures come from the REAL producers wherever one exists
 //! (`utils::get_device_id`, `birdo_pq::generate_keypair`,
 //! `commands::vpn::generate_wireguard_keypair`, `attestation::platform` /
@@ -28,9 +33,10 @@
 
 use super::attestation::{self, DesktopAttestation};
 use super::client::{build_connect_request, build_multi_hop_request};
-use super::types::{ConnectRequest, LoginRequest, MultiHopConnectRequest};
+use super::types::{ConnectRequest, HeartbeatResponse, LoginRequest, MultiHopConnectRequest};
 use super::{ApiError, BirdoApi};
 use crate::commands::ipc_error::{IpcError, IpcErrorCode};
+use crate::vpn::reconnect_policy::{self, HeartbeatVerdict};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use jsonschema::error::ValidationErrorKind;
@@ -978,4 +984,449 @@ fn an_unknown_error_code_decodes_to_the_fallback() {
     assert_eq!(err.code, IpcErrorCode::ServerUnavailable);
     assert!(err.retryable);
     assert_eq!(err.server_asked_to_wait(), None);
+}
+
+// ── heartbeat replies (MR-1638) ─────────────────────────────────────────────
+
+const HEARTBEAT: &str = "HeartbeatResponse";
+const HEARTBEAT_REASON: &str = "HeartbeatReason";
+
+/// Heartbeat-reply properties desktop deliberately does NOT read.
+/// `quotaGraceEndsAt` is the end of the Free grace window as a wall-clock
+/// instant; desktop counts down from `quotaGraceSecondsRemaining` instead,
+/// which a skewed local clock cannot move. Listed explicitly so that when the
+/// backend adds a property the key-set test fails and someone DECIDES (read
+/// it, or add it here with a reason).
+const HEARTBEAT_KNOWN_UNREAD: &[&str] = &["quotaGraceEndsAt"];
+
+// birdo-web `VpnService.heartbeat`'s own sentences (`freeTierCapMessage` for
+// the ended quota one; `in_grace` words the grace one by its seconds).
+const HB_REVOKED: &str = "Connection has been revoked. Please reconnect.";
+const HB_NOT_FOUND: &str = "Connection not found. Please reconnect.";
+const HB_OFFLINE: &str =
+    "Your current VPN server is offline. Please reconnect to a different server.";
+const HB_ENDED: &str = "Free-tier data limit reached (50.2 / 50 GB this period). This \
+                        connection has ended. Upgrade to Operative for unlimited data.";
+
+/// One heartbeat reply, shaped as birdo-web's `VpnService.heartbeat` writes
+/// it, and what desktop decided to make of it on BOTH paths that read one.
+struct HeartbeatCase {
+    reason: &'static str,
+    body: Value,
+    /// `reconnect_policy::heartbeat_verdict`: the check-in of a live session.
+    live: HeartbeatVerdict,
+    /// `reconnect_policy::after_teardown`: the old key's answer after a dead
+    /// tunnel's teardown (`None` = re-dial), for a session confirmed alive
+    /// within the reap window, and for one that was not (or slept since).
+    probe_alive: Option<IpcErrorCode>,
+    probe_not_alive: Option<IpcErrorCode>,
+}
+
+/// The reply for a key whose row is gone: the reason comes from the removal
+/// record (`readKeyRemoval`); the sentence stays the one every shipped client
+/// already handles.
+fn key_gone(reason: &str) -> Value {
+    json!({
+        "valid": false,
+        "serverOnline": false,
+        "message": HB_NOT_FOUND,
+        "reason": reason,
+    })
+}
+
+/// A live reply inside an over-cap Free session's grace window
+/// (`VpnService.withQuota`): the reason stays ok / server_offline, and the
+/// three quota fields announce the end.
+fn in_grace(mut reply: Value, seconds: u64) -> Value {
+    reply["quotaExceeded"] = json!(true);
+    reply["quotaGraceEndsAt"] = json!("2026-10-15T12:15:00.000Z");
+    reply["quotaGraceSecondsRemaining"] = json!(seconds);
+    // `freeTierCapMessage(bw, 'grace', ceil(seconds / 60))`.
+    let mins = seconds.div_ceil(60).max(1);
+    let plural = if mins == 1 { "" } else { "s" };
+    reply["message"] = json!(format!(
+        "Free-tier data limit reached (50.2 / 50 GB this period). This connection will end in \
+         {mins} minute{plural}. Upgrade to Operative for unlimited data."
+    ));
+    reply
+}
+
+/// Every reason in `$defs/HeartbeatReason`, decided, in each shape the server
+/// sends it.
+fn heartbeat_cases() -> Vec<HeartbeatCase> {
+    use reconnect_policy::{quota_exceeded_error, revoked_error};
+    let revoked = Some(IpcErrorCode::Revoked);
+    let quota = Some(IpcErrorCode::QuotaExceeded);
+    // On a live session every valid:false ends it, in the server's words.
+    // For reaped and server_offline that answer is rare: the server removes
+    // the node's peer BEFORE it answers and the check-in rides the tunnel, so
+    // it arrives as the teardown probe's, which re-dials as the contract
+    // allows.
+    let ended = |message: &str| HeartbeatVerdict::End(revoked_error(Some(message)));
+    let ok = json!({ "valid": true, "serverOnline": true, "reason": "ok" });
+    let offline = json!({
+        "valid": true,
+        "serverOnline": false,
+        "message": HB_OFFLINE,
+        "reason": "server_offline",
+    });
+    let mut quota_record = key_gone("quota_exceeded");
+    quota_record["quotaExceeded"] = json!(true);
+    vec![
+        HeartbeatCase {
+            reason: "ok",
+            body: ok.clone(),
+            live: HeartbeatVerdict::Fine,
+            probe_alive: None,
+            probe_not_alive: None,
+        },
+        // Over the Free cap, still live: tell the user, keep the tunnel.
+        HeartbeatCase {
+            reason: "ok",
+            body: in_grace(ok, 540),
+            live: HeartbeatVerdict::QuotaGrace {
+                seconds_remaining: Some(540),
+            },
+            probe_alive: None,
+            probe_not_alive: None,
+        },
+        // valid:true: the key lives, its server is not ONLINE.
+        HeartbeatCase {
+            reason: "server_offline",
+            body: offline.clone(),
+            live: HeartbeatVerdict::ServerGoingOffline,
+            probe_alive: None,
+            probe_not_alive: None,
+        },
+        // The grace warning outranks the offline notice.
+        HeartbeatCase {
+            reason: "server_offline",
+            body: in_grace(offline, 60),
+            live: HeartbeatVerdict::QuotaGrace {
+                seconds_remaining: Some(60),
+            },
+            probe_alive: None,
+            probe_not_alive: None,
+        },
+        // valid:false: the key went with a drained or deleted server.
+        HeartbeatCase {
+            reason: "server_offline",
+            body: key_gone("server_offline"),
+            live: ended(HB_NOT_FOUND),
+            probe_alive: None,
+            probe_not_alive: None,
+        },
+        // A deactivated row, then a removal record: stop, never re-dial.
+        HeartbeatCase {
+            reason: "revoked",
+            body: json!({
+                "valid": false,
+                "serverOnline": false,
+                "message": HB_REVOKED,
+                "reason": "revoked",
+            }),
+            live: ended(HB_REVOKED),
+            probe_alive: revoked,
+            probe_not_alive: revoked,
+        },
+        HeartbeatCase {
+            reason: "revoked",
+            body: key_gone("revoked"),
+            live: ended(HB_NOT_FOUND),
+            probe_alive: revoked,
+            probe_not_alive: revoked,
+        },
+        // A newer connection took the slot: a re-dial would evict it back.
+        HeartbeatCase {
+            reason: "evicted",
+            body: key_gone("evicted"),
+            live: ended(HB_NOT_FOUND),
+            probe_alive: revoked,
+            probe_not_alive: revoked,
+        },
+        // Housekeeping released it and nobody holds the slot: one re-dial.
+        HeartbeatCase {
+            reason: "reaped",
+            body: key_gone("reaped"),
+            live: ended(HB_NOT_FOUND),
+            probe_alive: None,
+            probe_not_alive: None,
+        },
+        // The allowance ended the session at a live check-in, then the record
+        // a later one finds: terminal, and not a revocation.
+        HeartbeatCase {
+            reason: "quota_exceeded",
+            body: json!({
+                "valid": false,
+                "serverOnline": true,
+                "quotaExceeded": true,
+                "reason": "quota_exceeded",
+                "message": HB_ENDED,
+            }),
+            live: HeartbeatVerdict::End(quota_exceeded_error()),
+            probe_alive: quota,
+            probe_not_alive: quota,
+        },
+        HeartbeatCase {
+            reason: "quota_exceeded",
+            body: quota_record,
+            live: HeartbeatVerdict::End(quota_exceeded_error()),
+            probe_alive: quota,
+            probe_not_alive: quota,
+        },
+        // No record of why: a reply without a reason. Taken from a session
+        // that was just checking in, reaped from one that was not.
+        HeartbeatCase {
+            reason: "not_found",
+            body: key_gone("not_found"),
+            live: ended(HB_NOT_FOUND),
+            probe_alive: revoked,
+            probe_not_alive: None,
+        },
+    ]
+}
+
+fn contract_heartbeat_reasons() -> BTreeSet<String> {
+    def(HEARTBEAT_REASON)["enum"]
+        .as_array()
+        .expect("$defs/HeartbeatReason.enum is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The reply as desktop's model holds it, decoded from the wire text as
+/// `BirdoApi::heartbeat` decodes it.
+fn heartbeat_reply(body: &Value) -> HeartbeatResponse {
+    serde_json::from_str(&body.to_string())
+        .unwrap_or_else(|e| panic!("desktop's HeartbeatResponse refused {body}: {e}"))
+}
+
+/// What both paths make of one reply: the live check-in's verdict, then the
+/// teardown probe's for a session confirmed alive and for one that was not.
+fn heartbeat_decisions(
+    body: &Value,
+) -> (HeartbeatVerdict, Option<IpcErrorCode>, Option<IpcErrorCode>) {
+    let reply = heartbeat_reply(body);
+    (
+        reconnect_policy::heartbeat_verdict(&reply),
+        reconnect_policy::after_teardown(Some(&reply), true).map(|e| e.code),
+        reconnect_policy::after_teardown(Some(&reply), false).map(|e| e.code),
+    )
+}
+
+/// A re-vendored contract with a reason desktop has not decided on fails
+/// HERE, naming it, not in production as whatever a reply without a reason
+/// happens to do.
+#[test]
+fn every_contract_heartbeat_reason_has_a_decided_handling() {
+    let s = schema();
+    for name in [HEARTBEAT, HEARTBEAT_REASON] {
+        assert!(
+            s["_status"]["definitions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(name)),
+            "_status.definitions lists {name}"
+        );
+    }
+    let reasons = contract_heartbeat_reasons();
+    // The reply's own enum IS $defs/HeartbeatReason: were they to drift, this
+    // test would be checking the wrong list.
+    let inline: BTreeSet<String> = def(HEARTBEAT)["properties"]["reason"]["enum"]
+        .as_array()
+        .expect("$defs/HeartbeatResponse.reason.enum is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(inline, reasons);
+    let decided: BTreeSet<String> = heartbeat_cases()
+        .iter()
+        .map(|c| c.reason.to_string())
+        .collect();
+    assert_eq!(
+        reasons, decided,
+        "$defs/HeartbeatReason changed: decide what desktop does with the new reason on a live \
+         check-in and after a teardown, then add it to heartbeat_cases"
+    );
+}
+
+/// Each body IS the contract's shape, decodes into desktop's model, and is
+/// decided as listed on both paths.
+#[test]
+fn each_heartbeat_body_is_the_contracts_shape_and_decides_as_listed() {
+    for case in heartbeat_cases() {
+        let body = &case.body;
+        assert_valid(HEARTBEAT, body);
+        assert_eq!(body["reason"], json!(case.reason), "{body}");
+        assert!(
+            validator_for(HEARTBEAT_REASON).is_valid(&body["reason"]),
+            "{body}"
+        );
+        assert_eq!(
+            heartbeat_decisions(body),
+            (case.live, case.probe_alive, case.probe_not_alive),
+            "{body}"
+        );
+    }
+}
+
+/// Between them the bodies carry EVERY property of the reply, the three quota
+/// fields included, so none is left to a shape no test decodes.
+#[test]
+fn the_heartbeat_bodies_carry_every_contract_property() {
+    let carried: BTreeSet<String> = heartbeat_cases()
+        .iter()
+        .flat_map(|c| {
+            c.body
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(carried, def_properties(HEARTBEAT));
+}
+
+/// Values for one property's schema: every enum value, both booleans, a
+/// count, or an ISO-8601 instant.
+fn property_samples(schema: &Value) -> Vec<Value> {
+    if let Some(values) = schema["enum"].as_array() {
+        return values.clone();
+    }
+    match schema["type"].as_str() {
+        Some("boolean") => vec![json!(true), json!(false)],
+        Some("number" | "integer") => vec![json!(540)],
+        Some("string") => vec![json!("2026-10-15T12:15:00.000Z")],
+        other => panic!("no sample for a heartbeat property of type {other:?}: add one"),
+    }
+}
+
+/// The reply properties desktop's model READS: setting one changes what the
+/// model decodes. A serde rename slip shows up here as a property no longer
+/// read.
+fn heartbeat_properties_read() -> BTreeSet<String> {
+    let base = json!({ "valid": true, "serverOnline": true });
+    let decoded = |b: &Value| format!("{:?}", heartbeat_reply(b));
+    let reference = decoded(&base);
+    def(HEARTBEAT)["properties"]
+        .as_object()
+        .expect("$defs/HeartbeatResponse.properties is an object")
+        .iter()
+        .filter(|(key, schema)| {
+            property_samples(schema).into_iter().any(|sample| {
+                let mut b = base.clone();
+                b[key.as_str()] = sample;
+                decoded(&b) != reference
+            })
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// What the model reads ⊆ the contract's properties, and the complement is
+/// EXACTLY the documented unread list, so a new backend property, or a field
+/// the model stops reading, both fail with the property named.
+#[test]
+fn every_heartbeat_property_is_read_or_known_unread() {
+    let read = heartbeat_properties_read();
+    let props = def_properties(HEARTBEAT);
+    let unread: BTreeSet<String> = props.difference(&read).cloned().collect();
+    let expected: BTreeSet<String> = HEARTBEAT_KNOWN_UNREAD
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        unread, expected,
+        "heartbeat properties desktop does not read changed — decide, then update \
+         HEARTBEAT_KNOWN_UNREAD"
+    );
+    for key in def_required(HEARTBEAT) {
+        assert!(read.contains(&key), "required {key} is not read");
+    }
+}
+
+/// The contract's rule: an absent or unknown `reason` (an older server, or a
+/// reason added after this build) is a reply without one, on both paths; and
+/// so is not_found.
+#[test]
+fn an_unknown_or_absent_heartbeat_reason_is_a_reply_without_one() {
+    let future = "some_future_reason";
+    assert!(!contract_heartbeat_reasons().contains(future));
+    for case in heartbeat_cases() {
+        let mut without = case.body.clone();
+        without.as_object_mut().unwrap().remove("reason");
+        assert_valid(HEARTBEAT, &without);
+        let mut unknown = case.body.clone();
+        unknown["reason"] = json!(future);
+        // The contract refuses the value; desktop still decodes the reply.
+        assert!(
+            error_kinds(HEARTBEAT, &unknown)
+                .iter()
+                .any(|k| matches!(k, ValidationErrorKind::Enum { .. })),
+            "{unknown}"
+        );
+        assert_eq!(
+            heartbeat_decisions(&unknown),
+            heartbeat_decisions(&without),
+            "{}",
+            case.body
+        );
+        if case.reason == "not_found" {
+            assert_eq!(
+                heartbeat_decisions(&case.body),
+                heartbeat_decisions(&without)
+            );
+        }
+    }
+}
+
+/// The gate bites: a reply without `valid`, a reason outside the enum, a
+/// count sent as text: each refused under its own keyword. Desktop's model
+/// stays lenient where the contract is strict (a text count is "no count",
+/// never a failed heartbeat, which would also hide a valid:false), and the
+/// unknown keys the contract allows are ignored.
+#[test]
+fn heartbeat_mutations_are_refused_by_the_contract_and_decoded_leniently() {
+    let grace = heartbeat_cases()
+        .into_iter()
+        .find(|c| c.body["quotaGraceSecondsRemaining"].is_number())
+        .expect("a grace-window case")
+        .body;
+    assert_valid(HEARTBEAT, &grace);
+
+    let mut m = grace.clone();
+    m.as_object_mut().unwrap().remove("valid");
+    assert_eq!(
+        required_violations(HEARTBEAT, &m),
+        vec!["valid".to_string()]
+    );
+
+    let mut m = grace.clone();
+    m["reason"] = json!("Evicted");
+    assert!(error_kinds(HEARTBEAT, &m)
+        .iter()
+        .any(|k| matches!(k, ValidationErrorKind::Enum { .. })));
+
+    let mut m = grace.clone();
+    m["quotaGraceSecondsRemaining"] = json!("540");
+    assert!(error_kinds(HEARTBEAT, &m)
+        .iter()
+        .any(|k| matches!(k, ValidationErrorKind::Type { .. })));
+    assert_eq!(
+        reconnect_policy::heartbeat_verdict(&heartbeat_reply(&m)),
+        HeartbeatVerdict::QuotaGrace {
+            seconds_remaining: None
+        }
+    );
+
+    assert_eq!(def(HEARTBEAT)["additionalProperties"], true);
+    let mut m = grace.clone();
+    m["someFutureField"] = json!({ "nested": [1, 2] });
+    assert_valid(HEARTBEAT, &m);
+    assert_eq!(
+        format!("{:?}", heartbeat_reply(&m)),
+        format!("{:?}", heartbeat_reply(&grace))
+    );
 }
