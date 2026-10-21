@@ -117,16 +117,18 @@ beforeEach(() => {
 afterEach(() => setUserAgent(realUserAgent));
 
 describe('Crash reports toggle', () => {
-  it('reads OFF by default and says what would be sent', async () => {
+  // Owner, 2026-10-21: no description under a setting. What crash reports
+  // send is disclosed where the choice is first made (ConsentScreen); the
+  // Settings row is its title and its switch.
+  it('reads OFF by default; the row is its title and switch, with no description', async () => {
     render(<Settings />);
     const row = await screen.findByRole('switch', { name: /crash reports/i });
     expect(row).toHaveAttribute('aria-checked', 'false');
-    expect(screen.getByText(/Off by default/)).toBeInTheDocument();
-    // Second-pass #7: error reports are disclosed too, and nothing says "only".
-    expect(screen.getByText(/crash and error reports/)).toBeInTheDocument();
-    expect(screen.getByText(/No account details, IP address or browsing data/)).toBeInTheDocument();
-    expect(screen.queryByText(/crash details/i)).not.toBeInTheDocument();
-    // Applied live on the Rust side, so there is no restart note.
+    expect(row).toHaveTextContent(/^Crash Reports$/);
+    expect(row).toHaveAccessibleDescription('');
+    expect(screen.queryByText(/Off by default/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/crash and error reports/)).not.toBeInTheDocument();
+    // Applied live on the Rust side, so there is no restart note either.
     expect(screen.queryByText(/restart/i)).not.toBeInTheDocument();
   });
 
@@ -186,38 +188,22 @@ describe('a settings file that cannot be verified (review of #222, round 3)', ()
   });
 });
 
-describe('Kill switch copy and the always-on toggle', () => {
-  const BASE =
-    'If the tunnel drops unexpectedly, the app blocks traffic until it reconnects. Protection applies while the app is running.';
-  const GIVE_UP = ' If reconnecting keeps failing, the app stops blocking.';
-
-  it('scopes the promise to while the app is running (no "never leaks")', async () => {
-    setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36');
+describe('Kill switch row and the always-on toggle', () => {
+  // Owner, 2026-10-21: no description under a setting. The kill switch row
+  // used to carry the D-7 scope sentence and the give-up caveat; both went,
+  // and the row promises nothing at all (still no "never leaks").
+  it.each([
+    ['Linux', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'],
+    ['Windows', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'],
+  ])('%s: the row is its title and its switch, and promises nothing', async (_os, ua) => {
+    setUserAgent(ua);
     const { container } = render(<Settings />);
-    await screen.findByRole('switch', { name: /^kill switch/i });
-    // Second-pass #5: off Windows, auto_reconnect gives up after 10 attempts
-    // and releases the block, so the row says so (and not "tells you").
-    expect(screen.getByText(BASE + GIVE_UP)).toBeInTheDocument();
+    const row = await screen.findByRole('switch', { name: /^kill switch/i });
+    expect(row).toHaveTextContent(/^Kill Switch$/);
+    expect(row).toHaveAccessibleDescription('');
+    expect(screen.queryByText(/blocks traffic until it reconnects/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/the app stops blocking/)).not.toBeInTheDocument();
     expect(container.textContent ?? '').not.toMatch(/never leak|nothing leaves|tells you/i);
-  });
-
-  it('on Windows the give-up caveat follows the always-on setting', async () => {
-    setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-    mockStoreState.settings.lockdownMode = true;
-    const { unmount } = render(<Settings />);
-    await screen.findByRole('switch', { name: /^kill switch/i });
-    // Lockdown keeps blocking after the retries run out: no caveat.
-    expect(screen.getByText(BASE)).toBeInTheDocument();
-    unmount();
-
-    mockStoreState.settings.lockdownMode = false;
-    try {
-      render(<Settings />);
-      await screen.findByRole('switch', { name: /^kill switch/i });
-      expect(screen.getByText(BASE + GIVE_UP)).toBeInTheDocument();
-    } finally {
-      mockStoreState.settings.lockdownMode = true;
-    }
   });
 
   it('offers the always-on toggle on Windows, persisted without a live reapply', async () => {

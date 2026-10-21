@@ -1,10 +1,12 @@
 /**
- * VpnSettings — pushed sub-screen, mirroring mobile's `VpnSettingsScreen.kt` /
- * iOS VpnSettingsView.
+ * VpnSettings — pushed sub-screen, laid out as mobile's `VpnSettingsScreen.kt`
+ * (owner, 2026-10-21: "exactly the same design as the mobile").
  *
  * Sections: SECURITY (Stealth Mode, BirdoShield), NETWORK (Local Network
- * Sharing), WIREGUARD (the port, which is not a choice, + MTU), an info note,
- * then FEATURES (Kill Switch Exceptions, Windows-only).
+ * Sharing), WIREGUARD (the port, which is not a choice, + MTU), then the info
+ * note. Kill Switch Exceptions moved to Settings › VPN, where mobile has Split
+ * Tunneling. One row per card, title and control only: a row says something
+ * more only while it cannot be used, and why.
  *
  * Every setting here shapes the tunnel, so each save goes through
  * `persistSettings(…, { reapply: true })`: saved, rolled back and reported if
@@ -21,17 +23,18 @@
  */
 import { useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { EyeOff, ShieldCheck, Network, Router, SlidersHorizontal, Info, Split } from 'lucide-react';
+import { EyeOff, Shield, Network, Router, SlidersHorizontal, Info } from 'lucide-react';
+import { BirdoTopBar, BirdoTextField } from '@/components/birdo';
 import {
-  BirdoTopBar,
-  BirdoCard,
-  BirdoSectionHeader,
-  BirdoToggleRow,
-  BirdoNavRow,
-  BirdoTextField,
-} from '@/components/birdo';
+  SettingsCard,
+  SettingsCheckRow,
+  SettingsNote,
+  SettingsSectionHeader,
+  SettingsToggle,
+  SettingsValueRow,
+} from '@/components/settings/SettingsRows';
 import { useAppStore } from '@/store/app-store';
-import { isValidMtu, isWindowsPlatform } from '@/utils/helpers';
+import { isValidMtu } from '@/utils/helpers';
 import { white, status, brand } from '@/lib/birdo-theme';
 import { lowestPlanWith, planHasFeature, planName } from '@/lib/plan';
 import { persistSettings } from '@/session/settings-persist';
@@ -107,25 +110,21 @@ export function VpnSettings() {
     <div className="flex h-full flex-col">
       <BirdoTopBar title="VPN Settings" onBack={popRoute} />
 
-      <div className="flex-1 overflow-y-auto px-4 pb-8 pt-2">
-        {/* ── SECURITY ──────────────────────────────────────────────── */}
-        <BirdoSectionHeader title="Security" />
+      <div className="flex-1 overflow-y-auto">
+        <div className="flex flex-col gap-1 px-4 pb-8 pt-2">
+          {/* ── SECURITY ──────────────────────────────────────────────── */}
+          <SettingsSectionHeader title="Security" />
 
-        <BirdoCard padding="0">
           {/* Title without "· Premium" (P1-parity-032): a paying user saw an
               upsell word on a setting they own. When locked, the whole row
               routes to the plans — one affordance, not a dead switch plus a
               separate link. */}
-          <BirdoToggleRow
+          <SettingsToggle
+            rowStyle="bare"
+            icon={EyeOff}
+            iconColor={status.blue}
             title="Stealth Mode"
-            subtitle={
-              stealthUnlocked === null
-                ? 'Checking your plan…'
-                : 'Wraps WireGuard in an encrypted transport for networks that block VPNs. Slower.'
-            }
-            subtitleWrap
-            leadingIcon={EyeOff}
-            leadingTint={status.blue}
+            status={stealthUnlocked === null ? 'Checking your plan…' : undefined}
             // `&& unlocked` so a saved ON cannot resurface after a downgrade.
             checked={settings.stealthMode && stealthUnlocked === true}
             onCheckedChange={(v) => save({ stealthMode: v })}
@@ -140,7 +139,7 @@ export function VpnSettings() {
             <button
               type="button"
               onClick={() => void loadSubscription(true)}
-              className="px-3.5 pb-3 text-xs font-semibold"
+              className="self-start px-1 pb-1 text-xs font-semibold"
               style={{ color: brand.accentSoft }}
             >
               Retry
@@ -148,145 +147,92 @@ export function VpnSettings() {
           )}
           {/* BirdoShield (D18): per-device DNS filtering, sent as the
               `dnsFiltering` connect flag by BOTH Rust dial paths. No plan
-              gate. Gated by the fleet and by Custom DNS instead. */}
-          <BirdoToggleRow
+              gate. Gated by the fleet and by Custom DNS instead, and then the
+              row says which: that reason is the only text a row carries. */}
+          <SettingsToggle
+            rowStyle="bare"
+            icon={Shield}
+            iconColor={brand.accent}
             title="BirdoShield"
-            subtitle={
+            status={
               fleetGateOff
                 ? "Not available on your account's server fleet yet. Your preference is kept and applies as soon as it is."
                 : customDnsActive
                   ? 'Custom DNS overrides BirdoShield. Turn off Custom DNS Servers under Settings › VPN to use the filtering resolver.'
-                  : "Blocks ads, trackers and malware domains at the VPN's DNS resolver."
+                  : undefined
             }
-            // Every subtitle here is an explanation, longer than the ~34
-            // characters one 12px line fits in the 380px window; truncated,
-            // the user would never see that their preference is kept.
-            subtitleWrap
-            leadingIcon={ShieldCheck}
-            leadingTint={shieldBlocked ? white.w40 : brand.accent}
             checked={settings.dnsFiltering && !shieldBlocked}
             onCheckedChange={(v) => save({ dnsFiltering: v })}
             enabled={!shieldBlocked}
           />
-        </BirdoCard>
 
-        {/* ── NETWORK ───────────────────────────────────────────────── */}
-        <BirdoSectionHeader title="Network" className="mt-4" />
-
-        <BirdoCard padding="0">
-          <BirdoToggleRow
+          {/* ── NETWORK ───────────────────────────────────────────────── */}
+          <SettingsSectionHeader title="Network" />
+          <SettingsToggle
+            rowStyle="bare"
+            icon={Network}
+            iconColor={status.blue}
             title="Local Network Sharing"
-            subtitle="Allow access to devices on your local network (printers, NAS, etc.) while connected to VPN."
-            subtitleWrap
-            leadingIcon={Network}
-            leadingTint={status.blue}
             checked={settings.localNetworkSharing}
             onCheckedChange={(v) => save({ localNetworkSharing: v })}
           />
-        </BirdoCard>
 
-        {/* ── WIREGUARD ─────────────────────────────────────────────── */}
-        <BirdoSectionHeader title="WireGuard" className="mt-4" />
+          {/* ── WIREGUARD ─────────────────────────────────────────────── */}
+          <SettingsSectionHeader title="WireGuard" />
+          <SettingsValueRow icon={Router} iconColor={brand.accent} title="WireGuard Port" value="Automatic" />
 
-        <BirdoCard>
-          <div className="flex items-center gap-3.5">
-            <Router size={20} color={brand.accent} aria-hidden />
-            <div>
-              <div className="text-[15px] font-medium text-white">WireGuard Port</div>
-              <div className="text-xs" style={{ color: white.w60 }}>
-                Automatic
+          <SettingsCard rowStyle="bare" padding="16px">
+            <div className="flex items-center gap-3.5">
+              <SlidersHorizontal size={22} color={status.yellow} aria-hidden className="shrink-0" />
+              <div className="text-[14px] font-medium" style={{ color: white.w100 }}>
+                WireGuard MTU
               </div>
             </div>
-          </div>
-          <p className="mt-2 text-xs" style={{ color: white.w60 }}>
-            BirdoVPN servers accept WireGuard on port 51820 only.
-          </p>
-        </BirdoCard>
-
-        <div className="h-2" />
-        <BirdoCard>
-          <div className="flex items-center gap-3.5">
-            <SlidersHorizontal size={20} color={status.yellow} aria-hidden />
-            <div>
-              <div className="text-[15px] font-medium text-white">WireGuard MTU</div>
-              <div className="text-xs" style={{ color: white.w60 }}>
-                Packet size — lower values improve reliability on unstable networks
-              </div>
-            </div>
-          </div>
-          <div className="mt-3 space-y-1">
-            <BirdoToggleRow
-              title="Automatic (server default)"
-              checked={mtuAuto}
-              onCheckedChange={(auto) => {
-                setMtuError(null);
-                if (auto) {
-                  setMtuDraft('');
-                  save({ wireGuardMtu: 0 });
-                } else {
-                  setMtuDraft('1420');
-                  save({ wireGuardMtu: 1420 });
-                }
-              }}
-            />
-            {!mtuAuto && (
-              <BirdoTextField
-                className="px-1 pt-1"
-                ariaLabel="WireGuard MTU"
-                placeholder="1280-1500"
-                inputMode="numeric"
-                value={mtuDraft}
-                onChange={(raw) => {
-                  setMtuDraft(raw.replace(/\D/g, '').slice(0, 4));
-                  if (mtuError) setMtuError(null);
+            <div className="mt-3 space-y-2">
+              <SettingsCheckRow
+                title="Automatic (server default)"
+                checked={mtuAuto}
+                onCheckedChange={(auto) => {
+                  setMtuError(null);
+                  if (auto) {
+                    setMtuDraft('');
+                    save({ wireGuardMtu: 0 });
+                  } else {
+                    setMtuDraft('1420');
+                    save({ wireGuardMtu: 1420 });
+                  }
                 }}
-                onBlur={commitMtu}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') commitMtu();
-                }}
-                errorText={mtuError}
-                hint="Valid range: 1280–1500. Recommended: 1420."
               />
-            )}
-          </div>
-        </BirdoCard>
+              {!mtuAuto && (
+                <BirdoTextField
+                  ariaLabel="WireGuard MTU"
+                  placeholder="1280-1500"
+                  inputMode="numeric"
+                  value={mtuDraft}
+                  onChange={(raw) => {
+                    setMtuDraft(raw.replace(/\D/g, '').slice(0, 4));
+                    if (mtuError) setMtuError(null);
+                  }}
+                  onBlur={commitMtu}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') commitMtu();
+                  }}
+                  errorText={mtuError}
+                />
+              )}
+            </div>
+          </SettingsCard>
 
-        {/* ── Info note ─────────────────────────────────────────────── */}
-        <div
-          className="mt-3 flex items-center gap-2.5 rounded-birdo-sm px-3 py-2.5"
-          style={{ backgroundColor: white.w10 }}
-          aria-live="polite"
-        >
-          <Info size={16} color={white.w60} aria-hidden className="shrink-0" />
-          <p className="text-xs" style={{ color: white.w60 }}>
+          {/* ── Info note ─────────────────────────────────────────────── */}
+          <div className="h-2" />
+          <SettingsNote icon={Info} live>
             {reapplying
               ? 'Applying settings — reconnecting…'
               : connected
                 ? 'Changes apply to your current connection automatically (brief reconnect).'
                 : 'Changes take effect on the next connection.'}
-          </p>
+          </SettingsNote>
         </div>
-
-        {/* ── FEATURES ──────────────────────────────────────────────── */}
-        {/* WFP enforcement is Windows-only. Presented as "Kill Switch
-            Exceptions", not "Split Tunneling": WFP permit filters exempt an
-            app from the kill-switch block — they cannot route it outside the
-            VPN (that needs a signed redirect callout driver). */}
-        {isWindowsPlatform() && (
-          <>
-            <BirdoSectionHeader title="Features" className="mt-4" />
-            <BirdoCard padding="0">
-              <BirdoNavRow
-                title="Kill Switch Exceptions"
-                subtitle="Apps that stay online while the kill switch blocks traffic"
-                subtitleWrap
-                leadingIcon={Split}
-                leadingTint={white.w60}
-                onClick={() => pushRoute('splitTunnel')}
-              />
-            </BirdoCard>
-          </>
-        )}
       </div>
     </div>
   );

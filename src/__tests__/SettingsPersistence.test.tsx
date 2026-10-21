@@ -16,7 +16,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { invoke } from '@tauri-apps/api/core';
-import { CUSTOM_DNS_NOT_LAN_COPY, MACOS_IPV6_NOTE, Settings } from '@/components/Settings';
+import { MACOS_IPV6_NOTE, Settings } from '@/components/Settings';
 import { VpnSettings } from '@/screens/VpnSettings';
 import { defaultSettings, useAppStore } from '@/store/app-store';
 import {
@@ -162,15 +162,18 @@ describe('Custom DNS: draft fields, saved on leave', () => {
     expect(screen.getByText(outsideNote)).toBeInTheDocument();
   });
 
-  // MR-689: Local Network Sharing opens the private ranges and link-local, on
-  // every platform. A CGNAT or public-range LAN resolver is none of them, and
-  // only CGNAT space can be recognised, so the fields say it for every address.
-  it('says a carrier-grade NAT or public address is not your own network (MR-689)', () => {
+  // Owner, 2026-10-21: no helper lines under the fields, as mobile (label and
+  // placeholder only). The MR-689 CGNAT note and the popular-resolver list
+  // went with it; the warning above, about an address actually typed, stays.
+  it('the fields carry no static helper lines (owner, 2026-10-21)', () => {
     useAppStore.setState({
       settings: { ...defaultSettings, customDnsEnabled: true, customDns: ['100.100.100.100'], localNetworkSharing: true },
     });
     render(<Settings />);
-    expect(screen.getByText(CUSTOM_DNS_NOT_LAN_COPY)).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Primary DNS' })).toHaveValue('100.100.100.100');
+    expect(screen.queryByText(/carrier-grade NAT/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Popular: 1\.1\.1\.1/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Saved when you leave a field/)).not.toBeInTheDocument();
     expect(screen.queryByText(/on your own network is reached directly/)).not.toBeInTheDocument();
   });
 });
@@ -1231,7 +1234,8 @@ describe('VPN Settings: the port, and MTU as a draft', () => {
     expect(screen.queryByText(/port 53/)).toBeNull();
     expect(screen.getByText('WireGuard Port')).toBeInTheDocument();
     expect(screen.getByText('Automatic')).toBeInTheDocument();
-    expect(screen.getByText('BirdoVPN servers accept WireGuard on port 51820 only.')).toBeInTheDocument();
+    // Owner, 2026-10-21: a value row, no description under it.
+    expect(screen.queryByText(/port 51820 only/)).toBeNull();
     expect(saves()).toHaveLength(0);
   });
 
