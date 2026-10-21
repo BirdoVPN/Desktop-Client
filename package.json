@@ -24,7 +24,7 @@
     "@tauri-apps/plugin-notification": "~2.6.0",
     "@tauri-apps/plugin-opener": "2.7.1",
     "@tauri-apps/plugin-process": "^2.3.1",
-    "framer-motion": "^13.4.6",
+    "framer-motion": "^14.2.0",
     "lucide-react": "^1.54.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
