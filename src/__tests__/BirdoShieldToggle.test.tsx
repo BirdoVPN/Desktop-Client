@@ -123,18 +123,19 @@ const reapplyCalls = () =>
   mockedInvoke.mock.calls.filter(([cmd]) => cmd === 'reapply_vpn_settings');
 
 describe('BirdoShield toggle → dns_filtering', () => {
-  it('renders OFF by default under Security with the resolver copy, on the free plan (no plan gate)', async () => {
+  it('renders OFF by default under Security, title and switch only, on the free plan (no plan gate)', async () => {
     render(<VpnSettings />);
     const row = await screen.findByRole('switch', { name: /birdoshield/i });
     expect(row).toHaveAttribute('aria-checked', 'false');
-    // BirdoListItem renders an interactive <button> only when enabled; a
-    // gated row degrades to a static <div>.
+    // The row renders an interactive <button> only when enabled; a gated row
+    // degrades to a static <div>.
     expect(row.tagName).toBe('BUTTON');
-    // No "applies on your next connection" tail: the screen's info note
-    // already states the live-reapply behaviour and the two contradicted.
+    // Owner, 2026-10-21: no description under a setting. The resolver copy
+    // that sat here is gone; the row is its title and its switch.
+    expect(row).toHaveTextContent(/^BirdoShield$/);
     expect(
-      screen.getByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
-    ).toBeInTheDocument();
+      screen.queryByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
+    ).not.toBeInTheDocument();
     // Stealth, by contrast, IS plan-gated on RECON — the two rows differ on
     // purpose. The locked row is no switch at all: it routes to the plans.
     expect(screen.queryByRole('switch', { name: /stealth mode/i })).not.toBeInTheDocument();
@@ -297,9 +298,8 @@ describe('BirdoShield toggle → dns_filtering', () => {
       const row = await screen.findByRole('switch', { name: /birdoshield/i });
       expect(row.tagName).toBe('BUTTON');
       expect(row).toHaveAttribute('aria-checked', 'true');
-      expect(
-        screen.getByText("Blocks ads, trackers and malware domains at the VPN's DNS resolver."),
-      ).toBeInTheDocument();
+      // Available: nothing to explain, so no text under the title.
+      expect(row).toHaveTextContent(/^BirdoShield$/);
       expect(screen.queryByText(UNAVAILABLE_COPY)).not.toBeInTheDocument();
     });
   });
@@ -318,11 +318,12 @@ describe('BirdoShield toggle → dns_filtering', () => {
   //
   // There is no layout engine here to measure, so the assertion is structural:
   // a subtitle longer than one line must not be in a truncating container.
+  // Since 2026-10-21 (owner: no descriptions) only a BLOCKED row has one.
   describe('the blocked reason must be readable, not just present in the DOM', () => {
     /** Characters that fit on one 12px line in the 380px window (see above). */
     const ONE_LINE_BUDGET = 34;
 
-    /** The row's subtitle element (the title is `text-[15px]`). */
+    /** The row's reason element (the title is `text-[14px]`). */
     const subtitleOf = (row: HTMLElement) => {
       const el = row.querySelector('.text-xs');
       expect(el).not.toBeNull();
@@ -330,7 +331,6 @@ describe('BirdoShield toggle → dns_filtering', () => {
     };
 
     const states: Array<[string, () => void]> = [
-      ['default', () => {}],
       ['fleet gate off', () => { mockStoreState.dnsFilteringAvailable = false; }],
       ['custom DNS', () => {
         mockStoreState.settings.customDns = ['1.1.1.1'];
@@ -342,8 +342,8 @@ describe('BirdoShield toggle → dns_filtering', () => {
       setup();
       render(<VpnSettings />);
       const subtitle = subtitleOf(await screen.findByRole('switch', { name: /birdoshield/i }));
-      // Every one of the three copies is longer than a line -- if one ever is
-      // not, the budget below stops being the thing under test.
+      // Both reasons are longer than a line -- if one ever is not, the
+      // budget below stops being the thing under test.
       expect(subtitle.textContent!.length).toBeGreaterThan(ONE_LINE_BUDGET);
       expect(subtitle.className).not.toMatch(/\btruncate\b/);
       expect(subtitle.className).toMatch(/\bwhitespace-normal\b/);
@@ -421,9 +421,8 @@ describe('BirdoShield toggle → dns_filtering', () => {
       expect(row).not.toHaveAttribute('aria-disabled');
       // A <button> is focusable already; adding tabindex would be noise.
       expect(row).not.toHaveAttribute('tabindex');
-      expect(reasonOf(row)).toHaveTextContent(
-        "Blocks ads, trackers and malware domains at the VPN's DNS resolver.",
-      );
+      // Nothing to explain, so nothing to point at.
+      expect(row).not.toHaveAttribute('aria-describedby');
     });
 
     // The plan-gated Stealth row is no longer a disabled switch: it is a
@@ -476,13 +475,11 @@ describe('BirdoShield toggle → dns_filtering', () => {
       expect(row).toHaveAccessibleDescription(UNAVAILABLE_COPY);
     });
 
-    it('an ENABLED row does not announce its subtitle twice either', async () => {
+    it('an ENABLED row is announced by its name alone (no description since 2026-10-21)', async () => {
       render(<VpnSettings />);
       const row = await screen.findByRole('switch', { name: 'BirdoShield' });
       expect(row).toHaveAccessibleName('BirdoShield');
-      expect(row).toHaveAccessibleDescription(
-        "Blocks ads, trackers and malware domains at the VPN's DNS resolver.",
-      );
+      expect(row).toHaveAccessibleDescription('');
     });
 
     // The `subtitle=""` half pins a claim review made and MEASUREMENT refutes:

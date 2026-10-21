@@ -648,7 +648,7 @@ relay.
 ### W7. Kill Switch Exceptions (split tunnelling)
 
 The Windows app has no route-based split tunnelling. Its "split tunnelling" is
-**Kill Switch Exceptions** (Settings › VPN Settings › Kill Switch Exceptions):
+**Kill Switch Exceptions** (Settings › VPN › Kill Switch Exceptions):
 an excepted app is exempt from the kill switch's block, in both directions,
 while the tunnel is down. While the VPN is connected, its traffic still goes
 through the tunnel like everything else.
