@@ -366,6 +366,28 @@
   .birdo-globe__map { animation: none; }
 }
 
+/* The Limit tab's speed-dial gauge (screens/Limit.tsx). The fill sweeps in
+   from empty when the dial appears and glides to each new reading, the knob
+   (a one-dot dash on the same arc) with it, over 900 ms on the standard ease: iOS SpeedDialGauge's
+   easeStandard(0.9) (motion.ease in birdo-theme.ts). No fill mode, so once the
+   sweep ends the inline value holds and later readings run as transitions.
+   The reduced-motion rule below makes both instant. */
+.birdo-gauge__fill {
+  animation: birdo-gauge-fill 900ms cubic-bezier(0.2, 0, 0, 1);
+  transition: stroke-dashoffset 900ms cubic-bezier(0.2, 0, 0, 1);
+}
+.birdo-gauge__knob {
+  animation: birdo-gauge-knob 900ms cubic-bezier(0.2, 0, 0, 1);
+  transition: stroke-dashoffset 900ms cubic-bezier(0.2, 0, 0, 1);
+}
+@keyframes birdo-gauge-fill {
+  from { stroke-dashoffset: 1; }
+}
+/* -0.001: the empty-dial position, GAUGE_KNOB_END_INSET in lib/usage-gauge.ts. */
+@keyframes birdo-gauge-knob {
+  from { stroke-dashoffset: -0.001; }
+}
+
 /* Accessibility: respect user's reduced-motion preference */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -488,12 +510,20 @@ input::-ms-clear {
   .birdo-dialog {
     border: 1px solid CanvasText !important;
   }
-  .birdo-meter {
-    border: 1px solid CanvasText;
-  }
-  .birdo-meter > div {
+  .birdo-gauge svg {
     forced-color-adjust: none;
-    background-color: Highlight !important;
+  }
+  .birdo-gauge__track {
+    stroke: GrayText;
+  }
+  .birdo-gauge__fill {
+    stroke: Highlight;
+  }
+  .birdo-gauge__knob {
+    stroke: Highlight;
+  }
+  .birdo-gauge__knob.birdo-gauge__core {
+    stroke: Canvas;
   }
   :focus-visible {
     outline: 2px solid Highlight;
