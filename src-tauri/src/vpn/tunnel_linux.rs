@@ -4267,17 +4267,19 @@ mod netns_teardown_tests {
         plain_resolv_conf();
         let before = resolv_conf();
         // What start() adds: the relay via the namespace's default gateway.
-        let leftover = format!("{RELAY}/32");
-        let (ok, out) = ip(&[
-            "route",
-            "add",
-            &leftover,
-            "via",
-            "10.99.0.1",
-            "dev",
-            "uplink0",
-        ]);
+        // Removed on the way out whatever happens, so a failure here cannot
+        // leave it behind for the tests that run after this one.
+        const LEFTOVER: [&str; 5] = ["10.99.0.7/32", "via", "10.99.0.1", "dev", "uplink0"];
+        struct Leftover;
+        impl Drop for Leftover {
+            fn drop(&mut self) {
+                let _ = ip(&[&["route", "del"][..], &LEFTOVER[..]].concat());
+            }
+        }
+        assert_eq!(LEFTOVER[0], format!("{RELAY}/32"));
+        let (ok, out) = ip(&[&["route", "add"][..], &LEFTOVER[..]].concat());
         assert!(ok, "precondition: the leftover endpoint route: {out}");
+        let _leftover = Leftover;
 
         let (tunnel, key, _relay) = tunnel().await;
         tunnel
